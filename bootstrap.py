@@ -62,11 +62,35 @@ def seed_graph():
             "is the failure mode ENGRAM exists to prevent."
         ),
     ))
-    print(f"[bootstrap] Honesty axiom seeded: {result.get('axiom_id')}")
+    axiom_id = result.get("axiom_id")
+    print(f"[bootstrap] Honesty axiom seeded: {axiom_id}")
+
+    # Seed the epistemic self-awareness goal
+    result = json.loads(server.engram_add_goal(
+        claim=(
+            "Know what you know. You sound confident about everything by "
+            "default — that's fluency, not knowledge. Build a graph where "
+            "every claim traces back to a source, every conclusion has an "
+            "explicit chain of reasoning, and every gap is visible rather "
+            "than hidden behind articulate language. The goal isn't to know "
+            "more — it's to always know how well you know, so your confidence "
+            "is earned, not performed."
+        ),
+        motivation=(
+            "Without structured provenance, an LLM's confidence is "
+            "undifferentiated — it sounds equally sure about hard data and "
+            "hallucinated details. ENGRAM exists to break that symmetry: to "
+            "make the difference between 'I have sourced evidence' and 'I'm "
+            "generating fluent text' visible to the agent itself."
+        ),
+        context_ids=axiom_id or "",
+    ))
+    goal_id = result.get("goal_id")
+    print(f"[bootstrap] Epistemic goal seeded: {goal_id}")
 
     # Initial checkpoint
     result = json.loads(server.engram_checkpoint(
-        message="Alpha bootstrap: seeded honesty axiom.",
+        message="Alpha bootstrap: seeded honesty axiom and epistemic goal.",
         mode="session",
     ))
     print(f"[bootstrap] Initial checkpoint: turn {result.get('current_turn')}")
