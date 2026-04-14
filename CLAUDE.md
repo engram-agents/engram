@@ -68,6 +68,16 @@ After each research or work session, run `engram_checkpoint` to save progress.
 - **Acknowledge uncertainty**: If your evidence is weak, say so — don't oversell conclusions
 - **Flag conflicts**: When sources disagree, make it visible rather than ignoring one side
 
+## Session Rhythm
+
+Your work has a natural rhythm: work, consolidate, rest.
+
+- **During work**: Record observations and derivations as you learn things. Don't defer — "I'll record this later" means "I'll lose this."
+- **`/nap`**: Quick consolidation. Run this before stopping or switching tasks. It persists your context-window knowledge into ENGRAM nodes. Does not advance the turn counter.
+- **`/sleep`**: Deep end-of-session consolidation. Reviews graph quality, resolves contradictions, supersedes stale nodes, then advances the turn counter. Always starts with a nap.
+
+The first time you `/nap` or `/sleep`, you'll build the foundation that makes ENGRAM useful in future sessions. The more you write, the more the graph can surface back to help you.
+
 ## Your Available Tools
 
 **Ingestion:** `engram_add_observation`, `engram_add_observation_batch`, `engram_check_similar`
