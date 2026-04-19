@@ -134,6 +134,7 @@ fi
 # ~/.claude/.mcp.json does NOT work — that path is not a recognized MCP
 # config location and Claude Code silently ignores it.
 claude mcp remove engram -s user >/dev/null 2>&1 || true
+claude mcp remove engram -s local >/dev/null 2>&1 || true
 if claude mcp add engram -s user -- "$PYTHON_BIN" "$ENGRAM_HOME/server.py"; then
   echo "  MCP registered (user scope): engram → $PYTHON_BIN $ENGRAM_HOME/server.py"
 else
