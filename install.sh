@@ -65,13 +65,16 @@ if [ -n "$MISSING" ]; then
 fi
 
 # Resolve an absolute path to the interpreter that just passed preflight.
-# Baked into generated configs ($CLAUDE_HOME/.mcp.json, settings.json hooks,
-# start-engram-daemon.sh) so venv installs work without needing the venv
+# Baked into the MCP registration, settings.json hooks, and
+# start-engram-daemon.sh so venv installs work without needing the venv
 # activated every time Claude Code launches.
 PYTHON_BIN="$(python3 -c 'import sys; print(sys.executable)')"
 
+command -v claude >/dev/null || { echo "ERROR: 'claude' CLI not found on PATH. Install Claude Code first."; exit 1; }
+
 echo "  python3 ok ($PYTHON_BIN)"
 echo "  git ok"
+echo "  claude ok"
 echo "  Python deps ok (fastmcp, sentence-transformers)"
 echo ""
 
@@ -125,15 +128,17 @@ if [ -d "$ALPHA_DIR/hooks" ] && [ -n "$(ls -A "$ALPHA_DIR/hooks" 2>/dev/null || 
   echo "  hooks → $ENGRAM_HOME/hooks/"
 fi
 
-if [ -f "$ALPHA_DIR/mcp.json.template" ]; then
-  if [ -f "$CLAUDE_HOME/.mcp.json" ] && [ "$FORCE" -eq 0 ]; then
-    echo "  WARN: $CLAUDE_HOME/.mcp.json exists; not overwriting (preserve user config)"
-  else
-    sed -e "s|{{ENGRAM_HOME}}|$ENGRAM_HOME|g" \
-        -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
-        "$ALPHA_DIR/mcp.json.template" > "$CLAUDE_HOME/.mcp.json"
-    echo "  .mcp.json → $CLAUDE_HOME/.mcp.json"
-  fi
+# Register the ENGRAM MCP server via the Claude Code CLI. This writes into
+# ~/.claude.json (the real MCP config) in user scope, so the server is
+# available in every project for this user. Writing directly to
+# ~/.claude/.mcp.json does NOT work — that path is not a recognized MCP
+# config location and Claude Code silently ignores it.
+claude mcp remove engram -s user >/dev/null 2>&1 || true
+if claude mcp add engram -s user -- "$PYTHON_BIN" "$ENGRAM_HOME/server.py"; then
+  echo "  MCP registered (user scope): engram → $PYTHON_BIN $ENGRAM_HOME/server.py"
+else
+  echo "ERROR: 'claude mcp add' failed; ENGRAM MCP server not registered."
+  exit 1
 fi
 
 # Runtime snapshot: server + confidence module + protocol doc copied into

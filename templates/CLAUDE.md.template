@@ -128,7 +128,7 @@ The context tracker (`~/.engram/hooks/context_tracker.py`) measures JSONL file s
 |-----------|------|
 | ENGRAM data | `~/.engram/` |
 | Hook scripts | `~/.engram/hooks/` |
-| MCP server config | `~/.claude/.mcp.json` |
+| MCP server config | `~/.claude.json` (user-scope, managed via `claude mcp add/remove`) |
 | User settings + hooks | `~/.claude/settings.json` |
 | Skills | `~/.claude/skills/` |
 | Warm briefing | `~/.engram/warm-briefing.md` |

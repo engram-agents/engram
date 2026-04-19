@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "engram": {
-      "command": "{{PYTHON}}",
-      "args": ["{{ENGRAM_HOME}}/server.py"]
-    }
-  }
-}

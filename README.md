@@ -103,7 +103,7 @@ Expected terminal output (abbreviated):
 == Step 4: Copying files ==
   skills → /home/USER/.claude/skills/
   hooks → /home/USER/.engram/hooks/
-  .mcp.json → /home/USER/.claude/.mcp.json
+  MCP registered (user scope): engram → /path/to/python3 /home/USER/.engram/server.py
 == Step 5: Seed graph + template resolution ==
   Creating seed graph...
     {{AX_HONESTY}} = ax_0001
@@ -178,7 +178,7 @@ resolve. The grep should report that only those three remain.
 | 1 | Check `python3`, `git`, and required Python packages |
 | 2 | Refuse to overwrite an existing `~/.engram/knowledge.db` (unless `--force`) |
 | 3 | Create `~/.engram/`, `~/.engram/hooks/`, `~/.engram/diary/`, `~/.claude/skills/` |
-| 4 | Copy `alpha/skills/*` → `~/.claude/skills/`, `alpha/hooks/*` → `~/.engram/hooks/`, `alpha/viz_server.py` → `~/.engram/viz_server.py`, render `.mcp.json.template` → `~/.claude/.mcp.json` |
+| 4 | Copy `skills/*` → `~/.claude/skills/`, `hooks/*` → `~/.engram/hooks/`, `viz_server.py` → `~/.engram/viz_server.py`, register the `engram` MCP server via `claude mcp add -s user` (writes into `~/.claude.json`) |
 | 5 | Create 5 seed nodes via the MCP server, write `~/.engram/seed-manifest.json`, render `CLAUDE.md.template` + `warm-briefing.md.template` with seed IDs and repo path, merge hook registrations into `~/.claude/settings.json` |
 | 6 | Write `~/.engram/first-run-pending` so the cold-start skill fires on the next session |
 | 7 | `git init` inside `~/.engram/`; commit the install state |
@@ -228,9 +228,10 @@ the page to see new nodes.
 ## File layout after install
 
 ```
+~/.claude.json                        # engram MCP server registration (user scope, managed by `claude mcp`)
+
 ~/.claude/
 ├── CLAUDE.md                         # resolved from template
-├── .mcp.json                         # engram MCP server registration
 ├── settings.json                     # hooks merged in
 └── skills/
     └── engram-first-session/
@@ -292,7 +293,8 @@ written in.
 **Uninstall**
 ```bash
 rm -rf ~/.engram
-rm ~/.claude/CLAUDE.md ~/.claude/.mcp.json
+rm ~/.claude/CLAUDE.md
+claude mcp remove engram -s user
 # Edit ~/.claude/settings.json to remove ENGRAM hook entries
 # Edit ~/.claude/skills/ to remove engram-first-session
 ```
