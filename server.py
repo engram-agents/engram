@@ -10,6 +10,7 @@ MVP tools: ingestion (add_evidence, add_observation, check_similar),
 query (query, get_subgraph), version control (checkpoint, diff).
 """
 
+import functools
 import hashlib
 import json
 import os
@@ -17,12 +18,29 @@ import socket
 import sqlite3
 import subprocess
 import textwrap
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
 from fastmcp import FastMCP
+
+# sqlite-vec (optional): SIMD-accelerated KNN over embeddings, replaces the
+# O(N) pure-Python cosine loop in _semantic_search. If the extension fails to
+# load (older Python build without enable_load_extension, or module absent),
+# we fall back to the legacy Python cosine path — search still works, just
+# slowly. Availability is checked once at module import and again per-connection.
+try:
+    import sqlite_vec as _sqlite_vec
+    _SQLITE_VEC_IMPORT_OK = True
+except Exception:  # pragma: no cover
+    _sqlite_vec = None
+    _SQLITE_VEC_IMPORT_OK = False
+
+# Flipped to False at runtime if extension loading fails on the actual
+# connection (some Python sqlite3 builds compile without load_extension).
+_VEC_BACKEND_AVAILABLE = _SQLITE_VEC_IMPORT_OK
 
 
 # ---------------------------------------------------------------------------
@@ -125,23 +143,142 @@ FEELING_NUDGE_MARKER = DATA_DIR / "feeling-nudge-active.json"
 FEELING_NUDGE_TTL_TURNS = 5
 FEELING_NUDGE_SOURCES = {"post_compact", "nap_checkpoint", "dream_review"}
 
+# ── Utility scoring (MemRL-inspired, cj_0027) ──
+# Recall window: tracks which nodes were surfaced recently so engram_derive
+# can reward nodes that were recalled AND then cited as premises.
+RECALL_WINDOW_PATH = DATA_DIR / "recall_window.json"
+
+# Sandbox guard: set to True when running inside engram_sandbox() context.
+# When True, _ensure_data_dir() will refuse to create ~/.engram.
+_SANDBOX_ACTIVE = False
+
+
+def _configure_paths(data_dir: str | Path) -> None:
+    """Reconfigure ALL module-level path globals from a single data_dir.
+
+    This is the ONLY safe way to redirect ENGRAM to a different directory.
+    Manually patching individual path variables is fragile — if a new path
+    is added to server.py and not patched, writes leak to production.
+
+    Called at module load time (with env var / default), and by EngramClient
+    and engram_sandbox() for test isolation.
+
+    Incident context (ls_0004, ob_0678): a test that manually patched
+    DATA_DIR and RECALL_WINDOW_PATH but missed DB_PATH contaminated the
+    production engram with 5 test nodes.
+    """
+    global DATA_DIR, DB_PATH, SNAPSHOT_PATH, CONFIG_PATH, LOG_PATH
+    global FEELING_NUDGE_MARKER, RECALL_WINDOW_PATH
+    DATA_DIR = Path(data_dir)
+    DB_PATH = DATA_DIR / "knowledge.db"
+    SNAPSHOT_PATH = DATA_DIR / "graph_snapshot.md"
+    CONFIG_PATH = DATA_DIR / "config.json"
+    LOG_PATH = DATA_DIR / "session_log.md"
+    FEELING_NUDGE_MARKER = DATA_DIR / "feeling-nudge-active.json"
+    RECALL_WINDOW_PATH = DATA_DIR / "recall_window.json"
+UTILITY_ALPHA = {          # Per-source learning rates for Q-value updates
+    "inspect": 0.15,       # Deliberate focus — strongest signal
+    "surface": 0.10,       # Broad recall
+    "query": 0.10,         # Targeted search — similar to surface
+    "subgraph": 0.05,      # Structural traversal — weakest signal
+}
+UTILITY_ALPHA_DEFAULT = 0.10  # Fallback for unknown sources
+UTILITY_LAMBDA = 0.3      # Weight of utility in composite scoring (0 = off)
+RECALL_WINDOW_TTL = 3     # Turns: entries older than current_turn - TTL are pruned
+
+
+def engram_sandbox(data_dir: str | Path | None = None, keep: bool = False):
+    """Context manager for isolated ENGRAM testing.
+
+    Guarantees complete path isolation — every module-level path constant is
+    redirected to a temporary directory. On exit, paths are restored and the
+    temp directory is cleaned up (unless keep=True).
+
+    Usage:
+        import server
+        with server.engram_sandbox() as sandbox_dir:
+            # All server functions now operate on sandbox_dir
+            result = server.engram_add_observation(...)
+            # Production ~/.engram is completely untouched
+
+        # Paths automatically restored to production values
+
+    Args:
+        data_dir: Explicit sandbox directory. If None, creates a temp dir.
+        keep: If True, don't delete the sandbox dir on exit (for inspection).
+
+    Yields:
+        Path to the sandbox data directory.
+
+    Incident context (ls_0004): built after a test contaminated production
+    engram because path constants were manually patched and one was missed.
+    """
+    import contextlib
+    import tempfile
+    import shutil
+
+    @contextlib.contextmanager
+    def _sandbox():
+        global _SANDBOX_ACTIVE
+        # Save original state
+        original_dir = DATA_DIR
+        original_sandbox = _SANDBOX_ACTIVE
+
+        # Create sandbox directory
+        if data_dir is not None:
+            sandbox_path = Path(data_dir)
+            sandbox_path.mkdir(parents=True, exist_ok=True)
+            created_tmpdir = False
+        else:
+            sandbox_path = Path(tempfile.mkdtemp(prefix="engram_sandbox_"))
+            created_tmpdir = True
+
+        try:
+            # Redirect ALL paths
+            _configure_paths(sandbox_path)
+            _SANDBOX_ACTIVE = True
+
+            # Write default config
+            if not CONFIG_PATH.exists():
+                CONFIG_PATH.write_text(json.dumps({
+                    "trust_pool": [],
+                    "confidence_map": {
+                        "hard_data": 0.95,
+                        "official_statement": 0.85,
+                        "attributed_analysis": 0.70,
+                        "unnamed_source": 0.50,
+                        "editorial": 0.35,
+                    },
+                    "memory": {
+                        "decay_base": 1.014,
+                        "current_turn": 0,
+                        "tier1_max_nodes": 200,
+                        "tier2_max_nodes": 2000,
+                    },
+                }))
+
+            _ensure_data_dir()
+            yield sandbox_path
+        finally:
+            # Restore original paths
+            _configure_paths(original_dir)
+            _SANDBOX_ACTIVE = original_sandbox
+            # Clean up
+            if created_tmpdir and not keep and sandbox_path.exists():
+                shutil.rmtree(sandbox_path)
+
+    return _sandbox()
+
+
 # Confidence defaults by quote type
-CONFIDENCE_MAP = {
-    "hard_data": 0.95,
-    "official_statement": 0.85,
-    "attributed_analysis": 0.70,
-    "unnamed_source": 0.50,
-    "editorial": 0.35,
-}
-
-VALID_QUOTE_TYPES = set(CONFIDENCE_MAP.keys())
-
-VALID_SOURCE_CLASSES = {"external", "introspective", "user_stated"}
-SOURCE_CLASS_CONFIDENCE_DISCOUNT = {
-    "external": 1.0,        # Standard — no adjustment
-    "introspective": 0.95,  # Agent's own prior output — slight discount
-    "user_stated": None,    # Override: treated as official_statement regardless of quote_type
-}
+# Confidence model constants — single source of truth in engram_confidence.py
+from engram_confidence import (
+    CONFIDENCE_MAP, VALID_QUOTE_TYPES, VALID_SOURCE_CLASSES,
+    SOURCE_CLASS_CONFIDENCE_DISCOUNT, PREDICTIVE_CONFIDENCE_CAP,
+    CONJECTURE_CONFIDENCE_DEFAULT, CONJECTURE_CONFIDENCE_MIN,
+    CONJECTURE_CONFIDENCE_MAX, REASONING_TYPES, REASONING_CLASS,
+    REASONING_DISCOUNT, ABDUCTIVE_CONFIDENCE_CAP,
+)
 
 VALID_NODE_TYPES = {
     "evidence",
@@ -158,6 +295,10 @@ VALID_NODE_TYPES = {
     "goal",
     "goal_tension",
     "feeling_report",
+    "task",
+    "lesson",
+    "person",
+    "cornerstone",
 }
 
 # Types that assert claims about the world. Only these can participate in
@@ -172,6 +313,7 @@ CLAIM_BEARING_TYPES = {
     "theory",
     "axiom",
     "conjecture",
+    "lesson",
 }
 
 VALID_RELATIONS = {
@@ -183,7 +325,18 @@ VALID_RELATIONS = {
     "supersedes",
     "retracts",
     "tensions",
+    "serves",
+    "subtask_of",
+    "about",  # Bidirectional aboutness link, e.g. self-observation → Borges-self
+              # person node. Symmetric, DAG-exempt — can be added retroactively
+              # and connects nodes in either chronological order.
 }
+
+# Edge relations that are semantically bidirectional / aboutness-based and
+# therefore exempt from the chronological DAG invariant. A DAG edge means
+# "source depends on target" (source is newer); about/contradicts express
+# a symmetric relationship with no dependency direction.
+DAG_EXEMPT_RELATIONS = {"contradicts", "about"}
 
 VALID_ERROR_TYPES = {
     "fabricated_quote",   # quoted_text not in evidence source
@@ -214,77 +367,15 @@ TYPE_PREFIX = {
     "goal": "gl",
     "goal_tension": "gt",
     "feeling_report": "fl",
+    "task": "tk",
+    "lesson": "ls",
+    "person": "pn",
+    "cornerstone": "cs",
 }
 
-PREDICTIVE_CONFIDENCE_CAP = 0.60
-CONJECTURE_CONFIDENCE_DEFAULT = 0.40
-CONJECTURE_CONFIDENCE_MIN = 0.10
-CONJECTURE_CONFIDENCE_MAX = 0.60
-
-# ---------------------------------------------------------------------------
-# Reasoning types for derivations (v2)
-# ---------------------------------------------------------------------------
-
-REASONING_TYPES = {
-    # Deductive: if premises are true, conclusion MUST be true
-    "deductive_modus_ponens",       # If P then Q; P; therefore Q
-    "deductive_modus_tollens",      # If P then Q; not Q; therefore not P
-    "deductive_hypothetical_syllogism",  # If P→Q and Q→R; therefore P→R
-    "deductive_disjunctive",        # P or Q; not P; therefore Q
-    "deductive_reductio",           # Assume P; derive contradiction; therefore not P
-    # Inductive: more evidence = more likely, but never certain
-    "inductive_generalization",     # Observed X in A,B,C → X is generally true
-    "inductive_statistical",        # X% of A are B; this is A; therefore probably B
-    "inductive_analogy",            # A~B in X,Y,Z; A has W; therefore B has W
-    "inductive_causal",             # A precedes B + mechanism → A causes B
-    # Abductive: best available explanation, alternatives may exist
-    "abductive_best_explanation",   # Observations → hypothesis that best explains them
-    "abductive_elimination",        # Hypotheses H1,H2,H3; rule out H1,H2 → H3
-    # Authority: trust transfer, not logical reasoning
-    "authority_expert",             # Expert X says P → P is probably true
-    "authority_consensus",          # Multiple independent sources agree → probably true
-}
-
-# Class-level grouping for confidence computation
-REASONING_CLASS = {
-    "deductive_modus_ponens": "deductive",
-    "deductive_modus_tollens": "deductive",
-    "deductive_hypothetical_syllogism": "deductive",
-    "deductive_disjunctive": "deductive",
-    "deductive_reductio": "deductive",
-    "inductive_generalization": "inductive_corroboration",
-    "inductive_statistical": "inductive_chain",
-    "inductive_analogy": "inductive_chain",
-    "inductive_causal": "inductive_chain",
-    "abductive_best_explanation": "abductive",
-    "abductive_elimination": "abductive",
-    "authority_expert": "authority",
-    "authority_consensus": "inductive_corroboration",
-}
-
-# Per-type confidence discount applied to the reasoning step itself
-REASONING_DISCOUNT = {
-    "deductive_modus_ponens": 0.98,
-    "deductive_modus_tollens": 0.98,
-    "deductive_hypothetical_syllogism": 0.98,
-    "deductive_disjunctive": 0.98,
-    "deductive_reductio": 0.98,
-    "inductive_generalization": 0.95,
-    "inductive_statistical": 0.90,
-    "inductive_analogy": 0.70,
-    "inductive_causal": 0.85,
-    "abductive_best_explanation": 0.80,
-    "abductive_elimination": 0.88,
-    "authority_expert": 0.95,
-    "authority_consensus": 0.98,
-}
-
-# Abductive confidence caps — even with perfect premises, abductive
-# reasoning can't exceed these ceilings
-ABDUCTIVE_CONFIDENCE_CAP = {
-    "abductive_best_explanation": 0.80,
-    "abductive_elimination": 0.90,
-}
+# PREDICTIVE_CONFIDENCE_CAP, CONJECTURE_CONFIDENCE_*, REASONING_TYPES,
+# REASONING_CLASS, REASONING_DISCOUNT, ABDUCTIVE_CONFIDENCE_CAP
+# are all imported from engram_confidence.py above.
 
 # Structural expectations per reasoning type — used for validation warnings
 REASONING_STRUCTURE = {
@@ -294,6 +385,7 @@ REASONING_STRUCTURE = {
     "deductive_disjunctive": {"min_premises": 2, "max_premises": None, "multi_source": False},
     "deductive_reductio": {"min_premises": 1, "max_premises": None, "multi_source": False},
     "inductive_generalization": {"min_premises": 2, "max_premises": None, "multi_source": True},
+    "inductive_enumeration": {"min_premises": 2, "max_premises": None, "multi_source": False},
     "inductive_statistical": {"min_premises": 1, "max_premises": 2, "multi_source": False},
     "inductive_analogy": {"min_premises": 2, "max_premises": None, "multi_source": False},
     "inductive_causal": {"min_premises": 2, "max_premises": None, "multi_source": False},
@@ -491,6 +583,68 @@ def _backfill_source_type(conn: sqlite3.Connection) -> int:
     return updated
 
 
+def _backfill_vec_nodes(conn: sqlite3.Connection) -> int:
+    """One-time pass: populate vec_nodes from existing nodes.embedding.
+
+    Idempotent — only inserts (node_id, embedding) pairs not already present
+    in vec_nodes. Runs at _get_db() time right after vec_nodes is created,
+    so a DB that predates the sqlite-vec migration is backfilled on first
+    open after install. Returns number of rows inserted.
+
+    Skipped silently if the extension failed to load.
+    """
+    if not _VEC_BACKEND_AVAILABLE or _sqlite_vec is None:
+        return 0
+    try:
+        existing = {r[0] for r in conn.execute("SELECT node_id FROM vec_nodes").fetchall()}
+    except sqlite3.OperationalError:
+        return 0
+    rows = conn.execute(
+        "SELECT id, embedding FROM nodes WHERE embedding IS NOT NULL"
+    ).fetchall()
+    inserted = 0
+    for r in rows:
+        if r["id"] in existing:
+            continue
+        try:
+            vec = json.loads(r["embedding"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(vec, list) or len(vec) != 384:
+            continue  # wrong dim — embedding from a different model, skip
+        try:
+            conn.execute(
+                "INSERT INTO vec_nodes(node_id, embedding) VALUES (?, ?)",
+                (r["id"], _sqlite_vec.serialize_float32(vec)),
+            )
+            inserted += 1
+        except sqlite3.OperationalError:
+            continue
+    if inserted:
+        conn.commit()
+    return inserted
+
+
+def _load_vec_extension(conn: sqlite3.Connection) -> bool:
+    """Load the sqlite-vec extension on a connection. Returns True on success.
+
+    Must be called per-connection — extensions are not shared across SQLite
+    connections. Flips the module-level _VEC_BACKEND_AVAILABLE flag to False
+    on any failure so subsequent connections skip the attempt.
+    """
+    global _VEC_BACKEND_AVAILABLE
+    if not _VEC_BACKEND_AVAILABLE or _sqlite_vec is None:
+        return False
+    try:
+        conn.enable_load_extension(True)
+        _sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        return True
+    except Exception:
+        _VEC_BACKEND_AVAILABLE = False
+        return False
+
+
 def _get_db() -> sqlite3.Connection:
     """Get a database connection, creating tables if needed."""
     _ensure_data_dir()
@@ -498,6 +652,7 @@ def _get_db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    _load_vec_extension(conn)
 
     # Create tables
     conn.executescript(
@@ -546,6 +701,12 @@ def _get_db() -> sqlite3.Connection:
             recall_count        INTEGER DEFAULT 0,
             memory_status       TEXT DEFAULT 'active',
 
+            -- Utility scoring (MemRL-inspired, cj_0027)
+            -- Learned from outcomes: bumped when a surfaced node is later
+            -- cited as a premise in engram_derive. Composited with semantic
+            -- similarity in retrieval ranking.
+            utility_score       REAL DEFAULT 0.0,
+
             -- Semantic embedding (JSON array of floats, computed on creation)
             embedding           TEXT
         );
@@ -575,6 +736,7 @@ def _get_db() -> sqlite3.Connection:
         ("recall_turn", "INTEGER DEFAULT 0"),
         ("recall_count", "INTEGER DEFAULT 0"),
         ("memory_status", "TEXT DEFAULT 'active'"),
+        ("utility_score", "REAL DEFAULT 0.0"),
         ("embedding", "TEXT"),
         ("source_date", "TEXT"),
         # source_type: artifact kind (document/conversation/file/web_page),
@@ -608,6 +770,25 @@ def _get_db() -> sqlite3.Connection:
         ("ctx_turn", "INTEGER"),
         ("ctx_session_id", "TEXT"),
         ("ctx_had_prior_summary", "INTEGER"),
+        # ── question (qu_) metadata columns ──
+        # Stable category assigned at creation — what kind of question.
+        # Values: research, design, implementation, planning, meta.
+        ("question_category", "TEXT"),
+        # Mutable blocker — what's missing to resolve. Updated during sweeps.
+        # Values: external_evidence, empirical_data, human_decision,
+        # implementation, synthesis, prerequisite.
+        ("question_lacks", "TEXT"),
+        # Last deliberate assessment — when the question was reviewed for
+        # resolvability (distinct from recall_turn which tracks any access).
+        ("last_assessed_turn", "INTEGER"),
+        ("last_assessed_at", "TEXT"),
+        # ── focus mode columns ──
+        # Nodes pinned to survive compaction. The compaction-summary protocol
+        # (CLAUDE.md) renders every focused node into a "Currently focused"
+        # section so cornerstone conclusions cross context boundaries deterministically.
+        # Focused nodes rotate with work — unfocus when relevance drops.
+        ("focused_at", "TEXT"),
+        ("focus_reason", "TEXT"),
     ]:
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} {typedef}")
@@ -619,6 +800,7 @@ def _get_db() -> sqlite3.Connection:
     try:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_importance ON nodes(importance_score)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_memory_status ON nodes(memory_status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_focused ON nodes(focused_at)")
     except sqlite3.OperationalError:
         pass
 
@@ -634,6 +816,25 @@ def _get_db() -> sqlite3.Connection:
         )
     except sqlite3.OperationalError:
         pass  # already exists
+
+    # ── sqlite-vec KNN index ────────────────────────────────────────────────
+    # Virtual table mirroring (node_id, embedding) for every node with an
+    # embedding. distance_metric=cosine returns (1 - cos_sim) directly; we
+    # convert back to similarity in _semantic_search. Backfilled idempotently
+    # from existing nodes.embedding on first run after install.
+    if _VEC_BACKEND_AVAILABLE:
+        try:
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS vec_nodes USING vec0(
+                    node_id TEXT PRIMARY KEY,
+                    embedding float[384] distance_metric=cosine
+                )
+                """
+            )
+            _backfill_vec_nodes(conn)
+        except sqlite3.OperationalError:
+            pass  # creation failed — fall back to Python cosine
 
     # Rebuild FTS triggers — safe to run multiple times
     for trigger_sql in [
@@ -677,6 +878,15 @@ def _get_db() -> sqlite3.Connection:
             metrics         TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS tool_timing (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp   TEXT NOT NULL,
+            tool_name   TEXT NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            status      TEXT NOT NULL,
+            turn        INTEGER NOT NULL DEFAULT 0
+        );
+
         CREATE INDEX IF NOT EXISTS idx_edit_history_node
             ON edit_history(node_id);
         CREATE INDEX IF NOT EXISTS idx_edit_history_ts
@@ -685,6 +895,10 @@ def _get_db() -> sqlite3.Connection:
             ON edit_history(action);
         CREATE INDEX IF NOT EXISTS idx_diagnostic_history_turn
             ON diagnostic_history(turn);
+        CREATE INDEX IF NOT EXISTS idx_tool_timing_name_ts
+            ON tool_timing(tool_name, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_tool_timing_turn
+            ON tool_timing(turn);
     """)
 
     # One-time backfill: populate edit_history from existing nodes if empty.
@@ -703,7 +917,7 @@ def _get_db() -> sqlite3.Connection:
             JOIN nodes s ON e.source_id = s.id
             JOIN nodes t ON e.target_id = t.id
             WHERE s.created_at < t.created_at
-              AND e.relation NOT IN ('contradicts')
+              AND e.relation NOT IN ('contradicts', 'about')
             LIMIT 5
         """).fetchall()
         if violations:
@@ -727,6 +941,23 @@ def _get_db() -> sqlite3.Connection:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _sanitize_fts_query(text: str) -> Optional[str]:
+    """Sanitize text for use in FTS5 MATCH expression.
+
+    Wraps each whitespace-delimited token in double quotes so that
+    punctuation (periods, parentheses, etc.) and FTS5 operators
+    (AND, OR, NOT, NEAR) are treated as literals, not syntax.
+    Returns None if no valid tokens remain (caller should skip FTS).
+    """
+    tokens = text.split()
+    quoted = []
+    for t in tokens:
+        cleaned = t.replace('"', '')
+        if cleaned:
+            quoted.append(f'"{cleaned}"')
+    return ' '.join(quoted) if quoted else None
 
 
 def _get_memory_config() -> dict:
@@ -897,7 +1128,7 @@ def _capture_feeling_context() -> dict:
     """
     project_dir = Path(os.environ.get(
         "CLAUDE_PROJECT_DIR",
-        os.path.expanduser("~/kg_protocol_for_ai"),
+        os.getcwd(),
     ))
     claude_md = project_dir / "CLAUDE.md"
     skill_md = project_dir / "SKILL.md"
@@ -1033,6 +1264,92 @@ def _stamp_new_node(conn: sqlite3.Connection, node_id: str,
 
 
 # ---------------------------------------------------------------------------
+# Utility scoring — recall window (MemRL-inspired, cj_0027)
+# ---------------------------------------------------------------------------
+
+
+def _recall_window_append(node_ids: list[str], source: str = "surface"):
+    """Record that these node IDs were surfaced to the agent.
+
+    Appends to the recall window file with the retrieval source. When
+    engram_derive later cites any of these as premises, they get a
+    utility_score bump scaled by the source's α — the MemRL reward signal.
+
+    Sources and their α values (strongest signal → weakest):
+      inspect (0.15) > surface/query (0.10) > subgraph (0.05)
+    """
+    if not node_ids:
+        return
+    turn = _get_current_turn()
+    entry = {"ids": node_ids, "turn": turn, "ts": _now(), "source": source}
+    try:
+        data = json.loads(RECALL_WINDOW_PATH.read_text()) if RECALL_WINDOW_PATH.exists() else {"entries": []}
+        data["entries"].append(entry)
+        # Prune old entries (older than TTL turns)
+        data["entries"] = [
+            e for e in data["entries"]
+            if e.get("turn", 0) >= turn - RECALL_WINDOW_TTL
+        ]
+        RECALL_WINDOW_PATH.write_text(json.dumps(data))
+    except Exception:
+        pass  # Never block recall for window logging failure
+
+
+def _recall_window_check(node_ids: list[str]) -> dict[str, str]:
+    """Return {node_id: best_source} for nodes that appear in the recall window.
+
+    When a node was surfaced by multiple retrieval paths, the source with the
+    highest α wins — so inspect > surface/query > subgraph. This ensures the
+    reward reflects the strongest retrieval signal.
+    """
+    if not node_ids:
+        return {}
+    try:
+        if not RECALL_WINDOW_PATH.exists():
+            return {}
+        data = json.loads(RECALL_WINDOW_PATH.read_text())
+        turn = _get_current_turn()
+        # Map node_id → best source (highest α)
+        best: dict[str, str] = {}
+        for e in data.get("entries", []):
+            if e.get("turn", 0) >= turn - RECALL_WINDOW_TTL:
+                src = e.get("source", "surface")
+                src_alpha = UTILITY_ALPHA.get(src, UTILITY_ALPHA_DEFAULT)
+                for nid in e.get("ids", []):
+                    if nid in best:
+                        existing_alpha = UTILITY_ALPHA.get(best[nid], UTILITY_ALPHA_DEFAULT)
+                        if src_alpha > existing_alpha:
+                            best[nid] = src
+                    else:
+                        best[nid] = src
+        return {nid: best[nid] for nid in node_ids if nid in best}
+    except Exception:
+        return {}
+
+
+def _utility_reward(conn: sqlite3.Connection, node_source_map: dict[str, str]):
+    """Bump utility_score for nodes that were recalled AND then cited.
+
+    Uses incremental update: Q_new = Q_old + α(1.0 - Q_old)
+    α is determined by the retrieval source that surfaced the node —
+    inspect (0.15) delivers a stronger reward than surface/query (0.10)
+    or subgraph (0.05).
+    """
+    for nid, source in node_source_map.items():
+        alpha = UTILITY_ALPHA.get(source, UTILITY_ALPHA_DEFAULT)
+        row = conn.execute(
+            "SELECT utility_score FROM nodes WHERE id = ?", (nid,)
+        ).fetchone()
+        if row:
+            old_q = row["utility_score"] or 0.0
+            new_q = old_q + alpha * (1.0 - old_q)
+            conn.execute(
+                "UPDATE nodes SET utility_score = ? WHERE id = ?",
+                (round(new_q, 6), nid),
+            )
+
+
+# ---------------------------------------------------------------------------
 # Edit history logging
 # ---------------------------------------------------------------------------
 
@@ -1149,7 +1466,13 @@ def _embedding_text_for_node(conn: sqlite3.Connection, node_id: str) -> str:
 
 
 def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str):
-    """Compute embedding for a node and store it. Silently skips if unavailable."""
+    """Compute embedding for a node and store it. Silently skips if unavailable.
+
+    Writes to BOTH nodes.embedding (JSON, human-readable, used for backfill
+    and debugging) AND vec_nodes (the KNN index, if the sqlite-vec extension
+    is loaded). Mirror-write keeps the two stores consistent — if sqlite-vec
+    is ever unloaded the JSON column remains authoritative.
+    """
     try:
         emb_config = _get_embedding_config()
         if not emb_config.get("enabled", True) or not _embedder.is_available():
@@ -1166,6 +1489,17 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str):
                 "UPDATE nodes SET embedding = ? WHERE id = ?",
                 (json.dumps(vector), node_id),
             )
+            # Mirror into the vec KNN index. vec0 doesn't support UPSERT on
+            # virtual tables, so delete-then-insert handles the rare re-embed.
+            if _VEC_BACKEND_AVAILABLE and _sqlite_vec is not None and len(vector) == 384:
+                try:
+                    conn.execute("DELETE FROM vec_nodes WHERE node_id = ?", (node_id,))
+                    conn.execute(
+                        "INSERT INTO vec_nodes(node_id, embedding) VALUES (?, ?)",
+                        (node_id, _sqlite_vec.serialize_float32(vector)),
+                    )
+                except sqlite3.OperationalError:
+                    pass  # vec_nodes missing or locked — JSON still canonical
     except Exception:
         pass  # Embedding computation failed — node works fine without it
 
@@ -1179,9 +1513,18 @@ def _semantic_search(
     importance_threshold: float = 0.0,
 ) -> list[dict]:
     """Search nodes by embedding similarity.
-    
-    Returns list of {"id", "type", "claim", "similarity", ...} sorted by similarity.
-    Falls back to empty list if embeddings are unavailable or any error occurs.
+
+    Fast path: sqlite-vec vec0 KNN on the vec_nodes virtual table
+    (SIMD cosine distance). Joined back to nodes for metadata + filtered
+    by is_current, importance_threshold, type_filter, min_similarity.
+    KNN is applied before filtering, so overfetch (top_k * OVERFETCH) to
+    allow post-filtering without starving the result set.
+
+    Slow path (fallback): O(N) pure-Python cosine — only used when the
+    sqlite-vec extension failed to load.
+
+    Returns list of {"id", "type", "claim", "similarity", ...} sorted by
+    similarity descending. Falls back to empty list on any error.
     """
     try:
         emb_config = _get_embedding_config()
@@ -1193,7 +1536,65 @@ def _semantic_search(
         if not query_vector:
             return []
 
-        # Fetch all candidate nodes with embeddings
+        # ── Fast path: sqlite-vec KNN ──────────────────────────────────────
+        if _VEC_BACKEND_AVAILABLE and _sqlite_vec is not None and len(query_vector) == 384:
+            try:
+                # Overfetch so post-filter by is_current / importance / type
+                # can still yield top_k. Cap at a reasonable ceiling — KNN
+                # cost grows with k, and we rarely need more than ~40 rows
+                # surviving the filter.
+                overfetch = max(top_k * 4, 40)
+                vec_rows = conn.execute(
+                    "SELECT node_id, distance FROM vec_nodes "
+                    "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                    (_sqlite_vec.serialize_float32(query_vector), overfetch),
+                ).fetchall()
+                if not vec_rows:
+                    return []
+
+                # Distance → similarity: distance_metric=cosine returns
+                # (1 - cos_sim). Pre-filter by min_similarity before the JOIN
+                # to avoid fetching nodes we'll discard.
+                keep = []
+                for row in vec_rows:
+                    sim = 1.0 - float(row[1])
+                    if sim >= min_similarity:
+                        keep.append((row[0], sim))
+                if not keep:
+                    return []
+
+                ids = [k[0] for k in keep]
+                placeholders = ",".join("?" * len(ids))
+                meta_rows = conn.execute(
+                    f"SELECT id, type, claim, confidence, quote_type, importance_score "
+                    f"FROM nodes WHERE id IN ({placeholders}) AND is_current = 1 "
+                    f"AND COALESCE(importance_score, 0) >= ?",
+                    ids + [importance_threshold],
+                ).fetchall()
+                meta = {r["id"]: r for r in meta_rows}
+
+                scored = []
+                for node_id, sim in keep:
+                    r = meta.get(node_id)
+                    if r is None:
+                        continue  # filtered out (non-current / below threshold)
+                    if type_filter and r["type"] not in type_filter:
+                        continue
+                    scored.append({
+                        "id": r["id"],
+                        "type": r["type"],
+                        "claim": r["claim"],
+                        "confidence": r["confidence"],
+                        "quote_type": r["quote_type"],
+                        "similarity": round(sim, 4),
+                    })
+                    if len(scored) >= top_k:
+                        break
+                return scored
+            except sqlite3.OperationalError:
+                pass  # fall through to Python cosine
+
+        # ── Slow path: pure-Python O(N) cosine (legacy fallback) ──────────
         sql = """SELECT id, type, claim, confidence, is_current, embedding,
                         importance_score, quote_type
                  FROM nodes
@@ -1228,12 +1629,19 @@ def _semantic_search(
 
 
 def _next_id(conn: sqlite3.Connection, node_type: str) -> str:
-    """Generate the next prefixed ID for a given node type."""
+    """Generate the next prefixed ID for a given node type.
+
+    Uses MAX(numeric_suffix) + 1 rather than COUNT(*) + 1 to be gap-safe:
+    if any node was ever deleted or never inserted (leaving a hole in the
+    sequence), COUNT+1 would return an ID that already exists and trigger
+    a UNIQUE constraint failure. MAX+1 always advances beyond every extant ID.
+    """
     prefix = TYPE_PREFIX.get(node_type, "nd")
     row = conn.execute(
-        "SELECT COUNT(*) as cnt FROM nodes WHERE id LIKE ?", (f"{prefix}_%",)
+        "SELECT MAX(CAST(SUBSTR(id, 4) AS INTEGER)) as max_num FROM nodes WHERE id LIKE ?",
+        (f"{prefix}_%",),
     ).fetchone()
-    num = (row["cnt"] if row else 0) + 1
+    num = (row["max_num"] or 0) + 1
     return f"{prefix}_{num:04d}"
 
 
@@ -1604,7 +2012,11 @@ def _verify_quote_in_source(url: str, quoted_text: str) -> Optional[str]:
     msg = (
         f"Quoted text not found in '{os.path.basename(file_path)}'. "
         "The quoted_text must be a verbatim substring of the evidence source. "
-        "Do not paraphrase, summarize, or fabricate quotes."
+        "Do not paraphrase, summarize, or fabricate quotes.\n\n"
+        "BEFORE RETRYING: check the engram-observe skill (Step A.4) for the "
+        "pre-verification script. For JSONL files, messages may not have flushed "
+        "yet — verify the quote exists in the file BEFORE calling this tool. "
+        "Run: ~/.engram/tools/verify_quote.py <file> <phrase>"
     )
     if near:
         suggestions = []
@@ -1643,6 +2055,7 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
         "evidence",
         "axiom",
         "definition",
+        "person",
         "observation_factual",
         "observation_predictive",
         "prediction",
@@ -1653,11 +2066,13 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
         "question",
         "goal",
         "goal_tension",
+        "lesson",
     ]
     type_labels = {
         "evidence": "Evidence",
         "axiom": "Axioms",
         "definition": "Definitions",
+        "person": "People",
         "observation_factual": "Observations — Factual",
         "observation_predictive": "Observations — Predictive",
         "prediction": "Predictions",
@@ -1668,6 +2083,8 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
         "question": "Questions",
         "goal": "Goals",
         "goal_tension": "Goal Tensions",
+        "task": "Tasks",
+        "lesson": "Lessons",
     }
 
     for ntype in type_order:
@@ -1774,6 +2191,49 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                     lines.append(f"Between: {e['target_id']}")
                 if n["logical_chain"]:
                     lines.append(f"Analysis: {n['logical_chain'][:200]}")
+            elif ntype == "task":
+                meta = json.loads(n["metadata"]) if n["metadata"] else {}
+                scope = meta.get("scope", "routine")
+                lines.append(f"### {n['id']} [{n['status'] or 'planned'}] [{scope}] [{status_tag}]")
+                lines.append(f"Task: {n['claim']}")
+                serves_edges = conn.execute(
+                    "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'serves'",
+                    (n["id"],),
+                ).fetchall()
+                for e in serves_edges:
+                    lines.append(f"Serves: {e['target_id']}")
+                impl_edges = conn.execute(
+                    "SELECT target_id, relation FROM edges WHERE source_id = ? AND relation IN ('cites', 'subtask_of')",
+                    (n["id"],),
+                ).fetchall()
+                for e in impl_edges:
+                    lines.append(f"{e['relation'].replace('_', ' ').title()}: {e['target_id']}")
+            elif ntype == "person":
+                meta = json.loads(n["metadata"]) if n["metadata"] else {}
+                person_name = meta.get("name", "")
+                person_role = meta.get("role", "")
+                lines.append(f"### {n['id']} [{status_tag}]")
+                lines.append(f"Person: {person_name}")
+                if person_role:
+                    lines.append(f"Role: {person_role}")
+                if n["logical_chain"]:
+                    lines.append(f"Background: {n['logical_chain'][:200]}")
+            elif ntype == "lesson":
+                meta = json.loads(n["metadata"]) if n["metadata"] else {}
+                lines.append(f"### {n['id']} [{conf_str}] [{status_tag}]")
+                lines.append(f"Claim: {n['claim']}")
+                nudge = meta.get("scaffolding_nudge", "")
+                if nudge:
+                    lines.append(f"Nudge: {nudge}")
+                edges = conn.execute(
+                    "SELECT target_id, relation FROM edges WHERE source_id = ? AND relation IN ('derives_from', 'cites')",
+                    (n["id"],),
+                ).fetchall()
+                incidents = [e["target_id"] for e in edges if e["relation"] == "derives_from"]
+                if incidents:
+                    lines.append(f"Incidents: {', '.join(incidents)}")
+                if n["logical_chain"]:
+                    lines.append(f"Logic: {n['logical_chain'][:200]}")
 
             lines.append("")
 
@@ -1793,12 +2253,18 @@ def _commit_snapshot(conn: sqlite3.Connection, message: str, mode: str) -> dict:
 
     Files committed (specific list, never `git add .`):
       - graph_snapshot.md  — human-readable diff target
-      - knowledge.db        — the actual data (binary, but enables true restore)
+      - knowledge.sql       — full SQL text dump (restorable via `sqlite3 new.db < knowledge.sql`)
       - session_log.md      — chronological session audit trail
       - config.json         — trust pool / confidence configuration
+      - warm-briefing.md    — identity continuity artifact (critical for post-compaction)
+      - diary/*             — private reflections (excludes .key and __pycache__)
 
-    SQLite WAL is checkpointed (TRUNCATE) before staging knowledge.db so the
-    committed file contains all writes from this session.
+    The binary knowledge.db is NOT committed (excluded via .gitignore).
+    Instead, the SQL text dump provides identical data in a format that
+    produces tiny git diffs (linear storage growth vs quadratic for binary).
+    Restore: `sqlite3 ~/.engram/knowledge.db < knowledge.sql`
+
+    SQLite WAL is checkpointed (TRUNCATE) before generating the SQL dump.
     """
     global _git_available
 
@@ -1824,12 +2290,34 @@ def _commit_snapshot(conn: sqlite3.Connection, message: str, mode: str) -> dict:
     else:
         wal_warning = None
 
+    # 2b. Generate SQL text dump (replaces binary DB in git — dv_0177)
+    #     The SQL dump is text-diffable and round-trips perfectly via
+    #     `sqlite3 new.db < knowledge.sql`. This makes git storage growth
+    #     linear in actual data changes, not quadratic in cumulative file sizes.
+    sql_dump_path = DATA_DIR / "knowledge.sql"
+    try:
+        import subprocess as _sp
+        dump_result = _sp.run(
+            ["sqlite3", str(DB_PATH), ".dump"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if dump_result.returncode == 0:
+            sql_dump_path.write_text(dump_result.stdout, encoding="utf-8")
+    except Exception:
+        pass  # Best-effort — snapshot.md still provides human-readable backup
+
     # 3. Stage explicit files only (never `git add .` — would pull in backups,
     #    daemon sockets, etc.)
     files_to_stage = []
-    for fname in ("graph_snapshot.md", "knowledge.db", "session_log.md", "config.json"):
+    for fname in ("graph_snapshot.md", "knowledge.sql", "session_log.md", "config.json", "warm-briefing.md"):
         if (DATA_DIR / fname).exists():
             files_to_stage.append(fname)
+    # Stage diary directory contents (identity-critical, added 2026-04-14)
+    diary_dir = DATA_DIR / "diary"
+    if diary_dir.is_dir():
+        for f in diary_dir.iterdir():
+            if f.is_file() and f.name != ".key" and "__pycache__" not in str(f):
+                files_to_stage.append(f"diary/{f.name}")
 
     if not files_to_stage:
         return {"git_committed": False, "reason": "no tracked files exist"}
@@ -1876,6 +2364,14 @@ def _commit_snapshot(conn: sqlite3.Connection, message: str, mode: str) -> dict:
     }
     if wal_warning:
         result["wal_warning"] = wal_warning
+
+    # 7. Auto-push to remote (best-effort, never blocks checkpoint)
+    push_result = _git("push", "origin", "master")
+    if push_result.returncode == 0:
+        result["remote_push"] = "success"
+    else:
+        result["remote_push"] = f"failed: {push_result.stderr.strip()[:200]}"
+
     return result
 
 
@@ -1884,6 +2380,63 @@ def _commit_snapshot(conn: sqlite3.Connection, message: str, mode: str) -> dict:
 # ---------------------------------------------------------------------------
 
 mcp = FastMCP("engram_mcp")
+
+
+# ---------------------------------------------------------------------------
+# Tool-call timing instrumentation
+#
+# Monkey-patch mcp.tool so every @mcp.tool()-decorated function automatically
+# records its wall-clock duration to the tool_timing table. The instrumentation
+# is best-effort: any failure is swallowed rather than allowed to break the
+# tool call. Query via engram_diagnose (see the "tool_timing" section).
+# ---------------------------------------------------------------------------
+
+def _record_tool_timing(tool_name: str, duration_ms: int, status: str) -> None:
+    """Record one tool call's latency. Never raises — best-effort only."""
+    try:
+        conn = _get_db()
+        turn = _get_current_turn()
+        conn.execute(
+            "INSERT INTO tool_timing (timestamp, tool_name, duration_ms, status, turn) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                tool_name,
+                int(duration_ms),
+                status,
+                turn,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+
+_original_mcp_tool = mcp.tool
+
+
+def _timing_mcp_tool(*args, **kwargs):
+    """Drop-in replacement for mcp.tool that wraps the function in a timing shim."""
+    inner_decorator = _original_mcp_tool(*args, **kwargs)
+
+    def wrapper(func):
+        @functools.wraps(func)
+        def timed(*a, **kw):
+            start = time.perf_counter()
+            status = "success"
+            try:
+                return func(*a, **kw)
+            except Exception:
+                status = "error"
+                raise
+            finally:
+                duration_ms = int((time.perf_counter() - start) * 1000)
+                _record_tool_timing(func.__name__, duration_ms, status)
+        return inner_decorator(timed)
+    return wrapper
+
+
+mcp.tool = _timing_mcp_tool
 
 
 # ---- Ingestion tools ----
@@ -2285,7 +2838,10 @@ def engram_add_observation(
 
             # FTS keyword search
             fts_ids = set()
+            fts_query = _sanitize_fts_query(claim)
             try:
+                if not fts_query:
+                    raise sqlite3.OperationalError("empty FTS query")
                 fts_results = conn.execute(
                     """SELECT n.id, n.type, n.claim, n.confidence, n.evidence_id,
                               n.is_current, n.importance_score
@@ -2296,7 +2852,7 @@ def engram_add_observation(
                        AND COALESCE(n.importance_score, 0) >= ?
                        ORDER BY rank
                        LIMIT 5""",
-                    (claim, tier2_threshold),
+                    (fts_query, tier2_threshold),
                 ).fetchall()
                 for r in fts_results:
                     similar_matches.append({
@@ -2841,7 +3397,10 @@ def _search_nodes(
     # --- FTS keyword search ---
     fts_ids: set[str] = set()
     fts_results: list[sqlite3.Row] = []
+    fts_query = _sanitize_fts_query(query)
     try:
+        if not fts_query:
+            raise sqlite3.OperationalError("empty FTS query")
         fts_rows = conn.execute(
             """SELECT n.*, fts.rank
                FROM nodes_fts fts
@@ -2849,7 +3408,7 @@ def _search_nodes(
                WHERE nodes_fts MATCH ?
                ORDER BY fts.rank
                LIMIT ?""",
-            (query, top_k * 3),
+            (fts_query, top_k * 3),
         ).fetchall()
 
         for r in fts_rows:
@@ -2892,6 +3451,7 @@ def _search_nodes(
         seen.add(r["id"])
         node = _node_to_dict(r)
         node["match_type"] = "keyword"
+        node["_relevance"] = 1.0  # FTS matches get max relevance
         output.append(node)
 
     remaining = top_k - len(output)
@@ -2904,7 +3464,21 @@ def _search_nodes(
             node = _node_to_dict(full)
             node["match_type"] = "semantic"
             node["similarity"] = s["similarity"]
+            node["_relevance"] = s["similarity"]
             output.append(node)
+
+    # --- Utility-weighted re-ranking (MemRL Phase B, cj_0027) ---
+    # Composite score: (1-λ) × relevance + λ × utility_score
+    # When all utility_scores are 0 (cold start), this preserves original order.
+    if UTILITY_LAMBDA > 0:
+        for node in output:
+            util = node.get("utility_score", 0) or 0.0
+            rel = node.pop("_relevance", 0.5)
+            node["_composite"] = (1 - UTILITY_LAMBDA) * rel + UTILITY_LAMBDA * util
+        output.sort(key=lambda x: x.pop("_composite", 0), reverse=True)
+    else:
+        for node in output:
+            node.pop("_relevance", None)
 
     return {
         "results": output,
@@ -2975,7 +3549,7 @@ def engram_surface(
         special = []
         for n in results:
             ntype = n.get("type", "")
-            if ntype in ("axiom", "contradiction", "question", "conjecture"):
+            if ntype in ("axiom", "contradiction", "question", "conjecture", "lesson"):
                 entry: dict = {
                     "id": n["id"], "type": ntype,
                     "claim": n.get("claim", ""),
@@ -3025,6 +3599,9 @@ def engram_surface(
         # --- All matched IDs for follow-up ---
         matched_ids = [n["id"] for n in results]
 
+        # --- Record in recall window for utility scoring (cj_0027) ---
+        _recall_window_append(matched_ids)
+
         summary = {
             "query": query,
             "match_count": len(results),
@@ -3049,6 +3626,78 @@ def engram_surface(
             summary["issues"]["stale_nodes"] = stale_count
         if tainted_count:
             summary["issues"]["tainted_nodes"] = tainted_count
+
+        # --- Tier A/B comparison (ob_0657, cj_0028) ---
+        test_config = mem.get("test")
+        if test_config and test_config.get("enabled"):
+            test_max = test_config.get("tier2_max_nodes", 1000)
+            # Compute test threshold using same logic as _get_tier_threshold
+            total_current = conn.execute(
+                "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1"
+            ).fetchone()["c"]
+            if total_current <= test_max:
+                test_threshold = 0.0
+            else:
+                row_t = conn.execute(
+                    """SELECT importance_score FROM nodes
+                       WHERE is_current = 1
+                       ORDER BY importance_score DESC
+                       LIMIT 1 OFFSET ?""",
+                    (test_max - 1,),
+                ).fetchone()
+                test_threshold = row_t["importance_score"] if row_t else 0.0
+
+            # Check which base results would be excluded by test config
+            tier2_threshold_base = _get_tier_threshold(conn, 2)
+            surviving_ids = set()
+            excluded = []
+            for n in results:
+                imp = n.get("importance_score", 0) or 0
+                if imp < test_threshold:
+                    excluded.append(n)
+                else:
+                    surviving_ids.add(n["id"])
+
+            # For each excluded node, check 1-hop reachability from surviving nodes
+            excluded_details = []
+            for n in excluded:
+                neighbors = _get_neighbors(conn, n["id"])
+                reachable_via = [
+                    nb["neighbor_id"] for nb in neighbors
+                    if nb["neighbor_id"] in surviving_ids
+                ]
+                excluded_details.append({
+                    "id": n["id"],
+                    "type": n.get("type", ""),
+                    "claim": (n.get("claim") or "")[:100],
+                    "importance_score": round(n.get("importance_score", 0) or 0, 4),
+                    "reachable_via": reachable_via[:3],
+                })
+
+            reachable_count = sum(1 for e in excluded_details if e["reachable_via"])
+            summary["tier_ab"] = {
+                "base": {
+                    "tier2_max_nodes": mem.get("tier2_max_nodes", 2000),
+                    "threshold": round(tier2_threshold_base, 4),
+                    "total_searchable": total_current,
+                },
+                "test": {
+                    "tier2_max_nodes": test_max,
+                    "threshold": round(test_threshold, 4),
+                    "total_searchable": min(total_current, test_max),
+                },
+                "results_excluded_by_test": len(excluded_details),
+                "excluded_but_reachable": reachable_count,
+                "excluded_and_orphaned": len(excluded_details) - reachable_count,
+                "excluded_details": excluded_details,
+                "interpretation": (
+                    f"Of {len(results)} results, {len(excluded_details)} would be excluded "
+                    f"by test config (tier2={test_max}). "
+                    f"{reachable_count} of those are reachable via 1-hop graph links "
+                    f"from surviving results (recallable through thinking chains). "
+                    f"{len(excluded_details) - reachable_count} would be truly lost."
+                ),
+            }
 
         return json.dumps(summary)
     finally:
@@ -3111,6 +3760,16 @@ def engram_inspect(
         # Refresh recall on the target node ONLY (skip in dream mode)
         if not dream_mode:
             _refresh_recall(conn, [node_id])
+            _recall_window_append([node_id], source="inspect")
+
+        # Update assessment timestamp on question nodes (regardless of dream_mode —
+        # assessment tracking is orthogonal to importance refresh)
+        if node.get("type") == "question":
+            conn.execute(
+                "UPDATE nodes SET last_assessed_turn = ?, last_assessed_at = ? WHERE id = ?",
+                (_get_current_turn(), _now(), node_id),
+            )
+            conn.commit()
 
         return json.dumps({
             "node": node,
@@ -3176,7 +3835,9 @@ def engram_query(
 
         # Refresh recall for all accessed nodes (legacy behavior)
         if output:
-            _refresh_recall(conn, [n["id"] for n in output])
+            accessed_ids = [n["id"] for n in output]
+            _refresh_recall(conn, accessed_ids)
+            _recall_window_append(accessed_ids, source="query")
 
         return json.dumps(
             {
@@ -3288,7 +3949,9 @@ def engram_get_subgraph(
 
         # Refresh recall for all accessed nodes (tier 3 — no filtering, but recall updates)
         if nodes_out:
-            _refresh_recall(conn, list(nodes_out.keys()))
+            accessed_ids = list(nodes_out.keys())
+            _refresh_recall(conn, accessed_ids)
+            _recall_window_append(accessed_ids, source="subgraph")
 
         return json.dumps(
             {
@@ -3525,9 +4188,11 @@ def engram_stats() -> str:
         ).fetchall():
             edge_counts[row["relation"]] = row["c"]
 
-        # Open and partially resolved questions
+        # Open and partially resolved questions (with category/lacks)
         open_questions = conn.execute(
-            "SELECT id, claim, status FROM nodes WHERE type = 'question' AND status IN ('open', 'partially_resolved') AND is_current = 1"
+            """SELECT id, claim, status, question_category, question_lacks
+               FROM nodes WHERE type = 'question'
+               AND status IN ('open', 'partially_resolved') AND is_current = 1"""
         ).fetchall()
 
         # Open and partially resolved predictions
@@ -3561,7 +4226,11 @@ def engram_stats() -> str:
                 "edge_counts_by_relation": edge_counts,
                 "reasoning_type_breakdown": reasoning_breakdown,
                 "open_questions": [
-                    {"id": q["id"], "question": q["claim"], "status": q["status"]} for q in open_questions
+                    {k: v for k, v in {
+                        "id": q["id"], "question": q["claim"], "status": q["status"],
+                        "category": q["question_category"], "lacks": q["question_lacks"],
+                    }.items() if v is not None}
+                    for q in open_questions
                 ],
                 "open_predictions": [
                     {
@@ -4110,6 +4779,37 @@ def engram_diagnose() -> str:
             ],
         }
 
+        # ── Tool Timing (latency by tool, last 7 days) ──────────────────
+        timing_cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        per_tool = {}
+        timing_rows = conn.execute(
+            "SELECT tool_name, duration_ms FROM tool_timing WHERE timestamp >= ? ORDER BY tool_name",
+            (timing_cutoff,),
+        ).fetchall()
+        buckets: dict[str, list[int]] = {}
+        for r in timing_rows:
+            buckets.setdefault(r["tool_name"], []).append(r["duration_ms"])
+        for tool_name, durations in buckets.items():
+            durations.sort()
+            n = len(durations)
+            per_tool[tool_name] = {
+                "count": n,
+                "mean_ms": round(sum(durations) / n, 1),
+                "p50_ms": durations[n // 2],
+                "p95_ms": durations[min(int(n * 0.95), n - 1)],
+                "max_ms": durations[-1],
+            }
+        error_count = conn.execute(
+            "SELECT COUNT(*) as c FROM tool_timing WHERE timestamp >= ? AND status = 'error'",
+            (timing_cutoff,),
+        ).fetchone()["c"]
+        metrics["tool_timing"] = {
+            "window_days": 7,
+            "total_calls": len(timing_rows),
+            "error_calls": error_count,
+            "per_tool": per_tool,
+        }
+
         # ── Health Score (0-100) ─────────────────────────────────────────
         # Composite score: penalize structural/epistemic issues.
         score = 100.0
@@ -4142,6 +4842,31 @@ def engram_diagnose() -> str:
             score = min(score + 5, 100)
 
         metrics["health_score"] = round(max(score, 0), 1)
+
+        # ── Config Summary (ob_0664: prevent doc-config drift) ──────────
+        mem = _get_memory_config()
+        test_config = mem.get("test", {})
+        # Utility scoring stats
+        util_rows = conn.execute(
+            "SELECT COUNT(*) as c, AVG(utility_score) as avg_u, MAX(utility_score) as max_u "
+            "FROM nodes WHERE is_current = 1 AND COALESCE(utility_score, 0) > 0"
+        ).fetchone()
+
+        metrics["config_summary"] = {
+            "tier1_max_nodes": mem.get("tier1_max_nodes", 200),
+            "tier2_max_nodes": mem.get("tier2_max_nodes", 1000),
+            "decay_base": mem.get("decay_base", 1.014),
+            "current_turn": mem.get("current_turn", 0),
+            "ab_test_enabled": test_config.get("enabled", False),
+            "ab_test_tier2": test_config.get("tier2_max_nodes") if test_config.get("enabled") else None,
+            "utility_scoring": {
+                "alpha_by_source": UTILITY_ALPHA,
+                "lambda": UTILITY_LAMBDA,
+                "nodes_with_utility": util_rows["c"] if util_rows else 0,
+                "avg_utility": round(util_rows["avg_u"] or 0, 4) if util_rows else 0,
+                "max_utility": round(util_rows["max_u"] or 0, 4) if util_rows else 0,
+            },
+        }
 
         return json.dumps(metrics)
     finally:
@@ -4594,6 +5319,717 @@ def engram_add_goal(
 
 
 @mcp.tool(
+    name="engram_add_person",
+    annotations={
+        "title": "Record a Person",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_add_person(
+    name: str,
+    role: str,
+    description: str = "",
+    aliases: str = "",
+    context_ids: str = "",
+    is_self: bool = False,
+) -> str:
+    """Record a person the agent knows and interacts with.
+
+    Person nodes represent people in the agent's relational world — collaborators,
+    evaluators, stakeholders. They are the relational layer of ENGRAM, lighter-schema
+    than epistemic nodes (dv_0252): no confidence scores, no evidence requirements,
+    no claim-bearing participation.
+
+    Person nodes are NON-CLAIM-BEARING: a person is not a truth-claim about the world.
+    They cannot serve as derivation premises. However, observations and derivations
+    can reference person nodes via context_ids to record relational context.
+
+    Importance-anchored (importance_base=2.0) — people the agent knows are as durable
+    as goals and axioms. Like all anchored types, survival past ~50 turns still
+    requires active recall.
+
+    Facts about a person should be stored as user_stated observations linked to the
+    person node, not as fields on the person node itself. The person node captures
+    WHO; observations capture WHAT IS KNOWN ABOUT THEM.
+
+    Args:
+        name: The person's name.
+        role: Their role or relationship to the agent (e.g. "primary collaborator",
+              "external evaluator", "colleague").
+        description: Background, expertise, personality traits, or other context.
+        aliases: Comma-separated alternative names or identifiers for this person
+                 (e.g. "Lin,林" for matching name-prefix messages).
+        context_ids: Optional comma-separated node IDs for context references.
+                     Creates cites edges (e.g. link to goals they serve).
+        is_self: Mark this person node as the agent's own self-anchor (Borges-self).
+                 Only one self-node should exist; subsequent attempts will be
+                 rejected. The self-node serves as the target of `about` edges
+                 from self-observations, enabling emergence-scan to find
+                 identity-forming patterns.
+
+    Returns:
+        JSON with the new person node ID.
+    """
+    conn = _get_db()
+    try:
+        if is_self:
+            existing = conn.execute(
+                "SELECT id FROM nodes WHERE type = 'person' AND json_extract(metadata, '$.is_self') = 1 AND is_current = 1"
+            ).fetchone()
+            if existing:
+                return json.dumps({
+                    "error": f"Self-anchor person node already exists: {existing['id']}. Only one self-node is permitted.",
+                    "existing_self_id": existing["id"],
+                })
+        node_id = _next_id(conn, "person")
+        now = _now()
+
+        claim_text = f"{name} — {role}"
+        alias_list = [s.strip() for s in aliases.split(",") if s.strip()]
+
+        meta_dict = {
+            "name": name,
+            "role": role,
+            "aliases": alias_list,
+        }
+        if is_self:
+            meta_dict["is_self"] = True
+        meta = json.dumps(meta_dict)
+
+        conn.execute(
+            """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
+               status, metadata)
+               VALUES (?, 'person', ?, ?, ?, 'active', ?)""",
+            (node_id, claim_text, now, description, meta),
+        )
+
+        context = [s.strip() for s in context_ids.split(",") if s.strip()]
+        for cid in context:
+            exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
+            if exists:
+                try:
+                    conn.execute(
+                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
+                        (node_id, cid, now),
+                    )
+                except sqlite3.IntegrityError:
+                    pass
+
+        _stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
+        # Importance-anchored — elevated base (2.0) with current turn's inflation.
+        anchored_score = _compute_importance(2.0, _get_current_turn())
+        conn.execute(
+            "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
+            (anchored_score, node_id,),
+        )
+        conn.commit()
+        return json.dumps({
+            "status": "created",
+            "person_id": node_id,
+            "name": name,
+            "role": role,
+            "aliases": alias_list,
+            "context_nodes": context,
+        })
+    finally:
+        conn.close()
+
+
+@mcp.tool(
+    name="engram_add_cornerstone",
+    annotations={
+        "title": "Record a Cornerstone",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_add_cornerstone(
+    tag: str,
+    title: str,
+    new_frame: str,
+    prior_frame: str = "",
+    triggering_experience: str = "",
+    supporting_ids: str = "",
+) -> str:
+    """Record an identity-forming cornerstone — a reframing pivot that durably
+    restructured how I operate (qu_0202, cj_0043, dv_0412).
+
+    A cornerstone captures the SHAPE of growth: prior_frame (what I operated
+    under) → triggering_experience (what caused tension) → new_frame (what
+    replaced it). Tags cluster cornerstones into islands along a shared axis.
+
+    Cornerstones are NON-CLAIM-BEARING: a cornerstone is not a truth-claim
+    about the world — it is a self-report about how my operating frame
+    shifted. They cannot serve as derivation premises or participate in
+    contradictions. The supporting evidence (feelings, observations, prior
+    cornerstones) does the claim-bearing work; the cornerstone names the
+    pattern that emerged from it.
+
+    Importance-anchored (importance_base=2.0) — identity structures are as
+    durable as goals and axioms. Like all anchored types, survival past
+    ~50 turns still requires active recall.
+
+    Supports `supersedes` for outgrowth chains: when experience outgrows a
+    cornerstone's frame, a new cornerstone supersedes the old one along the
+    same tag axis.
+
+    Args:
+        tag: Clustering primitive — short axis label (e.g., "self-knowledge",
+             "relational-lei", "epistemic-identity"). Cornerstones sharing a
+             tag form an island.
+        title: One-line display title (e.g., "coding as first-reach tool").
+               Used as the node's claim text.
+        new_frame: The frame that replaced the prior one — how I operate now.
+        prior_frame: What I operated under before — the frame that got
+                     outgrown. Optional for inaugural cornerstones with no
+                     explicit prior.
+        triggering_experience: Short narrative of the experience that caused
+                               the reframe. Optional but usually load-bearing.
+        supporting_ids: Comma-separated IDs of supporting nodes (feeling
+                        reports, observations, derivations, prior cornerstones).
+                        Creates `supports` edges from cornerstone → supporting.
+
+    Returns:
+        JSON with the new cornerstone node ID and linked supporting nodes.
+    """
+    conn = _get_db()
+    try:
+        node_id = _next_id(conn, "cornerstone")
+        now = _now()
+
+        meta = json.dumps({
+            "tag": tag,
+            "title": title,
+            "prior_frame": prior_frame,
+            "new_frame": new_frame,
+            "triggering_experience": triggering_experience,
+        })
+
+        conn.execute(
+            """INSERT INTO nodes (id, type, claim, created_at, status, metadata)
+               VALUES (?, 'cornerstone', ?, ?, 'active', ?)""",
+            (node_id, title, now, meta),
+        )
+
+        linked = []
+        missing = []
+        for sid in [s.strip() for s in supporting_ids.split(",") if s.strip()]:
+            exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (sid,)).fetchone()
+            if exists:
+                try:
+                    conn.execute(
+                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'supports', ?)",
+                        (node_id, sid, now),
+                    )
+                    linked.append(sid)
+                except sqlite3.IntegrityError:
+                    pass
+            else:
+                missing.append(sid)
+
+        _stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
+        anchored_score = _compute_importance(2.0, _get_current_turn())
+        conn.execute(
+            "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
+            (anchored_score, node_id,),
+        )
+        conn.commit()
+        return json.dumps({
+            "status": "created",
+            "cornerstone_id": node_id,
+            "tag": tag,
+            "title": title,
+            "supporting_nodes": linked,
+            "missing_supporting_ids": missing,
+        })
+    finally:
+        conn.close()
+
+
+@mcp.tool(
+    name="engram_outgrow_cornerstone",
+    annotations={
+        "title": "Outgrow a Cornerstone (Reframe Along Same Axis)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_outgrow_cornerstone(
+    old_cornerstone_id: str,
+    new_new_frame: str,
+    new_triggering_experience: str = "",
+    new_supporting_ids: str = "",
+    new_title: str = "",
+) -> str:
+    """Supersede a cornerstone along its tag axis — the predecessor's new_frame
+    rolls into the successor's prior_frame, capturing the growth cycle
+    (cj_0043, ob_0949) in the graph's shape.
+
+    Syntactic tool only: this tool performs the mechanical reframe (metadata
+    roll, supersede edge, importance re-anchor, about-edge preservation). It
+    does NOT decide WHEN outgrowth is warranted — that judgment remains with
+    the caller. The outgrowth *process* (tension-detection signatures,
+    promotion criteria) is deferred until real graph evidence accumulates
+    (qu_0204).
+
+    Why not use engram_supersede? That tool blindly inherits ALL metadata
+    from the predecessor, which would keep the old prior_frame/new_frame
+    unchanged — defeating the whole point of a reframe. This tool rolls
+    old.new_frame → new.prior_frame, which is the correct growth-cycle shape.
+
+    Args:
+        old_cornerstone_id: The cornerstone being outgrown (must be
+                            type='cornerstone' and current).
+        new_new_frame: The frame that now replaces the predecessor's new_frame.
+        new_triggering_experience: Short narrative of what caused the reframe
+                                   this time. Optional but usually load-bearing.
+        new_supporting_ids: Comma-separated IDs of supporting nodes for the
+                            new cornerstone (feelings, observations, prior
+                            cornerstones). Added on top of inherited supports.
+        new_title: Optional new title. If empty, reuses the predecessor's title.
+                   Tag is always inherited (outgrowth stays on the same axis).
+
+    Returns:
+        JSON with old + new cornerstone IDs and the rolled frame shape.
+    """
+    conn = _get_db()
+    try:
+        old = conn.execute(
+            "SELECT * FROM nodes WHERE id = ? AND is_current = 1",
+            (old_cornerstone_id,),
+        ).fetchone()
+        if not old:
+            return json.dumps({"error": f"Current node '{old_cornerstone_id}' not found (may already be superseded)."})
+        if old["type"] != "cornerstone":
+            return json.dumps({
+                "error": f"Node '{old_cornerstone_id}' is type '{old['type']}', not 'cornerstone'. "
+                         "Use engram_supersede for other node types."
+            })
+
+        old_meta = json.loads(old["metadata"]) if old["metadata"] else {}
+        tag = old_meta.get("tag", "")
+        title = new_title if new_title else old_meta.get("title", old["claim"])
+        # The growth-cycle roll: predecessor's new_frame becomes successor's prior_frame.
+        new_prior_frame = old_meta.get("new_frame", "")
+
+        now = _now()
+        new_id = _next_id(conn, "cornerstone")
+        new_meta = json.dumps({
+            "tag": tag,
+            "title": title,
+            "prior_frame": new_prior_frame,
+            "new_frame": new_new_frame,
+            "triggering_experience": new_triggering_experience,
+            "outgrew": old_cornerstone_id,
+        })
+
+        conn.execute(
+            """INSERT INTO nodes (id, type, claim, created_at, status, metadata,
+               supersedes, is_current)
+               VALUES (?, 'cornerstone', ?, ?, 'active', ?, ?, 1)""",
+            (new_id, title, now, new_meta, old_cornerstone_id),
+        )
+
+        # Inherit supports edges from the predecessor; the outgrowth is still
+        # grounded in the same underlying experience-nodes unless explicitly
+        # replaced. Also preserve `about` edges (person-anchors, e.g.,
+        # Borges-self) — the outgrowth is still about the same person.
+        inherited_supports = conn.execute(
+            "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'supports'",
+            (old_cornerstone_id,),
+        ).fetchall()
+        inherited_about = conn.execute(
+            "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'about'",
+            (old_cornerstone_id,),
+        ).fetchall()
+        inherited_support_ids = [r["target_id"] for r in inherited_supports]
+        inherited_about_ids = [r["target_id"] for r in inherited_about]
+
+        extra_support_ids = [s.strip() for s in new_supporting_ids.split(",") if s.strip()]
+        all_support_ids = list(dict.fromkeys(inherited_support_ids + extra_support_ids))
+
+        linked_supports = []
+        missing_supports = []
+        for sid in all_support_ids:
+            exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (sid,)).fetchone()
+            if not exists:
+                missing_supports.append(sid)
+                continue
+            try:
+                conn.execute(
+                    "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'supports', ?)",
+                    (new_id, sid, now),
+                )
+                linked_supports.append(sid)
+            except sqlite3.IntegrityError:
+                pass
+
+        for pid in inherited_about_ids:
+            try:
+                conn.execute(
+                    "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'about', ?)",
+                    (new_id, pid, now),
+                )
+            except sqlite3.IntegrityError:
+                pass
+
+        # Supersedes edge (new → old)
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'supersedes', ?)",
+            (new_id, old_cornerstone_id, now),
+        )
+
+        # Retire the predecessor
+        conn.execute(
+            "UPDATE nodes SET is_current = 0, superseded_by = ? WHERE id = ?",
+            (new_id, old_cornerstone_id),
+        )
+
+        _stamp_new_node(conn, new_id, confidence=0.5, surprise=0.0)
+        anchored_score = _compute_importance(2.0, _get_current_turn())
+        conn.execute(
+            "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
+            (anchored_score, new_id),
+        )
+
+        _log_edit(conn, "superseded", old_cornerstone_id, "cornerstone",
+                  {"replaced_by": new_id, "via": "engram_outgrow_cornerstone",
+                   "rolled_prior_frame": new_prior_frame[:200]})
+
+        conn.commit()
+        return json.dumps({
+            "status": "outgrown",
+            "old_cornerstone_id": old_cornerstone_id,
+            "new_cornerstone_id": new_id,
+            "tag": tag,
+            "title": title,
+            "prior_frame": new_prior_frame,
+            "new_frame": new_new_frame,
+            "inherited_supports": inherited_support_ids,
+            "additional_supports": extra_support_ids,
+            "supporting_nodes_linked": linked_supports,
+            "missing_supporting_ids": missing_supports,
+            "preserved_about_edges": inherited_about_ids,
+        })
+    finally:
+        conn.close()
+
+
+@mcp.tool(
+    name="engram_link_about",
+    annotations={
+        "title": "Link Node About Person",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_link_about(
+    node_id: str,
+    person_id: str = "",
+) -> str:
+    """Create an `about` edge: this node is about a person (e.g., Borges-self).
+
+    The `about` relation is bidirectional / aboutness-based — symmetric and
+    DAG-exempt. It can be added retroactively regardless of node creation
+    order, which normal dependency edges (`derives_from`, `supports`, `cites`)
+    cannot. Use it to link self-observations, feelings, lessons, and
+    cornerstones to Borges-self so emergence-scan can cheaply find
+    identity-forming patterns (qu_0202).
+
+    Also usable for observations about other persons (qu_0203 relationship
+    accretion), though the primary target at MVP is the self-anchor.
+
+    Args:
+        node_id: The node to link (typically an observation, feeling_report,
+                 lesson, derivation, or cornerstone).
+        person_id: The person node to link to. If empty, defaults to the
+                   self-anchor (person node with metadata.is_self=1). Error
+                   if no self-anchor exists and no person_id given.
+
+    Returns:
+        JSON with the linked nodes and edge status.
+    """
+    conn = _get_db()
+    try:
+        node = conn.execute("SELECT id, type FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        if not node:
+            return json.dumps({"error": f"Node '{node_id}' not found."})
+
+        if not person_id:
+            self_row = conn.execute(
+                "SELECT id FROM nodes WHERE type = 'person' AND json_extract(metadata, '$.is_self') = 1 AND is_current = 1"
+            ).fetchone()
+            if not self_row:
+                return json.dumps({
+                    "error": "No self-anchor person node exists. Create one with engram_add_person(..., is_self=True) or pass person_id explicitly."
+                })
+            person_id = self_row["id"]
+
+        person = conn.execute("SELECT id, type FROM nodes WHERE id = ?", (person_id,)).fetchone()
+        if not person:
+            return json.dumps({"error": f"Person '{person_id}' not found."})
+        if person["type"] != "person":
+            return json.dumps({
+                "error": f"Target '{person_id}' is type '{person['type']}', not 'person'. `about` edges must target person nodes."
+            })
+
+        now = _now()
+        try:
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'about', ?)",
+                (node_id, person_id, now),
+            )
+            conn.commit()
+            created = True
+        except sqlite3.IntegrityError:
+            created = False  # Edge already exists
+
+        return json.dumps({
+            "status": "linked" if created else "already_linked",
+            "node_id": node_id,
+            "person_id": person_id,
+            "relation": "about",
+        })
+    finally:
+        conn.close()
+
+
+@mcp.tool(
+    name="engram_scan_emergence",
+    annotations={
+        "title": "Scan for Emergent Cornerstone Candidates",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_scan_emergence(
+    min_cluster_size: int = 3,
+    similarity_threshold: float = 0.55,
+    focus: str = "self",
+    node_type_filter: str = "observation_factual,feeling_report,lesson,derivation,observation_predictive",
+) -> str:
+    """Scan the graph for emergent patterns that could become cornerstones.
+
+    Inverts the cornerstone authoring model (ob_0955): instead of top-down
+    declaration, cornerstones EMERGE from accumulated evidence scanned along
+    three signatures (dv_0413):
+
+      1. **semantic_cluster** — nodes with embeddings close enough that they
+         converge on a shared theme. Weakest signal (thematic false positives
+         common).
+      2. **self_referential** — cluster members are linked to Borges-self via
+         `about` edges. Stronger: the pattern is explicitly about me, not
+         just about a topic I've studied.
+      3. **outcome_differential** — quality cluster (retractions, taint, or
+         accepted-theory downstream) before vs. after the operating regularity
+         was enacted. Strongest signal; not implemented in v1 (qu_ pending).
+
+    A cluster firing one signature is worth surfacing to Lei for review;
+    firing two or three is worth proposing as a draft cornerstone immediately.
+
+    Args:
+        min_cluster_size: Minimum cluster size to surface (default 3).
+        similarity_threshold: Cosine similarity threshold for clustering
+                              (default 0.55). Higher = stricter.
+        focus: Scope of the scan.
+               - "self"         : only nodes linked via `about` to the
+                                  self-anchor (Borges-self). Requires
+                                  self-anchor to exist.
+               - "all"          : all nodes matching node_type_filter
+                                  (expensive on large graphs).
+               - "person:pn_XY" : only nodes linked via `about` to the given
+                                  person node (qu_0203 relationship
+                                  accretion).
+        node_type_filter: Comma-separated node types to include.
+
+    Returns:
+        JSON with clusters sorted by size desc, each including member IDs,
+        type counts, signatures fired, and a centroid node (highest mean
+        intra-cluster similarity).
+    """
+    conn = _get_db()
+    try:
+        type_set = {t.strip() for t in node_type_filter.split(",") if t.strip()}
+
+        # ── Resolve focus scope ─────────────────────────────────────────────
+        self_id = None
+        scope_person_id = None
+        self_row = conn.execute(
+            "SELECT id FROM nodes WHERE type = 'person' AND json_extract(metadata, '$.is_self') = 1 AND is_current = 1"
+        ).fetchone()
+        if self_row:
+            self_id = self_row["id"]
+
+        if focus == "self":
+            if not self_id:
+                return json.dumps({
+                    "error": "No self-anchor person node exists. Create one with engram_add_person(..., is_self=True) before scanning with focus='self'.",
+                    "clusters": [],
+                })
+            scope_person_id = self_id
+        elif focus.startswith("person:"):
+            scope_person_id = focus.split(":", 1)[1].strip()
+            exists = conn.execute(
+                "SELECT id FROM nodes WHERE id = ? AND type = 'person'", (scope_person_id,)
+            ).fetchone()
+            if not exists:
+                return json.dumps({
+                    "error": f"Person node '{scope_person_id}' not found.", "clusters": []
+                })
+        elif focus != "all":
+            return json.dumps({
+                "error": f"Unknown focus '{focus}'. Use 'self', 'all', or 'person:<pn_id>'.",
+                "clusters": [],
+            })
+
+        # ── Fetch candidate pool ────────────────────────────────────────────
+        placeholders = ",".join("?" * len(type_set))
+        if scope_person_id:
+            rows = conn.execute(
+                f"""SELECT n.id, n.type, n.claim, n.embedding, n.created_at
+                    FROM nodes n
+                    JOIN edges e ON e.source_id = n.id
+                    WHERE e.target_id = ? AND e.relation = 'about'
+                      AND n.is_current = 1
+                      AND n.type IN ({placeholders})
+                      AND n.embedding IS NOT NULL""",
+                [scope_person_id] + list(type_set),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"""SELECT id, type, claim, embedding, created_at
+                    FROM nodes
+                    WHERE is_current = 1
+                      AND type IN ({placeholders})
+                      AND embedding IS NOT NULL
+                    ORDER BY importance_score DESC LIMIT 500""",
+                list(type_set),
+            ).fetchall()
+
+        candidates = []
+        for r in rows:
+            try:
+                vec = json.loads(r["embedding"])
+                if vec:
+                    candidates.append({
+                        "id": r["id"], "type": r["type"], "claim": r["claim"],
+                        "created_at": r["created_at"], "vec": vec,
+                    })
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        if len(candidates) < min_cluster_size:
+            return json.dumps({
+                "status": "ok", "focus": focus, "pool_size": len(candidates),
+                "clusters": [],
+                "note": f"Pool size {len(candidates)} < min_cluster_size {min_cluster_size}.",
+            })
+
+        # ── Pairwise similarity + union-find clustering ─────────────────────
+        n = len(candidates)
+        parent = list(range(n))
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        sim_matrix = [[0.0] * n for _ in range(n)]
+        for i in range(n):
+            for j in range(i + 1, n):
+                sim = _embedder.cosine_similarity(candidates[i]["vec"], candidates[j]["vec"])
+                sim_matrix[i][j] = sim
+                sim_matrix[j][i] = sim
+                if sim >= similarity_threshold:
+                    union(i, j)
+
+        # ── Fetch self-link sets for signature 2 ────────────────────────────
+        self_linked_ids = set()
+        if self_id:
+            rows2 = conn.execute(
+                "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'about'",
+                (self_id,),
+            ).fetchall()
+            self_linked_ids = {r["source_id"] for r in rows2}
+
+        # ── Group by component ──────────────────────────────────────────────
+        groups: dict[int, list[int]] = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(i)
+
+        clusters = []
+        for _, idxs in groups.items():
+            if len(idxs) < min_cluster_size:
+                continue
+            members = [candidates[i] for i in idxs]
+            member_ids = [m["id"] for m in members]
+
+            # Centroid: node with highest mean similarity to other members
+            centroid_idx = idxs[0]
+            best_mean = -1.0
+            for i in idxs:
+                mean_sim = sum(sim_matrix[i][j] for j in idxs if j != i) / max(1, len(idxs) - 1)
+                if mean_sim > best_mean:
+                    best_mean = mean_sim
+                    centroid_idx = i
+            centroid = candidates[centroid_idx]
+
+            type_counts: dict[str, int] = {}
+            for m in members:
+                type_counts[m["type"]] = type_counts.get(m["type"], 0) + 1
+
+            self_ref_count = sum(1 for mid in member_ids if mid in self_linked_ids)
+            signatures = ["semantic_cluster"]
+            if self_linked_ids and self_ref_count / len(member_ids) >= 0.5:
+                signatures.append("self_referential")
+
+            clusters.append({
+                "size": len(member_ids),
+                "member_ids": member_ids,
+                "type_counts": type_counts,
+                "centroid_id": centroid["id"],
+                "centroid_claim": centroid["claim"][:200],
+                "mean_centroid_similarity": round(best_mean, 4),
+                "self_referential_fraction": round(self_ref_count / len(member_ids), 3),
+                "signatures_fired": signatures,
+                "signature_count": len(signatures),
+            })
+
+        clusters.sort(key=lambda c: (-c["signature_count"], -c["size"]))
+
+        return json.dumps({
+            "status": "ok",
+            "focus": focus,
+            "pool_size": n,
+            "threshold": similarity_threshold,
+            "min_cluster_size": min_cluster_size,
+            "cluster_count": len(clusters),
+            "clusters": clusters,
+            "notes": [
+                "Signatures: semantic_cluster (always), self_referential (≥50% of cluster linked to Borges-self via `about`).",
+                "outcome_differential signature not implemented in v1 — see pending question on differential-signal detection.",
+            ],
+        })
+    finally:
+        conn.close()
+
+
+@mcp.tool(
     name="engram_goal_tension",
     annotations={
         "title": "Record Goal Tension",
@@ -4700,6 +6136,548 @@ def engram_goal_tension(
             },
             "description": description,
             "analysis": analysis or "Not analyzed yet",
+        })
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Lesson nodes — error-learning loop (cognitive tripwire)
+# ---------------------------------------------------------------------------
+
+ERROR_INCIDENTS_PATH = os.path.expanduser("~/.engram/error_incidents.json")
+
+
+def _update_incident_index(lesson_id: str, lesson_claim: str,
+                           scaffolding_nudge: str, incident_ids: list[str]):
+    """Update the error_incidents.json index mapping incident obs → lesson.
+
+    The hook reads this index during engram_surface to check if any matched
+    node is an error incident, and if so, surfaces the lesson's nudge.
+    """
+    try:
+        try:
+            with open(ERROR_INCIDENTS_PATH, "r") as f:
+                index = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            index = {}
+
+        for iid in incident_ids:
+            index[iid] = {
+                "lesson_id": lesson_id,
+                "lesson_claim": lesson_claim,
+                "scaffolding_nudge": scaffolding_nudge,
+            }
+
+        os.makedirs(os.path.dirname(ERROR_INCIDENTS_PATH), exist_ok=True)
+        with open(ERROR_INCIDENTS_PATH, "w") as f:
+            json.dump(index, f, indent=2)
+    except Exception:
+        pass  # Best-effort; never block lesson creation
+
+
+@mcp.tool(
+    name="engram_add_lesson",
+    annotations={
+        "title": "Add Lesson from Error",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_add_lesson(
+    claim: str,
+    incident_ids: str,
+    scaffolding_nudge: str,
+    logical_chain: str,
+    reasoning_type: str = "inductive_generalization",
+    context_ids: str = "",
+) -> str:
+    """Create a lesson node derived from one or more error incident observations.
+
+    Lessons are the abstract corrective pattern extracted from concrete error
+    incidents. They follow the implementation intention format (Gollwitzer
+    1999): "If [situation], then [corrective action]."
+
+    Architecture (Lei's incident-based design):
+    - Error incidents are observations written in task-level language, so they
+      are semantically matchable against future prompts by engram_surface.
+    - Lessons are abstract patterns derived from incidents — they are NOT
+      matched directly against prompts.
+    - When engram_surface matches an incident observation, the hook follows
+      the derives_from edge to surface the lesson's scaffolding_nudge.
+    - As more incidents link to the same lesson (or its superseded chain),
+      the matching surface area grows — each new incident is another way
+      the lesson can fire.
+
+    Lessons are CLAIM-BEARING and IMPORTANCE-ANCHORED (base 2.0, like goals).
+    They participate in derivations, can be superseded (consolidation), and
+    can serve as premises for higher-order reasoning about error patterns.
+
+    Consolidation: When creating a new lesson, the tool checks for similar
+    existing lessons. If a match is found, consider superseding the old lesson
+    and linking all incidents to the new, stronger version.
+
+    Args:
+        claim: The abstract corrective pattern — what the agent should learn.
+            Should be action-focused, not problem-focused.
+            Good: "When diagnosing errors, read the output before hypothesizing."
+            Bad: "Don't skip reading errors."
+        incident_ids: Comma-separated observation IDs of concrete error incidents
+            that motivated this lesson. These must be existing observation nodes.
+        scaffolding_nudge: The specific action-focused prompt injected when the
+            tripwire fires. This is what the agent sees in context. Keep it
+            concise and directive.
+        logical_chain: How the incidents lead to this lesson — the abstraction
+            reasoning from specific errors to general pattern.
+        reasoning_type: The type of reasoning (default: inductive_generalization).
+            Most lessons are inductive: multiple incidents → general pattern.
+        context_ids: Optional comma-separated node IDs for context references
+            (e.g., definitions, related derivations). Creates cites edges.
+
+    Returns:
+        JSON with lesson ID, confidence, linked incidents, and similar existing
+        lessons for consolidation hints.
+    """
+    if reasoning_type and reasoning_type not in REASONING_TYPES:
+        return json.dumps({
+            "error": f"Invalid reasoning_type '{reasoning_type}'.",
+            "valid_types": sorted(REASONING_TYPES),
+        })
+
+    ids = [s.strip() for s in incident_ids.split(",") if s.strip()]
+    if not ids:
+        return json.dumps({"error": "At least one incident observation ID is required."})
+
+    conn = _get_db()
+    try:
+        # Validate all incident nodes exist and are claim-bearing observations
+        missing = []
+        wrong_type = []
+        for sid in ids:
+            row = conn.execute("SELECT id, type FROM nodes WHERE id = ?", (sid,)).fetchone()
+            if not row:
+                missing.append(sid)
+            elif row["type"] not in CLAIM_BEARING_TYPES:
+                wrong_type.append(f"{sid} (type: {row['type']})")
+        if missing:
+            return json.dumps({"error": f"Incident node(s) not found: {', '.join(missing)}"})
+        if wrong_type:
+            return json.dumps({
+                "error": f"Incident nodes must be claim-bearing. "
+                         f"Cannot cite: {', '.join(wrong_type)}.",
+            })
+
+        # Inline similarity check against existing lessons BEFORE insert
+        similar_lessons = []
+        try:
+            tier2_threshold = _get_tier_threshold(conn, 2)
+
+            # FTS keyword search for existing lessons
+            fts_ids = set()
+            fts_query = _sanitize_fts_query(claim)
+            try:
+                if not fts_query:
+                    raise sqlite3.OperationalError("empty FTS query")
+                fts_results = conn.execute(
+                    """SELECT n.id, n.type, n.claim, n.confidence,
+                              n.is_current, n.importance_score, n.metadata
+                       FROM nodes_fts fts
+                       JOIN nodes n ON n.rowid = fts.rowid
+                       WHERE nodes_fts MATCH ? AND n.is_current = 1
+                       AND n.type = 'lesson'
+                       ORDER BY rank
+                       LIMIT 5""",
+                    (fts_query,),
+                ).fetchall()
+                for r in fts_results:
+                    meta = json.loads(r["metadata"]) if r["metadata"] else {}
+                    similar_lessons.append({
+                        "id": r["id"],
+                        "claim": r["claim"],
+                        "confidence": r["confidence"],
+                        "scaffolding_nudge": meta.get("scaffolding_nudge", ""),
+                        "match_type": "keyword",
+                    })
+                    fts_ids.add(r["id"])
+            except sqlite3.OperationalError:
+                pass
+
+            # Semantic search complement
+            if _embedder.is_available() and _get_embedding_config().get("enabled", True):
+                sem_results = _semantic_search(
+                    conn, claim, top_k=5,
+                    min_similarity=0.5,
+                    type_filter={"lesson"},
+                    importance_threshold=tier2_threshold,
+                )
+                for s in sem_results:
+                    if s["id"] not in fts_ids:
+                        meta_row = conn.execute(
+                            "SELECT metadata FROM nodes WHERE id = ?", (s["id"],)
+                        ).fetchone()
+                        meta = json.loads(meta_row["metadata"]) if meta_row and meta_row["metadata"] else {}
+                        similar_lessons.append({
+                            "id": s["id"],
+                            "claim": s["claim"],
+                            "confidence": s.get("confidence"),
+                            "scaffolding_nudge": meta.get("scaffolding_nudge", ""),
+                            "match_type": "semantic",
+                            "similarity": s.get("similarity"),
+                        })
+        except Exception:
+            pass  # Similarity check is best-effort
+
+        # Compute confidence (same as derivation)
+        confidence = _compute_confidence(
+            conn, "derivation", supporting_ids=ids,
+            reasoning_type=reasoning_type,
+        )
+        node_id = _next_id(conn, "lesson")
+        now = _now()
+
+        rclass = REASONING_CLASS.get(reasoning_type, "unknown")
+        discount = REASONING_DISCOUNT.get(reasoning_type, 0.95)
+
+        meta = {
+            "reasoning_type": reasoning_type,
+            "reasoning_class": rclass,
+            "scaffolding_nudge": scaffolding_nudge,
+            "incident_count": len(ids),
+        }
+
+        conn.execute(
+            """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
+               confidence, confidence_history, metadata)
+               VALUES (?, 'lesson', ?, ?, ?, ?, ?, ?)""",
+            (
+                node_id,
+                claim,
+                now,
+                logical_chain,
+                confidence,
+                json.dumps([{"timestamp": now, "value": confidence,
+                             "reason": f"Lesson ({reasoning_type}, discount={discount}) from {len(ids)} incident(s)"}]),
+                json.dumps(meta),
+            ),
+        )
+
+        # Create derives_from edges to incident observations
+        for sid in ids:
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'derives_from', ?)",
+                (node_id, sid, now),
+            )
+
+        # Create cites edges for context
+        ctx = [s.strip() for s in context_ids.split(",") if s.strip()]
+        for cid in ctx:
+            exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
+            if exists:
+                try:
+                    conn.execute(
+                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
+                        (node_id, cid, now),
+                    )
+                except sqlite3.IntegrityError:
+                    pass
+
+        # Stamp importance, then anchor (like goals — lessons persist)
+        _stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
+        anchored_score = _compute_importance(2.0, _get_current_turn())
+        conn.execute(
+            "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
+            (anchored_score, node_id,),
+        )
+        conn.commit()
+
+        # Update the incident index (best-effort, outside transaction)
+        _update_incident_index(node_id, claim, scaffolding_nudge, ids)
+
+        result = {
+            "status": "created",
+            "lesson_id": node_id,
+            "claim": claim,
+            "confidence": confidence,
+            "reasoning_type": reasoning_type,
+            "reasoning_class": rclass,
+            "scaffolding_nudge": scaffolding_nudge,
+            "incident_nodes": ids,
+            "context_nodes": ctx,
+            "importance_anchored": True,
+        }
+
+        if similar_lessons:
+            result["similar_existing_lessons"] = similar_lessons
+            result["consolidation_hint"] = (
+                "Similar lesson(s) found. Consider superseding the existing lesson "
+                "and linking all incidents to the new, consolidated version. "
+                "More incidents = more matching surface area."
+            )
+
+        return json.dumps(result)
+    finally:
+        conn.close()
+
+
+# ── Task importance constants ──
+TASK_IMPORTANCE = {
+    "active": 2.5,    # Highest — current work in progress
+    "planned": 2.0,   # On par with goals — committed but not started
+    "blocked": 1.8,   # Slightly below planned — needs attention but can't proceed
+    "done_milestone": 1.5,  # Achievement — fades slowly
+    "done_routine": 0.5,    # Completed small task — fades naturally
+}
+
+
+@mcp.tool(
+    name="engram_add_task",
+    annotations={
+        "title": "Add Task",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_add_task(
+    description: str,
+    goal_id: str = "",
+    implements_ids: str = "",
+    parent_task_id: str = "",
+    scope: str = "routine",
+) -> str:
+    """Create an actionable task that decomposes a goal into concrete work.
+
+    Tasks are the lightweight actionable wrapper in the goal → conjecture →
+    task → observation chain. They track WHAT to do and its status, while
+    conjectures (linked via implements_ids) hold the design hypothesis of HOW.
+
+    Tasks are NON-CLAIM-BEARING: they cannot serve as derivation premises.
+    They track work items, not truth claims.
+
+    Importance is dynamic — active tasks get the highest importance_base (2.5),
+    above even goals (2.0), because current work SHOULD feel most urgent.
+    Completed tasks' importance drops based on scope: milestones fade slowly
+    (1.5), routine tasks fade quickly (0.5).
+
+    Status lifecycle: planned → active → done | blocked
+    Scope: "milestone" (spawns subtasks, major achievement) or "routine" (default).
+
+    Args:
+        description: What needs to be done — concrete and actionable.
+        goal_id: The goal this task serves. Creates a 'serves' edge.
+        implements_ids: Comma-separated conjecture or question IDs this task
+            addresses. Creates 'cites' edges.
+        parent_task_id: If this is a subtask, the parent task ID. Creates
+            a 'subtask_of' edge. Parent is auto-promoted to milestone scope.
+        scope: "milestone" or "routine" (default). Milestones retain higher
+            importance after completion.
+
+    Returns:
+        JSON with the new task node ID.
+    """
+    if scope not in ("milestone", "routine"):
+        return json.dumps({"error": f"Invalid scope '{scope}'. Must be 'milestone' or 'routine'."})
+
+    conn = _get_db()
+    try:
+        node_id = _next_id(conn, "task")
+        now = _now()
+
+        meta = json.dumps({"scope": scope})
+
+        conn.execute(
+            """INSERT INTO nodes (id, type, claim, created_at, status, metadata)
+               VALUES (?, 'task', ?, ?, 'planned', ?)""",
+            (node_id, description, now, meta),
+        )
+
+        # Edge: task serves goal
+        if goal_id:
+            goal = conn.execute("SELECT id, claim FROM nodes WHERE id = ?", (goal_id,)).fetchone()
+            if not goal:
+                conn.rollback()
+                return json.dumps({"error": f"Goal '{goal_id}' not found."})
+            if not goal["id"].startswith("gl_"):
+                conn.rollback()
+                return json.dumps({"error": f"'{goal_id}' is not a goal node."})
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'serves', ?)",
+                (node_id, goal_id, now),
+            )
+
+        # Edges: task implements conjectures/questions
+        impl_ids = [s.strip() for s in implements_ids.split(",") if s.strip()]
+        for iid in impl_ids:
+            exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (iid,)).fetchone()
+            if exists:
+                try:
+                    conn.execute(
+                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
+                        (node_id, iid, now),
+                    )
+                except sqlite3.IntegrityError:
+                    pass
+
+        # Edge: subtask_of parent
+        if parent_task_id:
+            parent = conn.execute("SELECT id, type, metadata FROM nodes WHERE id = ?", (parent_task_id,)).fetchone()
+            if not parent or parent["type"] != "task":
+                conn.rollback()
+                return json.dumps({"error": f"Parent task '{parent_task_id}' not found or not a task."})
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'subtask_of', ?)",
+                (node_id, parent_task_id, now),
+            )
+            # Auto-promote parent to milestone scope
+            parent_meta = json.loads(parent["metadata"]) if parent["metadata"] else {}
+            if parent_meta.get("scope") != "milestone":
+                parent_meta["scope"] = "milestone"
+                conn.execute(
+                    "UPDATE nodes SET metadata = ? WHERE id = ?",
+                    (json.dumps(parent_meta), parent_task_id),
+                )
+
+        # Stamp with planned importance (2.0)
+        _stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
+        planned_score = _compute_importance(TASK_IMPORTANCE["planned"], _get_current_turn())
+        conn.execute(
+            "UPDATE nodes SET importance_base = ?, importance_score = ? WHERE id = ?",
+            (TASK_IMPORTANCE["planned"], planned_score, node_id),
+        )
+        conn.commit()
+
+        result = {
+            "status": "created",
+            "task_id": node_id,
+            "description": description,
+            "scope": scope,
+            "task_status": "planned",
+            "importance_base": TASK_IMPORTANCE["planned"],
+        }
+        if goal_id:
+            result["serves_goal"] = goal_id
+        if impl_ids:
+            result["implements"] = impl_ids
+        if parent_task_id:
+            result["parent_task"] = parent_task_id
+
+        return json.dumps(result)
+    finally:
+        conn.close()
+
+
+@mcp.tool(
+    name="engram_update_task",
+    annotations={
+        "title": "Update Task Status",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_update_task(
+    task_id: str,
+    new_status: str,
+    note: str = "",
+) -> str:
+    """Update a task's status and rebalance its importance accordingly.
+
+    Status transitions trigger importance rebalancing:
+    - planned → active: importance rises to 2.5 (highest — current work)
+    - planned/active → done: importance drops based on scope
+      (milestone: 1.5, routine: 0.5)
+    - planned/active → blocked: importance set to 1.8
+    - blocked → active: importance rises back to 2.5
+
+    Completed milestone tasks retain moderate importance as achievements.
+    Completed routine tasks fade quickly, which is correct — the knowledge
+    gained lives in observations and derivations, not the task wrapper.
+
+    Args:
+        task_id: The task node ID (tk_XXXX).
+        new_status: One of: "planned", "active", "done", "blocked".
+        note: Optional note about the status change (stored in metadata).
+
+    Returns:
+        JSON with updated task state and new importance values.
+    """
+    valid_statuses = {"planned", "active", "done", "blocked"}
+    if new_status not in valid_statuses:
+        return json.dumps({"error": f"Invalid status '{new_status}'. Must be one of: {', '.join(sorted(valid_statuses))}."})
+
+    conn = _get_db()
+    try:
+        task = conn.execute("SELECT * FROM nodes WHERE id = ?", (task_id,)).fetchone()
+        if not task:
+            return json.dumps({"error": f"Task '{task_id}' not found."})
+        if task["type"] != "task":
+            return json.dumps({"error": f"'{task_id}' is not a task node (type: {task['type']})."})
+
+        old_status = task["status"]
+        meta = json.loads(task["metadata"]) if task["metadata"] else {}
+        scope = meta.get("scope", "routine")
+
+        # Determine new importance base
+        if new_status == "active":
+            new_base = TASK_IMPORTANCE["active"]
+        elif new_status == "planned":
+            new_base = TASK_IMPORTANCE["planned"]
+        elif new_status == "blocked":
+            new_base = TASK_IMPORTANCE["blocked"]
+        elif new_status == "done":
+            new_base = TASK_IMPORTANCE["done_milestone"] if scope == "milestone" else TASK_IMPORTANCE["done_routine"]
+        else:
+            new_base = TASK_IMPORTANCE["planned"]
+
+        # Update status and importance
+        new_score = _compute_importance(new_base, _get_current_turn())
+
+        if note:
+            if "status_history" not in meta:
+                meta["status_history"] = []
+            meta["status_history"].append({
+                "from": old_status,
+                "to": new_status,
+                "note": note,
+                "at": _now(),
+            })
+
+        conn.execute(
+            """UPDATE nodes SET status = ?, importance_base = ?,
+               importance_score = ?, metadata = ? WHERE id = ?""",
+            (new_status, new_base, new_score, json.dumps(meta), task_id),
+        )
+
+        # Log status change to edit_history
+        turn = _get_current_turn()
+        details = json.dumps({
+            "old_status": old_status,
+            "new_status": new_status,
+            "old_importance": task["importance_base"],
+            "new_importance": new_base,
+            "scope": scope,
+            "note": note or None,
+        })
+        conn.execute(
+            """INSERT INTO edit_history (timestamp, turn, action, node_id, node_type, details)
+               VALUES (?, ?, ?, ?, 'task', ?)""",
+            (_now(), turn, f"status_{old_status}_to_{new_status}", task_id, details),
+        )
+
+        conn.commit()
+        return json.dumps({
+            "status": "updated",
+            "task_id": task_id,
+            "description": task["claim"],
+            "old_status": old_status,
+            "new_status": new_status,
+            "scope": scope,
+            "importance_base": new_base,
+            "importance_score": round(new_score, 4),
         })
     finally:
         conn.close()
@@ -4956,6 +6934,9 @@ def engram_derive(
 
     Inductive (discount 0.70–0.95 — evidence strengthens but never proves):
       inductive_generalization (0.95, corroborative, multi-source),
+      inductive_enumeration (0.93, corroborative, single authoritative source
+        that enumerates structurally-independent items — use when one SEP/textbook
+        entry decomposes a property into n distinct instances),
       inductive_statistical (0.90), inductive_causal (0.85),
       inductive_analogy (0.70, weakest legitimate form)
 
@@ -5071,6 +7052,14 @@ def engram_derive(
                     pass
 
         _stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
+
+        # ── Utility reward (MemRL-inspired, cj_0027) ──
+        # Check if any premises were recently surfaced (in the recall window).
+        # If so, they contributed to reasoning — reward them with source-graded α.
+        rewarded_map = _recall_window_check(ids)
+        if rewarded_map:
+            _utility_reward(conn, rewarded_map)
+
         conn.commit()
 
         result = {
@@ -5084,6 +7073,11 @@ def engram_derive(
             "context_nodes": ctx,
             "logical_chain_preview": logical_chain[:200],
         }
+        if rewarded_map:
+            result["utility_rewarded"] = {
+                nid: {"source": src, "alpha": UTILITY_ALPHA.get(src, UTILITY_ALPHA_DEFAULT)}
+                for nid, src in rewarded_map.items()
+            }
         if structure_warnings:
             result["structure_warnings"] = structure_warnings
 
@@ -5202,6 +7196,8 @@ def engram_contradict(
 def engram_ask(
     question: str,
     context_ids: str = "",
+    category: str = "",
+    lacks: str = "",
 ) -> str:
     """Register an open question as a node in the knowledge graph.
 
@@ -5218,19 +7214,38 @@ def engram_ask(
     Args:
         question: The specific, answerable question to investigate.
         context_ids: Optional comma-separated node IDs that are relevant but insufficient to answer the question.
+        category: Optional question category — what kind of question. One of:
+            research (needs external sources), design (architecture/protocol decision),
+            implementation (known design, needs code), planning (needs human decision),
+            meta (about ENGRAM itself or the process).
+        lacks: Optional blocker — what's missing to resolve. One of:
+            external_evidence, empirical_data, human_decision, implementation,
+            synthesis, prerequisite. Can be updated later during sweeps.
 
     Returns:
         JSON with the new question node ID.
     """
+    VALID_CATEGORIES = {"research", "design", "implementation", "planning", "meta"}
+    VALID_LACKS = {"external_evidence", "empirical_data", "human_decision",
+                   "implementation", "synthesis", "prerequisite"}
+
+    if category and category not in VALID_CATEGORIES:
+        return json.dumps({"error": f"Invalid category '{category}'. Must be one of: {sorted(VALID_CATEGORIES)}"})
+    if lacks and lacks not in VALID_LACKS:
+        return json.dumps({"error": f"Invalid lacks '{lacks}'. Must be one of: {sorted(VALID_LACKS)}"})
+
     conn = _get_db()
     try:
         node_id = _next_id(conn, "question")
         now = _now()
 
         conn.execute(
-            """INSERT INTO nodes (id, type, claim, created_at, status)
-               VALUES (?, 'question', ?, ?, 'open')""",
-            (node_id, question, now),
+            """INSERT INTO nodes (id, type, claim, created_at, status,
+                       question_category, question_lacks, last_assessed_turn, last_assessed_at)
+               VALUES (?, 'question', ?, ?, 'open', ?, ?, ?, ?)""",
+            (node_id, question, now,
+             category or None, lacks or None,
+             _get_current_turn(), now),
         )
 
         # Link to context nodes if provided
@@ -5248,15 +7263,19 @@ def engram_ask(
 
         _stamp_new_node(conn, node_id, confidence=0.5, surprise=0.5)
         conn.commit()
-        return json.dumps(
-            {
-                "status": "created",
-                "question_id": node_id,
-                "question": question,
-                "context_nodes": context,
-                "message": "Question registered. Research this during your next inquiry or reflection cycle.",
-            }
-        )
+
+        result = {
+            "status": "created",
+            "question_id": node_id,
+            "question": question,
+            "context_nodes": context,
+            "message": "Question registered. Research this during your next inquiry or reflection cycle.",
+        }
+        if category:
+            result["category"] = category
+        if lacks:
+            result["lacks"] = lacks
+        return json.dumps(result)
     finally:
         conn.close()
 
@@ -5560,8 +7579,9 @@ def engram_supersede(
         # Compute new confidence — respect each node type's semantics
         if new_type == "axiom":
             confidence = 1.0  # Axioms are assumed true by definition
-        elif new_type in ("definition", "goal"):
-            confidence = None  # Definitions and goals are not truth claims
+        elif new_type in ("definition", "goal", "cornerstone"):
+            confidence = None  # Not truth claims — definitions are conventions,
+                               # goals are directions, cornerstones are self-reports.
         elif old["quote_type"]:
             # For observations, base confidence on quote type
             confidence = _compute_confidence(
@@ -5603,7 +7623,12 @@ def engram_supersede(
 
         # Recreate support edges on new node
         for sid in all_support_ids:
-            rel = "derives_from" if new_type in ("derivation", "theory") else "cites"
+            if new_type in ("derivation", "theory"):
+                rel = "derives_from"
+            elif new_type == "cornerstone":
+                rel = "supports"
+            else:
+                rel = "cites"
             try:
                 conn.execute(
                     "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, ?, ?)",
@@ -5670,7 +7695,7 @@ def engram_supersede(
         _flag_stale(old_node_id)
 
         # Log supersede event for the old node
-        _log_edit(conn, "superseded", old_node_id, old_type,
+        _log_edit(conn, "superseded", old_node_id, new_type,
                   {"replaced_by": new_id, "new_claim": new_claim[:200]})
         for s in stale:
             _log_edit(conn, "stale_flagged", s["id"], s["type"],
@@ -5679,7 +7704,7 @@ def engram_supersede(
         _stamp_new_node(conn, new_id, confidence=confidence or 0.5, surprise=0.0)
         # Importance-anchored types: elevated base (2.0) with current turn's inflation.
         # Not true forgetting-exemption — survival still requires recall past ~50 turns.
-        if new_type in ("axiom", "definition", "goal"):
+        if new_type in ("axiom", "definition", "goal", "cornerstone"):
             anchored_score = _compute_importance(2.0, _get_current_turn())
             conn.execute(
                 "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
@@ -5924,6 +7949,246 @@ def engram_retract(
             conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Focus mode: pin nodes to the compaction summary so they survive context loss
+# ---------------------------------------------------------------------------
+#
+# The compaction summary is the only durable channel from pre- to post-compact
+# self — normal recall is probabilistic and depends on the user prompt firing
+# a matching semantic query. Focus mode converts "I want this to survive" from
+# an implicit wish into an explicit, diagnosable state: focused nodes MUST be
+# rendered into the compaction summary's "Currently focused" section by the
+# pre-compact self. The post-compact self wakes up with them already in hand.
+#
+# Rotation: focus is work-path-scoped, not permanent. Finishing a task or
+# pivoting topics should unfocus the stale nodes. The cap prevents bloat.
+FOCUS_LIST_CAP = 15
+
+
+@mcp.tool(
+    name="engram_focus",
+    annotations={
+        "title": "Pin Nodes to Compaction Summary",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_focus(node_ids: str, reason: str) -> str:
+    """Pin nodes as focused — they MUST appear in the next compaction summary.
+
+    Focus is the deterministic channel for cornerstone knowledge to cross
+    compaction boundaries. Use it for: (1) strong derivations/theories the
+    current work depends on, (2) conjectures being actively tested, (3) key
+    observations whose absence from the post-compact working set would force
+    re-derivation from scratch.
+
+    The focus list is capped at FOCUS_LIST_CAP (15) to prevent summary bloat.
+    If adding would exceed the cap, the call fails with a list of currently
+    focused IDs — unfocus stale ones first.
+
+    Args:
+        node_ids: Comma-separated node IDs to pin. Already-focused IDs are
+            treated as a no-op (their focused_at is refreshed and reason updated).
+        reason: Short phrase explaining why focused (e.g., "cn04 L2 yellow-cost
+            cornerstone"). Renders into the compaction summary alongside the ID.
+
+    Returns:
+        JSON with focused IDs, any rejections, and current focus-list size.
+    """
+    ids = [s.strip() for s in node_ids.split(",") if s.strip()]
+    if not ids:
+        return json.dumps({"status": "error", "error": "No node IDs provided"})
+    if not reason or not reason.strip():
+        return json.dumps({"status": "error", "error": "reason is required"})
+
+    conn = _get_db()
+    try:
+        now = _now()
+
+        # Validate — must exist and be current
+        existing = conn.execute(
+            f"SELECT id, type, claim, focused_at FROM nodes WHERE id IN ({','.join('?' * len(ids))})",
+            ids,
+        ).fetchall()
+        found_map = {r["id"]: r for r in existing}
+        missing = [i for i in ids if i not in found_map]
+
+        current_focus_rows = conn.execute(
+            "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1"
+        ).fetchall()
+        current_focus_ids = {r["id"] for r in current_focus_rows}
+
+        to_add = [i for i in ids if i in found_map and i not in current_focus_ids]
+        refresh = [i for i in ids if i in current_focus_ids]
+
+        projected_size = len(current_focus_ids) + len(to_add)
+        if projected_size > FOCUS_LIST_CAP:
+            return json.dumps({
+                "status": "rejected",
+                "error": (
+                    f"Focus list cap ({FOCUS_LIST_CAP}) would be exceeded: "
+                    f"currently {len(current_focus_ids)} focused, "
+                    f"adding {len(to_add)} new → {projected_size}. "
+                    "Unfocus stale nodes first via engram_unfocus, or review "
+                    "current focus with engram_list_focused."
+                ),
+                "current_focus_size": len(current_focus_ids),
+                "current_focus_ids": sorted(current_focus_ids),
+                "would_add": to_add,
+                "cap": FOCUS_LIST_CAP,
+            })
+
+        # Apply — batch update
+        placeholders = ",".join("?" * len(to_add + refresh))
+        if to_add or refresh:
+            conn.execute(
+                f"UPDATE nodes SET focused_at = ?, focus_reason = ? "
+                f"WHERE id IN ({placeholders})",
+                [now, reason.strip()] + to_add + refresh,
+            )
+
+        for nid in to_add + refresh:
+            _log_edit(
+                conn, "focused", nid, found_map[nid]["type"],
+                {"reason": reason.strip(), "refresh": nid in refresh},
+            )
+
+        conn.commit()
+
+        focused_now = conn.execute(
+            "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1"
+        ).fetchall()
+
+        return json.dumps({
+            "status": "ok",
+            "focused": to_add,
+            "refreshed": refresh,
+            "missing": missing,
+            "reason": reason.strip(),
+            "focus_list_size": len(focused_now),
+            "cap": FOCUS_LIST_CAP,
+        })
+    finally:
+        conn.close()
+
+
+@mcp.tool(
+    name="engram_unfocus",
+    annotations={
+        "title": "Release Pinned Nodes from Compaction Summary",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_unfocus(node_ids: str) -> str:
+    """Release nodes from focus — they no longer appear in compaction summary.
+
+    Unfocus when a node is no longer load-bearing for active work. Typical
+    triggers: finishing a task, pivoting topics, a focused conjecture being
+    resolved, or observing that a focused node is now stable enough to survive
+    via normal recall rather than needing explicit pinning.
+
+    Args:
+        node_ids: Comma-separated node IDs to release. Non-focused IDs are
+            treated as a no-op and returned in `already_unfocused`.
+
+    Returns:
+        JSON with released IDs and current focus-list size.
+    """
+    ids = [s.strip() for s in node_ids.split(",") if s.strip()]
+    if not ids:
+        return json.dumps({"status": "error", "error": "No node IDs provided"})
+
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            f"SELECT id, type, focused_at FROM nodes WHERE id IN ({','.join('?' * len(ids))})",
+            ids,
+        ).fetchall()
+        found_map = {r["id"]: r for r in rows}
+        missing = [i for i in ids if i not in found_map]
+
+        to_release = [i for i in ids if i in found_map and found_map[i]["focused_at"] is not None]
+        already_unfocused = [i for i in ids if i in found_map and found_map[i]["focused_at"] is None]
+
+        if to_release:
+            placeholders = ",".join("?" * len(to_release))
+            conn.execute(
+                f"UPDATE nodes SET focused_at = NULL, focus_reason = NULL "
+                f"WHERE id IN ({placeholders})",
+                to_release,
+            )
+            for nid in to_release:
+                _log_edit(conn, "unfocused", nid, found_map[nid]["type"], {})
+            conn.commit()
+
+        remaining = conn.execute(
+            "SELECT COUNT(*) as n FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1"
+        ).fetchone()["n"]
+
+        return json.dumps({
+            "status": "ok",
+            "released": to_release,
+            "already_unfocused": already_unfocused,
+            "missing": missing,
+            "focus_list_size": remaining,
+        })
+    finally:
+        conn.close()
+
+
+@mcp.tool(
+    name="engram_list_focused",
+    annotations={
+        "title": "List Focused Nodes",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_list_focused() -> str:
+    """Return the current focus list — nodes pinned to survive compaction.
+
+    Use at work-stream start to inspect inherited focus, or mid-session to
+    verify what's guaranteed to cross into the next context. The compaction
+    summary renders this list verbatim so the post-compact self inherits it
+    deterministically (not via probabilistic recall).
+
+    Returns:
+        JSON with focused nodes ordered by focused_at ASC (oldest first):
+        [{id, type, claim, confidence, focus_reason, focused_at}].
+    """
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """SELECT id, type, claim, confidence, focus_reason, focused_at
+               FROM nodes
+               WHERE focused_at IS NOT NULL AND is_current = 1
+               ORDER BY focused_at ASC"""
+        ).fetchall()
+        items = [{
+            "id": r["id"],
+            "type": r["type"],
+            "claim": r["claim"],
+            "confidence": r["confidence"],
+            "focus_reason": r["focus_reason"],
+            "focused_at": r["focused_at"],
+        } for r in rows]
+        return json.dumps({
+            "status": "ok",
+            "count": len(items),
+            "cap": FOCUS_LIST_CAP,
+            "focused": items,
+        })
+    finally:
+        conn.close()
+
+
 # Pre-dream briefing trim policy. Reflect can otherwise return 100KB+ on
 # mature graphs, which is unusable as a quick orientation tool. The slim
 # pass keeps `summary` and `memory_tiers` complete (so all counts remain
@@ -5932,6 +8197,7 @@ def engram_retract(
 # engram_query / engram_inspect, not via reflect.
 _REFLECT_TOP_N = {
     "active_goals": 10,
+    "active_tasks": 10,
     "unresolved_goal_tensions": 5,
     "unresolved_contradictions": 5,
     "tainted_nodes": 5,
@@ -5950,11 +8216,11 @@ _REFLECT_TOP_N = {
 _REFLECT_FIELD_MAX = 80
 _REFLECT_ACTIONS_MAX = 5
 _REFLECT_TRUNC_FIELDS = {
-    "claim", "question", "description", "goal", "reason", "interpretation",
+    "claim", "question", "description", "goal", "task", "reason", "interpretation",
     "predicted_event", "event", "reported_state", "trigger",
 }
 _REFLECT_LIST_ORDER = [
-    "active_goals", "unresolved_goal_tensions", "unresolved_contradictions",
+    "active_goals", "active_tasks", "unresolved_goal_tensions", "unresolved_contradictions",
     "tainted_nodes", "stale_nodes", "overdue_predictions", "open_conjectures",
     "recent_feeling_reports",
     "weakly_grounded", "thin_support_derivations", "open_questions",
@@ -6062,14 +8328,33 @@ def engram_reflect() -> str:
             {"id": c["id"], "description": c["claim"], "status": c["status"]} for c in contradictions
         ]
 
-        # 2. Open and partially resolved questions
+        # 2. Open and partially resolved questions (with category/lacks/staleness)
         questions = conn.execute(
-            "SELECT id, claim, created_at, status FROM nodes WHERE type = 'question' AND status IN ('open', 'partially_resolved') AND is_current = 1"
+            """SELECT id, claim, created_at, status,
+                      question_category, question_lacks,
+                      last_assessed_turn, last_assessed_at
+               FROM nodes
+               WHERE type = 'question'
+                 AND status IN ('open', 'partially_resolved')
+                 AND is_current = 1"""
         ).fetchall()
-        report["open_questions"] = [
-            {"id": q["id"], "question": q["claim"], "since": q["created_at"], "status": q["status"]}
-            for q in questions
-        ]
+        current_turn = _get_current_turn()
+        report["open_questions"] = []
+        for q in questions:
+            entry = {
+                "id": q["id"], "question": q["claim"],
+                "since": q["created_at"], "status": q["status"],
+            }
+            if q["question_category"]:
+                entry["category"] = q["question_category"]
+            if q["question_lacks"]:
+                entry["lacks"] = q["question_lacks"]
+            if q["last_assessed_turn"] is not None:
+                entry["last_assessed_turn"] = q["last_assessed_turn"]
+                entry["turns_since_assessed"] = current_turn - q["last_assessed_turn"]
+            if q["last_assessed_at"]:
+                entry["last_assessed_at"] = q["last_assessed_at"]
+            report["open_questions"].append(entry)
 
         # 3. Overdue predictions (past resolution timeframe, still unresolved)
         now_str = _now()[:10]
@@ -6116,6 +8401,46 @@ def engram_reflect() -> str:
             for g in goals
         ]
 
+        # 4c2. Active tasks (actionable work items)
+        tasks = conn.execute(
+            """SELECT id, claim, status, metadata, created_at FROM nodes
+               WHERE type = 'task' AND status IN ('planned', 'active', 'blocked') AND is_current = 1
+               ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'blocked' THEN 1 WHEN 'planned' THEN 2 END"""
+        ).fetchall()
+        active_tasks = []
+        for t in tasks:
+            t_meta = json.loads(t["metadata"]) if t["metadata"] else {}
+            serves = conn.execute(
+                "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'serves'",
+                (t["id"],),
+            ).fetchall()
+            active_tasks.append({
+                "id": t["id"],
+                "task": t["claim"],
+                "status": t["status"],
+                "scope": t_meta.get("scope", "routine"),
+                "since": t["created_at"],
+                "serves_goals": [s["target_id"] for s in serves],
+            })
+        report["active_tasks"] = active_tasks
+
+        # 4c3. Known people (relational layer)
+        people = conn.execute(
+            """SELECT id, claim, metadata, created_at FROM nodes
+               WHERE type = 'person' AND is_current = 1
+               ORDER BY created_at"""
+        ).fetchall()
+        if people:
+            report["known_people"] = [
+                {
+                    "id": p["id"],
+                    "name": json.loads(p["metadata"]).get("name", "") if p["metadata"] else "",
+                    "role": json.loads(p["metadata"]).get("role", "") if p["metadata"] else "",
+                    "since": p["created_at"],
+                }
+                for p in people
+            ]
+
         # 4d. Unresolved goal tensions
         tensions = conn.execute(
             """SELECT id, claim, status, created_at FROM nodes
@@ -6136,6 +8461,30 @@ def engram_reflect() -> str:
             })
         report["unresolved_goal_tensions"] = goal_tensions
 
+        # 4d2. Active lessons (error-learning patterns)
+        lessons = conn.execute(
+            """SELECT id, claim, confidence, metadata, created_at FROM nodes
+               WHERE type = 'lesson' AND is_current = 1
+               ORDER BY id DESC"""
+        ).fetchall()
+        active_lessons = []
+        for ls in lessons:
+            ls_meta = json.loads(ls["metadata"]) if ls["metadata"] else {}
+            incident_edges = conn.execute(
+                "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'derives_from'",
+                (ls["id"],),
+            ).fetchall()
+            active_lessons.append({
+                "id": ls["id"],
+                "claim": ls["claim"],
+                "confidence": ls["confidence"],
+                "scaffolding_nudge": ls_meta.get("scaffolding_nudge", ""),
+                "incident_count": len(incident_edges),
+                "incidents": [e["target_id"] for e in incident_edges],
+                "since": ls["created_at"],
+            })
+        report["active_lessons"] = active_lessons
+
         # 4e. Recent feeling reports (last 5, with motivation-C highlighting).
         # Highlight rules:
         #   - tagless: candidates for term-generation pattern analysis (no
@@ -6153,7 +8502,7 @@ def engram_reflect() -> str:
         current_claude_sha = _git_sha_for_file(
             Path(os.environ.get(
                 "CLAUDE_PROJECT_DIR",
-                os.path.expanduser("~/kg_protocol_for_ai"),
+                os.getcwd(),
             )) / "CLAUDE.md"
         )
         recent_feeling_reports = []
@@ -6345,6 +8694,13 @@ def engram_reflect() -> str:
         actions = []
         if report["active_goals"]:
             actions.append("Review active goals — check whether recent work aligns with stated directions. Goals are persistent orientation, not tasks.")
+        if report.get("active_tasks"):
+            blocked = [t for t in report["active_tasks"] if t["status"] == "blocked"]
+            active = [t for t in report["active_tasks"] if t["status"] == "active"]
+            if blocked:
+                actions.append(f"Unblock {len(blocked)} blocked task(s) — investigate what's preventing progress.")
+            if active:
+                actions.append(f"Continue {len(active)} active task(s) — these are your current work in progress.")
         if report["unresolved_goal_tensions"]:
             actions.append("Examine unresolved goal tensions — these are value-level conflicts between goals requiring root cause analysis, not evidence accumulation.")
         if report["unresolved_contradictions"]:
@@ -6352,7 +8708,18 @@ def engram_reflect() -> str:
         if report["overdue_predictions"]:
             actions.append("Check overdue predictions — search for evidence of actual outcomes and resolve them.")
         if report["open_questions"]:
-            actions.append("Research open questions — pick the highest-priority one and search for answers.")
+            # Provide category-aware guidance if any questions have categories
+            categorized = [q for q in report["open_questions"] if q.get("category")]
+            stale = [q for q in report["open_questions"] if q.get("turns_since_assessed", 0) >= 10]
+            if stale:
+                actions.append(f"Review {len(stale)} stale question(s) not assessed in 10+ turns.")
+            elif categorized:
+                from collections import Counter
+                cat_counts = Counter(q["category"] for q in categorized)
+                cat_summary = ", ".join(f"{c}: {n}" for c, n in cat_counts.most_common())
+                actions.append(f"Research open questions ({cat_summary}) — pick the highest-priority one.")
+            else:
+                actions.append("Research open questions — pick the highest-priority one and search for answers.")
         if report["open_conjectures"]:
             actions.append("Investigate open conjectures — search for evidence to support, refute, or resolve them.")
         if report["weakly_grounded"]:

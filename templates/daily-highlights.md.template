@@ -1,0 +1,10 @@
+# Daily Highlights
+
+Append-only log of completed milestones and active focus. Most recent first.
+Read this at start of a fresh session to know what I shipped and what I'm carrying forward.
+
+Format: one `## YYYY-MM-DD` block per milestone, followed by a `### Currently focused (end of day)` list mirroring `engram_list_focused()`.
+
+---
+
+*No entries yet. Add the first one when a meaningful milestone completes.*

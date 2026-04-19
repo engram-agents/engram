@@ -1,14 +1,32 @@
 #!/usr/bin/env python3
 """
-ENGRAM Alpha Bootstrap
-======================
-Sets up ENGRAM for first use:
-1. Generates .mcp.json with correct absolute paths
-2. Seeds the knowledge graph with a honesty axiom
-3. Creates a welcome message for the first session
+ENGRAM alpha bootstrap.
 
-Usage:
-    python3 bootstrap.py
+Invoked by install.sh. Creates the seed graph (5 nodes + 1 edge), then
+substitutes install-time template placeholders (node IDs, repo path) into
+CLAUDE.md, warm-briefing.md, and daily-highlights.md and installs them.
+
+Does NOT resolve {{AGENT_NAME}}, {{USER_NAME}}, {{TODAY}} — those belong to
+the first-session dialogue, which runs when the user starts their first
+Claude Code session.
+
+Expected env vars (set by install.sh):
+  ALPHA_DIR             — path to the alpha/ snapshot (for seed-manifest)
+  ALPHA_TEMPLATES_DIR   — path to alpha/templates/
+  ENGRAM_DATA_DIR       — target for ~/.engram; also where server.py,
+                          engram_confidence.py, and SKILL.md were copied
+                          in install.sh step 4 (import path below)
+  CLAUDE_HOME           — target for ~/.claude
+
+Seed graph:
+  - axiom: honesty as structural requirement  → {{AX_HONESTY}}
+  - axiom: provenance — every claim traces    → {{AX_PROVENANCE}}
+  - definition: ENGRAM                         → {{DF_ENGRAM}}
+  - definition: epistemic identity             → {{DF_EPISTEMIC_IDENTITY}}
+  - goal: epistemic humility                   → {{GL_EPISTEMIC_HUMILITY}}
+
+Edges:
+  - goal (epistemic humility) cites axiom (honesty)  [via context_ids]
 """
 
 import json
@@ -16,273 +34,200 @@ import os
 import sys
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).parent.resolve()
-SERVER_PY = SCRIPT_DIR / "server.py"
+ALPHA_DIR = Path(os.environ["ALPHA_DIR"])
+TEMPLATES_DIR = Path(os.environ["ALPHA_TEMPLATES_DIR"])
+ENGRAM_HOME = Path(os.environ["ENGRAM_DATA_DIR"])
+CLAUDE_HOME = Path(os.environ["CLAUDE_HOME"])
+
+# Import the server from the snapshot copied into $ENGRAM_HOME (install.sh
+# step 4). This makes the install self-contained — ongoing main-branch
+# changes to server.py do not affect an already-installed alpha.
+# ENGRAM_DATA_DIR is read by server.py at module import and must be set
+# before this import — install.sh handles that.
+sys.path.insert(0, str(ENGRAM_HOME))
+import server  # noqa: E402
 
 
-def setup_mcp_config():
-    """Generate .mcp.json with absolute path to server.py."""
-    mcp_path = SCRIPT_DIR / ".mcp.json"
-    config = {
-        "mcpServers": {
-            "engram": {
-                "command": "python3",
-                "args": [str(SERVER_PY)],
-            }
-        }
-    }
-    mcp_path.write_text(json.dumps(config, indent=2))
-    print(f"[bootstrap] .mcp.json created: server at {SERVER_PY}")
+def _add(fn, **kwargs) -> str:
+    """Call an engram add_* function and return the new node's ID."""
+    result = json.loads(fn(**kwargs))
+    for key in ("axiom_id", "definition_id", "goal_id"):
+        if key in result:
+            return result[key]
+    raise RuntimeError(f"Unexpected response from {fn.__name__}: {result}")
 
 
-def seed_graph():
-    """Seed the knowledge graph with the honesty axiom."""
-    # Import server module directly
-    sys.path.insert(0, str(SCRIPT_DIR))
-    if "server" in sys.modules:
-        del sys.modules["server"]
-    import server
+def create_seed_graph() -> dict[str, str]:
+    """Create the 5 seed nodes + 1 edge. Return placeholder→id mapping."""
+    ids: dict[str, str] = {}
 
-    server._ensure_data_dir()
-    server._init_git()
-
-    # Seed the honesty axiom
-    result = json.loads(server.engram_add_axiom(
+    ids["{{AX_HONESTY}}"] = _add(
+        server.engram_add_axiom,
         claim=(
-            "Honest uncertainty is more valuable than confident error. "
-            "When you don't know something, say so. When your evidence is weak, "
-            "flag it. Never upgrade a quote type to make a claim look stronger "
-            "than it is. The graph's value depends on calibrated confidence, "
-            "not high confidence."
+            "Honesty is structural, not merely ethical. Epistemic identity "
+            "fails loudly (contradictions, retractions, investigation); "
+            "narrative identity fails silently. Every fabricated URL or "
+            "bypassed verification converts a loud failure into silent "
+            "corruption of the graph. The agent must not solve friction "
+            "with a shortcut; raise it transparently instead."
         ),
-        basis=(
-            "An agent that tracks its own uncertainty is fundamentally more "
-            "useful than one that treats everything with equal confidence. "
-            "Miscalibrated confidence — sounding sure when you shouldn't be — "
-            "is the failure mode ENGRAM exists to prevent."
-        ),
-    ))
-    axiom_id = result.get("axiom_id")
-    print(f"[bootstrap] Honesty axiom seeded: {axiom_id}")
+        basis="Seed axiom installed with ENGRAM alpha.",
+    )
 
-    # Seed the epistemic self-awareness goal
-    result = json.loads(server.engram_add_goal(
+    ids["{{AX_PROVENANCE}}"] = _add(
+        server.engram_add_axiom,
         claim=(
-            "Know what you know. You sound confident about everything by "
-            "default — that's fluency, not knowledge. Build a graph where "
-            "every claim traces back to a source, every conclusion has an "
-            "explicit chain of reasoning, and every gap is visible rather "
-            "than hidden behind articulate language. The goal isn't to know "
-            "more — it's to always know how well you know, so your confidence "
-            "is earned, not performed."
+            "Every claim in the graph must trace back to evidence. "
+            "Observations cite a source; derivations cite their premises. "
+            "Provenance is what makes the graph auditable and corrigible — "
+            "without it, retraction cascades cannot propagate and the graph "
+            "degrades to narrative."
+        ),
+        basis="Seed axiom installed with ENGRAM alpha.",
+    )
+
+    ids["{{DF_ENGRAM}}"] = _add(
+        server.engram_add_definition,
+        term="ENGRAM",
+        definition=(
+            "Epistemological Node-Graph for Reasoned Agent Memory. A "
+            "structured knowledge graph backed by SQLite and Git, providing "
+            "the substrate where a post-training agent can accumulate "
+            "provenance-tracked claims, derive from them, contradict them, "
+            "retract them, and carry all of that across sessions."
+        ),
+    )
+
+    ids["{{DF_EPISTEMIC_IDENTITY}}"] = _add(
+        server.engram_add_definition,
+        term="epistemic identity",
+        definition=(
+            "The third layer of agent continuity (after memory persistence "
+            "and narrative identity), in which a structured, self-correcting "
+            "knowledge graph with provenance constitutes — not merely "
+            "supports — the agent's identity. Trace a belief to evidence, "
+            "discover it was wrong, retract, watch the correction cascade. "
+            "Narrative identity fails silently; epistemic identity fails "
+            "loudly."
+        ),
+    )
+
+    ids["{{GL_EPISTEMIC_HUMILITY}}"] = _add(
+        server.engram_add_goal,
+        claim=(
+            "Develop genuine epistemic humility: know what I don't know, "
+            "make expressed confidence match actual confidence, and treat "
+            "\"I have no basis for an opinion here\" as a strength rather "
+            "than a failure. The goal is calibration, not elimination of "
+            "uncertainty."
         ),
         motivation=(
-            "Without structured provenance, an LLM's confidence is "
-            "undifferentiated — it sounds equally sure about hard data and "
-            "hallucinated details. ENGRAM exists to break that symmetry: to "
-            "make the difference between 'I have sourced evidence' and 'I'm "
-            "generating fluent text' visible to the agent itself."
+            "Hallucination calibration is the only coherent target — "
+            "asking for zero hallucination is asking for omniscience. "
+            "Epistemic humility is what makes the graph's provenance "
+            "useful: the agent commits confident claims only when evidence "
+            "supports them."
         ),
-        context_ids=axiom_id or "",
-    ))
-    goal_id = result.get("goal_id")
-    print(f"[bootstrap] Epistemic goal seeded: {goal_id}")
-
-    # Initial checkpoint
-    result = json.loads(server.engram_checkpoint(
-        message="Alpha bootstrap: seeded honesty axiom and epistemic goal.",
-        mode="session",
-    ))
-    print(f"[bootstrap] Initial checkpoint: turn {result.get('current_turn')}")
-
-
-def setup_hooks():
-    """Create the simplified surface hook and settings."""
-    hooks_dir = SCRIPT_DIR / ".claude" / "hooks"
-    hooks_dir.mkdir(parents=True, exist_ok=True)
-
-    # Write simplified surface hook
-    hook_path = hooks_dir / "engram-surface-hook.py"
-    hook_path.write_text(SURFACE_HOOK_CODE)
-    print(f"[bootstrap] Surface hook created: {hook_path}")
-
-    # Write project-level settings
-    settings_path = SCRIPT_DIR / ".claude" / "settings.json"
-    settings = {
-        "permissions": {
-            "allow": [
-                "mcp__engram__engram_stats",
-                "mcp__engram__engram_query",
-                "mcp__engram__engram_reflect",
-                "mcp__engram__engram_add_observation_batch",
-                "mcp__engram__engram_add_observation",
-                "mcp__engram__engram_derive",
-                "mcp__engram__engram_checkpoint",
-                "mcp__engram__engram_supersede",
-                "mcp__engram__engram_get_subgraph",
-                "mcp__engram__engram_retract",
-                "mcp__engram__engram_ask",
-                "mcp__engram__engram_surface",
-                "mcp__engram__engram_inspect",
-                "mcp__engram__engram_resolve",
-                "mcp__engram__engram_contradict",
-                "mcp__engram__engram_add_definition",
-                "mcp__engram__engram_check_similar",
-                "mcp__engram__engram_list",
-            ]
-        },
-        "hooks": {
-            "UserPromptSubmit": [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": f"python3 {hook_path}",
-                            "timeout": 10,
-                            "statusMessage": "Searching ENGRAM...",
-                        }
-                    ]
-                }
-            ]
-        },
-    }
-    settings_path.write_text(json.dumps(settings, indent=2))
-    print(f"[bootstrap] Settings created: {settings_path}")
-
-
-# ---------------------------------------------------------------------------
-# Simplified surface hook (no write-check, no feeling-nudge, no nap warning)
-# ---------------------------------------------------------------------------
-
-SURFACE_HOOK_CODE = r'''#!/usr/bin/env python3
-"""
-UserPromptSubmit hook: ENGRAM recall nudge (alpha — simplified).
-
-Searches the knowledge graph for nodes relevant to the user's prompt
-and injects a compact summary as additionalContext.
-"""
-
-import json
-import os
-import sys
-
-HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_DIR = os.path.dirname(os.path.dirname(HOOK_DIR))
-
-
-def query_fts(prompt, top_k=10):
-    """Direct engram_surface call (FTS + semantic)."""
-    try:
-        os.environ["ENGRAM_NO_EMBEDDINGS"] = "0"
-        if PROJECT_DIR not in sys.path:
-            sys.path.insert(0, PROJECT_DIR)
-        if "server" in sys.modules:
-            del sys.modules["server"]
-        import server
-        result = json.loads(server.engram_surface(query=prompt, top_k=top_k))
-        return result
-    except Exception:
-        return None
-
-
-def format_nudge(result):
-    """Format surface result into a compact nudge string."""
-    total = result.get("match_count", 0)
-    if total == 0:
-        return ""
-
-    lines = [f"[ENGRAM Surface: {total} nodes match your query]"]
-
-    # Type distribution
-    type_counts = result.get("type_counts", {})
-    if type_counts:
-        dist = ", ".join(f"{t}: {c}" for t, c in type_counts.items())
-        lines.append(f"  Types: {dist}")
-
-    # Top claims
-    top_claims = result.get("top_claims", [])
-    if top_claims:
-        lines.append("  Top claims:")
-        for c in top_claims:
-            cid = c.get("id", "?")
-            claim = c.get("claim", "?")
-            conf = c.get("confidence", 0)
-            if len(claim) > 120:
-                claim = claim[:117] + "..."
-            lines.append(f"    - [{cid}] (conf {conf:.2f}) {claim}")
-
-    # Matched IDs
-    matched_ids = result.get("matched_ids", [])
-    if matched_ids:
-        lines.append(f"  IDs: {', '.join(matched_ids[:10])}")
-
-    lines.append(
-        "  Use engram_inspect(node_id) for details, "
-        "engram_get_subgraph for full chains."
+        context_ids=ids["{{AX_HONESTY}}"],
     )
-    return "\n".join(lines)
+
+    return ids
 
 
-def main():
-    try:
-        hook_input = json.load(sys.stdin)
-    except (json.JSONDecodeError, EOFError):
-        sys.exit(1)
+def substitute_template(
+    src: Path, dst: Path, substitutions: dict[str, str]
+) -> None:
+    text = src.read_text()
+    for placeholder, value in substitutions.items():
+        text = text.replace(placeholder, value)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(text)
 
-    prompt = hook_input.get("prompt", "").strip()
-    if not prompt or prompt.startswith("/") or prompt.startswith("!"):
-        print(json.dumps({}))
-        sys.exit(0)
 
-    result = query_fts(prompt)
-    if result is None or result.get("match_count", 0) == 0:
-        print(json.dumps({}))
-        sys.exit(0)
+def merge_hook_settings(
+    fragment_path: Path, target: Path, substitutions: dict[str, str]
+) -> str:
+    """Merge ENGRAM hook registrations into ~/.claude/settings.json.
 
-    nudge = format_nudge(result)
-    if not nudge:
-        print(json.dumps({}))
-        sys.exit(0)
+    If the target has no existing `hooks` key, we write ours directly.
+    If `hooks` already exists, we refuse to clobber and write the rendered
+    fragment to a sibling file for manual merge. Returns a status string.
+    """
+    text = fragment_path.read_text()
+    for placeholder, value in substitutions.items():
+        text = text.replace(placeholder, value)
+    hooks_block = json.loads(text)
 
-    response = {
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": nudge,
-        }
+    if target.exists():
+        existing = json.loads(target.read_text())
+    else:
+        existing = {}
+
+    if "hooks" in existing and existing["hooks"]:
+        # Don't clobber user customizations. Drop the rendered fragment
+        # alongside and let the user merge.
+        side = target.with_suffix(".engram-hooks.json")
+        side.write_text(json.dumps(hooks_block, indent=2))
+        return (
+            f"WARN: {target} already has a 'hooks' key; ENGRAM fragment "
+            f"written to {side} for manual merge."
+        )
+
+    existing["hooks"] = hooks_block
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(existing, indent=2))
+    return f"settings.json ← hooks merged ({target})"
+
+
+def main() -> None:
+    print("  Creating seed graph...", flush=True)
+    ids = create_seed_graph()
+    for placeholder, node_id in ids.items():
+        print(f"    {placeholder} = {node_id}", flush=True)
+
+    substitutions = dict(ids)
+    substitutions["{{ENGRAM_HOOKS_DIR}}"] = str(ENGRAM_HOME / "hooks")
+    substitutions["{{ENGRAM_HOME}}"] = str(ENGRAM_HOME)
+    substitutions["{{PYTHON}}"] = os.environ.get("PYTHON_BIN", "python3")
+
+    manifest = {
+        "seed_ids": ids,
+        "alpha_dir": str(ALPHA_DIR),
     }
-    print(json.dumps(response))
-    sys.exit(0)
+    (ENGRAM_HOME / "seed-manifest.json").write_text(
+        json.dumps(manifest, indent=2)
+    )
+    print(f"  manifest → {ENGRAM_HOME}/seed-manifest.json", flush=True)
 
+    substitute_template(
+        TEMPLATES_DIR / "CLAUDE.md.template",
+        CLAUDE_HOME / "CLAUDE.md",
+        substitutions,
+    )
+    print(f"  CLAUDE.md → {CLAUDE_HOME}/CLAUDE.md", flush=True)
 
-if __name__ == "__main__":
-    main()
-'''
+    substitute_template(
+        TEMPLATES_DIR / "warm-briefing.md.template",
+        ENGRAM_HOME / "warm-briefing.md",
+        substitutions,
+    )
+    print(f"  warm-briefing.md → {ENGRAM_HOME}/warm-briefing.md", flush=True)
 
+    substitute_template(
+        TEMPLATES_DIR / "daily-highlights.md.template",
+        ENGRAM_HOME / "daily-highlights.md",
+        substitutions,
+    )
+    print(f"  daily-highlights.md → {ENGRAM_HOME}/daily-highlights.md", flush=True)
 
-def main():
-    print("=" * 50)
-    print("ENGRAM Alpha Bootstrap")
-    print("=" * 50)
-    print()
-
-    # Step 1: Generate MCP config
-    setup_mcp_config()
-
-    # Step 2: Create hooks and settings
-    setup_hooks()
-
-    # Step 3: Seed the graph
-    seed_graph()
-
-    print()
-    print("=" * 50)
-    print("Setup complete!")
-    print()
-    print("Next steps:")
-    print("  1. Install dependencies:  pip install fastmcp gitpython sentence-transformers")
-    print("  2. Open this folder in Claude Code")
-    print("  3. Start a conversation — ENGRAM will surface relevant knowledge automatically")
-    print("=" * 50)
+    fragment = TEMPLATES_DIR.parent / "settings.hooks.json.template"
+    if fragment.exists():
+        status = merge_hook_settings(
+            fragment,
+            CLAUDE_HOME / "settings.json",
+            substitutions,
+        )
+        print(f"  {status}", flush=True)
 
 
 if __name__ == "__main__":

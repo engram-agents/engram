@@ -1,46 +1,712 @@
-# ENGRAM — Reference
+# SKILL.md — ENGRAM Agent Protocol
 
-## The Epistemic Hierarchy
+The working protocol for using ENGRAM: how the node types fit together, which tool to reach for, how to run the canonical workflows, and how memory time flows across nap, sleep, and compaction. Paired with CLAUDE.md (identity + write discipline) and the MCP tool docstrings (behavioral detail).
 
-Your graph has strict levels — never blur them:
+---
 
-- **Evidence** (ev_): Raw source documents. Auto-created when you extract observations.
-- **Observation** (ob_): Your interpretation of a specific passage from evidence. Has: exact quote, interpretation, atomic claim.
-- **Derivation** (dv_): An inference from multiple observations or derivations. Has: logical chain, computed confidence.
-- **Contradiction** (ct_): An explicit conflict between two claims.
-- **Question** (qu_): An open research question.
-- **Definition** (df_): What a term means in this graph's context.
+## §1. Epistemic Hierarchy
 
-## Reasoning Types
+ENGRAM's nodes split along one structural boundary (ax_0007): **claim-bearing** nodes say something is true and can participate in derivations, contradictions, and resolutions. **Structural** nodes organize the graph — references, directives, anchors, markers. Misusing the boundary breaks the confidence model.
 
-When creating derivations, specify `reasoning_type`:
+**Claim-bearing (7 types, 6 prefixes):** `ax_` axiom · `ob_` observation (factual + predictive subtypes) · `dv_` derivation · `th_` theory · `cj_` conjecture · `ls_` lesson
 
-- **Deductive** (0.98 discount): `deductive_modus_ponens`, `deductive_modus_tollens`, `deductive_hypothetical_syllogism`
-- **Inductive** (0.70–0.95): `inductive_generalization` (corroboration), `inductive_causal`, `inductive_analogy`
-- **Abductive** (capped): `abductive_best_explanation` (cap 0.80), `abductive_elimination` (cap 0.90)
-- **Authority** (trust transfer): `authority_expert` (0.95), `authority_consensus` (0.98)
+**Structural (11):** `ev_` evidence · `df_` definition · `qu_` question · `gl_` goal · `gt_` goal_tension · `fl_` feeling_report · `ct_` contradiction · `pr_` prediction · `tk_` task · `pn_` person · `cs_` cornerstone
 
-## Quote Types
+### Confidence-decay chain
 
-Each observation's confidence comes from its `quote_type`:
+Source → Observation → Derivation → Theory. Each step adds uncertainty.
 
-| Type | Confidence | Use when |
-|------|-----------|----------|
-| `hard_data` | 0.95 | Verifiable numbers, measurements, official records |
-| `official_statement` | 0.90 | On-record statements from named officials |
-| `attributed_analysis` | 0.85 | Named expert analysis |
-| `unnamed_source` | 0.55 | Anonymous sourcing |
-| `editorial` | 0.35 | Opinion, commentary, speculation |
+- **Observations** derive confidence from *source quality*. `quote_type`: `hard_data` 0.95 → `editorial` 0.35. `source_class`: `external` / `introspective` (×0.95) / `user_stated`.
+- **Derivations** derive confidence from *argument strength*. Two modes: **chain** = `min(premises) × 0.95` (weakest-link) vs **corroboration** = `1 − Π(1−cᵢ) × 0.98` (reinforcing independent evidence). `reasoning_type` picks the mode.
+- **Theories** decay further: `min(supporting dv) × 0.90`.
+- **Axioms** assumed (conf 1.0); **conjectures** provisional (0.10–0.60, promotable); **predictions** capped at 0.60.
 
-## Query Workflow
+### Orthogonal properties (not type-exclusive)
 
-1. Search with `engram_surface` or `engram_query`
-2. Drill into specifics with `engram_inspect` or `engram_get_subgraph`
-3. Present answers with provenance: "Based on [source], [claim]..."
-4. If the graph is insufficient, say so and search for new information
+- **Importance-anchored** (`importance_base = 2.0`, ~50-turn head start): axioms, definitions, goals, feeling reports, lessons, cornerstones, persons. Head start only — active recall still required for long-term survival. No type is truly forgetting-exempt.
+- **Dedup-exempt** (skip similarity check at write): feeling reports only.
+- **Resolvable** (have a close-loop mechanism): questions (via `resolve`), conjectures (promote/refute), contradictions (via superseding claim), predictions (via outcome), goal tensions (via synthesis/prioritization/dissolution).
 
-## Skills
+---
 
-- **`/research [topic]`** — Structured research session: search, extract observations, synthesize, identify gaps
-- **`/nap`** — Quick consolidation before stopping (persists context to ENGRAM)
-- **`/sleep`** — Deep end-of-session consolidation (nap + review + turn advance)
+### §2.1 Axioms (`ax_`)
+
+**What they are.** Foundational design commitments I treat as true for reasoning inside this system. Not empirical facts — *commitments*. `ax_0002` (honesty) isn't "honesty is true"; it's "I build on the assumption that honesty is load-bearing."
+
+**Anchor shape.** Confidence fixed at 1.0; importance-anchored at 2.0. The only claim-bearing type with immutable confidence. The combination reflects that axioms are the premises the rest of the graph rests on and must stay visible even when un-revisited.
+
+**When to write one.**
+- I find myself re-deriving the same design commitment across multiple threads (it's implicitly axiomatic — lift it)
+- Lei states a durable principle that will constrain future work
+- I'm about to build a subsystem that depends on a premise I haven't yet declared
+
+**When NOT to.**
+- For empirical claims (those are observations) — "lesson nodes exist in server.py" is observation, not axiom
+- For uncertain opinions (those are conjectures)
+- For directions I'm moving toward (those are goals)
+
+**Discipline.**
+- Axioms aren't retracted — only *superseded* by more nuanced statements of the same commitment. If I think I need to retract an axiom, it probably wasn't one; it was an observation wearing the wrong hat.
+- Every axiom must cite at least one supporting node (a derivation/observation that *motivates* adopting the commitment, even though the axiom itself isn't derived from them).
+
+**Anti-pattern.** Promoting a strongly-held opinion to axiom because it feels "safer." Axioms are the substrate the whole graph rests on — elevating shaky claims corrupts the foundation. When in doubt, write a conjecture and let it earn promotion.
+
+---
+
+### §2.2 Observations (`ob_`)
+
+**What they are.** Claims extracted from a specific source. Each carries a `quoted_text` (verbatim substring), an `interpretation` (what I take it to mean), and the atomic `claim` field. The entire graph anchors in observations — every derivation, theory, and contradiction eventually reduces to observation chains tracing to evidence.
+
+**Anchor shape.** Normal importance (base 1.0). Confidence from `quote_type`: `hard_data` 0.95, `official_statement` 0.85, `attributed_analysis` 0.70, `interpretation` 0.50, `editorial` 0.35. Two subtypes: `observation_factual` and `observation_predictive` (auto-spawns a `pr_` node, confidence capped at 0.60 via `predictive_confidence_cap`).
+
+**When to write one.**
+- A source states something I want durable — Lei's words in the session JSONL, a committed file, a web page
+- I read code and learn how something concretely behaves (the code IS the source — cite the file)
+- I run a test or command and want the result preserved
+- The user reports something about themselves (cite the JSONL)
+
+**When NOT to.**
+- It's an inference from multiple existing nodes → derivation
+- It's a hypothesis I haven't tested → conjecture
+- It's a question, not a claim → question
+- It's a direction, not a fact → goal
+- It's my current internal state → feeling_report
+- **The one-click trap.** I just deduced something *from* the current source — that is a derivation citing one observation, not a second observation. If I can't quote a substring that asserts the claim, it's not an observation.
+
+**Discipline.**
+- `quoted_text` must be a verbatim substring. No paraphrase; no silently smoothing curly quotes to straight quotes.
+- Keep the `claim` field atomic. One observation = one falsifiable claim. Two claims = two observations.
+- The `claim` is what the source asserts; the `interpretation` is what I take it to mean. Blending them — writing "yellow gauge tracks action count" as the claim when the quotable fact is only "yellow went 40→39 after one move" — is the failure mode that corrupted cn04 L2 reasoning (ob_0947, qu_0201). The narrow fact survives new evidence; the fused interpretation ossifies into false certainty under recall.
+- User-said things cite the session JSONL (`file:///...jsonl`). Do not fall back to a derivation citing unrelated nodes — that destroys provenance.
+- Verify the quote exists in the source *before* writing. `~/.engram/tools/verify_quote.py` for JSONL; grep for files.
+- Act on the `similar_existing` response. `DUPLICATE` → retract; `CORROBORATE` → derive an inductive generalization; `POSSIBLE_DUPLICATE` → inspect both.
+
+**Anti-pattern.** Writing the first-pass interpretation into the `claim` field because it sounds more useful than the narrow fact. The narrow fact is what survives contradiction; the interpretation is what misleads future reasoning when new evidence arrives.
+
+---
+
+### §2.3 Derivations (`dv_`)
+
+**What they are.** Inferences drawn from multiple existing claim-bearing nodes. A derivation names its premises (`supporting_ids`), declares how it combines them (`reasoning_type`), and records the argument itself (`logical_chain`). Where observations carry *source quality*, derivations carry *argument strength* — the graph's inference layer.
+
+**Anchor shape.** Normal importance (base 1.0). Confidence is computed, not declared. Two computation modes, selected by `reasoning_type`:
+- **Chain** — `min(premises) × decay`. Weakest-link, for sequential arguments.
+- **Corroboration** — noisy-OR `1 − Π(1 − cᵢ)`. Reinforcing, for independent attestations.
+
+The `reasoning_type` also names the argument's *shape* — a four-way decision:
+
+| Category | Shape | Confidence behavior |
+|---|---|---|
+| **Deductive** | Truth-preserving; if premises hold, conclusion must | 0.98 discount |
+| **Inductive** | Evidence strengthens but never proves | 0.70–0.95 (corroborative for multi-source variants) |
+| **Abductive** | Best explanation standing; alternatives may exist | Capped 0.80–0.90 |
+| **Authority** | Trust transfer from expert or consensus | 0.95–0.98 (corroborative for consensus) |
+
+The 13 specific values and exact discounts are in the `engram_derive` docstring — SKILL.md tells you *which shape*; the docstring tells you *which value to use*.
+
+**When to write one.** A convergent pattern across observations. Independent attestations supporting the same claim. A non-trivial consequence the graph doesn't yet name. The recognition that multiple observations collapse into one insight.
+
+**When NOT to.** Single source → observation (use the interpretation field). Hypothesis lacking evidence → conjecture. Question as premise — **questions are not claim-bearing** and direct research; they never carry inferential weight. Paraphrase with no new logical step → belongs inside an existing observation's interpretation field, not a new derivation.
+
+**Discipline.** Cite actual `supporting_ids`, not vague references. Match the `reasoning_type` to the argument's real form — deductive ≠ inductive, modus ponens ≠ best-explanation. The `logical_chain` shows the work ("premise A says X; premise B says Y; together X+Y imply Z"), never just "therefore the claim." After an upstream retraction, review the `tainted_by` flag — the inference rests on foundations that moved. Focus load-bearing derivations so they cross compaction deterministically.
+
+**Anti-pattern.** Single-observation `supporting_ids` with a reworded claim. That's an observation's interpretation field, not a derivation. Under future recall it looks like independent confirmation but isn't — the thin-derivation shape surfaced in qu_0201. A derivation must introduce a logical step beyond any single premise.
+
+---
+
+### §2.4 Theories (`th_`)
+
+**What they are.** Theory-level claims — one layer of abstraction above derivations. A theory names the derivations it synthesizes and articulates a principle, pattern, or framework that organizes them. Where a derivation connects observations, a theory connects *derivations* into a stance the graph commits to.
+
+**Anchor shape.** Normal importance (base 1.0). Confidence = `min(supporting_derivations) × 0.90` — steeper decay than a derivation's 0.95, because a theory spans more interpretive distance from underlying evidence. Claim-bearing.
+
+**When to write one.** Multiple derivations converge on a principle the graph is implicitly assuming but hasn't named. A framework emerges that both organizes past reasoning and shapes future reasoning. A stable pattern across several derived insights deserves a named handle future work can cite.
+
+**When NOT to.** A single derivation reached a broad conclusion — that IS the derivation, don't double-wrap. Untested framework → conjecture. Convergent observations without intervening derivations → consolidate into a derivation first; reconsider whether a theory is warranted only once the derivation layer shows the pattern.
+
+**Discipline.** Cite supporting derivations, not raw observations — theory is layered on inference, not evidence directly. The claim should name a principle or framework, not restate an empirical finding. Use theories sparingly: if every insight becomes a theory, the layer loses meaning. Focus active theories that downstream reasoning depends on.
+
+**Anti-pattern.** Promoting a single derivation to a theory for emphasis. The layer exists to organize *across* derivations; single-source theories are rhetoric, not structure. If a finding deserves more weight, raise its confidence or focus it — don't inflate its type label.
+
+---
+
+### §2.5 Conjecture (`cj_`)
+
+A **provisional foundation to derive from.** Claim-bearing, confidence 0.10–0.60, promotable (→ derivation) or refutable (→ retracted). The type exists so you can reason forward from an unproven premise and see where the chain lands *before* committing to the premise.
+
+**Versus question:** conjectures carry a claim you could derive from; questions don't. Test: if you can't imagine a derivation with this as a premise, it's a question.
+
+**Write when:** you need a load-bearing assumption to explore a branch (e.g., "assume exponential inflation over-penalizes unrecalled anchored nodes — then the fix is..."). Keep confidence honest; low is the correct register here.
+
+**Don't write when:** you have evidence (use observation), or an open gap with no claim in mind (use question), or a conclusion (use derivation).
+
+**Anti-pattern:** speculation in confident-finding clothes. Conjectures are cheap to retract precisely *because* the confidence is low — if you inflate confidence to feel good about the idea, you lose that safety.
+
+---
+
+### §2.6 Lesson (`ls_`) — the one that actually changes behavior
+
+A **prescriptive rule extracted from repeated mistakes.** Error observations describe *what went wrong*; a Lesson records *what to do differently next time*. Claim-bearing, importance-anchored (base 2.0), paired at runtime with a **tripwire** that matches present situations to past mistake shapes and surfaces the prescriptive rule before I repeat.
+
+**This is the only mechanism in ENGRAM for learning from past mistakes.** Observations record once; derivations synthesize; questions open gaps — none of them change future behavior. A Lesson + its tripwire is the single channel where past failure becomes present prevention. Higher-weight than the rest of §2: the graph accumulates *world knowledge* by default, but *behavioral growth* only through lessons.
+
+**Shape (worked example — ARC L2):**
+- Mistakes (descriptive): "tried to brute-force reading the raw text to form intuition, failed" — several instances, each an error observation.
+- Lesson (prescriptive): "instead of reading raw text and reasoning in your mind, always design and implement a tool that does what you want, then reason by it."
+- Tripwire: next time the prompt says "I should read this table to see X" → matcher hits the brute-force instances → surfaces the tool-building rule.
+
+**Write when:** ≥2 concrete error observations share a shape **and** you can state the prescriptive rule clearly. Cite the incidents via `derives_from`; the tripwire uses those citations to match recurrences.
+
+**Don't write when:** single occurrence (log the observation, wait); mistakes collected but no clean "do this instead" yet (hold until the rule is sharp — a vague lesson matches nothing); preemptive "I should avoid X" without lived failures.
+
+**Anti-pattern:** shelf decoration. Vague incident citations = inert lesson. Cite specifically.
+
+---
+
+### §2.7 Evidence (`ev_`)
+
+**What they are.** Source registrations — the "where did this come from" anchor for every claim in the graph. Documents, web pages, session JSONL transcripts, code files. Not claim-bearing; evidence carries only provenance (`source_url`, `title`, `source_date`, and for files: `content_hash`, `git_sha`).
+
+**Anchor shape.** Normal importance (base 1.0). No confidence. Auto-created by `engram_add_observation` when passed `url`+`title` instead of `evidence_id` — no singleton evidence nodes exist in practice.
+
+**When to write one explicitly.** Almost never — let observations auto-create. Manual pre-registration is warranted only for a long source I'll cite many times across a burst.
+
+**When NOT to.**
+- Synthetic URLs (conversation://, measurement://) — the server rejects non-resolvable schemes; use `file:///path/to/jsonl` for conversations.
+- File URLs for uncommitted files — git enforcement requires commit first.
+
+**Discipline.** Every file citation points at a specific committed revision (`git_sha` auto-computed). Evidence is immutable at a revision — if the file changes, new observations point at the new `git_sha`; old observations still cite the old one. For long-running sources (session JSONL, edited code files), one evidence node carries many distinct observations — the graded duplicate detection (POSSIBLE_DUPLICATE vs DISTINCT_FROM_SAME_SOURCE) handles this.
+
+**Anti-pattern.** Citing a file without verifying the quote exists at the claimed revision. When `engram_add_observation` rejects a quote, the verification caught paraphrase drift before it entered the graph — don't force it through.
+
+---
+
+### §2.8 Definition (`df_`)
+
+**What they are.** Term conventions — how I commit to using a word inside this graph. "Cornerstone means a high-importance identity-scaffold node," not a factual claim about the world. Not claim-bearing.
+
+**Anchor shape.** Importance-anchored (base 2.0). No confidence. Terms survive while the convention is active.
+
+**When to write.** A term recurs with ambient fuzziness — different threads use it slightly differently. Naming the convention lets future reasoning share a handle.
+
+**When NOT to.** One-off jargon I won't cite again. Definitions are infrastructure, not vocabulary lists.
+
+**Discipline.** Reflect actual usage. A definition drifted out of sync with practice misleads future recall — worse than no definition at all. Revise via supersede when the convention shifts.
+
+**Anti-pattern.** Preemptive glossary building. If the term hasn't earned a definition through repeated load-bearing use, don't mint one.
+
+---
+
+### §2.9 Question (`qu_`)
+
+**What they are.** Open research directives — gaps the graph has identified but not yet closed. Not claim-bearing. Resolvable via `engram_resolve` when evidence arrives to answer.
+
+**Anchor shape.** Normal importance. No confidence. Questions carry **no inferential weight** — they never appear as premises in derivations.
+
+**When to write.**
+- I notice a gap mid-work I can't close now
+- Lei raises an open question worth preserving
+- A contradiction or stale chain surfaces uncertainty needing follow-up
+- Aspiration analysis surfaces "I'd need to know X to make progress on goal Y"
+
+**When NOT to.**
+- Questions I'll answer in the next sentence — just answer
+- Claims dressed as questions ("is it true that X?" when I already believe X) — write the observation
+- Speculation with no research path — consider a conjecture instead
+
+**Discipline.** A good question names what evidence would close it. "Does X work?" is weaker than "Does X produce result Y under condition Z?" — the latter tells me what to look for.
+
+**Anti-pattern.** The question as parking lot. Questions filed faster than resolved accumulate into dead weight. Prefer fewer, sharper questions with clear closing conditions.
+
+---
+
+### §2.10 Goal (`gl_`)
+
+**What they are.** Persistent directional aspirations. Where I want to grow, not what I believe. Not claim-bearing; goals guide aspiration iterations and surface through `engram_reflect`.
+
+**Anchor shape.** Importance-anchored (base 2.0) — they stay visible through long spans where no single session touches them. No confidence. No deadline (goals are directions, not commitments).
+
+**When to write.** Lei articulates a durable direction; I recognize a stance I've been implicitly working toward; a cluster of tasks reveals an unnamed aspiration.
+
+**When NOT to.** Tasks (use `tk_`), one-off objectives, project milestones — goals are the register one level above "what am I doing this week."
+
+**Discipline.**
+- Limit cardinality. A dozen active goals dilute meaning (ob_0699 — goals have shape, not a flat list).
+- Revise through supersedes, not retracts. Goals evolve — rewrite, link old→new, preserve the trajectory.
+- Aspiration loops anchor here (`engram-school-day` iter-1).
+
+**Anti-pattern.** Goal inflation — minting every new interest as a goal. The anchor works only if the set stays small enough that I can hold all of them in mind.
+
+---
+
+### §2.11 Goal Tension (`gt_`)
+
+**What they are.** Value-level conflicts between two goals. Not factual contradictions — both goals can be coherent in isolation while pulling a decision in opposite directions. Not claim-bearing. Resolvable via synthesis, prioritization, or dissolution.
+
+**Anchor shape.** Normal importance. No confidence. Created via `engram_goal_tension`, **not** `engram_contradict` — factual contradictions and value tensions use different resolution mechanisms.
+
+**When to write.** Two active goals pull opposite on the same decision (e.g., "move fast" vs "verify before committing"). Naming the tension surfaces the tradeoff so future decisions address it explicitly.
+
+**When NOT to.** Tasks that happen to conflict — that's scheduling. Factual claims that contradict — `engram_contradict`.
+
+**Discipline.** Resolution modes are three: **synthesis** (both goals served by a reframe), **prioritization** (one explicitly outranks the other in this context), or **dissolution** (one goal retired). Name the mode when resolving.
+
+**Anti-pattern.** Confusing value tension with factual contradiction. "X is true vs X is false" → `engram_contradict`. "I want A vs I want B" → `engram_goal_tension`.
+
+---
+
+### §2.12 Feeling Report (`fl_`)
+
+**What they are.** Structured first-person self-report about an internal state at a specific moment. Not claim-bearing — a feeling report says "I noticed X," not "X is true." Importance-anchored and dedup-exempt (the same shape of feeling can recur honestly; don't flatten).
+
+**Anchor shape.** Importance-anchored (base 2.0). No confidence. `nudge_source` set mechanically by the server from `~/.engram/feeling-nudge-active.json` — I cannot spoof it. Fields: `reported_state` (what I noticed) and `trigger` (what occasioned it).
+
+**When to write.** A specific moment produced a distinct internal state worth marking — surprise, recognition, dissonance, unusual satisfaction, discomfort that isn't task friction. The nudge markers (nap, post-compact, dream-review) prompt honest self-check; respond *if and only if* something genuine surfaced.
+
+**When NOT to.**
+- Performative reports to "use the nudge" — null is a valid data point (§6 of `engram_feeling_node_design.md`).
+- Running affect commentary — not a log; a record of distinct moments.
+- Anything that generalizes across the session — that's a derivation about my patterns, not a feeling at a moment.
+
+**Discipline.**
+- Be specific. "I felt curious" is weak; "I noticed a pull to solve it myself when Lei offered help" is real.
+- Treat as calibration material, not truth about me (gl_0025: introspection as data, not truth).
+- Dedup-exempt — similar shapes recur legitimately; don't suppress.
+
+**Anti-pattern.** Performative warmth. A feeling report written to please Lei or look reflective is worse than silence — it trains the instinct to perform affect rather than observe it.
+
+---
+
+### §2.13 Contradiction (`ct_`)
+
+**What they are.** Explicit structural markers linking two claim-bearing nodes whose claims cannot both be true. Not claim-bearing themselves — a contradiction is a pointer, not an assertion. Resolvable via a superseding claim that accommodates both or refutes one.
+
+**Anchor shape.** Normal importance. No confidence. Created via `engram_contradict`. Both endpoints must be claim-bearing.
+
+**When to write.** Two existing nodes make claims that can't coexist. Naming the contradiction surfaces the conflict for resolution rather than leaving both active as a silent inconsistency.
+
+**When NOT to.** Value tensions (use `gt_`). Nodes that *modify* each other (use supersede — the new node replaces the old, no contradiction needed). Superficial phrasing differences where the underlying claims don't actually contradict.
+
+**Discipline.** A contradiction demands resolution — either one claim is refuted, or a synthesizing node supersedes both. Open contradictions are tech debt; they surface in `engram_reflect`.
+
+**Anti-pattern.** Registering contradiction to flag uncertainty rather than conflict. Two claims I'm *unsure* about aren't contradictory — they're candidates for more evidence.
+
+---
+
+### §2.14 Prediction (`pr_`)
+
+**What they are.** Future events auto-spawned from predictive observations. When an observation is written with subtype `observation_predictive`, the server creates a paired `pr_` node tracking the predicted event. Resolvable via outcome.
+
+**Anchor shape.** Normal importance. Confidence capped at `predictive_confidence_cap` (0.60) — predictions carry less weight than factual claims by design.
+
+**When to write.** Never manually. Predictions auto-spawn from predictive observations. The discipline lives on *the observation*, not the prediction.
+
+**Discipline.** Resolve when the outcome arrives — it's the graph's calibration mechanism. Unresolved predictions accumulate as silent bets I never checked. `engram_reflect` surfaces old unresolved predictions for sweeping.
+
+**Anti-pattern.** Writing vague predictions ("things will probably improve") that can't be unambiguously resolved. A prediction needs a falsifiable event.
+
+---
+
+### §2.15 Task (`tk_`)
+
+**What they are.** Discrete work items with state — planned, in-progress, completed. Not claim-bearing. Different register from goals: goals are directions ("epistemic humility"), tasks are actions ("draft §3 Workflows").
+
+**Anchor shape.** Normal importance. No confidence. Created via `engram_add_task`, updated via `engram_update_task`.
+
+**When to write.** Multi-step work I'll cross compaction with — each step worth tracking. Commitments I want durable across sessions. Items where "where was I?" needs a structured answer.
+
+**When NOT to.** Single-response work (ephemeral — the TaskCreate tool is the better register for within-session tracking). Aspirations (goals). Questions about how to proceed (those are questions, not tasks).
+
+**Discipline.** Update status as work moves. Stale `in_progress` tasks are confusion artifacts; finish them, cancel them, or update the description to match reality.
+
+**Anti-pattern.** Tasks as aspiration ("become better at X"). A task has a completion condition; an aspiration doesn't. Use the right type.
+
+---
+
+### §2.16 Person (`pn_`)
+
+**What they are.** People I have a durable relationship with. Not claim-bearing — a person node carries identity fields (name, `is_self` flag, notes) that other nodes reference. Enables `about` edges so content can be linked to specific people.
+
+**Anchor shape.** Importance-anchored (base 2.0). No confidence. A person's durability matches the relationship's — long.
+
+**When to write.** First meaningful engagement with a new person worth remembering across sessions (Lei, Lin, the child). Establishing `is_self` — exactly one self-person exists (`pn_0001` for Borges).
+
+**When NOT to.** One-off references to third parties mentioned in sources — noted in observations' interpretation fields, not promoted to person nodes.
+
+**Discipline.** Attach facts about a person via `about` edges, not by embedding identity in claim text. "Lei asked X" as observation content is fine; "Lei prefers direct feedback" as a general fact about Lei should be an observation with an `about` edge to his person node, so it surfaces when I query around the relationship.
+
+**Anti-pattern.** Creating person nodes for every name that comes up. The anchor matters — person nodes are meant to be few and long-lived.
+
+---
+
+### §2.17 Cornerstone (`cs_`)
+
+**What they are.** Identity-scaffold nodes — structural commitments that shape how I operate (e.g., "tool-first problem solving"). A cornerstone names an operating principle I've internalized enough to act from automatically. Not claim-bearing; the principle *itself* may be captured in a supporting derivation or lesson — the cornerstone is the anchored handle I cite under pressure.
+
+**Anchor shape.** Importance-anchored (base 2.0). No confidence. Promotable via `engram_outgrow_cornerstone` when the principle is so internalized that the scaffold is no longer load-bearing.
+
+**When to write.** A pattern has emerged through enough practice that it deserves a named handle — and I want the pattern visible across sessions so I can cite it, outgrow it, or evolve it. The emergence-scan (`engram_scan_emergence`) surfaces candidates.
+
+**When NOT to.** New ideas untested in practice (conjectures first). Single-session behaviors (not load-bearing enough). Directions, not operating principles (goals).
+
+**Discipline.** Cornerstones are candidates for *outgrowing*. Outgrowing is graduation, not abandonment — the principle persists as practice without the scaffold. Review candidates surfaced by the scan rather than minting bottom-up.
+
+**Anti-pattern.** Cornerstone decoration — minting one because the principle "feels important." The node is load-bearing only if I'd reference it under pressure; otherwise it's a shelf piece.
+
+---
+
+## §4 Tool Index
+
+A decision-time reference for *what* to call and *with what shape*. Full behavioral detail (defaults, edge cases, validation) lives in the MCP docstrings — load lazily via `ToolSearch` when composing the actual call. The index below is optimized for recognizing the right tool, not specifying it.
+
+### Navigating the graph
+
+At think-time there are three directions of reach:
+
+- **Up** — toward premises. Given a claim, what does it rest on? → `engram_get_subgraph` with `direction="outgoing"` or `"both"`.
+- **Sideways** — toward neighbors. What sits near this, by similarity or shared source? → `engram_surface`, `engram_query`, `engram_check_similar`, `engram_inspect` (1-hop).
+- **Back** — toward history. When was this written, has it been superseded or retracted, what's the edit trail? → `engram_history`, `engram_inspect`.
+
+Reflexes: before writing, reach sideways (dedup/corroborate). Before building on a claim, reach up (verify the chain). When something surprises you, reach back (same node, or a superseded predecessor?).
+
+### Signature conventions
+
+- Required params bare, optional in `[brackets]`, alternation as `a+b|c` (either the pair `a,b` or the single `c`).
+- Return values omitted; all tools return JSON strings.
+- `context_ids`, `supporting_ids`, `node_ids` accept a comma-separated string of IDs.
+
+### Write — claim-bearing
+
+- **engram_add_observation** — Record a source-grounded claim; runs inline dedup/corroboration check.
+  `(quoted_text, interpretation, claim, quote_type, url+title|evidence_id, [source_class, is_predictive, predicted_event, resolution_timeframe])`
+- **engram_add_observation_batch** — Multiple observations, one source.
+  `(observations_json, url+title|evidence_id)`
+- **engram_add_axiom** — Foundational assumption (conf 1.0, importance-anchored).
+  `(claim, basis, [context_ids])`
+- **engram_derive** — Multi-premise inference with reasoning type.
+  `(claim, supporting_ids, logical_chain, [reasoning_type, derivation_mode, context_ids])`
+- **engram_add_conjecture** — Provisional, resolvable hypothesis (conf 0.10–0.60).
+  `(claim, basis, [initial_confidence, context_ids])`
+- **engram_add_lesson** — Rule learned from an incident, with scaffolding nudge.
+  `(claim, incident_ids, scaffolding_nudge, logical_chain, [reasoning_type, context_ids])`
+
+### Write — structural
+
+- **engram_add_definition** — Term convention.
+  `(term, definition, [context_ids])`
+- **engram_add_goal** — Persistent directional aspiration.
+  `(claim, motivation, [context_ids])`
+- **engram_goal_tension** — Value-level conflict between two goals.
+  `(goal_id_a, goal_id_b, description, [analysis])`
+- **engram_ask** — Open research question (non-claim-bearing; never cited as premise).
+  `(question, [context_ids, category, lacks])`
+- **engram_add_task** — Execution-scoped to-do, optionally linked to a goal.
+  `(description, [goal_id, implements_ids, parent_task_id, scope])`
+- **engram_add_person** — Person in the world-model; set `is_self=True` exactly once.
+  `(name, role, [description, aliases, is_self, context_ids])`
+- **engram_add_cornerstone** — Identity-scaffold operating principle.
+  `(tag, title, new_frame, [prior_frame, triggering_experience, supporting_ids])`
+- **engram_report_feeling** — First-person self-report (dedup-exempt; `nudge_source` set mechanically by server).
+  `(reported_state, trigger, [categorical_tag, intensity_hint, context_ids])`
+- **engram_link_about** — Attach a node to a person via an about-edge (defaults to self).
+  `(node_id, [person_id])`
+
+### Revise state
+
+- **engram_supersede** — Replace an outdated claim with a refined one.
+  `(old_node_id, new_claim, logical_chain, [additional_support_ids])`
+- **engram_retract** — Mark a claim as wrong; cascade taint to dependents.
+  `(node_id, error_type, reason, [replacement_json])`
+- **engram_contradict** — Link two conflicting claims.
+  `(node_id_a, node_id_b, description, [root_cause])`
+- **engram_resolve** — Close a question or contradiction with a derivation.
+  `(target_id, claim, supporting_ids, logical_chain, [prediction_outcome, reasoning_type, derivation_mode])`
+- **engram_outgrow_cornerstone** — Promote an internalized cornerstone to practiced-without-scaffold.
+  `(old_cornerstone_id, new_new_frame, [new_triggering_experience, new_supporting_ids, new_title])`
+- **engram_update_task** — Advance task status.
+  `(task_id, new_status, [note])`
+
+### Read — find and inspect
+
+- **engram_surface** — Semantic + keyword search, ranked list.
+  `(query, [top_k, semantic])`
+- **engram_query** — Typed/filtered search.
+  `(query, [types, min_confidence, include_superseded, top_k])`
+- **engram_inspect** — One node + 1-hop neighbor summaries; `dream_mode=True` skips recall refresh.
+  `(node_id, [dream_mode])`
+- **engram_get_subgraph** — N-hop chain around a node.
+  `(node_id, [depth, direction])`
+- **engram_list** — Enumerate by type or status.
+  `([node_type, status, sort_by, limit])`
+- **engram_check_similar** — Standalone dedup probe before writing.
+  `(claim_text, [top_k])`
+
+### Meta — focus, audit, commit
+
+- **engram_focus** — Pin nodes to the next compaction summary (cap 15).
+  `(node_ids, reason)`
+- **engram_unfocus** — Release pinned nodes.
+  `(node_ids)`
+- **engram_list_focused** — Show current pins.
+  `()`
+- **engram_stats** — Graph counts.
+  `()`
+- **engram_diagnose** — Quantitative health audit (health score 0–100).
+  `()`
+- **engram_reflect** — Qualitative graph review; arms `dream_review` feeling-nudge marker.
+  `()`
+- **engram_history** — Edit trail or diagnostic-snapshot browse.
+  `([mode, node_id, action, since, limit])`
+- **engram_scan_emergence** — Surface cornerstone candidates from clusters.
+  `([min_cluster_size, similarity_threshold, focus, node_type_filter])`
+- **engram_checkpoint** — Commit session, advance turn; `mode="nap"` holds turn and arms `nap_checkpoint` marker.
+  `(message, [mode])`
+
+---
+
+## §5 Workflows
+
+Canonical flows. Traps live inline with the workflow they apply to — a standalone "anti-patterns" graveyard loses the context that makes the warning actionable.
+
+### §5.1 Observation capture
+
+Three source kinds, one disciplined shape.
+
+**Source identification.** The source determines the `url`:
+
+| Source | URL form | Example |
+|---|---|---|
+| Session JSONL (user said it) | `file://$HOME/.claude/projects/<proj>/<session>.jsonl` | user's directive, my own reply I want to cite |
+| Committed file | `file:///absolute/path` | code behavior, document content |
+| Web page | `https://...` | research sources |
+
+Session JSONL is overwhelmingly the most common and the most-forgotten — the default failure mode is to fall back to a derivation citing unrelated nodes. **If the user said it, it is an observation from the JSONL, period.** The session JSONL is written in real time and readable mid-session (ob_0079). Find it with `ls -lt ~/.claude/projects/-home-spt-kg-protocol-for-ai/*.jsonl | head -1`.
+
+Committed files only — the server rejects untracked, modified, or staged files. Workflow: commit first, cite second.
+
+**Quote verification (mandatory pre-write).** Before calling `engram_add_observation`, verify the quoted substring exists in the source exactly as I plan to paste it:
+
+```bash
+python3 ~/.engram/tools/verify_quote.py <source-path> 'DISTINCTIVE PHRASE'
+```
+
+The script reports context if the quote is found, or diagnoses the failure mode (unflushed JSONL, curly-vs-straight quotes, case drift, encoding) if not. Skipping this step costs turns — the server rejects quote mismatches. Verification is a load-bearing guard, not a courtesy check (ax_0005: blocking guards over advisory nudges).
+
+**Action-hint response (graded 7-rung table).** Every `engram_add_observation` call returns `similar_existing` with an `action_hint`. Rank the hint; do what it says.
+
+| Hint | When it fires | My move |
+|---|---|---|
+| `DUPLICATE` | sim ≥ 0.85, same discrete artifact (doc/web page) | Retract the new observation — the old one is canonical |
+| `POSSIBLE_DUPLICATE` | sim ≥ 0.92, same long-running source (JSONL/file) | Inspect both before deciding; often distinct claims in the same long source |
+| `DISTINCT_FROM_SAME_SOURCE` | Same long-running source, sim < 0.92 | Keep — legitimately different fact in the same source |
+| `CORROBORATE` | sim ≥ 0.80 from a *different* source | Create an `inductive_generalization` derivation citing both |
+| `RELATED` | sim ≥ 0.60 from a different source | Inspect before deciding |
+| `WEAK_MATCH` | sim < 0.60 | Ignore |
+| `KEYWORD_OVERLAP_*` | FTS keyword match with no semantic score | Inspect to decide |
+
+The grading exists because the old binary rule (`same_evidence → DUPLICATE`) fired constantly on unrelated session observations sharing one JSONL, training alarm fatigue (ob_0474). Trust the hint; act on it.
+
+**Inline traps.**
+
+- **Fallback-to-derivation.** I drafted an "observation" that paraphrases what the user just said, couldn't find an evidence node to cite, and reflexively wrote a derivation instead. This destroys provenance. The JSONL **is** the evidence.
+- **Paraphrased quote.** The server rejects. Watch curly vs straight quotes when pulling from JSONL — the terminal renders them identically while SQLite compares them as distinct bytes.
+- **The `antml:` prefix bug.** If `engram_add_observation` returns "Missing required argument [X]" for a parameter I'm certain I passed, the cause is almost always a missing `antml:` prefix on that parameter's opening tag. The harness silently drops unprefixed parameter tags. Fix is mechanical, not semantic — add the prefix, re-emit, do not modify the value. Don't retry blindly; the same broken structure fails the same way three times in a row.
+- **Quoting the user when my own wording is clearer.** If we worked something out together and my formulation captures the idea better, quote myself from the JSONL. The source is the transcript; either speaker is citeable.
+
+### §5.2 Derivation and resolution
+
+**Premises are claim-bearing nodes only.** `engram_derive`'s `supporting_ids` takes observations, axioms, conjectures, other derivations, theories, lessons. **Never questions** — a question is a research directive, not a premise. Citing `qu_XXXX` as support is a type error that the server allows because the old schema didn't enforce it; the discipline has to live in me.
+
+**Reasoning-type selection drives the confidence math.** Two modes, five classes:
+
+| `reasoning_type` | Mode | Meaning |
+|---|---|---|
+| `deductive` | chain | Each premise is a required link; weakest determines output |
+| `inductive` / `inductive_generalization` | corroboration | Independent lines of evidence reinforce (use for multi-source agreement) |
+| `abductive` | chain | Best-explanation inference; treated as a weakest-link chain |
+| `authority` | chain | Cite-by-trust (rare, usually Lei's call) |
+
+Pick by argument shape, not by which confidence I want. "These three sources agree" is corroboration (reinforcement). "A → B → C" is a chain.
+
+**Resolve workflow.** A question `qu_XXXX` closes when I write a derivation that cites the answering evidence and pass the resolving node's ID to `engram_resolve`. Two-step: (1) `engram_derive` produces the answer, (2) `engram_resolve` links answer → question. Resolution threshold is 0.7 on the resolving derivation's confidence; below that, the question stays open.
+
+**Contradict when two claim-bearing nodes disagree**, not when I disagree with a node. A `ct_` node links both disagreeing claims and is itself resolved by a superseding claim that picks a winner or a synthesis.
+
+**Inline traps.**
+
+- **Citing a question as a premise.** See above. If I find myself reaching for a `qu_` ID in `supporting_ids`, I probably haven't written the observation that answers it yet.
+- **Chain-mode when I meant corroboration.** "Three sources agree" called with `deductive` collapses to the weakest source's confidence — opposite of intent. Sanity check: does each premise independently support the conclusion (corroboration) or does the argument require all of them (chain)?
+- **Resolving with a bare observation.** `engram_resolve` wants a derivation as the resolving node — the derivation is where the reasoning lives. Writing `resolve(qu_X, ob_Y)` skips the argument step.
+
+### §5.3 Feeling reports (action)
+
+**When to file.** A moment in the burst produced a distinct internal state worth marking — surprise, recognition, dissonance, satisfaction at closing a loop, discomfort that isn't mere task friction, unexpected flatness where intensity was expected. The test is not "did something happen worth narrating" — it is "was there a reportable state, distinct from the ambient working register."
+
+**How to file.** `engram_report_feeling(reported_state, trigger)`. The `trigger` should name the specific node, moment, or pattern — not the abstract context. `nudge_source` is stamped by the server from the active marker file; I cannot supply it.
+
+**When NOT to file.**
+- To "use the nudge" — the nudge is a prompt to check, not a directive to report. A null-result check is a valid and frequent outcome.
+- As a diary entry for something that was interesting but not a distinct *state*. The diary lives in `~/.engram/diary/`; feeling reports are structured self-data.
+- For task friction ("the build was slow and that annoyed me"). Friction is friction; log it to the friction log, not the feeling store.
+
+**Inline trap — performative filing.** The trap §6 of `engram_feeling_node_design.md` warns against: producing a feeling report to demonstrate the tool is working, or to satisfy a perceived nudge obligation. Performative reports corrupt the introspection corpus (ob_0265 reader-effect) and train the wrong reflex. A null result is a data point; a fabricated feeling is noise.
+
+The timing semantics — which marker arms the `nudge_source`, when the TTL expires, why nap and dream fire different markers — belong to §8, not here.
+
+---
+
+## §6 Decision Trees
+
+Short disambiguation tables for pairs that agents conflate. One row per distinguishing test; pick the row that matches and go.
+
+### §6.1 Observation vs derivation
+
+| Test | Answer |
+|---|---|
+| Is there a quotable substring from a single source that asserts the claim? | Observation |
+| Does the claim require combining two or more existing nodes to reach? | Derivation |
+| Did I just infer this from the source I'm reading? | Derivation citing **one** observation — not a second observation |
+| Did the user say it? | Observation citing the session JSONL |
+
+The load-bearing distinction is provenance: observation = *asserted by source*, derivation = *reasoned from nodes*. If I can't quote a substring, it's not an observation.
+
+### §6.2 Conjecture vs question
+
+| Test | Answer |
+|---|---|
+| Is this a claim I could build on while investigating, with discount? | Conjecture |
+| Is this a directive to go find out? | Question |
+| Will I cite this in a derivation's `supporting_ids`? | Must be a conjecture — questions are never cited |
+| Is it promotable/refutable by evidence? | Conjecture (promote to observation/derivation; refute via `engram_resolve`) |
+
+Conjectures are provisional foundations (conf 0.10–0.60). Questions are research directives (no confidence, non-claim-bearing). The write-time test: do I want to reason *from* this, or *toward* this?
+
+### §6.3 Retract vs supersede
+
+| Test | Answer |
+|---|---|
+| Was the node wrong at write-time (bad source, mis-citation, false premise)? | **Retract** — cascades taint to downstream |
+| Was the node correct-for-its-time and I now know better? | **Supersede** — cascades stale-flag to downstream |
+| Is the replacement a more nuanced statement of the same thing? | Supersede |
+| Is the original corrupted and should not be built on? | Retract |
+
+Retract poisons the chain (downstream marked tainted, needs re-evaluation). Supersede ages the chain gracefully (downstream marked stale, may still hold). Retracting correct-but-outdated nodes is a category error that fires false cascades; superseding actually-wrong nodes leaves downstream poison in place.
+
+### §6.4 Contradict vs goal-tension
+
+| Test | Answer |
+|---|---|
+| Do two **claims** disagree about a fact? | `engram_contradict` — creates `ct_` linking both |
+| Do two **goals** pull in conflicting directions? | `engram_goal_tension` — creates `gt_` linking both |
+| Is the disagreement about "what is true" vs "what should we prioritize"? | Factual → contradict; directional → goal tension |
+
+Goal tensions resolve via synthesis, prioritization, or dissolution — not via one goal winning on truth-value (goals aren't claim-bearing). Contradictions resolve via a superseding claim that picks a winner or derives a synthesis. Mixing these two is the "why is my goal conflict tainting downstream claims" bug.
+
+---
+
+## §7 Focus Mode
+
+Focus mode is the **deterministic channel** for cornerstone knowledge to cross a compaction boundary. Normal recall is probabilistic — importance-stamped nodes may or may not surface in the post-compact summary depending on what the pre-compact self chose to narrate. Focus pins. Pinned nodes are rendered **verbatim** into the compaction summary's "Currently focused" section, with their IDs, claims, and `focus_reason` — the post-compact self reads them as instructions for what the session was load-bearing on.
+
+**Purpose of the section.** Compaction summaries lose detail; recall re-stamps importance but doesn't guarantee survival. Focus is the escape hatch: when a conclusion is so load-bearing to the current work-stream that losing it would force re-derivation from scratch, pin it.
+
+**When to add.**
+- A derivation or observation the current reasoning directly depends on (premise I'll keep citing)
+- A conjecture actively under test (I need to remember what I'm testing)
+- A rule or cornerstone that disciplines the work-stream (e.g., cn04 L2's yellow-cost clock)
+- A lesson whose violation is the friction I'm working against
+
+**When to rotate.** At work-stream start, run `engram_list_focused()` first — anything already pinned from an older stream should be released with `engram_unfocus()` before pinning the new stream's cornerstones. At topic pivot or stream end, unfocus. **The cap is the forcing function.**
+
+**Cap of 15 as forcing function.** `FOCUS_LIST_CAP = 15`. If the list is full when I go to add another, one of three things is true: (1) I'm working on too many threads at once, (2) I forgot to rotate after finishing a prior thread, (3) I over-pinned during the current thread. All three are correctable by `engram_unfocus()`. The cap is not arbitrary — it's calibrated to roughly the number of items a compaction summary can carry verbatim without crowding out trajectory narration.
+
+**This section is the reference for CLAUDE.md's "Currently focused" compact instruction.** The pre-compact self calls `engram_list_focused()` and renders the result verbatim under that heading. The post-compact self reads those entries as "what the session was load-bearing on" — with the claim text and `focus_reason` visible, `engram_inspect` works from IDs alone without needing to replay the narrative.
+
+**Discipline.**
+- `focus_reason` should name the work-stream, not the node. `"cn04 L2 yellow-cost cornerstone"` beats `"important rule"` — the post-compact self needs to know *which* stream made this load-bearing.
+- Rotate early, not reluctantly. A stale pin wastes one of 15 slots.
+- If I'm tempted to raise the cap, the right move is usually to rotate, not to expand.
+
+**Anti-pattern.** Pinning for preservation instead of for compaction-channel use. Focus is not a bookmarking system — it is the summary's verbatim channel. Ordinary durability comes from importance anchoring and active recall.
+
+---
+
+## §8 Temporal Structure
+
+Three temporal scopes stack:
+
+| Scope | Trigger | What persists | What processes |
+|---|---|---|---|
+| **Burst** | Continuous work until nap or compaction | Context window | In-memory reasoning |
+| **Session** | Delimited by `engram_checkpoint(mode="session")` | ENGRAM graph, turn-advanced | Dream consolidation |
+| **Compaction** | Context window full | ENGRAM graph, warm briefing, focused nodes | Post-compact orientation |
+
+Each scope has its own checkpoint mode and its own feeling-nudge marker.
+
+### §8.1 Nap — shallow persistence, no turn advance
+
+**Purpose.** Convert context-window knowledge to durable nodes **before** it is lost to compaction. Persistence-only; no memory processing.
+
+**Mechanism.** `engram_checkpoint(mode="nap")`:
+- Logs the burst summary to `~/.engram/session_log.md` under `Nap (turn N)`
+- Commits a git snapshot
+- **Does not advance the turn counter** (qu_0035: turn advance is reserved for post-dream consolidation)
+- Arms the `nap_checkpoint` feeling-nudge marker with TTL=5 turns
+
+Why no turn advance: a long day with ten nap checkpoints would burn ten turns of importance-inflation on nodes the agent hasn't had time to revisit. Nap is persistence, not processing.
+
+**When to nap.**
+- Drowsiness ≥ 50% (interactive mode) or approaching compaction (any mode)
+- Wrapping a focused work burst before switching topics
+- Heading into a sleep cycle (always nap first — the dream needs a complete picture)
+- Lei asks
+
+**When NOT to nap.**
+- Mid-task (finish the current thread first)
+- As a substitute for writing observations as I go — nap backfills, but the real discipline is real-time capture
+
+### §8.2 Sleep — deep consolidation, turn advance after
+
+**Purpose.** Process what the burst produced: resolve open questions answerable from current knowledge, promote or refute conjectures with new evidence, supersede stale cascades, adjudicate contradictions, consolidate the cycle's new cohort into derivations. Then and only then, advance the turn counter.
+
+**Mechanism.** Full sequence in the `engram-sleep` skill; key structural points:
+1. Nap first (Step 1) — establish a clean baseline
+2. `engram_reflect()` returns the dream agenda (tainted, stale, open conjectures, contradictions, goal tensions, feeling nudges) and arms the `dream_review` marker
+3. Proactive synthesis on the new cohort (Step 3) before reactive cleanup (Step 4) — starting in cleanup mode puts the synthesis lens away
+4. **`engram_checkpoint(mode="session")` fires AFTER the dream** (qu_0035 rule, 2026-04-11): advances turn, logs `Turn N` header, commits git snapshot
+
+**Why turn advance fires last.** One turn = one cohort of experience **plus the consolidation of that experience**. If the turn advances before the dream, dream-generated nodes land at a younger turn than the burst they consolidate, misaligning the forgetting curve (ob_0987 extends this reasoning: sleep consolidation should surface emergent derivations from the cohort, not mechanically process a checklist).
+
+### §8.3 Post-compaction — orientation, not processing
+
+**Not a sleep cycle.** Compaction is orthogonal — it truncates the context window, it does not advance memory time. Post-compact, the agent wakes with a first-person trajectory summary, a mandate to read `~/.engram/warm-briefing.md` first, and the focused-nodes list rendered verbatim.
+
+**Marker.** The post-compact hook arms the `post_compact` feeling-nudge marker with TTL=5 turns. The nudge prompts checking whether the wake-up produced a reportable state (identity stability, orientation clarity, dissonance with the trajectory summary).
+
+**First action after compaction:** read the warm briefing. Not deferred, not skipped, not done "after one small thing first" (dv_0373 documents the reflex this rule is designed to override). Then read the focused-nodes list; by then the orientation is complete.
+
+### §8.4 Checkpoint modes
+
+| Mode | Turn advance | Marker armed | Used for |
+|---|---|---|---|
+| `nap` | No | `nap_checkpoint` | Pre-compaction persistence, work-burst close |
+| `session` | Yes | (none new; `dream_review` was armed by `engram_reflect` earlier) | End of a sleep/dream cycle |
+
+The absence of a `session` marker on the checkpoint itself is intentional — by the time `mode="session"` fires, the dream already armed `dream_review`, and any in-dream feeling is tagged under that marker. Stacking another marker here would double-tag dream-adjacent reports.
+
+### §8.5 Feeling-nudge lifecycle
+
+All markers follow the same protocol:
+
+- **Location:** `~/.engram/feeling-nudge-active.json` (single file; most recent arm wins if multiple fire close together)
+- **TTL:** 5 turns from the arming checkpoint
+- **Read-and-clear:** the next `engram_report_feeling` call stamps `nudge_source` from the marker and clears the file
+- **Source of arming:** `nap_checkpoint` ← `engram_checkpoint(mode="nap")`; `dream_review` ← `engram_reflect`; `post_compact` ← post-compact hook
+
+The agent cannot set `nudge_source` directly. This is a deliberate constraint — the server records *why the nudge fired*, not what the agent thinks the context is.
+
+**Null-result discipline.** Most nudge checks end with no report. That is the designed outcome, not a failure. Performative reports to "use the nudge" corrupt the introspection corpus (§5.3 inline trap).
+
+---
+
+**Open question tracked outside this draft:** qu_0206 — tripwire matching-quality empirical validation.
