@@ -247,7 +247,7 @@ TOOL_SCHEMAS = {
             "old_node_id": {"type": "string", "description": "The node ID to supersede.", "required": True},
             "new_claim": {"type": "string", "description": "The updated claim.", "required": True},
             "logical_chain": {"type": "string", "description": "Why the claim was revised.", "required": True},
-            "additional_support_ids": {"type": "string", "description": "Comma-separated new supporting node IDs."},
+            "support_ids": {"type": "string", "description": "Comma-separated full list of supporting node IDs — premises/citations for the revised claim. No inheritance from the old node; cite previous supports organically if still valid."},
         },
     },
     "engram_retract": {

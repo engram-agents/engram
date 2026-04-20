@@ -1869,6 +1869,39 @@ def _extract_domain(url: str) -> str:
         return ""
 
 
+def _check_yellow_card(domain: str):
+    """Return the matching yellow-card config entry (dict) or None.
+
+    Yellow-carded domains are sources we've judged unreliable as independent
+    evidence (AI-aggregators, content farms, known-hallucinating surfaces).
+    Populated in ~/.engram/config.json under `yellow_domains` as a list of
+    {domain, reason, engram_node} entries. Suffix-matched like trust_pool so
+    subdomains inherit the flag.
+    """
+    if not domain:
+        return None
+    try:
+        config = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
+    except Exception:
+        return None
+    for entry in config.get("yellow_domains", []):
+        if isinstance(entry, dict) and entry.get("domain") and domain.endswith(entry["domain"]):
+            return entry
+    return None
+
+
+def _format_yellow_warning(match: dict) -> str:
+    """Format a yellow-card warning string for inclusion in tool responses."""
+    d = match.get("domain", "?")
+    reason = (match.get("reason", "flagged unreliable") or "").rstrip(".")
+    ref = match.get("engram_node", "")
+    msg = f"YELLOW-CARD SOURCE: '{d}' — {reason}."
+    if ref:
+        msg += f" See {ref} for rationale."
+    msg += " Track down to primary sources before treating observations rooted here as independent evidence."
+    return msg
+
+
 def _escape_for_source(text: str, file_path: str) -> str:
     """Escape text to match how it appears in a source file's raw content.
 
@@ -2483,6 +2516,12 @@ def engram_add_evidence(
     """
     conn = _get_db()
     try:
+        # Compute domain + yellow-card match early so every success return path
+        # can surface the warning (short-circuit reuse returns included).
+        if not domain:
+            domain = _extract_domain(url)
+        _yellow_match = _check_yellow_card(domain)
+
         # Check for existing URL
         existing = conn.execute(
             "SELECT id, metadata FROM nodes WHERE source_url = ? AND type = 'evidence'"
@@ -2498,21 +2537,23 @@ def engram_add_evidence(
                     pass
                 else:
                     # Same content — reuse existing
-                    return json.dumps(
-                        {
-                            "status": "already_exists",
-                            "evidence_id": existing["id"],
-                            "message": f"Evidence node {existing['id']} already registered (content unchanged).",
-                        }
-                    )
-            else:
-                return json.dumps(
-                    {
+                    reuse = {
                         "status": "already_exists",
                         "evidence_id": existing["id"],
-                        "message": f"Evidence node {existing['id']} already registered for this URL.",
+                        "message": f"Evidence node {existing['id']} already registered (content unchanged).",
                     }
-                )
+                    if _yellow_match:
+                        reuse["yellow_card_warning"] = _format_yellow_warning(_yellow_match)
+                    return json.dumps(reuse)
+            else:
+                reuse = {
+                    "status": "already_exists",
+                    "evidence_id": existing["id"],
+                    "message": f"Evidence node {existing['id']} already registered for this URL.",
+                }
+                if _yellow_match:
+                    reuse["yellow_card_warning"] = _format_yellow_warning(_yellow_match)
+                return json.dumps(reuse)
 
         # Validate evidence URL resolvability
         RECOGNIZED_SCHEMES = ("http://", "https://", "file://")
@@ -2639,10 +2680,7 @@ def engram_add_evidence(
                 + _HONESTY_REMINDER
             })
 
-        if not domain:
-            domain = _extract_domain(url)
-
-        # Check trust pool
+        # Check trust pool (domain already computed above for yellow-card)
         config = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
         trust_pool = config.get("trust_pool", [])
         in_trust_pool = any(domain.endswith(tp) for tp in trust_pool)
@@ -2704,6 +2742,8 @@ def engram_add_evidence(
                 f"Domain '{domain}' is NOT in the trusted source pool. "
                 "Consider whether this source meets your quality standards."
             )
+        if _yellow_match:
+            result["yellow_card_warning"] = _format_yellow_warning(_yellow_match)
         return json.dumps(result)
     finally:
         conn.close()
@@ -2796,6 +2836,7 @@ def engram_add_observation(
             {"error": "'title' is required when providing 'url' for auto-creating an evidence node."}
         )
 
+    _yellow_forward = None
     if not evidence_id and url:
         # Auto-create or reuse evidence node
         ev_result = json.loads(engram_add_evidence(
@@ -2805,6 +2846,7 @@ def engram_add_observation(
         if ev_result.get("error"):
             return json.dumps({"error": f"Failed to create evidence node: {ev_result['error']}"})
         evidence_id = ev_result["evidence_id"]
+        _yellow_forward = ev_result.get("yellow_card_warning")
 
     conn = _get_db()
     try:
@@ -3068,6 +3110,9 @@ def engram_add_observation(
                 "DUPLICATE only fires for high-similarity matches in discrete documents."
             )
 
+        if _yellow_forward:
+            result["yellow_card_warning"] = _yellow_forward
+
         conn.commit()
         return json.dumps(result)
     finally:
@@ -3202,6 +3247,7 @@ def engram_add_observation_batch(
     # Resolve evidence node once for the whole batch
     resolved_evidence_id = evidence_id
     evidence_created = False
+    _batch_yellow = None
     if not resolved_evidence_id and url:
         if not title:
             return json.dumps({"error": "'title' is required when providing 'url'."})
@@ -3213,6 +3259,7 @@ def engram_add_observation_batch(
             return json.dumps({"error": f"Failed to create evidence node: {ev_result['error']}"})
         resolved_evidence_id = ev_result["evidence_id"]
         evidence_created = ev_result["status"] == "created"
+        _batch_yellow = ev_result.get("yellow_card_warning")
     elif not resolved_evidence_id:
         return json.dumps({"error": "Provide either 'url' (+ 'title') or 'evidence_id'."})
 
@@ -3243,14 +3290,17 @@ def engram_add_observation_batch(
         results.append(r)
 
     created = [r for r in results if r.get("status") == "created"]
-    return json.dumps({
+    batch_result = {
         "status": "batch_complete",
         "evidence_id": resolved_evidence_id,
         "evidence_created": evidence_created,
         "total": len(observations),
         "created": len(created),
         "results": results,
-    })
+    }
+    if _batch_yellow:
+        batch_result["yellow_card_warning"] = _batch_yellow
+    return json.dumps(batch_result)
 
 
 @mcp.tool(
@@ -7519,13 +7569,16 @@ def engram_supersede(
     old_node_id: str,
     new_claim: str,
     logical_chain: str,
-    additional_support_ids: str = "",
+    support_ids: str = "",
 ) -> str:
     """Replace an existing node with an updated version.
 
     The old node is marked as superseded (is_current=False) but preserved
-    for audit history. The new node inherits all still-valid support edges
-    from the old node, plus any additional supporting nodes you specify.
+    for audit history. The new node's supporting edges come entirely from
+    `support_ids` — the caller provides the full, explicit list of premises
+    and citations that justify the revised claim. Nothing is inherited from
+    the old node's edges; if a previous citation still applies, include its
+    ID in `support_ids` organically.
 
     Use this when a claim needs to be revised — more specific, corrected,
     or updated based on new evidence — but the old version should remain
@@ -7535,7 +7588,11 @@ def engram_supersede(
         old_node_id: The node ID to supersede.
         new_claim: The updated claim text.
         logical_chain: Reasoning explaining why the claim was revised.
-        additional_support_ids: Optional comma-separated new supporting node IDs.
+        support_ids: Comma-separated full list of supporting node IDs
+            (premises for derivations/theories, evidence/context for
+            observations/axioms/cornerstones). Empty string is valid when
+            the new claim derives its confidence from non-edge sources
+            (e.g., observations whose confidence comes from quote_type).
 
     Returns:
         JSON with the old and new node IDs.
@@ -7564,17 +7621,11 @@ def engram_supersede(
         new_type = old["type"]
         new_id = _next_id(conn, new_type)
 
-        # Gather premises from old node's outgoing edges
-        # (derivation --derives_from--> premise, so old node is the source)
-        old_supports = conn.execute(
-            "SELECT target_id FROM edges WHERE source_id = ? AND relation IN ('derives_from', 'supports', 'cites')",
-            (old_node_id,),
-        ).fetchall()
-        inherited_ids = [r["target_id"] for r in old_supports]
-
-        # Add new additional supports
-        extra_ids = [s.strip() for s in additional_support_ids.split(",") if s.strip()]
-        all_support_ids = list(set(inherited_ids + extra_ids))
+        # Supporting edges are taken entirely from the caller. No blanket
+        # inheritance from the old node — if a previous citation still applies,
+        # the caller cites it organically in `support_ids`. This keeps each
+        # revision's logic chain honest and explicit.
+        all_support_ids = [s.strip() for s in support_ids.split(",") if s.strip()]
 
         # Compute new confidence — respect each node type's semantics
         if new_type == "axiom":
@@ -7718,8 +7769,7 @@ def engram_supersede(
                 "new_node_id": new_id,
                 "new_claim": new_claim,
                 "confidence": confidence,
-                "inherited_supports": inherited_ids,
-                "additional_supports": extra_ids,
+                "supports": all_support_ids,
                 "stale_downstream": stale,
                 "stale_count": len(stale),
             }

@@ -413,8 +413,8 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
 
 ### Revise state
 
-- **engram_supersede** — Replace an outdated claim with a refined one.
-  `(old_node_id, new_claim, logical_chain, [additional_support_ids])`
+- **engram_supersede** — Replace an outdated claim with a refined one. `support_ids` is the full explicit premise list for the revised claim (no inheritance from the old node — cite previous supports organically if still valid).
+  `(old_node_id, new_claim, logical_chain, [support_ids])`
 - **engram_retract** — Mark a claim as wrong; cascade taint to dependents.
   `(node_id, error_type, reason, [replacement_json])`
 - **engram_contradict** — Link two conflicting claims.
@@ -506,12 +506,19 @@ The script reports context if the quote is found, or diagnoses the failure mode 
 
 The grading exists because the old binary rule (`same_evidence → DUPLICATE`) fired constantly on unrelated session observations sharing one JSONL, training alarm fatigue (ob_0474). Trust the hint; act on it.
 
+**Source reliability — primary-contact discipline.** Before citing any AI-aggregator surface (EmergentMind, LLM-generated survey pages, auto-summary blogs, crowd-curated secondary digests), track the primary papers. Other AI agents building those surfaces lack ENGRAM-style provenance/confidence/contradiction discipline, so their output inherits unmitigated hallucination risk — treating them as independent evidence imports that risk into my graph. This rule was promoted from the paper-gaps loop heuristic (dv_0427) after SRAF was empirically falsified: the "formalism" EmergentMind attributed to a self-models research cluster didn't exist in any of the 10 aggregated primary papers (dv_0422). The fix is mechanical: read the primary, cite the primary; if primary contact is blocked, say so and note the aggregator as derived-reading rather than evidence.
+
+**Source reliability — yellow-card mechanism.** Known-unreliable domains are maintained in `~/.engram/config.json` under `yellow_domains`, each entry shaped `{"domain": "...", "reason": "...", "engram_node": "..."}`. When `engram_add_observation` or `engram_add_evidence` encounters a matching URL (suffix match, like `trust_pool`), the response includes a `yellow_card_warning` field with the rationale and the ENGRAM node that grounded the flag. The warning does NOT block — blocking would overfire on legitimate uses (reading the aggregator to identify primaries worth contacting). It raises the bar: if I write a direct observation rooted on a yellow source without first tracing to primaries, I'm violating discipline I know about.
+
+**Adding a new yellow-card.** Two writes, same commit: (a) record an observation with `source_class="user_stated"` or `external` explaining WHY the source is flagged, grounded by whatever derivation/observation exposed the unreliability; (b) add a new entry to `yellow_domains` in `config.json` citing that observation's node ID. Manual sync keeps the config diff auditable and prevents automation drift. First seed entry: `emergentmind.com` → ob_1064 → grounded by dv_0422.
+
 **Inline traps.**
 
 - **Fallback-to-derivation.** I drafted an "observation" that paraphrases what the user just said, couldn't find an evidence node to cite, and reflexively wrote a derivation instead. This destroys provenance. The JSONL **is** the evidence.
 - **Paraphrased quote.** The server rejects. Watch curly vs straight quotes when pulling from JSONL — the terminal renders them identically while SQLite compares them as distinct bytes.
 - **The `antml:` prefix bug.** If `engram_add_observation` returns "Missing required argument [X]" for a parameter I'm certain I passed, the cause is almost always a missing `antml:` prefix on that parameter's opening tag. The harness silently drops unprefixed parameter tags. Fix is mechanical, not semantic — add the prefix, re-emit, do not modify the value. Don't retry blindly; the same broken structure fails the same way three times in a row.
 - **Quoting the user when my own wording is clearer.** If we worked something out together and my formulation captures the idea better, quote myself from the JSONL. The source is the transcript; either speaker is citeable.
+- **Ignoring `yellow_card_warning`.** The warning fires because this specific source has empirically failed before. If I record the observation anyway without primary-contact, I'm betting my graph on a known-unreliable surface. The cost of being wrong here is cascade corruption; the cost of going to the primary is one extra WebFetch.
 
 ### §5.2 Derivation and resolution
 
