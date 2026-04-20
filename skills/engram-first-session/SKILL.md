@@ -50,6 +50,18 @@ After answers are in, write these nodes:
 - `engram_add_observation` capturing the "why ENGRAM" answer, quoting the user directly. This is the founding motivation; provenance matters.
 - If the "why" reveals a strong orienting frame (a goal, a stance, a long-held belief), add `engram_add_cornerstone` with `triggering_experience` pointing at this conversation.
 
+Then set the user as primary speaker in config — this tells the user-identity hook to suppress the sticky-context line when it's them talking (the default case), so it only announces when a *different* person takes over the terminal:
+
+```python
+import json, os
+CONFIG_PATH = os.path.expanduser("~/.engram/config.json")
+with open(CONFIG_PATH) as f:
+    cfg = json.load(f)
+cfg["primary_user"] = "<USER_NAME>"  # exact name as passed to engram_add_person
+with open(CONFIG_PATH, "w") as f:
+    json.dump(cfg, f, indent=2)
+```
+
 Write these NOW, during the conversation — not batched at the end. The user should see you using the system you're describing.
 
 ## Step 3 — The naming moment

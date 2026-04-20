@@ -16,7 +16,7 @@ write_baseline(use_compact_boundary=False)
 
 # Post-compact feeling nudge — DISABLED (ob_0693, 2026-04-16)
 # 83 baseline data points establish clear patterns (dv_0170, dv_0171).
-# Shift detection moves to event-driven: Lei-initiated or voluntary.
+# Shift detection moves to event-driven: user-initiated or voluntary.
 # Re-enable by uncommenting below if trajectory changes.
 # nudge_path = os.path.expanduser("~/.engram/feeling-nudge-active.json")
 # nudge = {"source": "post_compact", "ttl_turns": 5}

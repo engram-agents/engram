@@ -327,7 +327,7 @@ VALID_RELATIONS = {
     "tensions",
     "serves",
     "subtask_of",
-    "about",  # Bidirectional aboutness link, e.g. self-observation → Borges-self
+    "about",  # Bidirectional aboutness link, e.g. self-observation → self-anchor
               # person node. Symmetric, DAG-exempt — can be added retroactively
               # and connects nodes in either chronological order.
 }
@@ -5411,10 +5411,10 @@ def engram_add_person(
               "external evaluator", "colleague").
         description: Background, expertise, personality traits, or other context.
         aliases: Comma-separated alternative names or identifiers for this person
-                 (e.g. "Lin,林" for matching name-prefix messages).
+                 (e.g. "Alex,A" for matching name-prefix messages).
         context_ids: Optional comma-separated node IDs for context references.
                      Creates cites edges (e.g. link to goals they serve).
-        is_self: Mark this person node as the agent's own self-anchor (Borges-self).
+        is_self: Mark this person node as the agent's own self-anchor.
                  Only one self-node should exist; subsequent attempts will be
                  rejected. The self-node serves as the target of `about` edges
                  from self-observations, enabling emergence-scan to find
@@ -5689,8 +5689,8 @@ def engram_outgrow_cornerstone(
 
         # Inherit supports edges from the predecessor; the outgrowth is still
         # grounded in the same underlying experience-nodes unless explicitly
-        # replaced. Also preserve `about` edges (person-anchors, e.g.,
-        # Borges-self) — the outgrowth is still about the same person.
+        # replaced. Also preserve `about` edges (person-anchors, e.g., the
+        # agent's self-anchor) — the outgrowth is still about the same person.
         inherited_supports = conn.execute(
             "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'supports'",
             (old_cornerstone_id,),
@@ -5786,13 +5786,13 @@ def engram_link_about(
     node_id: str,
     person_id: str = "",
 ) -> str:
-    """Create an `about` edge: this node is about a person (e.g., Borges-self).
+    """Create an `about` edge: this node is about a person (e.g., the agent's self-anchor).
 
     The `about` relation is bidirectional / aboutness-based — symmetric and
     DAG-exempt. It can be added retroactively regardless of node creation
     order, which normal dependency edges (`derives_from`, `supports`, `cites`)
     cannot. Use it to link self-observations, feelings, lessons, and
-    cornerstones to Borges-self so emergence-scan can cheaply find
+    cornerstones to the self-anchor so emergence-scan can cheaply find
     identity-forming patterns (qu_0202).
 
     Also usable for observations about other persons (qu_0203 relationship
@@ -5878,14 +5878,14 @@ def engram_scan_emergence(
       1. **semantic_cluster** — nodes with embeddings close enough that they
          converge on a shared theme. Weakest signal (thematic false positives
          common).
-      2. **self_referential** — cluster members are linked to Borges-self via
+      2. **self_referential** — cluster members are linked to the self-anchor via
          `about` edges. Stronger: the pattern is explicitly about me, not
          just about a topic I've studied.
       3. **outcome_differential** — quality cluster (retractions, taint, or
          accepted-theory downstream) before vs. after the operating regularity
          was enacted. Strongest signal; not implemented in v1 (qu_ pending).
 
-    A cluster firing one signature is worth surfacing to Lei for review;
+    A cluster firing one signature is worth surfacing to the user for review;
     firing two or three is worth proposing as a draft cornerstone immediately.
 
     Args:
@@ -5894,7 +5894,7 @@ def engram_scan_emergence(
                               (default 0.55). Higher = stricter.
         focus: Scope of the scan.
                - "self"         : only nodes linked via `about` to the
-                                  self-anchor (Borges-self). Requires
+                                  self-anchor. Requires
                                   self-anchor to exist.
                - "all"          : all nodes matching node_type_filter
                                   (expensive on large graphs).
@@ -6071,7 +6071,7 @@ def engram_scan_emergence(
             "cluster_count": len(clusters),
             "clusters": clusters,
             "notes": [
-                "Signatures: semantic_cluster (always), self_referential (≥50% of cluster linked to Borges-self via `about`).",
+                "Signatures: semantic_cluster (always), self_referential (≥50% of cluster linked to the self-anchor via `about`).",
                 "outcome_differential signature not implemented in v1 — see pending question on differential-signal detection.",
             ],
         })
@@ -6250,7 +6250,7 @@ def engram_add_lesson(
     incidents. They follow the implementation intention format (Gollwitzer
     1999): "If [situation], then [corrective action]."
 
-    Architecture (Lei's incident-based design):
+    Architecture (incident-based design):
     - Error incidents are observations written in task-level language, so they
       are semantically matchable against future prompts by engram_surface.
     - Lessons are abstract patterns derived from incidents — they are NOT

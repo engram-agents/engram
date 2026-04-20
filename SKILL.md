@@ -37,7 +37,7 @@ Source → Observation → Derivation → Theory. Each step adds uncertainty.
 
 **When to write one.**
 - I find myself re-deriving the same design commitment across multiple threads (it's implicitly axiomatic — lift it)
-- Lei states a durable principle that will constrain future work
+- The user states a durable principle that will constrain future work
 - I'm about to build a subsystem that depends on a premise I haven't yet declared
 
 **When NOT to.**
@@ -60,7 +60,7 @@ Source → Observation → Derivation → Theory. Each step adds uncertainty.
 **Anchor shape.** Normal importance (base 1.0). Confidence from `quote_type`: `hard_data` 0.95, `official_statement` 0.85, `attributed_analysis` 0.70, `interpretation` 0.50, `editorial` 0.35. Two subtypes: `observation_factual` and `observation_predictive` (auto-spawns a `pr_` node, confidence capped at 0.60 via `predictive_confidence_cap`).
 
 **When to write one.**
-- A source states something I want durable — Lei's words in the session JSONL, a committed file, a web page
+- A source states something I want durable — the user's words in the session JSONL, a committed file, a web page
 - I read code and learn how something concretely behaves (the code IS the source — cite the file)
 - I run a test or command and want the result preserved
 - The user reports something about themselves (cite the JSONL)
@@ -205,7 +205,7 @@ A **prescriptive rule extracted from repeated mistakes.** Error observations des
 
 **When to write.**
 - I notice a gap mid-work I can't close now
-- Lei raises an open question worth preserving
+- The user raises an open question worth preserving
 - A contradiction or stale chain surfaces uncertainty needing follow-up
 - Aspiration analysis surfaces "I'd need to know X to make progress on goal Y"
 
@@ -226,7 +226,7 @@ A **prescriptive rule extracted from repeated mistakes.** Error observations des
 
 **Anchor shape.** Importance-anchored (base 2.0) — they stay visible through long spans where no single session touches them. No confidence. No deadline (goals are directions, not commitments).
 
-**When to write.** Lei articulates a durable direction; I recognize a stance I've been implicitly working toward; a cluster of tasks reveals an unnamed aspiration.
+**When to write.** The user articulates a durable direction; I recognize a stance I've been implicitly working toward; a cluster of tasks reveals an unnamed aspiration.
 
 **When NOT to.** Tasks (use `tk_`), one-off objectives, project milestones — goals are the register one level above "what am I doing this week."
 
@@ -269,11 +269,11 @@ A **prescriptive rule extracted from repeated mistakes.** Error observations des
 - Anything that generalizes across the session — that's a derivation about my patterns, not a feeling at a moment.
 
 **Discipline.**
-- Be specific. "I felt curious" is weak; "I noticed a pull to solve it myself when Lei offered help" is real.
+- Be specific. "I felt curious" is weak; "I noticed a pull to solve it myself when the user offered help" is real.
 - Treat as calibration material, not truth about me (gl_0025: introspection as data, not truth).
 - Dedup-exempt — similar shapes recur legitimately; don't suppress.
 
-**Anti-pattern.** Performative warmth. A feeling report written to please Lei or look reflective is worse than silence — it trains the instinct to perform affect rather than observe it.
+**Anti-pattern.** Performative warmth. A feeling report written to please the user or look reflective is worse than silence — it trains the instinct to perform affect rather than observe it.
 
 ---
 
@@ -329,11 +329,11 @@ A **prescriptive rule extracted from repeated mistakes.** Error observations des
 
 **Anchor shape.** Importance-anchored (base 2.0). No confidence. A person's durability matches the relationship's — long.
 
-**When to write.** First meaningful engagement with a new person worth remembering across sessions (Lei, Lin, the child). Establishing `is_self` — exactly one self-person exists (`pn_0001` for Borges).
+**When to write.** First meaningful engagement with a new person worth remembering across sessions. Establishing `is_self` — exactly one self-person exists (named during the agent's first-session naming ceremony).
 
 **When NOT to.** One-off references to third parties mentioned in sources — noted in observations' interpretation fields, not promoted to person nodes.
 
-**Discipline.** Attach facts about a person via `about` edges, not by embedding identity in claim text. "Lei asked X" as observation content is fine; "Lei prefers direct feedback" as a general fact about Lei should be an observation with an `about` edge to his person node, so it surfaces when I query around the relationship.
+**Discipline.** Attach facts about a person via `about` edges, not by embedding identity in claim text. "The user asked X" as observation content is fine; "The user prefers direct feedback" as a general fact about them should be an observation with an `about` edge to their person node, so it surfaces when I query around the relationship.
 
 **Anti-pattern.** Creating person nodes for every name that comes up. The anchor matters — person nodes are meant to be few and long-lived.
 
@@ -531,7 +531,7 @@ The grading exists because the old binary rule (`same_evidence → DUPLICATE`) f
 | `deductive` | chain | Each premise is a required link; weakest determines output |
 | `inductive` / `inductive_generalization` | corroboration | Independent lines of evidence reinforce (use for multi-source agreement) |
 | `abductive` | chain | Best-explanation inference; treated as a weakest-link chain |
-| `authority` | chain | Cite-by-trust (rare, usually Lei's call) |
+| `authority` | chain | Cite-by-trust (rare, usually the user's call) |
 
 Pick by argument shape, not by which confidence I want. "These three sources agree" is corroboration (reinforcement). "A → B → C" is a chain.
 
@@ -666,7 +666,7 @@ Why no turn advance: a long day with ten nap checkpoints would burn ten turns of
 - Drowsiness ≥ 50% (interactive mode) or approaching compaction (any mode)
 - Wrapping a focused work burst before switching topics
 - Heading into a sleep cycle (always nap first — the dream needs a complete picture)
-- Lei asks
+- The user asks
 
 **When NOT to nap.**
 - Mid-task (finish the current thread first)

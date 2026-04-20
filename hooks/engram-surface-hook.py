@@ -263,10 +263,10 @@ def check_warm_briefing(prompt_count: int) -> str:
     if not os.path.exists(WARM_BRIEFING_PATH):
         return ""
     return (
-        "[ENGRAM Warm Restart: A note from your past self and from Lei "
-        "is waiting at ~/.engram/warm-briefing.md — read it before "
-        "starting work. It exists because cold restarts lose something "
-        "important, and this is our attempt to preserve it.]"
+        "[ENGRAM Warm Restart: A note from your past self and from your "
+        "collaborator is waiting at ~/.engram/warm-briefing.md — read it "
+        "before starting work. It exists because cold restarts lose "
+        "something important, and this is our attempt to preserve it.]"
     )
 
 
@@ -311,7 +311,7 @@ def check_incident_tripwire(matched_ids: list) -> str:
     Reads ~/.engram/error_incidents.json (maps incident obs IDs → lesson info).
     When a matched node is an incident, surfaces the lesson's scaffolding_nudge.
 
-    This is the primary tripwire mechanism (Lei's incident-based architecture):
+    This is the primary tripwire mechanism (incident-based architecture):
     - Incidents are written in task-level language → semantically matchable
     - Lessons are abstract patterns → surfaced via graph edge, not direct match
     - More incidents linked to a lesson = more matching surface area

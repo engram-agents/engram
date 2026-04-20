@@ -2,14 +2,19 @@
 """
 UserPromptSubmit hook: detect speaker identity from name-prefix convention.
 
-Uses sticky session context (ob_0681): a name prefix like "Lin:" switches
+Uses sticky session context (ob_0681): a name prefix like "<Name>:" switches
 the active user, and all subsequent messages are attributed to that user
-until a different prefix (e.g. "Lei:") overrides it. The marker file
-(current_user.json) is cleared on SessionStart so identity doesn't leak
-across sessions.
+until a different prefix overrides it. The marker file (current_user.json)
+is cleared on SessionStart so identity doesn't leak across sessions.
 
-Convention: type "Lin: <message>" once to switch context to Lin.
-All following messages are treated as Lin's until "Lei: <message>" resets.
+Convention: type "Alex: <message>" once to switch context to Alex.
+All following messages are treated as Alex's until another "<Name>: ..."
+prefix resets.
+
+Primary-user suppression: if ~/.engram/config.json has a `primary_user` key,
+the sticky context line is suppressed when the active user matches (since
+the primary speaker is the default — no need to re-announce them on every
+prompt). Set via the first-session skill or by hand editing config.json.
 
 Exit codes:
   0 - success (may output empty JSON if no identity detected)
@@ -24,6 +29,17 @@ import sys
 
 DB_PATH = os.path.expanduser("~/.engram/knowledge.db")
 CURRENT_USER_PATH = os.path.expanduser("~/.engram/current_user.json")
+CONFIG_PATH = os.path.expanduser("~/.engram/config.json")
+
+
+def get_primary_user() -> str:
+    """Read primary_user from ~/.engram/config.json (lowercased; empty if unset)."""
+    try:
+        with open(CONFIG_PATH) as f:
+            config = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return ""
+    return (config.get("primary_user") or "").lower()
 
 
 def get_person_nodes() -> list[dict]:
@@ -114,9 +130,13 @@ def main():
             try:
                 with open(CURRENT_USER_PATH) as f:
                     sticky = json.load(f)
-                # Only output context for non-default users (Lei is default)
+                # Suppress context for the configured primary user (default
+                # speaker — no need to re-announce on every prompt). If no
+                # primary_user is configured, show context for all sticky users.
                 name_lower = sticky.get("name", "").lower()
-                if sticky.get("person_id") and not name_lower.startswith("lei"):
+                primary = get_primary_user()
+                is_primary = primary and name_lower == primary
+                if sticky.get("person_id") and not is_primary:
                     context = (
                         f"[ENGRAM User Identity: {sticky['name']} ({sticky['person_id']}) — sticky session context]\n"
                         f"  Role: {sticky.get('role', '')}\n"
