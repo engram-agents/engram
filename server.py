@@ -14,6 +14,7 @@ import functools
 import hashlib
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -21,7 +22,7 @@ import textwrap
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 from urllib.parse import urlparse
 
 from fastmcp import FastMCP
@@ -327,16 +328,24 @@ VALID_RELATIONS = {
     "tensions",
     "serves",
     "subtask_of",
-    "about",  # Bidirectional aboutness link, e.g. self-observation → self-anchor
+    "about",  # Bidirectional aboutness link, e.g. self-observation → the self-anchor
               # person node. Symmetric, DAG-exempt — can be added retroactively
               # and connects nodes in either chronological order.
+    "exemplifies",  # Lightweight incident → lesson membership (incident is an
+                    # instance of the lesson's pattern). Classification, not
+                    # logical dependency — no confidence propagation, DAG-exempt
+                    # so post-hoc registration and initial-creation use the
+                    # same relation regardless of chronological order.
 }
 
 # Edge relations that are semantically bidirectional / aboutness-based and
 # therefore exempt from the chronological DAG invariant. A DAG edge means
 # "source depends on target" (source is newer); about/contradicts express
-# a symmetric relationship with no dependency direction.
-DAG_EXEMPT_RELATIONS = {"contradicts", "about"}
+# a symmetric relationship with no dependency direction. `exemplifies` is
+# structural (membership, not dependency) and must work in both directions
+# of time — incidents known at lesson birth are older, incidents registered
+# later are newer.
+DAG_EXEMPT_RELATIONS = {"contradicts", "about", "exemplifies"}
 
 VALID_ERROR_TYPES = {
     "fabricated_quote",   # quoted_text not in evidence source
@@ -793,6 +802,12 @@ def _get_db() -> sqlite3.Connection:
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} {typedef}")
 
+    # Edges migration: add metadata column for optional per-edge annotations
+    # (e.g. `exemplifies` note explaining why an incident fits a lesson).
+    edge_cols = {r[1] for r in conn.execute("PRAGMA table_info(edges)").fetchall()}
+    if "metadata" not in edge_cols:
+        conn.execute("ALTER TABLE edges ADD COLUMN metadata TEXT")
+
     # One-time backfill: classify any evidence rows that still have NULL source_type
     # using URL pattern rules. Idempotent: re-runs are no-ops once all rows are filled.
     _backfill_source_type(conn)
@@ -887,6 +902,29 @@ def _get_db() -> sqlite3.Connection:
             turn        INTEGER NOT NULL DEFAULT 0
         );
 
+        -- Focus sets: named, persistent focus-group snapshots (tabs model).
+        -- Active list stays in nodes.focused_at; saved sets live here and are
+        -- loaded into active on demand. node_ids is an immutable JSON array
+        -- of the raw IDs captured at save time — cascade resolution (supersede
+        -- auto-follow, retract drop) happens at load time, not in-place.
+        CREATE TABLE IF NOT EXISTS focus_sets (
+            name            TEXT PRIMARY KEY,
+            node_ids        TEXT NOT NULL,
+            description     TEXT,
+            created_at      TEXT NOT NULL,
+            last_loaded_at  TEXT,
+            load_count      INTEGER NOT NULL DEFAULT 0
+        );
+
+        -- Singleton row tracking which saved set (if any) is currently loaded
+        -- into the active list. NULL active_set_name = ad-hoc (diverged from
+        -- any saved set, or never loaded). Updated by load/save/swap; cleared
+        -- when engram_focus/engram_unfocus mutate the active list off-set.
+        CREATE TABLE IF NOT EXISTS focus_state (
+            singleton_key    INTEGER PRIMARY KEY CHECK (singleton_key = 1),
+            active_set_name  TEXT
+        );
+
         CREATE INDEX IF NOT EXISTS idx_edit_history_node
             ON edit_history(node_id);
         CREATE INDEX IF NOT EXISTS idx_edit_history_ts
@@ -904,22 +942,30 @@ def _get_db() -> sqlite3.Connection:
     # One-time backfill: populate edit_history from existing nodes if empty.
     _backfill_edit_history(conn)
 
+    # Backfill focus_state singleton row if missing. active_set_name stays
+    # NULL until the first engram_focus_load / engram_focus_save call.
+    conn.execute(
+        "INSERT OR IGNORE INTO focus_state (singleton_key, active_set_name) VALUES (1, NULL)"
+    )
+
     conn.commit()
 
     # DAG invariant check: source (dependent) should be created at or after
     # target (dependency). Log warnings for violations (may exist from legacy
     # reroute operations).
     try:
-        violations = conn.execute("""
-            SELECT e.source_id, e.target_id, e.relation,
-                   s.created_at as src_time, t.created_at as tgt_time
-            FROM edges e
-            JOIN nodes s ON e.source_id = s.id
-            JOIN nodes t ON e.target_id = t.id
-            WHERE s.created_at < t.created_at
-              AND e.relation NOT IN ('contradicts', 'about')
-            LIMIT 5
-        """).fetchall()
+        exempt_placeholders = ",".join("?" * len(DAG_EXEMPT_RELATIONS))
+        violations = conn.execute(
+            f"""SELECT e.source_id, e.target_id, e.relation,
+                       s.created_at as src_time, t.created_at as tgt_time
+                FROM edges e
+                JOIN nodes s ON e.source_id = s.id
+                JOIN nodes t ON e.target_id = t.id
+                WHERE s.created_at < t.created_at
+                  AND e.relation NOT IN ({exempt_placeholders})
+                LIMIT 5""",
+            tuple(DAG_EXEMPT_RELATIONS),
+        ).fetchall()
         if violations:
             import logging
             for v in violations:
@@ -941,6 +987,51 @@ def _get_db() -> sqlite3.Connection:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _humanized_ago(then_iso: Optional[str], now: Optional[datetime] = None) -> str:
+    """Render an ISO-8601 timestamp as a humanized relative string.
+
+    MECH-2 of the time-awareness design (dv_0472): converts buried
+    created_at / focused_at / last_assessed_at signals into surfaced ones
+    alongside the ISO timestamp. Scale: seconds → years, more precision at
+    the recent end. Returns '?' when input is missing, 'parse-error' on
+    malformed ISO, 'future?' if the timestamp is ahead of now. Always
+    additive — never replaces the ISO field it accompanies (dv_0468 MECH-2
+    rationale: "losing precision on '2d ago' is fine because the ISO is
+    still there to zoom in").
+    """
+    if not then_iso:
+        return "?"
+    try:
+        then = datetime.fromisoformat(then_iso.replace("Z", "+00:00"))
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+    except Exception:
+        return "parse-error"
+    now = now or datetime.now(timezone.utc)
+    secs = int((now - then).total_seconds())
+    if secs < 0:
+        return "future?"
+    if secs < 60:
+        return f"{secs}s ago"
+    mins, _ = divmod(secs, 60)
+    if mins < 60:
+        return f"{mins}m ago"
+    hrs, rem_mins = divmod(mins, 60)
+    if hrs < 24:
+        return f"{hrs}h{rem_mins}m ago" if rem_mins else f"{hrs}h ago"
+    days, rem_hrs = divmod(hrs, 24)
+    if days < 7:
+        return f"{days}d{rem_hrs}h ago" if rem_hrs else f"{days}d ago"
+    if days < 30:
+        weeks = days // 7
+        return f"{weeks}w ago"
+    if days < 365:
+        months = days // 30
+        return f"{months}mo ago"
+    years = days // 365
+    return f"{years}y ago"
 
 
 def _sanitize_fts_query(text: str) -> Optional[str]:
@@ -1662,7 +1753,8 @@ def _get_neighbors(conn: sqlite3.Connection, node_id: str) -> list[dict]:
         """
         SELECT e.relation, e.source_id, e.target_id,
                n.type as neighbor_type, n.claim as neighbor_claim,
-               n.confidence as neighbor_confidence, n.is_current as neighbor_is_current
+               n.confidence as neighbor_confidence, n.is_current as neighbor_is_current,
+               n.created_at as neighbor_created_at
         FROM edges e
         LEFT JOIN nodes n ON (
             CASE WHEN e.source_id = ? THEN e.target_id ELSE e.source_id END
@@ -1672,10 +1764,14 @@ def _get_neighbors(conn: sqlite3.Connection, node_id: str) -> list[dict]:
         (node_id, node_id, node_id),
     ).fetchall()
 
+    # Snapshot now once so every neighbor's humanized age is rendered against
+    # a single clock reading (MECH-2 / dv_0469 CLOCK-DRIFT hygiene).
+    now = datetime.now(timezone.utc)
     result = []
     for e in edges:
         neighbor_id = e["target_id"] if e["source_id"] == node_id else e["source_id"]
         direction = "outgoing" if e["source_id"] == node_id else "incoming"
+        neighbor_created_at = e["neighbor_created_at"]
         result.append(
             {
                 "relation": e["relation"],
@@ -1684,9 +1780,372 @@ def _get_neighbors(conn: sqlite3.Connection, node_id: str) -> list[dict]:
                 "neighbor_type": e["neighbor_type"],
                 "neighbor_claim": e["neighbor_claim"],
                 "neighbor_confidence": e["neighbor_confidence"],
+                "neighbor_created_at": neighbor_created_at,
+                "neighbor_created_ago": _humanized_ago(neighbor_created_at, now=now),
             }
         )
     return result
+
+
+# Excerpt length for warning surfacing (claim + retraction_reason).
+# Long enough to carry gist, short enough to keep responses compact.
+_WARNING_EXCERPT_LEN = 140
+
+
+def _extract_warnings(
+    metadata: Union[str, dict, None],
+    conn: sqlite3.Connection,
+) -> Optional[dict]:
+    """Convert metadata.tainted_by / metadata.stale_by into a structured
+    warnings object for surface-level exposure (MECH-5).
+
+    Previously these fields were buried inside the raw metadata JSON blob,
+    so agents reading a tainted derivation saw the original confidence and
+    proceeded as if the node were sound (dv_0477 diagnosis).
+
+    Returns None when the node is clean — callers should omit the field
+    rather than render an empty object.
+
+    Shape:
+        {
+            "tainted_by": [
+                {"retracted_id", "retracted_claim_excerpt",
+                 "retracted_at", "retraction_reason_excerpt"},
+                ...
+            ],
+            "stale_by": [
+                {"superseded_id", "replaced_by_id", "superseded_at"},
+                ...
+            ],
+        }
+    """
+    if metadata is None:
+        return None
+    if isinstance(metadata, str):
+        if not metadata:
+            return None
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if not isinstance(metadata, dict):
+        return None
+
+    tainted_ids = metadata.get("tainted_by") or []
+    stale_ids = metadata.get("stale_by") or []
+    if not tainted_ids and not stale_ids:
+        return None
+
+    warnings: dict = {}
+
+    if tainted_ids:
+        t_entries = []
+        for rid in tainted_ids:
+            row = conn.execute(
+                "SELECT claim, metadata FROM nodes WHERE id = ?", (rid,)
+            ).fetchone()
+            if not row:
+                t_entries.append({
+                    "retracted_id": rid,
+                    "retracted_claim_excerpt": None,
+                    "retracted_at": None,
+                    "retraction_reason_excerpt": None,
+                })
+                continue
+            rmeta: dict = {}
+            if row["metadata"]:
+                try:
+                    rmeta = json.loads(row["metadata"])
+                except (json.JSONDecodeError, TypeError):
+                    rmeta = {}
+            claim = row["claim"] or ""
+            reason = rmeta.get("retraction_reason") or ""
+            t_entries.append({
+                "retracted_id": rid,
+                "retracted_claim_excerpt": claim[:_WARNING_EXCERPT_LEN],
+                "retracted_at": rmeta.get("retracted_at"),
+                "retraction_reason_excerpt": reason[:_WARNING_EXCERPT_LEN],
+            })
+        warnings["tainted_by"] = t_entries
+
+    if stale_ids:
+        s_entries = []
+        for sid in stale_ids:
+            row = conn.execute(
+                "SELECT superseded_by FROM nodes WHERE id = ?", (sid,)
+            ).fetchone()
+            replaced_by = row["superseded_by"] if row else None
+            superseded_at = None
+            if replaced_by:
+                repl_row = conn.execute(
+                    "SELECT created_at FROM nodes WHERE id = ?", (replaced_by,)
+                ).fetchone()
+                if repl_row:
+                    superseded_at = repl_row["created_at"]
+            s_entries.append({
+                "superseded_id": sid,
+                "replaced_by_id": replaced_by,
+                "superseded_at": superseded_at,
+            })
+        warnings["stale_by"] = s_entries
+
+    return warnings if warnings else None
+
+
+def _validate_premises(
+    supporting_ids: list,
+    conn: sqlite3.Connection,
+    use_stale: bool = False,
+) -> tuple[Optional[dict], list]:
+    """MECH-5 taint/stale blocking guard for engram_derive.
+
+    Classifies each supporting premise and blocks derivations built on
+    compromised foundations — the Mao-Cao compounding pattern that
+    dv_0477 diagnosed.
+
+    Rules:
+      - Any premise with metadata.tainted_by → hard block (BLOCKED_TAINTED).
+        No override. Taint means an upstream was retracted (proven wrong).
+      - Any premise with metadata.stale_by AND use_stale=False →
+        soft block (BLOCKED_STALE). Agent opts in with use_stale=True
+        when the upstream update is judged irrelevant to current logic.
+      - Mixed taint + stale → treated as tainted (taint dominates).
+
+    Returns:
+        (block_response, stale_ids)
+        - block_response: None if premises are clean (or stale-opt-in
+          covers them). Otherwise a dict ready for json.dumps with a
+          structured block error.
+        - stale_ids: list of premise IDs that are stale (for the caller
+          to stamp metadata.built_on_stale when use_stale=True lets us
+          proceed).
+    """
+    tainted_premises = []
+    stale_premises = []
+    stale_ids: list = []
+    for sid in supporting_ids:
+        row = conn.execute(
+            "SELECT metadata, status, is_current, superseded_by FROM nodes WHERE id = ?",
+            (sid,),
+        ).fetchone()
+        if not row:
+            continue
+        meta = {}
+        if row["metadata"]:
+            try:
+                meta = json.loads(row["metadata"])
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+        tainted_by = list(meta.get("tainted_by") or [])
+        stale_by = list(meta.get("stale_by") or [])
+
+        # The premise itself may be the retracted or superseded node (not
+        # just downstream of one) — the cascade markers only hit dependents.
+        # Treat a directly-retracted premise as tainted; a directly-
+        # superseded premise as stale with the replacement pulled from
+        # the superseded_by column.
+        if row["status"] == "retracted" and sid not in tainted_by:
+            tainted_by.insert(0, sid)
+        is_superseded_here = (
+            row["is_current"] == 0
+            and row["superseded_by"] is not None
+            and row["status"] != "retracted"
+        )
+        if is_superseded_here and sid not in stale_by:
+            stale_by.insert(0, sid)
+
+        if tainted_by:
+            retraction_info = []
+            for rid in tainted_by:
+                rrow = conn.execute(
+                    "SELECT metadata FROM nodes WHERE id = ?", (rid,)
+                ).fetchone()
+                r_reason = None
+                if rrow and rrow["metadata"]:
+                    try:
+                        rmeta = json.loads(rrow["metadata"])
+                        r_reason = rmeta.get("retraction_reason")
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                retraction_info.append({
+                    "retracted_by": rid,
+                    "retraction_reason_excerpt": (r_reason or "")[:_WARNING_EXCERPT_LEN],
+                })
+            tainted_premises.append({
+                "id": sid,
+                "retracted_by": retraction_info,
+            })
+        elif stale_by:
+            replacement_info = []
+            for old_id in stale_by:
+                drow = conn.execute(
+                    "SELECT superseded_by FROM nodes WHERE id = ?", (old_id,)
+                ).fetchone()
+                replacement_info.append({
+                    "superseded_id": old_id,
+                    "replaced_by_id": drow["superseded_by"] if drow else None,
+                })
+            stale_premises.append({
+                "id": sid,
+                "stale_because": replacement_info,
+            })
+            stale_ids.append(sid)
+
+    # Taint dominates — block even if use_stale=True.
+    if tainted_premises:
+        return ({
+            "status": "blocked_tainted",
+            "error": "BLOCKED_TAINTED: cannot derive from retracted or tainted premises.",
+            "tainted_premises": tainted_premises,
+            "guidance": (
+                "Resolve taint before deriving: (1) drop the tainted premise, "
+                "(2) re-derive on a replacement if the retracted upstream was "
+                "superseded with a correction, (3) file a question with "
+                "engram_ask if the conclusion's validity under the correction "
+                "is non-obvious."
+            ),
+        }, stale_ids)
+
+    if stale_premises and not use_stale:
+        return ({
+            "status": "blocked_stale",
+            "error": "BLOCKED_STALE: premise(s) have superseded upstream.",
+            "stale_premises": stale_premises,
+            "guidance": (
+                "Either retry with use_stale=True (writes a "
+                "metadata.built_on_stale audit marker — use when the upstream "
+                "update does not affect your logic), OR cite the replacement "
+                "premise(s) directly via their IDs."
+            ),
+        }, stale_ids)
+
+    return (None, stale_ids)
+
+
+def _create_derivation(
+    conn: sqlite3.Connection,
+    *,
+    claim: str,
+    supporting_ids: list,
+    logical_chain: str,
+    reasoning_type: str,
+    context_ids: Optional[list] = None,
+    use_stale: bool = False,
+    extra_meta: Optional[dict] = None,
+    history_reason: Optional[str] = None,
+) -> tuple:
+    """Shared derivation-creation core for engram_derive and engram_resolve.
+
+    Runs the MECH-5 premise guard, computes confidence, INSERTs the
+    derivation row, wires derives_from + cites edges, stamps the node,
+    and issues utility rewards. Does NOT commit — caller owns the
+    transaction boundary so resolve can append a resolves edge and
+    update the target atomically.
+
+    Claim-bearing-type validation and node-existence checks are the
+    caller's responsibility so each tool can produce its own error
+    messages.
+
+    Args:
+        conn: open DB connection (caller commits)
+        claim, logical_chain: the derivation's text
+        supporting_ids: pre-validated claim-bearing premise IDs
+        reasoning_type: required — caller resolves legacy derivation_mode
+            → reasoning_type default before calling
+        context_ids: optional 'cites' targets; missing IDs are silently
+            filtered (legacy engram_derive behavior)
+        use_stale: MECH-5 opt-in for stale premises
+        extra_meta: merged into derivation metadata after reasoning
+            fields — use for resolve-specific keys (resolves,
+            resolution_status)
+        history_reason: optional confidence_history reason string;
+            defaults to a generic "Derived (reasoning_type, ...)" line
+
+    Returns:
+        (block, success) — exactly one is non-None.
+          block: MECH-5 guard response ready for json.dumps when a
+            premise was tainted or stale without opt-in
+          success: dict with node_id, confidence, reasoning_type,
+            reasoning_class, stale_ids, structure_warnings,
+            rewarded_map, context_nodes
+    """
+    block, stale_ids = _validate_premises(supporting_ids, conn, use_stale=use_stale)
+    if block is not None:
+        return (block, None)
+
+    structure_warnings = _validate_reasoning_structure(conn, reasoning_type, supporting_ids)
+
+    confidence = _compute_confidence(
+        conn, "derivation", supporting_ids=supporting_ids,
+        reasoning_type=reasoning_type,
+    )
+    node_id = _next_id(conn, "derivation")
+    now = _now()
+
+    rclass = REASONING_CLASS.get(reasoning_type, "unknown")
+    discount = REASONING_DISCOUNT.get(reasoning_type, 0.95)
+
+    derive_meta = {"reasoning_type": reasoning_type, "reasoning_class": rclass}
+    if use_stale and stale_ids:
+        derive_meta["built_on_stale"] = stale_ids
+    if extra_meta:
+        derive_meta.update(extra_meta)
+
+    reason_line = history_reason or (
+        f"Derived ({reasoning_type}, discount={discount}) from {len(supporting_ids)} premises"
+    )
+
+    conn.execute(
+        """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
+           confidence, confidence_history, metadata)
+           VALUES (?, 'derivation', ?, ?, ?, ?, ?, ?)""",
+        (
+            node_id,
+            claim,
+            now,
+            logical_chain,
+            confidence,
+            json.dumps([{"timestamp": now, "value": confidence, "reason": reason_line}]),
+            json.dumps(derive_meta),
+        ),
+    )
+
+    for sid in supporting_ids:
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'derives_from', ?)",
+            (node_id, sid, now),
+        )
+
+    ctx_used: list = []
+    if context_ids:
+        for cid in context_ids:
+            exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
+            if exists:
+                try:
+                    conn.execute(
+                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
+                        (node_id, cid, now),
+                    )
+                    ctx_used.append(cid)
+                except sqlite3.IntegrityError:
+                    pass
+
+    _stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
+
+    rewarded_map = _recall_window_check(supporting_ids)
+    if rewarded_map:
+        _utility_reward(conn, rewarded_map)
+
+    return (None, {
+        "node_id": node_id,
+        "confidence": confidence,
+        "reasoning_type": reasoning_type,
+        "reasoning_class": rclass,
+        "stale_ids": stale_ids,
+        "structure_warnings": structure_warnings,
+        "rewarded_map": rewarded_map,
+        "context_nodes": ctx_used,
+    })
 
 
 def _compute_confidence(
@@ -2258,13 +2717,22 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                 nudge = meta.get("scaffolding_nudge", "")
                 if nudge:
                     lines.append(f"Nudge: {nudge}")
-                edges = conn.execute(
-                    "SELECT target_id, relation FROM edges WHERE source_id = ? AND relation IN ('derives_from', 'cites')",
+                # Incidents point AT the lesson via `exemplifies` (incident → lesson).
+                incident_rows = conn.execute(
+                    "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'exemplifies'",
                     (n["id"],),
                 ).fetchall()
-                incidents = [e["target_id"] for e in edges if e["relation"] == "derives_from"]
+                incidents = [r["source_id"] for r in incident_rows]
                 if incidents:
                     lines.append(f"Incidents: {', '.join(incidents)}")
+                # Cites edges for context still flow lesson → context_node.
+                ctx_rows = conn.execute(
+                    "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'cites'",
+                    (n["id"],),
+                ).fetchall()
+                ctx_ids = [r["target_id"] for r in ctx_rows]
+                if ctx_ids:
+                    lines.append(f"Context: {', '.join(ctx_ids)}")
                 if n["logical_chain"]:
                     lines.append(f"Logic: {n['logical_chain'][:200]}")
 
@@ -3589,6 +4057,11 @@ def engram_surface(
                 "message": "No matching nodes found in the knowledge graph.",
             })
 
+        # Snapshot wall-clock now once so every humanized timestamp in this
+        # surface response is rendered against the same reading (MECH-2 of
+        # dv_0472 / dv_0469 CLOCK-DRIFT hygiene).
+        now_utc = datetime.now(timezone.utc)
+
         # --- Type breakdown ---
         type_counts: dict[str, int] = {}
         for n in results:
@@ -3603,6 +4076,7 @@ def engram_surface(
                 entry: dict = {
                     "id": n["id"], "type": ntype,
                     "claim": n.get("claim", ""),
+                    "created_ago": _humanized_ago(n.get("created_at"), now=now_utc),
                 }
                 if ntype == "question":
                     entry["status"] = n.get("status", "open")
@@ -3625,6 +4099,7 @@ def engram_surface(
                 "id": n["id"], "type": n["type"],
                 "claim": n.get("claim", ""),
                 "confidence": n.get("confidence"),
+                "created_ago": _humanized_ago(n.get("created_at"), now=now_utc),
             }
             for n in claim_nodes[:3]
         ]
@@ -3635,9 +4110,28 @@ def engram_surface(
         recall_turns = [n.get("recall_turn", 0) for n in results if n.get("recall_turn") is not None]
         old_nodes = [n["id"] for n in results if (n.get("recall_turn") or 0) < max(0, current_turn - 2)]
 
-        # --- Stale / tainted counts ---
+        # Humanized wall-clock range across the matched set — converts the
+        # recall_turn-only age signal (which measures checkpoints, not
+        # wall-clock) into a real-time cue, covering T4 (gap-since-last-session)
+        # of the dv_0472 temporal-awareness matrix.
+        created_ats = [n.get("created_at") for n in results if n.get("created_at")]
+        if created_ats:
+            newest_iso = max(created_ats)
+            oldest_iso = min(created_ats)
+            wall_clock_range = {
+                "newest_ago": _humanized_ago(newest_iso, now=now_utc),
+                "oldest_ago": _humanized_ago(oldest_iso, now=now_utc),
+            }
+        else:
+            wall_clock_range = None
+
+        # --- Stale / tainted counts + structured per-node warnings ---
+        # MECH-5: in addition to aggregate counts, surface the full
+        # warnings shape per-node so agents can act on specific taints
+        # without a follow-up engram_inspect call.
         stale_count = 0
         tainted_count = 0
+        warned_nodes: dict[str, dict] = {}
         for n in results:
             meta_str = n.get("metadata", "")
             if isinstance(meta_str, str) and meta_str:
@@ -3645,6 +4139,17 @@ def engram_surface(
                     stale_count += 1
                 if '"tainted_by"' in meta_str:
                     tainted_count += 1
+            w = _extract_warnings(meta_str, conn)
+            if w:
+                warned_nodes[n["id"]] = w
+        # Attach warnings inline on top_claims / special entries so callers
+        # can notice without cross-referencing the warned_nodes map.
+        for entry in top_claims:
+            if entry["id"] in warned_nodes:
+                entry["warnings"] = warned_nodes[entry["id"]]
+        for entry in special:
+            if entry["id"] in warned_nodes:
+                entry["warnings"] = warned_nodes[entry["id"]]
 
         # --- All matched IDs for follow-up ---
         matched_ids = [n["id"] for n in results]
@@ -3661,6 +4166,7 @@ def engram_surface(
             "age": {
                 "current_turn": current_turn,
                 "recall_turn_range": [min(recall_turns), max(recall_turns)] if recall_turns else None,
+                "wall_clock_range": wall_clock_range,
                 "not_recalled_recently": old_nodes,
             },
             "issues": {},
@@ -3676,6 +4182,8 @@ def engram_surface(
             summary["issues"]["stale_nodes"] = stale_count
         if tainted_count:
             summary["issues"]["tainted_nodes"] = tainted_count
+        if warned_nodes:
+            summary["issues"]["warnings_by_id"] = warned_nodes
 
         # --- Tier A/B comparison (ob_0657, cj_0028) ---
         test_config = mem.get("test")
@@ -3803,9 +4311,26 @@ def engram_inspect(
                 pass
         node["parsed_metadata"] = meta
 
-        # 1-hop neighbors with summaries
+        # MECH-2 (dv_0472): render humanized wall-clock ages alongside the
+        # ISO timestamps the schema already stores. Additive — the ISO fields
+        # stay, so precision isn't lost. `created_ago` is always rendered;
+        # the other two only if the source field is present (feeling-nudge
+        # nodes have no focused_at, non-question nodes have no last_assessed_at).
+        now_utc = datetime.now(timezone.utc)
+        node["created_ago"] = _humanized_ago(node.get("created_at"), now=now_utc)
+        if node.get("focused_at"):
+            node["focused_ago"] = _humanized_ago(node.get("focused_at"), now=now_utc)
+        if node.get("last_assessed_at"):
+            node["last_assessed_ago"] = _humanized_ago(node.get("last_assessed_at"), now=now_utc)
+
+        # 1-hop neighbors with summaries (already carry humanized ages from
+        # _get_neighbors — MECH-2 plumbed at the helper level).
         neighbors = _get_neighbors(conn, node_id)
         node["neighbors"] = neighbors
+
+        # MECH-5: surface taint / stale as a top-level warning so agents can't
+        # miss it by skimming past raw metadata JSON.
+        warnings = _extract_warnings(meta, conn)
 
         # Refresh recall on the target node ONLY (skip in dream mode)
         if not dream_mode:
@@ -3821,12 +4346,15 @@ def engram_inspect(
             )
             conn.commit()
 
-        return json.dumps({
+        response = {
             "node": node,
             "neighbor_count": len(neighbors),
             "dream_mode": dream_mode,
             "hint": "Use engram_get_subgraph(node_id) to trace the full evidence chain.",
-        })
+        }
+        if warnings:
+            response["warnings"] = warnings
+        return json.dumps(response)
     finally:
         conn.close()
 
@@ -3879,8 +4407,13 @@ def engram_query(
         # Enrich results with neighbors (legacy behavior)
         output = []
         for node in search["results"]:
+            # MECH-5: extract warnings BEFORE popping metadata so agents
+            # reading query results see taint / stale status.
+            w = _extract_warnings(node.get("metadata"), conn)
             node.pop("metadata", None)
             node["neighbors"] = _get_neighbors(conn, node["id"])
+            if w:
+                node["warnings"] = w
             output.append(node)
 
         # Refresh recall for all accessed nodes (legacy behavior)
@@ -3956,7 +4489,13 @@ def engram_get_subgraph(
 
             node = conn.execute("SELECT * FROM nodes WHERE id = ?", (nid,)).fetchone()
             if node:
-                nodes_out[nid] = _node_to_dict(node)
+                node_dict = _node_to_dict(node)
+                # MECH-5: surface taint / stale per-node so the caller
+                # can't miss them while scanning a large subgraph.
+                w = _extract_warnings(node_dict.get("metadata"), conn)
+                if w:
+                    node_dict["warnings"] = w
+                nodes_out[nid] = node_dict
 
             if remaining_depth == 0:
                 return
@@ -4377,13 +4916,15 @@ def engram_diagnose() -> str:
         structure["total_edges"] = total_edges
 
         # DAG violations
-        dag_violations = conn.execute("""
-            SELECT COUNT(*) as c FROM edges e
-            JOIN nodes s ON e.source_id = s.id
-            JOIN nodes t ON e.target_id = t.id
-            WHERE s.created_at < t.created_at
-              AND e.relation NOT IN ('contradicts')
-        """).fetchone()["c"]
+        exempt_placeholders = ",".join("?" * len(DAG_EXEMPT_RELATIONS))
+        dag_violations = conn.execute(
+            f"""SELECT COUNT(*) as c FROM edges e
+                JOIN nodes s ON e.source_id = s.id
+                JOIN nodes t ON e.target_id = t.id
+                WHERE s.created_at < t.created_at
+                  AND e.relation NOT IN ({exempt_placeholders})""",
+            tuple(DAG_EXEMPT_RELATIONS),
+        ).fetchone()["c"]
         structure["dag_violations"] = dag_violations
 
         # Orphan nodes (no edges at all)
@@ -5216,7 +5757,6 @@ def engram_add_conjecture(
 
     Lifecycle:
     - Supported: cite the conjecture in a derivation with supporting evidence
-    - Promoted: engram_supersede to replace with a fully-evidenced derivation
     - Resolved: engram_resolve to close with outcome (supported/refuted/inconclusive)
     - Abandoned: engram_retract if no longer worth investigating
 
@@ -5629,10 +6169,11 @@ def engram_outgrow_cornerstone(
     promotion criteria) is deferred until real graph evidence accumulates
     (qu_0204).
 
-    Why not use engram_supersede? That tool blindly inherits ALL metadata
-    from the predecessor, which would keep the old prior_frame/new_frame
-    unchanged — defeating the whole point of a reframe. This tool rolls
-    old.new_frame → new.prior_frame, which is the correct growth-cycle shape.
+    Why not decompose into engram_add_cornerstone + engram_supersede? The
+    growth-cycle roll (old.new_frame → new.prior_frame) is specialized
+    cornerstone logic that would leak onto every caller. This tool keeps
+    the roll + supersede edge insertion atomic; the generic supersede tool
+    is purely relational and doesn't touch metadata.
 
     Args:
         old_cornerstone_id: The cornerstone being outgrown (must be
@@ -5689,8 +6230,8 @@ def engram_outgrow_cornerstone(
 
         # Inherit supports edges from the predecessor; the outgrowth is still
         # grounded in the same underlying experience-nodes unless explicitly
-        # replaced. Also preserve `about` edges (person-anchors, e.g., the
-        # agent's self-anchor) — the outgrowth is still about the same person.
+        # replaced. Also preserve `about` edges (person-anchors, e.g.,
+        # the self-anchor) — the outgrowth is still about the same person.
         inherited_supports = conn.execute(
             "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'supports'",
             (old_cornerstone_id,),
@@ -6256,7 +6797,7 @@ def engram_add_lesson(
     - Lessons are abstract patterns derived from incidents — they are NOT
       matched directly against prompts.
     - When engram_surface matches an incident observation, the hook follows
-      the derives_from edge to surface the lesson's scaffolding_nudge.
+      the exemplifies edge to surface the lesson's scaffolding_nudge.
     - As more incidents link to the same lesson (or its superseded chain),
       the matching surface area grows — each new incident is another way
       the lesson can fire.
@@ -6413,11 +6954,15 @@ def engram_add_lesson(
             ),
         )
 
-        # Create derives_from edges to incident observations
+        # Create exemplifies edges (incident → lesson). This is a classification
+        # edge — "this incident is an instance of this lesson's pattern" — not
+        # a logical dependency. DAG-exempt, so initial-creation (incidents older
+        # than lesson) and post-hoc registration (incidents newer) use the same
+        # relation in the same direction.
         for sid in ids:
             conn.execute(
-                "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'derives_from', ?)",
-                (node_id, sid, now),
+                "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'exemplifies', ?)",
+                (sid, node_id, now),
             )
 
         # Create cites edges for context
@@ -6469,6 +7014,199 @@ def engram_add_lesson(
         return json.dumps(result)
     finally:
         conn.close()
+
+
+def _rebuild_incidents_cache() -> dict:
+    """Rebuild `~/.engram/error_incidents.json` from the graph.
+
+    Walks all `exemplifies` edges (incident → lesson), pairs each incident
+    with its lesson's claim + scaffolding_nudge from metadata, and writes
+    the full index from scratch. Idempotent. Used by
+    `engram_lesson_register_incident` to resync the hot-path cache after
+    an incremental append, and available for manual recovery if the cache
+    drifts (e.g. after a backfill migration, or if the JSON was deleted).
+
+    Returns a summary dict with counts — never raises.
+    """
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """SELECT e.source_id AS incident_id, e.target_id AS lesson_id,
+                      n.claim AS lesson_claim, n.metadata AS lesson_meta
+               FROM edges e
+               JOIN nodes n ON n.id = e.target_id
+               WHERE e.relation = 'exemplifies' AND n.type = 'lesson'
+                 AND n.is_current = 1"""
+        ).fetchall()
+
+        index: dict[str, dict] = {}
+        lesson_count: set[str] = set()
+        for r in rows:
+            try:
+                meta = json.loads(r["lesson_meta"]) if r["lesson_meta"] else {}
+            except (TypeError, json.JSONDecodeError):
+                meta = {}
+            index[r["incident_id"]] = {
+                "lesson_id": r["lesson_id"],
+                "lesson_claim": r["lesson_claim"],
+                "scaffolding_nudge": meta.get("scaffolding_nudge", ""),
+            }
+            lesson_count.add(r["lesson_id"])
+
+        os.makedirs(os.path.dirname(ERROR_INCIDENTS_PATH), exist_ok=True)
+        with open(ERROR_INCIDENTS_PATH, "w") as f:
+            json.dump(index, f, indent=2)
+
+        return {
+            "status": "rebuilt",
+            "incident_count": len(index),
+            "lesson_count": len(lesson_count),
+            "path": ERROR_INCIDENTS_PATH,
+        }
+    finally:
+        conn.close()
+
+
+@mcp.tool(
+    name="engram_lesson_register_incident",
+    annotations={
+        "title": "Register Incident on Existing Lesson",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_lesson_register_incident(
+    lesson_id: str,
+    incident_id: str,
+    note: str = "",
+) -> str:
+    """Register a post-hoc incident observation as another instance of an
+    existing lesson's pattern.
+
+    Post-hoc path for lesson growth: when a new error incident surfaces that
+    exemplifies a lesson already in the graph, attach it with one call
+    instead of superseding the lesson. Writes one `exemplifies` edge
+    (incident → lesson, DAG-exempt) and refreshes the error_incidents.json
+    cache so the surface hook picks it up without code changes.
+
+    This is the distinct-cognitive-act path (ob_1235): recognizing that a
+    fresh error matches a known lesson is its own moment, worth a dedicated
+    call. The initial-creation path (incidents known at lesson birth) stays
+    on `engram_add_lesson(..., incident_ids=[...])`.
+
+    Args:
+        lesson_id: ID of an existing lesson node (type='lesson', is_current=1).
+        incident_id: ID of the incident observation. Must be claim-bearing
+            (observation_factual, observation_predictive, derivation, theory,
+            axiom, conjecture).
+        note: Optional brief annotation of why this incident exemplifies the
+            lesson — stored on the edge's metadata field for audit.
+
+    Returns:
+        JSON with status + the new edge's source/target, the lesson's
+        current incident count, and cache rebuild result.
+    """
+    conn = _get_db()
+    try:
+        lesson_row = conn.execute(
+            "SELECT id, type, claim, metadata, is_current FROM nodes WHERE id = ?",
+            (lesson_id,),
+        ).fetchone()
+        if not lesson_row:
+            return json.dumps({"error": f"Lesson node not found: {lesson_id}"})
+        if lesson_row["type"] != "lesson":
+            return json.dumps({
+                "error": f"Target must be a lesson node. {lesson_id} has type '{lesson_row['type']}'.",
+            })
+        if not lesson_row["is_current"]:
+            return json.dumps({
+                "error": f"Target lesson {lesson_id} is superseded (is_current=0). "
+                         f"Register against its current replacement.",
+            })
+
+        incident_row = conn.execute(
+            "SELECT id, type FROM nodes WHERE id = ?",
+            (incident_id,),
+        ).fetchone()
+        if not incident_row:
+            return json.dumps({"error": f"Incident node not found: {incident_id}"})
+        if incident_row["type"] not in CLAIM_BEARING_TYPES:
+            return json.dumps({
+                "error": f"Incident must be claim-bearing. {incident_id} has type "
+                         f"'{incident_row['type']}'.",
+            })
+
+        # Idempotent — report existing edge as no-op rather than error.
+        existing = conn.execute(
+            """SELECT id FROM edges
+               WHERE source_id = ? AND target_id = ? AND relation = 'exemplifies'""",
+            (incident_id, lesson_id),
+        ).fetchone()
+        if existing:
+            count_row = conn.execute(
+                """SELECT COUNT(*) AS c FROM edges
+                   WHERE target_id = ? AND relation = 'exemplifies'""",
+                (lesson_id,),
+            ).fetchone()
+            return json.dumps({
+                "status": "noop",
+                "reason": "edge already exists",
+                "edge": {"source": incident_id, "target": lesson_id, "relation": "exemplifies"},
+                "lesson_incident_count": count_row["c"] if count_row else None,
+            })
+
+        now = _now()
+        edge_meta = json.dumps({"note": note}) if note else None
+        conn.execute(
+            """INSERT INTO edges (source_id, target_id, relation, created_at, metadata)
+               VALUES (?, ?, 'exemplifies', ?, ?)""",
+            (incident_id, lesson_id, now, edge_meta),
+        )
+
+        # Bump the lesson's incident_count in metadata so engram_reflect / inspect
+        # rendering stays consistent without a full count requery every time.
+        try:
+            meta = json.loads(lesson_row["metadata"]) if lesson_row["metadata"] else {}
+        except (TypeError, json.JSONDecodeError):
+            meta = {}
+        meta["incident_count"] = int(meta.get("incident_count", 0)) + 1
+        conn.execute(
+            "UPDATE nodes SET metadata = ? WHERE id = ?",
+            (json.dumps(meta), lesson_id),
+        )
+        conn.commit()
+
+        count_row = conn.execute(
+            """SELECT COUNT(*) AS c FROM edges
+               WHERE target_id = ? AND relation = 'exemplifies'""",
+            (lesson_id,),
+        ).fetchone()
+        incident_count = count_row["c"] if count_row else None
+    finally:
+        conn.close()
+
+    # Refresh the JSON cache from the graph (outside the transaction —
+    # best-effort, never blocks the edge write).
+    try:
+        cache_result = _rebuild_incidents_cache()
+    except Exception as exc:
+        cache_result = {"status": "error", "detail": str(exc)}
+
+    return json.dumps({
+        "status": "created",
+        "edge": {
+            "source": incident_id,
+            "target": lesson_id,
+            "relation": "exemplifies",
+            "note": note or None,
+        },
+        "lesson_id": lesson_id,
+        "lesson_claim": lesson_row["claim"],
+        "lesson_incident_count": incident_count,
+        "cache_rebuild": cache_result,
+    })
 
 
 # ── Task importance constants ──
@@ -6968,6 +7706,7 @@ def engram_derive(
     reasoning_type: str = "",
     derivation_mode: str = "chain",
     context_ids: str = "",
+    use_stale: bool = False,
 ) -> str:
     """Create a new derived claim by combining evidence from existing nodes.
 
@@ -7008,34 +7747,37 @@ def engram_derive(
             Kept for backward compatibility: "chain" or "corroboration".
         context_ids: Optional comma-separated node IDs for context references (e.g. definitions).
             Creates 'cites' edges (not 'derives_from') — these don't affect confidence computation.
+        use_stale: Opt-in override for MECH-5 stale-premise guard. Set to True ONLY when
+            you've judged that the upstream supersede does not affect the logic of your
+            derivation — the new derivation will carry a metadata.built_on_stale audit
+            marker so future maintenance tools can auto-redirect edges to replacements.
+            Has no effect on tainted premises (taint is always a hard block — no override).
 
     Returns:
         JSON with the new derivation node ID, computed confidence, reasoning type, and supporting nodes.
+        If premises are compromised, returns a structured block response:
+          - BLOCKED_TAINTED: any premise was retracted; no override path.
+          - BLOCKED_STALE: premise(s) have superseded upstream and use_stale=False.
     """
-    # Validate reasoning_type
     if reasoning_type and reasoning_type not in REASONING_TYPES:
-        valid_types = sorted(REASONING_TYPES)
         return json.dumps({
             "error": f"Invalid reasoning_type '{reasoning_type}'.",
-            "valid_types": valid_types,
+            "valid_types": sorted(REASONING_TYPES),
         })
-
-    # Legacy fallback: if no reasoning_type, use derivation_mode
     if not reasoning_type:
         if derivation_mode == "corroboration":
             reasoning_type = "inductive_generalization"
         else:
-            reasoning_type = "deductive_hypothetical_syllogism"  # safest default for chain
+            reasoning_type = "deductive_hypothetical_syllogism"
 
     ids = [s.strip() for s in supporting_ids.split(",") if s.strip()]
     if not ids:
         return json.dumps({"error": "At least one supporting node ID is required."})
+    ctx = [s.strip() for s in context_ids.split(",") if s.strip()]
 
     conn = _get_db()
     try:
-        # Validate all supporting nodes exist and are claim-bearing
-        missing = []
-        wrong_type = []
+        missing, wrong_type = [], []
         for sid in ids:
             row = conn.execute("SELECT id, type FROM nodes WHERE id = ?", (sid,)).fetchone()
             if not row:
@@ -7052,84 +7794,40 @@ def engram_derive(
                          f"If you want to reference a definition, use context_ids instead of supporting_ids.",
             })
 
-        # Structural validation
-        structure_warnings = _validate_reasoning_structure(conn, reasoning_type, ids)
-
-        confidence = _compute_confidence(
-            conn, "derivation", supporting_ids=ids,
+        block, success = _create_derivation(
+            conn,
+            claim=claim,
+            supporting_ids=ids,
+            logical_chain=logical_chain,
             reasoning_type=reasoning_type,
+            context_ids=ctx,
+            use_stale=use_stale,
         )
-        node_id = _next_id(conn, "derivation")
-        now = _now()
-
-        rclass = REASONING_CLASS.get(reasoning_type, "unknown")
-        discount = REASONING_DISCOUNT.get(reasoning_type, 0.95)
-
-        conn.execute(
-            """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
-               confidence, confidence_history, metadata)
-               VALUES (?, 'derivation', ?, ?, ?, ?, ?, ?)""",
-            (
-                node_id,
-                claim,
-                now,
-                logical_chain,
-                confidence,
-                json.dumps([{"timestamp": now, "value": confidence,
-                             "reason": f"Derived ({reasoning_type}, discount={discount}) from {len(ids)} premises"}]),
-                json.dumps({"reasoning_type": reasoning_type, "reasoning_class": rclass}),
-            ),
-        )
-
-        # Create derives_from edges
-        for sid in ids:
-            conn.execute(
-                "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'derives_from', ?)",
-                (node_id, sid, now),
-            )
-
-        # Create cites edges for context (definitions, related nodes)
-        ctx = [s.strip() for s in context_ids.split(",") if s.strip()]
-        for cid in ctx:
-            exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
-            if exists:
-                try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
-                except sqlite3.IntegrityError:
-                    pass
-
-        _stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
-
-        # ── Utility reward (MemRL-inspired, cj_0027) ──
-        # Check if any premises were recently surfaced (in the recall window).
-        # If so, they contributed to reasoning — reward them with source-graded α.
-        rewarded_map = _recall_window_check(ids)
-        if rewarded_map:
-            _utility_reward(conn, rewarded_map)
+        if block is not None:
+            return json.dumps(block)
 
         conn.commit()
 
         result = {
             "status": "created",
-            "derivation_id": node_id,
+            "derivation_id": success["node_id"],
             "claim": claim,
-            "confidence": confidence,
-            "reasoning_type": reasoning_type,
-            "reasoning_class": rclass,
+            "confidence": success["confidence"],
+            "reasoning_type": success["reasoning_type"],
+            "reasoning_class": success["reasoning_class"],
             "supporting_nodes": ids,
-            "context_nodes": ctx,
+            "context_nodes": success["context_nodes"],
             "logical_chain_preview": logical_chain[:200],
         }
-        if rewarded_map:
+        if success["rewarded_map"]:
             result["utility_rewarded"] = {
                 nid: {"source": src, "alpha": UTILITY_ALPHA.get(src, UTILITY_ALPHA_DEFAULT)}
-                for nid, src in rewarded_map.items()
+                for nid, src in success["rewarded_map"].items()
             }
-        if structure_warnings:
-            result["structure_warnings"] = structure_warnings
+        if success["structure_warnings"]:
+            result["structure_warnings"] = success["structure_warnings"]
+        if use_stale and success["stale_ids"]:
+            result["built_on_stale"] = success["stale_ids"]
 
         return json.dumps(result)
     finally:
@@ -7348,12 +8046,17 @@ def engram_resolve(
     prediction_outcome: str = "",
     reasoning_type: str = "",
     derivation_mode: str = "chain",
+    context_ids: str = "",
+    use_stale: bool = False,
 ) -> str:
     """Resolve an open question, contradiction, prediction, or goal tension by creating a derivation.
 
     A resolution IS a derivation — it cites claim-bearing nodes and reasons
     toward a conclusion that closes an open item. The derivation node is
-    created with a 'resolves' edge to the target.
+    created with a 'resolves' edge to the target. Internally, this shares
+    the derivation-creation core with engram_derive, so it inherits the
+    MECH-5 taint/stale premise guard, utility rewards for recalled
+    premises, and the context_ids cites mechanism.
 
     You should specify reasoning_type to classify the logical argument
     (e.g. 'deductive_modus_ponens', 'abductive_elimination'). See engram_derive
@@ -7373,28 +8076,43 @@ def engram_resolve(
     (the tension was only apparent, not real).
 
     Args:
-        target_id: The node ID to resolve (qu_XXXX, ct_XXXX, pr_XXXX, or gt_XXXX).
+        target_id: The node ID to resolve (qu_XXXX, ct_XXXX, pr_XXXX, cj_XXXX, or gt_XXXX).
         claim: The resolution claim — your answer, verdict, or outcome assessment.
         supporting_ids: Comma-separated claim-bearing node IDs that support this resolution.
         logical_chain: Explicit reasoning connecting the cited premises to the resolution.
         prediction_outcome: Required for predictions: confirmed, partially_confirmed, partially_refuted, or refuted.
-        reasoning_type: The type of logical argument (e.g. 'deductive_modus_ponens', 'abductive_elimination'). See engram_derive for full list.
+        reasoning_type: The type of logical argument. See engram_derive for full list.
         derivation_mode: LEGACY — use reasoning_type instead.
+        context_ids: Optional comma-separated node IDs for 'cites' context (e.g. definitions).
+        use_stale: MECH-5 opt-in for stale premises — see engram_derive docs.
 
     Returns:
         JSON with the new derivation ID, resolution status, and confidence.
+        May return BLOCKED_TAINTED or BLOCKED_STALE if a premise is
+        compromised (same guard as engram_derive).
     """
     RESOLVABLE_TYPES = {"question", "contradiction", "prediction", "conjecture", "goal_tension"}
     VALID_PREDICTION_OUTCOMES = {"confirmed", "partially_confirmed", "refuted", "partially_refuted"}
     VALID_CONJECTURE_OUTCOMES = {"supported", "refuted", "inconclusive"}
 
+    if reasoning_type and reasoning_type not in REASONING_TYPES:
+        return json.dumps({
+            "error": f"Invalid reasoning_type '{reasoning_type}'.",
+            "valid_types": sorted(REASONING_TYPES),
+        })
+    if not reasoning_type:
+        if derivation_mode == "corroboration":
+            reasoning_type = "inductive_generalization"
+        else:
+            reasoning_type = "deductive_hypothetical_syllogism"
+
     ids = [s.strip() for s in supporting_ids.split(",") if s.strip()]
     if not ids:
         return json.dumps({"error": "At least one supporting node ID is required."})
+    ctx = [s.strip() for s in context_ids.split(",") if s.strip()]
 
     conn = _get_db()
     try:
-        # Validate target exists and is resolvable
         target = conn.execute(
             "SELECT id, type, claim, status FROM nodes WHERE id = ?",
             (target_id,),
@@ -7412,7 +8130,6 @@ def engram_resolve(
                            f"If you have new evidence, consider superseding the existing resolution.",
             })
 
-        # For predictions, require outcome
         if target["type"] == "prediction":
             if not prediction_outcome:
                 return json.dumps({
@@ -7423,8 +8140,6 @@ def engram_resolve(
                     "error": f"Invalid prediction_outcome '{prediction_outcome}'. "
                              f"Must be one of: {', '.join(sorted(VALID_PREDICTION_OUTCOMES))}",
                 })
-
-        # For conjectures, require prediction_outcome (reuse the field) with conjecture-specific values
         if target["type"] == "conjecture":
             if not prediction_outcome:
                 return json.dumps({
@@ -7436,9 +8151,7 @@ def engram_resolve(
                              f"Must be one of: {', '.join(sorted(VALID_CONJECTURE_OUTCOMES))}",
                 })
 
-        # Validate supporting nodes are claim-bearing
-        missing = []
-        wrong_type = []
+        missing, wrong_type = [], []
         for sid in ids:
             row = conn.execute("SELECT id, type FROM nodes WHERE id = ?", (sid,)).fetchone()
             if not row:
@@ -7455,73 +8168,44 @@ def engram_resolve(
                          f"Extract observations from evidence first.",
             })
 
-        # Validate reasoning_type if provided
-        if reasoning_type and reasoning_type not in REASONING_TYPES:
-            return json.dumps({
-                "error": f"Invalid reasoning_type '{reasoning_type}'.",
-                "valid_types": sorted(REASONING_TYPES),
-            })
-
-        if not reasoning_type:
-            if derivation_mode == "corroboration":
-                reasoning_type = "inductive_generalization"
-            else:
-                reasoning_type = "deductive_hypothetical_syllogism"
-
-        # Compute confidence from supporting nodes
-        confidence = _compute_confidence(
+        # Pre-compute confidence to decide resolution_status (same inputs
+        # _create_derivation will use — the helper recomputes, matches).
+        preview_confidence = _compute_confidence(
             conn, "derivation", supporting_ids=ids, reasoning_type=reasoning_type,
         )
-
-        # Structural validation
-        structure_warnings = _validate_reasoning_structure(conn, reasoning_type, ids)
-
-        # Determine resolution status based on confidence threshold
         config = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
         threshold = config.get("resolution_confidence_threshold", DEFAULT_RESOLUTION_THRESHOLD)
-
         if target["type"] == "prediction":
             resolution_status = prediction_outcome
         elif target["type"] == "conjecture":
-            resolution_status = prediction_outcome  # reuses the field: supported/refuted/inconclusive
-        elif confidence >= threshold:
+            resolution_status = prediction_outcome
+        elif preview_confidence >= threshold:
             resolution_status = "resolved"
         else:
             resolution_status = "partially_resolved"
 
-        # Create the derivation node
-        node_id = _next_id(conn, "derivation")
+        block, success = _create_derivation(
+            conn,
+            claim=claim,
+            supporting_ids=ids,
+            logical_chain=logical_chain,
+            reasoning_type=reasoning_type,
+            context_ids=ctx,
+            use_stale=use_stale,
+            extra_meta={"resolves": target_id, "resolution_status": resolution_status},
+            history_reason=f"Resolution of {target_id} ({reasoning_type})",
+        )
+        if block is not None:
+            return json.dumps(block)
+
+        node_id = success["node_id"]
+        confidence = success["confidence"]
         now = _now()
 
-        conn.execute(
-            """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
-               confidence, confidence_history, metadata)
-               VALUES (?, 'derivation', ?, ?, ?, ?, ?, ?)""",
-            (
-                node_id,
-                claim,
-                now,
-                logical_chain,
-                confidence,
-                json.dumps([{"timestamp": now, "value": confidence, "reason": f"Resolution of {target_id} ({reasoning_type})"}]),
-                json.dumps({"resolves": target_id, "resolution_status": resolution_status, "reasoning_type": reasoning_type}),
-            ),
-        )
-
-        # Create derives_from edges to supporting nodes
-        for sid in ids:
-            conn.execute(
-                "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'derives_from', ?)",
-                (node_id, sid, now),
-            )
-
-        # Create resolves edge to target
         conn.execute(
             "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'resolves', ?)",
             (node_id, target_id, now),
         )
-
-        # Update target status
         conn.execute(
             "UPDATE nodes SET status = ? WHERE id = ?",
             (resolution_status, target_id),
@@ -7529,7 +8213,6 @@ def engram_resolve(
         _log_edit(conn, "resolved", target_id, target["type"],
                   {"resolved_by": node_id, "resolution_status": resolution_status})
 
-        _stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
         conn.commit()
 
         result = {
@@ -7542,7 +8225,17 @@ def engram_resolve(
             "resolution_status": resolution_status,
             "supporting_nodes": ids,
         }
-
+        if success["context_nodes"]:
+            result["context_nodes"] = success["context_nodes"]
+        if success["rewarded_map"]:
+            result["utility_rewarded"] = {
+                nid: {"source": src, "alpha": UTILITY_ALPHA.get(src, UTILITY_ALPHA_DEFAULT)}
+                for nid, src in success["rewarded_map"].items()
+            }
+        if success["structure_warnings"]:
+            result["structure_warnings"] = success["structure_warnings"]
+        if use_stale and success["stale_ids"]:
+            result["built_on_stale"] = success["stale_ids"]
         if resolution_status == "partially_resolved":
             result["note"] = (
                 f"Confidence {confidence:.2f} is below the resolution threshold {threshold:.2f}. "
@@ -7558,7 +8251,7 @@ def engram_resolve(
 @mcp.tool(
     name="engram_supersede",
     annotations={
-        "title": "Supersede a Node with Updated Claim",
+        "title": "Link a Replacement Node to the Node It Supersedes",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
@@ -7567,48 +8260,76 @@ def engram_resolve(
 )
 def engram_supersede(
     old_node_id: str,
-    new_claim: str,
-    logical_chain: str,
-    support_ids: str = "",
+    new_node_id: str,
+    supersede_reason: str = "",
 ) -> str:
-    """Replace an existing node with an updated version.
+    """Mark `new_node_id` as the successor of `old_node_id`.
 
-    The old node is marked as superseded (is_current=False) but preserved
-    for audit history. The new node's supporting edges come entirely from
-    `support_ids` — the caller provides the full, explicit list of premises
-    and citations that justify the revised claim. Nothing is inherited from
-    the old node's edges; if a previous citation still applies, include its
-    ID in `support_ids` organically.
+    This is a purely relational operation — it does NOT create a new node.
+    The caller creates the replacement via the canonical creation tool for
+    its type (engram_derive, engram_add_observation, engram_add_axiom,
+    engram_add_definition, engram_add_goal, engram_add_conjecture,
+    engram_add_cornerstone, …) and then calls this tool with both IDs.
 
-    Use this when a claim needs to be revised — more specific, corrected,
-    or updated based on new evidence — but the old version should remain
-    in the history.
+    The canonical creation tools are the single source of truth for each
+    node type's confidence math, metadata, edges, and importance anchoring.
+    Keeping supersede relational-only means those rules never diverge.
+
+    Workflow:
+      1. Draft the corrected/refined claim and create the new node with
+         the right creation tool — pass the FULL explicit support list
+         for the new node (no inheritance from the old — cite previous
+         premises organically if they still apply).
+      2. Call engram_supersede(old_id, new_id) to wire the supersede
+         relationship: old is marked is_current=0, new.supersedes = old,
+         a supersedes edge is inserted, and downstream dependents of old
+         are flagged stale.
+
+    Validation:
+      - Both nodes must exist and be is_current=1 (no resurrecting
+        superseded/retracted nodes).
+      - old.type must equal new.type (cross-type "promotion" is not
+        supersede — use retract + create fresh instead).
+      - new.created_at must be >= old.created_at (DAG invariant).
+      - new.supersedes must be NULL (a node can't already be the
+        successor of a different supersede chain).
+      - old.type cannot be feeling_report (terminal type — file a new
+        report or retract).
+
+    Evidence nodes (ev_XXXX) are supersede-capable in principle but
+    usually the wrong tool — if a URL is wrong or a source is bad, use
+    engram_retract and cite corrected evidence via a new observation.
 
     Args:
-        old_node_id: The node ID to supersede.
-        new_claim: The updated claim text.
-        logical_chain: Reasoning explaining why the claim was revised.
-        support_ids: Comma-separated full list of supporting node IDs
-            (premises for derivations/theories, evidence/context for
-            observations/axioms/cornerstones). Empty string is valid when
-            the new claim derives its confidence from non-edge sources
-            (e.g., observations whose confidence comes from quote_type).
+        old_node_id: The node being superseded.
+        new_node_id: The replacement node, already created via its
+            type's canonical creation tool.
+        supersede_reason: Optional short rationale for WHY this
+            revision exists (e.g., "reasoning_type correction:
+            inductive_generalization → authority_expert", "narrower
+            claim, original was over-generalized"). Lands in the
+            supersedes edge's metadata column. The claim diff usually
+            speaks for itself; add a reason only when the diff alone
+            wouldn't make the motivation obvious.
 
     Returns:
-        JSON with the old and new node IDs.
+        JSON with old_node_id, new_node_id, the stale downstream list,
+        and stale_count.
     """
     conn = _get_db()
     try:
         old = conn.execute(
-            "SELECT * FROM nodes WHERE id = ? AND is_current = 1",
+            "SELECT id, type, is_current FROM nodes WHERE id = ?",
             (old_node_id,),
         ).fetchone()
         if not old:
-            return json.dumps({"error": f"Current node '{old_node_id}' not found (may already be superseded)."})
-
-        # Feeling reports are terminal in the reasoning graph — a self-report
-        # is a record of a moment, not a claim that gets revised. To correct
-        # an erroneous report, retract it and (optionally) file a new one.
+            return json.dumps({"error": f"old_node_id '{old_node_id}' not found."})
+        if old["is_current"] != 1:
+            return json.dumps({
+                "error": f"old_node_id '{old_node_id}' is not current "
+                         f"(already superseded or retracted). "
+                         f"Use engram_history or engram_inspect to see its state.",
+            })
         if old["type"] == "feeling_report":
             return json.dumps({
                 "error": "Protocol violation: feeling reports cannot be superseded. "
@@ -7617,92 +8338,71 @@ def engram_supersede(
                          "If your understanding has shifted, file a NEW feeling report.",
             })
 
+        new = conn.execute(
+            "SELECT id, type, is_current, created_at, supersedes FROM nodes WHERE id = ?",
+            (new_node_id,),
+        ).fetchone()
+        if not new:
+            return json.dumps({
+                "error": f"new_node_id '{new_node_id}' not found. "
+                         f"Create the replacement node via its type's canonical creation "
+                         f"tool (engram_derive, engram_add_observation, engram_add_axiom, "
+                         f"engram_add_definition, engram_add_goal, engram_add_conjecture, "
+                         f"engram_add_cornerstone, …) BEFORE calling engram_supersede.",
+            })
+        if new["is_current"] != 1:
+            return json.dumps({
+                "error": f"new_node_id '{new_node_id}' is not current "
+                         f"(already superseded or retracted). Cannot use it as a replacement.",
+            })
+        if new_node_id == old_node_id:
+            return json.dumps({"error": "old_node_id and new_node_id must differ."})
+        if new["type"] != old["type"]:
+            return json.dumps({
+                "error": f"Type mismatch: old is '{old['type']}', new is '{new['type']}'. "
+                         f"Supersede preserves type — superseding a conjecture with a "
+                         f"derivation (or similar cross-type revision) is not supersede. "
+                         f"If the correction changes the epistemic category, use "
+                         f"engram_retract on the old node and cite the replacement "
+                         f"organically in new derivations.",
+            })
+        if new["supersedes"] is not None:
+            return json.dumps({
+                "error": f"new_node_id '{new_node_id}' already supersedes "
+                         f"'{new['supersedes']}'. A node cannot be the successor of "
+                         f"more than one supersede chain.",
+            })
+
+        old_created = conn.execute(
+            "SELECT created_at FROM nodes WHERE id = ?", (old_node_id,)
+        ).fetchone()["created_at"]
+        if new["created_at"] < old_created:
+            return json.dumps({
+                "error": f"DAG invariant violation: new_node '{new_node_id}' was created "
+                         f"at {new['created_at']}, before old_node '{old_node_id}' "
+                         f"created at {old_created}. Supersede requires the replacement "
+                         f"to be at least as new as the node it replaces.",
+            })
+
         now = _now()
-        new_type = old["type"]
-        new_id = _next_id(conn, new_type)
 
-        # Supporting edges are taken entirely from the caller. No blanket
-        # inheritance from the old node — if a previous citation still applies,
-        # the caller cites it organically in `support_ids`. This keeps each
-        # revision's logic chain honest and explicit.
-        all_support_ids = [s.strip() for s in support_ids.split(",") if s.strip()]
-
-        # Compute new confidence — respect each node type's semantics
-        if new_type == "axiom":
-            confidence = 1.0  # Axioms are assumed true by definition
-        elif new_type in ("definition", "goal", "cornerstone"):
-            confidence = None  # Not truth claims — definitions are conventions,
-                               # goals are directions, cornerstones are self-reports.
-        elif old["quote_type"]:
-            # For observations, base confidence on quote type
-            confidence = _compute_confidence(
-                conn, new_type, quote_type=old["quote_type"],
-                is_predictive=(new_type == "observation_predictive"),
-            )
-        else:
-            confidence = _compute_confidence(conn, new_type, supporting_ids=all_support_ids)
-
-        # Propagate transferable metadata from old node (reasoning_type,
-        # reasoning_class, term, etc.) but NOT node-specific state
-        # (stale_by, tainted_by, stale_replacement).
-        NON_TRANSFERABLE_META = {"stale_by", "tainted_by", "stale_replacement"}
-        old_meta = json.loads(old["metadata"]) if old["metadata"] else {}
-        new_meta = {k: v for k, v in old_meta.items() if k not in NON_TRANSFERABLE_META}
-
-        # Create new node
+        # Wire the supersedes relationship.
         conn.execute(
-            """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
-               confidence, confidence_history, supersedes, is_current,
-               evidence_id, quoted_text, interpretation, quote_type, metadata)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)""",
-            (
-                new_id,
-                new_type,
-                new_claim,
-                now,
-                logical_chain,
-                confidence,
-                json.dumps([{"timestamp": now, "value": confidence, "reason": f"Supersedes {old_node_id}"}]),
-                old_node_id,
-                old["evidence_id"],
-                old["quoted_text"],
-                old["interpretation"],
-                old["quote_type"],
-                json.dumps(new_meta) if new_meta else "{}",
-            ),
+            "UPDATE nodes SET supersedes = ? WHERE id = ?",
+            (old_node_id, new_node_id),
         )
-
-        # Recreate support edges on new node
-        for sid in all_support_ids:
-            if new_type in ("derivation", "theory"):
-                rel = "derives_from"
-            elif new_type == "cornerstone":
-                rel = "supports"
-            else:
-                rel = "cites"
-            try:
-                conn.execute(
-                    "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, ?, ?)",
-                    (new_id, sid, rel, now),
-                )
-            except sqlite3.IntegrityError:
-                pass
-
-        # Also create supersedes edge
+        edge_meta = json.dumps({"reason": supersede_reason}) if supersede_reason else None
         conn.execute(
-            "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'supersedes', ?)",
-            (new_id, old_node_id, now),
+            "INSERT INTO edges (source_id, target_id, relation, created_at, metadata) "
+            "VALUES (?, ?, 'supersedes', ?, ?)",
+            (new_node_id, old_node_id, now, edge_meta),
         )
-
-        # Mark old node as superseded
         conn.execute(
             "UPDATE nodes SET is_current = 0, superseded_by = ? WHERE id = ?",
-            (new_id, old_node_id),
+            (new_node_id, old_node_id),
         )
 
-        # Flag downstream dependents as stale (premise was superseded).
-        # This replaces the old reroute approach which violated the DAG invariant
-        # by creating edges from older nodes to the newer replacement.
+        # Flag downstream dependents of the old node as stale.
         visited = set()
         stale = []
 
@@ -7716,7 +8416,7 @@ def engram_supersede(
             ).fetchall()
             for d in dependents:
                 did = d["source_id"]
-                if did == new_id:
+                if did == new_node_id:
                     continue  # Don't flag the replacement itself
                 dep = conn.execute(
                     "SELECT id, type, claim, metadata FROM nodes WHERE id = ? AND is_current = 1",
@@ -7729,7 +8429,7 @@ def engram_supersede(
                 if old_node_id not in stale_by:
                     stale_by.append(old_node_id)
                 meta["stale_by"] = stale_by
-                meta["stale_replacement"] = new_id
+                meta["stale_replacement"] = new_node_id
                 conn.execute(
                     "UPDATE nodes SET metadata = ? WHERE id = ?",
                     (json.dumps(meta), did),
@@ -7739,41 +8439,27 @@ def engram_supersede(
                     "type": dep["type"],
                     "claim": dep["claim"],
                     "stale_premise": old_node_id,
-                    "replacement": new_id,
+                    "replacement": new_node_id,
                 })
                 _flag_stale(did)
 
         _flag_stale(old_node_id)
 
-        # Log supersede event for the old node
-        _log_edit(conn, "superseded", old_node_id, new_type,
-                  {"replaced_by": new_id, "new_claim": new_claim[:200]})
+        _log_edit(conn, "superseded", old_node_id, old["type"],
+                  {"replaced_by": new_node_id, "reason": supersede_reason or None})
         for s in stale:
             _log_edit(conn, "stale_flagged", s["id"], s["type"],
-                      {"stale_premise": old_node_id, "replacement": new_id})
+                      {"stale_premise": old_node_id, "replacement": new_node_id})
 
-        _stamp_new_node(conn, new_id, confidence=confidence or 0.5, surprise=0.0)
-        # Importance-anchored types: elevated base (2.0) with current turn's inflation.
-        # Not true forgetting-exemption — survival still requires recall past ~50 turns.
-        if new_type in ("axiom", "definition", "goal", "cornerstone"):
-            anchored_score = _compute_importance(2.0, _get_current_turn())
-            conn.execute(
-                "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
-                (anchored_score, new_id,),
-            )
         conn.commit()
-        return json.dumps(
-            {
-                "status": "superseded",
-                "old_node_id": old_node_id,
-                "new_node_id": new_id,
-                "new_claim": new_claim,
-                "confidence": confidence,
-                "supports": all_support_ids,
-                "stale_downstream": stale,
-                "stale_count": len(stale),
-            }
-        )
+        return json.dumps({
+            "status": "superseded",
+            "old_node_id": old_node_id,
+            "new_node_id": new_node_id,
+            "supersede_reason": supersede_reason or None,
+            "stale_downstream": stale,
+            "stale_count": len(stale),
+        })
     finally:
         conn.close()
 
@@ -8015,6 +8701,107 @@ def engram_retract(
 FOCUS_LIST_CAP = 15
 
 
+# Focus-set name pattern: lowercase alphanumerics, underscore, hyphen; 1–50 chars.
+# No spaces (CLI-friendly), no uppercase (case-insensitive lookup without ambiguity).
+FOCUS_SET_NAME_PATTERN = re.compile(r"^[a-z0-9_-]{1,50}$")
+
+
+def _resolve_set_members(node_ids_json, conn):
+    """Resolve a saved set's raw IDs into currently-loadable nodes.
+
+    For each raw ID: walk the supersede chain to the current version; drop
+    if the chain ends at a retracted node or the ID doesn't exist. Saved
+    sets store raw IDs (immutable); resolution happens at load time.
+
+    Returns:
+        Tuple of (loaded, auto_followed_supersede, dropped_retracted,
+        dropped_missing). loaded is the list of current node IDs to focus;
+        auto_followed_supersede is a list of (original_id, final_id) pairs;
+        the two dropped lists are original IDs that didn't survive.
+    """
+    try:
+        raw_ids = json.loads(node_ids_json) if node_ids_json else []
+    except (json.JSONDecodeError, TypeError):
+        raw_ids = []
+
+    loaded = []
+    followed = []
+    dropped_retracted = []
+    dropped_missing = []
+
+    for raw_id in raw_ids:
+        current_id = raw_id
+        visited = set()
+        while True:
+            if current_id in visited:
+                # Cycle shield — shouldn't happen given DAG invariant.
+                dropped_missing.append(raw_id)
+                break
+            visited.add(current_id)
+            row = conn.execute(
+                "SELECT id, status, superseded_by FROM nodes WHERE id = ?",
+                (current_id,),
+            ).fetchone()
+            if row is None:
+                dropped_missing.append(raw_id)
+                break
+            if row["status"] == "retracted":
+                dropped_retracted.append(raw_id)
+                break
+            if row["superseded_by"]:
+                current_id = row["superseded_by"]
+                continue
+            if current_id != raw_id:
+                followed.append((raw_id, current_id))
+            loaded.append(current_id)
+            break
+
+    return loaded, followed, dropped_retracted, dropped_missing
+
+
+def _set_active_set_name(name_or_none, conn):
+    """Update focus_state singleton with the given name (or NULL for ad-hoc)."""
+    conn.execute(
+        "UPDATE focus_state SET active_set_name = ? WHERE singleton_key = 1",
+        (name_or_none,),
+    )
+
+
+def _clear_active_set_name_if_diverged(conn):
+    """Clear active_set_name if the current active list no longer matches the saved set.
+
+    Called after engram_focus / engram_unfocus mutations. Ground truth: the
+    set of currently focused node IDs vs the resolved members of the saved
+    set. If they differ for any reason (node added, node removed, saved set
+    deleted), the active list is now ad-hoc.
+    """
+    row = conn.execute(
+        "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
+    ).fetchone()
+    if row is None or row["active_set_name"] is None:
+        return
+
+    saved_name = row["active_set_name"]
+    saved_row = conn.execute(
+        "SELECT node_ids FROM focus_sets WHERE name = ?",
+        (saved_name,),
+    ).fetchone()
+    if saved_row is None:
+        _set_active_set_name(None, conn)
+        return
+
+    resolved, _, _, _ = _resolve_set_members(saved_row["node_ids"], conn)
+    saved_set = set(resolved)
+
+    active_rows = conn.execute(
+        "SELECT id FROM nodes WHERE focused_at IS NOT NULL"
+    ).fetchall()
+    active_set = {r["id"] for r in active_rows}
+
+    if saved_set != active_set:
+        _set_active_set_name(None, conn)
+
+
 @mcp.tool(
     name="engram_focus",
     annotations={
@@ -8105,11 +8892,17 @@ def engram_focus(node_ids: str, reason: str) -> str:
                 {"reason": reason.strip(), "refresh": nid in refresh},
             )
 
+        # If adding/refreshing pushed active off the currently-loaded saved
+        # set, clear active_set_name — the active list is now ad-hoc.
+        _clear_active_set_name_if_diverged(conn)
         conn.commit()
 
         focused_now = conn.execute(
             "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1"
         ).fetchall()
+        state_now = conn.execute(
+            "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
+        ).fetchone()
 
         return json.dumps({
             "status": "ok",
@@ -8119,6 +8912,7 @@ def engram_focus(node_ids: str, reason: str) -> str:
             "reason": reason.strip(),
             "focus_list_size": len(focused_now),
             "cap": FOCUS_LIST_CAP,
+            "active_set_name": state_now["active_set_name"] if state_now else None,
         })
     finally:
         conn.close()
@@ -8174,11 +8968,17 @@ def engram_unfocus(node_ids: str) -> str:
             )
             for nid in to_release:
                 _log_edit(conn, "unfocused", nid, found_map[nid]["type"], {})
+            # Removing a node from the active list diverges it from the
+            # saved set — clear active_set_name if that's what just happened.
+            _clear_active_set_name_if_diverged(conn)
             conn.commit()
 
         remaining = conn.execute(
             "SELECT COUNT(*) as n FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1"
         ).fetchone()["n"]
+        state_now = conn.execute(
+            "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
+        ).fetchone()
 
         return json.dumps({
             "status": "ok",
@@ -8186,6 +8986,7 @@ def engram_unfocus(node_ids: str) -> str:
             "already_unfocused": already_unfocused,
             "missing": missing,
             "focus_list_size": remaining,
+            "active_set_name": state_now["active_set_name"] if state_now else None,
         })
     finally:
         conn.close()
@@ -8209,9 +9010,14 @@ def engram_list_focused() -> str:
     summary renders this list verbatim so the post-compact self inherits it
     deterministically (not via probabilistic recall).
 
+    The returned `active_set_name` names which saved focus set (if any) is
+    currently loaded — `null` means the active list is ad-hoc (never loaded,
+    or diverged from the last-loaded set via focus/unfocus).
+
     Returns:
         JSON with focused nodes ordered by focused_at ASC (oldest first):
-        [{id, type, claim, confidence, focus_reason, focused_at}].
+        {status, count, cap, active_set_name, focused: [{id, type, claim,
+        confidence, focus_reason, focused_at}]}.
     """
     conn = _get_db()
     try:
@@ -8229,11 +9035,607 @@ def engram_list_focused() -> str:
             "focus_reason": r["focus_reason"],
             "focused_at": r["focused_at"],
         } for r in rows]
+        state = conn.execute(
+            "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
+        ).fetchone()
         return json.dumps({
             "status": "ok",
             "count": len(items),
             "cap": FOCUS_LIST_CAP,
+            "active_set_name": state["active_set_name"] if state else None,
             "focused": items,
+        })
+    finally:
+        conn.close()
+
+
+@mcp.tool(
+    name="engram_focus_save",
+    annotations={
+        "title": "Snapshot Current Active Focus List Under a Name",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_focus_save(name: str, description: str = "", overwrite: bool = False) -> str:
+    """Snapshot the current active focus list under `name`.
+
+    Saving is a bookmark, not a rotation — the active list is unchanged. The
+    set captures raw IDs; cascade resolution (supersede auto-follow, retract
+    drop) happens at load time, not in place. After save, active_set_name is
+    set to `name` — the active list IS this set, identity-wise, until a
+    mutation diverges it.
+
+    Args:
+        name: Set name. Must match ^[a-z0-9_-]{1,50}$ (lowercase alphanumerics,
+            underscore, hyphen; 1–50 chars). No spaces, no uppercase.
+        description: Optional one-line purpose. Used as the default focus_reason
+            when the set is later loaded.
+        overwrite: If True, replace an existing set with this name. Default
+            False errors on name collision.
+
+    Returns:
+        JSON with saved IDs, node count, and active_set_name.
+    """
+    name = name.strip()
+    if not FOCUS_SET_NAME_PATTERN.match(name):
+        return json.dumps({
+            "status": "error",
+            "error": (
+                f"Invalid name '{name}': must match ^[a-z0-9_-]{{1,50}}$ "
+                "(lowercase alphanumerics, underscore, hyphen; 1–50 chars)."
+            ),
+        })
+
+    conn = _get_db()
+    try:
+        active_rows = conn.execute(
+            "SELECT id FROM nodes WHERE focused_at IS NOT NULL AND is_current = 1 "
+            "ORDER BY focused_at ASC"
+        ).fetchall()
+        if not active_rows:
+            return json.dumps({
+                "status": "error",
+                "error": (
+                    "Active focus list is empty — nothing to save. "
+                    "Focus nodes first, then save."
+                ),
+            })
+        active_ids = [r["id"] for r in active_rows]
+
+        existing = conn.execute(
+            "SELECT name FROM focus_sets WHERE name = ?",
+            (name,),
+        ).fetchone()
+        if existing and not overwrite:
+            return json.dumps({
+                "status": "error",
+                "error": (
+                    f"Focus set '{name}' already exists. "
+                    "Pass overwrite=True to replace."
+                ),
+            })
+
+        now = _now()
+        if existing:
+            conn.execute(
+                "UPDATE focus_sets SET node_ids = ?, description = ?, created_at = ? "
+                "WHERE name = ?",
+                (json.dumps(active_ids), description.strip(), now, name),
+            )
+            action = "overwritten"
+        else:
+            conn.execute(
+                "INSERT INTO focus_sets "
+                "(name, node_ids, description, created_at, load_count) "
+                "VALUES (?, ?, ?, ?, 0)",
+                (name, json.dumps(active_ids), description.strip(), now),
+            )
+            action = "created"
+
+        _set_active_set_name(name, conn)
+        conn.commit()
+
+        return json.dumps({
+            "status": "ok",
+            "action": action,
+            "name": name,
+            "node_count": len(active_ids),
+            "node_ids": active_ids,
+            "active_set_name": name,
+        })
+    finally:
+        conn.close()
+
+
+@mcp.tool(
+    name="engram_focus_load",
+    annotations={
+        "title": "Load a Saved Focus Set Into Active",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_focus_load(name: str, if_active: str = "error") -> str:
+    """Load a saved focus set into the active list.
+
+    Default errors if the active list is non-empty. Pass if_active="overwrite"
+    to unfocus the current list first. Saved sets store raw IDs; resolution
+    happens here — supersede chains are auto-followed, retracted/missing nodes
+    are dropped with reports.
+
+    Args:
+        name: Name of the saved set to load.
+        if_active: "error" (default) to refuse loading when active is non-empty;
+            "overwrite" to unfocus current first. For save-then-load atomicity,
+            use engram_focus_swap instead.
+
+    Returns:
+        JSON with loaded IDs, cascade resolution report (auto_followed_supersede,
+        dropped_retracted, dropped_missing), and active_set_name.
+    """
+    name = name.strip()
+    if if_active not in {"error", "overwrite"}:
+        return json.dumps({
+            "status": "error",
+            "error": f"if_active must be 'error' or 'overwrite', got '{if_active}'",
+        })
+
+    conn = _get_db()
+    try:
+        saved_row = conn.execute(
+            "SELECT name, node_ids, description FROM focus_sets WHERE name = ?",
+            (name,),
+        ).fetchone()
+        if saved_row is None:
+            return json.dumps({
+                "status": "error",
+                "error": (
+                    f"No focus set named '{name}'. "
+                    "Use engram_focus_sets() to list available sets."
+                ),
+            })
+
+        state = conn.execute(
+            "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
+        ).fetchone()
+        active_rows = conn.execute(
+            "SELECT id, type FROM nodes "
+            "WHERE focused_at IS NOT NULL AND is_current = 1 "
+            "ORDER BY focused_at ASC"
+        ).fetchall()
+
+        # Resolve upfront so we can distinguish "truly already-active" from
+        # "name matches but cascade state has shifted since last load."
+        loaded, followed, dropped_retracted, dropped_missing = _resolve_set_members(
+            saved_row["node_ids"], conn,
+        )
+        active_ids_set = {r["id"] for r in active_rows}
+        resolved_set = set(loaded)
+        name_matches = bool(state and state["active_set_name"] == name)
+
+        # Already-active fast path: name matches AND resolved members match
+        # current active list exactly. Refresh timestamps, return.
+        if name_matches and active_rows and resolved_set == active_ids_set:
+            now = _now()
+            conn.execute(
+                "UPDATE focus_sets SET last_loaded_at = ?, "
+                "load_count = load_count + 1 WHERE name = ?",
+                (now, name),
+            )
+            conn.commit()
+            return json.dumps({
+                "status": "already_active",
+                "name": name,
+                "focused": [r["id"] for r in active_rows],
+                "focus_list_size": len(active_rows),
+                "active_set_name": name,
+            })
+
+        # Name matches but resolved differs — this is a reload to refresh
+        # cascade state. Treat as implicit overwrite (no need for the user
+        # to pass if_active='overwrite' to reload their own set).
+        implicit_overwrite = name_matches and resolved_set != active_ids_set
+
+        if active_rows and if_active == "error" and not implicit_overwrite:
+            return json.dumps({
+                "status": "error",
+                "error": (
+                    f"Active focus list has {len(active_rows)} node(s) "
+                    f"(active_set_name={state['active_set_name'] if state else None}). "
+                    "Pass if_active='overwrite' to unfocus first, or use "
+                    "engram_focus_swap to save-current + load-other atomically."
+                ),
+                "current_focus_size": len(active_rows),
+                "current_focus_ids": [r["id"] for r in active_rows],
+                "current_active_set_name": state["active_set_name"] if state else None,
+            })
+
+        now = _now()
+
+        if active_rows and (if_active == "overwrite" or implicit_overwrite):
+            ids_to_clear = [r["id"] for r in active_rows]
+            type_map_clear = {r["id"]: r["type"] for r in active_rows}
+            placeholders = ",".join("?" * len(ids_to_clear))
+            conn.execute(
+                f"UPDATE nodes SET focused_at = NULL, focus_reason = NULL "
+                f"WHERE id IN ({placeholders})",
+                ids_to_clear,
+            )
+            clear_reason = "reloaded_same_set" if implicit_overwrite else "cleared_for_load"
+            for nid in ids_to_clear:
+                _log_edit(
+                    conn, "unfocused", nid, type_map_clear.get(nid, "unknown"),
+                    {"reason": clear_reason, "loading_set": name},
+                )
+
+        load_reason = (
+            saved_row["description"].strip()
+            if saved_row["description"] and saved_row["description"].strip()
+            else f"loaded from set: {name}"
+        )
+
+        if loaded:
+            placeholders = ",".join("?" * len(loaded))
+            type_rows = conn.execute(
+                f"SELECT id, type FROM nodes WHERE id IN ({placeholders})",
+                loaded,
+            ).fetchall()
+            type_map = {r["id"]: r["type"] for r in type_rows}
+            conn.execute(
+                f"UPDATE nodes SET focused_at = ?, focus_reason = ? "
+                f"WHERE id IN ({placeholders})",
+                [now, load_reason] + loaded,
+            )
+            for nid in loaded:
+                _log_edit(
+                    conn, "focused", nid, type_map.get(nid, "unknown"),
+                    {"reason": load_reason, "from_set": name},
+                )
+
+        conn.execute(
+            "UPDATE focus_sets SET last_loaded_at = ?, "
+            "load_count = load_count + 1 WHERE name = ?",
+            (now, name),
+        )
+        _set_active_set_name(name, conn)
+        conn.commit()
+
+        return json.dumps({
+            "status": "ok",
+            "name": name,
+            "loaded": loaded,
+            "auto_followed_supersede": [
+                {"original": o, "loaded": n} for (o, n) in followed
+            ],
+            "dropped_retracted": dropped_retracted,
+            "dropped_missing": dropped_missing,
+            "focus_list_size": len(loaded),
+            "active_set_name": name,
+        })
+    finally:
+        conn.close()
+
+
+@mcp.tool(
+    name="engram_focus_swap",
+    annotations={
+        "title": "Atomic Save-Current + Load-Other",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_focus_swap(save_as: str, load: str = "", description: str = "") -> str:
+    """Atomic save-current + optionally-load-other. The common "pivot" op.
+
+    Saves the current active list as `save_as`, then loads `load` (if given).
+    Both halves run in one transaction — if the load target doesn't exist,
+    the save is rolled back too.
+
+    If save_as == load, this is a no-op: saves current under the same name
+    and returns already_active.
+
+    Args:
+        save_as: Name to save current active list under. Overwrites if it
+            already exists.
+        load: Name of the set to load after saving. Empty string means
+            save-only (active_set_name is set to save_as).
+        description: Optional description for save_as.
+
+    Returns:
+        JSON with both save and load summaries, and active_set_name.
+    """
+    save_as = save_as.strip()
+    load = load.strip()
+    if not FOCUS_SET_NAME_PATTERN.match(save_as):
+        return json.dumps({
+            "status": "error",
+            "error": f"Invalid save_as '{save_as}': must match ^[a-z0-9_-]{{1,50}}$",
+        })
+    if load and not FOCUS_SET_NAME_PATTERN.match(load):
+        return json.dumps({
+            "status": "error",
+            "error": f"Invalid load '{load}': must match ^[a-z0-9_-]{{1,50}}$",
+        })
+
+    conn = _get_db()
+    try:
+        active_rows = conn.execute(
+            "SELECT id, type FROM nodes "
+            "WHERE focused_at IS NOT NULL AND is_current = 1 "
+            "ORDER BY focused_at ASC"
+        ).fetchall()
+        if not active_rows:
+            return json.dumps({
+                "status": "error",
+                "error": "Active focus list is empty — nothing to save.",
+            })
+        active_ids = [r["id"] for r in active_rows]
+        active_type_map = {r["id"]: r["type"] for r in active_rows}
+
+        now = _now()
+
+        # Save half
+        existing_save = conn.execute(
+            "SELECT name FROM focus_sets WHERE name = ?",
+            (save_as,),
+        ).fetchone()
+        if existing_save:
+            conn.execute(
+                "UPDATE focus_sets SET node_ids = ?, description = ?, created_at = ? "
+                "WHERE name = ?",
+                (json.dumps(active_ids), description.strip(), now, save_as),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO focus_sets "
+                "(name, node_ids, description, created_at, load_count) "
+                "VALUES (?, ?, ?, ?, 0)",
+                (save_as, json.dumps(active_ids), description.strip(), now),
+            )
+
+        # No-load branch
+        if not load:
+            _set_active_set_name(save_as, conn)
+            conn.commit()
+            return json.dumps({
+                "status": "ok",
+                "saved": {
+                    "name": save_as,
+                    "node_count": len(active_ids),
+                    "node_ids": active_ids,
+                },
+                "loaded": None,
+                "active_set_name": save_as,
+            })
+
+        # Same-name no-op
+        if save_as == load:
+            _set_active_set_name(save_as, conn)
+            conn.execute(
+                "UPDATE focus_sets SET last_loaded_at = ?, "
+                "load_count = load_count + 1 WHERE name = ?",
+                (now, save_as),
+            )
+            conn.commit()
+            return json.dumps({
+                "status": "already_active",
+                "saved": {"name": save_as, "node_count": len(active_ids)},
+                "loaded": {"name": save_as, "node_count": len(active_ids)},
+                "active_set_name": save_as,
+            })
+
+        # Load target validation — rollback save if missing
+        load_row = conn.execute(
+            "SELECT name, node_ids, description FROM focus_sets WHERE name = ?",
+            (load,),
+        ).fetchone()
+        if load_row is None:
+            conn.rollback()
+            return json.dumps({
+                "status": "error",
+                "error": (
+                    f"Load target set '{load}' does not exist. "
+                    "No changes made (save rolled back)."
+                ),
+            })
+
+        # Clear active
+        placeholders_clear = ",".join("?" * len(active_ids))
+        conn.execute(
+            f"UPDATE nodes SET focused_at = NULL, focus_reason = NULL "
+            f"WHERE id IN ({placeholders_clear})",
+            active_ids,
+        )
+        for nid in active_ids:
+            _log_edit(
+                conn, "unfocused", nid, active_type_map.get(nid, "unknown"),
+                {"reason": "swap_out_to", "to_set": load, "saved_as": save_as},
+            )
+
+        # Resolve + focus load set
+        loaded, followed, dropped_retracted, dropped_missing = _resolve_set_members(
+            load_row["node_ids"], conn,
+        )
+        load_reason = (
+            load_row["description"].strip()
+            if load_row["description"] and load_row["description"].strip()
+            else f"loaded from set: {load}"
+        )
+
+        if loaded:
+            p2 = ",".join("?" * len(loaded))
+            type_rows2 = conn.execute(
+                f"SELECT id, type FROM nodes WHERE id IN ({p2})",
+                loaded,
+            ).fetchall()
+            type_map2 = {r["id"]: r["type"] for r in type_rows2}
+            conn.execute(
+                f"UPDATE nodes SET focused_at = ?, focus_reason = ? "
+                f"WHERE id IN ({p2})",
+                [now, load_reason] + loaded,
+            )
+            for nid in loaded:
+                _log_edit(
+                    conn, "focused", nid, type_map2.get(nid, "unknown"),
+                    {"reason": load_reason, "from_set": load},
+                )
+
+        conn.execute(
+            "UPDATE focus_sets SET last_loaded_at = ?, "
+            "load_count = load_count + 1 WHERE name = ?",
+            (now, load),
+        )
+        _set_active_set_name(load, conn)
+        conn.commit()
+
+        return json.dumps({
+            "status": "ok",
+            "saved": {
+                "name": save_as,
+                "node_count": len(active_ids),
+                "node_ids": active_ids,
+            },
+            "loaded": {
+                "name": load,
+                "node_count": len(loaded),
+                "loaded_ids": loaded,
+                "auto_followed_supersede": [
+                    {"original": o, "loaded": n} for (o, n) in followed
+                ],
+                "dropped_retracted": dropped_retracted,
+                "dropped_missing": dropped_missing,
+            },
+            "active_set_name": load,
+        })
+    finally:
+        conn.close()
+
+
+@mcp.tool(
+    name="engram_focus_sets",
+    annotations={
+        "title": "List All Saved Focus Sets",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_focus_sets() -> str:
+    """List all saved focus sets with metadata and the current active_set_name.
+
+    Ordered by last_loaded_at DESC (most-recently-used first), then created_at
+    DESC. The `is_active` field on each set indicates whether it's the currently-
+    loaded set.
+
+    Returns:
+        JSON: {status, count, active_set_name, sets: [{name, node_count,
+        description, created_at, last_loaded_at, load_count, is_active}]}.
+    """
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT name, node_ids, description, created_at, last_loaded_at, load_count "
+            "FROM focus_sets "
+            "ORDER BY COALESCE(last_loaded_at, '0000') DESC, created_at DESC"
+        ).fetchall()
+        state = conn.execute(
+            "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
+        ).fetchone()
+        active_set_name = state["active_set_name"] if state else None
+
+        sets = []
+        for r in rows:
+            try:
+                nids = json.loads(r["node_ids"])
+            except (json.JSONDecodeError, TypeError):
+                nids = []
+            sets.append({
+                "name": r["name"],
+                "node_count": len(nids),
+                "description": r["description"] or "",
+                "created_at": r["created_at"],
+                "last_loaded_at": r["last_loaded_at"],
+                "load_count": r["load_count"],
+                "is_active": r["name"] == active_set_name,
+            })
+        return json.dumps({
+            "status": "ok",
+            "count": len(sets),
+            "active_set_name": active_set_name,
+            "sets": sets,
+        })
+    finally:
+        conn.close()
+
+
+@mcp.tool(
+    name="engram_focus_delete_set",
+    annotations={
+        "title": "Delete a Saved Focus Set",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_focus_delete_set(name: str) -> str:
+    """Remove a saved focus set. Active list is unaffected.
+
+    Deleting is dropping the bookmark, not closing the tab — if this set was
+    currently active, active_set_name is cleared to NULL (the active list
+    becomes ad-hoc) but the focused nodes stay focused.
+
+    Args:
+        name: Name of the saved set to delete.
+
+    Returns:
+        JSON with deleted name, node_count it contained, and whether it was
+        the active set.
+    """
+    name = name.strip()
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            "SELECT name, node_ids FROM focus_sets WHERE name = ?",
+            (name,),
+        ).fetchone()
+        if row is None:
+            return json.dumps({
+                "status": "error",
+                "error": f"No focus set named '{name}'",
+            })
+
+        state = conn.execute(
+            "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
+        ).fetchone()
+        was_active = bool(state and state["active_set_name"] == name)
+
+        conn.execute("DELETE FROM focus_sets WHERE name = ?", (name,))
+        if was_active:
+            _set_active_set_name(None, conn)
+        conn.commit()
+
+        try:
+            node_count = len(json.loads(row["node_ids"]))
+        except (json.JSONDecodeError, TypeError):
+            node_count = 0
+
+        return json.dumps({
+            "status": "ok",
+            "deleted": name,
+            "node_count": node_count,
+            "was_active": was_active,
+            "active_set_name": None if was_active else (
+                state["active_set_name"] if state else None
+            ),
         })
     finally:
         conn.close()
@@ -8248,6 +9650,7 @@ def engram_list_focused() -> str:
 _REFLECT_TOP_N = {
     "active_goals": 10,
     "active_tasks": 10,
+    "active_lessons": 10,
     "unresolved_goal_tensions": 5,
     "unresolved_contradictions": 5,
     "tainted_nodes": 5,
@@ -8270,7 +9673,8 @@ _REFLECT_TRUNC_FIELDS = {
     "predicted_event", "event", "reported_state", "trigger",
 }
 _REFLECT_LIST_ORDER = [
-    "active_goals", "active_tasks", "unresolved_goal_tensions", "unresolved_contradictions",
+    "active_goals", "active_tasks", "active_lessons",
+    "unresolved_goal_tensions", "unresolved_contradictions",
     "tainted_nodes", "stale_nodes", "overdue_predictions", "open_conjectures",
     "recent_feeling_reports",
     "weakly_grounded", "thin_support_derivations", "open_questions",
@@ -8520,8 +9924,9 @@ def engram_reflect() -> str:
         active_lessons = []
         for ls in lessons:
             ls_meta = json.loads(ls["metadata"]) if ls["metadata"] else {}
+            # Incidents point AT the lesson via `exemplifies` (incident → lesson).
             incident_edges = conn.execute(
-                "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'derives_from'",
+                "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'exemplifies'",
                 (ls["id"],),
             ).fetchall()
             active_lessons.append({
@@ -8530,7 +9935,7 @@ def engram_reflect() -> str:
                 "confidence": ls["confidence"],
                 "scaffolding_nudge": ls_meta.get("scaffolding_nudge", ""),
                 "incident_count": len(incident_edges),
-                "incidents": [e["target_id"] for e in incident_edges],
+                "incidents": [e["source_id"] for e in incident_edges],
                 "since": ls["created_at"],
             })
         report["active_lessons"] = active_lessons

@@ -269,7 +269,7 @@ A **prescriptive rule extracted from repeated mistakes.** Error observations des
 - Anything that generalizes across the session — that's a derivation about my patterns, not a feeling at a moment.
 
 **Discipline.**
-- Be specific. "I felt curious" is weak; "I noticed a pull to solve it myself when the user offered help" is real.
+- Be specific. "I felt curious" is weak; "I noticed a pull to solve it myself when the collaborator offered help" is real.
 - Treat as calibration material, not truth about me (gl_0025: introspection as data, not truth).
 - Dedup-exempt — similar shapes recur legitimately; don't suppress.
 
@@ -329,11 +329,11 @@ A **prescriptive rule extracted from repeated mistakes.** Error observations des
 
 **Anchor shape.** Importance-anchored (base 2.0). No confidence. A person's durability matches the relationship's — long.
 
-**When to write.** First meaningful engagement with a new person worth remembering across sessions. Establishing `is_self` — exactly one self-person exists (named during the agent's first-session naming ceremony).
+**When to write.** First meaningful engagement with a new person worth remembering across sessions. Establishing `is_self` — exactly one self-person exists, named during the agent's first-session naming ceremony.
 
 **When NOT to.** One-off references to third parties mentioned in sources — noted in observations' interpretation fields, not promoted to person nodes.
 
-**Discipline.** Attach facts about a person via `about` edges, not by embedding identity in claim text. "The user asked X" as observation content is fine; "The user prefers direct feedback" as a general fact about them should be an observation with an `about` edge to their person node, so it surfaces when I query around the relationship.
+**Discipline.** Attach facts about a person via `about` edges, not by embedding identity in claim text. "Alex asked X" as observation content is fine; "Alex prefers direct feedback" as a general fact about Alex should be an observation with an `about` edge to their person node, so it surfaces when I query around the relationship.
 
 **Anti-pattern.** Creating person nodes for every name that comes up. The anchor matters — person nodes are meant to be few and long-lived.
 
@@ -383,12 +383,14 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
   `(observations_json, url+title|evidence_id)`
 - **engram_add_axiom** — Foundational assumption (conf 1.0, importance-anchored).
   `(claim, basis, [context_ids])`
-- **engram_derive** — Multi-premise inference with reasoning type.
-  `(claim, supporting_ids, logical_chain, [reasoning_type, derivation_mode, context_ids])`
+- **engram_derive** — Multi-premise inference with reasoning type. Blocks hard on retracted/tainted premises and soft on stale premises (see §6.5). Soft block is opt-in with `use_stale=True`; opting in stamps a `metadata.built_on_stale` audit marker so later maintenance tools can redirect the edge to the replacement without re-deriving.
+  `(claim, supporting_ids, logical_chain, [reasoning_type, derivation_mode, context_ids, use_stale])`
 - **engram_add_conjecture** — Provisional, resolvable hypothesis (conf 0.10–0.60).
   `(claim, basis, [initial_confidence, context_ids])`
-- **engram_add_lesson** — Rule learned from an incident, with scaffolding nudge.
+- **engram_add_lesson** — Rule learned from an incident, with scaffolding nudge. Incidents are linked with `exemplifies` edges (incident → lesson, DAG-exempt).
   `(claim, incident_ids, scaffolding_nudge, logical_chain, [reasoning_type, context_ids])`
+- **engram_lesson_register_incident** — Attach a post-hoc incident to an existing lesson. Writes one `exemplifies` edge and refreshes the surface-hook cache. Use when a fresh error surfaces that matches a lesson already in the graph — avoids supersede churn. Idempotent.
+  `(lesson_id, incident_id, [note])`
 
 ### Write — structural
 
@@ -398,7 +400,7 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
   `(claim, motivation, [context_ids])`
 - **engram_goal_tension** — Value-level conflict between two goals.
   `(goal_id_a, goal_id_b, description, [analysis])`
-- **engram_ask** — Open research question (non-claim-bearing; never cited as premise).
+- **engram_ask** — Open research question (non-claim-bearing; never cited as premise). Recommended: run `engram_check_similar(question)` first — no inline dedup fallback exists here, unlike `engram_add_observation`. The general "reach sideways before writing" reflex is the only line of defense against duplicate questions.
   `(question, [context_ids, category, lacks])`
 - **engram_add_task** — Execution-scoped to-do, optionally linked to a goal.
   `(description, [goal_id, implements_ids, parent_task_id, scope])`
@@ -413,8 +415,7 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
 
 ### Revise state
 
-- **engram_supersede** — Replace an outdated claim with a refined one. `support_ids` is the full explicit premise list for the revised claim (no inheritance from the old node — cite previous supports organically if still valid).
-  `(old_node_id, new_claim, logical_chain, [support_ids])`
+- **engram_supersede** — Wire the supersede relationship between an already-created replacement node and the old node it replaces. Purely relational — does NOT create the new node. **Two-step workflow:** first create the replacement via its type's canonical creation tool (`engram_derive` for derivations, `engram_add_observation` for observations, `engram_add_axiom` / `engram_add_definition` / `engram_add_goal` / `engram_add_conjecture` for those types), then call `engram_supersede(old_id, new_id, [supersede_reason])`. Same-type only; DAG invariant enforced (new.created_at >= old.created_at); new node must not already supersede something else; feeling_reports cannot be superseded (retract + file new). `supersede_reason` lands in the supersedes edge's metadata — include it only when the claim diff alone wouldn't make the motivation obvious. Signature: `(old_node_id, new_node_id, supersede_reason="")`.
 - **engram_retract** — Mark a claim as wrong; cascade taint to dependents.
   `(node_id, error_type, reason, [replacement_json])`
 - **engram_contradict** — Link two conflicting claims.
@@ -443,12 +444,22 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
 
 ### Meta — focus, audit, commit
 
-- **engram_focus** — Pin nodes to the next compaction summary (cap 15).
+- **engram_focus** — Pin nodes to the active focus list (cap 15).
   `(node_ids, reason)`
 - **engram_unfocus** — Release pinned nodes.
   `(node_ids)`
-- **engram_list_focused** — Show current pins.
+- **engram_list_focused** — Show current pins + `active_set_name`.
   `()`
+- **engram_focus_save** — Snapshot active list under a named saved set.
+  `(name, description="", overwrite=False)`
+- **engram_focus_load** — Load a saved set into the active list (cascade-resolves).
+  `(name, if_active="error")`
+- **engram_focus_swap** — Atomic save-current + optionally-load-other.
+  `(save_as, load=None, description="")`
+- **engram_focus_sets** — List all saved sets + metadata.
+  `()`
+- **engram_focus_delete_set** — Remove a saved set.
+  `(name)`
 - **engram_stats** — Graph counts.
   `()`
 - **engram_diagnose** — Quantitative health audit (health score 0–100).
@@ -599,6 +610,8 @@ Conjectures are provisional foundations (conf 0.10–0.60). Questions are resear
 
 Retract poisons the chain (downstream marked tainted, needs re-evaluation). Supersede ages the chain gracefully (downstream marked stale, may still hold). Retracting correct-but-outdated nodes is a category error that fires false cascades; superseding actually-wrong nodes leaves downstream poison in place.
 
+**Retract is on-the-spot error cleanup, not knowledge update.** If I realize a claim was wrong *at write time* — fabricated quote, mis-citation, hallucinated premise — retract. If my *understanding* evolved and the earlier claim was honest-but-outdated, supersede. The distinction matters because retract poisons downstream; using it for knowledge updates fires false cascades and makes agents avoid recording revisions. (This is also why `engram_revive` doesn't exist — with the retract-vs-supersede line crisp, the "I retracted and shouldn't have" case collapses to supersede or to recreating the observation.)
+
 ### §6.4 Contradict vs goal-tension
 
 | Test | Answer |
@@ -608,6 +621,47 @@ Retract poisons the chain (downstream marked tainted, needs re-evaluation). Supe
 | Is the disagreement about "what is true" vs "what should we prioritize"? | Factual → contradict; directional → goal tension |
 
 Goal tensions resolve via synthesis, prioritization, or dissolution — not via one goal winning on truth-value (goals aren't claim-bearing). Contradictions resolve via a superseding claim that picks a winner or derives a synthesis. Mixing these two is the "why is my goal conflict tainting downstream claims" bug.
+
+### §6.5 Taint & stale — visibility and blocking
+
+When an upstream node is retracted or superseded, the cascade marks every downstream dependent. The four read tools (`engram_inspect`, `engram_surface`, `engram_query`, `engram_get_subgraph`) expose these flags as top-level `warnings`, separate from the node's confidence — confidence stays intact; the warning carries the epistemic weight.
+
+Shape of `warnings` when present:
+
+```
+{
+  "tainted_by": [
+    {"retracted_id", "retracted_claim_excerpt",
+     "retracted_at", "retraction_reason_excerpt"},
+    ...
+  ],
+  "stale_by": [
+    {"superseded_id", "replaced_by_id", "superseded_at"},
+    ...
+  ]
+}
+```
+
+Absent when the node is clean. `engram_surface` additionally rolls up per-node warnings into `issues.warnings_by_id` for all matched nodes, plus inline copies on entries in `top_claims` / `special_nodes`.
+
+`engram_derive` enforces a two-tier block on `supporting_ids`:
+
+| Upstream state of a premise | Block | Override |
+|---|---|---|
+| Retracted (or downstream of a retraction) | **hard** — `BLOCKED_TAINTED` | none |
+| Superseded (or downstream of a supersede) | **soft** — `BLOCKED_STALE` | `use_stale=True` |
+| Mixed tainted + stale | hard (taint dominates) | none |
+
+Soft-block opt-in stamps `metadata.built_on_stale=[id,...]` on the new derivation. Read it as a declaration: *"I saw the update, judged it irrelevant to this logic, proceed."* Future maintenance tools can redirect these edges to the replacements mechanically without re-deriving.
+
+**When a read surfaces warnings, four resolutions:**
+
+1. **Drop it.** Base the reasoning on solid grounds. Lowest-friction default for non-cornerstone tainted derivations.
+2. **Re-derive on the replacement premise.** When the retracted upstream has a correction: `engram_derive` citing the replacement to produce a new derivation, then `engram_supersede(old_tainted_dv_id, new_dv_id)` to wire the supersede relationship. (Remember supersede is same-type and purely relational — the new derivation must exist first.)
+3. **Queue with a review marker.** When dropping would lose the conclusion and re-deriving isn't possible right now: leave a note and come back.
+4. **File a question.** When the conclusion's validity under the correction is non-obvious — `engram_ask` makes the uncertainty tractable.
+
+Never pretend not to see the warning. The whole point of the top-level surfacing is that silent propagation (the Mao-Cao pattern) is the failure the cascade was designed to prevent.
 
 ---
 
@@ -635,6 +689,40 @@ Focus mode is the **deterministic channel** for cornerstone knowledge to cross a
 - If I'm tempted to raise the cap, the right move is usually to rotate, not to expand.
 
 **Anti-pattern.** Pinning for preservation instead of for compaction-channel use. Focus is not a bookmarking system — it is the summary's verbatim channel. Ordinary durability comes from importance anchoring and active recall.
+
+### §7.1 Tabs model — saved focus sets
+
+The active list is one tab. **Saved focus sets** are additional tabs — named, persistent snapshots of node IDs that can be swapped into active on demand. Total addressable focused-knowledge surface = `FOCUS_LIST_CAP × N_saved_sets` instead of just `FOCUS_LIST_CAP`.
+
+When to use saved sets:
+- Multiple concurrent work-streams (paper drafting, MECH-N mechanics, a conjecture investigation, a relational thread). Each stream gets its own set; the active tab is whichever stream I'm on right now.
+- Pausing a thread that isn't dead (it'll come back). Save as a named set before rotating to the next stream; the thread-state is preserved in full instead of dismantled piecemeal for slot pressure.
+- Coming back to a thread after a pivot. Load the saved set; the exact pins are restored (with cascade resolution — supersede chains auto-follow to current versions, retracted nodes drop with a report).
+
+The five tools:
+
+| Tool | Purpose |
+|---|---|
+| `engram_focus_save(name, description="", overwrite=False)` | Snapshot current active under `name`. Bookmark, not rotation — active is unchanged. Sets `active_set_name = name`. |
+| `engram_focus_load(name, if_active="error")` | Load a saved set into active. Default errors if active is non-empty; `if_active="overwrite"` unfocuses current first. Cascade resolution applied at load time. |
+| `engram_focus_swap(save_as, load=None, description="")` | Atomic save-current + optionally-load-other. Both halves succeed or neither. Common "pivot thread" op. |
+| `engram_focus_sets()` | List all saved sets with metadata (`name`, `node_count`, `description`, `created_at`, `last_loaded_at`, `load_count`, `is_active`, plus top-level `active_set_name`). |
+| `engram_focus_delete_set(name)` | Remove a saved set. Clears `active_set_name` if it was active; active list itself is untouched (dropping the bookmark ≠ closing the tab). |
+
+**Naming.** Set names must match `^[a-z0-9_-]{1,50}$` — lowercase alphanumerics, underscore, hyphen; 1–50 chars. No spaces (CLI-friendly), no uppercase (case-insensitive lookup without ambiguity). Convention: stream-local names like `paper-ch1-philosophy`, `mech-5-taint`, `arc-agi-l2`, `cj-0047-investigation`. Keep them flat — tag grouping is YAGNI until there are ~20+ sets.
+
+**Cap.** Each saved set is capped at `FOCUS_LIST_CAP = 15` (enforced implicitly because save snapshots the active list which is already capped). Per-set cap keeps the guarantee that any saved set is legally loadable without blowing the compaction-summary budget. The ergonomic win comes from *many* sets, not bigger ones.
+
+**Cascade resolution on load.** Saved sets store **raw IDs**, immutable — cascade events don't rewrite them. Resolution happens at load time:
+- **Supersede** → auto-follow chain to current version. Reported in `auto_followed_supersede`. Rationale: supersede is a refinement; user's intent was "pin this thread," and the thread is now a node-version better.
+- **Retract** → drop silently, reported in `dropped_retracted`. Retracted nodes are explicitly wrong; loading them back propagates corruption.
+- **Missing** → drop silently, reported in `dropped_missing`. Defensive; shouldn't happen.
+
+**`active_set_name` tracking.** `focus_state` (singleton table) stores which saved set (if any) is currently loaded into active. `engram_list_focused()` exposes it in the return JSON — the post-compact self reads it to know "which tab am I on." `engram_focus` / `engram_unfocus` clear it to `null` when they mutate active in a way that diverges from the saved set (adding a non-member, removing a member). `null` = ad-hoc active list; non-null = named tab.
+
+**Dogfood discipline.** Save sets when rotating threads, don't hoard them. A set that hasn't been `last_loaded_at` in a week is probably dormant — either reload + integrate its pins into current work, or delete. Sets accumulate dust fast if left unrotated.
+
+**Anti-pattern (saved sets).** Using saved sets as general-purpose bookmarks for "interesting nodes." Same rule as active focus: saved sets are the *tabbed* form of the compaction-channel, not a ranked list of things I liked. If a set isn't going to be loaded-back-into-active within a session or two, it doesn't belong here — the node's importance score and recall do the general-preservation job.
 
 ---
 
