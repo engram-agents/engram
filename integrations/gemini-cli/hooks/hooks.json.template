@@ -1,0 +1,57 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "name": "start-engram-daemon",
+            "command": "bash {{ENGRAM_HOOKS_DIR}}/start-engram-daemon.sh",
+            "timeout": 15000,
+            "description": "Starting ENGRAM surface daemon"
+          },
+          {
+            "type": "command",
+            "name": "engram-session-start",
+            "command": "{{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-session-start-hook.py",
+            "timeout": 5000,
+            "description": "Record active-session marker, reset context-tracker baseline"
+          }
+        ]
+      }
+    ],
+    "BeforeAgent": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "name": "engram-user-identity",
+            "command": "{{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-user-identity-hook.py",
+            "timeout": 3000,
+            "description": "Detect user identity from prompt"
+          },
+          {
+            "type": "command",
+            "name": "engram-surface",
+            "command": "{{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-surface-hook.py",
+            "timeout": 10000,
+            "description": "Surface ENGRAM recall and write nudges"
+          }
+        ]
+      }
+    ],
+    "AfterAgent": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "name": "engram-stop",
+            "command": "{{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-stop-hook.py",
+            "timeout": 5000,
+            "description": "Flag missing ENGRAM writes for the turn"
+          }
+        ]
+      }
+    ]
+  }
+}

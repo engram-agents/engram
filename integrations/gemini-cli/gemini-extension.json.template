@@ -1,0 +1,13 @@
+{
+  "name": "engram",
+  "version": "0.1.0",
+  "description": "ENGRAM — Epistemological Node-Graph for Reasoned Agent Memory. Provides MCP tools, hooks, and agent context for structured memory across sessions.",
+  "contextFileName": "GEMINI.md",
+  "mcpServers": {
+    "engram": {
+      "command": "{{PYTHON}}",
+      "args": ["{{ENGRAM_HOME}}/server.py"],
+      "cwd": "{{ENGRAM_HOME}}"
+    }
+  }
+}
