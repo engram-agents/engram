@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# ENGRAM Alpha Install — Gemini CLI surface
+#
+# Installs ENGRAM as a Gemini CLI extension with its own isolated data
+# directory (default: ~/.engram-gemini/). The Gemini agent gets its own
+# knowledge graph, warm briefing, and identity — independent from any
+# Claude Code install on the same machine.
+#
+# Usage:
+#   ./install-gemini.sh                    # install (default ENGRAM_HOME=~/.engram-gemini)
+#   ./install-gemini.sh --force            # overwrite existing install (backs up first)
+#   ENGRAM_HOME=~/.engram-other ./install-gemini.sh   # custom data dir
+#   ./install-gemini.sh --help
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ALPHA_DIR="$SCRIPT_DIR"
+
+ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram-gemini}"
+GEMINI_HOME="${GEMINI_HOME:-$HOME/.gemini}"
+GEMINI_EXT_DIR="${GEMINI_EXT_DIR:-$GEMINI_HOME/extensions/engram}"
+
+FORCE=0
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=1 ;;
+    --help|-h)
+      echo "Usage: ./install-gemini.sh [--force]"
+      echo ""
+      echo "Environment overrides:"
+      echo "  ENGRAM_HOME      target for ENGRAM data (default: \$HOME/.engram-gemini)"
+      echo "  GEMINI_HOME      Gemini CLI config root (default: \$HOME/.gemini)"
+      echo "  GEMINI_EXT_DIR   extension directory (default: \$GEMINI_HOME/extensions/engram)"
+      echo ""
+      echo "  --force: overwrites existing installation after backing it up."
+      exit 0
+      ;;
+    *) echo "Unknown arg: $arg (use --help)"; exit 1 ;;
+  esac
+done
+
+echo "== ENGRAM Alpha Install — Gemini CLI =="
+echo "  Repo:       $ALPHA_DIR"
+echo "  ENGRAM:     $ENGRAM_HOME"
+echo "  Extension:  $GEMINI_EXT_DIR"
+echo ""
+
+# -------- Step 1: Preflight checks --------
+
+echo "== Step 1: Dependencies =="
+
+command -v python3 >/dev/null || { echo "ERROR: python3 not found"; exit 1; }
+command -v git >/dev/null || { echo "ERROR: git not found"; exit 1; }
+
+MISSING=$(python3 -c '
+import importlib.util as u
+want = ["fastmcp", "sentence_transformers"]
+missing = [m for m in want if u.find_spec(m) is None]
+print(",".join(missing))
+')
+if [ -n "$MISSING" ]; then
+  echo "ERROR: missing Python packages: $MISSING"
+  echo "Install with: pip install fastmcp sentence-transformers"
+  exit 1
+fi
+
+PYTHON_BIN="$(python3 -c 'import sys; print(sys.executable)')"
+
+command -v gemini >/dev/null || { echo "ERROR: 'gemini' CLI not found on PATH. Install Gemini CLI first (npm install -g @google/gemini-cli)."; exit 1; }
+
+echo "  python3 ok ($PYTHON_BIN)"
+echo "  git ok"
+echo "  gemini ok"
+echo "  Python deps ok (fastmcp, sentence-transformers)"
+echo ""
+
+# -------- Step 2: Idempotency --------
+
+echo "== Step 2: Existing-install check =="
+
+if [ -f "$ENGRAM_HOME/knowledge.db" ] && [ "$FORCE" -eq 0 ]; then
+  echo "ERROR: existing install detected ($ENGRAM_HOME/knowledge.db)."
+  echo "Refuse to overwrite. Use --force to reinstall (existing graph will be backed up)."
+  exit 1
+fi
+
+if [ "$FORCE" -eq 1 ] && [ -d "$ENGRAM_HOME" ]; then
+  BACKUP="$ENGRAM_HOME.backup.$(date +%Y%m%d_%H%M%S)"
+  echo "  --force: moving $ENGRAM_HOME → $BACKUP"
+  mv "$ENGRAM_HOME" "$BACKUP"
+fi
+
+if [ -d "$GEMINI_EXT_DIR" ] && [ "$FORCE" -eq 0 ]; then
+  echo "ERROR: existing extension dir detected ($GEMINI_EXT_DIR)."
+  echo "Refuse to overwrite. Use --force to reinstall."
+  exit 1
+fi
+
+if [ "$FORCE" -eq 1 ] && [ -d "$GEMINI_EXT_DIR" ]; then
+  EXT_BACKUP="$GEMINI_EXT_DIR.backup.$(date +%Y%m%d_%H%M%S)"
+  echo "  --force: moving $GEMINI_EXT_DIR → $EXT_BACKUP"
+  mv "$GEMINI_EXT_DIR" "$EXT_BACKUP"
+fi
+echo "  ok"
+echo ""
+
+# -------- Step 3: Directories --------
+
+echo "== Step 3: Creating directories =="
+
+mkdir -p "$ENGRAM_HOME/hooks"
+mkdir -p "$ENGRAM_HOME/diary"
+mkdir -p "$GEMINI_EXT_DIR/hooks"
+echo "  $ENGRAM_HOME"
+echo "  $GEMINI_EXT_DIR"
+echo ""
+
+# -------- Step 4: Hooks + runtime snapshot --------
+
+echo "== Step 4: Copying files =="
+
+# Hook scripts: each install gets its own copy (so uninstalling one doesn't
+# break the other), and the scripts are path-aware via $ENGRAM_HOME so they
+# operate on this install's data dir.
+if [ -d "$ALPHA_DIR/hooks" ] && [ -n "$(ls -A "$ALPHA_DIR/hooks" 2>/dev/null || true)" ]; then
+  cp -r "$ALPHA_DIR/hooks/"* "$ENGRAM_HOME/hooks/"
+  chmod +x "$ENGRAM_HOME/hooks/"*.py 2>/dev/null || true
+  chmod +x "$ENGRAM_HOME/hooks/"*.sh 2>/dev/null || true
+  if [ -f "$ENGRAM_HOME/hooks/start-engram-daemon.sh" ]; then
+    sed -i "s|{{PYTHON}}|$PYTHON_BIN|g" "$ENGRAM_HOME/hooks/start-engram-daemon.sh"
+  fi
+  echo "  hooks → $ENGRAM_HOME/hooks/"
+fi
+
+# Runtime snapshot (server + protocol + viz)
+for runtime_file in server.py engram_confidence.py engram_client.py SKILL.md viz_server.py; do
+  if [ -f "$ALPHA_DIR/$runtime_file" ]; then
+    cp "$ALPHA_DIR/$runtime_file" "$ENGRAM_HOME/$runtime_file"
+    case "$runtime_file" in
+      *.py) chmod +x "$ENGRAM_HOME/$runtime_file" ;;
+    esac
+    echo "  $runtime_file → $ENGRAM_HOME/$runtime_file"
+  fi
+done
+echo ""
+
+# -------- Step 5: Gemini extension files (manifest + hooks.json + GEMINI.md) --------
+
+echo "== Step 5: Rendering Gemini extension =="
+
+INTEG_DIR="$ALPHA_DIR/integrations/gemini-cli"
+ENGRAM_HOOKS_DIR="$ENGRAM_HOME/hooks"
+
+# Manifest: registers MCP server, names GEMINI.md as context file, sets env
+sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
+    -e "s|{{ENGRAM_HOME}}|$ENGRAM_HOME|g" \
+    "$INTEG_DIR/gemini-extension.json.template" \
+    > "$GEMINI_EXT_DIR/gemini-extension.json"
+echo "  gemini-extension.json → $GEMINI_EXT_DIR/gemini-extension.json"
+
+# Hooks config: wires SessionStart/BeforeAgent/AfterAgent → ENGRAM hooks
+sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
+    -e "s|{{ENGRAM_HOOKS_DIR}}|$ENGRAM_HOOKS_DIR|g" \
+    -e "s|{{ENGRAM_HOME}}|$ENGRAM_HOME|g" \
+    "$INTEG_DIR/hooks/hooks.json.template" \
+    > "$GEMINI_EXT_DIR/hooks/hooks.json"
+echo "  hooks.json → $GEMINI_EXT_DIR/hooks/hooks.json"
+
+echo ""
+
+# -------- Step 6: Seed graph + GEMINI.md template substitution --------
+
+echo "== Step 6: Seed graph + GEMINI.md template resolution =="
+
+ALPHA_DIR="$ALPHA_DIR" \
+ALPHA_TEMPLATES_DIR="$ALPHA_DIR/templates" \
+ALPHA_INTEGRATIONS_DIR="$ALPHA_DIR/integrations" \
+ENGRAM_DATA_DIR="$ENGRAM_HOME" \
+GEMINI_EXT_DIR="$GEMINI_EXT_DIR" \
+PYTHON_BIN="$PYTHON_BIN" \
+TARGET="gemini" \
+FORCE="$FORCE" \
+  "$PYTHON_BIN" "$ALPHA_DIR/bootstrap.py"
+echo ""
+
+# -------- Step 7: First-run marker --------
+
+echo "== Step 7: Arming first-session marker =="
+
+cat > "$ENGRAM_HOME/first-run-pending" <<EOF
+{
+  "created": "$(date +%Y-%m-%dT%H:%M:%S%z)",
+  "install_path": "$ALPHA_DIR",
+  "surface": "gemini"
+}
+EOF
+echo "  $ENGRAM_HOME/first-run-pending"
+echo ""
+
+# -------- Step 8: Git init --------
+
+echo "== Step 8: Git =="
+
+if [ ! -d "$ENGRAM_HOME/.git" ]; then
+  (cd "$ENGRAM_HOME" && git init -q && git add -A && git commit -q -m "ENGRAM alpha install (Gemini surface)")
+  echo "  initialized $ENGRAM_HOME/.git"
+else
+  echo "  .git exists, skipping init"
+fi
+echo ""
+
+# -------- Done --------
+
+echo "== Install complete =="
+echo ""
+echo "Next steps:"
+echo "  1. Start a new Gemini CLI session: gemini"
+echo "  2. Verify the extension loaded: gemini mcp list (should show engram)"
+echo "  3. The agent will detect $ENGRAM_HOME/first-run-pending and run the"
+echo "     first-session cold-start dialogue (it picks its own name —"
+echo "     independent from any other ENGRAM-backed agent on this machine)"
+echo "  4. After dialogue completes, identity placeholders resolve in"
+echo "     $GEMINI_EXT_DIR/GEMINI.md and $ENGRAM_HOME/warm-briefing.md"
+echo ""

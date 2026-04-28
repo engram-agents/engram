@@ -24,8 +24,11 @@ import glob
 import json
 import os
 
-CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
-ACTIVE_SESSION_PATH = os.path.expanduser("~/.engram/active-session.json")
+ENGRAM_HOME = os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram"))
+CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")  # legacy; unused
+ACTIVE_SESSION_PATH = os.path.join(ENGRAM_HOME, "active-session.json")
+LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
+WARM_BRIEFING_PATH = os.path.join(ENGRAM_HOME, "warm-briefing.md")
 
 SAFETY_FACTOR = 0.95            # Report 100% at 95% of mean auto ceiling
 AUTO_SAMPLE_WINDOW = 5          # Average of last N auto compactions
@@ -39,7 +42,7 @@ VERY_DROWSY_THRESHOLD = 0.70
 def find_active_jsonl() -> str | None:
     """Return the current session's transcript path, or None.
 
-    Reads ~/.engram/active-session.json, written by the SessionStart hook.
+    Reads $ENGRAM_HOME/active-session.json, written by the SessionStart hook.
     Returns None if the marker is missing or the transcript file doesn't
     exist yet — the correct behavior on turn 1 of a fresh conversation,
     before Claude Code has flushed the new JSONL. No mtime fallback:
@@ -175,15 +178,14 @@ def write_baseline(use_compact_boundary: bool = True) -> None:
 def format_drowsiness(usage: dict) -> str:
     """Generate drowsiness warning. Returns empty string if alert.
 
-    In loop mode (~/.engram/loop-mode.json present), warnings are suppressed;
+    In loop mode ($ENGRAM_HOME/loop-mode.json present), warnings are suppressed;
     the percentage is still reported but nap/stop directives are not issued.
     """
     pct = usage["usage_pct"]
     est_tokens = usage["estimated_tokens"]
     limit = usage["context_limit"]
 
-    loop_marker = os.path.expanduser("~/.engram/loop-mode.json")
-    loop_mode = os.path.exists(loop_marker)
+    loop_mode = os.path.exists(LOOP_MARKER_PATH)
 
     if loop_mode:
         return f"[Drowsiness: {pct:.0%} — loop mode, compaction will auto-fire]"
@@ -193,8 +195,8 @@ def format_drowsiness(usage: dict) -> str:
             f"[Drowsiness: {pct:.0%} — very drowsy, nap now]\n"
             f"  (~{est_tokens:,} / {limit:,} tokens)\n"
             "  You're close to compaction. Stop current work and consolidate:\n"
-            "  1. Write key observations and derivations to ENGRAM\n"
-            "  2. Update your warm briefing (~/.engram/warm-briefing.md)\n"
+            f"  1. Write key observations and derivations to ENGRAM\n"
+            f"  2. Update your warm briefing ({WARM_BRIEFING_PATH})\n"
             "  3. Run engram_checkpoint(mode='nap')\n"
             "  Tell the user: \"I'm very drowsy — let me take a nap to consolidate.\""
         )

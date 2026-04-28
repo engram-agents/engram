@@ -2,23 +2,28 @@
 """
 ENGRAM alpha bootstrap.
 
-Invoked by install.sh. Creates the seed graph (5 nodes + 1 edge), then
-substitutes install-time template placeholders (node IDs, repo path) into
-CLAUDE.md, warm-briefing.md, and daily-highlights.md and installs them.
+Invoked by install.sh (TARGET=claude, default) or install-gemini.sh
+(TARGET=gemini). Creates the seed graph (5 nodes + 1 edge) and renders
+target-specific templates with the install-time placeholders.
 
 Does NOT resolve {{AGENT_NAME}}, {{USER_NAME}}, {{TODAY}} — those belong to
 the first-session dialogue, which runs when the user starts their first
-Claude Code session.
+session in the chosen CLI.
 
-Expected env vars (set by install.sh):
-  ALPHA_DIR             — path to the alpha/ snapshot (for seed-manifest)
-  ALPHA_TEMPLATES_DIR   — path to alpha/templates/
-  ENGRAM_DATA_DIR       — target for ~/.engram; also where server.py,
-                          engram_confidence.py, and SKILL.md were copied
-                          in install.sh step 4 (import path below)
-  CLAUDE_HOME           — target for ~/.claude
+Expected env vars:
+  ALPHA_DIR              — path to the alpha/ snapshot (for seed-manifest)
+  ALPHA_TEMPLATES_DIR    — path to alpha/templates/
+  ENGRAM_DATA_DIR        — target for the ENGRAM data dir; also where
+                           server.py, engram_confidence.py, and SKILL.md
+                           were copied (import path below)
+  TARGET                 — 'claude' (default) | 'gemini'
+  CLAUDE_HOME            — required for TARGET=claude (target for ~/.claude)
+  GEMINI_EXT_DIR         — required for TARGET=gemini (target for the
+                           Gemini CLI extension dir, e.g. ~/.gemini/extensions/engram)
+  ALPHA_INTEGRATIONS_DIR — required for TARGET=gemini (path to alpha/integrations/)
 
-Seed graph:
+Seed graph (same for both targets — each install gets its own copy in
+its own knowledge.db):
   - axiom: honesty as structural requirement  → {{AX_HONESTY}}
   - axiom: provenance — every claim traces    → {{AX_PROVENANCE}}
   - definition: ENGRAM                         → {{DF_ENGRAM}}
@@ -37,7 +42,16 @@ from pathlib import Path
 ALPHA_DIR = Path(os.environ["ALPHA_DIR"])
 TEMPLATES_DIR = Path(os.environ["ALPHA_TEMPLATES_DIR"])
 ENGRAM_HOME = Path(os.environ["ENGRAM_DATA_DIR"])
-CLAUDE_HOME = Path(os.environ["CLAUDE_HOME"])
+TARGET = os.environ.get("TARGET", "claude").lower()
+
+if TARGET not in ("claude", "gemini"):
+    raise SystemExit(f"Unknown TARGET={TARGET!r}; must be 'claude' or 'gemini'")
+
+CLAUDE_HOME = Path(os.environ["CLAUDE_HOME"]) if TARGET == "claude" else None
+GEMINI_EXT_DIR = Path(os.environ["GEMINI_EXT_DIR"]) if TARGET == "gemini" else None
+ALPHA_INTEGRATIONS_DIR = (
+    Path(os.environ["ALPHA_INTEGRATIONS_DIR"]) if TARGET == "gemini" else None
+)
 
 # Import the server from the snapshot copied into $ENGRAM_HOME (install.sh
 # step 4). This makes the install self-contained — ongoing main-branch
@@ -199,13 +213,7 @@ def main() -> None:
     )
     print(f"  manifest → {ENGRAM_HOME}/seed-manifest.json", flush=True)
 
-    substitute_template(
-        TEMPLATES_DIR / "CLAUDE.md.template",
-        CLAUDE_HOME / "CLAUDE.md",
-        substitutions,
-    )
-    print(f"  CLAUDE.md → {CLAUDE_HOME}/CLAUDE.md", flush=True)
-
+    # Shared (both targets): warm briefing + daily highlights live in ENGRAM_HOME
     substitute_template(
         TEMPLATES_DIR / "warm-briefing.md.template",
         ENGRAM_HOME / "warm-briefing.md",
@@ -220,14 +228,37 @@ def main() -> None:
     )
     print(f"  daily-highlights.md → {ENGRAM_HOME}/daily-highlights.md", flush=True)
 
-    fragment = TEMPLATES_DIR.parent / "settings.hooks.json.template"
-    if fragment.exists():
-        status = merge_hook_settings(
-            fragment,
-            CLAUDE_HOME / "settings.json",
+    # Target-specific identity doc + hook config
+    if TARGET == "claude":
+        substitute_template(
+            TEMPLATES_DIR / "CLAUDE.md.template",
+            CLAUDE_HOME / "CLAUDE.md",
             substitutions,
         )
-        print(f"  {status}", flush=True)
+        print(f"  CLAUDE.md → {CLAUDE_HOME}/CLAUDE.md", flush=True)
+
+        fragment = TEMPLATES_DIR.parent / "settings.hooks.json.template"
+        if fragment.exists():
+            status = merge_hook_settings(
+                fragment,
+                CLAUDE_HOME / "settings.json",
+                substitutions,
+            )
+            print(f"  {status}", flush=True)
+
+    elif TARGET == "gemini":
+        gemini_template = (
+            ALPHA_INTEGRATIONS_DIR / "gemini-cli" / "GEMINI.md.template"
+        )
+        substitute_template(
+            gemini_template,
+            GEMINI_EXT_DIR / "GEMINI.md",
+            substitutions,
+        )
+        print(f"  GEMINI.md → {GEMINI_EXT_DIR}/GEMINI.md", flush=True)
+        # gemini-extension.json + hooks/hooks.json are rendered by
+        # install-gemini.sh via shell sed (they need only PYTHON / ENGRAM_HOME
+        # / ENGRAM_HOOKS_DIR — none of the seed-graph IDs).
 
 
 if __name__ == "__main__":

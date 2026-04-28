@@ -7,7 +7,11 @@
     "engram": {
       "command": "{{PYTHON}}",
       "args": ["{{ENGRAM_HOME}}/server.py"],
-      "cwd": "{{ENGRAM_HOME}}"
+      "cwd": "{{ENGRAM_HOME}}",
+      "env": {
+        "ENGRAM_HOME": "{{ENGRAM_HOME}}",
+        "ENGRAM_DATA_DIR": "{{ENGRAM_HOME}}"
+      }
     }
   }
 }

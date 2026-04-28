@@ -2,10 +2,11 @@
 # SessionStart hook: ensure the engram surface daemon is running.
 # If already running, this is a no-op.
 
-SOCKET_PATH="$HOME/.engram/recall-daemon.sock"
-PID_PATH="$HOME/.engram/recall-daemon.pid"
+: "${ENGRAM_HOME:=$HOME/.engram}"
+SOCKET_PATH="$ENGRAM_HOME/recall-daemon.sock"
+PID_PATH="$ENGRAM_HOME/recall-daemon.pid"
 DAEMON_SCRIPT="$(dirname "$0")/engram-surface-daemon.py"
-LOG_PATH="$HOME/.engram/surface-daemon.log"
+LOG_PATH="$ENGRAM_HOME/surface-daemon.log"
 
 # Check if daemon is already running
 if [ -f "$PID_PATH" ]; then
@@ -33,8 +34,8 @@ except:
 fi
 
 # Start daemon in background
-mkdir -p "$HOME/.engram"
-nohup {{PYTHON}} "$DAEMON_SCRIPT" >> "$LOG_PATH" 2>&1 &
+mkdir -p "$ENGRAM_HOME"
+nohup env ENGRAM_HOME="$ENGRAM_HOME" {{PYTHON}} "$DAEMON_SCRIPT" >> "$LOG_PATH" 2>&1 &
 
 # Wait briefly for socket to appear
 for i in $(seq 1 20); do

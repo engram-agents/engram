@@ -18,7 +18,7 @@ write_baseline(use_compact_boundary=False)
 # 83 baseline data points establish clear patterns (dv_0170, dv_0171).
 # Shift detection moves to event-driven: user-initiated or voluntary.
 # Re-enable by uncommenting below if trajectory changes.
-# nudge_path = os.path.expanduser("~/.engram/feeling-nudge-active.json")
+# nudge_path = os.path.join(os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram")), "feeling-nudge-active.json")
 # nudge = {"source": "post_compact", "ttl_turns": 5}
 # with open(nudge_path, "w") as f:
 #     json.dump(nudge, f)

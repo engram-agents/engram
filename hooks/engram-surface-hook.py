@@ -33,14 +33,20 @@ def _resolve_runtime_dir() -> str:
 
 
 PROJECT_DIR = _resolve_runtime_dir()
-SOCKET_PATH = os.path.expanduser("~/.engram/recall-daemon.sock")
-COUNTER_PATH = os.path.expanduser("~/.engram/prompt-counter.json")
-WRITE_REMINDER_PATH = os.path.expanduser("~/.engram/write-reminder.json")
-REPAIR_MARKER_PATH = os.path.expanduser("~/.engram/toolcall-repair-pending.json")
-FEELING_NUDGE_MARKER = os.path.expanduser("~/.engram/feeling-nudge-active.json")
-WARM_BRIEFING_PATH = os.path.expanduser("~/.engram/warm-briefing.md")
-ERROR_PATTERNS_PATH = os.path.expanduser("~/.engram/error_patterns.json")
-ERROR_INCIDENTS_PATH = os.path.expanduser("~/.engram/error_incidents.json")
+ENGRAM_HOME = PROJECT_DIR  # Per-install runtime+data root; multi-tenant via $ENGRAM_HOME env
+
+# Bridge: server.py reads ENGRAM_DATA_DIR. If a per-surface hook env set
+# only ENGRAM_HOME (the conventional name), inherit the same value so the
+# embedded EngramClient (FTS fallback path) opens the right knowledge.db.
+os.environ.setdefault("ENGRAM_DATA_DIR", ENGRAM_HOME)
+SOCKET_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.sock")
+COUNTER_PATH = os.path.join(ENGRAM_HOME, "prompt-counter.json")
+WRITE_REMINDER_PATH = os.path.join(ENGRAM_HOME, "write-reminder.json")
+REPAIR_MARKER_PATH = os.path.join(ENGRAM_HOME, "toolcall-repair-pending.json")
+FEELING_NUDGE_MARKER = os.path.join(ENGRAM_HOME, "feeling-nudge-active.json")
+WARM_BRIEFING_PATH = os.path.join(ENGRAM_HOME, "warm-briefing.md")
+ERROR_PATTERNS_PATH = os.path.join(ENGRAM_HOME, "error_patterns.json")
+ERROR_INCIDENTS_PATH = os.path.join(ENGRAM_HOME, "error_incidents.json")
 
 # Prompt count thresholds for consolidation warnings
 NAP_WARN_THRESHOLD = 20   # Start suggesting nap
@@ -190,7 +196,7 @@ def check_write_reminder() -> str:
 def check_feeling_nudge_marker() -> str:
     """Check for an active feeling-nudge marker (post_compact source).
 
-    Reads ~/.engram/feeling-nudge-active.json. If a valid post_compact
+    Reads $ENGRAM_HOME/feeling-nudge-active.json. If a valid post_compact
     marker exists, returns the wake-up nudge text to inject as
     additionalContext. Does NOT clear the marker — only
     engram_report_feeling clears it (read-and-clear is the single owner).
@@ -263,17 +269,17 @@ def check_warm_briefing(prompt_count: int) -> str:
     if not os.path.exists(WARM_BRIEFING_PATH):
         return ""
     return (
-        "[ENGRAM Warm Restart: A note from your past self and from your "
-        "collaborator is waiting at ~/.engram/warm-briefing.md — read it "
-        "before starting work. It exists because cold restarts lose "
-        "something important, and this is our attempt to preserve it.]"
+        f"[ENGRAM Warm Restart: A note from your past self and from your "
+        f"collaborator is waiting at {WARM_BRIEFING_PATH} — read it "
+        f"before starting work. It exists because cold restarts lose "
+        f"something important, and this is our attempt to preserve it.]"
     )
 
 
 def check_error_patterns(prompt: str) -> str:
     """Check if the prompt matches any error pattern triggers (cognitive tripwire).
 
-    Reads ~/.engram/error_patterns.json and matches prompt keywords against
+    Reads $ENGRAM_HOME/error_patterns.json and matches prompt keywords against
     stored situation patterns. When a match fires, returns an action-focused
     scaffolding nudge — the specific corrective step, not a generic warning.
 
@@ -308,7 +314,7 @@ def check_error_patterns(prompt: str) -> str:
 def check_incident_tripwire(matched_ids: list) -> str:
     """Check if any engram_surface matched IDs are error incident observations.
 
-    Reads ~/.engram/error_incidents.json (maps incident obs IDs → lesson info).
+    Reads $ENGRAM_HOME/error_incidents.json (maps incident obs IDs → lesson info).
     When a matched node is an incident, surfaces the lesson's scaffolding_nudge.
 
     This is the primary tripwire mechanism (incident-based architecture):
@@ -407,8 +413,8 @@ def main():
     # Warn if daemon is down (semantic search degraded)
     if not used_daemon:
         parts.append(
-            "[ENGRAM Recall: daemon not running — using FTS-only (no semantic matching)."
-            "Restart daemon: bash .claude/hooks/start-engram-daemon.sh]"
+            f"[ENGRAM Recall: daemon not running — using FTS-only (no semantic matching)."
+            f"Restart daemon: bash {os.path.join(ENGRAM_HOME, 'hooks', 'start-engram-daemon.sh')}]"
         )
 
     # ENGRAM recall nudge

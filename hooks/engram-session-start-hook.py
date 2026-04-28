@@ -2,7 +2,7 @@
 """Session start: record active-session marker, reset context-tracker baseline,
 clear sticky user identity, and inject session info into the conversation.
 
-The active-session marker (~/.engram/active-session.json) is the canonical
+The active-session marker ($ENGRAM_HOME/active-session.json) is the canonical
 pointer to the current JSONL. Fixes the turn-1 drowsiness bug where the
 tracker picked newest-by-mtime globally and grabbed yesterday's file before
 the new conversation's JSONL had flushed. Also gives observation tooling a
@@ -16,8 +16,11 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import write_baseline
 
-ACTIVE_SESSION_PATH = os.path.expanduser("~/.engram/active-session.json")
-CURRENT_USER_PATH = os.path.expanduser("~/.engram/current_user.json")
+ENGRAM_HOME = os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram"))
+ACTIVE_SESSION_PATH = os.path.join(ENGRAM_HOME, "active-session.json")
+CURRENT_USER_PATH = os.path.join(ENGRAM_HOME, "current_user.json")
+WARM_BRIEFING_PATH = os.path.join(ENGRAM_HOME, "warm-briefing.md")
+DAILY_HIGHLIGHTS_PATH = os.path.join(ENGRAM_HOME, "daily-highlights.md")
 
 
 def write_marker(hook_input: dict) -> dict | None:
@@ -64,9 +67,9 @@ def main() -> None:
             f"transcript at {marker['transcript_path']}]"
         )
     lines.append(
-        "[Session start reading — before responding to the first task, read "
-        "~/.engram/warm-briefing.md (relational context) and "
-        "~/.engram/daily-highlights.md (yesterday's milestones + current focus).]"
+        f"[Session start reading — before responding to the first task, read "
+        f"{WARM_BRIEFING_PATH} (relational context) and "
+        f"{DAILY_HIGHLIGHTS_PATH} (yesterday's milestones + current focus).]"
     )
     print(json.dumps({
         "hookSpecificOutput": {

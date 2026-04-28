@@ -20,8 +20,6 @@ import sys
 import threading
 import time
 
-SOCKET_PATH = os.path.expanduser("~/.engram/recall-daemon.sock")
-PID_PATH = os.path.expanduser("~/.engram/recall-daemon.pid")
 IDLE_TIMEOUT = 28800  # 8 hours without queries -> exit
 
 
@@ -38,6 +36,14 @@ def _resolve_runtime_dir() -> str:
 
 
 PROJECT_DIR = _resolve_runtime_dir()
+ENGRAM_HOME = PROJECT_DIR  # Per-install runtime+data root; multi-tenant via $ENGRAM_HOME
+SOCKET_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.sock")
+PID_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.pid")
+
+# Bridge: server.py reads ENGRAM_DATA_DIR; if only ENGRAM_HOME was set
+# (e.g., per-surface hook env), inherit the same value so the embedded
+# EngramClient opens the right knowledge.db.
+os.environ.setdefault("ENGRAM_DATA_DIR", ENGRAM_HOME)
 
 _last_activity = time.time()
 _shutdown = threading.Event()

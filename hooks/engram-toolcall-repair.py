@@ -48,16 +48,17 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+ENGRAM_HOME = os.environ.get("ENGRAM_HOME", str(Path.home() / ".engram"))
 REPAIR_LOG = Path(
     os.environ.get(
         "ENGRAM_REPAIR_LOG",
-        str(Path.home() / ".engram" / "toolcall-repairs.jsonl"),
+        str(Path(ENGRAM_HOME) / "toolcall-repairs.jsonl"),
     )
 ).expanduser()
 REPAIR_MARKER = Path(
     os.environ.get(
         "ENGRAM_REPAIR_MARKER",
-        str(Path.home() / ".engram" / "toolcall-repair-pending.json"),
+        str(Path(ENGRAM_HOME) / "toolcall-repair-pending.json"),
     )
 ).expanduser()
 

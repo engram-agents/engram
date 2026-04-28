@@ -11,7 +11,7 @@ Convention: type "Alex: <message>" once to switch context to Alex.
 All following messages are treated as Alex's until another "<Name>: ..."
 prefix resets.
 
-Primary-user suppression: if ~/.engram/config.json has a `primary_user` key,
+Primary-user suppression: if $ENGRAM_HOME/config.json has a `primary_user` key,
 the sticky context line is suppressed when the active user matches (since
 the primary speaker is the default — no need to re-announce them on every
 prompt). Set via the first-session skill or by hand editing config.json.
@@ -27,13 +27,14 @@ import re
 import sqlite3
 import sys
 
-DB_PATH = os.path.expanduser("~/.engram/knowledge.db")
-CURRENT_USER_PATH = os.path.expanduser("~/.engram/current_user.json")
-CONFIG_PATH = os.path.expanduser("~/.engram/config.json")
+ENGRAM_HOME = os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram"))
+DB_PATH = os.path.join(ENGRAM_HOME, "knowledge.db")
+CURRENT_USER_PATH = os.path.join(ENGRAM_HOME, "current_user.json")
+CONFIG_PATH = os.path.join(ENGRAM_HOME, "config.json")
 
 
 def get_primary_user() -> str:
-    """Read primary_user from ~/.engram/config.json (lowercased; empty if unset)."""
+    """Read primary_user from $ENGRAM_HOME/config.json (lowercased; empty if unset)."""
     try:
         with open(CONFIG_PATH) as f:
             config = json.load(f)
