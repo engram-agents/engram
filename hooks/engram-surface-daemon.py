@@ -23,20 +23,32 @@ import time
 IDLE_TIMEOUT = 28800  # 8 hours without queries -> exit
 
 
-def _resolve_runtime_dir() -> str:
-    """Locate the engram runtime snapshot (server.py + engram_client.py).
+def _resolve_engram_home() -> str:
+    """Per-install data dir: knowledge.db, sockets, briefing, history."""
+    return os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram"))
 
-    The alpha installer copies these into $ENGRAM_HOME — that snapshot is
-    the canonical import source. $ENGRAM_HOME is the env override;
-    ~/.engram is the default.
+
+def _resolve_runtime_dir(engram_home: str) -> str:
+    """Locate where engram_client.py lives for import.
+
+    Priority:
+      1. $ENGRAM_RUNTIME_DIR if set explicitly.
+      2. $ENGRAM_HOME if it bundles a snapshot (alpha-install pattern —
+         install-gemini.sh copies server.py + engram_client.py into the
+         data dir).
+      3. ~/kg_protocol_for_ai (live-source fallback for the original
+         single-tenant Borges install, which never bundled a snapshot).
     """
-    return os.environ.get(
-        "ENGRAM_HOME", os.path.expanduser("~/.engram")
-    )
+    explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
+    if explicit:
+        return explicit
+    if os.path.exists(os.path.join(engram_home, "engram_client.py")):
+        return engram_home
+    return os.path.expanduser("~/kg_protocol_for_ai")
 
 
-PROJECT_DIR = _resolve_runtime_dir()
-ENGRAM_HOME = PROJECT_DIR  # Per-install runtime+data root; multi-tenant via $ENGRAM_HOME
+ENGRAM_HOME = _resolve_engram_home()
+PROJECT_DIR = _resolve_runtime_dir(ENGRAM_HOME)
 SOCKET_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.sock")
 PID_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.pid")
 
