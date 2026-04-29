@@ -277,6 +277,10 @@ TOOL_SCHEMAS = {
             "limit": {"type": "integer", "description": "Max entries (default 50, max 200)."},
         },
     },
+    "engram_list_focused": {
+        "description": "List the set of nodes currently in focus. Use this to maintain context across sessions.",
+        "parameters": {},
+    },
     "engram_list": {
         "description": "List nodes in compact triage format. No neighbor data, no memory refresh.",
         "parameters": {

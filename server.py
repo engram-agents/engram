@@ -654,6 +654,16 @@ def _load_vec_extension(conn: sqlite3.Connection) -> bool:
         return False
 
 
+def _assert_sqlite_version(conn: sqlite3.Connection):
+    """Assert that SQLite version is >= 3.35 for UPDATE...RETURNING support."""
+    version_str = conn.execute("SELECT sqlite_version()").fetchone()[0]
+    parts = tuple(int(x) for x in version_str.split(".")[:2])
+    if parts < (3, 35):
+        raise RuntimeError(
+            f"SQLite {version_str} is too old; need >= 3.35 for UPDATE...RETURNING. "
+        )
+
+
 def _get_db() -> sqlite3.Connection:
     """Get a database connection, creating tables if needed."""
     _ensure_data_dir()
@@ -662,6 +672,8 @@ def _get_db() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     _load_vec_extension(conn)
+
+    _assert_sqlite_version(conn)
 
     # Create tables
     conn.executescript(
@@ -729,6 +741,11 @@ def _get_db() -> sqlite3.Connection:
             UNIQUE(source_id, target_id, relation)
         );
 
+        CREATE TABLE IF NOT EXISTS sequences (
+            node_type TEXT PRIMARY KEY,
+            last_num INTEGER NOT NULL DEFAULT 0
+        );
+
         CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
         CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
         CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
@@ -736,6 +753,22 @@ def _get_db() -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_nodes_evidence_id ON nodes(evidence_id);
     """
     )
+
+    # Coordinated migration: seed sequences table from existing nodes
+    conn.execute(
+        """
+        INSERT INTO sequences (node_type, last_num)
+        SELECT
+            SUBSTR(id, 1, INSTR(id, '_') - 1) AS prefix,
+            MAX(CAST(SUBSTR(id, INSTR(id, '_') + 1) AS INTEGER)) AS max_num
+        FROM nodes
+        WHERE id LIKE '%_%'
+        GROUP BY prefix
+        ON CONFLICT(node_type) DO UPDATE SET last_num = excluded.last_num
+            WHERE excluded.last_num > sequences.last_num
+    """
+    )
+    conn.commit()
 
     # Migrate existing DBs: add memory columns if missing
     existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(nodes)").fetchall()}
@@ -1720,19 +1753,20 @@ def _semantic_search(
 
 
 def _next_id(conn: sqlite3.Connection, node_type: str) -> str:
-    """Generate the next prefixed ID for a given node type.
+    """Generate the next prefixed ID for a given node type using the sequences table.
 
-    Uses MAX(numeric_suffix) + 1 rather than COUNT(*) + 1 to be gap-safe:
-    if any node was ever deleted or never inserted (leaving a hole in the
-    sequence), COUNT+1 would return an ID that already exists and trigger
-    a UNIQUE constraint failure. MAX+1 always advances beyond every extant ID.
+    Atomic statement handles concurrent increment and returns the new value.
     """
     prefix = TYPE_PREFIX.get(node_type, "nd")
-    row = conn.execute(
-        "SELECT MAX(CAST(SUBSTR(id, 4) AS INTEGER)) as max_num FROM nodes WHERE id LIKE ?",
-        (f"{prefix}_%",),
-    ).fetchone()
-    num = (row["max_num"] or 0) + 1
+    cursor = conn.execute(
+        """
+        INSERT INTO sequences (node_type, last_num) VALUES (?, 1)
+        ON CONFLICT(node_type) DO UPDATE SET last_num = last_num + 1
+        RETURNING last_num
+        """,
+        (prefix,),
+    )
+    num = cursor.fetchone()[0]
     return f"{prefix}_{num:04d}"
 
 
