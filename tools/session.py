@@ -30,12 +30,17 @@ from _session_context import (
 
 def cmd_create(args):
     participants = [p.strip() for p in args.participants.split(",")]
+    conjectures = [c.strip() for c in args.conjectures.split(",")] if args.conjectures else []
+    questions = [q.strip() for q in args.questions.split(",")] if args.questions else []
+    
     session = create_session(
         channel_dir(),
         args.session_id,
         participants,
         description=args.desc or "",
         goal_id=args.goal or "",
+        linked_conjectures=conjectures,
+        linked_questions=questions,
         ttl_seconds=args.ttl,
         hot_seat_enabled=not args.no_hot_seat
     )
@@ -135,6 +140,8 @@ def main():
     p_create.add_argument("participants", help="Comma-separated list of participants")
     p_create.add_argument("--desc", help="Optional description")
     p_create.add_argument("--goal", help="Optional goal ID")
+    p_create.add_argument("--conjectures", help="Optional comma-separated list of linked conjecture IDs")
+    p_create.add_argument("--questions", help="Optional comma-separated list of linked question IDs")
     p_create.add_argument("--ttl", type=int, default=300, help="Expiry TTL in seconds (default 300)")
     p_create.add_argument("--no-hot-seat", action="store_true", help="Disable hot-seat wake-ups for this session")
 
