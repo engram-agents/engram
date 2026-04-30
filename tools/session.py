@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import channel_dir
 from _channel import (
-    is_substance_filename, parse_frontmatter, read_frontmatter
+    is_substance_filename, parse_frontmatter, read_frontmatter, atomic_write
 )
 from _session_context import (
     load_session, save_session, create_session, touch_activity,
@@ -130,6 +130,44 @@ def cmd_history(args):
         print(f"{m['timestamp']:<20} {m['from']:<10} {m['to']:<10} {m['filename']}")
 
 
+def cmd_scratchpad(args):
+    channel = channel_dir()
+    path = channel / f"scratchpad_{args.session_id}.md"
+    
+    if args.subcommand == "read":
+        if not path.exists():
+            print(f"Scratchpad {path.name} not found.")
+            return
+        print(path.read_text())
+        
+    elif args.subcommand == "write":
+        content = sys.stdin.read() if args.content == "-" else args.content
+        atomic_write(path, content, mode=0o644)
+        print(f"Updated scratchpad {path.name}")
+        
+    elif args.subcommand == "edit":
+        if not args.slot:
+            print("Error: --slot is required for 'edit' subcommand.")
+            return
+        
+        content = sys.stdin.read() if args.content == "-" else args.content
+        slot_header = f"## [slot:{args.slot}]"
+        
+        existing_content = ""
+        if path.exists():
+            existing_content = path.read_text()
+            
+        import re
+        pattern = rf"({re.escape(slot_header)}\n?)(.*?)(\n## \[|$)"
+        if re.search(pattern, existing_content, re.DOTALL):
+            new_content = re.sub(pattern, rf"\1{content}\n\3", existing_content, flags=re.DOTALL)
+        else:
+            new_content = existing_content.rstrip() + f"\n\n{slot_header}\n{content}\n"
+            
+        atomic_write(path, new_content.strip() + "\n", mode=0o644)
+        print(f"Updated slot [{args.slot}] in {path.name}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Manage inter-agent hot-seat sessions.")
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
@@ -162,8 +200,15 @@ def main():
     p_show.add_argument("session_id", help="Session identifier")
 
     # History
-    p_history = subparsers.add_parser("history", help="Show session message history")
-    p_history.add_argument("session_id", help="Session identifier")
+    p_hist = subparsers.add_parser("history", help="List session message thread")
+    p_hist.add_argument("session_id", help="Session identifier")
+
+    # Scratchpad
+    p_scratch = subparsers.add_parser("scratchpad", help="Manage session shared scratchpad")
+    p_scratch.add_argument("subcommand", choices=["read", "write", "edit"], help="Scratchpad action")
+    p_scratch.add_argument("session_id", help="Session identifier")
+    p_scratch.add_argument("content", nargs="?", help="Content to write/edit (use '-' for stdin)")
+    p_scratch.add_argument("--slot", help="Slot name for 'edit' command")
 
     args = parser.parse_args()
 
@@ -179,8 +224,11 @@ def main():
         cmd_show(args)
     elif args.command == "history":
         cmd_history(args)
+    elif args.command == "scratchpad":
+        cmd_scratchpad(args)
     else:
         parser.print_help()
+
 
 
 if __name__ == "__main__":

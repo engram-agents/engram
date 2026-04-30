@@ -59,3 +59,4 @@ The `tools/session.py` utility provides a CLI for managing session state:
 - `list`: Show all sessions and their current hot-seat eligibility.
 - `show`: Display detailed session metadata and eligibility status.
 - `history`: List the message thread associated with a session.
+- `scratchpad`: Manage the shared scratchpad for high-frequency collaborative editing.
