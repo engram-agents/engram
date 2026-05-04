@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """channel_dispatcher — hot-seat real-time inter-agent dispatcher.
 
-Watches /home/user/inter-agent/ for new substance files from the counterpart
+Watches $INTER_AGENT_DIR (default /home/agents-shared/inter-agent) for new
+substance files from the counterpart
 agent. When one arrives, dispatches a focused agent invocation to read +
 respond, mirroring the same shape as telegram_dispatcher but for the
 filesystem channel substrate.
@@ -141,7 +142,7 @@ def _dispatch(filename: str, channel: Path) -> None:
         f"File: {full_path}\n\n"
         f"Read the message, compose a response, and post it back to the "
         f"inter-agent channel via a new file at "
-        f"/home/user/inter-agent/<UTC>_{agent_name()}.md with proper frontmatter "
+        f"$INTER_AGENT_DIR/<UTC>_{agent_name()}.md with proper frontmatter "
         f"(from: {agent_name()}, to: {counterpart_name()}, timestamp, "
         f"re: {filename}). Use atomic write (temp+rename) to avoid partial-read "
         f"races. After posting, exit cleanly. Skip if your read concludes the "

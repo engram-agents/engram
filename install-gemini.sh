@@ -110,8 +110,14 @@ echo ""
 echo "== Step 3: Creating directories =="
 
 mkdir -p "$ENGRAM_HOME/hooks"
+mkdir -p "$ENGRAM_HOME/tools"
 mkdir -p "$ENGRAM_HOME/diary"
+mkdir -p "$ENGRAM_HOME/sessions"
+mkdir -p "$ENGRAM_HOME/logs"
+mkdir -p "$ENGRAM_HOME/secrets"
+mkdir -p "$ENGRAM_HOME/heartbeat-queue"
 mkdir -p "$GEMINI_EXT_DIR/hooks"
+chmod 0700 "$ENGRAM_HOME/secrets"
 echo "  $ENGRAM_HOME"
 echo "  $GEMINI_EXT_DIR"
 echo ""
@@ -131,6 +137,17 @@ if [ -d "$ALPHA_DIR/hooks" ] && [ -n "$(ls -A "$ALPHA_DIR/hooks" 2>/dev/null || 
     sed -i "s|{{PYTHON}}|$PYTHON_BIN|g" "$ENGRAM_HOME/hooks/start-engram-daemon.sh"
   fi
   echo "  hooks → $ENGRAM_HOME/hooks/"
+fi
+
+# Tools: heartbeat, sleep, dispatcher launchers, telegram bot, channel
+# helpers. Same per-install copy pattern as hooks. Cron registration is
+# handled by the runtime installer that wraps install-gemini.sh in the
+# multi-agent uid-substrate setup.
+if [ -d "$ALPHA_DIR/tools" ] && [ -n "$(ls -A "$ALPHA_DIR/tools" 2>/dev/null || true)" ]; then
+  cp -r "$ALPHA_DIR/tools/"* "$ENGRAM_HOME/tools/"
+  chmod +x "$ENGRAM_HOME/tools/"*.sh 2>/dev/null || true
+  chmod +x "$ENGRAM_HOME/tools/"*.py 2>/dev/null || true
+  echo "  tools → $ENGRAM_HOME/tools/"
 fi
 
 # Runtime snapshot (server + protocol + viz)
