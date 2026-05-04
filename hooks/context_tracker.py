@@ -35,8 +35,17 @@ AUTO_SAMPLE_WINDOW = 5          # Average of last N auto compactions
 FALLBACK_CEILING = 160_000      # Legacy alias; prefer FALLBACK_CEILING_BY_MODE
 TAIL_SCAN_BYTES = 5_000_000     # How far back to look for the latest usage
 
-DROWSY_THRESHOLD = 0.50
-VERY_DROWSY_THRESHOLD = 0.70
+# Drowsiness warning thresholds. Calibrated for both 200K and 1M context modes:
+#   200k mode (ceiling ~152K after safety factor): 80% = 121K used, ~47K headroom
+#                                                  90% = 137K used, ~31K headroom
+#   1m mode   (ceiling ~807K after safety factor): 80% = 645K used, ~155K headroom
+#                                                  90% = 726K used, ~80K headroom
+# Earlier values (0.50 / 0.70) were calibrated when 200K was the only mode and
+# fired far too early on 1M sessions — at 70% on 1M, 240K headroom remains, more
+# than a full fresh 200K window. Lei's framing 2026-05-04: only fire warnings
+# when truly close to compaction, not as a routine nudge.
+DROWSY_THRESHOLD = 0.80
+VERY_DROWSY_THRESHOLD = 0.90
 
 # Two distinct context-window modes the harness supports:
 #   "200k" — default Anthropic API context (auto preTokens cluster ~150-200K)
