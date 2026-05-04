@@ -4833,16 +4833,33 @@ def engram_stats() -> str:
         ).fetchall():
             edge_counts[row["relation"]] = row["c"]
 
-        # Open and partially resolved questions (with category/lacks)
+        # Open / partially-resolved questions: count + top 5 most-recent
+        # highlights. The full enumeration belongs to engram_reflect; bulk-
+        # listing all of them here ballooned the response past the MCP
+        # token budget when the graph accumulated >100 open questions
+        # (ob_1473 cohort, observed 2026-05-03 — 111K bytes, harness fell
+        # back to file redirection). Pattern matches weakest_nodes (top 5).
+        open_question_count = conn.execute(
+            """SELECT COUNT(*) as c FROM nodes WHERE type = 'question'
+               AND status IN ('open', 'partially_resolved') AND is_current = 1"""
+        ).fetchone()["c"]
         open_questions = conn.execute(
             """SELECT id, claim, status, question_category, question_lacks
                FROM nodes WHERE type = 'question'
-               AND status IN ('open', 'partially_resolved') AND is_current = 1"""
+               AND status IN ('open', 'partially_resolved') AND is_current = 1
+               ORDER BY created_at DESC LIMIT 5"""
         ).fetchall()
 
-        # Open and partially resolved predictions
+        # Open / partially-resolved predictions: count + top 5 most-recent.
+        open_prediction_count = conn.execute(
+            """SELECT COUNT(*) as c FROM nodes WHERE type = 'prediction'
+               AND status IN ('open', 'partially_resolved') AND is_current = 1"""
+        ).fetchone()["c"]
         open_predictions = conn.execute(
-            "SELECT id, predicted_event, resolution_timeframe, status FROM nodes WHERE type = 'prediction' AND status IN ('open', 'partially_resolved') AND is_current = 1"
+            """SELECT id, predicted_event, resolution_timeframe, status
+               FROM nodes WHERE type = 'prediction'
+               AND status IN ('open', 'partially_resolved') AND is_current = 1
+               ORDER BY created_at DESC LIMIT 5"""
         ).fetchall()
 
         # Reasoning type breakdown for derivations
@@ -4870,14 +4887,16 @@ def engram_stats() -> str:
                 "node_counts_by_type": type_counts,
                 "edge_counts_by_relation": edge_counts,
                 "reasoning_type_breakdown": reasoning_breakdown,
-                "open_questions": [
+                "open_questions_count": open_question_count,
+                "open_questions_recent": [
                     {k: v for k, v in {
                         "id": q["id"], "question": q["claim"], "status": q["status"],
                         "category": q["question_category"], "lacks": q["question_lacks"],
                     }.items() if v is not None}
                     for q in open_questions
                 ],
-                "open_predictions": [
+                "open_predictions_count": open_prediction_count,
+                "open_predictions_recent": [
                     {
                         "id": p["id"],
                         "event": p["predicted_event"],

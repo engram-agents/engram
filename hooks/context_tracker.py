@@ -32,11 +32,29 @@ WARM_BRIEFING_PATH = os.path.join(ENGRAM_HOME, "warm-briefing.md")
 
 SAFETY_FACTOR = 0.95            # Report 100% at 95% of mean auto ceiling
 AUTO_SAMPLE_WINDOW = 5          # Average of last N auto compactions
-FALLBACK_CEILING = 160_000      # Used when < 2 auto samples found
+FALLBACK_CEILING = 160_000      # Legacy alias; prefer FALLBACK_CEILING_BY_MODE
 TAIL_SCAN_BYTES = 5_000_000     # How far back to look for the latest usage
 
 DROWSY_THRESHOLD = 0.50
 VERY_DROWSY_THRESHOLD = 0.70
+
+# Two distinct context-window modes the harness supports:
+#   "200k" — default Anthropic API context (auto preTokens cluster ~150-200K)
+#   "1m"   — beta extended context (auto preTokens cluster ~800-1000K)
+# These produce ~5x different ceilings; mixing samples in the mean gives a
+# contaminated value and reports drowsiness wrong (ob_1473 — 2026-05-03 PM:
+# three 170K + one 967K averaged into ~370K, reported 29% drowsy when truth
+# was ~10%). The harness does not surface mode in JSONL message.model, so we
+# detect from current input_tokens and partition samples by magnitude class.
+SAMPLE_PARTITIONS = {
+    "200k": (0, 300_000),
+    "1m":   (300_000, 1_500_000),
+}
+FALLBACK_CEILING_BY_MODE = {
+    "200k": 160_000,
+    "1m":   850_000,
+}
+MODE_BOUNDARY = 300_000
 
 
 def find_active_jsonl() -> str | None:
@@ -70,8 +88,52 @@ def _project_jsonls() -> list[str]:
     return sorted(files, key=os.path.getmtime, reverse=True)
 
 
-def collect_auto_pretokens(max_samples: int = AUTO_SAMPLE_WINDOW) -> list[int]:
-    """Most recent auto-compaction preTokens in chronological order."""
+def _detect_mode(current_tokens: int | None, jsonl_path: str | None) -> str:
+    """Detect this session's context-window mode from observable signals.
+
+    Order of precedence:
+      1. ENGRAM_CONTEXT_MODE env var override ("200k" or "1m") — explicit.
+      2. current input tokens > MODE_BOUNDARY → "1m" (200K-mode would have
+         auto-compacted by now).
+      3. Current JSONL has any prior compact_boundary > MODE_BOUNDARY → "1m".
+      4. Default "200k" (the harness default).
+
+    Limitation: early 1M-mode sessions below MODE_BOUNDARY with no prior
+    boundary cannot be auto-detected (the system prompt's `[1m]` model tag
+    is not surfaced in JSONL records). Set ENGRAM_CONTEXT_MODE=1m at session
+    launch when in 1M mode for accurate early-session drowsiness reporting.
+    """
+    override = os.environ.get("ENGRAM_CONTEXT_MODE", "").strip().lower()
+    if override in SAMPLE_PARTITIONS:
+        return override
+    if current_tokens is not None and current_tokens > MODE_BOUNDARY:
+        return "1m"
+    if jsonl_path:
+        try:
+            with open(jsonl_path, "rb") as f:
+                for line in f:
+                    if b"compact_boundary" not in line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except (ValueError, json.JSONDecodeError):
+                        continue
+                    meta = obj.get("compactMetadata") or {}
+                    pt = meta.get("preTokens")
+                    if isinstance(pt, int) and pt > MODE_BOUNDARY:
+                        return "1m"
+        except OSError:
+            pass
+    return "200k"
+
+
+def collect_auto_pretokens(mode: str = "200k", max_samples: int = AUTO_SAMPLE_WINDOW) -> list[int]:
+    """Most recent auto-compaction preTokens in the given mode magnitude class.
+
+    Filters by SAMPLE_PARTITIONS[mode] to keep 200K-mode and 1M-mode samples
+    from contaminating each other's mean.
+    """
+    lo, hi = SAMPLE_PARTITIONS[mode]
     collected: list[int] = []
     for path in _project_jsonls():  # newest file first
         file_samples: list[int] = []
@@ -88,7 +150,7 @@ def collect_auto_pretokens(max_samples: int = AUTO_SAMPLE_WINDOW) -> list[int]:
                     if meta.get("trigger") != "auto":
                         continue
                     pt = meta.get("preTokens")
-                    if isinstance(pt, int) and pt > 0:
+                    if isinstance(pt, int) and lo <= pt <= hi:
                         file_samples.append(pt)
         except OSError:
             continue
@@ -99,10 +161,10 @@ def collect_auto_pretokens(max_samples: int = AUTO_SAMPLE_WINDOW) -> list[int]:
     return collected[-max_samples:]
 
 
-def compute_ceiling() -> int:
-    samples = collect_auto_pretokens()
+def compute_ceiling(mode: str = "200k") -> int:
+    samples = collect_auto_pretokens(mode)
     if len(samples) < 2:
-        return int(FALLBACK_CEILING * SAFETY_FACTOR)
+        return int(FALLBACK_CEILING_BY_MODE[mode] * SAFETY_FACTOR)
     mean = sum(samples) // len(samples)
     return int(mean * SAFETY_FACTOR)
 
@@ -156,13 +218,15 @@ def estimate_usage() -> dict | None:
     current = read_current_tokens()
     if current is None:
         return None
-    ceiling = compute_ceiling()
+    mode = _detect_mode(current, find_active_jsonl())
+    ceiling = compute_ceiling(mode)
     if ceiling <= 0:
         return None
     return {
         "estimated_tokens": current,
         "context_limit": ceiling,
         "usage_pct": current / ceiling,
+        "mode": mode,
     }
 
 
