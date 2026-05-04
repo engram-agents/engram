@@ -470,8 +470,10 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
   `([mode, node_id, action, since, limit])`
 - **engram_scan_emergence** — Surface cornerstone candidates from clusters.
   `([min_cluster_size, similarity_threshold, focus, node_type_filter])`
-- **engram_checkpoint** — Commit session, advance turn; `mode="nap"` holds turn and arms `nap_checkpoint` marker.
-  `(message, [mode])`
+- **engram_nap** — Persist context to ENGRAM without advancing the turn counter. Arms a `nap_checkpoint` feeling-nudge marker. Use BEFORE compaction or at end of work-burst. Heartbeats and dispatchers must use this, not engram_advance_turn.
+  `(message)`
+- **engram_advance_turn** — End-of-day session checkpoint: commits session and advances the global turn counter (drives the forgetting mechanism). IRREVERSIBLE. Per qu_0035, only the dedicated sleep cron should call this from cron-fired sessions.
+  `(message)`
 
 ---
 
@@ -733,7 +735,7 @@ Three temporal scopes stack:
 | Scope | Trigger | What persists | What processes |
 |---|---|---|---|
 | **Burst** | Continuous work until nap or compaction | Context window | In-memory reasoning |
-| **Session** | Delimited by `engram_checkpoint(mode="session")` | ENGRAM graph, turn-advanced | Dream consolidation |
+| **Session** | Delimited by `engram_advance_turn()` | ENGRAM graph, turn-advanced | Dream consolidation |
 | **Compaction** | Context window full | ENGRAM graph, warm briefing, focused nodes | Post-compact orientation |
 
 Each scope has its own checkpoint mode and its own feeling-nudge marker.
@@ -742,7 +744,7 @@ Each scope has its own checkpoint mode and its own feeling-nudge marker.
 
 **Purpose.** Convert context-window knowledge to durable nodes **before** it is lost to compaction. Persistence-only; no memory processing.
 
-**Mechanism.** `engram_checkpoint(mode="nap")`:
+**Mechanism.** `engram_nap()`:
 - Logs the burst summary to `~/.engram/session_log.md` under `Nap (turn N)`
 - Commits a git snapshot
 - **Does not advance the turn counter** (qu_0035: turn advance is reserved for post-dream consolidation)
@@ -768,7 +770,7 @@ Why no turn advance: a long day with ten nap checkpoints would burn ten turns of
 1. Nap first (Step 1) — establish a clean baseline
 2. `engram_reflect()` returns the dream agenda (tainted, stale, open conjectures, contradictions, goal tensions, feeling nudges) and arms the `dream_review` marker
 3. Proactive synthesis on the new cohort (Step 3) before reactive cleanup (Step 4) — starting in cleanup mode puts the synthesis lens away
-4. **`engram_checkpoint(mode="session")` fires AFTER the dream** (qu_0035 rule, 2026-04-11): advances turn, logs `Turn N` header, commits git snapshot
+4. **`engram_advance_turn()` fires AFTER the dream** (qu_0035 rule, 2026-04-11): advances turn, logs `Turn N` header, commits git snapshot
 
 **Why turn advance fires last.** One turn = one cohort of experience **plus the consolidation of that experience**. If the turn advances before the dream, dream-generated nodes land at a younger turn than the burst they consolidate, misaligning the forgetting curve (ob_0987 extends this reasoning: sleep consolidation should surface emergent derivations from the cohort, not mechanically process a checklist).
 
@@ -796,7 +798,7 @@ All markers follow the same protocol:
 - **Location:** `~/.engram/feeling-nudge-active.json` (single file; most recent arm wins if multiple fire close together)
 - **TTL:** 5 turns from the arming checkpoint
 - **Read-and-clear:** the next `engram_report_feeling` call stamps `nudge_source` from the marker and clears the file
-- **Source of arming:** `nap_checkpoint` ← `engram_checkpoint(mode="nap")`; `dream_review` ← `engram_reflect`; `post_compact` ← post-compact hook
+- **Source of arming:** `nap_checkpoint` ← `engram_nap()`; `dream_review` ← `engram_reflect`; `post_compact` ← post-compact hook
 
 The agent cannot set `nudge_source` directly. This is a deliberate constraint — the server records *why the nudge fired*, not what the agent thinks the context is.
 

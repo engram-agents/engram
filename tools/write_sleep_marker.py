@@ -2,7 +2,7 @@
 """Write the sleep-success marker after a coordinated sleep cycle completes.
 
 Called by the engram-sleep skill (Step 6.5) immediately after
-engram_checkpoint(mode="session") succeeds. The marker is the canonical
+engram_advance_turn succeeds. The marker is the canonical
 signal to:
   - sleep.sh's self-check (skips redundant cron firings if marker fresh
     and cohort empty)

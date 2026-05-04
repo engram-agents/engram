@@ -292,10 +292,16 @@ TOOL_SCHEMAS = {
         "description": "Get graph statistics: node/edge counts, open questions, open predictions, weakest nodes, memory tier info.",
         "parameters": {},
     },
-    "engram_checkpoint": {
-        "description": "End a research session: advance the memory turn counter, log a summary, return stats.",
+    "engram_nap": {
+        "description": "Persist context to ENGRAM without advancing the turn counter. Use BEFORE compaction or at end of work-burst to save knowledge; arms a nap_checkpoint feeling-report nudge. Forgetting stays paused.",
         "parameters": {
-            "message": {"type": "string", "description": "Summary of what was learned in this session.", "required": True},
+            "message": {"type": "string", "description": "Summary of what was learned/changed in this work-burst.", "required": True},
+        },
+    },
+    "engram_advance_turn": {
+        "description": "End-of-day session checkpoint: advances the global turn counter (drives forgetting) and logs the session summary. IRREVERSIBLE — turn advances cannot be undone without direct DB intervention. Heartbeats and dispatchers must use engram_nap instead.",
+        "parameters": {
+            "message": {"type": "string", "description": "Summary of what was learned/changed across the cohort being closed by this turn advance.", "required": True},
         },
     },
 }

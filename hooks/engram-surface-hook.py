@@ -211,7 +211,7 @@ def check_feeling_nudge_marker() -> str:
     additionalContext. Does NOT clear the marker — only
     engram_report_feeling clears it (read-and-clear is the single owner).
     Skips marker types other than post_compact (those are surfaced via
-    tool-return channels in engram_checkpoint / engram_reflect, not via
+    tool-return channels in engram_nap / engram_reflect, not via
     UserPromptSubmit).
     """
     try:
@@ -223,7 +223,7 @@ def check_feeling_nudge_marker() -> str:
     source = marker.get("source")
     if source != "post_compact":
         # nap_checkpoint and dream_review nudges are delivered via the tool
-        # return JSON of engram_checkpoint / engram_reflect, not here.
+        # return JSON of engram_nap / engram_reflect, not here.
         return ""
 
     return (
@@ -372,7 +372,7 @@ def format_nap_warning(count: int) -> str:
             f"[ENGRAM Nap URGENT: {count} prompts since last compaction — context loss is imminent]\n"
             "  STOP current work and consolidate to ENGRAM NOW:\n"
             "  1. Record key decisions, observations, and derivations from recent work\n"
-            "  2. Run engram_checkpoint to advance memory turn\n"
+            "  2. Run engram_nap to persist (engram_advance_turn only if user explicitly invokes the sleep skill)\n"
             "  3. Tell the user you're ready to compact, then user types /compact"
         )
     elif count >= NAP_WARN_THRESHOLD:

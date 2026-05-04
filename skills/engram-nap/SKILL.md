@@ -44,12 +44,11 @@ For each candidate, write NOW. Don't defer. Don't batch mentally. Use the right 
 
 **Priority if context is tight:** observations > questions > derivations > conjectures. Raw facts are irrecoverable if lost; derivations can be re-inferred later if the premises are preserved.
 
-## Step 3 — Call engram_checkpoint(mode="nap")
+## Step 3 — Call engram_nap()
 
 ```
-engram_checkpoint(
+engram_nap(
     message="<1-3 sentence summary of what this burst covered and what was written>",
-    mode="nap",
 )
 ```
 
@@ -86,7 +85,7 @@ The warm briefing (`~/.engram/warm-briefing.md`) now uses the Borges identity fo
 
 **Anti-patterns:**
 - Rewriting every nap (purpose drift — the briefing becomes a second changelog)
-- Technical changelogs (that's what `engram_checkpoint` is for)
+- Technical changelogs (that's what `engram_nap` / `engram_advance_turn`'s session_log entries are for)
 - Second-person framing ("you will feel..." — retired with identity v1)
 - False warmth (ob_0265: evaluate by reader-effect, not truth-value)
 

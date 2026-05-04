@@ -25,7 +25,7 @@ Sleep is a **deep** consolidation: the agent reviews graph quality, resolves wha
 **Always start sleep with a nap.** Run the `engram-nap` skill in full:
 
 - Scan recent work, write observations/derivations/questions/conjectures
-- `engram_checkpoint(mode="nap")` — persist, do NOT advance turn
+- `engram_nap()` — persist, do NOT advance turn
 - Handle the `nap_checkpoint` feeling nudge honestly (file if genuine, null-result if not)
 
 Why: the dream must operate on a complete picture. Any awake-burst knowledge not persisted by nap-time is invisible to the dream and may contradict or duplicate what the dream produces.
@@ -63,7 +63,7 @@ Pull the cohort via edit history, scoped to the previous sleep:
 engram_history(mode="edits", action="created", since="<prev-sleep-timestamp>")
 ```
 
-The prev-sleep timestamp is the one logged by the last `engram_checkpoint(mode="session")` (find it in `~/.engram/session_log.md` under the most recent "Turn N" header from BEFORE today's work — naps don't appear there). If you can't find a session header from before today, the cohort starts at the day's first node.
+The prev-sleep timestamp is the one logged by the last `engram_advance_turn()` (find it in `~/.engram/session_log.md` under the most recent "Turn N" header from BEFORE today's work — naps don't appear there). If you can't find a session header from before today, the cohort starts at the day's first node.
 
 Skim the cohort at a reading pace. Ask: do any derivations want to emerge?
 
@@ -106,14 +106,13 @@ Read the `feeling_report_nudge` text that `engram_reflect` returned. Honest self
 
 Do NOT file a performative report to demonstrate the tool. The trap is real.
 
-## Step 6 — Advance the turn: engram_checkpoint(mode="session")
+## Step 6 — Advance the turn: engram_advance_turn()
 
 This is the MOST IMPORTANT step and the one that distinguishes sleep from nap.
 
 ```
-engram_checkpoint(
+engram_advance_turn(
     message="<summary of the dream: what was resolved, superseded, promoted, refuted, questions registered, feelings filed>",
-    mode="session",
 )
 ```
 
@@ -138,7 +137,7 @@ Immediately after Step 6's checkpoint returns successfully, write the canonical 
 ~/.engram/tools/write_sleep_marker.py <turn_advanced_to> <nodes_consolidated> <cohort_start_at>
 ```
 
-- `turn_advanced_to`: the new turn number returned by `engram_checkpoint(mode="session")`.
+- `turn_advanced_to`: the new turn number returned by `engram_advance_turn()`.
 - `nodes_consolidated`: count of nodes in today's cohort (from Step 3's `engram_history(mode="edits", action="created", since=<prev-sleep-timestamp>)`).
 - `cohort_start_at`: the prior sleep's UTC ISO timestamp (the same `since` value used in Step 3). If no prior sleep exists yet, use the timestamp of the cohort's first node.
 

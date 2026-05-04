@@ -104,7 +104,7 @@ Do this step LAST, only after the dialogue is genuinely complete. If the session
    - Any other `{{...}}` markers present — consult the user if ambiguous, do not guess.
 3. Write the resolved files back.
 4. Delete `~/.engram/first-run-pending`.
-5. Call `engram_checkpoint(message="First session with <USER_NAME>: named <AGENT_NAME>. Founding motivation: <one-line quote or summary>.", mode="session")` — this is a real session checkpoint (advances turn counter), not a nap. The naming event is worth a turn.
+5. Call `engram_advance_turn(message="First session with <USER_NAME>: named <AGENT_NAME>. Founding motivation: <one-line quote or summary>.")` — this is a real session checkpoint (advances turn counter), not a nap. The naming event is worth a turn.
 
 ## Step 6 — Offer to keep going or stop
 

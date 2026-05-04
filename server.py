@@ -450,8 +450,8 @@ def _init_git():
     environments where git resolution is broken — historically the Claude Desktop
     Windows app picked up the WSL git binary instead of the Windows one and the
     versioning layer had to be disabled. With ENGRAM_DISABLE_GIT=1, _git_available
-    stays False and engram_checkpoint silently skips committing while still
-    saving the session log and graph state to disk.
+    stays False and engram_nap / engram_advance_turn silently skip committing
+    while still saving the session log and graph state to disk.
     """
     global _git_available, GIT_TIMEOUT
     if os.environ.get("ENGRAM_DISABLE_GIT"):
@@ -4616,48 +4616,28 @@ def engram_get_subgraph(
 # ---- Version control tools ----
 
 
-@mcp.tool(
-    name="engram_checkpoint",
-    annotations={
-        "title": "End Session and Save Progress",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False,
-    },
-)
-def engram_checkpoint(message: str, mode: str = "session") -> str:
-    """End a research session: advance the memory turn counter and log a summary.
+def _checkpoint_internal(message: str, advance_turn: bool) -> str:
+    """Internal checkpoint logic shared by engram_nap and engram_advance_turn.
 
-    Call this at the END of each research session. It:
-    1. Advances the global turn counter (drives the forgetting mechanism)
-    2. Computes what changed: new nodes added this turn
-    3. Appends a timestamped summary to ~/.engram/session_log.md
-    4. Returns current graph statistics and memory tier info
+    Computes graph stats, appends to session_log, snapshots + commits, stores
+    a diagnostic snapshot. If advance_turn is True, increments the global
+    turn counter (driving the forgetting mechanism). If False, leaves the
+    turn counter alone (nap mode) and arms a nap_checkpoint feeling nudge.
 
-    The session log is a human-readable audit trail of what the agent
-    learned in each session. It accumulates across sessions.
-
-    Args:
-        message: Summary of what was learned/changed in this session.
-        mode: Checkpoint depth — "session" (default) advances the turn counter,
-            triggering memory decay. "nap" logs the summary and stats but does
-            NOT advance the turn counter, so no forgetting occurs. Use "nap"
-            for quick pre-compaction dumps where the goal is persistence, not
-            consolidation.
-
-    Returns:
-        JSON with turn info, changes summary, graph stats, and memory tiers.
+    The two public tools (engram_nap and engram_advance_turn) exist as
+    distinct MCP entry points so a missed kwarg cannot accidentally promote
+    a nap into a turn-advancing checkpoint — the prior single-tool design
+    was bug-prone under context pressure (heartbeat sessions especially).
     """
+    mode = "session" if advance_turn else "nap"
     mem = _get_memory_config()
     old_turn = mem.get("current_turn", 0)
 
-    # Only advance turn for full session checkpoints, not naps
-    if mode == "nap":
-        new_turn = old_turn  # no advancement
-    else:
+    if advance_turn:
         new_turn = old_turn + 1
         _set_current_turn(new_turn)
+    else:
+        new_turn = old_turn  # no advancement
 
     conn = _get_db()
     try:
@@ -4790,6 +4770,75 @@ def engram_checkpoint(message: str, mode: str = "session") -> str:
         conn.close()
 
 
+@mcp.tool(
+    name="engram_nap",
+    annotations={
+        "title": "Pre-compaction Nap (no turn advance)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_nap(message: str) -> str:
+    """Persist context to ENGRAM without advancing the turn counter.
+
+    Use BEFORE compaction, at the end of a work-burst, or whenever you want
+    to preserve session knowledge to the durable graph without triggering
+    forgetting. Logs the summary to session_log, snapshots + commits the
+    graph, stores a diagnostic snapshot, and arms a nap_checkpoint feeling-
+    report nudge (TTL 5 turns). Does NOT advance the global turn counter —
+    the forgetting mechanism stays paused.
+
+    For end-of-day session checkpoints (sleep cycle), use engram_advance_turn
+    instead. The two functions exist as distinct tools so a missed kwarg
+    cannot accidentally promote a nap into a turn-advancing checkpoint.
+
+    Args:
+        message: Summary of what was learned/changed in this work-burst.
+
+    Returns:
+        JSON with previous_turn (unchanged from current_turn since no
+        advance), changes summary, graph stats, and memory tiers.
+    """
+    return _checkpoint_internal(message, advance_turn=False)
+
+
+@mcp.tool(
+    name="engram_advance_turn",
+    annotations={
+        "title": "Session Checkpoint with Turn Advance (irreversible)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_advance_turn(message: str) -> str:
+    """End-of-day session checkpoint — advance the turn counter + log summary.
+
+    Advances the global turn counter (drives the forgetting mechanism that
+    inflates importance scores of fresh nodes relative to stale ones), logs
+    the session summary to session_log, snapshots + commits the graph, and
+    records a diagnostic snapshot. **This action is IRREVERSIBLE** — turn
+    advances cannot be undone without direct DB intervention.
+
+    Coordinated multi-role discipline (per qu_0035): only the dedicated sleep
+    cron at end-of-day should call this from cron-fired sessions. Heartbeat
+    / telegram / dispatcher roles must use engram_nap instead. The user's
+    explicit sleep skill invocation also overrides cron coordination — but
+    state explicitly that the day's turn is being consumed so the cron knows
+    to skip its session-mode call.
+
+    Args:
+        message: Summary of what was learned/changed across the cohort
+                 being closed by this turn advance.
+
+    Returns:
+        JSON with new turn number, changes summary, graph stats, and memory
+        tiers.
+    """
+    return _checkpoint_internal(message, advance_turn=True)
 
 
 # ---- Bonus: stats tool (lightweight, useful even in MVP) ----
@@ -10398,7 +10447,7 @@ if __name__ == "__main__":
     _ensure_data_dir()
     # Initialize ~/.engram/.git for the durable version-controlled snapshot.
     # Best-effort: if git is missing or init fails, _git_available stays False
-    # and engram_checkpoint will report version_control.git_committed=False.
+    # and engram_nap / engram_advance_turn will report version_control.git_committed=False.
     _init_git()
 
     # Pre-warm embedding model if already cached locally.

@@ -76,8 +76,11 @@ PROTECTED_TOOLS = {
         "observations_json", "url", "title", "domain", "source_date",
         "evidence_id", "content_hash", "git_sha",
     },
-    "mcp__engram__engram_checkpoint": {
-        "message", "mode",
+    "mcp__engram__engram_nap": {
+        "message",
+    },
+    "mcp__engram__engram_advance_turn": {
+        "message",
     },
     "mcp__engram__engram_add_axiom": {
         "claim", "basis", "context_ids",

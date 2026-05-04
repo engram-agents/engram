@@ -282,9 +282,8 @@ mv ~/.engram/loop-scratch.md ~/.engram/reports/scratch_$(date +%Y-%m-%d_%H%M%S).
 ### 4. Checkpoint
 
 ```
-engram_checkpoint(
+engram_nap(
     message="School day complete: [N] cycles, [summary of key findings]",
-    mode="nap",
 )
 ```
 

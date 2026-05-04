@@ -102,9 +102,8 @@ Each derivation or observation may open new sub-questions. Follow them. This is 
 When wrapping up (context limit or natural stopping point):
 
 ```
-engram_checkpoint(
+engram_nap(
     message="<summary: question investigated, depth reached, sub-questions registered, key findings>",
-    mode="nap",
 )
 ```
 

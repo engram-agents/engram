@@ -64,7 +64,7 @@ Short phrases you can drop into normal conversation. These do more than they loo
 | *"What does engram say about X?"* | Triggers a `engram_query` — your agent checks its own memory before answering. |
 | *"Show me the subgraph around `dv_0042`."* | Opens up provenance: what claim, what evidence, what derivations. |
 | *"Is this consistent with what we decided last week?"* | Invites contradiction-checking against the graph. |
-| *"Checkpoint before we move on."* | Prompts a `engram_checkpoint` — the graph commits, history advances. |
+| *"Checkpoint before we move on."* | Prompts a `engram_nap` (mid-session preserve) or `engram_advance_turn` (end-of-day; advances the turn counter, drives forgetting). |
 | *"Reflect on the graph."* | Runs `engram_reflect` — surfaces tainted nodes, unresolved questions, open conjectures. |
 
 You don't need to memorize these. Say them in your own words. The point is that the agent-ENGRAM loop gets stronger every time *you* close it from the outside. You're scaffolding a habit until it runs on its own.
@@ -122,7 +122,7 @@ These are agent-facing tools, not shell commands — you don't run them directly
 | An audit of graph quality | `engram_reflect()` |
 | Quantitative health score | `engram_diagnose()` |
 | A search | `engram_query(query)` |
-| A checkpoint / version-save | `engram_checkpoint(summary)` |
+| A checkpoint / version-save | `engram_nap(summary)` (mid-session) or `engram_advance_turn(summary)` (end of day) |
 
 If you ever want a direct look at the graph, the viz server is the right surface. The database itself is `~/.engram/knowledge.db` — don't edit it by hand; ask your agent if you need a correction.
 

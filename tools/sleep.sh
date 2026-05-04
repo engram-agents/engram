@@ -101,7 +101,7 @@ PROMPT="Run the engram-sleep skill to consolidate today's work across all roles 
 
 This is the SINGLE turn-advance for $TODAY (NYC local) per the coordinated-sleep design — all other roles today used nap-mode only. The dream cohort spans the full day across all roles.
 
-Follow the skill in order: nap → engram_reflect → day-wide synthesis (engram_history since the previous sleep) → work the dream agenda → handle the dream-review feeling nudge → engram_checkpoint(mode=session) → update warm-briefing session note → reconcile today's history file at \$ENGRAM_HOME/history/$TODAY.md → report.
+Follow the skill in order: nap → engram_reflect → day-wide synthesis (engram_history since the previous sleep) → work the dream agenda → handle the dream-review feeling nudge → engram_advance_turn → update warm-briefing session note → reconcile today's history file at \$ENGRAM_HOME/history/$TODAY.md → report.
 
 When done, exit cleanly."
 

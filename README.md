@@ -201,7 +201,7 @@ When the user starts Claude Code after install, the agent:
    cornerstone.
 6. Substitutes `{{AGENT_NAME}}`, `{{USER_NAME}}`, `{{TODAY}}` in
    `CLAUDE.md` and `warm-briefing.md`, deletes the marker, and runs
-   `engram_checkpoint(mode="session")`.
+   `engram_advance_turn()`.
 
 The skill is in `~/.claude/skills/engram-first-session/SKILL.md`.
 
