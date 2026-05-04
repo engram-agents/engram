@@ -129,14 +129,23 @@ echo "== Step 4: Copying files =="
 # Hook scripts: each install gets its own copy (so uninstalling one doesn't
 # break the other), and the scripts are path-aware via $ENGRAM_HOME so they
 # operate on this install's data dir.
-if [ -d "$ALPHA_DIR/hooks" ] && [ -n "$(ls -A "$ALPHA_DIR/hooks" 2>/dev/null || true)" ]; then
-  cp -r "$ALPHA_DIR/hooks/"* "$ENGRAM_HOME/hooks/"
+# Hooks: deploy from hooks/gemini/ if populated; fall back to hooks/claude/
+# while Mneme hasn't yet mirrored gemini-side sidecar versions. Per ob_1354,
+# the hook surface JSON shape is mostly compatible between the two CLIs, so
+# the claude hooks are usable as-is on gemini until divergence is forced.
+GEMINI_HOOKS_SRC="$ALPHA_DIR/hooks/gemini"
+if [ ! -d "$GEMINI_HOOKS_SRC" ] || [ -z "$(ls -A "$GEMINI_HOOKS_SRC" 2>/dev/null | grep -v '^\.gitkeep$' || true)" ]; then
+  GEMINI_HOOKS_SRC="$ALPHA_DIR/hooks/claude"
+  echo "  (gemini sidecar empty; bootstrapping hooks from claude/)"
+fi
+if [ -d "$GEMINI_HOOKS_SRC" ] && [ -n "$(ls -A "$GEMINI_HOOKS_SRC" 2>/dev/null | grep -v '^\.gitkeep$' || true)" ]; then
+  cp -r "$GEMINI_HOOKS_SRC/"* "$ENGRAM_HOME/hooks/"
   chmod +x "$ENGRAM_HOME/hooks/"*.py 2>/dev/null || true
   chmod +x "$ENGRAM_HOME/hooks/"*.sh 2>/dev/null || true
   if [ -f "$ENGRAM_HOME/hooks/start-engram-daemon.sh" ]; then
     sed -i "s|{{PYTHON}}|$PYTHON_BIN|g" "$ENGRAM_HOME/hooks/start-engram-daemon.sh"
   fi
-  echo "  hooks → $ENGRAM_HOME/hooks/"
+  echo "  hooks → $ENGRAM_HOME/hooks/ (from $GEMINI_HOOKS_SRC#$ALPHA_DIR/)"
 fi
 
 # Tools: heartbeat, sleep, dispatcher launchers, telegram bot, channel

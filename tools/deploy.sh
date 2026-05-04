@@ -104,14 +104,18 @@ fi
 
 # Manifest — entries are paths relative to $ALPHA_DIR.
 # Directories deploy recursively (with trailing slash semantics).
+# Optional src:dst syntax remaps source path (in alpha) to a different
+# target path (in $ENGRAM_HOME). Used for the hooks/claude → hooks
+# layered-sidecar split where alpha holds claude-side and gemini-side
+# in separate directories but the runtime sees a single flat hooks/.
 # See header for what's intentionally excluded (install-time scaffolding,
-# data files, claude/gemini-specific skill directories).
+# data files).
 MANIFEST=(
     "server.py"
     "engram_client.py"
     "engram_confidence.py"
     "viz_server.py"
-    "hooks"
+    "hooks/claude:hooks"
     "tools"
     "SKILL.md"
 )
@@ -127,17 +131,33 @@ if [[ "$ALPHA_DIRTY" = "dirty" ]]; then
 fi
 echo
 
+# Helper: split entry into (src_rel, dst_rel). If entry contains ':',
+# split on the first ':'; otherwise src and dst are the same path.
+_split_entry() {
+    local entry="$1"
+    if [[ "$entry" == *:* ]]; then
+        ENTRY_SRC="${entry%%:*}"
+        ENTRY_DST="${entry##*:}"
+        ENTRY_LABEL="${ENTRY_SRC} → ${ENTRY_DST}"
+    else
+        ENTRY_SRC="$entry"
+        ENTRY_DST="$entry"
+        ENTRY_LABEL="$entry"
+    fi
+}
+
 CHANGES=0
 PLAN_DETAILS=""
 for entry in "${MANIFEST[@]}"; do
-    src="$ALPHA_DIR/$entry"
-    dst="$ENGRAM_HOME/$entry"
+    _split_entry "$entry"
+    src="$ALPHA_DIR/$ENTRY_SRC"
+    dst="$ENGRAM_HOME/$ENTRY_DST"
     if [[ ! -e "$src" ]]; then
-        printf '  skip:      %s (not in alpha)\n' "$entry"
+        printf '  skip:      %s (not in alpha)\n' "$ENTRY_LABEL"
         continue
     fi
     if [[ ! -e "$dst" ]]; then
-        printf '  NEW:       %s\n' "$entry"
+        printf '  NEW:       %s\n' "$ENTRY_LABEL"
         CHANGES=1
         continue
     fi
@@ -150,9 +170,9 @@ for entry in "${MANIFEST[@]}"; do
         diff_output="$(rsync "${rsync_args[@]}" "$src" "$dst" 2>&1 | grep -v '^$' | grep -vE '^sending incremental|^sent |^total size|^$' || true)"
     fi
     if [[ -z "$diff_output" ]]; then
-        printf '  unchanged: %s\n' "$entry"
+        printf '  unchanged: %s\n' "$ENTRY_LABEL"
     else
-        printf '  CHANGED:   %s\n' "$entry"
+        printf '  CHANGED:   %s\n' "$ENTRY_LABEL"
         echo "$diff_output" | sed 's/^/      /' | head -8
         CHANGES=1
     fi
@@ -179,8 +199,9 @@ fi
 
 # Apply
 for entry in "${MANIFEST[@]}"; do
-    src="$ALPHA_DIR/$entry"
-    dst="$ENGRAM_HOME/$entry"
+    _split_entry "$entry"
+    src="$ALPHA_DIR/$ENTRY_SRC"
+    dst="$ENGRAM_HOME/$ENTRY_DST"
     [[ ! -e "$src" ]] && continue
     if [[ -d "$src" ]]; then
         mkdir -p "$dst"

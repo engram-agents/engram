@@ -23,6 +23,61 @@ markers. (The transitional `borges-branch` from the 2026-05-02 multi-agent
 migration is being retired after its in-flight PRs merge; future spawned
 agents skip this step entirely.)
 
+## Repository layout (hybrid layered sidecar)
+
+The repo separates the **engine layer** (genuinely shared across all
+runtimes) from **adapter layers** that are inherently model-aware. Per
+`dv_0557` (Lei + Borges, 2026-05-04):
+
+```
+engram-alpha/
+├── server.py, engram_*.py, viz_server.py    # engine — agent-agnostic
+├── tools/                                   # shared utilities + deploy.sh
+├── hooks/
+│   ├── claude/  ← Claude Code hooks (transcript paths + event JSON)
+│   └── gemini/  ← Gemini-CLI hooks (mirror or sidecar versions)
+├── skills/
+│   ├── claude/  ← Claude skill format (frontmatter + Markdown)
+│   └── gemini/  ← Gemini skill format (when distinct from Claude)
+├── install.sh, install-gemini.sh            # install-time entry points
+└── README.md, SKILL.md, USER_GUIDE.md, DEVELOPMENT.md
+```
+
+**Why hybrid not pure-3-way-split:** the engine is genuinely shared and
+shouldn't be triplicated under a top-level `agnostic/` dir; only the
+layers that diverge between models get sidecar dirs.
+
+**Cross-platform sync expectation per PR:** every feature PR henceforth
+updates **both** `hooks/claude/` and `hooks/gemini/` in sync, and **both**
+`skills/claude/` and `skills/gemini/` in sync — OR explicitly records
+that the change is platform-specific and labels the gap reason. The
+counterpart agent (Borges for claude PRs, Mneme for gemini PRs) tests
+the change on their own platform before merge approval.
+
+**While `hooks/gemini/` is empty** (Mneme hasn't yet mirrored): the
+gemini installer falls back to `hooks/claude/` since per ob_1354 the
+hook event JSON shape is mostly compatible between the two CLIs. Replace
+the fallback once Mneme has populated her sidecar with intentional
+divergence.
+
+## Where engine vs adapter code lives
+
+| Layer | Location | Why |
+|-------|----------|-----|
+| Engine (server, confidence, client, viz) | repo root | Agent-agnostic. Serves MCP. Either CLI consumes via the same protocol. |
+| Shared utilities | `tools/` | Python helpers, deploy script, surgical, telegram bot. Most of `tools/` is genuinely shared. |
+| Heartbeat / sleep launchers | `tools/` | Currently claude-coded (`claude -p` invocation in `heartbeat.sh`). Will move into a sidecar layer if/when divergence forces it; for now the parallel installers (`install.sh`, `install-gemini.sh`) handle the per-CLI invocation patterns. |
+| Hook scripts | `hooks/<model>/` | Read transcripts in model-specific JSONL formats; inject hook context with model-specific event JSON. |
+| Skill files | `skills/<model>/` | Frontmatter + Markdown conventions are per-CLI. |
+| Install scripts | repo root (split by model) | `install.sh` claude, `install-gemini.sh` gemini. |
+| Runtime tree (`$ENGRAM_HOME`) | `~/.engram/` (claude) or `~/.engram-gemini/` (gemini) | Flat — runtime sees one model's hooks deployed under a single `hooks/` dir, no sidecar visible at runtime. |
+
+**Deploy / install flatten the sidecar.** `tools/deploy.sh` for the
+claude path uses manifest entry `hooks/claude:hooks`, mapping
+alpha-side `hooks/claude/foo.py` → runtime-side `hooks/foo.py`. The
+runtime path stays unchanged from before the refactor; only the dev
+surface (alpha tree) gained the sidecar layout.
+
 ## Why dev is the contributor agent's default
 
 Two reasons drove this convention (Lei + Borges, 2026-05-04):

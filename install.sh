@@ -117,13 +117,13 @@ echo ""
 
 echo "== Step 4: Copying files =="
 
-if [ -d "$ALPHA_DIR/skills" ] && [ -n "$(ls -A "$ALPHA_DIR/skills" 2>/dev/null || true)" ]; then
-  cp -r "$ALPHA_DIR/skills/"* "$CLAUDE_HOME/skills/"
-  echo "  skills → $CLAUDE_HOME/skills/"
+if [ -d "$ALPHA_DIR/skills/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/skills/claude" 2>/dev/null | grep -v '^\.gitkeep$' || true)" ]; then
+  cp -r "$ALPHA_DIR/skills/claude/"* "$CLAUDE_HOME/skills/"
+  echo "  skills → $CLAUDE_HOME/skills/ (from skills/claude/)"
 fi
 
-if [ -d "$ALPHA_DIR/hooks" ] && [ -n "$(ls -A "$ALPHA_DIR/hooks" 2>/dev/null || true)" ]; then
-  cp -r "$ALPHA_DIR/hooks/"* "$ENGRAM_HOME/hooks/"
+if [ -d "$ALPHA_DIR/hooks/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/hooks/claude" 2>/dev/null | grep -v '^\.gitkeep$' || true)" ]; then
+  cp -r "$ALPHA_DIR/hooks/claude/"* "$ENGRAM_HOME/hooks/"
   chmod +x "$ENGRAM_HOME/hooks/"*.py 2>/dev/null || true
   chmod +x "$ENGRAM_HOME/hooks/"*.sh 2>/dev/null || true
   # Bake the resolved interpreter path into the daemon-launch script so it
@@ -131,7 +131,7 @@ if [ -d "$ALPHA_DIR/hooks" ] && [ -n "$(ls -A "$ALPHA_DIR/hooks" 2>/dev/null || 
   if [ -f "$ENGRAM_HOME/hooks/start-engram-daemon.sh" ]; then
     sed -i "s|{{PYTHON}}|$PYTHON_BIN|g" "$ENGRAM_HOME/hooks/start-engram-daemon.sh"
   fi
-  echo "  hooks → $ENGRAM_HOME/hooks/"
+  echo "  hooks → $ENGRAM_HOME/hooks/ (from hooks/claude/)"
 fi
 
 # Tools: heartbeat, sleep, dispatcher launchers, telegram bot, channel
