@@ -19,6 +19,7 @@ CONFIDENCE_MAP = {
     "official_statement": 0.85,
     "attributed_analysis": 0.70,
     "unnamed_source": 0.50,
+    "personal_communication": 0.40,
     "editorial": 0.35,
 }
 

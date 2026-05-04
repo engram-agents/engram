@@ -33,15 +33,13 @@ from typing import Any, Optional
 
 TOOL_SCHEMAS = {
     "engram_add_evidence": {
-        "description": "Register a source document (webpage, article, data release). Returns existing node if URL matches.",
+        "description": "Register a source document (webpage, article, data release). Returns existing node if URL matches. Per-observation versioning (dv_0547): file content_hash and git_sha live on each observation, not the evidence node.",
         "parameters": {
             "url": {"type": "string", "description": "Canonical URL of the source document.", "required": True},
             "title": {"type": "string", "description": "Article or page title.", "required": True},
             "domain": {"type": "string", "description": "Source domain (auto-extracted from URL if omitted)."},
             "source_date": {"type": "string", "description": "Publication date (ISO format)."},
             "content_snippet": {"type": "string", "description": "Optional truncated excerpt."},
-            "content_hash": {"type": "string", "description": "SHA-256 hash of file content."},
-            "git_sha": {"type": "string", "description": "Git commit SHA."},
         },
     },
     "engram_add_evidence_batch": {
@@ -56,7 +54,7 @@ TOOL_SCHEMAS = {
             "quoted_text": {"type": "string", "description": "Verbatim quote from the source.", "required": True},
             "interpretation": {"type": "string", "description": "Your reasoning about what this quote means and why it matters.", "required": True},
             "claim": {"type": "string", "description": "A single, atomic, falsifiable claim.", "required": True},
-            "quote_type": {"type": "string", "description": "One of: hard_data, official_statement, attributed_analysis, unnamed_source, editorial.", "required": True, "enum": ["hard_data", "official_statement", "attributed_analysis", "unnamed_source", "editorial"]},
+            "quote_type": {"type": "string", "description": "One of: hard_data, official_statement, attributed_analysis, unnamed_source, personal_communication, editorial.", "required": True, "enum": ["hard_data", "official_statement", "attributed_analysis", "unnamed_source", "personal_communication", "editorial"]},
             "url": {"type": "string", "description": "URL of the source. Evidence node is auto-created or reused. Use this OR evidence_id."},
             "title": {"type": "string", "description": "Title of the source (required if url is provided)."},
             "domain": {"type": "string", "description": "Domain name (auto-extracted from URL if omitted)."},

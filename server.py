@@ -248,6 +248,7 @@ def engram_sandbox(data_dir: str | Path | None = None, keep: bool = False):
                         "official_statement": 0.85,
                         "attributed_analysis": 0.70,
                         "unnamed_source": 0.50,
+                        "personal_communication": 0.40,
                         "editorial": 0.35,
                     },
                     "memory": {
@@ -2487,6 +2488,123 @@ def _find_near_matches(
     return matches
 
 
+def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "") -> dict:
+    """Validate a file:// URL is citable and capture its version state.
+
+    Used by both evidence creation (for the "must be committed before cite"
+    guard) and observation creation (for the per-observation version metadata
+    introduced by dv_0547). Replaces the old inline block in engram_add_evidence.
+
+    Behavior:
+      - Non file:// URLs: returns ok=True, no version data, no validation here.
+      - file:// URLs that don't exist: returns error.
+      - file:// URLs outside any git repo: returns ok=True, no version data
+        (versioning enforcement only applies inside git).
+      - file:// URLs in a git repo with uncommitted changes (untracked,
+        modified, staged): returns error explaining what's wrong.
+      - file:// URLs in a git repo, clean: returns ok=True with computed
+        content_hash (sha256 of working-tree file) and git_sha (HEAD if not
+        provided). If git_sha was provided, verifies the file exists at that
+        revision; returns error if not.
+
+    Returns a dict with keys:
+      - ok (bool): True if validation passed
+      - error (str | None): error message if ok=False
+      - content_hash (str): sha256 hash, or "" if not applicable
+      - git_sha (str): commit SHA, or "" if not applicable
+    """
+    _HONESTY_REMINDER = (
+        "\n\nRemember: cheating blinds you. A fabricated URL corrupts your own memory "
+        "and every future step built on it. If the real source is hard to find, "
+        "raise the problem transparently — never solve it with a shortcut. (ax_0002)"
+    )
+
+    if not url.startswith("file://"):
+        return {"ok": True, "error": None, "content_hash": "", "git_sha": ""}
+
+    file_path = url[7:]
+    if not os.path.exists(file_path):
+        return {
+            "ok": False,
+            "error": (
+                f"File not found: '{file_path}'. Evidence URLs with file:// must "
+                "point to existing files. If citing a conversation, use the "
+                "JSONL transcript file path instead." + _HONESTY_REMINDER
+            ),
+            "content_hash": "",
+            "git_sha": "",
+        }
+
+    file_dir = os.path.dirname(os.path.abspath(file_path))
+    _file_git = lambda *args: subprocess.run(
+        [GIT_EXE, *args], cwd=file_dir, capture_output=True, text=True, timeout=GIT_TIMEOUT
+    )
+    try:
+        repo_check = _file_git("rev-parse", "--is-inside-work-tree")
+        file_in_git_repo = repo_check.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        file_in_git_repo = False
+
+    if not file_in_git_repo:
+        return {"ok": True, "error": None, "content_hash": "", "git_sha": ""}
+
+    repo_root_result = _file_git("rev-parse", "--show-toplevel")
+    repo_root = repo_root_result.stdout.strip()
+    abs_file = os.path.abspath(file_path)
+    rel_path = os.path.relpath(abs_file, repo_root)
+
+    status_result = _file_git("status", "--porcelain", "--", rel_path)
+    file_status = status_result.stdout.strip()
+    if file_status:
+        status_code = file_status[:2]
+        if status_code == "??":
+            status_desc = "untracked (not yet added to git)"
+        elif "M" in status_code:
+            status_desc = "modified but not committed"
+        elif "A" in status_code:
+            status_desc = "staged but not committed"
+        else:
+            status_desc = f"uncommitted (status: {status_code.strip()})"
+        return {
+            "ok": False,
+            "error": (
+                f"File is {status_desc}: '{rel_path}'. "
+                "File-based evidence must be committed to git before it can be cited. "
+                "This ensures the evidence is verifiable at the claimed revision. "
+                "Commit the file first, then retry with the new git SHA."
+                + _HONESTY_REMINDER
+            ),
+            "content_hash": "",
+            "git_sha": "",
+        }
+
+    if not content_hash:
+        with open(abs_file, "rb") as f:
+            content_hash = hashlib.sha256(f.read()).hexdigest()
+
+    if not git_sha:
+        head_result = _file_git("rev-parse", "HEAD")
+        if head_result.returncode == 0:
+            git_sha = head_result.stdout.strip()
+
+    if git_sha:
+        verify_result = _file_git("cat-file", "-e", f"{git_sha}:{rel_path}")
+        if verify_result.returncode != 0:
+            return {
+                "ok": False,
+                "error": (
+                    f"File '{rel_path}' does not exist at git revision {git_sha[:8]}. "
+                    "The git_sha must point to a commit that contains this file. "
+                    "Check that you committed the file before this revision."
+                    + _HONESTY_REMINDER
+                ),
+                "content_hash": "",
+                "git_sha": "",
+            }
+
+    return {"ok": True, "error": None, "content_hash": content_hash, "git_sha": git_sha}
+
+
 def _verify_quote_in_source(url: str, quoted_text: str) -> Optional[str]:
     """Verify that quoted_text exists in the evidence source file.
 
@@ -2985,19 +3103,18 @@ def engram_add_evidence(
     domain: str = "",
     source_date: str = "",
     content_snippet: str = "",
-    content_hash: str = "",
-    git_sha: str = "",
 ) -> str:
     """Register a new source document (webpage, article, data release) in the knowledge graph.
 
     Creates an Evidence node representing the raw source material. Evidence nodes
-    are immutable references — they record that a specific source exists, not what
-    it means. Observations are extracted from evidence in a separate step.
+    are immutable, URL-keyed references — they record that a specific source
+    exists, not what it means or what version was read. Per-observation versioning
+    (git_sha + content_hash) lives on observations, not evidence (dv_0547).
 
-    For web sources: if the URL already exists, returns the existing node ID.
-    For file-based sources (file:// URLs): if the URL exists but content_hash
-    differs, creates a new version (the file changed since last read). If the
-    content_hash matches, returns the existing node (file unchanged).
+    Same URL → same evidence node, regardless of content changes. For file-based
+    sources, the file must be committed to git before it can be cited (the
+    "committed-before-cite" guard remains enforced); the specific revision read
+    is recorded on each observation that cites this evidence.
 
     Args:
         url: Canonical URL of the source document. For local files, use
@@ -3007,11 +3124,6 @@ def engram_add_evidence(
         source_date: Publication or byline date of the source (ISO format, e.g. '2026-03-20').
                      Extract from the article's dateline or byline when available.
         content_snippet: Optional truncated excerpt of relevant content for offline re-reading.
-        content_hash: SHA-256 hash of the file content. Used for change detection on
-                      file-based evidence. If the same URL exists with a different hash,
-                      a new evidence version is created.
-        git_sha: Git commit SHA at the time this evidence was read. Enables future
-                 diffing via 'git diff old_sha..new_sha -- file'.
 
     Returns:
         JSON with the evidence node ID and trust pool status.
@@ -3024,38 +3136,23 @@ def engram_add_evidence(
             domain = _extract_domain(url)
         _yellow_match = _check_yellow_card(domain)
 
-        # Check for existing URL
+        # Check for existing URL — same URL → same evidence node, always.
+        # Per-observation versioning (dv_0547) means content changes don't fork
+        # evidence; the new revision is recorded on the observation citing it.
         existing = conn.execute(
-            "SELECT id, metadata FROM nodes WHERE source_url = ? AND type = 'evidence'"
-            " ORDER BY created_at DESC",
+            "SELECT id FROM nodes WHERE source_url = ? AND type = 'evidence'"
+            " ORDER BY created_at DESC LIMIT 1",
             (url,)
         ).fetchone()
         if existing:
-            # For file-based evidence with content_hash, check if content changed
-            if content_hash and url.startswith("file://"):
-                existing_meta = json.loads(existing["metadata"] or "{}")
-                if existing_meta.get("content_hash") != content_hash:
-                    # File changed — create new version (fall through to creation below)
-                    pass
-                else:
-                    # Same content — reuse existing
-                    reuse = {
-                        "status": "already_exists",
-                        "evidence_id": existing["id"],
-                        "message": f"Evidence node {existing['id']} already registered (content unchanged).",
-                    }
-                    if _yellow_match:
-                        reuse["yellow_card_warning"] = _format_yellow_warning(_yellow_match)
-                    return json.dumps(reuse)
-            else:
-                reuse = {
-                    "status": "already_exists",
-                    "evidence_id": existing["id"],
-                    "message": f"Evidence node {existing['id']} already registered for this URL.",
-                }
-                if _yellow_match:
-                    reuse["yellow_card_warning"] = _format_yellow_warning(_yellow_match)
-                return json.dumps(reuse)
+            reuse = {
+                "status": "already_exists",
+                "evidence_id": existing["id"],
+                "message": f"Evidence node {existing['id']} already registered for this URL.",
+            }
+            if _yellow_match:
+                reuse["yellow_card_warning"] = _format_yellow_warning(_yellow_match)
+            return json.dumps(reuse)
 
         # Validate evidence URL resolvability
         RECOGNIZED_SCHEMES = ("http://", "https://", "file://")
@@ -3065,76 +3162,12 @@ def engram_add_evidence(
             "raise the problem transparently — never solve it with a shortcut. (ax_0002)"
         )
         if url.startswith("file://"):
-            file_path = url[7:]  # Strip file:// prefix
-            if not os.path.exists(file_path):
-                return json.dumps({
-                    "error": f"File not found: '{file_path}'. Evidence URLs with file:// must point to existing files. "
-                    "If citing a conversation, use the JSONL transcript file path instead."
-                    + _HONESTY_REMINDER
-                })
-
-            # --- Git versioning enforcement for file-based evidence ---
-            # Determine file's git repo (if any)
-            file_dir = os.path.dirname(os.path.abspath(file_path))
-            _file_git = lambda *args: subprocess.run(
-                [GIT_EXE, *args], cwd=file_dir, capture_output=True, text=True, timeout=GIT_TIMEOUT
-            )
-            try:
-                repo_check = _file_git("rev-parse", "--is-inside-work-tree")
-                file_in_git_repo = repo_check.returncode == 0
-            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-                file_in_git_repo = False
-
-            if file_in_git_repo:
-                # Get repo-relative path for git commands
-                repo_root_result = _file_git("rev-parse", "--show-toplevel")
-                repo_root = repo_root_result.stdout.strip()
-                abs_file = os.path.abspath(file_path)
-                rel_path = os.path.relpath(abs_file, repo_root)
-
-                # Check if file is committed (tracked and clean)
-                status_result = _file_git("status", "--porcelain", "--", rel_path)
-                file_status = status_result.stdout.strip()
-                if file_status:
-                    # File has uncommitted changes — determine the kind
-                    status_code = file_status[:2]
-                    if status_code == "??":
-                        status_desc = "untracked (not yet added to git)"
-                    elif "M" in status_code:
-                        status_desc = "modified but not committed"
-                    elif "A" in status_code:
-                        status_desc = "staged but not committed"
-                    else:
-                        status_desc = f"uncommitted (status: {status_code.strip()})"
-                    return json.dumps({
-                        "error": f"File is {status_desc}: '{rel_path}'. "
-                        "File-based evidence must be committed to git before it can be cited. "
-                        "This ensures the evidence is verifiable at the claimed revision. "
-                        "Commit the file first, then retry with the new git SHA."
-                        + _HONESTY_REMINDER
-                    })
-
-                # Auto-compute content_hash if not provided
-                if not content_hash:
-                    with open(abs_file, "rb") as f:
-                        content_hash = hashlib.sha256(f.read()).hexdigest()
-
-                # Auto-populate git_sha from HEAD if not provided
-                if not git_sha:
-                    head_result = _file_git("rev-parse", "HEAD")
-                    if head_result.returncode == 0:
-                        git_sha = head_result.stdout.strip()
-
-                # If git_sha is provided, verify the file exists at that revision
-                if git_sha:
-                    verify_result = _file_git("cat-file", "-e", f"{git_sha}:{rel_path}")
-                    if verify_result.returncode != 0:
-                        return json.dumps({
-                            "error": f"File '{rel_path}' does not exist at git revision {git_sha[:8]}. "
-                            "The git_sha must point to a commit that contains this file. "
-                            "Check that you committed the file before this revision."
-                            + _HONESTY_REMINDER
-                        })
+            # File:// URLs: enforce the committed-before-cite guard. Do NOT
+            # store the version state on the evidence — that lives on each
+            # citing observation now.
+            ver = _capture_file_version(url)
+            if not ver["ok"]:
+                return json.dumps({"error": ver["error"]})
         elif url.startswith("http://") or url.startswith("https://"):
             # --- Validation for web URLs ---
             parsed_url = urlparse(url)
@@ -3190,18 +3223,6 @@ def engram_add_evidence(
         node_id = _next_id(conn, "evidence")
         now = _now()
 
-        # Build metadata for file-based evidence
-        ev_metadata = {}
-        prior_evidence_id = None
-        if content_hash:
-            ev_metadata["content_hash"] = content_hash
-        if git_sha:
-            ev_metadata["git_sha"] = git_sha
-        if existing and content_hash and url.startswith("file://"):
-            # This is a new version of a changed file
-            prior_evidence_id = existing["id"]
-            ev_metadata["prior_evidence_id"] = prior_evidence_id
-
         # Auto-tag source_type from URL pattern (orthogonal to source_class).
         # Used by the dedup heuristic to grade action_hints by artifact kind.
         source_type = _infer_source_type(url)
@@ -3212,19 +3233,9 @@ def engram_add_evidence(
                source_type)
                VALUES (?, 'evidence', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (node_id, now, url, title, domain, source_date or None, now,
-             content_snippet or None, json.dumps(ev_metadata) if ev_metadata else "{}",
+             content_snippet or None, "{}",
              source_type),
         )
-
-        # If this is a new version, add supersedes edge to prior version
-        if prior_evidence_id:
-            try:
-                conn.execute(
-                    "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'supersedes', ?)",
-                    (node_id, prior_evidence_id, now),
-                )
-            except sqlite3.IntegrityError:
-                pass
 
         _stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
         conn.commit()
@@ -3236,9 +3247,6 @@ def engram_add_evidence(
             "source_date": source_date or None,
             "in_trust_pool": in_trust_pool,
         }
-        if prior_evidence_id:
-            result["prior_evidence_id"] = prior_evidence_id
-            result["message"] = f"New version of {prior_evidence_id} (content changed)."
         if not in_trust_pool:
             result["warning"] = (
                 f"Domain '{domain}' is NOT in the trusted source pool. "
@@ -3297,7 +3305,7 @@ def engram_add_observation(
         quoted_text: Exact quote from the source document.
         interpretation: Agent's reasoning about what this quote means.
         claim: The atomic, falsifiable claim this observation supports.
-        quote_type: One of: hard_data, official_statement, attributed_analysis, unnamed_source, editorial.
+        quote_type: One of: hard_data, official_statement, attributed_analysis, unnamed_source, personal_communication, editorial.
         url: URL of the source document. The evidence node is auto-created or reused.
         title: Title of the source document (required if url is provided).
         domain: Source domain (auto-extracted from URL if omitted).
@@ -3343,7 +3351,6 @@ def engram_add_observation(
         # Auto-create or reuse evidence node
         ev_result = json.loads(engram_add_evidence(
             url=url, title=title, domain=domain, source_date=source_date,
-            content_hash=content_hash, git_sha=git_sha,
         ))
         if ev_result.get("error"):
             return json.dumps({"error": f"Failed to create evidence node: {ev_result['error']}"})
@@ -3367,6 +3374,15 @@ def engram_add_observation(
         quote_error = _verify_quote_in_source(ev_url, quoted_text)
         if quote_error:
             return json.dumps({"error": quote_error})
+
+        # Capture per-observation file version (dv_0547). For file:// URLs
+        # in a git repo: enforce committed-before-cite + record the specific
+        # revision read on this observation. For other URLs: no-op.
+        ver = _capture_file_version(ev_url, content_hash=content_hash, git_sha=git_sha)
+        if not ver["ok"]:
+            return json.dumps({"error": ver["error"]})
+        captured_content_hash = ver["content_hash"]
+        captured_git_sha = ver["git_sha"]
 
         node_type = "observation_predictive" if is_predictive else "observation_factual"
         confidence = _compute_confidence(
@@ -3437,7 +3453,12 @@ def engram_add_observation(
 
         node_id = _next_id(conn, node_type)
         now = _now()
-        metadata = json.dumps({"source_class": source_class})
+        obs_metadata = {"source_class": source_class}
+        if captured_git_sha:
+            obs_metadata["git_sha"] = captured_git_sha
+        if captured_content_hash:
+            obs_metadata["content_hash"] = captured_content_hash
+        metadata = json.dumps(obs_metadata)
         conf_reason = f"Initial: {quote_type}"
         if source_class != "external":
             conf_reason += f" (source_class: {source_class})"
@@ -3719,7 +3740,7 @@ def engram_add_observation_batch(
             - quoted_text (required): Verbatim quote from the source
             - interpretation (required): Your reasoning about what this means
             - claim (required): Atomic, falsifiable claim
-            - quote_type (required): hard_data, official_statement, attributed_analysis, unnamed_source, or editorial
+            - quote_type (required): hard_data, official_statement, attributed_analysis, unnamed_source, personal_communication, or editorial
             - is_predictive (optional): boolean, default false
             - predicted_event (optional): if predictive, the event predicted
             - resolution_timeframe (optional): if predictive, ISO date for resolution
@@ -3755,7 +3776,6 @@ def engram_add_observation_batch(
             return json.dumps({"error": "'title' is required when providing 'url'."})
         ev_result = json.loads(engram_add_evidence(
             url=url, title=title, domain=domain, source_date=source_date,
-            content_hash=content_hash, git_sha=git_sha,
         ))
         if ev_result.get("error"):
             return json.dumps({"error": f"Failed to create evidence node: {ev_result['error']}"})
@@ -3787,6 +3807,8 @@ def engram_add_observation_batch(
             predicted_event=obs.get("predicted_event", ""),
             resolution_timeframe=obs.get("resolution_timeframe", ""),
             source_class=obs.get("source_class", "external"),
+            content_hash=content_hash,
+            git_sha=git_sha,
         ))
         r["index"] = i
         results.append(r)
