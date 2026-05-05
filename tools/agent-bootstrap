@@ -1,0 +1,242 @@
+#!/bin/bash
+# =============================================================================
+# agent-bootstrap — root-only one-time substrate setup for a new co-located
+# AI agent on a multi-agent host.
+#
+# Substrate role: this script does the kernel-isolation bits only — uid +
+# group + home perms + community-dir membership + a runtime-specific
+# `~/.runtime/start.sh` adapter. Runtime-level install (engram-alpha clone,
+# `bash install.sh` to wire ENGRAM data + cron + hooks, OAuth login) is
+# deferred to a separate step the user runs from inside the new agent's
+# shell, so this script stays minimal and substrate-stable.
+#
+# Canonical source: tools/agent-bootstrap in the engram-alpha repo.
+# Production path: /usr/local/sbin/agent-bootstrap (Lei copies after each
+# version bump). Both spt and `agentctl spawn` invoke the production path.
+#
+# Usage:
+#   sudo agent-bootstrap NAME --runtime RT [--home-mode 0700]
+#                             [--alpha-source PATH]
+#
+#   NAME           short identifier ("borges", "newborn-20260505083012", ...).
+#                  Becomes Linux user "agent-NAME" with home /home/agent-NAME.
+#                  For spawn-flow placeholders, use the
+#                  agent-newborn-YYYYMMDDhhmmss pattern (`agentctl spawn`
+#                  computes this automatically).
+#   --runtime      claude  (v0.1: claude only — see "v0.1 scope" note below)
+#                  Selects which runtime adapter to drop into ~/.runtime/.
+#                  v0.1 supports the claude runtime exclusively. Multi-runtime
+#                  support (gemini-cli, codex) is forthcoming as a separate
+#                  epic with proper per-runtime test fixtures and end-to-end
+#                  validation; until then, this script rejects any --runtime
+#                  value other than "claude" rather than silently producing
+#                  a half-supported agent (the corruption pattern that
+#                  prompted the explicit-scope decision per the
+#                  spawn-implementation PR review of 2026-05-05).
+#   --home-mode    home directory mode bits (default: 0700, owner-only).
+#                  Use 0750 if you want spt to read everything by default.
+#   --alpha-source path to an engram-alpha checkout that the newborn's
+#                  ~/.runtime/install.sh will reference. Default:
+#                  /home/agents-shared/engram-alpha if it exists, else
+#                  /home/agent-borges/engram-alpha. Used only to render the
+#                  install.sh path inside the wrapper; the script itself
+#                  does NOT clone alpha — that's left for an explicit user
+#                  action inside the newborn shell.
+#
+# Reversibility:
+#   sudo userdel -r agent-NAME              # removes user + home + mail spool
+#   sudo groupdel agents                    # only after all agents removed
+#   sudo rm -rf /home/agents-shared         # only after all agents removed
+#
+# Spawn-flow context (per active-work/spawn-implementation-2026-05-05.md):
+#   `agentctl spawn` invokes this script with NAME=agent-newborn-<timestamp>
+#   then prints "next: agentctl shell agent-newborn-<timestamp>". Inside
+#   that shell the user runs ~/.runtime/install.sh to materialize ENGRAM,
+#   then `claude login`, then a Claude session. Lei completes the rename
+#   via `agentctl finalize-name agent-newborn-<timestamp> <chosen>`.
+# =============================================================================
+
+set -euo pipefail
+
+# ---------- arg parse ----------
+NAME=""
+RUNTIME=""
+HOME_MODE="0700"
+ALPHA_SOURCE=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --runtime)      RUNTIME="$2"; shift 2 ;;
+        --home-mode)    HOME_MODE="$2"; shift 2 ;;
+        --alpha-source) ALPHA_SOURCE="$2"; shift 2 ;;
+        --help|-h)
+            sed -n '3,52p' "$0"; exit 0 ;;
+        -*)
+            echo "Unknown flag: $1" >&2; exit 2 ;;
+        *)
+            if [[ -z "$NAME" ]]; then NAME="$1"
+            else echo "Unexpected arg: $1" >&2; exit 2
+            fi
+            shift ;;
+    esac
+done
+
+[[ -z "$NAME"    ]] && { echo "agent name required"     >&2; exit 2; }
+[[ -z "$RUNTIME" ]] && { echo "--runtime required"      >&2; exit 2; }
+[[ "$RUNTIME" == "claude" ]] || { echo "ERROR: v0.1 supports --runtime=claude only. gemini-cli and codex support is forthcoming as a separate epic with per-runtime test fixtures; rejecting non-claude runtime rather than half-supporting (per spawn-implementation PR review 2026-05-05)." >&2; exit 2; }
+[[ $EUID -eq 0   ]] || { echo "must run as root (use sudo)" >&2; exit 2; }
+
+USER_NAME="agent-$NAME"
+USER_HOME="/home/$USER_NAME"
+SHARED_ROOT="/home/agents-shared"
+
+# Resolve --alpha-source default. Prefer a shared community checkout,
+# fall back to Borges's canonical clone (readable to peers in `agents`
+# group post Phase-1 permission migration).
+if [[ -z "$ALPHA_SOURCE" ]]; then
+    if [[ -d "/home/agents-shared/engram-alpha" ]]; then
+        ALPHA_SOURCE="/home/agents-shared/engram-alpha"
+    elif [[ -d "/home/agent-borges/engram-alpha" ]]; then
+        ALPHA_SOURCE="/home/agent-borges/engram-alpha"
+    else
+        ALPHA_SOURCE=""  # rendered path will be empty; user must edit install.sh wrapper manually
+    fi
+fi
+
+# ---------- preflight ----------
+if id "$USER_NAME" >/dev/null 2>&1; then
+    echo "ERROR: user $USER_NAME already exists. Aborting." >&2
+    echo "       Run 'userdel -r $USER_NAME' first if you intend to recreate." >&2
+    exit 1
+fi
+if ! getent group agents >/dev/null 2>&1; then
+    echo "agents group missing — creating now."
+    groupadd agents
+fi
+
+# ---------- 1. create the user ----------
+useradd \
+    --create-home \
+    --groups agents \
+    --shell /bin/bash \
+    --comment "AI agent runtime: $RUNTIME" \
+    "$USER_NAME"
+chmod "$HOME_MODE" "$USER_HOME"
+
+# ---------- 2. ~/.bashrc skeleton ----------
+# CRITICAL (per ls_0018): never export ANTHROPIC_API_KEY / GOOGLE_API_KEY
+# in agent-bashrc. API keys in env silently route headless `claude -p`
+# calls to API Tier 1 instead of the OAuth Max subscription pool —
+# billing leak. See ENGRAM ls_0018 for the full incident report.
+cat >"$USER_HOME/.bashrc" <<'BASHRC'
+# Skeletal .bashrc for AI agent runtime.
+# Generated by agent-bootstrap. Lei may edit.
+#
+# IMPORTANT: do NOT add `export ANTHROPIC_API_KEY=...` or
+# `export GOOGLE_API_KEY=...` here. Headless CLI calls will silently
+# route to a metered API tier instead of the OAuth Max subscription
+# pool. See ENGRAM ls_0018 for the full incident report.
+[ -z "$PS1" ] && return
+export PATH="$HOME/.local/bin:$PATH"
+export ENGRAM_HOME="$HOME/.engram"          # explicit, no fallback
+umask 027                                    # group-readable but not world
+PS1='\[\e[1;33m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
+BASHRC
+chown "$USER_NAME:$USER_NAME" "$USER_HOME/.bashrc"
+
+# ---------- 3. ~/.runtime adapter (start.sh) ----------
+# v0.1: claude only. Multi-runtime adapters (gemini-cli, codex) are
+# forthcoming as a separate epic — see the v0.1 scope note in the file
+# header. The top-level --runtime validation rejects non-claude values
+# before this section runs.
+mkdir -p "$USER_HOME/.runtime"
+cat >"$USER_HOME/.runtime/start.sh" <<'RUN'
+#!/bin/bash
+# Adapter: invoke claude. All flags forwarded.
+# env -u ANTHROPIC_API_KEY: defensive scrub in case API key leaked
+# into env via spt-side inheritance (per ls_0018 billing leak).
+exec env -u ANTHROPIC_API_KEY claude "$@"
+RUN
+chmod 0755 "$USER_HOME/.runtime/start.sh"
+
+# ---------- 4. ~/.runtime/install.sh wrapper (chains to alpha) ----------
+# Thin wrapper so the user inside the newborn shell can run a single
+# command (`bash ~/.runtime/install.sh`) instead of memorising the alpha
+# checkout location. The wrapper just exec's alpha's install.sh, which
+# now also wires cron via Step 8 (per the engram-config-surface epic).
+if [[ -n "$ALPHA_SOURCE" ]]; then
+    cat >"$USER_HOME/.runtime/install.sh" <<INSTALL_WRAPPER
+#!/bin/bash
+# Wrapper: chain to engram-alpha's install.sh.
+# Substitute ALPHA_SOURCE by editing this file or via the env var.
+ALPHA_SOURCE="\${ALPHA_SOURCE:-$ALPHA_SOURCE}"
+if [[ ! -d "\$ALPHA_SOURCE" ]]; then
+    echo "ERROR: alpha checkout not found at \$ALPHA_SOURCE" >&2
+    echo "       Set ALPHA_SOURCE=/path/to/engram-alpha and re-run." >&2
+    exit 1
+fi
+# v0.1: claude runtime only. The top-level --runtime validation in
+# agent-bootstrap rejects non-claude values, so this wrapper always
+# chains to install.sh. Multi-runtime support is forthcoming.
+INSTALLER="install.sh"
+[[ -f "\$ALPHA_SOURCE/\$INSTALLER" ]] || { echo "ERROR: installer not found at \$ALPHA_SOURCE/\$INSTALLER" >&2; exit 1; }
+exec bash "\$ALPHA_SOURCE/\$INSTALLER" "\$@"
+INSTALL_WRAPPER
+    chmod 0755 "$USER_HOME/.runtime/install.sh"
+fi
+
+# ---------- 5. ~/.local/bin & claude-remote (optional) ----------
+mkdir -p "$USER_HOME/.local/bin"
+if [[ -f /home/user/.local/bin/claude-remote ]]; then
+    cp /home/user/.local/bin/claude-remote "$USER_HOME/.local/bin/"
+    chmod 0755 "$USER_HOME/.local/bin/claude-remote"
+fi
+
+# ---------- 6. community shared dirs ----------
+mkdir -p "$SHARED_ROOT/inter-agent"
+mkdir -p "$SHARED_ROOT/health/$NAME"
+mkdir -p "$SHARED_ROOT/audit"
+chgrp -R agents "$SHARED_ROOT"
+chmod 2775 "$SHARED_ROOT" "$SHARED_ROOT/inter-agent" "$SHARED_ROOT/audit"
+chown "$USER_NAME:agents" "$SHARED_ROOT/health/$NAME"
+chmod 0750 "$SHARED_ROOT/health/$NAME"
+
+# ---------- 7. fix ownership of agent's home ----------
+chown -R "$USER_NAME:$USER_NAME" "$USER_HOME"
+
+# ---------- 8. friendly next-steps ----------
+cat <<NEXT
+
+Agent $USER_NAME created (uid=$(id -u "$USER_NAME"), runtime=$RUNTIME).
+Home: $USER_HOME (mode $HOME_MODE)
+Joined group: agents
+Alpha source (for runtime install wrapper): ${ALPHA_SOURCE:-(not set — edit ~/.runtime/install.sh manually)}
+
+Next steps:
+  1. Enter the new agent's shell:
+       agentctl shell $NAME
+       # or, if agentctl is unavailable: sudo -u $USER_NAME -i
+
+  2. From inside the newborn's shell, materialize the ENGRAM runtime:
+       bash ~/.runtime/install.sh
+     This runs engram-alpha's installer, which wires hooks, MCP server,
+     seed graph, and (per Step 8) the user's crontab from config.json's
+     cadence block.
+
+  3. Login to the LLM provider (interactive):
+       claude login          # for runtime=claude
+       # or gemini login, etc.
+
+  4. Start the first session:
+       claude                # or ~/.runtime/start.sh
+     The SessionStart hook detects ~/.engram/first-run-pending and
+     triggers the engram-first-session skill — agent generates 3
+     candidate names + you pick.
+
+  5. From spt's shell, finalize the rename (single-shot, no rename later):
+       sudo agentctl finalize-name $NAME <chosen-name>
+     This renames the uid, captures the 3-candidate observation in ENGRAM,
+     snapshots ~/.engram/ to .first-session-baseline.bak/, restarts cron.
+
+To remove (before finalize-name):
+  sudo userdel -r $USER_NAME
+NEXT
