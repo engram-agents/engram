@@ -38,9 +38,13 @@
 #     USER_GUIDE.md (these belong to fresh installs, not running upgrades)
 #   - Install-time scaffolding: templates/, integrations/, inter-agent/
 #     (deployed at install time only, not part of the running tree)
-#   - Skills: skills/ in alpha is the source-of-truth for fresh installs;
-#     they live at ~/.claude/skills/ (claude) or ~/.gemini/skills/ (gemini)
-#     once installed and are not part of $ENGRAM_HOME.
+#   - Skills: skills/ in alpha is the source-of-truth for fresh installs.
+#     For Claude they live at ~/.claude/skills/, for Gemini they're folded
+#     into GEMINI.md + the extension's hooks.json at install time (no
+#     parallel runtime skills/ dir). Either way, the live destination is
+#     outside $ENGRAM_HOME, so deploy.sh (which only writes inside
+#     $ENGRAM_HOME) cannot reach it. Skills updates require re-running
+#     install.sh / install-gemini.sh.
 #
 # After deploy: restart your MCP client to reload server.py.
 
@@ -51,6 +55,15 @@ ALPHA_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
 YES=0
 DRY_RUN=0
+
+# Detect target model platform if not set
+if [[ -z "${TARGET:-}" ]]; then
+    if [[ "$ENGRAM_HOME" == *"-gemini"* ]]; then
+        TARGET="gemini"
+    else
+        TARGET="claude"
+    fi
+fi
 DELETE=0
 
 usage() {
@@ -111,14 +124,22 @@ fi
 # See header for what's intentionally excluded (install-time scaffolding,
 # data files).
 MANIFEST=(
+    "hooks/$TARGET:hooks"
     "server.py"
     "engram_client.py"
     "engram_confidence.py"
     "viz_server.py"
-    "hooks/claude:hooks"
     "tools"
     "SKILL.md"
 )
+# Note: skills/ deliberately NOT in the manifest. The live skills surface
+# is OUTSIDE $ENGRAM_HOME — Claude reads from $CLAUDE_HOME/skills/, and
+# Gemini folds skills into GEMINI.md + the extension's hooks.json at install
+# time (no parallel skills/ runtime directory). install.sh and
+# install-gemini.sh handle the per-CLI placement; deploy.sh (which only
+# writes inside $ENGRAM_HOME) cannot reach the right destination.
+# If runtime-deployable skills become a need, deploy.sh needs a manifest
+# mechanism for destinations outside $ENGRAM_HOME — separate epic.
 
 # Per-deploy report — check what would change before applying.
 echo "=== ENGRAM deploy ==="
