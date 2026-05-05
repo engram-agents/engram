@@ -115,6 +115,20 @@ mkdir -p "$ENGRAM_HOME/secrets"
 mkdir -p "$ENGRAM_HOME/heartbeat-queue"
 mkdir -p "$CLAUDE_HOME/skills"
 chmod 0700 "$ENGRAM_HOME/secrets"
+chmod 0700 "$ENGRAM_HOME/diary"
+
+# Open the top-level $ENGRAM_HOME dir to peer agents (group=agents) so the
+# multi-agent viz_server can read this agent's knowledge.db. Subdirs that
+# hold private content (secrets/, diary/) keep mode 700 above and stay
+# invisible. The DB itself gets group-read in the bootstrap step below
+# (after server.py creates knowledge.db). If the `agents` group doesn't
+# exist (single-tenant install with no shared infra), this is a no-op
+# silently — peer access wasn't requested.
+if getent group agents >/dev/null 2>&1; then
+  chgrp agents "$ENGRAM_HOME" 2>/dev/null || true
+  chmod g+rx "$ENGRAM_HOME" 2>/dev/null || true
+fi
+
 echo "  $ENGRAM_HOME"
 echo "  $CLAUDE_HOME"
 echo ""
@@ -198,6 +212,14 @@ CLAUDE_HOME="$CLAUDE_HOME" \
 PYTHON_BIN="$PYTHON_BIN" \
 FORCE="$FORCE" \
   "$PYTHON_BIN" "$ALPHA_DIR/bootstrap.py"
+
+# Open the just-created knowledge.db (and WAL friends) to peer agents
+# (group=agents) so the multi-agent viz_server can read it. Pairs with
+# the $ENGRAM_HOME group-traversal opening in Step 3.
+if getent group agents >/dev/null 2>&1 && [ -f "$ENGRAM_HOME/knowledge.db" ]; then
+  chgrp agents "$ENGRAM_HOME"/knowledge.db* 2>/dev/null || true
+  chmod g+r "$ENGRAM_HOME"/knowledge.db* 2>/dev/null || true
+fi
 echo ""
 
 # -------- Step 6: First-run marker --------

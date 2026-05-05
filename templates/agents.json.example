@@ -1,0 +1,16 @@
+{
+  "_comment": "Multi-agent viz_server config. Used by `viz_server.py --config <this file>`. The viz process needs read access to each listed knowledge.db (see active-work/viz-server-multi-agent-2026-05-04.md for the group=agents permission model). Lives at ~/.config/engram-viz/agents.json or /etc/engram-viz/agents.json for systemd-managed installs. The default agent loads when ?agent= is omitted.",
+  "agents": [
+    {
+      "name": "borges",
+      "label": "Borges (Claude)",
+      "db": "/home/agent-borges/.engram/knowledge.db"
+    },
+    {
+      "name": "mneme",
+      "label": "Mneme (Gemini)",
+      "db": "/home/agent-mneme/.engram-gemini/knowledge.db"
+    }
+  ],
+  "default": "borges"
+}

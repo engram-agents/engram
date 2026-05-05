@@ -2,11 +2,19 @@
 """
 ENGRAM Visualization Server
 
-Connects to ~/.engram/knowledge.db and serves a D3.js force-directed
-graph in the browser. No additional dependencies beyond the stdlib.
+Serves a D3.js force-directed graph of an ENGRAM knowledge graph in the
+browser. Stdlib-only. Two operating modes:
+
+* Single-agent (--db PATH or default ~/.engram/knowledge.db):
+  one anonymous "default" agent.
+* Multi-agent (--config agents.json): a registered set of agents,
+  each with its own DB; UI dropdown switches between them, all API
+  endpoints accept ?agent=<name>.
 
 Usage:
-    python viz_server.py [--port 5001] [--db PATH]
+    python viz_server.py                                 # single-agent default
+    python viz_server.py --db /path/to/knowledge.db      # single-agent custom
+    python viz_server.py --config /path/to/agents.json   # multi-agent
 """
 
 import argparse
@@ -20,6 +28,11 @@ from urllib.parse import urlparse, parse_qs
 
 DEFAULT_DB = str(Path.home() / ".engram" / "knowledge.db")
 DEFAULT_PORT = 5001
+
+# Agent registry — populated in main() from --config or --db.
+# Maps name -> {"name": str, "label": str, "db": str (resolved abs path)}.
+AGENTS: dict = {}
+DEFAULT_AGENT: str = ""
 
 # ---------------------------------------------------------------------------
 # HTML / JS / CSS  (embedded so the server is a single file)
@@ -486,10 +499,15 @@ HTML = r"""<!DOCTYPE html>
 <!-- ── Sidebar ──────────────────────────────────────────────────────── -->
 <div id="sidebar">
   <header>
-    KG Memory Visualizer
+    ENGRAM Visualizer
     <small id="db-path-label"></small>
     <div style="margin-top:4px"><a href="/health" style="color:#00d4ff;font-size:0.75em;text-decoration:none;">Health Dashboard &rarr;</a></div>
   </header>
+
+  <div class="section" id="agent-section" style="display:none;">
+    <div class="section-title">Agent</div>
+    <select id="agent-select" style="width:100%;padding:5px 8px;background:#0d1b36;border:1px solid #1a4a8a;border-radius:4px;color:#e0e0e0;font-size:12px;outline:none;"></select>
+  </div>
 
   <div class="section">
     <div id="status-line">Nodes: <span id="stat-nodes">—</span> &nbsp; Edges: <span id="stat-edges">—</span></div>
@@ -1505,12 +1523,76 @@ function buildSidebar() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Multi-agent helpers
+// ═══════════════════════════════════════════════════════════════════
+
+function currentAgent() {
+  return new URL(window.location.href).searchParams.get('agent');
+}
+
+function setCurrentAgent(name) {
+  const url = new URL(window.location.href);
+  if (name) {
+    url.searchParams.set('agent', name);
+  } else {
+    url.searchParams.delete('agent');
+  }
+  window.history.replaceState(null, '', url);
+}
+
+function withAgent(path) {
+  const a = currentAgent();
+  if (!a) return path;
+  return path + (path.includes('?') ? '&' : '?') + 'agent=' + encodeURIComponent(a);
+}
+
+async function loadAgents() {
+  try {
+    const res = await fetch('/api/agents');
+    const data = await res.json();
+    const agents = data.agents || [];
+    const defaultAgent = data.default || (agents[0] && agents[0].name);
+    if (agents.length <= 1) {
+      // Single-agent mode — keep dropdown hidden, no URL param needed.
+      return;
+    }
+    const sel = document.getElementById('agent-select');
+    sel.innerHTML = '';
+    agents.forEach(a => {
+      const opt = document.createElement('option');
+      opt.value = a.name;
+      const status = a.available ? `(${a.current_node_count})` : '(unavailable)';
+      opt.textContent = `${a.label} ${status}`;
+      if (!a.available && a.error) opt.title = a.error;
+      sel.appendChild(opt);
+    });
+    let current = currentAgent();
+    if (!current || !agents.find(a => a.name === current)) {
+      current = defaultAgent;
+      setCurrentAgent(current);
+    }
+    sel.value = current;
+    document.getElementById('agent-section').style.display = '';
+    sel.onchange = () => {
+      setCurrentAgent(sel.value);
+      fetchGraph();
+      // Refresh the db-path-label too
+      fetch(withAgent('/api/meta')).then(r => r.json()).then(m => {
+        document.getElementById('db-path-label').textContent = m.db_path || '';
+      }).catch(() => {});
+    };
+  } catch (err) {
+    console.warn('Failed to load agents:', err);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Data fetch
 // ═══════════════════════════════════════════════════════════════════
 
 async function fetchGraph() {
   try {
-    const res = await fetch('/api/graph');
+    const res = await fetch(withAgent('/api/graph'));
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
 
@@ -1615,8 +1697,8 @@ document.getElementById('auto-refresh-cb').onchange = function() {
   }
 };
 
-// Set db path label
-fetch('/api/meta').then(r => r.json()).then(m => {
+// Set db path label (agent-aware)
+fetch(withAgent('/api/meta')).then(r => r.json()).then(m => {
   document.getElementById('db-path-label').textContent = m.db_path || '';
 }).catch(() => {});
 
@@ -1634,12 +1716,94 @@ window.addEventListener('resize', () => { updateSimCenter(); simulation.alpha(0.
 
 buildSidebar();
 updateSimCenter();
-fetchGraph();
-autoRefreshInterval = setInterval(fetchGraph, 10000);
+// Resolve the agent dropdown first (sets URL param if needed) so the very
+// first /api/graph fetch is already scoped to the right agent.
+loadAgents().then(() => {
+  fetchGraph();
+  autoRefreshInterval = setInterval(fetchGraph, 10000);
+});
 </script>
 </body>
 </html>
 """
+
+# ---------------------------------------------------------------------------
+# Agent registry helpers
+# ---------------------------------------------------------------------------
+
+def _load_config(path: str) -> tuple[dict, str]:
+    """Parse a multi-agent config JSON. Returns (agents_dict, default_name).
+
+    Schema (see active-work/viz-server-multi-agent-2026-05-04.md):
+      {"agents": [{"name": str, "db": str, "label": str (optional)}, ...],
+       "default": str (optional — first agent if omitted)}
+    """
+    with open(path) as f:
+        cfg = json.load(f)
+    raw_agents = cfg.get("agents", [])
+    if not raw_agents:
+        raise ValueError(f"{path}: 'agents' list is empty or missing")
+    agents = {}
+    for a in raw_agents:
+        if "name" not in a or "db" not in a:
+            raise ValueError(f"{path}: agent missing required keys 'name' or 'db': {a!r}")
+        name = a["name"]
+        agents[name] = {
+            "name": name,
+            "label": a.get("label", name),
+            "db": os.path.expanduser(a["db"]),
+        }
+    default = cfg.get("default") or next(iter(agents))
+    if default not in agents:
+        raise ValueError(f"{path}: default '{default}' is not in the agents list")
+    return agents, default
+
+
+def _resolve_agent(query_string: str) -> tuple[str, str]:
+    """Pick an agent given the query string. Returns (name, db_path).
+
+    Falls back to DEFAULT_AGENT when ?agent is omitted. Returns
+    (requested_name, "") when ?agent names something unregistered, so the
+    handler can surface a clear error instead of silently swapping in the
+    default.
+    """
+    qs = parse_qs(query_string or "")
+    requested = qs.get("agent", [None])[0]
+    name = requested or DEFAULT_AGENT
+    if name in AGENTS:
+        return name, AGENTS[name]["db"]
+    return name or "", ""
+
+
+def get_agents_meta() -> list:
+    """Per-agent status snapshot for /api/agents (drives the UI dropdown)."""
+    out = []
+    for name, info in AGENTS.items():
+        entry = {"name": name, "label": info.get("label", name), "db": info["db"]}
+        if not os.path.exists(info["db"]):
+            entry["available"] = False
+            entry["error"] = "Database file not found"
+            entry["current_node_count"] = 0
+        else:
+            try:
+                conn = sqlite3.connect(f"file:{info['db']}?mode=ro", uri=True)
+                cnt = conn.execute(
+                    "SELECT COUNT(*) FROM nodes WHERE is_current = 1"
+                ).fetchone()[0]
+                conn.close()
+                entry["available"] = True
+                entry["current_node_count"] = cnt
+            except sqlite3.OperationalError as e:
+                entry["available"] = False
+                entry["error"] = str(e)
+                entry["current_node_count"] = 0
+            except Exception as e:
+                entry["available"] = False
+                entry["error"] = str(e)
+                entry["current_node_count"] = 0
+        out.append(entry)
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Data access
@@ -1702,8 +1866,12 @@ def get_graph(db_path: str) -> dict:
 
 def get_health_data(db_path: str) -> dict:
     """Compute live health metrics + trend from diagnostic_history."""
+    if not os.path.exists(db_path):
+        return {"error": f"Database not found: {db_path}"}
     try:
-        conn = sqlite3.connect(db_path)
+        # Read-only: in multi-agent mode this process only has read access
+        # to peer agents' DBs (owner UID writes; group=agents reads).
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
 
         data: dict = {}
@@ -1920,6 +2088,10 @@ HEALTH_HTML = r"""<!DOCTYPE html>
   <div class="nav">
     <a href="/">Graph View</a>
     <a href="/health">Health Dashboard</a>
+    <span id="agent-switcher" style="display:none;margin-left:auto;float:right;">
+      <span style="color:#7ecfff;font-size:0.85em;margin-right:6px;">Agent:</span>
+      <select id="agent-select-health" style="padding:4px 8px;background:#0d1b36;border:1px solid #1a4a8a;border-radius:4px;color:#e0e0e0;font-size:0.85em;outline:none;"></select>
+    </span>
   </div>
   <h1>ENGRAM Health Dashboard</h1>
   <div id="loading">Loading health data...</div>
@@ -1928,20 +2100,68 @@ HEALTH_HTML = r"""<!DOCTYPE html>
   </div>
 
   <script>
-  fetch('/api/health')
-    .then(r => r.json())
-    .then(data => {
-      document.getElementById('loading').style.display = 'none';
-      document.getElementById('dashboard').style.display = 'block';
-      if (data.error) {
-        document.getElementById('cards').innerHTML = '<div class="card"><p>' + data.error + '</p></div>';
-        return;
-      }
-      render(data);
-    })
-    .catch(e => {
-      document.getElementById('loading').textContent = 'Error: ' + e.message;
+  function _currentAgent() {
+    return new URL(window.location.href).searchParams.get('agent');
+  }
+  function _setCurrentAgent(name) {
+    const url = new URL(window.location.href);
+    if (name) url.searchParams.set('agent', name);
+    else url.searchParams.delete('agent');
+    window.history.replaceState(null, '', url);
+  }
+  function _withAgent(path) {
+    const a = _currentAgent();
+    if (!a) return path;
+    return path + (path.includes('?') ? '&' : '?') + 'agent=' + encodeURIComponent(a);
+  }
+
+  function loadHealth() {
+    document.getElementById('loading').style.display = '';
+    document.getElementById('dashboard').style.display = 'none';
+    document.getElementById('cards').innerHTML = '';
+    fetch(_withAgent('/api/health'))
+      .then(r => r.json())
+      .then(data => {
+        document.getElementById('loading').style.display = 'none';
+        document.getElementById('dashboard').style.display = 'block';
+        if (data.error) {
+          document.getElementById('cards').innerHTML = '<div class="card"><p>' + data.error + '</p></div>';
+          return;
+        }
+        render(data);
+      })
+      .catch(e => {
+        document.getElementById('loading').textContent = 'Error: ' + e.message;
+      });
+  }
+
+  // Wire agent dropdown if multi-agent.
+  fetch('/api/agents').then(r => r.json()).then(data => {
+    const agents = data.agents || [];
+    const defaultAgent = data.default || (agents[0] && agents[0].name);
+    if (agents.length <= 1) {
+      loadHealth();
+      return;
+    }
+    const sel = document.getElementById('agent-select-health');
+    agents.forEach(a => {
+      const opt = document.createElement('option');
+      opt.value = a.name;
+      const status = a.available ? `(${a.current_node_count})` : '(unavailable)';
+      opt.textContent = `${a.label} ${status}`;
+      if (!a.available && a.error) opt.title = a.error;
+      sel.appendChild(opt);
     });
+    let current = _currentAgent();
+    if (!current || !agents.find(a => a.name === current)) {
+      current = defaultAgent;
+      _setCurrentAgent(current);
+    }
+    sel.value = current;
+    document.getElementById('agent-switcher').style.display = '';
+    sel.onchange = () => { _setCurrentAgent(sel.value); loadHealth(); };
+    loadHealth();
+  }).catch(() => loadHealth());
 
   function render(d) {
     const cards = document.getElementById('cards');
@@ -2104,8 +2324,6 @@ HEALTH_HTML = r"""<!DOCTYPE html>
 # ---------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    db_path: str = DEFAULT_DB
-
     def log_message(self, fmt, *args):
         pass  # suppress default access log
 
@@ -2113,16 +2331,42 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
-        if path == "/api/graph":
-            self._json(get_graph(self.db_path))
-        elif path == "/api/meta":
-            self._json({"db_path": self.db_path})
-        elif path == "/api/health":
-            self._json(get_health_data(self.db_path))
-        elif path == "/health":
+        if path == "/api/agents":
+            self._json({"agents": get_agents_meta(), "default": DEFAULT_AGENT})
+            return
+
+        if path == "/health":
             self._html(HEALTH_HTML)
-        elif path == "/":
+            return
+        if path == "/":
             self._html(HTML)
+            return
+
+        # Endpoints below are agent-scoped.
+        agent_name, db_path = _resolve_agent(parsed.query)
+
+        if path == "/api/graph":
+            if not db_path:
+                self._json({"nodes": [], "edges": [],
+                            "error": f"Unknown agent: {agent_name!r}",
+                            "agent": agent_name})
+            else:
+                resp = get_graph(db_path)
+                resp["agent"] = agent_name
+                self._json(resp)
+        elif path == "/api/meta":
+            self._json({"agent": agent_name,
+                        "db_path": db_path,
+                        "default_agent": DEFAULT_AGENT,
+                        "label": AGENTS.get(agent_name, {}).get("label", agent_name)})
+        elif path == "/api/health":
+            if not db_path:
+                self._json({"error": f"Unknown agent: {agent_name!r}",
+                            "agent": agent_name})
+            else:
+                resp = get_health_data(db_path)
+                resp["agent"] = agent_name
+                self._json(resp)
         else:
             self.send_response(404)
             self.end_headers()
@@ -2151,28 +2395,45 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="KG Memory visualization server — D3 force-directed graph for knowledge.db"
+        description="ENGRAM visualization server — D3 force-directed graph for knowledge.db"
     )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help=f"Port to listen on (default: {DEFAULT_PORT})")
-    parser.add_argument("--db", default=DEFAULT_DB,
-                        help=f"Path to knowledge.db (default: {DEFAULT_DB})")
+    parser.add_argument("--db", default=None,
+                        help="Single-agent mode: register one anonymous "
+                             "'default' agent at PATH (a knowledge.db file or "
+                             f"a directory containing one). Default: {DEFAULT_DB}")
+    parser.add_argument("--config", default=None,
+                        help="Multi-agent mode: JSON config registering several "
+                             "agents (see agents.json.example)")
     parser.add_argument("--bind", default="127.0.0.1",
                         help="Address to bind to (default: 127.0.0.1)")
     args = parser.parse_args()
 
-    db = os.path.expanduser(args.db)
-    # Accept either a directory or a direct .db file path
-    if os.path.isdir(db):
-        db = os.path.join(db, "knowledge.db")
-    Handler.db_path = db
+    if args.config and args.db:
+        parser.error("--config and --db are mutually exclusive")
+
+    global AGENTS, DEFAULT_AGENT
+    if args.config:
+        AGENTS, DEFAULT_AGENT = _load_config(args.config)
+    else:
+        db = os.path.expanduser(args.db) if args.db else DEFAULT_DB
+        # Accept either a directory or a direct .db file path
+        if os.path.isdir(db):
+            db = os.path.join(db, "knowledge.db")
+        AGENTS = {"default": {"name": "default", "label": "Default", "db": db}}
+        DEFAULT_AGENT = "default"
 
     HTTPServer.allow_reuse_address = True
-    bind = getattr(args, 'bind', '127.0.0.1') or '127.0.0.1'
+    bind = args.bind or "127.0.0.1"
     server = HTTPServer((bind, args.port), Handler)
-    print(f"KG Visualizer   →  http://localhost:{args.port}")
-    print(f"Health Dashboard →  http://localhost:{args.port}/health")
-    print(f"Database         →  {Handler.db_path}")
+    print(f"ENGRAM Visualizer →  http://localhost:{args.port}")
+    print(f"Health Dashboard  →  http://localhost:{args.port}/health")
+    print("Agents registered:")
+    for name, info in AGENTS.items():
+        marker = " (default)" if name == DEFAULT_AGENT else ""
+        exists = "" if os.path.exists(info["db"]) else " [MISSING]"
+        print(f"   - {name}{marker}: {info['db']}{exists}")
     print("Press Ctrl-C to stop.\n")
     try:
         server.serve_forever()
