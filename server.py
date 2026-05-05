@@ -488,6 +488,9 @@ def _ensure_data_dir():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not CONFIG_PATH.exists():
         default_config = {
+            # Schema v2 (2026-05-05): adds cadence block. Migration from
+            # v1 → v2 is in tools/migrate_config_v2.py for existing installs.
+            "schema_version": 2,
             "trust_pool": [
                 "reuters.com",
                 "apnews.com",
@@ -517,6 +520,19 @@ def _ensure_data_dir():
             "embedding": {
                 "model": DEFAULT_EMBEDDING_MODEL,
                 "enabled": True,
+            },
+            "cadence": {
+                # Cron + drowsiness tunables. Single source of truth for
+                # tools/sync-cron.sh to render the user's crontab from.
+                # Defaults match the production Borges crontab cadence.
+                # Multi-agent stagger: each agent edits its own config —
+                # no auto-offset (see tools/migrate_config_v2.py header).
+                "heartbeat_minutes": [0, 30],
+                "sleep_hour": 20,
+                "sleep_minute": 30,
+                "sleep_protected_window_minutes": 60,
+                "drowsiness_caution_pct": 80,
+                "drowsiness_urgent_pct": 90,
             },
         }
         CONFIG_PATH.write_text(json.dumps(default_config, indent=2))

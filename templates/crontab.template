@@ -1,0 +1,21 @@
+# BEGIN ENGRAM (managed by tools/sync-cron.sh; manual edits inside this block will be overwritten)
+PATH={path}
+MAILTO=""
+ENGRAM_HOME={engram_home}
+AGENT_NAME={agent_name}
+COUNTERPART_NAME={counterpart_name}
+
+# ENGRAM heartbeat — fires at minutes {heartbeat_minutes} of every hour,
+# skipping hours/minutes inside the sleep protected window.
+{heartbeat_lines}
+
+# ENGRAM coordinated sleep at {sleep_hour:02d}:{sleep_minute:02d} ({timezone}).
+{sleep_minute} {sleep_hour} * * * {engram_home}/tools/sleep.sh >> {engram_home}/logs/sleep.log 2>&1
+
+# Dispatcher autostart at boot + watchdog every 5 min (idempotent — the
+# scripts no-op if the tmux session is already alive).
+@reboot AGENT_NAME={agent_name} COUNTERPART_NAME={counterpart_name} AGENT_CLI={agent_cli} {engram_home}/tools/start-channel-dispatcher.sh
+@reboot AGENT_NAME={agent_name} COUNTERPART_NAME={counterpart_name} AGENT_CLI={agent_cli} {engram_home}/tools/start-telegram-dispatcher.sh
+*/5 * * * * AGENT_NAME={agent_name} COUNTERPART_NAME={counterpart_name} AGENT_CLI={agent_cli} {engram_home}/tools/start-channel-dispatcher.sh > /dev/null 2>&1
+*/5 * * * * AGENT_NAME={agent_name} COUNTERPART_NAME={counterpart_name} AGENT_CLI={agent_cli} {engram_home}/tools/start-telegram-dispatcher.sh > /dev/null 2>&1
+# END ENGRAM

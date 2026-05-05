@@ -22,18 +22,24 @@ GEMINI_HOME="${GEMINI_HOME:-$HOME/.gemini}"
 GEMINI_EXT_DIR="${GEMINI_EXT_DIR:-$GEMINI_HOME/extensions/engram}"
 
 FORCE=0
+NO_CRON=0
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=1 ;;
+    --no-cron) NO_CRON=1 ;;
     --help|-h)
-      echo "Usage: ./install-gemini.sh [--force]"
+      echo "Usage: ./install-gemini.sh [--force] [--no-cron]"
       echo ""
       echo "Environment overrides:"
-      echo "  ENGRAM_HOME      target for ENGRAM data (default: \$HOME/.engram-gemini)"
-      echo "  GEMINI_HOME      Gemini CLI config root (default: \$HOME/.gemini)"
-      echo "  GEMINI_EXT_DIR   extension directory (default: \$GEMINI_HOME/extensions/engram)"
+      echo "  ENGRAM_HOME        target for ENGRAM data (default: \$HOME/.engram-gemini)"
+      echo "  GEMINI_HOME        Gemini CLI config root (default: \$HOME/.gemini)"
+      echo "  GEMINI_EXT_DIR     extension directory (default: \$GEMINI_HOME/extensions/engram)"
+      echo "  AGENT_NAME         cron identity for the installed agent (default: derived from username)"
+      echo "  COUNTERPART_NAME   peer agent name for inter-agent dispatcher (optional)"
       echo ""
       echo "  --force: overwrites existing installation after backing it up."
+      echo "  --no-cron: skip Step 9 (cron schedule install). Useful for headless"
+      echo "             servers, CI, or users who manage their crontab separately."
       exit 0
       ;;
     *) echo "Unknown arg: $arg (use --help)"; exit 1 ;;
@@ -169,6 +175,13 @@ for runtime_file in server.py engram_confidence.py engram_client.py SKILL.md viz
     echo "  $runtime_file → $ENGRAM_HOME/$runtime_file"
   fi
 done
+
+# Crontab template: staged into $ENGRAM_HOME so tools/sync-cron.sh can
+# read it post-install without reaching back into the alpha source tree.
+if [ -f "$ALPHA_DIR/templates/crontab.template" ]; then
+  cp "$ALPHA_DIR/templates/crontab.template" "$ENGRAM_HOME/crontab.template"
+  echo "  crontab.template → $ENGRAM_HOME/crontab.template"
+fi
 echo ""
 
 # -------- Step 5: Gemini extension files (manifest + hooks.json + GEMINI.md) --------
@@ -236,6 +249,39 @@ else
 fi
 echo ""
 
+# -------- Step 9: Cron schedule (optional) --------
+
+if [ "$NO_CRON" -eq 1 ]; then
+  echo "== Step 9: Cron (skipped per --no-cron) =="
+  echo "  Run later via: AGENT_NAME=<name> $ENGRAM_HOME/tools/sync-cron.sh --apply --agent-cli gemini"
+  echo ""
+else
+  echo "== Step 9: Cron schedule =="
+
+  CRON_AGENT_NAME="${AGENT_NAME:-$(id -un | sed 's/^agent-//')}"
+  CRON_COUNTERPART="${COUNTERPART_NAME:-}"
+
+  if [ -x "$ENGRAM_HOME/tools/sync-cron.sh" ]; then
+    AGENT_NAME="$CRON_AGENT_NAME" \
+    COUNTERPART_NAME="$CRON_COUNTERPART" \
+    AGENT_CLI="gemini" \
+    ENGRAM_HOME="$ENGRAM_HOME" \
+      "$ENGRAM_HOME/tools/sync-cron.sh" --apply \
+        || {
+          echo ""
+          echo "  WARN: cron install failed (see message above). Common causes:"
+          echo "    - Existing un-bracketed ENGRAM lines in your crontab. Edit"
+          echo "      crontab manually to remove them, then re-run:"
+          echo "        AGENT_NAME=$CRON_AGENT_NAME $ENGRAM_HOME/tools/sync-cron.sh --apply --agent-cli gemini"
+          echo "    - config.json missing 'cadence' block. Run:"
+          echo "        $ENGRAM_HOME/tools/migrate_config_v2.py"
+        }
+  else
+    echo "  sync-cron.sh not staged (unexpected); skipping cron install"
+  fi
+  echo ""
+fi
+
 # -------- Done --------
 
 echo "== Install complete =="
@@ -248,4 +294,5 @@ echo "     first-session cold-start dialogue (it picks its own name —"
 echo "     independent from any other ENGRAM-backed agent on this machine)"
 echo "  4. After dialogue completes, identity placeholders resolve in"
 echo "     $GEMINI_EXT_DIR/GEMINI.md and $ENGRAM_HOME/warm-briefing.md"
+echo "  5. Verify cron with 'crontab -l' (or re-run with --no-cron to skip)"
 echo ""

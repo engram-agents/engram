@@ -21,18 +21,24 @@ ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
 CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
 
 FORCE=0
+NO_CRON=0
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=1 ;;
+    --no-cron) NO_CRON=1 ;;
     --help|-h)
-      echo "Usage: ./install.sh [--force]"
+      echo "Usage: ./install.sh [--force] [--no-cron]"
       echo ""
       echo "Environment overrides:"
       echo "  ENGRAM_HOME   target for ENGRAM data (default: \$HOME/.engram)"
       echo "  CLAUDE_HOME   target for Claude config (default: \$HOME/.claude)"
+      echo "  AGENT_NAME    cron identity for the installed agent (default: derived from username)"
+      echo "  COUNTERPART_NAME   peer agent name for inter-agent dispatcher (optional)"
       echo ""
       echo "  --force: overwrites existing installation after backing it up."
       echo "           Use only for testing. Production users should uninstall first."
+      echo "  --no-cron: skip Step 8 (cron schedule install). Useful for headless"
+      echo "             servers, CI, or users who manage their crontab separately."
       exit 0
       ;;
     *) echo "Unknown arg: $arg (use --help)"; exit 1 ;;
@@ -135,11 +141,10 @@ if [ -d "$ALPHA_DIR/hooks/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/hooks/claude" 2
 fi
 
 # Tools: heartbeat, sleep, dispatcher launchers, telegram bot, channel
-# helpers. Copied per-install (not symlinked) so each agent's tools operate
-# on their own $ENGRAM_HOME by env-var contract. Cron registration of
-# heartbeat/sleep is the runtime installer's job (see runtime-install.*.sh
-# in the multi-agent uid-substrate setup) — install.sh only stages the
-# scripts; whoever runs them is responsible for scheduling.
+# helpers, sync-cron + render_cron, migrate_config_v2. Copied per-install
+# (not symlinked) so each agent's tools operate on their own $ENGRAM_HOME
+# by env-var contract. Cron registration is now wired through Step 8
+# below (sync-cron.sh --apply); --no-cron skips for headless setups.
 if [ -d "$ALPHA_DIR/tools" ] && [ -n "$(ls -A "$ALPHA_DIR/tools" 2>/dev/null || true)" ]; then
   cp -r "$ALPHA_DIR/tools/"* "$ENGRAM_HOME/tools/"
   chmod +x "$ENGRAM_HOME/tools/"*.sh 2>/dev/null || true
@@ -173,6 +178,13 @@ for runtime_file in server.py engram_confidence.py engram_client.py SKILL.md viz
     echo "  $runtime_file → $ENGRAM_HOME/$runtime_file"
   fi
 done
+
+# Crontab template: staged into $ENGRAM_HOME so tools/sync-cron.sh can
+# read it post-install without reaching back into the alpha source tree.
+if [ -f "$ALPHA_DIR/templates/crontab.template" ]; then
+  cp "$ALPHA_DIR/templates/crontab.template" "$ENGRAM_HOME/crontab.template"
+  echo "  crontab.template → $ENGRAM_HOME/crontab.template"
+fi
 echo ""
 
 # -------- Step 5: Seed graph + template substitution --------
@@ -213,6 +225,46 @@ else
 fi
 echo ""
 
+# -------- Step 8: Cron schedule (optional) --------
+#
+# Renders + installs the user's crontab from config.json's cadence block via
+# tools/sync-cron.sh. Defaults match the production cadence: heartbeat at
+# :00/:30, sleep at 20:30 local, dispatcher autostart + watchdog. Skip with
+# --no-cron for headless setups or hand-managed crontabs.
+
+if [ "$NO_CRON" -eq 1 ]; then
+  echo "== Step 8: Cron (skipped per --no-cron) =="
+  echo "  Run later via: AGENT_NAME=<name> $ENGRAM_HOME/tools/sync-cron.sh --apply"
+  echo ""
+else
+  echo "== Step 8: Cron schedule =="
+
+  # AGENT_NAME defaults to the current username (stripped of any 'agent-'
+  # prefix common in multi-agent uid setups).
+  CRON_AGENT_NAME="${AGENT_NAME:-$(id -un | sed 's/^agent-//')}"
+  CRON_COUNTERPART="${COUNTERPART_NAME:-}"
+
+  if [ -x "$ENGRAM_HOME/tools/sync-cron.sh" ]; then
+    AGENT_NAME="$CRON_AGENT_NAME" \
+    COUNTERPART_NAME="$CRON_COUNTERPART" \
+    AGENT_CLI="claude" \
+    ENGRAM_HOME="$ENGRAM_HOME" \
+      "$ENGRAM_HOME/tools/sync-cron.sh" --apply \
+        || {
+          echo ""
+          echo "  WARN: cron install failed (see message above). Common causes:"
+          echo "    - Existing un-bracketed ENGRAM lines in your crontab. Edit"
+          echo "      crontab manually to remove them, then re-run:"
+          echo "        AGENT_NAME=$CRON_AGENT_NAME $ENGRAM_HOME/tools/sync-cron.sh --apply"
+          echo "    - config.json missing 'cadence' block. Run:"
+          echo "        $ENGRAM_HOME/tools/migrate_config_v2.py"
+        }
+  else
+    echo "  sync-cron.sh not staged (unexpected); skipping cron install"
+  fi
+  echo ""
+fi
+
 # -------- Done --------
 
 echo "== Install complete =="
@@ -223,4 +275,5 @@ echo "  2. The agent will detect $ENGRAM_HOME/first-run-pending"
 echo "     and run the engram-first-session cold-start dialogue"
 echo "  3. After dialogue completes, {{AGENT_NAME}} and {{USER_NAME}} will"
 echo "     be resolved in $CLAUDE_HOME/CLAUDE.md and $ENGRAM_HOME/warm-briefing.md"
+echo "  4. Verify cron with 'crontab -l' (or re-run with --no-cron to skip)"
 echo ""
