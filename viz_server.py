@@ -1786,7 +1786,7 @@ def get_agents_meta() -> list:
             entry["current_node_count"] = 0
         else:
             try:
-                conn = sqlite3.connect(f"file:{info['db']}?mode=ro", uri=True)
+                conn = sqlite3.connect(f"file:{info['db']}?mode=ro&immutable=1", uri=True)
                 cnt = conn.execute(
                     "SELECT COUNT(*) FROM nodes WHERE is_current = 1"
                 ).fetchone()[0]
@@ -1813,7 +1813,7 @@ def get_graph(db_path: str) -> dict:
     if not os.path.exists(db_path):
         return {"nodes": [], "edges": [], "error": f"Database not found: {db_path}"}
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
@@ -1871,7 +1871,7 @@ def get_health_data(db_path: str) -> dict:
     try:
         # Read-only: in multi-agent mode this process only has read access
         # to peer agents' DBs (owner UID writes; group=agents reads).
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
         conn.row_factory = sqlite3.Row
 
         data: dict = {}
