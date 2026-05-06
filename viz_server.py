@@ -255,20 +255,24 @@ HTML = r"""<!DOCTYPE html>
     }
 
     /* ── Detail panel ───────────────────────────────────────────────── */
+    /* Collapses to 0 width when no node is selected so it doesn't reserve
+       layout space; expands to 400px when .open is added on node click.
+       Pre-fix: width:400px + transform:translateX(100%) hid the panel
+       visually but the flex slot still consumed 400px from #main. */
     #detail-panel {
-      width: 400px;
-      min-width: 400px;
+      width: 0;
+      min-width: 0;
       background: #16213e;
       border-left: 1px solid #0f3460;
       display: flex;
       flex-direction: column;
       overflow: hidden;
-      transform: translateX(100%);
-      transition: transform 0.25s ease;
+      transition: width 0.25s ease, min-width 0.25s ease;
     }
 
     #detail-panel.open {
-      transform: translateX(0);
+      width: 400px;
+      min-width: 400px;
     }
 
     #detail-header {
