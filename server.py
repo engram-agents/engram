@@ -4566,6 +4566,11 @@ def engram_audit_string(
     if not needle:
         return json.dumps({"error": "needle is required and must be non-empty"})
 
+    # Clamp limit to a sane range (consistent with engram_query / engram_list).
+    # Negative values would silently disable LIMIT under SQLite (LIMIT -1 = no
+    # limit) and produce a resource-exhaustion path on large corpora.
+    limit = max(1, min(int(limit), 10000))
+
     allowed_fields = {
         "claim", "quoted_text", "interpretation", "logical_chain",
         "source_title", "content_snippet", "trigger_text", "predicted_event",
@@ -4588,6 +4593,15 @@ def engram_audit_string(
 
     conn = _get_db()
     try:
+        # When case_sensitive=True, push the case predicate into SQL via the
+        # per-connection PRAGMA (SQLite's default LIKE is ASCII-case-insensitive
+        # which would force a Python post-filter, and that post-filter combined
+        # with SQL LIMIT produces silent false negatives when the LIMIT
+        # saturates with case-wrong rows). PRAGMA scope is this connection
+        # only; the conn closes in the finally block.
+        if case_sensitive:
+            conn.execute("PRAGMA case_sensitive_like = ON")
+
         # Build a UNION ALL across the requested field columns. fname is
         # whitelisted above, so direct interpolation is safe; needle goes
         # through a parameter binding.
@@ -4607,12 +4621,14 @@ def engram_audit_string(
         hits = []
         for node_id, type_, field_, matched_, conf, is_current in rows:
             text = matched_ or ""
-            search_text = text if case_sensitive else text.lower()
-            search_needle = needle if case_sensitive else needle.lower()
-            idx = search_text.find(search_needle)
+            # SQL handled both case-insensitive (default LIKE) and
+            # case-sensitive (PRAGMA above) matching, so we use the raw text
+            # and needle directly to locate the substring for snippet anchoring.
+            idx = text.find(needle) if case_sensitive else text.lower().find(needle.lower())
             if idx < 0:
-                # Case-sensitive filter rejected a row that LIKE accepted (since
-                # SQLite's default LIKE is ASCII-case-insensitive). Skip it.
+                # Defensive — should not happen now that SQL handles both modes,
+                # but skip rather than crash if SQL returned a row we can't
+                # locate the needle in (e.g. encoding edge case).
                 continue
             start = max(0, idx - 40)
             end = min(len(text), idx + len(needle) + 40)

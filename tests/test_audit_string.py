@@ -162,6 +162,45 @@ def test_limit_caps_results():
     assert r["count"] == 3
 
 
+def test_case_sensitive_with_limit_finds_uppercase_after_lowercase_noise():
+    """Regression for the bug where case_sensitive=True + LIMIT produced
+    silent false negatives: SQL's default LIKE is ASCII-case-insensitive,
+    so the SQL arm fetched up to `limit` rows that included case-wrong
+    matches; the Python post-filter then discarded them, returning count=0
+    even when exact-case matches existed beyond the LIMIT boundary.
+
+    Fixed 2026-05-07 (PR #37 round 1) by setting PRAGMA case_sensitive_like
+    = ON when case_sensitive=True, so SQL itself only returns case-correct
+    matches. This test inserts 5 lowercase-needle rows BEFORE 2 uppercase-
+    needle rows; under the buggy implementation, limit=3 would saturate
+    with the 5 lowercase rows and return count=0."""
+    server = fresh_server()
+    for i in range(5):
+        _add_observation(server, claim=f"row {i} contains target lowercase")
+    _add_observation(server, claim="row A contains TARGET uppercase first")
+    _add_observation(server, claim="row B contains TARGET uppercase second")
+
+    r = json.loads(server.engram_audit_string(
+        needle="TARGET", case_sensitive=True, limit=3
+    ))
+    assert r["count"] == 2
+    for hit in r["hits"]:
+        assert "TARGET" in hit["snippet"]
+
+
+def test_limit_clamped_against_negative_or_zero():
+    """Negative limit silently disabled the cap (SQLite LIMIT -1 = no limit),
+    a resource-exhaustion path on large corpora. Fixed 2026-05-07 (PR #37
+    round 1) by clamping limit to [1, 10000]."""
+    server = fresh_server()
+    for i in range(20):
+        _add_observation(server, claim=f"Row {i} TARGET")
+    r = json.loads(server.engram_audit_string(needle="TARGET", limit=-1))
+    assert r["count"] == 1
+    r = json.loads(server.engram_audit_string(needle="TARGET", limit=0))
+    assert r["count"] == 1
+
+
 def test_no_hits_returns_empty_list_not_error():
     server = fresh_server()
     _add_observation(server, claim="completely unrelated content")
