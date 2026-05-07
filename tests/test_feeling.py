@@ -39,11 +39,13 @@ def fresh_client():
     """Reset state and return a fresh EngramClient + its server module."""
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
-    # Defensive: a sibling test (test_supersede_relational.py) prepends an
-    # older /home/user/kg_protocol_for_ai path at module-import time, which
-    # then wins for `import server` / `import engram_client`. Ensure THIS
-    # repo's directory is the first hit, and drop stale module caches so
-    # the active server has the current API surface (engram_nap etc.).
+    # Defensive against any sibling test polluting sys.path or sys.modules
+    # at import time. Ensures THIS repo's directory is the first hit and
+    # drops stale module caches so the active server has the current API
+    # surface (engram_nap etc.). Originally added to work around the
+    # /home/user/kg_protocol_for_ai injection in three sibling tests; that
+    # injection was removed in fix/test-hardcoded-spt-paths, but the
+    # defensive shape is cheap and worth keeping as belt-and-suspenders.
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if sys.path[0] != repo_root:
         sys.path.insert(0, repo_root)

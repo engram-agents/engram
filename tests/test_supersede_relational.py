@@ -1,7 +1,7 @@
 """Sandbox tests for the relational-only engram_supersede (2026-04-24 refactor).
 
 Verifies: happy paths, validation guards, stale cascade, chain supersede.
-Run with: python3 test_supersede_relational.py
+Run with: python3 tests/test_supersede_relational.py  OR  pytest tests/test_supersede_relational.py
 """
 
 import json
