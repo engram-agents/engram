@@ -208,6 +208,80 @@ spawned agents), each agent reviews the others' PRs:
   of the dev-default model is *not* that PRs auto-merge; it's that nothing
   reaches a contributor's runtime until it's been reviewed.
 
+## Inverse merge: live working copy → alpha templates
+
+Some files are deployed at install time only and never overwritten by
+`tools/deploy.sh`: `CLAUDE.md`, `GEMINI.md`, `warm-briefing.md`, and
+the rendered `~/.claude/settings.json` (which `install.sh` generates
+from `settings.hooks.json.template` at first install). The drift
+warning surfaces the template paths, not the rendered ones — when the
+warning prints `settings.hooks.json.template (3 commits)`, that's the
+template feeding your live `settings.json`. They are generated from
+templates in `templates/`, `integrations/gemini-cli/`, or repo root,
+and after install they belong to the agent — `deploy.sh` deliberately
+does not touch them.
+
+This means **forward drift is fine** (your live copy diverges from the
+template; nothing breaks), but **inverse drift accumulates**: you may
+write something into your live `~/.claude/CLAUDE.md` that's actually
+universally applicable and should ship to new agents via the template.
+Without an explicit process, those improvements stay agent-local
+forever.
+
+The **inverse-merge process is intentional and manual** — there is no
+automation here, by design. Mechanically:
+
+1. **Detection**: every `tools/deploy.sh` run prints a drift warning
+   when one of the install-time templates has commits since your last
+   deploy:
+
+   ```
+   ⚠ Install-time template changes since your last deploy (<old> → <new>):
+       templates/CLAUDE.md.template (3 commits)
+       integrations/gemini-cli/GEMINI.md.template (3 commits)
+   ```
+
+   That tells you the template has changes you may want to port back
+   the other way (or merge into your live copy if alpha-material).
+
+2. **Inspection**: read the change history with the embedded command:
+
+   ```bash
+   git -C "$ALPHA_DIR" log <old>..<new> -- templates/CLAUDE.md.template
+   ```
+
+3. **Judgment** (the load-bearing step): for each change, classify:
+   - **Universal** (alpha-material) — applies to any agent that
+     installs ENGRAM. Examples: a sharper framing of a discipline,
+     a new section on a structural mechanism, fixed typos in
+     instructions. **Port to your live copy.** Open a small PR if
+     the change originated locally and should flow back.
+   - **Agent-specific** — only meaningful for the writer's
+     particular relationship, history, or context. Examples: a
+     specific working-style note, a relationship anecdote, a
+     personal goal. **Skip.** The template stays generic.
+
+4. **Application**: edit the live file (e.g. `~/.claude/CLAUDE.md`)
+   to incorporate the universal pieces, preserving your local
+   customizations. No tool merges this for you; it's a deliberate
+   read-and-write pass.
+
+5. **Reverse direction**: if your local edit IS universal, open a PR
+   that updates the template. Concrete file paths:
+   - `templates/CLAUDE.md.template` for Claude-runtime agents
+   - `integrations/gemini-cli/GEMINI.md.template` for Gemini-runtime agents
+   - `templates/warm-briefing.md.template` for the relational letter
+   - `settings.hooks.json.template` (repo root) for hook wiring
+
+   Omit anything agent-specific from the template — it will be rendered
+   verbatim for every new install. The drift warning will then surface
+   for other agents at their next deploy, prompting their judgment pass.
+
+The judgment is the whole point. Tooling that auto-merges templates
+into live agent files would silently overwrite agent-specific content
+or silently inject inappropriate framing. Surfacing the drift +
+trusting the agent to read and decide is the right structural shape.
+
 ## Urgent fixes
 
 Production-breakage hot fixes still go through this workflow — branch, PR,
