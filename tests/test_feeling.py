@@ -39,8 +39,16 @@ def fresh_client():
     """Reset state and return a fresh EngramClient + its server module."""
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
-    if "server" in sys.modules:
-        del sys.modules["server"]
+    # Defensive: a sibling test (test_supersede_relational.py) prepends an
+    # older /home/user/kg_protocol_for_ai path at module-import time, which
+    # then wins for `import server` / `import engram_client`. Ensure THIS
+    # repo's directory is the first hit, and drop stale module caches so
+    # the active server has the current API surface (engram_nap etc.).
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if sys.path[0] != repo_root:
+        sys.path.insert(0, repo_root)
+    for mod in ("server", "engram_client"):
+        sys.modules.pop(mod, None)
     from engram_client import EngramClient
     client = EngramClient(db_dir=TEST_DIR)
     server = client._server
@@ -550,18 +558,27 @@ def test_feeling_reflect_arms_dream_review_marker():
 
 # ── Supersede rejection ────────────────────────────────────────────────
 
-@pytest.mark.skip(reason="alpha refactored engram_supersede to relational-only; rewrite needed to test rejection path under new signature.")
 def test_feeling_cannot_be_superseded():
-    """engram_supersede must reject feeling_report with an instructive error."""
+    """engram_supersede must reject feeling_report with an instructive error.
+
+    Under alpha's relational-only supersede, both old and new node IDs must
+    exist. The feeling_report guard in engram_supersede fires before the
+    type-match check, so two real feeling reports are enough to exercise the
+    rejection.
+    """
     client, _ = fresh_client()
-    r = client.call("engram_report_feeling", {
+    r1 = client.call("engram_report_feeling", {
         "reported_state": "Original.",
         "trigger": "Test.",
     })
+    r2 = client.call("engram_report_feeling", {
+        "reported_state": "Replacement attempt.",
+        "trigger": "Test.",
+    })
     s = client.call("engram_supersede", {
-        "old_node_id": r["feeling_id"],
-        "new_claim": "Attempting to supersede a feeling report",
-        "logical_chain": "Should fail",
+        "old_node_id": r1["feeling_id"],
+        "new_node_id": r2["feeling_id"],
+        "supersede_reason": "Should fail",
     })
     assert "error" in s, f"Expected error, got {s}"
     assert "feeling" in s["error"].lower()
@@ -569,17 +586,20 @@ def test_feeling_cannot_be_superseded():
 
 # ── Checkpoint nap arms marker ─────────────────────────────────────────
 
-@pytest.mark.skip(reason="alpha renamed engram_checkpoint(mode=nap) to engram_nap (PR #10); test still calls old API.")
 def test_checkpoint_nap_arms_marker():
-    """engram_checkpoint(mode='nap') should arm a nap_checkpoint nudge marker."""
+    """engram_nap should arm a nap_checkpoint nudge marker.
+
+    Renamed from engram_checkpoint(mode='nap') in PR #10 — engram_nap is
+    now a dedicated tool that never advances the turn counter and arms
+    the nap_checkpoint feeling-report nudge.
+    """
     client, server = fresh_client()
     assert not server.FEELING_NUDGE_MARKER.exists()
-    r = client.call("engram_checkpoint", {
+    r = client.call("engram_nap", {
         "message": "Test nap checkpoint",
-        "mode": "nap",
     })
     # Return should include the nudge text.
-    assert "feeling_report_nudge" in r, f"Expected feeling_report_nudge in checkpoint return, got keys: {list(r.keys())}"
+    assert "feeling_report_nudge" in r, f"Expected feeling_report_nudge in nap return, got keys: {list(r.keys())}"
     # Marker file should now exist with source=nap_checkpoint.
     assert server.FEELING_NUDGE_MARKER.exists()
     marker = json.loads(server.FEELING_NUDGE_MARKER.read_text())

@@ -191,7 +191,6 @@ def test_goal_in_reflect():
 
 # ── Supersede ───────────────────────────────────────────────────────────
 
-@pytest.mark.skip(reason="alpha refactored engram_supersede to relational-only; needs rewrite to two-step pattern.")
 def test_goal_supersede_no_confidence():
     """Superseding a goal should produce a new goal with no confidence."""
     client = fresh_client()
@@ -199,10 +198,16 @@ def test_goal_supersede_no_confidence():
         "claim": "Original goal",
         "motivation": "First version",
     })
+    # Two-step supersede under the relational-only API: create the
+    # replacement goal via engram_add_goal first, then wire the supersede.
+    new = client.call("engram_add_goal", {
+        "claim": "Refined goal with better direction",
+        "motivation": "Refined after discussion",
+    })
     s = client.call("engram_supersede", {
         "old_node_id": r["goal_id"],
-        "new_claim": "Refined goal with better direction",
-        "logical_chain": "Refined after discussion",
+        "new_node_id": new["goal_id"],
+        "supersede_reason": "Refined after discussion",
     })
     assert s.get("status") == "superseded", f"Expected success, got {s}"
     node = client.call("engram_inspect", {"node_id": s["new_node_id"]})

@@ -27,10 +27,6 @@ import tempfile
 
 import pytest
 
-SKIP_SUPERSEDE_NEW_API = pytest.mark.skip(
-    reason="alpha refactored engram_supersede to relational-only (caller creates new node first); test still uses kg's old all-in-one signature. Rewrite needed."
-)
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_focus_sets")
@@ -212,21 +208,30 @@ def test_load_if_active_overwrite_clears_and_loads():
     assert set(r["loaded"]) == {"ob_0001", "ob_0002"}
 
 
-@SKIP_SUPERSEDE_NEW_API
 def test_load_implicit_overwrite_on_cascade_shift():
     """Name matches active_set_name but cascade state has shifted → reload without erroring."""
     client = fresh_client()
     ids = seed_observations(client, 3)
     client.call("engram_focus", {"node_ids": ",".join(ids), "reason": "t"})
     client.call("engram_focus_save", {"name": "s1"})
-    # Supersede ob_0001 → new ID
+    # Supersede ob_0001 → new ID. Under the relational-only API, the caller
+    # first creates the replacement node via the canonical creation tool and
+    # then calls engram_supersede with both IDs.
+    rep = client.call("engram_add_observation", {
+        "url": "https://example.com/a-v2",
+        "title": "A v2",
+        "quoted_text": "quote a v2",
+        "interpretation": "refined",
+        "claim": "claim a v2",
+        "quote_type": "hard_data",
+    })
+    new_id = rep["observation_id"]
     sr = client.call("engram_supersede", {
         "old_node_id": "ob_0001",
-        "new_claim": "v2",
-        "logical_chain": "refinement",
-        "support_ids": "",
+        "new_node_id": new_id,
+        "supersede_reason": "refinement",
     })
-    new_id = sr["new_node_id"]
+    assert sr["status"] == "superseded", sr
     # Load s1 again — active still has old IDs, resolved has new. Implicit overwrite.
     r = client.call("engram_focus_load", {"name": "s1"})
     assert r["status"] == "ok"
@@ -337,19 +342,28 @@ def test_delete_ghost_rejected():
 # ── Cascade resolution on load ─────────────────────────────────────────────
 
 
-@SKIP_SUPERSEDE_NEW_API
 def test_load_cascade_supersede_and_retract():
     client = fresh_client()
     seed_observations(client, 3)
     client.call("engram_focus", {"node_ids": "ob_0001,ob_0002,ob_0003", "reason": "t"})
     client.call("engram_focus_save", {"name": "s1"})
+    # Two-step supersede: create the replacement via the canonical creation
+    # tool, then wire the relational supersede.
+    rep = client.call("engram_add_observation", {
+        "url": "https://example.com/a-v2",
+        "title": "A v2",
+        "quoted_text": "quote a v2",
+        "interpretation": "refined",
+        "claim": "claim a v2",
+        "quote_type": "hard_data",
+    })
+    new_id = rep["observation_id"]
     sr = client.call("engram_supersede", {
         "old_node_id": "ob_0001",
-        "new_claim": "v2",
-        "logical_chain": "refinement",
-        "support_ids": "",
+        "new_node_id": new_id,
+        "supersede_reason": "refinement",
     })
-    new_id = sr["new_node_id"]
+    assert sr["status"] == "superseded", sr
     client.call("engram_retract", {
         "node_id": "ob_0002",
         "error_type": "hallucinated_claim",
