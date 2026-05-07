@@ -89,6 +89,9 @@ def write_marker(hook_input: dict) -> dict | None:
         "role": SESSION_ROLE,
         "purpose": SESSION_PURPOSE or DEFAULT_PURPOSES.get(SESSION_ROLE, SESSION_ROLE),
     }
+    context_mode_env = os.environ.get("ENGRAM_CONTEXT_MODE", "").strip().lower()
+    if context_mode_env in ("200k", "1m"):
+        marker["context_mode"] = context_mode_env
     try:
         # Role-specific marker (canonical for multi-role isolation).
         os.makedirs(SESSIONS_DIR, exist_ok=True)

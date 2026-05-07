@@ -63,7 +63,12 @@ FALLBACK_CEILING_BY_MODE = {
     "200k": 160_000,
     "1m":   850_000,
 }
-MODE_BOUNDARY = 300_000
+# 200k mode auto-compacts at ~160-165K preTokens. If current_tokens exceed
+# this AND no compact_boundary has fired in the session JSONL, the session
+# can only be 1m mode — 200k mode would have already compacted. Lowered
+# 2026-05-06 from 300_000 after a 1m-mode session at 184K input_tokens
+# was misclassified as 200k → reported 122% drowsy when truly at ~23%.
+MODE_BOUNDARY = 175_000
 
 
 def find_active_jsonl() -> str | None:
@@ -102,10 +107,12 @@ def _detect_mode(current_tokens: int | None, jsonl_path: str | None) -> str:
 
     Order of precedence:
       1. ENGRAM_CONTEXT_MODE env var override ("200k" or "1m") — explicit.
-      2. current input tokens > MODE_BOUNDARY → "1m" (200K-mode would have
+      2. active-session.json `context_mode` field — session metadata,
+         written by SessionStart hook from ENGRAM_CONTEXT_MODE.
+      3. current input tokens > MODE_BOUNDARY → "1m" (200K-mode would have
          auto-compacted by now).
-      3. Current JSONL has any prior compact_boundary > MODE_BOUNDARY → "1m".
-      4. Default "200k" (the harness default).
+      4. Current JSONL has any prior compact_boundary > MODE_BOUNDARY → "1m".
+      5. Default "200k" (the harness default).
 
     Limitation: early 1M-mode sessions below MODE_BOUNDARY with no prior
     boundary cannot be auto-detected (the system prompt's `[1m]` model tag
@@ -115,6 +122,14 @@ def _detect_mode(current_tokens: int | None, jsonl_path: str | None) -> str:
     override = os.environ.get("ENGRAM_CONTEXT_MODE", "").strip().lower()
     if override in SAMPLE_PARTITIONS:
         return override
+    try:
+        with open(ACTIVE_SESSION_PATH) as f:
+            marker = json.load(f)
+        marker_mode = (marker.get("context_mode") or "").strip().lower()
+        if marker_mode in SAMPLE_PARTITIONS:
+            return marker_mode
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
     if current_tokens is not None and current_tokens > MODE_BOUNDARY:
         return "1m"
     if jsonl_path:
