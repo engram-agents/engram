@@ -31,6 +31,12 @@
           "command": "{{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-surface-hook.py",
           "timeout": 10,
           "statusMessage": "Searching ENGRAM..."
+        },
+        {
+          "type": "command",
+          "command": "{{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-deference-detector-prompt.py",
+          "timeout": 3,
+          "statusMessage": "Surfacing deference markers..."
         }
       ]
     }
@@ -67,6 +73,12 @@
           "command": "{{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-stop-hook.py",
           "timeout": 5,
           "statusMessage": "Flagging ENGRAM write check..."
+        },
+        {
+          "type": "command",
+          "command": "{{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-deference-detector-stop.py",
+          "timeout": 5,
+          "statusMessage": "Detecting deference patterns..."
         }
       ]
     }
