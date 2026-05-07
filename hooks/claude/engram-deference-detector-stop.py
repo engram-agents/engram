@@ -58,7 +58,7 @@ _PHRASE_RULES = [
 _INTENT_RULES = [
     ("doing-it-now",     re.compile(r"\bdoing (it|this) now\b", re.I)),
     ("starting-now",     re.compile(r"\bstarting (it|now|this)\b", re.I)),
-    ("ill-add-fix-etc",  re.compile(r"\bI(?:'ll| will) (add|fix|write|implement|build|create|update|patch|do|start|begin|land|ship|send|run|verify|test|check|investigate|continue|extend|refactor|restructure)\b", re.I)),
+    ("ill-add-fix-etc",  re.compile(r"\bI(?:'ll| will) (add|fix|write|implement|build|create|update|patch|do|start|begin|land|ship|send|run|verify|test|check|investigate|continue|extend|refactor|restructure|pick|grab|tackle|return to|revisit|come back to)\b", re.I)),
     ("let-me-verb",      re.compile(r"\blet me (start|begin|do|add|write|fix|build|investigate|check|verify|run|test|implement)\b", re.I)),
     ("going-to-verb",    re.compile(r"\b(?:I'?m |I am )?going to (start|begin|do|add|write|fix|build|investigate|check|verify|run|test|implement|land|ship|continue)\b", re.I)),
     ("moving-on-to",     re.compile(r"\bmoving (on )?to\b", re.I)),
@@ -66,6 +66,19 @@ _INTENT_RULES = [
     ("next-up",          re.compile(r"^next up:?\s|^next:?\s", re.I | re.M)),
     ("ill-get-to",       re.compile(r"\bI(?:'ll| will) get (to|on)\b", re.I)),
     ("on-it",            re.compile(r"^(on it|got it)\.?\s*$", re.I | re.M)),
+    # Future-promise patterns added 2026-05-06: when I name a future event
+    # (cron fire, next session, next turn) and commit to action AT that future
+    # event in trailing prose, the structural pattern is identical to "I'll X
+    # now" — I end the turn on a promise and wait for the future event to
+    # arrive without doing the work. The cron caught me on this 3 times in
+    # one hour: "next pass will pick distributed-systems patterns", "When the
+    # cron fires next, I'll do another iteration", etc. Each one ended the
+    # response and made the next cron-fire the trigger for committing to do
+    # the thing I'd already named. Same regression, future-tense grammar.
+    ("next-pass-will",   re.compile(r"\bnext (pass|fire|cron-?fire|cron|iteration|round|turn|session)\b[^.!?]*?\b(I[''']?ll| will| should| can)\b", re.I)),
+    ("when-X-fires-ill", re.compile(r"\bwhen (the )?(cron|next prompt|next turn|next session|that)[^.!?]*?\b(I[''']?ll| will)\b", re.I)),
+    ("ill-pick-X-next",  re.compile(r"\bI(?:'ll| will) (pick|grab|tackle|tackle next|continue with|come back to|return to|revisit) [^.!?]+? (next|later|tomorrow|tonight|after|when)\b", re.I)),
+    ("preserved-for",    re.compile(r"\b(preserved|saved|queued|deferred|reserved) for (?:the )?(next|later|tomorrow|future)\b", re.I)),
 ]
 
 
