@@ -432,6 +432,12 @@ if [[ -n "$PYTHON_BIN" && -f "$ENGRAM_HOME/hooks/start-engram-daemon.sh" ]]; the
     echo "  ✓ Substituted {{PYTHON}} → $PYTHON_BIN in hooks/start-engram-daemon.sh"
 fi
 
+# Capture the previous deploy's sha BEFORE we overwrite the marker. The
+# template-drift warning below uses this to compute what alpha-side changes
+# the agent has missed since their last deploy. Empty if no prior marker
+# (first install) or if the recorded sha is no longer reachable.
+BASELINE_SHA="$(_last_deployed_sha)"
+
 # Stamp version marker for forensics + future "what version is running?" queries
 TS="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 cat > "$ENGRAM_HOME/.deployed-version" <<EOF
@@ -445,6 +451,56 @@ EOF
 echo
 echo "✓ Deployed alpha @ $ALPHA_SHA → $ENGRAM_HOME"
 echo "  Version marker: $ENGRAM_HOME/.deployed-version"
+
+# Template-drift warning. deploy.sh deliberately doesn't touch install-time
+# template-rendered files (CLAUDE.md, GEMINI.md, warm-briefing.md, settings.json)
+# — those are written ONCE at install time from templates/* and never overwritten.
+# But when the ALPHA template files have been updated since the agent's
+# last deploy, the agent's live working copy may be missing alpha-material
+# changes. This warning surfaces the drift for the agent's intentional
+# merge/no-merge judgment (the inverse-merge workflow — manual port from
+# live working copy, deliberate PR back to alpha when alpha-material).
+#
+# settings.hooks.json.template included because hook wiring drift has high
+# operational consequence: an upstream hook addition or invocation-path
+# change would silently no-op for an agent on a stale rendered settings.json.
+# daily-highlights.md.template intentionally excluded — append-only live
+# state with a thin template; drift there is genuinely low-signal.
+TEMPLATE_FILES=(
+    "templates/CLAUDE.md.template"
+    "integrations/gemini-cli/GEMINI.md.template"
+    "templates/warm-briefing.md.template"
+    "settings.hooks.json.template"
+)
+if [[ -n "$BASELINE_SHA" ]]; then
+    drifted=()
+    for tpl in "${TEMPLATE_FILES[@]}"; do
+        # git log returns lines for each commit that touched the file in
+        # the range. Empty output = no changes since baseline. Use xargs
+        # to strip whitespace robustly (tr -d ' ' only handles spaces;
+        # some wc implementations emit tabs).
+        n_commits=$(git -C "$ALPHA_DIR" log --oneline "$BASELINE_SHA..$ALPHA_SHA" -- "$tpl" 2>/dev/null | wc -l | xargs)
+        if [[ "$n_commits" -gt 0 ]]; then
+            drifted+=("$tpl ($n_commits commit$( [[ "$n_commits" -eq 1 ]] || echo s ))")
+        fi
+    done
+    if [[ ${#drifted[@]} -gt 0 ]]; then
+        echo
+        echo "⚠ Install-time template changes since your last deploy ($BASELINE_SHA → $ALPHA_SHA):"
+        for d in "${drifted[@]}"; do
+            echo "    $d"
+        done
+        echo
+        echo "  These templates render install-time files (CLAUDE.md, GEMINI.md, warm-briefing.md,"
+        echo "  settings.json) that deploy.sh deliberately does NOT touch. Your live working copy"
+        echo "  may be missing alpha-material changes. Review with:"
+        echo "    git -C \"$ALPHA_DIR\" log $BASELINE_SHA..$ALPHA_SHA -- <template-path>"
+        echo "  and intentionally port universal-applicable parts into your live config (or skip"
+        echo "  if the changes are not alpha-material for your install). Inverse-merge is judgment"
+        echo "  work, not automation — both directions can drift."
+    fi
+fi
+
 echo
 echo "Next step: restart the MCP server so it loads the new server.py."
 echo "  - In Claude Code: /mcp restart engram (or kill the engram MCP process)."
