@@ -10456,6 +10456,535 @@ def engram_list(
 
 
 # ---------------------------------------------------------------------------
+# engram_query_pattern — KnowQL-inspired pattern queries (ob_1500 design)
+# ---------------------------------------------------------------------------
+#
+# A small library of named compositional graph queries. The TOOL does
+# mechanical work (graph queries, similarity, ranking); the AGENT applies
+# judgment to the ranked candidates. Three presets bundle (cosine_threshold,
+# top_k, min_confidence) for the precision/recall tradeoff.
+#
+# v0.1 ships ONE pattern (contradiction_obsolescence_ready) end-to-end and
+# the framework + telemetry harness; further patterns from the design doc
+# (active-work/engram-query-pattern-design-2026-05-06.md) can land
+# additively. Each call appends to ~/.engram/pattern_query_telemetry.jsonl
+# for empirical preset calibration per ls_0023's discipline.
+
+PATTERN_QUERY_PRESETS: dict[str, dict[str, float | int]] = {
+    # Placeholder values — calibrate from telemetry per ob_1500's deferred
+    # discussion. Each pattern uses whichever fields make sense for it.
+    "high_precision": {"cosine_threshold": 0.80, "top_k": 5,  "min_confidence": 0.70},
+    "balanced":       {"cosine_threshold": 0.65, "top_k": 15, "min_confidence": 0.50},
+    "high_recall":    {"cosine_threshold": 0.50, "top_k": 30, "min_confidence": 0.00},
+}
+
+
+def _pattern_telemetry_log(pattern_name: str, preset: str,
+                            args: dict, candidates: list[dict]) -> None:
+    """Append one entry per call to enable empirical preset calibration.
+
+    The schema mirrors ob_1500's calibration plan: (pattern_name, args,
+    candidate_id, score, agent_action) tuples. agent_action is filled
+    later out-of-band when the agent acts on a candidate; this hook only
+    captures the surfacing event.
+
+    Best-effort: telemetry failures must never block a pattern call.
+    """
+    try:
+        path = Path(DATA_DIR) / "pattern_query_telemetry.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "pattern_name": pattern_name,
+            "preset": preset,
+            "args": args,
+            "candidate_count": len(candidates),
+            "candidate_ids": [c.get("id") for c in candidates],
+            "scores": [c.get("score") for c in candidates],
+        }
+        with open(path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+def _pattern_contradiction_obsolescence_ready(
+    conn, preset_params: dict, **_filters
+) -> list[dict]:
+    """Active contradictions where one side is retracted/superseded.
+
+    A contradiction with one side already obsolete is resolution-by-
+    obsolescence ready: the agent can write a derivation citing the
+    obsolescence event as the resolution mechanism. This is mechanical
+    (no embeddings) — the ranking is by how unambiguous the obsolescence
+    signal is.
+
+    Score: 1.0 if exactly one side is non-current AND the contradiction
+    is still status='active'; 0.5 if both sides are non-current (likely
+    already moot but the contradiction node wasn't resolved); 0.0 if
+    neither side is obsolete (returned only at high_recall).
+
+    Returns: list of {id, claim, side_a, side_b, side_a_status,
+    side_b_status, score, suggested_action}.
+    """
+    threshold = float(preset_params.get("cosine_threshold", 0.50))
+    top_k = int(preset_params.get("top_k", 15))
+
+    contradictions = conn.execute(
+        "SELECT id, claim, status FROM nodes "
+        "WHERE type='contradiction' AND is_current=1 AND status='active' "
+        "ORDER BY id DESC"
+    ).fetchall()
+
+    candidates: list[dict] = []
+    for ct_id, ct_claim, ct_status in contradictions:
+        sides = conn.execute(
+            "SELECT target_id FROM edges WHERE source_id=? AND relation='contradicts'",
+            (ct_id,),
+        ).fetchall()
+        if len(sides) != 2:
+            continue
+        side_a_id, side_b_id = sides[0][0], sides[1][0]
+        side_a = conn.execute(
+            "SELECT id, claim, is_current, status FROM nodes WHERE id=?",
+            (side_a_id,),
+        ).fetchone()
+        side_b = conn.execute(
+            "SELECT id, claim, is_current, status FROM nodes WHERE id=?",
+            (side_b_id,),
+        ).fetchone()
+        if not side_a or not side_b:
+            continue
+
+        a_obsolete = side_a[2] == 0
+        b_obsolete = side_b[2] == 0
+        if a_obsolete and not b_obsolete:
+            score = 1.0
+            obsolete_side, surviving_side = "a", "b"
+        elif b_obsolete and not a_obsolete:
+            score = 1.0
+            obsolete_side, surviving_side = "b", "a"
+        elif a_obsolete and b_obsolete:
+            score = 0.5
+            obsolete_side, surviving_side = "both", None
+        else:
+            score = 0.0
+            obsolete_side, surviving_side = None, None
+
+        if score < threshold:
+            continue
+
+        candidates.append({
+            "id": ct_id,
+            "claim": (ct_claim[:160] + "...") if ct_claim and len(ct_claim) > 160 else ct_claim,
+            "score": score,
+            "side_a": {"id": side_a[0], "is_current": bool(side_a[2]), "status": side_a[3]},
+            "side_b": {"id": side_b[0], "is_current": bool(side_b[2]), "status": side_b[3]},
+            "obsolete_side": obsolete_side,
+            "surviving_side": surviving_side,
+            "suggested_action": (
+                f"Resolve via engram_resolve({ct_id}, claim='Resolution-by-obsolescence: "
+                f"side {obsolete_side} is no longer current.', supporting_ids='{side_a[0] if surviving_side == 'a' else side_b[0]}', ...)"
+                if surviving_side else
+                "Both sides obsolete — write resolution citing both obsolescence events."
+            ),
+        })
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    return candidates[:top_k]
+
+
+def _pattern_open_question_answerable(
+    conn, preset_params: dict, **_filters
+) -> list[dict]:
+    """Open questions with a derivation chain nearby that may resolve them.
+
+    For each open question, semantic-search for derivations whose claim is
+    similar to the question's content. Threshold by cosine_threshold and
+    rank by best-match similarity. Only questions that have at least one
+    candidate derivation above threshold survive.
+
+    Returns: list of {id, claim, score, candidate_resolution, alternates,
+    suggested_action}.
+    """
+    threshold = float(preset_params.get("cosine_threshold", 0.50))
+    top_k = int(preset_params.get("top_k", 15))
+    min_conf = float(preset_params.get("min_confidence", 0.0))
+
+    questions = conn.execute(
+        "SELECT id, claim FROM nodes "
+        "WHERE type='question' AND is_current=1 AND status='open' "
+        "ORDER BY id DESC LIMIT 200"
+    ).fetchall()
+
+    candidates: list[dict] = []
+    for q_id, q_claim in questions:
+        if not q_claim:
+            continue
+        matches = _semantic_search(
+            conn, q_claim, top_k=5,
+            min_similarity=threshold,
+            type_filter={"derivation"},
+            importance_threshold=0.0,
+        )
+        matches = [m for m in matches if (m.get("confidence") or 0) >= min_conf]
+        if not matches:
+            continue
+        best = matches[0]
+        candidates.append({
+            "id": q_id,
+            "claim": (q_claim[:160] + "...") if len(q_claim) > 160 else q_claim,
+            "score": best["similarity"],
+            "candidate_resolution": {
+                "id": best["id"],
+                "claim": (best["claim"][:160] + "...") if best["claim"] and len(best["claim"]) > 160 else best["claim"],
+                "confidence": best["confidence"],
+            },
+            "alternates": [
+                {"id": m["id"], "similarity": m["similarity"]}
+                for m in matches[1:]
+            ],
+            "suggested_action": (
+                f"Inspect {best['id']} and consider engram_resolve({q_id}, "
+                f"claim=..., supporting_ids='{best['id']}', ...) if it answers the question."
+            ),
+        })
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    return candidates[:top_k]
+
+
+def _pattern_stale_load_bearing(
+    conn, preset_params: dict, **_filters
+) -> list[dict]:
+    """High-importance, low-recall non-cornerstone nodes — re-engagement candidates.
+
+    Heuristic score: importance / (recall_count + 1). High score means
+    important + rarely accessed = likely stale-but-still-load-bearing.
+    Cornerstones are excluded (they're anchored against forgetting by design).
+
+    Returns: list of {id, type, claim, score, importance, recall_count,
+    suggested_action}.
+    """
+    top_k = int(preset_params.get("top_k", 15))
+    importance_floor = 1.0  # only consider nodes above the typical median
+
+    rows = conn.execute(
+        "SELECT id, type, claim, importance_score, recall_count "
+        "FROM nodes "
+        "WHERE is_current=1 AND type != 'cornerstone' "
+        "AND COALESCE(importance_score, 0) > ? "
+        "ORDER BY importance_score DESC LIMIT 100",
+        (importance_floor,),
+    ).fetchall()
+
+    candidates: list[dict] = []
+    for nid, ntype, claim, imp, recalls in rows:
+        recalls = recalls or 0
+        imp = imp or 0
+        score = imp / (recalls + 1)
+        candidates.append({
+            "id": nid,
+            "type": ntype,
+            "claim": (claim[:160] + "...") if claim and len(claim) > 160 else claim,
+            "score": round(score, 3),
+            "importance": round(imp, 3),
+            "recall_count": recalls,
+            "suggested_action": (
+                f"Re-engage with {nid} (engram_inspect) or supersede if outdated. "
+                f"High importance + low recall suggests load-bearing-but-cold."
+            ),
+        })
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    return candidates[:top_k]
+
+
+def _pattern_cornerstone_candidate(
+    conn, preset_params: dict, **_filters
+) -> list[dict]:
+    """High-importance non-cornerstone nodes that are heavily cited.
+
+    A cornerstone candidate is a node that has been load-bearing in the
+    graph (cited by many derivations / observations) but isn't yet anchored
+    as a cornerstone. Score: importance × (1 + citation_count / 10).
+
+    Returns: list of {id, type, claim, score, importance, citation_count,
+    recall_count, suggested_action}.
+    """
+    top_k = int(preset_params.get("top_k", 15))
+    min_citations = 3  # below this, not load-bearing enough to anchor
+
+    rows = conn.execute(
+        "SELECT id, type, claim, importance_score, recall_count "
+        "FROM nodes "
+        "WHERE is_current=1 AND type != 'cornerstone' "
+        "AND COALESCE(importance_score, 0) > 1.5 "
+        "ORDER BY importance_score DESC LIMIT 50"
+    ).fetchall()
+
+    candidates: list[dict] = []
+    for nid, ntype, claim, imp, recalls in rows:
+        cite_count = conn.execute(
+            "SELECT COUNT(*) FROM edges WHERE target_id=? "
+            "AND relation IN ('supports', 'cites', 'derives_from')",
+            (nid,),
+        ).fetchone()[0]
+        if cite_count < min_citations:
+            continue
+        imp = imp or 0
+        score = imp * (1 + cite_count / 10.0)
+        candidates.append({
+            "id": nid,
+            "type": ntype,
+            "claim": (claim[:160] + "...") if claim and len(claim) > 160 else claim,
+            "score": round(score, 3),
+            "importance": round(imp, 3),
+            "citation_count": cite_count,
+            "recall_count": recalls or 0,
+            "suggested_action": (
+                f"Consider engram_focus or engram_add_cornerstone for {nid} — "
+                f"{cite_count} downstream citations suggest it's load-bearing."
+            ),
+        })
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    return candidates[:top_k]
+
+
+def _pattern_tainted_still_valid(
+    conn, preset_params: dict, **_filters
+) -> list[dict]:
+    """Tainted derivations whose substantive claim may still survive.
+
+    A tainted derivation cited a node that was later retracted. The cascade
+    flagged it tainted automatically — but the derivation's substantive
+    claim may still hold under a corrected/superseded version of its
+    premise. This pattern surfaces high-confidence tainted nodes for the
+    agent to inspect and either re-derive cleanly or supersede with fresh
+    citation.
+
+    Score: the original confidence — high-confidence tainted derivations
+    are most likely to have substance worth preserving.
+
+    Returns: list of {id, type, claim, score, confidence, tainted_by,
+    suggested_action}.
+    """
+    top_k = int(preset_params.get("top_k", 15))
+    min_conf = float(preset_params.get("min_confidence", 0.0))
+
+    # Taint is stored in metadata.tainted_by (array of upstream retracted/
+    # superseded node IDs that triggered the cascade). The memory_status
+    # field remains 'active' — the taint signal lives in the JSON metadata,
+    # not in a top-level column. json_extract scans efficiently in SQLite.
+    rows = conn.execute(
+        "SELECT id, type, claim, confidence, metadata FROM nodes "
+        "WHERE is_current=1 "
+        "AND json_extract(metadata, '$.tainted_by') IS NOT NULL "
+        "AND json_array_length(json_extract(metadata, '$.tainted_by')) > 0"
+    ).fetchall()
+
+    candidates: list[dict] = []
+    for nid, ntype, claim, conf, metadata in rows:
+        conf = conf or 0
+        if conf < min_conf:
+            continue
+        try:
+            md = json.loads(metadata or "{}")
+        except (ValueError, json.JSONDecodeError):
+            md = {}
+        tainted_by = md.get("tainted_by") or []
+        candidates.append({
+            "id": nid,
+            "type": ntype,
+            "claim": (claim[:160] + "...") if claim and len(claim) > 160 else claim,
+            "score": round(conf, 3),
+            "confidence": round(conf, 3),
+            "tainted_by": tainted_by,
+            "suggested_action": (
+                f"Inspect {nid} and its tainted_by={tainted_by}: if the substantive "
+                f"claim survives the retraction's correction, write a fresh derivation "
+                f"and supersede; otherwise leave tainted."
+            ),
+        })
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    return candidates[:top_k]
+
+
+def _pattern_recent_resolution_echo(
+    conn, preset_params: dict, **_filters
+) -> list[dict]:
+    """Recent resolutions whose logic may apply to similar still-open questions.
+
+    Resolutions are derivations linked via 'resolves' edges to a target
+    (typically a question). When a resolution lands, similar still-open
+    questions may be resolvable by the same logical chain. This pattern
+    semantic-searches for those echo candidates.
+
+    Score: cosine similarity between the resolver's claim and each
+    candidate question's claim.
+
+    Returns: list of {id, claim, score, echo_resolution, suggested_action}.
+    """
+    threshold = float(preset_params.get("cosine_threshold", 0.50))
+    top_k = int(preset_params.get("top_k", 15))
+
+    recent_resolutions = conn.execute(
+        "SELECT e.source_id, e.target_id, n.claim "
+        "FROM edges e JOIN nodes n ON n.id = e.source_id "
+        "WHERE e.relation='resolves' AND n.is_current=1 "
+        "ORDER BY n.created_at DESC LIMIT 30"
+    ).fetchall()
+
+    candidates: list[dict] = []
+    seen_questions: set[str] = set()
+    for resolver_id, resolved_id, resolution_claim in recent_resolutions:
+        if not resolution_claim:
+            continue
+        matches = _semantic_search(
+            conn, resolution_claim, top_k=5,
+            min_similarity=threshold,
+            type_filter={"question"},
+            importance_threshold=0.0,
+        )
+        for m in matches:
+            if m["id"] == resolved_id or m["id"] in seen_questions:
+                continue
+            row = conn.execute(
+                "SELECT status FROM nodes WHERE id=?", (m["id"],)
+            ).fetchone()
+            if not row or row[0] != "open":
+                continue
+            seen_questions.add(m["id"])
+            candidates.append({
+                "id": m["id"],
+                "claim": (m["claim"][:160] + "...") if m["claim"] and len(m["claim"]) > 160 else m["claim"],
+                "score": m["similarity"],
+                "echo_resolution": {
+                    "resolver_id": resolver_id,
+                    "originally_resolved": resolved_id,
+                },
+                "suggested_action": (
+                    f"Inspect resolver {resolver_id} and consider whether the "
+                    f"same logical chain applies: engram_resolve({m['id']}, ...)."
+                ),
+            })
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    return candidates[:top_k]
+
+
+PATTERN_QUERY_REGISTRY: dict[str, callable] = {
+    "contradiction_obsolescence_ready": _pattern_contradiction_obsolescence_ready,
+    "open_question_answerable":          _pattern_open_question_answerable,
+    "stale_load_bearing":                _pattern_stale_load_bearing,
+    "cornerstone_candidate":             _pattern_cornerstone_candidate,
+    "tainted_still_valid":               _pattern_tainted_still_valid,
+    "recent_resolution_echo":            _pattern_recent_resolution_echo,
+}
+
+
+@mcp.tool(
+    name="engram_query_pattern",
+    annotations={
+        "title": "Run a Named Pattern Query",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_query_pattern(
+    pattern_name: str,
+    preset: str = "balanced",
+    cosine_threshold_override: float = -1.0,
+    top_k_override: int = -1,
+    min_confidence_override: float = -1.0,
+) -> str:
+    """Run a named compositional graph-pattern query.
+
+    The tool does mechanical work (graph traversal + ranking); the agent
+    applies judgment to the ranked candidates. Each call appends a tuple
+    to ~/.engram/pattern_query_telemetry.jsonl for empirical preset
+    calibration. See active-work/engram-query-pattern-design-2026-05-06.md
+    for the full design.
+
+    Args:
+        pattern_name: One of the registered patterns:
+            - contradiction_obsolescence_ready: active contradictions
+              where one side is retracted/superseded, ranked by how
+              unambiguous the obsolescence signal is.
+            - open_question_answerable: open questions with a derivation
+              chain nearby (semantic) that may resolve them.
+            - stale_load_bearing: high-importance + low-recall non-
+              cornerstone nodes (re-engagement candidates).
+            - cornerstone_candidate: heavily-cited high-importance non-
+              cornerstone nodes (anchoring candidates).
+            - tainted_still_valid: tainted derivations whose substantive
+              claim may survive the upstream retraction.
+            - recent_resolution_echo: still-open questions semantically
+              similar to a recent resolution's claim (echo candidates).
+        preset: One of high_precision / balanced (default) / high_recall.
+            Bundles (cosine_threshold, top_k, min_confidence). The
+            placeholder values are deferred for calibration discussion;
+            override individual parameters with the *_override args.
+        cosine_threshold_override: If >= 0, overrides the preset's
+            cosine_threshold. Default -1 (use preset).
+        top_k_override: If >= 0, overrides the preset's top_k. Default -1.
+        min_confidence_override: If >= 0, overrides the preset's
+            min_confidence. Default -1.
+
+    Returns:
+        JSON with {pattern_name, preset, params_used, candidates,
+        candidate_count, hint}. Each candidate is a dict whose shape
+        is pattern-specific but always includes id, score, and
+        suggested_action.
+    """
+    if pattern_name not in PATTERN_QUERY_REGISTRY:
+        return json.dumps({
+            "error": f"Unknown pattern_name '{pattern_name}'. "
+                     f"Registered: {sorted(PATTERN_QUERY_REGISTRY.keys())}.",
+        })
+    if preset not in PATTERN_QUERY_PRESETS:
+        return json.dumps({
+            "error": f"Unknown preset '{preset}'. "
+                     f"Available: {sorted(PATTERN_QUERY_PRESETS.keys())}.",
+        })
+
+    params = dict(PATTERN_QUERY_PRESETS[preset])
+    if cosine_threshold_override >= 0:
+        params["cosine_threshold"] = cosine_threshold_override
+    if top_k_override >= 0:
+        params["top_k"] = top_k_override
+    if min_confidence_override >= 0:
+        params["min_confidence"] = min_confidence_override
+
+    conn = _get_db()
+    try:
+        impl = PATTERN_QUERY_REGISTRY[pattern_name]
+        candidates = impl(conn, params)
+    finally:
+        conn.close()
+
+    _pattern_telemetry_log(pattern_name, preset,
+                            {"params_used": params}, candidates)
+
+    return json.dumps({
+        "pattern_name": pattern_name,
+        "preset": preset,
+        "params_used": params,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "hint": (
+            "Each candidate has a suggested_action. Use it as a starting "
+            "point — apply judgment before acting. Telemetry of this call "
+            "is logged for preset calibration."
+        ),
+    })
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
