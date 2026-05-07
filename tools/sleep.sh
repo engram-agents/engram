@@ -101,7 +101,9 @@ PROMPT="Run the engram-sleep skill to consolidate today's work across all roles 
 
 This is the SINGLE turn-advance for $TODAY (NYC local) per the coordinated-sleep design — all other roles today used nap-mode only. The dream cohort spans the full day across all roles.
 
-Follow the skill in order: nap → engram_reflect → day-wide synthesis (engram_history since the previous sleep) → work the dream agenda → handle the dream-review feeling nudge → engram_advance_turn → update warm-briefing session note → reconcile today's history file at \$ENGRAM_HOME/history/$TODAY.md → report.
+Follow the skill in order: dispatch dream-fairies in parallel (Step 0 — six fairies via Agent tool with subagent_type=engram-dream-fairy and run_in_background=true, one per scan category 1–6, each writing to a unique \$ENGRAM_HOME/dream/$TODAY-fairy-{N}-{slug}.md path so reports don't collide) → nap (Step 1) → engram_reflect (Step 2) → day-wide synthesis via engram_history since the previous sleep (Step 3) → integrate fairy reports into the dream agenda (Step 3.5) → work the dream agenda (Step 4) → handle the dream-review feeling nudge (Step 5) → engram_advance_turn (Step 6) → write the sleep-success marker (Step 6.5) → update warm-briefing session note (Step 7) → reconcile today's history file at \$ENGRAM_HOME/history/$TODAY.md (Step 8) → report (Step 9).
+
+The fairy dispatch is new tonight — if subagent_type=engram-dream-fairy is unrecognized in this cron-spawned session, log the failure in the Step 6 checkpoint message, skip Step 3.5, and proceed with the existing reflect+synthesis flow. Don't block sleep on fairy availability.
 
 When done, exit cleanly."
 

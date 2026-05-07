@@ -20,6 +20,28 @@ Sleep is a **deep** consolidation: the agent reviews graph quality, resolves wha
 
 ---
 
+## Step 0 — Dispatch dream-fairies in parallel (run before Step 1)
+
+**Why this step exists:** the dream-fairy is a read-only consolidation-suggestion scanner (definition at `engram-alpha/.claude/agents/engram-dream-fairy.md`, runs on Sonnet). Dispatching one fairy per scan category in parallel surfaces high-leverage targets that the parent's sequential reflect+synthesis might miss. Fairy compute overlaps with Steps 1–3, so this step costs almost no wall-clock time.
+
+**How:** call the `Agent` tool **six times in a single message** with `subagent_type="engram-dream-fairy"` and `run_in_background=true`. One fairy per well-supported category (1–6 in the agent definition). Each fairy gets a category-scoped prompt and a unique output path so reports don't collide.
+
+The six categories (from the agent definition):
+1. Open questions with sufficient answers nearby
+2. Contradictions ready for resolution
+3. Stale-but-load-bearing nodes
+4. Cornerstone candidates
+5. Tainted-but-still-valid derivations
+6. Recent-resolution echoes
+
+For each, dispatch with this prompt template (substitute `{N}`, `{CATEGORY_NAME}`, and `{SLUG}` — slug examples: `open-questions`, `contradictions`, `stale-load-bearing`, `cornerstone-candidates`, `tainted-still-valid`, `resolution-echoes`):
+
+> Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md` (override the default path so the six fairies don't collide). Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only the file path and a 5-bullet TL;DR for this category. Do not run categories other than {N}; do not run the heuristic categories (7, 8) unless the parent explicitly asks.
+
+After dispatching all six, **proceed immediately to Step 1.** Do not wait — fairies run in the background and notifications arrive when each completes. Steps 1–3 are sequential consolidation work that runs in parallel with fairy compute.
+
+**If subagent dispatch fails** (e.g., `subagent_type` unrecognized because the agent definition hasn't propagated to this session, or the alpha CWD wasn't loaded): note the failure in the Step 6 checkpoint message, skip Step 3.5, proceed with sequential consolidation only. Don't block the dream on fairy availability — the existing reflect+synthesis flow is self-sufficient.
+
 ## Step 1 — Nap first (establish clean baseline)
 
 **Always start sleep with a nap.** Run the `engram-nap` skill in full:
@@ -79,9 +101,27 @@ Skim the cohort at a reading pace. Ask: do any derivations want to emerge?
 
 Why proactive before reactive: if today's cohort produces a derivation or resolution, Step 4's agenda shrinks. Starting with cleanup mode first puts the synthesis lens away.
 
+## Step 3.5 — Integrate fairy reports into the dream agenda
+
+If Step 0 dispatched fairies, the six reports should be landing or already landed by now (each is a Sonnet-scoped scan of a single category, ~30–90s typical). The Agent runtime surfaces a notification when each completes — don't poll, but do check whether reports are ready before opening the agenda:
+
+```bash
+ls -1 ~/.engram/dream/$(date +%Y-%m-%d)-fairy-*.md 2>/dev/null
+```
+
+For each report file, read it and walk the structured suggestions (each tagged with `verified` / `pattern-match` / `inferred` confidence):
+
+- **`verified` suggestions** — high-confidence structural facts (e.g., "qu_XXXX has resolution-by-obsolescence ready"). Default to acting on these in Step 4.
+- **`pattern-match` suggestions** — inspect briefly before acting; the fairy saw a clear pattern but the parent's judgement still applies.
+- **`inferred` suggestions** — heuristic, lower priority; act only if it aligns with what the parent already saw in `engram_reflect`.
+
+The fairy reports are advisory — the parent makes the call. If a fairy suggests an action the parent disagrees with after inspection, note the disagreement briefly in Step 6's checkpoint message (this is the empirical signal we need to calibrate fairy quality across nights).
+
+**Skip this step if Step 0 was skipped or all fairies failed.** Step 4's existing agenda (from `engram_reflect` + day-wide synthesis) is sufficient on its own.
+
 ## Step 4 — Work the dream agenda
 
-Pick threads in this order of priority:
+Pick threads in this order of priority (starting from the merged agenda — `engram_reflect` briefing + day-wide synthesis from Step 3 + fairy suggestions from Step 3.5):
 
 1. **Tainted nodes** — these are epistemically corrupted. For each: inspect the chain, decide whether to retract, supersede, or downgrade confidence. Resolve fully where possible.
 2. **Unresolved contradictions** — use `engram_resolve` with a derivation that cites whichever claim-bearing nodes support the resolution. Pick a `reasoning_type` that matches the argument (deductive, inductive, abductive, authority).
@@ -116,7 +156,7 @@ engram_advance_turn(
 )
 ```
 
-The `session` mode:
+It:
 - Advances the global turn counter — all dream-derived nodes and awake-burst nodes written this session share turn N, and unrecalled nodes get decayed toward turn N+1
 - Logs to `~/.engram/session_log.md` with a "Turn N" header
 - Commits a git snapshot of the graph state
@@ -194,6 +234,7 @@ The directory is git-tracked for version history and diff-ability (dv_0478 piece
 
 Tell the user, in 3-6 short bullets:
 - How many nodes were resolved/superseded/promoted/refuted
+- Of those, how many came from fairy suggestions vs. parent-only synthesis (if Step 0 ran) — this is the empirical signal for fairy quality
 - What's still open (count only, not a full list)
 - Whether a feeling was filed or null-reported
 - Any new questions registered for future research
