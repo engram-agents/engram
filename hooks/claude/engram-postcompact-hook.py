@@ -1,24 +1,63 @@
 #!/usr/bin/env python3
-"""Post-compact: reset context tracker baseline from current file position.
+"""Post-compact: write the last-compact-at marker so the context tracker can
+correctly compute drowsiness against the post-compact byte-offset.
 
-Uses use_compact_boundary=False because the PostCompact hook fires BEFORE
-the compact_boundary marker is written to the JSONL. Using the boundary
-marker would find the PREVIOUS compaction, not the current one, causing
-inflated drowsiness readings. Current file size is the correct baseline
-since compaction just happened.
+Background. Earlier Claude Code versions wrote a `compact_boundary` JSONL
+entry at /compact time, and context_tracker scanned the JSONL for that
+marker to determine where the post-compact window begins. As of ~2026-05-07
+that marker is no longer written (or no longer present in the surfaces we
+read). Without it, read_current_tokens iterates back to the latest pre-
+compact usage record and reports the pre-compact token count — the meter
+shows ~100% drowsy on a freshly-compacted session.
+
+Fix (2026-05-07, ob_1532): the PostCompact hook records the JSONL byte
+offset AT POST-COMPACT TIME into ~/.engram/last-compact-at.json. The
+tracker then reads only the post-offset portion of the JSONL to compute
+current_tokens, and falls back to the legacy compact_boundary scan if the
+marker file is missing or stale.
 """
-import os, sys, json
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from context_tracker import write_baseline
+from context_tracker import find_active_jsonl, write_baseline
 
-# Reset context tracker — use current file size, NOT compact_boundary marker
-write_baseline(use_compact_boundary=False)
+ENGRAM_HOME = os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram"))
+MARKER_PATH = os.path.join(ENGRAM_HOME, "last-compact-at.json")
 
-# Post-compact feeling nudge — DISABLED (ob_0693, 2026-04-16)
-# 83 baseline data points establish clear patterns (dv_0170, dv_0171).
-# Shift detection moves to event-driven: user-initiated or voluntary.
-# Re-enable by uncommenting below if trajectory changes.
-# nudge_path = os.path.join(os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram")), "feeling-nudge-active.json")
-# nudge = {"source": "post_compact", "ttl_turns": 5}
-# with open(nudge_path, "w") as f:
-#     json.dump(nudge, f)
+
+def main() -> None:
+    jsonl_path = find_active_jsonl()
+    if not jsonl_path or not os.path.exists(jsonl_path):
+        # No active JSONL to mark — defensive no-op.
+        return
+    try:
+        byte_offset = os.path.getsize(jsonl_path)
+    except OSError:
+        return
+    marker = {
+        "jsonl_path": jsonl_path,
+        "byte_offset": byte_offset,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        with open(MARKER_PATH, "w") as f:
+            json.dump(marker, f)
+    except OSError:
+        pass
+
+    # Legacy call retained for back-compat with the old write_baseline
+    # signature; it's a no-op in the current stateless tracker, but importing
+    # and calling it preserves the structural contract for any older
+    # context_tracker still in flight.
+    try:
+        write_baseline(use_compact_boundary=False)
+    except TypeError:
+        # Newer signature — safe to ignore the kwarg.
+        write_baseline()
+
+
+if __name__ == "__main__":
+    main()

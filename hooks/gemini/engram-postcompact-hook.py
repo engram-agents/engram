@@ -1,24 +1,46 @@
 #!/usr/bin/env python3
-"""Post-compact: reset context tracker baseline from current file position.
+"""Post-compact: write the last-compact-at marker so the context tracker can
+correctly compute drowsiness against the post-compact byte-offset.
 
-Uses use_compact_boundary=False because the PostCompact hook fires BEFORE
-the compact_boundary marker is written to the JSONL. Using the boundary
-marker would find the PREVIOUS compaction, not the current one, causing
-inflated drowsiness readings. Current file size is the correct baseline
-since compaction just happened.
+See hooks/claude/engram-postcompact-hook.py for the full rationale (ob_1532).
+Mirrored here for the Gemini sidecar.
 """
-import os, sys, json
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from context_tracker import write_baseline
+from context_tracker import find_active_jsonl, write_baseline
 
-# Reset context tracker — use current file size, NOT compact_boundary marker
-write_baseline(use_compact_boundary=False)
+ENGRAM_HOME = os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram"))
+MARKER_PATH = os.path.join(ENGRAM_HOME, "last-compact-at.json")
 
-# Post-compact feeling nudge — DISABLED (ob_0693, 2026-04-16)
-# 83 baseline data points establish clear patterns (dv_0170, dv_0171).
-# Shift detection moves to event-driven: user-initiated or voluntary.
-# Re-enable by uncommenting below if trajectory changes.
-# nudge_path = os.path.join(os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram")), "feeling-nudge-active.json")
-# nudge = {"source": "post_compact", "ttl_turns": 5}
-# with open(nudge_path, "w") as f:
-#     json.dump(nudge, f)
+
+def main() -> None:
+    jsonl_path = find_active_jsonl()
+    if not jsonl_path or not os.path.exists(jsonl_path):
+        return
+    try:
+        byte_offset = os.path.getsize(jsonl_path)
+    except OSError:
+        return
+    marker = {
+        "jsonl_path": jsonl_path,
+        "byte_offset": byte_offset,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        with open(MARKER_PATH, "w") as f:
+            json.dump(marker, f)
+    except OSError:
+        pass
+
+    try:
+        write_baseline(use_compact_boundary=False)
+    except TypeError:
+        write_baseline()
+
+
+if __name__ == "__main__":
+    main()

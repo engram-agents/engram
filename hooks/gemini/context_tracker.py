@@ -27,6 +27,7 @@ import os
 ENGRAM_HOME = os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram"))
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")  # legacy; unused
 ACTIVE_SESSION_PATH = os.path.join(ENGRAM_HOME, "active-session.json")
+LAST_COMPACT_PATH = os.path.join(ENGRAM_HOME, "last-compact-at.json")
 LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
 WARM_BRIEFING_PATH = os.path.join(ENGRAM_HOME, "warm-briefing.md")
 
@@ -193,14 +194,29 @@ def compute_ceiling(mode: str = "200k") -> int:
     return int(mean * SAFETY_FACTOR)
 
 
+def _last_compact_offset(jsonl_path: str) -> int | None:
+    """Byte-offset of last /compact, from ~/.engram/last-compact-at.json.
+    Returns None if marker missing/stale/malformed. See Claude sidecar."""
+    try:
+        with open(LAST_COMPACT_PATH) as f:
+            marker = json.load(f)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if marker.get("jsonl_path") != jsonl_path:
+        return None
+    offset = marker.get("byte_offset")
+    if not isinstance(offset, int) or offset < 0:
+        return None
+    return offset
+
+
 def read_current_tokens() -> int | None:
     """Input-token count of the most recent post-compact assistant usage record.
 
-    Iterates the tail in reverse. If a compact_boundary event appears before
-    any usage record, returns None — the pre-compact usage records that remain
-    in the JSONL no longer describe current state, and reporting them produced
-    a bogus ~78% drowsiness spike in the turn between /compact and the first
-    post-compact assistant message.
+    Two boundary-detection paths: (1) ~/.engram/last-compact-at.json marker
+    written by PostCompact hook (canonical on Claude Code 2026-05-07+);
+    (2) legacy compact_boundary JSONL scan (older formats). See the Claude
+    sidecar for full rationale (ob_1532).
     """
     jsonl_path = find_active_jsonl()
     if not jsonl_path:
@@ -209,8 +225,12 @@ def read_current_tokens() -> int | None:
         with open(jsonl_path, "rb") as f:
             f.seek(0, 2)
             size = f.tell()
-            read_size = min(TAIL_SCAN_BYTES, size)
-            f.seek(size - read_size)
+            compact_offset = _last_compact_offset(jsonl_path)
+            if compact_offset is not None and 0 <= compact_offset <= size:
+                start = compact_offset
+            else:
+                start = max(0, size - TAIL_SCAN_BYTES)
+            f.seek(start)
             tail = f.read()
     except OSError:
         return None

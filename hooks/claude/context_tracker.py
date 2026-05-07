@@ -27,6 +27,7 @@ import os
 ENGRAM_HOME = os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram"))
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")  # legacy; unused
 ACTIVE_SESSION_PATH = os.path.join(ENGRAM_HOME, "active-session.json")
+LAST_COMPACT_PATH = os.path.join(ENGRAM_HOME, "last-compact-at.json")
 LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
 WARM_BRIEFING_PATH = os.path.join(ENGRAM_HOME, "warm-briefing.md")
 
@@ -200,14 +201,51 @@ def compute_ceiling(mode: str = "200k") -> int:
     return int(mean * SAFETY_FACTOR)
 
 
+def _last_compact_offset(jsonl_path: str) -> int | None:
+    """Return the byte-offset where the last /compact fired, if known.
+
+    Reads ~/.engram/last-compact-at.json (written by the PostCompact hook).
+    Returns None if the marker is missing, stale (records a different
+    JSONL than the current session), or unreadable. As of ~2026-05-07
+    Claude Code no longer writes a `compact_boundary` JSONL entry, so
+    this marker file is the only reliable source of "where did the
+    post-compact window begin." Older sessions still have JSONL markers
+    and rely on the legacy fallback path in read_current_tokens.
+    """
+    try:
+        with open(LAST_COMPACT_PATH) as f:
+            marker = json.load(f)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if marker.get("jsonl_path") != jsonl_path:
+        return None
+    offset = marker.get("byte_offset")
+    if not isinstance(offset, int) or offset < 0:
+        return None
+    return offset
+
+
 def read_current_tokens() -> int | None:
     """Input-token count of the most recent post-compact assistant usage record.
 
-    Iterates the tail in reverse. If a compact_boundary event appears before
-    any usage record, returns None — the pre-compact usage records that remain
-    in the JSONL no longer describe current state, and reporting them produced
-    a bogus ~78% drowsiness spike in the turn between /compact and the first
-    post-compact assistant message.
+    Two boundary-detection paths, in priority order:
+
+    1. ~/.engram/last-compact-at.json marker file written by the PostCompact
+       hook. If present and matches the current JSONL, only the post-marker
+       portion of the file is scanned — pre-compact usage records are
+       structurally invisible. This is the canonical path on Claude Code
+       versions that no longer write compact_boundary JSONL entries
+       (~2026-05-07 onward; ob_1532).
+
+    2. Fallback: scan the last TAIL_SCAN_BYTES of the JSONL in reverse.
+       If a `compact_boundary` event appears before any usage record,
+       return None. This path catches older JSONL formats and any session
+       that compacted before the PostCompact hook was deployed.
+
+    Returns None when the post-compact window has no usage record yet —
+    the correct behavior in the turn between /compact and the first
+    post-compact assistant message (which prevents the bogus drowsiness
+    spike documented in ob_1013 and ob_1532).
     """
     jsonl_path = find_active_jsonl()
     if not jsonl_path:
@@ -216,14 +254,26 @@ def read_current_tokens() -> int | None:
         with open(jsonl_path, "rb") as f:
             f.seek(0, 2)
             size = f.tell()
-            read_size = min(TAIL_SCAN_BYTES, size)
-            f.seek(size - read_size)
+            # Path 1: if a post-compact marker exists for this JSONL, start
+            # scanning from that offset. Records before it are pre-compact.
+            compact_offset = _last_compact_offset(jsonl_path)
+            if compact_offset is not None and 0 <= compact_offset <= size:
+                # Use the marker even when offset == size: that means
+                # /compact just fired and no post-compact content has been
+                # written yet. The post-compact window is empty → reading
+                # an empty slice yields no usage records → returns None,
+                # which suppresses the drowsiness banner correctly.
+                start = compact_offset
+            else:
+                start = max(0, size - TAIL_SCAN_BYTES)
+            f.seek(start)
             tail = f.read()
     except OSError:
         return None
 
     for line in reversed(tail.split(b"\n")):
         if b'"compact_boundary"' in line:
+            # Path 2 fallback: legacy JSONL format had this marker.
             return None
         if b'"usage"' not in line:
             continue
