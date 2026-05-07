@@ -167,6 +167,138 @@ _split_entry() {
     fi
 }
 
+# Files that may carry user/agent appendices and thus need 3-way conflict
+# checking before deploy.sh overwrites them. The check uses the alpha SHA
+# recorded in $ENGRAM_HOME/.deployed-version as the baseline (recoverable
+# via `git show $sha:<path>` from the alpha repo). See header section
+# "What does NOT get deployed" for files this list deliberately excludes
+# (CLAUDE.md, warm-briefing.md, settings.json — those are install-once
+# files that deploy.sh never touches today). Adding a file to this set
+# means deploy.sh refuses to silently overwrite a user-divergent local copy.
+PROTECTED_FILES=(
+    "SKILL.md"
+)
+
+# Read the last-deployed alpha SHA from $ENGRAM_HOME/.deployed-version.
+# Returns "" if the file is missing, malformed, or the SHA isn't resolvable
+# in the alpha repo (orphan SHA, branch deleted). Callers treat empty as
+# "no-baseline" and skip the 3-way check (with a warning).
+_last_deployed_sha() {
+    local marker="$ENGRAM_HOME/.deployed-version"
+    [[ -f "$marker" ]] || { echo ""; return; }
+    local sha
+    sha=$(grep -E "^alpha_sha=" "$marker" 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' \r\n')
+    [[ -n "$sha" ]] || { echo ""; return; }
+    if ! git -C "$ALPHA_DIR" rev-parse --verify "$sha^{commit}" >/dev/null 2>&1; then
+        echo ""
+        return
+    fi
+    echo "$sha"
+}
+
+# 3-way comparison for a single file. Echoes one of:
+#   no-baseline  — no recoverable baseline; caller falls back to default behavior
+#   identical    — alpha-NEW == user-LOCAL == baseline (or no change to apply)
+#   safe-update  — user-LOCAL == baseline; safe to overwrite with alpha-NEW
+#   conflict     — both alpha-NEW and user-LOCAL diverged from baseline
+#   new-file     — file did not exist at baseline (first time being deployed)
+# All comparisons are content-hash based (git hash-object) — robust against
+# whitespace-only differences in the runtime tree (e.g. line-ending munging).
+_check_3way() {
+    local rel="$1"  # path relative to alpha root, also relative to $ENGRAM_HOME for protected files
+    local alpha_path="$ALPHA_DIR/$rel"
+    local local_path="$ENGRAM_HOME/$rel"
+    local sha; sha="$(_last_deployed_sha)"
+
+    if [[ -z "$sha" ]]; then
+        echo "no-baseline"
+        return
+    fi
+
+    local alpha_hash local_hash baseline_hash
+    # Guard alpha-side existence: hash-object on a missing file emits empty;
+    # if local is ALSO missing then both empties would falsely classify as
+    # "identical". Manifest expects alpha files to exist — a missing alpha
+    # means manifest drift, not a deploy outcome.
+    if [[ ! -f "$alpha_path" ]]; then
+        echo "alpha-missing"
+        return
+    fi
+    alpha_hash="$(git -C "$ALPHA_DIR" hash-object "$alpha_path" 2>/dev/null || echo "")"
+    [[ -f "$local_path" ]] && local_hash="$(git -C "$ALPHA_DIR" hash-object "$local_path" 2>/dev/null || echo "")" || local_hash=""
+    baseline_hash="$(git -C "$ALPHA_DIR" rev-parse "$sha:$rel" 2>/dev/null || echo "")"
+
+    if [[ -z "$baseline_hash" ]]; then
+        # File didn't exist at the baseline SHA — first time being deployed.
+        echo "new-file"
+        return
+    fi
+    if [[ "$alpha_hash" == "$local_hash" && "$alpha_hash" == "$baseline_hash" ]]; then
+        echo "identical"; return
+    fi
+    if [[ "$local_hash" == "$baseline_hash" ]]; then
+        echo "safe-update"; return
+    fi
+    if [[ "$alpha_hash" == "$baseline_hash" ]]; then
+        # User has diverged but alpha hasn't changed since baseline —
+        # nothing for us to push, leave the user's version alone.
+        echo "identical"; return
+    fi
+    echo "conflict"
+}
+
+# Show the relevant diffs and prompt the user when a conflict is detected.
+# Returns 0 if user chose accept-alpha (caller proceeds with rsync),
+#         1 if user chose keep-local (caller saves alpha-NEW as .alpha-pending and skips),
+#         2 if user chose abort.
+_resolve_conflict() {
+    local rel="$1"
+    local alpha_path="$ALPHA_DIR/$rel"
+    local local_path="$ENGRAM_HOME/$rel"
+    local sha; sha="$(_last_deployed_sha)"
+
+    echo
+    echo "=== CONFLICT on $rel ==="
+    echo "Both alpha and your local copy have diverged from the last-deployed baseline ($sha)."
+    echo
+    echo "--- baseline → alpha-NEW (alpha changes since last deploy) ---"
+    git -C "$ALPHA_DIR" --no-pager diff --no-color "$sha" -- "$rel" | sed 's/^/    /' | head -40
+    echo
+    echo "--- baseline → user-LOCAL (your changes since last deploy) ---"
+    diff -u <(git -C "$ALPHA_DIR" show "$sha:$rel" 2>/dev/null) "$local_path" | sed 's/^/    /' | head -40
+    echo
+
+    if [[ $YES = 1 ]]; then
+        # In --yes mode we never auto-clobber a divergent local copy.
+        echo "  --yes mode: refusing to auto-overwrite divergent local. Saving alpha-NEW to ${rel}.alpha-pending and skipping."
+        cp "$alpha_path" "$local_path.alpha-pending"
+        return 1
+    fi
+    if [[ $DRY_RUN = 1 ]]; then
+        echo "  dry-run mode: conflict would block update. Re-run without --dry-run to choose."
+        return 2  # treat dry-run conflicts as block — surfaces them in the report
+    fi
+
+    local choice=""
+    while [[ ! "$choice" =~ ^[abc]$ ]]; do
+        read -r -p "Choose: (a) accept alpha (overwrite local), (b) keep local (skip + save .alpha-pending), (c) abort deploy [a/b/c]: " choice
+    done
+    case "$choice" in
+        a) return 0 ;;
+        b)
+            cp "$alpha_path" "$local_path.alpha-pending"
+            echo "  saved alpha-NEW to ${rel}.alpha-pending — merge manually when ready."
+            return 1
+            ;;
+        c) return 2 ;;
+    esac
+    # Defensive fallthrough — should be unreachable since the read-loop
+    # only exits on [abc]. Treat any other value as abort to avoid a
+    # silent function-success return that would let caller rsync over a
+    # conflict.
+    return 2
+}
+
 CHANGES=0
 PLAN_DETAILS=""
 for entry in "${MANIFEST[@]}"; do
@@ -219,11 +351,54 @@ if [[ $YES = 0 ]]; then
 fi
 
 # Apply
+SKIP_DST_PATHS=()  # protected files the user chose to keep local (skip rsync)
+ABORT_DEPLOY=0
 for entry in "${MANIFEST[@]}"; do
     _split_entry "$entry"
     src="$ALPHA_DIR/$ENTRY_SRC"
     dst="$ENGRAM_HOME/$ENTRY_DST"
     [[ ! -e "$src" ]] && continue
+
+    # 3-way conflict check for protected files (SKILL.md etc.). Only applies
+    # to single-file manifest entries — directories are out of scope for
+    # this layer (handled by per-file rules at install/edit time).
+    if [[ ! -d "$src" ]] && [[ " ${PROTECTED_FILES[*]} " == *" $ENTRY_SRC "* ]]; then
+        status="$(_check_3way "$ENTRY_SRC")"
+        case "$status" in
+            no-baseline)
+                echo "  warning: no recoverable baseline for $ENTRY_SRC — overwriting (first deploy or orphaned baseline SHA)"
+                ;;
+            alpha-missing)
+                # Defense-in-depth: the early `[[ ! -e "$src" ]] && continue`
+                # at the top of this loop already skips manifest entries
+                # missing on the alpha side. This branch is reached only if
+                # something has gone subtly wrong (race, manifest drift) —
+                # warn loudly and skip rather than risk a "false identical"
+                # that lets rsync overwrite the local file with nothing.
+                echo "  warning: alpha-side file missing for $ENTRY_SRC — skipping (manifest may be drifted)"
+                continue
+                ;;
+            identical|safe-update|new-file)
+                : # proceed with normal rsync
+                ;;
+            conflict)
+                if _resolve_conflict "$ENTRY_SRC"; then
+                    : # user chose accept-alpha — proceed with rsync
+                else
+                    rc=$?
+                    if [[ $rc -eq 1 ]]; then
+                        SKIP_DST_PATHS+=("$dst")
+                        continue
+                    fi
+                    if [[ $rc -eq 2 ]]; then
+                        ABORT_DEPLOY=1
+                        break
+                    fi
+                fi
+                ;;
+        esac
+    fi
+
     if [[ -d "$src" ]]; then
         mkdir -p "$dst"
         rsync_args=(-ac)
@@ -233,6 +408,18 @@ for entry in "${MANIFEST[@]}"; do
         rsync -ac "$src" "$dst"
     fi
 done
+
+if [[ $ABORT_DEPLOY = 1 ]]; then
+    echo
+    echo "✗ Deploy aborted at user request. Some files may have been updated before the abort."
+    echo "  Run again to continue, or resolve the conflicts manually."
+    exit 1
+fi
+if [[ ${#SKIP_DST_PATHS[@]} -gt 0 ]]; then
+    echo
+    echo "  Files kept-local (alpha-NEW saved as .alpha-pending alongside each):"
+    for p in "${SKIP_DST_PATHS[@]}"; do echo "    - $p"; done
+fi
 
 # Apply install-time template substitutions that install.sh would have done.
 # These need to run after every deploy because rsync overwrites the substituted
