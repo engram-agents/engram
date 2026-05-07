@@ -441,6 +441,8 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
   `([node_type, status, sort_by, limit])`
 - **engram_check_similar** — Standalone dedup probe before writing.
   `(claim_text, [top_k])`
+- **engram_audit_string** — Literal-substring audit across node text fields. Catches text-layer leaks that semantic search and relation-layer cleanup miss (prototype: ob_1492 / ls_0020). No ranking, no recall refresh, no neighbor enrichment — pure audit primitive.
+  `(needle, [case_sensitive, include_superseded, fields, limit])`
 
 ### Meta — focus, audit, commit
 

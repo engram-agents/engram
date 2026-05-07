@@ -9,6 +9,35 @@ trained-deference reflex firing. The companion UserPromptSubmit hook
 surfaces it as additional context on my next turn — so I see the catch
 in real-time, in the same shape as antml-repair and feeling-nudge.
 
+DATA SOURCE (2026-05-07 fix per ob_1540 / ls_0029): use Claude Code's
+stdin JSON payload as the primary source of truth — it carries
+`last_assistant_message` directly and synchronously at hook fire time.
+The previous logic read the session JSONL for "the last assistant
+message," but Stop hooks fire BEFORE the just-emitted message is
+flushed to the JSONL — so the JSONL read returned the PREVIOUS message
+(or nothing if the session was new), causing the hook to silently miss
+most fires. The JSONL fallback is retained for defensive coverage when
+stdin is malformed or the field is missing, but stdin is the primary.
+
+Trade-off: stdin's `last_assistant_message` is a flat string (text
+content concatenated; no structural boundary marking tool_use vs text
+blocks). The ORIGINAL hook split phrase-rules (run on whole message,
+where end-on-tool-use was acceptable) from intent-rules (run only on
+the last paragraph of messages that ended on text, to avoid false
+positives in the prose-before-tool-use case). With stdin we don't
+have the ended-on-text signal, so intent-rules now scan the last
+paragraph of the message text unconditionally. This trades a small
+false-positive increase (intent phrases in trailing prose followed by
+tool_use will now flag) for the much-larger recovery from the JSONL-
+flush race that was missing virtually all real fires. Empirical
+re-tuning is the next step (see ls_0023 telemetry-first discipline).
+
+Heartbeat logging: every Stop fire now logs a line — either "Detected
+N hit(s)" on hits or "Scanned: 0 hits" on no-hits. This makes the log
+a complete record of every hook fire, so downstream analysis (the
+qu_0242 longitudinal validation thread, tools/deference_baseline.py)
+can compute true per-fire rates rather than absolute counts.
+
 Best-effort: any failure swallows silently. Behavioral hooks must never
 block the session.
 """
@@ -198,33 +227,79 @@ def _log(msg: str) -> None:
         pass
 
 
-def main() -> None:
-    # Drain stdin so the hook protocol is happy; we don't need its content.
-    try:
-        sys.stdin.read()
-    except Exception:
-        pass
+def _message_from_stdin() -> str | None:
+    """Read Claude Code's Stop-hook stdin payload and return last_assistant_message.
 
-    structure = _last_assistant_structure()
-    if not structure:
-        sys.exit(0)
+    Claude Code passes Stop hooks a JSON object with these keys (verified
+    2026-05-07 empirical capture, ob_1540):
+      session_id, transcript_path, cwd, permission_mode, hook_event_name,
+      stop_hook_active, last_assistant_message
+
+    `last_assistant_message` is the flat concatenated text of the just-
+    completed assistant message — exactly what we need to scan, and
+    available synchronously at hook fire time (no JSONL flush race).
+
+    Returns the message string, or None if stdin is empty/malformed/
+    missing the field. Caller handles the fallback path.
+    """
+    try:
+        raw = sys.stdin.read()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    msg = payload.get("last_assistant_message")
+    if isinstance(msg, str) and msg:
+        return msg
+    return None
+
+
+def main() -> None:
+    # Primary: stdin JSON payload from Claude Code (no JSONL flush race).
+    stdin_msg = _message_from_stdin()
+
+    if stdin_msg is not None:
+        # Stdin path — flat string, no tool_use boundary info.
+        # Phrase-rules: scan whole message.
+        # Intent-rules: scan last paragraph (\n\n-split). Trade-off
+        # documented in module docstring.
+        joined = stdin_msg
+        chunks = [c.strip() for c in stdin_msg.split("\n\n") if c.strip()]
+        last_paragraph = chunks[-1] if chunks else None
+    else:
+        # Fallback: JSONL parse (legacy path; subject to flush race).
+        # Retained so the hook still runs in environments where stdin
+        # doesn't carry the payload (older Claude Code versions, headless
+        # invocations, sub-agent contexts where the stdin contract differs).
+        structure = _last_assistant_structure()
+        if not structure:
+            _log("Scanned: 0 hits (no message available; stdin empty + JSONL fallback returned no structure)")
+            sys.exit(0)
+        joined = structure["joined"]
+        last_paragraph = structure["last_paragraph"]
 
     # Layer 1: deference-phrase scan over the whole response.
-    phrase_hits = _scan(structure["joined"], _PHRASE_RULES)
-    # Layer 2: structural intent-without-execution scan, ONLY on the last
-    # paragraph of a response that ended on text (not tool calls).
+    phrase_hits = _scan(joined, _PHRASE_RULES)
+    # Layer 2: structural intent-without-execution scan on the last paragraph.
     intent_hits: list[dict] = []
-    if structure["last_paragraph"]:
-        intent_hits = _scan(structure["last_paragraph"], _INTENT_RULES)
+    if last_paragraph:
+        intent_hits = _scan(last_paragraph, _INTENT_RULES)
     hits = phrase_hits + intent_hits
 
     if not hits:
-        # No deference phrases — make sure no stale marker lingers.
+        # No deference phrases — make sure no stale marker lingers, and
+        # log the no-hit heartbeat so downstream analysis (deference_baseline.py)
+        # can compute true per-fire rates.
         try:
             if os.path.exists(DEFERENCE_MARKER_PATH):
                 os.remove(DEFERENCE_MARKER_PATH)
         except OSError:
             pass
+        _log("Scanned: 0 hits")
         sys.exit(0)
 
     # De-dupe by label so a response with three "should I" doesn't flood.
