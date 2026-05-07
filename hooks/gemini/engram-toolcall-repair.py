@@ -55,6 +55,16 @@ REPAIR_LOG = Path(
         str(Path(ENGRAM_HOME) / "toolcall-repairs.jsonl"),
     )
 ).expanduser()
+# Every invocation through this hook is appended here — the denominator for
+# repair-rate computation. The repair log captures only the numerator
+# (calls that needed the antml-prefix fix). Without this baseline counter,
+# we cannot tell if a future migration improves or regresses error rate.
+INVOCATION_LOG = Path(
+    os.environ.get(
+        "ENGRAM_INVOCATION_LOG",
+        str(Path(ENGRAM_HOME) / "toolcall-invocations.jsonl"),
+    )
+).expanduser()
 REPAIR_MARKER = Path(
     os.environ.get(
         "ENGRAM_REPAIR_MARKER",
@@ -247,6 +257,24 @@ def log_repair(tool_name: str, repairs: list[str],
         f.write(json.dumps(entry) + "\n")
 
 
+def log_invocation(tool_name: str, was_repaired: bool) -> None:
+    """Append every protected-tool invocation as a baseline-rate denominator.
+
+    Writes one line per call regardless of repair status. Pair with the
+    repair log to compute repair rate over time. JSONL append on a tiny
+    payload (timestamp + tool_name + flag) is well under PIPE_BUF, so
+    concurrent writers (e.g. cron + interactive sessions) interleave safely.
+    """
+    INVOCATION_LOG.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "tool_name": tool_name,
+        "repaired": was_repaired,
+    }
+    with open(INVOCATION_LOG, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
 def write_marker(tool_name: str, repairs: list[str]) -> None:
     """Write a marker file the UserPromptSubmit hook surfaces next turn."""
     REPAIR_MARKER.parent.mkdir(parents=True, exist_ok=True)
@@ -293,6 +321,12 @@ def main() -> None:
         sys.exit(0)
 
     repaired, repairs = attempt_repair(tool_name, tool_input)
+    was_repaired = bool(repairs)
+
+    try:
+        log_invocation(tool_name, was_repaired)
+    except Exception:
+        pass  # baseline telemetry must not block the call
 
     if not repairs:
         sys.exit(0)  # no repair needed, let the call through unchanged
