@@ -13,32 +13,32 @@ def test_inductive_enumeration_and_timing():
         print(f"Sandbox: {sandbox_dir}\n")
 
         # ── Setup: one evidence, three observations citing it ──────────
-        ev = json.loads(server.engram_add_observation(
-            url="https://plato.stanford.edu/entries/test-enumeration/",
-            title="Test SEP entry",
-            claim="System A is a paraconsistent logic that blocks modus ponens.",
-            quoted_text="System A blocks modus ponens.",
-            quote_type="attributed_analysis",
-            interpretation="testing enumeration",
-        ))
+        ev = json.loads(server.engram_add_observation(payload_json=json.dumps({
+            "url": "https://plato.stanford.edu/entries/test-enumeration/",
+            "title": "Test SEP entry",
+            "claim": "System A is a paraconsistent logic that blocks modus ponens.",
+            "quoted_text": "System A blocks modus ponens.",
+            "quote_type": "attributed_analysis",
+            "interpretation": "testing enumeration",
+        })))
         print(f"obs1: {ev.get('observation_id')} cites {ev.get('evidence_id')}")
         obs1 = ev["observation_id"]
         ev_id = ev["evidence_id"]
 
-        obs2 = json.loads(server.engram_add_observation(
-            evidence_id=ev_id,
-            claim="System B is a paraconsistent logic that uses relevance constraints.",
-            quoted_text="System B uses relevance.",
-            quote_type="attributed_analysis",
-            interpretation="testing",
-        ))["observation_id"]
-        obs3 = json.loads(server.engram_add_observation(
-            evidence_id=ev_id,
-            claim="System C is a paraconsistent logic that blocks conjunction introduction.",
-            quoted_text="System C blocks adjunction.",
-            quote_type="attributed_analysis",
-            interpretation="testing",
-        ))["observation_id"]
+        obs2 = json.loads(server.engram_add_observation(payload_json=json.dumps({
+            "evidence_id": ev_id,
+            "claim": "System B is a paraconsistent logic that uses relevance constraints.",
+            "quoted_text": "System B uses relevance.",
+            "quote_type": "attributed_analysis",
+            "interpretation": "testing",
+        })))["observation_id"]
+        obs3 = json.loads(server.engram_add_observation(payload_json=json.dumps({
+            "evidence_id": ev_id,
+            "claim": "System C is a paraconsistent logic that blocks conjunction introduction.",
+            "quoted_text": "System C blocks adjunction.",
+            "quote_type": "attributed_analysis",
+            "interpretation": "testing",
+        })))["observation_id"]
         print(f"  obs2={obs2}, obs3={obs3} (all cite {ev_id})\n")
 
         # ── Test 1: inductive_enumeration with same-source premises → NO warning ──

@@ -49,23 +49,9 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_add_observation": {
-        "description": "Extract and record a claim from a source document with full provenance. Provide url+title to auto-create the evidence node, OR evidence_id to cite an existing one.",
+        "description": "Extract and record a claim from a source document with full provenance. Single-payload signature — pass all fields as one JSON object string in payload_json. Required fields inside payload_json: quoted_text, interpretation, claim, quote_type. Source identification: include url+title to auto-create the evidence node, OR evidence_id to cite an existing one.",
         "parameters": {
-            "quoted_text": {"type": "string", "description": "Verbatim quote from the source.", "required": True},
-            "interpretation": {"type": "string", "description": "Your reasoning about what this quote means and why it matters.", "required": True},
-            "claim": {"type": "string", "description": "A single, atomic, falsifiable claim.", "required": True},
-            "quote_type": {"type": "string", "description": "One of: hard_data, official_statement, attributed_analysis, unnamed_source, personal_communication, editorial.", "required": True, "enum": ["hard_data", "official_statement", "attributed_analysis", "unnamed_source", "personal_communication", "editorial"]},
-            "url": {"type": "string", "description": "URL of the source. Evidence node is auto-created or reused. Use this OR evidence_id."},
-            "title": {"type": "string", "description": "Title of the source (required if url is provided)."},
-            "domain": {"type": "string", "description": "Domain name (auto-extracted from URL if omitted)."},
-            "source_date": {"type": "string", "description": "Publication date (ISO format, e.g. '2026-03-20')."},
-            "evidence_id": {"type": "string", "description": "ID of an existing evidence node. Use this OR url+title."},
-            "is_predictive": {"type": "boolean", "description": "Whether this observation is a forward-looking prediction."},
-            "predicted_event": {"type": "string", "description": "If predictive, the event being predicted."},
-            "resolution_timeframe": {"type": "string", "description": "If predictive, when the prediction should be resolvable (ISO date)."},
-            "source_class": {"type": "string", "description": "Epistemic origin: 'external' (published sources, default), 'introspective' (agent's own prior output, ×0.95 discount), 'user_stated' (user-provided facts, official_statement confidence).", "enum": ["external", "introspective", "user_stated"]},
-            "content_hash": {"type": "string", "description": "SHA-256 hash of file content (for file-based evidence). Enables change detection."},
-            "git_sha": {"type": "string", "description": "Git commit SHA when file was read (for file-based evidence). Enables future diffing."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) containing observation fields. Required: quoted_text, interpretation, claim, quote_type (one of hard_data/official_statement/attributed_analysis/unnamed_source/personal_communication/editorial). Optional: url, title, domain, source_date, evidence_id, is_predictive, predicted_event, resolution_timeframe, source_class (external/introspective/user_stated), content_hash, git_sha.", "required": True},
         },
     },
     "engram_add_observation_batch": {
@@ -369,18 +355,33 @@ class EngramClient:
 
     def call(self, tool_name: str, arguments: dict[str, Any] = None) -> dict:
         """Execute a tool call and return parsed JSON result.
-        
+
         Args:
             tool_name: Name of the kg_* tool to call.
             arguments: Dict of keyword arguments for the tool.
-            
+
         Returns:
             Parsed JSON response from the tool.
+
+        Single-payload tools (e.g. engram_add_observation): if the schema's
+        only parameter is `payload_json` and the caller passes the legacy
+        named-field dict instead, this auto-wraps it. Lets pre-migration
+        callers keep working without each having to know about the JSON
+        shape, while LLMs that follow the published schema pass payload_json
+        directly. New code should pass `{"payload_json": json.dumps({...})}`
+        explicitly.
         """
         if tool_name not in self._tools:
             return {"error": f"Unknown tool '{tool_name}'. Available: {self.tool_names}"}
 
         args = arguments or {}
+
+        schema = TOOL_SCHEMAS.get(tool_name)
+        if (schema
+                and list(schema.get("parameters", {}).keys()) == ["payload_json"]
+                and "payload_json" not in args):
+            args = {"payload_json": json.dumps(args)}
+
         try:
             result_str = self._tools[tool_name](**args)
             return json.loads(result_str)
@@ -645,11 +646,13 @@ if __name__ == "__main__":
         print(f"Add evidence: {r['status']} → {r['evidence_id']}")
 
         r = client.call("engram_add_observation", {
-            "evidence_id": "ev_0001",
-            "quoted_text": "Gold fell 9.6%",
-            "interpretation": "Worst weekly decline in 15 years",
-            "claim": "Gold fell 9.6% in the week ending March 20, 2026",
-            "quote_type": "hard_data",
+            "payload_json": json.dumps({
+                "evidence_id": "ev_0001",
+                "quoted_text": "Gold fell 9.6%",
+                "interpretation": "Worst weekly decline in 15 years",
+                "claim": "Gold fell 9.6% in the week ending March 20, 2026",
+                "quote_type": "hard_data",
+            }),
         })
         print(f"Add observation: {r['status']} → {r['observation_id']} (conf: {r['confidence']})")
 

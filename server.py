@@ -3275,6 +3275,17 @@ def engram_add_evidence(
         conn.close()
 
 
+# Set of legitimate field names for the engram_add_observation payload.
+# Used by the MCP wrapper to reject unknown fields up-front (catches typos
+# before they reach the impl signature where they'd raise TypeError).
+_ADD_OBSERVATION_FIELDS = frozenset({
+    "quoted_text", "interpretation", "claim", "quote_type",
+    "url", "title", "domain", "source_date", "evidence_id",
+    "is_predictive", "predicted_event", "resolution_timeframe",
+    "source_class", "content_hash", "git_sha",
+})
+
+
 @mcp.tool(
     name="engram_add_observation",
     annotations={
@@ -3285,11 +3296,70 @@ def engram_add_evidence(
         "openWorldHint": False,
     },
 )
-def engram_add_observation(
-    quoted_text: str,
-    interpretation: str,
-    claim: str,
-    quote_type: str,
+def engram_add_observation(payload_json: str) -> str:
+    """Extract and record a claim from a source document with full provenance.
+
+    Creates an Observation node representing the agent's interpretation of a
+    specific passage from an evidence source. Every observation has three parts:
+    the exact quoted text, the agent's interpretation, and the atomic claim.
+
+    Single-payload signature: pass ALL fields as one JSON object string in
+    `payload_json`. This eliminates the antml-prefix multi-parameter swallow
+    risk that the previous N-parameter signature was prone to (see ob_1499).
+
+    Source identification: provide EITHER url+title (the evidence node will be
+    auto-created or reused if the URL already exists) OR evidence_id (to cite
+    an already-registered evidence node). If both are provided, evidence_id
+    takes precedence.
+
+    If is_predictive is True, also creates or links to a Prediction node,
+    decomposing the forward-looking claim into a factual observation (who
+    predicted it) plus a prediction target (what was predicted).
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            quoted_text (str, required): Exact quote from the source document.
+            interpretation (str, required): Agent's reasoning about what this quote means.
+            claim (str, required): The atomic, falsifiable claim this observation supports.
+            quote_type (str, required): One of: hard_data, official_statement, attributed_analysis, unnamed_source, personal_communication, editorial.
+            url (str, optional): URL of the source document. The evidence node is auto-created or reused.
+            title (str, optional): Title of the source document (required if url is provided).
+            domain (str, optional): Source domain (auto-extracted from URL if omitted).
+            source_date (str, optional): Publication date in ISO format (e.g. '2026-03-20').
+            evidence_id (str, optional): ID of an existing evidence node. Use this OR url+title, not both.
+            is_predictive (bool, optional): Whether this observation records a forward-looking prediction.
+            predicted_event (str, optional): Required if is_predictive. The event being predicted.
+            resolution_timeframe (str, optional): Optional timeframe for when the prediction should be resolvable.
+            source_class (str, optional): Epistemic origin — 'external' (default), 'introspective' (×0.95 confidence discount), or 'user_stated'.
+            content_hash (str, optional): SHA-256 hash of file content (for file-based evidence).
+            git_sha (str, optional): Git commit SHA when the file was read (for file-based evidence).
+
+    Returns:
+        JSON with the new observation ID, confidence, evidence ID, and any prediction node created.
+        On payload-parsing failure, returns {"error": "..."} with no node created.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _ADD_OBSERVATION_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ADD_OBSERVATION_FIELDS)}"
+        })
+
+    return _add_observation_impl(**params)
+
+
+def _add_observation_impl(
+    quoted_text: str = "",
+    interpretation: str = "",
+    claim: str = "",
+    quote_type: str = "",
     url: str = "",
     title: str = "",
     domain: str = "",
@@ -3302,41 +3372,22 @@ def engram_add_observation(
     content_hash: str = "",
     git_sha: str = "",
 ) -> str:
-    """Extract and record a claim from a source document with full provenance.
-
-    Creates an Observation node representing the agent's interpretation of a
-    specific passage from an evidence source. Every observation has three parts:
-    the exact quoted text, the agent's interpretation, and the atomic claim.
-
-    Source identification: provide EITHER url+title (the evidence node will be
-    auto-created or reused if the URL already exists) OR evidence_id (to cite
-    an already-registered evidence node). If both are provided, evidence_id
-    takes precedence.
-
-    If is_predictive is True, also creates or links to a Prediction node,
-    decomposing the forward-looking claim into a factual observation (who
-    predicted it) plus a prediction target (what was predicted).
-
-    Args:
-        quoted_text: Exact quote from the source document.
-        interpretation: Agent's reasoning about what this quote means.
-        claim: The atomic, falsifiable claim this observation supports.
-        quote_type: One of: hard_data, official_statement, attributed_analysis, unnamed_source, personal_communication, editorial.
-        url: URL of the source document. The evidence node is auto-created or reused.
-        title: Title of the source document (required if url is provided).
-        domain: Source domain (auto-extracted from URL if omitted).
-        source_date: Publication date in ISO format (e.g. '2026-03-20').
-        evidence_id: ID of an existing evidence node. Use this OR url+title, not both.
-        is_predictive: Whether this observation records a forward-looking prediction.
-        predicted_event: Required if is_predictive. The event being predicted.
-        resolution_timeframe: Optional timeframe for when the prediction should be resolvable.
-        source_class: Epistemic origin — 'external' (published sources, default), 'introspective' (agent's own prior output, ×0.95 confidence discount), or 'user_stated' (user-provided facts, treated as official_statement confidence).
-        content_hash: SHA-256 hash of file content (for file-based evidence). Enables change detection across consolidation cycles.
-        git_sha: Git commit SHA when the file was read (for file-based evidence). Enables future diffing.
-
-    Returns:
-        JSON with the new observation ID, confidence, evidence ID, and any prediction node created.
+    """Internal implementation — see engram_add_observation MCP tool for the
+    public payload schema. Kept callable with named kwargs for in-server
+    callers (engram_add_observation_batch, engram_retract replacement path).
     """
+    missing = [
+        name for name, val in (
+            ("quoted_text", quoted_text),
+            ("interpretation", interpretation),
+            ("claim", claim),
+            ("quote_type", quote_type),
+        ) if not val
+    ]
+    if missing:
+        return json.dumps({
+            "error": f"Missing required fields: {', '.join(missing)}"
+        })
     if quote_type not in VALID_QUOTE_TYPES:
         return json.dumps(
             {
@@ -3813,7 +3864,7 @@ def engram_add_observation_batch(
             results.append({"index": i, "error": f"Missing required fields: {', '.join(missing)}"})
             continue
 
-        r = json.loads(engram_add_observation(
+        r = json.loads(_add_observation_impl(
             evidence_id=resolved_evidence_id,
             quoted_text=obs["quoted_text"],
             interpretation=obs["interpretation"],
@@ -8931,7 +8982,7 @@ def engram_retract(
                     "node_id": node_id,
                 })
 
-            repl_result = json.loads(engram_add_observation(
+            repl_result = json.loads(_add_observation_impl(
                 evidence_id=ev_id,
                 quoted_text=repl.get("quoted_text", ""),
                 interpretation=repl.get("interpretation", ""),

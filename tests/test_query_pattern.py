@@ -46,14 +46,14 @@ def fresh_server():
 
 def _add_observation(server, claim: str, url: str = "https://example.com/test") -> str:
     """Create an observation, return its id."""
-    r = json.loads(server.engram_add_observation(
-        url=url,
-        title="Test source",
-        quoted_text=claim,
-        interpretation=f"Interpretation of: {claim}",
-        claim=claim,
-        quote_type="hard_data",
-    ))
+    r = json.loads(server.engram_add_observation(payload_json=json.dumps({
+        "url": url,
+        "title": "Test source",
+        "quoted_text": claim,
+        "interpretation": f"Interpretation of: {claim}",
+        "claim": claim,
+        "quote_type": "hard_data",
+    })))
     return r["observation_id"]
 
 

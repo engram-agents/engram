@@ -16,16 +16,16 @@ import server
 
 def _mk_observation(claim: str, quote_type: str = "attributed_analysis") -> str:
     """Create an observation via the canonical tool and return its ID."""
-    result = json.loads(server.engram_add_observation(
-        url="https://example.com/test",
-        title="Test source",
-        domain="example.com",
-        source_date="2026-04-24",
-        claim=claim,
-        quoted_text=claim,
-        interpretation=f"Test observation: {claim}",
-        quote_type=quote_type,
-    ))
+    result = json.loads(server.engram_add_observation(payload_json=json.dumps({
+        "url": "https://example.com/test",
+        "title": "Test source",
+        "domain": "example.com",
+        "source_date": "2026-04-24",
+        "claim": claim,
+        "quoted_text": claim,
+        "interpretation": f"Test observation: {claim}",
+        "quote_type": quote_type,
+    })))
     assert "observation_id" in result, f"obs creation failed: {result}"
     return result["observation_id"]
 

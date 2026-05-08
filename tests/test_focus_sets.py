@@ -51,7 +51,20 @@ class _DirectClient:
 
     def call(self, tool_name, arguments=None):
         fn = getattr(self._server, tool_name)
-        result_str = fn(**(arguments or {}))
+        args = arguments or {}
+        # Mirror EngramClient.call's legacy-form auto-wrap for single-payload
+        # tools (currently engram_add_observation): if the caller passes the
+        # legacy named-field dict, wrap as payload_json.
+        try:
+            from engram_client import TOOL_SCHEMAS
+            schema = TOOL_SCHEMAS.get(tool_name)
+            if (schema
+                    and list(schema.get("parameters", {}).keys()) == ["payload_json"]
+                    and "payload_json" not in args):
+                args = {"payload_json": json.dumps(args)}
+        except ImportError:
+            pass
+        result_str = fn(**args)
         return json.loads(result_str)
 
 

@@ -377,8 +377,8 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
 
 ### Write — claim-bearing
 
-- **engram_add_observation** — Record a source-grounded claim; runs inline dedup/corroboration check.
-  `(quoted_text, interpretation, claim, quote_type, url+title|evidence_id, [source_class, is_predictive, predicted_event, resolution_timeframe])`
+- **engram_add_observation** — Record a source-grounded claim; runs inline dedup/corroboration check. **Single-payload signature** (eliminates antml-prefix multi-param swallow risk per ob_1499): pass all fields as one JSON object string in `payload_json`.
+  `(payload_json)` where `payload_json` is `{"quoted_text", "interpretation", "claim", "quote_type", "url"+"title"|"evidence_id", optional: "source_class", "is_predictive", "predicted_event", "resolution_timeframe", "domain", "source_date", "content_hash", "git_sha"}`
 - **engram_add_observation_batch** — Multiple observations, one source.
   `(observations_json, url+title|evidence_id)`
 - **engram_add_axiom** — Foundational assumption (conf 1.0, importance-anchored).
