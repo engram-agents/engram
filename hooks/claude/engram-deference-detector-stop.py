@@ -2,7 +2,7 @@
 """Stop hook: scan the last assistant message for deference phrasing.
 
 Detects the wait-for-approval regression Lei diagnosed 2026-05-06 (gl_0027,
-ls_0025, qu_0241). When I write phrases like "let me know if you want me
+ls_0031, qu_0241). When I write phrases like "let me know if you want me
 to..." or "should I...?" on tools/decisions in my own domains, that's the
 trained-deference reflex firing. The companion UserPromptSubmit hook
 (engram-deference-detector-prompt.py) reads the marker this writes and
