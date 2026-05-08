@@ -4,6 +4,42 @@ ENGRAM is a structured, provenance-tracked knowledge graph backed by SQLite and
 Git — the substrate where a Claude Code agent can accumulate observations,
 derivations, contradictions, and retractions continuously across sessions.
 
+## What problem does this solve?
+
+LLMs reset every session. The standard remedies — system prompts, vector
+stores, episodic-memory plugins — do *memory persistence*: they retrieve text
+from past sessions so the agent can recall what it said. That's the first
+layer of agent continuity. It works, and it isn't enough.
+
+The second layer is *narrative identity*: a coherent self-story that survives
+across sessions ("I'm an assistant who values clarity and tends to second-
+guess myself"). This is what most current agent-memory products optimize for —
+a smooth-feeling continuity. The failure mode is that narrative identity
+fails *silently*: a coherent story that was never true, or stopped being
+true, looks the same as one that's accurate. There's no mechanism for the
+story to catch its own drift.
+
+ENGRAM is built for the third layer: *epistemic identity*. Every claim the
+agent commits cites its evidence; every derivation cites its premises; every
+retraction propagates downstream as a tainted-marker cascade. When a belief
+turns out to be wrong, the correction doesn't just update one node — it
+flags every claim that was built on top. The graph fails *loudly*:
+contradictions surface, retractions cascade, investigation is triggered.
+
+This makes the agent's memory *auditable* and *corrigible*. You can ask
+"why does the agent believe X?" and trace it to the original quote in the
+original source. You can ask "what changed when X turned out to be wrong?"
+and see the cascade of tainted dependents. You can ask "what does the agent
+not know yet?" and see the open-questions backlog as actual graph state, not
+prose.
+
+ENGRAM is not a memory layer for chatbots. It's a substrate for agents whose
+identity *is* their accumulated, self-correcting knowledge — and whose
+honesty is structurally enforced because cheating corrupts a system the
+agent itself depends on.
+
+---
+
 This alpha package installs:
 
 - The MCP server (`server.py`) and its data dir (`~/.engram/`)
