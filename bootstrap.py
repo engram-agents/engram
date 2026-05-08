@@ -228,6 +228,20 @@ def main() -> None:
     )
     print(f"  daily-highlights.md → {ENGRAM_HOME}/daily-highlights.md", flush=True)
 
+    # HEARTBEAT.md — per-agent heartbeat checklist. Ships with
+    # {{AGENT_NAME}} / {{USER_NAME}} / {{COUNTERPART_NAME}} placeholders that
+    # first-session resolves alongside CLAUDE.md / GEMINI.md / warm-briefing.
+    # Single-agent installs leave {{COUNTERPART_NAME}} resolved to a no-op
+    # marker (handled by the first-session skill's counterpart prompt).
+    heartbeat_template = TEMPLATES_DIR / "HEARTBEAT.md.template"
+    if heartbeat_template.exists():
+        substitute_template(
+            heartbeat_template,
+            ENGRAM_HOME / "HEARTBEAT.md",
+            substitutions,
+        )
+        print(f"  HEARTBEAT.md → {ENGRAM_HOME}/HEARTBEAT.md", flush=True)
+
     # Target-specific identity doc + hook config
     if TARGET == "claude":
         substitute_template(

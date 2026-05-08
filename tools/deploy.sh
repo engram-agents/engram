@@ -470,6 +470,7 @@ TEMPLATE_FILES=(
     "templates/CLAUDE.md.template"
     "integrations/gemini-cli/GEMINI.md.template"
     "templates/warm-briefing.md.template"
+    "templates/HEARTBEAT.md.template"
     "settings.hooks.json.template"
 )
 if [[ -n "$BASELINE_SHA" ]]; then
