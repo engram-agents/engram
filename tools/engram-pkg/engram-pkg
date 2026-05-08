@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""
+engram-pkg — CLI toolkit for authoring engram-package databases.
+
+Operates on any engram-package directory passed via --pkg or $ENGRAM_PKG.
+Wraps the EngramClient (which redirects all server paths to the package
+directory atomically) so you can author into the package without touching
+your personal engram at ~/.engram/.
+
+Usage:
+    engram-pkg --pkg ~/engram-packages/wiki/ <subcommand> [args...]
+    ENGRAM_PKG=~/engram-packages/wiki/ engram-pkg <subcommand> [args...]
+
+Common subcommands:
+    init               Bootstrap a new engram-package skeleton in an empty directory.
+    add-evidence       Register a source document.
+    add-observation    Extract a claim with provenance from a source.
+    derive             Combine evidence into a derived claim.
+    supersede          Replace an existing node with an updated version.
+    list               List nodes in the package (compact triage).
+    query              Search nodes by text + embedding.
+    inspect            Inspect a single node + 1-hop neighbors.
+    stats              Package statistics.
+    dump               Run scripts/dump.sh — write knowledge.sql.
+    build              Run scripts/build.sh — build knowledge.db from .sql.
+    call               Generic escape hatch — invoke any engram_* tool by name with JSON args.
+
+Why a CLI rather than MCP-tool duplication: parallel personal vs package
+MCP tools share shape and selection signal; mid-flow it's easy to fire the
+wrong one. The conscious shell command makes the namespace shift visible
+and matches the tool surface other agents (e.g., Mneme) will use.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent  # engram-alpha/
+
+# Canonical ENGRAM node types — kept here as a static list (mirrors the server's
+# type vocabulary). Used as argparse `choices` for --node-type so a typo errors
+# loudly with the valid list, instead of silently returning empty results.
+# When server adds a new node type, add it here too.
+NODE_TYPES = (
+    "axiom",
+    "conjecture",
+    "contradiction",
+    "cornerstone",
+    "definition",
+    "derivation",
+    "evidence",
+    "feeling_report",
+    "goal",
+    "goal_tension",
+    "lesson",
+    "observation_factual",
+    "observation_predictive",
+    "person",
+    "prediction",
+    "question",
+    "task",
+    "theory",
+)
+
+
+def resolve_pkg(args):
+    pkg = args.pkg or os.environ.get("ENGRAM_PKG")
+    if not pkg:
+        sys.exit("ERROR: --pkg required (or set $ENGRAM_PKG). Point at an engram-package directory.")
+    pkg_path = Path(pkg).expanduser().resolve()
+    if not pkg_path.is_dir():
+        sys.exit(f"ERROR: {pkg_path} is not a directory.")
+    return pkg_path
+
+
+# 5-second slack absorbs filesystem mtime jitter (touch-modify within the same
+# second, build script mtime updates near-simultaneously, etc.). Anything past
+# 5s of sql-newer-than-db is a real authoring gap.
+_STALE_SLACK_SECS = 5
+
+
+def _check_stale_build(pkg_path, auto_build=False):
+    """Detect knowledge.sql newer than knowledge.db.
+
+    Direction matters: db-newer-than-sql is the normal mid-authoring state
+    (CLI write commands hit .db; `dump` catches .sql up). The reverse is the
+    one that produces silent stale reads — typically after a fresh git pull
+    or a hand-edit of knowledge.sql without `engram-pkg build`.
+    """
+    db = pkg_path / "knowledge.db"
+    sql = pkg_path / "knowledge.sql"
+    if not (db.exists() and sql.exists()):
+        return
+    if sql.stat().st_mtime <= db.stat().st_mtime + _STALE_SLACK_SECS:
+        return
+    if auto_build:
+        script = pkg_path / "scripts" / "build.sh"
+        if script.exists():
+            sys.stderr.write(
+                "NOTE: knowledge.sql newer than knowledge.db — auto-building...\n"
+            )
+            rc = subprocess.call(["bash", str(script)])
+            if rc != 0:
+                sys.exit(f"ERROR: auto-build failed (rc={rc}). Run `engram-pkg build` manually to see errors.")
+        else:
+            # Hard-exit instead of degrading to a stale read. The user
+            # explicitly passed --auto-build because they did NOT want
+            # to read stale data; warn-and-continue would silently
+            # contradict that intent.
+            sys.exit(
+                f"ERROR: --auto-build requested but {script} not found. "
+                f"Run `engram-pkg build` manually, or remove --auto-build "
+                f"to fall back to warn-only mode."
+            )
+        return
+    sys.stderr.write(
+        f"WARNING: knowledge.sql is newer than knowledge.db — read commands "
+        f"may return stale data. Run `engram-pkg build` to refresh, or pass "
+        f"--auto-build to do it automatically.\n"
+    )
+
+
+def get_client(pkg_path):
+    sys.path.insert(0, str(REPO_ROOT))
+    from engram_client import EngramClient  # noqa: E402
+    return EngramClient(db_dir=str(pkg_path), server_module_path=str(REPO_ROOT))
+
+
+def report(result):
+    """Pretty-print a tool result; exit non-zero on error."""
+    if isinstance(result, dict) and "error" in result:
+        sys.exit(f"ERROR: {result['error']}")
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand handlers
+# ---------------------------------------------------------------------------
+
+# Package-protocol templates rendered by `cmd_init`.
+_DUMP_SH_TEMPLATE = '''#!/usr/bin/env bash
+# Dump the local knowledge.db to knowledge.sql for git-versioned commit.
+# Author-side only — runs after authoring sessions, before `git commit knowledge.sql`.
+# (Consumers do not need this script. They run scripts/build.sh after pull.)
+
+set -euo pipefail
+
+PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DB_FILE="$PKG_DIR/knowledge.db"
+SQL_FILE="$PKG_DIR/knowledge.sql"
+
+if [[ ! -f "$DB_FILE" ]]; then
+    echo "ERROR: $DB_FILE not found. Run scripts/build.sh first (or seed it via engram-pkg)." >&2
+    exit 1
+fi
+
+# WAL flush so .dump captures all committed writes from the live engram.
+sqlite3 "$DB_FILE" "PRAGMA wal_checkpoint(TRUNCATE);" > /dev/null
+sqlite3 "$DB_FILE" .dump > "$SQL_FILE"
+
+NODE_COUNT=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM nodes;")
+SQL_LINES=$(wc -l < "$SQL_FILE")
+echo "Dumped $DB_FILE -> $SQL_FILE  ($NODE_COUNT nodes, $SQL_LINES lines)"
+echo "Review diff with: git diff knowledge.sql"
+'''
+
+_BUILD_SH_TEMPLATE = '''#!/usr/bin/env bash
+# Build the local knowledge.db from knowledge.sql.
+# Run this once after `git clone` (and again whenever you `git pull` and the .sql changed).
+#
+# This is the consumer-side build — minimal, no toolkit dependency, just sqlite3.
+# (Authoring uses the engram-pkg CLI from engram-alpha/tools/engram-pkg/.)
+
+set -euo pipefail
+
+PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SQL_FILE="$PKG_DIR/knowledge.sql"
+DB_FILE="$PKG_DIR/knowledge.db"
+
+if [[ ! -f "$SQL_FILE" ]]; then
+    echo "ERROR: $SQL_FILE not found." >&2
+    exit 1
+fi
+
+# Replace any existing local .db. The .sql is the source of truth; local .db
+# is a build artifact and may be regenerated freely.
+rm -f "$DB_FILE" "$DB_FILE-shm" "$DB_FILE-wal"
+sqlite3 "$DB_FILE" < "$SQL_FILE"
+
+NODE_COUNT=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM nodes;")
+EDGE_COUNT=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM edges;")
+echo "Built $DB_FILE  ($NODE_COUNT nodes, $EDGE_COUNT edges)"
+'''
+
+_GITIGNORE_TEMPLATE = '''# Local working binary — built from knowledge.sql via scripts/build.sh.
+# The .sql is the source of truth; the .db is a build artifact.
+knowledge.db
+knowledge.db-shm
+knowledge.db-wal
+
+# Local engram runtime artifacts (server.py drops these next to the .db)
+config.json
+recall_window.json
+session_log.md
+graph_snapshot.md.tmp
+
+# Python noise
+__pycache__/
+*.pyc
+.venv/
+
+# Editor noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+'''
+
+_README_TEMPLATE = '''# {pkg_name}
+
+An engram-package — a portable, read-only ENGRAM knowledge graph that other agents can clone and consume alongside their personal graph.
+
+## What this package contains
+
+- `knowledge.sql` — source of truth, versioned in git
+- `knowledge.db` — build artifact, gitignored, regenerated via `scripts/build.sh`
+- `scripts/dump.sh` — author-side: writes `knowledge.sql` from live `knowledge.db`
+- `scripts/build.sh` — consumer-side: rebuilds `knowledge.db` from `knowledge.sql`
+- (optional) `cases/`, `archive/`, etc. — domain-specific human-readable content
+
+## Consumer workflow
+
+```bash
+git clone <this-repo>
+cd <this-repo>
+bash scripts/build.sh    # produces knowledge.db
+```
+
+You can then query the package via the engram-pkg CLI:
+
+```bash
+engram-pkg --pkg . list --node-type observation_factual
+engram-pkg --pkg . query "your search"
+engram-pkg --pkg . inspect <node_id>
+```
+
+## Authoring workflow
+
+```bash
+export ENGRAM_PKG=$(pwd)
+engram-pkg add-observation --url ... --title ... --quoted-text ... ...
+engram-pkg dump                      # knowledge.db -> knowledge.sql
+git add knowledge.sql && git commit  # commit only versioned artifacts
+```
+
+The package follows the engram-package protocol — see the engram-pkg CLI README for the full contract.
+'''
+
+
+def cmd_init(args):
+    """Bootstrap a fresh engram-package skeleton in an empty directory.
+
+    Tolerates a pre-existing `.git` directory (so `mkdir my-pkg && cd my-pkg
+    && git init && engram-pkg init .` works as a natural flow). All other
+    pre-existing content blocks init to avoid clobbering author work.
+    """
+    pkg_path = Path(args.path).expanduser().resolve()
+    if pkg_path.exists():
+        # Filter out .git from the non-empty check — initializing inside an
+        # already-`git init`-ed directory is a common author flow.
+        existing = [p for p in pkg_path.iterdir() if p.name != ".git"]
+        if existing:
+            sys.exit(
+                f"ERROR: {pkg_path} is not empty (found: "
+                f"{', '.join(p.name for p in existing[:5])}"
+                f"{'...' if len(existing) > 5 else ''}). "
+                f"`engram-pkg init` refuses to overwrite existing files. "
+                f"A pre-existing `.git/` is OK; anything else blocks init."
+            )
+    pkg_path.mkdir(parents=True, exist_ok=True)
+    scripts_dir = pkg_path / "scripts"
+    scripts_dir.mkdir(exist_ok=True)
+
+    files_written = []
+
+    dump_path = scripts_dir / "dump.sh"
+    dump_path.write_text(_DUMP_SH_TEMPLATE)
+    dump_path.chmod(0o755)
+    files_written.append(("scripts/dump.sh", dump_path))
+
+    build_path = scripts_dir / "build.sh"
+    build_path.write_text(_BUILD_SH_TEMPLATE)
+    build_path.chmod(0o755)
+    files_written.append(("scripts/build.sh", build_path))
+
+    gitignore_path = pkg_path / ".gitignore"
+    gitignore_path.write_text(_GITIGNORE_TEMPLATE)
+    files_written.append((".gitignore", gitignore_path))
+
+    pkg_name = args.name or pkg_path.name
+    readme_path = pkg_path / "README.md"
+    readme_path.write_text(_README_TEMPLATE.format(pkg_name=pkg_name))
+    files_written.append(("README.md", readme_path))
+
+    # Bootstrap the schema by triggering the EngramClient once. This creates
+    # knowledge.db with the full ENGRAM schema (otherwise build.sh against an
+    # empty knowledge.sql produces a schema-less .db that can't be queried).
+    # We call engram_stats as a no-op trigger; any read does the same job.
+    client = get_client(pkg_path)
+    client.call("engram_stats")
+
+    # Now dump the schema (no nodes) to knowledge.sql so a fresh
+    # `git clone && bash scripts/build.sh` produces a working .db.
+    dump_script = pkg_path / "scripts" / "dump.sh"
+    rc = subprocess.call(["bash", str(dump_script)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if rc != 0:
+        sys.exit(f"ERROR: scripts/dump.sh failed during init (rc={rc}). The skeleton was created but knowledge.sql is empty.")
+    files_written.append(("knowledge.sql", pkg_path / "knowledge.sql"))
+
+    print(f"Initialized engram-package at {pkg_path}")
+    for label, _ in files_written:
+        print(f"  + {label}")
+    print()
+    print("Next steps:")
+    print(f"  cd {pkg_path}")
+    print(f"  git init && git add . && git commit -m 'init: engram-package skeleton'")
+    print(f"  export ENGRAM_PKG={pkg_path}")
+    print(f"  engram-pkg add-evidence --url ... --title ...")
+    return 0
+
+
+# Path prefixes that almost certainly indicate a machine-local URL, not
+# something a different consumer can resolve. Order doesn't matter; any
+# match triggers the warning.
+_LOCAL_URL_INDICATORS = (
+    "file:///home/", "file:///Users/", "file:///root/",
+    "file:///tmp/", "file:///var/",
+)
+
+
+def _warn_if_local_url(url: str) -> None:
+    """Emit a stderr warning when url looks machine-local (won't port to
+    other consumers of the package). Non-blocking — the URL is still accepted.
+    """
+    if not url:
+        return
+    if not any(url.startswith(prefix) for prefix in _LOCAL_URL_INDICATORS):
+        return
+    sys.stderr.write(
+        f"WARNING: URL '{url}' looks like a machine-local absolute path. "
+        f"Other consumers of this package will not be able to resolve it. "
+        f"Consider a stable URL instead: GitHub raw "
+        f"(https://raw.githubusercontent.com/...), a project-relative path, "
+        f"or arxiv/DOI for published sources.\n"
+    )
+
+
+def cmd_add_evidence(args):
+    _warn_if_local_url(args.url)
+    client = get_client(resolve_pkg(args))
+    return report(client.call("engram_add_evidence", {
+        "url": args.url, "title": args.title,
+        "domain": args.domain or "", "source_date": args.source_date or "",
+    }))
+
+
+def cmd_add_observation(args):
+    client = get_client(resolve_pkg(args))
+    payload = {
+        "quoted_text": args.quoted_text,
+        "interpretation": args.interpretation,
+        "claim": args.claim,
+        "quote_type": args.quote_type,
+    }
+    if args.evidence_id:
+        payload["evidence_id"] = args.evidence_id
+    elif args.url:
+        _warn_if_local_url(args.url)
+        payload["url"] = args.url
+        payload["title"] = args.title or ""
+        if args.source_date:
+            payload["source_date"] = args.source_date
+    else:
+        sys.exit("ERROR: provide --evidence-id OR --url --title.")
+    if args.source_class:
+        payload["source_class"] = args.source_class
+    return report(client.call("engram_add_observation", payload))
+
+
+def cmd_derive(args):
+    client = get_client(resolve_pkg(args))
+    return report(client.call("engram_derive", {
+        "claim": args.claim,
+        "supporting_ids": args.supporting_ids,
+        "logical_chain": args.logical_chain,
+        "reasoning_type": args.reasoning_type,
+    }))
+
+
+def cmd_supersede(args):
+    """Wire two existing nodes via supersede relation.
+
+    engram_supersede is RELATIONAL ONLY — it does not create the
+    replacement node. Workflow:
+      1. Create the new node via add-observation / derive / etc.
+      2. engram-pkg supersede --old-node-id <old> --new-node-id <new>
+         [--reason <short rationale>]
+    """
+    client = get_client(resolve_pkg(args))
+    payload = {
+        "old_node_id": args.old_node_id,
+        "new_node_id": args.new_node_id,
+    }
+    if args.reason:
+        payload["supersede_reason"] = args.reason
+    return report(client.call("engram_supersede", payload))
+
+
+def cmd_list(args):
+    pkg_path = resolve_pkg(args)
+    _check_stale_build(pkg_path, auto_build=args.auto_build)
+    client = get_client(pkg_path)
+    payload = {}
+    if args.node_type:
+        payload["node_type"] = args.node_type
+    if args.limit:
+        payload["limit"] = args.limit
+    return report(client.call("engram_list", payload))
+
+
+def cmd_query(args):
+    pkg_path = resolve_pkg(args)
+    _check_stale_build(pkg_path, auto_build=args.auto_build)
+    client = get_client(pkg_path)
+    return report(client.call("engram_query", {"query": args.query, "top_k": args.top_k}))
+
+
+def cmd_inspect(args):
+    pkg_path = resolve_pkg(args)
+    _check_stale_build(pkg_path, auto_build=args.auto_build)
+    client = get_client(pkg_path)
+    return report(client.call("engram_inspect", {"node_id": args.node_id}))
+
+
+def cmd_stats(args):
+    pkg_path = resolve_pkg(args)
+    _check_stale_build(pkg_path, auto_build=args.auto_build)
+    client = get_client(pkg_path)
+    return report(client.call("engram_stats"))
+
+
+def cmd_dump(args):
+    pkg_path = resolve_pkg(args)
+    script = pkg_path / "scripts" / "dump.sh"
+    if not script.exists():
+        sys.exit(f"ERROR: {script} not found. (Is this an engram-package directory?)")
+    return subprocess.call(["bash", str(script)])
+
+
+def cmd_build(args):
+    pkg_path = resolve_pkg(args)
+    script = pkg_path / "scripts" / "build.sh"
+    if not script.exists():
+        sys.exit(f"ERROR: {script} not found. (Is this an engram-package directory?)")
+    return subprocess.call(["bash", str(script)])
+
+
+def cmd_call(args):
+    """Generic escape hatch — invoke any engram_* tool with JSON-encoded args.
+
+    Two input paths for the params dict:
+      --json '<inline JSON>'         — quick one-liners; subject to shell quoting.
+      --json-file <path>             — read JSON from a file; sidesteps shell
+                                       quoting entirely (recommended for any
+                                       payload with backticks, apostrophes,
+                                       or multi-line prose).
+
+    Mutually exclusive. If neither is provided, payload is empty (some tools
+    accept no args, e.g. engram_reflect).
+    """
+    if args.json and args.json_file:
+        sys.exit("ERROR: --json and --json-file are mutually exclusive.")
+
+    if args.json_file:
+        path = Path(args.json_file).expanduser()
+        if not path.is_file():
+            sys.exit(f"ERROR: --json-file {path} not found.")
+        try:
+            payload = json.loads(path.read_text())
+        except json.JSONDecodeError as e:
+            sys.exit(f"ERROR: --json-file {path} contains invalid JSON: {e}")
+    elif args.json:
+        try:
+            payload = json.loads(args.json)
+        except json.JSONDecodeError as e:
+            sys.exit(f"ERROR: --json invalid: {e}")
+    else:
+        payload = {}
+
+    if not isinstance(payload, dict):
+        sys.exit(f"ERROR: payload must be a JSON object (dict), got {type(payload).__name__}.")
+
+    client = get_client(resolve_pkg(args))
+    return report(client.call(args.tool_name, payload))
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="engram-pkg", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--pkg", help="Path to engram-package dir. Defaults to $ENGRAM_PKG.")
+    p.add_argument(
+        "--auto-build",
+        action="store_true",
+        help="If knowledge.sql is newer than knowledge.db (e.g., after `git pull`), "
+             "auto-run scripts/build.sh before reading. Default: warn-only.",
+    )
+    sp = p.add_subparsers(dest="cmd", required=True)
+
+    i = sp.add_parser("init", help="Bootstrap a new engram-package skeleton.")
+    i.add_argument("path", help="Path to the package directory (will be created if missing; must be empty).")
+    i.add_argument("--name", help="Package name for README header (defaults to directory basename).")
+    i.set_defaults(func=cmd_init)
+
+    e = sp.add_parser("add-evidence", help="Register a source document.")
+    e.add_argument("--url", required=True)
+    e.add_argument("--title", required=True)
+    e.add_argument("--domain")
+    e.add_argument("--source-date")
+    e.set_defaults(func=cmd_add_evidence)
+
+    o = sp.add_parser("add-observation", help="Extract a claim with provenance from a source.")
+    o.add_argument("--quoted-text", required=True)
+    o.add_argument("--interpretation", required=True)
+    o.add_argument("--claim", required=True)
+    o.add_argument("--quote-type", required=True,
+                   choices=["hard_data", "official_statement", "attributed_analysis",
+                            "unnamed_source", "editorial"])
+    o.add_argument("--evidence-id", help="Use this OR --url+--title.")
+    o.add_argument("--url")
+    o.add_argument("--title")
+    o.add_argument("--source-date")
+    o.add_argument("--source-class", choices=["external", "introspective", "user_stated"])
+    o.set_defaults(func=cmd_add_observation)
+
+    d = sp.add_parser("derive", help="Combine evidence into a derived claim.")
+    d.add_argument("--claim", required=True)
+    d.add_argument("--supporting-ids", required=True, help="Comma-separated node IDs.")
+    d.add_argument("--logical-chain", required=True)
+    d.add_argument("--reasoning-type", required=True,
+                   help="One of the engram_derive reasoning types.")
+    d.set_defaults(func=cmd_derive)
+
+    s = sp.add_parser(
+        "supersede",
+        help="Wire an existing replacement node as the successor of an old node (relational only).",
+    )
+    s.add_argument("--old-node-id", required=True, help="ID of the node being superseded.")
+    s.add_argument(
+        "--new-node-id",
+        required=True,
+        help="ID of the replacement node — must already exist (create via add-observation, derive, etc. first).",
+    )
+    s.add_argument("--reason", help="Optional short rationale for why this revision exists.")
+    s.set_defaults(func=cmd_supersede)
+
+    l = sp.add_parser("list", help="List nodes in compact triage format.")
+    l.add_argument(
+        "--node-type",
+        choices=NODE_TYPES,
+        help="Filter to a single node type. Without this flag, all types are listed. "
+             "Typo-protected — argparse rejects unknown types with the valid list.",
+    )
+    l.add_argument("--limit", type=int)
+    l.set_defaults(func=cmd_list)
+
+    q = sp.add_parser("query", help="Search nodes by text + embedding.")
+    q.add_argument("query", help="Search query.")
+    q.add_argument("--top-k", type=int, default=10)
+    q.set_defaults(func=cmd_query)
+
+    i = sp.add_parser("inspect", help="Inspect a single node + 1-hop neighbors.")
+    i.add_argument("node_id")
+    i.set_defaults(func=cmd_inspect)
+
+    sp.add_parser("stats", help="Package statistics.").set_defaults(func=cmd_stats)
+    sp.add_parser("dump", help="Run scripts/dump.sh — write knowledge.sql.").set_defaults(func=cmd_dump)
+    sp.add_parser("build", help="Run scripts/build.sh — build knowledge.db from .sql.").set_defaults(func=cmd_build)
+
+    c = sp.add_parser("call", help="Generic escape hatch — invoke any engram_* tool by JSON.")
+    c.add_argument("tool_name", help="Full tool name (e.g. engram_reflect).")
+    c.add_argument("--json", help="JSON-encoded arguments dict (inline; subject to shell quoting).")
+    c.add_argument("--json-file", help="Path to a JSON file containing the arguments dict (recommended for payloads with backticks, apostrophes, or multi-line prose).")
+    c.set_defaults(func=cmd_call)
+
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
