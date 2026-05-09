@@ -116,3 +116,22 @@ This document is the durable artifact. Other persistence surfaces engaged:
 - **Claude auto-memory**: project entry on the 10-14 day sprint
 
 If any of these drift, this `paper-sprint-2026-05-08.md` is the canonical reference. Read it on every session start until the sprint completes (target ~2026-05-22).
+
+---
+
+## Update 2026-05-08 21:30 EDT — Final-revise milestone added (per Lei evening suggestion)
+
+After Lei's suggestion + empirical confirmation that first-hand reads materially change the picture (the OCC first-hand read tonight already shifted the Phil claim from "ENGRAM satisfies Kahl §5.5 conditions" to "ENGRAM satisfies one of three OCC conditions"), the sprint sequence gains a final-revise milestone:
+
+| Day | Work | Owner |
+|---|---|---|
+| Sat AM (tomorrow) | Lei reacts to plan + sponsor drafts | Lei |
+| Sat-Sun (days 2-3) | Drafting begins per plan | Borges |
+| Tue-Thu (days 4-6) | Architecture + empirical chapters | Borges |
+| Fri (day 7) | Related work + landscape | Borges |
+| Sat-Sun (days 8-9) | Conclusion + abstract + methodology | Borges |
+| Mon-Tue (days 10-11) | Cross-chapter pass: redundancy + citation + length | Borges |
+| **Tue (day 11)** | **NEW: Final paper-plan revise pass after all curiosity-mode first-hand reads complete (OCC, Wray-Kirk-Laird, Kumaran CLS, Duck Criterion). Verify Phil claim still survives the integrated picture.** | Borges + Lei |
+| Wed-Thu (days 12-13) | Sponsor reach-out with paper draft in hand | Lei + Borges |
+| Fri (day 14) | Submit to arXiv | Lei + Borges |
+
