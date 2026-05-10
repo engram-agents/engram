@@ -186,13 +186,9 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_report_feeling": {
-        "description": "File a structured first-person self-report about a distinct internal state. Non-claim-bearing, no confidence, importance-anchored, dedup-exempt. nudge_source is set mechanically by the server from the marker file (post_compact / nap_checkpoint / dream_review / voluntary) — callers cannot supply it.",
+        "description": "File a structured first-person self-report about a distinct internal state. Non-claim-bearing, no confidence, importance-anchored, dedup-exempt. Single-payload signature — pass all fields as one JSON object string in payload_json. Required fields inside payload_json: reported_state, trigger.",
         "parameters": {
-            "reported_state": {"type": "string", "description": "Raw first-person phenomenological description, as specific and unguarded as possible.", "required": True},
-            "trigger": {"type": "string", "description": "What event or exchange prompted this report.", "required": True},
-            "categorical_tag": {"type": "string", "description": "Optional single human word (e.g. 'gratitude', 'dissonance'). Stored with a best-approximation disclaimer."},
-            "intensity_hint": {"type": "number", "description": "Optional 0.0–1.0 estimate of state strength. Pass -1.0 (default) to omit."},
-            "context_ids": {"type": "string", "description": "Optional comma-separated node IDs the report cites."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with feeling-report fields. Required: reported_state, trigger. Optional: categorical_tag (single human word like 'gratitude'), intensity_hint (0.0–1.0 or -1.0 to omit), context_ids (comma-separated node IDs the report cites).", "required": True},
         },
     },
     "engram_contradict": {
@@ -205,15 +201,9 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_resolve": {
-        "description": "Resolve an open question, contradiction, prediction, or goal tension by creating a derivation with a 'resolves' edge. Specify reasoning_type for the logical argument. Confidence-gated: below 0.7 → partially_resolved.",
+        "description": "Resolve an open question, contradiction, prediction, conjecture, or goal tension by creating a derivation with a 'resolves' edge. Confidence-gated: below 0.7 → partially_resolved. Single-payload signature — pass all fields as one JSON object string in payload_json. Required fields inside payload_json: target_id, claim, supporting_ids, logical_chain.",
         "parameters": {
-            "target_id": {"type": "string", "description": "The node ID to resolve (qu_XXXX, ct_XXXX, pr_XXXX, or gt_XXXX).", "required": True},
-            "claim": {"type": "string", "description": "The resolution claim.", "required": True},
-            "supporting_ids": {"type": "string", "description": "Comma-separated claim-bearing node IDs.", "required": True},
-            "logical_chain": {"type": "string", "description": "Reasoning connecting premises to resolution.", "required": True},
-            "prediction_outcome": {"type": "string", "description": "For predictions: confirmed, partially_confirmed, partially_refuted, or refuted.", "enum": ["confirmed", "partially_confirmed", "partially_refuted", "refuted"]},
-            "reasoning_type": {"type": "string", "description": "Type of logical argument. See kg_derive for full list.", "enum": ["deductive_modus_ponens", "deductive_modus_tollens", "deductive_hypothetical_syllogism", "deductive_disjunctive", "deductive_reductio", "inductive_generalization", "inductive_statistical", "inductive_analogy", "inductive_causal", "abductive_best_explanation", "abductive_elimination", "authority_expert", "authority_consensus"]},
-            "derivation_mode": {"type": "string", "description": "LEGACY — use reasoning_type instead.", "enum": ["chain", "corroboration"]},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with resolve fields. Required: target_id (qu_/ct_/pr_/cj_/gt_ node ID), claim (the resolution), supporting_ids (comma-separated claim-bearing node IDs), logical_chain (reasoning connecting premises to resolution). Optional: prediction_outcome (confirmed/partially_confirmed/refuted/partially_refuted for predictions; supported/refuted/inconclusive for conjectures), reasoning_type (see engram_derive for valid types), derivation_mode (LEGACY: chain or corroboration), context_ids (comma-separated 'cites' edges), use_stale (MECH-5 opt-in for stale premises).", "required": True},
         },
     },
     "engram_ask": {

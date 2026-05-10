@@ -131,9 +131,13 @@ PROTECTED_TOOLS = {
     "mcp__engram__engram_update_task": {
         "task_id", "new_status", "note",
     },
+    # Migrated to single-payload signature in wave 2a (PR #63). Repair-hook
+    # must NOT include the old multi-field names — otherwise SWALLOW_RE could
+    # match XML-like patterns inside payload_json content and silently inject
+    # spurious top-level keys (ax_0005-adjacent corruption risk per PR #63
+    # fairy blocker).
     "mcp__engram__engram_report_feeling": {
-        "reported_state", "trigger", "categorical_tag",
-        "intensity_hint", "context_ids",
+        "payload_json",
     },
     "mcp__engram__engram_derive": {
         "claim", "supporting_ids", "logical_chain", "reasoning_type",
@@ -145,9 +149,10 @@ PROTECTED_TOOLS = {
     "mcp__engram__engram_ask": {
         "question", "context_ids", "category", "lacks",
     },
+    # Migrated to single-payload signature in wave 2a (PR #63) — see comment
+    # on engram_report_feeling above for the corruption risk this prevents.
     "mcp__engram__engram_resolve": {
-        "target_id", "claim", "supporting_ids", "logical_chain",
-        "prediction_outcome", "reasoning_type", "derivation_mode",
+        "payload_json",
     },
     "mcp__engram__engram_supersede": {
         "old_node_id", "new_claim", "logical_chain", "additional_support_ids",

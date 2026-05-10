@@ -8125,6 +8125,13 @@ def engram_update_task(
         conn.close()
 
 
+# Set of legitimate field names for the engram_report_feeling payload.
+_REPORT_FEELING_FIELDS = frozenset({
+    "reported_state", "trigger", "categorical_tag",
+    "intensity_hint", "context_ids",
+})
+
+
 @mcp.tool(
     name="engram_report_feeling",
     annotations={
@@ -8135,14 +8142,61 @@ def engram_update_task(
         "openWorldHint": False,
     },
 )
-def engram_report_feeling(
-    reported_state: str,
-    trigger: str,
+def engram_report_feeling(payload_json: str) -> str:
+    """Record a structured first-person self-report about an internal state.
+
+    Single-payload signature (wave 2 of ob_1499 — see issue #55): pass ALL
+    fields as one JSON object string in `payload_json`. This eliminates the
+    antml-prefix multi-parameter swallow risk that 2x-fired on this tool the
+    night of 2026-05-08 (fl_0203 + fl_0204 attempts).
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            reported_state (str, required): Raw first-person phenomenological
+                description. As specific and unguarded as possible.
+            trigger (str, required): What event/exchange prompted this report.
+            categorical_tag (str, optional): Single human word (e.g. "gratitude").
+            intensity_hint (float, optional): 0.0–1.0 estimate of state strength.
+                Pass -1.0 (default) to omit.
+            context_ids (str, optional): Comma-separated node IDs cited.
+
+    Returns:
+        JSON with the new feeling node ID, formatted claim, captured context
+        fingerprint, and the determined nudge_source. On payload-parsing
+        failure, returns {"error": "..."}.
+
+    See _report_feeling_impl for full semantics — kept callable with named
+    kwargs for in-server callers.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _REPORT_FEELING_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_REPORT_FEELING_FIELDS)}"
+        })
+
+    return _report_feeling_impl(**params)
+
+
+def _report_feeling_impl(
+    reported_state: str = "",
+    trigger: str = "",
     categorical_tag: str = "",
     intensity_hint: float = -1.0,
     context_ids: str = "",
 ) -> str:
-    """Record a structured first-person self-report about an internal state.
+    """Internal implementation — see engram_report_feeling MCP tool for the
+    public payload schema. Kept callable with named kwargs for in-server
+    callers (heartbeat-hook callbacks, batch ingestion paths).
+
+    Records a structured first-person self-report about an internal state.
 
     Feeling reports preserve self-aware moments — moments where you notice a
     distinct internal state worth marking — that would otherwise be lost on
@@ -8682,6 +8736,14 @@ def engram_ask(
         conn.close()
 
 
+# Set of legitimate field names for the engram_resolve payload.
+_RESOLVE_FIELDS = frozenset({
+    "target_id", "claim", "supporting_ids", "logical_chain",
+    "prediction_outcome", "reasoning_type", "derivation_mode",
+    "context_ids", "use_stale",
+})
+
+
 @mcp.tool(
     name="engram_resolve",
     annotations={
@@ -8692,18 +8754,73 @@ def engram_ask(
         "openWorldHint": False,
     },
 )
-def engram_resolve(
-    target_id: str,
-    claim: str,
-    supporting_ids: str,
-    logical_chain: str,
+def engram_resolve(payload_json: str) -> str:
+    """Resolve an open question, contradiction, prediction, conjecture, or goal tension by creating a derivation.
+
+    Single-payload signature (wave 2 of ob_1499 — see issue #55 for empirical
+    rationale): pass ALL fields as one JSON object string in `payload_json`.
+    This eliminates the antml-prefix multi-parameter swallow risk that fired
+    on this tool the night of 2026-05-08 (claim split at bare `</claim>`).
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            target_id (str, required): The node ID to resolve (qu_XXXX,
+                ct_XXXX, pr_XXXX, cj_XXXX, or gt_XXXX).
+            claim (str, required): The resolution claim — your answer,
+                verdict, or outcome assessment.
+            supporting_ids (str, required): Comma-separated claim-bearing
+                node IDs that support this resolution.
+            logical_chain (str, required): Explicit reasoning connecting
+                cited premises to the resolution.
+            prediction_outcome (str, optional): Required for predictions
+                (confirmed/partially_confirmed/refuted/partially_refuted)
+                or conjectures (supported/refuted/inconclusive).
+            reasoning_type (str, optional): The type of logical argument.
+                See engram_derive for full list.
+            derivation_mode (str, optional): LEGACY — use reasoning_type.
+            context_ids (str, optional): Comma-separated node IDs for
+                'cites' context.
+            use_stale (bool, optional): MECH-5 opt-in for stale premises.
+
+    Returns:
+        JSON with the new derivation ID, resolution status, and confidence.
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _resolve_impl for full semantics — kept callable with named kwargs
+    for in-server callers.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _RESOLVE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_RESOLVE_FIELDS)}"
+        })
+
+    return _resolve_impl(**params)
+
+
+def _resolve_impl(
+    target_id: str = "",
+    claim: str = "",
+    supporting_ids: str = "",
+    logical_chain: str = "",
     prediction_outcome: str = "",
     reasoning_type: str = "",
     derivation_mode: str = "chain",
     context_ids: str = "",
     use_stale: bool = False,
 ) -> str:
-    """Resolve an open question, contradiction, prediction, or goal tension by creating a derivation.
+    """Internal implementation — see engram_resolve MCP tool for the public
+    payload schema. Kept callable with named kwargs for in-server callers.
+
+    Resolve an open question, contradiction, prediction, conjecture, or goal tension by creating a derivation.
 
     A resolution IS a derivation — it cites claim-bearing nodes and reasons
     toward a conclusion that closes an open item. The derivation node is
@@ -8748,6 +8865,17 @@ def engram_resolve(
     RESOLVABLE_TYPES = {"question", "contradiction", "prediction", "conjecture", "goal_tension"}
     VALID_PREDICTION_OUTCOMES = {"confirmed", "partially_confirmed", "refuted", "partially_refuted"}
     VALID_CONJECTURE_OUTCOMES = {"supported", "refuted", "inconclusive"}
+
+    # Empty-string guards on required fields (parallels _report_feeling_impl).
+    # Without these, payload_json={"target_id": "qu_X", "claim": "", ...} would
+    # create a derivation with an empty claim — semantic corruption even though
+    # the structural guards (claim-bearing-type check, MECH-5) still fire.
+    if not target_id or not target_id.strip():
+        return json.dumps({"error": "target_id is required and cannot be empty."})
+    if not claim or not claim.strip():
+        return json.dumps({"error": "claim is required and cannot be empty."})
+    if not logical_chain or not logical_chain.strip():
+        return json.dumps({"error": "logical_chain is required and cannot be empty."})
 
     if reasoning_type and reasoning_type not in REASONING_TYPES:
         return json.dumps({

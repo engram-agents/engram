@@ -136,18 +136,19 @@ def test_supersede_relational():
         passed += 1
 
         # ---- Test 5: feeling_report blocked ----
-        fl_result = json.loads(server.engram_report_feeling(
-            reported_state="test feeling for supersede block",
-            trigger="sandbox test",
-        ))
+        # engram_report_feeling migrated to single-payload signature (wave 2a).
+        fl_result = json.loads(server.engram_report_feeling(payload_json=json.dumps({
+            "reported_state": "test feeling for supersede block",
+            "trigger": "sandbox test",
+        })))
         fl_id = fl_result.get("feeling_id") or fl_result.get("node_id")
         assert fl_id, f"T5: feeling creation failed: {fl_result}"
         # Can't create another feeling with same-type for cross-feel test; use any node. Type mismatch hits first.
         # To isolate the feeling_report block, craft a same-type attempt — make second feeling.
-        fl_result2 = json.loads(server.engram_report_feeling(
-            reported_state="second feeling",
-            trigger="sandbox test",
-        ))
+        fl_result2 = json.loads(server.engram_report_feeling(payload_json=json.dumps({
+            "reported_state": "second feeling",
+            "trigger": "sandbox test",
+        })))
         fl_id2 = fl_result2.get("feeling_id") or fl_result2.get("node_id")
         r = json.loads(server.engram_supersede(fl_id, fl_id2))
         assert "error" in r and "feeling reports cannot be superseded" in r["error"], f"T5: {r}"
