@@ -113,7 +113,7 @@ def test_include_superseded_toggles_currency_filter():
     server = fresh_server()
     a = _add_observation(server, claim="Original claim with Mao-Cao reference")
     b = _add_observation(server, claim="Replacement claim without the bad name")
-    server.engram_supersede(old_node_id=a, new_node_id=b, supersede_reason="testing supersede")
+    server._supersede_impl(old_node_id=a, new_node_id=b, supersede_reason="testing supersede")
     # Default: only current nodes scanned — replacement has no Mao-Cao, original is superseded
     r1 = json.loads(server.engram_audit_string(needle="Mao-Cao"))
     assert r1["count"] == 0

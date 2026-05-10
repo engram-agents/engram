@@ -167,6 +167,12 @@ TOOL_SCHEMAS = {
             "analysis": {"type": "string", "description": "Root cause analysis — why do these goals conflict?"},
         },
     },
+    "engram_link_about": {
+        "description": "Create an `about` edge: this node is about a person (e.g., the agent's self-anchor). Symmetric and DAG-exempt — can be added retroactively. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: node_id.",
+        "parameters": {
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with link_about fields. Required: node_id (the node to link, typically an observation, feeling_report, lesson, derivation, or cornerstone). Optional: person_id (target person node; defaults to self-anchor if empty).", "required": True},
+        },
+    },
     "engram_add_task": {
         "description": "Create an actionable task that decomposes a goal into concrete work. Tasks are non-claim-bearing lightweight wrappers — conjectures hold the design content, tasks track what to do. Importance is dynamic: active (2.5), planned (2.0), done-milestone (1.5), done-routine (0.5).",
         "parameters": {
@@ -192,12 +198,9 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_contradict": {
-        "description": "Flag a conflict between two claim-bearing nodes (observations, derivations, theories).",
+        "description": "Flag a conflict between two claim-bearing nodes (observations, derivations, theories). Single-payload signature — pass all fields as one JSON object string in payload_json. Required: node_id_a, node_id_b, description.",
         "parameters": {
-            "node_id_a": {"type": "string", "description": "First conflicting node ID.", "required": True},
-            "node_id_b": {"type": "string", "description": "Second conflicting node ID.", "required": True},
-            "description": {"type": "string", "description": "What conflicts and why.", "required": True},
-            "root_cause": {"type": "string", "description": "Why the sources disagree."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with contradict fields. Required: node_id_a (first conflicting node ID), node_id_b (second), description (what conflicts and why). Optional: root_cause (analysis of why the sources disagree).", "required": True},
         },
     },
     "engram_resolve": {
@@ -216,21 +219,15 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_supersede": {
-        "description": "Replace an existing node with an updated version, preserving history.",
+        "description": "Mark new_node_id as the successor of old_node_id. Purely relational — does NOT create a new node (caller creates replacement via type's canonical creation tool first). Single-payload signature — pass all fields as one JSON object string in payload_json. Required: old_node_id, new_node_id.",
         "parameters": {
-            "old_node_id": {"type": "string", "description": "The node ID to supersede.", "required": True},
-            "new_claim": {"type": "string", "description": "The updated claim.", "required": True},
-            "logical_chain": {"type": "string", "description": "Why the claim was revised.", "required": True},
-            "support_ids": {"type": "string", "description": "Comma-separated full list of supporting node IDs — premises/citations for the revised claim. No inheritance from the old node; cite previous supports organically if still valid."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with supersede fields. Required: old_node_id (the node being superseded), new_node_id (the replacement, already created via its type's canonical creation tool). Optional: supersede_reason (short rationale for the revision; lands in supersedes-edge metadata).", "required": True},
         },
     },
     "engram_retract": {
-        "description": "Retract an erroneous node and flag downstream dependents as tainted. Unlike kg_supersede (opinion changed due to new evidence), kg_retract is for ERROR CORRECTION — the node was never valid.",
+        "description": "Retract an erroneous node and flag downstream dependents as tainted. Unlike engram_supersede (opinion evolved due to new evidence), engram_retract is for ERROR CORRECTION — the node was never valid. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: node_id, error_type, reason. Note: the OUTER param is payload_json; there is also an INNER field replacement_json inside the payload — don't confuse them.",
         "parameters": {
-            "node_id": {"type": "string", "description": "The node ID to retract.", "required": True},
-            "error_type": {"type": "string", "description": "Type of error.", "required": True, "enum": ["fabricated_quote", "wrong_citation", "wrong_evidence", "hallucinated_claim", "duplicate", "other"]},
-            "reason": {"type": "string", "description": "Human-readable explanation of the error.", "required": True},
-            "replacement_json": {"type": "string", "description": "Optional JSON with replacement observation fields: {quoted_text, interpretation, claim, quote_type, source_class}."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with retract fields. Required: node_id (the node to retract), error_type (one of fabricated_quote/wrong_citation/wrong_evidence/hallucinated_claim/duplicate/other), reason (human-readable explanation). Optional: replacement_json (inner JSON object string with replacement observation fields {quoted_text, interpretation, claim, quote_type, source_class}; cites the same evidence as the retracted node).", "required": True},
         },
     },
     "engram_reflect": {

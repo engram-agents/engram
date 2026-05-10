@@ -6938,6 +6938,10 @@ def engram_outgrow_cornerstone(
         conn.close()
 
 
+# Set of legitimate field names for the engram_link_about payload.
+_LINK_ABOUT_FIELDS = frozenset({"node_id", "person_id"})
+
+
 @mcp.tool(
     name="engram_link_about",
     annotations={
@@ -6948,11 +6952,52 @@ def engram_outgrow_cornerstone(
         "openWorldHint": False,
     },
 )
-def engram_link_about(
-    node_id: str,
+def engram_link_about(payload_json: str) -> str:
+    """Create an `about` edge: this node is about a person (e.g., the agent's self-anchor).
+
+    Single-payload signature (wave 2b of ob_1499 — see issue #55): pass ALL
+    fields as one JSON object string in `payload_json`. This eliminates the
+    antml-prefix multi-parameter swallow risk that affects multi-param tools.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            node_id (str, required): The node to link (typically an observation,
+                feeling_report, lesson, derivation, or cornerstone).
+            person_id (str, optional): The person node to link to. If empty,
+                defaults to the self-anchor (person node with metadata.is_self=1).
+
+    Returns:
+        JSON with the linked nodes and edge status. On payload-parsing failure,
+        returns {"error": "..."} with no edge created.
+
+    See _link_about_impl for full semantics — kept callable with named kwargs
+    for in-server callers.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _LINK_ABOUT_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_LINK_ABOUT_FIELDS)}"
+        })
+
+    return _link_about_impl(**params)
+
+
+def _link_about_impl(
+    node_id: str = "",
     person_id: str = "",
 ) -> str:
-    """Create an `about` edge: this node is about a person (e.g., the agent's self-anchor).
+    """Internal implementation — see engram_link_about MCP tool for the public
+    payload schema. Kept callable with named kwargs for in-server callers.
+
+    Create an `about` edge: this node is about a person (e.g., the agent's self-anchor).
 
     The `about` relation is bidirectional / aboutness-based — symmetric and
     DAG-exempt. It can be added retroactively regardless of node creation
@@ -6974,6 +7019,9 @@ def engram_link_about(
     Returns:
         JSON with the linked nodes and edge status.
     """
+    if not node_id or not node_id.strip():
+        return json.dumps({"error": "node_id is required and cannot be empty."})
+
     conn = _get_db()
     try:
         node = conn.execute("SELECT id, type FROM nodes WHERE id = ?", (node_id,)).fetchone()
@@ -8514,6 +8562,10 @@ def engram_derive(
         conn.close()
 
 
+# Set of legitimate field names for the engram_contradict payload.
+_CONTRADICT_FIELDS = frozenset({"node_id_a", "node_id_b", "description", "root_cause"})
+
+
 @mcp.tool(
     name="engram_contradict",
     annotations={
@@ -8524,13 +8576,52 @@ def engram_derive(
         "openWorldHint": False,
     },
 )
-def engram_contradict(
-    node_id_a: str,
-    node_id_b: str,
-    description: str,
+def engram_contradict(payload_json: str) -> str:
+    """Explicitly flag a conflict between two nodes in the knowledge graph.
+
+    Single-payload signature (wave 2b of ob_1499 — see issue #55): pass ALL
+    fields as one JSON object string in `payload_json`.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            node_id_a (str, required): ID of the first conflicting node.
+            node_id_b (str, required): ID of the second conflicting node.
+            description (str, required): Clear description of the contradiction.
+            root_cause (str, optional): Analysis of the root cause.
+
+    Returns:
+        JSON with the new contradiction node ID and linked claims. On
+        payload-parsing failure, returns {"error": "..."}.
+
+    See _contradict_impl for full semantics.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _CONTRADICT_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_CONTRADICT_FIELDS)}"
+        })
+
+    return _contradict_impl(**params)
+
+
+def _contradict_impl(
+    node_id_a: str = "",
+    node_id_b: str = "",
+    description: str = "",
     root_cause: str = "",
 ) -> str:
-    """Explicitly flag a conflict between two nodes in the knowledge graph.
+    """Internal implementation — see engram_contradict MCP tool for the public
+    payload schema. Kept callable with named kwargs for in-server callers.
+
+    Explicitly flag a conflict between two nodes in the knowledge graph.
 
     Creates a Contradiction node linking both conflicting claims. Both sides
     are preserved with their evidence chains. Resolution is a deliberate act
@@ -8548,6 +8639,13 @@ def engram_contradict(
     Returns:
         JSON with the new contradiction node ID and linked claims.
     """
+    if not node_id_a or not node_id_a.strip():
+        return json.dumps({"error": "node_id_a is required and cannot be empty."})
+    if not node_id_b or not node_id_b.strip():
+        return json.dumps({"error": "node_id_b is required and cannot be empty."})
+    if not description or not description.strip():
+        return json.dumps({"error": "description is required and cannot be empty."})
+
     conn = _get_db()
     try:
         # Validate both nodes exist and are claim-bearing
@@ -9002,6 +9100,10 @@ def _resolve_impl(
         conn.close()
 
 
+# Set of legitimate field names for the engram_supersede payload.
+_SUPERSEDE_FIELDS = frozenset({"old_node_id", "new_node_id", "supersede_reason"})
+
+
 @mcp.tool(
     name="engram_supersede",
     annotations={
@@ -9012,12 +9114,51 @@ def _resolve_impl(
         "openWorldHint": False,
     },
 )
-def engram_supersede(
-    old_node_id: str,
-    new_node_id: str,
+def engram_supersede(payload_json: str) -> str:
+    """Mark `new_node_id` as the successor of `old_node_id`.
+
+    Single-payload signature (wave 2b of ob_1499 — see issue #55): pass ALL
+    fields as one JSON object string in `payload_json`.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            old_node_id (str, required): The node being superseded.
+            new_node_id (str, required): The replacement node, already created
+                via its type's canonical creation tool.
+            supersede_reason (str, optional): Short rationale for the revision.
+
+    Returns:
+        JSON with old_node_id, new_node_id, the stale downstream list,
+        and stale_count. On payload-parsing failure, returns {"error": "..."}.
+
+    See _supersede_impl for full semantics + workflow + validation rules.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _SUPERSEDE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_SUPERSEDE_FIELDS)}"
+        })
+
+    return _supersede_impl(**params)
+
+
+def _supersede_impl(
+    old_node_id: str = "",
+    new_node_id: str = "",
     supersede_reason: str = "",
 ) -> str:
-    """Mark `new_node_id` as the successor of `old_node_id`.
+    """Internal implementation — see engram_supersede MCP tool for the public
+    payload schema. Kept callable with named kwargs for in-server callers.
+
+    Mark `new_node_id` as the successor of `old_node_id`.
 
     This is a purely relational operation — it does NOT create a new node.
     The caller creates the replacement via the canonical creation tool for
@@ -9070,6 +9211,11 @@ def engram_supersede(
         JSON with old_node_id, new_node_id, the stale downstream list,
         and stale_count.
     """
+    if not old_node_id or not old_node_id.strip():
+        return json.dumps({"error": "old_node_id is required and cannot be empty."})
+    if not new_node_id or not new_node_id.strip():
+        return json.dumps({"error": "new_node_id is required and cannot be empty."})
+
     conn = _get_db()
     try:
         old = conn.execute(
@@ -9218,6 +9364,10 @@ def engram_supersede(
         conn.close()
 
 
+# Set of legitimate field names for the engram_retract payload.
+_RETRACT_FIELDS = frozenset({"node_id", "error_type", "reason", "replacement_json"})
+
+
 @mcp.tool(
     name="engram_retract",
     annotations={
@@ -9228,13 +9378,61 @@ def engram_supersede(
         "openWorldHint": False,
     },
 )
-def engram_retract(
-    node_id: str,
-    error_type: str,
-    reason: str,
+def engram_retract(payload_json: str) -> str:
+    """Retract a node that contains an error and flag downstream dependents.
+
+    Single-payload signature (wave 2b of ob_1499 — see issue #55): pass ALL
+    fields as one JSON object string in `payload_json`.
+
+    Note: the outer parameter is `payload_json` and there is also an INNER
+    field also named `replacement_json` inside the payload. Don't confuse
+    them — the outer is the wrapper-protocol JSON; the inner is the
+    optional replacement-observation JSON for the retract semantics.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            node_id (str, required): The node to retract.
+            error_type (str, required): One of: fabricated_quote, wrong_citation,
+                wrong_evidence, hallucinated_claim, duplicate, other.
+            reason (str, required): Human-readable explanation of the error.
+            replacement_json (str, optional): JSON object string with replacement
+                observation fields {quoted_text, interpretation, claim,
+                quote_type, source_class}. The replacement cites the same
+                evidence.
+
+    Returns:
+        JSON with retraction details, tainted downstream nodes, and optional
+        replacement. On payload-parsing failure, returns {"error": "..."}.
+
+    See _retract_impl for full semantics + error-type catalog.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _RETRACT_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_RETRACT_FIELDS)}"
+        })
+
+    return _retract_impl(**params)
+
+
+def _retract_impl(
+    node_id: str = "",
+    error_type: str = "",
+    reason: str = "",
     replacement_json: str = "",
 ) -> str:
-    """Retract a node that contains an error and flag downstream dependents.
+    """Internal implementation — see engram_retract MCP tool for the public
+    payload schema. Kept callable with named kwargs for in-server callers.
+
+    Retract a node that contains an error and flag downstream dependents.
 
     Unlike engram_supersede (epistemic evolution — old claim was valid at the time),
     engram_retract is for ERROR CORRECTION — the node was never valid. The retracted
@@ -9262,6 +9460,13 @@ def engram_retract(
     Returns:
         JSON with retraction details, tainted downstream nodes, and optional replacement.
     """
+    if not node_id or not node_id.strip():
+        return json.dumps({"error": "node_id is required and cannot be empty."})
+    if not error_type or not error_type.strip():
+        return json.dumps({"error": "error_type is required and cannot be empty."})
+    if not reason or not reason.strip():
+        return json.dumps({"error": "reason is required and cannot be empty."})
+
     if error_type not in VALID_ERROR_TYPES:
         return json.dumps({
             "error": f"Invalid error_type '{error_type}'. Must be one of: {', '.join(sorted(VALID_ERROR_TYPES))}"

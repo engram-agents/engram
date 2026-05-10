@@ -115,8 +115,10 @@ PROTECTED_TOOLS = {
         "old_cornerstone_id", "new_new_frame", "new_triggering_experience",
         "new_supporting_ids", "new_title",
     },
+    # Migrated to single-payload signature in wave 2b (PR #66) — see comment
+    # on engram_report_feeling above for the corruption risk this prevents.
     "mcp__engram__engram_link_about": {
-        "node_id", "person_id",
+        "payload_json",
     },
     "mcp__engram__engram_goal_tension": {
         "goal_id_a", "goal_id_b", "description", "analysis",
@@ -143,8 +145,9 @@ PROTECTED_TOOLS = {
         "claim", "supporting_ids", "logical_chain", "reasoning_type",
         "derivation_mode", "context_ids",
     },
+    # Migrated to single-payload signature in wave 2b (PR #66).
     "mcp__engram__engram_contradict": {
-        "node_id_a", "node_id_b", "description", "root_cause",
+        "payload_json",
     },
     "mcp__engram__engram_ask": {
         "question", "context_ids", "category", "lacks",
@@ -154,11 +157,13 @@ PROTECTED_TOOLS = {
     "mcp__engram__engram_resolve": {
         "payload_json",
     },
+    # Migrated to single-payload signature in wave 2b (PR #66).
     "mcp__engram__engram_supersede": {
-        "old_node_id", "new_claim", "logical_chain", "additional_support_ids",
+        "payload_json",
     },
+    # Migrated to single-payload signature in wave 2b (PR #66).
     "mcp__engram__engram_retract": {
-        "node_id", "error_type", "reason", "replacement_json",
+        "payload_json",
     },
     "mcp__engram__engram_focus": {
         "node_ids", "reason",

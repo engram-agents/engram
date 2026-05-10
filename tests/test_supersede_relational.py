@@ -68,7 +68,7 @@ def test_supersede_relational():
         dv1 = _mk_derivation("Initial conclusion", [ob1, ob2], "inductive_generalization")
         # Create replacement derivation with corrected reasoning_type
         dv2 = _mk_derivation("Initial conclusion", [ob1, ob2], "authority_expert")
-        r = json.loads(server.engram_supersede(dv1, dv2, supersede_reason="reasoning_type correction: inductive_generalization → authority_expert"))
+        r = json.loads(server._supersede_impl(dv1, dv2, supersede_reason="reasoning_type correction: inductive_generalization → authority_expert"))
         assert r["status"] == "superseded", f"T1: {r}"
         assert r["old_node_id"] == dv1
         assert r["new_node_id"] == dv2
@@ -97,7 +97,7 @@ def test_supersede_relational():
         ob4 = _mk_observation("Premise D")
         dv3 = _mk_derivation("Claim X", [ob3], "inductive_generalization")
         dv4 = _mk_derivation("Claim X refined", [ob3, ob4], "inductive_generalization")
-        r = json.loads(server.engram_supersede(dv3, dv4))
+        r = json.loads(server._supersede_impl(dv3, dv4))
         assert r["status"] == "superseded", f"T2: {r}"
         assert r["supersede_reason"] is None
         conn = server._get_db()
@@ -114,7 +114,7 @@ def test_supersede_relational():
         old_ob = _mk_observation("Observed pattern", quote_type="editorial")
         # New obs with corrected quote_type
         new_ob = _mk_observation("Observed pattern", quote_type="hard_data")
-        r = json.loads(server.engram_supersede(old_ob, new_ob, supersede_reason="quote_type correction: editorial → hard_data"))
+        r = json.loads(server._supersede_impl(old_ob, new_ob, supersede_reason="quote_type correction: editorial → hard_data"))
         assert r["status"] == "superseded", f"T3: {r}"
         conn = server._get_db()
         try:
@@ -130,7 +130,7 @@ def test_supersede_relational():
         # ---- Test 4: type mismatch blocked ----
         ob5 = _mk_observation("Premise E")
         dv5 = _mk_derivation("Claim Y", [ob5])
-        r = json.loads(server.engram_supersede(ob5, dv5))
+        r = json.loads(server._supersede_impl(ob5, dv5))
         assert "error" in r and "Type mismatch" in r["error"], f"T4: expected type mismatch error, got {r}"
         print("  T4  PASS — cross-type supersede (obs → derivation) blocked")
         passed += 1
@@ -150,7 +150,7 @@ def test_supersede_relational():
             "trigger": "sandbox test",
         })))
         fl_id2 = fl_result2.get("feeling_id") or fl_result2.get("node_id")
-        r = json.loads(server.engram_supersede(fl_id, fl_id2))
+        r = json.loads(server._supersede_impl(fl_id, fl_id2))
         assert "error" in r and "feeling reports cannot be superseded" in r["error"], f"T5: {r}"
         print("  T5  PASS — feeling_report supersede blocked with clear message")
         passed += 1
@@ -159,7 +159,7 @@ def test_supersede_relational():
         # dv4 already supersedes dv3 (from T2). Try to make dv4 supersede something else.
         ob6 = _mk_observation("Premise F")
         dv6 = _mk_derivation("Another claim", [ob6])
-        r = json.loads(server.engram_supersede(dv6, dv4))
+        r = json.loads(server._supersede_impl(dv6, dv4))
         assert "error" in r and "already supersedes" in r["error"], f"T6: {r}"
         print("  T6  PASS — new node already superseding something → blocked")
         passed += 1
@@ -167,21 +167,21 @@ def test_supersede_relational():
         # ---- Test 7: old already superseded (is_current=0) — blocked ----
         # dv3 is already superseded (from T2). Try to supersede it again.
         dv7 = _mk_derivation("Yet another refinement", [ob3])
-        r = json.loads(server.engram_supersede(dv3, dv7))
+        r = json.loads(server._supersede_impl(dv3, dv7))
         assert "error" in r and "not current" in r["error"], f"T7: {r}"
         print("  T7  PASS — old already superseded → blocked")
         passed += 1
 
         # ---- Test 8: nonexistent IDs blocked ----
-        r = json.loads(server.engram_supersede("dv_9999", dv7))
+        r = json.loads(server._supersede_impl("dv_9999", dv7))
         assert "error" in r and "not found" in r["error"], f"T8a: {r}"
-        r = json.loads(server.engram_supersede(dv7, "dv_9999"))
+        r = json.loads(server._supersede_impl(dv7, "dv_9999"))
         assert "error" in r and "not found" in r["error"], f"T8b: {r}"
         print("  T8  PASS — missing IDs blocked (both old and new)")
         passed += 1
 
         # ---- Test 9: old == new blocked ----
-        r = json.loads(server.engram_supersede(dv7, dv7))
+        r = json.loads(server._supersede_impl(dv7, dv7))
         assert "error" in r and ("must differ" in r["error"] or "already supersedes" in r["error"]), f"T9: {r}"
         print("  T9  PASS — same-ID supersede blocked")
         passed += 1
@@ -207,7 +207,7 @@ def test_supersede_relational():
             conn.commit()
         finally:
             conn.close()
-        r = json.loads(server.engram_supersede(dv_newer, dv_older))
+        r = json.loads(server._supersede_impl(dv_newer, dv_older))
         assert "error" in r and "DAG invariant" in r["error"], f"T10: {r}"
         print("  T10 PASS — DAG invariant violation (new older than old) blocked")
         passed += 1
@@ -218,7 +218,7 @@ def test_supersede_relational():
         dv_upstream = _mk_derivation("Upstream claim", [ob_x])
         dv_downstream = _mk_derivation("Downstream depends on upstream", [dv_upstream])
         dv_upstream_v2 = _mk_derivation("Upstream claim refined", [ob_x])
-        r = json.loads(server.engram_supersede(dv_upstream, dv_upstream_v2))
+        r = json.loads(server._supersede_impl(dv_upstream, dv_upstream_v2))
         assert r["stale_count"] >= 1, f"T11: expected cascade, got stale_count={r['stale_count']}"
         stale_ids = {s["id"] for s in r["stale_downstream"]}
         assert dv_downstream in stale_ids, f"T11: {dv_downstream} should be in stale set {stale_ids}"
@@ -238,9 +238,9 @@ def test_supersede_relational():
         a = _mk_derivation("Version A", [ob_y])
         b = _mk_derivation("Version B", [ob_y])
         c = _mk_derivation("Version C", [ob_y])
-        r1 = json.loads(server.engram_supersede(a, b))
+        r1 = json.loads(server._supersede_impl(a, b))
         assert r1["status"] == "superseded", f"T12.1: {r1}"
-        r2 = json.loads(server.engram_supersede(b, c))
+        r2 = json.loads(server._supersede_impl(b, c))
         assert r2["status"] == "superseded", f"T12.2: {r2}"
         conn = server._get_db()
         try:
@@ -257,13 +257,13 @@ def test_supersede_relational():
 
         # ---- Test 13: old node was retracted (is_current=0, status='retracted') — blocked ----
         ob_retracted = _mk_observation("To be retracted")
-        json.loads(server.engram_retract(
+        json.loads(server._retract_impl(
             node_id=ob_retracted,
             error_type="hallucinated_claim",
             reason="test",
         ))
         ob_replacement = _mk_observation("Replacement")
-        r = json.loads(server.engram_supersede(ob_retracted, ob_replacement))
+        r = json.loads(server._supersede_impl(ob_retracted, ob_replacement))
         assert "error" in r and "not current" in r["error"], f"T13: {r}"
         print("  T13 PASS — supersede of retracted old node blocked (is_current=0)")
         passed += 1
@@ -271,7 +271,7 @@ def test_supersede_relational():
         # ---- Test 14: edit history audit trail recorded ----
         ob_a = _mk_observation("Audit test A")
         ob_b = _mk_observation("Audit test B")
-        json.loads(server.engram_supersede(ob_a, ob_b))
+        json.loads(server._supersede_impl(ob_a, ob_b))
         conn = server._get_db()
         try:
             history = conn.execute(

@@ -61,7 +61,7 @@ def _add_active_contradiction(server, claim_a: str, claim_b: str) -> tuple[str, 
     """Add two contradicting observations and a contradiction node. Returns (ct_id, a_id, b_id)."""
     a_id = _add_observation(server, claim_a)
     b_id = _add_observation(server, claim_b)
-    r = json.loads(server.engram_contradict(
+    r = json.loads(server._contradict_impl(
         node_id_a=a_id,
         node_id_b=b_id,
         description=f"Contradiction: {claim_a[:30]}... vs {claim_b[:30]}...",
@@ -118,7 +118,7 @@ def test_contradiction_one_side_obsolete_scores_high():
         server, "X is true", "X is false"
     )
     # Retract side A — now side B survives
-    server.engram_retract(
+    server._retract_impl(
         node_id=a_id, error_type="other", reason="test fixture: simulating retraction"
     )
 
@@ -139,8 +139,8 @@ def test_contradiction_both_sides_obsolete_scores_medium():
     ct_id, a_id, b_id = _add_active_contradiction(
         server, "Y holds at noon", "Y does not hold at noon"
     )
-    server.engram_retract(node_id=a_id, error_type="other", reason="fixture")
-    server.engram_retract(node_id=b_id, error_type="other", reason="fixture")
+    server._retract_impl(node_id=a_id, error_type="other", reason="fixture")
+    server._retract_impl(node_id=b_id, error_type="other", reason="fixture")
 
     # Score is 0.5 — below balanced threshold (0.55), at-or-above high_recall (0.50).
     # Confirms: high_recall surfaces the both-obsolete case for cleanup; balanced
@@ -248,7 +248,7 @@ def test_tainted_still_valid_surfaces_tainted_nodes():
     deriv_id = deriv_result["derivation_id"]
 
     # Retract one of the premises — cascade should taint the derivation
-    server.engram_retract(
+    server._retract_impl(
         node_id=obs_a, error_type="hallucinated_claim",
         reason="test fixture: simulating premise retraction"
     )
