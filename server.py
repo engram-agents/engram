@@ -1649,9 +1649,17 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str):
 # Empirical similarity thresholds — calibrated 2026-05-09 against live graph.
 # See kg/paper_research/threshold_calibration_2026-05-09/v4_tight_groups.py
 # (tight-semantic-group ROC AUC 0.984, peak F1 0.843 at t=0.41, peak F2
-# recall-weighted 0.868 at t=0.33). These constants encode chosen operating
-# points; downstream code references them by name (ls_0005 DRY — one source
-# of truth, no silent divergence between dedup and action-hint thresholds).
+# recall-weighted 0.868 at t=0.33). These DEFAULT constants encode the chosen
+# operating points; per-agent overrides live in ~/.engram/config.json under
+# the `thresholds` section (schema v3 — see tools/migrate_config_v3.py).
+#
+# Downstream code references the *_get_thresholds_config()*-returned dict
+# rather than these constants directly, so a config edit takes effect on the
+# next call without a server restart.
+#
+# These module-level constants remain as: (a) the defaults if config is
+# absent, (b) the source of truth for what was empirically calibrated, and
+# (c) the values asserted by tests/test_thresholds.py invariant suite.
 # ---------------------------------------------------------------------------
 # Dedup at write time: how many neighbors to fetch + how similar must they be.
 DEDUP_TOP_K = 15                          # was 5; dv_0446 at sim 0.75 to ob_1602 was cut by top_k floor, not similarity floor
@@ -1660,6 +1668,191 @@ DEDUP_MIN_SIMILARITY = 0.40               # was 0.50; tight-group recall lifts 6
 ACTION_HINT_CORROBORATE_THRESHOLD = 0.65  # was 0.80; old tier fired on only 9.5% of true relateds (effectively dead code)
 ACTION_HINT_RELATED_THRESHOLD = 0.50      # was 0.60; recall-precision shift consistent with v4 F1 peak
 
+# NLI polarity-dedup defaults — calibrated 2026-05-10 (issue #56 bake-off).
+# See kg/paper_research/nli_polarity_bakeoff_2026-05-10/DECISION.md.
+# ModernCE-large-nli won the empirical bake-off (AUC 0.847, peak F1 0.889 at
+# t=0.46, recall 84%, precision 94%). All four sub-200M models fell to AUC
+# 0.66-0.75 — not viable. Threshold default is the peak-F1 operating point.
+POLARITY_DEFAULT_MODEL = "dleemiller/ModernCE-large-nli"
+POLARITY_DEFAULT_THRESHOLD = 0.46
+POLARITY_DEFAULT_MIN_SIMILARITY_FOR_CHECK = 0.30  # below this cosine, skip NLI (truly unrelated)
+
+
+def _get_thresholds_config() -> dict:
+    """Get similarity-threshold config (config.json `thresholds` section).
+
+    Returns a dict with the keys defined in tools/migrate_config_v3.py
+    DEFAULT_THRESHOLDS. Falls back to module-level constants if the config
+    file is absent or the section is missing.
+
+    Read-on-demand (no caching) so config edits take effect on next call
+    without a server restart — same pattern as _get_memory_config and
+    _get_embedding_config.
+    """
+    defaults = {
+        "dedup_top_k": DEDUP_TOP_K,
+        "dedup_min_similarity": DEDUP_MIN_SIMILARITY,
+        "action_hint_corroborate": ACTION_HINT_CORROBORATE_THRESHOLD,
+        "action_hint_related": ACTION_HINT_RELATED_THRESHOLD,
+        "pattern_balanced_cosine": 0.55,
+    }
+    if CONFIG_PATH.exists():
+        try:
+            config = json.loads(CONFIG_PATH.read_text())
+            user = config.get("thresholds", {})
+            if isinstance(user, dict):
+                merged = dict(defaults)
+                merged.update(user)
+                return merged
+        except (json.JSONDecodeError, OSError):
+            pass
+    return defaults
+
+
+def _get_polarity_config() -> dict:
+    """Get NLI polarity-dedup config (config.json `polarity` section).
+
+    Returns dict with keys: enabled (bool), model (str), threshold (float),
+    min_similarity_for_check (float). Falls back to defaults if config
+    absent.
+
+    Disabled if `ENGRAM_NO_POLARITY` env var is set (test-mode escape hatch
+    so tests don't have to download a 1.5GB model).
+    """
+    defaults = {
+        "enabled": True,
+        "model": POLARITY_DEFAULT_MODEL,
+        "threshold": POLARITY_DEFAULT_THRESHOLD,
+        "min_similarity_for_check": POLARITY_DEFAULT_MIN_SIMILARITY_FOR_CHECK,
+    }
+    if os.environ.get("ENGRAM_NO_POLARITY"):
+        defaults["enabled"] = False
+        return defaults
+    if CONFIG_PATH.exists():
+        try:
+            config = json.loads(CONFIG_PATH.read_text())
+            user = config.get("polarity", {})
+            if isinstance(user, dict):
+                merged = dict(defaults)
+                merged.update(user)
+                return merged
+        except (json.JSONDecodeError, OSError):
+            pass
+    return defaults
+
+
+# ── NLI cross-encoder lazy singleton ───────────────────────────────────────
+# Lazy because the model is ~1.5GB and loads in ~17s — we don't want server
+# boot to pay that cost; first polarity check pays it once. After load, kept
+# resident in process memory for the lifetime of the server.
+#
+# Safe to fail: if the model fails to load (no GPU, missing dep, etc.),
+# _score_polarity returns None and downstream skips the polarity check.
+
+class _NLIClassifier:
+    """Lazy singleton wrapping a sentence-transformers CrossEncoder for NLI.
+
+    .available()         — True iff loaded successfully
+    .score(prem, hyp)    — returns contradiction probability in [0, 1] or None
+                           (None on any error or if not available)
+
+    Mirrors _embedder pattern. Single resident model; .score() can be called
+    repeatedly without reload cost.
+    """
+
+    def __init__(self):
+        self._model = None
+        self._loaded = False
+        self._load_failed = False
+        self._loaded_model_name = None  # tracks which model is resident
+        self._label_idx_contradiction = None
+
+    def _ensure_loaded(self, model_name: str) -> bool:
+        # Reload if the requested model differs from the one resident
+        # (mirror EmbeddingManager pattern — config edits to polarity.model
+        # take effect on next call without server restart).
+        if self._loaded and self._loaded_model_name == model_name:
+            return True
+        if self._load_failed and self._loaded_model_name == model_name:
+            return False
+        try:
+            # PYTORCH_JIT=0 is needed for DeBERTa-v2-style models on some
+            # systems (libnvrtc-builtins.so issue); set defensively.
+            os.environ.setdefault("PYTORCH_JIT", "0")
+            from sentence_transformers import CrossEncoder  # noqa: WPS433
+            import torch  # noqa: WPS433
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self._model = CrossEncoder(model_name, device=device)
+            # ModernCE-large + EttinX use this label order; assume same for
+            # other cross-encoder/nli-* models (verified empirically in
+            # kg/paper_research/nli_polarity_bakeoff_2026-05-10/).
+            self._label_idx_contradiction = 0
+            self._loaded = True
+            self._load_failed = False
+            self._loaded_model_name = model_name
+            return True
+        except Exception as e:
+            # Mirror _embedder pattern: log to stderr so the agent / user
+            # has at least one breadcrumb for why POLARITY_ALERT never fires.
+            print(f"[engram] Failed to load NLI model '{model_name}': {e}",
+                  file=sys.stderr)
+            self._load_failed = True
+            self._loaded_model_name = model_name
+            self._model = None
+            return False
+
+    def available(self) -> bool:
+        return self._loaded
+
+    def score(self, premise: str, hypothesis: str, model_name: str) -> float | None:
+        """Return p(contradiction) in [0, 1] or None on failure/unavailable."""
+        if not self._ensure_loaded(model_name):
+            return None
+        try:
+            import numpy as np  # noqa: WPS433
+            logits = self._model.predict(
+                [(premise, hypothesis)], show_progress_bar=False
+            )
+            arr = np.asarray(logits)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            # Numerically stable softmax over the 3 NLI classes
+            row = arr[0]
+            ex = np.exp(row - row.max())
+            probs = ex / ex.sum()
+            return float(probs[self._label_idx_contradiction])
+        except Exception:
+            return None
+
+
+_nli_classifier = _NLIClassifier()
+
+
+def _maybe_polarity_alert(
+    new_claim: str, existing_claim: str, sim: float
+) -> str | None:
+    """If polarity NLI fires, return a one-line POLARITY_ALERT prefix; else None.
+
+    Skips if (a) polarity disabled, (b) sim below polarity-min-similarity floor
+    (truly unrelated; not worth NLI cost), (c) model fails to load. Lazy: the
+    model load cost is only paid the first time this fires positively across
+    the server's lifetime.
+    """
+    cfg = _get_polarity_config()
+    if not cfg.get("enabled", True):
+        return None
+    min_sim = float(cfg.get("min_similarity_for_check", POLARITY_DEFAULT_MIN_SIMILARITY_FOR_CHECK))
+    if sim < min_sim:
+        return None
+    threshold = float(cfg.get("threshold", POLARITY_DEFAULT_THRESHOLD))
+    model_name = cfg.get("model", POLARITY_DEFAULT_MODEL)
+    p_contra = _nli_classifier.score(new_claim, existing_claim, model_name)
+    if p_contra is None or p_contra < threshold:
+        return None
+    return (
+        f"POLARITY_ALERT — NLI flags potential contradiction (p={p_contra:.2f}). "
+        f"Consider engram_contradict if this claim genuinely contradicts. "
+    )
 
 def _semantic_search(
     conn: sqlite3.Connection,
@@ -3511,9 +3704,10 @@ def _add_observation_impl(
 
             # Semantic search (complement)
             if _embedder.is_available() and _get_embedding_config().get("enabled", True):
+                _th = _get_thresholds_config()
                 sem_results = _semantic_search(
-                    conn, claim, top_k=DEDUP_TOP_K,
-                    min_similarity=DEDUP_MIN_SIMILARITY,
+                    conn, claim, top_k=int(_th["dedup_top_k"]),
+                    min_similarity=float(_th["dedup_min_similarity"]),
                     importance_threshold=tier2_threshold,
                 )
                 for s in sem_results:
@@ -3643,6 +3837,9 @@ def _add_observation_impl(
                 (own_st_row["source_type"] if own_st_row and own_st_row["source_type"] else None)
                 or "document"
             )
+            # Hoist config out of the per-candidate loop — for K=15 candidates
+            # this avoids 15x CONFIG_PATH.read_text() + json.loads() per write.
+            _th = _get_thresholds_config()
 
             for m in similar_matches:
                 same_ev = (m.get("evidence_id") == evidence_id)
@@ -3691,13 +3888,13 @@ def _add_observation_impl(
                             f"Create normally if the claim adds new information."
                         )
                 else:
-                    if sim >= ACTION_HINT_CORROBORATE_THRESHOLD:
+                    if sim >= float(_th["action_hint_corroborate"]):
                         m["action_hint"] = (
                             f"CORROBORATE — high-similarity ({sim:.2f}) claim from an independent source. "
                             f"Create a corroboration derivation (inductive_generalization) "
                             f"citing both {m['id']} and {node_id}."
                         )
-                    elif sim >= ACTION_HINT_RELATED_THRESHOLD:
+                    elif sim >= float(_th["action_hint_related"]):
                         m["action_hint"] = (
                             f"RELATED — moderate similarity ({sim:.2f}) from a different source. "
                             f"Inspect to decide whether corroboration is warranted."
@@ -3707,6 +3904,16 @@ def _add_observation_impl(
                             f"WEAK_MATCH — low similarity ({sim:.2f}). "
                             f"Probably unrelated. Ignore unless inspection suggests otherwise."
                         )
+
+                # Polarity NLI overlay — applies to BOTH same-source and
+                # cross-source semantic matches (per Lei 2026-05-10:
+                # "same source still worth marking contradiction"). Prepended
+                # to whichever tier hint was set above. Skipped when sim is
+                # below min_similarity_for_check (truly unrelated, no NLI cost)
+                # or when polarity is disabled via config / ENGRAM_NO_POLARITY.
+                polarity_prefix = _maybe_polarity_alert(claim, m["claim"], sim)
+                if polarity_prefix:
+                    m["action_hint"] = polarity_prefix + m["action_hint"]
 
             result["similar_existing"] = similar_matches
             result["similar_count"] = len(similar_matches)
@@ -3976,9 +4183,10 @@ def engram_check_similar(claim_text: str, top_k: int = 5) -> str:
 
         # --- Semantic search (complement) ---
         if _embedder.is_available() and _get_embedding_config().get("enabled", True):
+            _th = _get_thresholds_config()
             sem_results = _semantic_search(
                 conn, claim_text, top_k=top_k,
-                min_similarity=DEDUP_MIN_SIMILARITY,
+                min_similarity=float(_th["dedup_min_similarity"]),
                 importance_threshold=tier2_threshold,
             )
             for s in sem_results:
@@ -7252,9 +7460,10 @@ def engram_add_lesson(
 
             # Semantic search complement
             if _embedder.is_available() and _get_embedding_config().get("enabled", True):
+                _th = _get_thresholds_config()
                 sem_results = _semantic_search(
-                    conn, claim, top_k=DEDUP_TOP_K,
-                    min_similarity=DEDUP_MIN_SIMILARITY,
+                    conn, claim, top_k=int(_th["dedup_top_k"]),
+                    min_similarity=float(_th["dedup_min_similarity"]),
                     type_filter={"lesson"},
                     importance_threshold=tier2_threshold,
                 )
