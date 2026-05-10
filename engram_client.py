@@ -116,36 +116,27 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_add_axiom": {
-        "description": "Record a foundational assumption taken as true without proof. Confidence fixed at 1.0, importance-anchored (elevated base, survival still requires recall). Claim-bearing — derivations can cite axioms as premises.",
+        "description": "Record a foundational assumption taken as true without proof. Confidence fixed at 1.0, importance-anchored. Claim-bearing — derivations can cite axioms as premises. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: claim, basis.",
         "parameters": {
-            "claim": {"type": "string", "description": "The axiom statement.", "required": True},
-            "basis": {"type": "string", "description": "Why this axiom is adopted (justification, not proof).", "required": True},
-            "context_ids": {"type": "string", "description": "Optional comma-separated node IDs for context."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with axiom fields. Required: claim (the axiom statement), basis (why this axiom is adopted — justification, not proof). Optional: context_ids (comma-separated node IDs cited).", "required": True},
         },
     },
     "engram_add_definition": {
-        "description": "Record what a term means in this knowledge graph's context. No confidence score, not claim-bearing. Derivations can reference definitions via context_ids.",
+        "description": "Record what a term means in this knowledge graph's context. No confidence score, not claim-bearing. Derivations can reference definitions via context_ids. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: term, definition.",
         "parameters": {
-            "term": {"type": "string", "description": "The term being defined.", "required": True},
-            "definition": {"type": "string", "description": "What the term means.", "required": True},
-            "context_ids": {"type": "string", "description": "Optional comma-separated node IDs for context."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with definition fields. Required: term (the term being defined), definition (what the term means). Optional: context_ids (comma-separated node IDs cited).", "required": True},
         },
     },
     "engram_add_conjecture": {
-        "description": "Propose a hypothesis for investigation. Conjectures are provisional foundations — claim-bearing leaf nodes other derivations CAN cite (with confidence penalty). Use when you have a specific claim to build on before proving. For open-ended gaps, use kg_ask instead. Resolve via kg_resolve or promote via kg_supersede.",
+        "description": "Propose a hypothesis for investigation. Conjectures are provisional foundations — claim-bearing leaf nodes other derivations CAN cite (with confidence penalty). Use when you have a specific claim to build on before proving. For open-ended gaps, use engram_ask. Resolve via engram_resolve or promote via engram_supersede. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: claim, basis.",
         "parameters": {
-            "claim": {"type": "string", "description": "The hypothesis.", "required": True},
-            "basis": {"type": "string", "description": "Why this is worth investigating.", "required": True},
-            "initial_confidence": {"type": "number", "description": "Starting confidence, default 0.40, range [0.10, 0.60]."},
-            "context_ids": {"type": "string", "description": "Optional comma-separated node IDs for context."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with conjecture fields. Required: claim (the hypothesis), basis (why this is worth investigating). Optional: initial_confidence (number in [0.10, 0.60], default 0.40), context_ids (comma-separated node IDs cited).", "required": True},
         },
     },
     "engram_add_goal": {
-        "description": "Record a persistent directional goal. Goals are aspirational north-star directions (non-claim-bearing, no confidence, importance-anchored — elevated base, survival still requires recall). Cannot serve as derivation premises. Use engram_goal_tension for value-level conflicts between goals.",
+        "description": "Record a persistent directional goal. Goals are aspirational north-star directions (non-claim-bearing, no confidence, importance-anchored). Cannot serve as derivation premises. Use engram_goal_tension for value-level conflicts between goals. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: claim, motivation.",
         "parameters": {
-            "claim": {"type": "string", "description": "The goal statement — a desired state or direction.", "required": True},
-            "motivation": {"type": "string", "description": "Why this goal matters.", "required": True},
-            "context_ids": {"type": "string", "description": "Optional comma-separated node IDs for context."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with goal fields. Required: claim (the goal statement — a desired state or direction), motivation (why this goal matters). Optional: context_ids (comma-separated node IDs cited).", "required": True},
         },
     },
     "engram_add_person": {

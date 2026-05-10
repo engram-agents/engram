@@ -6209,6 +6209,10 @@ def engram_history(
 # ---------------------------------------------------------------------------
 
 
+# Set of legitimate field names for the engram_add_axiom payload.
+_ADD_AXIOM_FIELDS = frozenset({"claim", "basis", "context_ids"})
+
+
 @mcp.tool(
     name="engram_add_axiom",
     annotations={
@@ -6219,12 +6223,50 @@ def engram_history(
         "openWorldHint": False,
     },
 )
-def engram_add_axiom(
-    claim: str,
-    basis: str,
+def engram_add_axiom(payload_json: str) -> str:
+    """Record a foundational assumption taken as true without proof.
+
+    Single-payload signature (wave 2c of ob_1499 — see issue #55): pass ALL
+    fields as one JSON object string in `payload_json`.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            claim (str, required): The axiom statement.
+            basis (str, required): Why this axiom is adopted.
+            context_ids (str, optional): Comma-separated node IDs cited.
+
+    Returns:
+        JSON with the new axiom node ID and confidence (always 1.0). On
+        payload-parsing failure, returns {"error": "..."}.
+
+    See _add_axiom_impl for full semantics.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _ADD_AXIOM_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ADD_AXIOM_FIELDS)}"
+        })
+
+    return _add_axiom_impl(**params)
+
+
+def _add_axiom_impl(
+    claim: str = "",
+    basis: str = "",
     context_ids: str = "",
 ) -> str:
-    """Record a foundational assumption taken as true without proof.
+    """Internal implementation — see engram_add_axiom MCP tool for the public
+    payload schema. Kept callable with named kwargs for in-server callers.
+
+    Record a foundational assumption taken as true without proof.
 
     Axioms are premises the agent adopts explicitly. They have confidence 1.0
     (assumed true) and are exempt from memory forgetting. Derivations can cite
@@ -6239,6 +6281,11 @@ def engram_add_axiom(
     Returns:
         JSON with the new axiom node ID and confidence (always 1.0).
     """
+    if not claim or not claim.strip():
+        return json.dumps({"error": "claim is required and cannot be empty."})
+    if not basis or not basis.strip():
+        return json.dumps({"error": "basis is required and cannot be empty."})
+
     conn = _get_db()
     try:
         node_id = _next_id(conn, "axiom")
@@ -6281,6 +6328,10 @@ def engram_add_axiom(
         conn.close()
 
 
+# Set of legitimate field names for the engram_add_definition payload.
+_ADD_DEFINITION_FIELDS = frozenset({"term", "definition", "context_ids"})
+
+
 @mcp.tool(
     name="engram_add_definition",
     annotations={
@@ -6291,12 +6342,50 @@ def engram_add_axiom(
         "openWorldHint": False,
     },
 )
-def engram_add_definition(
-    term: str,
-    definition: str,
+def engram_add_definition(payload_json: str) -> str:
+    """Record what a term means in this knowledge graph's context.
+
+    Single-payload signature (wave 2c of ob_1499 — see issue #55): pass ALL
+    fields as one JSON object string in `payload_json`.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            term (str, required): The term being defined.
+            definition (str, required): What the term means.
+            context_ids (str, optional): Comma-separated node IDs cited.
+
+    Returns:
+        JSON with the new definition node ID. On payload-parsing failure,
+        returns {"error": "..."}.
+
+    See _add_definition_impl for full semantics.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _ADD_DEFINITION_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ADD_DEFINITION_FIELDS)}"
+        })
+
+    return _add_definition_impl(**params)
+
+
+def _add_definition_impl(
+    term: str = "",
+    definition: str = "",
     context_ids: str = "",
 ) -> str:
-    """Record what a term means in this knowledge graph's context.
+    """Internal implementation — see engram_add_definition MCP tool for the
+    public payload schema. Kept callable with named kwargs for in-server callers.
+
+    Record what a term means in this knowledge graph's context.
 
     Definitions are conventions, not claims — they have no confidence score
     and are not claim-bearing (cannot be cited as premises in derivations).
@@ -6311,6 +6400,11 @@ def engram_add_definition(
     Returns:
         JSON with the new definition node ID.
     """
+    if not term or not term.strip():
+        return json.dumps({"error": "term is required and cannot be empty."})
+    if not definition or not definition.strip():
+        return json.dumps({"error": "definition is required and cannot be empty."})
+
     conn = _get_db()
     try:
         node_id = _next_id(conn, "definition")
@@ -6354,6 +6448,10 @@ def engram_add_definition(
         conn.close()
 
 
+# Set of legitimate field names for the engram_add_conjecture payload.
+_ADD_CONJECTURE_FIELDS = frozenset({"claim", "basis", "initial_confidence", "context_ids"})
+
+
 @mcp.tool(
     name="engram_add_conjecture",
     annotations={
@@ -6364,13 +6462,53 @@ def engram_add_definition(
         "openWorldHint": False,
     },
 )
-def engram_add_conjecture(
-    claim: str,
-    basis: str,
+def engram_add_conjecture(payload_json: str) -> str:
+    """Propose a hypothesis for investigation.
+
+    Single-payload signature (wave 2c of ob_1499 — see issue #55): pass ALL
+    fields as one JSON object string in `payload_json`.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            claim (str, required): The hypothesis.
+            basis (str, required): Why this conjecture is worth investigating.
+            initial_confidence (float, optional): Starting confidence in
+                [0.10, 0.60]. Default per CONJECTURE_CONFIDENCE_DEFAULT (0.40).
+            context_ids (str, optional): Comma-separated node IDs cited.
+
+    Returns:
+        JSON with the new conjecture node ID and confidence. On payload-
+        parsing failure, returns {"error": "..."}.
+
+    See _add_conjecture_impl for full lifecycle semantics.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _ADD_CONJECTURE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ADD_CONJECTURE_FIELDS)}"
+        })
+
+    return _add_conjecture_impl(**params)
+
+
+def _add_conjecture_impl(
+    claim: str = "",
+    basis: str = "",
     initial_confidence: float = CONJECTURE_CONFIDENCE_DEFAULT,
     context_ids: str = "",
 ) -> str:
-    """Propose a hypothesis for investigation.
+    """Internal implementation — see engram_add_conjecture MCP tool for the
+    public payload schema. Kept callable with named kwargs for in-server callers.
+
+    Propose a hypothesis for investigation.
 
     Conjectures are provisional foundations — claims you BELIEVE or HOPE to be
     true but lack evidence for. They are claim-bearing leaf nodes (no citations
@@ -6397,6 +6535,23 @@ def engram_add_conjecture(
     Returns:
         JSON with the new conjecture node ID and confidence.
     """
+    if not claim or not claim.strip():
+        return json.dumps({"error": "claim is required and cannot be empty."})
+    if not basis or not basis.strip():
+        return json.dumps({"error": "basis is required and cannot be empty."})
+
+    # Type-coerce initial_confidence — payload_json may deliver it as a string
+    # (e.g. "0.55" instead of 0.55), and the float type hint isn't enforced
+    # at runtime. Without coercion the max/min comparison raises TypeError
+    # which the timed wrapper re-raises rather than turning into a clean
+    # error response (PR #67 fairy round-1 blocker).
+    try:
+        initial_confidence = float(initial_confidence)
+    except (TypeError, ValueError):
+        return json.dumps({
+            "error": "initial_confidence must be a number in [0.10, 0.60]."
+        })
+
     conf = max(CONJECTURE_CONFIDENCE_MIN, min(CONJECTURE_CONFIDENCE_MAX, initial_confidence))
 
     conn = _get_db()
@@ -6437,6 +6592,10 @@ def engram_add_conjecture(
         conn.close()
 
 
+# Set of legitimate field names for the engram_add_goal payload.
+_ADD_GOAL_FIELDS = frozenset({"claim", "motivation", "context_ids"})
+
+
 @mcp.tool(
     name="engram_add_goal",
     annotations={
@@ -6447,12 +6606,50 @@ def engram_add_conjecture(
         "openWorldHint": False,
     },
 )
-def engram_add_goal(
-    claim: str,
-    motivation: str,
+def engram_add_goal(payload_json: str) -> str:
+    """Record a persistent directional goal for the project.
+
+    Single-payload signature (wave 2c of ob_1499 — see issue #55): pass ALL
+    fields as one JSON object string in `payload_json`.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            claim (str, required): The goal statement.
+            motivation (str, required): Why this goal matters.
+            context_ids (str, optional): Comma-separated node IDs cited.
+
+    Returns:
+        JSON with the new goal node ID. On payload-parsing failure,
+        returns {"error": "..."}.
+
+    See _add_goal_impl for full semantics.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _ADD_GOAL_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ADD_GOAL_FIELDS)}"
+        })
+
+    return _add_goal_impl(**params)
+
+
+def _add_goal_impl(
+    claim: str = "",
+    motivation: str = "",
     context_ids: str = "",
 ) -> str:
-    """Record a persistent directional goal for the project.
+    """Internal implementation — see engram_add_goal MCP tool for the public
+    payload schema. Kept callable with named kwargs for in-server callers.
+
+    Record a persistent directional goal for the project.
 
     Goals are aspirational north-star directions — "this SHOULD become true."
     They represent desired states or design philosophies, not truth claims.
@@ -6487,6 +6684,11 @@ def engram_add_goal(
     Returns:
         JSON with the new goal node ID.
     """
+    if not claim or not claim.strip():
+        return json.dumps({"error": "claim is required and cannot be empty."})
+    if not motivation or not motivation.strip():
+        return json.dumps({"error": "motivation is required and cannot be empty."})
+
     conn = _get_db()
     try:
         node_id = _next_id(conn, "goal")

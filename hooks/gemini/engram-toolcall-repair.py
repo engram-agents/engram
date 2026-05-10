@@ -92,17 +92,21 @@ PROTECTED_TOOLS = {
     "mcp__engram__engram_advance_turn": {
         "message",
     },
+    # Migrated to single-payload signature in wave 2c (PR #67).
     "mcp__engram__engram_add_axiom": {
-        "claim", "basis", "context_ids",
+        "payload_json",
     },
+    # Migrated to single-payload signature in wave 2c (PR #67).
     "mcp__engram__engram_add_definition": {
-        "term", "definition", "context_ids",
+        "payload_json",
     },
+    # Migrated to single-payload signature in wave 2c (PR #67).
     "mcp__engram__engram_add_conjecture": {
-        "claim", "basis", "initial_confidence", "context_ids",
+        "payload_json",
     },
+    # Migrated to single-payload signature in wave 2c (PR #67).
     "mcp__engram__engram_add_goal": {
-        "claim", "motivation", "context_ids",
+        "payload_json",
     },
     "mcp__engram__engram_add_person": {
         "name", "role", "description", "aliases", "context_ids", "is_self",
