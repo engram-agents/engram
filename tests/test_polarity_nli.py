@@ -47,12 +47,17 @@ def fresh_server(*, polarity_enabled: bool, nli_score: float | None = None):
     server._embedder = _StubEmb()
     server._get_embedding_config = lambda: {"enabled": True}
 
-    # Stub the NLI classifier to return the chosen score (or None if not set)
+    # Stub the NLI classifier to return the chosen score (or None if not set).
+    # Provides BOTH score() and score_batch() since the production code path
+    # uses score_batch() (one batched call per write) and tests + back-compat
+    # callers use score() (single-pair).
     if nli_score is not None:
         class _StubNLI:
             def __init__(self_): self_._loaded = True
             def available(self_): return True
             def score(self_, prem, hyp, model_name): return nli_score
+            def score_batch(self_, pairs, model_name):
+                return [nli_score] * len(pairs)
         server._nli_classifier = _StubNLI()
 
     return server
@@ -254,6 +259,9 @@ def test_polarity_skipped_when_sim_below_min_check():
         def score(self_, prem, hyp, model_name):
             call_count["n"] += 1
             return 0.99
+        def score_batch(self_, pairs, model_name):
+            call_count["n"] += len(pairs)
+            return [0.99] * len(pairs)
     server._nli_classifier = _CountingNLI()
 
     first_id = _seed_first_obs(server)
@@ -307,6 +315,7 @@ def test_polarity_nli_returning_none_is_safe():
         def __init__(self_): self_._loaded = False
         def available(self_): return False
         def score(self_, prem, hyp, model_name): return None
+        def score_batch(self_, pairs, model_name): return None
     server._nli_classifier = _FailingNLI()
 
     first_id = _seed_first_obs(server)
@@ -317,6 +326,118 @@ def test_polarity_nli_returning_none_is_safe():
     # No POLARITY_ALERT, but the underlying tier hint must still work
     assert not hint.startswith("POLARITY_ALERT"), hint
     assert hint.startswith("CORROBORATE"), f"Tier hint must still work: {hint}"
+
+
+def test_batched_polarity_one_call_per_write():
+    """The hot path makes exactly ONE score_batch() call per write, not K calls.
+
+    Validates the batch optimization: even with 5 candidates returned by
+    semantic search, score_batch is called once with all 5 pairs (filtered
+    by min_similarity_for_check) — not 5 sequential single-pair calls.
+    """
+    server = fresh_server(polarity_enabled=True)
+
+    batch_calls = {"n": 0, "max_pair_count": 0}
+
+    class _BatchCountingNLI:
+        def __init__(self_): self_._loaded = True
+        def available(self_): return True
+        def score(self_, prem, hyp, model_name):
+            # Should NOT be called by the hot path.
+            raise AssertionError("score() called — hot path should use score_batch()")
+        def score_batch(self_, pairs, model_name):
+            batch_calls["n"] += 1
+            batch_calls["max_pair_count"] = max(
+                batch_calls["max_pair_count"], len(pairs)
+            )
+            return [0.70] * len(pairs)
+
+    server._nli_classifier = _BatchCountingNLI()
+
+    first_id = _seed_first_obs(server)
+
+    # Stub semantic search to return MULTIPLE candidates (5).
+    def stub_multi(conn, query_text, **kwargs):
+        return [
+            {
+                "id": f"ob_900{i}",
+                "type": "observation_factual",
+                "claim": f"Stub claim {i} about topic Z.",
+                "confidence": 0.8,
+                "similarity": 0.65,  # above min_sim_for_check (0.30) → all eligible
+                "quote_type": "attributed_analysis",
+                "importance_score": 1.0,
+            }
+            for i in range(5)
+        ]
+    server._semantic_search = stub_multi
+
+    r = _add_second_obs(server, claim="Topic Z disputed claim.")
+
+    # Hot path should have made exactly ONE batched call covering all 5 candidates
+    assert batch_calls["n"] == 1, (
+        f"Expected exactly 1 score_batch call (the batch optimization), "
+        f"got {batch_calls['n']}"
+    )
+    assert batch_calls["max_pair_count"] == 5, (
+        f"Expected the batched call to include all 5 candidates, got "
+        f"{batch_calls['max_pair_count']} pairs"
+    )
+    # All 5 should have POLARITY_ALERT prepended (stub returns 0.70 ≥ 0.46)
+    for m in r["similar_existing"]:
+        assert m["action_hint"].startswith("POLARITY_ALERT"), (
+            f"Expected POLARITY_ALERT on candidate {m['id']}, got: {m['action_hint']}"
+        )
+
+
+def test_batched_polarity_filters_below_min_sim():
+    """Candidates below min_similarity_for_check must NOT enter the batch."""
+    server = fresh_server(polarity_enabled=True)
+    batch_calls = {"pairs_seen": 0}
+
+    class _PairCountNLI:
+        def __init__(self_): self_._loaded = True
+        def available(self_): return True
+        def score(self_, prem, hyp, model_name): return 0.70
+        def score_batch(self_, pairs, model_name):
+            batch_calls["pairs_seen"] = len(pairs)
+            return [0.70] * len(pairs)
+
+    server._nli_classifier = _PairCountNLI()
+
+    first_id = _seed_first_obs(server)
+
+    # Mix: 2 candidates below floor (sim=0.20), 3 above (sim=0.65)
+    def stub_mixed(conn, query_text, **kwargs):
+        rows = []
+        for i in range(2):
+            rows.append({
+                "id": f"ob_low_{i}", "type": "observation_factual",
+                "claim": f"Low-sim stub {i}", "confidence": 0.5,
+                "similarity": 0.20,  # below min_sim_for_check (0.30)
+                "quote_type": "attributed_analysis", "importance_score": 1.0,
+            })
+        for i in range(3):
+            rows.append({
+                "id": f"ob_high_{i}", "type": "observation_factual",
+                "claim": f"High-sim stub {i}", "confidence": 0.8,
+                "similarity": 0.65,
+                "quote_type": "attributed_analysis", "importance_score": 1.0,
+            })
+        return rows
+    server._semantic_search = stub_mixed
+
+    # min_similarity_for_check is 0.30 by default; with sim=0.20 both
+    # the dedup floor (0.40 default) AND the polarity floor (0.30) are below
+    # — so the low-sim ones may not surface in similar_existing at all
+    # (engram_check_similar uses dedup_min_similarity, not stub-bypassed here
+    # because we're stubbing _semantic_search). The KEY assertion: the
+    # batched call must NOT contain low-sim pairs even if they DID surface.
+    _add_second_obs(server, claim="Topic Z disputed claim.")
+    assert batch_calls["pairs_seen"] <= 3, (
+        f"Batch should exclude pairs below min_sim_for_check (0.30); "
+        f"got {batch_calls['pairs_seen']} pairs in the batch"
+    )
 
 
 # ── Config defaults match v0 recommendation (issue #56 bake-off) ───────────

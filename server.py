@@ -1805,22 +1805,42 @@ class _NLIClassifier:
         return self._loaded
 
     def score(self, premise: str, hypothesis: str, model_name: str) -> float | None:
-        """Return p(contradiction) in [0, 1] or None on failure/unavailable."""
+        """Return p(contradiction) in [0, 1] or None on failure/unavailable.
+
+        Single-pair convenience wrapper around score_batch — internal callers
+        and the test stub still use this entry point. The hot path
+        (_compute_polarity_alerts) goes through score_batch directly.
+        """
+        scores = self.score_batch([(premise, hypothesis)], model_name)
+        if scores is None:
+            return None
+        return scores[0]
+
+    def score_batch(self, pairs: list, model_name: str) -> list | None:
+        """Return [p(contradiction) for each (premise, hypothesis)] or None.
+
+        Single batched forward pass — for K=15 candidates on RTX 5090 this
+        is ~33% faster than K sequential single-pair calls per the bake-off
+        v2 measurement (16.6ms single-pair median vs 11.1ms batched-32 mean
+        for ModernCE-large).
+        """
+        if not pairs:
+            return []
         if not self._ensure_loaded(model_name):
             return None
         try:
             import numpy as np  # noqa: WPS433
             logits = self._model.predict(
-                [(premise, hypothesis)], show_progress_bar=False
+                pairs, show_progress_bar=False, batch_size=32
             )
             arr = np.asarray(logits)
             if arr.ndim == 1:
                 arr = arr.reshape(1, -1)
-            # Numerically stable softmax over the 3 NLI classes
-            row = arr[0]
-            ex = np.exp(row - row.max())
-            probs = ex / ex.sum()
-            return float(probs[self._label_idx_contradiction])
+            # Numerically stable softmax over the 3 NLI classes (per-row)
+            shifted = arr - arr.max(axis=-1, keepdims=True)
+            ex = np.exp(shifted)
+            probs = ex / ex.sum(axis=-1, keepdims=True)
+            return [float(p) for p in probs[:, self._label_idx_contradiction]]
         except Exception:
             return None
 
@@ -1831,12 +1851,14 @@ _nli_classifier = _NLIClassifier()
 def _maybe_polarity_alert(
     new_claim: str, existing_claim: str, sim: float
 ) -> str | None:
-    """If polarity NLI fires, return a one-line POLARITY_ALERT prefix; else None.
+    """Single-pair polarity check (back-compat path used by tests).
 
-    Skips if (a) polarity disabled, (b) sim below polarity-min-similarity floor
-    (truly unrelated; not worth NLI cost), (c) model fails to load. Lazy: the
-    model load cost is only paid the first time this fires positively across
-    the server's lifetime.
+    The hot path in _add_observation_impl uses _compute_polarity_alerts to
+    score all candidates in one batched forward pass. This single-pair entry
+    point is preserved for tests that stub _nli_classifier.score and for
+    in-server callers that need polarity on an isolated pair.
+
+    Returns a POLARITY_ALERT prefix string or None.
     """
     cfg = _get_polarity_config()
     if not cfg.get("enabled", True):
@@ -1853,6 +1875,65 @@ def _maybe_polarity_alert(
         f"POLARITY_ALERT — NLI flags potential contradiction (p={p_contra:.2f}). "
         f"Consider engram_contradict if this claim genuinely contradicts. "
     )
+
+
+def _compute_polarity_alerts(
+    new_claim: str, candidates: list
+) -> dict:
+    """Batched polarity scoring for the action-hint loop.
+
+    Args:
+        new_claim: The claim being added.
+        candidates: List of dicts with at least 'id', 'claim', 'similarity'
+            (the same shape as similar_matches in _add_observation_impl).
+
+    Returns:
+        Dict mapping candidate id → POLARITY_ALERT prefix string for any
+        candidate where polarity NLI fired. Candidates not in the dict had
+        no alert (either filtered by sim floor, polarity disabled, or NLI
+        score below threshold). All remaining candidates are scored in a
+        single batched forward pass.
+
+    Filtering preserves the same skip-on-floor optimization the per-pair
+    path had: candidates with sim < min_similarity_for_check are excluded
+    from the batch entirely, so we never pay NLI inference cost on truly
+    unrelated pairs.
+
+    Safe-fail: if polarity is disabled, the model fails to load, or
+    score_batch returns None, returns an empty dict.
+    """
+    cfg = _get_polarity_config()
+    if not cfg.get("enabled", True):
+        return {}
+    min_sim = float(cfg.get("min_similarity_for_check", POLARITY_DEFAULT_MIN_SIMILARITY_FOR_CHECK))
+    threshold = float(cfg.get("threshold", POLARITY_DEFAULT_THRESHOLD))
+    model_name = cfg.get("model", POLARITY_DEFAULT_MODEL)
+
+    eligible = []
+    for c in candidates:
+        sim = c.get("similarity")
+        if sim is None or sim < min_sim:
+            continue
+        if not c.get("claim"):
+            continue
+        eligible.append(c)
+    if not eligible:
+        return {}
+
+    pairs = [(new_claim, c["claim"]) for c in eligible]
+    scores = _nli_classifier.score_batch(pairs, model_name)
+    if scores is None or len(scores) != len(eligible):
+        return {}
+
+    alerts = {}
+    for c, p_contra in zip(eligible, scores):
+        if p_contra is None or p_contra < threshold:
+            continue
+        alerts[c["id"]] = (
+            f"POLARITY_ALERT — NLI flags potential contradiction (p={p_contra:.2f}). "
+            f"Consider engram_contradict if this claim genuinely contradicts. "
+        )
+    return alerts
 
 def _semantic_search(
     conn: sqlite3.Connection,
@@ -3840,6 +3921,13 @@ def _add_observation_impl(
             # Hoist config out of the per-candidate loop — for K=15 candidates
             # this avoids 15x CONFIG_PATH.read_text() + json.loads() per write.
             _th = _get_thresholds_config()
+            # Pre-compute polarity alerts in a single batched NLI forward pass
+            # for ALL eligible candidates (those above min_similarity_for_check).
+            # ~33% latency win vs per-candidate single-pair calls per the
+            # bake-off v2 measurement (ModernCE-large 16.6ms single → 11.1ms
+            # batched on RTX 5090). The per-pair _maybe_polarity_alert path is
+            # preserved for tests + isolated callers.
+            _polarity_alerts = _compute_polarity_alerts(claim, similar_matches)
 
             for m in similar_matches:
                 same_ev = (m.get("evidence_id") == evidence_id)
@@ -3908,10 +3996,12 @@ def _add_observation_impl(
                 # Polarity NLI overlay — applies to BOTH same-source and
                 # cross-source semantic matches (per Lei 2026-05-10:
                 # "same source still worth marking contradiction"). Prepended
-                # to whichever tier hint was set above. Skipped when sim is
-                # below min_similarity_for_check (truly unrelated, no NLI cost)
-                # or when polarity is disabled via config / ENGRAM_NO_POLARITY.
-                polarity_prefix = _maybe_polarity_alert(claim, m["claim"], sim)
+                # to whichever tier hint was set above. Pre-computed in a single
+                # batched NLI call above (_compute_polarity_alerts); look up by
+                # candidate id here. Candidates filtered out (sim below floor,
+                # polarity disabled, model load failure, score below threshold)
+                # are simply not in the dict.
+                polarity_prefix = _polarity_alerts.get(m["id"])
                 if polarity_prefix:
                     m["action_hint"] = polarity_prefix + m["action_hint"]
 
