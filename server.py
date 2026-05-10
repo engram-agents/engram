@@ -1645,6 +1645,22 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str):
         pass  # Embedding computation failed — node works fine without it
 
 
+# ---------------------------------------------------------------------------
+# Empirical similarity thresholds — calibrated 2026-05-09 against live graph.
+# See kg/paper_research/threshold_calibration_2026-05-09/v4_tight_groups.py
+# (tight-semantic-group ROC AUC 0.984, peak F1 0.843 at t=0.41, peak F2
+# recall-weighted 0.868 at t=0.33). These constants encode chosen operating
+# points; downstream code references them by name (ls_0005 DRY — one source
+# of truth, no silent divergence between dedup and action-hint thresholds).
+# ---------------------------------------------------------------------------
+# Dedup at write time: how many neighbors to fetch + how similar must they be.
+DEDUP_TOP_K = 15                          # was 5; dv_0446 at sim 0.75 to ob_1602 was cut by top_k floor, not similarity floor
+DEDUP_MIN_SIMILARITY = 0.40               # was 0.50; tight-group recall lifts 65% → 86% at this threshold (precision still 83%)
+# Action-hint tier thresholds (used after dedup to label each candidate match).
+ACTION_HINT_CORROBORATE_THRESHOLD = 0.65  # was 0.80; old tier fired on only 9.5% of true relateds (effectively dead code)
+ACTION_HINT_RELATED_THRESHOLD = 0.50      # was 0.60; recall-precision shift consistent with v4 F1 peak
+
+
 def _semantic_search(
     conn: sqlite3.Connection,
     query_text: str,
@@ -3496,8 +3512,8 @@ def _add_observation_impl(
             # Semantic search (complement)
             if _embedder.is_available() and _get_embedding_config().get("enabled", True):
                 sem_results = _semantic_search(
-                    conn, claim, top_k=5,
-                    min_similarity=0.5,
+                    conn, claim, top_k=DEDUP_TOP_K,
+                    min_similarity=DEDUP_MIN_SIMILARITY,
                     importance_threshold=tier2_threshold,
                 )
                 for s in sem_results:
@@ -3675,13 +3691,13 @@ def _add_observation_impl(
                             f"Create normally if the claim adds new information."
                         )
                 else:
-                    if sim >= 0.80:
+                    if sim >= ACTION_HINT_CORROBORATE_THRESHOLD:
                         m["action_hint"] = (
                             f"CORROBORATE — high-similarity ({sim:.2f}) claim from an independent source. "
                             f"Create a corroboration derivation (inductive_generalization) "
                             f"citing both {m['id']} and {node_id}."
                         )
-                    elif sim >= 0.60:
+                    elif sim >= ACTION_HINT_RELATED_THRESHOLD:
                         m["action_hint"] = (
                             f"RELATED — moderate similarity ({sim:.2f}) from a different source. "
                             f"Inspect to decide whether corroboration is warranted."
@@ -3962,7 +3978,7 @@ def engram_check_similar(claim_text: str, top_k: int = 5) -> str:
         if _embedder.is_available() and _get_embedding_config().get("enabled", True):
             sem_results = _semantic_search(
                 conn, claim_text, top_k=top_k,
-                min_similarity=0.5,  # higher threshold for dedup
+                min_similarity=DEDUP_MIN_SIMILARITY,
                 importance_threshold=tier2_threshold,
             )
             for s in sem_results:
@@ -7237,8 +7253,8 @@ def engram_add_lesson(
             # Semantic search complement
             if _embedder.is_available() and _get_embedding_config().get("enabled", True):
                 sem_results = _semantic_search(
-                    conn, claim, top_k=5,
-                    min_similarity=0.5,
+                    conn, claim, top_k=DEDUP_TOP_K,
+                    min_similarity=DEDUP_MIN_SIMILARITY,
                     type_filter={"lesson"},
                     importance_threshold=tier2_threshold,
                 )
@@ -10670,10 +10686,12 @@ def engram_list(
 # for empirical preset calibration per ls_0023's discipline.
 
 PATTERN_QUERY_PRESETS: dict[str, dict[str, float | int]] = {
-    # Placeholder values — calibrate from telemetry per ob_1500's deferred
-    # discussion. Each pattern uses whichever fields make sense for it.
+    # "balanced" cosine_threshold v4-calibrated 2026-05-09 (see calibration
+    # study at kg/paper_research/threshold_calibration_2026-05-09/v4_tight_groups.py).
+    # high_precision and high_recall remain placeholders pending pattern-specific
+    # telemetry per ob_1500. Each pattern uses whichever fields make sense for it.
     "high_precision": {"cosine_threshold": 0.80, "top_k": 5,  "min_confidence": 0.70},
-    "balanced":       {"cosine_threshold": 0.65, "top_k": 15, "min_confidence": 0.50},
+    "balanced":       {"cosine_threshold": 0.55, "top_k": 15, "min_confidence": 0.50},
     "high_recall":    {"cosine_threshold": 0.50, "top_k": 30, "min_confidence": 0.00},
 }
 
@@ -10820,6 +10838,9 @@ def _pattern_open_question_answerable(
     for q_id, q_claim in questions:
         if not q_claim:
             continue
+        # top_k=5 here is intentionally narrower than DEDUP_TOP_K — this is a
+        # per-question inner lookup over up to N questions; we want the few
+        # best derivation candidates per question, not the dedup-pool size.
         matches = _semantic_search(
             conn, q_claim, top_k=5,
             min_similarity=threshold,
@@ -11041,6 +11062,8 @@ def _pattern_recent_resolution_echo(
     for resolver_id, resolved_id, resolution_claim in recent_resolutions:
         if not resolution_claim:
             continue
+        # top_k=5 here is intentionally narrower than DEDUP_TOP_K — per-resolution
+        # inner lookup, want the few best question candidates per resolution.
         matches = _semantic_search(
             conn, resolution_claim, top_k=5,
             min_similarity=threshold,

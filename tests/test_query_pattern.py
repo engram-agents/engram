@@ -142,7 +142,7 @@ def test_contradiction_both_sides_obsolete_scores_medium():
     server.engram_retract(node_id=a_id, error_type="other", reason="fixture")
     server.engram_retract(node_id=b_id, error_type="other", reason="fixture")
 
-    # Score is 0.5 — below balanced threshold (0.65), at-or-above high_recall (0.50).
+    # Score is 0.5 — below balanced threshold (0.55), at-or-above high_recall (0.50).
     # Confirms: high_recall surfaces the both-obsolete case for cleanup; balanced
     # filters it as a less-clean candidate than the one-side case.
     r = json.loads(server.engram_query_pattern(
@@ -164,7 +164,7 @@ def test_contradiction_both_sides_obsolete_scores_medium():
 def test_contradiction_neither_obsolete_filtered_at_balanced_threshold():
     server = fresh_server()
     _add_active_contradiction(server, "Z is alpha", "Z is beta")
-    # Both sides current; score = 0.0; balanced threshold = 0.65 → filtered out
+    # Both sides current; score = 0.0; balanced threshold = 0.55 → filtered out
 
     r = json.loads(server.engram_query_pattern(
         "contradiction_obsolescence_ready", preset="balanced"
