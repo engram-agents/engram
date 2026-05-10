@@ -1848,35 +1848,6 @@ class _NLIClassifier:
 _nli_classifier = _NLIClassifier()
 
 
-def _maybe_polarity_alert(
-    new_claim: str, existing_claim: str, sim: float
-) -> str | None:
-    """Single-pair polarity check (back-compat path used by tests).
-
-    The hot path in _add_observation_impl uses _compute_polarity_alerts to
-    score all candidates in one batched forward pass. This single-pair entry
-    point is preserved for tests that stub _nli_classifier.score and for
-    in-server callers that need polarity on an isolated pair.
-
-    Returns a POLARITY_ALERT prefix string or None.
-    """
-    cfg = _get_polarity_config()
-    if not cfg.get("enabled", True):
-        return None
-    min_sim = float(cfg.get("min_similarity_for_check", POLARITY_DEFAULT_MIN_SIMILARITY_FOR_CHECK))
-    if sim < min_sim:
-        return None
-    threshold = float(cfg.get("threshold", POLARITY_DEFAULT_THRESHOLD))
-    model_name = cfg.get("model", POLARITY_DEFAULT_MODEL)
-    p_contra = _nli_classifier.score(new_claim, existing_claim, model_name)
-    if p_contra is None or p_contra < threshold:
-        return None
-    return (
-        f"POLARITY_ALERT — NLI flags potential contradiction (p={p_contra:.2f}). "
-        f"Consider engram_contradict if this claim genuinely contradicts. "
-    )
-
-
 def _compute_polarity_alerts(
     new_claim: str, candidates: list
 ) -> dict:
@@ -1927,7 +1898,9 @@ def _compute_polarity_alerts(
 
     alerts = {}
     for c, p_contra in zip(eligible, scores):
-        if p_contra is None or p_contra < threshold:
+        # score_batch returns floats only (None case caught above) — no
+        # None-element check needed here.
+        if p_contra < threshold:
             continue
         alerts[c["id"]] = (
             f"POLARITY_ALERT — NLI flags potential contradiction (p={p_contra:.2f}). "
@@ -3925,8 +3898,7 @@ def _add_observation_impl(
             # for ALL eligible candidates (those above min_similarity_for_check).
             # ~33% latency win vs per-candidate single-pair calls per the
             # bake-off v2 measurement (ModernCE-large 16.6ms single → 11.1ms
-            # batched on RTX 5090). The per-pair _maybe_polarity_alert path is
-            # preserved for tests + isolated callers.
+            # batched on RTX 5090).
             _polarity_alerts = _compute_polarity_alerts(claim, similar_matches)
 
             for m in similar_matches:
