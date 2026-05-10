@@ -6735,6 +6735,11 @@ def _add_goal_impl(
         conn.close()
 
 
+_ADD_PERSON_FIELDS = frozenset({
+    "name", "role", "description", "aliases", "context_ids", "is_self",
+})
+
+
 @mcp.tool(
     name="engram_add_person",
     annotations={
@@ -6745,15 +6750,64 @@ def _add_goal_impl(
         "openWorldHint": False,
     },
 )
-def engram_add_person(
-    name: str,
-    role: str,
+def engram_add_person(payload_json: str) -> str:
+    """Record a person the agent knows and interacts with.
+
+    Single-payload signature (wave 2c-ii of ob_1499 — see issue #55): pass
+    ALL fields as one JSON object string in `payload_json`.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            name (str, required): The person's name.
+            role (str, required): Their role or relationship to the agent.
+            description (str, optional): Background, expertise, traits, or other context.
+            aliases (str, optional): Comma-separated alternative names.
+            context_ids (str, optional): Comma-separated node IDs for context references.
+            is_self (bool, optional): Mark as the agent's own self-anchor (only one allowed).
+
+    Returns:
+        JSON with the new person node ID. On payload-parsing failure,
+        returns {"error": "..."}.
+
+    See _add_person_impl for full semantics.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _ADD_PERSON_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ADD_PERSON_FIELDS)}"
+        })
+
+    # PR #68 fairy round-1 blocker: is_self is the only non-string field, and a
+    # JSON-string "false" or "true" is truthy in Python — silently creates a
+    # spurious self-anchor. Reject non-bool explicitly before splat.
+    if "is_self" in params and not isinstance(params["is_self"], bool):
+        return json.dumps({
+            "error": "is_self must be a JSON boolean (true/false), not a string or other type."
+        })
+
+    return _add_person_impl(**params)
+
+
+def _add_person_impl(
+    name: str = "",
+    role: str = "",
     description: str = "",
     aliases: str = "",
     context_ids: str = "",
     is_self: bool = False,
 ) -> str:
-    """Record a person the agent knows and interacts with.
+    """Internal implementation — see engram_add_person MCP tool for the public
+    payload schema. Kept callable with named kwargs for in-server callers.
+
+    Record a person the agent knows and interacts with.
 
     Person nodes represent people in the agent's relational world — collaborators,
     evaluators, stakeholders. They are the relational layer of ENGRAM, lighter-schema
@@ -6790,6 +6844,11 @@ def engram_add_person(
     Returns:
         JSON with the new person node ID.
     """
+    if not name or not name.strip():
+        return json.dumps({"error": "name is required and cannot be empty."})
+    if not role or not role.strip():
+        return json.dumps({"error": "role is required and cannot be empty."})
+
     conn = _get_db()
     try:
         if is_self:
@@ -6855,6 +6914,12 @@ def engram_add_person(
         conn.close()
 
 
+_ADD_CORNERSTONE_FIELDS = frozenset({
+    "tag", "title", "new_frame",
+    "prior_frame", "triggering_experience", "supporting_ids",
+})
+
+
 @mcp.tool(
     name="engram_add_cornerstone",
     annotations={
@@ -6865,15 +6930,57 @@ def engram_add_person(
         "openWorldHint": False,
     },
 )
-def engram_add_cornerstone(
-    tag: str,
-    title: str,
-    new_frame: str,
+def engram_add_cornerstone(payload_json: str) -> str:
+    """Record an identity-forming cornerstone — a reframing pivot that durably
+    restructured how I operate (qu_0202, cj_0043, dv_0412).
+
+    Single-payload signature (wave 2c-ii of ob_1499 — see issue #55): pass
+    ALL fields as one JSON object string in `payload_json`.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            tag (str, required): Clustering primitive — short axis label.
+            title (str, required): One-line display title; used as the claim text.
+            new_frame (str, required): The frame that replaced the prior one.
+            prior_frame (str, optional): What I operated under before.
+            triggering_experience (str, optional): Narrative of the experience that caused the reframe.
+            supporting_ids (str, optional): Comma-separated IDs of supporting nodes.
+
+    Returns:
+        JSON with the new cornerstone node ID and linked supporting nodes.
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _add_cornerstone_impl for full semantics.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _ADD_CORNERSTONE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ADD_CORNERSTONE_FIELDS)}"
+        })
+
+    return _add_cornerstone_impl(**params)
+
+
+def _add_cornerstone_impl(
+    tag: str = "",
+    title: str = "",
+    new_frame: str = "",
     prior_frame: str = "",
     triggering_experience: str = "",
     supporting_ids: str = "",
 ) -> str:
-    """Record an identity-forming cornerstone — a reframing pivot that durably
+    """Internal implementation — see engram_add_cornerstone MCP tool for the
+    public payload schema. Kept callable with named kwargs for in-server callers.
+
+    Record an identity-forming cornerstone — a reframing pivot that durably
     restructured how I operate (qu_0202, cj_0043, dv_0412).
 
     A cornerstone captures the SHAPE of growth: prior_frame (what I operated
@@ -6914,6 +7021,13 @@ def engram_add_cornerstone(
     Returns:
         JSON with the new cornerstone node ID and linked supporting nodes.
     """
+    if not tag or not tag.strip():
+        return json.dumps({"error": "tag is required and cannot be empty."})
+    if not title or not title.strip():
+        return json.dumps({"error": "title is required and cannot be empty."})
+    if not new_frame or not new_frame.strip():
+        return json.dumps({"error": "new_frame is required and cannot be empty."})
+
     conn = _get_db()
     try:
         node_id = _next_id(conn, "cornerstone")
@@ -7642,6 +7756,12 @@ def _update_incident_index(lesson_id: str, lesson_claim: str,
         pass  # Best-effort; never block lesson creation
 
 
+_ADD_LESSON_FIELDS = frozenset({
+    "claim", "incident_ids", "scaffolding_nudge", "logical_chain",
+    "reasoning_type", "context_ids",
+})
+
+
 @mcp.tool(
     name="engram_add_lesson",
     annotations={
@@ -7652,15 +7772,57 @@ def _update_incident_index(lesson_id: str, lesson_claim: str,
         "openWorldHint": False,
     },
 )
-def engram_add_lesson(
-    claim: str,
-    incident_ids: str,
-    scaffolding_nudge: str,
-    logical_chain: str,
+def engram_add_lesson(payload_json: str) -> str:
+    """Create a lesson node derived from one or more error incident observations.
+
+    Single-payload signature (wave 2c-ii of ob_1499 — see issue #55): pass
+    ALL fields as one JSON object string in `payload_json`.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            claim (str, required): The abstract corrective pattern.
+            incident_ids (str, required): Comma-separated observation IDs of incidents.
+            scaffolding_nudge (str, required): The action-focused prompt injected when tripwire fires.
+            logical_chain (str, required): How the incidents lead to this lesson.
+            reasoning_type (str, optional): Default 'inductive_generalization'.
+            context_ids (str, optional): Comma-separated node IDs for context references.
+
+    Returns:
+        JSON with lesson ID, confidence, linked incidents, and similar
+        existing lessons for consolidation hints. On payload-parsing failure,
+        returns {"error": "..."}.
+
+    See _add_lesson_impl for full semantics.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _ADD_LESSON_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ADD_LESSON_FIELDS)}"
+        })
+
+    return _add_lesson_impl(**params)
+
+
+def _add_lesson_impl(
+    claim: str = "",
+    incident_ids: str = "",
+    scaffolding_nudge: str = "",
+    logical_chain: str = "",
     reasoning_type: str = "inductive_generalization",
     context_ids: str = "",
 ) -> str:
-    """Create a lesson node derived from one or more error incident observations.
+    """Internal implementation — see engram_add_lesson MCP tool for the public
+    payload schema. Kept callable with named kwargs for in-server callers.
+
+    Create a lesson node derived from one or more error incident observations.
 
     Lessons are the abstract corrective pattern extracted from concrete error
     incidents. They follow the implementation intention format (Gollwitzer
@@ -7706,6 +7868,14 @@ def engram_add_lesson(
         JSON with lesson ID, confidence, linked incidents, and similar existing
         lessons for consolidation hints.
     """
+    if not claim or not claim.strip():
+        return json.dumps({"error": "claim is required and cannot be empty."})
+    if not incident_ids or not incident_ids.strip():
+        return json.dumps({"error": "incident_ids is required and cannot be empty."})
+    if not scaffolding_nudge or not scaffolding_nudge.strip():
+        return json.dumps({"error": "scaffolding_nudge is required and cannot be empty."})
+    if not logical_chain or not logical_chain.strip():
+        return json.dumps({"error": "logical_chain is required and cannot be empty."})
     if reasoning_type and reasoning_type not in REASONING_TYPES:
         return json.dumps({
             "error": f"Invalid reasoning_type '{reasoning_type}'.",
@@ -8095,6 +8265,11 @@ TASK_IMPORTANCE = {
 }
 
 
+_ADD_TASK_FIELDS = frozenset({
+    "description", "goal_id", "implements_ids", "parent_task_id", "scope",
+})
+
+
 @mcp.tool(
     name="engram_add_task",
     annotations={
@@ -8105,14 +8280,54 @@ TASK_IMPORTANCE = {
         "openWorldHint": False,
     },
 )
-def engram_add_task(
-    description: str,
+def engram_add_task(payload_json: str) -> str:
+    """Create an actionable task that decomposes a goal into concrete work.
+
+    Single-payload signature (wave 2c-ii of ob_1499 — see issue #55): pass
+    ALL fields as one JSON object string in `payload_json`.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            description (str, required): What needs to be done — concrete and actionable.
+            goal_id (str, optional): The goal this task serves. Creates 'serves' edge.
+            implements_ids (str, optional): Comma-separated conjecture or question IDs this task addresses.
+            parent_task_id (str, optional): Parent task ID for subtasks.
+            scope (str, optional): "milestone" or "routine" (default).
+
+    Returns:
+        JSON with the new task node ID. On payload-parsing failure,
+        returns {"error": "..."}.
+
+    See _add_task_impl for full semantics.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _ADD_TASK_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ADD_TASK_FIELDS)}"
+        })
+
+    return _add_task_impl(**params)
+
+
+def _add_task_impl(
+    description: str = "",
     goal_id: str = "",
     implements_ids: str = "",
     parent_task_id: str = "",
     scope: str = "routine",
 ) -> str:
-    """Create an actionable task that decomposes a goal into concrete work.
+    """Internal implementation — see engram_add_task MCP tool for the public
+    payload schema. Kept callable with named kwargs for in-server callers.
+
+    Create an actionable task that decomposes a goal into concrete work.
 
     Tasks are the lightweight actionable wrapper in the goal → conjecture →
     task → observation chain. They track WHAT to do and its status, while
@@ -8142,6 +8357,8 @@ def engram_add_task(
     Returns:
         JSON with the new task node ID.
     """
+    if not description or not description.strip():
+        return json.dumps({"error": "description is required and cannot be empty."})
     if scope not in ("milestone", "routine"):
         return json.dumps({"error": f"Invalid scope '{scope}'. Must be 'milestone' or 'routine'."})
 

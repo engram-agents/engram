@@ -216,7 +216,7 @@ def test_stale_load_bearing_surfaces_high_importance_low_recall():
 
 def test_stale_load_bearing_excludes_cornerstones():
     server = fresh_server()
-    cs_result = json.loads(server.engram_add_cornerstone(
+    cs_result = json.loads(server._add_cornerstone_impl(
         tag="test_cornerstone",
         title="Test Cornerstone",
         new_frame="Cornerstones are anchored against forgetting by design.",

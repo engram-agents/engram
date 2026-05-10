@@ -140,13 +140,21 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_add_person": {
-        "description": "Record a person the agent knows. Person nodes are relational (non-claim-bearing, no confidence, importance-anchored). Facts about a person should be stored as user_stated observations linked to the person node.",
+        "description": "Record a person the agent knows. Person nodes are relational (non-claim-bearing, no confidence, importance-anchored). Facts about a person should be stored as user_stated observations linked to the person node. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: name, role.",
         "parameters": {
-            "name": {"type": "string", "description": "The person's name.", "required": True},
-            "role": {"type": "string", "description": "Their role or relationship to the agent.", "required": True},
-            "description": {"type": "string", "description": "Background, expertise, personality traits."},
-            "aliases": {"type": "string", "description": "Comma-separated alternative names or identifiers."},
-            "context_ids": {"type": "string", "description": "Optional comma-separated node IDs for context."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with person fields. Required: name (the person's name), role (their role or relationship to the agent). Optional: description (background, expertise, traits), aliases (comma-separated alternative names), context_ids (comma-separated node IDs cited), is_self (bool — mark as self-anchor; only one allowed).", "required": True},
+        },
+    },
+    "engram_add_cornerstone": {
+        "description": "Record an identity-forming cornerstone — a reframing pivot that durably restructured how the agent operates. Non-claim-bearing self-report node, importance-anchored. Tags cluster cornerstones into islands along a shared axis. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: tag, title, new_frame.",
+        "parameters": {
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with cornerstone fields. Required: tag (clustering primitive — short axis label), title (one-line display title; used as claim text), new_frame (the frame that replaced the prior one). Optional: prior_frame (what was operating before; omit for inaugural), triggering_experience (narrative of the experience that caused the reframe), supporting_ids (comma-separated IDs of supporting nodes — feelings, observations, derivations, prior cornerstones).", "required": True},
+        },
+    },
+    "engram_add_lesson": {
+        "description": "Create a lesson node derived from one or more error incident observations. Lessons are abstract corrective patterns extracted from incidents (Gollwitzer-style implementation intentions). Claim-bearing, importance-anchored. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: claim, incident_ids, scaffolding_nudge, logical_chain.",
+        "parameters": {
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with lesson fields. Required: claim (the abstract corrective pattern — action-focused), incident_ids (comma-separated observation IDs of concrete error incidents), scaffolding_nudge (the action-focused prompt injected when the tripwire fires), logical_chain (how incidents lead to this lesson). Optional: reasoning_type (default 'inductive_generalization'), context_ids (comma-separated node IDs cited).", "required": True},
         },
     },
     "engram_goal_tension": {
@@ -165,13 +173,9 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_add_task": {
-        "description": "Create an actionable task that decomposes a goal into concrete work. Tasks are non-claim-bearing lightweight wrappers — conjectures hold the design content, tasks track what to do. Importance is dynamic: active (2.5), planned (2.0), done-milestone (1.5), done-routine (0.5).",
+        "description": "Create an actionable task that decomposes a goal into concrete work. Tasks are non-claim-bearing lightweight wrappers — conjectures hold the design content, tasks track what to do. Importance is dynamic: active (2.5), planned (2.0), done-milestone (1.5), done-routine (0.5). Single-payload signature — pass all fields as one JSON object string in payload_json. Required: description.",
         "parameters": {
-            "description": {"type": "string", "description": "What needs to be done — concrete and actionable.", "required": True},
-            "goal_id": {"type": "string", "description": "The goal this task serves (gl_XXXX). Creates a 'serves' edge."},
-            "implements_ids": {"type": "string", "description": "Comma-separated conjecture or question IDs this task addresses."},
-            "parent_task_id": {"type": "string", "description": "If this is a subtask, the parent task ID (tk_XXXX). Parent auto-promoted to milestone."},
-            "scope": {"type": "string", "description": "'milestone' or 'routine' (default). Milestones retain higher importance after completion."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with task fields. Required: description (what needs to be done — concrete and actionable). Optional: goal_id (the goal this task serves, gl_XXXX, creates 'serves' edge), implements_ids (comma-separated conjecture or question IDs this task addresses), parent_task_id (parent task ID for subtasks, tk_XXXX; parent auto-promoted to milestone), scope ('milestone' or 'routine' default).", "required": True},
         },
     },
     "engram_update_task": {

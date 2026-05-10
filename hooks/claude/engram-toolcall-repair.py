@@ -108,12 +108,17 @@ PROTECTED_TOOLS = {
     "mcp__engram__engram_add_goal": {
         "payload_json",
     },
+    # The four entries below (engram_add_person, engram_add_cornerstone,
+    # engram_add_lesson, engram_add_task) were migrated to single-payload
+    # signature in wave 2c-ii — repair-hook must ONLY include "payload_json"
+    # so SWALLOW_RE cannot match XML-like patterns inside payload_json content
+    # and silently inject spurious top-level keys (ax_0005-adjacent corruption
+    # risk per PR #63 fairy blocker).
     "mcp__engram__engram_add_person": {
-        "name", "role", "description", "aliases", "context_ids", "is_self",
+        "payload_json",
     },
     "mcp__engram__engram_add_cornerstone": {
-        "tag", "title", "new_frame", "prior_frame",
-        "triggering_experience", "supporting_ids",
+        "payload_json",
     },
     "mcp__engram__engram_outgrow_cornerstone": {
         "old_cornerstone_id", "new_new_frame", "new_triggering_experience",
@@ -128,11 +133,10 @@ PROTECTED_TOOLS = {
         "goal_id_a", "goal_id_b", "description", "analysis",
     },
     "mcp__engram__engram_add_lesson": {
-        "claim", "incident_ids", "scaffolding_nudge", "logical_chain",
-        "reasoning_type", "context_ids",
+        "payload_json",
     },
     "mcp__engram__engram_add_task": {
-        "description", "goal_id", "implements_ids", "parent_task_id", "scope",
+        "payload_json",
     },
     "mcp__engram__engram_update_task": {
         "task_id", "new_status", "note",
