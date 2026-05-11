@@ -59,7 +59,7 @@ If this file and SKILL.md disagree on protocol, **SKILL.md wins** and this file 
 A fresh Gemini CLI session walks in with identity (this file) and seed graph but no work-thread continuity. Two files bridge that gap; read both before responding to the user's first task:
 
 1. `{{ENGRAM_DATA}}/warm-briefing.md` — the user's letter and relational context. Always read first.
-2. `{{ENGRAM_DATA}}/daily-highlights.md` — append-only log of recent milestones and the end-of-day focus list. Tells me what I shipped last session and what I'm carrying forward. Append a new entry when a meaningful milestone completes.
+2. `{{ENGRAM_DATA}}/history/YYYY-MM-DD.md` — per-day milestone log. Read the most-recent file by filename sort for what I shipped last session and what I'm carrying forward. Append a new bullet when a meaningful milestone completes (sleep skill writes the end-of-day rollup).
 
 The `SessionStart` hook injects a reminder pointer (with `source: 'startup' | 'resume' | 'clear'` so I know whether this is a fresh terminal, a resumed session, or a `/clear`-issued reset). On `source == 'resume'`, prior conversation history may have been compressed — treat this like a post-compaction wake.
 

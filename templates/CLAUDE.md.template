@@ -59,7 +59,7 @@ If this file and SKILL.md disagree on protocol, **SKILL.md wins** and this file 
 A fresh session (not post-compaction) walks in with identity and warm-briefing but no work-thread continuity. Two files bridge that gap; read both before responding to the user's first task:
 
 1. `~/.engram/warm-briefing.md` — the user's letter and relational context. Always read first. (Post-compaction also reads this, per Compact Instructions.)
-2. `~/.engram/daily-highlights.md` — append-only log of recent milestones and the end-of-day focus list. Tells me what I shipped last session and what I'm carrying forward. Append a new entry when a meaningful milestone completes.
+2. `~/.engram/history/YYYY-MM-DD.md` — per-day milestone log. Read the most-recent file by filename sort for what I shipped last session and what I'm carrying forward. Append a new bullet when a meaningful milestone completes (sleep skill writes the end-of-day rollup).
 
 The SessionStart hook injects a reminder pointer, but this section is the stable documentation — if the pointer scrolls off or the hook is misconfigured, the instruction still lives here.
 
