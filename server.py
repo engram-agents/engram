@@ -11702,11 +11702,16 @@ def engram_list(
 # judgment to the ranked candidates. Three presets bundle (cosine_threshold,
 # top_k, min_confidence) for the precision/recall tradeoff.
 #
-# v0.1 ships ONE pattern (contradiction_obsolescence_ready) end-to-end and
-# the framework + telemetry harness; further patterns from the design doc
-# (active-work/engram-query-pattern-design-2026-05-06.md) can land
-# additively. Each call appends to ~/.engram/pattern_query_telemetry.jsonl
-# for empirical preset calibration per ls_0023's discipline.
+# PR #29 (merged 2026-05-07) shipped all six patterns from the design doc
+# (active-work/engram-query-pattern-design-2026-05-06.md): open_question_answerable,
+# contradiction_obsolescence_ready, stale_load_bearing, cornerstone_candidate,
+# tainted_still_valid, recent_resolution_echo. Three presets (high_precision /
+# balanced / high_recall) bundle the precision/recall tradeoff; balanced
+# defaults are v4-calibrated 2026-05-09 (kg/paper_research/threshold_calibration_2026-05-09).
+# Each call appends to ~/.engram/pattern_query_telemetry.jsonl for empirical
+# preset calibration per ls_0023's discipline. Dream-fairy agent definition
+# updated 2026-05-11 to use these as the primary surface for the six
+# well-supported scan categories (one-to-one pattern↔category mapping).
 
 PATTERN_QUERY_PRESETS: dict[str, dict[str, float | int]] = {
     # "balanced" cosine_threshold v4-calibrated 2026-05-09 (see calibration

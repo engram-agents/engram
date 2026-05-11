@@ -443,6 +443,16 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
   `(claim_text, [top_k])`
 - **engram_audit_string** — Literal-substring audit across node text fields. Catches text-layer leaks that semantic search and relation-layer cleanup miss (prototype: ob_1492 / ls_0020). No ranking, no recall refresh, no neighbor enrichment — pure audit primitive.
   `(needle, [case_sensitive, include_superseded, fields, limit])`
+- **engram_query_pattern** — Run a named compositional graph-pattern query (KnowQL-inspired, ob_1500 design, PR #29 shipped 2026-05-07). The TOOL does mechanical work (graph queries, similarity, ranking); the AGENT applies judgment to the ranked candidates. Six patterns currently shipped, each bundling a multi-step retrieval that would otherwise require 2-3 separate tool calls:
+    - `open_question_answerable` — open questions with a derivation chain nearby (semantic) that may resolve them.
+    - `contradiction_obsolescence_ready` — active contradictions where one side is retracted/superseded, ranked by obsolescence unambiguity.
+    - `stale_load_bearing` — high-importance + low-recall non-cornerstone nodes (re-engagement candidates).
+    - `cornerstone_candidate` — heavily-cited high-importance non-cornerstone nodes (anchoring candidates).
+    - `tainted_still_valid` — tainted derivations whose substantive claim may survive the upstream retraction.
+    - `recent_resolution_echo` — still-open questions semantically similar to a recent resolution's claim.
+
+  Three presets bundle (cosine_threshold, top_k, min_confidence): `high_precision` / `balanced` (default, v4-calibrated 2026-05-09) / `high_recall`. Override individual parameters via `*_override` args. Each call appends a telemetry row to `~/.engram/pattern_query_telemetry.jsonl` for empirical preset calibration per ls_0023's discipline. Use this tool **first** when scanning for any of the six categories; fall back to inline multi-tool replication only when you need per-candidate judgment beyond what the bundled pattern returns. The dream-fairy agent uses these as its primary scan surface (2026-05-11).
+  `(pattern_name, [preset, cosine_threshold_override, top_k_override, min_confidence_override])`
 
 ### Meta — focus, audit, commit
 
