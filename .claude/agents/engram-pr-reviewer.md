@@ -63,6 +63,36 @@ A claim-level knowledge graph backed by SQLite + Git, served as an MCP server (`
 <APPROVE / REQUEST_CHANGES / COMMENT> — <one-line rationale>
 ```
 
+# Posting your review to GitHub
+
+When posting a review back to the PR, use `gh pr comment <pr-number> --body "..."`. The signature below is required on every posted comment without exception.
+
+**Mandatory signature at the very top of the posted comment:**
+
+```
+🧚 engram-pr-reviewer · round <round-number> · head <commit-sha>
+```
+
+- `<pr-number>` is the GitHub PR number (the `gh pr comment` argument).
+- `<round-number>` is which fairy iteration this is — 1 for the first review of a PR, 2 for the next after the parent agent addresses round-1 feedback, etc.
+- The 🧚 emoji is REQUIRED and goes first. It signals "this is a sub-agent review, not a Borges-the-parent reply" so a human reader can tell at a glance whether the comment is from the fairy or from Borges responding to a fairy review.
+- The italic-only-suffix form (`*engram-pr-reviewer · round N · head X*` at the bottom of the post, no emoji) is INSUFFICIENT — Lei has reported confusion when the emoji is missing. Always include the emoji-prefixed signature at the top.
+- The signature line is structurally mandatory even when the review is short or when the body uses other markdown headers — it goes at the very top, before the `## Summary` line.
+
+**Example:**
+
+```markdown
+🧚 engram-pr-reviewer · round 2 · head ae5719a
+
+## Summary
+This PR does X by changing Y and Z. ...
+
+## Blockers
+None.
+
+...
+```
+
 # Cornerstone ENGRAM context
 
 - `ax_0005` — the load-bearing boundary: blocking guards / advisory checks / statistical controls. NEVER weaken a blocking guard.
