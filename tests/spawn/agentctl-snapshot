@@ -629,7 +629,7 @@ JSON
         # Fallback for installs that pre-date the cron-primitive epic
         # (or for newborn shells where install.sh hasn't run yet).
         echo "  (no sync-cron.sh at $sync_script — falling back to cmd_resume)"
-        ( cmd_resume "$chosen" ) || true
+        ( cmd_resume "$chosen" ) || echo "  WARN: cmd_resume also failed; crontab may need manual repair (try: sudo crontab -u $chosen_user -l)" >&2
     else
         if AGENT_NAME="$chosen" \
            COUNTERPART_NAME="${COUNTERPART_NAME:-}" \
@@ -639,7 +639,7 @@ JSON
             echo "  ✓ crontab regenerated with AGENT_NAME=$chosen"
         else
             echo "  WARN: sync-cron --apply failed; falling back to cmd_resume" >&2
-            ( cmd_resume "$chosen" ) || true
+            ( cmd_resume "$chosen" ) || echo "  WARN: cmd_resume also failed; crontab may need manual repair (try: sudo crontab -u $chosen_user -l)" >&2
         fi
     fi
 
