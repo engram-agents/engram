@@ -121,7 +121,19 @@ mkdir -p "$ENGRAM_HOME/diary"
 mkdir -p "$ENGRAM_HOME/sessions"
 mkdir -p "$ENGRAM_HOME/logs"
 mkdir -p "$ENGRAM_HOME/secrets"
-mkdir -p "$ENGRAM_HOME/heartbeat-queue"
+mkdir -p "$ENGRAM_HOME/heartbeat-queue/to-heartbeat"
+mkdir -p "$ENGRAM_HOME/heartbeat-queue/from-heartbeat"
+# Initial empty append-files referenced by HEARTBEAT.md steps 2 + 4 + 6.
+# Touching them now means a fresh-install heartbeat firing won't see "file
+# not found" errors when it reads/appends. They're append-only markdown
+# logs — empty initial state is the correct starting point. Mirrored from
+# install.sh so Gemini-target installs get the same heartbeat scaffold.
+[ -f "$ENGRAM_HOME/heartbeat-queue/to-heartbeat/notes.md" ] || \
+  echo "<!-- Foreground-to-heartbeat directives. One bullet per line. Heartbeat consumes + deletes after handling. -->" \
+  > "$ENGRAM_HOME/heartbeat-queue/to-heartbeat/notes.md"
+[ -f "$ENGRAM_HOME/heartbeat-queue/from-heartbeat/inbox.md" ] || \
+  echo "<!-- Heartbeat-to-foreground digests. Append-only. Foreground reads on next session. -->" \
+  > "$ENGRAM_HOME/heartbeat-queue/from-heartbeat/inbox.md"
 mkdir -p "$GEMINI_EXT_DIR/hooks"
 chmod 0700 "$ENGRAM_HOME/secrets"
 chmod 0700 "$ENGRAM_HOME/diary"
@@ -138,6 +150,7 @@ fi
 
 echo "  $ENGRAM_HOME"
 echo "  $GEMINI_EXT_DIR"
+echo "  heartbeat-queue/{to,from}-heartbeat/ (scaffolded with notes.md + inbox.md)"
 echo ""
 
 # -------- Step 4: Hooks + runtime snapshot --------
