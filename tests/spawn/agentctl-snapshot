@@ -548,10 +548,13 @@ cmd_finalize_name() {
     echo
 
     # Pause the newborn's crons so nothing mid-run during the rename.
-    # (cmd_pause is idempotent — safe even if heartbeat lines aren't
-    # established yet.)
+    # cmd_pause is idempotent in spirit — but it `exit 1`s when there's
+    # no crontab to pause (e.g., post-spawn before install.sh wires cron,
+    # or after install.sh --no-cron). Subshell-wrap so its exit doesn't
+    # kill the finalize. The "no crontab" case is the expected newborn
+    # state and should be a silent no-op.
     echo "Step 1: pausing newborn crons..."
-    cmd_pause "$newborn_tag" || true
+    ( cmd_pause "$newborn_tag" ) || true
 
     # Substrate rename: usermod + groupmod + home dir move.
     echo "Step 2: usermod -l + -d -m + groupmod -n..."
@@ -626,7 +629,7 @@ JSON
         # Fallback for installs that pre-date the cron-primitive epic
         # (or for newborn shells where install.sh hasn't run yet).
         echo "  (no sync-cron.sh at $sync_script — falling back to cmd_resume)"
-        cmd_resume "$chosen" || true
+        ( cmd_resume "$chosen" ) || true
     else
         if AGENT_NAME="$chosen" \
            COUNTERPART_NAME="${COUNTERPART_NAME:-}" \
@@ -636,7 +639,7 @@ JSON
             echo "  ✓ crontab regenerated with AGENT_NAME=$chosen"
         else
             echo "  WARN: sync-cron --apply failed; falling back to cmd_resume" >&2
-            cmd_resume "$chosen" || true
+            ( cmd_resume "$chosen" ) || true
         fi
     fi
 

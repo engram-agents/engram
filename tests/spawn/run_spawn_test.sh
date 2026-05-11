@@ -101,7 +101,12 @@ assert_file "$NEWBORN_HOME/.bashrc"
 assert_dir "$NEWBORN_HOME/.runtime"
 assert_file "$NEWBORN_HOME/.runtime/start.sh"
 assert_file "$NEWBORN_HOME/.runtime/install.sh"
-echo "  ✓ newborn is in 'agents' group: $(id -nG "$NEWBORN_USER" | grep -qw agents && echo yes || echo NO)"
+if id -nG "$NEWBORN_USER" | grep -qw agents; then
+    echo "  ✓ newborn is in 'agents' group"
+else
+    echo "FAIL: newborn '$NEWBORN_USER' is not in 'agents' group" >&2
+    exit 2
+fi
 
 # ---------------------------------------------------------------------
 # Phase 2: install.sh as the newborn
