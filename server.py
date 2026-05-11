@@ -11613,38 +11613,156 @@ def engram_list(
     status: str = "",
     sort_by: str = "id",
     limit: int = 100,
+    filters_json: str = "",
+    fields_json: str = "",
+    unlimited: bool = False,
 ) -> str:
-    """List nodes in a compact triage format — no neighbor data, no full content.
+    """List nodes — single-field shorthand OR full structured filter.
 
-    Designed for bulk review: question triage, observation audits, graph
-    overview. Returns ID, claim (truncated), status, confidence, recall
-    count, and age. Much lighter than engram_query or engram_inspect.
+    Two modes, mutually exclusive:
+
+    Single-field mode (default, backward compat): pass node_type and/or
+    status as plain strings. Returns the compact triage shape with claim
+    truncated to 130 chars.
+
+    Structured-filter mode (issue #81): pass filters_json with a recursive
+    condition tree. Supports multi-field AND/OR/NOT composition, text
+    contains, ID-range, date-range, NULL handling, and cross-table
+    cites/cited_by virtual fields. Optional fields_json projects only the
+    listed columns.
 
     Does NOT refresh memory on any node (read-only scan, no side effects).
 
+    Filter grammar (one recursive rule):
+        Condition := Atomic | Compound
+        Atomic    := {"field": str, "op": <atomic_op>, "value": <val>}
+        Compound  := {"logic": "AND" | "OR" | "NOT", "conditions": [Condition, ...]}
+
+    Top-level shorthand: a bare list is implicit AND. Nested lists must be
+    wrapped with `logic` explicitly. Max nesting depth 8.
+
+    Atomic operators:
+        eq, ne, gt, gte, lt, lte         — equality/comparison
+        in, not_in                       — value-in-list (value: list)
+        between                          — inclusive range (value: [low, high])
+        contains, starts_with, ends_with — text match (case-insensitive by default;
+                                           opt-in case_sensitive: true)
+        is_null, is_not_null             — NULL checks (no value)
+
+    Virtual fields (cross-table edges lookup, ops: eq/ne/in/not_in):
+        cites: <id>     — this node has an outgoing cites/supports/derives_from edge to <id>
+        cited_by: <id>  — this node is cited by <id> (incoming edge)
+
+    Atomic field whitelist: id, type, claim, created_at, evidence_id,
+        quoted_text, interpretation, quote_type, status, confidence,
+        importance_score, recall_count, memory_status, source_url,
+        source_title, source_date, reported_state, trigger_text,
+        categorical_tag, intensity_hint, and other node-table columns.
+        Unknown field → error with the full valid-fields list.
+
+    Example payload (yesterday's wiki-PR batch-verification use case):
+        filters_json = json.dumps({
+            "logic": "AND",
+            "conditions": [
+                {"field": "type", "op": "eq", "value": "observation_factual"},
+                {"field": "evidence_id", "op": "eq", "value": "ev_0014"},
+                {"field": "id", "op": "between", "value": ["ob_0043", "ob_0046"]},
+                {"field": "quoted_text", "op": "contains", "value": "thoughtful"}
+            ]
+        })
+        fields_json = '["id", "claim", "evidence_id"]'
+
     Args:
-        node_type: Filter by node type (e.g. 'question', 'observation_factual',
-            'conjecture', 'derivation'). Empty = all types.
-        status: Filter by status (e.g. 'open', 'resolved', 'active',
-            'partially_resolved'). Empty = all statuses.
+        node_type: Single-field filter by node type. Empty = all types.
+            Conflicts with a 'type' field in filters_json (errors loudly).
+        status: Single-field filter by status. Empty = all statuses.
+            Conflicts with a 'status' field in filters_json (errors loudly).
         sort_by: Sort order — 'id' (default), 'created' (newest first),
             'importance' (highest first), 'recalls' (most recalled first).
-        limit: Maximum results (default 100, max 500).
+        limit: Cap on rows returned. Default 100. Set to 0 for a metadata-
+            only response (total_matched without rows). Ignored if
+            unlimited=True. Hard ceiling 500 in single-field mode (legacy);
+            no ceiling in structured-filter mode (rely on filter narrowing).
+        filters_json: JSON-encoded condition tree. A dict (Compound or
+            Atomic) or list (implicit AND shorthand at top level). Empty
+            string = use single-field mode.
+        fields_json: JSON-encoded list of column names to project.
+            Empty = return the default compact triage shape.
+        unlimited: If True, return all matched rows regardless of limit.
+            Mutually exclusive with limit > 0 (set limit=0 and unlimited=True
+            for the same effect, or just unlimited=True).
+
+    Returns JSON:
+        {status, total_matched, shown, truncated, sort_by, nodes,
+         mode: "single_field" | "structured"}
     """
-    conn = _get_db()
-    limit = max(1, min(limit, 500))
+    from engram_filter import (
+        FilterError,
+        parse_filters,
+        validate_fields,
+        contains_field,
+    )
 
-    conditions = ["is_current = 1"]
+    structured_mode = bool(filters_json) or bool(fields_json)
+
+    # Parse + validate structured-filter inputs up front so errors are
+    # reported before any DB work.
+    filter_sql_frag: str = ""
+    filter_params: list = []
+    projected_fields: list[str] = []
+
+    if filters_json:
+        try:
+            filters_obj = json.loads(filters_json)
+        except json.JSONDecodeError as e:
+            return json.dumps({"status": "error", "error": f"filters_json: invalid JSON — {e}"})
+        try:
+            filter_sql_frag, filter_params = parse_filters(filters_obj)
+        except FilterError as e:
+            return json.dumps({"status": "error", "error": str(e)})
+
+        # Conflict check: if filters_json includes a 'type' or 'status' atomic
+        # AND the caller also set the legacy kwarg, refuse rather than merge.
+        # (Per issue #81 Item 11.) The recursive walk via contains_field is
+        # more precise than a textual scan: it inspects condition fields only,
+        # avoiding false positives where a value happens to equal "type" or
+        # "status" (e.g., {"field": "claim", "op": "contains", "value": "type"}).
+        if node_type and contains_field(filters_obj, "type"):
+            return json.dumps({
+                "status": "error",
+                "error": "conflict: 'node_type' kwarg AND a 'type' field in filters_json are both set. Use one or the other."
+            })
+        if status and contains_field(filters_obj, "status"):
+            return json.dumps({
+                "status": "error",
+                "error": "conflict: 'status' kwarg AND a 'status' field in filters_json are both set. Use one or the other."
+            })
+
+    if fields_json:
+        try:
+            fields_obj = json.loads(fields_json)
+        except json.JSONDecodeError as e:
+            return json.dumps({"status": "error", "error": f"fields_json: invalid JSON — {e}"})
+        try:
+            projected_fields = validate_fields(fields_obj)
+        except FilterError as e:
+            return json.dumps({"status": "error", "error": str(e)})
+
+    # Build WHERE clause. `is_current = 1` is always applied (current-revision
+    # only is the contract for engram_list).
+    where_parts: list[str] = ["is_current = 1"]
     params: list = []
-
     if node_type:
-        conditions.append("type = ?")
+        where_parts.append("type = ?")
         params.append(node_type)
     if status:
-        conditions.append("status = ?")
+        where_parts.append("status = ?")
         params.append(status)
+    if filter_sql_frag:
+        where_parts.append(filter_sql_frag)
+        params.extend(filter_params)
 
-    where = " AND ".join(conditions)
+    where = " AND ".join(where_parts)
 
     sort_map = {
         "id": "id ASC",
@@ -11654,43 +11772,103 @@ def engram_list(
     }
     order = sort_map.get(sort_by, "id ASC")
 
-    rows = conn.execute(
-        f"SELECT id, type, claim, status, confidence, recall_count, "
-        f"importance_score, created_at, memory_status "
-        f"FROM nodes WHERE {where} ORDER BY {order} LIMIT ?",
-        params + [limit],
-    ).fetchall()
+    # Limit semantics (per issue #81 + Lei's state-table refinement):
+    #   unlimited=True OR limit=None  → no cap
+    #   limit == 0                    → count-only (no rows fetched)
+    #   limit > 0                     → cap at that int
+    #   limit < 0                     → reject as malformed
+    if limit is not None and limit < 0:
+        return json.dumps({"status": "error", "error": "limit must be >= 0 or unlimited=True"})
 
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM nodes WHERE {where}",
-        params,
-    ).fetchone()[0]
+    if unlimited:
+        effective_limit = None  # SQL "LIMIT -1" returns all rows; we'll just omit LIMIT
+    elif limit == 0:
+        effective_limit = 0  # count-only
+    elif structured_mode:
+        # No hard ceiling in structured-filter mode — caller has the precision
+        # they need via filters. The default 100 still applies if they didn't
+        # touch limit. Otherwise honor whatever they passed.
+        effective_limit = limit
+    else:
+        # Legacy single-field-mode ceiling of 500.
+        effective_limit = max(1, min(limit, 500))
+
+    # Compute total_matched regardless of effective_limit.
+    total = _conn_total_count(where, params)
+
+    # Determine columns to fetch.
+    if projected_fields:
+        # Always include 'id' so callers can correlate even if they didn't
+        # ask for it; preserves order otherwise.
+        cols_to_fetch = ["id"] + [f for f in projected_fields if f != "id"]
+        select_cols = ", ".join(f'"{c}"' for c in cols_to_fetch)
+    else:
+        # Default compact triage shape (unchanged from legacy single-field mode).
+        cols_to_fetch = [
+            "id", "type", "claim", "status", "confidence", "recall_count",
+            "importance_score", "created_at", "memory_status",
+        ]
+        select_cols = ", ".join(f'"{c}"' for c in cols_to_fetch)
+
+    if effective_limit == 0:
+        rows: list = []
+    else:
+        conn = _get_db()
+        query = f"SELECT {select_cols} FROM nodes WHERE {where} ORDER BY {order}"
+        if effective_limit is not None:
+            query += " LIMIT ?"
+            rows = conn.execute(query, params + [effective_limit]).fetchall()
+        else:
+            rows = conn.execute(query, params).fetchall()
 
     entries = []
-    for row in rows:
-        nid, ntype, claim, st, conf, recalls, imp, created, mem_st = row
-        claim_trunc = (claim[:130] + "...") if claim and len(claim) > 130 else (claim or "")
-        entry = {
-            "id": nid,
-            "type": ntype,
-            "claim": claim_trunc,
-            "status": st,
-            "recall_count": recalls,
-            "created": created[:10] if created else None,
-        }
-        if conf is not None:
-            entry["confidence"] = round(conf, 3)
-        entries.append(entry)
+    if projected_fields:
+        # Custom projection: return raw column values keyed by name.
+        for row in rows:
+            entry = dict(zip(cols_to_fetch, row))
+            entries.append(entry)
+    else:
+        # Default compact triage shape (matches legacy output).
+        for row in rows:
+            nid, ntype, claim, st, conf, recalls, imp, created, mem_st = row
+            claim_trunc = (claim[:130] + "...") if claim and len(claim) > 130 else (claim or "")
+            entry = {
+                "id": nid,
+                "type": ntype,
+                "claim": claim_trunc,
+                "status": st,
+                "recall_count": recalls,
+                "created": created[:10] if created else None,
+            }
+            if conf is not None:
+                entry["confidence"] = round(conf, 3)
+            entries.append(entry)
 
-    return json.dumps({
+    truncated_count = (total - len(entries)) if total > len(entries) else 0
+
+    response = {
         "status": "ok",
+        "total_matched": total,
+        # total_matching kept as alias for backward compat with any callers
+        # that read the legacy field name.
         "total_matching": total,
         "shown": len(entries),
-        "truncated": total - len(entries) if total > len(entries) else 0,
+        "truncated": truncated_count,
         "sort_by": sort_by,
-        "filters": {"type": node_type or "all", "status": status or "all"},
+        "mode": "structured" if structured_mode else "single_field",
         "nodes": entries,
-    })
+    }
+    # Legacy single-field mode also reports the resolved filters in the old
+    # shape for backward compat with any callers that read that field.
+    if not structured_mode:
+        response["filters"] = {"type": node_type or "all", "status": status or "all"}
+    return json.dumps(response)
+
+
+def _conn_total_count(where_clause: str, params: list) -> int:
+    """Run COUNT(*) for the given WHERE clause. Helper for engram_list."""
+    conn = _get_db()
+    return conn.execute(f"SELECT COUNT(*) FROM nodes WHERE {where_clause}", params).fetchone()[0]
 
 
 # ---------------------------------------------------------------------------

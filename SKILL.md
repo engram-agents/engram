@@ -437,8 +437,9 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
   `(node_id, [dream_mode])`
 - **engram_get_subgraph** — N-hop chain around a node.
   `(node_id, [depth, direction])`
-- **engram_list** — Enumerate by type or status.
-  `([node_type, status, sort_by, limit])`
+- **engram_list** — Enumerate by single-field shorthand OR structured filter.
+  `([node_type, status, sort_by, limit, filters_json, fields_json, unlimited])`
+  Single-field mode is the legacy shorthand (pass `node_type` and/or `status`). Structured mode (issue #81, ships 2026-05-11) takes a recursive condition tree via `filters_json` and supports multi-field AND/OR/NOT composition, text-contains, ID-range, date-range, NULL handling, and cross-table `cites`/`cited_by` virtual fields (V1: cites/supports/derives_from edges). Grammar: `Atomic={field,op,value}` | `Compound={logic,conditions}` — top-level list = implicit AND. Operators: eq/ne/gt/gte/lt/lte/in/not_in/contains/starts_with/ends_with/between/is_null/is_not_null. `limit=0` = count-only; `unlimited=True` = no cap. Return shape always populates `total_matched` so truncation is never silent.
 - **engram_check_similar** — Standalone dedup probe before writing.
   `(claim_text, [top_k])`
 - **engram_audit_string** — Literal-substring audit across node text fields. Catches text-layer leaks that semantic search and relation-layer cleanup miss (prototype: ob_1492 / ls_0020). No ranking, no recall refresh, no neighbor enrichment — pure audit primitive.
