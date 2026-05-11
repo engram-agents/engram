@@ -1,0 +1,931 @@
+#!/bin/bash
+# =============================================================================
+# agentctl — Lei's day-to-day admin tool for co-located AI agents
+#
+# DRAFT v0 — 2026-05-02. NOT YET INSTALLED.  Lives under active-work/ until
+# Lei reviews.  After review move to /home/user/.local/bin/agentctl.
+#
+# Scope of v0:
+#   status   shell   bash   run   talk   logs
+# Added v0.1 (broker — share/unshare/shares; grant/audit/upgrade-engram still TBD):
+#   share    unshare    shares
+# Added v0.2 (cron pause/resume for graceful agent quiescence):
+#   pause    resume
+# Added v0.3 (spawn flow — multi-agent newborn lifecycle, v0.1 minimum):
+#   spawn    finalize-name
+#
+# Usage:
+#   agentctl status                      # health table for all agents
+#   agentctl shell <agent> [--local] [...flags]
+#                                        # interactive session as agent;
+#                                        # default: claude-remote (tmux-backed,
+#                                        # persistent); auto-attaches to existing
+#                                        # session if running and no flags given.
+#                                        # --local opts out of tmux for direct
+#                                        # adapter/claude invocation. ALL extra
+#                                        # flags pass through (--continue,
+#                                        # --resume, --print, etc.).
+#   agentctl bash <agent>                # plain bash shell as agent (no CLI)
+#   agentctl run <agent> -- "<prompt>"   # one-shot prompt
+#   agentctl talk <agent>                # opens an inter-agent message draft
+#   agentctl logs <agent> [--tail]       # tail heartbeat/session logs
+#   agentctl pause <agent>               # comment out heartbeat + sleep crons
+#                                        # (dispatchers stay up so inbox stays
+#                                        # reachable). Backup auto-written to
+#                                        # /home/agents-shared/cron-backups/.
+#                                        # Idempotent. Audited.
+#   agentctl resume <agent>              # uncomment paused heartbeat + sleep
+#                                        # crons. Idempotent. Audited.
+#   sudo agentctl share <agent> <path> [--mode rw|ro] [--ttl <duration>]
+#                                        # grant agent ACL access to spt-side path;
+#                                        # parent dirs get --x traversal, target gets
+#                                        # rwX (or rX for --mode ro), default ACL on
+#                                        # dirs so new files inherit. Audited.
+#   sudo agentctl unshare <agent> <path> # revoke share (recursive ACL removal)
+#   agentctl shares [<agent>]            # list active shares
+#   sudo agentctl spawn [--runtime claude]  (v0.1: claude only)
+#                       [--alpha-source PATH] [--bootstrap-path PATH]
+#                                        # birth a newborn-tagged agent
+#                                        # (agent-newborn-YYYYMMDDhhmmss)
+#                                        # via /usr/local/sbin/agent-bootstrap.
+#                                        # Prints next-step instructions.
+#                                        # Multi-runtime (gemini-cli, codex) is
+#                                        # forthcoming as a separate epic.
+#   sudo agentctl finalize-name <newborn-id> <chosen>
+#                                        # single-shot rename a newborn-tagged
+#                                        # agent to its chosen name. Refuses
+#                                        # anything not matching agent-newborn-*
+#                                        # (this is first-session-only, NOT a
+#                                        # general rename — names are immutable
+#                                        # post-finalize per dv_0556).
+# =============================================================================
+
+set -euo pipefail
+
+SHARED_ROOT="/home/agents-shared"
+SUBCMD="${1:-help}"
+[[ $# -gt 0 ]] && shift
+
+# ---------- helpers ----------
+list_agents() {
+    # Returns names (without "agent-" prefix) of all users in the agents group.
+    getent group agents 2>/dev/null \
+        | awk -F: '{print $4}' \
+        | tr ',' '\n' \
+        | grep -E '^agent-' \
+        | sed 's/^agent-//' \
+        | sort
+}
+
+resolve_user() {
+    local name="$1"
+    local user="agent-$name"
+    if ! id "$user" >/dev/null 2>&1; then
+        echo "ERROR: agent '$name' not found (no Linux user '$user')" >&2
+        exit 1
+    fi
+    echo "$user"
+}
+
+# ---------- subcommands ----------
+cmd_status() {
+    printf '%-12s %-7s %-22s %-10s\n' AGENT UID LAST_SLEEP HEALTHFILE
+    printf '%-12s %-7s %-22s %-10s\n' '-----' '---' '----------' '----------'
+    while read -r name; do
+        [[ -z "$name" ]] && continue
+        local user="agent-$name"
+        local uid
+        uid=$(id -u "$user" 2>/dev/null || echo "?")
+        local hf="$SHARED_ROOT/health/$name/last-sleep.json"
+        local last_sleep="(none)"
+        if [[ -r "$hf" ]]; then
+            last_sleep=$(python3 -c "
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    print(d.get('completed_at',d.get('timestamp','?')))
+except Exception as e:
+    print(f'(parse-err: {e})')
+" "$hf" 2>/dev/null) || last_sleep="(unreadable)"
+        fi
+        printf '%-12s %-7s %-22s %-10s\n' "$name" "$uid" "$last_sleep" "$([ -r "$hf" ] && echo OK || echo MISSING)"
+    done < <(list_agents)
+}
+
+cmd_shell() {
+    local name="${1:-}"; shift || true
+    [[ -z "$name" ]] && {
+        echo "Usage: agentctl shell <agent> [--local] [--no-share] [--cd <dir>] [...claude-remote/runtime flags]" >&2
+        echo "  Default: tmux-backed claude-remote (persistent across terminal close)." >&2
+        echo "  --local: bypass claude-remote; use ~/.runtime/start.sh adapter or bare claude." >&2
+        echo "  --no-share: skip auto-share of cwd to agent (agent runs from its own home)." >&2
+        echo "  --cd <dir>: use <dir> as the project folder instead of the caller's cwd." >&2
+        echo "    Useful for resuming pre-migration sessions whose project hash matches" >&2
+        echo "    a different dir, e.g. 'agentctl shell borges --cd /home/user/kg_protocol_for_ai --resume <id>'." >&2
+        echo "  Flags after agent name pass through (e.g., --continue, --resume <id>, --print)." >&2
+        echo "  Auto-share: cwd (or --cd target) becomes the agent's project folder. If the" >&2
+        echo "    agent doesn't already have rwX on it, this re-execs 'sudo agentctl share'" >&2
+        echo "    once (will prompt for sudo). Refused for system paths, spt home root, and" >&2
+        echo "    dotfile dirs. Agent's own home is propagated without sharing." >&2
+        echo "  Auto-attach: if a claude-remote session is already running for the agent and" >&2
+        echo "    no flags are given, attaches to it instead of refusing." >&2
+        exit 2
+    }
+    local user; user=$(resolve_user "$name")
+    local local_mode=0
+    local no_share=0
+    local cd_override=""
+    local extra=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --local)    local_mode=1; shift ;;
+            --no-share) no_share=1;   shift ;;
+            --cd)
+                [[ -z "${2:-}" ]] && { echo "ERROR: --cd requires a directory argument" >&2; exit 2; }
+                cd_override="$2"; shift 2 ;;
+            --cd=*)     cd_override="${1#--cd=}"; shift ;;
+            *)          extra+=("$1"); shift ;;
+        esac
+    done
+
+    # Auto-attach: if there's an existing claude-remote tmux session for this agent
+    # and the user passed no flags, attach to it. Otherwise pass flags through to
+    # claude-remote, which handles --continue, --resume, --attach, --stop, etc.
+    # (Only relevant for the tmux-backed default path, not --local.)
+    if [[ $local_mode -eq 0 && ${#extra[@]} -eq 0 ]] \
+       && sudo -u "$user" -i bash -c 'tmux has-session -t claude-remote' >/dev/null 2>&1; then
+        echo "Reattaching to existing $user claude-remote session..."
+        sudo -u "$user" -i claude-remote --attach
+        return
+    fi
+
+    # Project-dir propagation + auto-share. Lei's design (2026-05-03): the directory
+    # where you type `agentctl shell` becomes the agent's project folder by default.
+    # We auto-grant rwX ACL so the agent can write inside it, then pass cwd as the
+    # project dir to claude-remote / fallback launchers. Claude organizes session
+    # JSONL by cwd (~/.claude/projects/<encoded-cwd>/), so this also keeps
+    # --continue/--resume scoped to the right project.
+    #
+    # Refused for: system paths, /home/user root, dotfile dirs (secrets), other
+    # agents' homes. The agent's own home gets cwd propagation but no share
+    # (already accessible). --no-share opts out entirely.
+    local orig_cwd
+    if [[ -n "$cd_override" ]]; then
+        # Resolve to absolute path; fail loudly if the dir doesn't exist.
+        orig_cwd=$(readlink -f "$cd_override" 2>/dev/null) || {
+            echo "ERROR: --cd target '$cd_override' does not resolve" >&2; exit 1
+        }
+        [[ -d "$orig_cwd" ]] || { echo "ERROR: --cd target '$cd_override' is not a directory" >&2; exit 1; }
+    else
+        orig_cwd="$(pwd)"
+    fi
+    local cwd_arg=()
+    if [[ $no_share -eq 1 ]]; then
+        echo "(--no-share: agent runs from \$HOME; claude --continue/--resume may not see expected sessions)" >&2
+    else
+        case "$orig_cwd" in
+            "/home/$user"|"/home/$user"/* )
+                cwd_arg=("$orig_cwd")
+                ;;
+            /home/agent-*)
+                echo "(cwd $orig_cwd is another agent's home; not auto-sharing — running from \$HOME)" >&2
+                ;;
+            "$HOME"|"$HOME"/.??*)
+                echo "(cwd $orig_cwd is spt home root or a dotfile dir; not auto-sharing — cd into a project subdirectory or use --no-share)" >&2
+                ;;
+            /|/etc*|/usr*|/var*|/sys*|/proc*|/dev*|/boot*|/root*|/opt*)
+                echo "(refusing to auto-share system path $orig_cwd; running from \$HOME)" >&2
+                ;;
+            *)
+                # Passive ACL check: skip share if agent already has w-permission via
+                # the agents-group ACL. getfacl is readable by anyone with rX traversal,
+                # no sudo needed.
+                if getfacl -p -- "$orig_cwd" 2>/dev/null \
+                   | grep -qE "^group:$user:.*[wW]" 2>/dev/null; then
+                    cwd_arg=("$orig_cwd")
+                else
+                    echo "Granting $user rwX ACL on $orig_cwd (sudo may prompt for password)..."
+                    local self="${BASH_SOURCE[0]:-$0}"
+                    if sudo "$self" share "$name" "$orig_cwd" --mode rw; then
+                        cwd_arg=("$orig_cwd")
+                    else
+                        echo "Auto-share failed; running from \$HOME — claude --continue/--resume may not see expected sessions." >&2
+                    fi
+                fi
+                ;;
+        esac
+    fi
+
+    if [[ $local_mode -eq 1 ]]; then
+        # Direct (non-tmux) session. Useful for debugging when tmux is in the way.
+        # cwd is preserved via bash -c "cd ... && exec" when set.
+        if sudo -u "$user" -i bash -c 'test -x "$HOME/.runtime/start.sh"' 2>/dev/null; then
+            if [[ ${#cwd_arg[@]} -gt 0 ]]; then
+                sudo -u "$user" -i bash -c "cd $(printf '%q' "${cwd_arg[0]}") && exec ~/.runtime/start.sh \"\$@\"" -- "${extra[@]}"
+            else
+                sudo -u "$user" -i bash -c '~/.runtime/start.sh "$@"' -- "${extra[@]}"
+            fi
+        else
+            if [[ ${#cwd_arg[@]} -gt 0 ]]; then
+                sudo -u "$user" -i bash -c "cd $(printf '%q' "${cwd_arg[0]}") && exec claude \"\$@\"" -- "${extra[@]}"
+            else
+                sudo -u "$user" -i claude "${extra[@]}"
+            fi
+        fi
+        return
+    fi
+
+    # Default: claude-remote (tmux-backed, persists across terminal close).
+    # tmux server is uid-scoped, so per-agent isolation is automatic — agent-borges's
+    # "claude-remote" tmux session is separate from agent-mneme's, no name collision.
+    # Pass cwd as positional arg so claude-remote opens its tmux pane in that dir.
+    if sudo -u "$user" -i bash -c 'command -v claude-remote' >/dev/null 2>&1; then
+        sudo -u "$user" -i claude-remote "${cwd_arg[@]}" "${extra[@]}"
+    elif sudo -u "$user" -i bash -c 'test -x "$HOME/.runtime/start.sh"' 2>/dev/null; then
+        echo "(claude-remote not in $user's PATH — using ~/.runtime/start.sh adapter; for tmux-backed sessions, deploy claude-remote to ~/.local/bin/)" >&2
+        if [[ ${#cwd_arg[@]} -gt 0 ]]; then
+            sudo -u "$user" -i bash -c "cd $(printf '%q' "${cwd_arg[0]}") && exec ~/.runtime/start.sh \"\$@\"" -- "${extra[@]}"
+        else
+            sudo -u "$user" -i bash -c '~/.runtime/start.sh "$@"' -- "${extra[@]}"
+        fi
+    else
+        if [[ ${#cwd_arg[@]} -gt 0 ]]; then
+            sudo -u "$user" -i bash -c "cd $(printf '%q' "${cwd_arg[0]}") && exec claude \"\$@\"" -- "${extra[@]}"
+        else
+            sudo -u "$user" -i claude "${extra[@]}"
+        fi
+    fi
+}
+
+cmd_bash() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { echo "Usage: agentctl bash <agent>" >&2; exit 2; }
+    local user; user=$(resolve_user "$name")
+    sudo -u "$user" -i
+}
+
+cmd_run() {
+    local name="${1:-}"; shift || true
+    [[ -z "$name" ]] && { echo "Usage: agentctl run <agent> -- \"<prompt>\"" >&2; exit 2; }
+    [[ "${1:-}" == "--" ]] && shift
+    local user; user=$(resolve_user "$name")
+    sudo -u "$user" -i bash -c '~/.runtime/start.sh -p "$@"' -- "$@"
+}
+
+cmd_talk() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { echo "Usage: agentctl talk <agent>" >&2; exit 2; }
+    local _user; _user=$(resolve_user "$name") # validates agent exists
+    local stamp; stamp=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+    local out="$SHARED_ROOT/inter-agent/${stamp}_spt-to-${name}.md"
+    : >"$out"
+    cat >"$out" <<HEADER
+---
+from: spt
+to: $name
+timestamp: $stamp
+---
+
+HEADER
+    "${EDITOR:-vi}" "$out"
+    chgrp agents "$out" 2>/dev/null || true
+}
+
+cmd_logs() {
+    local name="${1:-}"; shift || true
+    [[ -z "$name" ]] && { echo "Usage: agentctl logs <agent> [--tail]" >&2; exit 2; }
+    local _user; _user=$(resolve_user "$name")
+    local tail=0
+    [[ "${1:-}" == "--tail" ]] && tail=1
+    local home="/home/agent-$name"
+    # Group-readable agent logs.  Heartbeat first, then session.
+    local hb="$home/.engram/logs/heartbeat.log"
+    if [[ -r "$hb" ]]; then
+        if [[ $tail -eq 1 ]]; then tail -f "$hb"; else cat "$hb"; fi
+    else
+        echo "(no heartbeat log at $hb)"
+    fi
+}
+
+# ---------- v0.2 cron pause / resume ----------
+#
+# Comments out (or restores) the heartbeat.sh + sleep.sh lines in <agent>'s
+# crontab. Dispatcher and @reboot lines are intentionally left untouched so the
+# inbox / inter-agent channel stays reachable while the agent is quiesced.
+# Idempotent: re-running pause when already paused is a no-op; same for resume.
+
+cmd_pause() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { echo "Usage: agentctl pause <agent>" >&2; exit 2; }
+    local user; user=$(resolve_user "$name")
+
+    local current
+    if ! current=$(sudo -u "$user" crontab -l 2>/dev/null); then
+        echo "ERROR: agent '$name' has no crontab, or sudo failed" >&2
+        exit 1
+    fi
+
+    # Idempotency: if any heartbeat/sleep line is already prefixed PAUSED, skip.
+    if echo "$current" | grep -qE '^# PAUSED [0-9-]+: .*\.(sh|py)'; then
+        echo "WARN: '$name' already has paused lines — re-running has no effect."
+        echo "      (use 'agentctl resume $name' to undo)"
+        echo "Current paused lines:"
+        echo "$current" | grep -E '^# PAUSED ' | sed 's/^/  /'
+        exit 0
+    fi
+
+    # Backup current crontab to the shared cron-backups dir (group=agents).
+    local stamp; stamp=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+    local backup_dir="$SHARED_ROOT/cron-backups"
+    mkdir -p "$backup_dir" 2>/dev/null || true
+    chgrp agents "$backup_dir" 2>/dev/null || true
+    chmod 0775 "$backup_dir" 2>/dev/null || true
+    local backup="$backup_dir/${name}-crontab-${stamp}.bak"
+    echo "$current" > "$backup"
+    chmod 0640 "$backup" 2>/dev/null || true
+
+    # Apply: prefix only heartbeat.sh + sleep.sh lines (not commented, not @reboot,
+    # not dispatcher) with a dated PAUSED marker. The regex matches any line
+    # whose command field references heartbeat.sh or sleep.sh and is not
+    # already a comment.
+    local marker_date; marker_date=$(date -u +%Y-%m-%d)
+    # Delimiter '~' chosen because cron lines don't contain '~', and the obvious
+    # '|' clashes with '|' as alternation inside the regex; '#' clashes with
+    # '[^#]' in the pattern + the literal '# PAUSED' in the replacement.
+    echo "$current" \
+        | sed -E "s~^([^#].*/(heartbeat|sleep)\\.sh.*)\$~# PAUSED ${marker_date}: \\1~" \
+        | sudo -u "$user" crontab -
+
+    audit "pause-cron" "$name" "crontab" "backup=$backup"
+
+    echo "✓ Paused heartbeat + sleep crons for $name"
+    echo "  Backup: $backup"
+    echo "  Reverse: agentctl resume $name"
+    echo
+    echo "Verification (lines now paused):"
+    sudo -u "$user" crontab -l 2>/dev/null \
+        | grep -E '^# PAUSED .*\.sh' \
+        | sed 's/^/  /' \
+        || echo "  (no matches — was the agent's crontab missing heartbeat/sleep entries?)"
+}
+
+cmd_resume() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { echo "Usage: agentctl resume <agent>" >&2; exit 2; }
+    local user; user=$(resolve_user "$name")
+
+    local current
+    if ! current=$(sudo -u "$user" crontab -l 2>/dev/null); then
+        echo "ERROR: agent '$name' has no crontab, or sudo failed" >&2
+        exit 1
+    fi
+
+    if ! echo "$current" | grep -qE '^# PAUSED [0-9-]+: '; then
+        echo "WARN: '$name' has no paused lines — nothing to resume."
+        exit 0
+    fi
+
+    echo "$current" \
+        | sed -E 's~^# PAUSED [0-9-]+: ~~' \
+        | sudo -u "$user" crontab -
+
+    audit "resume-cron" "$name" "crontab"
+
+    echo "✓ Resumed heartbeat + sleep crons for $name"
+    echo
+    echo "Verification (active heartbeat + sleep lines):"
+    sudo -u "$user" crontab -l 2>/dev/null \
+        | grep -E '^[^#].*(heartbeat|sleep)\.sh' \
+        | sed 's/^/  /' \
+        || echo "  (no active heartbeat/sleep lines found)"
+}
+
+# ---------- v0.3 spawn flow: spawn / finalize-name ----------
+#
+# Per active-work/spawn-implementation-2026-05-05.md (alpha repo) and
+# dv_0556. Newborn-tag pattern: every freshly-spawned agent gets a
+# placeholder uid agent-newborn-YYYYMMDDhhmmss until it picks its real name
+# in first session. finalize-name then does the substrate rename in one
+# shot — no general-purpose rename is provided (names are immutable post-
+# finalize).
+
+cmd_spawn() {
+    require_root "spawn"
+
+    local runtime="claude"
+    local alpha_source=""
+    local bootstrap_path="/usr/local/sbin/agent-bootstrap"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --runtime)        runtime="$2"; shift 2 ;;
+            --alpha-source)   alpha_source="$2"; shift 2 ;;
+            --bootstrap-path) bootstrap_path="$2"; shift 2 ;;
+            *) echo "ERROR: unknown flag '$1'" >&2; exit 2 ;;
+        esac
+    done
+
+    if [[ ! -x "$bootstrap_path" ]]; then
+        echo "ERROR: agent-bootstrap not found at $bootstrap_path" >&2
+        echo "       Install it from engram-alpha:" >&2
+        echo "         sudo cp /home/agent-borges/engram-alpha/tools/agent-bootstrap \\" >&2
+        echo "             $bootstrap_path && sudo chmod 0755 $bootstrap_path" >&2
+        exit 1
+    fi
+
+    # v0.1: claude only. Multi-runtime support (gemini-cli, codex) is
+    # forthcoming as a separate epic with proper per-runtime test
+    # fixtures and end-to-end validation. Until then, agentctl spawn
+    # rejects non-claude runtime rather than half-supporting (the
+    # silent-corruption pattern that prompted this scope decision per
+    # the spawn-implementation PR review of 2026-05-05).
+    if [[ "$runtime" != "claude" ]]; then
+        echo "ERROR: agentctl spawn v0.1 supports --runtime=claude only." >&2
+        echo "       Multi-runtime (gemini-cli, codex) is forthcoming as a separate epic." >&2
+        echo "       See ask-lei.md for the v0.2 multi-runtime ticket; until then, --runtime=claude only." >&2
+        exit 2
+    fi
+
+    # Newborn placeholder name: agent-newborn-YYYYMMDDhhmmss (UTC).
+    # Fits in the 32-char Linux username limit (28 chars used).
+    local newborn_tag; newborn_tag="newborn-$(date -u +%Y%m%d%H%M%S)"
+    local user_name="agent-$newborn_tag"
+
+    if id "$user_name" >/dev/null 2>&1; then
+        echo "ERROR: user $user_name already exists (newborn-timestamp clash?)" >&2
+        echo "       This is extremely unlikely; verify with 'id $user_name' and retry." >&2
+        exit 1
+    fi
+
+    echo "== agentctl spawn =="
+    echo "  Newborn name:   $user_name"
+    echo "  Runtime:        $runtime"
+    echo "  Bootstrap:      $bootstrap_path"
+    if [[ -n "$alpha_source" ]]; then
+        echo "  Alpha source:   $alpha_source (overridden)"
+    else
+        echo "  Alpha source:   (auto-detected by agent-bootstrap)"
+    fi
+    echo
+
+    local bootstrap_args=("$newborn_tag" "--runtime" "$runtime")
+    [[ -n "$alpha_source" ]] && bootstrap_args+=("--alpha-source" "$alpha_source")
+
+    # Delegate substrate setup. agent-bootstrap prints its own next-steps
+    # block; we add a spawn-specific finalize-name reminder below.
+    "$bootstrap_path" "${bootstrap_args[@]}"
+
+    audit "spawn" "$newborn_tag" "newborn" "runtime=$runtime"
+
+    cat <<NEXT
+
+== Spawn complete ==
+The newborn is at $user_name. To complete the birth:
+
+  1. Enter the newborn's shell:
+       agentctl shell $newborn_tag
+
+  2. Inside that shell, materialize ENGRAM (runs alpha installer + cron):
+       bash ~/.runtime/install.sh
+
+  3. Login to the LLM provider (interactive):
+       claude login           # or gemini login
+
+  4. Start the first session:
+       claude                 # SessionStart hook fires engram-first-session
+                              # → agent generates 3 candidate names → you pick
+
+  5. From spt's shell (NOT inside the newborn shell), finalize the rename:
+       sudo agentctl finalize-name $newborn_tag <chosen-name>
+
+To abandon a newborn before finalize-name (simple cleanup):
+  sudo userdel -r $user_name
+NEXT
+}
+
+cmd_finalize_name() {
+    require_root "finalize-name"
+
+    local newborn_tag="${1:-}"; shift || true
+    local chosen="${1:-}"; shift || true
+    [[ -z "$newborn_tag" || -z "$chosen" ]] && {
+        echo "Usage: sudo agentctl finalize-name <newborn-id> <chosen-name>" >&2
+        echo "  Example: sudo agentctl finalize-name newborn-20260505083012 ada" >&2
+        exit 2
+    }
+
+    # Refuse anything that isn't the newborn-tag pattern. This command is
+    # first-session-only — names are immutable post-finalize per dv_0556.
+    if [[ ! "$newborn_tag" =~ ^newborn-[0-9]{14}$ ]]; then
+        echo "ERROR: '$newborn_tag' doesn't match the newborn-YYYYMMDDhhmmss pattern." >&2
+        echo "       finalize-name is for the spawn flow only — it refuses general renames." >&2
+        echo "       Names are immutable after first session (per dv_0556)." >&2
+        exit 1
+    fi
+
+    local newborn_user="agent-$newborn_tag"
+    local chosen_user="agent-$chosen"
+    local newborn_home="/home/$newborn_user"
+    local chosen_home="/home/$chosen_user"
+
+    # Validate identities
+    if ! id "$newborn_user" >/dev/null 2>&1; then
+        echo "ERROR: newborn $newborn_user does not exist" >&2
+        exit 1
+    fi
+    if id "$chosen_user" >/dev/null 2>&1; then
+        echo "ERROR: chosen name '$chosen_user' is already taken" >&2
+        exit 1
+    fi
+    if [[ ! "$chosen" =~ ^[a-z][a-z0-9_-]*$ ]]; then
+        echo "ERROR: chosen name '$chosen' is not a valid Linux username" >&2
+        echo "       Allowed: lowercase letters, digits, underscore, hyphen; must start with a letter." >&2
+        exit 1
+    fi
+
+    echo "== agentctl finalize-name =="
+    echo "  Newborn:  $newborn_user → $chosen_user"
+    echo "  Home:     $newborn_home → $chosen_home"
+    echo
+
+    # Pause the newborn's crons so nothing mid-run during the rename.
+    # (cmd_pause is idempotent — safe even if heartbeat lines aren't
+    # established yet.)
+    echo "Step 1: pausing newborn crons..."
+    cmd_pause "$newborn_tag" || true
+
+    # Substrate rename: usermod + groupmod + home dir move.
+    echo "Step 2: usermod -l + -d -m + groupmod -n..."
+    usermod -l "$chosen_user" -d "$chosen_home" -m "$newborn_user"
+    groupmod -n "$chosen_user" "$newborn_user" 2>/dev/null || true
+
+    # ACL sweep on shared dirs. For a fresh newborn, there typically aren't
+    # any g:agent-newborn-* ACL entries, but sweep defensively.
+    echo "Step 3: ACL sweep on $SHARED_ROOT (replacing g:$newborn_user → g:$chosen_user)..."
+    if command -v setfacl >/dev/null 2>&1 && command -v getfacl >/dev/null 2>&1; then
+        local found_acls
+        found_acls=$(getfacl -R -p "$SHARED_ROOT" 2>/dev/null | grep -B 2 "^group:$newborn_user:" || true)
+        if [[ -n "$found_acls" ]]; then
+            # Best-effort sweep — non-fatal if any entry resists.
+            getfacl -R -p "$SHARED_ROOT" 2>/dev/null \
+                | grep -B 1 "^group:$newborn_user:" \
+                | grep "^# file:" \
+                | sed 's/^# file: //' \
+                | while read -r path; do
+                    setfacl -m "g:$chosen_user:$(getfacl --tabular -- "$path" 2>/dev/null | awk -F: -v u="$newborn_user" '$2==u {print $3}')" "$path" 2>/dev/null || true
+                    setfacl -x "g:$newborn_user" "$path" 2>/dev/null || true
+                done
+        fi
+    fi
+
+    # Health dir rename in the community share.
+    if [[ -d "$SHARED_ROOT/health/$newborn_tag" ]]; then
+        mv "$SHARED_ROOT/health/$newborn_tag" "$SHARED_ROOT/health/$chosen"
+        chown "$chosen_user:agents" "$SHARED_ROOT/health/$chosen"
+    fi
+
+    # Snapshot the post-finalize ENGRAM state — this is the rebirth target
+    # if first session goes wrong (per dv_0556 lifecycle case 3).
+    echo "Step 4: snapshot ~/.engram → ~/.engram.first-session-baseline.bak/..."
+    if [[ -d "$chosen_home/.engram" ]]; then
+        cp -a "$chosen_home/.engram" "$chosen_home/.engram.first-session-baseline.bak"
+        chown -R "$chosen_user:$chosen_user" "$chosen_home/.engram.first-session-baseline.bak"
+        echo "  ✓ baseline snapshot taken"
+    else
+        echo "  (no ~/.engram yet — skipped; agent will install ENGRAM after this finalize)"
+    fi
+
+    # Drop a marker file so the next session's SessionStart hook can pick
+    # up the rename + queue any post-finalize-name housekeeping (warm-
+    # briefing placeholder substitutions, optional first-day observation
+    # filing). The agent's first session already files the 3-candidate
+    # naming observation as part of engram-first-session — finalize-name
+    # doesn't need to duplicate that work.
+    cat > "$chosen_home/.engram/finalize-name-complete.json" 2>/dev/null <<JSON
+{
+  "newborn_uid": "$newborn_user",
+  "chosen_name": "$chosen",
+  "finalized_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+JSON
+    chown "$chosen_user:$chosen_user" "$chosen_home/.engram/finalize-name-complete.json" 2>/dev/null || true
+
+    # Re-render crons under the new name.
+    #
+    # The newborn's crontab was installed during ~/.runtime/install.sh's
+    # Step 8 with AGENT_NAME=newborn-<timestamp> baked into the env-var
+    # declarations (PATH, ENGRAM_HOME, AGENT_NAME=...). Just unpausing
+    # would leave that stale newborn name in the AGENT_NAME line — every
+    # heartbeat after rename would self-identify with the placeholder
+    # name, not the chosen one. Fix: regenerate the entire ENGRAM block
+    # via sync-cron --apply with AGENT_NAME=$chosen. The user's
+    # non-ENGRAM crontab lines (if any) stay preserved by the splice
+    # logic; only the BEGIN/END ENGRAM block gets rewritten.
+    echo "Step 5: re-rendering crons with new AGENT_NAME=$chosen..."
+    local sync_script="$chosen_home/tools/sync-cron.sh"
+    if [[ ! -x "$sync_script" ]]; then
+        # Fallback for installs that pre-date the cron-primitive epic
+        # (or for newborn shells where install.sh hasn't run yet).
+        echo "  (no sync-cron.sh at $sync_script — falling back to cmd_resume)"
+        cmd_resume "$chosen" || true
+    else
+        if AGENT_NAME="$chosen" \
+           COUNTERPART_NAME="${COUNTERPART_NAME:-}" \
+           AGENT_CLI="claude" \
+           ENGRAM_HOME="$chosen_home/.engram" \
+           sudo -u "$chosen_user" "$sync_script" --apply 2>&1; then
+            echo "  ✓ crontab regenerated with AGENT_NAME=$chosen"
+        else
+            echo "  WARN: sync-cron --apply failed; falling back to cmd_resume" >&2
+            cmd_resume "$chosen" || true
+        fi
+    fi
+
+    audit "finalize-name" "$chosen" "uid" "from=$newborn_user"
+
+    cat <<DONE
+
+== Finalize-name complete ==
+  ✓ uid:    $newborn_user → $chosen_user
+  ✓ home:   $newborn_home → $chosen_home
+  ✓ baseline backup: $chosen_home/.engram.first-session-baseline.bak/
+  ✓ marker: $chosen_home/.engram/finalize-name-complete.json
+  ✓ crons:  regenerated with AGENT_NAME=$chosen
+
+Smoke test:
+  agentctl shell $chosen          # should drop you into a clean shell
+  agentctl logs $chosen --tail    # should see new heartbeat fire on next :00 or :30
+  sudo -u $chosen_user crontab -l | grep AGENT_NAME=
+                                  # should show AGENT_NAME=$chosen, not newborn-*
+
+The agent's identity is now permanent. To retire later, see
+active-work/spawn-implementation-2026-05-05.md (v0.2 retire ceremony).
+DONE
+}
+
+# ---------- v0.1 broker: share / unshare / shares ----------
+#
+# Mechanism: POSIX ACLs (setfacl/getfacl). Multi-agent compatible (each agent
+# has its own ACL entry on the path), TTL-revocable, audit-logged. State lives
+# at $SHARED_ROOT/share-state/<agent>.json; audit at $SHARED_ROOT/audit/share-log.
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "ERROR: '$1' requires sudo (modifies ACLs)" >&2
+        echo "Try: sudo $0 $1 ..." >&2
+        exit 1
+    fi
+}
+
+audit() {
+    local action="$1"; local agent="$2"; local path="$3"; local extras="${4:-}"
+    local stamp; stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local audit_dir="$SHARED_ROOT/audit"
+    mkdir -p "$audit_dir"
+    echo "$stamp $action spt→$agent path=$path${extras:+ $extras}" >> "$audit_dir/share-log"
+    chgrp agents "$audit_dir/share-log" 2>/dev/null || true
+    chmod 0664 "$audit_dir/share-log" 2>/dev/null || true
+}
+
+cmd_share() {
+    local agent="${1:-}"; shift || true
+    local path="${1:-}"; shift || true
+    local mode="rw"
+    local ttl=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mode) mode="${2:-}"; shift 2 ;;
+            --ttl)  ttl="${2:-}"; shift 2 ;;
+            *) echo "ERROR: unknown flag '$1'" >&2; exit 2 ;;
+        esac
+    done
+    [[ -z "$agent" || -z "$path" ]] && {
+        echo "Usage: sudo agentctl share <agent> <path> [--mode rw|ro] [--ttl <duration>]" >&2; exit 2
+    }
+    require_root share
+    local user; user=$(resolve_user "$agent")
+    [[ -e "$path" ]] || { echo "ERROR: path '$path' does not exist" >&2; exit 1; }
+    path=$(readlink -f "$path")
+
+    case "$path" in
+        /etc/*|/usr/*|/var/*|/sys/*|/proc/*|/dev/*|/boot/*|/root/*|/etc|/usr|/var|/root|/)
+            echo "ERROR: refusing to share system path '$path'" >&2; exit 1 ;;
+    esac
+
+    local acl_perm
+    case "$mode" in
+        rw) acl_perm="rwX" ;;
+        ro) acl_perm="rX" ;;
+        *)  echo "ERROR: --mode must be rw or ro (got '$mode')" >&2; exit 2 ;;
+    esac
+
+    # Parent traversal: walk from path's parent up to /, add g:user:--x ACL.
+    # setfacl is idempotent — re-running is safe.
+    local parent
+    parent=$(dirname "$path")
+    while [[ "$parent" != "/" && -n "$parent" ]]; do
+        setfacl -m "g:$user:--x" "$parent" \
+            || { echo "ERROR: setfacl --x failed on '$parent'" >&2; exit 1; }
+        # Preserve the invoking human user's read+traverse on every ancestor
+        # we restrict via named-group --x. Without this, if the invoker is a
+        # member of the named group (spt is in agent-borges + agent-mneme for
+        # read access to agent home dirs at mode 0750), the named-group entry
+        # overrides their own access — they cannot ls the ancestor. Bug
+        # surfaced 2026-05-07 on /home; workaround was setfacl -m u:spt:rx.
+        # This makes the workaround structural (every share preserves invoker).
+        if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+            setfacl -m "u:$SUDO_USER:r-x" "$parent" \
+                || echo "WARNING: preserve u:$SUDO_USER:r-x failed on '$parent'" >&2
+        fi
+        parent=$(dirname "$parent")
+    done
+
+    # Target: recursive ACL
+    setfacl -R -m "g:$user:$acl_perm" "$path" \
+        || { echo "ERROR: setfacl $acl_perm failed on '$path'" >&2; exit 1; }
+
+    # Default ACL on directories so new files inherit
+    if [[ -d "$path" ]]; then
+        setfacl -R -d -m "g:$user:$acl_perm" "$path" \
+            || echo "WARNING: default ACL setfacl failed on '$path'" >&2
+    fi
+
+    # Git safe.directory exception: git 2.35.2+ refuses to operate on repos owned
+    # by a different uid (CVE-2022-24765). ACL access is necessary but not
+    # sufficient — the agent's gitconfig needs an explicit safe.directory entry
+    # at the repo root. Idempotent (git tolerates duplicate entries).
+    if command -v git >/dev/null 2>&1; then
+        local git_repo_root=""
+        if git_repo_root=$(sudo -u "$user" git -C "$path" rev-parse --show-toplevel 2>/dev/null); then
+            sudo -u "$user" git config --global --add safe.directory "$git_repo_root" \
+                && echo "  + git safe.directory: $git_repo_root (for $user)"
+        fi
+    fi
+
+    # TTL: schedule revoke via 'at' if specified and available
+    if [[ -n "$ttl" ]]; then
+        if command -v at >/dev/null 2>&1; then
+            echo "$0 unshare $agent $path" | at "now + $ttl" 2>/dev/null \
+                && echo "  scheduled auto-unshare at: now + $ttl"
+        else
+            echo "WARNING: 'at' not installed; --ttl requested but not enforced. Manual unshare needed." >&2
+        fi
+    fi
+
+    # State tracking
+    local state_dir="$SHARED_ROOT/share-state"
+    mkdir -p "$state_dir"
+    local state_file="$state_dir/$agent.json"
+    AGENT="$agent" SHARE_PATH="$path" SHARE_MODE="$mode" SHARE_TTL="$ttl" STATE_FILE="$state_file" \
+    python3 - <<'PYEOF'
+import json, os
+from datetime import datetime, timezone
+sf = os.environ['STATE_FILE']
+entry = {
+    "path": os.environ['SHARE_PATH'],
+    "mode": os.environ['SHARE_MODE'],
+    "ttl": os.environ['SHARE_TTL'] or None,
+    "granted_at": datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z'),
+}
+state = []
+if os.path.exists(sf):
+    try: state = json.load(open(sf))
+    except Exception: state = []
+state = [s for s in state if s.get("path") != entry["path"]]
+state.append(entry)
+json.dump(state, open(sf, "w"), indent=2)
+PYEOF
+    chgrp agents "$state_file" 2>/dev/null || true
+    chmod 0664 "$state_file" 2>/dev/null || true
+
+    audit share "$agent" "$path" "mode=$mode ttl=${ttl:-none}"
+    echo "✓ Shared $path with $agent (mode=$mode${ttl:+, ttl=$ttl})"
+}
+
+cmd_unshare() {
+    local agent="${1:-}"; shift || true
+    local path="${1:-}"; shift || true
+    [[ -z "$agent" || -z "$path" ]] && {
+        echo "Usage: sudo agentctl unshare <agent> <path>" >&2; exit 2
+    }
+    require_root unshare
+    local user; user=$(resolve_user "$agent")
+    path=$(readlink -f "$path" 2>/dev/null || echo "$path")
+
+    # Remove recursive + default ACL
+    if [[ -e "$path" ]]; then
+        setfacl -R -x "g:$user" "$path" 2>/dev/null || true
+        [[ -d "$path" ]] && setfacl -R -d -x "g:$user" "$path" 2>/dev/null || true
+    fi
+
+    # Update state file
+    local state_file="$SHARED_ROOT/share-state/$agent.json"
+    if [[ -f "$state_file" ]]; then
+        SHARE_PATH="$path" STATE_FILE="$state_file" python3 - <<'PYEOF'
+import json, os
+sf = os.environ['STATE_FILE']
+target = os.environ['SHARE_PATH']
+state = json.load(open(sf))
+state = [s for s in state if s.get("path") != target]
+json.dump(state, open(sf, "w"), indent=2)
+PYEOF
+        # GC parent --x ACLs: remove any parent ACL not needed by remaining shares
+        REMAINING=$(python3 -c "import json; print('\n'.join(s['path'] for s in json.load(open('$state_file'))))")
+        local parent
+        parent=$(dirname "$path")
+        while [[ "$parent" != "/" && -n "$parent" ]]; do
+            local still_needed=0
+            while IFS= read -r remp; do
+                [[ -z "$remp" ]] && continue
+                case "$remp" in
+                    "$parent"/*|"$parent") still_needed=1; break ;;
+                esac
+            done <<< "$REMAINING"
+            if [[ $still_needed -eq 0 ]]; then
+                setfacl -x "g:$user" "$parent" 2>/dev/null || true
+            fi
+            parent=$(dirname "$parent")
+        done
+
+        # GC git safe.directory: remove the agent's exception for this repo
+        # root only if no remaining share is inside the same repo. Path may be
+        # gone post-unshare, so try resolving repo root from path first; if that
+        # fails, skip (stale gitconfig entry is harmless).
+        if command -v git >/dev/null 2>&1; then
+            local unshared_repo_root=""
+            if unshared_repo_root=$(sudo -u "$user" git -C "$path" rev-parse --show-toplevel 2>/dev/null); then
+                local still_needed_git=0
+                while IFS= read -r remp; do
+                    [[ -z "$remp" ]] && continue
+                    local rem_root=""
+                    if rem_root=$(sudo -u "$user" git -C "$remp" rev-parse --show-toplevel 2>/dev/null); then
+                        if [[ "$rem_root" == "$unshared_repo_root" ]]; then
+                            still_needed_git=1; break
+                        fi
+                    fi
+                done <<< "$REMAINING"
+                if [[ $still_needed_git -eq 0 ]]; then
+                    sudo -u "$user" git config --global --unset-all safe.directory "$unshared_repo_root" 2>/dev/null \
+                        && echo "  - git safe.directory: $unshared_repo_root (removed for $user)"
+                fi
+            fi
+        fi
+    fi
+
+    audit unshare "$agent" "$path"
+    echo "✓ Unshared $path from $agent"
+}
+
+cmd_shares() {
+    local agent="${1:-}"
+    local state_dir="$SHARED_ROOT/share-state"
+    if [[ ! -d "$state_dir" ]]; then
+        echo "(no shares — $state_dir not yet created)"
+        return 0
+    fi
+    if [[ -n "$agent" ]]; then
+        local _; _=$(resolve_user "$agent") # validate
+        local sf="$state_dir/$agent.json"
+        if [[ -r "$sf" ]]; then
+            echo "=== $agent ==="
+            cat "$sf"
+        else
+            echo "No active shares for $agent"
+        fi
+    else
+        local found=0
+        for sf in "$state_dir"/*.json; do
+            [[ -f "$sf" ]] || continue
+            found=1
+            local name; name=$(basename "$sf" .json)
+            echo "=== $name ==="
+            cat "$sf"
+            echo
+        done
+        [[ $found -eq 0 ]] && echo "No active shares for any agent"
+    fi
+}
+
+cmd_help() {
+    sed -n '3,33p' "$0"
+}
+
+case "$SUBCMD" in
+    status)        cmd_status        "$@" ;;
+    shell)         cmd_shell         "$@" ;;
+    bash)          cmd_bash          "$@" ;;
+    run)           cmd_run           "$@" ;;
+    talk)          cmd_talk          "$@" ;;
+    logs)          cmd_logs          "$@" ;;
+    pause)         cmd_pause         "$@" ;;
+    resume)        cmd_resume        "$@" ;;
+    spawn)         cmd_spawn         "$@" ;;
+    finalize-name) cmd_finalize_name "$@" ;;
+    share)         cmd_share         "$@" ;;
+    unshare)       cmd_unshare       "$@" ;;
+    shares)        cmd_shares        "$@" ;;
+    grant|audit|upgrade-engram)
+        echo "ERROR: '$SUBCMD' not implemented yet.  See active-work/multi-agent-uid-substrate-2026-05-02.md" >&2
+        exit 3 ;;
+    help|--help|-h) cmd_help ;;
+    *) echo "Unknown subcommand: $SUBCMD"; cmd_help; exit 2 ;;
+esac

@@ -252,7 +252,21 @@ echo ""
 echo "== Step 7: Git =="
 
 if [ ! -d "$ENGRAM_HOME/.git" ]; then
-  (cd "$ENGRAM_HOME" && git init -q && git add -A && git commit -q -m "ENGRAM alpha install")
+  (
+    cd "$ENGRAM_HOME"
+    git init -q
+    # Ensure a local git identity exists so the install commit can succeed
+    # even when no global identity is configured (fresh newborn agents on
+    # a host where git was never set up for the new uid). Local config
+    # only — no global pollution.
+    if ! git config user.email >/dev/null 2>&1; then
+      git config user.email "${USER:-engram}@$(hostname)"
+    fi
+    if ! git config user.name >/dev/null 2>&1; then
+      git config user.name "${USER:-engram} (ENGRAM agent)"
+    fi
+    git add -A && git commit -q -m "ENGRAM alpha install"
+  )
   echo "  initialized $ENGRAM_HOME/.git"
 else
   echo "  .git exists, skipping init"

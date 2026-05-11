@@ -118,7 +118,7 @@ useradd \
     --create-home \
     --groups agents \
     --shell /bin/bash \
-    --comment "AI agent runtime: $RUNTIME" \
+    --comment "AI agent runtime - $RUNTIME" \
     "$USER_NAME"
 chmod "$HOME_MODE" "$USER_HOME"
 
