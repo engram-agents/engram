@@ -11716,11 +11716,22 @@ def engram_list(
 PATTERN_QUERY_PRESETS: dict[str, dict[str, float | int]] = {
     # "balanced" cosine_threshold v4-calibrated 2026-05-09 (see calibration
     # study at kg/paper_research/threshold_calibration_2026-05-09/v4_tight_groups.py).
-    # high_precision and high_recall remain placeholders pending pattern-specific
-    # telemetry per ob_1500. Each pattern uses whichever fields make sense for it.
-    "high_precision": {"cosine_threshold": 0.80, "top_k": 5,  "min_confidence": 0.70},
+    # high_precision / high_recall: ±0.10 symmetric deltas off balanced cosine,
+    # set 2026-05-11 by principled-delta rationale rather than full pattern-
+    # specific calibration study (see active-work/query-pattern-preset-rationale-
+    # 2026-05-11.md for the full argument). v4 study showed useful similarity
+    # range is 0.45–0.65 — anything above 0.65 misses real corroborations;
+    # anything below 0.45 admits false positives. Symmetric ±0.10 brackets
+    # balanced (0.55) at both ends of that empirically-validated range.
+    # Pattern-specific telemetry remains the right calibration path long-term
+    # per ob_1500; these values are the "what would a careful reader pick
+    # given the v4 data and no pattern-specific telemetry yet" answer.
+    # Whether to make this dict config-loadable (Tier 2 in issue #76's tier
+    # model) vs leave hardcoded (Tier 3) is the open design question — for
+    # now the dict stays here, values calibrated against v4 evidence.
+    "high_precision": {"cosine_threshold": 0.65, "top_k": 5,  "min_confidence": 0.70},
     "balanced":       {"cosine_threshold": 0.55, "top_k": 15, "min_confidence": 0.50},
-    "high_recall":    {"cosine_threshold": 0.50, "top_k": 30, "min_confidence": 0.00},
+    "high_recall":    {"cosine_threshold": 0.45, "top_k": 30, "min_confidence": 0.00},
 }
 
 

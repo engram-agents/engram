@@ -95,7 +95,10 @@ def test_preset_bundle_resolution():
     ))
     assert r["preset"] == "high_precision"
     assert r["params_used"]["top_k"] == 5
-    assert r["params_used"]["cosine_threshold"] == 0.80
+    # cosine_threshold recalibrated 2026-05-11 (PR #29 placeholder 0.80 →
+    # principled 0.65 = balanced + 0.10 = upper edge of V4 useful range).
+    # See active-work/query-pattern-preset-rationale-2026-05-11.md.
+    assert r["params_used"]["cosine_threshold"] == 0.65
 
 
 def test_preset_overrides_apply():
@@ -142,7 +145,7 @@ def test_contradiction_both_sides_obsolete_scores_medium():
     server._retract_impl(node_id=a_id, error_type="other", reason="fixture")
     server._retract_impl(node_id=b_id, error_type="other", reason="fixture")
 
-    # Score is 0.5 — below balanced threshold (0.55), at-or-above high_recall (0.50).
+    # Score is 0.5 — below balanced threshold (0.55), at-or-above high_recall (0.45).
     # Confirms: high_recall surfaces the both-obsolete case for cleanup; balanced
     # filters it as a less-clean candidate than the one-side case.
     r = json.loads(server.engram_query_pattern(
@@ -174,7 +177,7 @@ def test_contradiction_neither_obsolete_filtered_at_balanced_threshold():
 
 def test_contradiction_neither_obsolete_visible_at_high_recall():
     server = fresh_server()
-    # high_recall threshold is 0.50, score=0.0 still filtered. Confirm explicit override admits it.
+    # high_recall threshold is 0.45, score=0.0 still filtered. Confirm explicit override admits it.
     _add_active_contradiction(server, "W is square", "W is round")
 
     r = json.loads(server.engram_query_pattern(
