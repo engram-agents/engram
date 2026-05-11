@@ -36,11 +36,19 @@ def fresh_server():
 
 
 def _seed_self_anchor_and_obs(server):
-    """Create a self-anchor person + an observation; return their IDs."""
-    p = json.loads(server.engram_add_person(
-        name="Test Self", role="agent", description="self-anchor for tests",
-        is_self=True,
-    ))
+    """Create a self-anchor person + an observation; return their IDs.
+
+    NB: engram_add_person was migrated to single-payload signature in PR #68
+    (wave 2c-ii, merged 2026-05-10). This helper now wraps the person kwargs
+    in payload_json. Issue #75 documents the post-migration test-helper-gap
+    that this fix closes.
+    """
+    p = json.loads(server.engram_add_person(payload_json=json.dumps({
+        "name": "Test Self",
+        "role": "agent",
+        "description": "self-anchor for tests",
+        "is_self": True,
+    })))
     person_id = p.get("person_id") or p.get("node_id")
 
     obs_payload = {
