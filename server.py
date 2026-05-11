@@ -3639,6 +3639,21 @@ def _add_observation_impl(
     public payload schema. Kept callable with named kwargs for in-server
     callers (engram_add_observation_batch, engram_retract replacement path).
     """
+    # Per ls_0034: bool-string truthy trap at wrapper boundary. JSON-string
+    # "false" is truthy in Python, so an `is_predictive: "false"` payload
+    # would silently create an observation_predictive node. Same fix shape
+    # as PR #68 (is_self). Check here at the impl entry so both the
+    # single-observation wrapper AND the batch processor get protection.
+    if not isinstance(is_predictive, bool):
+        return json.dumps({
+            "error": (
+                f"is_predictive must be a JSON boolean (true/false), got "
+                f"{type(is_predictive).__name__}: {is_predictive!r}. "
+                "Some MCP clients emit booleans as strings — make sure your "
+                "JSON encodes `true`/`false` not `\"true\"`/`\"false\"`."
+            )
+        })
+
     missing = [
         name for name, val in (
             ("quoted_text", quoted_text),
@@ -8717,6 +8732,30 @@ def _report_feeling_impl(
     if not trigger or not trigger.strip():
         return json.dumps({"error": "trigger is required and cannot be empty."})
 
+    # Coerce intensity_hint if a non-default value came in as a string (some
+    # MCP clients emit numeric fields as strings). Without this, the
+    # `intensity_hint >= 0.0` comparison below raises TypeError on str vs
+    # float instead of a clean validation error. Mirrors the PR #67 fix for
+    # engram_add_conjecture.initial_confidence (same shape).
+    #
+    # Reading-clarification: the `intensity_hint != -1.0` clause only
+    # short-circuits the actual-float-sentinel case (`-1.0`). For string
+    # values it always trips (str != float is True), but those still exit
+    # harmlessly via the range check below (`-1.0 >= 0.0` is False, no
+    # state mutation). The clause is correct but the load-bearing work is
+    # done by the isinstance check.
+    if intensity_hint is not None and intensity_hint != -1.0 and not isinstance(intensity_hint, (int, float)):
+        try:
+            intensity_hint = float(intensity_hint)
+        except (TypeError, ValueError):
+            return json.dumps({
+                "error": (
+                    f"intensity_hint must be a number in [0.0, 1.0] or -1.0 "
+                    f"to omit, got {type(intensity_hint).__name__}: "
+                    f"{intensity_hint!r}."
+                )
+            })
+
     # Validate intensity_hint range. -1.0 = sentinel for "not provided".
     intensity_value: Optional[float] = None
     if intensity_hint is not None and intensity_hint >= 0.0:
@@ -9351,6 +9390,19 @@ def _resolve_impl(
         May return BLOCKED_TAINTED or BLOCKED_STALE if a premise is
         compromised (same guard as engram_derive).
     """
+    # Per ls_0034: bool-string truthy trap at wrapper boundary. JSON-string
+    # "false" is truthy in Python; without this check, a use_stale: "false"
+    # payload would silently bypass the MECH-5 stale-premise guard.
+    if not isinstance(use_stale, bool):
+        return json.dumps({
+            "error": (
+                f"use_stale must be a JSON boolean (true/false), got "
+                f"{type(use_stale).__name__}: {use_stale!r}. "
+                "Some MCP clients emit booleans as strings — make sure your "
+                "JSON encodes `true`/`false` not `\"true\"`/`\"false\"`."
+            )
+        })
+
     RESOLVABLE_TYPES = {"question", "contradiction", "prediction", "conjecture", "goal_tension"}
     VALID_PREDICTION_OUTCOMES = {"confirmed", "partially_confirmed", "refuted", "partially_refuted"}
     VALID_CONJECTURE_OUTCOMES = {"supported", "refuted", "inconclusive"}
