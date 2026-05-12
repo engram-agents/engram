@@ -8,8 +8,14 @@
 #
 # Usage:
 #   ./install.sh            # install
-#   ./install.sh --force    # overwrite existing install (backs up first)
+#   ./install.sh --force    # archive existing install and start fresh
+#                           #   (knowledge graph + history are moved to a
+#                           #   timestamped backup dir; NOT preserved)
 #   ./install.sh --help
+#
+# To UPGRADE an existing install while preserving the knowledge graph,
+# history, diary, and sessions, use:  tools/deploy.sh
+# (install.sh --force is for fresh-start, not upgrade.)
 
 set -euo pipefail
 
@@ -35,8 +41,12 @@ for arg in "$@"; do
       echo "  AGENT_NAME    cron identity for the installed agent (default: derived from username)"
       echo "  COUNTERPART_NAME   peer agent name for inter-agent dispatcher (optional)"
       echo ""
-      echo "  --force: overwrites existing installation after backing it up."
-      echo "           Use only for testing. Production users should uninstall first."
+      echo "  --force: archive existing installation and start fresh."
+      echo "           Moves \$ENGRAM_HOME (graph, history, diary, sessions, logs)"
+      echo "           to a timestamped backup directory. The new install starts"
+      echo "           with an empty knowledge graph — old data is NOT migrated in."
+      echo "           To UPGRADE an existing install while preserving data, use:"
+      echo "             tools/deploy.sh"
       echo "  --no-cron: skip Step 8 (cron schedule install). Useful for headless"
       echo "             servers, CI, or users who manage their crontab separately."
       exit 0
@@ -90,7 +100,14 @@ echo "== Step 2: Existing-install check =="
 
 if [ -f "$ENGRAM_HOME/knowledge.db" ] && [ "$FORCE" -eq 0 ]; then
   echo "ERROR: existing install detected ($ENGRAM_HOME/knowledge.db)."
-  echo "Refuse to overwrite. Use --force to reinstall (existing graph will be backed up)."
+  echo ""
+  echo "To UPGRADE this install (preserve graph + history + sessions, update code only):"
+  echo "    tools/deploy.sh"
+  echo ""
+  echo "To reinstall fresh (archive existing data and start over):"
+  echo "    ./install.sh --force"
+  echo "  (Existing \$ENGRAM_HOME is moved to a timestamped backup; old graph is NOT"
+  echo "   migrated into the new install.)"
   exit 1
 fi
 

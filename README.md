@@ -84,11 +84,21 @@ From inside a clone of this repo:
 That's it. Start a new Claude Code session; the agent will read
 `~/.engram/first-run-pending` and run the cold-start dialogue.
 
-To force-reinstall (backs up the existing `~/.engram/` first):
+### Upgrading vs reinstalling
 
-```bash
-./install.sh --force
-```
+- **To upgrade an existing install** (pick up newer alpha code while keeping
+  your graph, history, diary, and sessions intact):
+  ```bash
+  tools/deploy.sh
+  ```
+  Works for both Claude (`~/.engram/`) and Gemini (`~/.engram-gemini/`)
+  installs — `tools/deploy.sh` auto-detects the target from `$ENGRAM_HOME`.
+- **To reinstall fresh** (archive the existing data dir to a timestamped
+  backup dir and start over with an empty graph — data is NOT migrated in):
+  ```bash
+  ./install.sh --force            # Claude target
+  ./install-gemini.sh --force     # Gemini target
+  ```
 
 ---
 
@@ -158,14 +168,22 @@ Expected terminal output (abbreviated):
 
 ### 3. Refuse to overwrite existing installs
 
-If step 2 fails with `existing install detected`, the user already has an
-ENGRAM graph at `~/.engram/knowledge.db`. **Do not pass `--force` without
-explicit user consent** — that will move their existing graph to
-`~/.engram.backup.TIMESTAMP/` and start fresh. The backup is recoverable but
-no sessions will auto-restore from it. Ask the user:
+If step 2 fails with `existing install detected` (Claude target, at
+`~/.engram/knowledge.db`) or `existing extension dir detected` (Gemini
+target, at `~/.gemini/extensions/engram/`), the user already has an
+install. **Almost always, the user wants `tools/deploy.sh` instead** —
+that upgrades the running code while leaving the graph, history, diary,
+and sessions untouched. Suggest that first.
 
-> You already have an ENGRAM graph at `~/.engram/`. Running with `--force`
-> will back it up to `~/.engram.backup.TIMESTAMP/` and start fresh. Continue?
+Only pass `--force` if the user has explicitly said they want a fresh
+start — it moves their existing data dir (or extension dir, for the
+Gemini target) to a `.backup.TIMESTAMP/` sibling and the new install
+starts with an empty knowledge.db. The backup is recoverable but no
+sessions auto-restore from it. Ask the user:
+
+> You already have an ENGRAM install. Running with `--force` will back
+> the existing data dir up to a timestamped sibling and start fresh.
+> Continue?
 
 ### 4. Handle the settings.json warning case
 
@@ -304,9 +322,17 @@ Run `pip install fastmcp sentence-transformers`. If you use a
 venv, activate it before running `install.sh`.
 
 **Install refuses to overwrite existing install**
-Intentional. Use `./install.sh --force` to back up and start fresh. The
-existing graph is moved to `~/.engram.backup.YYYYMMDD_HHMMSS/` — you can
-restore from it by swapping the directory back.
+Intentional. Two paths forward:
+- **Upgrade** (keep your graph, history, sessions; update code only):
+  `tools/deploy.sh` — works for both Claude and Gemini installs.
+- **Fresh reinstall** (archive existing data, start over with empty graph):
+  - `./install.sh --force` — Claude target; moves `~/.engram/` to
+    `~/.engram.backup.YYYYMMDD_HHMMSS/`.
+  - `./install-gemini.sh --force` — Gemini target; moves `~/.engram-gemini/`
+    and `~/.gemini/extensions/engram/` to timestamped sibling backups.
+
+  The backup is recoverable by swapping the directory back, but the new
+  install does NOT inherit the old graph automatically.
 
 **Hooks don't fire in Claude Code**
 Check `~/.claude/settings.json` has a `hooks` key with ENGRAM
@@ -348,7 +374,11 @@ claude mcp remove engram -s user
   session. Placeholders are only substituted after the dialogue completes.
 - **Idempotency guard.** Re-running the installer without `--force` refuses
   to overwrite an existing `~/.engram/knowledge.db`. With `--force`, the
-  existing data dir is moved to a timestamped backup before reinstall.
+  existing data dir is moved to a timestamped backup before reinstall. The
+  fresh install starts with an empty graph; old data is preserved in the
+  backup but not migrated. To upgrade an existing install while preserving
+  the graph, use `tools/deploy.sh` instead — it deploys code into the
+  running tree without touching data files.
 - **Agency.** The hooks are advisory; the agent is never blocked from
   writing to the graph. The only mechanical guards are on the server side
   (provenance, DAG invariant, claim-bearing types for derivations).
