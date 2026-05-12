@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Pre-deploy check — runs pytest against tests/.
 
-Exit code 0 = all tests passed, safe to start the server.
-Exit code != 0 = failures detected, investigate before deploying.
+Exit codes:
+    0   all tests passed, safe to start the server
+    2   pytest is not installed in this interpreter; nothing ran
+    other  pytest's own exit code (test failures, collection errors, etc.)
 
 Usage:
     python3 selftest.py            # run full suite
@@ -14,12 +16,34 @@ Tests live under tests/. CI runs the same invocation via
 .github/workflows/tests.yml on PRs to dev / master.
 """
 
+import importlib.util
 import os
 import subprocess
 import sys
 
 
+def _pytest_available() -> bool:
+    try:
+        return importlib.util.find_spec("pytest") is not None
+    except (ValueError, ModuleNotFoundError):
+        return False
+
+
 def main():
+    if not _pytest_available():
+        print(
+            "ERROR: pytest is not installed in this Python environment.\n"
+            f"  Interpreter: {sys.executable}\n"
+            "\n"
+            "Install it before running selftest:\n"
+            "  pip install pytest\n"
+            "\n"
+            "If you use a virtual environment, activate it first — selftest\n"
+            "runs against whichever interpreter invoked it.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     here = os.path.dirname(os.path.abspath(__file__))
     extra = sys.argv[1:]
 

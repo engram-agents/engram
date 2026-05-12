@@ -363,6 +363,26 @@ claude mcp remove engram -s user
 
 ---
 
+## Running the test suite (for contributors)
+
+`selftest.py` runs the test suite under `tests/`. It requires `pytest` in
+the same Python environment as the alpha's other dependencies. Fresh dev
+boxes (a fresh Docker container, a clean VM, a new venv) won't have it pre-installed:
+
+```bash
+pip install pytest                # one-time
+python3 selftest.py               # full suite
+python3 selftest.py --quiet       # one-line summary
+```
+
+If pytest is missing, selftest prints a clear actionable message and exits
+non-zero rather than failing opaquely in the pytest subprocess.
+
+If you use a virtualenv, activate it before running selftest — it executes
+against whichever interpreter invoked it.
+
+---
+
 ## Design notes
 
 - **Two-phase template substitution.** The installer resolves seed node IDs
