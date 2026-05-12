@@ -63,8 +63,14 @@ import server  # noqa: E402
 
 
 def _add(fn, **kwargs) -> str:
-    """Call an engram add_* function and return the new node's ID."""
-    result = json.loads(fn(**kwargs))
+    """Call an engram add_* function and return the new node's ID.
+
+    server.py's add_* tools take a single payload_json string; this helper
+    packs kwargs into that shape so the call sites below stay readable.
+    """
+    result = json.loads(fn(payload_json=json.dumps(kwargs)))
+    if "error" in result:
+        raise RuntimeError(f"{fn.__name__} returned error: {result['error']}")
     for key in ("axiom_id", "definition_id", "goal_id"):
         if key in result:
             return result[key]
