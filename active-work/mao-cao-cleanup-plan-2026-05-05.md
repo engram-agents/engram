@@ -33,7 +33,7 @@ Three categories:
 These uses of "Mao-Cao" or "Mao-Cao pattern" name the historical failure pattern itself; they are correct as written. Do not touch.
 
 - `engram-alpha/SKILL.md:666` — "the Mao-Cao pattern" (named failure pattern)
-- `engram-alpha/paper_research/engram_empirical_inventory_2026-05-05.md:51, 77` — "post-Mao-Cao-cleanup" feeling-report quote + "Mao-Cao compounding failure" diagnosis reference (both historical)
+- `kg/paper_research/engram_empirical_inventory_2026-05-05.md:51, 77` — "post-Mao-Cao-cleanup" feeling-report quote + "Mao-Cao compounding failure" diagnosis reference (both historical; file relocated kg-only per 2026-05-11 repo split)
 - `kg/paper_draft/engram_paper_ch5_walkthrough.md:7` — the **explicit attribution-correction note**. This is the canonical historical-record reference; it's the GOOD one and proves the cleanup happened.
 - `kg/active-work/MECH-5-taint-visibility.md` — engineering doc about the taint-visibility fix, references the pattern by name.
 - `kg/active-work/engram-housekeeping-sweep-2026-04-24.md` — historical sweep doc.

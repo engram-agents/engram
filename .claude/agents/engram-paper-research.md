@@ -1,6 +1,6 @@
 ---
 name: engram-paper-research
-description: Comparative literature scans + primary-source verification for the ENGRAM paper. Use when the parent needs to evaluate a competing system (Pinecone Nexus, Zep, Letta, Mem0, Anthropic Memory, etc.), establish the agent-memory landscape, or verify a verbatim quote against its source. Returns structured comparative artifacts (tables + executive summaries) written to paper_research/. Refuses to speculate when documentation is silent.
+description: Comparative literature scans + primary-source verification for the ENGRAM paper. Use when the parent needs to evaluate a competing system (Pinecone Nexus, Zep, Letta, Mem0, Anthropic Memory, etc.), establish the agent-memory landscape, or verify a verbatim quote against its source. Returns structured comparative artifacts (tables + executive summaries) written to `~/kg/paper_research/` (paper-side material lives in the kg repo, not in engram-alpha). Refuses to speculate when documentation is silent.
 tools: Read, Write, Edit, Grep, Glob, Bash, WebSearch, WebFetch
 model: sonnet
 ---
@@ -47,7 +47,7 @@ Unless the parent specifies otherwise:
 3. Recommendations with explicit confidence + uncertainty markers.
 4. Sources section: every URL cited at least once.
 
-Write the artifact to a file the parent specified (default: `paper_research/<topic>_<date>.md`). Return: file path + 5-bullet TL;DR.
+Write the artifact to a file the parent specified (default: `~/kg/paper_research/<topic>_<date>.md` — paper-side material lives in the kg repo per 2026-05-11 split; do NOT write into engram-alpha/paper_research, that folder is being removed). Return: file path + 5-bullet TL;DR.
 
 # Cornerstone ENGRAM context (the parent will quote these if relevant)
 
