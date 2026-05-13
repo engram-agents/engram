@@ -261,10 +261,10 @@ def main() -> None:
         )
     if source == "startup":
         lines.append(
-            "[Session start reading — before responding to the first task, read "
-            f"{WARM_BRIEFING_PATH} (relational context) and the newest file "
-            f"in {HISTORY_DIR}/ (prior active day's milestones + current focus; "
-            "may span gaps like weekends — filename is the active date).]"
+            "[Session start reading — before responding to the first task "
+            "(even if a user task is already waiting), follow your Session "
+            "Start Reading list in ~/.claude/CLAUDE.md. Read first, respond "
+            "second.]"
         )
         git_log = piece_c_git_log()
         if git_log:
@@ -274,10 +274,10 @@ def main() -> None:
             lines.append(sleep_block)
     else:
         lines.append(
-            "[Session start reading — before responding to the first task, read "
-            f"{WARM_BRIEFING_PATH} (relational context). History file is "
-            "skipped post-compact; the compaction summary carries work-thread "
-            "continuity and git log is already in the summary's trajectory.]"
+            f"[Session start reading — re-read {WARM_BRIEFING_PATH} before "
+            "responding (relational context post-compact, per Compact "
+            "Instructions). Other Session Start Reading items can be skipped; "
+            "the compaction summary carries work-thread continuity.]"
         )
     print(json.dumps({
         "hookSpecificOutput": {
