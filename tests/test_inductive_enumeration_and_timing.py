@@ -43,12 +43,12 @@ def test_inductive_enumeration_and_timing():
 
         # ── Test 1: inductive_enumeration with same-source premises → NO warning ──
         print("Test 1: inductive_enumeration across 3 same-source observations")
-        result = json.loads(server.engram_derive(
-            claim="Paraconsistent logic has at least 3 structurally-distinct strategies.",
-            supporting_ids=f"{obs1},{obs2},{obs3}",
-            logical_chain="Source enumerates three systems (A, B, C) each rejecting a different classical rule.",
-            reasoning_type="inductive_enumeration",
-        ))
+        result = json.loads(server.engram_derive(payload_json=json.dumps({
+            "claim": "Paraconsistent logic has at least 3 structurally-distinct strategies.",
+            "supporting_ids": f"{obs1},{obs2},{obs3}",
+            "logical_chain": "Source enumerates three systems (A, B, C) each rejecting a different classical rule.",
+            "reasoning_type": "inductive_enumeration",
+        })))
         warnings = result.get("structure_warnings", [])
         print(f"  → dv_id={result.get('derivation_id')}, conf={result.get('confidence')}, warnings={warnings}")
         assert result.get("derivation_id"), f"No id returned: {result}"
@@ -58,12 +58,12 @@ def test_inductive_enumeration_and_timing():
 
         # ── Test 2: inductive_generalization still WARNS on same-source ──
         print("Test 2: inductive_generalization across same 3 same-source observations (regression check)")
-        result2 = json.loads(server.engram_derive(
-            claim="Paraconsistent logic is a family (repeated claim).",
-            supporting_ids=f"{obs1},{obs2},{obs3}",
-            logical_chain="Same premises as test 1 but using inductive_generalization instead.",
-            reasoning_type="inductive_generalization",
-        ))
+        result2 = json.loads(server.engram_derive(payload_json=json.dumps({
+            "claim": "Paraconsistent logic is a family (repeated claim).",
+            "supporting_ids": f"{obs1},{obs2},{obs3}",
+            "logical_chain": "Same premises as test 1 but using inductive_generalization instead.",
+            "reasoning_type": "inductive_generalization",
+        })))
         warnings2 = result2.get("structure_warnings", [])
         print(f"  → dv_id={result2.get('derivation_id')}, warnings={warnings2}")
         assert any("independent sources" in w for w in warnings2), \
@@ -103,12 +103,12 @@ def test_inductive_enumeration_and_timing():
 
         # ── Test 5: invalid reasoning_type still rejected ──
         print("Test 5: invalid reasoning_type rejection (regression check)")
-        result5 = json.loads(server.engram_derive(
-            claim="x",
-            supporting_ids=f"{obs1},{obs2}",
-            logical_chain="x",
-            reasoning_type="inductive_nonsense",
-        ))
+        result5 = json.loads(server.engram_derive(payload_json=json.dumps({
+            "claim": "x",
+            "supporting_ids": f"{obs1},{obs2}",
+            "logical_chain": "x",
+            "reasoning_type": "inductive_nonsense",
+        })))
         assert "error" in result5, f"Expected error for invalid type: {result5}"
         assert "inductive_enumeration" in result5.get("valid_types", []), \
             f"New type missing from valid_types list: {result5.get('valid_types')}"

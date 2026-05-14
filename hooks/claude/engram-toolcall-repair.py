@@ -149,9 +149,11 @@ PROTECTED_TOOLS = {
     "mcp__engram__engram_report_feeling": {
         "payload_json",
     },
+    # Migrated to single-payload signature in wave 3 (PR for #99) — see
+    # comment on engram_report_feeling above for the corruption risk this
+    # prevents.
     "mcp__engram__engram_derive": {
-        "claim", "supporting_ids", "logical_chain", "reasoning_type",
-        "derivation_mode", "context_ids",
+        "payload_json",
     },
     # Migrated to single-payload signature in wave 2b (PR #66).
     "mcp__engram__engram_contradict": {

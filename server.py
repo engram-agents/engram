@@ -8875,6 +8875,13 @@ def _report_feeling_impl(
 # ---------------------------------------------------------------------------
 
 
+# Set of legitimate field names for the engram_derive payload.
+_DERIVE_FIELDS = frozenset({
+    "claim", "supporting_ids", "logical_chain", "reasoning_type",
+    "derivation_mode", "context_ids", "use_stale",
+})
+
+
 @mcp.tool(
     name="engram_derive",
     annotations={
@@ -8885,16 +8892,69 @@ def _report_feeling_impl(
         "openWorldHint": False,
     },
 )
-def engram_derive(
-    claim: str,
-    supporting_ids: str,
-    logical_chain: str,
+def engram_derive(payload_json: str) -> str:
+    """Create a new derived claim by combining evidence from existing nodes.
+
+    Single-payload signature (wave 3 of ob_1499 — see issue #99): pass ALL
+    fields as one JSON object string in `payload_json`. This eliminates the
+    antml-prefix multi-parameter swallow risk that the previous 7-parameter
+    signature was prone to.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            claim (str, required): The atomic, falsifiable claim being derived.
+            supporting_ids (str, required): Comma-separated claim-bearing node IDs
+                (e.g. 'ob_0001,ob_0003,dv_0002').
+            logical_chain (str, required): Explicit reasoning connecting the cited
+                premises to the conclusion. Show your work.
+            reasoning_type (str, optional): The type of logical argument. See
+                _derive_impl docstring for the full list and confidence discounts.
+            derivation_mode (str, optional): LEGACY — use reasoning_type instead.
+                Kept for backward compatibility: "chain" or "corroboration".
+            context_ids (str, optional): Comma-separated node IDs for context
+                references (e.g. definitions). Creates 'cites' edges.
+            use_stale (bool, optional): Opt-in override for MECH-5 stale-premise
+                guard. Default False. Has no effect on tainted premises.
+
+    Returns:
+        JSON with the new derivation node ID, computed confidence, reasoning
+        type, and supporting nodes. If premises are compromised, returns a
+        structured block response (BLOCKED_TAINTED or BLOCKED_STALE). On
+        payload-parsing failure, returns {"error": "..."}.
+
+    See _derive_impl for full reasoning-type list, confidence-computation
+    semantics, and structural-validation details.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _DERIVE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_DERIVE_FIELDS)}"
+        })
+
+    return _derive_impl(**params)
+
+
+def _derive_impl(
+    claim: str = "",
+    supporting_ids: str = "",
+    logical_chain: str = "",
     reasoning_type: str = "",
     derivation_mode: str = "chain",
     context_ids: str = "",
     use_stale: bool = False,
 ) -> str:
-    """Create a new derived claim by combining evidence from existing nodes.
+    """Internal implementation — see engram_derive MCP tool for the public
+    payload schema. Kept callable with named kwargs for in-server callers.
+
+    Create a new derived claim by combining evidence from existing nodes.
 
     A derivation is an inference the agent makes by reasoning over multiple
     observations or other derivations. The logical chain must explicitly show
@@ -8945,6 +9005,20 @@ def engram_derive(
           - BLOCKED_TAINTED: any premise was retracted; no override path.
           - BLOCKED_STALE: premise(s) have superseded upstream and use_stale=False.
     """
+    # Per ls_0034: bool-string truthy trap at wrapper boundary. JSON-string
+    # "false" is truthy in Python; without this check, a use_stale: "false"
+    # payload would silently bypass the MECH-5 stale-premise guard.
+    # Same guard pattern as _resolve_impl (server.py:9456).
+    if not isinstance(use_stale, bool):
+        return json.dumps({
+            "error": (
+                f"use_stale must be a JSON boolean (true/false), got "
+                f"{type(use_stale).__name__}: {use_stale!r}. "
+                "Some MCP clients emit booleans as strings — make sure your "
+                "JSON encodes `true`/`false` not `\"true\"`/`\"false\"`."
+            )
+        })
+
     if reasoning_type and reasoning_type not in REASONING_TYPES:
         return json.dumps({
             "error": f"Invalid reasoning_type '{reasoning_type}'.",

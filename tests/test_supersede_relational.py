@@ -31,12 +31,12 @@ def _mk_observation(claim: str, quote_type: str = "attributed_analysis") -> str:
 
 
 def _mk_derivation(claim: str, support_ids: list[str], reasoning_type: str = "deductive_hypothetical_syllogism") -> str:
-    result = json.loads(server.engram_derive(
-        claim=claim,
-        supporting_ids=",".join(support_ids),
-        logical_chain=f"Derivation: {claim}",
-        reasoning_type=reasoning_type,
-    ))
+    result = json.loads(server.engram_derive(payload_json=json.dumps({
+        "claim": claim,
+        "supporting_ids": ",".join(support_ids),
+        "logical_chain": f"Derivation: {claim}",
+        "reasoning_type": reasoning_type,
+    })))
     assert "derivation_id" in result, f"derivation failed: {result}"
     return result["derivation_id"]
 

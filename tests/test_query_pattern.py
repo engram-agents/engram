@@ -242,12 +242,12 @@ def test_tainted_still_valid_surfaces_tainted_nodes():
     # Create a derivation by adding two observations + deriving from them
     obs_a = _add_observation(server, "Premise A holds in scenario 1")
     obs_b = _add_observation(server, "Premise B holds in scenario 1")
-    deriv_result = json.loads(server.engram_derive(
-        claim="Combined: A ∧ B implies conclusion C",
-        supporting_ids=f"{obs_a},{obs_b}",
-        logical_chain="From A and B, C follows by conjunction.",
-        reasoning_type="deductive_modus_ponens",
-    ))
+    deriv_result = json.loads(server.engram_derive(payload_json=json.dumps({
+        "claim": "Combined: A ∧ B implies conclusion C",
+        "supporting_ids": f"{obs_a},{obs_b}",
+        "logical_chain": "From A and B, C follows by conjunction.",
+        "reasoning_type": "deductive_modus_ponens",
+    })))
     deriv_id = deriv_result["derivation_id"]
 
     # Retract one of the premises — cascade should taint the derivation
