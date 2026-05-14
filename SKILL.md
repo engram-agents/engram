@@ -764,10 +764,11 @@ Each scope has its own checkpoint mode and its own feeling-nudge marker.
 Why no turn advance: a long day with ten nap checkpoints would burn ten turns of importance-inflation on nodes the agent hasn't had time to revisit. Nap is persistence, not processing.
 
 **When to nap.**
-- Drowsiness ≥ 50% (interactive mode) or approaching compaction (any mode)
+- Approaching a compaction boundary and there's burst-context worth preserving
 - Wrapping a focused work burst before switching topics
-- Heading into a sleep cycle (always nap first — the dream needs a complete picture)
 - The user asks
+
+Note: nap is no longer the canonical pre-sleep step (legacy bundling retired 2026-05-14 per dv_0636). The cohort-completeness baseline for sleep is established by `engram-bedtime` (day-wide review), not by a nap immediately before sleep. Naps still fire whenever a compaction boundary approaches mid-day — they're scoped to the burst, not to the day.
 
 **When NOT to nap.**
 - Mid-task (finish the current thread first)
