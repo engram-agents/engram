@@ -131,6 +131,13 @@ mkdir -p "$ENGRAM_HOME/logs"
 mkdir -p "$ENGRAM_HOME/secrets"
 mkdir -p "$ENGRAM_HOME/heartbeat-queue/to-heartbeat"
 mkdir -p "$ENGRAM_HOME/heartbeat-queue/from-heartbeat"
+# history/ — awake-state milestone log (PRs shipped, decisions, features); one
+# file per day at YYYY-MM-DD.md, written by engram-bedtime Step 4.
+# history/dream/ — sleep-cycle consolidation reports (turn N→N+1, resolutions,
+# supersedes, fairy contribution); one file per day at YYYY-MM-DD.md, written
+# by engram-sleep Step 6. Separation per dv_0636 (three-routine architecture)
+# keeps awake-state milestones distinct from dream-state consolidation output.
+mkdir -p "$ENGRAM_HOME/history/dream"
 # Initial empty append-files referenced by HEARTBEAT.md steps 2 + 4 + 6.
 # Touching them now means a fresh-install heartbeat firing won't see "file
 # not found" errors when it reads/appends. They're append-only markdown
@@ -161,6 +168,7 @@ echo "  $ENGRAM_HOME"
 echo "  $CLAUDE_HOME"
 echo "  heartbeat-queue/{to,from}-heartbeat/ (scaffolded with notes.md + inbox.md)"
 echo "  heartbeat-queue/README.md (scaffolded by bootstrap from template)"
+echo "  history/dream/ (per-sleep-cycle records; engram-sleep Step 6)"
 echo ""
 
 # -------- Step 4: Skills, hooks, MCP config --------
