@@ -216,7 +216,7 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_reflect": {
-        "description": "Perform a structured self-audit: contradictions, open questions, weak claims, overdue predictions, uncited observations, tainted and retracted nodes.",
+        "description": "[Sleep cycle — pre-dream briefing.] Structured self-audit of the graph (contradictions, open questions, weak claims, overdue predictions, uncited observations, tainted and retracted nodes). Opens the dream cycle for the engram-sleep skill. Not a tool to reach for during awake-state work.",
         "parameters": {},
     },
     "engram_diagnose": {
@@ -257,14 +257,17 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_advance_turn": {
-        "description": "End-of-day session checkpoint: advances the global turn counter (drives forgetting) and logs the session summary. IRREVERSIBLE — turn advances cannot be undone without direct DB intervention. Heartbeats and dispatchers must use engram_nap instead.",
+        "description": "[Sleep cycle / first session only — DO NOT call awake.] End-of-day session checkpoint that advances the global turn counter (drives forgetting) and logs the session summary. IRREVERSIBLE — turn advances cannot be undone without direct DB intervention. For pre-compaction / end-of-burst persistence in awake state, use engram_nap instead. Heartbeats and dispatchers must use engram_nap.",
         "parameters": {
             "message": {"type": "string", "description": "Summary of what was learned/changed across the cohort being closed by this turn advance.", "required": True},
         },
     },
 }
 
-# Tools that only read from the graph (no mutations)
+# Tools that only read from the graph (no mutations).
+# Note: engram_reflect is listed here because it is non-mutating, but it is
+# sleep-cycle-only at the workflow level — see its [Sleep cycle] description.
+# READ_ONLY membership does NOT imply awake-safe; check the description.
 READ_ONLY_TOOLS = {
     "engram_query", "engram_get_subgraph", "engram_stats", "engram_reflect", "engram_check_similar",
 }

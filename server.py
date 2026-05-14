@@ -5392,7 +5392,7 @@ def engram_nap(message: str) -> str:
 @mcp.tool(
     name="engram_advance_turn",
     annotations={
-        "title": "Session Checkpoint with Turn Advance (irreversible)",
+        "title": "[Sleep cycle / first session only — DO NOT call awake.] Session Checkpoint with Turn Advance (irreversible)",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
@@ -5400,7 +5400,11 @@ def engram_nap(message: str) -> str:
     },
 )
 def engram_advance_turn(message: str) -> str:
-    """End-of-day session checkpoint — advance the turn counter + log summary.
+    """[Sleep cycle / first session only — DO NOT call awake.] End-of-day
+    session checkpoint that advances the turn counter + logs summary.
+
+    For pre-compaction / end-of-burst persistence in awake state, use
+    engram_nap instead — it persists without consuming the day's turn.
 
     Advances the global turn counter (drives the forgetting mechanism that
     inflates importance scores of fresh nodes relative to stale ones), logs
@@ -7470,7 +7474,7 @@ def _link_about_impl(
 @mcp.tool(
     name="engram_scan_emergence",
     annotations={
-        "title": "Scan for Emergent Cornerstone Candidates",
+        "title": "[Sleep cycle] Scan for Emergent Cornerstone Candidates",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
@@ -7483,7 +7487,8 @@ def engram_scan_emergence(
     focus: str = "self",
     node_type_filter: str = "observation_factual,feeling_report,lesson,derivation,observation_predictive",
 ) -> str:
-    """Scan the graph for emergent patterns that could become cornerstones.
+    """[Sleep cycle — invoked by dream-mode dispatch; do not call awake.]
+    Scan the graph for emergent patterns that could become cornerstones.
 
     Inverts the cornerstone authoring model (ob_0955): instead of top-down
     declaration, cornerstones EMERGE from accumulated evidence scanned along
@@ -11317,7 +11322,7 @@ def _slim_reflect_briefing(report: dict) -> dict:
 @mcp.tool(
     name="engram_reflect",
     annotations={
-        "title": "Audit Knowledge Graph Quality",
+        "title": "[Sleep cycle] Audit Knowledge Graph Quality (pre-dream briefing)",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
@@ -11325,7 +11330,8 @@ def _slim_reflect_briefing(report: dict) -> dict:
     },
 )
 def engram_reflect() -> str:
-    """Perform a structured self-audit of the knowledge graph.
+    """[Sleep cycle — pre-dream briefing.] Structured self-audit of the
+    knowledge graph; opens the dream cycle for the engram-sleep skill.
 
     Returns a comprehensive report identifying areas that need attention:
     active goals, unresolved goal tensions, unresolved contradictions,
