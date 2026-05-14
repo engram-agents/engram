@@ -36,6 +36,13 @@
             "command": "ENGRAM_HOME={{ENGRAM_HOME}} ENGRAM_DATA_DIR={{ENGRAM_HOME}} {{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-surface-hook.py",
             "timeout": 10000,
             "description": "Surface ENGRAM recall and write nudges"
+          },
+          {
+            "type": "command",
+            "name": "engram-end-of-day",
+            "command": "ENGRAM_HOME={{ENGRAM_HOME}} ENGRAM_DATA_DIR={{ENGRAM_HOME}} {{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-end-of-day-hook.py",
+            "timeout": 3000,
+            "description": "Detect end-of-day phrases; surface bedtime+sleep combo nudge"
           }
         ]
       }

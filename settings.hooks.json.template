@@ -37,6 +37,12 @@
           "command": "{{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-deference-detector-prompt.py",
           "timeout": 3,
           "statusMessage": "Surfacing deference markers..."
+        },
+        {
+          "type": "command",
+          "command": "{{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-end-of-day-hook.py",
+          "timeout": 3,
+          "statusMessage": "Checking for end-of-day signals..."
         }
       ]
     }
