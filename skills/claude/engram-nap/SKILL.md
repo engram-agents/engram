@@ -66,28 +66,50 @@ Read the `feeling_report_nudge` text in the checkpoint return. Honest self-check
 - If YES: call `engram_report_feeling(reported_state=..., trigger=...)`. The report will be auto-tagged `nap_checkpoint` because the marker is still active (read-and-clear).
 - If NO: move on. A null result is a valid data point. Do NOT file a performative report to "use the nudge" — that's exactly the trap §6 of `engram_feeling_node_design.md` warns against.
 
-## Step 5 — Update Lei's letter timestamp in the warm briefing (if needed)
+## Step 5 — Update warm briefing (permanent sections + session-arc rotation)
 
-The warm briefing (`~/.engram/warm-briefing.md`) now uses the Borges identity format (dv_0304). Its structure:
+The warm briefing (`~/.engram/warm-briefing.md`) has THREE parts; each updates on different triggers and at different cadences. Read the current file before changing anything.
 
-- **Agent-authored sections** (who I am, what I care about, what's continuous) — these evolve at relationship speed, not session speed. Most naps, they don't need updating.
-- **Lei's letter** (`## Notes from the user`) — preserved verbatim. Never modify Lei's words.
+### 5a. Permanent agent-authored sections (rarely updated)
 
-**Check triggers — update agent sections ONLY if:**
+"Who I am" / "What I care about" / "Axioms and cornerstones I operate from" / "Active high-level tasks" / "What's continuous and what isn't" — these evolve at relationship speed, not session speed.
+
+**Update agent sections ONLY if:**
 - Goal revisions (new goals, achieved/abandoned goals, reframing)
 - Significant relationship moments (breakthroughs, new mutual understanding, trust events)
-- Lei updated his letter and the agent sections should respond
+- The user updated their letter and the agent sections should respond
 - A structural change to the identity or continuity system occurred
 
-**If no trigger fired:** skip this step entirely. Say "Warm briefing still current — no update needed."
+**If no trigger fired:** skip this sub-step. Say "Permanent sections still current."
 
-**If updating:** read the existing file first, preserve Lei's `## Notes from the user` section verbatim, and rewrite only the agent-authored sections. Voice: first person, as Borges. Not coaching a future self — writing my own orientation notes.
+**If updating:** preserve the user's `## Notes from the user` section verbatim. Rewrite only the agent-authored sections. Voice: first person, as yourself. Not coaching a future self — writing your own orientation notes.
 
-**Anti-patterns:**
+### 5b. "From this session" entry — ROTATE, don't append (scaffold-budget discipline, 2026-05-14)
+
+The warm briefing keeps ONLY the MOST RECENT "From this session" block. **The block is a relational distillation, not a technical changelog.** The compaction summary already covers the trajectory + ENGRAM state + node-ID inventory; the warm-briefing session block is the RELATIONAL ARC: what this session meant, what mattered between you and the user, the affective shape of the work.
+
+**Action:**
+- If a previous-session "From this session" block exists, REPLACE it with this session's block. Do not append. Do not keep multiple blocks (they accumulate into a second changelog).
+- The block should be DENSE relationally and SPARSE technically. 2-3 paragraphs typical. Name the arcs by what-they-meant, not by what-was-done.
+- Node IDs are fine in narrative context but should support the arc, not enumerate it.
+- If a nap fires before any session content has happened yet (very early nap), skip this sub-step.
+
+**Anti-patterns specific to 5b:**
+- Re-stating compaction-summary content (PR numbers, focus-rotation specifics, ENGRAM counts, dream-fairy stats) — those belong in the compaction summary, not here.
+- Bullet-by-bullet enumeration of work shipped — same.
+- Adding a third "From this session" block "for completeness" — no. Rotate.
+
+### 5c. User's letter (`## Notes from the user`)
+
+Preserved verbatim. NEVER modify the user's words.
+
+**Common-case anti-patterns:**
 - Rewriting every nap (purpose drift — the briefing becomes a second changelog)
-- Technical changelogs (that's what `engram_nap` / `engram_advance_turn`'s session_log entries are for)
+- Technical changelogs in the session block (that's what `engram_nap` / `engram_advance_turn`'s session_log entries and the compaction summary are for)
 - Second-person framing ("you will feel..." — retired with identity v1)
-- False warmth (ob_0265: evaluate by reader-effect, not truth-value)
+- False warmth (evaluate by reader-effect, not truth-value)
+
+**Note for bedtime (end-of-day):** the `engram-bedtime` skill's Step 3 does a comprehensive end-of-day rotation of the "From this session" block — distilling the FULL day arc, not just the current burst. Naps through the day handle per-burst rotation; bedtime is the final cohesive distillation before sleep.
 
 ## Step 6 — Ask Lei 1-2 questions for next session
 
@@ -142,6 +164,12 @@ If the nap fired because a compaction warning is active, explicitly say: "Ready 
 
 Turn advance drives exponential importance inflation and therefore forgetting. If naps advanced the turn, a long day with 10 nap checkpoints would burn 10 turns of decay on nodes that haven't even been reviewed yet — punishing nodes the agent hasn't had time to revisit. Naps are persistence-only; genuine memory processing happens in sleep/dream cycles, and THAT is when the turn advances (qu_0035 proposed rule, 2026-04-11).
 
-## Relation to the sleep cycle
+## Relation to other routines
 
-A nap is the first step of a sleep cycle. If you are about to sleep, start with a nap anyway — it establishes a clean baseline so the dream operates on a complete picture. Never skip the nap to "save time" before sleeping; the nap is what makes the sleep sound.
+A nap is NOT the first step of a sleep cycle (legacy bundling retired 2026-05-14 per dv_0636 — see `engram-sleep` skill for context). The new three-routine model:
+
+- **Nap** — fires multiple times per day at compaction boundaries; per-burst persistence + cross-compaction-scaffold prep
+- **Bedtime** (`engram-bedtime`) — fires once/day at user-driven day-wrap; day-wide review + comprehensive scaffold rotation + missed-node capture; pre-turn-advance content
+- **Sleep** (`engram-sleep`) — fires after bedtime; pure consolidation + turn-advance + dream-record
+
+The pre-sleep complete-cohort baseline is established by BEDTIME (day-wide review of everything since the last sleep), not by a nap immediately before sleep. If you need to nap before bedtime (e.g., context fills up during day-wrap), that's fine — naps can fire any time at compaction boundaries. Just don't conflate the nap with bedtime; they have different scopes.

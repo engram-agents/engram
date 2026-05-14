@@ -97,13 +97,30 @@ SESSIONS_DIR="$ENGRAM_HOME/sessions"
 mkdir -p "$SESSIONS_DIR"
 echo "$SESSION_UUID" > "$SESSIONS_DIR/sleep-$TODAY.id"
 
-PROMPT="Run the engram-sleep skill to consolidate today's work across all roles (interactive, heartbeat, telegram).
+PROMPT="Run engram-bedtime then engram-sleep to consolidate today's work across all roles (interactive, heartbeat, telegram). This is the SINGLE turn-advance for $TODAY (NYC local) per the coordinated-sleep design — all other roles today used nap-mode only.
 
-This is the SINGLE turn-advance for $TODAY (NYC local) per the coordinated-sleep design — all other roles today used nap-mode only. The dream cohort spans the full day across all roles.
+NOTE: This cron-driven path is deprecated pending engram-alpha #133 PR C (cron removal + interactive-only sleep). Until that PR ships, cron-fired sleep runs both bedtime and sleep skills in sequence so the new three-routine architecture (dv_0636) stays correct in the autonomous case.
 
-Follow the skill in order: dispatch dream-fairies in parallel (Step 0 — six fairies via Agent tool with subagent_type=engram-dream-fairy and run_in_background=true, one per scan category 1–6, each writing to a unique \$ENGRAM_HOME/dream/$TODAY-fairy-{N}-{slug}.md path so reports don't collide) → nap (Step 1) → engram_reflect (Step 2) → day-wide synthesis via engram_history since the previous sleep (Step 3) → integrate fairy reports into the dream agenda (Step 3.5) → work the dream agenda (Step 4) → handle the dream-review feeling nudge (Step 5) → engram_advance_turn (Step 6) → write the sleep-success marker (Step 6.5) → update warm-briefing session note (Step 7) → reconcile today's history file at \$ENGRAM_HOME/history/$TODAY.md (Step 8) → report (Step 9).
+PHASE 1 — engram-bedtime (pre-turn-advance, this-turn content):
+  - Walk the day's full cohort via engram_history(mode='edits', action='created', since=<prev-sleep-timestamp>)
+  - File any missed nodes (cross-burst derivations, late-day insights) — these belong to this turn
+  - Rotate warm-briefing 'From this session' block comprehensively (full day arc)
+  - Reconcile today's history file at \$ENGRAM_HOME/history/$TODAY.md + commit
+  - Strategically reconcile ask-lei.md (git-log walk + state verify; deferred items → ask-lei-backlog.md) + commit
+  - Hand off to sleep
 
-The fairy dispatch is new tonight — if subagent_type=engram-dream-fairy is unrecognized in this cron-spawned session, log the failure in the Step 6 checkpoint message, skip Step 3.5, and proceed with the existing reflect+synthesis flow. Don't block sleep on fairy availability.
+PHASE 2 — engram-sleep (consolidation + turn-advance):
+  - Step 0: dispatch dream-fairies in parallel (six fairies via Agent tool with subagent_type=engram-dream-fairy and run_in_background=true, one per scan category 1–6, each writing to a unique \$ENGRAM_HOME/dream/$TODAY-fairy-{N}-{slug}.md path)
+  - Step 1: engram_reflect — read the dream agenda
+  - Step 2: integrate fairy reports as they land
+  - Step 3: work the dream agenda (resolve / supersede / promote / refute — NO new awake-state synthesis here; that was bedtime's job)
+  - Step 4: dream-review feeling nudge
+  - Step 5: engram_advance_turn — single daily turn-advance
+  - Step 5b: write sleep-success marker via tools/write_sleep_marker.py
+  - Step 6: write dream-record at \$ENGRAM_HOME/history/dream/$TODAY.md + commit
+  - Step 7: report
+
+If subagent_type=engram-dream-fairy is unrecognized in this cron-spawned session, log the failure in the Step 7 report and proceed with the reflect-driven flow. Don't block sleep on fairy availability.
 
 When done, exit cleanly."
 

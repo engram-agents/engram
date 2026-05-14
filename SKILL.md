@@ -773,17 +773,31 @@ Why no turn advance: a long day with ten nap checkpoints would burn ten turns of
 - Mid-task (finish the current thread first)
 - As a substitute for writing observations as I go — nap backfills, but the real discipline is real-time capture
 
-### §8.2 Sleep — deep consolidation, turn advance after
+### §8.2 Bedtime + Sleep — end-of-day handoff and consolidation (three-routine model, dv_0636)
 
-**Purpose.** Process what the burst produced: resolve open questions answerable from current knowledge, promote or refute conjectures with new evidence, supersede stale cascades, adjudicate contradictions, consolidate the cycle's new cohort into derivations. Then and only then, advance the turn counter.
+**Purpose.** Separate the day's awake-state review (BEDTIME) from the dream-state consolidation (SLEEP), so cross-compaction scaffold work and consolidation work don't get tangled. Legacy bundling retired 2026-05-14.
 
-**Mechanism.** Full sequence in the `engram-sleep` skill; key structural points:
-1. Nap first (Step 1) — establish a clean baseline
-2. `engram_reflect()` returns the dream agenda (tainted, stale, open conjectures, contradictions, goal tensions, feeling nudges) and arms the `dream_review` marker
-3. Proactive synthesis on the new cohort (Step 3) before reactive cleanup (Step 4) — starting in cleanup mode puts the synthesis lens away
-4. **`engram_advance_turn()` fires AFTER the dream** (qu_0035 rule, 2026-04-11): advances turn, logs `Turn N` header, commits git snapshot
+**Mechanism.** Two skills fired in sequence at end-of-day:
 
-**Why turn advance fires last.** One turn = one cohort of experience **plus the consolidation of that experience**. If the turn advances before the dream, dream-generated nodes land at a younger turn than the burst they consolidate, misaligning the forgetting curve (ob_0987 extends this reasoning: sleep consolidation should surface emergent derivations from the cohort, not mechanically process a checklist).
+1. **`engram-bedtime`** (pre-turn-advance, this-turn content):
+   - Walk the day's full cohort via `engram_history(mode="edits", action="created", since=<prev-sleep-timestamp>)`
+   - File missed nodes (cross-burst derivations, late-day insights — they belong to this turn)
+   - Rotate warm-briefing "From this session" comprehensively (full day arc; per-burst rotations already done by naps)
+   - Reconcile today's history file + commit
+   - Strategically reconcile ask-lei.md (git-log walk + state verify) + commit
+   - Hand off to sleep with a complete cohort
+2. **`engram-sleep`** (consolidation + turn-advance):
+   - Dispatch dream-fairies in parallel (Step 0)
+   - `engram_reflect()` returns the dream agenda (tainted, stale, open conjectures, contradictions, goal tensions, feeling nudges) and arms the `dream_review` marker
+   - Work the agenda: resolve / supersede / promote / refute (NO new awake-state synthesis here; that was bedtime's job)
+   - Handle the dream-review feeling nudge honestly
+   - **`engram_advance_turn()` fires AFTER the dream** (qu_0035 rule, 2026-04-11): advances turn, logs `Turn N` header, commits git snapshot
+   - Write sleep-success marker via `tools/write_sleep_marker.py`
+   - Write dream-record at `~/.engram/history/dream/YYYY-MM-DD.md` (separate from the awake-state milestone log)
+
+**Why turn advance fires last.** One turn = one cohort of experience **plus the consolidation of that experience**. If the turn advances before the dream, dream-generated nodes land at a younger turn than the burst they consolidate, misaligning the forgetting curve (ob_0987 extends this reasoning).
+
+**Why bedtime is pre-turn-advance.** Nodes filed during bedtime are awake-state cognition about the just-completed cohort — they belong to THIS turn, not next. Bedtime → sleep is the load-bearing ordering (dv_0636).
 
 ### §8.3 Post-compaction — orientation, not processing
 
