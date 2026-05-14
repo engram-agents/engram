@@ -6,7 +6,7 @@ for LLM agents, implementing epistemic hierarchy principles:
 Evidence → Observation → Derivation, with full provenance tracking,
 confidence propagation, and version control via git checkpoints.
 
-MVP tools: ingestion (add_evidence, add_observation, check_similar),
+MVP tools: ingestion (add_evidence, add_observation),
 query (query, get_subgraph), version control (checkpoint, diff).
 """
 
@@ -1329,7 +1329,7 @@ def _get_tier_threshold(conn: sqlite3.Connection, tier: int) -> float:
     target count for this tier.
 
     Tier 1 (working memory): used by reflect, checkpoint, stats
-    Tier 2 (searchable): used by query, check_similar
+    Tier 2 (searchable): used by query, add_* auto-similarity-hints
     Tier 3 (total): no threshold, everything visible
     """
     if tier >= 3:
@@ -4253,125 +4253,6 @@ def _add_observation_batch_impl(
     if _batch_yellow:
         batch_result["yellow_card_warning"] = _batch_yellow
     return json.dumps(batch_result)
-
-
-@mcp.tool(
-    name="engram_check_similar",
-    annotations={
-        "title": "Check for Similar Existing Claims",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-def engram_check_similar(claim_text: str, top_k: int = 5) -> str:
-    """Search for existing nodes with claims similar to the given text.
-
-    Combines keyword matching (FTS5) with semantic similarity (embeddings)
-    to catch both exact and conceptual duplicates. Use this BEFORE creating
-    new observations or derivations to check whether a similar claim exists.
-
-    Args:
-        claim_text: The candidate claim to check against existing nodes.
-        top_k: Maximum number of results to return (default 5).
-
-    Returns:
-        JSON list of similar existing nodes with IDs, claims, confidence, support count, and match type.
-    """
-    conn = _get_db()
-    try:
-        tier2_threshold = _get_tier_threshold(conn, 2)
-
-        # --- FTS keyword search ---
-        fts_ids = set()
-        matches = []
-        try:
-            fts_results = conn.execute(
-                """SELECT n.id, n.type, n.claim, n.confidence, n.is_current,
-                          n.quote_type, n.created_at, n.importance_score
-                   FROM nodes_fts fts
-                   JOIN nodes n ON n.rowid = fts.rowid
-                   WHERE nodes_fts MATCH ? AND n.is_current = 1
-                   AND COALESCE(n.importance_score, 0) >= ?
-                   ORDER BY rank
-                   LIMIT ?""",
-                (claim_text, tier2_threshold, top_k),
-            ).fetchall()
-
-            for r in fts_results:
-                support_count = conn.execute(
-                    "SELECT COUNT(*) as c FROM edges WHERE target_id = ? AND relation IN ('supports', 'cites', 'derives_from')",
-                    (r["id"],),
-                ).fetchone()["c"]
-
-                matches.append({
-                    "id": r["id"],
-                    "type": r["type"],
-                    "claim": r["claim"],
-                    "confidence": r["confidence"],
-                    "quote_type": r["quote_type"],
-                    "support_count": support_count,
-                    "created_at": r["created_at"],
-                    "match_type": "keyword",
-                })
-                fts_ids.add(r["id"])
-        except sqlite3.OperationalError:
-            pass  # FTS query syntax error
-
-        # --- Semantic search (complement) ---
-        if _embedder.is_available() and _get_embedding_config().get("enabled", True):
-            _th = _get_thresholds_config()
-            sem_results = _semantic_search(
-                conn, claim_text, top_k=top_k,
-                min_similarity=float(_th["dedup_min_similarity"]),
-                importance_threshold=tier2_threshold,
-            )
-            for s in sem_results:
-                if s["id"] not in fts_ids:
-                    support_count = conn.execute(
-                        "SELECT COUNT(*) as c FROM edges WHERE target_id = ? AND relation IN ('supports', 'cites', 'derives_from')",
-                        (s["id"],),
-                    ).fetchone()["c"]
-
-                    full = conn.execute(
-                        "SELECT created_at FROM nodes WHERE id = ?", (s["id"],)
-                    ).fetchone()
-
-                    matches.append({
-                        "id": s["id"],
-                        "type": s["type"],
-                        "claim": s["claim"],
-                        "confidence": s["confidence"],
-                        "quote_type": s["quote_type"],
-                        "support_count": support_count,
-                        "created_at": full["created_at"] if full else "",
-                        "match_type": "semantic",
-                        "similarity": s["similarity"],
-                    })
-
-        # Trim to top_k
-        matches = matches[:top_k]
-
-        return json.dumps(
-            {
-                "query": claim_text,
-                "matches": matches,
-                "count": len(matches),
-                "search_methods": {
-                    "keyword_matches": len(fts_ids),
-                    "semantic_matches": len(matches) - len(fts_ids),
-                    "semantic_available": _embedder.is_available(),
-                },
-                "message": (
-                    "No similar claims found. Safe to create a new node."
-                    if not matches
-                    else f"Found {len(matches)} similar claim(s). Consider adding support to an existing node instead of creating a duplicate."
-                ),
-            }
-        )
-    finally:
-        conn.close()
 
 
 # ---- Internal search layer ----

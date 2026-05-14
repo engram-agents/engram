@@ -364,7 +364,7 @@ A decision-time reference for *what* to call and *with what shape*. Full behavio
 At think-time there are three directions of reach:
 
 - **Up** — toward premises. Given a claim, what does it rest on? → `engram_get_subgraph` with `direction="outgoing"` or `"both"`.
-- **Sideways** — toward neighbors. What sits near this, by similarity or shared source? → `engram_surface`, `engram_query`, `engram_check_similar`, `engram_inspect` (1-hop).
+- **Sideways** — toward neighbors. What sits near this, by similarity or shared source? → `engram_surface`, `engram_query`, `engram_inspect` (1-hop). For dedup before writing, the add_* tools fire an auto-similarity-hint at creation (with `action_hints` like CORROBORATE, DUPLICATE, POLARITY_ALERT) — no standalone pre-check needed.
 - **Back** — toward history. When was this written, has it been superseded or retracted, what's the edit trail? → `engram_history`, `engram_inspect`.
 
 Reflexes: before writing, reach sideways (dedup/corroborate). Before building on a claim, reach up (verify the chain). When something surprises you, reach back (same node, or a superseded predecessor?).
@@ -400,7 +400,7 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
   `(claim, motivation, [context_ids])`
 - **engram_goal_tension** — Value-level conflict between two goals.
   `(goal_id_a, goal_id_b, description, [analysis])`
-- **engram_ask** — Open research question (non-claim-bearing; never cited as premise). Recommended: run `engram_check_similar(question)` first — no inline dedup fallback exists here, unlike `engram_add_observation`. The general "reach sideways before writing" reflex is the only line of defense against duplicate questions.
+- **engram_ask** — Open research question (non-claim-bearing; never cited as premise). Recommended: run `engram_surface(question)` first — no inline dedup fallback exists here, unlike `engram_add_observation`. The general "reach sideways before writing" reflex is the only line of defense against duplicate questions.
   `(question, [context_ids, category, lacks])`
 - **engram_add_task** — Execution-scoped to-do, optionally linked to a goal.
   `(description, [goal_id, implements_ids, parent_task_id, scope])`
@@ -440,8 +440,6 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
 - **engram_list** — Enumerate by single-field shorthand OR structured filter.
   `([node_type, status, sort_by, limit, filters_json, fields_json, unlimited, include_superseded])`
   Single-field mode is the legacy shorthand (pass `node_type` and/or `status`). Structured mode (issue #81, ships 2026-05-11) takes a recursive condition tree via `filters_json` and supports multi-field AND/OR/NOT composition, text-contains, ID-range, date-range, NULL handling, and cross-table `cites`/`cited_by` virtual fields (V1: cites/supports/derives_from edges). Grammar: `Atomic={field,op,value}` | `Compound={logic,conditions}` — top-level list = implicit AND. Operators: eq/ne/gt/gte/lt/lte/in/not_in/contains/starts_with/ends_with/between/is_null/is_not_null. `limit=0` = count-only; `unlimited=True` = no cap. Default scans current-revision only; `include_superseded=True` relaxes the `is_current=1` predicate (text-layer leak audits — Mao-Cao prototype ob_1492 / ls_0020; capability inherited from retired audit_string in #123). Return shape always populates `total_matched` so truncation is never silent.
-- **engram_check_similar** — Standalone dedup probe before writing.
-  `(claim_text, [top_k])`
 - **engram_query_pattern** — Run a named compositional graph-pattern query (KnowQL-inspired, ob_1500 design, PR #29 shipped 2026-05-07). The TOOL does mechanical work (graph queries, similarity, ranking); the AGENT applies judgment to the ranked candidates. Six patterns currently shipped, each bundling a multi-step retrieval that would otherwise require 2-3 separate tool calls:
     - `open_question_answerable` — open questions with a derivation chain nearby (semantic) that may resolve them.
     - `contradiction_obsolescence_ready` — active contradictions where one side is retracted/superseded, ranked by obsolescence unambiguity.

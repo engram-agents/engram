@@ -60,13 +60,6 @@ TOOL_SCHEMAS = {
             "payload_json": {"type": "string", "description": "JSON object (as a string) with batch fields. Required: observations_json (stringified JSON array; each observation needs quoted_text, interpretation, claim, quote_type — optional: is_predictive, predicted_event, resolution_timeframe, source_class). Source: url+title OR evidence_id. Optional: domain, source_date, content_hash, git_sha.", "required": True},
         },
     },
-    "engram_check_similar": {
-        "description": "Search for existing nodes with similar claims. Use before creating new nodes to avoid duplicates.",
-        "parameters": {
-            "claim_text": {"type": "string", "description": "The claim text to search for.", "required": True},
-            "top_k": {"type": "integer", "description": "Max results to return (default 5)."},
-        },
-    },
     "engram_surface": {
         "description": "Shallow surface: search KG and return a compact summary nudge (type counts, special nodes, top claims, age signal). No memory refresh — ambient awareness, not deliberate recall. Use to decide whether to dig deeper with engram_inspect or engram_get_subgraph.",
         "parameters": {
@@ -270,7 +263,7 @@ TOOL_SCHEMAS = {
 # sleep-cycle-only at the workflow level — see its [Sleep cycle] description.
 # READ_ONLY membership does NOT imply awake-safe; check the description.
 READ_ONLY_TOOLS = {
-    "engram_query", "engram_get_subgraph", "engram_stats", "engram_reflect", "engram_check_similar",
+    "engram_query", "engram_get_subgraph", "engram_stats", "engram_reflect",
 }
 
 

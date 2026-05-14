@@ -123,7 +123,7 @@ Plus `VALID_ERROR_TYPES` for retract: fabricated_quote, wrong_citation, wrong_ev
 
 | Tool | Tentative tier | Notes |
 |------|----------------|-------|
-| `engram_check_similar` | ⬜ | dedup heuristic + action_hints |
+| ~~`engram_check_similar`~~ | retired #119 | superseded by auto-similarity-hint inside add_*-impl (PR #132); standalone tool was rarely invoked voluntarily |
 | `engram_diagnose` | ⬜ | health/state diagnostic |
 | `engram_stats` | ⬜ | graph stats |
 | `engram_reflect` | ⬜ | pre-dream briefing |

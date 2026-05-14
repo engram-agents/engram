@@ -127,7 +127,7 @@ For any engram tool not exposed as a dedicated subcommand:
 
 ```bash
 engram-pkg call engram_reflect
-engram-pkg call engram_check_similar --json '{"claim_text": "...", "top_k": 5}'
+engram-pkg call engram_surface --json '{"query": "Bitcoin halving impact"}'
 
 # For payloads with backticks, apostrophes, or multi-line prose, use --json-file
 # to sidestep shell quoting entirely:

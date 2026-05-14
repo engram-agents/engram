@@ -430,9 +430,10 @@ def test_batched_polarity_filters_below_min_sim():
     # min_similarity_for_check is 0.30 by default; with sim=0.20 both
     # the dedup floor (0.40 default) AND the polarity floor (0.30) are below
     # — so the low-sim ones may not surface in similar_existing at all
-    # (engram_check_similar uses dedup_min_similarity, not stub-bypassed here
-    # because we're stubbing _semantic_search). The KEY assertion: the
-    # batched call must NOT contain low-sim pairs even if they DID surface.
+    # (the add_* inline auto-similarity-hint uses dedup_min_similarity, not
+    # stub-bypassed here because we're stubbing _semantic_search). The KEY
+    # assertion: the batched call must NOT contain low-sim pairs even if
+    # they DID surface.
     _add_second_obs(server, claim="Topic Z disputed claim.")
     assert batch_calls["pairs_seen"] <= 3, (
         f"Batch should exclude pairs below min_sim_for_check (0.30); "
