@@ -4072,6 +4072,13 @@ def engram_add_evidence_batch(sources_json: str) -> str:
     })
 
 
+# Set of legitimate field names for the engram_add_observation_batch payload.
+_ADD_OBSERVATION_BATCH_FIELDS = frozenset({
+    "observations_json", "url", "title", "domain", "source_date",
+    "evidence_id", "content_hash", "git_sha",
+})
+
+
 @mcp.tool(
     name="engram_add_observation_batch",
     annotations={
@@ -4082,8 +4089,56 @@ def engram_add_evidence_batch(sources_json: str) -> str:
         "openWorldHint": False,
     },
 )
-def engram_add_observation_batch(
-    observations_json: str,
+def engram_add_observation_batch(payload_json: str) -> str:
+    """Extract multiple observations from a single source in one call.
+
+    Single-payload signature (wave 3 of ob_1499 — see issue #99): pass ALL
+    fields as one JSON object string in `payload_json`. The inner
+    `observations_json` field is itself a stringified JSON array of
+    observation objects (nested-encoding pattern matching engram_retract's
+    `replacement_json`).
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            observations_json (str, required): Stringified JSON array of
+                observation objects. Each observation must have quoted_text,
+                interpretation, claim, quote_type; optional is_predictive,
+                predicted_event, resolution_timeframe, source_class.
+            url (str, optional): Source URL. The evidence node is auto-created
+                or reused. Use this+title OR evidence_id, not both.
+            title (str, optional): Source title (required when url given).
+            domain (str, optional): Auto-extracted from URL if omitted.
+            source_date (str, optional): ISO date (e.g. '2026-03-20').
+            evidence_id (str, optional): ID of existing evidence node.
+            content_hash (str, optional): SHA-256 of file content (file evidence).
+            git_sha (str, optional): Git commit SHA (file evidence).
+
+    Returns:
+        JSON with list of created observation nodes, their confidence scores,
+        and any predictions. On payload-parsing failure, returns {"error": "..."}.
+
+    See _add_observation_batch_impl for full per-observation semantics + the
+    evidence-resolution logic.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _ADD_OBSERVATION_BATCH_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ADD_OBSERVATION_BATCH_FIELDS)}"
+        })
+
+    return _add_observation_batch_impl(**params)
+
+
+def _add_observation_batch_impl(
+    observations_json: str = "",
     url: str = "",
     title: str = "",
     domain: str = "",
@@ -4092,11 +4147,14 @@ def engram_add_observation_batch(
     content_hash: str = "",
     git_sha: str = "",
 ) -> str:
-    """Extract multiple observations from a single source in one call.
+    """Internal implementation — see engram_add_observation_batch MCP tool for
+    the public payload schema. Kept callable with named kwargs for in-server
+    callers.
 
-    Use this after reading a source holistically — extract ALL substantive
-    claims at once rather than calling engram_add_observation repeatedly.
-    All observations in the batch cite the same source.
+    Extract multiple observations from a single source in one call. Use this
+    after reading a source holistically — extract ALL substantive claims at
+    once rather than calling engram_add_observation repeatedly. All
+    observations in the batch cite the same source.
 
     Source identification: provide EITHER url+title (the evidence node will be
     auto-created or reused) OR evidence_id. If both are provided, evidence_id
@@ -4141,6 +4199,9 @@ def engram_add_observation_batch(
     if not resolved_evidence_id and url:
         if not title:
             return json.dumps({"error": "'title' is required when providing 'url'."})
+        # wave-3 dependency: update to _add_evidence_impl(...) when engram_add_evidence
+        # is migrated (issue #99 caller-sweep). PR #113 handles this on its own branch;
+        # post-batch-merge this line should call _add_evidence_impl directly.
         ev_result = json.loads(engram_add_evidence(
             url=url, title=title, domain=domain, source_date=source_date,
         ))

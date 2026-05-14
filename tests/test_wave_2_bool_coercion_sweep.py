@@ -120,11 +120,11 @@ class TestObservationIsPredictiveBool:
                 "is_predictive": "false",  # STRING — should error per-obs
             },
         ]
-        r = json.loads(server.engram_add_observation_batch(
-            observations_json=json.dumps(observations),
-            url="https://example.com/batch",
-            title="Batch test source",
-        ))
+        r = json.loads(server.engram_add_observation_batch(payload_json=json.dumps({
+            "observations_json": json.dumps(observations),
+            "url": "https://example.com/batch",
+            "title": "Batch test source",
+        })))
         # Per-obs semantics: obs[0] succeeds (actual bool), obs[1] errors
         # with an is_predictive message. Whole-batch isn't aborted.
         per_obs = r.get("results") or r.get("observations") or []

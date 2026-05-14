@@ -55,14 +55,9 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_add_observation_batch": {
-        "description": "Extract multiple observations from a single source in one call. Provide url+title to auto-create the evidence node, OR evidence_id to cite an existing one.",
+        "description": "Extract multiple observations from a single source in one call. Single-payload signature — pass all fields as one JSON object string in payload_json. Required inside payload_json: observations_json (itself a stringified JSON array of observation objects). Source identification: include url+title to auto-create the evidence node, OR evidence_id to cite an existing one.",
         "parameters": {
-            "observations_json": {"type": "string", "description": "JSON array of observation objects, each with: quoted_text, interpretation, claim, quote_type (all required); is_predictive, predicted_event, resolution_timeframe, source_class (optional).", "required": True},
-            "url": {"type": "string", "description": "URL of the source. Evidence node is auto-created or reused. Use this OR evidence_id."},
-            "title": {"type": "string", "description": "Title of the source (required if url is provided)."},
-            "domain": {"type": "string", "description": "Domain name (auto-extracted from URL if omitted)."},
-            "source_date": {"type": "string", "description": "Publication date (ISO format, e.g. '2026-03-20')."},
-            "evidence_id": {"type": "string", "description": "ID of an existing evidence node. Use this OR url+title."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with batch fields. Required: observations_json (stringified JSON array; each observation needs quoted_text, interpretation, claim, quote_type — optional: is_predictive, predicted_event, resolution_timeframe, source_class). Source: url+title OR evidence_id. Optional: domain, source_date, content_hash, git_sha.", "required": True},
         },
     },
     "engram_check_similar": {

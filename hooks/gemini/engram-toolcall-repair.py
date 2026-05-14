@@ -82,9 +82,11 @@ PROTECTED_TOOLS = {
         "is_predictive", "predicted_event", "resolution_timeframe",
         "source_class", "content_hash", "git_sha",
     },
+    # Migrated to single-payload signature in wave 3 (PR for #99) — see
+    # comment on engram_report_feeling below for the corruption risk this
+    # prevents.
     "mcp__engram__engram_add_observation_batch": {
-        "observations_json", "url", "title", "domain", "source_date",
-        "evidence_id", "content_hash", "git_sha",
+        "payload_json",
     },
     "mcp__engram__engram_nap": {
         "message",
