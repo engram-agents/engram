@@ -155,6 +155,12 @@ TOOL_SCHEMAS = {
             "payload_json": {"type": "string", "description": "JSON object (as a string) with link_about fields. Required: node_id (the node to link, typically an observation, feeling_report, lesson, derivation, or cornerstone). Optional: person_id (target person node; defaults to self-anchor if empty).", "required": True},
         },
     },
+    "engram_remove_edge": {
+        "description": "Remove a non-cascade edge between two nodes — typically for correcting over-applied `about` edges without engram-surgical. Safe whitelist: about, tensions, subtask_of, serves, exemplifies. Blocked: derives_from, supports, supersedes, retracts, contradicts, resolves, cites (cascade-bearing, structural-commitment, or provenance). Idempotent: removing a non-existent edge returns success. Audit-logged in edit_history. Single-payload signature.",
+        "parameters": {
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with remove_edge fields. Required: source_id (source node of the edge), target_id (target node of the edge), relation (one of: about, tensions, subtask_of, serves, exemplifies).", "required": True},
+        },
+    },
     "engram_add_task": {
         "description": "Create an actionable task that decomposes a goal into concrete work. Tasks are non-claim-bearing lightweight wrappers — conjectures hold the design content, tasks track what to do. Importance is dynamic: active (2.5), planned (2.0), done-milestone (1.5), done-routine (0.5). Single-payload signature — pass all fields as one JSON object string in payload_json. Required: description.",
         "parameters": {

@@ -412,6 +412,8 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
   `(reported_state, trigger, [categorical_tag, intensity_hint, context_ids])`
 - **engram_link_about** — Attach a node to a person via an about-edge (defaults to self).
   `(node_id, [person_id])`
+- **engram_remove_edge** — Remove a non-cascade edge between two nodes (correction tool for over-applied `about` / other relational edges). Safe whitelist: `about`, `tensions`, `subtask_of`, `serves`, `exemplifies`. Cascade-bearing, structural-commitment, and provenance edges are blocked; use engram-surgical for those. Idempotent and audit-logged.
+  `(source_id, target_id, relation)`
 
 ### Revise state
 

@@ -7204,6 +7204,191 @@ def _link_about_impl(
         conn.close()
 
 
+# Set of legitimate field names for the engram_remove_edge payload.
+_REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
+
+# Whitelist of edge relations that engram_remove_edge can delete.
+#
+# Excluded by design:
+#   - Cascade-bearing edges (derives_from, supports, supersedes, retracts) —
+#     removing them would silently undo retraction taint walks, supersede
+#     stale walks, or confidence-propagation that already cascaded.
+#   - Structural commitments (contradicts, resolves) — they record a stance
+#     in the graph; un-recording is rewriting history, not correction.
+#   - cites — carries provenance (observations cite their evidence node,
+#     derivations cite context). Removal would orphan a claim from its source.
+#
+# If you truly need to remove one of the excluded relations, engram-surgical
+# is the correct (heavyweight, audited) path.
+_REMOVABLE_EDGE_RELATIONS = frozenset({
+    "about",
+    "tensions",
+    "subtask_of",
+    "serves",
+    "exemplifies",
+})
+
+
+@mcp.tool(
+    name="engram_remove_edge",
+    annotations={
+        "title": "Remove a Non-Cascade Edge Between Nodes",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_remove_edge(payload_json: str) -> str:
+    """Remove a non-cascade edge between two nodes.
+
+    Use when a relational edge (typically `about`) was applied incorrectly and
+    needs correction without invoking engram-surgical. Closes the substrate
+    gap where over-applied edges previously required direct SQL surgery.
+
+    Only edges in the safe whitelist can be removed; cascade-bearing edges,
+    structural commitments, and provenance edges are blocked. See
+    `_REMOVABLE_EDGE_RELATIONS` for the whitelist and rationale.
+
+    Safe whitelist: about, tensions, subtask_of, serves, exemplifies.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            source_id (str, required): The source node of the edge.
+            target_id (str, required): The target node of the edge.
+            relation (str, required): The edge relation to remove. Must be
+                one of the safe-whitelist relations above.
+
+    Returns:
+        JSON with `status`:
+          - 'removed': edge existed and was deleted; audit-logged.
+          - 'no_op_not_found': edge did not exist; idempotent success.
+          - 'error': payload invalid, nodes missing, or relation not whitelisted.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _REMOVE_EDGE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_REMOVE_EDGE_FIELDS)}"
+        })
+
+    return _remove_edge_impl(**params)
+
+
+def _remove_edge_impl(
+    source_id: str = "",
+    target_id: str = "",
+    relation: str = "",
+) -> str:
+    """Internal implementation — see engram_remove_edge MCP tool for the public
+    payload schema. Kept callable with named kwargs for in-server callers.
+    """
+    if not source_id or not source_id.strip():
+        return json.dumps({"error": "source_id is required and cannot be empty."})
+    if not target_id or not target_id.strip():
+        return json.dumps({"error": "target_id is required and cannot be empty."})
+    if not relation or not relation.strip():
+        return json.dumps({"error": "relation is required and cannot be empty."})
+
+    if relation not in _REMOVABLE_EDGE_RELATIONS:
+        return json.dumps({
+            "error": (
+                f"Relation '{relation}' is not removable via engram_remove_edge. "
+                f"Allowed: {sorted(_REMOVABLE_EDGE_RELATIONS)}. "
+                f"Cascade-bearing edges (derives_from, supports, supersedes, "
+                f"retracts), structural commitments (contradicts, resolves), "
+                f"and provenance (cites) are blocked. Use engram-surgical if "
+                f"removal is truly required."
+            )
+        })
+
+    conn = _get_db()
+    try:
+        source = conn.execute("SELECT id, type FROM nodes WHERE id = ?", (source_id,)).fetchone()
+        if not source:
+            return json.dumps({"error": f"Source node '{source_id}' not found."})
+        target = conn.execute("SELECT id, type FROM nodes WHERE id = ?", (target_id,)).fetchone()
+        if not target:
+            return json.dumps({"error": f"Target node '{target_id}' not found."})
+
+        existing = conn.execute(
+            "SELECT id FROM edges WHERE source_id = ? AND target_id = ? AND relation = ?",
+            (source_id, target_id, relation),
+        ).fetchone()
+
+        if not existing:
+            return json.dumps({
+                "status": "no_op_not_found",
+                "source_id": source_id,
+                "target_id": target_id,
+                "relation": relation,
+                "message": f"No '{relation}' edge from {source_id} to {target_id} — nothing to remove.",
+            })
+
+        conn.execute(
+            "DELETE FROM edges WHERE source_id = ? AND target_id = ? AND relation = ?",
+            (source_id, target_id, relation),
+        )
+
+        # `exemplifies` is the only whitelist relation with metadata + filesystem
+        # side effects (engram_lesson_register_incident bumps lesson.incident_count
+        # + appends to error_incidents.json). Mirror the reverse inside the same
+        # transaction so the lesson's surface-rendered count stays honest. The
+        # error_incidents.json rebuild happens outside the transaction (best-
+        # effort, never blocks the edge write — matches register_incident's
+        # treatment at line ~8400).
+        if relation == "exemplifies" and target["type"] == "lesson":
+            lesson_row = conn.execute(
+                "SELECT metadata FROM nodes WHERE id = ?", (target_id,)
+            ).fetchone()
+            try:
+                meta = json.loads(lesson_row["metadata"]) if lesson_row and lesson_row["metadata"] else {}
+            except (TypeError, json.JSONDecodeError):
+                meta = {}
+            current = int(meta.get("incident_count", 0))
+            meta["incident_count"] = max(0, current - 1)
+            conn.execute(
+                "UPDATE nodes SET metadata = ? WHERE id = ?",
+                (json.dumps(meta), target_id),
+            )
+
+        _log_edit(conn, "edge_removed", source_id, source["type"], {
+            "target_id": target_id,
+            "target_type": target["type"],
+            "relation": relation,
+        })
+        conn.commit()
+
+        # Best-effort cache rebuild for the exemplifies side-effect surface.
+        # Outside the transaction so a JSON-write failure can't roll back the
+        # edge delete. Mirrors engram_lesson_register_incident's pattern.
+        cache_rebuild = None
+        if relation == "exemplifies":
+            try:
+                cache_rebuild = _rebuild_incidents_cache()
+            except Exception as exc:
+                cache_rebuild = {"status": "error", "detail": str(exc)}
+
+        result = {
+            "status": "removed",
+            "source_id": source_id,
+            "target_id": target_id,
+            "relation": relation,
+        }
+        if cache_rebuild is not None:
+            result["cache_rebuild"] = cache_rebuild
+        return json.dumps(result)
+    finally:
+        conn.close()
+
+
 @mcp.tool(
     name="engram_scan_emergence",
     annotations={

@@ -131,6 +131,11 @@ PROTECTED_TOOLS = {
     "mcp__engram__engram_link_about": {
         "payload_json",
     },
+    # Single-payload from the start (issue #117) — companion to link_about for
+    # correcting over-applied non-cascade edges without engram-surgical.
+    "mcp__engram__engram_remove_edge": {
+        "payload_json",
+    },
     "mcp__engram__engram_goal_tension": {
         "goal_id_a", "goal_id_b", "description", "analysis",
     },
