@@ -4863,10 +4863,18 @@ def engram_query(
 ) -> str:
     """Search the knowledge graph by natural language query.
 
-    DEPRECATED: Prefer engram_surface (shallow nudge, no refresh) for initial
-    search, then engram_inspect (single node detail) or engram_get_subgraph (full
-    chain) for deeper retrieval. This tool is kept for backward compatibility
-    with the eval harness and existing workflows.
+    First-class voluntary semantic-recall tool — the autonoetic intentional-search
+    complement to engram_surface's ambient/noetic auto-surfacing. Use this when
+    you want to recall something specifically ("I know I worked on X before — let
+    me actually find it"), not just notice that something might be relevant.
+
+    Two recall surfaces, by design:
+      - engram_surface (noetic) — "this sounds familiar"; ambient hints, no refresh.
+      - engram_query (autonoetic) — "I want to recall this clearly"; full nodes,
+        refreshes recall, strengthens memory.
+
+    For tracing a specific node's chain after either entry point, use
+    engram_inspect (single node) or engram_get_subgraph (multi-hop).
 
     Combines keyword search (FTS5) with semantic similarity (embedding-based)
     for comprehensive retrieval. Keyword results appear first, semantic-only

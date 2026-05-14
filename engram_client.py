@@ -82,7 +82,7 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_query": {
-        "description": "DEPRECATED: Prefer kg_recall → kg_inspect → kg_get_subgraph funnel. Kept for backward compatibility. Searches by text, returns full nodes with neighbors, refreshes all matched nodes.",
+        "description": "First-class voluntary semantic-recall (autonoetic intentional-search complement to engram_surface's ambient/noetic auto-surfacing). Use when you want to recall something specifically. Combines FTS5 keyword + semantic similarity; returns full nodes with neighbors; refreshes recall on matched nodes.",
         "parameters": {
             "query": {"type": "string", "description": "Search query.", "required": True},
             "types": {"type": "string", "description": "Comma-separated node types to filter by."},

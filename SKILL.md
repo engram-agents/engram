@@ -429,9 +429,9 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
 
 ### Read — find and inspect
 
-- **engram_surface** — Semantic + keyword search, ranked list.
+- **engram_surface** — Ambient/noetic recall ("this sounds familiar"). Compact summary nudge — type counts, special-node hints, top-claim previews. **No memory refresh.** Use as a quick "is anything in the graph about this?" probe before deciding whether to dig deeper.
   `(query, [top_k, semantic])`
-- **engram_query** — Typed/filtered search.
+- **engram_query** — Voluntary/autonoetic semantic-recall ("I want to recall this clearly"). The deliberate-search complement to `engram_surface`'s ambient signal: returns full nodes with neighbors, refreshes recall on matched nodes (strengthens memory). FTS5 keyword + embedding semantic match. Use when you know there's something specific to find.
   `(query, [types, min_confidence, include_superseded, top_k])`
 - **engram_inspect** — One node + 1-hop neighbor summaries; `dream_mode=True` skips recall refresh.
   `(node_id, [dream_mode])`

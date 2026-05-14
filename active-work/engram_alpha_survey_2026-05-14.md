@@ -116,7 +116,7 @@ Plus `VALID_ERROR_TYPES` for retract: fabricated_quote, wrong_citation, wrong_ev
 |------|----------------|-------|
 | `engram_inspect` | ⬜ | autonoetic single, 1-hop neighbors |
 | `engram_get_subgraph` | ⬜ | autonoetic chain |
-| `engram_query` | ⬜ | DEPRECATED (legacy autonoetic) |
+| `engram_query` | ⬜ | autonoetic intentional-search (un-deprecated #118) |
 | `engram_query_pattern` | ⬜ | pattern-style query |
 
 #### 1.3.5 Reading — diagnostic + meta (5)
