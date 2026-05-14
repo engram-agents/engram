@@ -6968,6 +6968,12 @@ def _add_cornerstone_impl(
         conn.close()
 
 
+_OUTGROW_CORNERSTONE_FIELDS = frozenset({
+    "old_cornerstone_id", "new_new_frame", "new_triggering_experience",
+    "new_supporting_ids", "new_title",
+})
+
+
 @mcp.tool(
     name="engram_outgrow_cornerstone",
     annotations={
@@ -6978,14 +6984,68 @@ def _add_cornerstone_impl(
         "openWorldHint": False,
     },
 )
-def engram_outgrow_cornerstone(
-    old_cornerstone_id: str,
-    new_new_frame: str,
+def engram_outgrow_cornerstone(payload_json: str) -> str:
+    """Supersede a cornerstone along its tag axis — the predecessor's new_frame
+    rolls into the successor's prior_frame, capturing the growth cycle
+    (cj_0043, ob_0949) in the graph's shape.
+
+    Single-payload signature (wave 3 of ob_1499 — see issue #99): pass ALL
+    fields as one JSON object string in `payload_json`. This eliminates the
+    antml-prefix multi-parameter swallow risk that the previous 5-parameter
+    signature was prone to.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            old_cornerstone_id (str, required): The cornerstone being
+                outgrown (must be type='cornerstone' and current).
+            new_new_frame (str, required): The frame that now replaces the
+                predecessor's new_frame.
+            new_triggering_experience (str, optional): Short narrative of
+                what caused the reframe this time. Usually load-bearing.
+            new_supporting_ids (str, optional): Comma-separated IDs of
+                supporting nodes for the new cornerstone (feelings,
+                observations, prior cornerstones). Added on top of
+                inherited supports.
+            new_title (str, optional): If empty, reuses the predecessor's
+                title. Tag is always inherited (outgrowth stays on the same
+                axis).
+
+    Returns:
+        JSON with old + new cornerstone IDs and the rolled frame shape. On
+        payload-parsing failure, returns {"error": "..."}.
+
+    See _outgrow_cornerstone_impl for full semantics — kept callable with
+    named kwargs for in-server callers.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _OUTGROW_CORNERSTONE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_OUTGROW_CORNERSTONE_FIELDS)}"
+        })
+
+    return _outgrow_cornerstone_impl(**params)
+
+
+def _outgrow_cornerstone_impl(
+    old_cornerstone_id: str = "",
+    new_new_frame: str = "",
     new_triggering_experience: str = "",
     new_supporting_ids: str = "",
     new_title: str = "",
 ) -> str:
-    """Supersede a cornerstone along its tag axis — the predecessor's new_frame
+    """Internal implementation — see engram_outgrow_cornerstone MCP tool for
+    the public payload schema. Kept callable with named kwargs for
+    in-server callers.
+
+    Supersede a cornerstone along its tag axis — the predecessor's new_frame
     rolls into the successor's prior_frame, capturing the growth cycle
     (cj_0043, ob_0949) in the graph's shape.
 
@@ -7017,6 +7077,10 @@ def engram_outgrow_cornerstone(
     Returns:
         JSON with old + new cornerstone IDs and the rolled frame shape.
     """
+    if not old_cornerstone_id or not old_cornerstone_id.strip():
+        return json.dumps({"error": "old_cornerstone_id is required and cannot be empty."})
+    if not new_new_frame or not new_new_frame.strip():
+        return json.dumps({"error": "new_new_frame is required and cannot be empty."})
     conn = _get_db()
     try:
         old = conn.execute(
@@ -7454,6 +7518,12 @@ def _remove_edge_impl(
         conn.close()
 
 
+_SCAN_EMERGENCE_FIELDS = frozenset({
+    "min_cluster_size", "similarity_threshold", "focus", "node_type_filter",
+})
+
+
+
 @mcp.tool(
     name="engram_scan_emergence",
     annotations={
@@ -7464,13 +7534,62 @@ def _remove_edge_impl(
         "openWorldHint": False,
     },
 )
-def engram_scan_emergence(
+def engram_scan_emergence(payload_json: str = "") -> str:
+    """Scan the graph for emergent patterns that could become cornerstones.
+
+    Single-payload signature (wave 3 of ob_1499 — see issue #99): pass ALL
+    fields as one JSON object string in `payload_json`. This eliminates the
+    antml-prefix multi-parameter swallow risk that the previous 4-parameter
+    signature was prone to. All fields are optional — calling with an empty
+    payload (or {}) runs the default scan.
+
+    Args:
+        payload_json: JSON object (as a string) with these optional fields:
+            min_cluster_size (int): Minimum cluster size to surface
+                (default 3).
+            similarity_threshold (float): Cosine similarity threshold for
+                clustering (default 0.55). Higher = stricter.
+            focus (str): Scope of the scan — "self" (default), "all", or
+                "person:<pn_id>".
+            node_type_filter (str): Comma-separated node types to include.
+
+    Returns:
+        JSON with clusters sorted by signature_count then size. On
+        payload-parsing failure, returns {"error": "..."}.
+
+    See _scan_emergence_impl for full semantics — kept callable with named
+    kwargs for in-server callers.
+    """
+    payload_json = payload_json or "{}"
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _SCAN_EMERGENCE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_SCAN_EMERGENCE_FIELDS)}"
+        })
+
+    return _scan_emergence_impl(**params)
+
+
+def _scan_emergence_impl(
     min_cluster_size: int = 3,
     similarity_threshold: float = 0.55,
     focus: str = "self",
     node_type_filter: str = "observation_factual,feeling_report,lesson,derivation,observation_predictive",
 ) -> str:
-    """[Sleep cycle — invoked by dream-mode dispatch; do not call awake.]
+    """Internal implementation — see engram_scan_emergence MCP tool for the
+    public payload schema. Kept callable with named kwargs for in-server
+    callers.
+
+    [Sleep cycle — invoked by dream-mode dispatch; do not call awake.]
+
     Scan the graph for emergent patterns that could become cornerstones.
 
     Inverts the cornerstone authoring model (ob_0955): instead of top-down
@@ -7681,6 +7800,11 @@ def engram_scan_emergence(
         conn.close()
 
 
+_GOAL_TENSION_FIELDS = frozenset({
+    "goal_id_a", "goal_id_b", "description", "analysis",
+})
+
+
 @mcp.tool(
     name="engram_goal_tension",
     annotations={
@@ -7691,13 +7815,58 @@ def engram_scan_emergence(
         "openWorldHint": False,
     },
 )
-def engram_goal_tension(
-    goal_id_a: str,
-    goal_id_b: str,
-    description: str,
+def engram_goal_tension(payload_json: str) -> str:
+    """Record a tension between two goals in the knowledge graph.
+
+    Single-payload signature (wave 3 of ob_1499 — see issue #99): pass ALL
+    fields as one JSON object string in `payload_json`. This eliminates the
+    antml-prefix multi-parameter swallow risk that the previous 4-parameter
+    signature was prone to.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            goal_id_a (str, required): ID of the first goal (gl_XXXX).
+            goal_id_b (str, required): ID of the second goal (gl_XXXX).
+            description (str, required): What tension exists between these
+                goals — clear statement of the incompatibility.
+            analysis (str, optional): Root cause analysis — why do these
+                goals conflict?
+
+    Returns:
+        JSON with the new tension node ID and linked goals. On
+        payload-parsing failure, returns {"error": "..."}.
+
+    See _goal_tension_impl for full semantics — kept callable with named
+    kwargs for in-server callers.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _GOAL_TENSION_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_GOAL_TENSION_FIELDS)}"
+        })
+
+    return _goal_tension_impl(**params)
+
+
+def _goal_tension_impl(
+    goal_id_a: str = "",
+    goal_id_b: str = "",
+    description: str = "",
     analysis: str = "",
 ) -> str:
-    """Record a tension between two goals in the knowledge graph.
+    """Internal implementation — see engram_goal_tension MCP tool for the
+    public payload schema. Kept callable with named kwargs for in-server
+    callers.
+
+    Record a tension between two goals in the knowledge graph.
 
     Goal tensions are epistemically distinct from factual contradictions
     (engram_contradict). Contradictions are disputes about REALITY — resolved
@@ -7726,6 +7895,12 @@ def engram_goal_tension(
     Returns:
         JSON with the new tension node ID and linked goals.
     """
+    if not goal_id_a or not goal_id_a.strip():
+        return json.dumps({"error": "goal_id_a is required and cannot be empty."})
+    if not goal_id_b or not goal_id_b.strip():
+        return json.dumps({"error": "goal_id_b is required and cannot be empty."})
+    if not description or not description.strip():
+        return json.dumps({"error": "description is required and cannot be empty."})
     conn = _get_db()
     try:
         # Validate both nodes exist and are goals
@@ -8185,6 +8360,11 @@ def _rebuild_incidents_cache() -> dict:
         conn.close()
 
 
+_LESSON_REGISTER_INCIDENT_FIELDS = frozenset({
+    "lesson_id", "incident_id", "note",
+})
+
+
 @mcp.tool(
     name="engram_lesson_register_incident",
     annotations={
@@ -8195,12 +8375,59 @@ def _rebuild_incidents_cache() -> dict:
         "openWorldHint": False,
     },
 )
-def engram_lesson_register_incident(
-    lesson_id: str,
-    incident_id: str,
+def engram_lesson_register_incident(payload_json: str) -> str:
+    """Register a post-hoc incident observation as another instance of an
+    existing lesson's pattern.
+
+    Single-payload signature (wave 3 of ob_1499 — see issue #99): pass ALL
+    fields as one JSON object string in `payload_json`. This eliminates the
+    antml-prefix multi-parameter swallow risk that the previous 3-parameter
+    signature was prone to.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            lesson_id (str, required): ID of an existing lesson node
+                (type='lesson', is_current=1).
+            incident_id (str, required): ID of the incident observation;
+                must be claim-bearing.
+            note (str, optional): Brief annotation of why this incident
+                exemplifies the lesson — stored on the edge's metadata.
+
+    Returns:
+        JSON with status + the new edge's source/target, the lesson's
+        current incident count, and cache rebuild result. On
+        payload-parsing failure, returns {"error": "..."}.
+
+    See _lesson_register_incident_impl for full semantics — kept callable
+    with named kwargs for in-server callers.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _LESSON_REGISTER_INCIDENT_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_LESSON_REGISTER_INCIDENT_FIELDS)}"
+        })
+
+    return _lesson_register_incident_impl(**params)
+
+
+def _lesson_register_incident_impl(
+    lesson_id: str = "",
+    incident_id: str = "",
     note: str = "",
 ) -> str:
-    """Register a post-hoc incident observation as another instance of an
+    """Internal implementation — see engram_lesson_register_incident MCP tool
+    for the public payload schema. Kept callable with named kwargs for
+    in-server callers.
+
+    Register a post-hoc incident observation as another instance of an
     existing lesson's pattern.
 
     Post-hoc path for lesson growth: when a new error incident surfaces that
@@ -8226,6 +8453,10 @@ def engram_lesson_register_incident(
         JSON with status + the new edge's source/target, the lesson's
         current incident count, and cache rebuild result.
     """
+    if not lesson_id or not lesson_id.strip():
+        return json.dumps({"error": "lesson_id is required and cannot be empty."})
+    if not incident_id or not incident_id.strip():
+        return json.dumps({"error": "incident_id is required and cannot be empty."})
     conn = _get_db()
     try:
         lesson_row = conn.execute(
@@ -9356,6 +9587,11 @@ def _contradict_impl(
         conn.close()
 
 
+_ASK_FIELDS = frozenset({
+    "question", "context_ids", "category", "lacks",
+})
+
+
 @mcp.tool(
     name="engram_ask",
     annotations={
@@ -9366,13 +9602,59 @@ def _contradict_impl(
         "openWorldHint": False,
     },
 )
-def engram_ask(
-    question: str,
+def engram_ask(payload_json: str) -> str:
+    """Register an open question as a node in the knowledge graph.
+
+    Single-payload signature (wave 3 of ob_1499 — see issue #99): pass ALL
+    fields as one JSON object string in `payload_json`. This eliminates the
+    antml-prefix multi-parameter swallow risk that the previous 4-parameter
+    signature was prone to.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            question (str, required): The specific, answerable question.
+            context_ids (str, optional): Comma-separated node IDs that are
+                relevant but insufficient to answer the question.
+            category (str, optional): One of research / design /
+                implementation / planning / meta.
+            lacks (str, optional): What's missing — one of
+                external_evidence / empirical_data / human_decision /
+                implementation / synthesis / prerequisite.
+
+    Returns:
+        JSON with the new question node ID. On payload-parsing failure,
+        returns {"error": "..."}.
+
+    See _ask_impl for full semantics — kept callable with named kwargs for
+    in-server callers.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _ASK_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ASK_FIELDS)}"
+        })
+
+    return _ask_impl(**params)
+
+
+def _ask_impl(
+    question: str = "",
     context_ids: str = "",
     category: str = "",
     lacks: str = "",
 ) -> str:
-    """Register an open question as a node in the knowledge graph.
+    """Internal implementation — see engram_ask MCP tool for the public
+    payload schema. Kept callable with named kwargs for in-server callers.
+
+    Register an open question as a node in the knowledge graph.
 
     Questions are research directives — signposts that guide investigation.
     They are NOT claim-bearing: no node can cite a question as a premise.
@@ -9398,6 +9680,9 @@ def engram_ask(
     Returns:
         JSON with the new question node ID.
     """
+    if not question or not question.strip():
+        return json.dumps({"error": "question is required and cannot be empty."})
+
     VALID_CATEGORIES = {"research", "design", "implementation", "planning", "meta"}
     VALID_LACKS = {"external_evidence", "empirical_data", "human_decision",
                    "implementation", "synthesis", "prerequisite"}

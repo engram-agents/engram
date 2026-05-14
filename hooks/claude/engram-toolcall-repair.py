@@ -122,9 +122,25 @@ PROTECTED_TOOLS = {
     "mcp__engram__engram_add_cornerstone": {
         "payload_json",
     },
+    # Migrated to single-payload signature in wave 3 (PR for #99) — see
+    # comment on engram_report_feeling below for the corruption risk this
+    # prevents.
     "mcp__engram__engram_outgrow_cornerstone": {
-        "old_cornerstone_id", "new_new_frame", "new_triggering_experience",
-        "new_supporting_ids", "new_title",
+        "payload_json",
+    },
+    # Migrated to single-payload signature in wave 3 (PR for #99) — see
+    # comment on engram_report_feeling below for the corruption risk this
+    # prevents. Added post-migration per fairy round-1 (every migrated tool
+    # appears in PROTECTED_TOOLS for invocation-log completeness, even when
+    # single-param signature makes inter-swallow risk nil).
+    "mcp__engram__engram_scan_emergence": {
+        "payload_json",
+    },
+    # Migrated to single-payload signature in wave 3 (PR for #99) — see
+    # comment on engram_report_feeling below for the corruption risk this
+    # prevents. Added post-migration per fairy round-1.
+    "mcp__engram__engram_lesson_register_incident": {
+        "payload_json",
     },
     # Migrated to single-payload signature in wave 2b (PR #66) — see comment
     # on engram_report_feeling above for the corruption risk this prevents.
@@ -136,8 +152,11 @@ PROTECTED_TOOLS = {
     "mcp__engram__engram_remove_edge": {
         "payload_json",
     },
+    # Migrated to single-payload signature in wave 3 (PR for #99) — see
+    # comment on engram_report_feeling below for the corruption risk this
+    # prevents.
     "mcp__engram__engram_goal_tension": {
-        "goal_id_a", "goal_id_b", "description", "analysis",
+        "payload_json",
     },
     "mcp__engram__engram_add_lesson": {
         "payload_json",
@@ -169,8 +188,11 @@ PROTECTED_TOOLS = {
     "mcp__engram__engram_contradict": {
         "payload_json",
     },
+    # Migrated to single-payload signature in wave 3 (PR for #99) — see
+    # comment on engram_report_feeling below for the corruption risk this
+    # prevents.
     "mcp__engram__engram_ask": {
-        "question", "context_ids", "category", "lacks",
+        "payload_json",
     },
     # Migrated to single-payload signature in wave 2a (PR #63) — see comment
     # on engram_report_feeling above for the corruption risk this prevents.

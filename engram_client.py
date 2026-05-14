@@ -137,12 +137,9 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_goal_tension": {
-        "description": "Record a tension between two goals. Goal tensions are value-level conflicts (not factual contradictions) requiring root cause analysis and value examination. Both goals are preserved.",
+        "description": "Record a tension between two goals. Goal tensions are value-level conflicts (not factual contradictions) requiring root cause analysis and value examination. Both goals are preserved. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: goal_id_a, goal_id_b, description.",
         "parameters": {
-            "goal_id_a": {"type": "string", "description": "First goal ID (gl_XXXX).", "required": True},
-            "goal_id_b": {"type": "string", "description": "Second goal ID (gl_XXXX).", "required": True},
-            "description": {"type": "string", "description": "What tension exists between these goals.", "required": True},
-            "analysis": {"type": "string", "description": "Root cause analysis — why do these goals conflict?"},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with goal-tension fields. Required: goal_id_a (first goal ID, gl_XXXX), goal_id_b (second goal ID, gl_XXXX), description (what tension exists between these goals). Optional: analysis (root cause analysis — why do these goals conflict?).", "required": True},
         },
     },
     "engram_link_about": {
@@ -188,12 +185,9 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_ask": {
-        "description": "Register an open research question. Questions are NOT claim-bearing — no node can cite them as premises. Use for open-ended gaps to investigate. For specific claims to build on before proving, use kg_add_conjecture instead.",
+        "description": "Register an open research question. Questions are NOT claim-bearing — no node can cite them as premises. Use for open-ended gaps to investigate. For specific claims to build on before proving, use kg_add_conjecture instead. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: question.",
         "parameters": {
-            "question": {"type": "string", "description": "The specific question to investigate.", "required": True},
-            "context_ids": {"type": "string", "description": "Comma-separated relevant but insufficient node IDs."},
-            "category": {"type": "string", "description": "Question category: research, design, implementation, planning, meta."},
-            "lacks": {"type": "string", "description": "What blocks resolution: external_evidence, empirical_data, human_decision, implementation, synthesis, prerequisite."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with ask fields. Required: question (the specific, answerable question to investigate). Optional: context_ids (comma-separated relevant but insufficient node IDs), category (research / design / implementation / planning / meta), lacks (external_evidence / empirical_data / human_decision / implementation / synthesis / prerequisite).", "required": True},
         },
     },
     "engram_supersede": {

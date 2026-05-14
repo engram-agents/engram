@@ -48,7 +48,7 @@ def _seed_question_with_evidence(server):
     ob = json.loads(server.engram_add_observation(payload_json=json.dumps(obs_payload)))
     ob_id = ob["observation_id"]
 
-    q = json.loads(server.engram_ask("Is Y actually the case?"))
+    q = json.loads(server.engram_ask(payload_json=json.dumps({"question": "Is Y actually the case?"})))
     q_id = q["question_id"]
     return q_id, ob_id
 
