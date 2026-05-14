@@ -295,8 +295,16 @@ echo ""
 #
 # Renders + installs the user's crontab from config.json's cadence block via
 # tools/sync-cron.sh. Defaults match the production cadence: heartbeat at
-# :00/:30, sleep at 20:30 local, dispatcher autostart + watchdog. Skip with
-# --no-cron for headless setups or hand-managed crontabs.
+# :00/:30, dispatcher autostart + watchdog. Skip with --no-cron for headless
+# setups or hand-managed crontabs.
+#
+# Sleep is NOT cron-scheduled as of 2026-05-14 (alpha #133 PR C). Sleep is
+# interactive-first: the agent runs `engram-bedtime` then `engram-sleep` at
+# end-of-day in the user's active session. `cadence.sleep_hour` /
+# `cadence.sleep_minute` in config.json continue to define the heartbeat
+# protected window (preferred quiet slot for interactive bedtime + sleep).
+# Manual catch-up via `tools/sleep.sh` remains available if a day's sleep
+# was missed.
 
 if [ "$NO_CRON" -eq 1 ]; then
   echo "== Step 8: Cron (skipped per --no-cron) =="

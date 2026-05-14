@@ -1,9 +1,17 @@
 #!/bin/bash
-# ENGRAM coordinated daily sleep — fires once per day per the coordinated-
-# sleep design. The SINGLE turn-advance per day across all of an agent's
-# roles (interactive, heartbeat, telegram, sleep). Other roles use nap-mode
-# only. The dream cohort spans the full day across all roles via
-# engram_history(since=<prev-sleep-timestamp>).
+# ENGRAM sleep — MANUAL CATCH-UP only as of 2026-05-14 (alpha #133 PR C).
+#
+# Sleep is now interactive-first: the agent runs `engram-bedtime` then
+# `engram-sleep` at end-of-day in the user's active session (typically
+# surfaced by the end-of-day-detector hook on wrap-up phrases). The cron-
+# scheduled invocation that used to drive this script every night has been
+# removed (see templates/crontab.template and tools/render_cron.py).
+#
+# This script remains on disk for the catch-up case: if yesterday's sleep
+# was missed (host off at midnight, disconnected day, etc.), run this
+# manually to consolidate the accumulated cohort. It spawns a fresh
+# `claude -p` session that drives engram-bedtime + engram-sleep in
+# sequence with the new three-routine architecture (dv_0636).
 #
 # Required env (caller responsibility):
 #   AGENT_NAME       e.g. borges, mneme, aleph
@@ -14,9 +22,9 @@
 #   INTER_AGENT_DIR  /home/agents-shared/inter-agent
 #   PYTHON_BIN       /home/linuxbrew/.linuxbrew/bin/python3
 #
-# Why fresh session per night (no resume): the dream cycle starts with a
-# clean context window so the agent can survey today's full cohort
-# without compaction pressure from accumulated heartbeat traffic.
+# Why fresh session for catch-up: the dream cycle starts with a clean
+# context window so the agent can survey today's full cohort without
+# compaction pressure from accumulated heartbeat traffic.
 
 set -euo pipefail
 
@@ -99,7 +107,7 @@ echo "$SESSION_UUID" > "$SESSIONS_DIR/sleep-$TODAY.id"
 
 PROMPT="Run engram-bedtime then engram-sleep to consolidate today's work across all roles (interactive, heartbeat, telegram). This is the SINGLE turn-advance for $TODAY (NYC local) per the coordinated-sleep design — all other roles today used nap-mode only.
 
-NOTE: This cron-driven path is deprecated pending engram-alpha #133 PR C (cron removal + interactive-only sleep). Until that PR ships, cron-fired sleep runs both bedtime and sleep skills in sequence so the new three-routine architecture (dv_0636) stays correct in the autonomous case.
+NOTE: This script is for MANUAL catch-up invocation only. The cron-scheduled path was removed 2026-05-14 (alpha #133 PR C — interactive sleep is now canonical). You're reading this because someone (you, presumably) invoked sleep.sh by hand, typically to consolidate a cohort whose end-of-day sleep was missed.
 
 PHASE 1 — engram-bedtime (pre-turn-advance, this-turn content):
   - Walk the day's full cohort via engram_history(mode='edits', action='created', since=<prev-sleep-timestamp>)

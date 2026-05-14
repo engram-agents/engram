@@ -6,11 +6,18 @@ AGENT_NAME={agent_name}
 COUNTERPART_NAME={counterpart_name}
 
 # ENGRAM heartbeat — fires at minutes {heartbeat_minutes} of every hour,
-# skipping hours/minutes inside the sleep protected window.
+# skipping hours/minutes inside the sleep protected window. The window is
+# preserved to give the user a quiet end-of-day slot for interactive
+# bedtime/sleep handoff per the three-routine architecture (dv_0636).
 {heartbeat_lines}
 
-# ENGRAM coordinated sleep at {sleep_hour:02d}:{sleep_minute:02d} ({timezone}).
-{sleep_minute} {sleep_hour} * * * {engram_home}/tools/sleep.sh >> {engram_home}/logs/sleep.log 2>&1
+# Sleep is interactive-only as of 2026-05-14 (alpha #133 PR C — issue #133).
+# Run `engram-bedtime` then `engram-sleep` at end-of-day. Once issue #133 PR B
+# ships (pending), an end-of-day detector hook will surface a combo nudge on
+# wrap-up phrases ("good night", "call it a day", etc.) so one "Yes" triggers
+# the pair. The cron-driven `tools/sleep.sh` is no longer scheduled; the
+# script remains for manual catch-up invocation if yesterday's sleep was
+# missed (host off at midnight, disconnected day, etc.).
 
 # Dispatcher autostart at boot + watchdog every 5 min (idempotent — the
 # scripts no-op if the tmux session is already alive).

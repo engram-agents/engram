@@ -366,7 +366,7 @@ cmd_pause() {
     sudo -u "$user" crontab -l 2>/dev/null \
         | grep -E '^# PAUSED .*\.sh' \
         | sed 's/^/  /' \
-        || echo "  (no matches — was the agent's crontab missing heartbeat/sleep entries?)"
+        || echo "  (no matches — expected if installed post-#133-PR-C; sleep.sh is no longer scheduled. Heartbeat-only pause is the new correct shape.)"
 }
 
 cmd_resume() {

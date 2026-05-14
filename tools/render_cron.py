@@ -13,6 +13,14 @@ are the single source of truth for which heartbeat fires get suppressed —
 there is no separate `heartbeat_skip_hours` list. (Earlier schema sketches
 included one; it was dead code and got removed before merge.)
 
+Sleep is interactive-only as of 2026-05-14 (alpha #133 PR C). The
+`sleep_hour` + `sleep_minute` cadence fields are NO LONGER used to schedule
+an autonomous sleep cron — they only define the heartbeat protected window
+(the user's preferred quiet slot for interactive bedtime + sleep). The
+`tools/sleep.sh` script remains on disk for manual catch-up invocation but
+is no longer rendered into the crontab. See dv_0636 for the three-routine
+self-engram-maintenance architecture and skills/claude/engram-bedtime/.
+
 Compression: heartbeat hour ranges are minimised to standard cron syntax
 (`0-19,22-23` not `0,1,2,...,19,22,23`).
 
