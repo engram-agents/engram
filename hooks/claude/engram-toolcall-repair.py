@@ -145,8 +145,11 @@ PROTECTED_TOOLS = {
     "mcp__engram__engram_add_task": {
         "payload_json",
     },
+    # Migrated to single-payload signature in wave 3 (PR for #99) — see
+    # comment on engram_report_feeling below for the corruption risk this
+    # prevents.
     "mcp__engram__engram_update_task": {
-        "task_id", "new_status", "note",
+        "payload_json",
     },
     # Migrated to single-payload signature in wave 2a (PR #63). Repair-hook
     # must NOT include the old multi-field names — otherwise SWALLOW_RE could

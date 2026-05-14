@@ -164,11 +164,9 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_update_task": {
-        "description": "Update a task's status and rebalance its importance. Status transitions: planned→active (importance 2.5), →done (milestone 1.5, routine 0.5), →blocked (1.8).",
+        "description": "Update a task's status and rebalance its importance. Status transitions: planned→active (importance 2.5), →done (milestone 1.5, routine 0.5), →blocked (1.8). Single-payload signature — pass all fields as one JSON object string in payload_json. Required: task_id, new_status.",
         "parameters": {
-            "task_id": {"type": "string", "description": "The task node ID (tk_XXXX).", "required": True},
-            "new_status": {"type": "string", "description": "One of: planned, active, done, blocked.", "required": True},
-            "note": {"type": "string", "description": "Optional note about the status change."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with update-task fields. Required: task_id (the task node ID, tk_XXXX), new_status (one of 'planned', 'active', 'done', 'blocked'). Optional: note (note about the status change, stored in metadata as part of status_history).", "required": True},
         },
     },
     "engram_report_feeling": {

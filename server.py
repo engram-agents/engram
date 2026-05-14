@@ -8522,6 +8522,11 @@ def _add_task_impl(
         conn.close()
 
 
+_UPDATE_TASK_FIELDS = frozenset({
+    "task_id", "new_status", "note",
+})
+
+
 @mcp.tool(
     name="engram_update_task",
     annotations={
@@ -8532,12 +8537,55 @@ def _add_task_impl(
         "openWorldHint": False,
     },
 )
-def engram_update_task(
-    task_id: str,
-    new_status: str,
+def engram_update_task(payload_json: str) -> str:
+    """Update a task's status and rebalance its importance accordingly.
+
+    Single-payload signature (wave 3 of ob_1499 — see issue #99): pass ALL
+    fields as one JSON object string in `payload_json`. This eliminates the
+    antml-prefix multi-parameter swallow risk that the previous 3-parameter
+    signature was prone to.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            task_id (str, required): The task node ID (tk_XXXX).
+            new_status (str, required): One of "planned", "active", "done",
+                "blocked".
+            note (str, optional): Note about the status change (stored in
+                metadata as part of status_history).
+
+    Returns:
+        JSON with updated task state and new importance values. On
+        payload-parsing failure, returns {"error": "..."}.
+
+    See _update_task_impl for the full importance-rebalancing semantics —
+    kept callable with named kwargs for in-server callers.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _UPDATE_TASK_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_UPDATE_TASK_FIELDS)}"
+        })
+
+    return _update_task_impl(**params)
+
+
+def _update_task_impl(
+    task_id: str = "",
+    new_status: str = "",
     note: str = "",
 ) -> str:
-    """Update a task's status and rebalance its importance accordingly.
+    """Internal implementation — see engram_update_task MCP tool for the public
+    payload schema. Kept callable with named kwargs for in-server callers.
+
+    Update a task's status and rebalance its importance accordingly.
 
     Status transitions trigger importance rebalancing:
     - planned → active: importance rises to 2.5 (highest — current work)
@@ -8558,6 +8606,10 @@ def engram_update_task(
     Returns:
         JSON with updated task state and new importance values.
     """
+    if not task_id or not task_id.strip():
+        return json.dumps({"error": "task_id is required and cannot be empty."})
+    if not new_status or not new_status.strip():
+        return json.dumps({"error": "new_status is required and cannot be empty."})
     valid_statuses = {"planned", "active", "done", "blocked"}
     if new_status not in valid_statuses:
         return json.dumps({"error": f"Invalid status '{new_status}'. Must be one of: {', '.join(sorted(valid_statuses))}."})
@@ -8589,6 +8641,12 @@ def engram_update_task(
         # Update status and importance
         new_score = _compute_importance(new_base, _get_current_turn())
 
+        # Note-gated status_history: only records the transition when the caller
+        # supplies a note. Status changes without notes still log to edit_history
+        # below (the durable audit channel) — status_history is intentionally
+        # narrative-only, surfaced to the agent for human-readable transition
+        # context. A note-free planned→active toggle leaves status_history
+        # untouched by design (see test_payload_json_no_note_status_history_unchanged).
         if note:
             if "status_history" not in meta:
                 meta["status_history"] = []
