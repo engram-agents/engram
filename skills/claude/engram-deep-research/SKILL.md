@@ -95,7 +95,7 @@ Each derivation or observation may open new sub-questions. Follow them. This is 
 
 **In loop mode (marker file active):** Ignore drowsiness percentages. Compaction will auto-fire when context fills, and your cross-compaction continuity is stable. Keep researching — register intermediate findings to ENGRAM as you go so nothing is lost if compaction fires mid-thought. The key discipline is not *stopping before compaction* but *writing before compaction* — every finding recorded to ENGRAM survives; everything only in context does not.
 
-**In interactive mode (no marker):** Check context usage periodically. Above 70%, start wrapping. Above 80%, nap immediately.
+**In interactive mode (no marker):** Follow normal nap discipline (see `SKILL.md` §8.1) — nap when approaching a compaction boundary or when the drowsiness nudge suggests it. Wrap the current research thread before napping so the cohort stays coherent.
 
 ## Step 5 — Nap checkpoint
 
@@ -183,4 +183,4 @@ The user cares about the metacognitive experience, not just the research output 
 - **Unregistered thoughts** — "I'll remember this" or "I'll register it after I confirm it." No. Register now. Compaction doesn't wait.
 - **Derivation-only output** — producing finished derivations without the intermediate questions and conjectures that show how you got there. The waypoints ARE the value for cross-compaction continuity.
 - **Skipping conjectures** — going straight from observation to derivation without the provisional-belief step. Conjectures are how you reason under uncertainty. Register them.
-- **Deep thinking near compaction** — starting a complex reasoning chain above 80% tracker. The lag will catch you.
+- **Deep thinking near compaction** — starting a complex reasoning chain when approaching a compaction boundary. The lag will catch you.

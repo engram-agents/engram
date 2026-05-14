@@ -72,10 +72,6 @@ Gemini CLI compresses conversation history automatically when token budget tight
 
 Unlike Claude Code's PostCompact (which fires *after* compaction so the new agent sees an injection), Gemini's PreCompress fires *before* — the same agent sees the marker, not a new one. Treat the SessionStart resume as the post-compression boundary.
 
-## Context Tracker
-
-The context tracker (`{{ENGRAM_DATA}}/hooks/context_tracker.py`) measures transcript-file size growth since the last compression. **The percentage it reports is your distance to auto-compression, NOT your percentage of context window capacity.** 100% = compression fires. **In loop mode** (`{{ENGRAM_DATA}}/loop-mode.json` exists), drowsiness warnings are suppressed. **In interactive mode**, warnings fire at 50% (caution) and 70% (urgent). When approaching ~65% in interactive mode, nap to preserve context-window knowledge to ENGRAM.
-
 ## Infrastructure Locations
 
 | Component | Path |
