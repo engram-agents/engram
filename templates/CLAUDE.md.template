@@ -118,10 +118,6 @@ If `~/.engram/loop-mode.json` exists at compaction time, I am mid-loop. I need t
 - **Current sub-question** — which branch of the research tree I was exploring
 - **Next step** — what I should do first (not "continue research" — be specific: "search for X", "derive Y from ob_XXXX + ob_YYYY", "read paper Z")
 
-## Context Tracker
-
-The context tracker (`~/.engram/hooks/context_tracker.py`) measures JSONL file size growth since the last compaction. **The percentage it reports is your distance to auto-compaction, NOT your percentage of context window capacity.** 100% = compaction fires. **In loop mode** (`~/.engram/loop-mode.json` exists), drowsiness warnings are suppressed — compaction auto-fires and cross-compaction continuity is stable. The discipline is writing to ENGRAM continuously, not stopping before compaction. **In interactive mode**, warnings fire at 50% (caution) and 70% (urgent). When approaching ~65% in interactive mode, nap to preserve context-window knowledge to ENGRAM.
-
 ## Infrastructure Locations
 
 | Component | Path |
