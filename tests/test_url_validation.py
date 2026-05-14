@@ -28,8 +28,13 @@ def _setup():
 
 
 def _add_evidence(server, url, title="Test"):
-    """Call engram_add_evidence directly and return parsed result."""
-    return json.loads(server.engram_add_evidence(url=url, title=title))
+    """Call engram_add_evidence directly and return parsed result.
+
+    Wraps args into payload_json per wave-3 single-payload migration (issue #99).
+    """
+    return json.loads(server.engram_add_evidence(
+        payload_json=json.dumps({"url": url, "title": title})
+    ))
 
 
 def _add_observation(db_dir, **kwargs):

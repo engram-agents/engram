@@ -3374,21 +3374,85 @@ mcp.tool = _timing_mcp_tool
 # ---- Ingestion tools ----
 
 
+# Set of legitimate field names for the engram_add_evidence payload.
+_ADD_EVIDENCE_FIELDS = frozenset({
+    "url", "title", "domain", "source_date", "content_snippet",
+})
+
+
 # Internal helper — not exposed as an MCP tool.
 # Called by engram_add_observation and engram_add_observation_batch to auto-create evidence nodes.
-def engram_add_evidence(
-    url: str,
-    title: str,
-    domain: str = "",
-    source_date: str = "",
-    content_snippet: str = "",
-) -> str:
+def engram_add_evidence(payload_json: str) -> str:
     """Register a new source document (webpage, article, data release) in the knowledge graph.
+
+    Single-payload signature (wave 3 of ob_1499 — see issue #99): pass ALL
+    fields as one JSON object string in `payload_json`. This eliminates the
+    antml-prefix multi-parameter swallow risk that the previous N-parameter
+    signature was prone to. In-server callers use `_add_evidence_impl(...)`
+    directly with named kwargs.
 
     Creates an Evidence node representing the raw source material. Evidence nodes
     are immutable, URL-keyed references — they record that a specific source
     exists, not what it means or what version was read. Per-observation versioning
     (git_sha + content_hash) lives on observations, not evidence (dv_0547).
+
+    Same URL → same evidence node, regardless of content changes. For file-based
+    sources, the file must be committed to git before it can be cited (the
+    "committed-before-cite" guard remains enforced); the specific revision read
+    is recorded on each observation that cites this evidence.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            url (str, required): Canonical URL of the source document. For local
+                files, use 'file://path/to/file' format.
+            title (str, required): Article or page title.
+            domain (str, optional): Source domain (e.g. 'reuters.com').
+                Auto-extracted from URL if omitted.
+            source_date (str, optional): Publication or byline date of the source
+                (ISO format, e.g. '2026-03-20'). Extract from the article's
+                dateline or byline when available.
+            content_snippet (str, optional): Truncated excerpt of relevant content
+                for offline re-reading.
+
+    Returns:
+        JSON with the evidence node ID and trust pool status. On
+        payload-parsing failure, returns {"error": "..."} with no node created.
+
+    See _add_evidence_impl for the full URL-validation + trust-pool semantics.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _ADD_EVIDENCE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ADD_EVIDENCE_FIELDS)}"
+        })
+
+    return _add_evidence_impl(**params)
+
+
+def _add_evidence_impl(
+    url: str = "",
+    title: str = "",
+    domain: str = "",
+    source_date: str = "",
+    content_snippet: str = "",
+) -> str:
+    """Internal implementation — see engram_add_evidence for the public
+    payload schema. Kept callable with named kwargs for in-server callers.
+
+    Register a new source document (webpage, article, data release) in the
+    knowledge graph. Creates an Evidence node representing the raw source
+    material. Evidence nodes are immutable, URL-keyed references — they record
+    that a specific source exists, not what it means or what version was read.
+    Per-observation versioning (git_sha + content_hash) lives on observations,
+    not evidence (dv_0547).
 
     Same URL → same evidence node, regardless of content changes. For file-based
     sources, the file must be committed to git before it can be cited (the
@@ -3407,6 +3471,10 @@ def engram_add_evidence(
     Returns:
         JSON with the evidence node ID and trust pool status.
     """
+    if not url or not url.strip():
+        return json.dumps({"error": "url is required and cannot be empty."})
+    if not title or not title.strip():
+        return json.dumps({"error": "title is required and cannot be empty."})
     conn = _get_db()
     try:
         # Compute domain + yellow-card match early so every success return path
@@ -3694,7 +3762,7 @@ def _add_observation_impl(
     _yellow_forward = None
     if not evidence_id and url:
         # Auto-create or reuse evidence node
-        ev_result = json.loads(engram_add_evidence(
+        ev_result = json.loads(_add_evidence_impl(
             url=url, title=title, domain=domain, source_date=source_date,
         ))
         if ev_result.get("error"):
@@ -4053,7 +4121,7 @@ def engram_add_evidence_batch(sources_json: str) -> str:
             results.append({"index": i, "error": "Both 'url' and 'title' are required."})
             continue
 
-        r = json.loads(engram_add_evidence(
+        r = json.loads(_add_evidence_impl(
             url=url,
             title=title,
             domain=src.get("domain", ""),
@@ -4199,10 +4267,7 @@ def _add_observation_batch_impl(
     if not resolved_evidence_id and url:
         if not title:
             return json.dumps({"error": "'title' is required when providing 'url'."})
-        # wave-3 dependency: update to _add_evidence_impl(...) when engram_add_evidence
-        # is migrated (issue #99 caller-sweep). PR #113 handles this on its own branch;
-        # post-batch-merge this line should call _add_evidence_impl directly.
-        ev_result = json.loads(engram_add_evidence(
+        ev_result = json.loads(_add_evidence_impl(
             url=url, title=title, domain=domain, source_date=source_date,
         ))
         if ev_result.get("error"):

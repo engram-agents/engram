@@ -33,13 +33,9 @@ from typing import Any, Optional
 
 TOOL_SCHEMAS = {
     "engram_add_evidence": {
-        "description": "Register a source document (webpage, article, data release). Returns existing node if URL matches. Per-observation versioning (dv_0547): file content_hash and git_sha live on each observation, not the evidence node.",
+        "description": "Register a source document (webpage, article, data release). Returns existing node if URL matches. Per-observation versioning (dv_0547): file content_hash and git_sha live on each observation, not the evidence node. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: url, title.",
         "parameters": {
-            "url": {"type": "string", "description": "Canonical URL of the source document.", "required": True},
-            "title": {"type": "string", "description": "Article or page title.", "required": True},
-            "domain": {"type": "string", "description": "Source domain (auto-extracted from URL if omitted)."},
-            "source_date": {"type": "string", "description": "Publication date (ISO format)."},
-            "content_snippet": {"type": "string", "description": "Optional truncated excerpt."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with evidence fields. Required: url (canonical URL of the source — for local files use 'file://path/to/file'), title (article or page title). Optional: domain (auto-extracted from URL if omitted), source_date (ISO format, e.g. '2026-03-20'), content_snippet (truncated excerpt for offline re-reading).", "required": True},
         },
     },
     "engram_add_evidence_batch": {
@@ -616,8 +612,13 @@ if __name__ == "__main__":
         print(f"Tools available: {len(client.tool_names)}")
         print(f"  {client.tool_names}\n")
 
-        # Test direct calls
-        r = client.call("engram_add_evidence", {"url": "https://reuters.com/test", "title": "Test Article"})
+        # Test direct calls — canonical wave-3 payload_json form
+        r = client.call("engram_add_evidence", {
+            "payload_json": json.dumps({
+                "url": "https://reuters.com/test",
+                "title": "Test Article",
+            })
+        })
         print(f"Add evidence: {r['status']} → {r['evidence_id']}")
 
         r = client.call("engram_add_observation", {
