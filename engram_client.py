@@ -238,12 +238,13 @@ TOOL_SCHEMAS = {
         "parameters": {},
     },
     "engram_list": {
-        "description": "List nodes in compact triage format. No neighbor data, no memory refresh.",
+        "description": "List nodes in compact triage format. No neighbor data, no memory refresh. Supports structured filters via filters_json (recursive AND/OR/NOT with contains/starts_with/ends_with operators). Default scans current-revision only; set include_superseded=True to scan the historical layer (text-layer leak audits).",
         "parameters": {
             "node_type": {"type": "string", "description": "Filter by node type (e.g. 'question', 'observation_factual')."},
             "status": {"type": "string", "description": "Filter by status (e.g. 'open', 'resolved', 'active')."},
             "sort_by": {"type": "string", "description": "Sort order: id, created, importance, recalls.", "enum": ["id", "created", "importance", "recalls"]},
             "limit": {"type": "integer", "description": "Max results (default 100, max 500)."},
+            "include_superseded": {"type": "boolean", "description": "If True, scan non-current (superseded) nodes too. Default False (current-revision only)."},
         },
     },
     "engram_stats": {

@@ -127,7 +127,7 @@ Plus `VALID_ERROR_TYPES` for retract: fabricated_quote, wrong_citation, wrong_ev
 | `engram_diagnose` | ⬜ | health/state diagnostic |
 | `engram_stats` | ⬜ | graph stats |
 | `engram_reflect` | ⬜ | pre-dream briefing |
-| `engram_audit_string` | ⬜ | substring-grep across nodes |
+| ~~`engram_audit_string`~~ | retired #123 | superseded by `engram_list` contains operator + `include_superseded` flag |
 
 #### 1.3.6 Focus — compaction-bridge mechanism (7)
 

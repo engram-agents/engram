@@ -4937,154 +4937,6 @@ def engram_query(
 
 
 @mcp.tool(
-    name="engram_audit_string",
-    annotations={
-        "title": "Audit Nodes for Literal Substring",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-def engram_audit_string(
-    needle: str,
-    case_sensitive: bool = False,
-    include_superseded: bool = False,
-    fields: str = "claim",
-    limit: int = 200,
-) -> str:
-    """Find every CURRENT node whose text fields contain a literal substring.
-
-    Designed to catch text-layer leaks that semantic search (engram_query) and
-    relation-layer cleanup (engram_supersede / engram_retract) miss. The
-    Mao-Cao incident (ob_1492, ls_0020) is the prototype case: a hallucinated
-    name persisted in node text fields for two weeks after the relation-layer
-    retraction cascade fired correctly. A scan tool of this shape would have
-    caught the residue immediately.
-
-    Distinct from engram_query (semantic + FTS5, top-k by relevance, refreshes
-    recall, enriches with neighbors). This is a pure audit primitive: literal
-    substring scan, no ranking, no recall side effects, no neighbor enrichment.
-    Answer the single question — where in the corpus does this string appear?
-
-    Args:
-        needle: Literal substring to find. Required, non-empty. SQL LIKE
-            metachars (`%` and `_`) inside `needle` are treated literally
-            (they're escaped before the query).
-        case_sensitive: If True, only exact case matches count. Default False.
-        include_superseded: If True, scan non-current nodes too. Default False
-            (only scans live nodes since those are what produces fresh outputs).
-        fields: Comma-separated list of fields to scan. Allowed values:
-            'claim' (default), 'quoted_text', 'interpretation', 'logical_chain',
-            'source_title', 'content_snippet', 'trigger_text', 'predicted_event'.
-            Use 'all' for the full set.
-        limit: Cap on results returned. Default 200; raise if you need more.
-
-    Returns:
-        JSON: {needle, case_sensitive, fields, include_superseded, count,
-        hits: [{id, type, field, snippet, confidence, is_current}, ...], message}
-    """
-    if not needle:
-        return json.dumps({"error": "needle is required and must be non-empty"})
-
-    # Clamp limit to a sane range (consistent with engram_query / engram_list).
-    # Negative values would silently disable LIMIT under SQLite (LIMIT -1 = no
-    # limit) and produce a resource-exhaustion path on large corpora.
-    limit = max(1, min(int(limit), 10000))
-
-    allowed_fields = {
-        "claim", "quoted_text", "interpretation", "logical_chain",
-        "source_title", "content_snippet", "trigger_text", "predicted_event",
-    }
-    if fields == "all":
-        scan_fields = sorted(allowed_fields)
-    else:
-        scan_fields = [f.strip() for f in fields.split(",") if f.strip()]
-        invalid = [f for f in scan_fields if f not in allowed_fields]
-        if invalid:
-            return json.dumps({
-                "error": f"invalid field(s): {sorted(set(invalid))}; allowed: {sorted(allowed_fields)}"
-            })
-        if not scan_fields:
-            return json.dumps({"error": "fields must name at least one allowed field"})
-
-    # Escape SQL LIKE metachars so the substring is treated literally.
-    escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    like_pattern = f"%{escaped}%"
-
-    conn = _get_db()
-    try:
-        # When case_sensitive=True, push the case predicate into SQL via the
-        # per-connection PRAGMA (SQLite's default LIKE is ASCII-case-insensitive
-        # which would force a Python post-filter, and that post-filter combined
-        # with SQL LIMIT produces silent false negatives when the LIMIT
-        # saturates with case-wrong rows). PRAGMA scope is this connection
-        # only; the conn closes in the finally block.
-        if case_sensitive:
-            conn.execute("PRAGMA case_sensitive_like = ON")
-
-        # Build a UNION ALL across the requested field columns. fname is
-        # whitelisted above, so direct interpolation is safe; needle goes
-        # through a parameter binding.
-        union_parts = []
-        params: list[str] = []
-        current_clause = "" if include_superseded else " AND is_current = 1"
-        for fname in scan_fields:
-            union_parts.append(
-                f"SELECT id, type, '{fname}' AS field, {fname} AS matched_text, "
-                f"confidence, is_current FROM nodes "
-                f"WHERE {fname} IS NOT NULL AND {fname} LIKE ? ESCAPE '\\'{current_clause}"
-            )
-            params.append(like_pattern)
-        full_sql = " UNION ALL ".join(union_parts) + f" LIMIT {int(limit)}"
-        rows = conn.execute(full_sql, params).fetchall()
-
-        hits = []
-        for node_id, type_, field_, matched_, conf, is_current in rows:
-            text = matched_ or ""
-            # SQL handled both case-insensitive (default LIKE) and
-            # case-sensitive (PRAGMA above) matching, so we use the raw text
-            # and needle directly to locate the substring for snippet anchoring.
-            idx = text.find(needle) if case_sensitive else text.lower().find(needle.lower())
-            if idx < 0:
-                # Defensive — should not happen now that SQL handles both modes,
-                # but skip rather than crash if SQL returned a row we can't
-                # locate the needle in (e.g. encoding edge case).
-                continue
-            start = max(0, idx - 40)
-            end = min(len(text), idx + len(needle) + 40)
-            snippet = text[start:end].replace("\n", " ")
-            if start > 0:
-                snippet = "..." + snippet
-            if end < len(text):
-                snippet = snippet + "..."
-            hits.append({
-                "id": node_id,
-                "type": type_,
-                "field": field_,
-                "snippet": snippet,
-                "confidence": conf,
-                "is_current": bool(is_current),
-            })
-
-        return json.dumps({
-            "needle": needle,
-            "case_sensitive": case_sensitive,
-            "fields": scan_fields,
-            "include_superseded": include_superseded,
-            "count": len(hits),
-            "hits": hits,
-            "message": (
-                f"Found {len(hits)} hit(s) across {len(scan_fields)} field(s)."
-                if hits else
-                f"No hits for needle {needle!r} in fields {scan_fields}."
-            ),
-        })
-    finally:
-        conn.close()
-
-
-@mcp.tool(
     name="engram_get_subgraph",
     annotations={
         "title": "Inspect Node Neighborhood",
@@ -11817,6 +11669,7 @@ def engram_list(
     filters_json: str = "",
     fields_json: str = "",
     unlimited: bool = False,
+    include_superseded: bool = False,
 ) -> str:
     """List nodes — single-field shorthand OR full structured filter.
 
@@ -11892,6 +11745,17 @@ def engram_list(
         unlimited: If True, return all matched rows regardless of limit.
             Mutually exclusive with limit > 0 (set limit=0 and unlimited=True
             for the same effect, or just unlimited=True).
+        include_superseded: If True, scan non-current (superseded) nodes too.
+            Default False (the common case — list reflects the current
+            revision of the graph). Set True to scan the historical layer,
+            e.g., for text-layer leak audits where a stale claim persisted
+            in the text of a superseded node (Mao-Cao incident, ob_1492 /
+            ls_0020 prototype). Replaces the audit_string `include_superseded`
+            capability that retired with #123. Note: passing a manual
+            `{"field": "is_current", "op": "eq", "value": 0}` in filters_json
+            while leaving `include_superseded=False` is a no-op (compounds
+            with the default `is_current = 1` → impossible conjunction →
+            zero rows). Use the `include_superseded=True` kwarg instead.
 
     Returns JSON:
         {status, total_matched, shown, truncated, sort_by, nodes,
@@ -11949,9 +11813,12 @@ def engram_list(
         except FilterError as e:
             return json.dumps({"status": "error", "error": str(e)})
 
-    # Build WHERE clause. `is_current = 1` is always applied (current-revision
-    # only is the contract for engram_list).
-    where_parts: list[str] = ["is_current = 1"]
+    # Build WHERE clause. Default is current-revision only; `include_superseded`
+    # opt-in relaxes that predicate so the historical layer becomes visible
+    # (text-layer leak audits, e.g., Mao-Cao prototype ob_1492 / ls_0020).
+    where_parts: list[str] = []
+    if not include_superseded:
+        where_parts.append("is_current = 1")
     params: list = []
     if node_type:
         where_parts.append("type = ?")
@@ -11962,6 +11829,12 @@ def engram_list(
     if filter_sql_frag:
         where_parts.append(filter_sql_frag)
         params.extend(filter_params)
+
+    # Sentinel: if include_superseded=True AND no other predicates are set,
+    # where_parts is empty and `WHERE {where}` would be malformed. The 1=1
+    # no-op preserves the existing query-building shape and is harmless.
+    if not where_parts:
+        where_parts.append("1=1")
 
     where = " AND ".join(where_parts)
 

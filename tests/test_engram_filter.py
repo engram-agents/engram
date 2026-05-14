@@ -572,3 +572,84 @@ class TestEngramListStructured:
         assert _like_escape("a\\b") == "a\\\\b"
         # %, _, \ all get escaped
         assert _like_escape("ob_50%") == "ob\\_50\\%"
+
+
+# ---------------------------------------------------------------------------
+# include_superseded — text-layer leak audit capability (PR #131 round-2)
+#
+# Closes the parity gap surfaced when engram_audit_string was retired:
+# audit_string had `include_superseded` to scan the historical layer
+# for text-layer leaks (Mao-Cao prototype, ob_1492 / ls_0020). engram_list
+# hardcoded is_current=1, so retirement would have lost the capability.
+# These tests lock in the relaxed predicate.
+# ---------------------------------------------------------------------------
+
+
+class TestEngramListIncludeSuperseded:
+    def _seed_current_and_superseded(self, server):
+        """Insert one current and one superseded obs with the same target text."""
+        conn = server._get_db()
+        conn.execute(
+            "INSERT INTO nodes (id, type, claim, created_at, is_current) "
+            "VALUES (?, ?, ?, ?, 1)",
+            ("ob_s001", "observation_factual",
+             "Current claim mentioning Mao-Cao leak.",
+             "2026-05-14T00:00:00Z"),
+        )
+        conn.execute(
+            "INSERT INTO nodes (id, type, claim, created_at, is_current) "
+            "VALUES (?, ?, ?, ?, 0)",
+            ("ob_s002", "observation_factual",
+             "Superseded claim also mentioning Mao-Cao leak.",
+             "2026-05-13T00:00:00Z"),
+        )
+        conn.commit()
+
+    def test_default_excludes_superseded(self):
+        server = fresh_server()
+        self._seed_current_and_superseded(server)
+        result = json.loads(server.engram_list(
+            filters_json=json.dumps(
+                {"field": "claim", "op": "contains", "value": "Mao-Cao"}
+            )
+        ))
+        ids = {n["id"] for n in result["nodes"]}
+        assert "ob_s001" in ids
+        assert "ob_s002" not in ids, "superseded should be excluded by default"
+
+    def test_include_superseded_true_scans_historical_layer(self):
+        server = fresh_server()
+        self._seed_current_and_superseded(server)
+        result = json.loads(server.engram_list(
+            filters_json=json.dumps(
+                {"field": "claim", "op": "contains", "value": "Mao-Cao"}
+            ),
+            include_superseded=True,
+        ))
+        ids = {n["id"] for n in result["nodes"]}
+        assert "ob_s001" in ids
+        assert "ob_s002" in ids, (
+            "include_superseded=True must surface superseded nodes "
+            "(audit_string parity, retired in #123)"
+        )
+
+    def test_include_superseded_with_no_other_filters_does_not_blow_up_query(self):
+        """Sentinel test: include_superseded=True with no other predicates
+        previously would have produced `WHERE ` (malformed SQL). The 1=1
+        sentinel preserves a valid query shape."""
+        server = fresh_server()
+        self._seed_current_and_superseded(server)
+        result = json.loads(server.engram_list(include_superseded=True))
+        assert result["status"] == "ok"
+        ids = {n["id"] for n in result["nodes"]}
+        assert "ob_s001" in ids
+        assert "ob_s002" in ids
+
+    def test_include_superseded_false_explicit_is_default(self):
+        """Passing include_superseded=False explicitly matches the default."""
+        server = fresh_server()
+        self._seed_current_and_superseded(server)
+        result = json.loads(server.engram_list(include_superseded=False))
+        ids = {n["id"] for n in result["nodes"]}
+        assert "ob_s001" in ids
+        assert "ob_s002" not in ids
