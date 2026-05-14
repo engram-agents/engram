@@ -160,6 +160,7 @@ fi
 echo "  $ENGRAM_HOME"
 echo "  $CLAUDE_HOME"
 echo "  heartbeat-queue/{to,from}-heartbeat/ (scaffolded with notes.md + inbox.md)"
+echo "  heartbeat-queue/README.md (scaffolded by bootstrap from template)"
 echo ""
 
 # -------- Step 4: Skills, hooks, MCP config --------

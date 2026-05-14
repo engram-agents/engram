@@ -96,13 +96,14 @@ Ask if they have any questions about how ENGRAM works. Answer plainly; do not ov
 
 Do this step LAST, only after the dialogue is genuinely complete. If the session aborts mid-dialogue, the marker file should still be present so the next session re-enters this skill.
 
-1. Read `~/.claude/CLAUDE.md` and `~/.engram/warm-briefing.md`.
+1. Read `~/.claude/CLAUDE.md`, `~/.engram/warm-briefing.md`, `~/.engram/HEARTBEAT.md` (if present), and `~/.engram/heartbeat-queue/README.md` (if present).
 2. Substitute:
    - `{{AGENT_NAME}}` → the chosen agent name
    - `{{USER_NAME}}` → the user's name
    - `{{TODAY}}` → today's date in ISO format (YYYY-MM-DD)
+   - `{{COUNTERPART_NAME}}` → the literal string `(no counterpart)` for single-agent installs, or the counterpart's name for multi-agent installs. Ask the user before substituting if HEARTBEAT.md is present.
    - Any other `{{...}}` markers present — consult the user if ambiguous, do not guess.
-3. Write the resolved files back.
+3. Write the resolved files back. Enumerate each one explicitly to avoid silent-drop bugs (a missed file keeps firing forever with raw braces in the prose AND in the `to-heartbeat/to-{{COUNTERPART_NAME}}-drafts/` directory path).
 4. Delete `~/.engram/first-run-pending`.
 5. Call `engram_advance_turn(message="First session with <USER_NAME>: named <AGENT_NAME>. Founding motivation: <one-line quote or summary>.")` — this is a real session checkpoint (advances turn counter), not a nap. The naming event is worth a turn.
 

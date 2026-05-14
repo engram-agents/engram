@@ -248,6 +248,22 @@ def main() -> None:
         )
         print(f"  HEARTBEAT.md → {ENGRAM_HOME}/HEARTBEAT.md", flush=True)
 
+    # heartbeat-queue/README.md — protocol documentation for the foreground ↔
+    # heartbeat hot-memory channel. HEARTBEAT.md.template cross-references this
+    # file at lines 38 + 49 (full protocol + inbox.md entry format). Subset of
+    # HEARTBEAT.md.template's placeholders ({{AGENT_NAME}}, {{COUNTERPART_NAME}},
+    # {{ENGRAM_HOME}} — no {{USER_NAME}}); first-session-skill resolves them
+    # alongside HEARTBEAT.md (the skill's Step 5 read+write enumeration was
+    # updated in this PR to include the README).
+    heartbeat_readme_template = TEMPLATES_DIR / "heartbeat-queue" / "README.md.template"
+    if heartbeat_readme_template.exists():
+        substitute_template(
+            heartbeat_readme_template,
+            ENGRAM_HOME / "heartbeat-queue" / "README.md",
+            substitutions,
+        )
+        print(f"  heartbeat-queue/README.md → {ENGRAM_HOME}/heartbeat-queue/README.md", flush=True)
+
     # Target-specific identity doc + hook config
     if TARGET == "claude":
         substitute_template(

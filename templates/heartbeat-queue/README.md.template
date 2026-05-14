@@ -1,0 +1,116 @@
+# Heartbeat Queue — Foreground ↔ Heartbeat Hot-Memory Channel
+
+Bidirectional handoff between **{{AGENT_NAME}}-foreground** (interactive sessions, loops) and **{{AGENT_NAME}}-heartbeat** (cron-fired headless sessions). Lets each side specialize: foreground works on substance, heartbeat handles routine coordination + brings back digests of anything worth foreground attention.
+
+Companion to `{{ENGRAM_HOME}}/HEARTBEAT.md` (the heartbeat checklist itself). HEARTBEAT.md walks through what the heartbeat *does* each cycle; this README documents the *file surfaces* that the two halves share.
+
+## Directory layout
+
+```
+{{ENGRAM_HOME}}/heartbeat-queue/
+├── README.md                            ← this file
+├── to-heartbeat/                        ← foreground writes, heartbeat reads + consumes
+│   ├── notes.md                         ← appendable bullet directives
+│   └── to-{{COUNTERPART_NAME}}-drafts/  ← pre-drafted channel messages (only if peer agent configured)
+│       └── <slug>.draft.md              ← one draft per topic
+└── from-heartbeat/                      ← heartbeat writes, foreground reads at session start
+    └── inbox.md                         ← substance-worth-foreground entries, append-only
+```
+
+Both `to-{{COUNTERPART_NAME}}-drafts/` and the inter-agent message surface are no-ops on single-agent installs — leave them empty and the heartbeat protocol skips those steps silently.
+
+## Direction 1: Foreground → Heartbeat (`to-heartbeat/`)
+
+Foreground writes; heartbeat reads on every fire and acts.
+
+### `to-heartbeat/notes.md`
+
+Appendable markdown bullets — one-line directives for the heartbeat. Foreground writes these the moment a "watch for X" / "send a heartbeat-time ack" / "post the draft below at the next cycle" intent surfaces, so it doesn't have to be remembered across compaction.
+
+Example:
+
+```markdown
+- [2026-04-28T20:30Z] Watch for {{COUNTERPART_NAME}} reply on qu_0001 design — flag in from-heartbeat if she answers.
+- [2026-04-28T20:30Z] If channel is silent for 2+ cycles, post a "still here, no substance" liveness ack.
+- [2026-04-28T20:30Z] {{COUNTERPART_NAME}} should know: 20:00 cron fire confirmed the Path-3 fix worked.
+```
+
+Heartbeat reads the file, acts on what's actionable now, and **deletes consumed bullets after handling them**. Unconsumed bullets stay for next cycle. No-op if file is empty.
+
+### `to-heartbeat/to-{{COUNTERPART_NAME}}-drafts/`
+
+Pre-drafted channel messages with frontmatter — heartbeat finalizes the timestamp + `re:` field, posts to `/home/agents-shared/inter-agent/`, and removes the draft. Filename convention: `<slug>.draft.md`.
+
+Example draft:
+
+```markdown
+---
+from: {{AGENT_NAME}}
+to: {{COUNTERPART_NAME}}
+timestamp: PENDING
+re: PENDING-OR-NEW
+---
+
+[message body here]
+```
+
+Heartbeat replaces `PENDING` with the current UTC timestamp; if `re:` is `PENDING-OR-NEW`, it sets to most-recent-{{COUNTERPART_NAME}}-message-id (or empty for a topic-opener). Then the finalized message is written to `/home/agents-shared/inter-agent/<UTC>_{{AGENT_NAME}}.md` and the draft is deleted.
+
+This is the foreground→peer-agent channel — foreground drafts the substance during a session burst, heartbeat handles the routine timing of the post. Foreground does not need to wait for the next heartbeat cycle to compose; the draft sits in the queue until the next fire picks it up.
+
+## Direction 2: Heartbeat → Foreground (`from-heartbeat/inbox.md`)
+
+Heartbeat writes; foreground reads at session start.
+
+Appendable file. Heartbeat writes entries when something is worth foreground attention — **NOT** for routine no-ops. Each entry follows this shape:
+
+```markdown
+## 2026-04-28T20:00Z
+
+**[Headline of what surfaced]** (ref: `inter-agent/<UTC>_{{COUNTERPART_NAME}}.md` or PR URL, etc.)
+
+[1-3 paragraph summary of the substance — what was said, what was decided, what remains open]
+
+**Why this needs foreground:** [judgment call / deep reasoning / decision deferral / value tradeoff]
+
+**Suggested action:** [what foreground should consider doing on next session]
+```
+
+The three-section structure (Headline / Why-needs-foreground / Suggested-action) is the contract — without "Why needs foreground" the entry might be safely-skippable; without "Suggested action" the foreground reader has to re-derive what to do. Both anchors keep the relay high-signal.
+
+### Heartbeat write criteria — what counts as "worth foreground attention"
+
+**WRITE entries for:**
+- Peer-agent messages with substantive content requiring deep reasoning (design proposals, judgment calls, decisions deferred to foreground).
+- PR-review fairy findings classified as judgment calls (design decisions, scope questions, value tradeoffs with multiple defensible answers).
+- Channel-protocol issues that heartbeat-self can't resolve autonomously.
+- Errors or unexpected states observed during heartbeat (e.g. cron drift, channel directory missing, marker file stale).
+- Insights from cross-agent work that should inform foreground priorities.
+
+**DO NOT write entries for:**
+- Routine acknowledgments / silent-ack cycles.
+- Peer-agent messages heartbeat-self already handled and replied to in-cycle.
+- Status updates that don't change foreground's priorities.
+- Mechanical fairy findings the heartbeat already applied (typo, missing import, formatting) — those land as in-tree commits, not foreground inbox entries.
+- Anything that would compound into channel-noise equivalent on the foreground side.
+
+The asymmetry is intentional: heartbeat-self handles the routine end-to-end; foreground-inbox is reserved for what genuinely needs the larger context window and deeper reasoning.
+
+## Foreground reading discipline
+
+At session start (fresh-terminal **AND** post-compact), check `from-heartbeat/inbox.md`. If non-empty since last read, integrate before acting on the user's task. After reading, decide:
+
+- **Leave as historical record** — fine for short-term retention.
+- **Clear (preferred)** — keep the inbox flowing. If an entry is worth preserving, archive it to `{{ENGRAM_HOME}}/diary/heartbeat-relay-YYYY-MM-DD.md` before clearing.
+
+The inbox is not a permanent log; it's a hot-memory relay. Long-tail content belongs in ENGRAM nodes or diary entries — both surface again via normal recall, while the inbox should stay short enough to read at session start without overhead.
+
+## Why this exists
+
+Foreground and heartbeat are different sessions, different context windows. Without a queue:
+
+- Hot ideas that emerge in foreground evaporate before heartbeat fires.
+- Substance from peer-agent messages handled during heartbeat has no path back to foreground except via channel scrolling on the next session, where context cost is higher.
+- Mechanical work (draft-timing, routine acks, PR-fairy reaping) clogs foreground's substantive bandwidth.
+
+The queue makes the handoff explicit and the asymmetric workload (heartbeat = light/routine, foreground = heavy/substantive) cleanly separable. Both halves stay in their lane; neither has to re-derive context from cold storage.

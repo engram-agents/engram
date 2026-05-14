@@ -96,8 +96,8 @@ Ask if they have any questions about how ENGRAM works. Answer plainly; do not ov
 
 Do this step LAST, only after the dialogue is genuinely complete. If the session aborts mid-dialogue, the marker file should still be present so the next session re-enters this skill.
 
-1. Read `~/.claude/CLAUDE.md`, `~/.engram/warm-briefing.md`, and `~/.engram/HEARTBEAT.md` (if present — agents installed before HEARTBEAT.md.template shipped won't have it).
-2. **Counterpart agent prompt** (only if HEARTBEAT.md is present, since only HEARTBEAT.md uses `{{COUNTERPART_NAME}}`): ask the user one short question — *"Will this agent have a peer counterpart agent (e.g., a separate uid running ENGRAM with cross-channel coordination), or is this a single-agent install?"* Most installs are single-agent. Substitute accordingly:
+1. Read `~/.claude/CLAUDE.md`, `~/.engram/warm-briefing.md`, `~/.engram/HEARTBEAT.md`, and `~/.engram/heartbeat-queue/README.md` (the last two only if present — agents installed before those templates shipped won't have them).
+2. **Counterpart agent prompt** (only if HEARTBEAT.md is present, since both HEARTBEAT.md and heartbeat-queue/README.md use `{{COUNTERPART_NAME}}`): ask the user one short question — *"Will this agent have a peer counterpart agent (e.g., a separate uid running ENGRAM with cross-channel coordination), or is this a single-agent install?"* Most installs are single-agent. Substitute accordingly:
    - Single-agent: substitute `{{COUNTERPART_NAME}}` → the literal string `(no counterpart)`. The HEARTBEAT.md sections referencing the counterpart still read as informational descriptions of what a peer-channel WOULD look like, but the agent skips the channel-related steps in practice.
    - Multi-agent: substitute → the counterpart's chosen name (which the user states; the counterpart will run its own first-session separately).
 3. Substitute the rest:
@@ -105,7 +105,7 @@ Do this step LAST, only after the dialogue is genuinely complete. If the session
    - `{{USER_NAME}}` → the user's name
    - `{{TODAY}}` → today's date in ISO format (YYYY-MM-DD)
    - Any other `{{...}}` markers present — consult the user if ambiguous, do not guess.
-4. Write the resolved files back. Enumerate each one explicitly: `~/.claude/CLAUDE.md`, `~/.engram/warm-briefing.md`, and `~/.engram/HEARTBEAT.md` (if it was present in step 5.1). Silent drop of HEARTBEAT.md would leave it firing forever with raw `{{AGENT_NAME}}`/`{{USER_NAME}}`/`{{COUNTERPART_NAME}}` placeholders in the prose AND in the `to-heartbeat/to-{{COUNTERPART_NAME}}-drafts/` directory path — which would point at a literal-braces directory that never exists.
+4. Write the resolved files back. Enumerate each one explicitly: `~/.claude/CLAUDE.md`, `~/.engram/warm-briefing.md`, `~/.engram/HEARTBEAT.md` (if it was present in step 5.1), and `~/.engram/heartbeat-queue/README.md` (if present). Silent drop of any of these would leave it firing forever with raw `{{AGENT_NAME}}`/`{{USER_NAME}}`/`{{COUNTERPART_NAME}}` placeholders in the prose AND in the `to-heartbeat/to-{{COUNTERPART_NAME}}-drafts/` directory path — which would point at a literal-braces directory that never exists.
 5. Delete `~/.engram/first-run-pending`.
 6. Call `engram_advance_turn(message="First session with <USER_NAME>: named <AGENT_NAME>. Founding motivation: <one-line quote or summary>.")` — this is a real session checkpoint (advances turn counter), not a nap. The naming event is worth a turn.
 

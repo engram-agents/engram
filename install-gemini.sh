@@ -176,6 +176,7 @@ fi
 echo "  $ENGRAM_HOME"
 echo "  $GEMINI_EXT_DIR"
 echo "  heartbeat-queue/{to,from}-heartbeat/ (scaffolded with notes.md + inbox.md)"
+echo "  heartbeat-queue/README.md (scaffolded by bootstrap from template)"
 echo ""
 
 # -------- Step 4: Hooks + runtime snapshot --------
