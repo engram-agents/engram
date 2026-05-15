@@ -219,20 +219,13 @@ def main() -> None:
     )
     print(f"  manifest → {ENGRAM_HOME}/seed-manifest.json", flush=True)
 
-    # Shared (both targets): warm briefing + daily highlights live in ENGRAM_HOME
+    # Shared (both targets): warm briefing lives in ENGRAM_HOME.
     substitute_template(
         TEMPLATES_DIR / "warm-briefing.md.template",
         ENGRAM_HOME / "warm-briefing.md",
         substitutions,
     )
     print(f"  warm-briefing.md → {ENGRAM_HOME}/warm-briefing.md", flush=True)
-
-    substitute_template(
-        TEMPLATES_DIR / "daily-highlights.md.template",
-        ENGRAM_HOME / "daily-highlights.md",
-        substitutions,
-    )
-    print(f"  daily-highlights.md → {ENGRAM_HOME}/daily-highlights.md", flush=True)
 
     # HEARTBEAT.md — per-agent heartbeat checklist. Ships with
     # {{AGENT_NAME}} / {{USER_NAME}} / {{COUNTERPART_NAME}} placeholders that

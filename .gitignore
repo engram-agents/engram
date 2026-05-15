@@ -3,6 +3,13 @@ __pycache__/
 *.pyc
 *.pyo
 
+# HuggingFace / sentence-transformers caches that may land in CWD when a
+# tool runs with HF_HOME unset or empty (e.g. an install-sandbox shell
+# that forgets to pin the cache path). The model is ~90 MB — keep it
+# out of the repo regardless.
+hub/
+xet/
+
 # macOS / editors
 .DS_Store
 *.swp

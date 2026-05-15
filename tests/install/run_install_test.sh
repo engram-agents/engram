@@ -125,10 +125,19 @@ fi
 
 # Templates rendered (placeholders deferred to first-session, NOT bootstrap)
 echo ""
-echo "Templates rendered (CLAUDE.md / warm-briefing / daily-highlights / HEARTBEAT.md if shipped):"
+echo "Templates rendered (CLAUDE.md / warm-briefing / HEARTBEAT.md if shipped):"
 assert_file "$CLAUDE_HOME/CLAUDE.md"
 assert_file "$ENGRAM_HOME/warm-briefing.md"
-assert_file "$ENGRAM_HOME/daily-highlights.md"
+
+# Negative-assertion: daily-highlights.md was retired (dv_0478 / migrated
+# to history/YYYY-MM-DD.md). If a future change accidentally re-introduces
+# the bootstrap call, this catches it cleanly instead of leaving a silent
+# regression where the legacy file gets re-created.
+if [ -f "$ENGRAM_HOME/daily-highlights.md" ]; then
+    echo "FAIL: legacy daily-highlights.md was re-created — was retired; expected per-day files under history/." >&2
+    exit 2
+fi
+echo "  ✓ no legacy daily-highlights.md (retired; superseded by history/YYYY-MM-DD.md)"
 # HEARTBEAT.md ships once PR #44 lands. Currently optional — bootstrap.py
 # guards with .exists().
 if [ -f "$ENGRAM_HOME/HEARTBEAT.md" ]; then

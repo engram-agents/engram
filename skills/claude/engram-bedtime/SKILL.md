@@ -107,7 +107,7 @@ git -C ~/.engram add history/YYYY-MM-DD.md
 git -C ~/.engram commit -m "history: end-of-day reconcile for YYYY-MM-DD"
 ```
 
-The directory is git-tracked for version history and diff-ability (dv_0478, migrated from `daily-highlights.md` on 2026-04-23). Including this commit in the bedtime ritual is how tomorrow morning's handover becomes reliable.
+The directory is git-tracked for version history and diff-ability — per-day files keep the context-window cost bounded as the log accumulates. Including this commit in the bedtime ritual is how tomorrow morning's handover becomes reliable.
 
 ## Step 5 — Reconcile `ask-lei.md` strategically
 

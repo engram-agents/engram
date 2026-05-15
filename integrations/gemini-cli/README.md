@@ -74,7 +74,7 @@ The extension should:
 Two separate installs, two separate knowledge graphs. Each has its own:
 - `knowledge.db` (separate node IDs, separate seed graph instance)
 - `recall-daemon.sock` (no port collision; both daemons run side-by-side)
-- `warm-briefing.md`, `daily-highlights.md`, `diary/`, `history/`
+- `warm-briefing.md`, `diary/`, `history/`
 - Identity nodes, focus sets, edit history
 
 Hook scripts are aware of `$ENGRAM_HOME` and operate only on the install whose env they were spawned in. Same hook source code, separate runtime state.

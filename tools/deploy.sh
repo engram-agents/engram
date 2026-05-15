@@ -468,8 +468,6 @@ echo "  Version marker: $ENGRAM_HOME/.deployed-version"
 # settings.hooks.json.template included because hook wiring drift has high
 # operational consequence: an upstream hook addition or invocation-path
 # change would silently no-op for an agent on a stale rendered settings.json.
-# daily-highlights.md.template intentionally excluded — append-only live
-# state with a thin template; drift there is genuinely low-signal.
 TEMPLATE_FILES=(
     "templates/CLAUDE.md.template"
     "integrations/gemini-cli/GEMINI.md.template"
