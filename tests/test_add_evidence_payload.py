@@ -154,8 +154,8 @@ def test_payload_json_whitespace_only_url_rejected():
 
 def test_impl_callable_with_kwargs():
     """In-server callers should be able to call _add_evidence_impl directly
-    with named kwargs — this is the path engram_add_observation,
-    engram_add_observation_batch, and engram_add_evidence_batch take."""
+    with named kwargs — this is the path engram_add_observation and
+    engram_add_observation_batch take."""
     server = fresh_server()
     r = json.loads(server._add_evidence_impl(
         url=_file_url(),

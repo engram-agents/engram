@@ -4166,66 +4166,6 @@ def _add_observation_impl(
 # ---- Batch ingestion tools ----
 
 
-# Internal helper — not exposed as an MCP tool.
-# Kept for potential programmatic use but agents should use engram_add_observation_batch.
-def engram_add_evidence_batch(sources_json: str) -> str:
-    """Register multiple source documents in a single call.
-
-    Use this when you have several sources to register at once — saves tool
-    call round trips compared to calling engram_add_evidence individually.
-
-    Args:
-        sources_json: JSON array of source objects, each with:
-            - url (required): URL of the source
-            - title (required): Title or headline
-            - domain (optional): Domain name, auto-extracted from URL if omitted
-            - source_date (optional): Publication date in ISO format (e.g. '2026-03-20')
-            - content_snippet (optional): Brief excerpt
-
-    Example:
-        sources_json = '[{"url": "https://reuters.com/a", "title": "Article A", "source_date": "2026-03-20"}, {"url": "https://ft.com/b", "title": "Article B"}]'
-
-    Returns:
-        JSON with list of created evidence nodes and their trust pool status.
-    """
-    try:
-        sources = json.loads(sources_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON: {e}"})
-
-    if not isinstance(sources, list):
-        return json.dumps({"error": "sources_json must be a JSON array."})
-
-    results = []
-    for i, src in enumerate(sources):
-        if not isinstance(src, dict):
-            results.append({"index": i, "error": "Each source must be a JSON object."})
-            continue
-        url = src.get("url", "")
-        title = src.get("title", "")
-        if not url or not title:
-            results.append({"index": i, "error": "Both 'url' and 'title' are required."})
-            continue
-
-        r = json.loads(_add_evidence_impl(
-            url=url,
-            title=title,
-            domain=src.get("domain", ""),
-            source_date=src.get("source_date", ""),
-            content_snippet=src.get("content_snippet", ""),
-        ))
-        r["index"] = i
-        results.append(r)
-
-    created = [r for r in results if r.get("status") == "created"]
-    return json.dumps({
-        "status": "batch_complete",
-        "total": len(sources),
-        "created": len(created),
-        "results": results,
-    })
-
-
 # Set of legitimate field names for the engram_add_observation_batch payload.
 _ADD_OBSERVATION_BATCH_FIELDS = frozenset({
     "observations_json", "url", "title", "domain", "source_date",

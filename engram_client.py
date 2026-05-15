@@ -38,12 +38,6 @@ TOOL_SCHEMAS = {
             "payload_json": {"type": "string", "description": "JSON object (as a string) with evidence fields. Required: url (canonical URL of the source — for local files use 'file://path/to/file'), title (article or page title). Optional: domain (auto-extracted from URL if omitted), source_date (ISO format, e.g. '2026-03-20'), content_snippet (truncated excerpt for offline re-reading).", "required": True},
         },
     },
-    "engram_add_evidence_batch": {
-        "description": "Register multiple source documents in a single call.",
-        "parameters": {
-            "sources_json": {"type": "string", "description": "JSON array of source objects with url, title, domain, source_date, content_snippet.", "required": True},
-        },
-    },
     "engram_add_observation": {
         "description": "Extract and record a claim from a source document with full provenance. Single-payload signature — pass all fields as one JSON object string in payload_json. Required fields inside payload_json: quoted_text, interpretation, claim, quote_type. Source identification: include url+title to auto-create the evidence node, OR evidence_id to cite an existing one.",
         "parameters": {
