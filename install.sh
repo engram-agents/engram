@@ -186,8 +186,11 @@ if [ -d "$ALPHA_DIR/hooks/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/hooks/claude" 2
   chmod +x "$ENGRAM_HOME/hooks/"*.sh 2>/dev/null || true
   # Bake the resolved interpreter path into the daemon-launch script so it
   # doesn't depend on `python3` being on PATH at SessionStart-hook time.
+  # `-i.bak` is the BSD/GNU-portable form (works on both macOS and Linux);
+  # plain `-i` without an extension argument breaks on macOS BSD sed.
   if [ -f "$ENGRAM_HOME/hooks/start-engram-daemon.sh" ]; then
-    sed -i "s|{{PYTHON}}|$PYTHON_BIN|g" "$ENGRAM_HOME/hooks/start-engram-daemon.sh"
+    sed -i.bak "s|{{PYTHON}}|$PYTHON_BIN|g" "$ENGRAM_HOME/hooks/start-engram-daemon.sh"
+    rm -f "$ENGRAM_HOME/hooks/start-engram-daemon.sh.bak"
   fi
   echo "  hooks → $ENGRAM_HOME/hooks/ (from hooks/claude/)"
 fi
@@ -236,6 +239,21 @@ done
 if [ -f "$ALPHA_DIR/templates/crontab.template" ]; then
   cp "$ALPHA_DIR/templates/crontab.template" "$ENGRAM_HOME/crontab.template"
   echo "  crontab.template → $ENGRAM_HOME/crontab.template"
+fi
+
+# Pre-warm the sentence-transformers embedding model so the first MCP launch
+# in the user's next Claude Code session doesn't trip the 30s stdio handshake
+# timeout while downloading + loading the model on a cold HuggingFace cache
+# (alpha #144). On a warm cache this is a <1s no-op; on a cold cache it
+# downloads ~80MB. Non-fatal — if it fails (no network, HF rate limit) the
+# user can still recover via the /mcp slash command after the first timeout.
+echo "  Pre-warming sentence-transformers cache (one-time, up to ~30s)..."
+if "$PYTHON_BIN" -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')" >/dev/null 2>&1; then
+  echo "  pre-warm ok (embedding model cached for fast MCP startup)"
+else
+  echo "  WARN: pre-warm failed; first MCP launch may exceed Claude Code's 30s timeout."
+  echo "        Recovery if first session reports 'MCP engram unavailable': run /mcp inside"
+  echo "        Claude Code to reconnect once the embedder finishes loading in the background."
 fi
 echo ""
 

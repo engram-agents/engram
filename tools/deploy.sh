@@ -429,7 +429,10 @@ fi
 # Source of truth: install.sh's sed lines.
 PYTHON_BIN="$(python3 -c 'import sys; print(sys.executable)' 2>/dev/null || echo "")"
 if [[ -n "$PYTHON_BIN" && -f "$ENGRAM_HOME/hooks/start-engram-daemon.sh" ]]; then
-    sed -i "s|{{PYTHON}}|$PYTHON_BIN|g" "$ENGRAM_HOME/hooks/start-engram-daemon.sh"
+    # `-i.bak` is the BSD/GNU-portable form (works on both macOS and Linux);
+    # plain `-i` without an extension argument breaks on macOS BSD sed.
+    sed -i.bak "s|{{PYTHON}}|$PYTHON_BIN|g" "$ENGRAM_HOME/hooks/start-engram-daemon.sh"
+    rm -f "$ENGRAM_HOME/hooks/start-engram-daemon.sh.bak"
     echo "  ✓ Substituted {{PYTHON}} → $PYTHON_BIN in hooks/start-engram-daemon.sh"
 fi
 

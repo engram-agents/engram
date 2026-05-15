@@ -200,7 +200,10 @@ if [ -d "$GEMINI_HOOKS_SRC" ] && [ -n "$(ls -A "$GEMINI_HOOKS_SRC" 2>/dev/null |
   chmod +x "$ENGRAM_HOME/hooks/"*.py 2>/dev/null || true
   chmod +x "$ENGRAM_HOME/hooks/"*.sh 2>/dev/null || true
   if [ -f "$ENGRAM_HOME/hooks/start-engram-daemon.sh" ]; then
-    sed -i "s|{{PYTHON}}|$PYTHON_BIN|g" "$ENGRAM_HOME/hooks/start-engram-daemon.sh"
+    # `-i.bak` is the BSD/GNU-portable form (works on both macOS and Linux);
+    # plain `-i` without an extension argument breaks on macOS BSD sed.
+    sed -i.bak "s|{{PYTHON}}|$PYTHON_BIN|g" "$ENGRAM_HOME/hooks/start-engram-daemon.sh"
+    rm -f "$ENGRAM_HOME/hooks/start-engram-daemon.sh.bak"
   fi
   echo "  hooks → $ENGRAM_HOME/hooks/ (from $GEMINI_HOOKS_SRC#$ALPHA_DIR/)"
 fi
