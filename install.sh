@@ -247,7 +247,7 @@ fi
 # (alpha #144). On a warm cache this is a <1s no-op; on a cold cache it
 # downloads ~80MB. Non-fatal — if it fails (no network, HF rate limit) the
 # user can still recover via the /mcp slash command after the first timeout.
-echo "  Pre-warming sentence-transformers cache (one-time, up to ~30s)..."
+echo "  Pre-warming sentence-transformers cache (one-time, may take a few minutes on slow connections)..."
 if "$PYTHON_BIN" -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')" >/dev/null 2>&1; then
   echo "  pre-warm ok (embedding model cached for fast MCP startup)"
 else

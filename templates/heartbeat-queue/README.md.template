@@ -30,7 +30,7 @@ Appendable markdown bullets — one-line directives for the heartbeat. Foregroun
 Example:
 
 ```markdown
-- [2026-04-28T20:30Z] Watch for {{COUNTERPART_NAME}} reply on qu_0001 design — flag in from-heartbeat if she answers.
+- [2026-04-28T20:30Z] Watch for {{COUNTERPART_NAME}} reply on qu_XXXX design — flag in from-heartbeat if she answers.
 - [2026-04-28T20:30Z] If channel is silent for 2+ cycles, post a "still here, no substance" liveness ack.
 - [2026-04-28T20:30Z] {{COUNTERPART_NAME}} should know: 20:00 cron fire confirmed the Path-3 fix worked.
 ```

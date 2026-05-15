@@ -8,7 +8,7 @@ COUNTERPART_NAME={counterpart_name}
 # ENGRAM heartbeat — fires at minutes {heartbeat_minutes} of every hour,
 # skipping hours/minutes inside the sleep protected window. The window is
 # preserved to give the user a quiet end-of-day slot for interactive
-# bedtime/sleep handoff per the three-routine architecture (dv_0636).
+# bedtime/sleep handoff per the three-routine architecture.
 {heartbeat_lines}
 
 # Sleep is interactive-only as of 2026-05-14 (alpha #133 PR C — issue #133).

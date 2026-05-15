@@ -236,6 +236,21 @@ if [ -f "$ALPHA_DIR/templates/crontab.template" ]; then
   cp "$ALPHA_DIR/templates/crontab.template" "$ENGRAM_HOME/crontab.template"
   echo "  crontab.template → $ENGRAM_HOME/crontab.template"
 fi
+
+# Pre-warm the sentence-transformers embedding model so the first MCP launch
+# in the user's next session doesn't trip the stdio handshake timeout while
+# downloading + loading the model on a cold HuggingFace cache (alpha #144).
+# Mirror of the install.sh pre-warm step. Non-fatal — if it fails (no network,
+# HF rate limit) the user can still recover via the harness reconnect path
+# after the first timeout.
+echo "  Pre-warming sentence-transformers cache (one-time, may take a few minutes on slow connections)..."
+if "$PYTHON_BIN" -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')" >/dev/null 2>&1; then
+  echo "  pre-warm ok (embedding model cached for fast MCP startup)"
+else
+  echo "  WARN: pre-warm failed; first MCP launch may exceed the harness stdio handshake timeout."
+  echo "        Recovery if first session reports 'MCP engram unavailable': reconnect via the"
+  echo "        harness's MCP-refresh path once the embedder finishes loading in the background."
+fi
 echo ""
 
 # -------- Step 5: Gemini extension files (manifest + hooks.json + GEMINI.md) --------
