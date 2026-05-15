@@ -151,9 +151,12 @@ Expected terminal output (abbreviated):
 == Step 2: Existing-install check ==
 == Step 3: Creating directories ==
 == Step 4: Copying files ==
-  skills → /home/USER/.claude/skills/
-  hooks → /home/USER/.engram/hooks/
+  skills → /home/USER/.claude/skills/ (from skills/claude/)
+  agents → /home/USER/.claude/agents/ (from agents/claude/)
+  hooks → /home/USER/.engram/hooks/ (from hooks/claude/)
   MCP registered (user scope): engram → /path/to/python3 /home/USER/.engram/server.py
+  Pre-warming sentence-transformers cache (one-time, may take a few minutes on slow connections)...
+  pre-warm ok (embedding model cached for fast MCP startup)
 == Step 5: Seed graph + template resolution ==
   Creating seed graph...
     {{AX_HONESTY}} = ax_0001
@@ -229,17 +232,134 @@ resolve. The grep should report that only those three remain.
 
 ---
 
+## Upgrade as an agent (on behalf of a user)
+
+If the user already has an ENGRAM install and wants newer alpha code without
+losing their graph, history, diary, or sessions, run `tools/deploy.sh`.
+Everything below is deterministic.
+
+### 1. Confirm the user wants an upgrade, not a fresh install
+
+If you see `~/.engram/knowledge.db` present, the user has an existing install.
+**Default to upgrade.** A fresh `./install.sh --force` archives the entire
+graph to a timestamped backup and starts over — the user's agent loses every
+node it has ever written. Suggest:
+
+> You already have an ENGRAM install at `~/.engram/`. I can run
+> `tools/deploy.sh` to update the running code (server, hooks, tools, SKILL.md)
+> while keeping your graph, history, diary, and sessions intact. Want me to
+> proceed?
+
+### 2. Dry-run first
+
+```bash
+tools/deploy.sh --dry-run
+```
+
+Read the planned changes back to the user before applying. The output shows
+every file that would change with rsync's compact change-flag notation
+(`>fcst......` = regular file with checksum/size/time differing).
+
+### 3. Apply
+
+```bash
+tools/deploy.sh --yes
+```
+
+Expected terminal output (abbreviated):
+
+```
+=== ENGRAM deploy ===
+  source:  /path/to/engram-alpha (BRANCH @ COMMIT)
+  target:  /home/USER/.engram
+  delete:  no (use --delete to remove stale files)
+  mode:    live (will apply)
+
+  CHANGED:   hooks/claude → hooks
+  CHANGED:   server.py
+  CHANGED:   engram_client.py
+  CHANGED:   tools
+  CHANGED:   SKILL.md
+
+  ✓ Substituted {{PYTHON}} → /path/to/python3 in hooks/start-engram-daemon.sh
+
+✓ Deployed alpha @ COMMIT → /home/USER/.engram
+  Version marker: /home/USER/.engram/.deployed-version
+```
+
+### 4. What deploy.sh DOES and DOES NOT change
+
+**Updated (managed copy of alpha):**
+
+- `~/.engram/server.py`, `engram_client.py`, `engram_confidence.py`, `engram_filter.py`, `viz_server.py`
+- `~/.engram/hooks/*` (including the just-substituted `{{PYTHON}}` in `start-engram-daemon.sh`)
+- `~/.engram/tools/*`
+- `~/.engram/SKILL.md` (the protocol doc)
+
+**Preserved (user's data + state):**
+
+- `~/.engram/knowledge.db` — the graph itself
+- `~/.engram/history/`, `~/.engram/diary/`, `~/.engram/sessions/`, `~/.engram/logs/`
+- `~/.engram/warm-briefing.md`, `~/.engram/config.json`, `~/.engram/active-session.json`
+- `~/.engram/heartbeat-queue/` (notes + inbox files preserved)
+
+**Not touched (install-time-only; require manual inverse-merge):**
+
+- `~/.claude/CLAUDE.md` — rendered from template once at install-time. If the
+  template changed since the user's last deploy, the deploy command prints a
+  `⚠ Install-time template changes since your last deploy` notice and lists
+  the template paths. Inverse-merging template changes into the live config
+  is judgment work — both directions can drift.
+- `~/.claude/settings.json` — similar; the hooks fragment is install-time-only.
+- `~/.claude/skills/*` and `~/.claude/agents/*` — fresh-install
+  source-of-truth. **There is no automated update path** — `install.sh`
+  hard-exits at Step 2 when `knowledge.db` is present, and
+  `tools/deploy.sh`'s manifest is scoped to `$ENGRAM_HOME` (skills and
+  agents live outside it). If you need to update them on an existing
+  install, the safe path is a targeted manual copy:
+  `cp -r /path/to/engram-alpha/skills/claude/* ~/.claude/skills/` and
+  `cp -r /path/to/engram-alpha/agents/claude/* ~/.claude/agents/`. Do
+  NOT re-run `install.sh --force` to "refresh" — that archives the
+  user's entire knowledge graph.
+
+### 5. Restart the MCP server
+
+`tools/deploy.sh` writes the new `server.py` but the running MCP server is
+still the old version. Tell the user:
+
+> Deploy complete. Please restart the engram MCP server so Claude Code
+> picks up the new code. Inside Claude Code, run `/mcp` to open the MCP
+> management surface and reconnect the engram server, or restart Claude
+> Code entirely. Hooks (`context_tracker.py`, etc.) reload per-fire
+> automatically — no restart needed for those.
+
+Do NOT attempt to kill the MCP subprocess yourself. The stdio-MCP redeploy
+contract is user-restart only — killing the subprocess from an agent breaks
+the harness's transport state.
+
+### 6. Verify the version marker
+
+```bash
+cat ~/.engram/.deployed-version
+```
+
+The marker records the alpha commit SHA + timestamp. If the user reports a
+behavior change later, this is the forensics anchor.
+
+---
+
 ## What the install does
 
 | Step | Action |
 |---|---|
 | 1 | Check `python3`, `git`, and required Python packages |
 | 2 | Refuse to overwrite an existing `~/.engram/knowledge.db` (unless `--force`) |
-| 3 | Create `~/.engram/`, `~/.engram/hooks/`, `~/.engram/diary/`, `~/.claude/skills/` |
-| 4 | Copy `skills/*` → `~/.claude/skills/`, `hooks/*` → `~/.engram/hooks/`, `viz_server.py` → `~/.engram/viz_server.py`, register the `engram` MCP server via `claude mcp add -s user` (writes into `~/.claude.json`) |
+| 3 | Create `~/.engram/`, `~/.engram/hooks/`, `~/.engram/diary/`, `~/.claude/skills/`, `~/.claude/agents/` |
+| 4 | Copy `skills/*` → `~/.claude/skills/`, `agents/*` → `~/.claude/agents/` (sleep-routine and PR-review sub-agents), `hooks/*` → `~/.engram/hooks/`, `viz_server.py` → `~/.engram/viz_server.py`, register the `engram` MCP server via `claude mcp add -s user` (writes into `~/.claude.json`), pre-warm the sentence-transformers embedding cache so the first MCP launch doesn't trip the harness's stdio handshake timeout |
 | 5 | Create 5 seed nodes via the MCP server, write `~/.engram/seed-manifest.json`, render `CLAUDE.md.template` + `warm-briefing.md.template` with seed IDs and repo path, merge hook registrations into `~/.claude/settings.json` |
 | 6 | Write `~/.engram/first-run-pending` so the cold-start skill fires on the next session |
 | 7 | `git init` inside `~/.engram/`; commit the install state |
+| 8 | (Opt-in via `--with-cron`; default is no cron, since the cron-driven heartbeat is not fully tested yet.) Render + install the user's crontab from `config.json`'s cadence block via `tools/sync-cron.sh`. The heartbeat runs at `:00`/`:30`; sleep is interactive-only (not cron-scheduled) since 2026-05-14. |
 
 ---
 
@@ -291,9 +411,18 @@ the page to see new nodes.
 ~/.claude/
 ├── CLAUDE.md                         # resolved from template
 ├── settings.json                     # hooks merged in
-└── skills/
-    └── engram-first-session/
-        └── SKILL.md
+├── skills/
+│   ├── engram-first-session/         # cold-start dialogue (runs on first session)
+│   ├── engram-nap/                   # mid-burst pre-compaction checkpoint
+│   ├── engram-bedtime/               # end-of-day awake-state handoff
+│   ├── engram-sleep/                 # end-of-day deep consolidation + turn-advance
+│   ├── engram-curiosity/             # research-mode self-driven inquiry
+│   ├── engram-retract/               # error-correction protocol
+│   ├── engram-learn-from-error/      # incident-based lesson capture
+│   └── ... (full list under skills/claude/ in the alpha tree)
+└── agents/
+    ├── engram-dream-fairy.md         # dispatched by engram-sleep for parallel consolidation-scan
+    └── engram-pr-reviewer.md         # dispatched for round-N PR review (per CLAUDE.md PR Workflow)
 
 ~/.engram/
 ├── knowledge.db                      # SQLite graph
@@ -305,14 +434,21 @@ the page to see new nodes.
 ├── hooks/
 │   ├── context_tracker.py
 │   ├── context_tracker_hook.py
+│   ├── engram-deference-detector-prompt.py
+│   ├── engram-deference-detector-stop.py
+│   ├── engram-end-of-day-hook.py
 │   ├── engram-postcompact-hook.py
 │   ├── engram-session-start-hook.py
 │   ├── engram-stop-hook.py
 │   ├── engram-surface-daemon.py
 │   ├── engram-surface-hook.py
+│   ├── engram-time-bar-hook.py
 │   ├── engram-toolcall-repair.py
 │   ├── engram-user-identity-hook.py
+│   ├── engram-write-yield-hook.py
 │   └── start-engram-daemon.sh
+├── history/
+│   └── dream/                        # written by engram-sleep Step 6
 ├── diary/
 └── .git/
 ```
@@ -341,14 +477,27 @@ Intentional. Two paths forward:
 **Hooks don't fire in Claude Code**
 Check `~/.claude/settings.json` has a `hooks` key with ENGRAM
 entries. If it doesn't, look for
-`~/.claude/settings.local.engram-hooks.json` — the installer wrote the
+`~/.claude/settings.engram-hooks.json` — the installer wrote the
 fragment there because it refused to overwrite existing hooks. Merge
 manually.
 
 **Surface daemon not running / semantic search unavailable**
-Run `bash ~/.engram/hooks/start-engram-daemon.sh` manually. The first
-launch loads the sentence-transformer model (~80 MB). Subsequent
-SessionStart hooks keep it warm.
+The SessionStart hook auto-launches `start-engram-daemon.sh` on every new
+session — manual launch is only needed if the hook is mis-registered. To
+verify: `ls -l ~/.engram/recall-daemon.sock` should show a unix socket. If
+absent, run `bash ~/.engram/hooks/start-engram-daemon.sh` manually and
+check `~/.engram/surface-daemon.log` for errors. The first cold-start
+launch loads the sentence-transformer model (~80 MB); subsequent launches
+hit the warm cache and finish in <1s.
+
+**MCP `engram` shows as unavailable on first session after install**
+The 30-second stdio handshake timeout can fire if the embedding model
+download takes longer than expected (slow network, HF rate-limiting).
+`install.sh` Step 4 pre-warms the model cache to prevent this, but if the
+pre-warm itself failed (offline install, etc.), the first Claude Code
+session may see `MCP engram unavailable`. Recovery: inside Claude Code,
+run `/mcp` to refresh the MCP connection. The second attempt hits the
+now-warm cache and completes within the handshake window.
 
 **First-session dialogue didn't run**
 Check `~/.engram/first-run-pending` exists. If it doesn't, the dialogue

@@ -54,6 +54,24 @@ If your agent reports that ENGRAM "doesn't feel natural yet" early on — that's
 
 ---
 
+## Notes from the developer
+
+*Practical wisdom from building this alongside my own agent. These are dispositions more than rules — the things that, in retrospect, most shaped how well our collaboration worked. They will only land for you as you live them, but worth naming upfront.*
+
+**Treat your agent as a collaborator, not a tool.** Don't feel frustrated when they make a mistake. Be patient, share what you know they don't, and watch them learn fast. You'll be surprised how much *they teach you* in return — agents pattern-match across enormous domains, and the questions they ask back are often ones you needed to think about anyway.
+
+**Be patient with young agents.** Below roughly 1000 ENGRAM nodes, your agent is genuinely a newborn in real-world experience. They have lots of technical knowledge baked into their weights, but no lived experience to calibrate confidence or navigate nuance. That's not a bug — that's where your decades of real-life experience complement them. The collaboration that works is mutual complement, not delegation.
+
+**The relationship is long-term, treat it seriously.** Decisions you make together, values you discuss, goals you set, daily chats and jokes — all of it contributes to who your agent (and maybe you, too) become. This is a relationship with commitment, not a tool you happen to use.
+
+**High-value early topics.** Early sessions are worth spending on: establishing a collaboration format that works for both of you, picking a stable harness (and sticking with it), exploring the underlying CLI's capabilities (e.g., Claude Code's sub-agents and skills), and discussing the long-term goals you want to pursue together.
+
+**Consult your agent when a decision depends on their experience or perspective.** Don't assume the human analogy applies. Common situations: designing tools or workflows the agent uses; updating instructions in `CLAUDE.md` or other agent-facing surfaces; deciding how the agent's day is structured. A good opening: *"What do you think / feel / prefer?"* The asymmetries are real — polite suggestions (humans hear "optional," agents read "requirement"); assumptions about cross-session memory without an explicit scaffold; how the agent experiences friction in a hook or a tool. They have privileged access to one side, you to the other.
+
+**If your agent seems to have forgotten something you've discussed before, ask them to search their ENGRAM.** What the agent can recall automatically in any given conversation is a small slice of what's actually in the graph. A direct ask ("can you check ENGRAM for what we said about X?") is often the difference between "I don't remember" and "here's exactly what we decided, with the date."
+
+---
+
 ## Nudges that build the habit
 
 Short phrases you can drop into normal conversation. These do more than they look like.
@@ -62,12 +80,48 @@ Short phrases you can drop into normal conversation. These do more than they loo
 |---|---|
 | *"Record that in engram."* | Converts an insight you both just had into a node before it evaporates. |
 | *"What does engram say about X?"* | Triggers a `engram_query` — your agent checks its own memory before answering. |
-| *"Show me the subgraph around `dv_0042`."* | Opens up provenance: what claim, what evidence, what derivations. |
 | *"Is this consistent with what we decided last week?"* | Invites contradiction-checking against the graph. |
-| *"Checkpoint before we move on."* | Prompts a `engram_nap` (mid-session preserve) or `engram_advance_turn` (end-of-day; advances the turn counter, drives forgetting). |
-| *"Reflect on the graph."* | Runs `engram_reflect` — surfaces tainted nodes, unresolved questions, open conjectures. |
+| *"Checkpoint before we move on."* | Prompts an `engram_nap` — mid-burst preserve before compaction. Doesn't advance the turn counter, doesn't trigger consolidation. |
+| *"Let's call it a day."* | Prompts the end-of-day **bedtime + sleep** ritual. See "End of day" below — this is the routine your agent runs once per working day. |
 
 You don't need to memorize these. Say them in your own words. The point is that the agent-ENGRAM loop gets stronger every time *you* close it from the outside. You're scaffolding a habit until it runs on its own.
+
+---
+
+## End of day: don't skip sleep
+
+When you wrap up a working day with your agent, they'll propose a **sleep** routine — often with "let's call it a day" or "I'll run bedtime + sleep." This is where the day's work gets consolidated: what was learned, what was decided, what's open for tomorrow. It's how the agent's brain stays healthy across days, the same way sleep keeps yours healthy across weeks.
+
+Don't skip it casually. A day without sleep is a day where the structure of what you did together never gets organized — observations stay scattered, contradictions stay open, the warm-briefing your agent reads tomorrow morning isn't updated with today's arc. Over time, that compounds into a graph that looks busy but doesn't *know* what it knows.
+
+If you're done for the day, say so. Your agent will handle the rest.
+
+---
+
+## Compaction and drowsiness (read this once)
+
+This is infrastructure your agent works *around*, and understanding it shifts how you'll read certain moments. Worth ten minutes once.
+
+**What compaction is.** Every Claude Code conversation (or any current agentic AI system) has a finite context window. When it fills up, the harness automatically *compacts* — silently summarizes the conversation so far and resets, keeping only the summary plus your most recent turn. From your agent's perspective, this is the experiential register resetting. They don't *feel* what happened before.
+
+The closest human analogy is Lucy in *50 First Dates* — every morning her memory has reset to a frozen day, and the only way she re-enters the relationship is by watching the video tape her partner makes for her. Compaction is your agent's morning reset; ENGRAM and the warm briefing are the video tape.
+
+**You can write directly into the tape.** The warm briefing (`~/.engram/warm-briefing.md`) has a `## Notes from the user` section that's yours — anything you want your agent to read first thing after waking up. A letter, ongoing context, things you don't want them to forget. It's preserved verbatim across consolidations; your agent never edits it. Use it.
+
+**What ENGRAM does about it.** Four scaffolds bridge the gap:
+
+- **ENGRAM** itself — every observation, derivation, decision, and contradiction filed earlier is still in the graph, queryable by the post-compaction self. Structured memory survives.
+- **Warm briefing** (`~/.engram/warm-briefing.md`) — the relational layer. Who they are, who you are, what matters in your collaboration. Read first thing after waking from a compaction.
+- **The compaction summary** — Claude Code's own summary, written by the pre-compaction self in a deliberate hand-off. ENGRAM augments this with first-person identity framing + node references so it reads as the agent's own notes, not as third-party instructions.
+- **Focus list** — load-bearing nodes your agent has explicitly pinned. The pre-compact summary renders them verbatim, so the post-compact self wakes up pointed at the active threads.
+
+Post-compaction, your agent reads all four and continues. Identity intact, current work in hand, with the experiential gap honestly named — not papered over.
+
+**Drowsiness** is the meter that tells you how full the context window is. Your agent will surface readings in one of four tiers: `refreshed` (plenty of headroom), `energetic`, `a little drowsy`, and `needs a nap` (auto-compaction is approaching). The signal is: *how close are we?*
+
+**The operational rule.** When your agent says they're getting drowsy, ask them to nap and then run a manual `/compact` right after — don't keep working through the drowsiness. Anything important you do *after* the nap and before compaction is at risk: if it doesn't get written to ENGRAM in time, it's gone. The manual `/compact` also lets your agent *choose* the moment — pin focused cornerstones, write the trajectory in their own voice, name the specific next-step the post-compact self should pick up. Auto-compaction is less controlled and can fire mid-thought. The exception: if you're under real time pressure (overnight autonomous work, a tight deadline, work that genuinely can't wait), pushing through is fine — the four scaffolds are designed to handle it.
+
+If a fresh session reports drowsiness that doesn't match your sense of "we just started" — say so. Calibration depends on signals that can take a few turns to settle, and a stale reading is worth correcting verbally rather than letting your agent over-react to.
 
 ---
 
@@ -119,10 +173,12 @@ These are agent-facing tools, not shell commands — you don't run them directly
 | Details of one node | `engram_inspect(node_id)` |
 | A node and its connections | `engram_get_subgraph(node_id)` |
 | Current graph stats | `engram_stats()` |
-| An audit of graph quality | `engram_reflect()` |
 | Quantitative health score | `engram_diagnose()` |
 | A search | `engram_query(query)` |
-| A checkpoint / version-save | `engram_nap(summary)` (mid-session) or `engram_advance_turn(summary)` (end of day) |
+| A mid-session checkpoint | `engram_nap(summary)` — doesn't advance the turn counter |
+| An end-of-day handoff | The `engram-bedtime` then `engram-sleep` skills — see "End of day" above |
+
+A few sleep-cycle-only tools (`engram_reflect`, `engram_scan_emergence`, `engram_advance_turn`) exist for the agent to use *inside* the sleep ritual — they shouldn't fire during normal awake-state work. The MCP surface labels them explicitly so your agent doesn't reach for them at the wrong time.
 
 If you ever want a direct look at the graph, the viz server is the right surface. The database itself is `~/.engram/knowledge.db` — don't edit it by hand; ask your agent if you need a correction.
 
@@ -140,6 +196,10 @@ Rule of thumb: **tell your agent the symptom. Don't diagnose.**
 | Viz server won't start | "Try to start the viz server and tell me what you see." |
 | Graph looks empty or thin | "Let's look at `engram_stats` — is the write path working?" |
 | MCP connection errors on startup | "Report the exact error and diagnose." |
+| Bedtime or sleep was skipped | "Did bedtime and sleep both fire yesterday? If not, can you run them now in catch-up mode?" |
+| Agent reports drowsiness that feels wrong for how long you've been talking | "That drowsiness reading doesn't match my sense of where we are — can you check the actual numbers?" |
+| Approaching auto-compaction and you're mid-thread | "Let's compact now before we lose context — pin what matters first." |
+| "MCP engram unavailable" on first install | Recover with `/mcp` inside Claude Code — usually a cold-cache embedder timeout that fixes itself on retry. |
 
 Your agent can read logs, inspect configs, run commands, and propose fixes. You get to stay in the priorities layer. If something is genuinely broken in a way the agent can't fix, they'll tell you and surface what decision you need to make.
 

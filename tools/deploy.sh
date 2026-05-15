@@ -506,5 +506,5 @@ fi
 
 echo
 echo "Next step: restart the MCP server so it loads the new server.py."
-echo "  - In Claude Code: /mcp restart engram (or kill the engram MCP process)."
+echo "  - In Claude Code: run /mcp to reconnect the engram server (or restart Claude Code)."
 echo "  - Hooks (context_tracker.py, etc.) reload per-fire automatically."
