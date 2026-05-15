@@ -7,3 +7,11 @@ __pycache__/
 .DS_Store
 *.swp
 *~
+
+# Local working-notes desk — per Lei 2026-05-14: active-work/ is for
+# in-flight notes (audits, plans, drafts) that don't need versioning.
+# Tracked-by-default policy proved noisy: PRs of pure-doc working notes
+# add review overhead with no code-change value, and the docs go stale
+# after the work ships. Better as a local desk; if a note becomes
+# canonical, promote it to docs/ or skills/ explicitly.
+active-work/
