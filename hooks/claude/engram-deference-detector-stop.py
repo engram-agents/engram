@@ -111,7 +111,7 @@ _INTENT_RULES = [
 ]
 
 
-def _last_assistant_structure() -> dict | None:
+def _last_assistant_structure(jsonl_path: str | None = None) -> dict | None:
     """Structural extract of the most recent assistant message.
 
     Returns a dict with:
@@ -124,15 +124,27 @@ def _last_assistant_structure() -> dict | None:
       had_tool_use     — whether the message contained any tool_use blocks
                          (informational; not currently a filter)
     Returns None on parse failure.
+
+    Resolution order for the JSONL path (Issue #140 fix):
+      1. `jsonl_path` argument — from this hook's own stdin payload, which
+         is race-free per-caller even when multiple Claude sessions run.
+      2. `ACTIVE_SESSION_PATH` global marker — pre-#140 fallback. Note:
+         the fallback path STILL has the parallel-session race the #140
+         fix targets; it's intentionally retained for degraded environments
+         (older Claude Code versions, sub-agent contexts) but produces
+         wrong-session reads when multiple interactive sessions race.
+         Prefer arg-1 whenever stdin supplies transcript_path.
     """
-    try:
-        with open(ACTIVE_SESSION_PATH) as f:
-            marker = json.load(f)
-        jsonl = marker.get("transcript_path")
-        if not jsonl or not os.path.exists(jsonl):
+    jsonl = jsonl_path if (jsonl_path and os.path.exists(jsonl_path)) else None
+    if jsonl is None:
+        try:
+            with open(ACTIVE_SESSION_PATH) as f:
+                marker = json.load(f)
+            jsonl = marker.get("transcript_path")
+            if not jsonl or not os.path.exists(jsonl):
+                return None
+        except (OSError, ValueError, json.JSONDecodeError):
             return None
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
 
     # Find the last assistant message in the JSONL.
     last_msg_content = None
@@ -227,20 +239,20 @@ def _log(msg: str) -> None:
         pass
 
 
-def _message_from_stdin() -> str | None:
-    """Read Claude Code's Stop-hook stdin payload and return last_assistant_message.
+def _payload_from_stdin() -> dict | None:
+    """Read Claude Code's Stop-hook stdin payload as a dict.
 
     Claude Code passes Stop hooks a JSON object with these keys (verified
-    2026-05-07 empirical capture, ob_1540):
+    2026-05-07 empirical capture, ob_1540; transcript_path uniformity
+    re-verified pre-Issue #140 fix):
       session_id, transcript_path, cwd, permission_mode, hook_event_name,
       stop_hook_active, last_assistant_message
 
-    `last_assistant_message` is the flat concatenated text of the just-
-    completed assistant message — exactly what we need to scan, and
-    available synchronously at hook fire time (no JSONL flush race).
-
-    Returns the message string, or None if stdin is empty/malformed/
-    missing the field. Caller handles the fallback path.
+    Returns the parsed dict, or None if stdin is empty/malformed.
+    Stdin can only be read once, so the caller pulls every needed field
+    from the same dict — last_assistant_message for the primary scan
+    path, transcript_path for the JSONL fallback's path resolution
+    (Issue #140 fix: race-free per-caller).
     """
     try:
         raw = sys.stdin.read()
@@ -249,18 +261,24 @@ def _message_from_stdin() -> str | None:
     if not raw:
         return None
     try:
-        payload = json.loads(raw)
+        return json.loads(raw)
     except (ValueError, json.JSONDecodeError):
         return None
-    msg = payload.get("last_assistant_message")
-    if isinstance(msg, str) and msg:
-        return msg
-    return None
 
 
 def main() -> None:
-    # Primary: stdin JSON payload from Claude Code (no JSONL flush race).
-    stdin_msg = _message_from_stdin()
+    # Read stdin once and pull every needed field from the same dict.
+    payload = _payload_from_stdin()
+
+    stdin_msg: str | None = None
+    transcript_path: str | None = None
+    if payload is not None:
+        m = payload.get("last_assistant_message")
+        if isinstance(m, str) and m:
+            stdin_msg = m
+        tp = payload.get("transcript_path")
+        if isinstance(tp, str) and tp:
+            transcript_path = tp
 
     if stdin_msg is not None:
         # Stdin path — flat string, no tool_use boundary info.
@@ -273,9 +291,12 @@ def main() -> None:
     else:
         # Fallback: JSONL parse (legacy path; subject to flush race).
         # Retained so the hook still runs in environments where stdin
-        # doesn't carry the payload (older Claude Code versions, headless
-        # invocations, sub-agent contexts where the stdin contract differs).
-        structure = _last_assistant_structure()
+        # doesn't carry last_assistant_message (older Claude Code
+        # versions, headless invocations, sub-agent contexts where the
+        # stdin contract differs). Even on the fallback we still use
+        # transcript_path from stdin when available (Issue #140 fix:
+        # race-free per-caller path resolution).
+        structure = _last_assistant_structure(jsonl_path=transcript_path)
         if not structure:
             _log("Scanned: 0 hits (no message available; stdin empty + JSONL fallback returned no structure)")
             sys.exit(0)

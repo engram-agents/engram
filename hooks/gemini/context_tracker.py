@@ -78,9 +78,14 @@ def find_active_jsonl() -> str | None:
     Reads $ENGRAM_HOME/active-session.json, written by the SessionStart hook.
     Returns None if the marker is missing or the transcript file doesn't
     exist yet — the correct behavior on turn 1 of a fresh conversation,
-    before Claude Code has flushed the new JSONL. No mtime fallback:
+    before the harness has flushed the new JSONL. No mtime fallback:
     picking newest-by-mtime globally caused stale drowsiness to leak
     across conversations on turn 1.
+
+    Pre-#140 path. Subject to a parallel-session race when two interactive
+    sessions run concurrently. The Issue #140 fix threads transcript_path
+    through from each hook's stdin payload via _resolve_jsonl(); this
+    function remains for non-hook callers and the pre-fix fallback.
     """
     try:
         with open(ACTIVE_SESSION_PATH) as f:
@@ -93,9 +98,25 @@ def find_active_jsonl() -> str | None:
     return path
 
 
-def _project_jsonls() -> list[str]:
+def _resolve_jsonl(transcript_path: str | None = None) -> str | None:
+    """Resolution order: explicit transcript_path → global marker fallback.
+
+    The transcript_path argument is the per-event path the harness provides
+    on each hook's stdin payload. When the wrapper threads it in, every
+    path lookup in this module routes through the caller's own session —
+    race-free even when other sessions run concurrently. Falls back to
+    find_active_jsonl() when transcript_path is None, an empty string, or
+    points to a nonexistent file (older harness versions, sub-agent /
+    headless contexts).
+    """
+    if transcript_path and os.path.exists(transcript_path):
+        return transcript_path
+    return find_active_jsonl()
+
+
+def _project_jsonls(transcript_path: str | None = None) -> list[str]:
     """All JSONL files in the active project dir, newest first."""
-    active = find_active_jsonl()
+    active = _resolve_jsonl(transcript_path)
     if not active:
         return []
     project_dir = os.path.dirname(active)
@@ -152,7 +173,11 @@ def _detect_mode(current_tokens: int | None, jsonl_path: str | None) -> str:
     return "200k"
 
 
-def collect_auto_pretokens(mode: str = "200k", max_samples: int = AUTO_SAMPLE_WINDOW) -> list[int]:
+def collect_auto_pretokens(
+    mode: str = "200k",
+    max_samples: int = AUTO_SAMPLE_WINDOW,
+    transcript_path: str | None = None,
+) -> list[int]:
     """Most recent auto-compaction preTokens in the given mode magnitude class.
 
     Filters by SAMPLE_PARTITIONS[mode] to keep 200K-mode and 1M-mode samples
@@ -160,7 +185,7 @@ def collect_auto_pretokens(mode: str = "200k", max_samples: int = AUTO_SAMPLE_WI
     """
     lo, hi = SAMPLE_PARTITIONS[mode]
     collected: list[int] = []
-    for path in _project_jsonls():  # newest file first
+    for path in _project_jsonls(transcript_path):  # newest file first
         file_samples: list[int] = []
         try:
             with open(path, "rb") as f:
@@ -186,8 +211,8 @@ def collect_auto_pretokens(mode: str = "200k", max_samples: int = AUTO_SAMPLE_WI
     return collected[-max_samples:]
 
 
-def compute_ceiling(mode: str = "200k") -> int:
-    samples = collect_auto_pretokens(mode)
+def compute_ceiling(mode: str = "200k", transcript_path: str | None = None) -> int:
+    samples = collect_auto_pretokens(mode, transcript_path=transcript_path)
     if len(samples) < 2:
         return int(FALLBACK_CEILING_BY_MODE[mode] * SAFETY_FACTOR)
     mean = sum(samples) // len(samples)
@@ -210,7 +235,7 @@ def _last_compact_offset(jsonl_path: str) -> int | None:
     return offset
 
 
-def read_current_tokens() -> int | None:
+def read_current_tokens(transcript_path: str | None = None) -> int | None:
     """Input-token count of the most recent post-compact assistant usage record.
 
     Two boundary-detection paths: (1) ~/.engram/last-compact-at.json marker
@@ -218,7 +243,7 @@ def read_current_tokens() -> int | None:
     (2) legacy compact_boundary JSONL scan (older formats). See the Claude
     sidecar for full rationale (ob_1532).
     """
-    jsonl_path = find_active_jsonl()
+    jsonl_path = _resolve_jsonl(transcript_path)
     if not jsonl_path:
         return None
     try:
@@ -258,12 +283,26 @@ def read_current_tokens() -> int | None:
     return None
 
 
-def estimate_usage() -> dict | None:
-    current = read_current_tokens()
+def estimate_usage(transcript_path: str | None = None) -> dict | None:
+    """Compute current drowsiness reading.
+
+    If `transcript_path` is provided (Issue #140: the hook wrapper threads
+    the harness's per-event stdin payload here), every path lookup in this
+    call resolves to that session's JSONL — race-free even when other
+    sessions are concurrently overwriting the global active-session marker.
+    Falls back to find_active_jsonl() when None.
+
+    Note on triple-resolve: read_current_tokens() and compute_ceiling() each
+    re-call _resolve_jsonl(transcript_path) internally rather than receiving
+    the resolved path. Intentional — keeps each sub-function independently
+    callable. The redundant os.path.exists checks are cheap.
+    """
+    jsonl = _resolve_jsonl(transcript_path)
+    current = read_current_tokens(transcript_path)
     if current is None:
         return None
-    mode = _detect_mode(current, find_active_jsonl())
-    ceiling = compute_ceiling(mode)
+    mode = _detect_mode(current, jsonl)
+    ceiling = compute_ceiling(mode, transcript_path=transcript_path)
     if ceiling <= 0:
         return None
     return {
