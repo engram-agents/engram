@@ -1908,6 +1908,143 @@ def _compute_polarity_alerts(
         )
     return alerts
 
+
+def _similar_existing_matches(
+    conn: sqlite3.Connection,
+    claim: str,
+    *,
+    type_filter: set[str],
+    extra_columns: tuple[str, ...] = (),
+    extra_metadata_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """Return advisory similar-existing matches via FTS + semantic complement.
+
+    Called on write by engram_add_observation and engram_add_lesson BEFORE
+    the new node is inserted, so the new node doesn't match itself. The
+    returned records are advisory (non-blocking): a non-empty list surfaces
+    as a similar_existing action_hint nudging the agent to dedupe, but the
+    insert proceeds regardless. Best-effort: any exception returns an
+    empty list rather than blocking creation.
+
+    Both paths share the type_filter and the tier-2 importance floor —
+    the FTS path filters by importance_score in the WHERE clause; the
+    semantic path passes the same threshold to _semantic_search. Uniform
+    behavior across observation and lesson callers (#143 §3.1 drift
+    cleanup; the prior divergence where lesson FTS skipped the importance
+    filter was accidental, not designed).
+
+    Args:
+        conn: sqlite connection.
+        claim: claim text to scan against.
+        type_filter: node types to include (e.g. {"lesson"} or
+            {"observation_factual", "observation_predictive"}).
+        extra_columns: `nodes` table columns to include in each returned
+            record (e.g. ("evidence_id",) for observations).
+        extra_metadata_keys: JSON keys to pull from each node's metadata
+            blob and include in each returned record (e.g.
+            ("scaffolding_nudge",) for lessons).
+
+    Returns:
+        List of dicts with keys {id, claim, confidence, match_type} plus
+        `similarity` on semantic matches, plus any requested
+        extra_columns / extra_metadata_keys. Empty list on any failure
+        (FTS syntax error, semantic backend unavailable, exception).
+    """
+    if not type_filter:
+        return []
+    matches: list[dict] = []
+    try:
+        tier2_threshold = _get_tier_threshold(conn, 2)
+
+        # FTS keyword search. Importance floor in the WHERE clause for
+        # both callers — uniform with the semantic path's
+        # importance_threshold arg (drift cleanup; see docstring).
+        fts_ids: set[str] = set()
+        fts_query = _sanitize_fts_query(claim)
+        try:
+            if not fts_query:
+                raise sqlite3.OperationalError("empty FTS query")
+            type_placeholders = ", ".join(["?"] * len(type_filter))
+            extra_col_select = (
+                ", " + ", ".join(f"n.{c}" for c in extra_columns)
+                if extra_columns else ""
+            )
+            meta_col_select = ", n.metadata" if extra_metadata_keys else ""
+            fts_sql = (
+                "SELECT n.id, n.type, n.claim, n.confidence, "
+                "n.is_current, n.importance_score"
+                f"{extra_col_select}{meta_col_select} "
+                "FROM nodes_fts fts "
+                "JOIN nodes n ON n.rowid = fts.rowid "
+                f"WHERE nodes_fts MATCH ? AND n.is_current = 1 "
+                f"AND n.type IN ({type_placeholders}) "
+                "AND COALESCE(n.importance_score, 0) >= ? "
+                "ORDER BY rank "
+                "LIMIT 5"
+            )
+            params = (fts_query, *tuple(type_filter), tier2_threshold)
+            for r in conn.execute(fts_sql, params).fetchall():
+                rec = {
+                    "id": r["id"],
+                    "claim": r["claim"],
+                    "confidence": r["confidence"],
+                    "match_type": "keyword",
+                }
+                for col in extra_columns:
+                    rec[col] = r[col]
+                if extra_metadata_keys:
+                    meta = json.loads(r["metadata"]) if r["metadata"] else {}
+                    for key in extra_metadata_keys:
+                        rec[key] = meta.get(key, "")
+                matches.append(rec)
+                fts_ids.add(r["id"])
+        except sqlite3.OperationalError:
+            pass  # FTS syntax error; semantic complement still runs
+
+        # Semantic complement. _semantic_search returns standardized
+        # records (no per-caller column augmentation), so extras come
+        # from a per-match SELECT against `nodes`.
+        if _embedder.is_available() and _get_embedding_config().get("enabled", True):
+            _th = _get_thresholds_config()
+            sem_results = _semantic_search(
+                conn, claim,
+                top_k=int(_th["dedup_top_k"]),
+                min_similarity=float(_th["dedup_min_similarity"]),
+                type_filter=type_filter,
+                importance_threshold=tier2_threshold,
+            )
+            extras_cols: list[str] = list(extra_columns)
+            if extra_metadata_keys:
+                extras_cols.append("metadata")
+            extras_select = ", ".join(extras_cols) if extras_cols else None
+            for s in sem_results:
+                if s["id"] in fts_ids:
+                    continue
+                rec = {
+                    "id": s["id"],
+                    "claim": s["claim"],
+                    "confidence": s.get("confidence"),
+                    "match_type": "semantic",
+                    "similarity": s.get("similarity"),
+                }
+                if extras_select:
+                    row = conn.execute(
+                        f"SELECT {extras_select} FROM nodes WHERE id = ?",
+                        (s["id"],),
+                    ).fetchone()
+                    if row:
+                        for col in extra_columns:
+                            rec[col] = row[col]
+                        if extra_metadata_keys:
+                            meta = json.loads(row["metadata"]) if row["metadata"] else {}
+                            for key in extra_metadata_keys:
+                                rec[key] = meta.get(key, "")
+                matches.append(rec)
+    except Exception:
+        return []
+    return matches
+
+
 def _semantic_search(
     conn: sqlite3.Connection,
     query_text: str,
@@ -3803,67 +3940,16 @@ def _add_observation_impl(
             source_class=source_class,
         )
 
-        # Inline similarity check — run BEFORE insert so the new node
-        # doesn't match itself.  Results are advisory (non-blocking).
-        similar_matches = []
-        try:
-            tier2_threshold = _get_tier_threshold(conn, 2)
-
-            # FTS keyword search
-            fts_ids = set()
-            fts_query = _sanitize_fts_query(claim)
-            try:
-                if not fts_query:
-                    raise sqlite3.OperationalError("empty FTS query")
-                fts_results = conn.execute(
-                    """SELECT n.id, n.type, n.claim, n.confidence, n.evidence_id,
-                              n.is_current, n.importance_score
-                       FROM nodes_fts fts
-                       JOIN nodes n ON n.rowid = fts.rowid
-                       WHERE nodes_fts MATCH ? AND n.is_current = 1
-                       AND n.type IN ('observation_factual', 'observation_predictive')
-                       AND COALESCE(n.importance_score, 0) >= ?
-                       ORDER BY rank
-                       LIMIT 5""",
-                    (fts_query, tier2_threshold),
-                ).fetchall()
-                for r in fts_results:
-                    similar_matches.append({
-                        "id": r["id"],
-                        "claim": r["claim"],
-                        "confidence": r["confidence"],
-                        "evidence_id": r["evidence_id"],
-                        "match_type": "keyword",
-                    })
-                    fts_ids.add(r["id"])
-            except sqlite3.OperationalError:
-                pass  # FTS query syntax error (special chars in claim)
-
-            # Semantic search (complement)
-            if _embedder.is_available() and _get_embedding_config().get("enabled", True):
-                _th = _get_thresholds_config()
-                sem_results = _semantic_search(
-                    conn, claim, top_k=int(_th["dedup_top_k"]),
-                    min_similarity=float(_th["dedup_min_similarity"]),
-                    importance_threshold=tier2_threshold,
-                )
-                for s in sem_results:
-                    if s["id"] not in fts_ids and s["type"] in (
-                        "observation_factual", "observation_predictive"
-                    ):
-                        ev_row = conn.execute(
-                            "SELECT evidence_id FROM nodes WHERE id = ?", (s["id"],)
-                        ).fetchone()
-                        similar_matches.append({
-                            "id": s["id"],
-                            "claim": s["claim"],
-                            "confidence": s["confidence"],
-                            "evidence_id": ev_row["evidence_id"] if ev_row else None,
-                            "match_type": "semantic",
-                            "similarity": s["similarity"],
-                        })
-        except Exception:
-            pass  # Similarity check is best-effort; never block creation
+        # Similarity check — run BEFORE insert so the new node doesn't
+        # match itself. Results are advisory (non-blocking). Helper
+        # extracted 2026-05-14 (#143 §3.1) — same shape used by
+        # engram_add_lesson; the importance-floor-in-FTS divergence
+        # between callers was accidental drift and is now uniform.
+        similar_matches = _similar_existing_matches(
+            conn, claim,
+            type_filter={"observation_factual", "observation_predictive"},
+            extra_columns=("evidence_id",),
+        )
 
         node_id = _next_id(conn, node_type)
         now = _now()
@@ -8152,66 +8238,16 @@ def _add_lesson_impl(
                          f"Cannot cite: {', '.join(wrong_type)}.",
             })
 
-        # Inline similarity check against existing lessons BEFORE insert
-        similar_lessons = []
-        try:
-            tier2_threshold = _get_tier_threshold(conn, 2)
-
-            # FTS keyword search for existing lessons
-            fts_ids = set()
-            fts_query = _sanitize_fts_query(claim)
-            try:
-                if not fts_query:
-                    raise sqlite3.OperationalError("empty FTS query")
-                fts_results = conn.execute(
-                    """SELECT n.id, n.type, n.claim, n.confidence,
-                              n.is_current, n.importance_score, n.metadata
-                       FROM nodes_fts fts
-                       JOIN nodes n ON n.rowid = fts.rowid
-                       WHERE nodes_fts MATCH ? AND n.is_current = 1
-                       AND n.type = 'lesson'
-                       ORDER BY rank
-                       LIMIT 5""",
-                    (fts_query,),
-                ).fetchall()
-                for r in fts_results:
-                    meta = json.loads(r["metadata"]) if r["metadata"] else {}
-                    similar_lessons.append({
-                        "id": r["id"],
-                        "claim": r["claim"],
-                        "confidence": r["confidence"],
-                        "scaffolding_nudge": meta.get("scaffolding_nudge", ""),
-                        "match_type": "keyword",
-                    })
-                    fts_ids.add(r["id"])
-            except sqlite3.OperationalError:
-                pass
-
-            # Semantic search complement
-            if _embedder.is_available() and _get_embedding_config().get("enabled", True):
-                _th = _get_thresholds_config()
-                sem_results = _semantic_search(
-                    conn, claim, top_k=int(_th["dedup_top_k"]),
-                    min_similarity=float(_th["dedup_min_similarity"]),
-                    type_filter={"lesson"},
-                    importance_threshold=tier2_threshold,
-                )
-                for s in sem_results:
-                    if s["id"] not in fts_ids:
-                        meta_row = conn.execute(
-                            "SELECT metadata FROM nodes WHERE id = ?", (s["id"],)
-                        ).fetchone()
-                        meta = json.loads(meta_row["metadata"]) if meta_row and meta_row["metadata"] else {}
-                        similar_lessons.append({
-                            "id": s["id"],
-                            "claim": s["claim"],
-                            "confidence": s.get("confidence"),
-                            "scaffolding_nudge": meta.get("scaffolding_nudge", ""),
-                            "match_type": "semantic",
-                            "similarity": s.get("similarity"),
-                        })
-        except Exception:
-            pass  # Similarity check is best-effort
+        # Similarity check against existing lessons BEFORE insert.
+        # Helper extracted 2026-05-14 (#143 §3.1) — shared with
+        # engram_add_observation; lesson FTS now also filters on the
+        # tier-2 importance floor (drift cleanup, was accidentally
+        # semantic-only before).
+        similar_lessons = _similar_existing_matches(
+            conn, claim,
+            type_filter={"lesson"},
+            extra_metadata_keys=("scaffolding_nudge",),
+        )
 
         # Compute confidence (same as derivation)
         confidence = _compute_confidence(
