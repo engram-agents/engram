@@ -226,6 +226,7 @@ mkdir -p "$ENGRAM_HOME/history/dream"
   echo "<!-- Heartbeat-to-foreground digests. Append-only. Foreground reads on next session. -->" \
   > "$ENGRAM_HOME/heartbeat-queue/from-heartbeat/inbox.md"
 mkdir -p "$CLAUDE_HOME/skills"
+mkdir -p "$CLAUDE_HOME/agents"
 chmod 0700 "$ENGRAM_HOME/secrets"
 chmod 0700 "$ENGRAM_HOME/diary"
 
@@ -255,6 +256,16 @@ echo "== Step 4: Copying files =="
 if [ -d "$ALPHA_DIR/skills/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/skills/claude" 2>/dev/null | grep -v '^\.gitkeep$' || true)" ]; then
   cp -r "$ALPHA_DIR/skills/claude/"* "$CLAUDE_HOME/skills/"
   echo "  skills → $CLAUDE_HOME/skills/ (from skills/claude/)"
+fi
+
+# Sub-agents. Used by sleep-routine (engram-dream-fairy) and PR workflow
+# (engram-pr-reviewer). `cp -rL` follows symlinks at the source — the
+# alpha repo keeps `.claude/agents/*.md` symlinked to `agents/claude/*.md`
+# so the alpha-dev working copies and the shipped copies are guaranteed
+# byte-identical.
+if [ -d "$ALPHA_DIR/agents/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/agents/claude" 2>/dev/null | grep -v '^\.gitkeep$' || true)" ]; then
+  cp -rL "$ALPHA_DIR/agents/claude/"* "$CLAUDE_HOME/agents/"
+  echo "  agents → $CLAUDE_HOME/agents/ (from agents/claude/)"
 fi
 
 if [ -d "$ALPHA_DIR/hooks/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/hooks/claude" 2>/dev/null | grep -v '^\.gitkeep$' || true)" ]; then

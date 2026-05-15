@@ -138,6 +138,23 @@ if [ -f "$ENGRAM_HOME/daily-highlights.md" ]; then
     exit 2
 fi
 echo "  ✓ no legacy daily-highlights.md (retired; superseded by history/YYYY-MM-DD.md)"
+
+# Sub-agents shipped (used by sleep routine + PR workflow). engram-sleep
+# Step 0 dispatches engram-dream-fairy in parallel; CLAUDE.md.template's
+# PR Workflow section references engram-pr-reviewer.
+echo ""
+echo "Sub-agents shipped:"
+assert_file "$CLAUDE_HOME/agents/engram-dream-fairy.md"
+assert_file "$CLAUDE_HOME/agents/engram-pr-reviewer.md"
+# Verify no name-leak from the alpha-dev copies — the shipped versions
+# must use generic framing so any user's install works. Case-insensitive
+# to catch "borges" / "lei" lowercase variants too (fairy round-1
+# suggestion: -i flag catches future commits adding lowercase forms).
+if grep -iqE "(Borges|Lei)" "$CLAUDE_HOME/agents/engram-dream-fairy.md" "$CLAUDE_HOME/agents/engram-pr-reviewer.md"; then
+    echo "FAIL: shipped agents contain alpha-dev name leak (Borges/Lei, any case) — these should be de-personalized." >&2
+    exit 2
+fi
+echo "  ✓ agents are de-personalized (no Borges/Lei references, case-insensitive)"
 # HEARTBEAT.md ships once PR #44 lands. Currently optional — bootstrap.py
 # guards with .exists().
 if [ -f "$ENGRAM_HOME/HEARTBEAT.md" ]; then
