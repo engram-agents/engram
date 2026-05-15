@@ -27,13 +27,13 @@ ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
 CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
 
 FORCE=0
-NO_CRON=0
+WITH_CRON=0
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=1 ;;
-    --no-cron) NO_CRON=1 ;;
+    --with-cron) WITH_CRON=1 ;;
     --help|-h)
-      echo "Usage: ./install.sh [--force] [--no-cron]"
+      echo "Usage: ./install.sh [--force] [--with-cron]"
       echo ""
       echo "Environment overrides:"
       echo "  ENGRAM_HOME   target for ENGRAM data (default: \$HOME/.engram)"
@@ -47,8 +47,14 @@ for arg in "$@"; do
       echo "           with an empty knowledge graph — old data is NOT migrated in."
       echo "           To UPGRADE an existing install while preserving data, use:"
       echo "             tools/deploy.sh"
-      echo "  --no-cron: skip Step 8 (cron schedule install). Useful for headless"
-      echo "             servers, CI, or users who manage their crontab separately."
+      echo "  --with-cron: install the ENGRAM cron block (heartbeat at :00/:30,"
+      echo "             dispatcher autostart + watchdog). Cron is opt-in by"
+      echo "             default — heartbeat mode is not fully tested and shouldn't"
+      echo "             mix into a fresh tester's interactive experience. Add"
+      echo "             this flag when you specifically want the autonomous"
+      echo "             heartbeat + multi-agent dispatchers running. After install,"
+      echo "             cron can also be added later via:"
+      echo "               AGENT_NAME=<name> \$ENGRAM_HOME/tools/sync-cron.sh --apply"
       exit 0
       ;;
     *) echo "Unknown arg: $arg (use --help)"; exit 1 ;;
@@ -269,8 +275,9 @@ fi
 # Tools: heartbeat, sleep, dispatcher launchers, telegram bot, channel
 # helpers, sync-cron + render_cron, migrate_config_v2. Copied per-install
 # (not symlinked) so each agent's tools operate on their own $ENGRAM_HOME
-# by env-var contract. Cron registration is now wired through Step 8
-# below (sync-cron.sh --apply); --no-cron skips for headless setups.
+# by env-var contract. Cron registration happens in Step 8 below only
+# when --with-cron is passed (opt-in default; heartbeat mode is not yet
+# stable enough to ship into a fresh tester's environment by default).
 if [ -d "$ALPHA_DIR/tools" ] && [ -n "$(ls -A "$ALPHA_DIR/tools" 2>/dev/null || true)" ]; then
   cp -r "$ALPHA_DIR/tools/"* "$ENGRAM_HOME/tools/"
   chmod +x "$ENGRAM_HOME/tools/"*.sh 2>/dev/null || true
@@ -388,12 +395,19 @@ else
 fi
 echo ""
 
-# -------- Step 8: Cron schedule (optional) --------
+# -------- Step 8: Cron schedule (opt-in) --------
 #
 # Renders + installs the user's crontab from config.json's cadence block via
 # tools/sync-cron.sh. Defaults match the production cadence: heartbeat at
-# :00/:30, dispatcher autostart + watchdog. Skip with --no-cron for headless
-# setups or hand-managed crontabs.
+# :00/:30, dispatcher autostart + watchdog.
+#
+# Cron is OPT-IN as of 2026-05-15: heartbeat mode (autonomous cron-fired
+# sessions doing inter-agent coordination) is not fully tested and a fresh
+# tester's first-day experience is better focused on interactive
+# ENGRAM-with-Claude-Code without surprise background sessions. Single-
+# agent installs (no COUNTERPART_NAME set) don't benefit from the
+# dispatchers either. Pass --with-cron to enable, or run sync-cron.sh
+# manually later.
 #
 # Sleep is NOT cron-scheduled as of 2026-05-14 (alpha #133 PR C). Sleep is
 # interactive-first: the agent runs `engram-bedtime` then `engram-sleep` at
@@ -403,12 +417,12 @@ echo ""
 # Manual catch-up via `tools/sleep.sh` remains available if a day's sleep
 # was missed.
 
-if [ "$NO_CRON" -eq 1 ]; then
-  echo "== Step 8: Cron (skipped per --no-cron) =="
-  echo "  Run later via: AGENT_NAME=<name> $ENGRAM_HOME/tools/sync-cron.sh --apply"
+if [ "$WITH_CRON" -eq 0 ]; then
+  echo "== Step 8: Cron (skipped — default; pass --with-cron to enable) =="
+  echo "  Add later via: AGENT_NAME=<name> $ENGRAM_HOME/tools/sync-cron.sh --apply"
   echo ""
 else
-  echo "== Step 8: Cron schedule =="
+  echo "== Step 8: Cron schedule (--with-cron) =="
 
   # AGENT_NAME defaults to the current username (stripped of any 'agent-'
   # prefix common in multi-agent uid setups).
@@ -446,5 +460,6 @@ echo "  2. The agent will detect $ENGRAM_HOME/first-run-pending"
 echo "     and run the engram-first-session cold-start dialogue"
 echo "  3. After dialogue completes, {{AGENT_NAME}} and {{USER_NAME}} will"
 echo "     be resolved in $CLAUDE_HOME/CLAUDE.md and $ENGRAM_HOME/warm-briefing.md"
-echo "  4. Verify cron with 'crontab -l' (or re-run with --no-cron to skip)"
+echo "  4. (Optional) Enable the autonomous heartbeat: re-run with --with-cron, or"
+echo "     run: AGENT_NAME=<name> $ENGRAM_HOME/tools/sync-cron.sh --apply"
 echo ""

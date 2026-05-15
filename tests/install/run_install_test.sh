@@ -50,9 +50,9 @@ cp -r "$ALPHA_DIR" /tmp/alpha
 cd /tmp/alpha
 
 echo "==================================================="
-echo "  Phase 1: run install.sh (--no-cron for headless)"
+echo "  Phase 1: run install.sh (cron opt-in; default skips it)"
 echo "==================================================="
-if ! bash install.sh --no-cron; then
+if ! bash install.sh; then
     echo ""
     echo "FAIL: install.sh exited non-zero." >&2
     exit 1

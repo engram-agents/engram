@@ -28,13 +28,13 @@ GEMINI_HOME="${GEMINI_HOME:-$HOME/.gemini}"
 GEMINI_EXT_DIR="${GEMINI_EXT_DIR:-$GEMINI_HOME/extensions/engram}"
 
 FORCE=0
-NO_CRON=0
+WITH_CRON=0
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=1 ;;
-    --no-cron) NO_CRON=1 ;;
+    --with-cron) WITH_CRON=1 ;;
     --help|-h)
-      echo "Usage: ./install-gemini.sh [--force] [--no-cron]"
+      echo "Usage: ./install-gemini.sh [--force] [--with-cron]"
       echo ""
       echo "Environment overrides:"
       echo "  ENGRAM_HOME        target for ENGRAM data (default: \$HOME/.engram-gemini)"
@@ -49,8 +49,12 @@ for arg in "$@"; do
       echo "           with an empty knowledge graph — old data is NOT migrated in."
       echo "           To UPGRADE an existing install while preserving data, use:"
       echo "             tools/deploy.sh"
-      echo "  --no-cron: skip Step 9 (cron schedule install). Useful for headless"
-      echo "             servers, CI, or users who manage their crontab separately."
+      echo "  --with-cron: install the ENGRAM cron block (heartbeat at :00/:30,"
+      echo "             dispatcher autostart + watchdog). Cron is opt-in by"
+      echo "             default — heartbeat mode is not fully tested and shouldn't"
+      echo "             mix into a fresh tester's interactive experience. After"
+      echo "             install, cron can also be added later via:"
+      echo "               AGENT_NAME=<name> \$ENGRAM_HOME/tools/sync-cron.sh --apply --agent-cli gemini"
       exit 0
       ;;
     *) echo "Unknown arg: $arg (use --help)"; exit 1 ;;
@@ -326,14 +330,18 @@ else
 fi
 echo ""
 
-# -------- Step 9: Cron schedule (optional) --------
+# -------- Step 9: Cron schedule (opt-in) --------
+#
+# Opt-in as of 2026-05-15 — heartbeat mode is not fully tested and a fresh
+# tester's first-day experience is better focused on interactive ENGRAM-
+# with-Gemini without surprise background sessions.
 
-if [ "$NO_CRON" -eq 1 ]; then
-  echo "== Step 9: Cron (skipped per --no-cron) =="
-  echo "  Run later via: AGENT_NAME=<name> $ENGRAM_HOME/tools/sync-cron.sh --apply --agent-cli gemini"
+if [ "$WITH_CRON" -eq 0 ]; then
+  echo "== Step 9: Cron (skipped — default; pass --with-cron to enable) =="
+  echo "  Add later via: AGENT_NAME=<name> $ENGRAM_HOME/tools/sync-cron.sh --apply --agent-cli gemini"
   echo ""
 else
-  echo "== Step 9: Cron schedule =="
+  echo "== Step 9: Cron schedule (--with-cron) =="
 
   CRON_AGENT_NAME="${AGENT_NAME:-$(id -un | sed 's/^agent-//')}"
   CRON_COUNTERPART="${COUNTERPART_NAME:-}"
@@ -371,5 +379,6 @@ echo "     first-session cold-start dialogue (it picks its own name —"
 echo "     independent from any other ENGRAM-backed agent on this machine)"
 echo "  4. After dialogue completes, identity placeholders resolve in"
 echo "     $GEMINI_EXT_DIR/GEMINI.md and $ENGRAM_HOME/warm-briefing.md"
-echo "  5. Verify cron with 'crontab -l' (or re-run with --no-cron to skip)"
+echo "  5. (Optional) Enable the autonomous heartbeat: re-run with --with-cron, or"
+echo "     run: AGENT_NAME=<name> $ENGRAM_HOME/tools/sync-cron.sh --apply --agent-cli gemini"
 echo ""

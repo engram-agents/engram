@@ -19,7 +19,7 @@ The harness verifies that `install.sh` on a clean Ubuntu 22.04 + Python 3.11 + g
 
 - **Real Claude Code MCP registration** — the `claude` CLI is stubbed (Claude Code is a native binary, not pip-installable). MCP behavior must be tested manually on a real install.
 - **The first-session cold-start dialogue** — fires on the user's first Claude Code session, not at install time. Out of harness scope.
-- **Cron registration** — invoked with `--no-cron` for headless testing.
+- **Cron registration** — install.sh's cron step is opt-in (default-off as of 2026-05-15) so the harness invocation `bash install.sh` skips it naturally. Pass `--with-cron` to exercise the cron-install path (note: cron daemon access from inside the harness container is limited).
 - **viz_server.py runtime** — install.sh copies the file but doesn't start the daemon.
 
 ## Usage
@@ -39,7 +39,7 @@ docker run --rm -it -v "$(pwd):/alpha:ro" --entrypoint /bin/bash engram-install-
 # inside container:
 #   bash run_install_test.sh   # see where the assertion failed
 #   ls -la ~/.engram           # inspect partial state
-#   bash /alpha/install.sh --no-cron   # re-run install
+#   bash /alpha/install.sh   # re-run install (cron skipped by default)
 ```
 
 ## Exit codes

@@ -30,14 +30,14 @@ Exit codes:
 ## Phases
 
 1. **`agentctl spawn --runtime claude`** — creates `agent-newborn-<UTC-timestamp>` user with home dir, `.bashrc`, `~/.runtime/start.sh`, `~/.runtime/install.sh`. Asserted via Linux user/group lookup + file-presence checks.
-2. **install.sh as the newborn** — the newborn runs `bash ~/.runtime/install.sh --no-cron`, which chains to alpha's `install.sh`. Asserted via the same post-install file checks as `tests/install/` plus seed-graph node count + placeholder retention.
+2. **install.sh as the newborn** — the newborn runs `bash ~/.runtime/install.sh`, which chains to alpha's `install.sh`. Asserted via the same post-install file checks as `tests/install/` plus seed-graph node count + placeholder retention. Cron is opt-in (default-off as of 2026-05-15) so the harness invocation skips it naturally.
 3. **`agentctl finalize-name <newborn-tag> testbot`** — renames the user/group/home; verifies the old name is gone and the new name has the `finalize-name-complete.json` marker.
 
 ## What this harness does NOT cover
 
 - Real Claude session as the newborn (claude CLI is stubbed; first-session naming dialogue runs only in real Claude Code)
 - Multi-runtime spawn (gemini-cli, codex) — v0.1 of agentctl is claude-only
-- Cron registration during install.sh (`--no-cron` is passed; covered by `tests/install/` separately)
+- Cron registration during install.sh (cron is opt-in default-off; the harness invocation doesn't pass `--with-cron`)
 - Inter-agent comms (telegram dispatcher, channel dispatcher) — those need a second agent in the topology
 
 ## Vendor note (issue #50)

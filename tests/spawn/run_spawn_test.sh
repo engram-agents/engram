@@ -119,7 +119,7 @@ echo "========================================================="
 # The newborn's ~/.runtime/install.sh wraps alpha's install.sh. Run it
 # under the newborn's uid via sudo (sudo present in the image; spt's
 # sudoers config doesn't apply here since we're running in a container).
-if ! sudo -u "$NEWBORN_USER" -H bash -lc 'bash ~/.runtime/install.sh --no-cron'; then
+if ! sudo -u "$NEWBORN_USER" -H bash -lc 'bash ~/.runtime/install.sh'; then
     echo
     echo "FAIL: newborn's install.sh exited non-zero." >&2
     exit 3
@@ -206,7 +206,7 @@ assert_file "$CHOSEN_HOME/.engram/finalize-name-complete.json"
 if [ -d "$CHOSEN_HOME/.engram.first-session-baseline.bak" ]; then
     echo "  ✓ baseline snapshot at .engram.first-session-baseline.bak/"
 else
-    echo "  (no baseline snapshot — Phase 2 ran with --no-cron so install was minimal; non-fatal)"
+    echo "  (no baseline snapshot — Phase 2 install was minimal in this harness; non-fatal)"
 fi
 
 echo
