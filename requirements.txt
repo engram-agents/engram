@@ -1,0 +1,11 @@
+# ENGRAM Alpha runtime dependencies.
+#
+# Version-ranged for forward-compat: pip will pull the latest compatible
+# release. For the exact known-working snapshot (used by CI + the Docker
+# test harness for reproducible builds), see requirements-lock.txt.
+#
+# Install:  pip install -r requirements.txt
+# Upgrade:  pip install -U -r requirements.txt
+
+fastmcp>=3.0,<4
+sentence-transformers>=5.0,<6

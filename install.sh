@@ -68,16 +68,87 @@ echo "== Step 1: Dependencies =="
 command -v python3 >/dev/null || { echo "ERROR: python3 not found"; exit 1; }
 command -v git >/dev/null || { echo "ERROR: git not found"; exit 1; }
 
-MISSING=$(python3 -c '
+# Python version gate via capability check: `sys.get_int_max_str_digits`
+# was a CVE-2020-10735 backport landing in 3.10.7, 3.11.0 final, 3.9.14,
+# and 3.8.14. Current `transformers` (5.8.x) needs it at import time.
+# Capability check (hasattr) is preferable to a tuple-version check
+# because Python's version-info tuple comparison short-circuits on the
+# minor field: `(3, 11, 0, 'candidate', 1) >= (3, 10, 7)` evaluates
+# `11 > 10 → True` and never inspects releaselevel, so a tuple-based
+# gate would let 3.11.0rc1 pass (the specific broken case on Ubuntu 22.04).
+# Testing the attribute directly is immune to all such edge cases.
+if ! python3 -c "import sys; sys.exit(0 if hasattr(sys, 'get_int_max_str_digits') else 1)"; then
+  echo "ERROR: this Python is missing sys.get_int_max_str_digits (you have $(python3 --version 2>&1))."
+  echo "Required floor: 3.10.7+ or any 3.11.0 final or later. Earlier 3.10.x and"
+  echo "3.11.0rc1 release candidate miss the attribute that current transformers"
+  echo "and sentence-transformers need at import."
+  echo "Upgrade Python and try again."
+  exit 1
+fi
+
+# Python deps: validate against the declared ranges in requirements.txt
+# rather than just checking that the modules import. This catches the case
+# where a fresh `pip install fastmcp sentence-transformers` pulled
+# versions outside our supported range — symptoms range from import errors
+# to runtime AttributeErrors (e.g., the 2026-05 transformers/sentence-
+# transformers + Python 3.11rc release-candidate combination).
+REQS_FILE="$REPO_ROOT/requirements.txt"
+if [ -f "$REQS_FILE" ]; then
+  if ! python3 -c "
+import importlib.metadata as md
+import re
+import sys
+errors = []
+for line in open('$REQS_FILE'):
+    line = line.strip()
+    if not line or line.startswith('#'):
+        continue
+    # Skip recursive-include directives — these are valid in requirements.txt
+    # (e.g. '-r requirements-base.txt') but aren't package specs to validate.
+    if line.startswith('-r ') or line.startswith('--requirement ') or line.startswith('-c ') or line.startswith('--constraint '):
+        continue
+    m = re.match(r'([A-Za-z0-9_.-]+)\s*(.*)', line)
+    if not m:
+        continue
+    name, spec = m.group(1), m.group(2).strip()
+    try:
+        installed = md.version(name)
+    except md.PackageNotFoundError:
+        errors.append(f'{name}: not installed (need {spec or \"any\"})')
+        continue
+    if spec:
+        try:
+            from packaging.requirements import Requirement
+            from packaging.version import Version
+            req = Requirement(f'{name}{spec}')
+            if Version(installed) not in req.specifier:
+                errors.append(f'{name}: have {installed}, need {spec}')
+        except ImportError:
+            # packaging not available — best-effort skip range check
+            pass
+if errors:
+    print('\n'.join(errors))
+    sys.exit(1)
+" 2>&1; then
+    echo ""
+    echo "ERROR: one or more Python dependencies are missing or out of range."
+    echo "Install or upgrade with:"
+    echo "    pip install -r $REQS_FILE"
+    exit 1
+  fi
+else
+  # Fallback path for forks/branches that don't have requirements.txt yet.
+  MISSING=$(python3 -c '
 import importlib.util as u
 want = ["fastmcp", "sentence_transformers"]
 missing = [m for m in want if u.find_spec(m) is None]
 print(",".join(missing))
 ')
-if [ -n "$MISSING" ]; then
-  echo "ERROR: missing Python packages: $MISSING"
-  echo "Install with: pip install fastmcp sentence-transformers"
-  exit 1
+  if [ -n "$MISSING" ]; then
+    echo "ERROR: missing Python packages: $MISSING"
+    echo "Install with: pip install fastmcp sentence-transformers"
+    exit 1
+  fi
 fi
 
 # Resolve an absolute path to the interpreter that just passed preflight.
@@ -91,7 +162,7 @@ command -v claude >/dev/null || { echo "ERROR: 'claude' CLI not found on PATH. I
 echo "  python3 ok ($PYTHON_BIN)"
 echo "  git ok"
 echo "  claude ok"
-echo "  Python deps ok (fastmcp, sentence-transformers)"
+echo "  Python deps ok (validated against $REQS_FILE ranges)"
 echo ""
 
 # -------- Step 2: Idempotency --------

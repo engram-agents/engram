@@ -59,13 +59,15 @@ This alpha package installs:
 
 ## Prerequisites
 
-- **Python 3.10+** with `pip`
+- **Python 3.10.7+** with `pip` — 3.10.7 is the first backport of the `sys.get_int_max_str_digits` CVE fix that current `transformers` needs at import. Any 3.11.0 final or later is also fine; 3.10.0–3.10.6 and 3.11.0rc1 are specifically broken.
 - **git**
-- Python packages: `fastmcp`, `sentence-transformers`
+- Python packages declared in `requirements.txt` (currently: `fastmcp`, `sentence-transformers`)
 
 ```bash
-pip install fastmcp sentence-transformers
+pip install -r requirements.txt
 ```
+
+(`requirements-lock.txt` is also in the repo but is Linux-x86_64 CI-only — pinned to the CPU-torch wheel that only resolves on Linux. Do not use it on macOS or Windows.)
 
 - An existing Claude Code installation (the MCP client that will talk to the
   server)
@@ -113,15 +115,17 @@ Run each check. Stop and report missing dependencies instead of trying to
 install them yourself — leave those choices to the user.
 
 ```bash
-python3 --version             # require >=3.10
+python3 --version             # require >=3.10.7 (or any 3.11.0 final or later)
 command -v git                # require present
-python3 -c 'import fastmcp, sentence_transformers'
+pip install -r requirements.txt
 ```
 
-If the last command fails, tell the user:
+If the `pip install` step fails or reports version conflicts, tell the user:
 
-> `pip install fastmcp sentence-transformers` is required before
-> installing ENGRAM. Please install these and run me again.
+> `pip install -r requirements.txt` is required before installing ENGRAM.
+> Please install these and run me again. (If you see version conflicts,
+> share the error — we'll need to bump the supported range in
+> `requirements.txt`.)
 
 ### 2. Run the installer
 
