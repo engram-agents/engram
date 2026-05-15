@@ -51,10 +51,18 @@ DEFAULT_THRESHOLDS = {
 # Defaults: NLI polarity-dedup config (added 2026-05-10 per issue #56 + bake-off).
 # Default model is the empirical bake-off winner (AUC 0.847, F1 0.889).
 # Default threshold is the peak-F1 operating point (recall 84%, precision 94%).
-# enabled=True ships the feature ON; agents/users can disable via config or
-# the ENGRAM_NO_POLARITY env var (useful for tests + low-RAM environments).
+# enabled=FALSE as of 2026-05-15 (per Lei): the bake-off winner is a 1.5GB
+# GPU model that's slow/unavailable on Macs without a capable GPU, and
+# issue #106 documents a high false-positive "wolf-cry" rate on real
+# usage. Users with the hardware and the calibration confidence can
+# enable explicitly via `polarity.enabled = true` in config.json. Tests
+# can use the `ENGRAM_NO_POLARITY` env var to force disable regardless
+# of config.
+#
+# To enable: edit ~/.engram/config.json and set polarity.enabled = true.
+# Re-reads happen on every observation write (no server restart needed).
 DEFAULT_POLARITY = {
-    "enabled": True,
+    "enabled": False,
     "model": "dleemiller/ModernCE-large-nli",
     "threshold": 0.46,
     # Skip polarity scoring on candidates with cosine similarity below this floor —

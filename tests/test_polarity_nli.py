@@ -47,6 +47,31 @@ def fresh_server(*, polarity_enabled: bool, nli_score: float | None = None):
     server._embedder = _StubEmb()
     server._get_embedding_config = lambda: {"enabled": True}
 
+    # Patch polarity.enabled into config.json (read-modify-write) per the
+    # fixture flag. The production default is `enabled=False` as of
+    # 2026-05-15, so tests that want polarity on must opt-in explicitly
+    # via the config file — same path real users follow. Read-modify-write
+    # rather than overwrite so any other config sections that
+    # _ensure_data_dir() wrote (thresholds, memory, embedding, cadence)
+    # survive — keeps the fixture faithful to the real opt-in surface
+    # users edit.
+    if polarity_enabled:
+        config_path = server.CONFIG_PATH
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = {}
+        if config_path.exists():
+            try:
+                existing = json.loads(config_path.read_text())
+            except json.JSONDecodeError:
+                existing = {}
+        existing["polarity"] = {
+            "enabled": True,
+            "model": "dleemiller/ModernCE-large-nli",
+            "threshold": 0.46,
+            "min_similarity_for_check": 0.30,
+        }
+        config_path.write_text(json.dumps(existing))
+
     # Stub the NLI classifier to return the chosen score (or None if not set).
     # Provides BOTH score() and score_batch() since the production code path
     # uses score_batch() (one batched call per write) and tests + back-compat
@@ -445,7 +470,8 @@ def test_batched_polarity_filters_below_min_sim():
 
 
 def test_polarity_defaults():
-    """Defaults: enabled=True, model=ModernCE-large-nli, threshold=0.46."""
+    """Defaults: enabled=False (per Lei 2026-05-15 — opt-in for fresh installs),
+    model=ModernCE-large-nli, threshold=0.46."""
     if "ENGRAM_NO_POLARITY" in os.environ:
         del os.environ["ENGRAM_NO_POLARITY"]
     if "server" in sys.modules:
@@ -456,7 +482,7 @@ def test_polarity_defaults():
     server._configure_paths(TEST_DIR)
     server._ensure_data_dir()
     cfg = server._get_polarity_config()
-    assert cfg["enabled"] is True
+    assert cfg["enabled"] is False
     assert cfg["model"] == "dleemiller/ModernCE-large-nli"
     assert cfg["threshold"] == 0.46
     assert cfg["min_similarity_for_check"] == 0.30

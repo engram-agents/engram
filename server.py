@@ -1716,11 +1716,18 @@ def _get_polarity_config() -> dict:
     min_similarity_for_check (float). Falls back to defaults if config
     absent.
 
-    Disabled if `ENGRAM_NO_POLARITY` env var is set (test-mode escape hatch
-    so tests don't have to download a 1.5GB model).
+    `enabled` defaults to FALSE as of 2026-05-15 (per Lei: heartbeat-mode-
+    parallel — feature is not fully calibrated yet, the bake-off winner is
+    a 1.5GB GPU model that's slow/unavailable on Macs without GPU, and
+    issue #106 documents a high false-positive "wolf-cry" rate on real
+    usage. Opt-in for users who explicitly want it AND have the hardware).
+    Disabled if `ENGRAM_NO_POLARITY` env var is set (test-mode escape
+    hatch so tests don't have to download a 1.5GB model).
+
+    To enable: set `polarity.enabled = true` in `~/.engram/config.json`.
     """
     defaults = {
-        "enabled": True,
+        "enabled": False,
         "model": POLARITY_DEFAULT_MODEL,
         "threshold": POLARITY_DEFAULT_THRESHOLD,
         "min_similarity_for_check": POLARITY_DEFAULT_MIN_SIMILARITY_FOR_CHECK,
@@ -1874,7 +1881,12 @@ def _compute_polarity_alerts(
     score_batch returns None, returns an empty dict.
     """
     cfg = _get_polarity_config()
-    if not cfg.get("enabled", True):
+    # Fallback default is False to match the policy default in
+    # _get_polarity_config(). In practice this is dead code because that
+    # function always populates "enabled" from its defaults dict, but
+    # keeping the fallback semantically aligned protects against a future
+    # refactor that returns a partial dict.
+    if not cfg.get("enabled", False):
         return {}
     min_sim = float(cfg.get("min_similarity_for_check", POLARITY_DEFAULT_MIN_SIMILARITY_FOR_CHECK))
     threshold = float(cfg.get("threshold", POLARITY_DEFAULT_THRESHOLD))
