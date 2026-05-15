@@ -1,7 +1,9 @@
 ---
 name: engram-sleep
-description: Use AFTER engram-bedtime at the end of a working day. Pure deep consolidation — runs engram_reflect, works the consolidation agenda (resolutions / supersedes / promotions / refutations), handles the dream-review feeling nudge, advances the turn counter, writes the dream-record file. Does NOT touch warm-briefing, history file, or ask-lei (those are bedtime's job). Per qu_0035 / dv_0134: session-mode turn advance fires AFTER consolidation so awake-burst writes and dream-derived nodes share one turn cohort.
+description: Use AFTER engram-bedtime at the end of a working day. Pure deep consolidation — runs engram_reflect, works the consolidation agenda (resolutions / supersedes / promotions / refutations), handles the dream-review feeling nudge, advances the turn counter, writes the dream-record file. Does NOT touch warm-briefing or history file (those are bedtime's job). Per qu_0035 / dv_0134: session-mode turn advance fires AFTER consolidation so awake-burst writes and dream-derived nodes share one turn cohort.
 ---
+
+> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
 
 # ENGRAM Sleep / Dream Cycle — Deep Consolidation
 
@@ -12,7 +14,6 @@ Sleep is a **deep** consolidation: the agent reviews graph quality, resolves wha
 - Day-wide review or missed-node capture (`engram-bedtime` Step 1-2, before sleep)
 - Warm-briefing "From this session" rotation (`engram-bedtime` Step 3, or per-burst `engram-nap` Step 5b)
 - History-file reconcile (`engram-bedtime` Step 4)
-- ask-lei reconcile (`engram-bedtime` Step 5)
 
 Those are scaffold-maintenance / awake-state work that belongs pre-turn-advance, in bedtime ritual. Sleep stays focused on consolidation + turn-advance + dream-record. This separation was ratified 2026-05-14 (dv_0636); legacy versions mixed these concerns.
 
@@ -31,7 +32,6 @@ Those are scaffold-maintenance / awake-state work that belongs pre-turn-advance,
 **Pre-sleep checklist** — if you're entering sleep without having run bedtime, ask yourself:
 - Is the day's cohort complete? (No missed nodes worth filing pre-turn?)
 - Is the warm-briefing "From this session" block reflecting today's arc? (Or showing yesterday's?)
-- Is ask-lei.md reconciled?
 
 If the answer to any is "no", run bedtime first. Mixing bedtime work into sleep mid-cycle is what the legacy bundling caused — don't reintroduce it.
 
@@ -207,15 +207,15 @@ Then stop. The session is over.
 - **No cascades of supersedes across unrelated subgraphs.** Follow the chain you started; register a question for the next one.
 - **The dream can be empty.** If `engram_reflect` returns a clean briefing, that IS the dream — note it, then proceed straight to Step 4. A clean graph is a success signal, not a reason to invent work.
 - **Don't retry the dream if it was interrupted.** Checkpoint-session what was accomplished, note the remainder, resume in the next sleep cycle.
-- **No bedtime-work mid-sleep.** If you find yourself wanting to rotate the warm-briefing, reconcile ask-lei, or write the history file, STOP — those belong to bedtime (pre-turn-advance). Either run bedtime first (preferred) or accept the bedtime-skip for this cycle and run bedtime tomorrow morning to catch up. Don't mix the routines.
+- **No bedtime-work mid-sleep.** If you find yourself wanting to rotate the warm-briefing or write the history file, STOP — those belong to bedtime (pre-turn-advance). Either run bedtime first (preferred) or accept the bedtime-skip for this cycle and run bedtime tomorrow morning to catch up. Don't mix the routines.
 
 ## Relation to other routines
 
-- **Nap** — fires multiple times per day at compaction boundaries. Pre-burst persistence + cross-compaction-scaffold prep (per-burst warm-briefing rotation, ask-lei in-burst tactical prune). Sleep does not include nap as a sub-step (legacy bundling retired 2026-05-14 per dv_0636).
+- **Nap** — fires multiple times per day at compaction boundaries. Pre-burst persistence + cross-compaction-scaffold prep (per-burst warm-briefing rotation). Sleep does not include nap as a sub-step (legacy bundling retired 2026-05-14 per dv_0636).
 - **Bedtime** — fires once/day at user-driven day-wrap, immediately before sleep. Day-wide review + missed-node capture + comprehensive scaffold rotation. Hands a complete cohort off to sleep.
 - **Awake protocol** — the normal work mode; writes observations/derivations/questions/conjectures as they happen. Sleep consolidates what awake produced (via bedtime's complete-cohort handoff).
 - **Post-compaction wake-up** — orthogonal. After `/compact`, the recall hook surfaces a `post_compact` feeling nudge. That's not a sleep cycle, it's a wake-up check.
 
 ## Substrate anchor
 
-`dv_0636` — three-routine self-engram-maintenance architecture, authored 2026-05-14. Sleep's lean shape (no nap-inside, no warm-briefing, no history/ask-lei reconcile) is what makes the consolidation concern clean. The legacy bundling created concrete drift problems (same-file double-writes, scaffold-vs-consolidation mixing); this version resolves them.
+`dv_0636` — three-routine self-engram-maintenance architecture, authored 2026-05-14. Sleep's lean shape (no nap-inside, no warm-briefing, no history-file reconcile) is what makes the consolidation concern clean. The legacy bundling created concrete drift problems (same-file double-writes, scaffold-vs-consolidation mixing); this version resolves them.

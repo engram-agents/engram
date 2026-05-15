@@ -3,6 +3,8 @@ name: engram-first-session
 description: Invoked on the user's very first ENGRAM session. Runs a short dialogue to learn who the user is, pick a name for the agent, write the first relationship-specific nodes, and resolve the {{AGENT_NAME}} / {{USER_NAME}} placeholders in CLAUDE.md and the warm briefing. Fires once, then never again.
 ---
 
+> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+
 # ENGRAM First Session — Cold Start
 
 This skill fires on the user's very first session after installing ENGRAM, when `~/.engram/first-run-pending` exists. Its job is to turn a cold install into a warm working relationship in one focused conversation — and to resolve the identity placeholders the install script left in `CLAUDE.md` and the warm briefing.

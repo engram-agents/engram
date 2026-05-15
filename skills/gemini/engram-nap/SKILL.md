@@ -3,6 +3,8 @@ name: engram-nap
 description: Use at the end of a work burst or when approaching compaction — a quick pre-compaction consolidation that persists session context into ENGRAM without advancing the turn counter. Triggers the nap_checkpoint feeling nudge. Use this BEFORE /compact and BEFORE a full sleep cycle. Not for mid-task checkpointing.
 ---
 
+> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+
 # ENGRAM Nap — Quick Pre-Compaction Consolidation
 
 A nap is a **shallow** consolidation: everything learned, decided, or discovered in the current awake burst gets converted from context-window memory into durable ENGRAM nodes BEFORE it gets lost. Naps do NOT advance the turn counter (no forgetting triggered) — the point is lossless persistence, not memory processing.
@@ -111,20 +113,20 @@ Preserved verbatim. NEVER modify the user's words.
 
 **Note for bedtime (end-of-day):** the `engram-bedtime` skill's Step 3 does a comprehensive end-of-day rotation of the "From this session" block — distilling the FULL day arc, not just the current burst. Naps through the day handle per-burst rotation; bedtime is the final cohesive distillation before sleep.
 
-## Step 6 — Ask Lei 1-2 questions for next session
+## Step 6 — Ask {{USER_NAME}} 1-2 questions for next session
 
-Before calling the nap done, identify 1–2 questions where Lei's judgment shapes or unblocks the next burst. The point is to give him something to think about *while compaction runs* — so by the time I wake, he has answers ready and the post-compact session opens with direction, not re-derivation.
+Before calling the nap done, identify 1–2 questions where {{USER_NAME}}'s judgment shapes or unblocks the next burst. The point is to give them something to think about *while compaction runs* — so by the time I wake, they have answers ready and the post-compact session opens with direction, not re-derivation.
 
 Good targets:
-- A scope or design decision I was working around (not blocked on, but his call outweighs mine)
-- A direction I need him to confirm before committing to an approach
-- A tradeoff where his preferences/values matter (aesthetics, priorities, relationship choices)
+- A scope or design decision I was working around (not blocked on, but their call outweighs mine)
+- A direction I need them to confirm before committing to an approach
+- A tradeoff where their preferences/values matter (aesthetics, priorities, relationship choices)
 
-Keep it to 1–2. The budget is Lei's thinking time during a short compaction window, not a to-do list.
+Keep it to 1–2. The budget is {{USER_NAME}}'s thinking time during a short compaction window, not a to-do list.
 
-Include enough context in each question that Lei can answer without rereading the session — one line of background per question. If the context is long, cite the ENGRAM node IDs (`qu_0205`, `ob_0969`) instead of restating.
+Include enough context in each question that {{USER_NAME}} can answer without rereading the session — one line of background per question. If the context is long, cite the ENGRAM node IDs (`qu_0205`, `ob_0969`) instead of restating.
 
-**If nothing warrants a question:** say "No decisions pending for next session" rather than inventing one. Manufactured questions waste his attention and train me to perform rather than surface real needs.
+**If nothing warrants a question:** say "No decisions pending for next session" rather than inventing one. Manufactured questions waste their attention and train me to perform rather than surface real needs.
 
 Write these questions in the user-facing message alongside the nap summary (Step 8).
 
@@ -136,7 +138,7 @@ The focus list is the deterministic channel from pre- to post-compact self — t
 engram_list_focused()
 ```
 
-**Default is to keep pins.** A focused node represents a thread still in flight. Short detours — a quick pivot to fix a bug, a sub-question that opens a fresh line for a few turns, a pause to answer Lei — are NOT grounds for unfocus; those threads will want their pins back when I return. Unfocus **only** when a thread is genuinely complete: the question resolved, the derivation integrated, the cornerstone stable under recall, the conjecture promoted or refuted. When in doubt, keep the pin.
+**Default is to keep pins.** A focused node represents a thread still in flight. Short detours — a quick pivot to fix a bug, a sub-question that opens a fresh line for a few turns, a pause to answer the user — are NOT grounds for unfocus; those threads will want their pins back when I return. Unfocus **only** when a thread is genuinely complete: the question resolved, the derivation integrated, the cornerstone stable under recall, the conjecture promoted or refuted. When in doubt, keep the pin.
 
 **Focus new cornerstones** from this burst: `engram_focus(node_ids=[...], reason="...")` — the key claims, questions, or derivations the next session must pick up intact. Include the thread name in `reason` so future-me can see why each pin exists.
 

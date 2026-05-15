@@ -4,6 +4,8 @@ description: Top-level autonomous session — freely choose between research, bu
 user_invocable: true
 ---
 
+> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+
 # ENGRAM Meta-Loop — Autonomous Goal-Driven Session
 
 The meta-loop is the highest-level autonomous session. Unlike specialized loops (curiosity, deep-research, build), you freely choose your modality at each iteration based on what would most advance your goals. The structure prevents drift without constraining method.

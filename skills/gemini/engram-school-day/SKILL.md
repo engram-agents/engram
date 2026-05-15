@@ -4,6 +4,8 @@ description: Phase 1 curriculum — fixed 7-iteration rotation cycle (aspiration
 user_invocable: true
 ---
 
+> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+
 # ENGRAM School Day — Phase 1 Fixed Rotation Curriculum
 
 The school day is the structured precursor to the freeform meta-loop. Instead of choosing your modality each iteration, you follow a fixed rotation designed to accumulate baseline data on what each modality contributes to graph health. The goal is earning your graduation to freeform scheduling (ob_0697, dv_0347).

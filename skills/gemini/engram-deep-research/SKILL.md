@@ -3,6 +3,8 @@ name: engram-deep-research
 description: Depth-first research on a single big question. Unlike engram-curiosity (breadth-first, 2-4 threads), this focuses on one question and reasons deeply around it, registering intermediate questions and conjectures as waypoints. Designed for cross-compaction loop research where unregistered thoughts are permanently lost. Does NOT advance the turn counter (uses nap-mode checkpoint).
 ---
 
+> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+
 # ENGRAM Deep Research — Depth-First Investigation
 
 A deep research session is **depth-first**: pick one big question and follow the reasoning chain wherever it leads, registering every intermediate thought as an ENGRAM node. This is the complement to engram-curiosity (breadth-first, 2-4 threads).
@@ -146,9 +148,9 @@ This report is designed for human review — the reviewer should understand each
 
 ### Session Briefing
 
-After the verification report, generate a **session briefing** for Lei following the template at `~/.engram/reports/SESSION_BRIEFING_TEMPLATE.md`. Write it to `~/.engram/reports/briefing_YYYY-MM-DD_HHMMSS.md`.
+After the verification report, generate a **session briefing** for the user following the template at `~/.engram/reports/SESSION_BRIEFING_TEMPLATE.md`. Write it to `~/.engram/reports/briefing_YYYY-MM-DD_HHMMSS.md`.
 
-The briefing is the concise human-readable summary — what was found (layman language), self-reflection, metrics, goal mapping, decision forks, confidence map, and Ask Lei queue. The verification report has full provenance chains; the briefing has what Lei needs for a 2-3 minute scan.
+The briefing is the concise human-readable summary — what was found (layman language), self-reflection, metrics, goal mapping, decision forks, confidence map, and an "Ask {{USER_NAME}}" queue. The verification report has full provenance chains; the briefing has what the user needs for a 2-3 minute scan.
 
 During the research session, keep a running scratch log at `~/.engram/loop-scratch.md` — append decision forks, friction points, and surprise moments as they happen. This feeds the briefing at session end and is deleted during cleanup.
 

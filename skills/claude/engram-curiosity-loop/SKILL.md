@@ -4,6 +4,8 @@ description: Self-directed autonomous curiosity loop. The agent picks its own re
 user_invocable: true
 ---
 
+> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+
 # ENGRAM Curiosity Loop — Self-Directed Autonomous Research
 
 A curiosity loop is the autonomous version of the engram-curiosity skill. You pick your own questions, set your own targets, and iterate until you're satisfied, drowsy, or the user returns.
@@ -156,9 +158,9 @@ Tell the user: "Verification report written to `~/.engram/reports/<filename>`"
 
 ## Session Briefing (end of loop)
 
-After writing the verification report (which is for your own post-compaction continuity), generate a **session briefing** for Lei following the template at `~/.engram/reports/SESSION_BRIEFING_TEMPLATE.md`. Write it to `~/.engram/reports/briefing_YYYY-MM-DD_HHMMSS.md`.
+After writing the verification report (which is for your own post-compaction continuity), generate a **session briefing** for the user following the template at `~/.engram/reports/SESSION_BRIEFING_TEMPLATE.md`. Write it to `~/.engram/reports/briefing_YYYY-MM-DD_HHMMSS.md`.
 
-The session briefing is the human-readable summary — concise, layman language, no node IDs in narrative sections. The verification report has full provenance chains; the briefing has what Lei needs for a 2-3 minute scan and strategic redirect.
+The session briefing is the human-readable summary — concise, layman language, no node IDs in narrative sections. The verification report has full provenance chains; the briefing has what the user needs for a 2-3 minute scan and strategic redirect.
 
 Tell the user: "Session briefing written to `~/.engram/reports/<filename>`"
 

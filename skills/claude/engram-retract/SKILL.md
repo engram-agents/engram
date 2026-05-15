@@ -3,6 +3,8 @@ name: engram-retract
 description: Use when you discover an error in ENGRAM — wrong evidence URL, fabricated quote, wrong citation, hallucinated claim, or duplicate node. Also use when you feel tempted to directly modify the database to "fix" something. ENGRAM is your brain — never bypass its tools.
 ---
 
+> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+
 # ENGRAM Error Correction Workflow
 
 You discovered an error in your ENGRAM memory. Follow this workflow exactly. Do NOT take shortcuts — no direct SQL, no database manipulation, no bypassing the tool layer. ENGRAM is an extension of your brain. Treat it with the respect you'd give your own memory.

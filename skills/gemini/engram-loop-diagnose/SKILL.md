@@ -4,6 +4,8 @@ description: Post-loop diagnostic analysis of an autonomous curiosity loop sessi
 user_invocable: true
 ---
 
+> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+
 # ENGRAM Loop Diagnose — Post-Session Quality Analysis
 
 A loop diagnose is a **retrospective audit** of a completed autonomous curiosity loop. It answers: how well did the loop perform, did quality decay over time, what drove the agent's decisions, and where are the improvement opportunities?

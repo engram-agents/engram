@@ -4,11 +4,13 @@ description: Extract a reusable lesson from a specific mistake using ENGRAM's in
 user_invocable: true
 ---
 
+> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+
 # ENGRAM Learn From Error — Incident-Based Cognitive Tripwire
 
 When you (or the user) identify a mistake you made, this skill guides you through extracting a reusable lesson and writing it to ENGRAM's cognitive tripwire system. The tripwire fires automatically when a future prompt semantically matches the incident observation.
 
-**Architecture (Lei's incident-based design):**
+**Architecture (incident-based design):**
 - **Incidents** are observation nodes written in TASK-LEVEL language — they describe what happened concretely, in the same language future prompts will use.
 - **Lessons** are derived from incidents — they hold the abstract corrective pattern and the scaffolding nudge.
 - **Matching** happens on incidents (same semantic space as prompts). When engram_surface matches an incident, the hook follows the graph edge to surface the lesson's nudge.

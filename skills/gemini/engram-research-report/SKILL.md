@@ -4,6 +4,8 @@ description: Generate a professional research report from ENGRAM knowledge with 
 user_invocable: true
 ---
 
+> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+
 # ENGRAM Research Report — Provenance-Backed Professional Output
 
 Generates a polished research report from ENGRAM nodes. The report's distinguishing feature is **full provenance**: every claim cites the ENGRAM node that backs it, which in turn cites the evidence source. A domain expert can trace any statement to its origin and see the confidence level.

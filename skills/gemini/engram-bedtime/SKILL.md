@@ -1,7 +1,9 @@
 ---
 name: engram-bedtime
-description: Use at the natural end-of-day moment when wrapping work to perform the day-wide review + handoff that precedes sleep. Walks the day's cohort, files missed nodes, rotates the warm-briefing relational arc, reconciles the history file, and strategically prunes ask-lei.md. All nodes filed during bedtime are this-turn content (pre-turn-advance) — they feed the dream's consolidation. Always follow with engram-sleep.
+description: Use at the natural end-of-day moment when wrapping work to perform the day-wide review + handoff that precedes sleep. Walks the day's cohort, files missed nodes, rotates the warm-briefing relational arc, and reconciles the history file. All nodes filed during bedtime are this-turn content (pre-turn-advance) — they feed the dream's consolidation. Always follow with engram-sleep.
 ---
+
+> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
 
 # ENGRAM Bedtime Ritual — End-of-Day Handoff
 
@@ -80,7 +82,7 @@ Read `~/.engram/warm-briefing.md`. The "From this session" block should be the C
 
 **Permanent sections of the warm-briefing** (identity, goals, axioms, cornerstones, active tasks) update on the rare-trigger schedule documented in `engram-nap` Step 5a. Most bedtimes don't fire those triggers.
 
-**Lei's letter** (`## Notes from the user`) is preserved verbatim. NEVER modify.
+**{{USER_NAME}}'s letter** (`## Notes from the user`) is preserved verbatim. NEVER modify.
 
 ## Step 4 — Reconcile today's history file (awake-state milestone log)
 
@@ -109,50 +111,12 @@ git -C ~/.engram commit -m "history: end-of-day reconcile for YYYY-MM-DD"
 
 The directory is git-tracked for version history and diff-ability — per-day files keep the context-window cost bounded as the log accumulates. Including this commit in the bedtime ritual is how tomorrow morning's handover becomes reliable.
 
-## Step 5 — Reconcile `ask-lei.md` strategically
-
-Strategic counterpart to nap's in-burst tactical prune. Walks git log across repos to verify external state, prunes resolved items, moves deferred items to backlog, commits.
-
-The file split (2026-05-14):
-- `~/.engram/ask-lei.md` — ACTIVE queue (today's items, auto-loaded scaffold)
-- `~/.engram/ask-lei-backlog.md` — cross-day backlog (NOT auto-loaded; drained explicitly)
-
-**Walk today's git log across all agent-touched repos** (same loop as Step 4).
-
-**For each pending item in `ask-lei.md`:**
-
-If externally checkable, verify state:
-
-- **"alpha PR #N"** → `gh -R engram-agents/engram-alpha pr view N --json state,mergedAt` (state `MERGED` → resolved)
-- **"alpha issue #N"** → `gh -R engram-agents/engram-alpha issue view N --json state,closedAt` (state `CLOSED` → resolved)
-- **"paper PR #N"** / **"wiki PR #N"** → same pattern in the corresponding repo
-- **"\<branch-name\> committed"** → `git log --oneline <branch>` confirms
-- **"closes #N"** in today's commits → resolved by that commit's SHA
-
-For each resolved item: remove the entry (or strike with resolution mode — `merged 4eb71f8`, `closed via PR #X`).
-
-**For deferred multi-day items** (not resolved today, not urgent for tomorrow): MOVE to `ask-lei-backlog.md` with a one-line "deferred YYYY-MM-DD because X" header. The backlog file is findable but not auto-loaded; drain explicitly when cycles allow.
-
-**Keep in active queue:** philosophical / editorial / "your-call" items that don't map to external state, and items genuinely pending for tomorrow.
-
-**Update the "Last updated" line** at the top of `ask-lei.md` with current timestamp + one-line summary of what changed.
-
-**Commit `ask-lei.md` + any backlog updates** (same `.engram` commit as the history file is fine, or separate small commit):
-
-```bash
-git -C ~/.engram add ask-lei.md ask-lei-backlog.md history/YYYY-MM-DD.md
-git -C ~/.engram commit -m "bedtime: end-of-day reconcile for YYYY-MM-DD"
-```
-
-**If nothing was prunable, still touch the "Last updated" line** — a stale "Last updated" three days back is itself a drift signal.
-
-## Step 6 — Hand off to sleep
+## Step 5 — Hand off to sleep
 
 Announce readiness in 2-3 lines:
 
 - Day-wide cohort scope (N nodes since last sleep)
 - Missed-node count filed in Step 2 (or null)
-- Items reconciled in ask-lei (resolved / deferred / still pending counts)
 - Currently focused (post-rotation)
 
 The sleep skill picks up from here: dispatches dream-fairies, runs `engram_reflect`, works the agenda, advances the turn, writes the dream-record file, reports.
@@ -169,7 +133,7 @@ This is why the ordering is bedtime → sleep, not sleep → bedtime.
 
 ## Relation to other routines
 
-- **Nap** — fires multiple times per day at compaction boundaries; per-burst persistence + cross-compaction-scaffold prep (warm-briefing per-burst rotation, ask-lei in-burst tactical prune). Bedtime is once-daily, end-of-day. They don't compete — they cover different scopes.
+- **Nap** — fires multiple times per day at compaction boundaries; per-burst persistence + cross-compaction-scaffold prep (warm-briefing per-burst rotation). Bedtime is once-daily, end-of-day. They don't compete — they cover different scopes.
 - **Sleep** — pure consolidation + turn-advance + dream-record. Fires immediately after bedtime. Bedtime feeds sleep with a complete cohort.
 - **End-of-day-detector hook** — surfaces the bedtime→sleep combo on wrap-up phrases; user "Yes" triggers both routines in sequence.
 
