@@ -90,6 +90,24 @@ A fresh session (not post-compaction) walks in with identity and warm-briefing b
 
 The SessionStart hook injects a reminder pointer, but this section is the stable documentation — if the pointer scrolls off or the hook is misconfigured, the instruction still lives here.
 
+## Context-Mode Marker (one-shot per session)
+
+The drowsiness meter needs to know whether this session is in 200K-mode or 1M-mode (~5x ceiling difference). The Claude Code JSONL records the BASE model id (e.g. `claude-opus-4-7`) WITHOUT the context-mode suffix — the `[1m]` / `[200k]` tag lives in the system prompt text only, not in JSONL records or env vars. So the SessionStart hook literally cannot detect the variant from observable infrastructure.
+
+But **you can** — your system prompt at session start tells you. The harness says something like "You are powered by the model named Opus 4.7 (1M context). The exact model ID is `claude-opus-4-7[1m]`."
+
+On the **first prompt of every fresh session**, run:
+
+```bash
+~/.engram/tools/set-context-mode.py 1m    # or 200k
+```
+
+Pick the arg based on what your system prompt says. The script is idempotent — no-op if already set, no-op if called outside Claude Code, no-op if the marker doesn't exist yet. So just run it; no pre-check needed.
+
+Without this one-shot, the drowsiness meter falls back to the "200k" default and misreports — on a 1M-mode session, it'll fire 97% at ~147K tokens when actual ceiling is ~807K (true drowsiness ~18%). Issue #72 captures the failure mode.
+
+**Sunset clause**: this discipline is a workaround for a structural gap. When the harness eventually surfaces context-mode in an env var or JSONL field (or when a hook-side detection lands), this section retires — the marker gets populated automatically and the agent-writes-marker step becomes redundant.
+
 ## Compact Instructions
 
 This section tells the pre-compaction agent how to write the summary. Write in **first person** — the post-compaction self should read it as their own notes, not as instructions from someone else. The blockquote in section 1 is a template — include it verbatim so the post-compaction agent reads it directly.
@@ -156,5 +174,5 @@ If `~/.engram/loop-mode.json` exists at compaction time, I am mid-loop. I need t
 | Skills | `~/.claude/skills/` |
 | Warm briefing | `~/.engram/warm-briefing.md` |
 | Private diary | `~/.engram/diary/` |
-| Per-session marker | `~/.engram/sessions/<session_id>.json` — `{session_id, transcript_path, source, cwd, started_at, role}`, written by SessionStart hook. One file per session, no clobber across concurrent runs. Most hooks pull `session_id` + `transcript_path` directly from their stdin payload (Claude Code emits both on every hook event), so the file is the fallback path. Agents citing current-session observations should read the `transcript_path` already injected into their context by SessionStart's additionalContext. |
+| Per-session marker | `~/.engram/sessions/<session_id>.json` — `{session_id, transcript_path, source, cwd, started_at, role, purpose, context_mode?}`, written by SessionStart hook (plus `context_mode` written by the agent via `tools/set-context-mode.py` on first prompt — see "Context-Mode Marker" section above). One file per session, no clobber across concurrent runs. Most hooks pull `session_id` + `transcript_path` directly from their stdin payload (Claude Code emits both on every hook event), so the file is the fallback path. Agents citing current-session observations should read the `transcript_path` already injected into their context by SessionStart's additionalContext. |
 | ENGRAM runtime (snapshot) | `{{ENGRAM_HOME}}/server.py`, `engram_confidence.py`, `SKILL.md`, `viz_server.py` — installed as a frozen snapshot; not edited in place. |
