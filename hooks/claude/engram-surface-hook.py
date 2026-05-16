@@ -460,10 +460,13 @@ def main():
     try:
         sys.path.insert(0, HOOK_DIR)
         from context_tracker import estimate_usage, format_drowsiness
-        # #140: thread transcript_path from this hook's stdin so drowsiness
-        # reads THIS session's JSONL, not whichever interactive session most
-        # recently overwrote the global active-session.json marker.
-        usage = estimate_usage(transcript_path=hook_input.get("transcript_path"))
+        # #140: thread session_id + transcript_path from this hook's stdin
+        # so drowsiness reads THIS session's per-session marker, not a
+        # single shared global marker that other sessions could clobber.
+        usage = estimate_usage(
+            transcript_path=hook_input.get("transcript_path"),
+            session_id=hook_input.get("session_id"),
+        )
         if usage:
             nap_warning = format_drowsiness(usage)
             if nap_warning:

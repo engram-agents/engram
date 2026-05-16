@@ -156,5 +156,5 @@ If `~/.engram/loop-mode.json` exists at compaction time, I am mid-loop. I need t
 | Skills | `~/.claude/skills/` |
 | Warm briefing | `~/.engram/warm-briefing.md` |
 | Private diary | `~/.engram/diary/` |
-| Active session marker | `~/.engram/active-session.json` — `{session_id, transcript_path, source, cwd, started_at}`, written by SessionStart hook. Canonical pointer to the current conversation's JSONL — use it when citing current-session observations, and trust it over newest-by-mtime scans. |
+| Per-session marker | `~/.engram/sessions/<session_id>.json` — `{session_id, transcript_path, source, cwd, started_at, role}`, written by SessionStart hook. One file per session, no clobber across concurrent runs. Most hooks pull `session_id` + `transcript_path` directly from their stdin payload (Claude Code emits both on every hook event), so the file is the fallback path. Agents citing current-session observations should read the `transcript_path` already injected into their context by SessionStart's additionalContext. |
 | ENGRAM runtime (snapshot) | `{{ENGRAM_HOME}}/server.py`, `engram_confidence.py`, `SKILL.md`, `viz_server.py` — installed as a frozen snapshot; not edited in place. |

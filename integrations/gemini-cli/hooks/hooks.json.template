@@ -15,7 +15,7 @@
             "name": "engram-session-start",
             "command": "ENGRAM_HOME={{ENGRAM_HOME}} ENGRAM_DATA_DIR={{ENGRAM_HOME}} {{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-session-start-hook.py",
             "timeout": 5000,
-            "description": "Record active-session marker, reset context-tracker baseline"
+            "description": "Record per-session marker, reset context-tracker baseline"
           }
         ]
       }

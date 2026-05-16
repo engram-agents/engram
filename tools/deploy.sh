@@ -31,8 +31,8 @@
 # What does NOT get deployed:
 #   - Data files: knowledge.db, graph_snapshot.md, session_log.md,
 #     warm-briefing.md, config.json, recall_window.json
-#   - Per-agent state: diary/, sessions/, history/, logs/,
-#     active-session.json, feeling-nudge-active.json, etc.
+#   - Per-agent state: diary/, sessions/ (per-session markers),
+#     history/, logs/, feeling-nudge-active.json, etc.
 #   - Install-time entry points: install.sh, install-gemini.sh,
 #     bootstrap.py, settings.hooks.json.template, README.md, LICENSE,
 #     USER_GUIDE.md (these belong to fresh installs, not running upgrades)

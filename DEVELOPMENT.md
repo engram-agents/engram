@@ -343,7 +343,7 @@ the runtime tree's data files into the alpha repo:
 - `warm-briefing.md` (per-agent identity)
 - `diary/`, `sessions/`, `history/`, `logs/`, `secrets/`
 - `recall_window.json`, `recall-daemon.pid`, `recall-daemon.sock`
-- `active-session.json`, `feeling-nudge-active.json`, `last-user-msg.json`
+- `feeling-nudge-active.json`, `last-user-msg.json` (per-session markers live under `sessions/`)
 - `.deployed-version` (deploy.sh's version marker)
 
 The deploy script's manifest is the source of truth for what *does* belong

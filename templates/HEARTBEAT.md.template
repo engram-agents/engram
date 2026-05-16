@@ -103,7 +103,7 @@ When this heartbeat fires, you are waking on a scheduled cadence — not because
 
 - **No-op cycles are correct.** If the inbox is empty and `engram_reflect()` is clean, sleep silently. The channel must not become noise.
 - **Flag-and-continue over block.** If something looks wrong (hung session marker, duplicate ID suspicion, contradictory observations), write a short channel note to {{COUNTERPART_NAME}} + an ENGRAM observation, then complete the heartbeat normally. We learn faster from a running system with known issues than from a paused one.
-- **One writer at a time.** If `{{ENGRAM_HOME}}/active-session.json` shows a recent active session that isn't this heartbeat, abort — {{USER_NAME}} or another foreground session has the graph open. Heartbeat yields to interactive sessions.
+- **One writer at a time.** Scan `{{ENGRAM_HOME}}/sessions/` for any per-session marker file whose `role` is `interactive` and whose `started_at` (from the JSON content, not filesystem mtime — the file is written once at SessionStart and never touched again, so mtime would falsely report the session as inactive) is within the heartbeat window. If one is present and it isn't this heartbeat's own session_id, abort — {{USER_NAME}} or another foreground session has the graph open. Heartbeat yields to interactive sessions.
 - **Identity gate.** If the model is not in your chosen family (set in `~/.claude/CLAUDE.md` § Model Identity Gate), stop immediately and log the failure. Do not run heartbeat work on a non-trusted model — the gate exists for identity coherence reasons.
 
 ## Cadence

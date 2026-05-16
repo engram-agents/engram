@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Session start: record active-session marker, reset context-tracker baseline,
+"""Session start: record per-session marker, reset context-tracker baseline,
 clear sticky user identity, and inject session info into the conversation.
 
 Reading-reminder injection is source-conditional:
@@ -15,11 +15,13 @@ fix (dv_0478): on startup the agent cross-checks pending-status claims
 ("MECH-N deferred", "still uncommitted") against the git log before
 reporting to the user.
 
-The active-session marker (~/.engram/active-session.json) is the canonical
-pointer to the current JSONL. Fixes the turn-1 drowsiness bug where the
-tracker picked newest-by-mtime globally and grabbed yesterday's file before
-the new conversation's JSONL had flushed. Also gives observation tooling a
-reliable transcript_path for citing the current conversation.
+The per-session marker (~/.engram/sessions/<session_id>.json) is written
+on every SessionStart and carries session_id + transcript_path + cwd +
+started_at + role. Concurrent sessions own their own files — no clobber.
+Issue #140 retired the single shared ~/.engram/active-session.json marker
+that this replaces; agents and hooks read transcript_path either from
+SessionStart's injected additionalContext (preferred) or from the
+per-session file by session_id.
 """
 import json
 import os
@@ -35,8 +37,6 @@ ENGRAM_HOME = os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram"))
 SESSION_ROLE = os.environ.get("ENGRAM_SESSION_ROLE", "interactive").strip().lower()
 SESSION_PURPOSE = os.environ.get("ENGRAM_SESSION_PURPOSE", "").strip()
 SESSIONS_DIR = os.path.join(ENGRAM_HOME, "sessions")
-ROLE_MARKER_PATH = os.path.join(SESSIONS_DIR, f"{SESSION_ROLE}.json")
-ACTIVE_SESSION_PATH = os.path.join(ENGRAM_HOME, "active-session.json")
 CURRENT_USER_PATH = os.path.join(ENGRAM_HOME, "current_user.json")
 WARM_BRIEFING_PATH = os.path.join(ENGRAM_HOME, "warm-briefing.md")
 HISTORY_DIR = os.path.join(ENGRAM_HOME, "history")
@@ -93,17 +93,15 @@ def write_marker(hook_input: dict) -> dict | None:
     if context_mode_env in ("200k", "1m"):
         marker["context_mode"] = context_mode_env
     try:
-        # Role-specific marker (canonical for multi-role isolation).
+        # Per-session marker keyed by session_id. Concurrent sessions own
+        # their own files; the role field in the contents lets readers
+        # filter (e.g., heartbeat scanning for any active interactive
+        # session). Issue #140 retired the single shared active-session.json
+        # that this replaces.
         os.makedirs(SESSIONS_DIR, exist_ok=True)
-        with open(ROLE_MARKER_PATH, "w") as f:
+        session_marker_path = os.path.join(SESSIONS_DIR, f"{session_id}.json")
+        with open(session_marker_path, "w") as f:
             json.dump(marker, f)
-        # Back-compat: interactive role ALSO writes the legacy active-session.json
-        # so context_tracker.py and observation citation continue working
-        # against the human-facing session without a code change.
-        if SESSION_ROLE == "interactive":
-            os.makedirs(os.path.dirname(ACTIVE_SESSION_PATH), exist_ok=True)
-            with open(ACTIVE_SESSION_PATH, "w") as f:
-                json.dump(marker, f)
     except OSError:
         return None
     return marker

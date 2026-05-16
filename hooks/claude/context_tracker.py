@@ -26,7 +26,6 @@ import os
 
 ENGRAM_HOME = os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram"))
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")  # legacy; unused
-ACTIVE_SESSION_PATH = os.path.join(ENGRAM_HOME, "active-session.json")
 LAST_COMPACT_PATH = os.path.join(ENGRAM_HOME, "last-compact-at.json")
 LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
 WARM_BRIEFING_PATH = os.path.join(ENGRAM_HOME, "warm-briefing.md")
@@ -111,26 +110,26 @@ FALLBACK_CEILING_BY_MODE = {
 MODE_BOUNDARY = 175_000
 
 
-def find_active_jsonl() -> str | None:
-    """Return the current session's transcript path, or None.
+def find_active_jsonl(session_id: str | None = None) -> str | None:
+    """Return the transcript path for a given session_id, or None.
 
-    Reads $ENGRAM_HOME/active-session.json, written by the SessionStart hook.
-    Returns None if the marker is missing or the transcript file doesn't
-    exist yet — the correct behavior on turn 1 of a fresh conversation,
-    before Claude Code has flushed the new JSONL. No mtime fallback:
-    picking newest-by-mtime globally caused stale drowsiness to leak
-    across conversations on turn 1.
+    Reads $ENGRAM_HOME/sessions/<session_id>.json (per-session marker,
+    written by SessionStart hook). Issue #140 retired the global
+    active-session.json marker that this replaced — each session now owns
+    its own file by session_id, so concurrent sessions cannot clobber each
+    other's transcript_path.
 
-    Pre-#140 path. Subject to a parallel-session race: when two interactive
-    Claude sessions run concurrently, both SessionStart hooks overwrite the
-    same global marker and downstream consumers see whichever session
-    started most recently, not their own. The Issue #140 fix is to thread
-    transcript_path through from each hook's stdin payload via
-    _resolve_jsonl(); this function remains for non-hook callers and the
-    pre-fix fallback path.
+    Returns None when session_id is missing, the per-session file doesn't
+    exist (turn-1 of a fresh conversation before SessionStart fires), or
+    the transcript file itself doesn't exist yet (before Claude Code has
+    flushed the new JSONL). Callers MUST pass session_id — there is no
+    global fallback.
     """
+    if not session_id:
+        return None
+    marker_path = os.path.join(ENGRAM_HOME, "sessions", f"{session_id}.json")
     try:
-        with open(ACTIVE_SESSION_PATH) as f:
+        with open(marker_path) as f:
             marker = json.load(f)
     except (OSError, ValueError, json.JSONDecodeError):
         return None
@@ -140,8 +139,8 @@ def find_active_jsonl() -> str | None:
     return path
 
 
-def _resolve_jsonl(transcript_path: str | None = None) -> str | None:
-    """Resolution order: explicit transcript_path → global marker fallback.
+def _resolve_jsonl(transcript_path: str | None = None, session_id: str | None = None) -> str | None:
+    """Resolution order: explicit transcript_path → per-session marker by id.
 
     The transcript_path argument is the per-event path Claude Code provides
     on each hook's stdin payload (session_id + transcript_path are uniform
@@ -149,14 +148,14 @@ def _resolve_jsonl(transcript_path: str | None = None) -> str | None:
     wrapper threads that value into the tracker, every path lookup in this
     module routes through the caller's own session — race-free even when
     other Claude sessions are running concurrently. Falls back to
-    find_active_jsonl() when transcript_path is None, an empty string, or
-    points to a nonexistent file (the empty/missing case can arise on
-    older Claude Code versions that don't yet emit transcript_path on
-    UserPromptSubmit, or in sub-agent / headless contexts).
+    find_active_jsonl(session_id) when transcript_path is None, an empty
+    string, or points to a nonexistent file (the empty/missing case can
+    arise on older Claude Code versions that don't yet emit transcript_path
+    on UserPromptSubmit, or in sub-agent / headless contexts).
     """
     if transcript_path and os.path.exists(transcript_path):
         return transcript_path
-    return find_active_jsonl()
+    return find_active_jsonl(session_id)
 
 
 def _project_jsonls(transcript_path: str | None = None) -> list[str]:
@@ -169,13 +168,14 @@ def _project_jsonls(transcript_path: str | None = None) -> list[str]:
     return sorted(files, key=os.path.getmtime, reverse=True)
 
 
-def _detect_mode(current_tokens: int | None, jsonl_path: str | None) -> str:
+def _detect_mode(current_tokens: int | None, jsonl_path: str | None, session_id: str | None = None) -> str:
     """Detect this session's context-window mode from observable signals.
 
     Order of precedence:
       1. ENGRAM_CONTEXT_MODE env var override ("200k" or "1m") — explicit.
-      2. active-session.json's `context_mode` field — session metadata,
-         written by SessionStart hook or set manually for the current session.
+      2. The session's per-session marker `context_mode` field — session
+         metadata written by SessionStart hook at
+         ~/.engram/sessions/<session_id>.json.
       3. current input tokens > MODE_BOUNDARY → "1m" (200K-mode would have
          auto-compacted by now).
       4. Current JSONL has any prior compact_boundary > MODE_BOUNDARY → "1m".
@@ -184,21 +184,23 @@ def _detect_mode(current_tokens: int | None, jsonl_path: str | None) -> str:
     Limitation: early 1M-mode sessions below MODE_BOUNDARY with no prior
     boundary cannot be auto-detected from observable signals alone (the
     system prompt's `[1m]` model tag is not surfaced in JSONL records).
-    The active-session.json `context_mode` field exists for that case —
+    The per-session marker `context_mode` field exists for that case —
     the SessionStart hook should populate it whenever it can detect mode
     from harness env vars or the system prompt content.
     """
     override = os.environ.get("ENGRAM_CONTEXT_MODE", "").strip().lower()
     if override in SAMPLE_PARTITIONS:
         return override
-    try:
-        with open(ACTIVE_SESSION_PATH) as f:
-            marker = json.load(f)
-        marker_mode = (marker.get("context_mode") or "").strip().lower()
-        if marker_mode in SAMPLE_PARTITIONS:
-            return marker_mode
-    except (OSError, ValueError, json.JSONDecodeError):
-        pass
+    if session_id:
+        marker_path = os.path.join(ENGRAM_HOME, "sessions", f"{session_id}.json")
+        try:
+            with open(marker_path) as f:
+                marker = json.load(f)
+            marker_mode = (marker.get("context_mode") or "").strip().lower()
+            if marker_mode in SAMPLE_PARTITIONS:
+                return marker_mode
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
     if current_tokens is not None and current_tokens > MODE_BOUNDARY:
         return "1m"
     if jsonl_path:
@@ -360,29 +362,26 @@ def read_current_tokens(transcript_path: str | None = None) -> int | None:
     return None
 
 
-def estimate_usage(transcript_path: str | None = None) -> dict | None:
+def estimate_usage(transcript_path: str | None = None, session_id: str | None = None) -> dict | None:
     """Compute current drowsiness reading.
 
-    If `transcript_path` is provided (Issue #140: the hook wrapper threads
-    Claude Code's per-event stdin payload here), every path lookup in this
-    call resolves to that session's JSONL — race-free even when other
-    Claude sessions are concurrently overwriting the global active-session
-    marker. When None, falls back to find_active_jsonl() for legacy
-    non-hook callers.
+    Both arguments come from this hook's stdin payload (Claude Code emits
+    session_id + transcript_path on every hook event). Threading them
+    through means every path lookup resolves to THIS session — race-free
+    even when other Claude sessions run concurrently. When either is
+    missing, callers fall back to looking up the per-session marker at
+    ~/.engram/sessions/<session_id>.json by session_id.
 
     Note on triple-resolve: read_current_tokens() and compute_ceiling() each
-    re-call _resolve_jsonl(transcript_path) internally rather than receiving
-    the path resolved here. This is intentional — each sub-function accepts
-    transcript_path so it remains independently callable. The redundant
-    resolves are cheap (one os.path.exists per call) and the alternative
-    (threading the resolved jsonl down through every internal API) would
-    couple the sub-functions to estimate_usage's resolution choice.
+    re-call _resolve_jsonl(transcript_path, session_id) internally rather
+    than receiving the path resolved here. This is intentional — each
+    sub-function accepts both so it remains independently callable.
     """
-    jsonl = _resolve_jsonl(transcript_path)
+    jsonl = _resolve_jsonl(transcript_path, session_id)
     current = read_current_tokens(transcript_path)
     if current is None:
         return None
-    mode = _detect_mode(current, jsonl)
+    mode = _detect_mode(current, jsonl, session_id=session_id)
     ceiling = compute_ceiling(mode, transcript_path=transcript_path)
     if ceiling <= 0:
         return None

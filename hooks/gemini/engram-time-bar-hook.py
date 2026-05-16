@@ -12,7 +12,9 @@ Output (one line, prepended to the injected context):
 
 Signal sources:
   - UTC now: datetime.now(timezone.utc)
-  - Session start: ~/.engram/active-session.json 'started_at' (SessionStart hook writes it)
+  - Session start: ~/.engram/sessions/<session_id>.json 'started_at'
+    (SessionStart hook writes per-session marker; session_id read from this
+    hook's stdin payload per issue #140)
   - Last user msg: ~/.engram/last-user-msg.json (self-maintained by this hook)
   - Lei-local tz: ~/.engram/config.json 'user.timezone' (fallback 'America/Los_Angeles')
 
@@ -31,7 +33,7 @@ except ImportError:
     ZoneInfo = None
 
 ENGRAM_DIR = Path.home() / ".engram"
-ACTIVE_SESSION = ENGRAM_DIR / "active-session.json"
+SESSIONS_DIR = ENGRAM_DIR / "sessions"
 LAST_USER_MSG = ENGRAM_DIR / "last-user-msg.json"
 CONFIG = ENGRAM_DIR / "config.json"
 DEFAULT_TZ = "America/Los_Angeles"
@@ -76,12 +78,32 @@ def _get_lei_tz():
     return user.get("timezone") or DEFAULT_TZ
 
 
+def _read_session_id_from_stdin():
+    """Pull session_id off this hook's stdin payload. Returns None on any error."""
+    try:
+        raw = sys.stdin.read()
+        if not raw:
+            return None
+        payload = json.loads(raw)
+        sid = payload.get("session_id")
+        if isinstance(sid, str) and sid:
+            return sid
+    except Exception:
+        pass
+    return None
+
+
 def main():
     now_utc = datetime.now(timezone.utc)
     utc_iso = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
     weekday = now_utc.strftime("%a")
 
-    session = _read_json(ACTIVE_SESSION) or {}
+    # Per-session marker keyed by session_id (issue #140 retired the global
+    # active-session.json). Falls through to unknown when stdin is empty.
+    session = {}
+    session_id = _read_session_id_from_stdin()
+    if session_id:
+        session = _read_json(SESSIONS_DIR / f"{session_id}.json") or {}
     session_ago = _hms_ago(now_utc, session.get("started_at"))
 
     prev = _read_json(LAST_USER_MSG) or {}

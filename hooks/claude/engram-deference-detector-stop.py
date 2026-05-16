@@ -50,7 +50,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ENGRAM_HOME = os.environ.get("ENGRAM_HOME", str(Path.home() / ".engram"))
-ACTIVE_SESSION_PATH = os.path.join(ENGRAM_HOME, "active-session.json")
+SESSIONS_DIR = os.path.join(ENGRAM_HOME, "sessions")
 DEFERENCE_MARKER_PATH = os.path.join(ENGRAM_HOME, "deference-detected.json")
 LOG_PATH = os.path.join(ENGRAM_HOME, "deference-detector.log")
 
@@ -111,7 +111,7 @@ _INTENT_RULES = [
 ]
 
 
-def _last_assistant_structure(jsonl_path: str | None = None) -> dict | None:
+def _last_assistant_structure(jsonl_path: str | None = None, session_id: str | None = None) -> dict | None:
     """Structural extract of the most recent assistant message.
 
     Returns a dict with:
@@ -128,23 +128,22 @@ def _last_assistant_structure(jsonl_path: str | None = None) -> dict | None:
     Resolution order for the JSONL path (Issue #140 fix):
       1. `jsonl_path` argument — from this hook's own stdin payload, which
          is race-free per-caller even when multiple Claude sessions run.
-      2. `ACTIVE_SESSION_PATH` global marker — pre-#140 fallback. Note:
-         the fallback path STILL has the parallel-session race the #140
-         fix targets; it's intentionally retained for degraded environments
-         (older Claude Code versions, sub-agent contexts) but produces
-         wrong-session reads when multiple interactive sessions race.
-         Prefer arg-1 whenever stdin supplies transcript_path.
+      2. Per-session marker `~/.engram/sessions/<session_id>.json` by
+         session_id from stdin — same race-free guarantee.
     """
     jsonl = jsonl_path if (jsonl_path and os.path.exists(jsonl_path)) else None
-    if jsonl is None:
+    if jsonl is None and session_id:
+        marker_path = os.path.join(SESSIONS_DIR, f"{session_id}.json")
         try:
-            with open(ACTIVE_SESSION_PATH) as f:
+            with open(marker_path) as f:
                 marker = json.load(f)
             jsonl = marker.get("transcript_path")
             if not jsonl or not os.path.exists(jsonl):
                 return None
         except (OSError, ValueError, json.JSONDecodeError):
             return None
+    if jsonl is None:
+        return None
 
     # Find the last assistant message in the JSONL.
     last_msg_content = None
@@ -272,6 +271,7 @@ def main() -> None:
 
     stdin_msg: str | None = None
     transcript_path: str | None = None
+    session_id: str | None = None
     if payload is not None:
         m = payload.get("last_assistant_message")
         if isinstance(m, str) and m:
@@ -279,6 +279,9 @@ def main() -> None:
         tp = payload.get("transcript_path")
         if isinstance(tp, str) and tp:
             transcript_path = tp
+        sid = payload.get("session_id")
+        if isinstance(sid, str) and sid:
+            session_id = sid
 
     if stdin_msg is not None:
         # Stdin path — flat string, no tool_use boundary info.
@@ -296,7 +299,7 @@ def main() -> None:
         # stdin contract differs). Even on the fallback we still use
         # transcript_path from stdin when available (Issue #140 fix:
         # race-free per-caller path resolution).
-        structure = _last_assistant_structure(jsonl_path=transcript_path)
+        structure = _last_assistant_structure(jsonl_path=transcript_path, session_id=session_id)
         if not structure:
             _log("Scanned: 0 hits (no message available; stdin empty + JSONL fallback returned no structure)")
             sys.exit(0)

@@ -300,7 +300,7 @@ Expected terminal output (abbreviated):
 
 - `~/.engram/knowledge.db` — the graph itself
 - `~/.engram/history/`, `~/.engram/diary/`, `~/.engram/sessions/`, `~/.engram/logs/`
-- `~/.engram/warm-briefing.md`, `~/.engram/config.json`, `~/.engram/active-session.json`
+- `~/.engram/warm-briefing.md`, `~/.engram/config.json`
 - `~/.engram/heartbeat-queue/` (notes + inbox files preserved)
 
 **Not touched (install-time-only; require manual inverse-merge):**

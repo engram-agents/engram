@@ -38,24 +38,25 @@ import sys
 from datetime import datetime
 from typing import Any
 
-ACTIVE_SESSION_PATH = os.path.expanduser("~/.engram/active-session.json")
+SESSIONS_DIR = os.path.expanduser("~/.engram/sessions")
 PROJECTS_GLOB = os.path.expanduser("~/.claude/projects/*/")
 
 
 def resolve_transcript(session_id: str | None, explicit_path: str | None) -> str:
     if explicit_path:
         return os.path.abspath(os.path.expanduser(explicit_path))
-    if not session_id:
-        if os.path.exists(ACTIVE_SESSION_PATH):
-            with open(ACTIVE_SESSION_PATH) as f:
+    if session_id:
+        marker_path = os.path.join(SESSIONS_DIR, f"{session_id}.json")
+        if os.path.exists(marker_path):
+            with open(marker_path) as f:
                 marker = json.load(f)
             return marker["transcript_path"]
-        raise SystemExit("No --session, --transcript, or active-session marker found.")
-    for project_dir in glob.glob(PROJECTS_GLOB):
-        candidate = os.path.join(project_dir, f"{session_id}.jsonl")
-        if os.path.exists(candidate):
-            return candidate
-    raise SystemExit(f"No transcript found for session {session_id}")
+        for project_dir in glob.glob(PROJECTS_GLOB):
+            candidate = os.path.join(project_dir, f"{session_id}.jsonl")
+            if os.path.exists(candidate):
+                return candidate
+        raise SystemExit(f"No transcript found for session {session_id}")
+    raise SystemExit("Pass --session or --transcript; issue #140 retired the global active-session marker.")
 
 
 def load_entries(transcript_path: str) -> list[dict[str, Any]]:
