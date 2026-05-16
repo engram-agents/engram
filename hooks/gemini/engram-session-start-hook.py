@@ -25,9 +25,11 @@ per-session file by session_id.
 """
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -74,6 +76,47 @@ SLEEP_DEBT_HOURS_THRESHOLD = 28
 # nodes; any established graph is well above 100.
 SLEEP_BASELINE_NODE_THRESHOLD = 100
 
+# Prune session markers older than this many seconds (7 days).
+SEVEN_DAYS = 7 * 86400
+# Only delete files whose names look like session markers (UUID4 8-4-4-4-12
+# layout OR older hex-id shapes from pre-PR-160 markers). The UUID4 layout
+# is hex-only with fixed dash positions (not the looser `[0-9a-f\-]{36}` that
+# would match 36 dashes); the older shape also covers `.meta.json` siblings
+# from the pre-PR-160 era that should be pruned alongside their .jsonl.
+_MARKER_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$'
+    r'|^[0-9a-f]{8,}(\.meta)?\.json$'
+)
+
+
+def prune_stale_session_markers(current_session_id: str | None) -> None:
+    """Delete session marker files older than 7 days from SESSIONS_DIR.
+
+    Best-effort: OSError on any individual delete is swallowed (logged to stderr).
+    Only deletes files matching UUID-like or hex-id patterns; ignores anything
+    else (forward-compat against future file formats in sessions/).
+    Skips the current session's marker even if it appears old.
+    """
+    cutoff = time.time() - SEVEN_DAYS
+    current_filename = f"{current_session_id}.json" if current_session_id else None
+    try:
+        entries = os.listdir(SESSIONS_DIR)
+    except OSError:
+        return
+    for name in entries:
+        if not name.endswith(".json"):
+            continue
+        if not _MARKER_RE.match(name):
+            continue
+        if name == current_filename:
+            continue
+        path = os.path.join(SESSIONS_DIR, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError as exc:
+            print(f"[engram-session-start] prune: could not remove {path}: {exc}", file=sys.stderr)
+
 
 def write_marker(hook_input: dict) -> dict | None:
     session_id = hook_input.get("session_id")
@@ -99,6 +142,15 @@ def write_marker(hook_input: dict) -> dict | None:
         # session). Issue #140 retired the single shared active-session.json
         # that this replaces.
         os.makedirs(SESSIONS_DIR, exist_ok=True)
+        # Prune is best-effort: a bug in prune (any exception type) must
+        # NEVER kill the marker write, which is the load-bearing operation
+        # here. Per-file OSError is already swallowed inside the function;
+        # this outer guard catches anything else (AttributeError from a
+        # logic bug, MemoryError, etc.).
+        try:
+            prune_stale_session_markers(session_id)
+        except Exception as exc:
+            print(f"[engram-session-start] prune: unexpected error, skipped: {exc}", file=sys.stderr)
         session_marker_path = os.path.join(SESSIONS_DIR, f"{session_id}.json")
         with open(session_marker_path, "w") as f:
             json.dump(marker, f)
