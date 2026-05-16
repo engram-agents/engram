@@ -344,24 +344,28 @@ echo
 # changes that wouldn't apply to them anyway.
 # Note: templates/ drift (CLAUDE.md.template, warm-briefing.md.template,
 # HEARTBEAT.md.template, GEMINI.md.template, settings.hooks.json.template)
-# is already surfaced by the TEMPLATE_FILES warning at the END of this
-# script (live-apply mode only). This nudge covers only the agents/skills
+# is surfaced by the TEMPLATE_FILES warning block below — also fires in
+# both live and dry-run modes. This nudge covers only the agents/skills
 # install-time files that the existing warning doesn't catch — separate
 # drift category, separate remedy (cp instead of inverse-merge).
-nudge_sha="$(_last_deployed_sha)"
-if [[ -n "$nudge_sha" ]]; then
+# Single capture of the previous deploy's SHA, reused by both the agents/
+# skills nudge below and the TEMPLATE_FILES warning further down. Both
+# blocks need the same baseline; one capture keeps maintenance surface
+# minimal.
+BASELINE_SHA="$(_last_deployed_sha)"
+if [[ -n "$BASELINE_SHA" ]]; then
     if [[ "$TARGET" = "claude" ]]; then
         nudge_paths=(agents/claude/ skills/claude/ skills/shared/)
     else
         nudge_paths=(skills/gemini/ skills/shared/)
     fi
-    nudge_changed=$(git -C "$ALPHA_DIR" diff --name-only "$nudge_sha..HEAD" -- "${nudge_paths[@]}" 2>/dev/null || true)
+    nudge_changed=$(git -C "$ALPHA_DIR" diff --name-only "$BASELINE_SHA..HEAD" -- "${nudge_paths[@]}" 2>/dev/null || true)
     if [[ -n "$nudge_changed" ]]; then
         # Split changed paths by top-level dir so we surface the right cp command(s).
         nudge_agents_changed=$(echo "$nudge_changed" | grep -E '^agents/' || true)
         nudge_skills_changed=$(echo "$nudge_changed" | grep -E '^skills/' || true)
 
-        echo "⚠ agents/skills changed since last deploy ($nudge_sha → $ALPHA_SHA):"
+        echo "⚠ agents/skills changed since last deploy ($BASELINE_SHA → $ALPHA_SHA):"
         echo
         while IFS= read -r f; do
             echo "    $f"
@@ -389,8 +393,61 @@ if [[ -n "$nudge_sha" ]]; then
         fi
         echo
         echo "  (templates/ drift — CLAUDE.md / warm-briefing / HEARTBEAT — is covered"
-        echo "  separately by the TEMPLATE_FILES warning at end-of-deploy in live-apply mode.)"
+        echo "  separately by the TEMPLATE_FILES warning below; fires in both modes.)"
         echo
+    fi
+fi
+
+# Template-drift warning. deploy.sh deliberately doesn't touch install-time
+# template-rendered files (CLAUDE.md, GEMINI.md, warm-briefing.md, settings.json)
+# — those are written ONCE at install time from templates/* and never overwritten.
+# But when the ALPHA template files have been updated since the agent's
+# last deploy, the agent's live working copy may be missing alpha-material
+# changes. This warning surfaces the drift for the agent's intentional
+# merge/no-merge judgment (the inverse-merge workflow — manual port from
+# live working copy, deliberate PR back to alpha when alpha-material).
+#
+# settings.hooks.json.template included because hook wiring drift has high
+# operational consequence: an upstream hook addition or invocation-path
+# change would silently no-op for an agent on a stale rendered settings.json.
+#
+# Fires in both live and dry-run modes (informational either way — dry-run
+# is exactly when users want to see what's about to change).
+# BASELINE_SHA was captured earlier (before the agents/skills nudge block);
+# reuse it here.
+TEMPLATE_FILES=(
+    "templates/CLAUDE.md.template"
+    "integrations/gemini-cli/GEMINI.md.template"
+    "templates/warm-briefing.md.template"
+    "templates/HEARTBEAT.md.template"
+    "settings.hooks.json.template"
+)
+if [[ -n "$BASELINE_SHA" ]]; then
+    drifted=()
+    for tpl in "${TEMPLATE_FILES[@]}"; do
+        # git log returns lines for each commit that touched the file in
+        # the range. Empty output = no changes since baseline. Use xargs
+        # to strip whitespace robustly (tr -d ' ' only handles spaces;
+        # some wc implementations emit tabs).
+        n_commits=$(git -C "$ALPHA_DIR" log --oneline "$BASELINE_SHA..$ALPHA_SHA" -- "$tpl" 2>/dev/null | wc -l | xargs)
+        if [[ "$n_commits" -gt 0 ]]; then
+            drifted+=("$tpl ($n_commits commit$( [[ "$n_commits" -eq 1 ]] || echo s ))")
+        fi
+    done
+    if [[ ${#drifted[@]} -gt 0 ]]; then
+        echo
+        echo "⚠ Install-time template changes since your last deploy ($BASELINE_SHA → $ALPHA_SHA):"
+        for d in "${drifted[@]}"; do
+            echo "    $d"
+        done
+        echo
+        echo "  These templates render install-time files (CLAUDE.md, GEMINI.md, warm-briefing.md,"
+        echo "  settings.json) that deploy.sh deliberately does NOT touch. Your live working copy"
+        echo "  may be missing alpha-material changes. Review with:"
+        echo "    git -C \"$ALPHA_DIR\" log $BASELINE_SHA..$ALPHA_SHA -- <template-path>"
+        echo "  and intentionally port universal-applicable parts into your live config (or skip"
+        echo "  if the changes are not alpha-material for your install). Inverse-merge is judgment"
+        echo "  work, not automation — both directions can drift."
     fi
 fi
 
@@ -497,12 +554,6 @@ if [[ -n "$PYTHON_BIN" && -f "$ENGRAM_HOME/hooks/start-engram-daemon.sh" ]]; the
     echo "  ✓ Substituted {{PYTHON}} → $PYTHON_BIN in hooks/start-engram-daemon.sh"
 fi
 
-# Capture the previous deploy's sha BEFORE we overwrite the marker. The
-# template-drift warning below uses this to compute what alpha-side changes
-# the agent has missed since their last deploy. Empty if no prior marker
-# (first install) or if the recorded sha is no longer reachable.
-BASELINE_SHA="$(_last_deployed_sha)"
-
 # Stamp version marker for forensics + future "what version is running?" queries
 TS="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 cat > "$ENGRAM_HOME/.deployed-version" <<EOF
@@ -516,54 +567,6 @@ EOF
 echo
 echo "✓ Deployed alpha @ $ALPHA_SHA → $ENGRAM_HOME"
 echo "  Version marker: $ENGRAM_HOME/.deployed-version"
-
-# Template-drift warning. deploy.sh deliberately doesn't touch install-time
-# template-rendered files (CLAUDE.md, GEMINI.md, warm-briefing.md, settings.json)
-# — those are written ONCE at install time from templates/* and never overwritten.
-# But when the ALPHA template files have been updated since the agent's
-# last deploy, the agent's live working copy may be missing alpha-material
-# changes. This warning surfaces the drift for the agent's intentional
-# merge/no-merge judgment (the inverse-merge workflow — manual port from
-# live working copy, deliberate PR back to alpha when alpha-material).
-#
-# settings.hooks.json.template included because hook wiring drift has high
-# operational consequence: an upstream hook addition or invocation-path
-# change would silently no-op for an agent on a stale rendered settings.json.
-TEMPLATE_FILES=(
-    "templates/CLAUDE.md.template"
-    "integrations/gemini-cli/GEMINI.md.template"
-    "templates/warm-briefing.md.template"
-    "templates/HEARTBEAT.md.template"
-    "settings.hooks.json.template"
-)
-if [[ -n "$BASELINE_SHA" ]]; then
-    drifted=()
-    for tpl in "${TEMPLATE_FILES[@]}"; do
-        # git log returns lines for each commit that touched the file in
-        # the range. Empty output = no changes since baseline. Use xargs
-        # to strip whitespace robustly (tr -d ' ' only handles spaces;
-        # some wc implementations emit tabs).
-        n_commits=$(git -C "$ALPHA_DIR" log --oneline "$BASELINE_SHA..$ALPHA_SHA" -- "$tpl" 2>/dev/null | wc -l | xargs)
-        if [[ "$n_commits" -gt 0 ]]; then
-            drifted+=("$tpl ($n_commits commit$( [[ "$n_commits" -eq 1 ]] || echo s ))")
-        fi
-    done
-    if [[ ${#drifted[@]} -gt 0 ]]; then
-        echo
-        echo "⚠ Install-time template changes since your last deploy ($BASELINE_SHA → $ALPHA_SHA):"
-        for d in "${drifted[@]}"; do
-            echo "    $d"
-        done
-        echo
-        echo "  These templates render install-time files (CLAUDE.md, GEMINI.md, warm-briefing.md,"
-        echo "  settings.json) that deploy.sh deliberately does NOT touch. Your live working copy"
-        echo "  may be missing alpha-material changes. Review with:"
-        echo "    git -C \"$ALPHA_DIR\" log $BASELINE_SHA..$ALPHA_SHA -- <template-path>"
-        echo "  and intentionally port universal-applicable parts into your live config (or skip"
-        echo "  if the changes are not alpha-material for your install). Inverse-merge is judgment"
-        echo "  work, not automation — both directions can drift."
-    fi
-fi
 
 echo
 echo "Next step: restart the MCP server so it loads the new server.py."
