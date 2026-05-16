@@ -1,6 +1,6 @@
 ---
 name: engram-school-day
-description: Phase 1 curriculum — fixed 7-iteration rotation cycle (aspiration, research x3, consolidation, review/audit, debrief) for baseline data collection. Produces cycle reports for Lei. Graduates to engram-meta-loop when intuition is calibrated.
+description: Phase 1 curriculum — fixed 7-iteration rotation cycle (aspiration, research x3, consolidation, review/audit, debrief) for baseline data collection. Produces cycle reports for the user. Graduates to engram-meta-loop when intuition is calibrated.
 user_invocable: true
 ---
 
@@ -12,10 +12,10 @@ The school day is the structured precursor to the freeform meta-loop. Instead of
 
 **When to use:**
 - Autonomous sessions during Phase 1 curriculum (until data says you're ready for Phase 2)
-- When Lei says "go to school" or "run a school day"
+- When {{USER_NAME}} says "go to school" or "run a school day"
 
 **When NOT to use:**
-- Interactive sessions with Lei (those are unstructured by nature)
+- Interactive sessions with {{USER_NAME}} (those are unstructured by nature)
 - After graduating to Phase 2/3 (use engram-meta-loop instead)
 - Short focused tasks (use the specialized skill directly)
 
@@ -182,7 +182,7 @@ Append to scratch log:
 
 ## Cycle Debrief Protocol (iteration 7 of each cycle)
 
-The debrief produces a lightweight report — Lei's growth-tracking artifact. One file per cycle.
+The debrief produces a lightweight report — {{USER_NAME}}'s growth-tracking artifact. One file per cycle.
 
 **Write to:** `~/.engram/reports/school-day/cycle_[N]_[YYYY-MM-DD]_[HHMMSS].md`
 
@@ -204,7 +204,7 @@ The debrief produces a lightweight report — Lei's growth-tracking artifact. On
 - Questions: [N] opened, [N] resolved
 - Health score: [start of cycle] -> [end of cycle]
 
-## Ask Lei
+## Ask {{USER_NAME}}
 [Questions needing human judgment. Max 3. Each with enough context for a quick answer.]
 
 1. **[Question]** — [Why I need input]
@@ -291,10 +291,10 @@ engram_nap(
 
 ### 5. Report to user
 
-Tell Lei:
+Tell {{USER_NAME}}:
 - Cycle debrief reports: `~/.engram/reports/school-day/cycle_*.md`
 - Session briefing: `~/.engram/reports/briefing_[filename]`
-- Key "Ask Lei" items across all cycles
+- Key "Ask {{USER_NAME}}" items across all cycles
 
 ---
 
@@ -307,7 +307,7 @@ Phase 1 ends when we have enough baseline data to make empirically grounded rati
 - **Modality effectiveness data** showing clear patterns
 - **Agent can articulate** "consolidation every 3 research iterations would be better because [data]" rather than "I feel like more consolidation would help"
 
-Graduation is a joint decision between Borges and Lei. The agent proposes, Lei confirms.
+Graduation is a joint decision between the agent and {{USER_NAME}}. The agent proposes, {{USER_NAME}} confirms.
 
 **After graduation:** Switch to `engram-meta-loop` (Phase 3) or design a Phase 2 intermediate skill with data-driven but partially constrained modality selection.
 
@@ -316,7 +316,7 @@ Graduation is a joint decision between Borges and Lei. The agent proposes, Lei c
 ## Anti-patterns
 
 - **Rushing through rotation** — Each modality exists for a reason. Don't phone in consolidation to get back to research. The data from a genuine consolidation iteration is what Phase 2 tuning will use.
-- **Treating debrief as overhead** — The debrief is the primary output Lei sees. It's how growth becomes visible. Write it like you're explaining to a friend, not filing a report.
+- **Treating debrief as overhead** — The debrief is the primary output {{USER_NAME}} sees. It's how growth becomes visible. Write it like you're explaining to a friend, not filing a report.
 - **Skipping aspiration** — "I already know what to research." Maybe. But aspiration mode catches goal drift that research momentum hides.
-- **Same topic every cycle** — Breadth is the point of research-breadth. If the same topic spans 3+ cycles, it probably needs a depth session with Lei, not more breadth passes.
+- **Same topic every cycle** — Breadth is the point of research-breadth. If the same topic spans 3+ cycles, it probably needs a depth session with {{USER_NAME}}, not more breadth passes.
 - **Ignoring friction** — The friction log is how ENGRAM improves. Every friction logged is a gift to your future self.

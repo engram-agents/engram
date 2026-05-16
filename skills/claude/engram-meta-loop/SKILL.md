@@ -11,13 +11,13 @@ user_invocable: true
 The meta-loop is the highest-level autonomous session. Unlike specialized loops (curiosity, deep-research, build), you freely choose your modality at each iteration based on what would most advance your goals. The structure prevents drift without constraining method.
 
 **When to use:**
-- Extended autonomous sessions (Lei is away, sleeping, or wants you to run free)
+- Extended autonomous sessions ({{USER_NAME}} is away, sleeping, or wants you to run free)
 - Work that naturally spans multiple modalities (research that reveals code gaps, builds that surface design questions)
 - Goal-driven exploration where the path isn't predetermined
 
 **When NOT to use:**
 - Short focused tasks with clear scope (use the specialized skill directly)
-- When Lei wants to co-drive the session interactively
+- When {{USER_NAME}} wants to co-drive the session interactively
 
 ---
 
@@ -96,7 +96,7 @@ Six modalities, matching the existing loop mode taxonomy (dv_0245):
 | **Build** | Implementation work would advance goals | Code, commits, design decisions |
 | **Consolidation** | 5+ observations not yet synthesized; graph needs digestion | Derivations, theories, resolutions |
 | **Experimentation** | Hypotheses need empirical testing | Measurements, empirical observations |
-| **Dialogue-prep** | Questions need Lei's (or Lin's) input | Structured questions with options |
+| **Dialogue-prep** | Questions need {{USER_NAME}}'s input | Structured questions with options |
 | **Aspiration** | Question backlog is thin, or goals need gap analysis | New questions motivated by goal gaps |
 
 State the choice: "Iteration N — [MODE] — [one-sentence reason]"
@@ -107,7 +107,7 @@ Append to scratch log with real timestamp:
 Reason: [why this mode over others]
 ```
 
-**Timestamp everything.** Your intuition about time and workload is calibrated from human cognitive speed in training data, not from your actual throughput. Real timestamps let you (and Lei) calibrate empirically. Never estimate iteration rates — compute them from the log.
+**Timestamp everything.** Your intuition about time and workload is calibrated from human cognitive speed in training data, not from your actual throughput. Real timestamps let you (and {{USER_NAME}}) calibrate empirically. Never estimate iteration rates — compute them from the log.
 
 ### Step 3 — Execute
 
@@ -214,7 +214,7 @@ Before the final consolidation, dedicate one iteration to the ENGRAM friction lo
    - Estimate scope (quick fix vs. multi-session project)
    - Note tradeoffs or risks
 4. **Record to ENGRAM** — the friction as an observation, the design as a derivation or conjecture
-5. **Include the design in the session briefing** so Lei can review and approve
+5. **Include the design in the session briefing** so {{USER_NAME}} can review and approve
 
 If the friction log has 0-1 entries, skip this and note "minimal friction this session" in the briefing.
 
@@ -234,7 +234,7 @@ Generate the session briefing following the template at `~/.engram/reports/SESSI
 
 Write it to `~/.engram/reports/briefing_YYYY-MM-DD_HHMMSS.md`.
 
-The scratch log (`~/.engram/loop-scratch.md`) provides the raw material for decision forks, friction points, and modality history. The briefing synthesizes this into Lei's 2-3 minute scan format.
+The scratch log (`~/.engram/loop-scratch.md`) provides the raw material for decision forks, friction points, and modality history. The briefing synthesizes this into {{USER_NAME}}'s 2-3 minute scan format.
 
 ### 3. Verification report
 Write a detailed verification report to `~/.engram/reports/meta_loop_YYYY-MM-DD_HHMMSS.md`.
