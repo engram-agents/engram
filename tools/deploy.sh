@@ -38,13 +38,10 @@
 #     USER_GUIDE.md (these belong to fresh installs, not running upgrades)
 #   - Install-time scaffolding: templates/, integrations/, inter-agent/
 #     (deployed at install time only, not part of the running tree)
-#   - Skills: skills/ in alpha is the source-of-truth for fresh installs.
-#     For Claude they live at ~/.claude/skills/, for Gemini they're folded
-#     into GEMINI.md + the extension's hooks.json at install time (no
-#     parallel runtime skills/ dir). Either way, the live destination is
-#     outside $ENGRAM_HOME, so deploy.sh (which only writes inside
-#     $ENGRAM_HOME) cannot reach it. Skills updates require re-running
-#     install.sh / install-gemini.sh.
+#   - Skills (skills/) and agents (agents/claude/): destinations are outside
+#     $ENGRAM_HOME, so deploy.sh cannot reach them; updates require re-running
+#     install.sh / install-gemini.sh. deploy.sh prints a nudge if either
+#     changed since the last deploy.
 #
 # After deploy: restart your MCP client to reload server.py.
 
@@ -332,6 +329,70 @@ for entry in "${MANIFEST[@]}"; do
     fi
 done
 echo
+
+# Agents/skills nudge. agents/claude/ and skills/ ship to $CLAUDE_HOME via
+# install.sh at FRESH-INSTALL time — destinations outside $ENGRAM_HOME, so
+# deploy.sh cannot reach them, AND install.sh refuses to run on existing
+# installs (knowledge.db guard). Until the manifest-external-destinations
+# epic lands, the remedy for changed agents/skills on an existing install
+# is manual cp. Fire an alert with the actual command so users can copy-
+# paste — that's the honest remedy today.
+# Fires in both live and dry-run modes (informational either way).
+# TARGET-aware: install-gemini.sh does NOT install agents/claude/ (verified
+# by reading the script end-to-end). For TARGET=gemini we scope the diff
+# to skills/gemini/ only so Gemini users don't see irrelevant agents/
+# changes that wouldn't apply to them anyway.
+# Note: templates/ drift (CLAUDE.md.template, warm-briefing.md.template,
+# HEARTBEAT.md.template, GEMINI.md.template, settings.hooks.json.template)
+# is already surfaced by the TEMPLATE_FILES warning at the END of this
+# script (live-apply mode only). This nudge covers only the agents/skills
+# install-time files that the existing warning doesn't catch — separate
+# drift category, separate remedy (cp instead of inverse-merge).
+nudge_sha="$(_last_deployed_sha)"
+if [[ -n "$nudge_sha" ]]; then
+    if [[ "$TARGET" = "claude" ]]; then
+        nudge_paths=(agents/claude/ skills/claude/ skills/shared/)
+    else
+        nudge_paths=(skills/gemini/ skills/shared/)
+    fi
+    nudge_changed=$(git -C "$ALPHA_DIR" diff --name-only "$nudge_sha..HEAD" -- "${nudge_paths[@]}" 2>/dev/null || true)
+    if [[ -n "$nudge_changed" ]]; then
+        # Split changed paths by top-level dir so we surface the right cp command(s).
+        nudge_agents_changed=$(echo "$nudge_changed" | grep -E '^agents/' || true)
+        nudge_skills_changed=$(echo "$nudge_changed" | grep -E '^skills/' || true)
+
+        echo "⚠ agents/skills changed since last deploy ($nudge_sha → $ALPHA_SHA):"
+        echo
+        while IFS= read -r f; do
+            echo "    $f"
+        done <<< "$nudge_changed"
+        echo
+        echo "  These ship at FRESH-INSTALL time only — deploy.sh cannot reach their"
+        echo "  destinations (outside \$ENGRAM_HOME), and install.sh refuses to run on"
+        echo "  existing installs. Manual remedy until the manifest-external-destinations"
+        echo "  epic lands (issue #166):"
+        echo
+        if [[ -n "$nudge_agents_changed" && "$TARGET" = "claude" ]]; then
+            echo "    cp -rL $ALPHA_DIR/agents/claude/* \$CLAUDE_HOME/agents/"
+        fi
+        if [[ -n "$nudge_skills_changed" ]]; then
+            if [[ "$TARGET" = "claude" ]]; then
+                echo "    cp -rL $ALPHA_DIR/skills/claude/* \$CLAUDE_HOME/skills/"
+            else
+                # Gemini folds skills into GEMINI.md at install time — no parallel
+                # runtime skills dir. The manual remedy is to re-run install-gemini.sh
+                # --force (archives existing install). Surface this rather than a
+                # cp command that wouldn't reach the right destination.
+                echo "    (Gemini folds skills into GEMINI.md at install time. The only path"
+                echo "     is to back up data + re-run install-gemini.sh --force.)"
+            fi
+        fi
+        echo
+        echo "  (templates/ drift — CLAUDE.md / warm-briefing / HEARTBEAT — is covered"
+        echo "  separately by the TEMPLATE_FILES warning at end-of-deploy in live-apply mode.)"
+        echo
+    fi
+fi
 
 if [[ $CHANGES -eq 0 ]]; then
     echo "No changes needed. ENGRAM_HOME is up to date with alpha @ $ALPHA_SHA."
