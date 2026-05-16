@@ -36,15 +36,15 @@ def _resolve_runtime_dir(engram_home: str) -> str:
       2. $ENGRAM_HOME if it bundles a snapshot (alpha-install pattern —
          install-gemini.sh copies server.py + engram_client.py into the
          data dir).
-      3. ~/kg_protocol_for_ai (live-source fallback for the original
-         single-tenant Borges install, which never bundled a snapshot).
+      3. ~/engram-alpha (live-source fallback for dev installs that
+         haven't bundled a snapshot into $ENGRAM_HOME).
     """
     explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
     if explicit:
         return explicit
     if os.path.exists(os.path.join(engram_home, "engram_client.py")):
         return engram_home
-    return os.path.expanduser("~/kg_protocol_for_ai")
+    return os.path.expanduser("~/engram-alpha")
 
 
 ENGRAM_HOME = _resolve_engram_home()

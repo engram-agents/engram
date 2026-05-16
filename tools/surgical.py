@@ -34,8 +34,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Import confidence constants from the shared module (single source of truth)
-PROJECT_DIR = Path(os.path.expanduser("~/kg_protocol_for_ai"))
+# Import confidence constants from the shared module (single source of truth).
+# Derive the repo root from this script's location (tools/ is one level down).
+PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR))
 from engram_confidence import (
     CONFIDENCE_MAP, SOURCE_CLASS_CONFIDENCE_DISCOUNT,

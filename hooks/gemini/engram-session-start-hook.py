@@ -52,13 +52,14 @@ DEFAULT_PURPOSES = {
 }
 # Repos scanned for Piece C (recent commit cross-check at startup).
 # ENGRAM_HOME is always included. Extra repos via ENGRAM_PIECE_C_REPOS env var
-# (colon-separated). Default extra: ~/kg_protocol_for_ai if it exists (spt's
-# dev repo); for agents installed via alpha, the default silently no-ops.
+# (colon-separated). Default extra: ~/engram-alpha if it exists (Borges's
+# alpha dev repo); for agents installed without a local alpha clone, silently
+# no-ops because the isdir guard returns False.
 _PIECE_C_EXTRA = os.environ.get("ENGRAM_PIECE_C_REPOS", "").strip()
 if _PIECE_C_EXTRA:
     PIECE_C_REPOS = [os.path.expanduser(p) for p in _PIECE_C_EXTRA.split(":") if p] + [ENGRAM_HOME]
 else:
-    _default_extra = os.path.expanduser("~/kg_protocol_for_ai")
+    _default_extra = os.path.expanduser("~/engram-alpha")
     PIECE_C_REPOS = ([_default_extra] if os.path.isdir(_default_extra) else []) + [ENGRAM_HOME]
 PIECE_C_WINDOW = "2 days ago"
 PIECE_C_MAX_LINES = 20
