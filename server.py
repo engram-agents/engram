@@ -27,6 +27,14 @@ from urllib.parse import urlparse
 
 from fastmcp import FastMCP
 
+# engram_log_emitter (optional at import time — emit_if_initialized is a
+# silent no-op when the singleton has not been initialized, which is the
+# normal state for server.py: it runs as a long-lived MCP process serving
+# multiple Claude sessions and has no single session_id to bind to.
+# Phase 4 will add a separate init path for server-side events.
+# See ~/borges-desk/projects/engram-logging/DESIGN.md §4.2 for the spec.
+from engram_log_emitter import emit_if_initialized  # noqa: E402
+
 # sqlite-vec (optional): SIMD-accelerated KNN over embeddings, replaces the
 # O(N) pure-Python cosine loop in _semantic_search. If the extension fails to
 # load (older Python build without enable_load_extension, or module absent),
@@ -4170,6 +4178,37 @@ def _add_observation_impl(
             result["yellow_card_warning"] = _yellow_forward
 
         conn.commit()
+
+        # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
+        # Emit AFTER commit per ax_0001 (structural honesty): logging an event
+        # that says "this happened" before commit succeeds would risk
+        # asserting a falsehood if the commit raises.
+        # Decision context: similar-existing hits + dedup hint + result.
+        # emit_if_initialized is a silent no-op when the server-side emitter
+        # is not yet initialized (Phase 4 will add the init path).
+        _similar_count = len(similar_matches)
+        _highest_sim = None
+        _first_hint = None
+        if similar_matches:
+            sims = [m.get("similarity") for m in similar_matches if m.get("similarity") is not None]
+            if sims:
+                _highest_sim = max(sims)
+            _first_hint = similar_matches[0].get("action_hint")
+        emit_if_initialized(
+            event_type="engram.tool.engram_call",
+            level=1,
+            data={
+                "tool_name": "engram_add_observation",
+                "similar_existing_returned_count": _similar_count,
+                "highest_similarity": _highest_sim,
+                "dedup_action_hint": _first_hint,
+                "result_status": result.get("status"),
+                "result_node_id": result.get("observation_id"),
+                "validation_warnings": (
+                    [result["yellow_card_warning"]] if result.get("yellow_card_warning") else []
+                ),
+            },
+        )
         return json.dumps(result)
     finally:
         conn.close()
@@ -4355,6 +4394,28 @@ def _add_observation_batch_impl(
     }
     if _batch_yellow:
         batch_result["yellow_card_warning"] = _batch_yellow
+
+    # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
+    # Batch-level summary event — one event for the entire batch MCP call.
+    # Per-observation events are already emitted by _add_observation_impl above.
+    emit_if_initialized(
+        event_type="engram.tool.engram_call",
+        level=1,
+        data={
+            "tool_name": "engram_add_observation_batch",
+            "result_status": "batch_complete",
+            "result_node_id": None,
+            "batch_total": len(observations),
+            "batch_created": len(created),
+            "batch_error_count": len(observations) - len(created),
+            "validation_warnings": (
+                [batch_result["yellow_card_warning"]]
+                if batch_result.get("yellow_card_warning")
+                else []
+            ),
+        },
+    )
+
     return json.dumps(batch_result)
 
 
@@ -4923,6 +4984,22 @@ def engram_query(
             accessed_ids = [n["id"] for n in output]
             _refresh_recall(conn, accessed_ids)
             _recall_window_append(accessed_ids, source="query")
+
+        # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
+        # Decision context: query length + result count + type filter used.
+        # source_class_filter is not a parameter of engram_query (only type
+        # filter exists); emitted as None. Noted in phase-3 F1 handoff.
+        emit_if_initialized(
+            event_type="engram.tool.engram_call",
+            level=1,
+            data={
+                "tool_name": "engram_query",
+                "query_text_len": len(query),
+                "result_count": len(output),
+                "type_filter": types or None,
+                "source_class_filter": None,
+            },
+        )
 
         return json.dumps(
             {
@@ -9423,6 +9500,19 @@ def _derive_impl(
             use_stale=use_stale,
         )
         if block is not None:
+            # --- engram.tool.engram_call event — blocked path (DESIGN.md §4.2) ---
+            emit_if_initialized(
+                event_type="engram.tool.engram_call",
+                level=1,
+                data={
+                    "tool_name": "engram_derive",
+                    "supporting_ids_count": len(ids),
+                    "reasoning_type": reasoning_type,
+                    "premise_validation_warnings": [],
+                    "result_status": block.get("status", "blocked"),
+                    "result_node_id": None,
+                },
+            )
             return json.dumps(block)
 
         conn.commit()
@@ -9447,6 +9537,20 @@ def _derive_impl(
             result["structure_warnings"] = success["structure_warnings"]
         if use_stale and success["stale_ids"]:
             result["built_on_stale"] = success["stale_ids"]
+
+        # --- engram.tool.engram_call event — success path (DESIGN.md §4.2) ---
+        emit_if_initialized(
+            event_type="engram.tool.engram_call",
+            level=1,
+            data={
+                "tool_name": "engram_derive",
+                "supporting_ids_count": len(ids),
+                "reasoning_type": success["reasoning_type"],
+                "premise_validation_warnings": success.get("structure_warnings") or [],
+                "result_status": "created",
+                "result_node_id": success["node_id"],
+            },
+        )
 
         return json.dumps(result)
     finally:
@@ -9584,6 +9688,24 @@ def _contradict_impl(
 
         _stamp_new_node(conn, node_id, confidence=0.5, surprise=1.0)
         conn.commit()
+
+        # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
+        # target_id captures both conflicting nodes; the new contradiction node
+        # id is emitted as result_node_id. Includes both node IDs since
+        # contradictions link two targets (not a single "target").
+        emit_if_initialized(
+            event_type="engram.tool.engram_call",
+            level=1,
+            data={
+                "tool_name": "engram_contradict",
+                "target_id": node_id_a,
+                "target_id_b": node_id_b,
+                "action_type": "contradict",
+                "result_status": "created",
+                "result_node_id": node_id,
+            },
+        )
+
         return json.dumps(
             {
                 "status": "created",
@@ -10310,6 +10432,20 @@ def _supersede_impl(
                       {"stale_premise": old_node_id, "replacement": new_node_id})
 
         conn.commit()
+
+        # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
+        emit_if_initialized(
+            event_type="engram.tool.engram_call",
+            level=1,
+            data={
+                "tool_name": "engram_supersede",
+                "target_id": old_node_id,
+                "action_type": "supersede",
+                "result_status": "superseded",
+                "result_node_id": new_node_id,
+            },
+        )
+
         return json.dumps({
             "status": "superseded",
             "old_node_id": old_node_id,
@@ -10596,6 +10732,20 @@ def _retract_impl(
             result["reopened_count"] = len(reopened_targets)
         if replacement_id:
             result["replacement_id"] = replacement_id
+
+        # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
+        emit_if_initialized(
+            event_type="engram.tool.engram_call",
+            level=1,
+            data={
+                "tool_name": "engram_retract",
+                "target_id": node_id,
+                "action_type": "retract",
+                "result_status": "retracted",
+                "result_node_id": replacement_id,
+            },
+        )
+
         return json.dumps(result)
     finally:
         if conn is not None:
@@ -12969,6 +13119,25 @@ def engram_query_pattern(
 
     _pattern_telemetry_log(pattern_name, preset,
                             {"params_used": params}, candidates)
+
+    # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
+    # engram_query_pattern has no free-text query; query_text_len is the
+    # pattern_name length as a proxy. source_class_filter and type_filter
+    # are not parameters of this tool — emitted as None. See phase-3 F1
+    # handoff ambiguous-decisions log.
+    emit_if_initialized(
+        event_type="engram.tool.engram_call",
+        level=1,
+        data={
+            "tool_name": "engram_query_pattern",
+            "query_text_len": len(pattern_name),
+            "result_count": len(candidates),
+            "type_filter": None,
+            "source_class_filter": None,
+            "pattern_name": pattern_name,
+            "preset": preset,
+        },
+    )
 
     return json.dumps({
         "pattern_name": pattern_name,

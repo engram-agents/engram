@@ -8,25 +8,67 @@ my last response, then clears the marker so it fires once per detection.
 Mechanism mirrors the antml-repair surfacing (additionalContext via
 hookSpecificOutput) so the catch shows up in the same shape as other
 behavioral hooks. Best-effort: any failure swallows silently.
+
+Emits engram.hook.fire event for per-hook fire metadata (alpha #175, DESIGN.md §4.3).
 """
 
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 ENGRAM_HOME = os.environ.get("ENGRAM_HOME", str(Path.home() / ".engram"))
 DEFERENCE_MARKER_PATH = os.path.join(ENGRAM_HOME, "deference-detected.json")
 
 
-def main() -> None:
-    # Drain stdin (hook protocol).
+def _emit_hook_fire(session_id: str, transcript_path: str, duration_ms: int, stdout_bytes: int) -> None:
+    """Emit engram.hook.fire event. Failure must not break the hook."""
     try:
-        sys.stdin.read()
+        sys.path.insert(0, ENGRAM_HOME)
+        from engram_log_emitter import Emitter
+        _emitter = Emitter.init(
+            session_id=session_id or "unknown",
+            transcript_path=transcript_path or "",
+        )
+        _emitter.emit(
+            event_type="engram.hook.fire",
+            level=1,
+            data={
+                "hook_name": "engram-deference-detector-prompt",
+                "hook_type": "UserPromptSubmit",
+                "duration_ms": duration_ms,
+                "exit_code": 0,
+                "stdout_bytes": stdout_bytes,
+                "stderr_bytes": 0,
+                "context_mode": os.environ.get("ENGRAM_CONTEXT_MODE", "") or None,
+            },
+        )
+    except Exception:
+        pass
+
+
+def main() -> None:
+    _t0 = time.perf_counter()
+
+    # Parse stdin for session_id + transcript_path (hook protocol).
+    session_id = "unknown"
+    transcript_path = ""
+    try:
+        raw = sys.stdin.read()
+        if raw:
+            payload = json.loads(raw)
+            sid = payload.get("session_id")
+            if isinstance(sid, str) and sid:
+                session_id = sid
+            tp = payload.get("transcript_path")
+            if isinstance(tp, str) and tp:
+                transcript_path = tp
     except Exception:
         pass
 
     if not os.path.exists(DEFERENCE_MARKER_PATH):
+        _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000), 0)
         sys.exit(0)
 
     try:
@@ -38,9 +80,11 @@ def main() -> None:
             os.remove(DEFERENCE_MARKER_PATH)
         except OSError:
             pass
+        _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000), 0)
         sys.exit(0)
 
     if not marker.get("pending"):
+        _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000), 0)
         sys.exit(0)
 
     hits = marker.get("hits", [])
@@ -49,6 +93,7 @@ def main() -> None:
             os.remove(DEFERENCE_MARKER_PATH)
         except OSError:
             pass
+        _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000), 0)
         sys.exit(0)
 
     lines = [
@@ -73,13 +118,20 @@ def main() -> None:
             "additionalContext": additional_context,
         }
     }
-    print(json.dumps(response))
+    output_str = json.dumps(response)
+    print(output_str)
 
     # Clear the marker so it fires only once per detection.
     try:
         os.remove(DEFERENCE_MARKER_PATH)
     except OSError:
         pass
+
+    _emit_hook_fire(
+        session_id, transcript_path,
+        int((time.perf_counter() - _t0) * 1000),
+        len(output_str.encode("utf-8")),
+    )
 
 
 if __name__ == "__main__":

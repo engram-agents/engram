@@ -44,6 +44,7 @@ DEPLOY_SH = os.path.join(REPO_ROOT, "tools", "deploy.sh")
 MANIFEST_ORPHAN_ALLOWLIST: dict[str, str] = {
     "bootstrap.py": "install-time seed-graph creator, not a runtime module",
     "selftest.py": "developer pre-deploy pytest runner; not part of the runtime tree",
+    "engram_log_indexer.py": "Phase 3 deliverable; deploy.sh MANIFEST integration deferred to Phase 4 (alpha #175)",
 }
 
 

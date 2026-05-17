@@ -510,6 +510,7 @@ def main():
 
     # Try daemon first (fast, semantic), fall back to FTS-only
     used_daemon = False
+    _daemon_t0 = time.perf_counter()
     result = query_daemon(prompt, embed_query=embed_query)
     if result is not None:
         used_daemon = True
@@ -521,6 +522,38 @@ def main():
         # would pollute results with arbitrary prior-context tokens — exactly
         # what the design intentionally avoided in the daemon path.
         result = query_fts_fallback(prompt)
+    _daemon_latency_ms = int((time.perf_counter() - _daemon_t0) * 1000)
+
+    # Emit engram.surface.fire event for the structured event log.
+    # See ~/borges-desk/projects/engram-logging/DESIGN.md §4.1 + alpha #175.
+    # Failure-mode contract: emitter.emit NEVER raises; if init fails or
+    # the import itself fails, we degrade silently to a no-op.
+    try:
+        sys.path.insert(0, ENGRAM_HOME)  # ~/.engram/ contains the emitter
+        from engram_log_emitter import Emitter
+        _emitter = Emitter.init(
+            session_id=hook_input.get("session_id", "unknown"),
+            transcript_path=hook_input.get("transcript_path", ""),
+        )
+        _surface_matched = result.get("matched_ids", []) if result else []
+        _emitter.emit(
+            event_type="engram.surface.fire",
+            level=1,
+            data={
+                "prompt_len_chars": len(prompt),
+                "matched_ids": _surface_matched[:10],
+                "matched_ids_count": len(_surface_matched),
+                "daemon_latency_ms": _daemon_latency_ms,
+                "fallback_to_fts": (not used_daemon),
+                "daemon_returned_none": (result is None),
+                # Richer scoring intermediates (candidates_considered_count,
+                # composite scores, etc.) require server.py-side instrumentation
+                # — Phase 3 fairy F1 scope per DESIGN.md §4.1.
+            },
+        )
+    except Exception:
+        # Emitter failures must not break the hook — drop silently.
+        pass
 
     # Build context parts
     parts = []

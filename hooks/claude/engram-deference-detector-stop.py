@@ -46,6 +46,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -265,7 +266,35 @@ def _payload_from_stdin() -> dict | None:
         return None
 
 
+def _emit_hook_fire(session_id: str | None, transcript_path: str | None, duration_ms: int) -> None:
+    """Emit engram.hook.fire event. Failure must not break the hook."""
+    try:
+        sys.path.insert(0, ENGRAM_HOME)
+        from engram_log_emitter import Emitter
+        _emitter = Emitter.init(
+            session_id=session_id or "unknown",
+            transcript_path=transcript_path or "",
+        )
+        _emitter.emit(
+            event_type="engram.hook.fire",
+            level=1,
+            data={
+                "hook_name": "engram-deference-detector-stop",
+                "hook_type": "Stop",
+                "duration_ms": duration_ms,
+                "exit_code": 0,
+                "stdout_bytes": 0,
+                "stderr_bytes": 0,
+                "context_mode": os.environ.get("ENGRAM_CONTEXT_MODE", "") or None,
+            },
+        )
+    except Exception:
+        pass
+
+
 def main() -> None:
+    _t0 = time.perf_counter()
+
     # Read stdin once and pull every needed field from the same dict.
     payload = _payload_from_stdin()
 
@@ -302,6 +331,7 @@ def main() -> None:
         structure = _last_assistant_structure(jsonl_path=transcript_path, session_id=session_id)
         if not structure:
             _log("Scanned: 0 hits (no message available; stdin empty + JSONL fallback returned no structure)")
+            _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000))
             sys.exit(0)
         joined = structure["joined"]
         last_paragraph = structure["last_paragraph"]
@@ -324,6 +354,7 @@ def main() -> None:
         except OSError:
             pass
         _log("Scanned: 0 hits")
+        _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000))
         sys.exit(0)
 
     # De-dupe by label so a response with three "should I" doesn't flood.
@@ -350,6 +381,8 @@ def main() -> None:
         pass
 
     _log(f"Detected {len(hits)} hit(s) ({len(deduped)} unique): {[h['label'] for h in deduped]}")
+
+    _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000))
 
 
 if __name__ == "__main__":

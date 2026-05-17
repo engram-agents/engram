@@ -39,6 +39,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -188,29 +189,78 @@ def _log_deferred(payload: dict, marker: dict) -> None:
         pass
 
 
+def _emit_hook_fire(
+    session_id: str | None,
+    transcript_path: str | None,
+    duration_ms: int,
+    stdout_bytes: int = 0,
+) -> None:
+    """Emit engram.hook.fire event. Failure must not break the hook."""
+    try:
+        sys.path.insert(0, str(ENGRAM_HOME))
+        from engram_log_emitter import Emitter
+        _emitter = Emitter.init(
+            session_id=session_id or "unknown",
+            transcript_path=transcript_path or "",
+        )
+        _emitter.emit(
+            event_type="engram.hook.fire",
+            level=1,
+            data={
+                "hook_name": "engram-write-yield-hook",
+                "hook_type": "PreToolUse",
+                "duration_ms": duration_ms,
+                "exit_code": 0,
+                "stdout_bytes": stdout_bytes,
+                "stderr_bytes": 0,
+                "context_mode": os.environ.get("ENGRAM_CONTEXT_MODE", "") or None,
+            },
+        )
+    except Exception:
+        pass
+
+
 def main() -> int:
+    _t0 = time.perf_counter()
+
     # Read stdin payload (Claude Code passes JSON with tool_name, tool_input, etc.)
+    session_id: str | None = None
+    transcript_path: str | None = None
     try:
         raw = sys.stdin.read()
     except Exception:
+        _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000))
         return 0  # fail-open on stdin error
     if not raw:
+        _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000))
         return 0
     try:
         payload = json.loads(raw)
     except (ValueError, json.JSONDecodeError):
+        _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000))
         return 0  # fail-open on malformed payload
+
+    # Extract session context for emitter.
+    sid = payload.get("session_id")
+    if isinstance(sid, str) and sid:
+        session_id = sid
+    tp = payload.get("transcript_path")
+    if isinstance(tp, str) and tp:
+        transcript_path = tp
 
     tool_name = payload.get("tool_name", "")
     if not tool_name.startswith("mcp__engram__"):
+        _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000))
         return 0  # not our concern
 
     write_tools = _get_write_tools()
     if tool_name not in write_tools:
+        _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000))
         return 0  # read-only tool, pass through
 
     marker = _check_marker()
     if marker is None:
+        _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000))
         return 0  # heartbeat not writing, pass through
 
     # Heartbeat is writing — refuse the call. Log to deferred queue.
@@ -244,7 +294,13 @@ def main() -> int:
         },
         "systemMessage": msg,
     }
-    print(json.dumps(response))
+    output_str = json.dumps(response)
+    print(output_str)
+    _emit_hook_fire(
+        session_id, transcript_path,
+        int((time.perf_counter() - _t0) * 1000),
+        len(output_str.encode("utf-8")),
+    )
     return 0
 
 

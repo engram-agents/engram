@@ -126,6 +126,7 @@ MANIFEST=(
     "engram_client.py"
     "engram_confidence.py"
     "engram_filter.py"
+    "engram_log_emitter.py"
     "viz_server.py"
     "tools"
     "SKILL.md"

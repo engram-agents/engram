@@ -635,9 +635,16 @@ let autoRefreshInterval = null;
 let highlightedNodeIds = new Set();
 let highlightDepth = 2;
 
-// Memory tier thresholds (match server defaults)
-const TIER1_MAX = 200;
-const TIER2_MAX = 1000;
+// Memory tier thresholds. These mirror the agent's $ENGRAM_HOME/config.json
+// values (memory.tier1_max_nodes / tier2_max_nodes) — fetched at page load
+// from /api/meta so the viz reflects the ACTUAL config, not the historical
+// default that diverged silently (Lei caught this 2026-05-17: viz was
+// showing many nodes as tier 3 because TIER2_MAX=1000 was hardcoded while
+// production config had tier2_max_nodes=4000). The defaults below are used
+// only as a fallback until /api/meta resolves; the call site near line 1705
+// overrides these from the meta response.
+let TIER1_MAX = 200;
+let TIER2_MAX = 1000;
 
 // ═══════════════════════════════════════════════════════════════════
 // D3 setup
@@ -1580,9 +1587,21 @@ async function loadAgents() {
     sel.onchange = () => {
       setCurrentAgent(sel.value);
       fetchGraph();
-      // Refresh the db-path-label too
+      // Refresh the db-path-label AND re-sync memory tier thresholds
+      // for the newly-selected agent. Different agents can have different
+      // config.json values; without this re-sync, switching agents in
+      // multi-agent mode would leave the prior agent's TIER1_MAX/TIER2_MAX
+      // active and compute tiers wrong. Round-4 fairy caught this gap.
       fetch(withAgent('/api/meta')).then(r => r.json()).then(m => {
         document.getElementById('db-path-label').textContent = m.db_path || '';
+        if (m.memory_config) {
+          if (typeof m.memory_config.tier1_max_nodes === 'number') {
+            TIER1_MAX = m.memory_config.tier1_max_nodes;
+          }
+          if (typeof m.memory_config.tier2_max_nodes === 'number') {
+            TIER2_MAX = m.memory_config.tier2_max_nodes;
+          }
+        }
       }).catch(() => {});
     };
   } catch (err) {
@@ -1701,9 +1720,20 @@ document.getElementById('auto-refresh-cb').onchange = function() {
   }
 };
 
-// Set db path label (agent-aware)
+// Set db path label (agent-aware) AND sync memory tier thresholds from
+// the agent's config (Lei 2026-05-17: viz tier classification was wrong
+// because tier sizes were hardcoded JS constants instead of read from
+// $ENGRAM_HOME/config.json).
 fetch(withAgent('/api/meta')).then(r => r.json()).then(m => {
   document.getElementById('db-path-label').textContent = m.db_path || '';
+  if (m.memory_config) {
+    if (typeof m.memory_config.tier1_max_nodes === 'number') {
+      TIER1_MAX = m.memory_config.tier1_max_nodes;
+    }
+    if (typeof m.memory_config.tier2_max_nodes === 'number') {
+      TIER2_MAX = m.memory_config.tier2_max_nodes;
+    }
+  }
 }).catch(() => {});
 
 // Center simulation on container resize
@@ -2324,6 +2354,367 @@ HEALTH_HTML = r"""<!DOCTYPE html>
 
 
 # ---------------------------------------------------------------------------
+# Stats tab — agent-stats dashboard backed by ~/.engram/logs/index.db
+# Per alpha #175 + ~/borges-desk/projects/engram-logging/PHASE4-STATS-TAB.md.
+# Privacy: queries ONLY filter WHERE level = 1 (stats-only); L2 events are
+# in the index but never surfaced through this dashboard.
+# ---------------------------------------------------------------------------
+
+def _resolve_agent_config(agent_name: str) -> dict:
+    """Resolve agent's memory config from $ENGRAM_HOME/config.json.
+
+    Returns the relevant viz-tunable fields with their config-or-default values.
+    Defaults match server.py:_get_memory_config (lines 1108-1113). Returns
+    defaults if config.json is missing/malformed — never raises.
+
+    Used by /api/meta so the front-end tier-classification reads CONFIG values
+    (e.g. tier2_max=4000 in production) rather than viz-side hardcoded defaults
+    (tier2=1000 in the original JS, which mis-classified ~3000 nodes as tier 3).
+    """
+    defaults = {"tier1_max_nodes": 200, "tier2_max_nodes": 1000, "decay_base": 1.014}
+    agent_meta = AGENTS.get(agent_name)
+    if not agent_meta:
+        return defaults
+    db_path = agent_meta.get("db", "")
+    if not db_path:
+        return defaults
+    engram_home = os.path.dirname(os.path.abspath(db_path))
+    config_path = os.path.join(engram_home, "config.json")
+    if not os.path.exists(config_path):
+        return defaults
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        mem = config.get("memory", {})
+        return {
+            "tier1_max_nodes": int(mem.get("tier1_max_nodes", defaults["tier1_max_nodes"])),
+            "tier2_max_nodes": int(mem.get("tier2_max_nodes", defaults["tier2_max_nodes"])),
+            "decay_base": float(mem.get("decay_base", defaults["decay_base"])),
+        }
+    except (OSError, ValueError, json.JSONDecodeError, TypeError):
+        return defaults
+
+
+def _resolve_logs_index(agent_name: str) -> str:
+    """Resolve agent_name to its index.db path. Returns empty string if unknown."""
+    agent_meta = AGENTS.get(agent_name)
+    if not agent_meta:
+        return ""
+    # AGENTS metadata stores the agent's knowledge-db path under key "db"
+    # (per viz_server.py line 33 module-level comment + lines 1758, 1778, 1786,
+    # 2746). The logs index.db lives at $ENGRAM_HOME/logs/index.db where
+    # $ENGRAM_HOME is the parent of the knowledge.db file.
+    db_path = agent_meta.get("db", "")
+    if not db_path:
+        return ""
+    engram_home = os.path.dirname(os.path.abspath(db_path))
+    return os.path.join(engram_home, "logs", "index.db")
+
+
+def get_stats_data(index_db_path: str) -> dict:
+    """Run the 5 stats panels against the index.db. Returns a dict the
+    Stats HTML page renders. Empty-data states are explicit so the UI can
+    render a 'No events yet' placeholder rather than a blank card.
+    """
+    if not index_db_path or not os.path.exists(index_db_path):
+        return {"empty": True, "reason": "No index.db at expected location yet — has the indexer run? Try: python3 ~/.engram/engram_log_indexer.py"}
+    try:
+        conn = sqlite3.connect(index_db_path)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error as exc:
+        return {"empty": True, "reason": f"Could not open index.db: {exc}"}
+    try:
+        # Confirm events table exists (indexer hasn't run if it doesn't)
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='events'"
+        )
+        if not cur.fetchone():
+            return {"empty": True, "reason": "events table not found in index.db — has the indexer run?"}
+        # Total L1 events (cardinality check)
+        cur = conn.execute("SELECT COUNT(*) FROM events WHERE level = 1")
+        total = cur.fetchone()[0]
+        if total == 0:
+            return {"empty": True, "reason": "Index has no L1 events yet — start using ENGRAM to generate metrics."}
+
+        out: dict = {"total_events": total}
+
+        # Panel 1: auto-surface health (last 7 days)
+        cur = conn.execute(
+            """SELECT COUNT(*) AS fires,
+                      MIN(daemon_latency_ms) AS min_ms,
+                      AVG(daemon_latency_ms) AS avg_ms,
+                      MAX(daemon_latency_ms) AS max_ms,
+                      SUM(fallback_to_fts) AS fallback_count
+               FROM events
+               WHERE event_type = 'engram.surface.fire'
+                 AND level = 1
+                 AND ts > datetime('now', '-7 days')"""
+        )
+        row = cur.fetchone()
+        out["surface"] = {
+            "fires_7d": row["fires"] or 0,
+            "latency_min_ms": row["min_ms"],
+            "latency_avg_ms": round(row["avg_ms"], 1) if row["avg_ms"] is not None else None,
+            "latency_max_ms": row["max_ms"],
+            "fallback_count_7d": row["fallback_count"] or 0,
+            "fallback_pct": (100.0 * (row["fallback_count"] or 0) / row["fires"]) if row["fires"] else 0.0,
+        }
+
+        # Panel 2: hook fire profile (last 7 days, by hook_name)
+        cur = conn.execute(
+            """SELECT hook_name,
+                      COUNT(*) AS fires,
+                      AVG(hook_duration_ms) AS avg_duration_ms,
+                      SUM(CASE WHEN hook_exit_code != 0 THEN 1 ELSE 0 END) AS error_count
+               FROM events
+               WHERE event_type = 'engram.hook.fire'
+                 AND level = 1
+                 AND ts > datetime('now', '-7 days')
+                 AND hook_name IS NOT NULL
+               GROUP BY hook_name
+               ORDER BY fires DESC"""
+        )
+        out["hooks"] = [
+            {
+                "hook_name": r["hook_name"],
+                "fires_7d": r["fires"],
+                "avg_duration_ms": round(r["avg_duration_ms"], 1) if r["avg_duration_ms"] is not None else None,
+                "error_count_7d": r["error_count"],
+            }
+            for r in cur.fetchall()
+        ]
+
+        # Panel 3: tool decision context (last 7 days)
+        cur = conn.execute(
+            """SELECT tool_name, result_status, COUNT(*) AS n
+               FROM events
+               WHERE event_type = 'engram.tool.engram_call'
+                 AND level = 1
+                 AND ts > datetime('now', '-7 days')
+                 AND tool_name IS NOT NULL
+               GROUP BY tool_name, result_status
+               ORDER BY tool_name, n DESC"""
+        )
+        out["tools"] = [
+            {"tool_name": r["tool_name"], "result_status": r["result_status"], "n": r["n"]}
+            for r in cur.fetchall()
+        ]
+
+        # Panel 4: cohort-aligned (last 10 turns).
+        # Both the outer query AND the subquery must filter WHERE level = 1
+        # for the privacy invariant. Round-1 fairy caught the missing level
+        # filter on the subquery (would shift the window anchor if a future
+        # L2 event happened to carry a higher turn than L1 events).
+        cur = conn.execute(
+            """SELECT turn, COUNT(*) AS events,
+                      SUM(CASE WHEN event_type = 'engram.surface.fire' THEN 1 ELSE 0 END) AS surface_fires,
+                      SUM(CASE WHEN event_type = 'engram.tool.engram_call' THEN 1 ELSE 0 END) AS tool_calls,
+                      SUM(CASE WHEN event_type = 'engram.hook.fire' THEN 1 ELSE 0 END) AS hook_fires
+               FROM events
+               WHERE level = 1
+                 AND turn > (SELECT COALESCE(MAX(turn), 0) - 10 FROM events WHERE level = 1)
+               GROUP BY turn
+               ORDER BY turn DESC"""
+        )
+        out["cohort"] = [
+            {
+                "turn": r["turn"],
+                "events": r["events"],
+                "surface_fires": r["surface_fires"],
+                "tool_calls": r["tool_calls"],
+                "hook_fires": r["hook_fires"],
+            }
+            for r in cur.fetchall()
+        ]
+
+        # Panel 5: recent errors (last 24h, capped at 25)
+        cur = conn.execute(
+            """SELECT ts, event_type, tool_name, hook_name, result_status, hook_exit_code
+               FROM events
+               WHERE level = 1
+                 AND ts > datetime('now', '-1 day')
+                 AND (
+                   (event_type = 'engram.tool.engram_call' AND result_status NOT IN ('created', 'updated', 'ok', 'batch_complete', 'corroborated'))
+                   OR (event_type = 'engram.hook.fire' AND hook_exit_code IS NOT NULL AND hook_exit_code != 0)
+                 )
+               ORDER BY ts DESC
+               LIMIT 25"""
+        )
+        out["errors"] = [
+            {
+                "ts": r["ts"],
+                "event_type": r["event_type"],
+                "tool_name": r["tool_name"],
+                "hook_name": r["hook_name"],
+                "detail": r["result_status"] if r["event_type"] == "engram.tool.engram_call" else f"exit_code={r['hook_exit_code']}",
+            }
+            for r in cur.fetchall()
+        ]
+
+        return out
+    finally:
+        conn.close()
+
+
+STATS_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>ENGRAM Stats Dashboard</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+           background: #1a1a2e; color: #e0e0e0; padding: 24px; }
+    h1 { color: #00d4ff; font-size: 1.5em; margin-bottom: 16px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; }
+    .card { background: #16213e; border-radius: 8px; padding: 16px; border: 1px solid #0f3460; }
+    .card h3 { color: #00d4ff; font-size: 0.95em; margin-bottom: 10px; }
+    .metric { display: flex; justify-content: space-between; padding: 4px 0;
+              border-bottom: 1px solid #0f3460; font-size: 0.85em; }
+    .metric:last-child { border-bottom: none; }
+    .metric .label { color: #aaa; }
+    .metric .value { color: #fff; font-weight: 600; }
+    .metric .value.warn { color: #ff9800; }
+    .metric .value.good { color: #4caf50; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.8em; }
+    th { color: #7ecfff; text-align: left; padding: 4px 8px 4px 0; border-bottom: 1px solid #0f3460; }
+    td { padding: 3px 8px 3px 0; border-bottom: 1px solid #0f3460; color: #d0d0d0; }
+    .empty { color: #888; text-align: center; padding: 24px; font-style: italic; }
+    .nav { margin-bottom: 16px; }
+    .nav a { color: #00d4ff; text-decoration: none; margin-right: 16px; font-size: 0.9em; }
+    .nav a:hover { text-decoration: underline; }
+    .privacy-note { color: #888; font-size: 0.75em; margin-top: 24px; text-align: center; font-style: italic; }
+  </style>
+</head>
+<body>
+  <div class="nav">
+    <a href="/">Graph View</a>
+    <a href="/health">Health Dashboard</a>
+    <a href="/stats" style="font-weight:600;">Stats</a>
+  </div>
+  <h1>ENGRAM Stats Dashboard <span style="color:#7ecfff;font-size:0.7em;">(last 7 days unless noted)</span></h1>
+  <div id="loading">Loading stats…</div>
+  <div id="dashboard" style="display:none;">
+    <div class="grid" id="cards"></div>
+    <p class="privacy-note">Stats tab queries only L1 (stats-only) events. L2 (content) events are indexed but never surfaced through this dashboard.</p>
+  </div>
+
+  <script>
+  function _withAgent(path) {
+    const a = new URL(window.location.href).searchParams.get('agent');
+    if (!a) return path;
+    return path + (path.includes('?') ? '&' : '?') + 'agent=' + encodeURIComponent(a);
+  }
+  function fmtMs(v) { return (v === null || v === undefined) ? '—' : v + 'ms'; }
+  function fmtN(v) { return (v === null || v === undefined) ? '—' : v; }
+  // HTML-escape DB-sourced strings before innerHTML concatenation. The
+  // indexer accepts arbitrary JSONL from ~/.engram/logs/sessions/; while
+  // emitter-produced fields are well-controlled, externally crafted event
+  // files could land arbitrary content in hook_name/tool_name/result_status/
+  // event_type/ts/detail and into the dashboard via innerHTML. Per round-1
+  // fairy review: enforce the "database-sourced strings are not HTML" invariant.
+  function esc(s) {
+    if (s === null || s === undefined) return '';
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function loadStats() {
+    fetch(_withAgent('/api/stats'))
+      .then(r => r.json())
+      .then(data => {
+        document.getElementById('loading').style.display = 'none';
+        document.getElementById('dashboard').style.display = 'block';
+        if (data.error || data.empty) {
+          document.getElementById('cards').innerHTML =
+            '<div class="card"><p class="empty">' + (data.error || data.reason) + '</p></div>';
+          return;
+        }
+        render(data);
+      })
+      .catch(err => {
+        document.getElementById('loading').innerHTML = 'Error: ' + err;
+      });
+  }
+
+  function render(d) {
+    let html = '';
+    // Total events
+    html += '<div class="card"><h3>Total L1 Events Indexed</h3>'
+         + '<div class="metric"><span class="label">All-time</span>'
+         + '<span class="value">' + d.total_events.toLocaleString() + '</span></div></div>';
+
+    // Panel 1: auto-surface health
+    if (d.surface) {
+      const s = d.surface;
+      const fallbackCls = s.fallback_pct > 5 ? 'warn' : 'good';
+      html += '<div class="card"><h3>Auto-Surface Health</h3>'
+        + '<div class="metric"><span class="label">Fires (7d)</span><span class="value">' + fmtN(s.fires_7d) + '</span></div>'
+        + '<div class="metric"><span class="label">Latency min / avg / max</span><span class="value">' + fmtMs(s.latency_min_ms) + ' / ' + fmtMs(s.latency_avg_ms) + ' / ' + fmtMs(s.latency_max_ms) + '</span></div>'
+        + '<div class="metric"><span class="label">FTS fallback rate</span><span class="value ' + fallbackCls + '">' + s.fallback_pct.toFixed(1) + '% (' + s.fallback_count_7d + ')</span></div>'
+        + '</div>';
+    }
+
+    // Panel 2: hook fire profile
+    if (d.hooks && d.hooks.length) {
+      html += '<div class="card" style="grid-column: span 2"><h3>Hook Fire Profile (7d)</h3>'
+        + '<table><thead><tr><th>Hook</th><th style="text-align:right">Fires</th><th style="text-align:right">Avg dur</th><th style="text-align:right">Errors</th></tr></thead><tbody>';
+      d.hooks.forEach(h => {
+        const errCls = h.error_count_7d > 0 ? 'warn' : '';
+        html += '<tr><td>' + esc(h.hook_name) + '</td><td style="text-align:right">' + h.fires_7d + '</td><td style="text-align:right">' + fmtMs(h.avg_duration_ms) + '</td><td style="text-align:right" class="' + errCls + '">' + h.error_count_7d + '</td></tr>';
+      });
+      html += '</tbody></table></div>';
+    }
+
+    // Panel 3: tool decision context
+    if (d.tools && d.tools.length) {
+      html += '<div class="card" style="grid-column: span 2"><h3>Tool Decision Context (7d)</h3>'
+        + '<table><thead><tr><th>Tool</th><th>Status</th><th style="text-align:right">N</th></tr></thead><tbody>';
+      d.tools.forEach(t => {
+        html += '<tr><td>' + esc(t.tool_name) + '</td><td>' + esc(t.result_status) + '</td><td style="text-align:right">' + t.n + '</td></tr>';
+      });
+      html += '</tbody></table></div>';
+    }
+
+    // Panel 4: cohort-aligned (last 10 turns)
+    if (d.cohort && d.cohort.length) {
+      html += '<div class="card" style="grid-column: span 2"><h3>Cohort-Aligned View (last 10 turns)</h3>'
+        + '<table><thead><tr><th>Turn</th><th style="text-align:right">Events</th><th style="text-align:right">Surface</th><th style="text-align:right">Tools</th><th style="text-align:right">Hooks</th></tr></thead><tbody>';
+      d.cohort.forEach(c => {
+        html += '<tr><td>' + c.turn + '</td><td style="text-align:right">' + c.events + '</td><td style="text-align:right">' + c.surface_fires + '</td><td style="text-align:right">' + c.tool_calls + '</td><td style="text-align:right">' + c.hook_fires + '</td></tr>';
+      });
+      html += '</tbody></table></div>';
+    }
+
+    // Panel 5: recent errors
+    if (d.errors) {
+      if (d.errors.length === 0) {
+        html += '<div class="card"><h3>Recent Errors (24h)</h3><p class="empty">No errors in the last 24 hours.</p></div>';
+      } else {
+        html += '<div class="card" style="grid-column: span 2"><h3>Recent Errors (24h)</h3>'
+          + '<table><thead><tr><th>Time</th><th>Event</th><th>Source</th><th>Detail</th></tr></thead><tbody>';
+        d.errors.forEach(e => {
+          html += '<tr><td>' + esc(e.ts) + '</td><td>' + esc(e.event_type) + '</td><td>' + esc(e.tool_name || e.hook_name || '') + '</td><td>' + esc(e.detail) + '</td></tr>';
+        });
+        html += '</tbody></table></div>';
+      }
+    }
+
+    document.getElementById('cards').innerHTML = html;
+  }
+
+  loadStats();
+  </script>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 
@@ -2342,6 +2733,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             self._html(HEALTH_HTML)
             return
+        if path == "/stats":
+            self._html(STATS_HTML)
+            return
         if path == "/":
             self._html(HTML)
             return
@@ -2359,16 +2753,32 @@ class Handler(BaseHTTPRequestHandler):
                 resp["agent"] = agent_name
                 self._json(resp)
         elif path == "/api/meta":
-            self._json({"agent": agent_name,
-                        "db_path": db_path,
-                        "default_agent": DEFAULT_AGENT,
-                        "label": AGENTS.get(agent_name, {}).get("label", agent_name)})
+            meta_resp = {"agent": agent_name,
+                         "db_path": db_path,
+                         "default_agent": DEFAULT_AGENT,
+                         "label": AGENTS.get(agent_name, {}).get("label", agent_name)}
+            # Include agent's memory-config (tier sizes, decay base) so the
+            # front-end tier-classification uses the actual config values,
+            # not viz-side hardcoded defaults. Lei flagged 2026-05-17 that
+            # viz was showing nodes as tier 3 because TIER2_MAX=1000 was
+            # hardcoded while config has tier2_max_nodes=4000.
+            meta_resp["memory_config"] = _resolve_agent_config(agent_name)
+            self._json(meta_resp)
         elif path == "/api/health":
             if not db_path:
                 self._json({"error": f"Unknown agent: {agent_name!r}",
                             "agent": agent_name})
             else:
                 resp = get_health_data(db_path)
+                resp["agent"] = agent_name
+                self._json(resp)
+        elif path == "/api/stats":
+            if not db_path:
+                self._json({"error": f"Unknown agent: {agent_name!r}",
+                            "agent": agent_name})
+            else:
+                index_db_path = _resolve_logs_index(agent_name)
+                resp = get_stats_data(index_db_path)
                 resp["agent"] = agent_name
                 self._json(resp)
         else:

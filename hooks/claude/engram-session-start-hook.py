@@ -287,6 +287,8 @@ def sleep_status_block() -> str:
 
 
 def main() -> None:
+    _t0 = time.perf_counter()
+
     try:
         hook_input = json.load(sys.stdin)
     except (json.JSONDecodeError, EOFError):
@@ -330,12 +332,42 @@ def main() -> None:
             "Instructions). Other Session Start Reading items can be skipped; "
             "the compaction summary carries work-thread continuity.]"
         )
-    print(json.dumps({
+    output_obj = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": "\n".join(lines),
         }
-    }))
+    }
+    output_str = json.dumps(output_obj)
+    print(output_str)
+
+    _duration_ms = int((time.perf_counter() - _t0) * 1000)
+
+    # Emit engram.hook.fire event. Failure must not break the hook.
+    try:
+        _session_id = hook_input.get("session_id", "unknown") or "unknown"
+        _transcript_path = hook_input.get("transcript_path", "") or ""
+        sys.path.insert(0, ENGRAM_HOME)
+        from engram_log_emitter import Emitter
+        _emitter = Emitter.init(
+            session_id=_session_id,
+            transcript_path=_transcript_path,
+        )
+        _emitter.emit(
+            event_type="engram.hook.fire",
+            level=1,
+            data={
+                "hook_name": "engram-session-start-hook",
+                "hook_type": "SessionStart",
+                "duration_ms": _duration_ms,
+                "exit_code": 0,
+                "stdout_bytes": len(output_str.encode("utf-8")),
+                "stderr_bytes": 0,
+                "context_mode": os.environ.get("ENGRAM_CONTEXT_MODE", "") or None,
+            },
+        )
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ marker file is missing or stale.
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -28,7 +29,35 @@ ENGRAM_HOME = os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram"))
 MARKER_PATH = os.path.join(ENGRAM_HOME, "last-compact-at.json")
 
 
+def _emit_hook_fire(session_id: str, transcript_path: str, duration_ms: int) -> None:
+    """Emit engram.hook.fire event. Failure must not break the hook."""
+    try:
+        sys.path.insert(0, ENGRAM_HOME)
+        from engram_log_emitter import Emitter
+        _emitter = Emitter.init(
+            session_id=session_id or "unknown",
+            transcript_path=transcript_path or "",
+        )
+        _emitter.emit(
+            event_type="engram.hook.fire",
+            level=1,
+            data={
+                "hook_name": "engram-postcompact-hook",
+                "hook_type": "PostCompact",
+                "duration_ms": duration_ms,
+                "exit_code": 0,
+                "stdout_bytes": 0,
+                "stderr_bytes": 0,
+                "context_mode": os.environ.get("ENGRAM_CONTEXT_MODE", "") or None,
+            },
+        )
+    except Exception:
+        pass
+
+
 def main() -> None:
+    _t0 = time.perf_counter()
+
     # Issue #140: read session_id + transcript_path from this hook's stdin
     # payload to resolve THIS session's JSONL race-free, instead of reading
     # a single shared global marker.
@@ -53,10 +82,12 @@ def main() -> None:
         jsonl_path = find_active_jsonl(session_id)
     if not jsonl_path or not os.path.exists(jsonl_path):
         # No active JSONL to mark — defensive no-op.
+        _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000))
         return
     try:
         byte_offset = os.path.getsize(jsonl_path)
     except OSError:
+        _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000))
         return
     marker = {
         "jsonl_path": jsonl_path,
@@ -78,6 +109,8 @@ def main() -> None:
     except TypeError:
         # Newer signature — safe to ignore the kwarg.
         write_baseline()
+
+    _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000))
 
 
 if __name__ == "__main__":
