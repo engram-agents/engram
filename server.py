@@ -4369,8 +4369,19 @@ def _search_nodes(
     include_superseded: bool = False,
     top_k: int = 10,
     use_semantic: bool = True,
+    embed_query: str | None = None,
 ) -> dict:
     """Pure FTS5 + semantic search.  No side effects (no refresh, no neighbor expansion).
+
+    Args:
+        query: the FTS5 keyword query (also used as semantic query when
+            embed_query is None — backward-compat default).
+        embed_query: optional separate semantic-search query string. When
+            provided, semantic search uses this instead of `query`. Used by
+            the auto-surface hook for short prompts that benefit from
+            prev-response-tail prepending on the embedding side WITHOUT
+            polluting FTS (which stays keyword-matched against `query`).
+            See alpha #177 + ~/borges-desk/projects/auto-surface-prepending/.
 
     Returns dict with:
         results: list of node dicts (from _node_to_dict) with match_type/similarity added
@@ -4378,6 +4389,8 @@ def _search_nodes(
         semantic_matches: count of semantic-only hits
         semantic_available: bool
     """
+    # Default embed_query to query if not explicitly provided (backward compat).
+    effective_embed_query = embed_query if embed_query is not None else query
     type_filter = set(t.strip() for t in types.split(",") if t.strip()) if types else None
     tier2_threshold = _get_tier_threshold(conn, 2)
 
@@ -4415,10 +4428,14 @@ def _search_nodes(
         pass  # FTS query syntax error — fall through to semantic
 
     # --- Semantic search (complement, not replace) ---
+    # Uses effective_embed_query (= explicit embed_query if provided, else
+    # the same query as FTS). This split lets the auto-surface hook prepend
+    # prev-response-tail to the SEMANTIC query for short prompts without
+    # polluting FTS keyword matching with arbitrary prior-context tokens.
     semantic_only: list[dict] = []
     if use_semantic and _embedder.is_available() and _get_embedding_config().get("enabled", True):
         sem_results = _semantic_search(
-            conn, query, top_k=top_k,
+            conn, effective_embed_query, top_k=top_k,
             type_filter=type_filter,
             importance_threshold=tier2_threshold,
         )
@@ -4492,6 +4509,7 @@ def engram_surface(
     query: str,
     top_k: int = 10,
     semantic: bool = True,
+    embed_query: str | None = None,
 ) -> str:
     """Shallow recall: search the KG and return a compact summary nudge.
 
@@ -4504,11 +4522,17 @@ def engram_surface(
     detail) or engram_get_subgraph (full evidence chain).
 
     Args:
-        query: Natural language search query.
+        query: Natural language search query (used for FTS keyword matching,
+            and as the default semantic query when embed_query is None).
         top_k: Maximum nodes to scan (default 10).
         semantic: Whether to include semantic (embedding) search. Set False
             for fast keyword-only recall (useful in hooks where latency
             matters). Default True.
+        embed_query: Optional separate semantic-search string. When provided,
+            semantic search uses embed_query while FTS still uses query.
+            Designed for the auto-surface hook to prepend prev-response-tail
+            for short prompts without polluting FTS keyword matching.
+            See alpha #177 area 1.
 
     Returns:
         JSON with compact summary: type counts, special nodes, top claims,
@@ -4516,7 +4540,8 @@ def engram_surface(
     """
     conn = _get_db()
     try:
-        search = _search_nodes(conn, query, top_k=top_k, use_semantic=semantic)
+        search = _search_nodes(conn, query, top_k=top_k, use_semantic=semantic,
+                               embed_query=embed_query)
         results = search["results"]
 
         if not results:

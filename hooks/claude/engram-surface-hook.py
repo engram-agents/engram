@@ -62,15 +62,107 @@ ERROR_INCIDENTS_PATH = os.path.join(ENGRAM_HOME, "error_incidents.json")
 NAP_WARN_THRESHOLD = 20   # Start suggesting nap
 NAP_URGENT_THRESHOLD = 25  # Escalate urgency
 
+# Auto-surface prev-response-prepending defaults — overridden by
+# config.json auto_surface section if present. Per alpha #177 area 1.
+DEFAULT_SHORT_PROMPT_THRESHOLD_CHARS = 100
+DEFAULT_PREV_RESPONSE_TAIL_CHARS = 500
 
-def query_daemon(prompt: str, top_k: int = 10) -> dict | None:
-    """Send query to the daemon via Unix socket. Returns result dict or None."""
+
+def _get_auto_surface_config() -> dict:
+    """Read auto_surface tunables from $ENGRAM_HOME/config.json.
+
+    Returns {short_prompt_threshold_chars, prev_response_tail_chars} with
+    defaults if config absent / malformed / section missing. Never raises.
+    Cheap (one file read per hook fire — sub-ms typically).
+    """
+    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    defaults = {
+        "short_prompt_threshold_chars": DEFAULT_SHORT_PROMPT_THRESHOLD_CHARS,
+        "prev_response_tail_chars": DEFAULT_PREV_RESPONSE_TAIL_CHARS,
+    }
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        section = config.get("auto_surface", {})
+        return {
+            "short_prompt_threshold_chars": int(
+                section.get("short_prompt_threshold_chars", defaults["short_prompt_threshold_chars"])
+            ),
+            "prev_response_tail_chars": int(
+                section.get("prev_response_tail_chars", defaults["prev_response_tail_chars"])
+            ),
+        }
+    except (OSError, ValueError, json.JSONDecodeError, TypeError):
+        return defaults
+
+
+def _read_prev_assistant_tail(transcript_path: str | None, tail_chars: int) -> str:
+    """Return the last `tail_chars` characters of the most-recent assistant
+    text message in the session JSONL. Empty string on any failure (missing
+    file, no prior assistant, malformed lines). Never raises.
+
+    Scans backward (read whole file, iterate reversed) since JSONL transcripts
+    are append-only and not huge in practice (a typical session JSONL is well
+    under 10 MB even after compaction).
+
+    TODO: if session JSONLs grow into tens-of-MB range (long-loop or
+    cross-compaction continuity work), switch to a tail-seek pattern (open
+    in binary mode, seek to end, walk backward by chunks looking for the
+    last few newlines). Round-1 PR #186 fairy flagged this as a real
+    long-tail concern; round-number defer until measured.
+    """
+    if not transcript_path or not os.path.exists(transcript_path):
+        return ""
+    try:
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return ""
+    for raw in reversed(lines):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") != "assistant":
+            continue
+        msg = obj.get("message", {}) or {}
+        content = msg.get("content", []) or []
+        # content is a list of blocks (text/tool_use/...) — concatenate text blocks
+        text_parts: list[str] = []
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", "") or "")
+        elif isinstance(content, str):
+            text_parts.append(content)
+        full_text = "".join(text_parts).strip()
+        if not full_text:
+            # An assistant entry with no text body (e.g., pure tool_use) —
+            # skip it and keep scanning further back.
+            continue
+        return full_text[-tail_chars:] if len(full_text) > tail_chars else full_text
+    return ""
+
+
+def query_daemon(prompt: str, top_k: int = 10, embed_query: str | None = None) -> dict | None:
+    """Send query to the daemon via Unix socket. Returns result dict or None.
+
+    embed_query: optional separate semantic-search string. When provided,
+    semantic search uses it while FTS still uses prompt. Used for short-
+    prompt prev-response-tail prepending (alpha #177 area 1).
+    """
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(10)
         sock.connect(SOCKET_PATH)
 
-        request = json.dumps({"query": prompt, "top_k": top_k}) + "\n"
+        req_obj: dict = {"query": prompt, "top_k": top_k}
+        if embed_query is not None:
+            req_obj["embed_query"] = embed_query
+        request = json.dumps(req_obj) + "\n"
         sock.sendall(request.encode("utf-8"))
 
         data = b""
@@ -400,12 +492,34 @@ def main():
     counter["prompts_since_compaction"] = counter.get("prompts_since_compaction", 0) + 1
     write_prompt_counter(counter)
 
+    # Auto-surface prepending for short prompts (alpha #177 area 1).
+    # If prompt is short ("good go ahead"), the embedding has no semantic
+    # anchor — prepend last K chars of prev assistant response to give the
+    # SEMANTIC query topic context. FTS still uses prompt alone (not
+    # polluted). Falls back gracefully: if no prev response or read fails,
+    # embed_query stays None and daemon defaults to query.
+    _as_cfg = _get_auto_surface_config()
+    embed_query: str | None = None
+    if len(prompt) < _as_cfg["short_prompt_threshold_chars"]:
+        prev_tail = _read_prev_assistant_tail(
+            hook_input.get("transcript_path"),
+            _as_cfg["prev_response_tail_chars"],
+        )
+        if prev_tail:
+            embed_query = f"{prev_tail}\n\n{prompt}"
+
     # Try daemon first (fast, semantic), fall back to FTS-only
     used_daemon = False
-    result = query_daemon(prompt)
+    result = query_daemon(prompt, embed_query=embed_query)
     if result is not None:
         used_daemon = True
     else:
+        # FTS-only fallback path. We intentionally do NOT forward embed_query
+        # here — this path explicitly disables semantic search (semantic=False
+        # inside query_fts_fallback), and FTS keyword matching has always used
+        # the raw prompt. Prepending prev-response-tail to a keyword search
+        # would pollute results with arbitrary prior-context tokens — exactly
+        # what the design intentionally avoided in the daemon path.
         result = query_fts_fallback(prompt)
 
     # Build context parts

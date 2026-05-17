@@ -82,11 +82,18 @@ def handle_client(conn, client):
         request = json.loads(data.decode("utf-8").strip())
         query = request.get("query", "")
         top_k = request.get("top_k", 10)
+        # Optional separate semantic query (auto-surface prepending for short
+        # prompts — alpha #177 area 1). When omitted/None the server defaults
+        # to query for both FTS and semantic (backward compat).
+        embed_query = request.get("embed_query")
 
         if not query:
             response = {"status": "ok", "result": {}}
         else:
-            result = _client.call("engram_surface", {"query": query, "top_k": top_k, "semantic": True})
+            args = {"query": query, "top_k": top_k, "semantic": True}
+            if embed_query is not None:
+                args["embed_query"] = embed_query
+            result = _client.call("engram_surface", args)
             response = {"status": "ok", "result": result}
 
         conn.sendall((json.dumps(response) + "\n").encode("utf-8"))
