@@ -419,6 +419,7 @@ the page to see new nodes.
 │   ├── engram-curiosity/             # research-mode self-driven inquiry
 │   ├── engram-retract/               # error-correction protocol
 │   ├── engram-learn-from-error/      # incident-based lesson capture
+│   ├── engram-upgrade/               # step-by-step upgrade via tools/deploy.sh
 │   └── ... (full list under skills/claude/ in the alpha tree)
 └── agents/
     ├── engram-dream-fairy.md         # dispatched by engram-sleep for parallel consolidation-scan
