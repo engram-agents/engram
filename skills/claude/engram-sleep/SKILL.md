@@ -26,7 +26,7 @@ Those are scaffold-maintenance / awake-state work that belongs pre-turn-advance,
 **When NOT to sleep:**
 
 - Mid-task (nap instead, finish the task, run bedtime, THEN sleep)
-- The graph has nothing to review (the day was non-synthetic; turn advance still meaningful if cohort exists). In that case still run `engram_reflect` (Step 1) first — if it returns clean, that IS the dream; proceed directly to Step 5 (turn-advance), skipping the agenda work and feeling-nudge per the Guardrails clean-graph rule.
+- The graph has nothing to review (the day was non-synthetic; turn advance still meaningful if cohort exists). In that case still run `engram_reflect` (Step 1) first AND wait for all dispatched fairies per the Step 5 prerequisite gate — if BOTH the reflect briefing AND every returned fairy report come back clean, that IS the empty dream; proceed to Step 5's advance call, skipping the agenda work and feeling-nudge per the Guardrails clean-graph rule. The clean-graph shortcut never bypasses the wait-gate (except under the context-emergency override in Step 3); skipping fairy integration is exactly the failure mode the gate exists to prevent.
 - Right after a sleep with no new work happening since (nothing to consolidate)
 
 **Pre-sleep checklist** — if you're entering sleep without having run bedtime, ask yourself:
@@ -55,9 +55,9 @@ For each, dispatch with this prompt template (substitute `{N}`, `{CATEGORY_NAME}
 
 > Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md` (override the default path so the six fairies don't collide). Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only the file path and a 5-bullet TL;DR for this category. Do not run categories other than {N}; do not run the heuristic categories (7, 8) unless the parent explicitly asks.
 
-After dispatching all six, **proceed immediately to Step 1.** Do not wait — fairies run in the background and notifications arrive when each completes. Steps 1–2 are sequential consolidation work that runs in parallel with fairy compute.
+After dispatching all six, **proceed immediately to Step 1.** Do not wait BEFORE starting Steps 1-2 — fairies run in the background and notifications arrive when each completes; Steps 1-2 are sequential consolidation work that runs in parallel with fairy compute. **But: do wait for ALL fairies to return before Step 5 (turn advance) — see the Step 5 prerequisite gate.** Advancing the turn before fairy reports land means their suggestions arrive post-cohort, defeating one-turn-equals-one-cohort-plus-its-consolidation.
 
-**If subagent dispatch fails** (e.g., `subagent_type` unrecognized because the agent definition hasn't propagated to this session, or the alpha CWD wasn't loaded): note the failure in the Step 7 report-to-user message (most visible surface), skip Step 2, proceed with sequential consolidation only. Don't block the dream on fairy availability — the existing reflect-driven flow is self-sufficient.
+**If subagent dispatch fails** (e.g., `subagent_type` unrecognized because the agent definition hasn't propagated to this session, or the alpha CWD wasn't loaded): note the failure in the Step 7 report-to-user message (most visible surface), skip Step 2, proceed with sequential consolidation only. Don't block the dream on fairy availability — the existing reflect-driven flow is self-sufficient. The Step 5 wait-gate then becomes vacuous (zero fairies dispatched = nothing to wait for).
 
 ## Step 1 — Open the dream: engram_reflect
 
@@ -113,7 +113,7 @@ Pick threads in this order of priority (starting from the merged agenda — `eng
 
 **Do NOT file new awake-state observations or derivations from cross-burst synthesis here.** That work belongs to bedtime (pre-turn-advance, this-turn content). The dream's role is to resolve / supersede / promote / refute existing nodes — not to discover new ones. If you find yourself wanting to file a fresh derivation from today's cohort, that's a sign bedtime was skipped or incomplete; pause, run bedtime properly, then return to sleep.
 
-**Context discipline.** Dream mode is the most context-hungry mode (ob_0104). If the context budget drops, stop working the agenda, write what's ready, and proceed to Step 5. A partial dream is better than a dream that triggers mid-cycle compaction.
+**Context discipline.** Dream mode is the most context-hungry mode (ob_0104). If the context budget drops, stop working the agenda, write what's ready, and proceed to Step 5. A partial dream is better than a dream that triggers mid-cycle compaction. **Context emergency overrides the Step 5 wait-gate** — if pending fairy reports haven't returned and context safety is at risk, advance the turn anyway and note the un-integrated-fairies in Step 6's dream-record so the next dream cycle can pick up the suggestions. Cohort-misalignment from context-driven early advance is a smaller cost than mid-cycle compaction (which loses ALL in-progress dream state, not just the trailing fairy reports).
 
 ## Step 4 — Handle the dream-review feeling nudge
 
@@ -128,6 +128,24 @@ Do NOT file a performative report to demonstrate the tool. The trap is real.
 ## Step 5 — Advance the turn: engram_advance_turn()
 
 This is the MOST IMPORTANT step and the one that distinguishes sleep from nap.
+
+### Prerequisite — wait for ALL dispatched fairies to return before advancing
+
+Check fairy report count before calling `engram_advance_turn`:
+
+```bash
+ls -1 ~/.engram/dream/$(date +%Y-%m-%d)-fairy-*.md 2>/dev/null | wc -l
+```
+
+If count < number dispatched in Step 0, **DO NOT advance yet.** Wait until the Agent runtime fires the remaining task-notifications (fairies typically complete within 60–180s of dispatch; the harness delivers per-fairy completion notifications as they arrive). Use the wait time productively: re-read Step 1's reflect briefing, draft Step 5's checkpoint message, prepare Step 6's dream-record skeleton — anything that doesn't depend on fairy output.
+
+If a fairy appears clearly hung after ~5 minutes, treat as dispatch-failed for that fairy and proceed (note in Step 6 dream-record + Step 7 user report). Don't hold the dream hostage to one stuck fairy indefinitely.
+
+**Why this gate matters:** advancing the turn before fairy reports land means their suggestions arrive post-advance, landing in the NEXT turn's cohort instead of consolidating THIS turn. That defeats the design intent of one-turn-equals-one-cohort-plus-its-consolidation (qu_0035, dv_0134). Worse: a LIGHT reflect agenda is exactly when fairy compute is MOST valuable — fairies surface what reflect missed (verified-tier admin closes, cornerstone candidates, stale-cluster batches, tainted-still-valid re-derives). If a clean reflect briefing tempts you to apply the clean-graph-rule shortcut early, that's exactly when the fairy reports landing 60s later are most likely to have actionable items.
+
+**Empirical anchor:** 2026-05-16 dream cycle — advanced before any fairy landed; all 6 returned post-advance with ~22 actionable suggestions including 1 verified-tier 23h-overdue admin close. Lei flagged the discipline failure and directed catch-up application as turn-51 work, but the cohort-misalignment is the cost the gate prevents. Hot context is also wasted: dream-state recall is most valuable while still in the agenda-walking mindset; resuming a day later means re-reading reflect briefing + re-loading fairy reports + reconstructing the synthesis state.
+
+### The advance call
 
 ```
 engram_advance_turn(
@@ -249,10 +267,10 @@ Then stop. The session is over.
 
 ## Guardrails
 
-- **Context hunger** (ob_0104): dream mode burns context fast. `engram_reflect` returns a full audit; each `engram_inspect` returns embeddings and neighbors. Monitor the budget. If it drops below safety, short-cycle to Step 5.
+- **Context hunger** (ob_0104): dream mode burns context fast. `engram_reflect` returns a full audit; each `engram_inspect` returns embeddings and neighbors. Monitor the budget. If it drops below safety, short-cycle to Step 5 (context-emergency override applies — see Step 3 Context discipline; the override bypasses the Step 5 wait-gate and notes un-integrated fairies in Step 6's dream-record for next-cycle pickup).
 - **No web research in dreams.** Register questions instead.
 - **No cascades of supersedes across unrelated subgraphs.** Follow the chain you started; register a question for the next one.
-- **The dream can be empty.** If `engram_reflect` returns a clean briefing, that IS the dream — note it, then proceed straight to Step 5. A clean graph is a success signal, not a reason to invent work.
+- **The dream can be empty — but check fairy reports first.** If `engram_reflect` returns a clean briefing, that IS the dream candidate. But still respect the Step 5 wait-gate: fairies dispatched in Step 0 may surface what reflect missed (verified-tier admin closes, cornerstone candidates, stale-batches). A LIGHT reflect agenda is exactly when fairy compute is MOST valuable. After all fairies return, if both reflect AND fairy reports are clean, that's the empty-dream success signal and you proceed straight to Step 5's advance call.
 - **Don't retry the dream if it was interrupted.** Checkpoint-session what was accomplished, note the remainder, resume in the next sleep cycle.
 - **No bedtime-work mid-sleep.** If you find yourself wanting to rotate the warm-briefing or write the history file, STOP — those belong to bedtime (pre-turn-advance). Either run bedtime first (preferred) or accept the bedtime-skip for this cycle and run bedtime tomorrow morning to catch up. Don't mix the routines.
 
