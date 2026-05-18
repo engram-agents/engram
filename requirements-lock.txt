@@ -14,15 +14,24 @@
 #         fastmcp sentence-transformers
 # (the --extra-index-url avoids the default CUDA torch wheels, keeping
 # the harness CPU-only and skipping ~2GB of nvidia-* transitive deps).
+# NOTE: this historical command does NOT include the load-bearing pins;
+# do not use it as a regeneration template. See "To regenerate" below.
 #
 # Refresh this file when bumping the requirements.txt ranges or when a
 # transitive dep needs to be re-pinned for a security release.
 #
 # To regenerate:
 #   docker run --rm python:3.12-slim bash -c \
-#     'pip install -q --extra-index-url https://download.pytorch.org/whl/cpu fastmcp sentence-transformers && pip freeze' \
+#     'pip install -q --extra-index-url https://download.pytorch.org/whl/cpu \
+#         fastmcp "sentence-transformers==5.3.0" "huggingface_hub==1.8.0" && pip freeze' \
 #     > requirements-lock.txt
 # (then re-add this header comment)
+#
+# IMPORTANT: the explicit pins above are load-bearing. Before bumping them
+# here, FIRST update the pins in requirements.txt and re-validate the
+# cold-start scenario on a fresh-cache machine. See #162. Running pip install
+# without these pins will re-introduce the broken sentence-transformers 5.4.x
+# / huggingface_hub 1.15.x combination.
 
 aiofile==3.9.0
 annotated-doc==0.0.4
@@ -53,7 +62,7 @@ hf-xet==1.5.0
 httpcore==1.0.9
 httpx==0.28.1
 httpx-sse==0.4.3
-huggingface_hub==1.15.0
+huggingface_hub==1.8.0
 idna==3.15
 importlib_metadata==8.7.1
 jaraco.classes==3.4.0
@@ -101,7 +110,7 @@ safetensors==0.7.0
 scikit-learn==1.8.0
 scipy==1.17.1
 SecretStorage==3.5.0
-sentence-transformers==5.5.0
+sentence-transformers==5.3.0
 setuptools==81.0.0
 shellingham==1.5.4
 sse-starlette==3.4.4

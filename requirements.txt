@@ -1,11 +1,17 @@
 # ENGRAM Alpha runtime dependencies.
 #
-# Version-ranged for forward-compat: pip will pull the latest compatible
-# release. For the exact known-working snapshot (used by CI + the Docker
-# test harness for reproducible builds), see requirements-lock.txt.
+# Version-ranged where safe; hard-pinned where a specific version is
+# load-bearing for correctness (see inline comments). For the exact
+# known-working snapshot used by CI + the Docker test harness, see
+# requirements-lock.txt.
 #
 # Install:  pip install -r requirements.txt
 # Upgrade:  pip install -U -r requirements.txt
 
 fastmcp>=3.0,<4
-sentence-transformers>=5.0,<6
+# Hard-pinned (not >=/<) — sentence-transformers 5.4.x hangs on HuggingFace
+# Hub metadata fetch during cold-start, even with weights fully cached. The
+# hang originates in huggingface_hub.file_download.get_hf_file_metadata, so
+# huggingface_hub is equally load-bearing and pinned alongside. See #162.
+sentence-transformers==5.3.0
+huggingface_hub==1.8.0
