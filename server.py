@@ -890,6 +890,15 @@ def _get_db() -> sqlite3.Connection:
     except sqlite3.OperationalError:
         pass  # already exists
 
+    # FTS5 vocabulary table — required by engram_idf.extract_keywords for IDF
+    # lookups used by the new _sanitize_fts_query path (alpha #177 area 1).
+    # ensure_vocab_table is idempotent; safe to call on every startup.
+    try:
+        from engram_idf import ensure_vocab_table
+        ensure_vocab_table(conn)
+    except Exception:
+        pass  # engram_idf unavailable or vocab table creation failed — non-fatal
+
     # ── sqlite-vec KNN index ────────────────────────────────────────────────
     # Virtual table mirroring (node_id, embedding) for every node with an
     # embedding. distance_metric=cosine returns (1 - cos_sim) directly; we
@@ -1092,14 +1101,57 @@ def _humanized_ago(then_iso: Optional[str], now: Optional[datetime] = None) -> s
     return f"{years}y ago"
 
 
-def _sanitize_fts_query(text: str) -> Optional[str]:
-    """Sanitize text for use in FTS5 MATCH expression.
+def _sanitize_fts_query(text: str, conn: sqlite3.Connection | None = None) -> Optional[str]:
+    """Build an FTS5 MATCH expression from `text`.
 
-    Wraps each whitespace-delimited token in double quotes so that
-    punctuation (periods, parentheses, etc.) and FTS5 operators
-    (AND, OR, NOT, NEAR) are treated as literals, not syntax.
-    Returns None if no valid tokens remain (caller should skip FTS).
+    NEW (alpha #177 area 1): extracts high-IDF keywords via engram_idf and
+    builds an OR-match instead of AND-of-all-tokens. The shift from AND to
+    OR is the load-bearing change — the previous AND-of-all-tokens behavior
+    silently zeroed FTS hits for any prompt with more than ~3 words.
+
+    Fallback: if conn is None or engram_idf is unavailable (test environments,
+    bootstrap), falls back to the legacy whitespace-split + AND behavior so
+    callers without DB access still get a valid (if weak) query.
+
+    Returns None if no valid keywords remain (caller should skip FTS).
     """
+    if conn is None:
+        return _sanitize_fts_query_legacy(text)  # preserved as a fallback
+
+    try:
+        from engram_idf import extract_keywords
+        keywords = extract_keywords(conn, text, min_idf=4.0, top_k=5)
+    except Exception:
+        return _sanitize_fts_query_legacy(text)
+
+    if not keywords:
+        return _sanitize_fts_query_legacy(text)  # nothing high-IDF — fall back
+
+    # Bi-gram OR-of-AND-pairs (Lei design, 2026-05-18 PM): require any two
+    # of the top-K filtered keywords to co-occur in the same doc.
+    # Empirically best variant across 7 FTS-shape experiments on the v4.2
+    # golden set: NDCG@10 0.332 vs baseline 0.342, MRR 0.482 vs baseline
+    # 0.421 (+0.061 MRR — strongest lift, top-slot-relevance).
+    # Sentence-aware variants tested and rejected: prompts in our corpus
+    # tend to pack topic-keywords into one sentence, so sentence boundaries
+    # discard valid cross-sentence combinations without offering topical-
+    # coherence gain. See findings doc and PR description for full data.
+    # Single-keyword case falls through to a single-term match; legacy
+    # AND-of-quoted-tokens still reachable when conn is None or
+    # extract_keywords returns empty.
+    quoted = [f'"{kw[0]}"' for kw in keywords]
+    if len(quoted) == 1:
+        return quoted[0]
+    pairs = []
+    for i in range(len(quoted)):
+        for j in range(i+1, len(quoted)):
+            pairs.append(f"({quoted[i]} AND {quoted[j]})")
+    return " OR ".join(pairs)
+
+
+def _sanitize_fts_query_legacy(text: str) -> Optional[str]:
+    """Legacy whitespace-split + AND behavior. Kept as fallback for callers
+    without DB access (tests, bootstrap, or engram_idf errors)."""
     tokens = text.split()
     quoted = []
     for t in tokens:
@@ -1980,7 +2032,7 @@ def _similar_existing_matches(
         # both callers — uniform with the semantic path's
         # importance_threshold arg (drift cleanup; see docstring).
         fts_ids: set[str] = set()
-        fts_query = _sanitize_fts_query(claim)
+        fts_query = _sanitize_fts_query(claim, conn)
         try:
             if not fts_query:
                 raise sqlite3.OperationalError("empty FTS query")
@@ -4458,7 +4510,7 @@ def _search_nodes(
     # --- FTS keyword search ---
     fts_ids: set[str] = set()
     fts_results: list[sqlite3.Row] = []
-    fts_query = _sanitize_fts_query(query)
+    fts_query = _sanitize_fts_query(query, conn)
     try:
         if not fts_query:
             raise sqlite3.OperationalError("empty FTS query")
@@ -4483,7 +4535,15 @@ def _search_nodes(
                 continue
             fts_results.append(r)
             fts_ids.add(r["id"])
-            if len(fts_results) >= top_k:
+            # Cap FTS at half of top_k so semantic results retain real estate
+            # in the merged output. With the new IDF-driven OR-match,
+            # _sanitize_fts_query can return 40-100+ hits for a single query;
+            # without this cap, FTS would fill every slot and crowd out the
+            # high-quality semantic matches that carried the baseline.
+            # The composite re-rank at the merge tail still sorts the
+            # combined pool, so strong FTS hits can still outrank weak
+            # semantic ones — the cap just ensures both paths get a seat.
+            if len(fts_results) >= max(1, top_k // 2):
                 break
     except sqlite3.OperationalError:
         pass  # FTS query syntax error — fall through to semantic
@@ -4516,7 +4576,12 @@ def _search_nodes(
         seen.add(r["id"])
         node = _node_to_dict(r)
         node["match_type"] = "keyword"
-        node["_relevance"] = 1.0  # FTS matches get max relevance
+        # Normalize BM25 rank to [0, 1] range comparable to semantic similarity.
+        # fts.rank is negative (more negative = better match). Map via
+        # 1 - 1/(1 + |rank|) → rank=0 gives 0, rank=-1 gives 0.5, rank=-inf gives 1.
+        # Monotonic, simple, no tuning knobs.
+        bm25_rank = r["rank"]  # negative float, more-negative = better
+        node["_relevance"] = 1.0 - 1.0 / (1.0 + abs(bm25_rank))
         output.append(node)
 
     remaining = top_k - len(output)
