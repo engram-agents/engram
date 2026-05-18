@@ -1145,6 +1145,15 @@ function selectNode(d) {
       if (d.resolved_by) field('Resolved by', d.resolved_by, true);
       break;
 
+    case 'feeling_report':
+      field('Claim', d.claim);
+      if (d.categorical_tag) field('Tag', d.categorical_tag);
+      if (d.intensity_hint != null) field('Intensity', d.intensity_hint.toFixed(2));
+      if (d.reported_state) field('Reported state', d.reported_state);
+      if (d.trigger_text) field('Trigger', d.trigger_text);
+      if (d.nudge_source) field('Nudge source', d.nudge_source);
+      break;
+
     default:
       field('Claim', d.claim);
       if (d.confidence != null) confBar(body, d.confidence);
@@ -1864,7 +1873,10 @@ def get_graph(db_path: str) -> dict:
         ]
         # Memory-management and semantic columns (added in later schema versions)
         extra_cols = ["importance_base", "importance_score", "recall_turn",
-                      "recall_count", "memory_status", "source_class", "utility_score"]
+                      "recall_count", "memory_status", "source_class", "utility_score",
+                      # feeling_report-specific columns
+                      "reported_state", "trigger_text", "categorical_tag",
+                      "intensity_hint", "nudge_source"]
         select_cols = base_cols + [c for c in extra_cols if c in col_names]
         cur.execute(f"SELECT {','.join(select_cols)} FROM nodes ORDER BY id")
         nodes = []
