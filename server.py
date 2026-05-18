@@ -4483,6 +4483,8 @@ def _search_nodes(
     top_k: int = 10,
     use_semantic: bool = True,
     embed_query: str | None = None,
+    *,
+    return_debug: bool = False,
 ) -> dict:
     """Pure FTS5 + semantic search.  No side effects (no refresh, no neighbor expansion).
 
@@ -4495,22 +4497,46 @@ def _search_nodes(
             prev-response-tail prepending on the embedding side WITHOUT
             polluting FTS (which stays keyword-matched against `query`).
             See alpha #177 + ~/borges-desk/projects/auto-surface-prepending/.
+        return_debug: if True, include a ``debug`` key in the returned dict
+            with intermediate ranking signals (keyword extraction, FTS/semantic
+            candidate counts, per-result scores). Default False — never bloats
+            normal responses. Used by SxS comparison UI and retrieval diagnostics.
 
     Returns dict with:
         results: list of node dicts (from _node_to_dict) with match_type/similarity added
         keyword_matches: count of FTS hits
         semantic_matches: count of semantic-only hits
         semantic_available: bool
+        debug: (only present when return_debug=True) intermediate ranking signals
     """
     # Default embed_query to query if not explicitly provided (backward compat).
     effective_embed_query = embed_query if embed_query is not None else query
     type_filter = set(t.strip() for t in types.split(",") if t.strip()) if types else None
     tier2_threshold = _get_tier_threshold(conn, 2)
 
+    # --- Debug signal capture (pre-search) ---
+    # Collected here, populated incrementally, assembled at return.
+    _dbg_extracted_keywords: list = []
+    _dbg_fts_candidate_count: int = 0
+    _dbg_semantic_candidate_count: int = 0
+    _dbg_fts_cap_value: Optional[int] = None
+    # Per-result debug signals keyed by node ID (populated during merge loops).
+    _dbg_per_result: dict[str, dict] = {}
+
+    if return_debug:
+        # Extract keywords using the same function _sanitize_fts_query calls
+        # internally — captures its output without modifying it.
+        try:
+            from engram_idf import extract_keywords
+            _dbg_extracted_keywords = list(extract_keywords(conn, query, min_idf=4.0, top_k=5))
+        except Exception:
+            _dbg_extracted_keywords = []
+
     # --- FTS keyword search ---
     fts_ids: set[str] = set()
     fts_results: list[sqlite3.Row] = []
     fts_query = _sanitize_fts_query(query, conn)
+    fts_cap = max(1, top_k // 2)  # reservation cap for FTS
     try:
         if not fts_query:
             raise sqlite3.OperationalError("empty FTS query")
@@ -4523,6 +4549,9 @@ def _search_nodes(
                LIMIT ?""",
             (fts_query, top_k * 3),
         ).fetchall()
+
+        if return_debug:
+            _dbg_fts_candidate_count = len(fts_rows)
 
         for r in fts_rows:
             if type_filter and r["type"] not in type_filter:
@@ -4543,8 +4572,12 @@ def _search_nodes(
             # The composite re-rank at the merge tail still sorts the
             # combined pool, so strong FTS hits can still outrank weak
             # semantic ones — the cap just ensures both paths get a seat.
-            if len(fts_results) >= max(1, top_k // 2):
+            if len(fts_results) >= fts_cap:
                 break
+
+        if return_debug and len(fts_results) >= fts_cap:
+            _dbg_fts_cap_value = fts_cap
+
     except sqlite3.OperationalError:
         pass  # FTS query syntax error — fall through to semantic
 
@@ -4560,6 +4593,8 @@ def _search_nodes(
             type_filter=type_filter,
             importance_threshold=tier2_threshold,
         )
+        if return_debug:
+            _dbg_semantic_candidate_count = len(sem_results)
         for s in sem_results:
             if s["id"] not in fts_ids:
                 if s["confidence"] is not None and s["confidence"] < min_confidence:
@@ -4581,7 +4616,25 @@ def _search_nodes(
         # 1 - 1/(1 + |rank|) → rank=0 gives 0, rank=-1 gives 0.5, rank=-inf gives 1.
         # Monotonic, simple, no tuning knobs.
         bm25_rank = r["rank"]  # negative float, more-negative = better
-        node["_relevance"] = 1.0 - 1.0 / (1.0 + abs(bm25_rank))
+        relevance_norm = 1.0 - 1.0 / (1.0 + abs(bm25_rank))
+        node["_relevance"] = relevance_norm
+        if return_debug:
+            _dbg_per_result[r["id"]] = {
+                "id": r["id"],
+                # Use the same "keyword" label the result-node API uses
+                # (line 2063) so debug consumers can cross-reference cleanly.
+                "match_type": "keyword",
+                "bm25_raw": bm25_rank,
+                "relevance_normalized": relevance_norm,
+                "similarity": None,
+                "composite_score": None,   # computed below after re-rank
+                "utility_score": node.get("utility_score"),
+                "importance_score": node.get("importance_score"),
+                "importance_base": node.get("importance_base"),
+                "confidence": node.get("confidence"),
+                "surprise_score": None,    # not stored as a column
+                "recall_turn": node.get("recall_turn"),
+            }
         output.append(node)
 
     remaining = top_k - len(output)
@@ -4595,6 +4648,21 @@ def _search_nodes(
             node["match_type"] = "semantic"
             node["similarity"] = s["similarity"]
             node["_relevance"] = s["similarity"]
+            if return_debug:
+                _dbg_per_result[s["id"]] = {
+                    "id": s["id"],
+                    "match_type": "semantic",
+                    "bm25_raw": None,
+                    "relevance_normalized": None,
+                    "similarity": s["similarity"],
+                    "composite_score": None,   # computed below after re-rank
+                    "utility_score": node.get("utility_score"),
+                    "importance_score": node.get("importance_score"),
+                    "importance_base": node.get("importance_base"),
+                    "confidence": node.get("confidence"),
+                    "surprise_score": None,    # not stored as a column
+                    "recall_turn": node.get("recall_turn"),
+                }
             output.append(node)
 
     # --- Utility-weighted re-ranking (MemRL Phase B, cj_0027) ---
@@ -4604,18 +4672,48 @@ def _search_nodes(
         for node in output:
             util = node.get("utility_score", 0) or 0.0
             rel = node.pop("_relevance", 0.5)
-            node["_composite"] = (1 - UTILITY_LAMBDA) * rel + UTILITY_LAMBDA * util
+            composite = (1 - UTILITY_LAMBDA) * rel + UTILITY_LAMBDA * util
+            node["_composite"] = composite
+            if return_debug and node.get("id") in _dbg_per_result:
+                _dbg_per_result[node["id"]]["composite_score"] = composite
         output.sort(key=lambda x: x.pop("_composite", 0), reverse=True)
     else:
         for node in output:
-            node.pop("_relevance", None)
+            rel = node.pop("_relevance", None)
+            if return_debug and rel is not None and node.get("id") in _dbg_per_result:
+                # When UTILITY_LAMBDA == 0, composite == relevance (no utility weighting).
+                _dbg_per_result[node["id"]]["composite_score"] = rel
 
-    return {
+    base_result = {
         "results": output,
         "keyword_matches": len(fts_results),
         "semantic_matches": len(semantic_only),
         "semantic_available": _embedder.is_available(),
     }
+
+    if return_debug:
+        # Build per_result list in the same order as output (post-sort).
+        per_result_ordered = [
+            _dbg_per_result[node["id"]]
+            for node in output
+            if node.get("id") in _dbg_per_result
+        ]
+        base_result["debug"] = {
+            "extracted_keywords": _dbg_extracted_keywords,
+            "fts_query_string": fts_query,
+            "fts_candidate_count": _dbg_fts_candidate_count,
+            "semantic_candidate_count": _dbg_semantic_candidate_count,
+            "fts_cap_applied": _dbg_fts_cap_value,
+            # Always emit the actual query passed to the embedder (whether
+            # it was the caller's `query` arg or an explicit `embed_query`
+            # override for prepending). The flag distinguishes the two cases.
+            "embed_query_used": effective_embed_query,
+            "embed_query_overridden": embed_query is not None,
+            "per_result": per_result_ordered,
+            "snapshot_turn": _get_current_turn(),
+        }
+
+    return base_result
 
 
 # ---- Query tools ----
@@ -4995,6 +5093,7 @@ def engram_query(
     min_confidence: float = 0.0,
     include_superseded: bool = False,
     top_k: int = 10,
+    return_debug: bool = False,
 ) -> str:
     """Search the knowledge graph by natural language query.
 
@@ -5021,15 +5120,21 @@ def engram_query(
         min_confidence: Only return nodes at or above this confidence threshold (0.0–1.0).
         include_superseded: If True, include non-current (superseded) nodes. Default False.
         top_k: Maximum results to return (default 10).
+        return_debug: If True, include a ``debug`` key in the response with intermediate
+            ranking signals (extracted keywords, FTS/semantic candidate counts, per-result
+            scores). Default False — never bloats normal responses. Intended for SxS
+            comparison and retrieval diagnostics.
 
     Returns:
         JSON with matching nodes, each including its claim, confidence, type, and immediate neighbors.
+        When return_debug=True, also includes a ``debug`` key with ranking internals.
     """
     conn = _get_db()
     try:
         search = _search_nodes(
             conn, query, types=types, min_confidence=min_confidence,
             include_superseded=include_superseded, top_k=top_k,
+            return_debug=return_debug,
         )
 
         # Enrich results with neighbors (legacy behavior)
@@ -5066,23 +5171,24 @@ def engram_query(
             },
         )
 
-        return json.dumps(
-            {
-                "query": query,
-                "results": output,
-                "count": len(output),
-                "search_methods": {
-                    "keyword_matches": search["keyword_matches"],
-                    "semantic_matches": search["semantic_matches"],
-                    "semantic_available": search["semantic_available"],
-                },
-                "message": (
-                    f"Found {len(output)} matching node(s)."
-                    if output
-                    else "No matching nodes found in the knowledge graph."
-                ),
-            }
-        )
+        response_body: dict = {
+            "query": query,
+            "results": output,
+            "count": len(output),
+            "search_methods": {
+                "keyword_matches": search["keyword_matches"],
+                "semantic_matches": search["semantic_matches"],
+                "semantic_available": search["semantic_available"],
+            },
+            "message": (
+                f"Found {len(output)} matching node(s)."
+                if output
+                else "No matching nodes found in the knowledge graph."
+            ),
+        }
+        if return_debug and "debug" in search:
+            response_body["debug"] = search["debug"]
+        return json.dumps(response_body)
     finally:
         conn.close()
 
