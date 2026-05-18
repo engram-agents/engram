@@ -14,6 +14,7 @@ Exit codes:
 import json
 import os
 import socket
+import sqlite3
 import sys
 import time
 
@@ -57,6 +58,7 @@ FEELING_NUDGE_MARKER = os.path.join(ENGRAM_HOME, "feeling-nudge-active.json")
 WARM_BRIEFING_PATH = os.path.join(ENGRAM_HOME, "warm-briefing.md")
 ERROR_PATTERNS_PATH = os.path.join(ENGRAM_HOME, "error_patterns.json")
 ERROR_INCIDENTS_PATH = os.path.join(ENGRAM_HOME, "error_incidents.json")
+KNOWLEDGE_DB_PATH = os.path.join(ENGRAM_HOME, "knowledge.db")
 
 # Prompt count thresholds for consolidation warnings
 NAP_WARN_THRESHOLD = 20   # Start suggesting nap
@@ -67,18 +69,27 @@ NAP_URGENT_THRESHOLD = 25  # Escalate urgency
 DEFAULT_SHORT_PROMPT_THRESHOLD_CHARS = 100
 DEFAULT_PREV_RESPONSE_TAIL_CHARS = 500
 
+# IDF-based prepending gate defaults — alpha #177 area 1 refinement (PR after #192).
+DEFAULT_IDF_GATE_MIN_IDF = 4.0
+DEFAULT_IDF_GATE_SHORT_PROMPT_FLOOR_CHARS = 40
+DEFAULT_IDF_GATE_ENABLED = True  # feature flag for safe rollout
+
 
 def _get_auto_surface_config() -> dict:
     """Read auto_surface tunables from $ENGRAM_HOME/config.json.
 
-    Returns {short_prompt_threshold_chars, prev_response_tail_chars} with
-    defaults if config absent / malformed / section missing. Never raises.
+    Returns {short_prompt_threshold_chars, prev_response_tail_chars,
+    idf_gate_enabled, idf_gate_min_idf, idf_gate_short_prompt_floor_chars}
+    with defaults if config absent / malformed / section missing. Never raises.
     Cheap (one file read per hook fire — sub-ms typically).
     """
     config_path = os.path.join(ENGRAM_HOME, "config.json")
     defaults = {
         "short_prompt_threshold_chars": DEFAULT_SHORT_PROMPT_THRESHOLD_CHARS,
         "prev_response_tail_chars": DEFAULT_PREV_RESPONSE_TAIL_CHARS,
+        "idf_gate_enabled": DEFAULT_IDF_GATE_ENABLED,
+        "idf_gate_min_idf": DEFAULT_IDF_GATE_MIN_IDF,
+        "idf_gate_short_prompt_floor_chars": DEFAULT_IDF_GATE_SHORT_PROMPT_FLOOR_CHARS,
     }
     try:
         with open(config_path, "r", encoding="utf-8") as f:
@@ -90,6 +101,15 @@ def _get_auto_surface_config() -> dict:
             ),
             "prev_response_tail_chars": int(
                 section.get("prev_response_tail_chars", defaults["prev_response_tail_chars"])
+            ),
+            "idf_gate_enabled": bool(
+                section.get("idf_gate_enabled", defaults["idf_gate_enabled"])
+            ),
+            "idf_gate_min_idf": float(
+                section.get("idf_gate_min_idf", defaults["idf_gate_min_idf"])
+            ),
+            "idf_gate_short_prompt_floor_chars": int(
+                section.get("idf_gate_short_prompt_floor_chars", defaults["idf_gate_short_prompt_floor_chars"])
             ),
         }
     except (OSError, ValueError, json.JSONDecodeError, TypeError):
@@ -145,6 +165,53 @@ def _read_prev_assistant_tail(transcript_path: str | None, tail_chars: int) -> s
             continue
         return full_text[-tail_chars:] if len(full_text) > tail_chars else full_text
     return ""
+
+
+def _should_prepend(prompt: str, conn: sqlite3.Connection, cfg: dict) -> bool:
+    """IDF-based prepending gate. Returns True if prev_response_tail should be
+    prepended to the embedding query.
+
+    Three-rule decision, in order:
+      Rule 1: very short prompts can't self-anchor — always prepend.
+      Rule 2: if prompt has high-IDF non-stopword tokens, it self-anchors — skip.
+      Fallback: if engram_idf unavailable or any DB error occurs, fall back to
+        the legacy char-length heuristic. Preserves previous behavior on infra
+        failure.
+
+    Note: only called when cfg["idf_gate_enabled"] is True. The feature-flag
+    check lives in the call site (main()), not here, so the function contract
+    is clean for tests.
+    """
+    # Rule 1: very short prompts can't self-anchor — always prepend.
+    if len(prompt) < cfg["idf_gate_short_prompt_floor_chars"]:
+        return True
+
+    # Rule 2: if prompt has high-IDF non-stopword tokens, it self-anchors — skip.
+    # NOTE: we read the existing nodes_fts_vocab table but do NOT create it here.
+    # The hook opens a read-only connection (mode=ro), so a CREATE would fail
+    # anyway, but the deeper reason is separation of concerns: the hook reads;
+    # server.py startup is responsible for ensuring the schema exists. If the
+    # vocab table is missing, extract_keywords raises OperationalError and the
+    # except-block falls back to the legacy heuristic — safe behavior on any
+    # install that hasn't yet picked up the FTS-rewrite PR's startup bootstrap.
+    try:
+        if PROJECT_DIR not in sys.path:
+            sys.path.insert(0, PROJECT_DIR)
+        from engram_idf import extract_keywords
+        keywords = extract_keywords(
+            conn,
+            prompt,
+            min_idf=cfg["idf_gate_min_idf"],
+            top_k=5,
+        )
+        if keywords:
+            return False  # prompt has self-anchoring keywords
+        return True  # no high-IDF keywords — prepend for context
+    except Exception:
+        # Fallback to legacy char-length heuristic if engram_idf unavailable
+        # (ImportError) or any DB error occurs (vocab table missing, mode=ro
+        # conflict, etc). Preserves previous behavior on infra failure.
+        return len(prompt) < cfg["short_prompt_threshold_chars"]
 
 
 def query_daemon(prompt: str, top_k: int = 10, embed_query: str | None = None) -> dict | None:
@@ -492,21 +559,39 @@ def main():
     counter["prompts_since_compaction"] = counter.get("prompts_since_compaction", 0) + 1
     write_prompt_counter(counter)
 
-    # Auto-surface prepending for short prompts (alpha #177 area 1).
-    # If prompt is short ("good go ahead"), the embedding has no semantic
-    # anchor — prepend last K chars of prev assistant response to give the
-    # SEMANTIC query topic context. FTS still uses prompt alone (not
-    # polluted). Falls back gracefully: if no prev response or read fails,
-    # embed_query stays None and daemon defaults to query.
+    # Auto-surface prepending gate (alpha #177 area 1, IDF refinement).
+    # If prompt lacks self-anchoring keywords, prepend last K chars of the
+    # prev assistant response to give the SEMANTIC query topic context.
+    # FTS still uses the raw prompt alone (not polluted).
+    # Falls back gracefully: if no prev response or read fails, embed_query
+    # stays None and daemon defaults to query.
     _as_cfg = _get_auto_surface_config()
     embed_query: str | None = None
-    if len(prompt) < _as_cfg["short_prompt_threshold_chars"]:
-        prev_tail = _read_prev_assistant_tail(
-            hook_input.get("transcript_path"),
-            _as_cfg["prev_response_tail_chars"],
-        )
-        if prev_tail:
-            embed_query = f"{prev_tail}\n\n{prompt}"
+    conn = None
+    try:
+        if _as_cfg["idf_gate_enabled"]:
+            # IDF-based gate: open a read-only DB connection for keyword lookup.
+            # extract_keywords doesn't use sqlite-vec, so skip the extension load.
+            conn = sqlite3.connect(f"file:{KNOWLEDGE_DB_PATH}?mode=ro", uri=True)
+            should_prepend = _should_prepend(prompt, conn, _as_cfg)
+        else:
+            # Feature flag off — legacy char-length heuristic.
+            should_prepend = len(prompt) < _as_cfg["short_prompt_threshold_chars"]
+
+        if should_prepend:
+            prev_tail = _read_prev_assistant_tail(
+                hook_input.get("transcript_path"),
+                _as_cfg["prev_response_tail_chars"],
+            )
+            if prev_tail:
+                embed_query = f"{prev_tail}\n\n{prompt}"
+    except Exception:
+        # Any unexpected failure in gate logic must not break the hook.
+        # Degrade to no-prepend (embed_query stays None).
+        embed_query = None
+    finally:
+        if conn is not None:
+            conn.close()
 
     # Try daemon first (fast, semantic), fall back to FTS-only
     used_daemon = False
