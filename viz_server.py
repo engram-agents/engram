@@ -1829,7 +1829,7 @@ def get_agents_meta() -> list:
             entry["current_node_count"] = 0
         else:
             try:
-                conn = sqlite3.connect(f"file:{info['db']}?mode=ro&immutable=1", uri=True)
+                conn = sqlite3.connect(f"file:{info['db']}?mode=ro", uri=True)
                 cnt = conn.execute(
                     "SELECT COUNT(*) FROM nodes WHERE is_current = 1"
                 ).fetchone()[0]
@@ -1856,7 +1856,7 @@ def get_graph(db_path: str) -> dict:
     if not os.path.exists(db_path):
         return {"nodes": [], "edges": [], "error": f"Database not found: {db_path}"}
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
@@ -1915,9 +1915,11 @@ def get_health_data(db_path: str) -> dict:
     if not os.path.exists(db_path):
         return {"error": f"Database not found: {db_path}"}
     try:
-        # Read-only: in multi-agent mode this process only has read access
-        # to peer agents' DBs (owner UID writes; group=agents reads).
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+        # Read-only via mode=ro; multi-agent peer-DB safety is enforced by
+        # OS file permissions (owner UID writes; group=agents reads), not by
+        # this URI flag. The previous `immutable=1` was dropped (#184) because
+        # it caused the reader to ignore -wal entirely → silent staleness.
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
 
         data: dict = {}
@@ -2431,7 +2433,10 @@ def get_stats_data(index_db_path: str) -> dict:
     if not index_db_path or not os.path.exists(index_db_path):
         return {"empty": True, "reason": "No index.db at expected location yet — has the indexer run? Try: python3 ~/.engram/engram_log_indexer.py"}
     try:
-        conn = sqlite3.connect(index_db_path)
+        # mode=ro defensively; engram_log_indexer.py uses DELETE journal mode
+        # today so no WAL-staleness risk exists, but if it ever switches to WAL,
+        # mode=ro is correct AND we still need to NOT carry immutable=1 (#184).
+        conn = sqlite3.connect(f"file:{index_db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
     except sqlite3.Error as exc:
         return {"empty": True, "reason": f"Could not open index.db: {exc}"}
