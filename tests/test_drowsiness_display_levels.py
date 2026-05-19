@@ -119,7 +119,9 @@ class TestFormatDrowsinessOutput(unittest.TestCase):
     def test_a_little_drowsy_has_level_plus_warning(self, exists_mock):
         """At a_little_drowsy threshold, level word + warning text (no percentage)."""
         exists_mock.return_value = False
-        out = ct.format_drowsiness(self._usage(0.85, mode="1m"))
+        defaults_1m = ct.DEFAULT_DROWSINESS_THRESHOLDS_BY_MODE["1m"]
+        with patch.object(ct, "_load_drowsiness_thresholds", return_value=defaults_1m):
+            out = ct.format_drowsiness(self._usage(0.85, mode="1m"))
         self.assertIn("a little drowsy", out)
         self.assertIn("Plan a nap soon", out)
         self.assertNotIn("85%", out)
@@ -128,7 +130,9 @@ class TestFormatDrowsinessOutput(unittest.TestCase):
     def test_needs_a_nap_shows_percentage(self, exists_mock):
         """At urgent threshold, percentage is shown explicitly (calibration signal)."""
         exists_mock.return_value = False
-        out = ct.format_drowsiness(self._usage(0.92, mode="1m"))
+        defaults_1m = ct.DEFAULT_DROWSINESS_THRESHOLDS_BY_MODE["1m"]
+        with patch.object(ct, "_load_drowsiness_thresholds", return_value=defaults_1m):
+            out = ct.format_drowsiness(self._usage(0.92, mode="1m"))
         self.assertIn("needs a nap", out)
         self.assertIn("92%", out)
         self.assertIn("Stop current work", out)
@@ -154,7 +158,9 @@ class TestFormatDrowsinessOutput(unittest.TestCase):
     def test_loop_mode_at_urgent_shows_percentage(self, exists_mock):
         """Loop mode + urgent: percentage shown (so the agent sees calibration)."""
         exists_mock.return_value = True
-        out = ct.format_drowsiness(self._usage(0.93, mode="1m"))
+        defaults_1m = ct.DEFAULT_DROWSINESS_THRESHOLDS_BY_MODE["1m"]
+        with patch.object(ct, "_load_drowsiness_thresholds", return_value=defaults_1m):
+            out = ct.format_drowsiness(self._usage(0.93, mode="1m"))
         self.assertIn("needs a nap", out)
         self.assertIn("93%", out)
         self.assertIn("loop mode", out)
