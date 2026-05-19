@@ -991,6 +991,15 @@ def _get_db() -> sqlite3.Connection:
         # Focused nodes rotate with work — unfocus when relevance drops.
         ("focused_at", "TEXT"),
         ("focus_reason", "TEXT"),
+        # ── recall quality columns ──
+        # Curated ≤120-char summary string authored by Sonnet for fast agent
+        # recognition (PR A substrate; backfill via PR B sleep-fairy).
+        # NULL on existing rows and when not yet generated.
+        ("recall_summary", "TEXT"),
+        # JSON-encoded list of 3 short keyword strings for structural recognition
+        # cues and future-leverage for facet listing / keyword search / clustering.
+        # Format: '["kw1", "kw2", "kw3"]'. NULL on existing rows.
+        ("recall_keywords", "TEXT"),
     ]:
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} {typedef}")
@@ -5235,6 +5244,9 @@ def engram_surface(
         # contradiction, question, conjecture, lesson) and sparse anchor-types
         # (definition, person, goal). All now bypass composite+MMR in
         # _search_nodes, so they can arrive here even when relevance is low.
+        # Display cap: top-3 by retrieval order (symmetric with top_claims).
+        # Retrieval cap (SPECIAL_POOL_CAP=10) is separate — this is the display
+        # slice only.
         special = []
         for n in results:
             ntype = n.get("type", "")
@@ -5243,6 +5255,8 @@ def engram_surface(
                     "id": n["id"], "type": ntype,
                     "claim": n.get("claim", ""),
                     "created_ago": _humanized_ago(n.get("created_at"), now=now_utc),
+                    "recall_summary": n.get("recall_summary"),
+                    "recall_keywords": json.loads(n.get("recall_keywords") or "null"),
                 }
                 if ntype == "question":
                     entry["status"] = n.get("status", "open")
@@ -5252,6 +5266,7 @@ def engram_surface(
                 elif ntype == "axiom":
                     entry["confidence"] = n.get("confidence")
                 special.append(entry)
+        special = special[:3]
 
         # --- Top claims (MMR-ordered, non-special) ---
         # Historically this block re-sorted claim_nodes by raw confidence-desc
@@ -5275,6 +5290,8 @@ def engram_surface(
                 "claim": n.get("claim", ""),
                 "confidence": n.get("confidence"),
                 "created_ago": _humanized_ago(n.get("created_at"), now=now_utc),
+                "recall_summary": n.get("recall_summary"),
+                "recall_keywords": json.loads(n.get("recall_keywords") or "null"),
             }
             for n in claim_nodes[:3]
         ]
@@ -5329,6 +5346,26 @@ def engram_surface(
         # --- All matched IDs for follow-up ---
         matched_ids = [n["id"] for n in results]
 
+        # --- Per-node metadata for "Others" digest rendering (Lei 2026-05-19 PM) ---
+        # Surfaces id + type + recall_keywords for every matched node so the
+        # hook can render a faceted "Others:" list with keyword prefixes for
+        # the nodes not in top_claims/special_nodes. Keywords-only (no summary)
+        # keeps the lossy-by-design noetic-register principle intact: the agent
+        # gets a richer index for "which one should I deliberate-recall on"
+        # without flooding context with claim content.
+        matched_meta = []
+        for n in results:
+            kw_raw = n.get("recall_keywords")
+            try:
+                kw = json.loads(kw_raw) if kw_raw else None
+            except (json.JSONDecodeError, TypeError):
+                kw = None
+            matched_meta.append({
+                "id": n["id"],
+                "type": n.get("type"),
+                "recall_keywords": kw,
+            })
+
         summary = {
             "query": query,
             "match_count": len(results),
@@ -5343,6 +5380,7 @@ def engram_surface(
             },
             "issues": {},
             "matched_ids": matched_ids,
+            "matched_meta": matched_meta,
             "search_methods": {
                 "keyword_matches": search["keyword_matches"],
                 "semantic_matches": search["semantic_matches"],

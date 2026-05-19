@@ -265,8 +265,68 @@ def query_fts_fallback(prompt: str, top_k: int = 10) -> dict | None:
         return None
 
 
+def render_one_node_line(entry: dict, *, conf_prefix: bool, type_tag: bool) -> str:
+    """Render a single node as a compact line for the recall nudge.
+
+    Format:
+        - [<id>] <conf or type-tag> <kw_prefix><summary_or_fallback>
+
+    Args:
+        entry: node dict (id, claim, confidence, recall_summary, recall_keywords, type, …)
+        conf_prefix: if True, render ``(conf X.XX)`` ONLY when
+            ``entry.get("confidence") is not None``. Passed True for both
+            specials and top_claims — the None-guard suppresses the prefix
+            for special types that lack a confidence field (question,
+            person, definition, goal, lesson, contradiction) while still
+            rendering it for axioms/conjectures (which carry epistemic weight).
+        type_tag: if True, render ``[<type>]`` tag (for specials, so agent can
+            scan what kind of anchor this is).
+    """
+    nid = entry.get("id", "?")
+    ntype = entry.get("type", "?")
+    claim = entry.get("claim", "")
+    confidence = entry.get("confidence")
+    recall_summary = entry.get("recall_summary")
+    recall_keywords = entry.get("recall_keywords")
+
+    # Build prefix tokens (conf / type-tag)
+    prefix_parts = []
+    if type_tag:
+        prefix_parts.append(f"[{ntype}]")
+    if conf_prefix and confidence is not None:
+        prefix_parts.append(f"(conf {confidence:.2f})")
+    prefix = (" ".join(prefix_parts) + " ") if prefix_parts else ""
+
+    # Build keyword prefix: `kw1` · `kw2` · `kw3` —
+    if isinstance(recall_keywords, list) and len(recall_keywords) == 3:
+        kw_prefix = " · ".join(f"`{kw}`" for kw in recall_keywords) + " — "
+    else:
+        kw_prefix = ""
+
+    # Summary or fallback
+    if recall_summary is not None:
+        body = recall_summary
+    elif len(claim) > 120:
+        body = claim[:117] + "…"
+    else:
+        body = claim
+
+    return f"- [{nid}] {prefix}{kw_prefix}{body}"
+
+
 def format_nudge(result: dict) -> str:
-    """Format engram_surface result into a compact nudge string."""
+    """Format engram_surface result into a compact nudge string.
+
+    Layout (2026-05-19 redesign):
+      1. Header
+      2. Noteworthy: <type counts> (when specials present)
+      3. Specials section (rendered with full content, BEFORE top_claims)
+      4. Top claims section (with keyword+summary format)
+      5. Warnings / Memory / IDs / footer
+
+    Types: line dropped — Noteworthy already conveys the type breakdown for
+    specials, and when no specials are present the Types line is stats-noise.
+    """
     total = result.get("match_count", 0)
     if total == 0:
         return ""
@@ -274,31 +334,29 @@ def format_nudge(result: dict) -> str:
     lines = []
     lines.append(f"[ENGRAM Recall: {total} nodes match your query]")
 
-    # Special nodes
+    # Special nodes — rendered BEFORE top_claims
     special = result.get("special_nodes", [])
     if special:
         from collections import Counter
         type_counts_special = Counter(n.get("type", "unknown") for n in special)
         parts = [f"{c} {t}" for t, c in type_counts_special.items()]
         lines.append(f"  Noteworthy: {', '.join(parts)}")
+        lines.append("  Specials:")
+        # Defensive [:3] — engram_surface already caps specials at 3 (server.py:5269),
+        # but the slice here protects against any future surface payload that returns more.
+        for s in special[:3]:
+            line = render_one_node_line(s, conf_prefix=True, type_tag=True)
+            lines.append(f"    {line}")
 
-    # Type distribution
-    type_counts = result.get("type_counts", {})
-    if type_counts:
-        dist = ", ".join(f"{t}: {c}" for t, c in type_counts.items())
-        lines.append(f"  Types: {dist}")
-
-    # Top claims
+    # Top claims (keyword+summary format)
     top_claims = result.get("top_claims", [])
     if top_claims:
         lines.append("  Top claims:")
-        for c in top_claims:
-            cid = c.get("id", "?")
-            claim = c.get("claim", "?")
-            conf = c.get("confidence", 0)
-            if len(claim) > 120:
-                claim = claim[:117] + "..."
-            lines.append(f"    - [{cid}] (conf {conf:.2f}) {claim}")
+        # Defensive [:3] — engram_surface already caps top_claims at 3 (server.py:5296);
+        # same future-proofing as above.
+        for c in top_claims[:3]:
+            line = render_one_node_line(c, conf_prefix=True, type_tag=False)
+            lines.append(f"    {line}")
 
     # Age / issues
     age = result.get("age", {})
@@ -317,10 +375,30 @@ def format_nudge(result: dict) -> str:
     if isinstance(not_recalled, list) and not_recalled:
         lines.append(f"  Memory: {len(not_recalled)} nodes not recalled recently")
 
-    # Matched IDs
-    matched_ids = result.get("matched_ids", [])
-    if matched_ids:
-        lines.append(f"  IDs: {', '.join(matched_ids[:15])}")
+    # Others — non-top non-special matched IDs with optional keyword prefix
+    # (Lei 2026-05-19 PM extension). Each line: "[id] `kw1` · `kw2` · `kw3`"
+    # if recall_keywords present, else "[id]" alone. Keywords-only (no summary)
+    # gives the agent a faceted index for "which of these should I inspect"
+    # while preserving the lossy-by-design noetic-register principle.
+    rendered_ids = {s.get("id") for s in special[:3]} | {c.get("id") for c in top_claims[:3]}
+    matched_meta = result.get("matched_meta") or []
+    others = [m for m in matched_meta if m.get("id") not in rendered_ids]
+    if others:
+        lines.append("  Others:")
+        for m in others[:15]:
+            mid = m.get("id", "?")
+            kw = m.get("recall_keywords") or []
+            if isinstance(kw, list) and len(kw) == 3:
+                kw_str = " · ".join(f"`{k}`" for k in kw)
+                lines.append(f"    - [{mid}] {kw_str}")
+            else:
+                lines.append(f"    - [{mid}]")
+    elif not (special or top_claims):
+        # No content rendered yet — fall back to the legacy flat IDs line so
+        # the digest is never silently empty when matches exist.
+        matched_ids = result.get("matched_ids", [])
+        if matched_ids:
+            lines.append(f"  IDs: {', '.join(matched_ids[:15])}")
 
     lines.append("  Use engram_inspect(node_id) for details, engram_get_subgraph for full chains.")
     return "\n".join(lines)
