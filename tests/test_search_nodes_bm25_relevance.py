@@ -170,3 +170,89 @@ class TestBm25Normalization:
         assert "xylophone" in first["claim"].lower(), (
             f"Expected keyword match claim to contain 'xylophone', got: {first['claim']!r}"
         )
+
+
+# ── fts-sim-merge (alpha #208 mitigation) — new floor + multiplicative bump ──
+
+def test_fts_sim_merge_floor_drops_low_similarity(monkeypatch):
+    """When semantic is available and an FTS hit has sim < FTS_SIM_FLOOR,
+    the merge logic drops it regardless of BM25 strength.
+
+    Stubs `_semantic_search` to return a controlled sim_lookup that places
+    a known FTS-hit ID below the floor.
+    """
+    server = fresh_server()
+    _add_obs(server, "xylophone rhythm instrument unique term")
+    conn = server._get_db()
+
+    # Force semantic_available = True via stubbed _embedder + _semantic_search
+    class _StubEmbedder:
+        def is_available(self): return True
+    monkeypatch.setattr(server, "_embedder", _StubEmbedder())
+    monkeypatch.setattr(server, "_get_embedding_config", lambda: {"enabled": True})
+
+    # Stub _semantic_search to assert the FTS hit is found AND assigned
+    # a sub-floor similarity → the merge loop should drop it.
+    def _stub_sem(conn, q, top_k=10, min_similarity=0.0, **kw):
+        # Find the FTS-hit node id from the conn
+        row = conn.execute("SELECT id FROM nodes WHERE type='observation_factual' LIMIT 1").fetchone()
+        return [{"id": row["id"], "similarity": 0.05, "type": "observation_factual",
+                 "claim": "x", "confidence": 0.8}]
+    monkeypatch.setattr(server, "_semantic_search", _stub_sem)
+
+    result = server._search_nodes(conn, "xylophone", top_k=5, use_semantic=True)
+    # Sub-floor FTS hit should be dropped — no results from the FTS path,
+    # and semantic_only also empty (since it shares the same id, gets
+    # filtered from semantic_only by the existing fts_ids exclusion logic
+    # OR remains, depending on the merge order — verify it doesn't appear
+    # in output via match_type=keyword).
+    keyword_hits = [r for r in result.get("results", []) if r.get("match_type") == "keyword"]
+    assert len(keyword_hits) == 0, (
+        f"Expected zero keyword hits after sub-floor drop, got "
+        f"{[r['id'] for r in keyword_hits]}"
+    )
+
+
+def test_fts_sim_merge_bump_promotes_above_floor(monkeypatch):
+    """When semantic is available and an FTS hit has sim >= FTS_SIM_FLOOR,
+    the multiplicative bump produces relevance = min(1, sim * (1 + bump))
+    where bump = sqrt(|bm25|) / sqrt(FTS_BUMP_NORMALIZER).
+
+    Exercises arithmetic correctness against a known sim + known bm25.
+    """
+    server = fresh_server()
+    _add_obs(server, "xylophone rhythm instrument unique term")
+    conn = server._get_db()
+
+    class _StubEmbedder:
+        def is_available(self): return True
+    monkeypatch.setattr(server, "_embedder", _StubEmbedder())
+    monkeypatch.setattr(server, "_get_embedding_config", lambda: {"enabled": True})
+
+    captured_sim = 0.50
+    def _stub_sem(conn, q, top_k=10, min_similarity=0.0, **kw):
+        row = conn.execute("SELECT id FROM nodes WHERE type='observation_factual' LIMIT 1").fetchone()
+        return [{"id": row["id"], "similarity": captured_sim, "type": "observation_factual",
+                 "claim": "x", "confidence": 0.8}]
+    monkeypatch.setattr(server, "_semantic_search", _stub_sem)
+
+    result = server._search_nodes(
+        conn, "xylophone", top_k=5, use_semantic=True, return_debug=True,
+    )
+    debug = result["debug"]
+    per_result = debug["per_result"]
+    assert len(per_result) >= 1, "Expected at least one keyword hit to survive floor"
+    entry = per_result[0]
+    assert entry["match_type"] == "keyword"
+    assert entry["similarity"] == pytest.approx(captured_sim, abs=1e-9), (
+        f"Expected similarity={captured_sim} in debug, got {entry['similarity']}"
+    )
+    bm25 = entry["bm25_raw"]
+    assert bm25 is not None and bm25 < 0, f"Expected negative BM25, got {bm25}"
+    # Recompute the expected formula
+    expected_bump = min(1.0, math.sqrt(abs(bm25)) / math.sqrt(server.FTS_BUMP_NORMALIZER))
+    expected_rel = min(1.0, captured_sim * (1.0 + expected_bump))
+    assert entry["relevance_normalized"] == pytest.approx(expected_rel, abs=1e-9), (
+        f"Expected relevance={expected_rel:.6f} (sim={captured_sim}, bump={expected_bump:.6f}), "
+        f"got {entry['relevance_normalized']:.6f}"
+    )

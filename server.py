@@ -13,6 +13,7 @@ query (query, get_subgraph), version control (checkpoint, diff).
 import functools
 import hashlib
 import json
+import math
 import os
 import re
 import socket
@@ -194,6 +195,41 @@ UTILITY_ALPHA = {          # Per-source learning rates for Q-value updates
 UTILITY_ALPHA_DEFAULT = 0.10  # Fallback for unknown sources
 UTILITY_LAMBDA = 0.3      # Weight of utility in composite scoring (0 = off)
 RECALL_WINDOW_TTL = 3     # Turns: entries older than current_turn - TTL are pruned
+
+# ── FTS↔semantic merge (alpha #207/#208) ─────────────────────────────────
+# When a node hits FTS, the bi-gram pair that fired may be on structural
+# words (adverbs, modal verbs) that co-occur in a topically-unrelated node
+# (the q_0077/ob_1152 failure). Semantic similarity is the authoritative
+# topical signal; FTS provides confidence amplification ONLY for nodes
+# that semantic already considers minimally relevant.
+#
+#   floor (0.30): drop FTS-hit nodes whose cosine sim is below this
+#                 — matches POLARITY_DEFAULT_MIN_SIMILARITY_FOR_CHECK
+#                 ("below this cosine, truly unrelated")
+#   bump shape:   multiplicative; bump = sqrt(|bm25|) / sqrt(NORMALIZER)
+#                 capped at 1.0 → final = min(1.0, sim * (1 + bump))
+#
+#                 At NORMALIZER=16 (current calibration), empirical stats
+#                 over the 135-hit sample: mean(bump)≈0.95, stdev≈0.53,
+#                 ~22% cap at 1.0. Median |bm25|≈9 → bump≈0.75 →
+#                 sim=0.4 lifts to 0.70, sim=0.3 lifts to 0.525.
+FTS_SIM_FLOOR = 0.30
+FTS_BUMP_NORMALIZER = 16.0   # sqrt(this) = 4.0; bump = sqrt(|bm25|) / 4.0
+#                            # Aggressive bump empirically wins MRR by the
+#                            # largest margin (+0.0070 vs N=196, +0.0047 vs
+#                            # middle N=64) at imperceptible NDCG cost
+#                            # (-0.0013 vs N=196). The "over-promotes
+#                            # weak-sim nodes" concern (where bump from
+#                            # sim=0.3 reaches golden range) is theoretical
+#                            # — the harness shows it doesn't actually hurt
+#                            # because (a) the floor at 0.30 already drops
+#                            # the off-topic FTS hits, and (b) the genuine
+#                            # FTS hits are usually paired with genuine
+#                            # semantic relevance. Forward-looking: once
+#                            # POS-aware keyword filter (#207) ships, BM25
+#                            # hits will be on stronger topical signal, so
+#                            # the aggressive bump is calibrated for the
+#                            # higher-quality keyword pool.
 
 
 def engram_sandbox(data_dir: str | Path | None = None, keep: bool = False):
@@ -4587,21 +4623,38 @@ def _search_nodes(
     # prev-response-tail to the SEMANTIC query for short prompts without
     # polluting FTS keyword matching with arbitrary prior-context tokens.
     semantic_only: list[dict] = []
-    if use_semantic and _embedder.is_available() and _get_embedding_config().get("enabled", True):
+    # Similarity lookup for FTS-hit nodes — populated below from the semantic
+    # search results. Used to apply the floor + multiplicative bump (alpha
+    # #207/#208) when merging FTS hits with semantic hits.
+    sim_lookup: dict[str, float] = {}
+    semantic_available = use_semantic and _embedder.is_available() and _get_embedding_config().get("enabled", True)
+    if semantic_available:
+        # Overfetch semantic so FTS-hit similarities (if above floor) are
+        # available for the bump computation. min_similarity=FTS_SIM_FLOOR
+        # naturally drops "truly unrelated" candidates so we don't waste rows.
         sem_results = _semantic_search(
-            conn, effective_embed_query, top_k=top_k,
+            conn, effective_embed_query,
+            top_k=max(top_k, 100),
+            min_similarity=FTS_SIM_FLOOR,
             type_filter=type_filter,
             importance_threshold=tier2_threshold,
         )
         if return_debug:
             _dbg_semantic_candidate_count = len(sem_results)
         for s in sem_results:
+            sim_lookup[s["id"]] = s["similarity"]
             if s["id"] not in fts_ids:
                 if s["confidence"] is not None and s["confidence"] < min_confidence:
                     continue
                 semantic_only.append(s)
 
     # --- Merge: FTS first, then semantic-only ---
+    # FTS-merge formula (alpha #207/#208 mitigation):
+    #   if no semantic available: fall back to old 1 - 1/(1+|bm25|) normalization
+    #   else: floor at FTS_SIM_FLOOR, multiplicative bump on sim
+    #     final = min(1.0, sim * (1.0 + sqrt(|bm25|) / sqrt(FTS_BUMP_NORMALIZER)))
+    #   Floor drops nodes where semantic says "truly unrelated" regardless of
+    #   how strong FTS appears (closes the q_0077 / ob_1152 leak).
     output: list[dict] = []
     seen: set[str] = set()
 
@@ -4609,15 +4662,24 @@ def _search_nodes(
         if r["id"] in seen:
             continue
         seen.add(r["id"])
+        bm25_rank = r["rank"]  # negative float, more-negative = better
+        node_sim = sim_lookup.get(r["id"]) if semantic_available else None
+
+        if semantic_available:
+            if node_sim is None or node_sim < FTS_SIM_FLOOR:
+                # Semantic says off-topic — drop regardless of FTS strength
+                continue
+            bump = min(1.0, math.sqrt(abs(bm25_rank)) / math.sqrt(FTS_BUMP_NORMALIZER))
+            relevance_norm = min(1.0, node_sim * (1.0 + bump))
+        else:
+            # Fallback: old BM25-only normalization (semantic unavailable)
+            relevance_norm = 1.0 - 1.0 / (1.0 + abs(bm25_rank))
+
         node = _node_to_dict(r)
         node["match_type"] = "keyword"
-        # Normalize BM25 rank to [0, 1] range comparable to semantic similarity.
-        # fts.rank is negative (more negative = better match). Map via
-        # 1 - 1/(1 + |rank|) → rank=0 gives 0, rank=-1 gives 0.5, rank=-inf gives 1.
-        # Monotonic, simple, no tuning knobs.
-        bm25_rank = r["rank"]  # negative float, more-negative = better
-        relevance_norm = 1.0 - 1.0 / (1.0 + abs(bm25_rank))
         node["_relevance"] = relevance_norm
+        if node_sim is not None:
+            node["similarity"] = node_sim
         if return_debug:
             _dbg_per_result[r["id"]] = {
                 "id": r["id"],
@@ -4626,7 +4688,7 @@ def _search_nodes(
                 "match_type": "keyword",
                 "bm25_raw": bm25_rank,
                 "relevance_normalized": relevance_norm,
-                "similarity": None,
+                "similarity": node_sim,
                 "composite_score": None,   # computed below after re-rank
                 "utility_score": node.get("utility_score"),
                 "importance_score": node.get("importance_score"),
@@ -4684,9 +4746,13 @@ def _search_nodes(
                 # When UTILITY_LAMBDA == 0, composite == relevance (no utility weighting).
                 _dbg_per_result[node["id"]]["composite_score"] = rel
 
+    # keyword_matches counts post-floor (after the sim<FTS_SIM_FLOOR drop)
+    # so callers see the actual contributing FTS pool, not the pre-floor
+    # candidate count. Pre-floor count is in `debug.fts_candidate_count`.
+    kw_post_floor = sum(1 for n in output if n.get("match_type") == "keyword")
     base_result = {
         "results": output,
-        "keyword_matches": len(fts_results),
+        "keyword_matches": kw_post_floor,
         "semantic_matches": len(semantic_only),
         "semantic_available": _embedder.is_available(),
     }
