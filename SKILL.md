@@ -428,6 +428,8 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
   `(old_cornerstone_id, new_new_frame, [new_triggering_experience, new_supporting_ids, new_title])`
 - **engram_update_task** — Advance task status.
   `(task_id, new_status, [note])`
+- **engram_set_recall_summary** — Set `recall_summary` (authoring target ≤120 chars, hard cap 200) + `recall_keywords` (3–5 strings, each ≤30 chars) on one node. Idempotent — overwrites existing values; no importance/utility/recall_turn change, no audit log. Used by the one-shot backfill and the daily sleep-skill cohort step.
+  `(payload_json)` where `payload_json` is `{"node_id", "recall_summary", "recall_keywords"}`
 
 ### Read — find and inspect
 
