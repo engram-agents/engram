@@ -239,11 +239,15 @@ IMP_BETA = 0.05
 #   0.5 → calibrated default: halves the composite score for a node whose
 #          embedding is identical to an already-selected one
 #
-# MMR_POOL_MULTIPLIER: ratio of MMR input pool to desired output size.
-#   MMR needs more candidates than it returns so diversity selection has
-#   room to manoeuvre. 2× means: gather 20 candidates, return 10.
+# Tier-size multipliers (Lei 2026-05-19 architecture discussion).
+# Tier 1 retrieves a large raw pool per source; Tier 2 composite-shrinks;
+# Tier 3 MMR returns the final top_k. Numbers scale with top_k so callers
+# requesting more results get proportionally larger working pools.
+# Empirical calibration via harness — these defaults are starting points.
+TIER1_MULTIPLIER = 30   # raw-retrieval pool size per source = top_k × 30
+TIER2_MULTIPLIER = 4    # composite-shrink target           = top_k × 4
+# Tier 3 returns the caller's requested top_k.
 MMR_LAMBDA = 0.5
-MMR_POOL_MULTIPLIER = 2
 
 # ── FTS↔semantic merge (alpha #207/#208) ─────────────────────────────────
 # When a node hits FTS, the bi-gram pair that fired may be on structural
@@ -1506,7 +1510,10 @@ def _get_tier_threshold(conn: sqlite3.Connection, tier: int) -> float:
     return row["importance_score"] if row else 0.0
 
 
-def _get_min_queryable_importance(conn: sqlite3.Connection) -> float:
+def _get_min_queryable_importance(
+    conn: sqlite3.Connection,
+    tier2_threshold: Optional[float] = None,
+) -> float:
     """Lowest importance_score among currently-queryable nodes.
 
     Used as the normalization anchor for the importance amplifier in the
@@ -1521,8 +1528,13 @@ def _get_min_queryable_importance(conn: sqlite3.Connection) -> float:
     Returns 1.0 (no-op normalization) for an empty or degenerate graph
     rather than dividing by zero. The idx_nodes_importance index makes
     this O(log n).
+
+    Callers that already have tier2_threshold in scope (e.g. _search_nodes)
+    should pass it explicitly to avoid a redundant _get_tier_threshold
+    round-trip.
     """
-    tier2_threshold = _get_tier_threshold(conn, 2)
+    if tier2_threshold is None:
+        tier2_threshold = _get_tier_threshold(conn, 2)
     row = conn.execute(
         "SELECT MIN(importance_score) FROM nodes "
         "WHERE is_current = 1 AND importance_score > 0 "
@@ -4697,26 +4709,27 @@ def _search_nodes(
     Three-tier ranking pipeline (Lei 2026-05-19 architecture):
 
         TIER 1 — Raw retrieval (FTS + semantic, lossy floors only)
-            ── FTS5 keyword search: BM25-ranked, capped at pool_size//2,
+            ── FTS5 keyword search: BM25-ranked, capped at (top_k × TIER1_MULTIPLIER)//2,
                post-filtered for type/superseded/confidence/tier2.
             ── Semantic search: cosine-similarity-ranked, min_similarity =
-               FTS_SIM_FLOOR (0.30), overfetch to max(top_k, 100).
+               FTS_SIM_FLOOR (0.30), overfetch to max(top_k × TIER1_MULTIPLIER, 100).
             ── Merge: FTS hits first, then semantic-only; FTS hits get
                relevance via floor+bump (alpha #207/#208), semantic-only
-               keep their cosine similarity. Output size: ≤ pool_size.
-            Output contract: unsorted list with _relevance + optional
-            _embedding annotated.
+               keep their cosine similarity.
+            Output contract: ≤ top_k × TIER1_MULTIPLIER candidates after merge cap;
+            unsorted list with _relevance + optional _embedding annotated.
 
         TIER 2 — Composite ranking (mechanical, multiplicative amplifiers)
             composite = relevance × util_amp × imp_amp
                       = relevance × (1 + UTIL_BETA × utility_score)
                                   × (1 + IMP_BETA × normalized_importance)
-            Output contract: list sorted by _composite desc.
+            Then SORT + CUT to top_k × TIER2_MULTIPLIER.
+            Output contract: top_k × TIER2_MULTIPLIER candidates sorted by _composite desc.
 
         TIER 3 — MMR diversity rerank (perceptual, embedding-aware)
             mmr(c) = composite(c) × (1 − (1 − MMR_LAMBDA) × max_sim(c, selected))
-            Greedy selection of top_k from the pool_size-input pool.
-            Output contract: list of size ≤ top_k, MMR-ordered.
+            Greedy selection of top_k from the TIER2-sized pool.
+            Output contract: top_k candidates, MMR-ordered.
 
         Post-Tier-3 strip: remove _composite + _embedding internal keys.
 
@@ -4747,29 +4760,30 @@ def _search_nodes(
         except Exception:
             _dbg_extracted_keywords = []
 
-    # --- Pool sizing for MMR (alpha #178 area 2) ---
-    # Gather MMR_POOL_MULTIPLIER × top_k candidates so the MMR diversity
-    # pass has room to select diverse results.  The extra candidates are
-    # pruned back to top_k after MMR; callers see no change in result count.
-    pool_size = top_k * MMR_POOL_MULTIPLIER
+    # --- Tier-size derivation (Lei 2026-05-19 architecture discussion) ---
+    # Tier 1: large raw pool per source.  Tier 2: composite-shrink target.
+    # Tier 3 returns top_k (the caller's requested count).
+    tier1_size = top_k * TIER1_MULTIPLIER   # e.g. 300 for top_k=10
+    tier2_size = top_k * TIER2_MULTIPLIER   # e.g.  40 for top_k=10
 
     # ══ TIER 1: Raw retrieval (FTS + semantic) ══════════════════════════
-    # Output: pool_size candidates with _relevance + optional _embedding;
+    # Retrieve a large raw pool per source (TIER1_MULTIPLIER × top_k per path).
+    # Output: ≤ tier1_size candidates with _relevance + optional _embedding;
     # order is interleaved (FTS-first then semantic-only), NOT sorted.
 
     # --- FTS keyword search ---
     fts_ids: set[str] = set()
     fts_results: list[sqlite3.Row] = []
     fts_query = _sanitize_fts_query(query, conn)
-    fts_cap = max(1, pool_size // 2)  # reservation cap for FTS (half of pool)
+    fts_cap = max(1, tier1_size // 2)  # reservation cap for FTS (half of tier-1 pool)
     try:
         if not fts_query:
             raise sqlite3.OperationalError("empty FTS query")
-        # LIMIT is pool_size * 3 (= top_k * MMR_POOL_MULTIPLIER * 3) so the
-        # SQL fetch always supplies enough rows for fts_cap (= pool_size // 2)
-        # to be the binding constraint, regardless of MMR_POOL_MULTIPLIER's
+        # LIMIT is tier1_size * 3 (= top_k * TIER1_MULTIPLIER * 3) so the
+        # SQL fetch always supplies enough rows for fts_cap (= tier1_size // 2)
+        # to be the binding constraint, regardless of TIER1_MULTIPLIER's
         # value. Previously hardcoded as top_k * 3 — became the binding
-        # constraint at MMR_POOL_MULTIPLIER ≥ 3.
+        # constraint at the old MMR_POOL_MULTIPLIER ≥ 3.
         fts_rows = conn.execute(
             """SELECT n.*, fts.rank
                FROM nodes_fts fts
@@ -4777,7 +4791,7 @@ def _search_nodes(
                WHERE nodes_fts MATCH ?
                ORDER BY fts.rank
                LIMIT ?""",
-            (fts_query, pool_size * 3),
+            (fts_query, tier1_size * 3),
         ).fetchall()
 
         if return_debug:
@@ -4794,7 +4808,7 @@ def _search_nodes(
                 continue
             fts_results.append(r)
             fts_ids.add(r["id"])
-            # Cap FTS at half of pool_size so semantic results retain real estate
+            # Cap FTS at half of tier1_size so semantic results retain real estate
             # in the merged output. With the new IDF-driven OR-match,
             # _sanitize_fts_query can return 40-100+ hits for a single query;
             # without this cap, FTS would fill every slot and crowd out the
@@ -4828,7 +4842,7 @@ def _search_nodes(
         # naturally drops "truly unrelated" candidates so we don't waste rows.
         sem_results = _semantic_search(
             conn, effective_embed_query,
-            top_k=max(top_k, 100),
+            top_k=max(top_k * TIER1_MULTIPLIER, 100),
             min_similarity=FTS_SIM_FLOOR,
             type_filter=type_filter,
             importance_threshold=tier2_threshold,
@@ -4898,9 +4912,9 @@ def _search_nodes(
             }
         output.append(node)
 
-    # Fill remaining pool slots with semantic-only hits (up to pool_size total).
-    # Pool is larger than top_k so MMR can select diverse candidates.
-    remaining = pool_size - len(output)
+    # Fill remaining tier-1 slots with semantic-only hits (up to tier1_size total).
+    # Large tier-1 pool ensures tier-2 composite shrink has enough candidates.
+    remaining = tier1_size - len(output)
     for s in semantic_only[:remaining]:
         if s["id"] in seen:
             continue
@@ -4937,9 +4951,10 @@ def _search_nodes(
     # composition: relevance is the base, utility + importance are amplifiers.
     #   composite = relevance × (1 + UTIL_BETA × utility_score)
     #                         × (1 + IMP_BETA × normalized_importance)
-    # _composite is NOT popped here — the Tier 3 MMR pass below needs it.
+    # Then SORT + CUT to top_k × TIER2_MULTIPLIER (= 40 default).
+    # _composite is NOT popped here — Tier 3 MMR pass needs it.
     # _composite + _embedding stripped after Tier 3 completes.
-    min_queryable_imp = _get_min_queryable_importance(conn)
+    min_queryable_imp = _get_min_queryable_importance(conn, tier2_threshold=tier2_threshold)
     imp_norm_factor = 1.0 / min_queryable_imp
     for node in output:
         rel = node.pop("_relevance", 0.5) or 0.0
@@ -4960,10 +4975,13 @@ def _search_nodes(
     # MMR also re-sorts internally as a safety net, but enforcing the sort
     # here makes the boundary explicit and inspectable in debugging.
     output.sort(key=lambda x: x.get("_composite", 0), reverse=True)
+    # Tier-2 shrink: cut to top_k × TIER2_MULTIPLIER best-composite candidates.
+    # This is the tier-boundary cut — tier-1 retrieved broadly, tier-2 shrinks
+    # before handing off to MMR.  The sort above ensures we keep the top.
+    output = output[:tier2_size]
 
     # ── TIER 3: MMR diversity reranker (alpha #178 area 2) ───────────────
-    # Input: full pool (up to pool_size = top_k × MMR_POOL_MULTIPLIER nodes,
-    #   already composite-sorted above).
+    # Input: tier2_size candidates (top_k × TIER2_MULTIPLIER, composite-sorted).
     # Output: top_k nodes, MMR-ordered for diversity.
     # When MMR_LAMBDA=1 the output is identical to the composite-sorted order.
     # When embedder is disabled (ENGRAM_NO_EMBEDDINGS=1) all nodes have

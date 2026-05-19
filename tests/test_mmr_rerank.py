@@ -21,8 +21,8 @@ Covers:
      engram_query goes through _search_nodes and also gets MMR output.
   9. test_mmr_default_lambda_is_0_5
      MMR_LAMBDA == 0.5.
- 10. test_mmr_pool_multiplier_default_is_2
-     MMR_POOL_MULTIPLIER == 2.
+ 10. test_tier2_multiplier_default_is_4
+     TIER2_MULTIPLIER == 4 (replaced MMR_POOL_MULTIPLIER).
  11. test_mmr_returns_top_k_not_pool_size
      Input 20 → output 10.
  12. test_mmr_empty_candidates_returns_empty
@@ -101,11 +101,14 @@ def test_mmr_default_lambda_is_0_5():
     assert srv.MMR_LAMBDA == 0.5, f"Expected MMR_LAMBDA=0.5, got {srv.MMR_LAMBDA}"
 
 
-def test_mmr_pool_multiplier_default_is_2():
-    """MMR_POOL_MULTIPLIER must be 2 (gather 2×top_k candidates for diversity)."""
+def test_tier2_multiplier_default_is_4():
+    """TIER2_MULTIPLIER must be 4 (composite-shrink to 4×top_k before MMR)."""
     srv = fresh_server()
-    assert srv.MMR_POOL_MULTIPLIER == 2, (
-        f"Expected MMR_POOL_MULTIPLIER=2, got {srv.MMR_POOL_MULTIPLIER}"
+    assert srv.TIER2_MULTIPLIER == 4, (
+        f"Expected TIER2_MULTIPLIER=4, got {srv.TIER2_MULTIPLIER}"
+    )
+    assert not hasattr(srv, "MMR_POOL_MULTIPLIER"), (
+        "MMR_POOL_MULTIPLIER was removed — it should not exist on the module"
     )
 
 
