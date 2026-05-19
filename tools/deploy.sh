@@ -24,7 +24,7 @@
 #
 # What gets deployed (manifest at the bottom of this script):
 #   - Runtime Python: server.py, engram_client.py, engram_confidence.py,
-#     engram_filter.py, engram_idf.py, viz_server.py
+#     engram_filter.py, engram_idf.py, engram_ids.py, viz_server.py
 #   - Hooks (hooks/), tools (tools/)
 #   - Protocol doc (SKILL.md)
 #
@@ -127,6 +127,7 @@ MANIFEST=(
     "engram_confidence.py"
     "engram_filter.py"
     "engram_idf.py"
+    "engram_ids.py"
     "engram_log_emitter.py"
     "viz_server.py"
     "tools"
