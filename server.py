@@ -184,17 +184,35 @@ def _configure_paths(data_dir: str | Path) -> None:
     LOG_PATH = DATA_DIR / "session_log.md"
     FEELING_NUDGE_MARKER = DATA_DIR / "feeling-nudge-active.json"
 
-# Utility Q-update learning rate per USE action. Action is the engagement
-# tier — "intensity of impression" the node leaves when the agent acts on
-# it. V1 is 2-tier (Lei 2026-05-19): derive = tier-1 (strongest), all
-# others = tier-2 (moderate). Numbers preserve the existing α scale.
+# Utility Q-update learning rate per USE action. Three tiers per Lei
+# 2026-05-19 design call. Numbers preserve the existing α scale.
+# Tier 1 (0.15): deep cognitive load — derive / supersede / contradict /
+#   resolve / lesson_incident. The agent had to think with the node, not
+#   just read it.
+# Tier 2 (0.10): moderate engagement — deliberate probes, targeted writes,
+#   commitments. The agent acted on the node with intent.
+# Tier 3 (0.05): loose touch — focus_load brings IDs into view as a
+#   batch; unfocus is a removal action. The agent didn't engage deeply
+#   but the substrate counts the contact.
 USE_ALPHA = {
-    "derive":   0.15,  # tier 1 — premise citation, deep engagement
-    "inspect":  0.10,  # tier 2 — deliberate probe
-    "subgraph": 0.10,  # tier 2 — target probe of graph traversal
-    "mention":  0.10,  # tier 2 — prose narration / inline citation
+    # Tier 1 — deep cognitive load
+    "derive":          0.15,
+    "supersede":       0.15,
+    "contradict":      0.15,
+    "resolve":         0.15,
+    "lesson_incident": 0.15,
+    # Tier 2 — moderate engagement
+    "inspect":         0.10,
+    "subgraph":        0.10,
+    "mention":         0.10,
+    "focus":           0.10,  # focus_swap also uses this key — both outgoing+incoming sets
+    "history":         0.10,
+    "citation":        0.10,
+    # Tier 3 — loose touch
+    "focus_load":      0.05,
+    "unfocus":         0.05,
 }
-USE_ALPHA_DEFAULT = 0.10  # Fallback for unknown actions
+USE_ALPHA_DEFAULT = 0.10
 UTILITY_LAMBDA = 0.3      # Weight of utility in composite scoring (0 = off)
 
 # ── FTS↔semantic merge (alpha #207/#208) ─────────────────────────────────
@@ -6424,6 +6442,10 @@ def engram_history(
         count_query = f"SELECT COUNT(*) as c FROM edit_history{where}"
         total = conn.execute(count_query, params[:-1]).fetchone()["c"]
 
+        if node_id:
+            _utility_reward(conn, [node_id], action="history")
+            conn.commit()
+
         return json.dumps({
             "mode": "edits",
             "shown": len(entries),
@@ -6546,6 +6568,8 @@ def _add_axiom_impl(
         # Not true forgetting-exemption: survival still requires recall past ~50 turns.
         anchored_score = _compute_importance(2.0, _get_current_turn())
         conn.execute("UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?", (anchored_score, node_id,))
+        if context:
+            _utility_reward(conn, context, action="citation")
         conn.commit()
         return json.dumps({
             "status": "created",
@@ -6666,6 +6690,8 @@ def _add_definition_impl(
         # Not true forgetting-exemption: survival still requires recall past ~50 turns.
         anchored_score = _compute_importance(2.0, _get_current_turn())
         conn.execute("UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?", (anchored_score, node_id,))
+        if context:
+            _utility_reward(conn, context, action="citation")
         conn.commit()
         return json.dumps({
             "status": "created",
@@ -6810,6 +6836,8 @@ def _add_conjecture_impl(
                     pass
 
         _stamp_new_node(conn, node_id, confidence=conf, surprise=0.5)
+        if context:
+            _utility_reward(conn, context, action="citation")
         conn.commit()
         return json.dumps({
             "status": "created",
@@ -6953,6 +6981,8 @@ def _add_goal_impl(
             "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
             (anchored_score, node_id,),
         )
+        if context:
+            _utility_reward(conn, context, action="citation")
         conn.commit()
         return json.dumps({
             "status": "created",
@@ -7131,6 +7161,8 @@ def _add_person_impl(
             "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
             (anchored_score, node_id,),
         )
+        if context:
+            _utility_reward(conn, context, action="citation")
         conn.commit()
         return json.dumps({
             "status": "created",
@@ -7299,6 +7331,8 @@ def _add_cornerstone_impl(
             "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
             (anchored_score, node_id,),
         )
+        if linked:
+            _utility_reward(conn, linked, action="citation")
         conn.commit()
         return json.dumps({
             "status": "created",
@@ -8819,6 +8853,7 @@ def _lesson_register_incident_impl(
             "UPDATE nodes SET metadata = ? WHERE id = ?",
             (json.dumps(meta), lesson_id),
         )
+        _utility_reward(conn, [lesson_id], action="lesson_incident")
         conn.commit()
 
         count_row = conn.execute(
@@ -9888,6 +9923,7 @@ def _contradict_impl(
         )
 
         _stamp_new_node(conn, node_id, confidence=0.5, surprise=1.0)
+        _utility_reward(conn, [node_id_a, node_id_b], action="contradict")
         conn.commit()
 
         # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
@@ -10056,6 +10092,8 @@ def _ask_impl(
                     pass
 
         _stamp_new_node(conn, node_id, confidence=0.5, surprise=0.5)
+        if context:
+            _utility_reward(conn, context, action="citation")
         conn.commit()
 
         result = {
@@ -10346,6 +10384,7 @@ def _resolve_impl(
         _log_edit(conn, "resolved", target_id, target["type"],
                   {"resolved_by": node_id, "resolution_status": resolution_status})
 
+        _utility_reward(conn, [target_id, node_id], action="resolve")
         conn.commit()
 
         result = {
@@ -10629,6 +10668,7 @@ def _supersede_impl(
             _log_edit(conn, "stale_flagged", s["id"], s["type"],
                       {"stale_premise": old_node_id, "replacement": new_node_id})
 
+        _utility_reward(conn, [new_node_id], action="supersede")
         conn.commit()
 
         # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
@@ -11160,6 +11200,8 @@ def engram_focus(node_ids: str, reason: str) -> str:
         # If adding/refreshing pushed active off the currently-loaded saved
         # set, clear active_set_name — the active list is now ad-hoc.
         _clear_active_set_name_if_diverged(conn)
+        if to_add or refresh:
+            _utility_reward(conn, to_add + refresh, action="focus")
         conn.commit()
 
         focused_now = conn.execute(
@@ -11236,6 +11278,7 @@ def engram_unfocus(node_ids: str) -> str:
             # Removing a node from the active list diverges it from the
             # saved set — clear active_set_name if that's what just happened.
             _clear_active_set_name_if_diverged(conn)
+            _utility_reward(conn, to_release, action="unfocus")
             conn.commit()
 
         remaining = conn.execute(
@@ -11568,6 +11611,8 @@ def engram_focus_load(name: str, if_active: str = "error") -> str:
             (now, name),
         )
         _set_active_set_name(name, conn)
+        if loaded:
+            _utility_reward(conn, loaded, action="focus_load")
         conn.commit()
 
         return json.dumps({
@@ -11758,6 +11803,10 @@ def engram_focus_swap(save_as: str, load: str = "", description: str = "") -> st
             (now, load),
         )
         _set_active_set_name(load, conn)
+        # Bump both the outgoing and incoming node sets — swap is focus on both
+        swap_bump_ids = list(dict.fromkeys(active_ids + loaded))
+        if swap_bump_ids:
+            _utility_reward(conn, swap_bump_ids, action="focus")
         conn.commit()
 
         return json.dumps({
