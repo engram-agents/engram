@@ -273,7 +273,8 @@ class TestSearchNodesEmbedQuery(unittest.TestCase):
         with patch.object(self.server, "_semantic_search") as mock_sem, \
              patch.object(self.server._embedder, "is_available", return_value=True), \
              patch.object(self.server, "_get_embedding_config", return_value={"enabled": True}), \
-             patch.object(self.server, "_get_tier_threshold", return_value=0.0):
+             patch.object(self.server, "_get_tier_threshold", return_value=0.0), \
+             patch.object(self.server, "_get_min_queryable_importance", return_value=1.0):
             mock_sem.return_value = []
             self.server._search_nodes(self.conn, "the prompt", use_semantic=True)
             # First positional arg to _semantic_search after conn = query string
@@ -284,7 +285,8 @@ class TestSearchNodesEmbedQuery(unittest.TestCase):
         with patch.object(self.server, "_semantic_search") as mock_sem, \
              patch.object(self.server._embedder, "is_available", return_value=True), \
              patch.object(self.server, "_get_embedding_config", return_value={"enabled": True}), \
-             patch.object(self.server, "_get_tier_threshold", return_value=0.0):
+             patch.object(self.server, "_get_tier_threshold", return_value=0.0), \
+             patch.object(self.server, "_get_min_queryable_importance", return_value=1.0):
             mock_sem.return_value = []
             self.server._search_nodes(
                 self.conn, "yes ok",
@@ -299,7 +301,8 @@ class TestSearchNodesEmbedQuery(unittest.TestCase):
         with patch.object(self.server, "_semantic_search") as mock_sem, \
              patch.object(self.server._embedder, "is_available", return_value=True), \
              patch.object(self.server, "_get_embedding_config", return_value={"enabled": True}), \
-             patch.object(self.server, "_get_tier_threshold", return_value=0.0):
+             patch.object(self.server, "_get_tier_threshold", return_value=0.0), \
+             patch.object(self.server, "_get_min_queryable_importance", return_value=1.0):
             mock_sem.return_value = []
             self.server._search_nodes(self.conn, "hello", embed_query=None, use_semantic=True)
             args, _ = mock_sem.call_args

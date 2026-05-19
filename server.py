@@ -212,8 +212,19 @@ USE_ALPHA = {
     "focus_load":      0.05,
     "unfocus":         0.05,
 }
-USE_ALPHA_DEFAULT = 0.10
-UTILITY_LAMBDA = 0.3      # Weight of utility in composite scoring (0 = off)
+USE_ALPHA_DEFAULT = 0.10  # Fallback for unknown actions
+
+# Multiplicative-amplifier composite (Lei 2026-05-19 design call).
+# Replaces the additive (1-λ)×rel + λ×util blend with multiplicative
+# composition: relevance is the base, utility and importance are
+# multiplicative amplifiers. Empirical calibration via harness; these
+# starting points produce:
+#   util_amp ∈ [1.00, 1.50]     (utility ∈ [0, 1])
+#   imp_amp  ∈ [~1.05, ~2.15]   (normalized importance ∈ [1, ~23] for current graph)
+#   composite dynamic range:    cornerstone (max util, max imp) gets ~3.2x boost
+#                               typical median node gets ~1.5x boost
+UTIL_BETA = 0.5
+IMP_BETA = 0.05
 
 # ── MMR diversity reranker (alpha #178 area 2) ───────────────────────────
 # Maximal Marginal Relevance: balances relevance vs. diversity in the
@@ -1493,6 +1504,34 @@ def _get_tier_threshold(conn: sqlite3.Connection, tier: int) -> float:
     ).fetchone()
 
     return row["importance_score"] if row else 0.0
+
+
+def _get_min_queryable_importance(conn: sqlite3.Connection) -> float:
+    """Lowest importance_score among currently-queryable nodes.
+
+    Used as the normalization anchor for the importance amplifier in the
+    composite formula. Adapts to graph state — when the graph grows past
+    tier_2_max_nodes, the tier-2 threshold rises and this helper rises
+    with it, because `_search_nodes` itself filters candidates by
+    `importance_score >= tier2_threshold`. The "queryable" subset is
+    bounded below by that filter; using the global graph min as the
+    normalization anchor would over-amplify cornerstones once the floor
+    moves up.
+
+    Returns 1.0 (no-op normalization) for an empty or degenerate graph
+    rather than dividing by zero. The idx_nodes_importance index makes
+    this O(log n).
+    """
+    tier2_threshold = _get_tier_threshold(conn, 2)
+    row = conn.execute(
+        "SELECT MIN(importance_score) FROM nodes "
+        "WHERE is_current = 1 AND importance_score > 0 "
+        "  AND importance_score >= ?",
+        (max(0.0, tier2_threshold),),
+    ).fetchone()
+    if row is None or row[0] is None or row[0] <= 0:
+        return 1.0
+    return row[0]
 
 
 def _refresh_recall(conn: sqlite3.Connection, node_ids: list[str]):
@@ -4562,7 +4601,7 @@ def _mmr_rerank(
     top_k: int,
     mmr_lambda: float,
 ) -> list[dict]:
-    """Maximal Marginal Relevance reranker.
+    """Maximal Marginal Relevance reranker (Tier 3 of the ranking pipeline).
 
     Selects up to top_k nodes from candidates, greedily maximising:
 
@@ -4571,9 +4610,19 @@ def _mmr_rerank(
     where composite(c) is the pre-computed _composite score and max_sim is
     the highest cosine similarity between c and any already-selected node.
 
+    Input contract:
+        Each candidate has "_composite" (float) annotated by the upstream
+        composite phase. The caller (_search_nodes) is expected to have
+        sorted the input by _composite desc — MMR's first-slot pick relies
+        on candidate[0] being the highest-composite. As a safety net, MMR
+        re-sorts internally; the upstream sort + internal sort are
+        intentionally redundant so neither side has to trust the other's
+        invariant silently.
+        Each candidate may optionally have "_embedding" (decoded list[float]
+        or raw JSON str); when absent, max_sim=0 → no diversity penalty.
+
     Args:
-        candidates: list of node dicts, each with "_composite" (float) and
-            optionally "_embedding" (decoded list[float] or raw JSON str).
+        candidates: list of node dicts, sorted by _composite desc.
         top_k: desired output size (≤ len(candidates)).
         mmr_lambda: ∈ [0, 1].  1 = pure composite (no diversity); 0 = full
             diversity penalty.
@@ -4585,7 +4634,10 @@ def _mmr_rerank(
     if not candidates:
         return []
     remaining = list(candidates)
-    # First slot: highest composite score (before diversity matters)
+    # Defensive re-sort: pre-MMR sort by the caller is the documented input
+    # contract (see docstring), but the cost of re-sorting is negligible and
+    # the redundancy protects against either side's invariant breaking
+    # silently.  First slot is highest composite (before diversity matters).
     remaining.sort(key=lambda c: c.get("_composite", 0.0), reverse=True)
     selected: list[dict] = [remaining.pop(0)]
     while remaining and len(selected) < top_k:
@@ -4641,6 +4693,36 @@ def _search_nodes(
         semantic_matches: count of semantic-only hits
         semantic_available: bool
         debug: (only present when return_debug=True) intermediate ranking signals
+
+    Three-tier ranking pipeline (Lei 2026-05-19 architecture):
+
+        TIER 1 — Raw retrieval (FTS + semantic, lossy floors only)
+            ── FTS5 keyword search: BM25-ranked, capped at pool_size//2,
+               post-filtered for type/superseded/confidence/tier2.
+            ── Semantic search: cosine-similarity-ranked, min_similarity =
+               FTS_SIM_FLOOR (0.30), overfetch to max(top_k, 100).
+            ── Merge: FTS hits first, then semantic-only; FTS hits get
+               relevance via floor+bump (alpha #207/#208), semantic-only
+               keep their cosine similarity. Output size: ≤ pool_size.
+            Output contract: unsorted list with _relevance + optional
+            _embedding annotated.
+
+        TIER 2 — Composite ranking (mechanical, multiplicative amplifiers)
+            composite = relevance × util_amp × imp_amp
+                      = relevance × (1 + UTIL_BETA × utility_score)
+                                  × (1 + IMP_BETA × normalized_importance)
+            Output contract: list sorted by _composite desc.
+
+        TIER 3 — MMR diversity rerank (perceptual, embedding-aware)
+            mmr(c) = composite(c) × (1 − (1 − MMR_LAMBDA) × max_sim(c, selected))
+            Greedy selection of top_k from the pool_size-input pool.
+            Output contract: list of size ≤ top_k, MMR-ordered.
+
+        Post-Tier-3 strip: remove _composite + _embedding internal keys.
+
+    Boundary contracts are explicit (sort before MMR, MMR documents
+    the expectation) — see Lei's "quick_sort on 100 items is cheap,
+    failed-assumption is devastating" framing 2026-05-19.
     """
     # Default embed_query to query if not explicitly provided (backward compat).
     effective_embed_query = embed_query if embed_query is not None else query
@@ -4670,6 +4752,10 @@ def _search_nodes(
     # pass has room to select diverse results.  The extra candidates are
     # pruned back to top_k after MMR; callers see no change in result count.
     pool_size = top_k * MMR_POOL_MULTIPLIER
+
+    # ══ TIER 1: Raw retrieval (FTS + semantic) ══════════════════════════
+    # Output: pool_size candidates with _relevance + optional _embedding;
+    # order is interleaved (FTS-first then semantic-only), NOT sorted.
 
     # --- FTS keyword search ---
     fts_ids: set[str] = set()
@@ -4846,31 +4932,36 @@ def _search_nodes(
                 }
             output.append(node)
 
-    # --- Utility-weighted re-ranking (MemRL Phase B, cj_0027) ---
-    # Composite score: (1-λ) × relevance + λ × utility_score
-    # When all utility_scores are 0 (cold start), this preserves original order.
-    # NOTE: _composite is NOT popped from each node here — the MMR pass below
-    # needs it.  It is stripped (along with _embedding) after MMR completes.
-    if UTILITY_LAMBDA > 0:
-        for node in output:
-            util = node.get("utility_score", 0) or 0.0
-            rel = node.pop("_relevance", 0.5)
-            composite = (1 - UTILITY_LAMBDA) * rel + UTILITY_LAMBDA * util
-            node["_composite"] = composite
-            if return_debug and node.get("id") in _dbg_per_result:
-                _dbg_per_result[node["id"]]["composite_score"] = composite
-        output.sort(key=lambda x: x.get("_composite", 0), reverse=True)
-    else:
-        for node in output:
-            rel = node.pop("_relevance", None)
-            # MMR needs _composite even when UTILITY_LAMBDA==0; use relevance.
-            node["_composite"] = rel if rel is not None else 0.0
-            if return_debug and rel is not None and node.get("id") in _dbg_per_result:
-                # When UTILITY_LAMBDA == 0, composite == relevance (no utility weighting).
-                _dbg_per_result[node["id"]]["composite_score"] = rel
-        output.sort(key=lambda x: x.get("_composite", 0), reverse=True)
+    # ══ TIER 2: Composite ranking (multiplicative amplifiers) ═══════════
+    # Lei 2026-05-19. Replaces the additive λ-blend with pure multiplicative
+    # composition: relevance is the base, utility + importance are amplifiers.
+    #   composite = relevance × (1 + UTIL_BETA × utility_score)
+    #                         × (1 + IMP_BETA × normalized_importance)
+    # _composite is NOT popped here — the Tier 3 MMR pass below needs it.
+    # _composite + _embedding stripped after Tier 3 completes.
+    min_queryable_imp = _get_min_queryable_importance(conn)
+    imp_norm_factor = 1.0 / min_queryable_imp
+    for node in output:
+        rel = node.pop("_relevance", 0.5) or 0.0
+        util = node.get("utility_score", 0) or 0.0
+        imp = node.get("importance_score", 0) or 0.0
+        util_amp = 1.0 + UTIL_BETA * util
+        imp_amp = 1.0 + IMP_BETA * (imp * imp_norm_factor)
+        composite = rel * util_amp * imp_amp
+        node["_composite"] = composite
+        if return_debug and node.get("id") in _dbg_per_result:
+            _dbg_per_result[node["id"]]["composite_score"] = composite
+            # NEW debug fields surfacing the amp decomposition for harness diagnostics
+            _dbg_per_result[node["id"]]["util_amp"] = util_amp
+            _dbg_per_result[node["id"]]["imp_amp"] = imp_amp
+            _dbg_per_result[node["id"]]["imp_norm_factor"] = imp_norm_factor
+    # Sort by composite desc.  Contract with _mmr_rerank: input is sorted
+    # (MMR's first-slot pick assumes candidate[0] is highest-composite).
+    # MMR also re-sorts internally as a safety net, but enforcing the sort
+    # here makes the boundary explicit and inspectable in debugging.
+    output.sort(key=lambda x: x.get("_composite", 0), reverse=True)
 
-    # --- MMR diversity reranker (alpha #178 area 2) ---
+    # ── TIER 3: MMR diversity reranker (alpha #178 area 2) ───────────────
     # Input: full pool (up to pool_size = top_k × MMR_POOL_MULTIPLIER nodes,
     #   already composite-sorted above).
     # Output: top_k nodes, MMR-ordered for diversity.
@@ -5336,6 +5427,11 @@ def engram_query(
     Returns:
         JSON with matching nodes, each including its claim, confidence, type, and immediate neighbors.
         When return_debug=True, also includes a ``debug`` key with ranking internals.
+        Per-result debug entries include: id, match_type, bm25_raw, relevance_normalized,
+        similarity, composite_score, utility_score, importance_score, importance_base,
+        confidence, surprise_score, recall_turn. When return_debug=True, each entry also
+        includes util_amp, imp_amp, and imp_norm_factor (multiplicative amplifier
+        decomposition from the composite formula, for harness diagnostics).
     """
     conn = _get_db()
     try:
@@ -6484,7 +6580,8 @@ def engram_diagnose() -> str:
             "ab_test_tier2": test_config.get("tier2_max_nodes") if test_config.get("enabled") else None,
             "utility_scoring": {
                 "alpha_by_action": USE_ALPHA,
-                "lambda": UTILITY_LAMBDA,
+                "util_beta": UTIL_BETA,
+                "imp_beta": IMP_BETA,
                 "nodes_with_utility": util_rows["c"] if util_rows else 0,
                 "avg_utility": round(util_rows["avg_u"] or 0, 4) if util_rows else 0,
                 "max_utility": round(util_rows["max_u"] or 0, 4) if util_rows else 0,
@@ -9219,6 +9316,17 @@ def _add_task_impl(
             "UPDATE nodes SET importance_base = ?, importance_score = ? WHERE id = ?",
             (TASK_IMPORTANCE["planned"], planned_score, node_id),
         )
+
+        # Citation USE-bumps (alpha #177 area 4, Lei 2026-05-19 tier-2):
+        # implements_ids (cites edges) and goal_id (serves edge) are
+        # deliberate references to existing nodes — bump as tier-2 citations.
+        cite_targets: list[str] = []
+        if goal_id:
+            cite_targets.append(goal_id)
+        cite_targets.extend(impl_ids)
+        if cite_targets:
+            _utility_reward(conn, cite_targets, action="citation")
+
         conn.commit()
 
         result = {

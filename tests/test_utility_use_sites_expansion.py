@@ -613,3 +613,59 @@ def test_engram_outgrow_cornerstone_does_not_bump():
         f"engram_outgrow_cornerstone must not bump old cornerstone; "
         f"before={before_cs}, after={after_cs}"
     )
+
+
+def test_engram_add_task_bumps_goal_id_and_implements_ids_as_citation():
+    """engram_add_task with goal_id + implements_ids → each bumped α=0.10 (Lei 2026-05-19 Q2 greenlight).
+
+    Folded into the multiplicative-composite PR as the Q2 follow-up; previously
+    skipped because the spec said engram_add_task uses context_ids — it actually
+    uses goal_id (creates 'serves' edge) + implements_ids (creates 'cites' edges).
+    Both are deliberate references to existing nodes and qualify as tier-2
+    citation USEs.
+    """
+    server = fresh_server()
+
+    # Seed a goal and a conjecture as citation targets
+    g = json.loads(server.engram_add_goal(payload_json=json.dumps({
+        "claim": "test goal for task citation",
+        "motivation": "test fixture goal",
+    })))
+    assert "goal_id" in g, g
+    goal_id = g["goal_id"]
+
+    c = json.loads(server.engram_add_conjecture(payload_json=json.dumps({
+        "claim": "test conjecture for task citation",
+        "basis": "test fixture conjecture basis",
+    })))
+    assert "conjecture_id" in c, c
+    cj_id = c["conjecture_id"]
+
+    # Snapshot pre-bump utility for both targets
+    conn = server._get_db()
+    goal_pre = conn.execute("SELECT utility_score FROM nodes WHERE id=?", (goal_id,)).fetchone()[0] or 0.0
+    cj_pre = conn.execute("SELECT utility_score FROM nodes WHERE id=?", (cj_id,)).fetchone()[0] or 0.0
+    conn.close()
+
+    # Create task citing both
+    t = json.loads(server.engram_add_task(payload_json=json.dumps({
+        "description": "test task citing goal + conjecture",
+        "goal_id": goal_id,
+        "implements_ids": cj_id,
+    })))
+    assert "task_id" in t, t
+
+    # Both targets should have received tier-2 citation bump: Q_new = Q_old + 0.10×(1-Q_old)
+    conn = server._get_db()
+    goal_post = conn.execute("SELECT utility_score FROM nodes WHERE id=?", (goal_id,)).fetchone()[0] or 0.0
+    cj_post = conn.execute("SELECT utility_score FROM nodes WHERE id=?", (cj_id,)).fetchone()[0] or 0.0
+    conn.close()
+
+    expected_goal = round(goal_pre + 0.10 * (1.0 - goal_pre), 6)
+    expected_cj = round(cj_pre + 0.10 * (1.0 - cj_pre), 6)
+    assert abs(goal_post - expected_goal) < 1e-9, (
+        f"goal_id should bump α=0.10 citation: expected {expected_goal}, got {goal_post}"
+    )
+    assert abs(cj_post - expected_cj) < 1e-9, (
+        f"implements_ids should bump α=0.10 citation: expected {expected_cj}, got {cj_post}"
+    )
