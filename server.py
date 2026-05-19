@@ -154,9 +154,8 @@ FEELING_NUDGE_TTL_TURNS = 5
 FEELING_NUDGE_SOURCES = {"post_compact", "nap_checkpoint", "dream_review"}
 
 # ── Utility scoring (MemRL-inspired, cj_0027) ──
-# Recall window: tracks which nodes were surfaced recently so engram_derive
-# can reward nodes that were recalled AND then cited as premises.
-RECALL_WINDOW_PATH = DATA_DIR / "recall_window.json"
+# USE model: bump utility directly on each USE action, α determined by the
+# action's intensity-of-impression (Lei 2026-05-19 design call).
 
 # Sandbox guard: set to True when running inside engram_sandbox() context.
 # When True, _ensure_data_dir() will refuse to create ~/.engram.
@@ -174,27 +173,29 @@ def _configure_paths(data_dir: str | Path) -> None:
     and engram_sandbox() for test isolation.
 
     Incident context (ls_0004, ob_0678): a test that manually patched
-    DATA_DIR and RECALL_WINDOW_PATH but missed DB_PATH contaminated the
-    production engram with 5 test nodes.
+    DATA_DIR and DB_PATH contaminated the production engram with 5 test nodes.
     """
     global DATA_DIR, DB_PATH, SNAPSHOT_PATH, CONFIG_PATH, LOG_PATH
-    global FEELING_NUDGE_MARKER, RECALL_WINDOW_PATH
+    global FEELING_NUDGE_MARKER
     DATA_DIR = Path(data_dir)
     DB_PATH = DATA_DIR / "knowledge.db"
     SNAPSHOT_PATH = DATA_DIR / "graph_snapshot.md"
     CONFIG_PATH = DATA_DIR / "config.json"
     LOG_PATH = DATA_DIR / "session_log.md"
     FEELING_NUDGE_MARKER = DATA_DIR / "feeling-nudge-active.json"
-    RECALL_WINDOW_PATH = DATA_DIR / "recall_window.json"
-UTILITY_ALPHA = {          # Per-source learning rates for Q-value updates
-    "inspect": 0.15,       # Deliberate focus — strongest signal
-    "surface": 0.10,       # Broad recall
-    "query": 0.10,         # Targeted search — similar to surface
-    "subgraph": 0.05,      # Structural traversal — weakest signal
+
+# Utility Q-update learning rate per USE action. Action is the engagement
+# tier — "intensity of impression" the node leaves when the agent acts on
+# it. V1 is 2-tier (Lei 2026-05-19): derive = tier-1 (strongest), all
+# others = tier-2 (moderate). Numbers preserve the existing α scale.
+USE_ALPHA = {
+    "derive":   0.15,  # tier 1 — premise citation, deep engagement
+    "inspect":  0.10,  # tier 2 — deliberate probe
+    "subgraph": 0.10,  # tier 2 — target probe of graph traversal
+    "mention":  0.10,  # tier 2 — prose narration / inline citation
 }
-UTILITY_ALPHA_DEFAULT = 0.10  # Fallback for unknown sources
+USE_ALPHA_DEFAULT = 0.10  # Fallback for unknown actions
 UTILITY_LAMBDA = 0.3      # Weight of utility in composite scoring (0 = off)
-RECALL_WINDOW_TTL = 3     # Turns: entries older than current_turn - TTL are pruned
 
 # ── FTS↔semantic merge (alpha #207/#208) ─────────────────────────────────
 # When a node hits FTS, the bi-gram pair that fired may be on structural
@@ -1501,89 +1502,55 @@ def _stamp_new_node(conn: sqlite3.Connection, node_id: str,
 
 
 # ---------------------------------------------------------------------------
-# Utility scoring — recall window (MemRL-inspired, cj_0027)
+# Utility scoring — USE action model (cj_0027, Lei 2026-05-19 design call)
 # ---------------------------------------------------------------------------
 
 
-def _recall_window_append(node_ids: list[str], source: str = "surface"):
-    """Record that these node IDs were surfaced to the agent.
+def _utility_reward(conn: sqlite3.Connection, node_ids: list[str], action: str) -> int:
+    """Bump utility_score for each node_id using Q_new = Q_old + α(1 - Q_old).
 
-    Appends to the recall window file with the retrieval source. When
-    engram_derive later cites any of these as premises, they get a
-    utility_score bump scaled by the source's α — the MemRL reward signal.
+    α is determined by the USE action (USE_ALPHA[action]); missing actions
+    fall back to USE_ALPHA_DEFAULT. Q is rounded to 6 decimals to match
+    prior storage format. IDs not in the nodes table are silently skipped
+    (the substrate may be passed a shape-matching token that isn't a real
+    node, e.g. from a regex scan). Duplicates in `node_ids` are collapsed
+    to a single bump per ID — one engagement action equals one bump,
+    regardless of how many times the same ID appears in the call's input
+    (e.g. comma-split supporting_ids with the same node listed twice).
+    Returns the count of nodes updated.
 
-    Sources and their α values (strongest signal → weakest):
-      inspect (0.15) > surface/query (0.10) > subgraph (0.05)
+    Caller is responsible for committing the connection after this call
+    returns — `_utility_reward` issues UPDATEs but does not commit. Direct
+    callers (engram_inspect, engram_get_subgraph) commit explicitly;
+    `_create_derivation` relies on `_derive_impl` / `_resolve_impl` to
+    commit the surrounding transaction.
     """
     if not node_ids:
-        return
-    turn = _get_current_turn()
-    entry = {"ids": node_ids, "turn": turn, "ts": _now(), "source": source}
-    try:
-        data = json.loads(RECALL_WINDOW_PATH.read_text()) if RECALL_WINDOW_PATH.exists() else {"entries": []}
-        data["entries"].append(entry)
-        # Prune old entries (older than TTL turns)
-        data["entries"] = [
-            e for e in data["entries"]
-            if e.get("turn", 0) >= turn - RECALL_WINDOW_TTL
-        ]
-        RECALL_WINDOW_PATH.write_text(json.dumps(data))
-    except Exception:
-        pass  # Never block recall for window logging failure
-
-
-def _recall_window_check(node_ids: list[str]) -> dict[str, str]:
-    """Return {node_id: best_source} for nodes that appear in the recall window.
-
-    When a node was surfaced by multiple retrieval paths, the source with the
-    highest α wins — so inspect > surface/query > subgraph. This ensures the
-    reward reflects the strongest retrieval signal.
-    """
-    if not node_ids:
-        return {}
-    try:
-        if not RECALL_WINDOW_PATH.exists():
-            return {}
-        data = json.loads(RECALL_WINDOW_PATH.read_text())
-        turn = _get_current_turn()
-        # Map node_id → best source (highest α)
-        best: dict[str, str] = {}
-        for e in data.get("entries", []):
-            if e.get("turn", 0) >= turn - RECALL_WINDOW_TTL:
-                src = e.get("source", "surface")
-                src_alpha = UTILITY_ALPHA.get(src, UTILITY_ALPHA_DEFAULT)
-                for nid in e.get("ids", []):
-                    if nid in best:
-                        existing_alpha = UTILITY_ALPHA.get(best[nid], UTILITY_ALPHA_DEFAULT)
-                        if src_alpha > existing_alpha:
-                            best[nid] = src
-                    else:
-                        best[nid] = src
-        return {nid: best[nid] for nid in node_ids if nid in best}
-    except Exception:
-        return {}
-
-
-def _utility_reward(conn: sqlite3.Connection, node_source_map: dict[str, str]):
-    """Bump utility_score for nodes that were recalled AND then cited.
-
-    Uses incremental update: Q_new = Q_old + α(1.0 - Q_old)
-    α is determined by the retrieval source that surfaced the node —
-    inspect (0.15) delivers a stronger reward than surface/query (0.10)
-    or subgraph (0.05).
-    """
-    for nid, source in node_source_map.items():
-        alpha = UTILITY_ALPHA.get(source, UTILITY_ALPHA_DEFAULT)
+        return 0
+    # Dedup while preserving first-occurrence order so the bump is idempotent
+    # on duplicates within one call. Old recall_window-based model was
+    # immune via dict-key semantics; the action-keyed model has to enforce
+    # this explicitly at the bump boundary so every caller (existing or
+    # future) inherits the invariant.
+    deduped: list[str] = list(dict.fromkeys(node_ids))
+    alpha = USE_ALPHA.get(action, USE_ALPHA_DEFAULT)
+    updated = 0
+    for nid in deduped:
         row = conn.execute(
             "SELECT utility_score FROM nodes WHERE id = ?", (nid,)
         ).fetchone()
-        if row:
-            old_q = row["utility_score"] or 0.0
-            new_q = old_q + alpha * (1.0 - old_q)
-            conn.execute(
-                "UPDATE nodes SET utility_score = ? WHERE id = ?",
-                (round(new_q, 6), nid),
-            )
+        if row is None:
+            continue
+        q_old = row["utility_score"] if isinstance(row, sqlite3.Row) else (row[0] or 0.0)
+        if q_old is None:
+            q_old = 0.0
+        q_new = round(q_old + alpha * (1.0 - q_old), 6)
+        conn.execute(
+            "UPDATE nodes SET utility_score = ? WHERE id = ?",
+            (q_new, nid),
+        )
+        updated += 1
+    return updated
 
 
 # ---------------------------------------------------------------------------
@@ -2626,7 +2593,7 @@ def _create_derivation(
             premise was tainted or stale without opt-in
           success: dict with node_id, confidence, reasoning_type,
             reasoning_class, stale_ids, structure_warnings,
-            rewarded_map, context_nodes
+            bumped_count, context_nodes
     """
     block, stale_ids = _validate_premises(supporting_ids, conn, use_stale=use_stale)
     if block is not None:
@@ -2691,9 +2658,9 @@ def _create_derivation(
 
     _stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
 
-    rewarded_map = _recall_window_check(supporting_ids)
-    if rewarded_map:
-        _utility_reward(conn, rewarded_map)
+    bumped_count = 0
+    if supporting_ids:
+        bumped_count = _utility_reward(conn, supporting_ids, action="derive")
 
     return (None, {
         "node_id": node_id,
@@ -2702,7 +2669,7 @@ def _create_derivation(
         "reasoning_class": rclass,
         "stale_ids": stale_ids,
         "structure_warnings": structure_warnings,
-        "rewarded_map": rewarded_map,
+        "bumped_count": bumped_count,
         "context_nodes": ctx_used,
     })
 
@@ -4938,9 +4905,6 @@ def engram_surface(
         # --- All matched IDs for follow-up ---
         matched_ids = [n["id"] for n in results]
 
-        # --- Record in recall window for utility scoring (cj_0027) ---
-        _recall_window_append(matched_ids)
-
         summary = {
             "query": query,
             "match_count": len(results),
@@ -5119,7 +5083,8 @@ def engram_inspect(
         # Refresh recall on the target node ONLY (skip in dream mode)
         if not dream_mode:
             _refresh_recall(conn, [node_id])
-            _recall_window_append([node_id], source="inspect")
+            _utility_reward(conn, [node_id], action="inspect")
+            conn.commit()
 
         # Update assessment timestamp on question nodes (regardless of dream_mode —
         # assessment tracking is orthogonal to importance refresh)
@@ -5219,7 +5184,6 @@ def engram_query(
         if output:
             accessed_ids = [n["id"] for n in output]
             _refresh_recall(conn, accessed_ids)
-            _recall_window_append(accessed_ids, source="query")
 
         # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
         # Decision context: query length + result count + type filter used.
@@ -5352,11 +5316,14 @@ def engram_get_subgraph(
                     }
                 )
 
-        # Refresh recall for all accessed nodes (tier 3 — no filtering, but recall updates)
+        # Refresh recall for all accessed nodes (legacy behavior)
         if nodes_out:
             accessed_ids = list(nodes_out.keys())
             _refresh_recall(conn, accessed_ids)
-            _recall_window_append(accessed_ids, source="subgraph")
+            # Utility bump: only the seed node (the agent's explicit USE target),
+            # not the returned neighbors (they were shown, not actively used).
+            _utility_reward(conn, [node_id], action="subgraph")
+            conn.commit()
 
         return json.dumps(
             {
@@ -6339,7 +6306,7 @@ def engram_diagnose() -> str:
             "ab_test_enabled": test_config.get("enabled", False),
             "ab_test_tier2": test_config.get("tier2_max_nodes") if test_config.get("enabled") else None,
             "utility_scoring": {
-                "alpha_by_source": UTILITY_ALPHA,
+                "alpha_by_action": USE_ALPHA,
                 "lambda": UTILITY_LAMBDA,
                 "nodes_with_utility": util_rows["c"] if util_rows else 0,
                 "avg_utility": round(util_rows["avg_u"] or 0, 4) if util_rows else 0,
@@ -9765,11 +9732,8 @@ def _derive_impl(
             "context_nodes": success["context_nodes"],
             "logical_chain_preview": logical_chain[:200],
         }
-        if success["rewarded_map"]:
-            result["utility_rewarded"] = {
-                nid: {"source": src, "alpha": UTILITY_ALPHA.get(src, UTILITY_ALPHA_DEFAULT)}
-                for nid, src in success["rewarded_map"].items()
-            }
+        if success["bumped_count"]:
+            result["utility_bumped_count"] = success["bumped_count"]
         if success["structure_warnings"]:
             result["structure_warnings"] = success["structure_warnings"]
         if use_stale and success["stale_ids"]:
@@ -10396,11 +10360,8 @@ def _resolve_impl(
         }
         if success["context_nodes"]:
             result["context_nodes"] = success["context_nodes"]
-        if success["rewarded_map"]:
-            result["utility_rewarded"] = {
-                nid: {"source": src, "alpha": UTILITY_ALPHA.get(src, UTILITY_ALPHA_DEFAULT)}
-                for nid, src in success["rewarded_map"].items()
-            }
+        if success["bumped_count"]:
+            result["utility_bumped_count"] = success["bumped_count"]
         if success["structure_warnings"]:
             result["structure_warnings"] = success["structure_warnings"]
         if use_stale and success["stale_ids"]:

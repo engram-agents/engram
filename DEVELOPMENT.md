@@ -342,7 +342,7 @@ the runtime tree's data files into the alpha repo:
 - `graph_snapshot.md`, `session_log.md`
 - `warm-briefing.md` (per-agent identity)
 - `diary/`, `sessions/`, `history/`, `logs/`, `secrets/`
-- `recall_window.json`, `recall-daemon.pid`, `recall-daemon.sock`
+- `recall-daemon.pid`, `recall-daemon.sock`
 - `feeling-nudge-active.json`, `last-user-msg.json` (per-session markers live under `sessions/`)
 - `.deployed-version` (deploy.sh's version marker)
 

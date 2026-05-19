@@ -30,7 +30,7 @@
 #
 # What does NOT get deployed:
 #   - Data files: knowledge.db, graph_snapshot.md, session_log.md,
-#     warm-briefing.md, config.json, recall_window.json
+#     warm-briefing.md, config.json
 #   - Per-agent state: diary/, sessions/ (per-session markers),
 #     history/, logs/, feeling-nudge-active.json, etc.
 #   - Install-time entry points: install.sh, install-gemini.sh,

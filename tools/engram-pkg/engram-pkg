@@ -204,7 +204,6 @@ knowledge.db-wal
 
 # Local engram runtime artifacts (server.py drops these next to the .db)
 config.json
-recall_window.json
 session_log.md
 graph_snapshot.md.tmp
 
