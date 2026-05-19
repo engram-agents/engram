@@ -1,13 +1,17 @@
 """Tests for hooks/claude/engram-utility-credit-mention-stop.py.
 
 Covers the prose-mention credit-assignment hook (alpha #177 area 4):
-  - get_current_turn(): config.json memory.current_turn read
-  - recall_window_active_ids(): TTL semantics, missing/corrupt file
   - bump_utility(): Q-update formula correctness, missing IDs skipped
-  - credit_mentions(): end-to-end pipeline against tmp config + window + db
+  - credit_mentions(): end-to-end pipeline against tmp db (no recall_window)
+  - collect_turn_text(): JSONL-walk correctness
+
+The recall_window intersection was removed in PR #214 (tautology argument:
+post-cutover node IDs always originate from substrate context). Tests for
+get_current_turn and recall_window_active_ids have been removed along with
+those functions.
 
 All tests are self-contained: they build minimal in-memory or tmp_path
-sqlite schemas + JSON files. Production knowledge.db is NEVER touched.
+sqlite schemas. Production knowledge.db is NEVER touched.
 """
 
 from __future__ import annotations
@@ -63,122 +67,6 @@ def tmp_db(tmp_path) -> str:
     conn.commit()
     conn.close()
     return str(db_path)
-
-
-@pytest.fixture
-def tmp_config(tmp_path) -> str:
-    cfg_path = tmp_path / "config.json"
-    cfg_path.write_text(json.dumps({"memory": {"current_turn": 42}}))
-    return str(cfg_path)
-
-
-@pytest.fixture
-def tmp_window(tmp_path) -> str:
-    win_path = tmp_path / "recall_window.json"
-    win_path.write_text(
-        json.dumps(
-            {
-                "entries": [
-                    {"ids": ["ob_1234", "dv_0567"], "turn": 42, "source": "surface"},
-                    {"ids": ["ax_0001"], "turn": 41, "source": "query"},
-                    {"ids": ["ob_8888"], "turn": 38, "source": "surface"},  # outside TTL=3
-                ]
-            }
-        )
-    )
-    return str(win_path)
-
-
-# --------------------------------------------------------------------------- #
-# get_current_turn
-# --------------------------------------------------------------------------- #
-
-
-def test_get_current_turn_reads_memory_section(tmp_config):
-    assert hook.get_current_turn(tmp_config) == 42
-
-
-def test_get_current_turn_missing_file_returns_zero(tmp_path):
-    assert hook.get_current_turn(str(tmp_path / "nope.json")) == 0
-
-
-def test_get_current_turn_corrupt_json_returns_zero(tmp_path):
-    bad = tmp_path / "config.json"
-    bad.write_text("{ not valid json")
-    assert hook.get_current_turn(str(bad)) == 0
-
-
-def test_get_current_turn_missing_memory_section_returns_zero(tmp_path):
-    cfg = tmp_path / "config.json"
-    cfg.write_text(json.dumps({"other": "fields"}))
-    assert hook.get_current_turn(str(cfg)) == 0
-
-
-# --------------------------------------------------------------------------- #
-# recall_window_active_ids
-# --------------------------------------------------------------------------- #
-
-
-def test_recall_window_active_ids_within_ttl(tmp_window):
-    # turn=42, ttl=3 → cutoff=39. Entries at turn 42 and 41 qualify; turn 38 doesn't.
-    active = hook.recall_window_active_ids(42, tmp_window, ttl=3)
-    assert active == {"ob_1234", "dv_0567", "ax_0001"}
-
-
-def test_recall_window_active_ids_filters_old_entries(tmp_window):
-    # Move forward to turn 60 → cutoff=57. NO entries qualify.
-    active = hook.recall_window_active_ids(60, tmp_window, ttl=3)
-    assert active == set()
-
-
-def test_recall_window_active_ids_includes_exact_cutoff_turn(tmp_path):
-    # Pin the inclusive cutoff: current=42, ttl=3 → cutoff=39. An entry at
-    # turn=39 is KEPT (entry.turn >= cutoff), turn=38 is dropped. Mirrors
-    # server.py:1528.
-    win = tmp_path / "rw.json"
-    win.write_text(
-        json.dumps(
-            {
-                "entries": [
-                    {"ids": ["ob_at_cutoff"], "turn": 39, "source": "surface"},
-                    {"ids": ["ob_below_cutoff"], "turn": 38, "source": "surface"},
-                ]
-            }
-        )
-    )
-    active = hook.recall_window_active_ids(42, str(win), ttl=3)
-    assert active == {"ob_at_cutoff"}
-
-
-def test_recall_window_active_ids_missing_file(tmp_path):
-    assert hook.recall_window_active_ids(10, str(tmp_path / "nope.json")) == set()
-
-
-def test_recall_window_active_ids_corrupt_json(tmp_path):
-    bad = tmp_path / "rw.json"
-    bad.write_text("{ corrupt")
-    assert hook.recall_window_active_ids(10, str(bad)) == set()
-
-
-def test_recall_window_active_ids_empty_entries(tmp_path):
-    empty = tmp_path / "rw.json"
-    empty.write_text(json.dumps({"entries": []}))
-    assert hook.recall_window_active_ids(10, str(empty)) == set()
-
-
-def test_recall_window_active_ids_skips_non_string_ids(tmp_path):
-    """Defensive: a malformed entry with numeric IDs shouldn't crash or leak."""
-    rw = tmp_path / "rw.json"
-    rw.write_text(
-        json.dumps(
-            {
-                "entries": [
-                    {"ids": ["ob_1234", 12345, None, "dv_0567"], "turn": 10, "source": "surface"},
-                ]
-            }
-        )
-    )
-    assert hook.recall_window_active_ids(10, str(rw)) == {"ob_1234", "dv_0567"}
 
 
 # --------------------------------------------------------------------------- #
@@ -239,141 +127,117 @@ def test_bump_utility_empty_set_noop(tmp_db):
 
 
 # --------------------------------------------------------------------------- #
-# credit_mentions — end-to-end pipeline
+# credit_mentions — end-to-end pipeline (no recall_window, PR #214)
 # --------------------------------------------------------------------------- #
 
 
-def test_credit_mentions_happy_path(tmp_db, tmp_config, tmp_window):
-    message = "I built on ob_1234 and confirmed via dv_0567; see also ax_0001."
-    stats = hook.credit_mentions(
-        message,
-        config_path=tmp_config,
-        recall_window_path=tmp_window,
-        db_path=tmp_db,
-        alpha=0.12,
-        ttl=3,
+def test_credit_mentions_alpha_matches_server_use_alpha():
+    """ALPHA_MENTION must match server.py:USE_ALPHA['mention'].
+
+    The hook keeps ALPHA_MENTION as a local literal (to avoid importing the
+    full server module at hook-fire time). This test is the cross-file
+    invariant check: import server.USE_ALPHA at TEST time and assert the
+    two values agree. If they diverge (either side updates without the
+    other), this test fails and surfaces the drift loudly.
+    """
+    # The hook's _load_hook execution inserts ENGRAM_HOME (~/.engram) at
+    # sys.path[0], so a plain `import server` would resolve to the deployed
+    # snapshot, not the worktree under test. Re-prioritize REPO_ROOT here
+    # so the assertion checks THIS branch's server.py.
+    sys.path.insert(0, str(REPO_ROOT))
+    if "server" in sys.modules:
+        del sys.modules["server"]
+    import server  # heavy import OK at test time, NOT at hook fire
+    assert hook.ALPHA_MENTION == server.USE_ALPHA["mention"], (
+        f"Hook's ALPHA_MENTION={hook.ALPHA_MENTION} drifted from "
+        f"server.py:USE_ALPHA['mention']={server.USE_ALPHA['mention']}. "
+        f"Update both together; the comment in the hook flags this invariant."
     )
+
+
+def test_credit_mentions_bumps_all_mentioned_ids_present_in_db(tmp_db):
+    """Happy path: 3 IDs mentioned, all 3 in DB → all 3 bumped by α=0.10."""
+    message = "I built on ob_1234 and confirmed via dv_0567; see also ax_0001."
+    stats = hook.credit_mentions(message, db_path=tmp_db, alpha=0.10)
     assert stats["mentioned_count"] == 3
-    assert stats["active_window_count"] == 3
-    assert stats["eligible_count"] == 3
     assert stats["updated_count"] == 3
 
     conn = sqlite3.connect(tmp_db)
     rows = dict(conn.execute("SELECT id, utility_score FROM nodes").fetchall())
     conn.close()
-    # ob_1234: 0.0 → 0.12; dv_0567: 0.5 → 0.56; ax_0001: 0.9 → 0.912
-    assert rows["ob_1234"] == pytest.approx(0.12, abs=1e-9)
-    assert rows["dv_0567"] == pytest.approx(0.56, abs=1e-9)
-    assert rows["ax_0001"] == pytest.approx(0.912, abs=1e-9)
+    # ob_1234: 0.0 → 0.10; dv_0567: 0.5 → 0.55; ax_0001: 0.9 → 0.91
+    assert rows["ob_1234"] == pytest.approx(0.10, abs=1e-9)
+    assert rows["dv_0567"] == pytest.approx(0.55, abs=1e-9)
+    assert rows["ax_0001"] == pytest.approx(0.91, abs=1e-9)
 
 
-def test_credit_mentions_no_message_noop(tmp_db, tmp_config, tmp_window):
-    stats = hook.credit_mentions("", config_path=tmp_config, recall_window_path=tmp_window, db_path=tmp_db)
+def test_credit_mentions_silently_skips_missing_db_ids(tmp_db):
+    """IDs mentioned in prose but absent from DB → no error, updated_count=0."""
+    stats = hook.credit_mentions(
+        "Earlier I cited ob_0000 and ob_9876 in my response.",
+        db_path=tmp_db,
+        alpha=0.10,
+    )
+    assert stats["mentioned_count"] == 2
+    assert stats["updated_count"] == 0
+
+
+def test_credit_mentions_no_message_noop(tmp_db):
+    stats = hook.credit_mentions("", db_path=tmp_db)
     assert stats == {
         "mentioned_count": 0,
-        "active_window_count": 0,
-        "eligible_count": 0,
         "updated_count": 0,
     }
 
 
-def test_credit_mentions_no_ids_in_message(tmp_db, tmp_config, tmp_window):
+def test_credit_mentions_no_ids_in_message(tmp_db):
     stats = hook.credit_mentions(
         "Plain prose with no node IDs at all.",
-        config_path=tmp_config,
-        recall_window_path=tmp_window,
         db_path=tmp_db,
     )
     assert stats["mentioned_count"] == 0
     assert stats["updated_count"] == 0
 
 
-def test_credit_mentions_mentions_not_in_window(tmp_db, tmp_config, tmp_window):
-    # ob_5555 is mentioned but not in the recall window → no credit
-    stats = hook.credit_mentions(
-        "Some unrelated id ob_5555 in the response.",
-        config_path=tmp_config,
-        recall_window_path=tmp_window,
-        db_path=tmp_db,
-    )
-    assert stats["mentioned_count"] == 1
-    assert stats["active_window_count"] == 3
-    assert stats["eligible_count"] == 0
-    assert stats["updated_count"] == 0
-
-
-def test_credit_mentions_window_outside_ttl(tmp_db, tmp_config, tmp_path):
-    # All window entries are older than TTL → no credit even for mentioned IDs
-    rw = tmp_path / "rw.json"
-    rw.write_text(
-        json.dumps(
-            {"entries": [{"ids": ["ob_1234"], "turn": 10, "source": "surface"}]}
-        )
-    )
-    stats = hook.credit_mentions(
-        "Mentioning ob_1234 in this response.",
-        config_path=tmp_config,  # current_turn=42, cutoff=39
-        recall_window_path=str(rw),
-        db_path=tmp_db,
-    )
-    assert stats["mentioned_count"] == 1
-    assert stats["active_window_count"] == 0
-    assert stats["eligible_count"] == 0
-    assert stats["updated_count"] == 0
-
-
-def test_credit_mentions_deduplicates(tmp_db, tmp_config, tmp_window):
+def test_credit_mentions_deduplicates(tmp_db):
     # Same ID mentioned twice → counted once, bumped once
     stats = hook.credit_mentions(
         "First ob_1234, then again ob_1234 mentioned.",
-        config_path=tmp_config,
-        recall_window_path=tmp_window,
         db_path=tmp_db,
+        alpha=0.10,
     )
     assert stats["mentioned_count"] == 1
-    assert stats["eligible_count"] == 1
     assert stats["updated_count"] == 1
 
     conn = sqlite3.connect(tmp_db)
     val = conn.execute("SELECT utility_score FROM nodes WHERE id = 'ob_1234'").fetchone()[0]
     conn.close()
-    assert val == pytest.approx(0.12, abs=1e-9)  # single bump, not double
+    assert val == pytest.approx(0.10, abs=1e-9)  # single bump, not double
 
 
-def test_credit_mentions_shape_match_but_unknown_prefix(tmp_db, tmp_config, tmp_path):
-    """Shape-regex false-positives (in_1234, etc.) are caught at the DB layer.
+def test_credit_mentions_shape_match_but_unknown_prefix_capital(tmp_db):
+    """Shape-regex false-positives with capital prefix are not matched.
 
-    `in_1234` matches the regex but isn't a real node ID. recall_window
-    shouldn't contain it; even if it did (defensive), bump_utility would
-    skip the missing row in the DB.
+    `In_1234` (capital I) doesn't match the regex (requires lowercase prefix)
+    so mentioned_count=0 and nothing is bumped.
     """
-    rw = tmp_path / "rw.json"
-    rw.write_text(json.dumps({"entries": [{"ids": ["in_1234"], "turn": 42, "source": "surface"}]}))
     stats = hook.credit_mentions(
         "In_1234 was mentioned but it's not a real ID.",  # capital I won't match regex
-        config_path=tmp_config,
-        recall_window_path=str(rw),
         db_path=tmp_db,
     )
     # "In_1234" doesn't match (regex requires lowercase prefix)
     assert stats["mentioned_count"] == 0
 
 
-def test_credit_mentions_lowercase_shape_match_misses_in_db(tmp_db, tmp_config, tmp_path):
-    """Defensive case: lowercase `in_1234` matches the regex AND is in the
-    recall window, but the DB has no such row. bump_utility must silently
-    skip — mentioned_count=1, eligible_count=1, updated_count=0.
+def test_credit_mentions_lowercase_shape_match_misses_in_db(tmp_db):
+    """Defensive case: lowercase `in_1234` matches the regex but the DB has no
+    such row. bump_utility must silently skip — mentioned_count=1, updated_count=0.
     """
-    rw = tmp_path / "rw.json"
-    rw.write_text(json.dumps({"entries": [{"ids": ["in_1234"], "turn": 42, "source": "surface"}]}))
     stats = hook.credit_mentions(
         "Earlier I cited in_1234 in my response.",  # lowercase — DOES match regex
-        config_path=tmp_config,
-        recall_window_path=str(rw),
         db_path=tmp_db,
     )
     assert stats["mentioned_count"] == 1
-    assert stats["eligible_count"] == 1
     assert stats["updated_count"] == 0
 
 
@@ -555,7 +419,7 @@ def test_main_stop_hook_active_guard_skips_credit_assignment(monkeypatch):
 
     def _spy(*args, **kwargs):
         calls.append((args, kwargs))
-        return {"mentioned_count": 0, "active_window_count": 0, "eligible_count": 0, "updated_count": 0}
+        return {"mentioned_count": 0, "updated_count": 0}
 
     monkeypatch.setattr(hook, "credit_mentions", _spy)
 

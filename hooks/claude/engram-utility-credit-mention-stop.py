@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Stop hook: scrape last assistant message for ENGRAM node-id mentions and
-bump utility_score for IDs that were in the recall_window.
+bump utility_score for every mentioned ID found in the substrate DB.
 
 Implements alpha #177 area 4 (broader credit-assignment per Lei 2026-05-19):
 the prior utility-reward mechanism only fired when a recalled node was
@@ -8,31 +8,34 @@ later cited as a `derives_from` premise in engram_derive (server.py:2694).
 This misses prose-mention, inline ID-citation, and informed-but-uncited
 use. The stop hook captures the prose-mention / inline-citation cases
 by scanning the response text after every assistant turn and bumping
-utility_score for any mentioned IDs that ALSO appear in the recall
-window — i.e. IDs the substrate brought up via surface / query /
-inspect / subgraph within the TTL.
+utility_score for any mentioned node IDs directly — no window
+intersection required.
 
-Mechanism
+Mechanism (V1.2 — simplified in PR #215 after #214 retired recall_window; Lei 2026-05-19)
 ---------
 1. Read `last_assistant_message` from Claude Code's Stop-hook stdin
    payload (synchronous, not subject to the JSONL flush race that bit
    the deference-detector pre-2026-05-07 per ob_1540 / ls_0029).
-2. Extract node-shaped tokens via engram_ids.find_node_ids (SSoT
+2. Collect all assistant text blocks from the current turn via JSONL
+   walk (collect_turn_text).
+3. Extract node-shaped tokens via engram_ids.find_node_ids (SSoT
    regex shipped in PR #212, supports \\d{4,} past 9999).
-3. Load ~/.engram/recall_window.json and collect IDs whose window
-   entry has `turn >= current_turn - RECALL_WINDOW_TTL` (TTL = 3).
-4. INTERSECT mentioned IDs with the active window — only credit IDs
-   the substrate brought up. IDs the agent typed without substrate
-   recall (cited from training, copy-pasted, etc.) are not credited.
-5. Apply Q-update: `Q_new = Q_old + α(1 - Q_old)` with ALPHA_MENTION
-   = 0.12. The midpoint between surface(0.10, "passive substrate
-   hint") and inspect(0.15, "deliberate full-content recall") —
-   prose-mention is engagement evidence between those two.
+4. Apply Q-update: `Q_new = Q_old + α(1 - Q_old)` with ALPHA_MENTION
+   = 0.10 (matches USE_ALPHA["mention"] in server.py). If the DB has
+   the ID it bumps; if not (e.g. `in_1234` shape-false-positive), the
+   row-missing guard in bump_utility silently skips.
+
+Note: the original V1.0 hook intersected mentioned IDs with a
+recall_window (substrate-vs-elsewhere-context tracking). This was
+removed in PR #214 because post-cutover node IDs always come from
+substrate context — agents don't have training-time knowledge of
+session-specific IDs like ob_XXXX. The intersection was a no-op
+tautology. PR #214 also eliminated recall_window.json entirely,
+making the file-path reference a dead constant.
 
 Idempotency: a node mentioned twice in the same response receives a
 single bump (find_node_ids dedups in order). Mentioned across two
-turns within TTL → two bumps (matches MemRL repeated-engagement
-intent).
+turns → two bumps (matches MemRL repeated-engagement intent).
 
 Independent of engram_derive's existing credit path: derive scans
 premise IDs, this hook scans prose. Both can fire on the same turn
@@ -61,59 +64,15 @@ ENGRAM_HOME = os.environ.get("ENGRAM_HOME", str(Path.home() / ".engram"))
 # Make engram_ids importable at module scope (avoids duplicate sys.path inserts
 # on repeated calls to credit_mentions in test harnesses).
 sys.path.insert(0, ENGRAM_HOME)
-RECALL_WINDOW_PATH = os.path.join(ENGRAM_HOME, "recall_window.json")
 KNOWLEDGE_DB = os.path.join(ENGRAM_HOME, "knowledge.db")
-CONFIG_PATH = os.path.join(ENGRAM_HOME, "config.json")
 LOG_PATH = os.path.join(ENGRAM_HOME, "utility-credit-mention.log")
 
-# Q-update learning rate for "mention" credit. Midpoint between
-# UTILITY_ALPHA["surface"]=0.10 and UTILITY_ALPHA["inspect"]=0.15 from
-# server.py:UTILITY_ALPHA. Mention = "substrate brought it up AND agent
-# engaged enough to reference it in prose."
-ALPHA_MENTION = 0.12
-
-# Must match server.py RECALL_WINDOW_TTL.
-RECALL_WINDOW_TTL = 3
-
-
-def get_current_turn(config_path: str = CONFIG_PATH) -> int:
-    """Read current turn from config.json. 0 if unreadable or missing."""
-    try:
-        with open(config_path) as f:
-            config = json.load(f)
-        return int(config.get("memory", {}).get("current_turn", 0))
-    except Exception:
-        return 0
-
-
-def recall_window_active_ids(
-    current_turn: int,
-    recall_window_path: str = RECALL_WINDOW_PATH,
-    ttl: int = RECALL_WINDOW_TTL,
-) -> set[str]:
-    """Return IDs in the recall window whose entry-turn is within `ttl` of `current_turn`.
-
-    Empty set if file missing, corrupt, or no entries qualify.
-    """
-    if not os.path.exists(recall_window_path):
-        return set()
-    try:
-        with open(recall_window_path) as f:
-            data = json.load(f)
-    except Exception:
-        return set()
-    active: set[str] = set()
-    cutoff = current_turn - ttl
-    for entry in data.get("entries", []):
-        if entry.get("turn", 0) >= cutoff:
-            for nid in entry.get("ids", []):
-                if isinstance(nid, str):
-                    active.add(nid)
-    return active
+# Must match USE_ALPHA["mention"] in server.py. Action: "mention". Tier 2 — moderate engagement.
+ALPHA_MENTION = 0.10
 
 
 def bump_utility(
-    node_ids: set[str],
+    node_ids,
     alpha: float,
     db_path: str = KNOWLEDGE_DB,
 ) -> int:
@@ -242,22 +201,22 @@ def collect_turn_text(transcript_path: str, last_assistant_message: str) -> str:
 def credit_mentions(
     last_message: str,
     *,
-    config_path: str = CONFIG_PATH,
-    recall_window_path: str = RECALL_WINDOW_PATH,
     db_path: str = KNOWLEDGE_DB,
     alpha: float = ALPHA_MENTION,
-    ttl: int = RECALL_WINDOW_TTL,
 ) -> dict:
     """Run the credit-assignment pipeline against `last_message`.
 
-    Returns a stats dict with mentioned_count / active_window_count /
-    eligible_count / updated_count. Pure function (no I/O beyond the
-    configured paths) — testable independently of stdin parsing.
+    Returns a stats dict with mentioned_count / updated_count. Bumps
+    utility for every ENGRAM node ID typed in the agent's prose for
+    this turn. The prior recall_window intersection was removed in
+    PR #214: post-cutover node IDs always originate from substrate
+    context, so the intersection was a tautology.
+
+    Pure function (no I/O beyond the configured paths) — testable
+    independently of stdin parsing.
     """
     stats = {
         "mentioned_count": 0,
-        "active_window_count": 0,
-        "eligible_count": 0,
         "updated_count": 0,
     }
     if not last_message:
@@ -273,19 +232,11 @@ def credit_mentions(
     if not mentioned:
         return stats
 
-    current_turn = get_current_turn(config_path)
-    active = recall_window_active_ids(current_turn, recall_window_path, ttl)
-    stats["active_window_count"] = len(active)
-    if not active:
-        return stats
-
-    eligible = set(mentioned) & active
-    stats["eligible_count"] = len(eligible)
-    if not eligible:
-        return stats
-
     try:
-        stats["updated_count"] = bump_utility(eligible, alpha, db_path)
+        # `mentioned` is already deduplicated in first-occurrence order by
+        # engram_ids.find_node_ids; pass directly without re-wrapping in set()
+        # (which would discard the ordering without any correctness gain).
+        stats["updated_count"] = bump_utility(mentioned, alpha, db_path)
     except Exception as e:
         _log(f"bump_utility failed: {type(e).__name__}: {e}")
     return stats
@@ -327,8 +278,6 @@ def main() -> None:
         _log(
             f"session={session_id} "
             f"mentioned={stats['mentioned_count']} "
-            f"active_window={stats['active_window_count']} "
-            f"eligible={stats['eligible_count']} "
             f"updated={stats['updated_count']} "
             f"duration_ms={_duration_ms}"
         )
@@ -348,8 +297,6 @@ def main() -> None:
                 "duration_ms": _duration_ms,
                 "exit_code": 0,
                 "mentioned_count": stats["mentioned_count"],
-                "active_window_count": stats["active_window_count"],
-                "eligible_count": stats["eligible_count"],
                 "updated_count": stats["updated_count"],
                 "alpha_mention": ALPHA_MENTION,
                 "context_mode": os.environ.get("ENGRAM_CONTEXT_MODE", "") or None,
