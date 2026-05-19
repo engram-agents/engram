@@ -215,6 +215,25 @@ USE_ALPHA = {
 USE_ALPHA_DEFAULT = 0.10
 UTILITY_LAMBDA = 0.3      # Weight of utility in composite scoring (0 = off)
 
+# ── MMR diversity reranker (alpha #178 area 2) ───────────────────────────
+# Maximal Marginal Relevance: balances relevance vs. diversity in the
+# final ranked output to suppress near-duplicate nodes monopolising top-k.
+#
+# Formula (multiplicative, preserves composite-score scale):
+#   mmr(c) = composite(c) × (1 − (1 − MMR_LAMBDA) × max_sim(c, selected))
+#
+# MMR_LAMBDA ∈ [0, 1]:
+#   1 → no diversity penalty (pure composite order, MMR identity)
+#   0 → full penalty (max_sim term fully demotes duplicates)
+#   0.5 → calibrated default: halves the composite score for a node whose
+#          embedding is identical to an already-selected one
+#
+# MMR_POOL_MULTIPLIER: ratio of MMR input pool to desired output size.
+#   MMR needs more candidates than it returns so diversity selection has
+#   room to manoeuvre. 2× means: gather 20 candidates, return 10.
+MMR_LAMBDA = 0.5
+MMR_POOL_MULTIPLIER = 2
+
 # ── FTS↔semantic merge (alpha #207/#208) ─────────────────────────────────
 # When a node hits FTS, the bi-gram pair that fired may be on structural
 # words (adverbs, modal verbs) that co-occur in a topically-unrelated node
@@ -4492,6 +4511,99 @@ def _add_observation_batch_impl(
     return json.dumps(batch_result)
 
 
+# ---- MMR diversity reranker helpers (alpha #178 area 2) ----
+
+
+def _decode_embedding(raw) -> list[float] | None:
+    """Decode a node's embedding field to a list[float], or None if unavailable.
+
+    The embedding column stores JSON-serialised float arrays (set by
+    _compute_and_store_embedding).  Handles three cases:
+      - str  → JSON-parse to list[float]
+      - list → already decoded (e.g. when a caller stored the raw list)
+      - None / anything else → return None (cold-start; no diversity penalty)
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, (str, bytes)):
+        try:
+            decoded = json.loads(raw)
+            if isinstance(decoded, list):
+                return decoded
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return None
+
+
+def _max_cosine_to_selected(candidate: dict, selected: list[dict]) -> float:
+    """Return max cosine similarity between candidate and any already-selected node.
+
+    Uses EmbeddingManager.cosine_similarity (pure Python, no numpy dep).
+    Returns 0.0 when either embedding is absent (cold-start: no penalty).
+    """
+    e_c = _decode_embedding(candidate.get("_embedding"))
+    if e_c is None:
+        return 0.0
+    best = 0.0
+    for s in selected:
+        e_s = _decode_embedding(s.get("_embedding"))
+        if e_s is None:
+            continue
+        sim = _embedder.cosine_similarity(e_c, e_s)
+        if sim > best:
+            best = sim
+    return best
+
+
+def _mmr_rerank(
+    candidates: list[dict],
+    top_k: int,
+    mmr_lambda: float,
+) -> list[dict]:
+    """Maximal Marginal Relevance reranker.
+
+    Selects up to top_k nodes from candidates, greedily maximising:
+
+        mmr(c) = composite(c) × (1 − (1 − mmr_lambda) × max_sim(c, selected))
+
+    where composite(c) is the pre-computed _composite score and max_sim is
+    the highest cosine similarity between c and any already-selected node.
+
+    Args:
+        candidates: list of node dicts, each with "_composite" (float) and
+            optionally "_embedding" (decoded list[float] or raw JSON str).
+        top_k: desired output size (≤ len(candidates)).
+        mmr_lambda: ∈ [0, 1].  1 = pure composite (no diversity); 0 = full
+            diversity penalty.
+
+    Returns:
+        MMR-ordered list, length ≤ top_k.  The "_embedding" key is preserved
+        on each dict so the caller can strip it after the full pipeline.
+    """
+    if not candidates:
+        return []
+    remaining = list(candidates)
+    # First slot: highest composite score (before diversity matters)
+    remaining.sort(key=lambda c: c.get("_composite", 0.0), reverse=True)
+    selected: list[dict] = [remaining.pop(0)]
+    while remaining and len(selected) < top_k:
+        best: dict | None = None
+        best_score = float("-inf")
+        for c in remaining:
+            max_sim = _max_cosine_to_selected(c, selected)
+            mmr_score = c.get("_composite", 0.0) * (1.0 - (1.0 - mmr_lambda) * max_sim)
+            if mmr_score > best_score:
+                best_score = mmr_score
+                best = c
+        if best is None:
+            break
+        remaining.remove(best)
+        selected.append(best)
+    return selected
+
+
 # ---- Internal search layer ----
 
 
@@ -4553,14 +4665,25 @@ def _search_nodes(
         except Exception:
             _dbg_extracted_keywords = []
 
+    # --- Pool sizing for MMR (alpha #178 area 2) ---
+    # Gather MMR_POOL_MULTIPLIER × top_k candidates so the MMR diversity
+    # pass has room to select diverse results.  The extra candidates are
+    # pruned back to top_k after MMR; callers see no change in result count.
+    pool_size = top_k * MMR_POOL_MULTIPLIER
+
     # --- FTS keyword search ---
     fts_ids: set[str] = set()
     fts_results: list[sqlite3.Row] = []
     fts_query = _sanitize_fts_query(query, conn)
-    fts_cap = max(1, top_k // 2)  # reservation cap for FTS
+    fts_cap = max(1, pool_size // 2)  # reservation cap for FTS (half of pool)
     try:
         if not fts_query:
             raise sqlite3.OperationalError("empty FTS query")
+        # LIMIT is pool_size * 3 (= top_k * MMR_POOL_MULTIPLIER * 3) so the
+        # SQL fetch always supplies enough rows for fts_cap (= pool_size // 2)
+        # to be the binding constraint, regardless of MMR_POOL_MULTIPLIER's
+        # value. Previously hardcoded as top_k * 3 — became the binding
+        # constraint at MMR_POOL_MULTIPLIER ≥ 3.
         fts_rows = conn.execute(
             """SELECT n.*, fts.rank
                FROM nodes_fts fts
@@ -4568,7 +4691,7 @@ def _search_nodes(
                WHERE nodes_fts MATCH ?
                ORDER BY fts.rank
                LIMIT ?""",
-            (fts_query, top_k * 3),
+            (fts_query, pool_size * 3),
         ).fetchall()
 
         if return_debug:
@@ -4585,7 +4708,7 @@ def _search_nodes(
                 continue
             fts_results.append(r)
             fts_ids.add(r["id"])
-            # Cap FTS at half of top_k so semantic results retain real estate
+            # Cap FTS at half of pool_size so semantic results retain real estate
             # in the merged output. With the new IDF-driven OR-match,
             # _sanitize_fts_query can return 40-100+ hits for a single query;
             # without this cap, FTS would fill every slot and crowd out the
@@ -4661,6 +4784,11 @@ def _search_nodes(
             relevance_norm = 1.0 - 1.0 / (1.0 + abs(bm25_rank))
 
         node = _node_to_dict(r)
+        # Preserve embedding for MMR cosine computation (stripped after MMR).
+        # r is an sqlite3.Row from SELECT n.* which includes the embedding col.
+        raw_emb = r["embedding"] if "embedding" in r.keys() else None
+        if raw_emb is not None:
+            node["_embedding"] = raw_emb
         node["match_type"] = "keyword"
         node["_relevance"] = relevance_norm
         if node_sim is not None:
@@ -4684,7 +4812,9 @@ def _search_nodes(
             }
         output.append(node)
 
-    remaining = top_k - len(output)
+    # Fill remaining pool slots with semantic-only hits (up to pool_size total).
+    # Pool is larger than top_k so MMR can select diverse candidates.
+    remaining = pool_size - len(output)
     for s in semantic_only[:remaining]:
         if s["id"] in seen:
             continue
@@ -4692,6 +4822,10 @@ def _search_nodes(
         full = conn.execute("SELECT * FROM nodes WHERE id = ?", (s["id"],)).fetchone()
         if full:
             node = _node_to_dict(full)
+            # Preserve embedding for MMR cosine computation (stripped after MMR).
+            raw_emb = full["embedding"] if "embedding" in full.keys() else None
+            if raw_emb is not None:
+                node["_embedding"] = raw_emb
             node["match_type"] = "semantic"
             node["similarity"] = s["similarity"]
             node["_relevance"] = s["similarity"]
@@ -4715,6 +4849,8 @@ def _search_nodes(
     # --- Utility-weighted re-ranking (MemRL Phase B, cj_0027) ---
     # Composite score: (1-λ) × relevance + λ × utility_score
     # When all utility_scores are 0 (cold start), this preserves original order.
+    # NOTE: _composite is NOT popped from each node here — the MMR pass below
+    # needs it.  It is stripped (along with _embedding) after MMR completes.
     if UTILITY_LAMBDA > 0:
         for node in output:
             util = node.get("utility_score", 0) or 0.0
@@ -4723,13 +4859,30 @@ def _search_nodes(
             node["_composite"] = composite
             if return_debug and node.get("id") in _dbg_per_result:
                 _dbg_per_result[node["id"]]["composite_score"] = composite
-        output.sort(key=lambda x: x.pop("_composite", 0), reverse=True)
+        output.sort(key=lambda x: x.get("_composite", 0), reverse=True)
     else:
         for node in output:
             rel = node.pop("_relevance", None)
+            # MMR needs _composite even when UTILITY_LAMBDA==0; use relevance.
+            node["_composite"] = rel if rel is not None else 0.0
             if return_debug and rel is not None and node.get("id") in _dbg_per_result:
                 # When UTILITY_LAMBDA == 0, composite == relevance (no utility weighting).
                 _dbg_per_result[node["id"]]["composite_score"] = rel
+        output.sort(key=lambda x: x.get("_composite", 0), reverse=True)
+
+    # --- MMR diversity reranker (alpha #178 area 2) ---
+    # Input: full pool (up to pool_size = top_k × MMR_POOL_MULTIPLIER nodes,
+    #   already composite-sorted above).
+    # Output: top_k nodes, MMR-ordered for diversity.
+    # When MMR_LAMBDA=1 the output is identical to the composite-sorted order.
+    # When embedder is disabled (ENGRAM_NO_EMBEDDINGS=1) all nodes have
+    # _embedding=None → max_sim=0 everywhere → MMR reduces to composite order.
+    output = _mmr_rerank(output, top_k=top_k, mmr_lambda=MMR_LAMBDA)
+
+    # Strip internal-only fields before returning to callers.
+    for node in output:
+        node.pop("_composite", None)
+        node.pop("_embedding", None)
 
     # keyword_matches counts post-floor (after the sim<FTS_SIM_FLOOR drop)
     # so callers see the actual contributing FTS pool, not the pre-floor
@@ -4856,13 +5009,19 @@ def engram_surface(
                     entry["confidence"] = n.get("confidence")
                 special.append(entry)
 
-        # --- Top claims (highest confidence, non-special) ---
+        # --- Top claims (MMR-ordered, non-special) ---
+        # Historically this block re-sorted claim_nodes by raw confidence-desc
+        # before slicing [:3], which masked the composite+MMR ranked order
+        # produced by _search_nodes (ob_1939, alpha #178 area 1).
+        # The sort is intentionally removed: _search_nodes already delivers
+        # results in composite+MMR order, so claim_nodes[:3] preserves that
+        # canonical ranking.  "Lesson" nodes are excluded here too — they are
+        # surfaced in special_nodes above.
         claim_nodes = [
             n for n in results
-            if n.get("type", "") not in ("axiom", "contradiction", "question", "conjecture", "evidence")
+            if n.get("type", "") not in ("axiom", "contradiction", "question", "conjecture", "evidence", "lesson")
             and n.get("confidence") is not None
         ]
-        claim_nodes.sort(key=lambda x: x.get("confidence", 0), reverse=True)
         top_claims = [
             {
                 "id": n["id"], "type": n["type"],
