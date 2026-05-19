@@ -217,14 +217,15 @@ USE_ALPHA_DEFAULT = 0.10  # Fallback for unknown actions
 # Multiplicative-amplifier composite (Lei 2026-05-19 design call).
 # Replaces the additive (1-λ)×rel + λ×util blend with multiplicative
 # composition: relevance is the base, utility and importance are
-# multiplicative amplifiers. Empirical calibration via harness; these
-# starting points produce:
-#   util_amp ∈ [1.00, 1.50]     (utility ∈ [0, 1])
-#   imp_amp  ∈ [~1.05, ~2.15]   (normalized importance ∈ [1, ~23] for current graph)
-#   composite dynamic range:    cornerstone (max util, max imp) gets ~3.2x boost
-#                               typical median node gets ~1.5x boost
-UTIL_BETA = 0.5
-IMP_BETA = 0.05
+# multiplicative amplifiers. Calibrated by harness sweep on v4.2 golden set
+# 2026-05-19 PM — aggressive PR #218 defaults (UTIL=0.5, IMP=0.05) cost
+# NDCG -0.021 from IMP alone; scaled down 5x to restore baseline parity:
+#   util_amp ∈ [1.00, 1.10]     (utility ∈ [0, 1], β=0.10)
+#   imp_amp  ∈ [~1.005, ~1.115] (normalized importance ∈ [1, ~23], β=0.005)
+#   composite dynamic range:    cornerstone (max util, max imp) gets ~1.23x boost
+#                               typical median node gets ~1.09x boost
+UTIL_BETA = 0.10
+IMP_BETA = 0.005
 
 # ── MMR diversity reranker (alpha #178 area 2) ───────────────────────────
 # Maximal Marginal Relevance: balances relevance vs. diversity in the
@@ -236,8 +237,11 @@ IMP_BETA = 0.05
 # MMR_LAMBDA ∈ [0, 1]:
 #   1 → no diversity penalty (pure composite order, MMR identity)
 #   0 → full penalty (max_sim term fully demotes duplicates)
-#   0.5 → calibrated default: halves the composite score for a node whose
-#          embedding is identical to an already-selected one
+#   0.5 → halves the composite score for a node whose embedding is identical
+#          to an already-selected one
+#   0.9 → calibrated default: mild near-dup discount (10% max). Empirical
+#          harness sweep (2026-05-19): MMR=0.5 cost -0.044 NDCG vs baseline;
+#          MMR=0.9 recovers parity while still demoting true duplicates.
 #
 # Tier-size multipliers (Lei 2026-05-19 architecture discussion).
 # Tier 1 retrieves a large raw pool per source; Tier 2 composite-shrinks;
@@ -247,7 +251,49 @@ IMP_BETA = 0.05
 TIER1_MULTIPLIER = 30   # raw-retrieval pool size per source = top_k × 30
 TIER2_MULTIPLIER = 4    # composite-shrink target           = top_k × 4
 # Tier 3 returns the caller's requested top_k.
-MMR_LAMBDA = 0.5
+MMR_LAMBDA = 0.9
+
+# ── Special-type bypass (Lei 2026-05-19 the child-case fix) ─────────────────────
+# Sparse anchor-types (person, definition, goal) and status-bearing types
+# (axiom, contradiction, question, conjecture, lesson) skip the composite-ranking
+# + MMR gauntlet: they just need similarity >= FTS_SIM_FLOOR to surface.
+#
+# Motivation (the child case, 2026-05-19 PM): pn_0005 has sim=0.3786 to
+# "the child: Good night Borges!!!" — above the floor — but composite
+# (rel=0.38 × max-1.5x amps = max 0.57) can't compete with goodnight
+# observations (rel=0.7 × ~1.3 amps = ~0.91). MMR diversity discount is
+# insufficient. Bypass ensures these sparse/structural nodes always surface
+# when semantically relevant.
+#
+# Output contract: top_k is the GENERIC-result budget; special-type results
+# are always-include when similarity >= FTS_SIM_FLOOR, so len(results) may
+# exceed top_k.  Callers that need strict top_k can slice further.
+SPECIAL_TYPES_BYPASS = frozenset({
+    # Status-bearing (already in special_nodes channel of engram_surface)
+    "axiom",
+    "contradiction",
+    "question",
+    "conjecture",
+    "lesson",
+    # Sparse anchor-types (NEW — Lei 2026-05-19 PM)
+    "definition",
+    "person",
+    "goal",
+})
+
+# Cap on the special-type bypass pool. Unbounded pool returns ~40 specials per
+# query above FTS_SIM_FLOOR — fine for the engram_surface browse channel but
+# noisy for callers that just want the most relevant anchors. Diversity-preserving
+# selection (Lei 2026-05-19 PM): reserve top-1 per type that has members, then
+# fill remaining slots with the next-best across types by similarity desc.
+#
+# Empirical justification: pre-cap special-channel partitioned metrics on v4.2
+# golden set show recall 0.539 with precision 0.121 (n_returned=40). The cap
+# lets the user keep most of the recall lift while restoring reasonable
+# precision — each type's strongest anchor is preserved (so e.g. the child's
+# pn_0005 is never starved by 9 high-sim definitions), and the rest of the
+# budget goes to whichever type's secondary candidates are most relevant.
+SPECIAL_POOL_CAP = 10
 
 # ── FTS↔semantic merge (alpha #207/#208) ─────────────────────────────────
 # When a node hits FTS, the bi-gram pair that fired may be on structural
@@ -4706,7 +4752,8 @@ def _search_nodes(
         semantic_available: bool
         debug: (only present when return_debug=True) intermediate ranking signals
 
-    Three-tier ranking pipeline (Lei 2026-05-19 architecture):
+    Three-tier ranking pipeline (Lei 2026-05-19 architecture) with special-type
+    bypass (Lei 2026-05-19 PM, the child case):
 
         TIER 1 — Raw retrieval (FTS + semantic, lossy floors only)
             ── FTS5 keyword search: BM25-ranked, capped at (top_k × TIER1_MULTIPLIER)//2,
@@ -4719,19 +4766,34 @@ def _search_nodes(
             Output contract: ≤ top_k × TIER1_MULTIPLIER candidates after merge cap;
             unsorted list with _relevance + optional _embedding annotated.
 
-        TIER 2 — Composite ranking (mechanical, multiplicative amplifiers)
+        SPECIAL-TYPE PARTITION — After Tier 1, split the pool by type:
+            ── special_pool: types in SPECIAL_TYPES_BYPASS (person, definition, goal,
+               axiom, contradiction, question, conjecture, lesson).
+               These skip Tiers 2 + 3 entirely. Filter: similarity >= FTS_SIM_FLOOR.
+               Sort by similarity desc. All qualifying nodes surface regardless of
+               how many generic results exist.
+            ── generic_output: everything else (dominantly observation_factual,
+               derivation). Proceeds through Tiers 2 + 3 as usual.
+
+        TIER 2 — Composite ranking applied to generic_output only
             composite = relevance × util_amp × imp_amp
                       = relevance × (1 + UTIL_BETA × utility_score)
                                   × (1 + IMP_BETA × normalized_importance)
             Then SORT + CUT to top_k × TIER2_MULTIPLIER.
             Output contract: top_k × TIER2_MULTIPLIER candidates sorted by _composite desc.
 
-        TIER 3 — MMR diversity rerank (perceptual, embedding-aware)
+        TIER 3 — MMR diversity rerank applied to generic_output only
             mmr(c) = composite(c) × (1 − (1 − MMR_LAMBDA) × max_sim(c, selected))
             Greedy selection of top_k from the TIER2-sized pool.
             Output contract: top_k candidates, MMR-ordered.
 
-        Post-Tier-3 strip: remove _composite + _embedding internal keys.
+        FINAL MERGE — generic_output (top_k) + special_pool (all qualifying).
+            top_k is the GENERIC-result budget; special-type results are
+            always-include, so len(results) may exceed top_k.
+            Callers needing strict top_k can slice further.
+            Dedup by node ID (should not occur in practice since types partition cleanly).
+
+        Post-pipeline strip: remove _composite + _embedding internal keys.
 
     Boundary contracts are explicit (sort before MMR, MMR documents
     the expectation) — see Lei's "quick_sort on 100 items is cheap,
@@ -4946,6 +5008,63 @@ def _search_nodes(
                 }
             output.append(node)
 
+    # ══ SPECIAL-TYPE PARTITION ══════════════════════════════════════════
+    # After Tier 1, split the merged pool into special-type and generic paths.
+    # Special types (SPECIAL_TYPES_BYPASS) skip Tiers 2 + 3 entirely: they
+    # only need similarity >= FTS_SIM_FLOOR to surface. This ensures sparse
+    # anchor-types (person, definition, goal) and status-bearing types
+    # (axiom, contradiction, question, conjecture, lesson) are never buried
+    # by composite amplifiers on common observation_factual / derivation nodes.
+    # the child case (2026-05-19 PM): pn_0005 sim=0.3786 above floor but
+    # composite=0.57 loses to goodnight obs composite=0.91.
+    #
+    # Similarity for a node is in node["similarity"] (set during Tier-1 merge
+    # for both FTS-hit and semantic paths). When semantic is unavailable,
+    # FTS-only nodes won't have "similarity" set — fall back to treating them
+    # as passing the floor (FTS already applied its own relevance gate).
+    special_pool: list[dict] = []
+    generic_output: list[dict] = []
+    for node in output:
+        if node.get("type") in SPECIAL_TYPES_BYPASS:
+            sim = node.get("similarity")
+            # When semantic unavailable, sim is None; treat as passing floor.
+            if sim is None or sim >= FTS_SIM_FLOOR:
+                special_pool.append(node)
+            # If sim is explicitly below floor, drop (inconsistent but defensive).
+        else:
+            generic_output.append(node)
+    # Sort special_pool by similarity desc (None → 0.0 for sort stability).
+    special_pool.sort(key=lambda n: n.get("similarity") or 0.0, reverse=True)
+    # Strip _relevance from special nodes (not needed — they bypass composite).
+    for node in special_pool:
+        node.pop("_relevance", None)
+
+    # Diversity-preserving cap (SPECIAL_POOL_CAP). Reserve top-1 per type that
+    # has members in the pool, then fill remaining slots from the rest by
+    # similarity desc. Preserves the child-case rescue (the single best person
+    # node won't be starved by 9 high-sim definitions) while bounding the
+    # pool to a sensible size for surface-channel rendering.
+    if len(special_pool) > SPECIAL_POOL_CAP:
+        seen_types: set[str] = set()
+        top_per_type: list[dict] = []
+        remainder: list[dict] = []
+        for n in special_pool:  # already sim-desc sorted
+            ntype = n.get("type", "")
+            if ntype not in seen_types:
+                seen_types.add(ntype)
+                top_per_type.append(n)
+            else:
+                remainder.append(n)
+        # remainder is already sim-desc (preserves the input order from special_pool)
+        slots_left = max(0, SPECIAL_POOL_CAP - len(top_per_type))
+        capped = top_per_type + remainder[:slots_left]
+        # Resort the final cohort by similarity desc for consistent output order.
+        capped.sort(key=lambda n: n.get("similarity") or 0.0, reverse=True)
+        special_pool = capped
+
+    # Tier 2 + 3 operate on generic_output only.
+    output = generic_output
+
     # ══ TIER 2: Composite ranking (multiplicative amplifiers) ═══════════
     # Lei 2026-05-19. Replaces the additive λ-blend with pure multiplicative
     # composition: relevance is the base, utility + importance are amplifiers.
@@ -4992,6 +5111,18 @@ def _search_nodes(
     for node in output:
         node.pop("_composite", None)
         node.pop("_embedding", None)
+    # Strip _embedding from special_pool too (set during Tier 1).
+    for node in special_pool:
+        node.pop("_embedding", None)
+
+    # ══ FINAL MERGE: generic (top_k) + special-type bypass results ══════
+    # top_k is the generic-result budget. Special-type results append after,
+    # so len(results) may exceed top_k. Dedup by node ID (types partition
+    # cleanly in practice, but the guard is cheap).
+    generic_ids = {n["id"] for n in output}
+    for node in special_pool:
+        if node["id"] not in generic_ids:
+            output.append(node)
 
     # keyword_matches counts post-floor (after the sim<FTS_SIM_FLOOR drop)
     # so callers see the actual contributing FTS pool, not the pre-floor
@@ -5100,10 +5231,14 @@ def engram_surface(
             type_counts[t] = type_counts.get(t, 0) + 1
 
         # --- Special nodes (always worth reviewing) ---
+        # Covers all SPECIAL_TYPES_BYPASS types: status-bearing (axiom,
+        # contradiction, question, conjecture, lesson) and sparse anchor-types
+        # (definition, person, goal). All now bypass composite+MMR in
+        # _search_nodes, so they can arrive here even when relevance is low.
         special = []
         for n in results:
             ntype = n.get("type", "")
-            if ntype in ("axiom", "contradiction", "question", "conjecture", "lesson"):
+            if ntype in SPECIAL_TYPES_BYPASS:
                 entry: dict = {
                     "id": n["id"], "type": ntype,
                     "claim": n.get("claim", ""),
@@ -5124,11 +5259,14 @@ def engram_surface(
         # produced by _search_nodes (ob_1939, alpha #178 area 1).
         # The sort is intentionally removed: _search_nodes already delivers
         # results in composite+MMR order, so claim_nodes[:3] preserves that
-        # canonical ranking.  "Lesson" nodes are excluded here too — they are
-        # surfaced in special_nodes above.
+        # canonical ranking.  All SPECIAL_TYPES_BYPASS types are excluded here
+        # — they are surfaced in special_nodes above.
         claim_nodes = [
             n for n in results
-            if n.get("type", "") not in ("axiom", "contradiction", "question", "conjecture", "evidence", "lesson")
+            if n.get("type", "") not in (
+                "axiom", "contradiction", "question", "conjecture", "evidence",
+                "lesson", "definition", "person", "goal",
+            )
             and n.get("confidence") is not None
         ]
         top_claims = [

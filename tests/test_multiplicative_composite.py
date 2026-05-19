@@ -6,10 +6,10 @@ Covers:
   3. _get_min_queryable_importance excludes nodes with importance_score = 0
   4. _get_min_queryable_importance excludes retracted (is_current = 0) nodes
   5. composite = relevance × (1 + IMP_BETA×1) when util=0 and imp=min (floor case)
-  6. utility=1 → util_amp = 1 + UTIL_BETA = 1.5
+  6. utility=1 → util_amp = 1 + UTIL_BETA = 1.10
   7. high-importance node → imp_amp scales correctly via normalization
   8. no branching on utility=0 — imp_amp still applied (old UTILITY_LAMBDA=0 branch gone)
-  9. constant values: UTIL_BETA == 0.5, IMP_BETA == 0.05
+  9. constant values: UTIL_BETA == 0.10, IMP_BETA == 0.005
   10. UTILITY_LAMBDA is no longer defined in server
   11. return_debug=True exposes util_amp, imp_amp, imp_norm_factor per result
   12. with amps at unity, composite == relevance (sanity check)
@@ -235,7 +235,7 @@ def test_composite_full_utility_maximizes_util_amp():
             break
 
     assert debug_entry is not None, f"Node {nid} not in debug per_result"
-    expected_util_amp = 1.0 + server.UTIL_BETA  # = 1.5 with UTIL_BETA=0.5
+    expected_util_amp = 1.0 + server.UTIL_BETA  # = 1.10 with UTIL_BETA=0.10
     assert abs(debug_entry["util_amp"] - expected_util_amp) < 1e-9, (
         f"Expected util_amp={expected_util_amp} with utility=1.0, got {debug_entry['util_amp']}"
     )
@@ -339,13 +339,13 @@ def test_composite_no_branching_on_utility_disabled():
 
 
 def test_composite_constants_have_expected_values():
-    """UTIL_BETA == 0.5, IMP_BETA == 0.05."""
+    """UTIL_BETA == 0.10, IMP_BETA == 0.005 (calibrated 2026-05-19 PM harness sweep)."""
     server = fresh_server()
-    assert server.UTIL_BETA == 0.5, (
-        f"Expected UTIL_BETA=0.5, got {server.UTIL_BETA}"
+    assert server.UTIL_BETA == 0.10, (
+        f"Expected UTIL_BETA=0.10, got {server.UTIL_BETA}"
     )
-    assert server.IMP_BETA == 0.05, (
-        f"Expected IMP_BETA=0.05, got {server.IMP_BETA}"
+    assert server.IMP_BETA == 0.005, (
+        f"Expected IMP_BETA=0.005, got {server.IMP_BETA}"
     )
 
 

@@ -19,8 +19,8 @@ Covers:
      top_claims is NOT re-sorted by confidence post-MMR (the #178 area 1 fix).
   8. test_engram_query_uses_mmr_too
      engram_query goes through _search_nodes and also gets MMR output.
-  9. test_mmr_default_lambda_is_0_5
-     MMR_LAMBDA == 0.5.
+  9. test_mmr_default_lambda_is_0_9
+     MMR_LAMBDA == 0.9.
  10. test_tier2_multiplier_default_is_4
      TIER2_MULTIPLIER == 4 (replaced MMR_POOL_MULTIPLIER).
  11. test_mmr_returns_top_k_not_pool_size
@@ -95,10 +95,10 @@ def _vec(values: list[float]) -> list[float]:
 # ---------------------------------------------------------------------------
 
 
-def test_mmr_default_lambda_is_0_5():
-    """MMR_LAMBDA constant must be 0.5 (calibrated 2026-05-19)."""
+def test_mmr_default_lambda_is_0_9():
+    """MMR_LAMBDA constant must be 0.9 (calibrated 2026-05-19 PM harness sweep)."""
     srv = fresh_server()
-    assert srv.MMR_LAMBDA == 0.5, f"Expected MMR_LAMBDA=0.5, got {srv.MMR_LAMBDA}"
+    assert srv.MMR_LAMBDA == 0.9, f"Expected MMR_LAMBDA=0.9, got {srv.MMR_LAMBDA}"
 
 
 def test_tier2_multiplier_default_is_4():
