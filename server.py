@@ -424,6 +424,13 @@ from engram_confidence import (
     CONJECTURE_CONFIDENCE_MAX, REASONING_TYPES, REASONING_CLASS,
     REASONING_DISCOUNT, ABDUCTIVE_CONFIDENCE_CAP,
 )
+from tools.recall_summary_validator import (
+    validate_summary_entry,
+    RECALL_SUMMARY_HARD_CAP,
+    RECALL_KEYWORDS_MIN,
+    RECALL_KEYWORDS_MAX,
+    RECALL_KEYWORD_MAX_LEN,
+)
 
 VALID_NODE_TYPES = {
     "evidence",
@@ -12417,152 +12424,117 @@ def engram_focus_delete_set(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Recall summary write tool
+# Recall summary write tool (batch)
 # ---------------------------------------------------------------------------
-
-_SET_RECALL_SUMMARY_FIELDS = frozenset({
-    "node_id", "recall_summary", "recall_keywords",
-})
-
-# Hard cap on recall_summary character length. The authoring target is ≤120
-# (instructed via the generation prompt in tools/recall_summary_prompts.py);
-# the cap is a defensive guard against runaway output, not a tight constraint.
-# Per-type validation pilot (2026-05-19) showed Sonnet legitimately produces
-# 145-155 chars on dense load-bearing claims. 200 leaves headroom while still
-# catching truly-broken output.
-_RECALL_SUMMARY_HARD_CAP = 200
-_RECALL_KEYWORDS_MIN = 3
-_RECALL_KEYWORDS_MAX = 5
-_RECALL_KEYWORD_MAX_LEN = 30
+# Constants and per-entry validation live in tools/recall_summary_validator.py
+# (single source of truth). The module-level constants imported at the top of
+# this file (RECALL_SUMMARY_HARD_CAP, etc.) come from there.
 
 
 @mcp.tool(
-    name="engram_set_recall_summary",
+    name="engram_set_recall_summaries",
     annotations={
-        "title": "Set Recall Summary and Keywords",
+        "title": "Batch-Set Recall Summaries and Keywords",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
     },
 )
-def engram_set_recall_summary(payload_json: str) -> str:
-    """Set recall_summary + recall_keywords on one node.
+def engram_set_recall_summaries(payload_json: str) -> str:
+    """Batch-write recall_summary + recall_keywords for multiple nodes.
 
-    Used by the one-shot backfill (in-session fairy dispatch) and the daily
-    sleep-skill step. Idempotent — overwrites existing values without touching
-    other node fields (no importance/utility/recall_turn change, no audit log).
+    Best-effort: applies valid entries, returns per-item errors for invalid ones
+    (no all-or-nothing rollback). Use for sleep-cycle cohort writes and bulk
+    backfill operations.
 
     Args:
-        payload_json: JSON object string with required fields:
-            node_id (str): The node to update. Must exist + is_current=1.
-            recall_summary (str): curated summary. **Authoring target: ≤120
-                chars** (this is what the generation prompt instructs the
-                fairy to aim for). **Hard cap: 200 chars** — defensive guard
-                against truly runaway output, NOT a tight constraint. The
-                gap between the soft target and the hard cap is deliberate:
-                dense load-bearing claims may push 140-160 chars and that's
-                fine. Reject only above 200, and when rejecting return an
-                error message stating the cap explicitly so the caller can
-                make a runtime decision (truncate, regenerate, accept).
-            recall_keywords (list[str]): 3 to 5 short strings. Each ≤30 chars.
+        payload_json: JSON object string with required key:
+            summaries (list): list of entry objects, each with:
+                node_id (str): target node. Must exist + is_current=1.
+                recall_summary (str): curated summary. Authoring target ≤120
+                    chars; hard cap 200 chars (defensive guard).
+                recall_keywords (list[str]): 3–5 strings, each ≤30 chars,
+                    no duplicates (case-sensitive).
 
     Returns:
-        JSON: {"status": "set", "node_id": "..."} on success,
-              {"error": "..."} on validation failure.
+        JSON: {
+            "ok": [{"node_id": "..."}, ...],
+            "errors": [{"node_id": "...", "error": "...", ...}, ...],
+            "applied": N,
+            "failed": M
+        }
     """
+    # -- Parse payload --
     try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
-
-    unknown = set(params.keys()) - _SET_RECALL_SUMMARY_FIELDS
-    if unknown:
+        payload = json.loads(payload_json)
+    except json.JSONDecodeError:
         return json.dumps({
-            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
-                     f"Allowed: {sorted(_SET_RECALL_SUMMARY_FIELDS)}"
+            "error": "invalid JSON in payload_json",
+            "got": payload_json[:100],
         })
 
-    node_id = params.get("node_id", "")
-    recall_summary = params.get("recall_summary")
-    recall_keywords = params.get("recall_keywords")
+    if not isinstance(payload, dict) or not isinstance(payload.get("summaries"), list):
+        return json.dumps({"error": "payload_json must have 'summaries' as a list"})
 
-    # -- Validate node_id --
-    if not node_id or not str(node_id).strip():
-        return json.dumps({"error": "node_id is required and cannot be empty"})
-    node_id = str(node_id).strip()
+    summaries = payload["summaries"]
+    pre_flight_failures = payload.get("failures") or []
 
-    # -- Validate recall_summary --
-    if recall_summary is None or not isinstance(recall_summary, str):
-        return json.dumps({"error": "recall_summary must be a non-empty string"})
-    if not recall_summary.strip():
-        return json.dumps({"error": "recall_summary must be a non-empty string"})
-    # Hard cap defined at module level (_RECALL_SUMMARY_HARD_CAP = 200).
-    # Error message states the cap explicitly so callers can decide on the
-    # spot whether to truncate, regenerate, or accept.
-    if len(recall_summary) > _RECALL_SUMMARY_HARD_CAP:
-        return json.dumps({
-            "error": (
-                f"recall_summary exceeds the {_RECALL_SUMMARY_HARD_CAP} char "
-                f"hard cap (got {len(recall_summary)} chars). The authoring "
-                "target is ≤120 chars; the hard cap is a defensive guard at "
-                f"{_RECALL_SUMMARY_HARD_CAP}. Caller may truncate, regenerate, "
-                "or accept-as-truncated."
-            ),
-            "hard_cap": _RECALL_SUMMARY_HARD_CAP,
-            "got_length": len(recall_summary),
-        })
+    # -- Validate all entries, partition into valid / error --
+    valid_entries: list[dict] = []
+    errors: list[dict] = []
 
-    # -- Validate recall_keywords --
-    if not isinstance(recall_keywords, list):
-        return json.dumps({"error": "recall_keywords must be a JSON array"})
-    if len(recall_keywords) < _RECALL_KEYWORDS_MIN or len(recall_keywords) > _RECALL_KEYWORDS_MAX:
-        return json.dumps({
-            "error": (
-                f"recall_keywords must have {_RECALL_KEYWORDS_MIN} to "
-                f"{_RECALL_KEYWORDS_MAX} elements (got {len(recall_keywords)})"
-            )
-        })
-    for i, kw in enumerate(recall_keywords):
-        if not isinstance(kw, str):
-            return json.dumps({
-                "error": (
-                    f"recall_keywords[{i}] must be a string "
-                    f"(got {type(kw).__name__}: {kw!r})"
-                )
-            })
-        if not kw.strip():
-            return json.dumps({
-                "error": f"recall_keywords[{i}] must not be empty or whitespace-only"
-            })
-        if len(kw) > _RECALL_KEYWORD_MAX_LEN:
-            return json.dumps({
-                "error": (
-                    f"recall_keywords[{i}] exceeds {_RECALL_KEYWORD_MAX_LEN} "
-                    f"char limit (got {len(kw)} chars: {kw!r})"
-                )
-            })
+    for entry in summaries:
+        err = validate_summary_entry(entry)
+        if err is not None:
+            errors.append({"node_id": entry.get("node_id") if isinstance(entry, dict) else None,
+                            **err})
+        else:
+            valid_entries.append(entry)
 
-    # -- Look up node; require is_current = 1 --
+    # -- Apply valid entries in a single transaction --
+    ok: list[dict] = []
     conn = _get_db()
     try:
-        row = conn.execute(
-            "SELECT id, is_current FROM nodes WHERE id = ?",
-            (node_id,),
-        ).fetchone()
-        if row is None or row["is_current"] != 1:
-            return json.dumps({"error": "node not found or not current"})
-
-        conn.execute(
-            "UPDATE nodes SET recall_summary = ?, recall_keywords = ? WHERE id = ?",
-            (recall_summary, json.dumps(recall_keywords), node_id),
-        )
-        conn.commit()
-        return json.dumps({"status": "set", "node_id": node_id})
+        with conn:
+            for entry in valid_entries:
+                node_id = entry["node_id"].strip()
+                recall_summary = entry["recall_summary"]
+                recall_keywords = entry["recall_keywords"]
+                try:
+                    row = conn.execute(
+                        "SELECT id, is_current FROM nodes WHERE id = ?",
+                        (node_id,),
+                    ).fetchone()
+                    if row is None:
+                        errors.append({
+                            "node_id": node_id,
+                            "error": "node not found",
+                        })
+                        continue
+                    if row["is_current"] != 1:
+                        errors.append({
+                            "node_id": node_id,
+                            "error": "node is not current (superseded)",
+                        })
+                        continue
+                    conn.execute(
+                        "UPDATE nodes SET recall_summary = ?, recall_keywords = ? WHERE id = ?",
+                        (recall_summary, json.dumps(recall_keywords), node_id),
+                    )
+                    ok.append({"node_id": node_id})
+                except Exception as exc:  # noqa: BLE001
+                    errors.append({"node_id": node_id, "error": str(exc)})
     finally:
         conn.close()
+
+    return json.dumps({
+        "ok": ok,
+        "errors": errors,
+        "applied": len(ok),
+        "failed": len(errors),
+        "pre_flight_failures": pre_flight_failures,
+    })
 
 
 # Pre-dream briefing trim policy. Reflect can otherwise return 100KB+ on

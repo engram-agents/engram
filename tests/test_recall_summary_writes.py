@@ -1,27 +1,57 @@
-"""Tests for engram_set_recall_summary MCP tool + tools/recall_summary_prompts module.
+"""Tests for engram_set_recall_summaries (batch) MCP tool, recall_summary_validator,
+and PayloadBuilder.
 
-PR B-1: write path for recall_summary + recall_keywords columns added in PR A.
+PR B-1.5: collapse singular engram_set_recall_summary into batch tool + extract
+validator into tools/recall_summary_validator.py.
 
 Coverage:
-  Tool tests:
-  1.  test_set_recall_summary_happy_path          — sets both fields on a fresh obs node
-  2.  test_set_recall_summary_idempotent           — second call with different values overwrites
-  3.  test_set_recall_summary_keywords_round_trip  — 4-element list survives JSON round-trip
-  4.  test_set_recall_summary_validates_node_exists — nonexistent node_id → error
-  5.  test_set_recall_summary_validates_node_is_current — superseded node → error
-  6.  test_set_recall_summary_validates_summary_length  — >200 → err with hard_cap+got_length structured fields; 200 → ok; 155 typical → ok; empty → err
-  7.  test_set_recall_summary_validates_keyword_count   — <3 → err; 3 → ok; 5 → ok; 6 → err
-  8.  test_set_recall_summary_validates_keyword_strings — non-str → err; empty → err; >30 → err
-  9.  test_set_recall_summary_no_side_effects       — importance/utility/recall_turn unchanged
 
-  Prompts module tests:
-  10. test_build_prompt_per_type_guidance    — each TYPE_GUIDANCE key → type guidance in prompt
-  11. test_build_prompt_unknown_type_falls_back — unknown type → DEFAULT_GUIDANCE in prompt
-  12. test_build_prompt_includes_claim_text  — claim text appears verbatim in prompt
+Batch tool tests (engram_set_recall_summaries):
+  1.  test_batch_happy_path                — 3 valid entries → applied=3, failed=0
+  2.  test_batch_mixed_valid_and_overcap   — 2 valid + 1 over-cap → applied=2, failed=1,
+                                             error has hard_cap+got_length
+  3.  test_batch_all_invalid              — 3 wrong-keyword-counts → applied=0, failed=3
+  4.  test_batch_empty_list               — summaries=[] → applied=0, failed=0
+  5.  test_batch_bad_json                 — unparseable JSON → top-level error field
+  6.  test_batch_missing_summaries_key    — no "summaries" key → top-level error
+  7.  test_batch_node_not_found           — one entry for nonexistent node → that
+                                             entry errors, others apply
+  8.  test_batch_idempotent               — second call overwrites first
+  9.  test_batch_superseded_node          — superseded node errors with distinct message;
+                                             valid current node applies (applied=1, failed=1)
+  10. test_batch_passes_through_pre_flight_failures — failures key passes through as
+                                             pre_flight_failures; missing key → empty list
+
+Validator unit tests (tools.recall_summary_validator.validate_summary_entry):
+  9.  test_validator_valid_entry           — all-good entry → None
+  10. test_validator_missing_fields        — missing node_id/recall_summary/recall_keywords
+  11. test_validator_summary_empty         — empty string → error
+  12. test_validator_summary_overcap       — len > 200 → hard_cap + got_length in error
+  13. test_validator_summary_at_cap        — len = 200 → None (valid)
+  14. test_validator_keyword_count_min     — 2 keywords → error with got_count + min + max
+  15. test_validator_keyword_count_max     — 6 keywords → error
+  16. test_validator_keyword_count_exact   — 3 keywords → None; 5 keywords → None
+  17. test_validator_keyword_not_str       — int element → error
+  18. test_validator_keyword_empty         — empty-string element → error
+  19. test_validator_keyword_too_long      — > 30 chars → error
+  20. test_validator_keyword_at_limit      — 30 chars → None
+  21. test_validator_duplicate_keywords    — duplicate keyword → error
+
+PayloadBuilder unit tests (tools.recall_summary_payload.PayloadBuilder):
+  22. test_builder_add_summary_happy       — add 2 valid entries; to_json has both
+  23. test_builder_add_summary_rejected    — invalid entry → error returned, not added
+  24. test_builder_add_failure             — add_failure → appears in "failures" key
+  25. test_builder_to_json_shape           — to_json output has both "summaries" + "failures" keys
+
+Prompts module tests (carried over from PR #223):
+  26. test_build_prompt_per_type_guidance  — type-specific guidance in prompt
+  27. test_build_prompt_unknown_type_falls_back — DEFAULT_GUIDANCE used for unknown type
+  28. test_build_prompt_includes_claim_text — claim text verbatim in prompt
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
@@ -76,385 +106,519 @@ def _add_obs(srv, claim: str, quoted_text: str = "test quote") -> str:
     return r["observation_id"]
 
 
-def _make_payload(node_id, summary=None, keywords=None):
-    """Build a minimal valid set_recall_summary payload."""
-    if summary is None:
-        summary = "A short curated summary for this node."
+def _valid_entry(node_id: str, summary: str = "A short curated summary for this node.",
+                  keywords: list[str] | None = None) -> dict:
     if keywords is None:
         keywords = ["keyword-one", "keyword-two", "keyword-three"]
-    return {
-        "node_id": node_id,
-        "recall_summary": summary,
-        "recall_keywords": keywords,
-    }
+    return {"node_id": node_id, "recall_summary": summary, "recall_keywords": keywords}
+
+
+# ===========================================================================
+# Section 1 — Batch tool tests
+# ===========================================================================
 
 
 # ---------------------------------------------------------------------------
-# Test 1: Happy path
+# Test 1: Happy path — 3 valid entries
 # ---------------------------------------------------------------------------
 
-
-def test_set_recall_summary_happy_path():
-    """Call tool on a fresh obs node; verify DB row gets both fields."""
+def test_batch_happy_path():
+    """3 valid entries → applied=3, failed=0, ok has all 3 node_ids."""
     srv = fresh_server()
-    obs_id = _add_obs(srv, "happy path recall summary test claim")
-
-    payload = _make_payload(
-        obs_id,
-        summary="Happy path: obs node gets recall fields set correctly.",
-        keywords=["happy-path", "recall", "writes"],
-    )
-    r = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(payload)))
+    ids = [_add_obs(srv, f"batch happy path claim {i}") for i in range(3)]
+    summaries = [_valid_entry(id_, f"Summary for node {i}.", ["a", "b", "c"])
+                 for i, id_ in enumerate(ids)]
+    r = json.loads(srv.engram_set_recall_summaries(
+        payload_json=json.dumps({"summaries": summaries})
+    ))
     assert "error" not in r, r
-    assert r.get("status") == "set", r
-    assert r.get("node_id") == obs_id, r
+    assert r["applied"] == 3, r
+    assert r["failed"] == 0, r
+    assert len(r["ok"]) == 3, r
+    assert len(r["errors"]) == 0, r
+    ok_ids = {entry["node_id"] for entry in r["ok"]}
+    assert ok_ids == set(ids), f"ok IDs mismatch: {ok_ids} vs {set(ids)}"
 
-    # Verify DB state directly
+    # Verify DB state for one entry
+    conn = fresh_conn(srv)
+    try:
+        row = conn.execute(
+            "SELECT recall_summary, recall_keywords FROM nodes WHERE id = ?",
+            (ids[0],),
+        ).fetchone()
+        assert row["recall_summary"] == summaries[0]["recall_summary"]
+        assert json.loads(row["recall_keywords"]) == summaries[0]["recall_keywords"]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 2: Mixed — 2 valid + 1 over-cap
+# ---------------------------------------------------------------------------
+
+def test_batch_mixed_valid_and_overcap():
+    """2 valid + 1 over-cap → applied=2, failed=1, error has hard_cap+got_length."""
+    srv = fresh_server()
+    ids = [_add_obs(srv, f"batch mixed claim {i}") for i in range(3)]
+    overcap_summary = "X" * 201
+    summaries = [
+        _valid_entry(ids[0], "First valid summary."),
+        _valid_entry(ids[1], "Second valid summary."),
+        _valid_entry(ids[2], overcap_summary),
+    ]
+    r = json.loads(srv.engram_set_recall_summaries(
+        payload_json=json.dumps({"summaries": summaries})
+    ))
+    assert r["applied"] == 2, r
+    assert r["failed"] == 1, r
+    assert len(r["ok"]) == 2, r
+    assert len(r["errors"]) == 1, r
+
+    err_entry = r["errors"][0]
+    assert err_entry["node_id"] == ids[2], err_entry
+    assert "hard_cap" in err_entry, err_entry
+    assert err_entry["hard_cap"] == 200, err_entry
+    assert "got_length" in err_entry, err_entry
+    assert err_entry["got_length"] == 201, err_entry
+
+
+# ---------------------------------------------------------------------------
+# Test 3: All invalid
+# ---------------------------------------------------------------------------
+
+def test_batch_all_invalid():
+    """3 entries with wrong keyword counts → applied=0, failed=3."""
+    srv = fresh_server()
+    ids = [_add_obs(srv, f"batch all invalid claim {i}") for i in range(3)]
+    summaries = [
+        # 1 keyword (below min=3)
+        {"node_id": ids[0], "recall_summary": "Valid summary.", "recall_keywords": ["one"]},
+        # 6 keywords (above max=5)
+        {"node_id": ids[1], "recall_summary": "Valid summary.", "recall_keywords": ["a", "b", "c", "d", "e", "f"]},
+        # 0 keywords
+        {"node_id": ids[2], "recall_summary": "Valid summary.", "recall_keywords": []},
+    ]
+    r = json.loads(srv.engram_set_recall_summaries(
+        payload_json=json.dumps({"summaries": summaries})
+    ))
+    assert r["applied"] == 0, r
+    assert r["failed"] == 3, r
+    assert len(r["ok"]) == 0, r
+    assert len(r["errors"]) == 3, r
+
+
+# ---------------------------------------------------------------------------
+# Test 4: Empty list
+# ---------------------------------------------------------------------------
+
+def test_batch_empty_list():
+    """summaries=[] → applied=0, failed=0, no error."""
+    srv = fresh_server()
+    r = json.loads(srv.engram_set_recall_summaries(
+        payload_json=json.dumps({"summaries": []})
+    ))
+    assert "error" not in r, r
+    assert r["applied"] == 0, r
+    assert r["failed"] == 0, r
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Bad JSON payload
+# ---------------------------------------------------------------------------
+
+def test_batch_bad_json():
+    """Unparseable payload_json → top-level error field, no partial writes."""
+    srv = fresh_server()
+    r = json.loads(srv.engram_set_recall_summaries(payload_json="{not valid json"))
+    assert "error" in r, r
+    assert "invalid JSON" in r["error"].lower() or "json" in r["error"].lower(), r
+
+
+# ---------------------------------------------------------------------------
+# Test 6: Missing "summaries" key
+# ---------------------------------------------------------------------------
+
+def test_batch_missing_summaries_key():
+    """Payload without summaries key → top-level error."""
+    srv = fresh_server()
+    r = json.loads(srv.engram_set_recall_summaries(
+        payload_json=json.dumps({"nodes": []})
+    ))
+    assert "error" in r, r
+    assert "summaries" in r["error"], r
+
+
+# ---------------------------------------------------------------------------
+# Test 7: Node not in DB
+# ---------------------------------------------------------------------------
+
+def test_batch_node_not_found():
+    """One entry for nonexistent node_id → that entry errors, other valid ones apply."""
+    srv = fresh_server()
+    real_id = _add_obs(srv, "batch node-not-found test real node")
+    fake_id = "ob_9999999_does_not_exist"
+    summaries = [
+        _valid_entry(real_id, "Real node summary."),
+        _valid_entry(fake_id, "Fake node summary."),
+    ]
+    r = json.loads(srv.engram_set_recall_summaries(
+        payload_json=json.dumps({"summaries": summaries})
+    ))
+    assert r["applied"] == 1, r
+    assert r["failed"] == 1, r
+    assert r["ok"][0]["node_id"] == real_id, r
+
+    err_entry = r["errors"][0]
+    assert err_entry["node_id"] == fake_id, err_entry
+    assert "not found" in err_entry["error"].lower(), err_entry
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Idempotent — second call overwrites
+# ---------------------------------------------------------------------------
+
+def test_batch_idempotent():
+    """Second call with different values on same node_id — second call wins."""
+    srv = fresh_server()
+    obs_id = _add_obs(srv, "batch idempotent test node")
+
+    first = [_valid_entry(obs_id, "First summary.", ["first", "pass", "test"])]
+    r1 = json.loads(srv.engram_set_recall_summaries(payload_json=json.dumps({"summaries": first})))
+    assert r1["applied"] == 1, r1
+
+    second = [_valid_entry(obs_id, "Second summary overwrites.", ["second", "overwrite", "test"])]
+    r2 = json.loads(srv.engram_set_recall_summaries(payload_json=json.dumps({"summaries": second})))
+    assert r2["applied"] == 1, r2
+
     conn = fresh_conn(srv)
     try:
         row = conn.execute(
             "SELECT recall_summary, recall_keywords FROM nodes WHERE id = ?",
             (obs_id,),
         ).fetchone()
-        assert row is not None, f"Node {obs_id} not found in DB"
-        assert row["recall_summary"] == payload["recall_summary"], (
-            f"recall_summary mismatch: {row['recall_summary']!r}"
-        )
-        kw_list = json.loads(row["recall_keywords"])
-        assert kw_list == payload["recall_keywords"], (
-            f"recall_keywords mismatch: {kw_list!r}"
-        )
+        assert row["recall_summary"] == "Second summary overwrites."
+        assert json.loads(row["recall_keywords"]) == ["second", "overwrite", "test"]
     finally:
         conn.close()
 
 
 # ---------------------------------------------------------------------------
-# Test 2: Idempotent — second call overwrites
+# Test 9 (batch): Superseded node — distinct error from missing node
 # ---------------------------------------------------------------------------
 
-
-def test_set_recall_summary_idempotent():
-    """Calling the tool twice with different values — second call wins."""
-    srv = fresh_server()
-    obs_id = _add_obs(srv, "idempotent recall summary test claim")
-
-    first_payload = _make_payload(
-        obs_id,
-        summary="First summary written to this node.",
-        keywords=["first", "summary", "test"],
-    )
-    r1 = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(first_payload)))
-    assert "error" not in r1, r1
-
-    second_payload = _make_payload(
-        obs_id,
-        summary="Second summary that should overwrite the first.",
-        keywords=["second", "overwrite", "idempotent"],
-    )
-    r2 = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(second_payload)))
-    assert "error" not in r2, r2
-    assert r2.get("status") == "set", r2
-
-    # Second call's values must win
-    conn = fresh_conn(srv)
-    try:
-        row = conn.execute(
-            "SELECT recall_summary, recall_keywords FROM nodes WHERE id = ?",
-            (obs_id,),
-        ).fetchone()
-        assert row["recall_summary"] == second_payload["recall_summary"], (
-            f"Expected second summary to overwrite: {row['recall_summary']!r}"
-        )
-        kw_list = json.loads(row["recall_keywords"])
-        assert kw_list == second_payload["recall_keywords"], (
-            f"Expected second keywords to overwrite: {kw_list!r}"
-        )
-    finally:
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Test 3: Keywords round-trip (4-element list)
-# ---------------------------------------------------------------------------
-
-
-def test_set_recall_summary_keywords_round_trip():
-    """Set 4-keyword list, read back via direct SQL, JSON-decode, assert equal."""
-    srv = fresh_server()
-    obs_id = _add_obs(srv, "keywords round trip recall summary test claim")
-
-    four_keywords = ["alpha", "beta", "gamma", "delta"]
-    payload = _make_payload(obs_id, keywords=four_keywords)
-    r = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(payload)))
-    assert "error" not in r, r
-
-    conn = fresh_conn(srv)
-    try:
-        row = conn.execute(
-            "SELECT recall_keywords FROM nodes WHERE id = ?",
-            (obs_id,),
-        ).fetchone()
-        raw = row["recall_keywords"]
-        # Must be a JSON string, not a Python list, in the DB
-        assert isinstance(raw, str), f"Expected JSON string in DB, got {type(raw)}: {raw!r}"
-        decoded = json.loads(raw)
-        assert decoded == four_keywords, (
-            f"Round-trip failed: {decoded!r} != {four_keywords!r}"
-        )
-    finally:
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Test 4: Validation — node_id does not exist
-# ---------------------------------------------------------------------------
-
-
-def test_set_recall_summary_validates_node_exists():
-    """Call on nonexistent node_id → error response, no exception."""
-    srv = fresh_server()
-    payload = _make_payload("ob_9999999_does_not_exist")
-    r = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(payload)))
-    assert "error" in r, f"Expected error for nonexistent node, got: {r}"
-    assert "not found" in r["error"].lower() or "not current" in r["error"].lower(), (
-        f"Expected 'not found or not current' message, got: {r['error']!r}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 5: Validation — node exists but is_current = 0 (superseded)
-# ---------------------------------------------------------------------------
-
-
-def test_set_recall_summary_validates_node_is_current():
-    """Supersede a node, then try to set summary → error."""
+def test_batch_superseded_node():
+    """Superseded node (is_current=0) errors with distinct message; valid node applies."""
     srv = fresh_server()
 
-    # Create two observations, then supersede the first with the second
-    old_id = _add_obs(srv, "original claim for supersede test")
-    new_id = _add_obs(srv, "revised claim that supersedes the original")
+    # Create the node to be superseded + a replacement
+    old_id = _add_obs(srv, "original claim to be superseded")
+    new_id = _add_obs(srv, "refined replacement claim")
 
-    sup_payload = {
+    # Supersede old_id with new_id
+    sup_r = json.loads(srv.engram_supersede(payload_json=json.dumps({
         "old_node_id": old_id,
         "new_node_id": new_id,
-        "supersede_reason": "Revised after additional evidence.",
+        "supersede_reason": "Refined in test.",
+    })))
+    assert "error" not in sup_r, sup_r
+
+    # Add a third node that remains current
+    current_id = _add_obs(srv, "current node not superseded")
+
+    summaries = [
+        _valid_entry(old_id, "Summary for superseded node."),
+        _valid_entry(current_id, "Summary for current node."),
+    ]
+    r = json.loads(srv.engram_set_recall_summaries(
+        payload_json=json.dumps({"summaries": summaries})
+    ))
+    assert r["applied"] == 1, r
+    assert r["failed"] == 1, r
+    assert len(r["ok"]) == 1, r
+    assert r["ok"][0]["node_id"] == current_id, r
+
+    assert len(r["errors"]) == 1, r
+    err_entry = r["errors"][0]
+    assert err_entry["node_id"] == old_id, err_entry
+    assert err_entry["error"] == "node is not current (superseded)", err_entry
+
+
+# ---------------------------------------------------------------------------
+# Test 10 (batch): pre_flight_failures passthrough
+# ---------------------------------------------------------------------------
+
+def test_batch_passes_through_pre_flight_failures():
+    """failures key in payload passes through verbatim as pre_flight_failures in response."""
+    srv = fresh_server()
+    obs_id = _add_obs(srv, "node for pre-flight failure passthrough test")
+
+    # Payload with one valid summary + one pre-flight failure
+    pre_flight = [{"node_id": "ob_9999", "reason": "fairy couldn't generate"}]
+    payload = {
+        "summaries": [_valid_entry(obs_id, "Valid summary for passthrough test.")],
+        "failures": pre_flight,
     }
-    sup_r = json.loads(srv.engram_supersede(payload_json=json.dumps(sup_payload)))
-    assert "error" not in sup_r, f"Supersede failed: {sup_r}"
+    r = json.loads(srv.engram_set_recall_summaries(payload_json=json.dumps(payload)))
+    assert r["applied"] == 1, r
+    assert r["failed"] == 0, r
+    assert "pre_flight_failures" in r, r
+    assert r["pre_flight_failures"] == pre_flight, r
 
-    # Verify old node is now is_current=0
-    conn = fresh_conn(srv)
-    try:
-        row = conn.execute(
-            "SELECT is_current FROM nodes WHERE id = ?", (old_id,)
-        ).fetchone()
-        assert row["is_current"] == 0, f"Expected is_current=0 after supersede, got {row['is_current']}"
-    finally:
-        conn.close()
-
-    # Now try to set recall summary on the superseded node
-    payload = _make_payload(old_id)
-    r = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(payload)))
-    assert "error" in r, f"Expected error for superseded node, got: {r}"
-    assert "not found" in r["error"].lower() or "not current" in r["error"].lower(), (
-        f"Expected 'not found or not current' message, got: {r['error']!r}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 6: Validation — summary length
-# ---------------------------------------------------------------------------
-
-
-def test_set_recall_summary_validates_summary_length():
-    """len > 200 → error; len = 200 → success; empty string → error.
-
-    Hard cap = 200 (raised from 140 on 2026-05-19 PM after per-type validation
-    showed Sonnet legitimately pushes to ~155 on dense load-bearing claims;
-    200 leaves headroom while still guarding against truly runaway output).
-    """
-    srv = fresh_server()
-    obs_id = _add_obs(srv, "summary length validation test claim")
-
-    # Empty string → error
-    payload_empty = _make_payload(obs_id, summary="")
-    r_empty = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(payload_empty)))
-    assert "error" in r_empty, f"Expected error for empty summary, got: {r_empty}"
-
-    # len = 201 → error
-    summary_201 = "A" * 201
-    payload_too_long = _make_payload(obs_id, summary=summary_201)
-    r_too_long = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(payload_too_long)))
-    assert "error" in r_too_long, (
-        f"Expected error for 201-char summary, got: {r_too_long}"
-    )
-    assert "200" in r_too_long["error"], (
-        f"Expected '200' (the hard cap) in error message, got: {r_too_long['error']!r}"
-    )
-    # Error response includes structured cap info for caller's runtime decision
-    assert r_too_long.get("hard_cap") == 200, (
-        f"Expected hard_cap=200 in error response, got: {r_too_long}"
-    )
-    assert r_too_long.get("got_length") == 201, (
-        f"Expected got_length=201 in error response, got: {r_too_long}"
-    )
-
-    # len = 200 → success (at the hard cap boundary)
-    summary_200 = "B" * 200
-    payload_at_cap = _make_payload(obs_id, summary=summary_200)
-    r_at_cap = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(payload_at_cap)))
-    assert "error" not in r_at_cap, (
-        f"Expected success for 200-char summary (at hard cap), got: {r_at_cap}"
-    )
-    assert r_at_cap.get("status") == "set", r_at_cap
-
-    # len = 155 (typical Sonnet-dense output) → success well within cap
-    summary_155 = "C" * 155
-    payload_typical = _make_payload(obs_id, summary=summary_155)
-    r_typical = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(payload_typical)))
-    assert r_typical.get("status") == "set", (
-        f"Expected success for 155-char typical-Sonnet output, got: {r_typical}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 7: Validation — keyword count
-# ---------------------------------------------------------------------------
-
-
-def test_set_recall_summary_validates_keyword_count():
-    """< 3 → error; 3 → success; 5 → success; 6 → error."""
-    srv = fresh_server()
-    obs_id = _add_obs(srv, "keyword count validation test claim")
-
-    # 2 keywords → error
-    payload_2 = _make_payload(obs_id, keywords=["one", "two"])
-    r_2 = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(payload_2)))
-    assert "error" in r_2, f"Expected error for 2 keywords, got: {r_2}"
-    assert "3" in r_2["error"] and "5" in r_2["error"], (
-        f"Expected '3' and '5' in error message, got: {r_2['error']!r}"
-    )
-
-    # 3 keywords → success
-    payload_3 = _make_payload(obs_id, keywords=["one", "two", "three"])
-    r_3 = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(payload_3)))
-    assert "error" not in r_3, f"Expected success for 3 keywords, got: {r_3}"
-    assert r_3.get("status") == "set", r_3
-
-    # 5 keywords → success
-    payload_5 = _make_payload(obs_id, keywords=["one", "two", "three", "four", "five"])
-    r_5 = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(payload_5)))
-    assert "error" not in r_5, f"Expected success for 5 keywords, got: {r_5}"
-    assert r_5.get("status") == "set", r_5
-
-    # 6 keywords → error
-    payload_6 = _make_payload(obs_id, keywords=["one", "two", "three", "four", "five", "six"])
-    r_6 = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(payload_6)))
-    assert "error" in r_6, f"Expected error for 6 keywords, got: {r_6}"
-
-
-# ---------------------------------------------------------------------------
-# Test 8: Validation — keyword element constraints
-# ---------------------------------------------------------------------------
-
-
-def test_set_recall_summary_validates_keyword_strings():
-    """Non-string element → error; empty-string element → error; >30 chars → error."""
-    srv = fresh_server()
-    obs_id = _add_obs(srv, "keyword element validation test claim")
-
-    # Non-string element (integer) → error
-    payload_nonstr = {
-        "node_id": obs_id,
-        "recall_summary": "Valid summary for testing keyword validation.",
-        "recall_keywords": ["valid", 42, "also-valid"],
+    # Missing failures key → pre_flight_failures is empty list
+    payload_no_failures = {
+        "summaries": [_valid_entry(obs_id, "Updated summary for passthrough test.")],
     }
-    r_nonstr = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(payload_nonstr)))
-    assert "error" in r_nonstr, f"Expected error for non-string keyword, got: {r_nonstr}"
-    assert "string" in r_nonstr["error"].lower(), (
-        f"Expected 'string' in error message, got: {r_nonstr['error']!r}"
+    r2 = json.loads(srv.engram_set_recall_summaries(payload_json=json.dumps(payload_no_failures)))
+    assert "pre_flight_failures" in r2, r2
+    assert r2["pre_flight_failures"] == [], r2
+
+
+# ===========================================================================
+# Section 2 — Validator unit tests
+# ===========================================================================
+
+from tools.recall_summary_validator import validate_summary_entry  # noqa: E402
+
+
+def _valid_dict(node_id: str = "ob_0001",
+                summary: str = "A valid summary.",
+                keywords: list[str] | None = None) -> dict:
+    if keywords is None:
+        keywords = ["kw-one", "kw-two", "kw-three"]
+    return {"node_id": node_id, "recall_summary": summary, "recall_keywords": keywords}
+
+
+# ---------------------------------------------------------------------------
+# Test 9: Valid entry → None
+# ---------------------------------------------------------------------------
+
+def test_validator_valid_entry():
+    assert validate_summary_entry(_valid_dict()) is None
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Missing fields
+# ---------------------------------------------------------------------------
+
+def test_validator_missing_fields():
+    """Missing any required field → error with that field name."""
+    for missing_field in ("node_id", "recall_summary", "recall_keywords"):
+        entry = _valid_dict()
+        del entry[missing_field]
+        err = validate_summary_entry(entry)
+        assert err is not None, f"Expected error for missing {missing_field}"
+        assert "field" in err, err
+        assert err["field"] == missing_field, (
+            f"Expected field={missing_field!r}, got: {err}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 11: recall_summary empty string
+# ---------------------------------------------------------------------------
+
+def test_validator_summary_empty():
+    entry = _valid_dict(summary="")
+    err = validate_summary_entry(entry)
+    assert err is not None
+    assert "recall_summary" in err.get("error", "") or err.get("field") == "recall_summary"
+
+
+# ---------------------------------------------------------------------------
+# Test 12: recall_summary over hard cap
+# ---------------------------------------------------------------------------
+
+def test_validator_summary_overcap():
+    """len > 200 → error with hard_cap=200 and got_length=N."""
+    entry = _valid_dict(summary="A" * 201)
+    err = validate_summary_entry(entry)
+    assert err is not None
+    assert err.get("hard_cap") == 200, err
+    assert err.get("got_length") == 201, err
+    assert err.get("field") == "recall_summary", err
+
+
+# ---------------------------------------------------------------------------
+# Test 13: recall_summary exactly at cap → valid
+# ---------------------------------------------------------------------------
+
+def test_validator_summary_at_cap():
+    entry = _valid_dict(summary="B" * 200)
+    assert validate_summary_entry(entry) is None
+
+
+# ---------------------------------------------------------------------------
+# Test 14: keyword count below min
+# ---------------------------------------------------------------------------
+
+def test_validator_keyword_count_min():
+    """2 keywords → error with got_count, min, max."""
+    entry = _valid_dict(keywords=["one", "two"])
+    err = validate_summary_entry(entry)
+    assert err is not None
+    assert err.get("got_count") == 2, err
+    assert err.get("min") == 3, err
+    assert err.get("max") == 5, err
+    assert err.get("field") == "recall_keywords", err
+
+
+# ---------------------------------------------------------------------------
+# Test 15: keyword count above max
+# ---------------------------------------------------------------------------
+
+def test_validator_keyword_count_max():
+    """6 keywords → error."""
+    entry = _valid_dict(keywords=["a", "b", "c", "d", "e", "f"])
+    err = validate_summary_entry(entry)
+    assert err is not None
+    assert err.get("field") == "recall_keywords", err
+
+
+# ---------------------------------------------------------------------------
+# Test 16: keyword count exact boundaries → valid
+# ---------------------------------------------------------------------------
+
+def test_validator_keyword_count_exact():
+    assert validate_summary_entry(_valid_dict(keywords=["a", "b", "c"])) is None
+    assert validate_summary_entry(_valid_dict(keywords=["a", "b", "c", "d", "e"])) is None
+
+
+# ---------------------------------------------------------------------------
+# Test 17: keyword element not a string
+# ---------------------------------------------------------------------------
+
+def test_validator_keyword_not_str():
+    entry = _valid_dict(keywords=["valid", 42, "also-valid"])
+    err = validate_summary_entry(entry)
+    assert err is not None
+    assert "string" in err.get("error", "").lower(), err
+
+
+# ---------------------------------------------------------------------------
+# Test 18: keyword element empty string
+# ---------------------------------------------------------------------------
+
+def test_validator_keyword_empty():
+    entry = _valid_dict(keywords=["valid", "", "also-valid"])
+    err = validate_summary_entry(entry)
+    assert err is not None
+    assert "empty" in err.get("error", "").lower(), err
+
+
+# ---------------------------------------------------------------------------
+# Test 19: keyword element too long
+# ---------------------------------------------------------------------------
+
+def test_validator_keyword_too_long():
+    """keyword > 30 chars → error."""
+    long_kw = "x" * 31
+    entry = _valid_dict(keywords=["valid", long_kw, "also-valid"])
+    err = validate_summary_entry(entry)
+    assert err is not None
+    assert "30" in err.get("error", ""), err
+
+
+# ---------------------------------------------------------------------------
+# Test 20: keyword element exactly at limit → valid
+# ---------------------------------------------------------------------------
+
+def test_validator_keyword_at_limit():
+    exactly_30 = "y" * 30
+    entry = _valid_dict(keywords=["valid", exactly_30, "also-valid"])
+    assert validate_summary_entry(entry) is None
+
+
+# ---------------------------------------------------------------------------
+# Test 21: duplicate keywords
+# ---------------------------------------------------------------------------
+
+def test_validator_duplicate_keywords():
+    """Duplicate keyword (case-sensitive) → error."""
+    entry = _valid_dict(keywords=["alpha", "beta", "alpha"])
+    err = validate_summary_entry(entry)
+    assert err is not None
+    assert "duplicate" in err.get("error", "").lower(), err
+    assert err.get("field") == "recall_keywords", err
+
+    # Case-sensitive: "Alpha" and "alpha" are different, should be valid
+    entry_case = _valid_dict(keywords=["Alpha", "alpha", "gamma"])
+    assert validate_summary_entry(entry_case) is None, (
+        "Expected case-sensitive duplicate check to pass for 'Alpha' vs 'alpha'"
     )
 
-    # Empty string element → error
-    payload_empty_kw = _make_payload(obs_id, keywords=["valid", "", "also-valid"])
-    r_empty_kw = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(payload_empty_kw)))
-    assert "error" in r_empty_kw, f"Expected error for empty keyword, got: {r_empty_kw}"
-    assert "empty" in r_empty_kw["error"].lower(), (
-        f"Expected 'empty' in error message, got: {r_empty_kw['error']!r}"
-    )
 
-    # Keyword > 30 chars → error
-    long_kw = "a" * 31
-    payload_long_kw = _make_payload(obs_id, keywords=["valid", long_kw, "also-valid"])
-    r_long_kw = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(payload_long_kw)))
-    assert "error" in r_long_kw, f"Expected error for >30 char keyword, got: {r_long_kw}"
-    assert "30" in r_long_kw["error"], (
-        f"Expected '30' in error message, got: {r_long_kw['error']!r}"
-    )
+# ===========================================================================
+# Section 3 — PayloadBuilder unit tests
+# ===========================================================================
 
-    # Valid 30-char keyword → success
-    exactly_30 = "b" * 30
-    payload_30 = _make_payload(obs_id, keywords=["valid", exactly_30, "also-valid"])
-    r_30 = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(payload_30)))
-    assert "error" not in r_30, f"Expected success for 30-char keyword (at limit), got: {r_30}"
-    assert r_30.get("status") == "set", r_30
+from tools.recall_summary_payload import PayloadBuilder  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Test 9: No side effects on other node fields
+# Test 22: add_summary happy path
 # ---------------------------------------------------------------------------
 
-
-def test_set_recall_summary_no_side_effects():
-    """importance_score, utility_score, recall_count unchanged after set."""
-    srv = fresh_server()
-    obs_id = _add_obs(srv, "no side effects recall summary test claim")
-
-    # Read baseline values before the call
-    conn = fresh_conn(srv)
-    try:
-        before = conn.execute(
-            "SELECT importance_score, utility_score, recall_count FROM nodes WHERE id = ?",
-            (obs_id,),
-        ).fetchone()
-        importance_before = before["importance_score"]
-        utility_before = before["utility_score"]
-        recall_turn_before = before["recall_count"]
-    finally:
-        conn.close()
-
-    # Set the recall summary
-    payload = _make_payload(obs_id)
-    r = json.loads(srv.engram_set_recall_summary(payload_json=json.dumps(payload)))
-    assert "error" not in r, r
-
-    # Verify no change to other fields
-    conn = fresh_conn(srv)
-    try:
-        after = conn.execute(
-            "SELECT importance_score, utility_score, recall_count FROM nodes WHERE id = ?",
-            (obs_id,),
-        ).fetchone()
-        assert after["importance_score"] == importance_before, (
-            f"importance_score changed: {importance_before!r} → {after['importance_score']!r}"
-        )
-        assert after["utility_score"] == utility_before, (
-            f"utility_score changed: {utility_before!r} → {after['utility_score']!r}"
-        )
-        assert after["recall_count"] == recall_turn_before, (
-            f"recall_count changed: {recall_turn_before!r} → {after['recall_count']!r}"
-        )
-    finally:
-        conn.close()
+def test_builder_add_summary_happy():
+    """Two valid add_summary calls → both appear in summaries list."""
+    builder = PayloadBuilder()
+    err1 = builder.add_summary("ob_0001", "Summary one.", ["a", "b", "c"])
+    err2 = builder.add_summary("ob_0002", "Summary two.", ["d", "e", "f"])
+    assert err1 is None, err1
+    assert err2 is None, err2
+    payload = json.loads(builder.to_json())
+    assert len(payload["summaries"]) == 2
+    assert payload["summaries"][0]["node_id"] == "ob_0001"
+    assert payload["summaries"][1]["node_id"] == "ob_0002"
 
 
 # ---------------------------------------------------------------------------
-# Prompts module tests
+# Test 23: add_summary validation-rejected
 # ---------------------------------------------------------------------------
+
+def test_builder_add_summary_rejected():
+    """Invalid entry returns error dict and is NOT added to summaries."""
+    builder = PayloadBuilder()
+    err = builder.add_summary("ob_0001", "X" * 201, ["a", "b", "c"])
+    assert err is not None, "Expected error for over-cap summary"
+    assert "hard_cap" in err, err
+    payload = json.loads(builder.to_json())
+    assert len(payload["summaries"]) == 0, "Rejected entry must not appear in summaries"
+
+
+# ---------------------------------------------------------------------------
+# Test 24: add_failure
+# ---------------------------------------------------------------------------
+
+def test_builder_add_failure():
+    """add_failure records in failures list."""
+    builder = PayloadBuilder()
+    builder.add_failure("ob_0099", "LLM returned empty string")
+    payload = json.loads(builder.to_json())
+    assert len(payload["failures"]) == 1
+    assert payload["failures"][0]["node_id"] == "ob_0099"
+    assert payload["failures"][0]["reason"] == "LLM returned empty string"
+
+
+# ---------------------------------------------------------------------------
+# Test 25: to_json shape
+# ---------------------------------------------------------------------------
+
+def test_builder_to_json_shape():
+    """to_json output always has both 'summaries' and 'failures' keys."""
+    builder = PayloadBuilder()
+    payload = json.loads(builder.to_json())
+    assert "summaries" in payload, payload
+    assert "failures" in payload, payload
+    assert isinstance(payload["summaries"], list)
+    assert isinstance(payload["failures"], list)
+
+
+# ===========================================================================
+# Section 4 — Prompts module tests (carried over from PR #223)
+# ===========================================================================
 
 def _load_prompts():
     """Import tools/recall_summary_prompts from the project root."""
-    import importlib.util
     mod_path = os.path.join(PROJECT_ROOT, "tools", "recall_summary_prompts.py")
     spec = importlib.util.spec_from_file_location("recall_summary_prompts", mod_path)
     mod = importlib.util.module_from_spec(spec)
@@ -462,14 +626,12 @@ def _load_prompts():
     return mod
 
 
-# Test 10: Per-type guidance in prompt
+# Test 26
 def test_build_prompt_per_type_guidance():
     """Each type in TYPE_GUIDANCE produces a prompt containing the type-specific guidance."""
     prompts = _load_prompts()
     for node_type, guidance_text in prompts.TYPE_GUIDANCE.items():
         prompt = prompts.build_prompt(node_type, "A test claim for this node type.")
-        # The guidance text may be split across the PROMPT_TEMPLATE substitution;
-        # check that at least the first 40 chars of the guidance appear verbatim.
         sample = guidance_text[:40]
         assert sample in prompt, (
             f"Type-specific guidance not found in prompt for type={node_type!r}.\n"
@@ -478,26 +640,24 @@ def test_build_prompt_per_type_guidance():
         )
 
 
-# Test 11: Unknown type falls back to DEFAULT_GUIDANCE
+# Test 27
 def test_build_prompt_unknown_type_falls_back():
     """Passing an unknown node type uses DEFAULT_GUIDANCE text."""
     prompts = _load_prompts()
     unknown_type = "random_unknown_type_that_is_not_in_type_guidance"
     prompt = prompts.build_prompt(unknown_type, "A claim for an unknown type.")
-    # DEFAULT_GUIDANCE first 40 chars must appear in the prompt
     sample = prompts.DEFAULT_GUIDANCE[:40]
     assert sample in prompt, (
         f"DEFAULT_GUIDANCE not found in prompt for unknown type.\n"
         f"Expected to find: {sample!r}\n"
         f"Prompt snippet: {prompt[:400]!r}"
     )
-    # The unknown type name itself should appear (in the Type: line)
     assert unknown_type in prompt, (
         f"Unknown type name not in prompt: {unknown_type!r}"
     )
 
 
-# Test 12: Claim text appears verbatim
+# Test 28
 def test_build_prompt_includes_claim_text():
     """The claim text passed to build_prompt appears verbatim in the output."""
     prompts = _load_prompts()
