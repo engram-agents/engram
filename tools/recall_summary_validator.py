@@ -10,6 +10,8 @@ Constants mirror the guardrails from the singular engram_set_recall_summary tool
 
 from __future__ import annotations
 
+import re
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -18,6 +20,14 @@ RECALL_SUMMARY_HARD_CAP = 200
 RECALL_KEYWORDS_MIN = 3
 RECALL_KEYWORDS_MAX = 5
 RECALL_KEYWORD_MAX_LEN = 30
+
+# Pattern matching ENGRAM node IDs (e.g. ob_1234, dv_0500, fl_0148, ax_0010).
+# 2-3 lowercase letters + underscore + 4+ digits. Keywords matching this
+# pattern are rejected because IDs carry no recognition signal in the
+# auto-surface skim — the keyword slot is for content recognition; graph
+# navigation lives in edges and is accessed via engram_inspect. See
+# KEYWORD_GUIDANCE in tools/recall_summary_prompts.py for the disposition.
+_NODE_ID_PATTERN = re.compile(r"^[a-z]{2,3}_\d{4,}$")
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +118,16 @@ def validate_summary_entry(entry: dict) -> "dict | None":
                 "error": (
                     f"recall_keywords[{i}] exceeds {RECALL_KEYWORD_MAX_LEN} "
                     f"char limit (got {len(kw)} chars: {kw!r})"
+                ),
+                "field": "recall_keywords",
+            }
+        if _NODE_ID_PATTERN.match(kw):
+            return {
+                "error": (
+                    f"recall_keywords[{i}] is an ENGRAM node ID ({kw!r}); "
+                    "IDs carry no recognition signal in skim. Use a content "
+                    "keyword instead — graph navigation lives in edges and "
+                    "is accessed via engram_inspect."
                 ),
                 "field": "recall_keywords",
             }

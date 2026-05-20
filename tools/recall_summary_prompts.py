@@ -86,9 +86,18 @@ DEFAULT_GUIDANCE = (
 # Keyword guidance (shared across all types)
 KEYWORD_GUIDANCE = """3 to 5 load-bearing technical or topical terms a future
 agent might keyword-search to surface this node. As many as carry distinct
-signal; don't pad. Concrete terms over abstract concepts. ENGRAM node IDs
-valid when the node is the subject. ENGRAM tool names valid. Lower-case
-unless proper noun / code symbol / canonical capitalization. No duplicates.
+signal; don't pad. Concrete terms over abstract concepts. ENGRAM tool names
+valid. Lower-case unless proper noun / code symbol / canonical
+capitalization. No duplicates.
+
+DO NOT use ENGRAM node IDs (e.g., ob_1234, dv_0500, fl_0148) as keywords.
+IDs carry no recognition signal in skim — the keyword slot is for *content
+recognition*. Graph navigation (acts-on relationships, citations, references)
+lives in edges and is accessed via engram_inspect. Even for nodes that
+supersede / retract / contradict / resolve a specific target, the keyword
+line should describe the content of the new node, not name the old node's ID.
+This rule is also enforced structurally by the validator.
+
 DO NOT use generic words: node, claim, observation, derivation, agent,
 system — those carry zero discriminative signal."""
 

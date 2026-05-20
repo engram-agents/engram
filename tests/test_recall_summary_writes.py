@@ -547,6 +547,40 @@ def test_validator_duplicate_keywords():
     )
 
 
+def test_validator_rejects_node_id_as_keyword():
+    """ENGRAM node ID patterns (e.g. dv_0500, ob_1234, fl_0148) → error.
+
+    IDs carry no recognition signal in the auto-surface skim — the keyword
+    slot is for content recognition. Graph navigation lives in edges and
+    is accessed via engram_inspect. Disposition rule from KEYWORD_GUIDANCE
+    in tools/recall_summary_prompts.py, structurally enforced here.
+    """
+    # Various ENGRAM ID prefixes that should all be rejected
+    for kw in ["dv_0500", "ob_1234", "fl_0148", "ax_0010", "cs_0010",
+               "gl_0027", "ls_0011", "df_0048", "qu_0001", "ev_0277",
+               "pn_0005", "cj_0056", "ct_0006", "gt_0001", "co_0001",
+               "tk_0010", "cn_0001"]:
+        entry = _valid_dict(keywords=["concept-one", "concept-two", kw])
+        err = validate_summary_entry(entry)
+        assert err is not None, f"Expected rejection for keyword {kw!r}"
+        assert err.get("field") == "recall_keywords", err
+        assert "ENGRAM node ID" in err.get("error", ""), err
+
+    # Non-ID-looking keywords should still pass: tool names, hyphenated
+    # phrases, numbers in different positions
+    for kw_set in [
+        ["engram_focus", "fts_query", "mmr_lambda"],          # tool/symbol names
+        ["concept-one", "concept-two", "Lee 2024"],            # has digits but not ID-shape
+        ["abc_001", "concept-two", "concept-three"],           # 3 chars but only 3 digits
+        ["abcd_0001", "concept-two", "concept-three"],         # 4-char prefix, doesn't match
+    ]:
+        entry = _valid_dict(keywords=kw_set)
+        err = validate_summary_entry(entry)
+        assert err is None, (
+            f"Expected pass for {kw_set!r} but got error: {err}"
+        )
+
+
 # ===========================================================================
 # Section 3 — PayloadBuilder unit tests
 # ===========================================================================
