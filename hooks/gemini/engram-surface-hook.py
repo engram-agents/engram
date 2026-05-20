@@ -158,10 +158,34 @@ def format_nudge(result: dict) -> str:
     if isinstance(not_recalled, list) and not_recalled:
         lines.append(f"  Memory: {len(not_recalled)} nodes not recalled recently")
 
-    # Matched IDs
-    matched_ids = result.get("matched_ids", [])
-    if matched_ids:
-        lines.append(f"  IDs: {', '.join(matched_ids[:15])}")
+    # Others — non-top non-special matched IDs with keyword prefix
+    # (Lei 2026-05-19 PM extension, keyword-only filter per #234 2026-05-20).
+    # Each line: "[id] `kw1` · `kw2` · ..." — nodes without keywords are dropped
+    # (no-keywords nodes provide no recognition value in skim, just noise).
+    rendered_ids = {s.get("id") for s in special[:3]} | {c.get("id") for c in top_claims[:3]}
+    matched_meta = result.get("matched_meta") or []
+    others = [m for m in matched_meta if m.get("id") not in rendered_ids]
+    # Filter to nodes with at least 1 keyword; drop bare-ID entries entirely
+    # (per Lei 2026-05-20 issue #234 Findings 1+2): no-keywords nodes provide
+    # no recognition value in skim, just noise.
+    others_with_kw = [
+        m for m in others
+        if isinstance(m.get("recall_keywords"), list)
+        and len(m.get("recall_keywords") or []) >= 1
+    ]
+    if others_with_kw:
+        lines.append("  Others:")
+        for m in others_with_kw[:15]:
+            mid = m.get("id", "?")
+            kw = m.get("recall_keywords") or []
+            kw_str = " · ".join(f"`{k}`" for k in kw)
+            lines.append(f"    - [{mid}] {kw_str}")
+    elif not (special or top_claims or others_with_kw):
+        # No content rendered yet — fall back to the legacy flat IDs line so
+        # the digest is never silently empty when matches exist.
+        matched_ids = result.get("matched_ids", [])
+        if matched_ids:
+            lines.append(f"  IDs: {', '.join(matched_ids[:15])}")
 
     lines.append("  Use engram_inspect(node_id) for details, engram_get_subgraph for full chains.")
     return "\n".join(lines)

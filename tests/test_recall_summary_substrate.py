@@ -446,10 +446,11 @@ def test_format_nudge_summary_only_no_kw_prefix():
 
 def test_format_nudge_keywords_wrong_length_no_kw_prefix():
     """Contract: keyword prefix renders ONLY when recall_keywords is a list of
-    exactly 3 strings. Anything else (2 or 4 items, non-list, empty) → no
-    prefix, falls back to summary-or-truncation. PR B's generation prompt is
-    expected to always produce 3 keywords; this test pins the defensive
-    contract so a future drift can't silently break the rendering invariant.
+    exactly 3 strings (render_one_node_line path; Others-section path now uses >=1 per PR #235).
+    Anything else (2 or 4 items, non-list, empty) → no prefix, falls back to
+    summary-or-truncation. PR B's generation prompt is expected to always
+    produce 3 keywords; this test pins the defensive contract so a future drift
+    can't silently break the rendering invariant.
     """
     hook = _load_hook_module()
 
@@ -575,8 +576,10 @@ def test_format_nudge_types_line_not_rendered():
 
 def test_format_nudge_recall_keywords_fewer_than_three_no_prefix():
     """When recall_keywords has != 3 entries (e.g. 0, 1, 2, or 4+), the
-    keyword prefix is dropped — the renderer requires exactly 3. Documents the
-    contract: PR B's writer must always emit exactly 3 keywords or none."""
+    keyword prefix is dropped — the renderer requires exactly 3
+    (render_one_node_line path; Others-section path now uses >=1 per PR #235).
+    Documents the contract: PR B's writer must always emit exactly 3 keywords
+    or none."""
     hook = _load_hook_module()
 
     for bad_kw in ([], ["only-one"], ["one", "two"], ["one", "two", "three", "four"]):
@@ -650,8 +653,9 @@ def test_format_nudge_person_special_no_confidence_rendered():
 
 def test_format_nudge_others_section_renders_keywords():
     """Matched IDs not in top_claims or specials appear in an Others: block.
-    Each line shows `[id] kw1 · kw2 · kw3` when recall_keywords has 3 entries,
-    `[id]` alone when keywords are absent."""
+    Only nodes with at least 1 recall_keyword are rendered (issue #234 fix,
+    2026-05-20): bare-ID lines (no keywords) are dropped entirely as noise.
+    Each rendered line shows `[id] kw1 · kw2 · ...`."""
     hook = _load_hook_module()
 
     claim = _claim_entry(
@@ -676,23 +680,77 @@ def test_format_nudge_others_section_renders_keywords():
     )
     output = hook.format_nudge(result)
 
-    # Others: section header present
+    # Others: section header present (at least one keyword-bearing other exists)
     assert "Others:" in output, f"Expected Others: section header:\n{output}"
     # Node with keywords: full prefix
     assert "[ob_other_with_kw]" in output, f"Missing other-with-kw id:\n{output}"
     assert "`recall_summary`" in output, f"Missing keyword prefix:\n{output}"
     assert "`surface-render`" in output, f"Missing third keyword:\n{output}"
-    # Node without keywords: bare ID, no middots on that specific line
-    others_section = output[output.index("Others:"):]
-    no_kw_line = [ln for ln in others_section.split("\n") if "[ob_other_no_kw]" in ln]
-    assert no_kw_line, f"Missing legacy-fallback line:\n{output}"
-    assert " · " not in no_kw_line[0], (
-        f"Legacy node line should not have middot:\n{no_kw_line[0]}"
+    # Node without keywords: dropped entirely (issue #234 Finding 2)
+    assert "[ob_other_no_kw]" not in output, (
+        f"No-keywords node should be dropped, not shown as bare ID:\n{output}"
     )
     # Top-rendered node should NOT appear in Others
+    others_section = output[output.index("Others:"):]
     others_lines = [ln for ln in others_section.split("\n") if ln.startswith("    -")]
     assert all("ob_top" not in ln for ln in others_lines), (
         f"Top-rendered node leaked into Others:\n{output}"
+    )
+
+
+# ---- Test 14b: Others section renders at boundary values of >=1 (1 and 2 keywords) ----
+
+
+def test_format_nudge_others_section_renders_one_and_two_keywords():
+    """Boundary-value test for the Others-section >=1 keyword contract (PR #235).
+    A node with exactly 1 keyword must render with that keyword; a node with
+    exactly 2 keywords must render with both. Exercises the lower boundary of
+    the >=1 gate that replaced the previous ==3 filter."""
+    hook = _load_hook_module()
+
+    # One keyword
+    matched_meta_1 = [
+        {"id": "ob_one_kw", "type": "observation_factual",
+         "recall_keywords": ["single-keyword"]},
+    ]
+    result_1 = _make_result(
+        match_count=1,
+        matched_ids=["ob_one_kw"],
+        matched_meta=matched_meta_1,
+    )
+    output_1 = hook.format_nudge(result_1)
+    assert "Others:" in output_1, (
+        f"Expected Others: section with 1-keyword node:\n{output_1}"
+    )
+    assert "[ob_one_kw]" in output_1, (
+        f"1-keyword node should appear in Others:\n{output_1}"
+    )
+    assert "`single-keyword`" in output_1, (
+        f"1-keyword node's keyword should render:\n{output_1}"
+    )
+
+    # Two keywords
+    matched_meta_2 = [
+        {"id": "ob_two_kw", "type": "observation_factual",
+         "recall_keywords": ["first-keyword", "second-keyword"]},
+    ]
+    result_2 = _make_result(
+        match_count=1,
+        matched_ids=["ob_two_kw"],
+        matched_meta=matched_meta_2,
+    )
+    output_2 = hook.format_nudge(result_2)
+    assert "Others:" in output_2, (
+        f"Expected Others: section with 2-keyword node:\n{output_2}"
+    )
+    assert "[ob_two_kw]" in output_2, (
+        f"2-keyword node should appear in Others:\n{output_2}"
+    )
+    assert "`first-keyword`" in output_2, (
+        f"First keyword should render for 2-keyword node:\n{output_2}"
+    )
+    assert "`second-keyword`" in output_2, (
+        f"Second keyword should render for 2-keyword node:\n{output_2}"
     )
 
 
