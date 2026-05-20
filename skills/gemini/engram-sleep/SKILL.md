@@ -202,7 +202,7 @@ Then stop. The session is over.
 
 ## Guardrails
 
-- **Context hunger** (ob_0104): dream mode burns context fast. `engram_reflect` returns a full audit; each `engram_inspect` returns embeddings and neighbors. Monitor the budget. If it drops below safety, short-cycle to Step 4.
+- **Context hunger** (ob_0104): dream mode burns context fast. `engram_reflect` returns a full audit; each `engram_inspect` returns the focus node and its grouped 1-hop neighbors with recall_summary. Monitor the budget. If it drops below safety, short-cycle to Step 4.
 - **No web research in dreams.** Register questions instead.
 - **No cascades of supersedes across unrelated subgraphs.** Follow the chain you started; register a question for the next one.
 - **The dream can be empty.** If `engram_reflect` returns a clean briefing, that IS the dream — note it, then proceed straight to Step 4. A clean graph is a success signal, not a reason to invent work.

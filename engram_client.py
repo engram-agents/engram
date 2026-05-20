@@ -59,9 +59,11 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_inspect": {
-        "description": "Inspect a single node: full content plus 1-hop neighbor summaries. Refreshes memory on the target node only. Use after kg_recall to examine a specific node.",
+        "description": "Inspect a single node with three view modes: 'recall' (default — full focus claim + grouped logical-substrate neighbors with recall_summary + contextual neighbors with recall_keywords; the 'refresh my memory of this idea' view), 'deep' (all focus-node fields including confidence_history + 1-hop neighbors as adjacency map; for forensic / retract / supersede decisions), 'edges' (adjacency-map topology only, no node content; for graph-shape audits). dream_mode=True skips the recall-refresh side effect during maintenance / dream-cycle inspection.",
         "parameters": {
             "node_id": {"type": "string", "description": "The node ID to inspect (e.g. 'dv_0010').", "required": True},
+            "view": {"type": "string", "description": "Optional. One of 'recall' (default), 'deep', or 'edges'. Controls the shape of returned data.", "enum": ["recall", "deep", "edges"]},
+            "dream_mode": {"type": "boolean", "description": "Optional. If True, skips the recall-refresh side effect. Use during maintenance / dream-cycle inspection."},
         },
     },
     "engram_query": {

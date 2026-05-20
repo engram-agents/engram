@@ -198,7 +198,7 @@ def test_feeling_importance_anchored():
         "reported_state": "Anchor test.",
         "trigger": "Anchor test.",
     })
-    node = client.call("engram_inspect", {"node_id": r["feeling_id"]})
+    node = client.call("engram_inspect", {"node_id": r["feeling_id"], "view": "deep"})
     assert node["node"]["importance_base"] == 2.0
     # Score is 2.0 × 1.014^turn — at turn 0 it's exactly 2.0.
     assert node["node"]["importance_score"] >= 2.0
@@ -512,8 +512,9 @@ def test_feeling_with_context_ids():
     assert obs_id in r.get("context_nodes", []), f"Context not in return: {r}"
 
     node = client.call("engram_inspect", {"node_id": r["feeling_id"]})
-    neighbor_ids = [n["neighbor_id"] for n in node["node"]["neighbors"]]
-    assert obs_id in neighbor_ids, f"Cites edge missing. Neighbors: {node['node']['neighbors']}"
+    # context_ids creates a 'cites' edge, which is a contextual relation in recall view.
+    neighbor_ids = [n["id"] for n in node["contextual_neighbors"]]
+    assert obs_id in neighbor_ids, f"Cites edge missing. Contextual neighbors: {node['contextual_neighbors']}"
 
 
 # ── Reflect integration ────────────────────────────────────────────────

@@ -115,8 +115,8 @@ def test_supersede_same_type_marks_contradiction_stale():
     assert r["stale_contradiction_count"] == 1, r
     assert r["stale_contradictions"][0]["id"] == ct_id
 
-    # Inspect ct to confirm metadata
-    ct_inspect = json.loads(server.engram_inspect(node_id=ct_id, dream_mode=True))
+    # Inspect ct to confirm metadata (view="deep" for forensic field access)
+    ct_inspect = json.loads(server.engram_inspect(node_id=ct_id, view="deep", dream_mode=True))
     ct_meta = json.loads(ct_inspect["node"]["metadata"])
     assert "stale_by" in ct_meta
     assert ob_a in ct_meta["stale_by"]
@@ -141,9 +141,9 @@ def test_supersede_unrelated_node_does_not_flag_contradiction():
     assert r.get("status") == "superseded", r
     assert r["stale_contradiction_count"] == 0
 
-    # ct should still be clean
-    ct_inspect = json.loads(server.engram_inspect(node_id=ct_id, dream_mode=True))
-    ct_meta = json.loads(ct_inspect["node"]["metadata"]) if ct_inspect["node"]["metadata"] else {}
+    # ct should still be clean (view="deep" for forensic field access)
+    ct_inspect = json.loads(server.engram_inspect(node_id=ct_id, view="deep", dream_mode=True))
+    ct_meta = json.loads(ct_inspect["node"]["metadata"]) if ct_inspect["node"].get("metadata") else {}
     assert ct_meta.get("stale_by", []) == []
 
 
@@ -186,7 +186,7 @@ def test_retract_marks_contradiction_tainted_by():
     assert r["tainted_contradiction_count"] == 1, r
     assert r["tainted_contradictions"][0]["id"] == ct_id
 
-    ct_inspect = json.loads(server.engram_inspect(node_id=ct_id, dream_mode=True))
+    ct_inspect = json.loads(server.engram_inspect(node_id=ct_id, view="deep", dream_mode=True))
     ct_meta = json.loads(ct_inspect["node"]["metadata"])
     assert "tainted_by" in ct_meta
     assert ob_a in ct_meta["tainted_by"]
@@ -298,7 +298,7 @@ def test_both_sides_superseded_clobbers_stale_replacement():
     })))
     assert sup_b["stale_contradiction_count"] == 1
 
-    ct_inspect = json.loads(server.engram_inspect(node_id=ct_id, dream_mode=True))
+    ct_inspect = json.loads(server.engram_inspect(node_id=ct_id, view="deep", dream_mode=True))
     ct_meta = json.loads(ct_inspect["node"]["metadata"])
 
     # stale_by correctly appends both old IDs

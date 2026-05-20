@@ -175,8 +175,8 @@ def test_payload_json_no_note_status_history_unchanged():
     assert r.get("status") == "updated"
     # Inspect the task — status_history should be absent or empty.
     inspect = json.loads(server.engram_inspect(node_id=task_id))
-    meta_raw = inspect["node"].get("metadata", "{}")
-    meta = json.loads(meta_raw) if isinstance(meta_raw, str) else meta_raw
+    # parsed_metadata is available in both recall and deep views.
+    meta = inspect["node"].get("parsed_metadata") or {}
     history = meta.get("status_history", [])
     assert history == [], f"Expected empty status_history for note-free transition, got: {history}"
     # Now transition WITH note — status_history should grow by 1.
@@ -184,8 +184,7 @@ def test_payload_json_no_note_status_history_unchanged():
     r2 = json.loads(server.engram_update_task(payload_json=json.dumps(payload2)))
     assert "error" not in r2, r2
     inspect2 = json.loads(server.engram_inspect(node_id=task_id))
-    meta_raw2 = inspect2["node"].get("metadata", "{}")
-    meta2 = json.loads(meta_raw2) if isinstance(meta_raw2, str) else meta_raw2
+    meta2 = inspect2["node"].get("parsed_metadata") or {}
     history2 = meta2.get("status_history", [])
     assert len(history2) == 1, f"Expected 1 entry after with-note transition, got {len(history2)}: {history2}"
     assert history2[0]["note"] == "with note"

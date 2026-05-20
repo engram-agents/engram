@@ -436,8 +436,8 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
   `(query, [top_k, semantic])`
 - **engram_query** — Voluntary/autonoetic semantic-recall ("I want to recall this clearly"). The deliberate-search complement to `engram_surface`'s ambient signal: returns full nodes with neighbors, refreshes recall on matched nodes (strengthens memory). FTS5 keyword + embedding semantic match. Use when you know there's something specific to find.
   `(query, [types, min_confidence, include_superseded, top_k])`
-- **engram_inspect** — One node + 1-hop neighbor summaries; `dream_mode=True` skips recall refresh.
-  `(node_id, [dream_mode])`
+- **engram_inspect** — Single node + 1-hop neighbors in three views: `recall` (default — full claim + grouped logical-substrate neighbors with recall_summary + contextual with keywords), `deep` (all node fields + adjacency-map edge inventory), `edges` (adjacency-map only). `dream_mode=True` skips refresh.
+  `(node_id, view="recall", dream_mode=False)`
 - **engram_get_subgraph** — N-hop chain around a node.
   `(node_id, [depth, direction])`
 - **engram_list** — Enumerate by single-field shorthand OR structured filter.

@@ -83,7 +83,7 @@ def test_goal_exempt_from_forgetting():
         "claim": "Persist as orientation",
         "motivation": "Goals must outlast forgetting.",
     })
-    node = client.call("engram_inspect", {"node_id": r["goal_id"]})
+    node = client.call("engram_inspect", {"node_id": r["goal_id"], "view": "deep"})
     assert node["node"]["importance_base"] == 2.0
     # Score should be >= 2.0 (2.0 × 1.014^turn, at turn 0 it's exactly 2.0)
     assert node["node"]["importance_score"] >= 2.0
@@ -236,11 +236,10 @@ def test_goal_with_context_ids():
     })
     assert obs["observation_id"] in g.get("context_nodes", []), f"Context not in goal: {g}"
 
-    # Verify edge exists
+    # Verify edge exists — context_ids creates a 'cites' edge (contextual in recall view).
     node = client.call("engram_inspect", {"node_id": g["goal_id"]})
-    neighbors = node["node"]["neighbors"]
-    neighbor_ids = [n["neighbor_id"] for n in neighbors]
-    assert obs["observation_id"] in neighbor_ids, f"Edge not found. Neighbors: {neighbors}"
+    neighbor_ids = [n["id"] for n in node["contextual_neighbors"]]
+    assert obs["observation_id"] in neighbor_ids, f"Edge not found. Contextual neighbors: {node['contextual_neighbors']}"
 
 
 # ── Run all tests ───────────────────────────────────────────────────────

@@ -2463,6 +2463,285 @@ def _get_neighbors(conn: sqlite3.Connection, node_id: str) -> list[dict]:
     return result
 
 
+# ── engram_inspect view helpers ────────────────────────────────────────────
+
+# Edge relations that carry logical/epistemic weight — shown with full
+# recall_summary in the recall view.
+_LOGICAL_SUBSTRATE_RELATIONS = frozenset({
+    "derives_from",
+    "supports",
+    "supersedes",
+    "contradicts",
+    "resolves",
+    "retracts",
+    "exemplifies",
+    "subtask_of",
+    "tensions",
+})
+
+# Edge relations that supply context/reference only — shown with keywords only
+# in the recall view.
+_CONTEXTUAL_RELATIONS = frozenset({
+    "cites",
+    "about",
+    "serves",
+})
+
+# For recall view: cap per-group size to avoid response bloat when a popular
+# node has hundreds of dependents. Applied to each group independently.
+_INSPECT_RECALL_GROUP_CAP = 10
+
+
+def _get_neighbors_enriched(
+    conn: sqlite3.Connection,
+    node_id: str,
+) -> list[dict]:
+    """Fetch 1-hop neighbors with recall_summary + recall_keywords columns.
+
+    Returns a list of flat dicts with keys:
+        id, type, relation, direction, recall_summary, recall_keywords,
+        importance_score, recall_count
+    (recall_count and importance_score are used for capping downstream groups)
+    """
+    edges = conn.execute(
+        """
+        SELECT e.relation, e.source_id, e.target_id,
+               n.type          AS neighbor_type,
+               n.recall_summary   AS neighbor_recall_summary,
+               n.recall_keywords  AS neighbor_recall_keywords,
+               n.importance_score AS neighbor_importance_score,
+               n.recall_count     AS neighbor_recall_count
+        FROM edges e
+        LEFT JOIN nodes n ON (
+            CASE WHEN e.source_id = ? THEN e.target_id ELSE e.source_id END
+        ) = n.id
+        WHERE e.source_id = ? OR e.target_id = ?
+        """,
+        (node_id, node_id, node_id),
+    ).fetchall()
+
+    result = []
+    for e in edges:
+        neighbor_id = e["target_id"] if e["source_id"] == node_id else e["source_id"]
+        direction = "outgoing" if e["source_id"] == node_id else "incoming"
+        kw_raw = e["neighbor_recall_keywords"]
+        try:
+            keywords = json.loads(kw_raw) if kw_raw else []
+        except (json.JSONDecodeError, TypeError):
+            keywords = []
+        result.append({
+            "id": neighbor_id,
+            "type": e["neighbor_type"],
+            "relation": e["relation"],
+            "direction": direction,
+            "recall_summary": e["neighbor_recall_summary"],
+            "recall_keywords": keywords,
+            "importance_score": e["neighbor_importance_score"],
+            "recall_count": e["neighbor_recall_count"],
+        })
+    return result
+
+
+def _build_inspect_recall_view(
+    conn: sqlite3.Connection,
+    node: dict,
+    node_id: str,
+    dream_mode: bool,
+    warnings: Optional[dict],
+) -> dict:
+    """Build the recall-view response for engram_inspect."""
+    neighbors = _get_neighbors_enriched(conn, node_id)
+
+    # Partition into logical vs contextual.
+    logical: list[dict] = []
+    contextual: list[dict] = []
+    for nb in neighbors:
+        rel = nb["relation"]
+        if rel in _LOGICAL_SUBSTRATE_RELATIONS:
+            logical.append(nb)
+        elif rel in _CONTEXTUAL_RELATIONS:
+            contextual.append(nb)
+        else:
+            # Unknown relation — treat as contextual to avoid silent loss.
+            contextual.append(nb)
+
+    # Sort logical neighbors into upstream / downstream / lateral.
+    # Upstream: outgoing edges — the inspected node uses/cites/resolves/supersedes
+    #   the neighbor (outgoing derives_from, supports, supersedes, resolves, subtask_of).
+    # Downstream: incoming edges — the neighbor uses/cites/resolves/supersedes the
+    #   inspected node (incoming versions of the same relations, including incoming
+    #   subtask_of children).
+    # Lateral: contradicts (both dirs), tensions, exemplifies, retracts.
+    upstream: list[dict] = []
+    downstream: list[dict] = []
+    lateral: list[dict] = []
+
+    _UPSTREAM_OUTGOING = frozenset({
+        "derives_from", "supports", "supersedes", "resolves", "subtask_of"
+    })
+    _LATERAL_RELATIONS = frozenset({
+        "contradicts", "tensions", "exemplifies", "retracts"
+    })
+
+    for nb in logical:
+        rel = nb["relation"]
+        direction = nb["direction"]
+        if rel in _LATERAL_RELATIONS:
+            lateral.append(nb)
+        elif rel in _UPSTREAM_OUTGOING and direction == "outgoing":
+            upstream.append(nb)
+        else:
+            # incoming version of upstream relations → downstream;
+            # also catches incoming retracts etc that aren't lateral.
+            downstream.append(nb)
+
+    # Cap each group by importance_score desc (best nodes first), preserving
+    # a truncated_count field on the group when it fires.
+    def _cap_group(items: list[dict], cap: int) -> tuple[list[dict], int]:
+        if len(items) <= cap:
+            return items, 0
+        sorted_items = sorted(
+            items,
+            key=lambda x: (x.get("importance_score") or 0.0,
+                           x.get("recall_count") or 0),
+            reverse=True,
+        )
+        return sorted_items[:cap], len(items) - cap
+
+    upstream_capped, upstream_remainder = _cap_group(upstream, _INSPECT_RECALL_GROUP_CAP)
+    downstream_capped, downstream_remainder = _cap_group(downstream, _INSPECT_RECALL_GROUP_CAP)
+    lateral_capped, lateral_remainder = _cap_group(lateral, _INSPECT_RECALL_GROUP_CAP)
+    contextual_capped, contextual_remainder = _cap_group(contextual, _INSPECT_RECALL_GROUP_CAP)
+
+    # Build compact neighbor dicts for recall view (strip internal scoring fields).
+    def _trim_logical(items: list[dict]) -> list[dict]:
+        return [
+            {
+                "id": nb["id"],
+                "type": nb["type"],
+                "relation": nb["relation"],
+                "direction": nb["direction"],
+                "recall_summary": nb["recall_summary"],
+                "recall_keywords": nb["recall_keywords"],
+            }
+            for nb in items
+        ]
+
+    def _trim_contextual(items: list[dict]) -> list[dict]:
+        return [
+            {
+                "id": nb["id"],
+                "type": nb["type"],
+                "relation": nb["relation"],
+                "direction": nb["direction"],
+                "recall_keywords": nb["recall_keywords"],
+            }
+            for nb in items
+        ]
+
+    logical_neighbors: dict = {
+        "upstream": _trim_logical(upstream_capped),
+        "downstream": _trim_logical(downstream_capped),
+        "lateral": _trim_logical(lateral_capped),
+    }
+    if upstream_remainder:
+        logical_neighbors["truncated_upstream_count"] = upstream_remainder
+    if downstream_remainder:
+        logical_neighbors["truncated_downstream_count"] = downstream_remainder
+    if lateral_remainder:
+        logical_neighbors["truncated_lateral_count"] = lateral_remainder
+
+    # Strip heavyweight fields from the focus node for recall view.
+    _RECALL_OMIT = frozenset({
+        "confidence_history", "logical_chain", "metadata",
+        "importance_score", "importance_base", "utility_score",
+        "recall_turn", "recall_count",
+    })
+    node_recall = {k: v for k, v in node.items() if k not in _RECALL_OMIT}
+
+    response: dict = {
+        "node": node_recall,
+        "view": "recall",
+        "dream_mode": dream_mode,
+        "logical_neighbors": logical_neighbors,
+        "contextual_neighbors": _trim_contextual(contextual_capped),
+        "neighbor_count": len(neighbors),
+        "hint": "Use view=\"deep\" for full node detail + edge inventory; view=\"edges\" for just the connection map.",
+    }
+    if contextual_remainder:
+        response["truncated_contextual_count"] = contextual_remainder
+    if warnings:
+        response["warnings"] = warnings
+    return response
+
+
+def _build_topology_entries(
+    conn: sqlite3.Connection, node_id: str
+) -> tuple[dict[str, list[dict]], int]:
+    """Build the adjacency-map topology entries + edge count for a focal node.
+
+    Used by both view='deep' and view='edges' on engram_inspect to produce the
+    `{source_id: [{to, relation, direction}, ...]}` shape.
+    """
+    edges = conn.execute(
+        "SELECT relation, source_id, target_id FROM edges WHERE source_id = ? OR target_id = ?",
+        (node_id, node_id),
+    ).fetchall()
+
+    # Build adjacency map keyed by focus node id.
+    # Per-edge entry: {to, relation, direction}.
+    edge_entries: list[dict] = []
+    total = 0
+    for e in edges:
+        neighbor_id = e["target_id"] if e["source_id"] == node_id else e["source_id"]
+        direction = "outgoing" if e["source_id"] == node_id else "incoming"
+        rel = e["relation"]
+        entry: dict = {"to": neighbor_id, "relation": rel, "direction": direction}
+        edge_entries.append(entry)
+        total += 1
+
+    return {node_id: edge_entries}, total
+
+
+def _build_inspect_deep_view(
+    conn: sqlite3.Connection,
+    node: dict,
+    node_id: str,
+    dream_mode: bool,
+    warnings: Optional[dict],
+) -> dict:
+    """Build the deep-view response for engram_inspect."""
+    topology, total = _build_topology_entries(conn, node_id)
+
+    response: dict = {
+        "node": node,
+        "view": "deep",
+        "dream_mode": dream_mode,
+        "topology": topology,
+        "neighbor_count": total,
+    }
+    if warnings:
+        response["warnings"] = warnings
+    return response
+
+
+def _build_inspect_edges_view(
+    conn: sqlite3.Connection,
+    node_id: str,
+    node_type: str,
+) -> dict:
+    """Build the edges-view response for engram_inspect."""
+    topology, total = _build_topology_entries(conn, node_id)
+
+    return {
+        "node_id": node_id,
+        "node_type": node_type,
+        "view": "edges",
+        "topology": topology,
+        "neighbor_count": total,
+    }
+
+
 # Excerpt length for warning surfacing (claim + retraction_reason).
 # Long enough to carry gist, short enough to keep responses compact.
 _WARNING_EXCERPT_LEN = 140
@@ -5491,9 +5770,10 @@ def engram_surface(
 )
 def engram_inspect(
     node_id: str,
+    view: str = "recall",
     dream_mode: bool = False,
 ) -> str:
-    """Inspect a single node: full content plus 1-hop neighbor summaries.
+    """Inspect a single node with one of three view modes.
 
     This is the "let me think about that" layer — brings one node into full
     focus with its immediate connections. Refreshes memory on the target node
@@ -5501,25 +5781,82 @@ def engram_inspect(
 
     For the full evidence chain (multi-hop), use engram_get_subgraph instead.
 
+    Three view modes serve different use cases:
+
+      view="recall" (default):
+        "I want to refresh my memory of this idea." Full claim + logical
+        neighbors grouped into upstream / downstream / lateral with
+        recall_summary, plus contextual neighbors with keywords only.
+        Heavy fields (confidence_history, logical_chain, metadata, scores)
+        are omitted to keep the response concise.
+
+      view="deep":
+        "I need every detail of THIS node for a forensic decision."
+        All node fields including confidence_history, logical_chain, metadata,
+        importance/utility scores. Neighbors shown as a topology adjacency map
+        (per-edge entries with to/relation/direction).
+
+      view="edges":
+        "Just show me the connection inventory."
+        Node ID + type + topology adjacency map only. Minimal payload for
+        quick topology checks.
+
+    Edge classification for recall view:
+      Logical-substrate (shown with recall_summary):
+        derives_from, supports, supersedes, contradicts, resolves,
+        retracts, exemplifies, subtask_of, tensions
+      Contextual (shown with keywords only):
+        cites, about, serves
+
+    Grouping inside logical-substrate:
+      upstream   — inspected node depends on / supersedes / resolves the neighbor
+                   (outgoing derives_from, supports, supersedes, resolves, subtask_of)
+      downstream — neighbor depends on / supersedes / resolves the inspected node
+                   (incoming versions of the upstream relations)
+      lateral    — contradicts, tensions, exemplifies, retracts (no clear up/down)
+
     Args:
         node_id: The node ID to inspect (e.g. 'dv_0010').
+        view: One of "recall" (default), "deep", "edges".
         dream_mode: If True, skip memory refresh. Use during dream/audit
             cycles where inspection is maintenance, not informative recall.
             Prevents dream-selected nodes from getting artificially boosted
             importance scores. Default False (normal awake behavior).
 
     Returns:
-        JSON with the node's full content and 1-hop neighbor summaries
-        (type, claim, confidence, relation, direction).
+        JSON shaped by the chosen view mode (see above).
     """
+    _VALID_VIEWS = {"recall", "deep", "edges"}
+    if view not in _VALID_VIEWS:
+        return json.dumps({
+            "error": f"Invalid view '{view}'. Must be one of: recall, deep, edges."
+        })
+
     conn = _get_db()
     try:
         row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
         if not row:
             return json.dumps({"error": f"Node '{node_id}' not found."})
 
+        # For edges view, skip the heavy node fetch — just need id + type.
+        if view == "edges":
+            node_type = row["type"]
+
+            # Refresh + reward still fire for edges view (deliberate probe).
+            if not dream_mode:
+                _refresh_recall(conn, [node_id])
+                _utility_reward(conn, [node_id], action="inspect")
+                conn.commit()
+
+            # edges view is pure-topology browsing: the early-return here is intentional —
+            # it skips the question-node last_assessed_at bump below (pure-topology calls
+            # should not carry assessment side-effects).
+            return json.dumps(_build_inspect_edges_view(conn, node_id, node_type))
+
+        # recall + deep: build the full node dict.
         node = _node_to_dict(row)
-        # Parse metadata for structured fields
+
+        # Parse metadata for structured fields (needed by both recall + deep).
         meta = {}
         if node.get("metadata"):
             try:
@@ -5531,8 +5868,7 @@ def engram_inspect(
         # MECH-2 (dv_0472): render humanized wall-clock ages alongside the
         # ISO timestamps the schema already stores. Additive — the ISO fields
         # stay, so precision isn't lost. `created_ago` is always rendered;
-        # the other two only if the source field is present (feeling-nudge
-        # nodes have no focused_at, non-question nodes have no last_assessed_at).
+        # the other two only if the source field is present.
         now_utc = datetime.now(timezone.utc)
         node["created_ago"] = _humanized_ago(node.get("created_at"), now=now_utc)
         if node.get("focused_at"):
@@ -5540,13 +5876,7 @@ def engram_inspect(
         if node.get("last_assessed_at"):
             node["last_assessed_ago"] = _humanized_ago(node.get("last_assessed_at"), now=now_utc)
 
-        # 1-hop neighbors with summaries (already carry humanized ages from
-        # _get_neighbors — MECH-2 plumbed at the helper level).
-        neighbors = _get_neighbors(conn, node_id)
-        node["neighbors"] = neighbors
-
-        # MECH-5: surface taint / stale as a top-level warning so agents can't
-        # miss it by skimming past raw metadata JSON.
+        # MECH-5: surface taint / stale as a top-level warning.
         warnings = _extract_warnings(meta, conn)
 
         # Refresh recall on the target node ONLY (skip in dream mode)
@@ -5555,8 +5885,7 @@ def engram_inspect(
             _utility_reward(conn, [node_id], action="inspect")
             conn.commit()
 
-        # Update assessment timestamp on question nodes (regardless of dream_mode —
-        # assessment tracking is orthogonal to importance refresh)
+        # Update assessment timestamp on question nodes (orthogonal to dream_mode)
         if node.get("type") == "question":
             conn.execute(
                 "UPDATE nodes SET last_assessed_turn = ?, last_assessed_at = ? WHERE id = ?",
@@ -5564,15 +5893,14 @@ def engram_inspect(
             )
             conn.commit()
 
-        response = {
-            "node": node,
-            "neighbor_count": len(neighbors),
-            "dream_mode": dream_mode,
-            "hint": "Use engram_get_subgraph(node_id) to trace the full evidence chain.",
-        }
-        if warnings:
-            response["warnings"] = warnings
-        return json.dumps(response)
+        if view == "recall":
+            return json.dumps(
+                _build_inspect_recall_view(conn, node, node_id, dream_mode, warnings)
+            )
+        else:  # view == "deep"
+            return json.dumps(
+                _build_inspect_deep_view(conn, node, node_id, dream_mode, warnings)
+            )
     finally:
         conn.close()
 

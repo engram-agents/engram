@@ -70,12 +70,11 @@ def test_tension_links_both_goals():
         "description": "Active vs passive ENGRAM usage",
     })
     node = client.call("engram_inspect", {"node_id": r["tension_id"]})
-    neighbors = node["node"]["neighbors"]
-    tension_targets = [
-        n["neighbor_id"] for n in neighbors if n["relation"] == "tensions"
-    ]
-    assert g1 in tension_targets, f"Goal A not linked. Neighbors: {neighbors}"
-    assert g2 in tension_targets, f"Goal B not linked. Neighbors: {neighbors}"
+    # 'tensions' is a lateral logical-substrate relation in recall view.
+    lateral = node["logical_neighbors"]["lateral"]
+    tension_targets = [n["id"] for n in lateral if n["relation"] == "tensions"]
+    assert g1 in tension_targets, f"Goal A not linked. Lateral: {lateral}"
+    assert g2 in tension_targets, f"Goal B not linked. Lateral: {lateral}"
 
 
 def test_tension_initial_status_open():
@@ -102,7 +101,7 @@ def test_tension_with_analysis():
         "description": "Active vs passive",
         "analysis": analysis,
     })
-    node = client.call("engram_inspect", {"node_id": r["tension_id"]})
+    node = client.call("engram_inspect", {"node_id": r["tension_id"], "view": "deep"})
     assert node["node"].get("logical_chain") == analysis
 
 
