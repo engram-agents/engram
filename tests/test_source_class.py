@@ -165,9 +165,9 @@ def test_source_class_in_metadata():
         "source_class": "introspective",
     })
     assert r["status"] == "created"
-    # Verify via subgraph — nodes dict keyed by node_id
-    sub = client.call("engram_get_subgraph", {"node_id": r["observation_id"]})
-    node = sub["nodes"][r["observation_id"]]
+    # Verify via inspect — full node content
+    insp = client.call("engram_inspect", {"node_id": r["observation_id"], "view": "deep"})
+    node = insp["node"]
     meta = node.get("metadata", {})
     if isinstance(meta, str):
         meta = json.loads(meta)
@@ -233,8 +233,8 @@ def test_confidence_history_records_source_class():
         "source_class": "introspective",
     })
     assert r["status"] == "created"
-    sub = client.call("engram_get_subgraph", {"node_id": r["observation_id"]})
-    node = sub["nodes"][r["observation_id"]]
+    insp = client.call("engram_inspect", {"node_id": r["observation_id"], "view": "deep"})
+    node = insp["node"]
     history = node.get("confidence_history", "[]")
     if isinstance(history, str):
         history = json.loads(history)
@@ -367,8 +367,9 @@ def test_file_evidence_per_observation_versioning():
         f"(per-observation versioning), got {r3['evidence_id']}"
     )
 
-    sub = client.call("engram_get_subgraph", {"node_id": ev1})
-    ev_node = sub["nodes"][ev1]
+    # Check evidence node metadata via inspect
+    insp = client.call("engram_inspect", {"node_id": ev1, "view": "deep"})
+    ev_node = insp["node"]
     ev_meta = ev_node.get("metadata", {})
     if isinstance(ev_meta, str):
         ev_meta = json.loads(ev_meta)
@@ -376,11 +377,14 @@ def test_file_evidence_per_observation_versioning():
     assert "content_hash" not in ev_meta, "evidence must NOT carry content_hash"
     assert "prior_evidence_id" not in ev_meta, "evidence-version chains are gone"
 
-    edges = sub["edges"]
+    # Check no supersedes edges via subgraph topology
+    sub = client.call("engram_get_subgraph", {"node_id": ev1, "view": "edges"})
+    topo_entries = []
+    for entries in sub["topology"].values():
+        topo_entries.extend(entries)
     ev_supersedes = [
-        e for e in edges
+        e for e in topo_entries
         if e["relation"] == "supersedes"
-        and (e["source_id"] == ev1 or e["target_id"] == ev1)
     ]
     assert ev_supersedes == [], "no supersedes edges between evidence rows in v2 model"
 
@@ -448,15 +452,16 @@ def test_git_enforcement_uncommitted_file_rejected():
     assert r2.get("status") == "created", f"Expected success for committed file, got: {r2}"
 
     # Per dv_0547: version metadata lives on the observation, not the evidence.
-    sub = client.call("engram_get_subgraph", {"node_id": r2["observation_id"]})
-    obs_node = sub["nodes"][r2["observation_id"]]
+    obs_insp = client.call("engram_inspect", {"node_id": r2["observation_id"], "view": "deep"})
+    obs_node = obs_insp["node"]
     obs_meta = obs_node.get("metadata", "{}")
     if isinstance(obs_meta, str):
         obs_meta = json.loads(obs_meta)
     assert obs_meta.get("content_hash"), "obs content_hash should be auto-populated"
     assert obs_meta.get("git_sha"), "obs git_sha should be auto-populated"
 
-    ev_node = sub["nodes"][r2["evidence_id"]]
+    ev_insp = client.call("engram_inspect", {"node_id": r2["evidence_id"], "view": "deep"})
+    ev_node = ev_insp["node"]
     ev_meta = ev_node.get("metadata", "{}")
     if isinstance(ev_meta, str):
         ev_meta = json.loads(ev_meta)

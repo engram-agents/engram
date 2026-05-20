@@ -363,7 +363,7 @@ A decision-time reference for *what* to call and *with what shape*. Full behavio
 
 At think-time there are three directions of reach:
 
-- **Up** — toward premises. Given a claim, what does it rest on? → `engram_get_subgraph` with `direction="outgoing"` or `"both"`.
+- **Up** — toward premises. Given a claim, what does it rest on? → `engram_get_subgraph` with `direction="up"` or `"both"`.
 - **Sideways** — toward neighbors. What sits near this, by similarity or shared source? → `engram_surface`, `engram_query`, `engram_inspect` (1-hop). For dedup before writing, the add_* tools fire an auto-similarity-hint at creation (with `action_hints` like CORROBORATE, DUPLICATE, POLARITY_ALERT) — no standalone pre-check needed.
 - **Back** — toward history. When was this written, has it been superseded or retracted, what's the edit trail? → `engram_history`, `engram_inspect`.
 
@@ -438,8 +438,8 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
   `(query, [types, min_confidence, include_superseded, top_k])`
 - **engram_inspect** — Single node + 1-hop neighbors in three views: `recall` (default — full claim + grouped logical-substrate neighbors with recall_summary + contextual with keywords), `deep` (all node fields + adjacency-map edge inventory), `edges` (adjacency-map only). `dream_mode=True` skips refresh.
   `(node_id, view="recall", dream_mode=False)`
-- **engram_get_subgraph** — N-hop chain around a node.
-  `(node_id, [depth, direction])`
+- **engram_get_subgraph** — Browse connection topology N hops from a root. BROWSING tool — caller already knows the root's content; subgraph shows topology + just enough to recognise which branch to follow. view='recall' (default): topology + hop-graduated summaries (root+1-hop get recall_summary+keywords; 2+-hop get keywords only); view='edges': topology only. Chained pattern: subgraph → spot interesting node → engram_inspect it → subgraph from there.
+  `(node_id, [depth, direction, view, dream_mode])`
 - **engram_list** — Enumerate by single-field shorthand OR structured filter.
   `([node_type, status, sort_by, limit, filters_json, fields_json, unlimited, include_superseded])`
   Single-field mode is the legacy shorthand (pass `node_type` and/or `status`). Structured mode (issue #81, ships 2026-05-11) takes a recursive condition tree via `filters_json` and supports multi-field AND/OR/NOT composition, text-contains, ID-range, date-range, NULL handling, and cross-table `cites`/`cited_by` virtual fields (V1: cites/supports/derives_from edges). Grammar: `Atomic={field,op,value}` | `Compound={logic,conditions}` — top-level list = implicit AND. Operators: eq/ne/gt/gte/lt/lte/in/not_in/contains/starts_with/ends_with/between/is_null/is_not_null. `limit=0` = count-only; `unlimited=True` = no cap. Default scans current-revision only; `include_superseded=True` relaxes the `is_current=1` predicate (text-layer leak audits — Mao-Cao prototype ob_1492 / ls_0020; capability inherited from retired audit_string in #123). Return shape always populates `total_matched` so truncation is never silent.

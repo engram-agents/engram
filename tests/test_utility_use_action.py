@@ -317,9 +317,9 @@ def test_engram_get_subgraph_bumps_seed_only():
 
     result = json.loads(server.engram_get_subgraph(node_id=ax_seed))
     assert "error" not in result, f"engram_get_subgraph failed: {result}"
-    # Verify ax_neighbor appears in returned nodes (i.e., it IS a neighbor)
-    assert ax_neighbor in result["nodes"] or dv_id in result["nodes"], (
-        "Expected neighbor nodes in subgraph result"
+    # Verify ax_neighbor appears in topology (i.e., it IS a neighbor)
+    assert ax_neighbor in result["topology"] or dv_id in result["topology"], (
+        "Expected neighbor nodes in subgraph topology"
     )
 
     after_seed = _get_utility(server, ax_seed)

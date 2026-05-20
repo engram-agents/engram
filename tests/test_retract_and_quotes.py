@@ -172,9 +172,9 @@ def test_retract_basic():
     assert ret["node_id"] == ob_id
     assert ret["error_type"] == "fabricated_quote"
 
-    # Verify the node is marked retracted
-    sub = client.call("engram_get_subgraph", {"node_id": ob_id})
-    node = sub["nodes"][ob_id]
+    # Verify the node is marked retracted (use inspect for full node content)
+    insp = client.call("engram_inspect", {"node_id": ob_id, "view": "deep"})
+    node = insp["node"]
     assert node["status"] == "retracted"
     assert node["is_current"] == 0
     meta = json.loads(node["metadata"]) if isinstance(node["metadata"], str) else node["metadata"]
@@ -240,9 +240,9 @@ def test_retract_cascades_taint():
     tainted_ids = [t["id"] for t in ret["tainted_downstream"]]
     assert dv_id in tainted_ids, f"Derivation {dv_id} should be tainted, got {tainted_ids}"
 
-    # Verify taint metadata on derivation
-    sub = client.call("engram_get_subgraph", {"node_id": dv_id})
-    dv_node = sub["nodes"][dv_id]
+    # Verify taint metadata on derivation (use inspect for full node content)
+    insp = client.call("engram_inspect", {"node_id": dv_id, "view": "deep"})
+    dv_node = insp["node"]
     meta = json.loads(dv_node["metadata"]) if isinstance(dv_node["metadata"], str) else dv_node["metadata"]
     assert r1["observation_id"] in meta.get("tainted_by", [])
 
@@ -313,12 +313,13 @@ def test_retract_with_replacement():
     repl_id = ret["replacement_id"]
 
     # Verify replacement exists and cites same evidence
-    sub = client.call("engram_get_subgraph", {"node_id": repl_id, "depth": 1})
-    repl_node = sub["nodes"][repl_id]
+    insp = client.call("engram_inspect", {"node_id": repl_id})
+    repl_node = insp["node"]
     assert repl_node["claim"] == "Correct claim"
-    # Check retracts edge exists
-    retract_edges = [e for e in sub["edges"] if e["relation"] == "retracts"]
-    assert len(retract_edges) >= 1, f"Expected retracts edge, got {sub['edges']}"
+    # Check retracts edge exists (inspect recall view exposes 1-hop logical neighbours in grouped dict)
+    lateral = insp.get("logical_neighbors", {}).get("lateral", [])
+    retract_neighbors = [n for n in lateral if n["relation"] == "retracts"]
+    assert len(retract_neighbors) >= 1, f"Expected retracts neighbour, got lateral: {lateral}"
 
 
 def test_reflect_shows_tainted_and_retracted():

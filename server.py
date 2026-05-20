@@ -6039,105 +6039,202 @@ def engram_get_subgraph(
     node_id: str,
     depth: int = 2,
     direction: str = "both",
+    view: str = "recall",
+    dream_mode: bool = False,
 ) -> str:
-    """Retrieve a node and its surrounding subgraph within N hops.
+    """Browse a node's connection topology within N hops.
 
-    Use this to inspect the full evidence chain behind a claim (direction='up'),
-    see what depends on a node (direction='down'), or explore the full local
-    neighborhood (direction='both').
+    This is a BROWSING tool, not a content tool.  The caller is assumed to
+    already know the root node's content (from engram_inspect or a prior
+    query); subgraph shows the connection topology plus just-enough content
+    to recognise which branch is worth following next.  When a node in the
+    subgraph looks interesting, the caller does a fresh engram_inspect on
+    that node, then optionally calls engram_get_subgraph again from the new
+    root — the intended chained-call pattern.
+
+    Two views:
+
+    * ``recall`` (default) — topology + hop-graduated content summaries.
+      Root and 1-hop neighbours include ``recall_summary`` + ``recall_keywords``.
+      2+-hop neighbours include only ``recall_keywords`` (lighter — you need a
+      hint, not a read).  Each content entry also carries ``hop_distance`` so
+      the caller knows which depth the node sits at.
+
+    * ``edges`` — topology only (no ``content`` key).  Useful when you want
+      the pure connectivity map without any textual weight.
+
+    Hop-graduated lightness rule:
+      hop_distance=0 (root)   → type + recall_summary + recall_keywords
+      hop_distance=1          → type + recall_summary + recall_keywords
+      hop_distance=2+         → type + recall_keywords only (no recall_summary)
+
+    The topology dict is keyed by source node ID; each value is a list of
+    ``{to, relation, direction}`` entries.  Only edges where both endpoints
+    are in the subgraph are included — boundary edges to unseen nodes are
+    dropped.
 
     Args:
-        node_id: The node ID to inspect (e.g. 'dv_012').
-        depth: How many hops to traverse (default 2).
-        direction: 'up' (toward evidence), 'down' (toward derivations), 'both' (default).
+        node_id: Root node to explore (e.g. 'dv_0686').
+        depth: How many hops to traverse from the root (default 2).
+        direction: 'up' (toward evidence/sources), 'down' (toward derivations
+            that cite this), or 'both' (default).
+        view: 'recall' (default, topology + hop-graduated summaries) or
+            'edges' (topology only).  Passing 'deep' is rejected — use
+            engram_inspect(node_id, view='deep') instead.
+        dream_mode: If True, skip recall_refresh on neighbour nodes (useful
+            during dream/audit cycles).  The root node always receives a
+            utility bump regardless of dream_mode — it is the agent's explicit
+            USE target.  Default False.
 
     Returns:
-        JSON with all nodes and edges in the subgraph.
+        JSON with topology (adjacency map keyed by node ID) and, for
+        view='recall', a content dict with per-node summaries.
     """
+    if view not in ("recall", "edges"):
+        if view == "deep":
+            return json.dumps({
+                "error": (
+                    "view='deep' is not supported by engram_get_subgraph. "
+                    "Use engram_inspect(node_id, view='deep') for full node content."
+                )
+            })
+        return json.dumps({
+            "error": f"Invalid view '{view}'. Valid values: 'recall', 'edges'."
+        })
+
+    if direction not in ("up", "down", "both"):
+        return json.dumps({
+            "error": f"Invalid direction '{direction}'. Valid values: 'up', 'down', 'both'."
+        })
+
     conn = _get_db()
     try:
-        root = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
-        if not root:
+        root_row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        if not root_row:
             return json.dumps({"error": f"Node '{node_id}' not found."})
 
-        visited = set()
-        nodes_out = {}
-        edges_out = []
+        # BFS traversal — track hop_distance per node.
+        # visited maps node_id → hop_distance
+        visited: dict[str, int] = {}
+        edges_out: list[dict] = []
+        from collections import deque
 
-        def traverse(nid, remaining_depth):
-            if nid in visited or remaining_depth < 0:
-                return
-            visited.add(nid)
+        queue: deque[tuple[str, int]] = deque()
+        queue.append((node_id, 0))
 
-            node = conn.execute("SELECT * FROM nodes WHERE id = ?", (nid,)).fetchone()
-            if node:
-                node_dict = _node_to_dict(node)
-                # MECH-5: surface taint / stale per-node so the caller
-                # can't miss them while scanning a large subgraph.
-                w = _extract_warnings(node_dict.get("metadata"), conn)
-                if w:
-                    node_dict["warnings"] = w
-                nodes_out[nid] = node_dict
+        while queue:
+            nid, hop = queue.popleft()
+            if nid in visited:
+                continue
+            visited[nid] = hop
 
-            if remaining_depth == 0:
-                return
+            if hop >= depth:
+                # At the depth boundary — record the node but don't traverse further
+                continue
 
-            # Get edges based on direction
+            # Traverse edges based on direction
             if direction in ("up", "both"):
-                # Outgoing edges from this node (e.g., observation → evidence)
+                # Outgoing edges from this node (toward evidence/sources)
                 outgoing = conn.execute(
                     "SELECT * FROM edges WHERE source_id = ?", (nid,)
                 ).fetchall()
                 for e in outgoing:
                     edges_out.append(dict(e))
-                    traverse(e["target_id"], remaining_depth - 1)
+                    if e["target_id"] not in visited:
+                        queue.append((e["target_id"], hop + 1))
 
             if direction in ("down", "both"):
-                # Incoming edges to this node (e.g., derivation → observation)
+                # Incoming edges to this node (toward dependents)
                 incoming = conn.execute(
                     "SELECT * FROM edges WHERE target_id = ?", (nid,)
                 ).fetchall()
                 for e in incoming:
                     edges_out.append(dict(e))
-                    traverse(e["source_id"], remaining_depth - 1)
+                    if e["source_id"] not in visited:
+                        queue.append((e["source_id"], hop + 1))
 
-        traverse(node_id, depth)
-
-        # Deduplicate edges
-        seen_edges = set()
-        unique_edges = []
+        # Deduplicate edges (source_id, target_id, relation) and keep only those
+        # where BOTH endpoints are in the subgraph (topology truncation rule).
+        seen_edge_keys: set[tuple] = set()
+        unique_edges: list[dict] = []
         for e in edges_out:
-            key = (e["source_id"], e["target_id"], e["relation"])
-            if key not in seen_edges:
-                seen_edges.add(key)
-                unique_edges.append(
-                    {
-                        "source_id": e["source_id"],
-                        "target_id": e["target_id"],
-                        "relation": e["relation"],
-                    }
-                )
+            src, tgt, rel = e["source_id"], e["target_id"], e["relation"]
+            key = (src, tgt, rel)
+            if key in seen_edge_keys:
+                continue
+            # Drop boundary edges whose far endpoint is outside the subgraph
+            if src not in visited or tgt not in visited:
+                continue
+            seen_edge_keys.add(key)
+            edge_entry: dict = {"source_id": src, "target_id": tgt, "relation": rel}
+            unique_edges.append(edge_entry)
 
-        # Refresh recall for all accessed nodes (legacy behavior)
-        if nodes_out:
-            accessed_ids = list(nodes_out.keys())
-            _refresh_recall(conn, accessed_ids)
-            # Utility bump: only the seed node (the agent's explicit USE target),
-            # not the returned neighbors (they were shown, not actively used).
+        # Build adjacency-map topology: keyed by source node ID.
+        # Each entry: {to, relation, direction (outgoing/incoming relative to key node)}
+        topology: dict[str, list[dict]] = {nid: [] for nid in visited}
+        for e in unique_edges:
+            src, tgt, rel = e["source_id"], e["target_id"], e["relation"]
+            entry_out: dict = {"to": tgt, "relation": rel, "direction": "outgoing"}
+            entry_in: dict = {"to": src, "relation": rel, "direction": "incoming"}
+            topology[src].append(entry_out)
+            topology[tgt].append(entry_in)
+
+        # Build content dict for view="recall"
+        content: Optional[dict] = None
+        if view == "recall":
+            content = {}
+            for nid, hop in visited.items():
+                node_row = conn.execute(
+                    "SELECT type, recall_summary, recall_keywords FROM nodes WHERE id = ?",
+                    (nid,),
+                ).fetchone()
+                if not node_row:
+                    continue
+                entry: dict = {
+                    "type": node_row["type"],
+                    "hop_distance": hop,
+                }
+                kw_raw = node_row["recall_keywords"]
+                kw = None
+                if kw_raw:
+                    try:
+                        kw = json.loads(kw_raw)
+                    except (json.JSONDecodeError, TypeError):
+                        kw = None
+                if kw is not None:
+                    entry["recall_keywords"] = kw
+                # recall_summary: root + 1-hop only; suppress at 2+
+                if hop <= 1:
+                    rs = node_row["recall_summary"]
+                    if rs:
+                        entry["recall_summary"] = rs
+                content[nid] = entry
+
+        # Memory management
+        if visited:
+            # Utility bump: root only (the agent's explicit USE target)
             _utility_reward(conn, [node_id], action="subgraph")
+            # Recall refresh: all neighbours except root, unless dream_mode
+            if not dream_mode:
+                neighbor_ids = [nid for nid in visited if nid != node_id]
+                if neighbor_ids:
+                    _refresh_recall(conn, neighbor_ids)
             conn.commit()
 
-        return json.dumps(
-            {
-                "root": node_id,
-                "depth": depth,
-                "direction": direction,
-                "nodes": nodes_out,
-                "edges": unique_edges,
-                "node_count": len(nodes_out),
-                "edge_count": len(unique_edges),
-            }
-        )
+        response: dict = {
+            "root": node_id,
+            "depth": depth,
+            "direction": direction,
+            "view": view,
+            "dream_mode": dream_mode,
+            "topology": topology,
+            "node_count": len(visited),
+            "edge_count": len(unique_edges),
+        }
+        if content is not None:
+            response["content"] = content
+
+        return json.dumps(response)
     finally:
         conn.close()
 

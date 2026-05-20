@@ -53,8 +53,8 @@ def test_axiom_exempt_from_forgetting():
         "claim": "All observations must trace to evidence",
         "basis": "Core provenance requirement.",
     })
-    sub = client.call("engram_get_subgraph", {"node_id": r["axiom_id"]})
-    node = sub["nodes"][r["axiom_id"]]
+    insp = client.call("engram_inspect", {"node_id": r["axiom_id"], "view": "deep"})
+    node = insp["node"]
     assert node["importance_base"] == 2.0
 
 
@@ -102,7 +102,9 @@ def test_axiom_with_context():
     })
     assert ob["observation_id"] in ax["context_nodes"]
     sub = client.call("engram_get_subgraph", {"node_id": ax["axiom_id"]})
-    cites = [e for e in sub["edges"] if e["relation"] == "cites" and e["source_id"] == ax["axiom_id"]]
+    # topology: look for outgoing cites edges from the axiom
+    topo_entries = sub["topology"].get(ax["axiom_id"], [])
+    cites = [e for e in topo_entries if e["relation"] == "cites" and e["direction"] == "outgoing"]
     assert len(cites) == 1
 
 
@@ -127,8 +129,8 @@ def test_definition_no_confidence():
         "term": "bull market",
         "definition": "A market condition where prices are rising or expected to rise",
     })
-    sub = client.call("engram_get_subgraph", {"node_id": r["definition_id"]})
-    node = sub["nodes"][r["definition_id"]]
+    insp = client.call("engram_inspect", {"node_id": r["definition_id"], "view": "deep"})
+    node = insp["node"]
     # confidence is NULL in DB, so _node_to_dict omits it
     assert "confidence" not in node or node["confidence"] is None
 
@@ -140,8 +142,8 @@ def test_definition_in_metadata():
         "term": "epistemic",
         "definition": "Relating to knowledge or the conditions for acquiring it",
     })
-    sub = client.call("engram_get_subgraph", {"node_id": r["definition_id"]})
-    node = sub["nodes"][r["definition_id"]]
+    insp = client.call("engram_inspect", {"node_id": r["definition_id"], "view": "deep"})
+    node = insp["node"]
     meta = json.loads(node["metadata"]) if isinstance(node["metadata"], str) else node["metadata"]
     assert meta["term"] == "epistemic"
     assert meta["definition"] == "Relating to knowledge or the conditions for acquiring it"
@@ -154,8 +156,8 @@ def test_definition_exempt_from_forgetting():
         "term": "provenance",
         "definition": "The origin and chain of custody of a piece of information",
     })
-    sub = client.call("engram_get_subgraph", {"node_id": r["definition_id"]})
-    node = sub["nodes"][r["definition_id"]]
+    insp = client.call("engram_inspect", {"node_id": r["definition_id"], "view": "deep"})
+    node = insp["node"]
     assert node["importance_base"] == 2.0
 
 
@@ -308,9 +310,9 @@ def test_conjecture_resolved():
     })
     assert res["status"] == "resolution_created"
 
-    # Verify conjecture status is updated
-    sub = client.call("engram_get_subgraph", {"node_id": cj["conjecture_id"]})
-    node = sub["nodes"][cj["conjecture_id"]]
+    # Verify conjecture status is updated (use inspect for full node content)
+    insp = client.call("engram_inspect", {"node_id": cj["conjecture_id"]})
+    node = insp["node"]
     assert node["status"] == "refuted"
 
 

@@ -77,11 +77,20 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_get_subgraph": {
-        "description": "Retrieve a node and its surrounding subgraph. Use to trace evidence chains.",
+        "description": (
+            "Browse a node's connection topology within N hops. "
+            "BROWSING tool — shows connection topology + just-enough content to recognise which branch to follow. "
+            "view='recall' (default): topology + hop-graduated summaries (root+1-hop: recall_summary+keywords; 2+hop: keywords only). "
+            "view='edges': topology only, no content. "
+            "For full node content, use engram_inspect. "
+            "Chained-call pattern: subgraph → spot interesting node → engram_inspect that node → subgraph from there."
+        ),
         "parameters": {
-            "node_id": {"type": "string", "description": "The node ID to inspect.", "required": True},
-            "depth": {"type": "integer", "description": "How many hops to traverse (default 2)."},
-            "direction": {"type": "string", "description": "Traversal direction: 'up', 'down', or 'both' (default 'both').", "enum": ["up", "down", "both"]},
+            "node_id": {"type": "string", "description": "Root node to explore.", "required": True},
+            "depth": {"type": "integer", "description": "How many hops to traverse from root (default 2)."},
+            "direction": {"type": "string", "description": "Traversal direction: 'up' (toward evidence), 'down' (toward dependents), or 'both' (default).", "enum": ["up", "down", "both"]},
+            "view": {"type": "string", "description": "'recall' (default, topology + hop-graduated summaries) or 'edges' (topology only).", "enum": ["recall", "edges"]},
+            "dream_mode": {"type": "boolean", "description": "If True, skip recall_refresh on neighbours (default False)."},
         },
     },
     "engram_derive": {
