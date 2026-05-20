@@ -86,9 +86,23 @@ DEFAULT_GUIDANCE = (
 # Keyword guidance (shared across all types)
 KEYWORD_GUIDANCE = """3 to 5 load-bearing technical or topical terms a future
 agent might keyword-search to surface this node. As many as carry distinct
-signal; don't pad. Concrete terms over abstract concepts. ENGRAM tool names
-valid. Lower-case unless proper noun / code symbol / canonical
-capitalization. No duplicates.
+signal; don't pad.
+
+Prefer short keywords: 1-2 words is the sweet spot. 3 words is OK only
+when the phrase is itself the canonical multi-word term — examples of
+good 3-word keywords: "chain-of-thought", "hippocampus-cortex",
+"FTS5 syntax". Avoid coining descriptive multi-word phrases — examples
+to avoid: "structural slow-down scaffolding",
+"information-theoretic inevitability". The keyword slot is a search
+anchor, not a mini-summary — the summary already carries that load.
+
+Length: structural hard cap of 30 characters per keyword (enforced by
+the validator — overcap keywords are rejected). Aim for ≤25 as a soft
+target; staying under it signals you're picking proper terms instead
+of coining descriptions.
+
+Concrete terms over abstract concepts. ENGRAM tool names valid. Lower-case
+unless proper noun / code symbol / canonical capitalization. No duplicates.
 
 DO NOT use ENGRAM node IDs (e.g., ob_1234, dv_0500, fl_0148) as keywords.
 IDs carry no recognition signal in skim — the keyword slot is for *content
