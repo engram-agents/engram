@@ -21,6 +21,7 @@ import sqlite3
 import subprocess
 import textwrap
 import time
+import uuid as _uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Union
@@ -3985,6 +3986,139 @@ def _record_tool_timing(tool_name: str, duration_ms: int, status: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Privacy-strip set for tool-event data payloads.
+# Keys that contain long free-text content (user-authored claims, quoted text,
+# reasoning chains) are excluded from the data JSON stored in index.db so the
+# stats dashboard never surfaces L2-equivalent content through an L1 path.
+# Per viz_server.py:2617 privacy note ("L2 events are indexed but never
+# surfaced through this dashboard"). Only non-sensitive metadata is kept:
+# node/evidence IDs, shape descriptors, counts, filter parameters, etc.
+# ---------------------------------------------------------------------------
+_PAYLOAD_PRIVATE_KEYS = frozenset({
+    "quoted_text",
+    "interpretation",
+    "claim",
+    "logical_chain",
+})
+
+
+def _sanitize_params(raw_params: object) -> dict:
+    """Return a privacy-sanitized copy of a tool payload for logging.
+
+    Accepts a dict (already-parsed payload) or a JSON string (payload_json
+    style tools). Strips keys in _PAYLOAD_PRIVATE_KEYS. Returns {} on any
+    parsing failure — never raises.
+    """
+    try:
+        if isinstance(raw_params, str):
+            parsed = json.loads(raw_params)
+        elif isinstance(raw_params, dict):
+            parsed = raw_params
+        else:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        return {k: v for k, v in parsed.items() if k not in _PAYLOAD_PRIVATE_KEYS}
+    except Exception:
+        return {}
+
+
+def _extract_result_status(return_value: object) -> Optional[str]:
+    """Extract result_status from a tool's return value.
+
+    MCP tools return JSON strings; the status field lives at top level under
+    key "status" (e.g. {"status": "created", ...}). Returns None if the return
+    value is not parseable or has no status key. Never raises.
+    """
+    try:
+        if isinstance(return_value, str):
+            parsed = json.loads(return_value)
+            if isinstance(parsed, dict):
+                status = parsed.get("status")
+                if status is not None:
+                    return str(status)
+        return None
+    except Exception:
+        return None
+
+
+def _log_engram_tool_event(
+    tool_name: str,
+    duration_ms: int,
+    result_status: Optional[str],
+    params_dict: Optional[dict],
+) -> None:
+    """Emit one engram.tool.engram_call event directly into ~/.engram/logs/index.db.
+
+    This is the server-side event emission path (server.py Phase 4). It writes
+    directly to index.db rather than via the JSONL emitter, because server.py
+    runs as a long-lived process with no single session_id binding (the emitter
+    singleton is not initialized from server.py's context). See comment at
+    server.py:31-35.
+
+    Fire-and-forget: any failure is logged to stderr and silently swallowed.
+    The tool's main work is NEVER disrupted by a logging failure.
+    """
+    try:
+        logs_index_path = DATA_DIR / "logs" / "index.db"
+        if not logs_index_path.exists():
+            # index.db not yet created — skip silently (no events to receive yet)
+            return
+
+        turn = _get_current_turn()
+        session_id = (
+            os.environ.get("CLAUDE_SESSION_ID")
+            or os.environ.get("ANTHROPIC_SESSION_ID")
+            or "server.py"
+        )
+        _now = datetime.now(timezone.utc)
+        ts = _now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_now.microsecond // 1000:03d}Z"
+        event_uuid = _uuid.uuid4().hex
+        data_json = json.dumps(params_dict or {}, separators=(",", ":"))
+
+        conn = sqlite3.connect(str(logs_index_path))
+        try:
+            conn.execute(
+                """INSERT OR IGNORE INTO events (
+                    uuid, sessionId, turn, ts, event_type, tool_use_id, level,
+                    daemon_latency_ms, fallback_to_fts,
+                    hook_name, hook_duration_ms, hook_exit_code,
+                    tool_name, result_status,
+                    data
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?,
+                    ?, ?, ?,
+                    ?, ?,
+                    ?
+                )""",
+                (
+                    event_uuid,
+                    session_id,
+                    turn,
+                    ts,
+                    "engram.tool.engram_call",
+                    None,   # tool_use_id — not available from server.py context
+                    1,      # level = 1 (stats-only; never emit L2 from this path)
+                    duration_ms,  # daemon_latency_ms — the tool's wall-clock ms
+                    None,   # fallback_to_fts — N/A for tool events
+                    None,   # hook_name
+                    None,   # hook_duration_ms
+                    None,   # hook_exit_code
+                    tool_name,
+                    result_status,
+                    data_json,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        import sys
+        print(f"[engram-tool-event] _log_engram_tool_event({tool_name}) failed: {exc!r}", file=sys.stderr)
+
+
 _original_mcp_tool = mcp.tool
 
 
@@ -3996,15 +4130,26 @@ def _timing_mcp_tool(*args, **kwargs):
         @functools.wraps(func)
         def timed(*a, **kw):
             start = time.perf_counter()
-            status = "success"
+            timing_status = "success"
+            result_value = None
             try:
-                return func(*a, **kw)
+                result_value = func(*a, **kw)
+                return result_value
             except Exception:
-                status = "error"
+                timing_status = "error"
                 raise
             finally:
                 duration_ms = int((time.perf_counter() - start) * 1000)
-                _record_tool_timing(func.__name__, duration_ms, status)
+                _record_tool_timing(func.__name__, duration_ms, timing_status)
+                # Dual-emission: also write to logs/index.db for the viz-server
+                # stats dashboard. result_status is extracted from the tool's
+                # return value (JSON string with "status" key); falls back to
+                # timing_status for tools that don't return a status field.
+                result_status = _extract_result_status(result_value) or timing_status
+                # Sanitize params: strip private long-content keys before logging.
+                raw_payload = (a[0] if a else None) or kw.get("payload_json")
+                sanitized = _sanitize_params(raw_payload)
+                _log_engram_tool_event(func.__name__, duration_ms, result_status, sanitized)
         return inner_decorator(timed)
     return wrapper
 

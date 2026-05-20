@@ -2551,7 +2551,7 @@ def get_stats_data(index_db_path: str) -> dict:
                WHERE level = 1
                  AND ts > datetime('now', '-1 day')
                  AND (
-                   (event_type = 'engram.tool.engram_call' AND result_status NOT IN ('created', 'updated', 'ok', 'batch_complete', 'corroborated'))
+                   (event_type = 'engram.tool.engram_call' AND result_status IN ('error', 'blocked_tainted', 'blocked_stale', 'rejected'))
                    OR (event_type = 'engram.hook.fire' AND hook_exit_code IS NOT NULL AND hook_exit_code != 0)
                  )
                ORDER BY ts DESC
