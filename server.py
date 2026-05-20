@@ -13962,10 +13962,12 @@ def engram_list(
         cols_to_fetch = ["id"] + [f for f in projected_fields if f != "id"]
         select_cols = ", ".join(f'"{c}"' for c in cols_to_fetch)
     else:
-        # Default compact triage shape (unchanged from legacy single-field mode).
+        # Default compact triage shape. recall_summary is fetched alongside
+        # claim so the triage entry can surface the curated summary when one
+        # has been backfilled (per Wave-D recall_summary rollout).
         cols_to_fetch = [
             "id", "type", "claim", "status", "confidence", "recall_count",
-            "importance_score", "created_at", "memory_status",
+            "importance_score", "created_at", "memory_status", "recall_summary",
         ]
         select_cols = ", ".join(f'"{c}"' for c in cols_to_fetch)
 
@@ -13988,13 +13990,29 @@ def engram_list(
             entries.append(entry)
     else:
         # Default compact triage shape (matches legacy output).
+        # The `claim` output key sources from recall_summary when populated
+        # (curated dense recognition string, up to 200 chars) or falls back
+        # to the original claim truncated to 130 chars for legacy nodes that
+        # haven't been backfilled yet. Key name unchanged for downstream compat.
         for row in rows:
-            nid, ntype, claim, st, conf, recalls, imp, created, mem_st = row
-            claim_trunc = (claim[:130] + "...") if claim and len(claim) > 130 else (claim or "")
+            nid, ntype, claim, st, conf, recalls, imp, created, mem_st, rs = row
+            if rs and len(rs) <= 200:
+                # recall_summary present and within safety bound — use as-is
+                # (validator hard cap is 200 chars (see RECALL_SUMMARY_HARD_CAP);
+                # the 200 bound here matches that cap exactly, defense-in-depth
+                # for hypothetical direct-SQL bypasses).
+                claim_display = rs
+            elif rs:
+                # recall_summary present but unusually long (data integrity issue
+                # upstream, defense-in-depth) — truncate to cap with ellipsis
+                claim_display = rs[:200] + "..."
+            else:
+                # No recall_summary — fall back to truncated claim (legacy behavior)
+                claim_display = (claim[:130] + "...") if claim and len(claim) > 130 else (claim or "")
             entry = {
                 "id": nid,
                 "type": ntype,
-                "claim": claim_trunc,
+                "claim": claim_display,
                 "status": st,
                 "recall_count": recalls,
                 "created": created[:10] if created else None,

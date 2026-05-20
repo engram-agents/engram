@@ -67,6 +67,8 @@ ALLOWED_NODE_COLUMNS: frozenset[str] = frozenset(
         "importance_score",
         "recall_turn",
         "recall_count",
+        "recall_summary",
+        "recall_keywords",
         "memory_status",
         "utility_score",
         # Source classification
