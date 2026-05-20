@@ -266,12 +266,16 @@ def test_tension_resolvable():
         "url": "https://arxiv.org/abs/2401.00001",
         "title": "Test",
     })
-    r = client.call("engram_resolve", {
-        "target_id": t["tension_id"],
+    # Two-step (issue #229): compose resolving derivation, then wire it.
+    dv = client.call("engram_derive", {
         "claim": "The active-vs-passive tension is synthesized via graduated autonomy: start passive, earn active control through demonstrated reliability",
         "supporting_ids": obs["observation_id"],
         "logical_chain": "Graduated autonomy makes the dichotomy false — control is a spectrum, not binary",
         "reasoning_type": "abductive_best_explanation",
+    })
+    r = client.call("engram_resolve", {
+        "target_id": t["tension_id"],
+        "resolving_node_id": dv["derivation_id"],
     })
     assert r.get("status") == "resolution_created", f"Expected resolution, got {r}"
 
@@ -298,12 +302,15 @@ def test_resolved_tension_not_in_reflect():
         "url": "https://arxiv.org/abs/2401.00001",
         "title": "Test",
     })
-    client.call("engram_resolve", {
-        "target_id": t["tension_id"],
+    dv = client.call("engram_derive", {
         "claim": "Tension resolved",
         "supporting_ids": obs["observation_id"],
         "logical_chain": "Resolved by synthesis",
         "reasoning_type": "abductive_best_explanation",
+    })
+    client.call("engram_resolve", {
+        "target_id": t["tension_id"],
+        "resolving_node_id": dv["derivation_id"],
     })
     report = client.call("engram_reflect", {})
     # If fully resolved, the empty category is dropped from the briefing.

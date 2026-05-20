@@ -173,9 +173,9 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_resolve": {
-        "description": "Resolve an open question, contradiction, prediction, conjecture, or goal tension by creating a derivation with a 'resolves' edge. Confidence-gated: below 0.7 → partially_resolved. Single-payload signature — pass all fields as one JSON object string in payload_json. Required fields inside payload_json: target_id, claim, supporting_ids, logical_chain.",
+        "description": "Wire a 'resolves' edge from an existing claim-bearing node to a target (question, contradiction, prediction, conjecture, or goal_tension). Pure-wire as of issue #229 — does NOT create a derivation. Two-step workflow: compose the resolving derivation via engram_derive first, then call engram_resolve to wire it. When an existing canonical node already resolves the target, pass it directly. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: target_id, resolving_node_id.",
         "parameters": {
-            "payload_json": {"type": "string", "description": "JSON object (as a string) with resolve fields. Required: target_id (qu_/ct_/pr_/cj_/gt_ node ID), claim (the resolution), supporting_ids (comma-separated claim-bearing node IDs), logical_chain (reasoning connecting premises to resolution). Optional: prediction_outcome (confirmed/partially_confirmed/refuted/partially_refuted for predictions; supported/refuted/inconclusive for conjectures), reasoning_type (see engram_derive for valid types), derivation_mode (LEGACY: chain or corroboration), context_ids (comma-separated 'cites' edges), use_stale (MECH-5 opt-in for stale premises).", "required": True},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with resolve fields. Required: target_id (qu_/ct_/pr_/cj_/gt_ node ID), resolving_node_id (a claim-bearing node ID — observation, derivation, theory, axiom, or conjecture — that resolves the target; must be is_current=1). Optional: prediction_outcome (confirmed/partially_confirmed/refuted/partially_refuted for predictions; supported/refuted/inconclusive for conjectures).", "required": True},
         },
     },
     "engram_ask": {

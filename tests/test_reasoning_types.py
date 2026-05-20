@@ -396,7 +396,8 @@ def test_no_warning_multi_source_generalization():
 # ---------------------------------------------------------------------------
 
 def test_resolve_with_reasoning_type():
-    """engram_resolve should accept and use reasoning_type."""
+    """Two-step workflow (issue #229): derivation carries the reasoning_type;
+    engram_resolve wires it without recomputing confidence."""
     client = fresh_client()
     ids = setup_base_graph(client)
 
@@ -405,17 +406,24 @@ def test_resolve_with_reasoning_type():
     assert q.get("status") == "created"
     q_id = q["question_id"]
 
-    # Resolve with reasoning_type
-    result = client.call("engram_resolve", {
-        "target_id": q_id,
+    # Step 1: compose resolving derivation with reasoning_type
+    dv = client.call("engram_derive", {
         "claim": "Gold fell because of rising real rates",
         "supporting_ids": f"{ids['ob1']},{ids['ob2']}",
         "logical_chain": "Rate data + analyst attribution → causal explanation",
         "reasoning_type": "inductive_causal",
     })
-    assert result.get("status") == "resolution_created", f"Failed: {result}"
+    assert dv.get("status") == "created", f"Failed: {dv}"
     # min(0.95, 0.70) × 0.85 = 0.595
     expected = round(0.70 * 0.85, 3)
+    assert dv["confidence"] == expected, f"Expected {expected}, got {dv['confidence']}"
+
+    # Step 2: wire it
+    result = client.call("engram_resolve", {
+        "target_id": q_id,
+        "resolving_node_id": dv["derivation_id"],
+    })
+    assert result.get("status") == "resolution_created", f"Failed: {result}"
     assert result["confidence"] == expected, f"Expected {expected}, got {result['confidence']}"
     print(f"  PASS: engram_resolve with reasoning_type = {expected}")
 

@@ -247,8 +247,10 @@ def test_feeling_rejected_in_contradict():
     assert "claim-bearing" in ct["error"]
 
 
-def test_feeling_rejected_as_resolve_support():
-    """Feeling reports cannot be used as supporting_ids in engram_resolve."""
+def test_feeling_rejected_as_resolving_node():
+    """Feeling reports cannot be used as resolving_node_id in engram_resolve
+    (per issue #229 pure-wire semantics — resolver must be claim-bearing,
+    and feeling_report is not in CLAIM_BEARING_TYPES)."""
     client, _ = fresh_client()
     f = client.call("engram_report_feeling", {
         "reported_state": "Test.",
@@ -257,10 +259,7 @@ def test_feeling_rejected_as_resolve_support():
     q = client.call("engram_ask", {"question": "An open question?"})
     r = client.call("engram_resolve", {
         "target_id": q["question_id"],
-        "claim": "Attempting resolution from feeling",
-        "supporting_ids": f["feeling_id"],
-        "logical_chain": "Should fail",
-        "reasoning_type": "deductive_modus_ponens",
+        "resolving_node_id": f["feeling_id"],
     })
     assert "error" in r, f"Expected error, got {r}"
     assert "claim-bearing" in r["error"]

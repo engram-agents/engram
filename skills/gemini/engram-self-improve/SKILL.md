@@ -178,15 +178,21 @@ If the change affects architecture, invariants, or the self-improvement principl
 
 ### 5a. Resolve the gap
 
-Resolve the original question or observation that triggered the improvement:
+Resolve the original question or observation that triggered the improvement. Two-step (issue #229):
 
 ```
-engram_resolve(
-    target_id="<the gap node>",
+# Step 1: compose the resolving derivation
+dv = engram_derive(
     claim="<how the gap was addressed>",
     supporting_ids="<the design derivation, the new code observation>",
     logical_chain="<gap → design → implementation → resolution>",
     reasoning_type="deductive_modus_ponens",
+)
+
+# Step 2: wire it to the gap node
+engram_resolve(
+    target_id="<the gap node>",
+    resolving_node_id=dv["derivation_id"],
 )
 ```
 

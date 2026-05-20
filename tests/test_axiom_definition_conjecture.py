@@ -294,12 +294,16 @@ def test_conjecture_resolved():
         "claim": "Fed held rates steady through Q3 2026",
         "quote_type": "hard_data",
     })
-    res = client.call("engram_resolve", {
-        "target_id": cj["conjecture_id"],
-        "supporting_ids": ob["observation_id"],
+    # Two-step (issue #229): compose resolving derivation, then wire it.
+    dv = client.call("engram_derive", {
         "claim": "Rate cuts did not happen in Q3",
+        "supporting_ids": ob["observation_id"],
         "logical_chain": "Fed held rates steady — conjecture refuted.",
         "reasoning_type": "deductive_modus_tollens",
+    })
+    res = client.call("engram_resolve", {
+        "target_id": cj["conjecture_id"],
+        "resolving_node_id": dv["derivation_id"],
         "prediction_outcome": "refuted",
     })
     assert res["status"] == "resolution_created"
@@ -338,12 +342,15 @@ def test_conjecture_invalid_outcome():
         "claim": "Supporting claim",
         "quote_type": "hard_data",
     })
-    res = client.call("engram_resolve", {
-        "target_id": cj["conjecture_id"],
-        "supporting_ids": ob["observation_id"],
+    dv = client.call("engram_derive", {
         "claim": "Attempt with bad outcome",
+        "supporting_ids": ob["observation_id"],
         "logical_chain": "Testing.",
         "reasoning_type": "deductive_modus_ponens",
+    })
+    res = client.call("engram_resolve", {
+        "target_id": cj["conjecture_id"],
+        "resolving_node_id": dv["derivation_id"],
         "prediction_outcome": "confirmed",  # not valid for conjectures
     })
     assert "error" in res

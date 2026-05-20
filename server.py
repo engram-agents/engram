@@ -10581,10 +10581,13 @@ def _ask_impl(
 
 
 # Set of legitimate field names for the engram_resolve payload.
+# 2026-05-20 redesign: pure-wire tool. Resolve no longer creates derivations;
+# the caller composes the resolving derivation via engram_derive (or supplies
+# an existing claim-bearing node) and then calls engram_resolve to wire the
+# resolves edge. This eliminates the chain-dilution failure mode that broke
+# ct_0006 (issue #229) and parallels how engram_supersede is pure-relational.
 _RESOLVE_FIELDS = frozenset({
-    "target_id", "claim", "supporting_ids", "logical_chain",
-    "prediction_outcome", "reasoning_type", "derivation_mode",
-    "context_ids", "use_stale",
+    "target_id", "resolving_node_id", "prediction_outcome",
 })
 
 
@@ -10599,36 +10602,47 @@ _RESOLVE_FIELDS = frozenset({
     },
 )
 def engram_resolve(payload_json: str) -> str:
-    """Resolve an open question, contradiction, prediction, conjecture, or goal tension by creating a derivation.
+    """Resolve an open question, contradiction, prediction, conjecture, or goal tension by wiring a resolves edge from a claim-bearing node.
 
-    Single-payload signature (wave 2 of ob_1499 — see issue #55 for empirical
-    rationale): pass ALL fields as one JSON object string in `payload_json`.
-    This eliminates the antml-prefix multi-parameter swallow risk that fired
-    on this tool the night of 2026-05-08 (claim split at bare `</claim>`).
+    Pure-relational: this tool ONLY wires the resolves edge and flips the
+    target's status. It does NOT create the resolving derivation — compose
+    that upstream via engram_derive (or supply an existing claim-bearing
+    node like an axiom, observation, or canonical derivation).
+
+    Two-step workflow:
+      1. engram_derive(...) creates the resolving derivation (cite the
+         high-confidence root nodes that ground the resolution; avoid
+         citing prior weak resolution chains).
+      2. engram_resolve(target_id=..., resolving_node_id=...) wires the
+         resolves edge + flips status based on resolving_node.confidence.
+
+    When the resolving node already exists (e.g., a supersede dv_X→dv_Y
+    that substantively resolves a contradiction by altering the conflicting
+    claim), skip step 1 and call engram_resolve directly with the existing
+    node as resolving_node_id.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
             target_id (str, required): The node ID to resolve (qu_XXXX,
                 ct_XXXX, pr_XXXX, cj_XXXX, or gt_XXXX).
-            claim (str, required): The resolution claim — your answer,
-                verdict, or outcome assessment.
-            supporting_ids (str, required): Comma-separated claim-bearing
-                node IDs that support this resolution.
-            logical_chain (str, required): Explicit reasoning connecting
-                cited premises to the resolution.
+            resolving_node_id (str, required): A claim-bearing node ID
+                (observation, derivation, theory, axiom, or conjecture)
+                that resolves the target. Must be is_current=1.
             prediction_outcome (str, optional): Required for predictions
                 (confirmed/partially_confirmed/refuted/partially_refuted)
                 or conjectures (supported/refuted/inconclusive).
-            reasoning_type (str, optional): The type of logical argument.
-                See engram_derive for full list.
-            derivation_mode (str, optional): LEGACY — use reasoning_type.
-            context_ids (str, optional): Comma-separated node IDs for
-                'cites' context.
-            use_stale (bool, optional): MECH-5 opt-in for stale premises.
 
     Returns:
-        JSON with the new derivation ID, resolution status, and confidence.
-        On payload-parsing failure, returns {"error": "..."}.
+        JSON with the wired edge, target status flip, and resolving node's
+        confidence. On payload-parsing failure, returns {"error": "..."}.
+
+    Why pure-wire (issue #229, 2026-05-20):
+      The old combo (create-derivation-and-wire) made it cheap for callers
+      to wrap prior weak resolution chains in new derivations, compounding
+      confidence dilution. ct_0006 locked through 7 attempts this way until
+      the chain finally cited root nodes. The new shape forces deliberate
+      derivation authoring via engram_derive, where citing roots is the
+      natural pattern.
 
     See _resolve_impl for full semantics — kept callable with named kwargs
     for in-server callers.
@@ -10652,103 +10666,54 @@ def engram_resolve(payload_json: str) -> str:
 
 def _resolve_impl(
     target_id: str = "",
-    claim: str = "",
-    supporting_ids: str = "",
-    logical_chain: str = "",
+    resolving_node_id: str = "",
     prediction_outcome: str = "",
-    reasoning_type: str = "",
-    derivation_mode: str = "chain",
-    context_ids: str = "",
-    use_stale: bool = False,
 ) -> str:
     """Internal implementation — see engram_resolve MCP tool for the public
     payload schema. Kept callable with named kwargs for in-server callers.
 
-    Resolve an open question, contradiction, prediction, conjecture, or goal tension by creating a derivation.
+    Pure-wire semantics (issue #229, 2026-05-20):
+      - Validates target is a resolvable type (question, contradiction,
+        prediction, conjecture, goal_tension) and current.
+      - Validates resolving_node is claim-bearing (observation, derivation,
+        theory, axiom, conjecture) and current.
+      - For predictions/conjectures: prediction_outcome required.
+      - Inserts the resolves edge from resolving_node_id → target_id.
+      - Computes target.status from MAX(confidence) across all current,
+        non-retracted, non-superseded resolves of the target. This prevents
+        regression (a low-confidence later resolve cannot downgrade a
+        target previously resolved by a high-confidence resolver).
+      - Idempotent on duplicate (resolving_node_id, target_id, 'resolves')
+        — returns no_op without re-writing.
 
-    A resolution IS a derivation — it cites claim-bearing nodes and reasons
-    toward a conclusion that closes an open item. The derivation node is
-    created with a 'resolves' edge to the target. Internally, this shares
-    the derivation-creation core with engram_derive, so it inherits the
-    MECH-5 taint/stale premise guard, utility rewards for recalled
-    premises, and the context_ids cites mechanism.
-
-    You should specify reasoning_type to classify the logical argument
-    (e.g. 'deductive_modus_ponens', 'abductive_elimination'). See engram_derive
-    for the full list of 13 reasoning types and their confidence discounts.
-
-    If the resolution confidence (computed from supporting nodes) is below
-    the resolution threshold (default 0.7), the target is marked
-    'partially_resolved' instead of 'resolved'. Partially resolved items
-    remain visible during reflection so the agent can strengthen them later.
-
-    For predictions, you must specify prediction_outcome: confirmed,
-    partially_confirmed, partially_refuted, or refuted.
-
-    For goal tensions, the resolution claim should describe the resolution
-    approach: synthesis (creative reconciliation honoring both goals),
-    prioritization (choosing one direction with reasoning), or dissolution
-    (the tension was only apparent, not real).
+    Why pure-wire (#229 design):
+      The old combo create-and-wire made it cheap to wrap prior weak
+      resolution chains in new derivations. ct_0006 locked through 7
+      attempts this way (chain confidence diluting 0.585 → 0.392 → 0.384
+      → 0.376 → 0.368 → 0.361) until dv_0681 finally cited the root
+      nodes (ob_1598 + dv_0599, both conf 0.95) and produced conf 0.931.
+      Forcing callers to compose the resolving derivation explicitly via
+      engram_derive makes citing roots the natural pattern.
 
     Args:
-        target_id: The node ID to resolve (qu_XXXX, ct_XXXX, pr_XXXX, cj_XXXX, or gt_XXXX).
-        claim: The resolution claim — your answer, verdict, or outcome assessment.
-        supporting_ids: Comma-separated claim-bearing node IDs that support this resolution.
-        logical_chain: Explicit reasoning connecting the cited premises to the resolution.
-        prediction_outcome: Required for predictions: confirmed, partially_confirmed, partially_refuted, or refuted.
-        reasoning_type: The type of logical argument. See engram_derive for full list.
-        derivation_mode: LEGACY — use reasoning_type instead.
-        context_ids: Optional comma-separated node IDs for 'cites' context (e.g. definitions).
-        use_stale: MECH-5 opt-in for stale premises — see engram_derive docs.
+        target_id: The node ID to resolve.
+        resolving_node_id: A claim-bearing node that resolves the target.
+        prediction_outcome: Required for predictions/conjectures.
 
     Returns:
-        JSON with the new derivation ID, resolution status, and confidence.
-        May return BLOCKED_TAINTED or BLOCKED_STALE if a premise is
-        compromised (same guard as engram_derive).
+        JSON with the wired edge, target's new status, and the resolving
+        node's confidence.
     """
-    # Per ls_0034: bool-string truthy trap at wrapper boundary. JSON-string
-    # "false" is truthy in Python; without this check, a use_stale: "false"
-    # payload would silently bypass the MECH-5 stale-premise guard.
-    if not isinstance(use_stale, bool):
-        return json.dumps({
-            "error": (
-                f"use_stale must be a JSON boolean (true/false), got "
-                f"{type(use_stale).__name__}: {use_stale!r}. "
-                "Some MCP clients emit booleans as strings — make sure your "
-                "JSON encodes `true`/`false` not `\"true\"`/`\"false\"`."
-            )
-        })
-
     RESOLVABLE_TYPES = {"question", "contradiction", "prediction", "conjecture", "goal_tension"}
     VALID_PREDICTION_OUTCOMES = {"confirmed", "partially_confirmed", "refuted", "partially_refuted"}
     VALID_CONJECTURE_OUTCOMES = {"supported", "refuted", "inconclusive"}
 
-    # Empty-string guards on required fields (parallels _report_feeling_impl).
-    # Without these, payload_json={"target_id": "qu_X", "claim": "", ...} would
-    # create a derivation with an empty claim — semantic corruption even though
-    # the structural guards (claim-bearing-type check, MECH-5) still fire.
     if not target_id or not target_id.strip():
         return json.dumps({"error": "target_id is required and cannot be empty."})
-    if not claim or not claim.strip():
-        return json.dumps({"error": "claim is required and cannot be empty."})
-    if not logical_chain or not logical_chain.strip():
-        return json.dumps({"error": "logical_chain is required and cannot be empty."})
-
-    if reasoning_type and reasoning_type not in REASONING_TYPES:
-        return json.dumps({
-            "error": f"Invalid reasoning_type '{reasoning_type}'.",
-            "valid_types": sorted(REASONING_TYPES),
-        })
-    if not reasoning_type:
-        if derivation_mode == "corroboration":
-            reasoning_type = "inductive_generalization"
-        else:
-            reasoning_type = "deductive_hypothetical_syllogism"
-
-    ids = [s.strip() for s in supporting_ids.split(",") if s.strip()]
-    if not ids:
-        return json.dumps({"error": "At least one supporting node ID is required."})
-    ctx = [s.strip() for s in context_ids.split(",") if s.strip()]
+    if not resolving_node_id or not resolving_node_id.strip():
+        return json.dumps({"error": "resolving_node_id is required and cannot be empty."})
+    if target_id == resolving_node_id:
+        return json.dumps({"error": "target_id and resolving_node_id must differ."})
 
     conn = _get_db()
     try:
@@ -10760,19 +10725,37 @@ def _resolve_impl(
             return json.dumps({"error": f"Target node '{target_id}' not found."})
         if target["type"] not in RESOLVABLE_TYPES:
             return json.dumps({
-                "error": f"Protocol violation: can only resolve questions, contradictions, predictions, conjectures, or goal tensions. "
+                "error": f"Protocol violation: can only resolve questions, contradictions, "
+                         f"predictions, conjectures, or goal tensions. "
                          f"Node '{target_id}' is type '{target['type']}'.",
             })
-        if target["status"] == "resolved":
+
+        resolver = conn.execute(
+            "SELECT id, type, claim, confidence, is_current, status FROM nodes WHERE id = ?",
+            (resolving_node_id,),
+        ).fetchone()
+        if not resolver:
+            return json.dumps({"error": f"Resolving node '{resolving_node_id}' not found."})
+        if resolver["type"] not in CLAIM_BEARING_TYPES:
             return json.dumps({
-                "warning": f"Node '{target_id}' is already resolved. "
-                           f"If you have new evidence, consider superseding the existing resolution.",
+                "error": f"Protocol violation: resolving node must be claim-bearing "
+                         f"(observation, derivation, theory, axiom, conjecture). "
+                         f"'{resolving_node_id}' is type '{resolver['type']}'. "
+                         f"Compose a derivation via engram_derive first, then call "
+                         f"engram_resolve to wire it.",
+            })
+        if resolver["is_current"] != 1:
+            return json.dumps({
+                "error": f"Resolving node '{resolving_node_id}' is not current "
+                         f"(superseded or retracted). Cannot use as a resolution. "
+                         f"Use the current canonical replacement instead.",
             })
 
         if target["type"] == "prediction":
             if not prediction_outcome:
                 return json.dumps({
-                    "error": "Predictions require prediction_outcome: confirmed, partially_confirmed, partially_refuted, or refuted.",
+                    "error": "Predictions require prediction_outcome: "
+                             "confirmed, partially_confirmed, partially_refuted, or refuted.",
                 })
             if prediction_outcome not in VALID_PREDICTION_OUTCOMES:
                 return json.dumps({
@@ -10782,7 +10765,8 @@ def _resolve_impl(
         if target["type"] == "conjecture":
             if not prediction_outcome:
                 return json.dumps({
-                    "error": "Conjectures require prediction_outcome: supported, refuted, or inconclusive.",
+                    "error": "Conjectures require prediction_outcome: "
+                             "supported, refuted, or inconclusive.",
                 })
             if prediction_outcome not in VALID_CONJECTURE_OUTCOMES:
                 return json.dumps({
@@ -10790,94 +10774,85 @@ def _resolve_impl(
                              f"Must be one of: {', '.join(sorted(VALID_CONJECTURE_OUTCOMES))}",
                 })
 
-        missing, wrong_type = [], []
-        for sid in ids:
-            row = conn.execute("SELECT id, type FROM nodes WHERE id = ?", (sid,)).fetchone()
-            if not row:
-                missing.append(sid)
-            elif row["type"] not in CLAIM_BEARING_TYPES:
-                wrong_type.append(f"{sid} (type: {row['type']})")
-        if missing:
-            return json.dumps({"error": f"Supporting node(s) not found: {', '.join(missing)}"})
-        if wrong_type:
+        # Idempotency: if this (resolver, target, 'resolves') edge already
+        # exists, don't append a duplicate. Returning early also prevents
+        # double utility-reward and double _log_edit for repeat calls.
+        existing_edge = conn.execute(
+            "SELECT id FROM edges WHERE source_id = ? AND target_id = ? AND relation = 'resolves'",
+            (resolving_node_id, target_id),
+        ).fetchone()
+        if existing_edge:
             return json.dumps({
-                "error": f"Protocol violation: resolutions can only cite claim-bearing nodes "
-                         f"(observations, derivations, theories, axioms, conjectures). "
-                         f"Cannot cite: {', '.join(wrong_type)}. "
-                         f"Extract observations from evidence first.",
+                "status": "no_op",
+                "message": (
+                    f"Edge ({resolving_node_id} → {target_id}, resolves) already exists. "
+                    f"Target status: {target['status']}."
+                ),
+                "target_id": target_id,
+                "resolving_node_id": resolving_node_id,
+                "target_status": target["status"],
             })
 
-        # Pre-compute confidence to decide resolution_status (same inputs
-        # _create_derivation will use — the helper recomputes, matches).
-        preview_confidence = _compute_confidence(
-            conn, "derivation", supporting_ids=ids, reasoning_type=reasoning_type,
-        )
+        confidence = resolver["confidence"] if resolver["confidence"] is not None else 1.0
         config = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
         threshold = config.get("resolution_confidence_threshold", DEFAULT_RESOLUTION_THRESHOLD)
+
+        now = _now()
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'resolves', ?)",
+            (resolving_node_id, target_id, now),
+        )
+
+        # Compute status from MAX(confidence) across all current, non-retracted
+        # resolvers (including the one we just wired). This prevents regression:
+        # a later weak resolver cannot downgrade a target previously resolved
+        # by a stronger one. For predictions/conjectures the categorical
+        # outcome (prediction_outcome) wins last-writer regardless — the
+        # outcome IS the status, no confidence projection.
         if target["type"] == "prediction":
             resolution_status = prediction_outcome
         elif target["type"] == "conjecture":
             resolution_status = prediction_outcome
-        elif preview_confidence >= threshold:
-            resolution_status = "resolved"
         else:
-            resolution_status = "partially_resolved"
+            max_conf_row = conn.execute(
+                """SELECT MAX(n.confidence) AS max_conf FROM edges e
+                   JOIN nodes n ON e.source_id = n.id
+                   WHERE e.target_id = ? AND e.relation = 'resolves'
+                   AND n.is_current = 1 AND n.status != 'retracted'""",
+                (target_id,),
+            ).fetchone()
+            max_conf = max_conf_row["max_conf"] if max_conf_row and max_conf_row["max_conf"] is not None else confidence
+            if max_conf >= threshold:
+                resolution_status = "resolved"
+            else:
+                resolution_status = "partially_resolved"
 
-        block, success = _create_derivation(
-            conn,
-            claim=claim,
-            supporting_ids=ids,
-            logical_chain=logical_chain,
-            reasoning_type=reasoning_type,
-            context_ids=ctx,
-            use_stale=use_stale,
-            extra_meta={"resolves": target_id, "resolution_status": resolution_status},
-            history_reason=f"Resolution of {target_id} ({reasoning_type})",
-        )
-        if block is not None:
-            return json.dumps(block)
-
-        node_id = success["node_id"]
-        confidence = success["confidence"]
-        now = _now()
-
-        conn.execute(
-            "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'resolves', ?)",
-            (node_id, target_id, now),
-        )
         conn.execute(
             "UPDATE nodes SET status = ? WHERE id = ?",
             (resolution_status, target_id),
         )
         _log_edit(conn, "resolved", target_id, target["type"],
-                  {"resolved_by": node_id, "resolution_status": resolution_status})
+                  {"resolved_by": resolving_node_id, "resolution_status": resolution_status})
 
-        _utility_reward(conn, [target_id, node_id], action="resolve")
+        _utility_reward(conn, [target_id, resolving_node_id], action="resolve")
         conn.commit()
 
         result = {
             "status": "resolution_created",
-            "derivation_id": node_id,
             "target_id": target_id,
             "target_type": target["type"],
-            "claim": claim,
+            "resolving_node_id": resolving_node_id,
+            "resolving_node_type": resolver["type"],
             "confidence": confidence,
             "resolution_status": resolution_status,
-            "supporting_nodes": ids,
         }
-        if success["context_nodes"]:
-            result["context_nodes"] = success["context_nodes"]
-        if success["bumped_count"]:
-            result["utility_bumped_count"] = success["bumped_count"]
-        if success["structure_warnings"]:
-            result["structure_warnings"] = success["structure_warnings"]
-        if use_stale and success["stale_ids"]:
-            result["built_on_stale"] = success["stale_ids"]
         if resolution_status == "partially_resolved":
             result["note"] = (
-                f"Confidence {confidence:.2f} is below the resolution threshold {threshold:.2f}. "
-                f"The {target['type']} remains partially resolved and will appear in reflection. "
-                f"Strengthen the resolution by finding additional evidence."
+                f"No current resolver of '{target_id}' reaches the resolution "
+                f"threshold {threshold:.2f}. The {target['type']} remains "
+                f"partially resolved. To strengthen, compose a derivation "
+                f"via engram_derive that cites high-confidence root nodes, "
+                f"then call engram_resolve again to wire it."
             )
 
         return json.dumps(result)
@@ -10955,6 +10930,33 @@ def _supersede_impl(
     node type's confidence math, metadata, edges, and importance anchoring.
     Keeping supersede relational-only means those rules never diverge.
 
+    Supersede no-drop discipline (ls_0044, 2026-05-20):
+      The new node MUST preserve every load-bearing claim of the old node.
+      For each load-bearing claim in old, the only legitimate per-claim
+      moves are: keep unchanged in new, alter in new (refine / sharpen /
+      reframe / correct), or retract-separately via engram_retract on the
+      specific part. Drop is forbidden — supersede sets old.is_current=0,
+      and the old node disappears from queryable engram, so any unpreserved
+      claim is silently lost.
+
+    Atomic claims are unambiguous. Multi-claim nodes require explicit
+    per-claim review before supersede.
+
+    Cascade behavior (parallel cascades for derivation and contradiction
+    dependents):
+      - Derivation cascade: every node that derives_from / supports the
+        old node gets marked stale_by_premise (metadata.stale_by includes
+        old_node_id, metadata.stale_replacement = new_node_id).
+      - Contradiction cascade (issue #229): every contradiction node that
+        has old as a contradicting side gets marked stale_by_premise too.
+        Dream-fairy-2 reviews each stale contradiction and decides whether
+        the supersede substantively resolved the contradiction (case 1:
+        wire engram_resolve from new_node to ct) or preserved the conflict
+        (case 2: new-contradict between new_node + other side, then
+        supersede old_ct → new_ct). Per the no-drop discipline, case 3
+        (orthogonal supersede) cannot arise — new either kept or altered
+        the conflicting claim; dropping is forbidden.
+
     Workflow:
       1. Draft the corrected/refined claim and create the new node with
          the right creation tool — pass the FULL explicit support list
@@ -10994,7 +10996,8 @@ def _supersede_impl(
 
     Returns:
         JSON with old_node_id, new_node_id, the stale downstream list,
-        and stale_count.
+        stale_count, plus stale_contradictions (contradictions cascaded
+        via the contradicts-edge walk) and stale_contradiction_count.
     """
     if not old_node_id or not old_node_id.strip():
         return json.dumps({"error": "old_node_id is required and cannot be empty."})
@@ -11130,6 +11133,56 @@ def _supersede_impl(
 
         _flag_stale(old_node_id)
 
+        # Cascade to contradiction nodes that have old as a contradicting side
+        # (issue #229): mark each affected contradiction as stale_by_premise
+        # so dream-fairy-2 reviews whether the supersede substantively resolved
+        # the conflict (case 1: wire engram_resolve from new_node to ct) or
+        # preserved it (case 2: new-contradict between new_node + other side,
+        # then supersede old contradiction → new contradiction). Per the
+        # supersede no-drop discipline (ls_0044), case 3 (orthogonal supersede)
+        # cannot arise — the new node either kept or altered the conflicting
+        # claim; dropping is forbidden.
+        stale_contradictions = []
+        contradiction_edges = conn.execute(
+            "SELECT source_id, target_id FROM edges "
+            "WHERE relation = 'contradicts' AND (source_id = ? OR target_id = ?)",
+            (old_node_id, old_node_id),
+        ).fetchall()
+        affected_ct_ids = set()
+        for ce in contradiction_edges:
+            ct_id = ce["source_id"] if ce["source_id"].startswith("ct_") else ce["target_id"]
+            if not ct_id.startswith("ct_"):
+                continue  # contradicts edges only attach contradictions to claim-bearers; skip otherwise
+            affected_ct_ids.add(ct_id)
+        for ct_id in affected_ct_ids:
+            ct = conn.execute(
+                "SELECT id, type, claim, status, metadata FROM nodes WHERE id = ? AND is_current = 1",
+                (ct_id,),
+            ).fetchone()
+            if not ct:
+                continue
+            ct_meta = json.loads(ct["metadata"]) if ct["metadata"] else {}
+            stale_by = ct_meta.get("stale_by", [])
+            if old_node_id not in stale_by:
+                stale_by.append(old_node_id)
+            ct_meta["stale_by"] = stale_by
+            ct_meta["stale_replacement"] = new_node_id
+            conn.execute(
+                "UPDATE nodes SET metadata = ? WHERE id = ?",
+                (json.dumps(ct_meta), ct_id),
+            )
+            stale_contradictions.append({
+                "id": ct_id,
+                "type": "contradiction",
+                "claim": ct["claim"],
+                "status": ct["status"],
+                "stale_premise": old_node_id,
+                "replacement": new_node_id,
+            })
+            _log_edit(conn, "stale_flagged", ct_id, "contradiction",
+                      {"stale_premise": old_node_id, "replacement": new_node_id,
+                       "cascade_via": "contradicts_edge"})
+
         _log_edit(conn, "superseded", old_node_id, old["type"],
                   {"replaced_by": new_node_id, "reason": supersede_reason or None})
         for s in stale:
@@ -11159,6 +11212,8 @@ def _supersede_impl(
             "supersede_reason": supersede_reason or None,
             "stale_downstream": stale,
             "stale_count": len(stale),
+            "stale_contradictions": stale_contradictions,
+            "stale_contradiction_count": len(stale_contradictions),
         })
     finally:
         conn.close()
@@ -11239,6 +11294,21 @@ def _retract_impl(
     node is preserved for audit but marked as an error. All downstream nodes
     (derivations, theories) that depend on the retracted node are flagged as
     tainted so they can be reviewed and corrected.
+
+    Cascade behavior:
+      - Derivation cascade: every node that derives_from / supports the
+        retracted node gets marked tainted_by (metadata.tainted_by includes
+        the retracted node id).
+      - Contradiction cascade (issue #229): every contradiction node that
+        has the retracted node as a contradicting side gets marked
+        tainted_by. Dream-fairy-2 reviews tainted contradictions —
+        the retracted side was never valid, so the contradiction itself
+        may need to be closed (since one of its claims is now invalid)
+        or rewired to a corrected replacement observation if one was
+        created via the replacement_json path.
+      - Resolution reopening: if the retracted node was a resolution
+        (had outgoing resolves edges), each target without another
+        valid resolution is set back to status='open'.
 
     Error types:
       fabricated_quote — quoted_text not found in evidence source
@@ -11373,6 +11443,49 @@ def _retract_impl(
 
         _find_downstream(node_id)
 
+        # Cascade to contradiction nodes that have the retracted node as a
+        # contradicting side (issue #229): mark each affected contradiction
+        # as tainted_by so dream-fairy-2 reviews whether the contradiction
+        # itself is still valid (the retracted side was never valid; if the
+        # other side stands alone now, the contradiction may itself need
+        # supersede / explicit close).
+        tainted_contradictions = []
+        contradiction_edges = conn.execute(
+            "SELECT source_id, target_id FROM edges "
+            "WHERE relation = 'contradicts' AND (source_id = ? OR target_id = ?)",
+            (node_id, node_id),
+        ).fetchall()
+        affected_ct_ids = set()
+        for ce in contradiction_edges:
+            ct_id = ce["source_id"] if ce["source_id"].startswith("ct_") else ce["target_id"]
+            if not ct_id.startswith("ct_"):
+                continue
+            affected_ct_ids.add(ct_id)
+        for ct_id in affected_ct_ids:
+            ct = conn.execute(
+                "SELECT id, type, claim, status, metadata FROM nodes WHERE id = ? AND is_current = 1",
+                (ct_id,),
+            ).fetchone()
+            if not ct:
+                continue
+            ct_meta = json.loads(ct["metadata"]) if ct["metadata"] else {}
+            tainted_by = ct_meta.get("tainted_by", [])
+            if node_id not in tainted_by:
+                tainted_by.append(node_id)
+            ct_meta["tainted_by"] = tainted_by
+            conn.execute(
+                "UPDATE nodes SET metadata = ? WHERE id = ?",
+                (json.dumps(ct_meta), ct_id),
+            )
+            tainted_contradictions.append({
+                "id": ct_id,
+                "type": "contradiction",
+                "claim": ct["claim"],
+                "status": ct["status"],
+            })
+            _log_edit(conn, "tainted", ct_id, "contradiction",
+                      {"tainted_by": node_id, "cascade_via": "contradicts_edge"})
+
         # Log retraction and taint events
         _log_edit(conn, "retracted", node_id, node["type"],
                   {"error_type": error_type, "reason": reason[:200]})
@@ -11432,6 +11545,8 @@ def _retract_impl(
             "reason": reason,
             "tainted_downstream": tainted,
             "tainted_count": len(tainted),
+            "tainted_contradictions": tainted_contradictions,
+            "tainted_contradiction_count": len(tainted_contradictions),
         }
         if reopened_targets:
             result["reopened_targets"] = reopened_targets

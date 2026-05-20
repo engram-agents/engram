@@ -61,11 +61,11 @@ Read the briefing carefully. Don't skim. This IS the dream agenda.
 Pick threads in this order of priority:
 
 1. **Tainted nodes** — these are epistemically corrupted. For each: inspect the chain, decide whether to retract, supersede, or downgrade confidence. Resolve fully where possible.
-2. **Unresolved contradictions** — use `engram_resolve` with a derivation that cites whichever claim-bearing nodes support the resolution. Pick a `reasoning_type` that matches the argument (deductive, inductive, abductive, authority).
+2. **Unresolved contradictions** — two-step (issue #229): compose the resolving derivation via `engram_derive` (citing whichever claim-bearing nodes support the resolution, pick a `reasoning_type` that matches the argument), then wire via `engram_resolve(target_id, resolving_node_id)`. When an existing canonical node already resolves the contradiction, pass it directly. See the `engram-contradiction-resolution` skill for the full decision tree (open / stale_by_premise / tainted_by).
 3. **Stale cascades** — depth-first when cheap (conclusion unchanged, just premise pointer update). Breadth-first when expensive (new research required — register a question via `engram_ask` instead of blocking the dream on it). (qu_0020)
 4. **Open conjectures with new evidence** — promote (supersede to a proper derivation) or refute (resolve as refuted). Conjectures without movement stay open.
 5. **Open questions answerable from current graph knowledge** — resolve with derivations citing the answering nodes.
-6. **Goal tensions** — attempt synthesis, prioritization, or dissolution via `engram_resolve`.
+6. **Goal tensions** — attempt synthesis, prioritization, or dissolution: compose a derivation via `engram_derive` then wire via `engram_resolve(target_id, resolving_node_id)`.
 
 **Use `dream_mode=True` on every `engram_inspect` call during the dream.** This skips the recall-refresh side effect. Dream inspection is maintenance, not informative use — refreshing would artificially inflate importance on arbitrarily-selected nodes (qu_0017, dv_0038).
 

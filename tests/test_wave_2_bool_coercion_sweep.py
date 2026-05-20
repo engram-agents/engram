@@ -144,37 +144,13 @@ class TestObservationIsPredictiveBool:
 # ---------------------------------------------------------------------------
 # Issue #70 — use_stale bool-string truthy on engram_resolve
 # ---------------------------------------------------------------------------
-
-
-class TestResolveUseStaleBool:
-    def test_actual_bool_use_stale_accepted(self):
-        server = fresh_server()
-        # Just call with use_stale=False; we don't need a real resolve to fire
-        # — the isinstance check happens before any validation of target_id.
-        r = json.loads(server.engram_resolve(payload_json=json.dumps({
-            "target_id": "qu_nonexistent",
-            "claim": "test resolution",
-            "supporting_ids": "",
-            "logical_chain": "test chain",
-            "use_stale": False,
-        })))
-        # The isinstance check passes; downstream may error on target lookup
-        # but the error won't be about use_stale.
-        if "error" in r:
-            assert "use_stale" not in r["error"]
-
-    def test_string_false_rejected(self):
-        server = fresh_server()
-        r = json.loads(server.engram_resolve(payload_json=json.dumps({
-            "target_id": "qu_nonexistent",
-            "claim": "test resolution",
-            "supporting_ids": "",
-            "logical_chain": "test chain",
-            "use_stale": "false",  # STRING — should error
-        })))
-        assert "error" in r
-        assert "use_stale" in r["error"]
-        assert "boolean" in r["error"].lower()
+#
+# RETIRED 2026-05-20 (issue #229): use_stale is no longer a field on
+# engram_resolve. The 2026-05-20 redesign made engram_resolve pure-wire —
+# it just wires an existing resolving_node to a target, no derivation
+# creation, no MECH-5 stale guard. The bool-string truthy trap remains a
+# real concern for engram_derive (which still has use_stale); the
+# TestDeriveUseStaleBool class earlier in this file continues to enforce it.
 
 
 # ---------------------------------------------------------------------------

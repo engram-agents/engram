@@ -182,17 +182,28 @@ def test_engram_resolve_bumps_both_target_and_derivation():
 
     before_qu = _get_utility(server, qu_id)
 
-    resolve_result = json.loads(server.engram_resolve(payload_json=json.dumps({
-        "target_id": qu_id,
+    # Two-step (issue #229): compose resolving derivation, then wire it.
+    derive_result = json.loads(server.engram_derive(payload_json=json.dumps({
         "claim": "Resolution claim for use-sites expansion test.",
         "supporting_ids": f"{ax_a},{ax_b}",
         "logical_chain": "Test resolution derivation for use-sites expansion.",
         "reasoning_type": "deductive_modus_ponens",
     })))
+    assert "error" not in derive_result, f"engram_derive failed: {derive_result}"
+    dv_id = derive_result["derivation_id"]
+
+    # Capture derivation utility AFTER engram_derive (will already be bumped
+    # via _derive_impl's own _utility_reward call on its supporting_ids).
+    # The resolve bump is on dv_id and qu_id specifically.
+    before_dv = _get_utility(server, dv_id)
+
+    resolve_result = json.loads(server.engram_resolve(payload_json=json.dumps({
+        "target_id": qu_id,
+        "resolving_node_id": dv_id,
+    })))
     assert "error" not in resolve_result, f"engram_resolve failed: {resolve_result}"
     assert resolve_result["status"] == "resolution_created"
 
-    dv_id = resolve_result["derivation_id"]
     after_qu = _get_utility(server, qu_id)
     after_dv = _get_utility(server, dv_id)
 
@@ -202,11 +213,10 @@ def test_engram_resolve_bumps_both_target_and_derivation():
         f"question target should be bumped with α=0.15; expected {expected_qu}, got {after_qu}"
     )
 
-    # Derivation must be bumped with α=0.15
-    # Note: derivation was just born (utility_score starts at 0.0)
-    expected_dv = round(0.0 + 0.15 * (1.0 - 0.0), 6)
+    # Resolving derivation must also be bumped with α=0.15
+    expected_dv = round(before_dv + 0.15 * (1.0 - before_dv), 6)
     assert abs(after_dv - expected_dv) < 1e-9, (
-        f"derivation should be bumped with α=0.15; expected {expected_dv}, got {after_dv}"
+        f"resolving derivation should be bumped with α=0.15; expected {expected_dv}, got {after_dv}"
     )
 
 
