@@ -67,13 +67,29 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_query": {
-        "description": "First-class voluntary semantic-recall (autonoetic intentional-search complement to engram_surface's ambient/noetic auto-surfacing). Use when you want to recall something specifically. Combines FTS5 keyword + semantic similarity; returns full nodes with neighbors; refreshes recall on matched nodes.",
+        "description": "First-class voluntary semantic-recall (autonoetic intentional-search complement to engram_surface's ambient/noetic auto-surfacing). Use when you want to recall something specifically. Combines FTS5 keyword + semantic similarity; returns tiered {id,summary}/{id,keywords} shape; refreshes recall on matched nodes. Use engram_inspect for full content on any result.",
         "parameters": {
             "query": {"type": "string", "description": "Search query.", "required": True},
             "types": {"type": "string", "description": "Comma-separated node types to filter by."},
             "min_confidence": {"type": "number", "description": "Minimum confidence threshold (0.0-1.0)."},
             "include_superseded": {"type": "boolean", "description": "Include superseded nodes."},
             "top_k": {"type": "integer", "description": "Max results (default 10)."},
+            "summary_top_k": {"type": "integer", "description": "Top-N results returned with recall_summary (Tier 1); remainder get recall_keywords only (Tier 2). Default 3. Ignored when return_debug=True."},
+            "return_debug": {
+                "type": "boolean",
+                "description": "If True, return the full legacy shape with composite_score and ranking internals (eval/harness use only). Suppresses tiered render. Default False."
+            },
+        },
+    },
+    "engram_query_pattern": {
+        "description": "Run a named compositional graph-pattern query (KnowQL-inspired). Returns tiered {id,summary}/{id,keywords} shape. Six patterns: contradiction_obsolescence_ready, open_question_answerable, stale_load_bearing, cornerstone_candidate, tainted_still_valid, recent_resolution_echo. Three presets: high_precision / balanced (default) / high_recall. Telemetry logged per call.",
+        "parameters": {
+            "pattern_name": {"type": "string", "description": "One of: contradiction_obsolescence_ready, open_question_answerable, stale_load_bearing, cornerstone_candidate, tainted_still_valid, recent_resolution_echo.", "required": True},
+            "preset": {"type": "string", "description": "high_precision / balanced (default) / high_recall.", "enum": ["high_precision", "balanced", "high_recall"]},
+            "cosine_threshold_override": {"type": "number", "description": "Override preset cosine_threshold (>= 0 to apply). Default -1."},
+            "top_k_override": {"type": "integer", "description": "Override preset top_k (>= 0 to apply). Default -1."},
+            "min_confidence_override": {"type": "number", "description": "Override preset min_confidence (>= 0 to apply). Default -1."},
+            "summary_top_k": {"type": "integer", "description": "Top-N candidates returned with recall_summary (Tier 1); remainder get recall_keywords only (Tier 2). Default 3."},
         },
     },
     "engram_get_subgraph": {

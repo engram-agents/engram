@@ -5455,6 +5455,65 @@ def _search_nodes(
     return base_result
 
 
+# ---- Tiered-result helpers ----
+
+def _build_tiered_results(
+    results: list[dict],
+    summary_top_k: int,
+) -> list[dict]:
+    """Convert a ranked list of node dicts to the Wave-C tiered return shape.
+
+    Tier 1 (first ``summary_top_k`` entries):
+        {"id": "...", "summary": "<recall_summary or truncated claim>"}
+
+    Tier 2 (remaining entries):
+        {"id": "...", "keywords": [...]}   if recall_keywords present and non-empty
+        {"id": "..."}                       otherwise (bare-ID, intentional)
+
+    Ordering = input ranking order.  No score or position fields.
+    Type is carried by the ID prefix (ax_, ob_, dv_, etc.).
+
+    Note: for engram_query_pattern, Tier 2 entries are bare-ID because the
+    per-pattern result builders construct dicts from raw SQL without pulling
+    recall_keywords.  Future enhancement: update each ``_pattern_*`` function
+    to include ``recall_keywords`` for richer Tier 2 rendering on pattern
+    queries.
+
+    Args:
+        results: Ranked list of node dicts (already processed — metadata stripped,
+            neighbors added for engram_query; raw pattern dicts for query_pattern).
+        summary_top_k: How many top entries get summaries.  0 = all tier-2;
+            >= len(results) = all tier-1.  Caller is responsible for clamping
+            to valid range before calling.
+    """
+    tiered: list[dict] = []
+    for i, node in enumerate(results):
+        node_id = node.get("id", "")
+        if i < summary_top_k:
+            # Tier 1: prefer recall_summary, fall back to truncated claim.
+            summary = node.get("recall_summary") or None
+            if not summary:
+                claim = node.get("claim") or ""
+                summary = (claim[:160] + "...") if len(claim) > 160 else claim
+            tiered.append({"id": node_id, "summary": summary})
+        else:
+            # Tier 2: prefer recall_keywords; bare-ID if missing/empty.
+            kw = node.get("recall_keywords")
+            # recall_keywords may arrive as a list (already parsed by _node_to_dict)
+            # or as a JSON string if the node came from a pattern impl that does
+            # its own dict construction.  Normalise here.
+            if isinstance(kw, str):
+                try:
+                    kw = json.loads(kw)
+                except (ValueError, json.JSONDecodeError):
+                    kw = None
+            if kw:
+                tiered.append({"id": node_id, "keywords": kw})
+            else:
+                tiered.append({"id": node_id})
+    return tiered
+
+
 # ---- Query tools ----
 
 
@@ -5922,6 +5981,7 @@ def engram_query(
     include_superseded: bool = False,
     top_k: int = 10,
     return_debug: bool = False,
+    summary_top_k: int = 3,
 ) -> str:
     """Search the knowledge graph by natural language query.
 
@@ -5948,19 +6008,23 @@ def engram_query(
         min_confidence: Only return nodes at or above this confidence threshold (0.0–1.0).
         include_superseded: If True, include non-current (superseded) nodes. Default False.
         top_k: Maximum results to return (default 10).
-        return_debug: If True, include a ``debug`` key in the response with intermediate
-            ranking signals (extracted keywords, FTS/semantic candidate counts, per-result
-            scores). Default False — never bloats normal responses. Intended for SxS
-            comparison and retrieval diagnostics.
+        return_debug: If True, return the full legacy shape (all node fields, composite_score,
+            similarity, neighbor data, debug key with ranking internals). Default False.
+            Intended for SxS comparison and retrieval diagnostics; never bloats normal responses.
+        summary_top_k: How many top results get a recall_summary (Tier 1). The remaining
+            results get recall_keywords only (Tier 2). Default 3. Clamped to [0, top_k].
+            Set to 0 for all-keywords; set >= top_k for all-summaries.
+            Ignored when return_debug=True (full shape returned instead).
 
     Returns:
-        JSON with matching nodes, each including its claim, confidence, type, and immediate neighbors.
-        When return_debug=True, also includes a ``debug`` key with ranking internals.
-        Per-result debug entries include: id, match_type, bm25_raw, relevance_normalized,
-        similarity, composite_score, utility_score, importance_score, importance_base,
-        confidence, surprise_score, recall_turn. When return_debug=True, each entry also
-        includes util_amp, imp_amp, and imp_norm_factor (multiplicative amplifier
-        decomposition from the composite formula, for harness diagnostics).
+        Default (return_debug=False): tiered shape
+            {"results": [{"id": ..., "summary": ...}, ..., {"id": ..., "keywords": [...]}],
+             "query": ..., "total_matches": N}
+        When return_debug=True: full legacy shape with all node fields, neighbors,
+            composite_score, similarity, and a "debug" key with ranking internals.
+            Per-result debug entries include: id, match_type, bm25_raw, relevance_normalized,
+            similarity, composite_score, utility_score, importance_score, importance_base,
+            confidence, surprise_score, recall_turn, util_amp, imp_amp, imp_norm_factor.
     """
     conn = _get_db()
     try:
@@ -5970,7 +6034,9 @@ def engram_query(
             return_debug=return_debug,
         )
 
-        # Enrich results with neighbors (legacy behavior)
+        # Enrich results with neighbors (needed for both debug + tiered paths:
+        # debug returns the full enriched dicts; tiered path needs recall_keywords
+        # which come from _node_to_dict / _search_nodes, but warnings need conn).
         output = []
         for node in search["results"]:
             # MECH-5: extract warnings BEFORE popping metadata so agents
@@ -5982,7 +6048,7 @@ def engram_query(
                 node["warnings"] = w
             output.append(node)
 
-        # Refresh recall for all accessed nodes (legacy behavior)
+        # Refresh recall for all accessed nodes.
         if output:
             accessed_ids = [n["id"] for n in output]
             _refresh_recall(conn, accessed_ids)
@@ -6003,24 +6069,37 @@ def engram_query(
             },
         )
 
-        response_body: dict = {
+        # return_debug=True: preserve full legacy shape verbatim (eval/harness contract).
+        if return_debug:
+            response_body: dict = {
+                "query": query,
+                "results": output,
+                "count": len(output),
+                "search_methods": {
+                    "keyword_matches": search["keyword_matches"],
+                    "semantic_matches": search["semantic_matches"],
+                    "semantic_available": search["semantic_available"],
+                },
+                "message": (
+                    f"Found {len(output)} matching node(s)."
+                    if output
+                    else "No matching nodes found in the knowledge graph."
+                ),
+            }
+            if "debug" in search:
+                response_body["debug"] = search["debug"]
+            return json.dumps(response_body)
+
+        # Default path: tiered summary/keywords shape (Wave C recall_summary rollout).
+        # Clamp summary_top_k to [0, len(output)] so callers don't have to worry
+        # about off-by-one edge cases.
+        effective_top_k = max(0, min(summary_top_k, len(output)))
+        tiered = _build_tiered_results(output, effective_top_k)
+        return json.dumps({
+            "results": tiered,
             "query": query,
-            "results": output,
-            "count": len(output),
-            "search_methods": {
-                "keyword_matches": search["keyword_matches"],
-                "semantic_matches": search["semantic_matches"],
-                "semantic_available": search["semantic_available"],
-            },
-            "message": (
-                f"Found {len(output)} matching node(s)."
-                if output
-                else "No matching nodes found in the knowledge graph."
-            ),
-        }
-        if return_debug and "debug" in search:
-            response_body["debug"] = search["debug"]
-        return json.dumps(response_body)
+            "total_matches": len(output),
+        })
     finally:
         conn.close()
 
@@ -14420,6 +14499,7 @@ def engram_query_pattern(
     cosine_threshold_override: float = -1.0,
     top_k_override: int = -1,
     min_confidence_override: float = -1.0,
+    summary_top_k: int = 3,
 ) -> str:
     """Run a named compositional graph-pattern query.
 
@@ -14453,12 +14533,15 @@ def engram_query_pattern(
         top_k_override: If >= 0, overrides the preset's top_k. Default -1.
         min_confidence_override: If >= 0, overrides the preset's
             min_confidence. Default -1.
+        summary_top_k: How many top candidates get a recall_summary (Tier 1).
+            The remaining candidates get recall_keywords only (Tier 2). Default 3.
+            Clamped to [0, candidate_count].
 
     Returns:
-        JSON with {pattern_name, preset, params_used, candidates,
-        candidate_count, hint}. Each candidate is a dict whose shape
-        is pattern-specific but always includes id, score, and
-        suggested_action.
+        JSON with {pattern_name, preset, results, total_matches}.
+        Tier 1 (top summary_top_k entries): {"id": ..., "summary": ...}
+        Tier 2 (remainder): {"id": ..., "keywords": [...]} or {"id": ...}
+        Telemetry log writes are unaffected by the tier transformation.
     """
     if pattern_name not in PATTERN_QUERY_REGISTRY:
         return json.dumps({
@@ -14486,6 +14569,8 @@ def engram_query_pattern(
     finally:
         conn.close()
 
+    # Telemetry log: internal eval surface — preserved verbatim (ob_1500 discipline).
+    # The tier transformation applies to the agent-facing return shape only.
     _pattern_telemetry_log(pattern_name, preset,
                             {"params_used": params}, candidates)
 
@@ -14508,17 +14593,16 @@ def engram_query_pattern(
         },
     )
 
+    # Apply tiered render after pattern-internal ranking is complete.
+    # Clamp summary_top_k to [0, len(candidates)].
+    effective_top_k = max(0, min(summary_top_k, len(candidates)))
+    tiered = _build_tiered_results(candidates, effective_top_k)
+
     return json.dumps({
         "pattern_name": pattern_name,
         "preset": preset,
-        "params_used": params,
-        "candidate_count": len(candidates),
-        "candidates": candidates,
-        "hint": (
-            "Each candidate has a suggested_action. Use it as a starting "
-            "point — apply judgment before acting. Telemetry of this call "
-            "is logged for preset calibration."
-        ),
+        "results": tiered,
+        "total_matches": len(candidates),
     })
 
 
