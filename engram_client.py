@@ -224,8 +224,13 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_reflect": {
-        "description": "[Sleep cycle — pre-dream briefing.] Structured self-audit of the graph (contradictions, open questions, weak claims, overdue predictions, uncited observations, tainted and retracted nodes). Opens the dream cycle for the engram-sleep skill. Not a tool to reach for during awake-state work.",
-        "parameters": {},
+        "description": "[Sleep cycle — pre-dream briefing.] Structured self-audit of the graph (contradictions, open questions, weak claims, overdue predictions, uncited observations, tainted and retracted nodes). Opens the dream cycle for the engram-sleep skill. Not a tool to reach for during awake-state work. High-volume categories (weakly_grounded, thin_support_derivations, uncited_observations) are tiered: top summary_top_k entries get full claim text (from recall_summary if set, else claim); the remainder get keyword-style entries (recall_keywords list, no claim key). Low-volume categories source-swap their content field from recall_summary with claim fallback.",
+        "parameters": {
+            "summary_top_k": {
+                "type": "integer",
+                "description": "How many top-importance entries in each high-volume category receive summary-style rendering (claim from recall_summary). Remainder get keyword-style. Default 5. Clamped to >= 0. Set to 0 for all keyword-style; set high (e.g. 50) for all summary-style.",
+            },
+        },
     },
     "engram_diagnose": {
         "description": "Comprehensive quantitative health audit. Side-effect-free. Returns health score 0-100 across five dimensions.",

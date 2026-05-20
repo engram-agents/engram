@@ -13326,7 +13326,7 @@ _REFLECT_TOP_N = {
     "retracted_nodes": 3,
     "open_predictions": 3,
 }
-_REFLECT_FIELD_MAX = 80
+_REFLECT_FIELD_MAX = 200
 _REFLECT_ACTIONS_MAX = 5
 _REFLECT_TRUNC_FIELDS = {
     "claim", "question", "description", "goal", "task", "reason", "interpretation",
@@ -13349,7 +13349,7 @@ def _slim_reflect_briefing(report: dict) -> dict:
     - Always preserves `summary`, `memory_tiers`, `recommended_actions`.
     - Drops list categories with zero items (counts remain in `summary`).
     - Truncates each list to `_REFLECT_TOP_N[key]` with a `truncated` marker.
-    - Shortens long string fields (claim/question/reason/etc) to 120 chars.
+    - Shortens long string fields (claim/question/reason/etc) to _REFLECT_FIELD_MAX chars (currently 200).
     """
     def trunc_str(s):
         if not isinstance(s, str) or len(s) <= _REFLECT_FIELD_MAX:
@@ -13401,6 +13401,36 @@ def _slim_reflect_briefing(report: dict) -> dict:
     return out
 
 
+def _reflect_rs_or_claim(row, claim_field: str = "claim", max_len: int = 160) -> str:
+    """Return recall_summary (capped at 200) or claim truncated to max_len.
+
+    Used by engram_reflect's low-volume source-swap and high-volume Tier-1
+    claim rendering. Row must have recall_summary and the named claim_field.
+    Safety bound: recall_summary > 200 chars → truncated to 200 + "..."
+    (matches Wave D round-2 convention).
+    """
+    rs = row["recall_summary"] if "recall_summary" in row.keys() else None
+    rs = (rs or "").strip()
+    if rs:
+        if len(rs) > 200:
+            rs = rs[:200] + "..."
+        return rs
+    raw = row[claim_field] or ""
+    return (raw[:max_len] + "...") if len(raw) > max_len else raw
+
+
+def _reflect_keywords(row) -> list | None:
+    """Parse recall_keywords JSON from a DB row. Returns list or None."""
+    kw_raw = row["recall_keywords"] if "recall_keywords" in row.keys() else None
+    if not kw_raw:
+        return None
+    try:
+        parsed = json.loads(kw_raw)
+        return parsed if isinstance(parsed, list) else None
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
 @mcp.tool(
     name="engram_reflect",
     annotations={
@@ -13411,7 +13441,7 @@ def _slim_reflect_briefing(report: dict) -> dict:
         "openWorldHint": False,
     },
 )
-def engram_reflect() -> str:
+def engram_reflect(summary_top_k: int = 5) -> str:
     """[Sleep cycle — pre-dream briefing.] Structured self-audit of the
     knowledge graph; opens the dream cycle for the engram-sleep skill.
 
@@ -13425,9 +13455,31 @@ def engram_reflect() -> str:
     decide which issues to address — strengthen weak claims, resolve
     contradictions, investigate open questions, or check overdue predictions.
 
+    Two-tier-per-category rendering for high-volume categories
+    (weakly_grounded, thin_support_derivations, uncited_observations):
+      - Tier 1 (top summary_top_k by importance_score DESC):
+        {id, claim: recall_summary OR claim, confidence, ...existing_fields}.
+        Key name "claim" preserved for backward compat.
+      - Tier 2 (remainder): {id, keywords: list, confidence, ...existing_fields}.
+        "claim" key OMITTED — keywords only for triage signal at this tier.
+        If recall_keywords is missing: bare {id, confidence, ...} (no keywords key).
+
+    Low-volume categories (unresolved_contradictions, open_questions,
+    open_conjectures, active_goals, active_tasks, active_lessons,
+    unresolved_goal_tensions): source-swap — content field sourced from
+    recall_summary with fallback to claim. Key names unchanged for backward compat.
+
+    Args:
+        summary_top_k: How many top-importance entries in each high-volume
+            category receive summary-style rendering (claim from recall_summary).
+            The remainder get keyword-style. Default 5. Clamped to >= 0.
+            0 = all high-volume entries are keyword-style.
+            If >= category size, all are summary-style.
+
     Returns:
         JSON report with categorized issues and recommended actions.
     """
+    summary_top_k = max(0, int(summary_top_k))
     conn = _get_db()
     try:
         report = {}
@@ -13436,16 +13488,18 @@ def engram_reflect() -> str:
         t1 = _get_tier_threshold(conn, 1)
 
         # 1. Unresolved contradictions (open and partially resolved)
+        # LOW-VOLUME: source-swap description → recall_summary with claim fallback.
         contradictions = conn.execute(
-            "SELECT id, claim, status FROM nodes WHERE type = 'contradiction' AND status IN ('active', 'partially_resolved') AND is_current = 1"
+            "SELECT id, claim, recall_summary, status FROM nodes WHERE type = 'contradiction' AND status IN ('active', 'partially_resolved') AND is_current = 1"
         ).fetchall()
         report["unresolved_contradictions"] = [
-            {"id": c["id"], "description": c["claim"], "status": c["status"]} for c in contradictions
+            {"id": c["id"], "description": _reflect_rs_or_claim(c, "claim"), "status": c["status"]} for c in contradictions
         ]
 
         # 2. Open and partially resolved questions (with category/lacks/staleness)
+        # LOW-VOLUME: source-swap question → recall_summary with claim fallback.
         questions = conn.execute(
-            """SELECT id, claim, created_at, status,
+            """SELECT id, claim, recall_summary, created_at, status,
                       question_category, question_lacks,
                       last_assessed_turn, last_assessed_at
                FROM nodes
@@ -13457,7 +13511,7 @@ def engram_reflect() -> str:
         report["open_questions"] = []
         for q in questions:
             entry = {
-                "id": q["id"], "question": q["claim"],
+                "id": q["id"], "question": _reflect_rs_or_claim(q, "claim"),
                 "since": q["created_at"], "status": q["status"],
             }
             if q["question_category"]:
@@ -13497,28 +13551,31 @@ def engram_reflect() -> str:
         ]
 
         # 4b. Open conjectures awaiting investigation
+        # LOW-VOLUME: source-swap claim → recall_summary with claim fallback.
         conjectures = conn.execute(
-            """SELECT id, claim, confidence, created_at FROM nodes
+            """SELECT id, claim, recall_summary, confidence, created_at FROM nodes
                WHERE type = 'conjecture' AND status = 'active' AND is_current = 1"""
         ).fetchall()
         report["open_conjectures"] = [
-            {"id": c["id"], "claim": c["claim"], "confidence": c["confidence"], "since": c["created_at"]}
+            {"id": c["id"], "claim": _reflect_rs_or_claim(c, "claim"), "confidence": c["confidence"], "since": c["created_at"]}
             for c in conjectures
         ]
 
         # 4c. Active goals (persistent orientation)
+        # LOW-VOLUME: source-swap goal → recall_summary with claim fallback.
         goals = conn.execute(
-            """SELECT id, claim, created_at FROM nodes
+            """SELECT id, claim, recall_summary, created_at FROM nodes
                WHERE type = 'goal' AND status = 'open' AND is_current = 1"""
         ).fetchall()
         report["active_goals"] = [
-            {"id": g["id"], "goal": g["claim"], "since": g["created_at"]}
+            {"id": g["id"], "goal": _reflect_rs_or_claim(g, "claim"), "since": g["created_at"]}
             for g in goals
         ]
 
         # 4c2. Active tasks (actionable work items)
+        # LOW-VOLUME: source-swap task → recall_summary with claim fallback.
         tasks = conn.execute(
-            """SELECT id, claim, status, metadata, created_at FROM nodes
+            """SELECT id, claim, recall_summary, status, metadata, created_at FROM nodes
                WHERE type = 'task' AND status IN ('planned', 'active', 'blocked') AND is_current = 1
                ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'blocked' THEN 1 WHEN 'planned' THEN 2 END"""
         ).fetchall()
@@ -13531,7 +13588,7 @@ def engram_reflect() -> str:
             ).fetchall()
             active_tasks.append({
                 "id": t["id"],
-                "task": t["claim"],
+                "task": _reflect_rs_or_claim(t, "claim"),
                 "status": t["status"],
                 "scope": t_meta.get("scope", "routine"),
                 "since": t["created_at"],
@@ -13557,8 +13614,9 @@ def engram_reflect() -> str:
             ]
 
         # 4d. Unresolved goal tensions
+        # LOW-VOLUME: source-swap description → recall_summary with claim fallback.
         tensions = conn.execute(
-            """SELECT id, claim, status, created_at FROM nodes
+            """SELECT id, claim, recall_summary, status, created_at FROM nodes
                WHERE type = 'goal_tension' AND status IN ('open', 'partially_resolved') AND is_current = 1"""
         ).fetchall()
         goal_tensions = []
@@ -13569,7 +13627,7 @@ def engram_reflect() -> str:
             ).fetchall()
             goal_tensions.append({
                 "id": t_node["id"],
-                "description": t_node["claim"],
+                "description": _reflect_rs_or_claim(t_node, "claim"),
                 "status": t_node["status"],
                 "since": t_node["created_at"],
                 "goals": [g["target_id"] for g in linked_goals],
@@ -13577,8 +13635,9 @@ def engram_reflect() -> str:
         report["unresolved_goal_tensions"] = goal_tensions
 
         # 4d2. Active lessons (error-learning patterns)
+        # LOW-VOLUME: source-swap claim → recall_summary with claim fallback.
         lessons = conn.execute(
-            """SELECT id, claim, confidence, metadata, created_at FROM nodes
+            """SELECT id, claim, recall_summary, confidence, metadata, created_at FROM nodes
                WHERE type = 'lesson' AND is_current = 1
                ORDER BY id DESC"""
         ).fetchall()
@@ -13592,7 +13651,7 @@ def engram_reflect() -> str:
             ).fetchall()
             active_lessons.append({
                 "id": ls["id"],
-                "claim": ls["claim"],
+                "claim": _reflect_rs_or_claim(ls, "claim"),
                 "confidence": ls["confidence"],
                 "scaffolding_nudge": ls_meta.get("scaffolding_nudge", ""),
                 "incident_count": len(incident_edges),
@@ -13644,36 +13703,76 @@ def engram_reflect() -> str:
         report["recent_feeling_reports"] = recent_feeling_reports
 
         # 5. Weakly-grounded nodes (low confidence, in working memory)
+        # HIGH-VOLUME: tiered by importance_score DESC. Top summary_top_k get
+        # summary-style (claim from recall_summary OR claim); remainder get
+        # keyword-style (keywords from recall_keywords; no "claim" key).
         weak = conn.execute(
-            """SELECT id, type, claim, confidence FROM nodes
+            """SELECT id, type, claim, recall_summary, recall_keywords,
+                      confidence, COALESCE(importance_score, 0) AS imp
+               FROM nodes
                WHERE is_current = 1 AND confidence IS NOT NULL
                AND confidence < 0.5 AND type NOT IN ('evidence', 'contradiction', 'question')
                AND COALESCE(importance_score, 0) >= ?
-               ORDER BY confidence ASC LIMIT 10""",
+               ORDER BY imp DESC, confidence ASC LIMIT 10""",
             (t1,),
         ).fetchall()
-        report["weakly_grounded"] = [
-            {"id": w["id"], "type": w["type"], "claim": w["claim"], "confidence": w["confidence"]}
-            for w in weak
-        ]
+        weakly_grounded = []
+        for i, w in enumerate(weak):
+            if i < summary_top_k:
+                # Tier 1: summary-style
+                weakly_grounded.append({
+                    "id": w["id"], "type": w["type"],
+                    "claim": _reflect_rs_or_claim(w, "claim"),
+                    "confidence": w["confidence"],
+                })
+            else:
+                # Tier 2: keyword-style (no "claim" key)
+                entry: dict = {"id": w["id"], "type": w["type"], "confidence": w["confidence"]}
+                kws = _reflect_keywords(w)
+                if kws is not None:
+                    entry["keywords"] = kws
+                weakly_grounded.append(entry)
+        report["weakly_grounded"] = weakly_grounded
 
         # 6. Single-source derivations (in working memory)
+        # HIGH-VOLUME: tiered by importance_score DESC. Top summary_top_k get
+        # summary-style; remainder get keyword-style.
         derivations = conn.execute(
-            """SELECT id, claim, confidence FROM nodes
+            """SELECT id, claim, recall_summary, recall_keywords, confidence,
+                      COALESCE(importance_score, 0) AS imp
+               FROM nodes
                WHERE type = 'derivation' AND is_current = 1
-               AND COALESCE(importance_score, 0) >= ?""",
+               AND COALESCE(importance_score, 0) >= ?
+               ORDER BY imp DESC, id ASC""",
             (t1,),
         ).fetchall()
-        thin_support = []
+        # Filter to thin-support (support_count <= 1), preserving importance order.
+        thin_support_candidates = []
         for d in derivations:
             support_count = conn.execute(
                 "SELECT COUNT(*) as c FROM edges WHERE source_id = ? AND relation = 'derives_from'",
                 (d["id"],),
             ).fetchone()["c"]
             if support_count <= 1:
-                thin_support.append(
-                    {"id": d["id"], "claim": d["claim"], "support_count": support_count}
-                )
+                thin_support_candidates.append((d, support_count))
+        thin_support = []
+        for i, (d, support_count) in enumerate(thin_support_candidates):
+            if i < summary_top_k:
+                # Tier 1: summary-style
+                thin_support.append({
+                    "id": d["id"],
+                    "claim": _reflect_rs_or_claim(d, "claim"),
+                    "support_count": support_count,
+                })
+            else:
+                # Tier 2: keyword-style (no "claim" key)
+                entry = {"id": d["id"], "support_count": support_count}
+                if d["confidence"] is not None:
+                    entry["confidence"] = d["confidence"]
+                kws = _reflect_keywords(d)
+                if kws is not None:
+                    entry["keywords"] = kws
+                thin_support.append(entry)
         report["thin_support_derivations"] = thin_support
 
         # 7. Same-source observation tension check (in working memory)
@@ -13699,8 +13798,12 @@ def engram_reflect() -> str:
         report["same_source_review"] = same_source_tensions
 
         # 8. Uncited observations (in working memory, not referenced by any derivation)
+        # HIGH-VOLUME: tiered by importance_score DESC. Top summary_top_k get
+        # summary-style; remainder get keyword-style.
         uncited = conn.execute(
-            """SELECT n.id, n.claim, n.confidence FROM nodes n
+            """SELECT n.id, n.claim, n.recall_summary, n.recall_keywords,
+                      n.confidence, COALESCE(n.importance_score, 0) AS imp
+               FROM nodes n
                WHERE n.type IN ('observation_factual', 'observation_predictive')
                AND n.is_current = 1
                AND COALESCE(n.importance_score, 0) >= ?
@@ -13713,13 +13816,27 @@ def engram_reflect() -> str:
                    SELECT 1 FROM edges e
                    WHERE e.source_id = n.id AND e.relation = 'supports'
                )
+               ORDER BY imp DESC, n.id ASC
                LIMIT 15""",
             (t1,),
         ).fetchall()
-        report["uncited_observations"] = [
-            {"id": u["id"], "claim": u["claim"], "confidence": u["confidence"]}
-            for u in uncited
-        ]
+        uncited_observations = []
+        for i, u in enumerate(uncited):
+            if i < summary_top_k:
+                # Tier 1: summary-style
+                uncited_observations.append({
+                    "id": u["id"],
+                    "claim": _reflect_rs_or_claim(u, "claim"),
+                    "confidence": u["confidence"],
+                })
+            else:
+                # Tier 2: keyword-style (no "claim" key)
+                entry = {"id": u["id"], "confidence": u["confidence"]}
+                kws = _reflect_keywords(u)
+                if kws is not None:
+                    entry["keywords"] = kws
+                uncited_observations.append(entry)
+        report["uncited_observations"] = uncited_observations
 
         # 9. Tainted nodes (downstream of retracted nodes)
         tainted_nodes = conn.execute(

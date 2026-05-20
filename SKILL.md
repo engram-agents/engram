@@ -477,7 +477,22 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
 - **engram_diagnose** — Quantitative health audit (health score 0–100).
   `()`
 - **engram_reflect** — Qualitative graph review; arms `dream_review` feeling-nudge marker.
-  `()`
+  `([summary_top_k=5])`
+  Two-tier-per-category rendering: **high-volume** categories (`weakly_grounded`,
+  `thin_support_derivations`, `uncited_observations`) sort by `importance_score` DESC;
+  top `summary_top_k` entries get `{id, claim: recall_summary OR claim, confidence, ...}`;
+  the remainder get `{id, keywords: list, confidence, ...}` — no `claim` key at Tier 2.
+  Missing `recall_keywords` → bare `{id, confidence, ...}` (no `keywords` key).
+  **Low-volume** categories (`unresolved_contradictions`, `open_questions`,
+  `open_conjectures`, `active_goals`, `active_tasks`, `active_lessons`,
+  `unresolved_goal_tensions`): source-swap — content field (description/question/goal/
+  claim/task) sourced from `recall_summary`; fallback to claim truncated to 160 chars.
+  Key names unchanged for backward compat.
+  **Untouched** (semantically distinct content): `overdue_predictions`, `open_predictions`
+  (use `predicted_event`), `known_people` (use `metadata.name`), `recent_feeling_reports`,
+  `same_source_review` (flags `evidence_id` only).
+  Fallbacks: missing `recall_summary` → `claim[:160]`; `recall_summary` > 200 chars →
+  truncated to 200 + "...". `summary_top_k=0` → all high-volume entries are keyword-style.
 - **engram_history** — Edit trail or diagnostic-snapshot browse.
   `([mode, node_id, action, since, limit])`
 - **engram_scan_emergence** — Surface cornerstone candidates from clusters.
