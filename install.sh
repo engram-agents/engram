@@ -310,12 +310,24 @@ else
   exit 1
 fi
 
-# Runtime snapshot: server + confidence module + protocol doc copied into
+# Runtime snapshot: all top-level engram_*.py + SKILL.md copied into
 # $ENGRAM_HOME so the install is self-contained and version-locked against
-# ongoing main-branch development.
-for runtime_file in server.py engram_confidence.py engram_client.py SKILL.md viz_server.py; do
-  if [ -f "$ALPHA_DIR/$runtime_file" ]; then
-    cp "$ALPHA_DIR/$runtime_file" "$ENGRAM_HOME/$runtime_file"
+# ongoing main-branch development. Globs *.py so new top-level modules added
+# to alpha root are auto-shipped (no enum to maintain — historical drift
+# between this list and deploy.sh's manifest caused fresh-install crashes
+# when engram_log_emitter.py and friends were missed).
+for runtime_path in "$ALPHA_DIR"/*.py "$ALPHA_DIR/SKILL.md"; do
+  runtime_file="$(basename "$runtime_path")"
+  # Install-time scaffolding / dev tools — at alpha root but NOT runtime
+  # modules. Mirror the MANIFEST_ORPHAN_ALLOWLIST in
+  # tests/test_deploy_manifest_sync.py; deploy.sh's MANIFEST excludes
+  # these too (kept symmetric so upgrades and fresh installs ship the
+  # same set).
+  case "$runtime_file" in
+    bootstrap.py|selftest.py|engram_log_indexer.py) continue ;;
+  esac
+  if [ -f "$runtime_path" ]; then
+    cp "$runtime_path" "$ENGRAM_HOME/$runtime_file"
     case "$runtime_file" in
       *.py) chmod +x "$ENGRAM_HOME/$runtime_file" ;;
     esac
