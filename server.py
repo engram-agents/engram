@@ -7144,8 +7144,8 @@ def engram_diagnose() -> str:
 
     Side-effect-free: no memory refresh, no turn advance, no state mutation.
     Designed for both user and agent consumption. Returns machine-readable
-    metrics across five dimensions: graph structure, epistemic health, memory
-    health, provenance, and agent experience.
+    metrics across six dimensions: graph structure, epistemic health, memory
+    health, provenance, agent experience, and calibration.
 
     Unlike engram_reflect (pre-dream briefing, action-oriented), this tool
     produces exhaustive quantitative metrics suitable for trend analysis and
@@ -7153,7 +7153,15 @@ def engram_diagnose() -> str:
 
     Returns:
         JSON with metrics grouped into: structure, epistemic, memory,
-        provenance, experience, and a top-level health_score (0-100).
+        provenance, experience, calibration, and a top-level health_score
+        (0-100).
+
+        - calibration (new, weight=0 in health_score):
+          - corpus: confidence distribution from _compute_confidence_distribution (no time filter) —
+            by_type, by_quote_type, by_reasoning_type, by_source_class
+          - this_turn: same shape, mode=1-turn
+          - drift_by_type: per-type p50 delta between this_turn and corpus
+            (only reported when this_turn has ≥3 samples in that type)
     """
     conn = _get_db()
     try:
@@ -7679,6 +7687,46 @@ def engram_diagnose() -> str:
             "error_calls": error_count,
             "per_tool": per_tool,
         }
+
+        # ── Calibration ──────────────────────────────────────────────────
+        # Use _compute_confidence_distribution directly (not engram_stats) so
+        # this tool stays side-effect-free: engram_stats drives _timing_mcp_tool
+        # which would write tool_timing + logs/index.db rows.
+        try:
+            # Corpus: all-time (no time filter)
+            calibration_corpus = _compute_confidence_distribution(conn, "", [])
+            # This-turn: 1-turn window ≈ 24h (matches engram_stats mode="1-turn")
+            _now_utc = datetime.now(timezone.utc)
+            _cutoff_iso = (_now_utc - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            calibration_now = _compute_confidence_distribution(
+                conn, " AND created_at >= ?", [_cutoff_iso]
+            )
+            calibration: dict = {}
+            calibration["corpus"] = calibration_corpus
+            calibration["this_turn"] = calibration_now
+
+            # Drift indicators: per-type median delta (this_turn vs corpus)
+            drift: dict = {}
+            for node_type, corpus_stats in calibration["corpus"].get("by_type", {}).items():
+                now_stats = calibration["this_turn"].get("by_type", {}).get(node_type)
+                if now_stats and now_stats.get("n", 0) >= 3:
+                    # Only report drift when this-turn has enough samples (≥3) to be meaningful
+                    delta = round(now_stats["p50"] - corpus_stats["p50"], 3)
+                    drift[node_type] = {
+                        "this_turn_p50": now_stats["p50"],
+                        "corpus_p50": corpus_stats["p50"],
+                        "delta": delta,
+                        "n_this_turn": now_stats["n"],
+                    }
+            calibration["drift_by_type"] = drift
+        except Exception:
+            calibration = {"error": "calibration stats unavailable"}
+
+        # Calibration dimension is currently descriptive (weight=0). V2 will add
+        # drift-based scoring once thresholds are calibrated from observed data.
+        calibration_weight = 0  # noqa: F841
+
+        metrics["calibration"] = calibration
 
         # ── Health Score (0-100) ─────────────────────────────────────────
         # Composite score: penalize structural/epistemic issues.
