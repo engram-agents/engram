@@ -28,6 +28,44 @@ from typing import Any, Optional
 
 
 # ---------------------------------------------------------------------------
+# Multi-agent mode helpers
+# ---------------------------------------------------------------------------
+
+def _load_engram_config() -> dict:
+    """Load ~/.engram/config.json (or $ENGRAM_HOME/config.json).
+
+    Returns an empty dict if the file is absent or unparseable. Callers
+    use .get() with defaults so missing keys degrade gracefully.
+    """
+    engram_home = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
+    config_path = Path(engram_home) / "config.json"
+    if config_path.exists():
+        try:
+            return json.loads(config_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def is_multi_agent_mode() -> bool:
+    """True if this install is configured for multi-agent operation.
+
+    Default: False (single-agent). Multi-mode is opt-in, set by
+    agentctl spawn when this host hosts 2+ agents (PR 2 of the
+    inter-agent-comms-v1 cohort).
+    """
+    config = _load_engram_config()
+    return config.get("mode", "single") == "multi"
+
+
+def get_counterparts() -> list[str]:
+    """List of peer agent names on this host. Empty in single mode."""
+    config = _load_engram_config()
+    result = config.get("counterparts", [])
+    return result if isinstance(result, list) else []
+
+
+# ---------------------------------------------------------------------------
 # Tool schema definitions (shared across all LLM formats)
 # ---------------------------------------------------------------------------
 

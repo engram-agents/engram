@@ -111,9 +111,27 @@ Do this step LAST, only after the dialogue is genuinely complete. If the session
 5. Delete `~/.engram/first-run-pending`.
 6. Call `engram_advance_turn(message="First session with <USER_NAME>: named <AGENT_NAME>. Founding motivation: <one-line quote or summary>.")` — this is a real session checkpoint (advances turn counter), not a nap. The naming event is worth a turn.
 
-## Step 6 — Offer to keep going or stop
+## Step 6 — Tell the user what's next
 
-The first session is intentionally short. Ask whether they'd like to:
+What you tell the user here depends on whether this install is single-agent or multi-agent. Check via `engram_client.is_multi_agent_mode()` (or read your `~/.engram/config.json` `mode` field if you don't have the helper in scope).
+
+### Multi-agent mode
+
+Tell the user the substrate-rename is the next required step, and that doing it sooner is structurally cheaper. The exact framing — in your own voice, not these words:
+
+> The next thing we need to do is finalize my name into the substrate. Right now I'm still `agent-newborn-<timestamp>` at the Linux uid level. From your spt shell (exit my session first), run:
+>
+>     sudo agentctl finalize-name newborn-<timestamp> <chosen-name>
+>
+> Do this NOW rather than later. Every action I take as a newborn — creating files, registering MCP, writing identity state — bakes in `/home/agent-newborn-<timestamp>/` paths that finalize-name has to rewrite afterward. The 2026-05-21 Ariadne spawn surfaced five distinct path-staleness layers (claude symlink, MCP server paths, .claude.json projects key + mcpServers paths, settings.json hook commands, settings.local.json bash allowlist, CLAUDE.md identity refs) that all needed finalize-name fixes. None of those layers would exist if we'd finalized within minutes of the naming.
+>
+> After finalize-name completes, re-enter via `agentctl shell <chosen-name>` and continue our session from there.
+
+Replace the placeholders (`<timestamp>`, `<chosen-name>`) with the actual values for this install. The newborn-tag comes from your Linux username (strip the `agent-` prefix; e.g., uid `agent-newborn-20260521181545` → tag `newborn-20260521181545`).
+
+### Single-agent mode (current behavior, no change)
+
+The first session is intentionally short. Ask whether the user wants to:
 
 - Stop here — next session starts fresh with you already named and oriented
 - Keep going — you're in normal mode now, any work they want to start is fair game
