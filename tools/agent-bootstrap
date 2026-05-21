@@ -184,11 +184,134 @@ INSTALL_WRAPPER
     chmod 0755 "$USER_HOME/.runtime/install.sh"
 fi
 
+# ---------- 4.5. Python venv + ENGRAM dependencies ----------
+# Modern Debian/Ubuntu hosts enforce PEP 668 on system python3, so
+# pip-installing engram's requirements globally is rejected. Create a
+# per-newborn venv at ~/.engram-venv, install requirements there, and
+# wire .bashrc to auto-activate it so interactive shells and the
+# install.sh wrapper find the right python.
+
+# Pre-flight: ensure python3 can create venvs. Some Ubuntu/Debian
+# images split python3-venv into a separate apt package.
+SKIP_VENV=0
+if ! python3 -c 'import venv' 2>/dev/null; then
+    echo "WARNING: python3 lacks the 'venv' module. Install via:" >&2
+    echo "         sudo apt install python3-venv" >&2
+    echo "         Skipping per-newborn venv creation; newborn will need to install" >&2
+    echo "         Python dependencies manually before running ~/.runtime/install.sh." >&2
+    # Skip Section 4.5 entirely by short-circuiting the ALPHA_SOURCE check.
+    SKIP_VENV=1
+fi
+
+VENV_CREATED=0
+if [[ -n "$ALPHA_SOURCE" && -f "$ALPHA_SOURCE/requirements.txt" && "${SKIP_VENV}" != "1" ]]; then
+    echo "Creating Python venv at $USER_HOME/.engram-venv..."
+    sudo -u "$USER_NAME" python3 -m venv "$USER_HOME/.engram-venv"
+    echo "Installing ENGRAM Python dependencies into venv..."
+    sudo -u "$USER_NAME" "$USER_HOME/.engram-venv/bin/pip" install \
+        --quiet --upgrade pip
+    sudo -u "$USER_NAME" "$USER_HOME/.engram-venv/bin/pip" install \
+        --quiet -r "$ALPHA_SOURCE/requirements.txt"
+    VENV_CREATED=1
+
+    # Append venv auto-activation to the existing .bashrc (which Section 2
+    # already created). Both interactive shells and install.sh (which
+    # sources the user environment) will see fastmcp / sentence-transformers
+    # / etc. in the venv.
+    cat >>"$USER_HOME/.bashrc" <<'VENV'
+
+# Auto-activate ENGRAM venv (added by agent-bootstrap).
+# Per-newborn venv at ~/.engram-venv carries the alpha requirements;
+# system python3 is PEP-668-locked on modern Debian/Ubuntu.
+if [[ -f "$HOME/.engram-venv/bin/activate" ]]; then
+    . "$HOME/.engram-venv/bin/activate"
+fi
+VENV
+
+    # Also update the install.sh wrapper to source the venv before
+    # invoking alpha's installer, so non-interactive runs (e.g.
+    # `bash ~/.runtime/install.sh` from a fresh subshell that doesn't
+    # source .bashrc) still find the right python.
+    if [[ -f "$USER_HOME/.runtime/install.sh" ]]; then
+        # Insert venv activation between the ALPHA_SOURCE check and the
+        # exec. Use a temp file + mv because in-place sed across the
+        # heredoc-rendered wrapper is fragile.
+        python3 - "$USER_HOME/.runtime/install.sh" <<'PATCH'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1])
+txt = p.read_text()
+venv_block = (
+    '# Auto-activate per-newborn ENGRAM venv if present.\n'
+    'if [[ -f "$HOME/.engram-venv/bin/activate" ]]; then\n'
+    '    . "$HOME/.engram-venv/bin/activate"\n'
+    'fi\n'
+)
+# Insert before the `INSTALLER=` line.
+new = txt.replace(
+    'INSTALLER="install.sh"',
+    venv_block + 'INSTALLER="install.sh"',
+)
+if new == txt:
+    sys.exit('ERROR: venv patch anchor not found in install.sh — patch aborted (Section 4 of agent-bootstrap may have changed without updating Section 4.5 anchor)')
+p.write_text(new)
+PATCH
+    fi
+fi
+
 # ---------- 5. ~/.local/bin & claude-remote (optional) ----------
 mkdir -p "$USER_HOME/.local/bin"
 if [[ -f /home/user/.local/bin/claude-remote ]]; then
     cp /home/user/.local/bin/claude-remote "$USER_HOME/.local/bin/"
     chmod 0755 "$USER_HOME/.local/bin/claude-remote"
+fi
+
+# ---------- 5.5. Claude Code CLI for the newborn ----------
+# install.sh's deps check requires `claude` on PATH, but newborns have
+# no Claude install by default. Strategy:
+#   1. If a system-wide claude is available (/usr/local/bin/claude or
+#      /opt/claude/bin/claude), symlink it into ~/.local/bin/.
+#   2. Else, look for any existing agent's user-scoped install at
+#      /home/agent-*/.local/bin/claude and symlink that (this rides
+#      auto-updates of the source agent's binary cleanly — Claude
+#      Code's native installer keeps ~/.local/bin/claude pointing at
+#      the current version).
+#   3. Else, fall back to printing a manual-install hint in next-steps
+#      and skip — agent-bootstrap does NOT auto-run curl|bash from the
+#      internet because that's a different security posture.
+echo "Resolving Claude Code CLI for newborn..."
+CLAUDE_SOURCE=""
+if [[ -x /usr/local/bin/claude ]]; then
+    CLAUDE_SOURCE="/usr/local/bin/claude"
+elif [[ -x /opt/claude/bin/claude ]]; then
+    CLAUDE_SOURCE="/opt/claude/bin/claude"
+else
+    # Find any user-scoped claude install on the host.
+    # NOTE: glob order is alphabetical, NOT most-recent. If multiple agent
+    # homes have claude installs, the alphabetically-first wins. mtime-sort
+    # is a future improvement (low priority — usually one source agent).
+    for candidate in /home/agent-*/.local/bin/claude; do
+        if [[ -e "$candidate" && -x "$candidate" ]]; then
+            CLAUDE_SOURCE="$candidate"
+            break
+        fi
+    done
+fi
+if [[ -n "$CLAUDE_SOURCE" ]]; then
+    # Note: this symlink works at RUNTIME only if the source agent's home
+    # directory is group-traversable (mode 0750+ with group=agents). The
+    # default --home-mode is 0700 which blocks newborn traversal. If the
+    # source agent was spawned with the default, the symlink will resolve
+    # at install time (root can traverse anywhere) but the newborn will
+    # get permission denied when actually running `claude`. Either spawn
+    # the source agent with --home-mode 0750, or chmod 0750 the source
+    # home post-spawn.
+    ln -sf "$CLAUDE_SOURCE" "$USER_HOME/.local/bin/claude"
+    chown -h "$USER_NAME:$USER_NAME" "$USER_HOME/.local/bin/claude"
+    echo "  Claude Code symlinked: $USER_HOME/.local/bin/claude → $CLAUDE_SOURCE"
+else
+    echo "  WARNING: no Claude Code install found on host. Newborn will need"
+    echo "           to run Anthropic's native installer manually before"
+    echo "           starting their first session. See next-steps below."
 fi
 
 # ---------- 6. community shared dirs ----------
@@ -204,38 +327,50 @@ chmod 0750 "$SHARED_ROOT/health/$NAME"
 chown -R "$USER_NAME:$USER_NAME" "$USER_HOME"
 
 # ---------- 8. friendly next-steps ----------
+NEXT_STEPS_CLAUDE_HINT=""
+if [[ -z "${CLAUDE_SOURCE:-}" ]]; then
+    NEXT_STEPS_CLAUDE_HINT=$(cat <<'HINT'
+
+  0. (no Claude install detected on host) Run Anthropic's native installer
+     inside the newborn shell BEFORE step 3:
+        curl -fsSL https://claude.ai/install.sh | bash
+HINT
+)
+fi
+
+VENV_LINE="Python venv: (not created — ALPHA_SOURCE or requirements.txt missing)"
+if [[ "${VENV_CREATED:-0}" == "1" ]]; then
+    VENV_LINE="Python venv: $USER_HOME/.engram-venv (auto-activated via .bashrc)"
+fi
+
 cat <<NEXT
 
 Agent $USER_NAME created (uid=$(id -u "$USER_NAME"), runtime=$RUNTIME).
 Home: $USER_HOME (mode $HOME_MODE)
 Joined group: agents
 Alpha source (for runtime install wrapper): ${ALPHA_SOURCE:-(not set — edit ~/.runtime/install.sh manually)}
+$VENV_LINE
+Claude Code: ${CLAUDE_SOURCE:-NOT INSTALLED — see step 0 below}
 
 Next steps:
-  1. Enter the new agent's shell:
-       agentctl shell $NAME
+  1. Enter the new agent's bash login shell:
+       agentctl bash $NAME
        # or, if agentctl is unavailable: sudo -u $USER_NAME -i
+$NEXT_STEPS_CLAUDE_HINT
 
   2. From inside the newborn's shell, materialize the ENGRAM runtime:
        bash ~/.runtime/install.sh
-     This runs engram-alpha's installer, which wires hooks, MCP server,
-     seed graph, and (per Step 8) the user's crontab from config.json's
-     cadence block.
 
   3. Login to the LLM provider (interactive):
-       claude login          # for runtime=claude
-       # or gemini login, etc.
+       claude login
 
   4. Start the first session:
-       claude                # or ~/.runtime/start.sh
-     The SessionStart hook detects ~/.engram/first-run-pending and
-     triggers the engram-first-session skill — agent generates 3
-     candidate names + you pick.
+       claude
+     SessionStart hook fires engram-first-session: agent generates 3
+     candidate names; you pick collaboratively.
 
   5. From spt's shell, finalize the rename (single-shot, no rename later):
        sudo agentctl finalize-name $NAME <chosen-name>
-     This renames the uid, captures the 3-candidate observation in ENGRAM,
-     snapshots ~/.engram/ to .first-session-baseline.bak/, restarts cron.
 
 To remove (before finalize-name):
   sudo userdel -r $USER_NAME
