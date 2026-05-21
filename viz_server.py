@@ -2151,6 +2151,22 @@ HEALTH_HTML = r"""<!DOCTYPE html>
     .tag-resolved { background: #0d47a1; color: #90caf9; }
     .tag-other { background: #37474f; color: #b0bec5; }
     #loading { text-align: center; padding: 40px; color: #888; }
+    /* Calibration card — namespaced to avoid collision with existing .bar-chart */
+    .calibration-bar-chart { display: flex; align-items: flex-end; gap: 3px; height: 60px; margin: 6px 0 20px; }
+    .calibration-bar-chart .cal-bar { flex: 1; border-radius: 3px 3px 0 0; min-width: 16px;
+                                      position: relative; transition: height 0.3s; }
+    .calibration-bar-chart .cal-bar .cal-bar-label { position: absolute; bottom: -18px; left: 50%;
+                                                      transform: translateX(-50%); font-size: 0.6em;
+                                                      color: #888; white-space: nowrap; }
+    .calibration-bar-chart .cal-bar .cal-bar-value { position: absolute; top: -14px; left: 50%;
+                                                      transform: translateX(-50%); font-size: 0.65em; color: #ccc; }
+    .cal-type-label { color: #7ecfff; font-size: 0.8em; margin: 10px 0 2px; font-weight: 600; }
+    .cal-caption { font-size: 0.72em; color: #888; font-style: italic; margin: 8px 0 4px; }
+    .cal-col-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+    .cal-col-header { color: #7ecfff; font-size: 0.78em; font-weight: 600; text-align: center;
+                      border-bottom: 1px solid #0f3460; padding-bottom: 4px; margin-bottom: 4px; }
+    .cal-col-row { font-size: 0.75em; text-align: center; padding: 2px 0; color: #d0d0d0; }
+    .cal-col-type { font-size: 0.72em; color: #aaa; text-align: left; padding: 2px 0; }
   </style>
 </head>
 <body>
@@ -2189,9 +2205,10 @@ HEALTH_HTML = r"""<!DOCTYPE html>
     document.getElementById('loading').style.display = '';
     document.getElementById('dashboard').style.display = 'none';
     document.getElementById('cards').innerHTML = '';
-    fetch(_withAgent('/api/health'))
-      .then(r => r.json())
-      .then(data => {
+    Promise.all([
+      fetch(_withAgent('/api/health')).then(r => r.json()),
+      fetch(_withAgent('/api/calibration')).then(r => r.json()).catch(() => null),
+    ]).then(([data, calData]) => {
         document.getElementById('loading').style.display = 'none';
         document.getElementById('dashboard').style.display = 'block';
         if (data.error) {
@@ -2199,6 +2216,9 @@ HEALTH_HTML = r"""<!DOCTYPE html>
           return;
         }
         render(data);
+        if (calData && !calData.error) {
+          renderCalibration(calData);
+        }
       })
       .catch(e => {
         document.getElementById('loading').textContent = 'Error: ' + e.message;
@@ -2384,6 +2404,129 @@ HEALTH_HTML = r"""<!DOCTYPE html>
         `<circle cx="${xScale(i)}" cy="${yScale(t.health_score)}" r="3"><title>Turn ${t.turn}: ${t.health_score}</title></circle>`
       ).join('');
   }
+
+  // HTML-escape for DB-sourced strings used in innerHTML.
+  function esc(s) {
+    if (s === null || s === undefined) return '';
+    return String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  // Bucket boundaries for per-type histograms (5-6 buckets).
+  // Reserved for future histogram rendering — V1 uses quantile display.
+  const CAL_BUCKETS = [
+    {lo: 0,    hi: 0.30, label: '<0.30', color: '#f44336'},
+    {lo: 0.30, hi: 0.50, label: '0.30–0.50', color: '#ff9800'},
+    {lo: 0.50, hi: 0.70, label: '0.50–0.70', color: '#ffeb3b'},
+    {lo: 0.70, hi: 0.85, label: '0.70–0.85', color: '#8bc34a'},
+    {lo: 0.85, hi: 0.95, label: '0.85–0.95', color: '#4caf50'},
+    {lo: 0.95, hi: 1.01, label: '≥0.95',    color: '#00e676'},
+  ];
+
+  function calDeltaClass(delta) {
+    const abs = Math.abs(delta);
+    if (abs >= 0.15) return 'danger';
+    if (abs >= 0.10) return 'warn';
+    return 'good';
+  }
+
+  function renderCalibration(cal) {
+    const cards = document.getElementById('cards');
+    if (!cards) return;
+
+    const corpus = cal.corpus || {};
+    const byType = corpus.by_type || {};
+    const byQt   = corpus.by_quote_type || {};
+    const byRt   = corpus.by_reasoning_type || {};
+    const drift  = cal.drift_by_type || {};
+
+    const PRIMARY_TYPES = ['observation_factual', 'derivation', 'conjecture', 'lesson'];
+
+    // ── Per-type histograms ───────────────────────────────────────────────
+    let histHtml = '';
+    for (const ntype of PRIMARY_TYPES) {
+      const stats = byType[ntype] || {n: 0};
+      const n = stats.n || 0;
+      // We don't have raw distribution, so approximate from p-quantiles:
+      // use n + p25/p50/p75/p90/p95 to assign fractional counts to buckets.
+      // Simpler approach for V1: render a compact stats row instead of a
+      // histogram (true bucket data requires a separate query not in the
+      // current API shape). Display p25/p50/p75 summary row + N.
+      if (n === 0) {
+        histHtml += `<div class="cal-type-label">${esc(ntype)}</div>
+          <div style="color:#888;font-size:0.78em;font-style:italic;">No data</div>`;
+      } else {
+        const p50 = stats.p50 !== null ? stats.p50.toFixed(2) : '—';
+        const p25 = stats.p25 !== null ? stats.p25.toFixed(2) : '—';
+        const p75 = stats.p75 !== null ? stats.p75.toFixed(2) : '—';
+        const mean = stats.mean !== null ? stats.mean.toFixed(3) : '—';
+        histHtml += `<div class="cal-type-label">${esc(ntype)} <span style="color:#888;font-weight:normal;">(n=${n})</span></div>
+          ${metric('p25 / p50 / p75', p25 + ' / ' + p50 + ' / ' + p75)}
+          ${metric('mean', mean)}`;
+      }
+    }
+
+    // ── Per-quote_type table ──────────────────────────────────────────────
+    const qtEntries = Object.entries(byQt).sort((a, b) => b[1].n - a[1].n);
+    let qtHtml = '';
+    if (qtEntries.length === 0) {
+      qtHtml = '<p class="empty" style="padding:8px 0;">No quote_type data yet.</p>';
+    } else {
+      qtHtml = '<table><thead><tr><th>quote_type</th><th style="text-align:right">n</th><th style="text-align:right">mean</th></tr></thead><tbody>';
+      for (const [qt, s] of qtEntries) {
+        qtHtml += `<tr><td>${esc(qt)}</td><td style="text-align:right">${s.n}</td><td style="text-align:right">${s.mean.toFixed(3)}</td></tr>`;
+      }
+      qtHtml += '</tbody></table>';
+      qtHtml += '<p class="cal-caption">ax_0007 structural anchoring — see ob_1977 for the 2D matrix design.</p>';
+    }
+
+    // ── Per-reasoning_type table ──────────────────────────────────────────
+    const rtEntries = Object.entries(byRt).sort((a, b) => b[1].n - a[1].n);
+    let rtHtml = '';
+    if (rtEntries.length === 0) {
+      rtHtml = '<p class="empty" style="padding:8px 0;">No reasoning_type data yet.</p>';
+    } else {
+      rtHtml = '<table><thead><tr><th>reasoning_type</th><th style="text-align:right">n</th><th style="text-align:right">mean</th></tr></thead><tbody>';
+      for (const [rt, s] of rtEntries) {
+        rtHtml += `<tr><td>${esc(rt)}</td><td style="text-align:right">${s.n}</td><td style="text-align:right">${s.mean.toFixed(3)}</td></tr>`;
+      }
+      rtHtml += '</tbody></table>';
+    }
+
+    // ── Drift indicator ───────────────────────────────────────────────────
+    let driftHtml = '';
+    const driftEntries = Object.entries(drift);
+    if (driftEntries.length === 0) {
+      driftHtml = '<p style="color:#888;font-size:0.8em;font-style:italic;">No this-turn data yet — drift available after first filing.</p>';
+    } else {
+      for (const [ntype, d] of driftEntries) {
+        const cls = calDeltaClass(d.delta);
+        const sign = d.delta >= 0 ? '+' : '';
+        driftHtml += `<div class="metric">
+          <span class="label">${esc(ntype)}</span>
+          <span class="value ${cls}" title="this_turn p50=${d.this_turn_p50} corpus p50=${d.corpus_p50} n_this_turn=${d.n_this_turn}">
+            ${d.this_turn_p50.toFixed(2)} vs ${d.corpus_p50.toFixed(2)} · delta ${sign}${d.delta.toFixed(3)}
+          </span>
+        </div>`;
+      }
+    }
+
+    // ── Assemble card ─────────────────────────────────────────────────────
+    const cardHtml = `<div class="card" style="grid-column: span 2">
+      <h3>Confidence Calibration</h3>
+      <h2 style="margin-top:0;margin-bottom:6px;">Per-Type Summary (corpus)</h2>
+      ${histHtml}
+      <h2>Per-Quote-Type (observation_factual)</h2>
+      ${qtHtml}
+      <h2>Per-Reasoning-Type (derivation)</h2>
+      ${rtHtml}
+      <h2>Drift: This Turn vs Corpus (p50 delta)</h2>
+      ${driftHtml}
+    </div>`;
+
+    cards.innerHTML += cardHtml;
+  }
   </script>
 </body>
 </html>"""
@@ -2429,6 +2572,223 @@ def _resolve_agent_config(agent_name: str) -> dict:
         }
     except (OSError, ValueError, json.JSONDecodeError, TypeError):
         return defaults
+
+
+# ---------------------------------------------------------------------------
+# Calibration data — confidence distribution across windows
+# Queries replicated from server.py:_compute_confidence_distribution.
+# viz_server.py is stdlib-only; importing server.py would pull in the full
+# MCP server stack, so the SQL is dual-sourced here intentionally.
+#
+# WARNING: SQL queries in _conf_dist_for_window mirror
+# server.py:_compute_confidence_distribution (around lines 6971-7103).
+# If server.py's confidence aggregation logic changes, update both.
+# ---------------------------------------------------------------------------
+
+def _viz_percentile(sorted_vals: list, p: float) -> float:
+    """Compute p-th percentile of a pre-sorted list. Linear interpolation.
+
+    Mirrors server.py:_percentile exactly (same algorithm, same edge-case
+    handling). Duplicated here to keep viz_server.py self-contained.
+    """
+    n = len(sorted_vals)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return sorted_vals[0]
+    idx = (p / 100.0) * (n - 1)
+    lo = int(idx)
+    hi = lo + 1
+    if hi >= n:
+        return sorted_vals[-1]
+    frac = idx - lo
+    return sorted_vals[lo] + frac * (sorted_vals[hi] - sorted_vals[lo])
+
+
+def _conf_dist_for_window(
+    conn: sqlite3.Connection,
+    created_at_filter: str,
+    filter_args: list,
+) -> dict:
+    """Compute confidence distribution for a single time window.
+
+    Returns dict with by_type, by_quote_type, by_reasoning_type,
+    by_source_class sub-keys.  Empty results use empty dicts, never None.
+    Mirrors server.py:_compute_confidence_distribution.
+
+    INTENTIONAL DIVERGENCE: emits {"n": 0, ...} placeholder entries for empty
+    types so the UI always has consistent rows; server.py skips them via
+    continue.
+    """
+    _base_filter = (
+        " AND is_current = 1"
+        " AND (status IS NULL OR status != 'retracted')"
+    )
+    _CONFIDENCE_BEARING_TYPES = (
+        "observation_factual",
+        "derivation",
+        "conjecture",
+        "lesson",
+        "axiom",
+        "definition",
+    )
+
+    # ── by_type ──────────────────────────────────────────────────────────
+    by_type: dict = {}
+    for ntype in _CONFIDENCE_BEARING_TYPES:
+        rows = conn.execute(
+            "SELECT confidence FROM nodes WHERE type = ?"
+            + _base_filter
+            + created_at_filter
+            + " AND confidence IS NOT NULL ORDER BY confidence ASC",
+            [ntype] + filter_args,
+        ).fetchall()
+        confidences = [r["confidence"] for r in rows]
+        if not confidences:
+            # Emit explicit empty placeholder so the UI can render a row
+            by_type[ntype] = {"n": 0, "mean": None, "p25": None, "p50": None,
+                              "p75": None, "p90": None, "p95": None}
+            continue
+        n = len(confidences)
+        by_type[ntype] = {
+            "n": n,
+            "mean": round(sum(confidences) / n, 3),
+            "p25": round(_viz_percentile(confidences, 25), 2),
+            "p50": round(_viz_percentile(confidences, 50), 2),
+            "p75": round(_viz_percentile(confidences, 75), 2),
+            "p90": round(_viz_percentile(confidences, 90), 2),
+            "p95": round(_viz_percentile(confidences, 95), 2),
+        }
+
+    # ── by_quote_type ─────────────────────────────────────────────────────
+    by_quote_type: dict = {}
+    for row in conn.execute(
+        "SELECT quote_type, COUNT(*) as n, AVG(confidence) as mean_conf"
+        " FROM nodes WHERE type = 'observation_factual'"
+        + _base_filter
+        + created_at_filter
+        + " AND confidence IS NOT NULL AND quote_type IS NOT NULL"
+        " GROUP BY quote_type",
+        filter_args,
+    ).fetchall():
+        qt = row["quote_type"]
+        if not qt:
+            continue
+        by_quote_type[qt] = {"n": row["n"], "mean": round(row["mean_conf"], 3)}
+
+    # ── by_reasoning_type ────────────────────────────────────────────────
+    by_reasoning_type: dict = {}
+    deriv_rows = conn.execute(
+        "SELECT confidence, metadata FROM nodes WHERE type = 'derivation'"
+        + _base_filter
+        + created_at_filter
+        + " AND confidence IS NOT NULL AND metadata IS NOT NULL",
+        filter_args,
+    ).fetchall()
+    _rt_buckets: dict = {}
+    for row in deriv_rows:
+        try:
+            meta = json.loads(row["metadata"])
+            rtype = meta.get("reasoning_type")
+        except (json.JSONDecodeError, TypeError):
+            rtype = None
+        if not rtype:
+            rtype = "legacy_untyped"
+        _rt_buckets.setdefault(rtype, []).append(row["confidence"])
+    for rtype, vals in _rt_buckets.items():
+        by_reasoning_type[rtype] = {
+            "n": len(vals),
+            "mean": round(sum(vals) / len(vals), 3),
+        }
+
+    # ── by_source_class ──────────────────────────────────────────────────
+    by_source_class: dict = {}
+    obs_rows = conn.execute(
+        "SELECT confidence, metadata FROM nodes WHERE type = 'observation_factual'"
+        + _base_filter
+        + created_at_filter
+        + " AND confidence IS NOT NULL AND metadata IS NOT NULL",
+        filter_args,
+    ).fetchall()
+    _sc_buckets: dict = {}
+    for row in obs_rows:
+        try:
+            meta = json.loads(row["metadata"])
+            sc = meta.get("source_class", "external")
+        except (json.JSONDecodeError, TypeError):
+            sc = "external"
+        _sc_buckets.setdefault(sc, []).append(row["confidence"])
+    for sc, vals in _sc_buckets.items():
+        by_source_class[sc] = {
+            "n": len(vals),
+            "mean": round(sum(vals) / len(vals), 3),
+        }
+
+    return {
+        "by_type": by_type,
+        "by_quote_type": by_quote_type,
+        "by_reasoning_type": by_reasoning_type,
+        "by_source_class": by_source_class,
+    }
+
+
+def get_calibration_data(db_path: str) -> dict:
+    """Compute confidence calibration data across three time windows.
+
+    Windows mirror engram_stats / engram_diagnose conventions:
+      corpus       — all time (no created_at filter)
+      this_turn    — last 24 h (≈ 1-turn window in engram_stats terms)
+      rolling_7    — last 168 h (≈ 7-turn window)
+      drift_by_type — per-type p50 delta (this_turn vs corpus, only when n≥3)
+
+    Returns {"error": ...} on failure.  Never raises.
+    """
+    if not db_path or not os.path.exists(db_path):
+        return {"error": f"Database not found: {db_path!r}"}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error as exc:
+        return {"error": f"Could not open DB: {exc}"}
+    try:
+        now_utc = datetime.now(timezone.utc)
+
+        # Corpus: all-time, no filter
+        corpus = _conf_dist_for_window(conn, "", [])
+
+        # this_turn: last 24 h (matches engram_stats mode="1-turn")
+        cutoff_1t = (now_utc - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        this_turn = _conf_dist_for_window(conn, " AND created_at >= ?", [cutoff_1t])
+
+        # rolling_7: last 168 h (matches engram_stats mode="7-turn")
+        cutoff_7t = (now_utc - timedelta(hours=168)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        rolling_7 = _conf_dist_for_window(conn, " AND created_at >= ?", [cutoff_7t])
+
+        # Drift: this_turn p50 vs corpus p50, only when this_turn has ≥3 samples
+        # (mirrors engram_diagnose gate: avoids noisy single-node drift reports)
+        drift_by_type: dict = {}
+        for ntype, corpus_stats in corpus["by_type"].items():
+            this_stats = this_turn["by_type"].get(ntype, {})
+            corpus_p50 = corpus_stats.get("p50")
+            this_p50 = this_stats.get("p50")
+            n_this = this_stats.get("n", 0)
+            if corpus_p50 is None or this_p50 is None or n_this < 3:
+                continue
+            drift_by_type[ntype] = {
+                "this_turn_p50": this_p50,
+                "corpus_p50": corpus_p50,
+                "delta": round(this_p50 - corpus_p50, 3),
+                "n_this_turn": n_this,
+            }
+
+        return {
+            "corpus": corpus,
+            "this_turn": this_turn,
+            "rolling_7": rolling_7,
+            "drift_by_type": drift_by_type,
+        }
+    finally:
+        conn.close()
 
 
 def _resolve_logs_index(agent_name: str) -> str:
@@ -2664,9 +3024,10 @@ STATS_HTML = r"""<!DOCTYPE html>
   }
 
   function loadStats() {
-    fetch(_withAgent('/api/stats'))
-      .then(r => r.json())
-      .then(data => {
+    Promise.all([
+      fetch(_withAgent('/api/stats')).then(r => r.json()),
+      fetch(_withAgent('/api/calibration')).then(r => r.json()).catch(() => null),
+    ]).then(([data, calData]) => {
         document.getElementById('loading').style.display = 'none';
         document.getElementById('dashboard').style.display = 'block';
         if (data.error || data.empty) {
@@ -2675,6 +3036,9 @@ STATS_HTML = r"""<!DOCTYPE html>
           return;
         }
         render(data);
+        if (calData && !calData.error) {
+          renderConfidenceTrends(calData);
+        }
       })
       .catch(err => {
         document.getElementById('loading').innerHTML = 'Error: ' + err;
@@ -2745,6 +3109,47 @@ STATS_HTML = r"""<!DOCTYPE html>
     }
 
     document.getElementById('cards').innerHTML = html;
+  }
+
+  function renderConfidenceTrends(cal) {
+    const cards = document.getElementById('cards');
+    if (!cards) return;
+
+    const PRIMARY_TYPES = ['observation_factual', 'derivation', 'conjecture', 'lesson'];
+    const windows = [
+      {key: 'corpus',    label: 'All time'},
+      {key: 'rolling_7', label: '7-turn'},
+      {key: 'this_turn', label: '1-turn'},
+    ];
+
+    // Build header row
+    let tableHtml = '<table><thead><tr>'
+      + '<th>Type</th>'
+      + windows.map(w => '<th style="text-align:right">' + w.label + ' p50 (n)</th>').join('')
+      + '</tr></thead><tbody>';
+
+    for (const ntype of PRIMARY_TYPES) {
+      tableHtml += '<tr><td>' + esc(ntype) + '</td>';
+      for (const w of windows) {
+        const wdata = (cal[w.key] || {}).by_type || {};
+        const stats = wdata[ntype] || {};
+        if (!stats.n) {
+          tableHtml += '<td style="text-align:right;color:#888;">—</td>';
+        } else {
+          const p50 = stats.p50 !== null && stats.p50 !== undefined ? stats.p50.toFixed(2) : '—';
+          tableHtml += '<td style="text-align:right">' + p50 + ' <span style="color:#888;font-size:0.85em;">(' + stats.n + ')</span></td>';
+        }
+      }
+      tableHtml += '</tr>';
+    }
+    tableHtml += '</tbody></table>';
+
+    const cardHtml = '<div class="card" style="grid-column: span 2"><h3>Confidence Trends</h3>'
+      + '<p style="font-size:0.78em;color:#888;margin-bottom:8px;">Per-type median confidence — All time / 7-turn window / 1-turn window. Divergence indicates recent filing drift.</p>'
+      + tableHtml
+      + '</div>';
+
+    cards.innerHTML += cardHtml;
   }
 
   loadStats();
@@ -2818,6 +3223,14 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 index_db_path = _resolve_logs_index(agent_name)
                 resp = get_stats_data(index_db_path)
+                resp["agent"] = agent_name
+                self._json(resp)
+        elif path == "/api/calibration":
+            if not db_path:
+                self._json({"error": f"Unknown agent: {agent_name!r}",
+                            "agent": agent_name})
+            else:
+                resp = get_calibration_data(db_path)
                 resp["agent"] = agent_name
                 self._json(resp)
         else:
