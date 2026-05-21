@@ -19,10 +19,4 @@ COUNTERPART_NAME={counterpart_name}
 # script remains for manual catch-up invocation if yesterday's sleep was
 # missed (host off at midnight, disconnected day, etc.).
 
-# Dispatcher autostart at boot + watchdog every 5 min (idempotent — the
-# scripts no-op if the tmux session is already alive).
-@reboot AGENT_NAME={agent_name} COUNTERPART_NAME={counterpart_name} AGENT_CLI={agent_cli} {engram_home}/tools/start-channel-dispatcher.sh
-@reboot AGENT_NAME={agent_name} COUNTERPART_NAME={counterpart_name} AGENT_CLI={agent_cli} {engram_home}/tools/start-telegram-dispatcher.sh
-*/5 * * * * AGENT_NAME={agent_name} COUNTERPART_NAME={counterpart_name} AGENT_CLI={agent_cli} {engram_home}/tools/start-channel-dispatcher.sh > /dev/null 2>&1
-*/5 * * * * AGENT_NAME={agent_name} COUNTERPART_NAME={counterpart_name} AGENT_CLI={agent_cli} {engram_home}/tools/start-telegram-dispatcher.sh > /dev/null 2>&1
 # END ENGRAM

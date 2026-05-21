@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""UserPromptSubmit hook: surface unread inter-agent letters to the recipient.
+
+On every prompt, if the agent is in multi-agent mode, scans
+/home/agents-shared/inter-agent/ for markdown letters addressed to this
+agent and injects a summary of new and still-unread letters into the
+session context.
+
+Two-cursor state (see DESIGN.md Layer 3):
+  - inter-agent-surfaced-cursor.txt: advances on every hook fire. Drives
+    the "new since last prompt" bucket. After the hook fires, letters that
+    were "new" drop to "older still-unread" on the next prompt.
+  - inter-agent-read-cursor.txt: advances only when the agent explicitly
+    acknowledges a letter (via engram-letter skill or manual cursor edit).
+    Drives the "older still-unread" tally.
+
+Title extraction precedence (per DESIGN.md Layer 2):
+  1. First non-frontmatter `# Heading` line in the body.
+  2. The `re:` frontmatter field.
+  3. First 60 characters of the body text.
+
+Token budget cap: if "new since last prompt" exceeds 10 letters,
+group-summarize with a "+ N older from <authors>" line.
+
+Anti-patterns guarded:
+  - Mode gate is the first check — single-agent installs (Lin, Chenni)
+    see exactly zero behavior change.
+  - Read cursor is NEVER advanced here; only surfaced cursor advances.
+  - No LLM calls, no network, no DB — file-system reads only.
+    Timeout budget: 5 seconds max.
+
+Part of the inter-agent-comms-v1 cohort (PR 3), stacked on PR 1's
+mode-gate foundation (is_multi_agent_mode, get_counterparts helpers).
+
+Design doc: borges-desk/projects/inter-agent-comms-v1/DESIGN.md
+"""
+
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+ENGRAM_HOME = os.environ.get("ENGRAM_HOME", str(Path.home() / ".engram"))
+INTER_AGENT_DIR = os.environ.get("INTER_AGENT_DIR", "/home/agents-shared/inter-agent")
+
+SURFACED_CURSOR_PATH = os.path.join(ENGRAM_HOME, "inter-agent-surfaced-cursor.txt")
+READ_CURSOR_PATH = os.path.join(ENGRAM_HOME, "inter-agent-read-cursor.txt")
+
+# If "new since last prompt" exceeds this, group-summarize instead of listing.
+LIST_CAP = 10
+
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+def _load_config() -> dict:
+    """Load $ENGRAM_HOME/config.json. Returns {} on any failure."""
+    config_path = Path(ENGRAM_HOME) / "config.json"
+    if config_path.exists():
+        try:
+            return json.loads(config_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _get_agent_name(config: dict | None = None) -> str:
+    """Resolve this agent's own name.
+
+    Priority:
+      1. config.json["agent_name"] field.
+      2. Split Linux username agent-<name> → <name>.
+      3. Empty string (hook will see no matching letters — safe).
+    """
+    if config is None:
+        config = _load_config()
+    name = config.get("agent_name", "").strip()
+    if name:
+        return name
+    # Fall back to username splitting
+    username = os.environ.get("USER", "")
+    if username.startswith("agent-"):
+        return username[len("agent-"):]
+    return ""
+
+
+def _is_multi_agent_mode(config: dict | None = None) -> bool:
+    """True if config.json mode == 'multi'. Mirrors engram_client helper."""
+    if config is None:
+        config = _load_config()
+    return config.get("mode", "single") == "multi"
+
+
+# ---------------------------------------------------------------------------
+# Cursor helpers
+# ---------------------------------------------------------------------------
+
+def _read_cursor(path: str) -> Optional[datetime]:
+    """Read a cursor file; return UTC datetime or None if absent/invalid."""
+    try:
+        raw = Path(path).read_text().strip()
+        if not raw:
+            return None
+        # Normalize trailing Z to +00:00 for fromisoformat compat
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (OSError, ValueError):
+        return None
+
+
+def _write_cursor(path: str, ts: datetime) -> None:
+    """Write a UTC datetime to a cursor file (ISO format with Z suffix).
+
+    Uses an atomic tmp + os.replace pattern so a concurrent hook fire cannot
+    read an empty or partial file between O_TRUNC and the write completing.
+    """
+    ts_str = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    dest = Path(path)
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    try:
+        tmp.write_text(ts_str + "\n")
+        os.replace(tmp, dest)  # atomic on POSIX
+    except OSError as e:
+        # Best-effort cleanup of tmp on failure; preserve old cursor.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        # Don't crash the hook on cursor-write failure — log to stderr and continue.
+        print(f"WARN: cursor write failed: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Letter parsing
+# ---------------------------------------------------------------------------
+
+_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+_FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):\s*(.*)$", re.MULTILINE)
+
+
+def _parse_frontmatter(text: str) -> tuple[dict, str]:
+    """Extract YAML-ish frontmatter from a markdown letter.
+
+    Returns (fields_dict, body_text). On parse failure returns ({}, text).
+    Only parses simple key: value pairs — no nested YAML; sufficient for
+    the established frontmatter format (from, to, timestamp, re).
+    """
+    m = _FRONTMATTER_RE.match(text)
+    if not m:
+        return {}, text
+    fm_block = m.group(1)
+    body = text[m.end():]
+    fields = {}
+    for field_m in _FRONTMATTER_FIELD_RE.finditer(fm_block):
+        key = field_m.group(1).strip().lower()
+        val = field_m.group(2).strip()
+        fields[key] = val
+    return fields, body
+
+
+def _extract_title(fields: dict, body: str) -> str:
+    """Extract a display title from a parsed letter.
+
+    Precedence:
+      1. First non-frontmatter `# Heading` line in the body.
+      2. The `re:` frontmatter field.
+      3. First 60 chars of body text (stripped).
+    """
+    # Priority 1: first # heading in body
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith("#"):
+            title = line.lstrip("#").strip()
+            if title:
+                return title
+
+    # Priority 2: re: frontmatter field
+    re_field = fields.get("re", "").strip()
+    if re_field:
+        return re_field
+
+    # Priority 3: body-first-60 fallback. Skip hash-only / empty lines (those
+    # would produce a degenerate title like '##' or '').
+    body_lines = [
+        ln for ln in body.split("\n")
+        if ln.strip() and ln.strip().lstrip("#").strip()
+    ]
+    if body_lines:
+        first_line = body_lines[0].strip().lstrip("#").strip()
+        if len(first_line) > 60:
+            return first_line[:57] + "..."
+        return first_line
+
+    return "(no title)"
+
+
+def _parse_letter_timestamp(ts_str: str) -> Optional[datetime]:
+    """Parse a frontmatter timestamp string into a UTC datetime."""
+    if not ts_str:
+        return None
+    try:
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _format_ts(ts: datetime) -> str:
+    """Format a datetime for display: YYYY-MM-DDTHH:MMZ"""
+    return ts.strftime("%Y-%m-%dT%H:%MZ")
+
+
+# ---------------------------------------------------------------------------
+# Letter scanning
+# ---------------------------------------------------------------------------
+
+def _scan_letters(agent_name: str) -> list[dict]:
+    """Scan INTER_AGENT_DIR for letters addressed to agent_name.
+
+    Returns a list of dicts with keys: path, timestamp, from, title.
+    Files that don't parse cleanly are silently skipped.
+    """
+    inter_dir = Path(INTER_AGENT_DIR)
+    if not inter_dir.is_dir():
+        return []
+
+    letters = []
+    for md_file in inter_dir.glob("*.md"):
+        try:
+            text = md_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        fields, body = _parse_frontmatter(text)
+        if not fields:
+            # No frontmatter — skip (malformed or README)
+            continue
+
+        # Must have a valid 'to' field matching our agent name
+        to_field = fields.get("to", "").strip().lower()
+        if not agent_name or to_field != agent_name.lower():
+            continue
+
+        # Must have a parseable timestamp
+        ts = _parse_letter_timestamp(fields.get("timestamp", ""))
+        if ts is None:
+            continue
+
+        title = _extract_title(fields, body)
+        from_field = fields.get("from", "unknown").strip()
+
+        letters.append({
+            "path": str(md_file),
+            "timestamp": ts,
+            "from": from_field,
+            "title": title,
+        })
+
+    # Sort by timestamp ascending (oldest first within each bucket)
+    letters.sort(key=lambda l: l["timestamp"])
+    return letters
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    # ── Config (single load) ──────────────────────────────────────────────────
+    config = _load_config()
+
+    # ── Mode gate ─────────────────────────────────────────────────────────────
+    # First check — single-agent installs see zero output, zero state mutation.
+    if not _is_multi_agent_mode(config):
+        sys.exit(0)
+
+    # ── Read cursors ──────────────────────────────────────────────────────────
+    surfaced_cursor = _read_cursor(SURFACED_CURSOR_PATH)  # may be None
+    read_cursor = _read_cursor(READ_CURSOR_PATH)           # may be None
+
+    # ── Resolve own name ──────────────────────────────────────────────────────
+    agent_name = _get_agent_name(config)
+    # Even if agent_name is empty, scanning returns nothing (no match).
+
+    # ── Scan letters ──────────────────────────────────────────────────────────
+    all_letters = _scan_letters(agent_name)
+
+    # ── Partition ─────────────────────────────────────────────────────────────
+    # new_letters: timestamp > surfaced_cursor (arrived since last prompt)
+    # unread_letters: surfaced_cursor >= timestamp > read_cursor (seen before, still unread)
+    # read: timestamp <= read_cursor (acknowledged — invisible)
+    now = datetime.now(timezone.utc)
+
+    new_letters = []
+    unread_letters = []
+
+    for letter in all_letters:
+        ts = letter["timestamp"]
+        if surfaced_cursor is None:
+            # First ever run: treat everything as "new"
+            new_letters.append(letter)
+        elif ts > surfaced_cursor:
+            new_letters.append(letter)
+        elif read_cursor is None or ts > read_cursor:
+            unread_letters.append(letter)
+        # else: ts <= read_cursor → acknowledged, invisible
+
+    # ── Advance surfaced cursor ───────────────────────────────────────────────
+    # Always advance, even if nothing to surface — keeps the delta window current.
+    # Read cursor is NOT touched here; only explicit acknowledgment advances it.
+    _write_cursor(SURFACED_CURSOR_PATH, now)
+
+    # ── Exit silently if nothing to report ────────────────────────────────────
+    if not new_letters and not unread_letters:
+        sys.exit(0)
+
+    # ── Build injection block ─────────────────────────────────────────────────
+    lines = []
+
+    n_new = len(new_letters)
+    if n_new > 0:
+        lines.append(f"\U0001f4ec New letters since last prompt: {n_new}")
+        if n_new <= LIST_CAP:
+            for letter in new_letters:
+                ts_str = _format_ts(letter["timestamp"])
+                lines.append(
+                    f"  - [{ts_str}] from {letter['from']} — \"{letter['title']}\""
+                )
+        else:
+            # Group-summarize when over the cap
+            shown = new_letters[:LIST_CAP]
+            rest = new_letters[LIST_CAP:]
+            for letter in shown:
+                ts_str = _format_ts(letter["timestamp"])
+                lines.append(
+                    f"  - [{ts_str}] from {letter['from']} — \"{letter['title']}\""
+                )
+            rest_authors = sorted({l["from"] for l in rest})
+            authors_str = ", ".join(rest_authors)
+            lines.append(
+                f"  + {len(rest)} older from {authors_str}"
+            )
+
+    n_unread = len(unread_letters)
+    if n_unread > 0:
+        if n_new > 0:
+            lines.append(f"  (Plus {n_unread} older still-unread.)")
+        else:
+            lines.append(f"\U0001f4ec {n_unread} older still-unread letter{'s' if n_unread != 1 else ''}.")
+
+    context = "\n".join(lines)
+
+    response = {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }
+    }
+    print(json.dumps(response))
+
+
+if __name__ == "__main__":
+    main()
