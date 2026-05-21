@@ -617,3 +617,114 @@ def test_schema_has_summary_top_k():
         f"summary_top_k missing from engram_reflect schema parameters; "
         f"got: {list(params.keys())}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 13. calibration_snapshot key is present in the response
+# ---------------------------------------------------------------------------
+
+def test_calibration_snapshot_key_present():
+    """engram_reflect always returns a calibration_snapshot key at top level."""
+    server = fresh_server()
+    result = json.loads(server.engram_reflect())
+    assert "error" not in result, f"unexpected error: {result}"
+    assert "calibration_snapshot" in result, (
+        f"calibration_snapshot key missing from reflect output; keys: {list(result.keys())}"
+    )
+    snap = result["calibration_snapshot"]
+    assert isinstance(snap, dict), f"calibration_snapshot must be a dict; got: {type(snap)}"
+    assert "corpus" in snap, f"calibration_snapshot missing 'corpus' key; got: {list(snap.keys())}"
+    assert "this_turn" in snap, f"calibration_snapshot missing 'this_turn' key; got: {list(snap.keys())}"
+
+
+# ---------------------------------------------------------------------------
+# 14. corpus and this_turn are dicts with expected subkeys (when data exists)
+# ---------------------------------------------------------------------------
+
+def test_calibration_snapshot_subkeys_when_data_exists():
+    """corpus and this_turn contain by_type/by_quote_type/by_reasoning_type/by_source_class
+    when there are confidence-bearing nodes in the DB."""
+    server = fresh_server()
+    # Create an observation (confidence-bearing) so distributions are non-empty
+    r = json.loads(server.engram_add_observation(payload_json=json.dumps({
+        "url": "https://example.com/calib-test",
+        "title": "Calibration Test Source",
+        "quoted_text": "Test quoted text for calibration snapshot test.",
+        "interpretation": "Test interpretation.",
+        "claim": "Calibration test observation claim.",
+        "quote_type": "hard_data",
+    })))
+    assert r.get("status") == "created", f"observation creation failed: {r}"
+
+    result = json.loads(server.engram_reflect())
+    assert "error" not in result, f"unexpected error: {result}"
+
+    snap = result["calibration_snapshot"]
+    assert "error" not in snap, f"calibration_snapshot has error: {snap}"
+
+    corpus = snap["corpus"]
+    assert isinstance(corpus, dict), f"corpus must be a dict; got: {type(corpus)}"
+    # When confidence-bearing nodes exist, at least by_type should be populated.
+    assert "by_type" in corpus, (
+        f"corpus missing 'by_type' subkey; got: {list(corpus.keys())}"
+    )
+    assert "by_quote_type" in corpus, (
+        f"corpus missing 'by_quote_type' subkey; got: {list(corpus.keys())}"
+    )
+    assert "by_reasoning_type" in corpus, (
+        f"corpus missing 'by_reasoning_type' subkey; got: {list(corpus.keys())}"
+    )
+    assert "by_source_class" in corpus, (
+        f"corpus missing 'by_source_class' subkey; got: {list(corpus.keys())}"
+    )
+
+    # this_turn has the same key structure: the observation was just created so
+    # it falls within the 1-turn window and all four subkeys should be present.
+    this_turn = snap["this_turn"]
+    assert isinstance(this_turn, dict), f"this_turn must be a dict; got: {type(this_turn)}"
+    assert "by_type" in this_turn, (
+        f"this_turn missing 'by_type' subkey; got: {list(this_turn.keys())}"
+    )
+    assert "by_quote_type" in this_turn, (
+        f"this_turn missing 'by_quote_type' subkey; got: {list(this_turn.keys())}"
+    )
+    assert "by_reasoning_type" in this_turn, (
+        f"this_turn missing 'by_reasoning_type' subkey; got: {list(this_turn.keys())}"
+    )
+    assert "by_source_class" in this_turn, (
+        f"this_turn missing 'by_source_class' subkey; got: {list(this_turn.keys())}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 15. When stats unavailable (patched error), reflect still succeeds with error marker
+# ---------------------------------------------------------------------------
+
+def test_calibration_snapshot_graceful_on_stats_error():
+    """When engram_stats raises unexpectedly, reflect returns without error and
+    calibration_snapshot contains the error marker dict."""
+    server = fresh_server()
+
+    # Monkey-patch engram_stats in the server module to raise
+    original_engram_stats = server.engram_stats
+
+    def _broken_stats(payload_json="{}"):
+        raise RuntimeError("simulated engram_stats failure")
+
+    server.engram_stats = _broken_stats
+    try:
+        result = json.loads(server.engram_reflect())
+        # The overall reflect call must succeed (no top-level "error" key)
+        assert "error" not in result, (
+            f"reflect must not fail when engram_stats raises; got: {result}"
+        )
+        snap = result.get("calibration_snapshot")
+        assert snap is not None, "calibration_snapshot key must be present even on stats error"
+        assert "error" in snap, (
+            f"calibration_snapshot must contain 'error' key when stats fails; got: {snap}"
+        )
+        assert snap["error"] == "engram_stats unavailable", (
+            f"unexpected error message: {snap['error']!r}"
+        )
+    finally:
+        server.engram_stats = original_engram_stats

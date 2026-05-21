@@ -13699,6 +13699,8 @@ def _slim_reflect_briefing(report: dict) -> dict:
             out["recommended_actions_truncated"] = len(actions) - _REFLECT_ACTIONS_MAX
         else:
             out["recommended_actions"] = actions
+    if "calibration_snapshot" in report:
+        out["calibration_snapshot"] = report["calibration_snapshot"]
     return out
 
 
@@ -13779,6 +13781,9 @@ def engram_reflect(summary_top_k: int = 5) -> str:
 
     Returns:
         JSON report with categorized issues and recommended actions.
+        - calibration_snapshot (new): Two-key dict with `corpus` (mode=all) and `this_turn`
+          (mode=1-turn) confidence-distribution data from engram_stats. Lets dream-master
+          see filing-pattern shape alongside topic-selection candidates.
     """
     summary_top_k = max(0, int(summary_top_k))
     conn = _get_db()
@@ -14287,6 +14292,25 @@ def engram_reflect(summary_top_k: int = 5) -> str:
             "will be auto-tagged dream_review. If nothing distinct, move on; "
             "a null result is a valid data point."
         )
+
+        # Calibration snapshot — appended last so failures don't disrupt the
+        # rest of the report. Two calls to engram_stats: corpus-wide
+        # (mode=all) and this-turn window (mode=1-turn), both restricted to
+        # the "confidence" section only.
+        try:
+            _stats_corpus = json.loads(engram_stats(json.dumps({"sections": ["confidence"]})))
+            if "error" in _stats_corpus:
+                raise RuntimeError(f"engram_stats returned error: {_stats_corpus['error']}")
+            _stats_now = json.loads(engram_stats(json.dumps({"mode": "1-turn", "sections": ["confidence"]})))
+            if "error" in _stats_now:
+                raise RuntimeError(f"engram_stats returned error: {_stats_now['error']}")
+            report["calibration_snapshot"] = {
+                "corpus": _stats_corpus.get("confidence", {}),
+                "this_turn": _stats_now.get("confidence", {}),
+            }
+        except Exception:
+            report["calibration_snapshot"] = {"error": "engram_stats unavailable"}
+
         _write_feeling_nudge("dream_review")
 
         return json.dumps(_slim_reflect_briefing(report))
