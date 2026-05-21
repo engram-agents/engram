@@ -11050,6 +11050,14 @@ def engram_derive(payload_json: str) -> str:
                 premises to the conclusion. Show your work.
             reasoning_type (str, optional): The type of logical argument. See
                 _derive_impl docstring for the full list and confidence discounts.
+                DISCIPLINE NOTE — inductive_generalization: use only when
+                premises are from MULTIPLE INDEPENDENT nodes citing DISTINCT
+                evidence sources (typically 2+). NOT for: restating a single
+                source's claim (use authority_expert); single-case findings
+                (use deductive_modus_ponens if "if P then Q; P; therefore Q");
+                analogies (use inductive_analogy). The corroboration formula
+                1 - ∏(1-cᵢ) is mathematically valid only when premises are
+                genuinely independent.
             derivation_mode (str, optional): LEGACY — use reasoning_type instead.
                 Kept for backward compatibility: "chain" or "corroboration".
             context_ids (str, optional): Comma-separated node IDs for context

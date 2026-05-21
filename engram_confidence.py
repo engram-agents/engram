@@ -52,7 +52,7 @@ REASONING_TYPES = {
     "deductive_disjunctive",        # P or Q; not P; therefore Q
     "deductive_reductio",           # Assume P; derive contradiction; therefore not P
     # Inductive: more evidence = more likely, but never certain
-    "inductive_generalization",     # Observed X in A,B,C → X is generally true (INDEPENDENT sources)
+    "inductive_generalization",     # Observed X in A,B,C → X generally true. REQUIRES 2+ distinct evidence sources.
     "inductive_enumeration",        # Source S enumerates items I1,I2,...,In sharing property P → P has n instances (single authoritative source, structurally-independent items)
     "inductive_statistical",        # X% of A are B; this is A; therefore probably B
     "inductive_analogy",            # A~B in X,Y,Z; A has W; therefore B has W
