@@ -50,6 +50,7 @@ HTML = r"""<!DOCTYPE html>
 
     body {
       display: flex;
+      flex-direction: column;
       height: 100vh;
       background: #1a1a2e;
       color: #e0e0e0;
@@ -496,16 +497,34 @@ HTML = r"""<!DOCTYPE html>
     .link.supersedes { stroke-dasharray: 5 3; }
     .link.resolves { stroke-dasharray: 6 3; }
     .link.retracts { stroke-dasharray: 3 3; }
+
+    /* ── Top nav ────────────────────────────────────────────────────── */
+    .nav { margin-bottom: 0; padding: 8px 16px; background: #0f3460;
+           border-bottom: 1px solid #1a4a8a; flex-shrink: 0; }
+    .nav a { color: #00d4ff; text-decoration: none; margin-right: 16px; font-size: 0.9em; }
+    .nav a:hover { text-decoration: underline; }
+
+    /* ── Content row (sidebar + graph + detail) ─────────────────────── */
+    #content-row { display: flex; flex: 1; overflow: hidden; }
   </style>
 </head>
 <body>
+
+<!-- ── Top nav ──────────────────────────────────────────────────────── -->
+<div class="nav">
+  <a href="/" style="font-weight:600;">Graph View</a>
+  <a href="/health">Health Dashboard</a>
+  <a href="/stats">Stats</a>
+</div>
+
+<!-- ── Content row ──────────────────────────────────────────────────── -->
+<div id="content-row">
 
 <!-- ── Sidebar ──────────────────────────────────────────────────────── -->
 <div id="sidebar">
   <header>
     ENGRAM Visualizer
     <small id="db-path-label"></small>
-    <div style="margin-top:4px"><a href="/health" style="color:#00d4ff;font-size:0.75em;text-decoration:none;">Health Dashboard &rarr;</a></div>
   </header>
 
   <div class="section" id="agent-section" style="display:none;">
@@ -582,6 +601,8 @@ HTML = r"""<!DOCTYPE html>
   </div>
   <div id="detail-body"></div>
 </div>
+
+</div><!-- /#content-row -->
 
 <!-- ── Tooltip ───────────────────────────────────────────────────────── -->
 <div id="tooltip"></div>
@@ -2135,7 +2156,8 @@ HEALTH_HTML = r"""<!DOCTYPE html>
 <body>
   <div class="nav">
     <a href="/">Graph View</a>
-    <a href="/health">Health Dashboard</a>
+    <a href="/health" style="font-weight:600;">Health Dashboard</a>
+    <a href="/stats">Stats</a>
     <span id="agent-switcher" style="display:none;margin-left:auto;float:right;">
       <span style="color:#7ecfff;font-size:0.85em;margin-right:6px;">Agent:</span>
       <select id="agent-select-health" style="padding:4px 8px;background:#0d1b36;border:1px solid #1a4a8a;border-radius:4px;color:#e0e0e0;font-size:0.85em;outline:none;"></select>
