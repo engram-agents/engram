@@ -22,6 +22,13 @@ Issue #140 retired the single shared ~/.engram/active-session.json marker
 that this replaces; agents and hooks read transcript_path either from
 SessionStart's injected additionalContext (preferred) or from the
 per-session file by session_id.
+
+A compact [ENGRAM Calibration] block is injected on every SessionStart
+(both startup and compact/resume) so fresh-wake context has actual
+distribution anchors present — not just semantic labels. Closes the
+access≠presence gap (ob_1976). Sourced from engram_stats(sections=
+["confidence"]) + engram_stats(mode="7-turn", sections=["confidence"]).
+Silent skip on any stats failure: hook never blocks session start.
 """
 import json
 import os
@@ -36,6 +43,127 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import write_baseline
 
 ENGRAM_HOME = os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram"))
+
+
+def _resolve_runtime_dir(engram_home: str) -> str:
+    """Locate directory containing engram_client.py for stats import.
+
+    Priority:
+      1. $ENGRAM_RUNTIME_DIR if set explicitly.
+      2. $ENGRAM_HOME if it bundles a server snapshot (alpha-install pattern).
+      3. ~/engram-alpha (live-source fallback for dev installs).
+    """
+    explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
+    if explicit:
+        return explicit
+    if os.path.exists(os.path.join(engram_home, "engram_client.py")):
+        return engram_home
+    return os.path.expanduser("~/engram-alpha")
+
+
+def format_calibration_block(conf_all: dict, conf_7d: dict, current_turn: int) -> str:
+    """Render a 6-10 line calibration anchor for session start.
+
+    Formats per-type quantile rows from conf_all["by_type"] plus a
+    7-turn rolling median comparison. Empty buckets are silently skipped.
+    Block is always ≤10 lines and starts with [ENGRAM Calibration:].
+
+    Args:
+        conf_all: confidence section from engram_stats(sections=["confidence"]).
+        conf_7d:  confidence section from engram_stats(mode="7-turn",
+                  sections=["confidence"]).
+        current_turn: memory.current_turn from the all-time stats response.
+
+    Returns:
+        Multi-line string with the calibration block, or empty string if
+        conf_all has no usable by_type data.
+    """
+    by_type = conf_all.get("by_type", {})
+    if not by_type:
+        return ""
+
+    lines = [f"[ENGRAM Calibration: graph distribution at turn {current_turn}]"]
+
+    # All-claims aggregate: pool p25/p50/p75/p95 across all types that
+    # appear in by_type (weighted by n).
+    all_n = sum(v.get("n", 0) for v in by_type.values())
+    if all_n > 0:
+        # Weighted medians aren't available from per-type stats alone;
+        # use simple mean of p50/p25/p75/p95 weighted by n as a proxy.
+        def _wavg(key: str) -> float:
+            # Guard is `key in v` — v[key] is safe, no fallback needed.
+            total = sum(
+                v[key] * v.get("n", 0)
+                for v in by_type.values()
+                if v.get("n", 0) > 0 and key in v
+            )
+            denom = sum(
+                v.get("n", 0) for v in by_type.values()
+                if v.get("n", 0) > 0 and key in v
+            )
+            return round(total / denom, 2) if denom else 0.0
+
+        lines.append(
+            f"  All claims   (N={all_n:4d}) "
+            f"p25 {_wavg('p25'):.2f} · p50 {_wavg('p50'):.2f} · "
+            f"p75 {_wavg('p75'):.2f} · p95 {_wavg('p95'):.2f}"
+        )
+
+    # Per-type rows: observations, derivations, conjectures (most salient
+    # for calibration). Axioms and lessons included when present.
+    _TYPE_LABELS = {
+        "observation_factual": "observations ",
+        "derivation":          "derivations  ",
+        "conjecture":          "conjectures  ",
+        "lesson":              "lessons      ",
+        "axiom":               "axioms       ",
+    }
+    for ntype, label in _TYPE_LABELS.items():
+        stats = by_type.get(ntype)
+        if not stats:
+            continue
+        n = stats.get("n", 0)
+        lines.append(
+            f"  {label}(N={n:4d}) "
+            f"p25 {stats.get('p25', 0):.2f} · "
+            f"p50 {stats.get('p50', 0):.2f} · "
+            f"p75 {stats.get('p75', 0):.2f}"
+        )
+
+    # 7-turn rolling comparison
+    by_type_7d = conf_7d.get("by_type", {})
+    all_7d_n = sum(v.get("n", 0) for v in by_type_7d.values())
+    if all_7d_n > 0:
+        # Weighted p50 across 7-day window
+        total_50 = sum(
+            v.get("p50", 0) * v.get("n", 0)
+            for v in by_type_7d.values()
+            if v.get("n", 0) > 0 and "p50" in v
+        )
+        denom_7d = sum(
+            v.get("n", 0) for v in by_type_7d.values()
+            if v.get("p50") is not None
+        )
+        median_7d = round(total_50 / denom_7d, 2) if denom_7d else 0.0
+
+        # Corpus-wide p50 for comparison
+        corpus_p50 = _wavg("p50") if all_n > 0 else 0.0
+        lines.append(
+            f"  7-turn rolling: N={all_7d_n} median {median_7d:.2f} "
+            f"(vs corpus {corpus_p50:.2f})"
+        )
+
+    # Cap at 10 lines (header + 9 data lines).
+    # With the current _TYPE_LABELS (5 entries) the maximum is 8 lines
+    # (header + all_claims + 5 type rows + 7d rolling).  The cap is kept as
+    # forward-looking defense: if _TYPE_LABELS gains entries in the future,
+    # the block stays bounded without requiring a separate edit here.
+    if len(lines) > 10:
+        lines = lines[:10]
+
+    return "\n".join(lines)
+
+
 SESSION_ROLE = os.environ.get("ENGRAM_SESSION_ROLE", "interactive").strip().lower()
 SESSION_PURPOSE = os.environ.get("ENGRAM_SESSION_PURPOSE", "").strip()
 SESSIONS_DIR = os.path.join(ENGRAM_HOME, "sessions")
@@ -332,6 +460,37 @@ def main() -> None:
             "Instructions). Other Session Start Reading items can be skipped; "
             "the compaction summary carries work-thread continuity.]"
         )
+
+    # ── ENGRAM Calibration block ───────────────────────────────────────────
+    # Inject per-type distribution anchors on every SessionStart so fresh-wake
+    # context has actual quantile data present (not just semantic labels).
+    # Closes the access≠presence gap (ob_1976). Silent skip on any failure —
+    # hook must never block session start.
+    try:
+        _runtime_dir = _resolve_runtime_dir(ENGRAM_HOME)
+        os.environ.setdefault("ENGRAM_DATA_DIR", ENGRAM_HOME)
+        if _runtime_dir not in sys.path:
+            sys.path.insert(0, _runtime_dir)
+        from engram_client import EngramClient
+        _client = EngramClient()
+        _stats_all = _client.call(
+            "engram_stats", {"payload_json": json.dumps({"sections": ["confidence", "memory"]})}
+        )
+        _stats_7d = _client.call(
+            "engram_stats", {"payload_json": json.dumps({"mode": "7-turn", "sections": ["confidence"]})}
+        )
+        _current_turn = _stats_all.get("memory", {}).get("current_turn", 0)
+        _cal_block = format_calibration_block(
+            _stats_all.get("confidence", {}),
+            _stats_7d.get("confidence", {}),
+            _current_turn,
+        )
+        if _cal_block:
+            lines.append(_cal_block)
+    except Exception:
+        # Hook discipline: never surface calibration errors to session start.
+        pass
+
     output_obj = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
