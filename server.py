@@ -6708,124 +6708,424 @@ def engram_advance_turn(message: str) -> str:
         "openWorldHint": False,
     },
 )
-def engram_stats() -> str:
+def engram_stats(payload_json: str = "{}") -> str:
     """Get a summary of the current knowledge graph state.
 
-    Returns node counts by type, edge counts by relation, and highlights
-    like open questions, open predictions, and lowest-confidence nodes.
+    Single-payload signature: pass ALL options as one JSON object string in
+    `payload_json`. Default `{}` preserves backward compat (no-arg callers
+    continue to work unchanged — existing callers pass no payload at all,
+    which triggers the `="{}"` default).
+
+    Mode windowing: `mode` restricts all sections to nodes created within
+    a time window approximated from created_at timestamps. Because ENGRAM
+    does not record turn-advance timestamps (deferred to a future PR), each
+    turn-unit maps to 24h. This is accurate in steady-state where the dream
+    cycle advances the turn ~once per day, but drifts during high-velocity
+    or low-velocity periods. Future tightening can record last_turn_advance
+    in config.json and use that boundary directly.
+
+    Args:
+        payload_json: JSON object (as a string) with these optional fields:
+            mode (str, optional): Window filter — one of "all" (default),
+                "1-turn" (≈24h), "7-turn" (≈168h), "30-turn" (≈720h).
+                When mode != "all", all sections reflect only nodes created
+                within the window. A `window` key is added to the response
+                describing the cutoff.
+            sections (list of str, optional): Subset of sections to return.
+                Valid names: structure, edges, confidence, open_questions,
+                open_predictions, reasoning_breakdown, weakest_nodes,
+                health_score, memory. Default (omitted or null): all sections.
+                Unknown names are ignored with a logged warning.
 
     Returns:
-        JSON with comprehensive graph statistics.
+        JSON with comprehensive graph statistics. Top-level keys (all sections):
+            node_counts_by_type: per-type total + current counts (structure).
+            edge_counts_by_relation: per-relation edge counts (edges).
+            reasoning_type_breakdown: derivation counts by reasoning_type.
+            open_questions_count, open_questions_recent: open question summary.
+            open_predictions_count, open_predictions_recent: open predictions.
+            weakest_nodes: 5 lowest-confidence current non-evidence nodes.
+            memory: current_turn + tier thresholds.
+            confidence: distribution stats per type, quote_type, reasoning_type,
+                source_class. New in this version; always included unless
+                sections selector excludes it.
+            window (conditional): present only when mode != "all"; describes
+                the time window applied.
     """
+    # ── Parse + validate payload ───────────────────────────────────────────
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    mode = params.get("mode", "all")
+    sections_param = params.get("sections", None)
+
+    _VALID_MODES = {"all", "1-turn", "7-turn", "30-turn"}
+    if mode not in _VALID_MODES:
+        return json.dumps({
+            "error": f"Invalid mode '{mode}'. Must be one of: {sorted(_VALID_MODES)}"
+        })
+
+    # Section name → response key(s) mapping.
+    # "health_score" is a recognized name but engram_stats doesn't compute
+    # it (that's engram_diagnose's domain); including it in sections is a
+    # no-op that doesn't error.
+    _VALID_SECTIONS = {
+        "structure", "edges", "confidence", "open_questions",
+        "open_predictions", "reasoning_breakdown", "weakest_nodes",
+        "health_score", "memory",
+    }
+    if sections_param is not None:
+        if not isinstance(sections_param, list):
+            return json.dumps({"error": "sections must be a list of strings"})
+        if not all(isinstance(s, str) for s in sections_param):
+            return json.dumps({"error": "sections must be a list of strings"})
+        unknown = [s for s in sections_param if s not in _VALID_SECTIONS]
+        if unknown:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "engram_stats: unknown section name(s) ignored: %s", unknown
+            )
+        wanted = {s for s in sections_param if s in _VALID_SECTIONS}
+    else:
+        wanted = None  # None = all sections
+
+    def _want(section: str) -> bool:
+        return wanted is None or section in wanted
+
+    # ── Build window filter ────────────────────────────────────────────────
+    _MODE_HOURS = {"1-turn": 24, "7-turn": 168, "30-turn": 720}
+    now_utc = datetime.now(timezone.utc)
+    window_meta: Optional[dict] = None
+    created_at_filter = ""   # empty string = no filter (mode="all")
+    filter_args: list = []
+
+    if mode != "all":
+        hours = _MODE_HOURS[mode]
+        cutoff_dt = now_utc - timedelta(hours=hours)
+        cutoff_iso = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        created_at_filter = " AND created_at >= ?"
+        filter_args = [cutoff_iso]
+        window_meta = {
+            "mode": mode,
+            "approx_hours": hours,
+            "cutoff_iso": cutoff_iso,
+        }
+
     conn = _get_db()
     try:
-        # Node counts by type
-        type_counts = {}
-        for row in conn.execute(
-            "SELECT type, COUNT(*) as c, SUM(is_current) as current_c FROM nodes GROUP BY type"
-        ).fetchall():
-            type_counts[row["type"]] = {
-                "total": row["c"],
-                "current": row["current_c"],
+        result: dict = {}
+
+        # Attach window metadata first so callers see it regardless of sections.
+        if window_meta is not None:
+            result["window"] = window_meta
+
+        # ── structure ──────────────────────────────────────────────────────
+        if _want("structure"):
+            type_counts = {}
+            for row in conn.execute(
+                "SELECT type, COUNT(*) as c, SUM(is_current) as current_c"
+                " FROM nodes WHERE 1=1" + created_at_filter + " GROUP BY type",
+                filter_args,
+            ).fetchall():
+                type_counts[row["type"]] = {
+                    "total": row["c"],
+                    "current": row["current_c"],
+                }
+            result["node_counts_by_type"] = type_counts
+
+        # ── edges ──────────────────────────────────────────────────────────
+        if _want("edges"):
+            if mode == "all":
+                edge_rows = conn.execute(
+                    "SELECT relation, COUNT(*) as c FROM edges GROUP BY relation"
+                ).fetchall()
+            else:
+                # edges table has its own created_at column — use it directly.
+                edge_rows = conn.execute(
+                    "SELECT relation, COUNT(*) as c FROM edges"
+                    " WHERE created_at >= ? GROUP BY relation",
+                    filter_args,
+                ).fetchall()
+            edge_counts = {row["relation"]: row["c"] for row in edge_rows}
+            result["edge_counts_by_relation"] = edge_counts
+
+        # ── open_questions ─────────────────────────────────────────────────
+        if _want("open_questions"):
+            # Open / partially-resolved questions: count + top 5 most-recent
+            # highlights. The full enumeration belongs to engram_reflect; bulk-
+            # listing all of them here ballooned the response past the MCP
+            # token budget when the graph accumulated >100 open questions
+            # (ob_1473 cohort, observed 2026-05-03 — 111K bytes, harness fell
+            # back to file redirection). Pattern matches weakest_nodes (top 5).
+            open_question_count = conn.execute(
+                "SELECT COUNT(*) as c FROM nodes WHERE type = 'question'"
+                " AND status IN ('open', 'partially_resolved') AND is_current = 1"
+                + created_at_filter,
+                filter_args,
+            ).fetchone()["c"]
+            open_questions = conn.execute(
+                "SELECT id, claim, status, question_category, question_lacks"
+                " FROM nodes WHERE type = 'question'"
+                " AND status IN ('open', 'partially_resolved') AND is_current = 1"
+                + created_at_filter
+                + " ORDER BY created_at DESC LIMIT 5",
+                filter_args,
+            ).fetchall()
+            result["open_questions_count"] = open_question_count
+            result["open_questions_recent"] = [
+                {k: v for k, v in {
+                    "id": q["id"], "question": q["claim"], "status": q["status"],
+                    "category": q["question_category"], "lacks": q["question_lacks"],
+                }.items() if v is not None}
+                for q in open_questions
+            ]
+
+        # ── open_predictions ───────────────────────────────────────────────
+        if _want("open_predictions"):
+            # Open / partially-resolved predictions: count + top 5 most-recent.
+            open_prediction_count = conn.execute(
+                "SELECT COUNT(*) as c FROM nodes WHERE type = 'prediction'"
+                " AND status IN ('open', 'partially_resolved') AND is_current = 1"
+                + created_at_filter,
+                filter_args,
+            ).fetchone()["c"]
+            open_predictions = conn.execute(
+                "SELECT id, predicted_event, resolution_timeframe, status"
+                " FROM nodes WHERE type = 'prediction'"
+                " AND status IN ('open', 'partially_resolved') AND is_current = 1"
+                + created_at_filter
+                + " ORDER BY created_at DESC LIMIT 5",
+                filter_args,
+            ).fetchall()
+            result["open_predictions_count"] = open_prediction_count
+            result["open_predictions_recent"] = [
+                {
+                    "id": p["id"],
+                    "event": p["predicted_event"],
+                    "timeframe": p["resolution_timeframe"],
+                    "status": p["status"],
+                }
+                for p in open_predictions
+            ]
+
+        # ── reasoning_breakdown ────────────────────────────────────────────
+        if _want("reasoning_breakdown"):
+            reasoning_breakdown: dict = {}
+            derivations = conn.execute(
+                "SELECT metadata FROM nodes WHERE type = 'derivation'"
+                " AND is_current = 1 AND metadata IS NOT NULL"
+                + created_at_filter,
+                filter_args,
+            ).fetchall()
+            for d in derivations:
+                try:
+                    meta = json.loads(d["metadata"])
+                    rtype = meta.get("reasoning_type", "legacy_untyped")
+                except (json.JSONDecodeError, TypeError):
+                    rtype = "legacy_untyped"
+                reasoning_breakdown[rtype] = reasoning_breakdown.get(rtype, 0) + 1
+            result["reasoning_type_breakdown"] = reasoning_breakdown
+
+        # ── weakest_nodes ──────────────────────────────────────────────────
+        if _want("weakest_nodes"):
+            weak_nodes = conn.execute(
+                "SELECT id, type, claim, confidence FROM nodes"
+                " WHERE is_current = 1 AND confidence IS NOT NULL AND type != 'evidence'"
+                + created_at_filter
+                + " ORDER BY confidence ASC LIMIT 5",
+                filter_args,
+            ).fetchall()
+            result["weakest_nodes"] = [
+                {
+                    "id": w["id"],
+                    "type": w["type"],
+                    "claim": w["claim"],
+                    "confidence": w["confidence"],
+                }
+                for w in weak_nodes
+            ]
+
+        # ── memory ─────────────────────────────────────────────────────────
+        if _want("memory"):
+            result["memory"] = {
+                "current_turn": _get_current_turn(),
+                "tier1_threshold": _get_tier_threshold(conn, 1),
+                "tier2_threshold": _get_tier_threshold(conn, 2),
             }
 
-        # Edge counts by relation
-        edge_counts = {}
-        for row in conn.execute(
-            "SELECT relation, COUNT(*) as c FROM edges GROUP BY relation"
-        ).fetchall():
-            edge_counts[row["relation"]] = row["c"]
+        # ── confidence ─────────────────────────────────────────────────────
+        if _want("confidence"):
+            result["confidence"] = _compute_confidence_distribution(
+                conn, created_at_filter, filter_args
+            )
 
-        # Open / partially-resolved questions: count + top 5 most-recent
-        # highlights. The full enumeration belongs to engram_reflect; bulk-
-        # listing all of them here ballooned the response past the MCP
-        # token budget when the graph accumulated >100 open questions
-        # (ob_1473 cohort, observed 2026-05-03 — 111K bytes, harness fell
-        # back to file redirection). Pattern matches weakest_nodes (top 5).
-        open_question_count = conn.execute(
-            """SELECT COUNT(*) as c FROM nodes WHERE type = 'question'
-               AND status IN ('open', 'partially_resolved') AND is_current = 1"""
-        ).fetchone()["c"]
-        open_questions = conn.execute(
-            """SELECT id, claim, status, question_category, question_lacks
-               FROM nodes WHERE type = 'question'
-               AND status IN ('open', 'partially_resolved') AND is_current = 1
-               ORDER BY created_at DESC LIMIT 5"""
-        ).fetchall()
-
-        # Open / partially-resolved predictions: count + top 5 most-recent.
-        open_prediction_count = conn.execute(
-            """SELECT COUNT(*) as c FROM nodes WHERE type = 'prediction'
-               AND status IN ('open', 'partially_resolved') AND is_current = 1"""
-        ).fetchone()["c"]
-        open_predictions = conn.execute(
-            """SELECT id, predicted_event, resolution_timeframe, status
-               FROM nodes WHERE type = 'prediction'
-               AND status IN ('open', 'partially_resolved') AND is_current = 1
-               ORDER BY created_at DESC LIMIT 5"""
-        ).fetchall()
-
-        # Reasoning type breakdown for derivations
-        reasoning_breakdown = {}
-        derivations = conn.execute(
-            "SELECT metadata FROM nodes WHERE type = 'derivation' AND is_current = 1 AND metadata IS NOT NULL"
-        ).fetchall()
-        for d in derivations:
-            try:
-                meta = json.loads(d["metadata"])
-                rtype = meta.get("reasoning_type", "legacy_untyped")
-            except (json.JSONDecodeError, TypeError):
-                rtype = "legacy_untyped"
-            reasoning_breakdown[rtype] = reasoning_breakdown.get(rtype, 0) + 1
-
-        # Weakest current nodes (lowest confidence, non-evidence)
-        weak_nodes = conn.execute(
-            """SELECT id, type, claim, confidence FROM nodes
-               WHERE is_current = 1 AND confidence IS NOT NULL AND type != 'evidence'
-               ORDER BY confidence ASC LIMIT 5"""
-        ).fetchall()
-
-        return json.dumps(
-            {
-                "node_counts_by_type": type_counts,
-                "edge_counts_by_relation": edge_counts,
-                "reasoning_type_breakdown": reasoning_breakdown,
-                "open_questions_count": open_question_count,
-                "open_questions_recent": [
-                    {k: v for k, v in {
-                        "id": q["id"], "question": q["claim"], "status": q["status"],
-                        "category": q["question_category"], "lacks": q["question_lacks"],
-                    }.items() if v is not None}
-                    for q in open_questions
-                ],
-                "open_predictions_count": open_prediction_count,
-                "open_predictions_recent": [
-                    {
-                        "id": p["id"],
-                        "event": p["predicted_event"],
-                        "timeframe": p["resolution_timeframe"],
-                        "status": p["status"],
-                    }
-                    for p in open_predictions
-                ],
-                "weakest_nodes": [
-                    {
-                        "id": w["id"],
-                        "type": w["type"],
-                        "claim": w["claim"],
-                        "confidence": w["confidence"],
-                    }
-                    for w in weak_nodes
-                ],
-                "memory": {
-                    "current_turn": _get_current_turn(),
-                    "tier1_threshold": _get_tier_threshold(conn, 1),
-                    "tier2_threshold": _get_tier_threshold(conn, 2),
-                },
-            }
-        )
+        return json.dumps(result)
     finally:
         conn.close()
+
+
+def _compute_confidence_distribution(
+    conn: sqlite3.Connection,
+    created_at_filter: str,
+    filter_args: list,
+) -> dict:
+    """Compute the confidence distribution section for engram_stats.
+
+    Returns a dict with by_type, by_quote_type, by_reasoning_type,
+    by_source_class sub-keys. Empty buckets are omitted. Quantiles are
+    computed via Python after fetching confidence values (simpler than
+    SQLite window functions, and the dataset is small enough that the
+    extra round-trip is negligible).
+
+    Status filter applied: is_current=1 AND (status IS NULL OR status != 'retracted').
+    The created_at_filter / filter_args are passed through from the caller
+    to respect the mode window.
+    """
+    # Common status + current filter
+    _base_filter = (
+        " AND is_current = 1"
+        " AND (status IS NULL OR status != 'retracted')"
+    )
+
+    # ── by_type: full quantile stats ──────────────────────────────────────
+    _CONFIDENCE_BEARING_TYPES = (
+        "observation_factual",
+        "derivation",
+        "conjecture",
+        "lesson",
+        "axiom",
+        "definition",
+    )
+    by_type: dict = {}
+    for ntype in _CONFIDENCE_BEARING_TYPES:
+        rows = conn.execute(
+            "SELECT confidence FROM nodes WHERE type = ?"
+            + _base_filter
+            + created_at_filter
+            + " AND confidence IS NOT NULL ORDER BY confidence ASC",
+            [ntype] + filter_args,
+        ).fetchall()
+        confidences = [r["confidence"] for r in rows]
+        if not confidences:
+            continue
+        n = len(confidences)
+        mean_val = round(sum(confidences) / n, 3)
+        by_type[ntype] = {
+            "n": n,
+            "mean": mean_val,
+            "p25": round(_percentile(confidences, 25), 2),
+            "p50": round(_percentile(confidences, 50), 2),
+            "p75": round(_percentile(confidences, 75), 2),
+            "p90": round(_percentile(confidences, 90), 2),
+            "p95": round(_percentile(confidences, 95), 2),
+        }
+
+    # ── by_quote_type: mean only, restricted to observation_factual ────────
+    by_quote_type: dict = {}
+    for row in conn.execute(
+        "SELECT quote_type, COUNT(*) as n, AVG(confidence) as mean_conf"
+        " FROM nodes WHERE type = 'observation_factual'"
+        + _base_filter
+        + created_at_filter
+        + " AND confidence IS NOT NULL AND quote_type IS NOT NULL"
+        " GROUP BY quote_type",
+        filter_args,
+    ).fetchall():
+        qt = row["quote_type"]
+        if not qt:
+            continue
+        by_quote_type[qt] = {
+            "n": row["n"],
+            "mean": round(row["mean_conf"], 3),
+        }
+
+    # ── by_reasoning_type: mean only, restricted to derivation ─────────────
+    # reasoning_type lives in metadata JSON; fetch all derivations and
+    # aggregate in Python to avoid fragile json_extract across SQLite versions.
+    by_reasoning_type: dict = {}
+    deriv_rows = conn.execute(
+        "SELECT confidence, metadata FROM nodes WHERE type = 'derivation'"
+        + _base_filter
+        + created_at_filter
+        + " AND confidence IS NOT NULL AND metadata IS NOT NULL",
+        filter_args,
+    ).fetchall()
+    _rt_buckets: dict = {}  # reasoning_type → list of confidence values
+    for row in deriv_rows:
+        try:
+            meta = json.loads(row["metadata"])
+            rtype = meta.get("reasoning_type")
+        except (json.JSONDecodeError, TypeError):
+            rtype = None
+        if not rtype:
+            rtype = "legacy_untyped"
+        _rt_buckets.setdefault(rtype, []).append(row["confidence"])
+    for rtype, vals in _rt_buckets.items():
+        by_reasoning_type[rtype] = {
+            "n": len(vals),
+            "mean": round(sum(vals) / len(vals), 3),
+        }
+
+    # ── by_source_class: mean only, restricted to observation_factual ──────
+    # source_class lives in metadata JSON; aggregate in Python.
+    by_source_class: dict = {}
+    obs_rows = conn.execute(
+        "SELECT confidence, metadata FROM nodes WHERE type = 'observation_factual'"
+        + _base_filter
+        + created_at_filter
+        + " AND confidence IS NOT NULL AND metadata IS NOT NULL",
+        filter_args,
+    ).fetchall()
+    _sc_buckets: dict = {}
+    for row in obs_rows:
+        try:
+            meta = json.loads(row["metadata"])
+            sc = meta.get("source_class", "external")
+        except (json.JSONDecodeError, TypeError):
+            sc = "external"
+        _sc_buckets.setdefault(sc, []).append(row["confidence"])
+    for sc, vals in _sc_buckets.items():
+        by_source_class[sc] = {
+            "n": len(vals),
+            "mean": round(sum(vals) / len(vals), 3),
+        }
+
+    return {
+        "by_type": by_type,
+        "by_quote_type": by_quote_type,
+        "by_reasoning_type": by_reasoning_type,
+        "by_source_class": by_source_class,
+    }
+
+
+def _percentile(sorted_vals: list, p: float) -> float:
+    """Compute the p-th percentile of a pre-sorted list of floats.
+
+    Uses linear interpolation between the two nearest ranks (same as
+    numpy's `percentile` with method='linear'). If the list has one
+    element, returns that element regardless of p.
+
+    Tie handling: when multiple values are identical at a percentile
+    boundary, interpolation still applies to the two boundary values,
+    which happen to be equal — so the result is unambiguous.
+    """
+    n = len(sorted_vals)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return sorted_vals[0]
+    # Map p ∈ [0, 100] to an index in [0, n-1]
+    idx = (p / 100.0) * (n - 1)
+    lo = int(idx)
+    hi = lo + 1
+    if hi >= n:
+        return sorted_vals[-1]
+    frac = idx - lo
+    return sorted_vals[lo] + frac * (sorted_vals[hi] - sorted_vals[lo])
 
 
 @mcp.tool(

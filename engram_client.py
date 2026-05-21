@@ -261,8 +261,18 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_stats": {
-        "description": "Get graph statistics: node/edge counts, open questions, open predictions, weakest nodes, memory tier info.",
-        "parameters": {},
+        "description": "Get graph statistics: node/edge counts, open questions, open predictions, weakest nodes, confidence distribution, memory tier info. Supports mode windowing (all/1-turn/7-turn/30-turn) and sections selector.",
+        "parameters": {
+            "payload_json": {
+                "type": "string",
+                "description": (
+                    'Optional JSON object with: mode (str: "all"|"1-turn"|"7-turn"|"30-turn", default "all") '
+                    'and sections (list of str: structure|edges|confidence|open_questions|open_predictions|'
+                    'reasoning_breakdown|weakest_nodes|health_score|memory, default all). '
+                    'Default empty payload "{}" preserves legacy no-arg behavior.'
+                ),
+            },
+        },
     },
     "engram_nap": {
         "description": "Persist context to ENGRAM without advancing the turn counter. Use BEFORE compaction or at end of work-burst to save knowledge; arms a nap_checkpoint feeling-report nudge. Forgetting stays paused.",
