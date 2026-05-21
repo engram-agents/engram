@@ -16,7 +16,7 @@ Upgrading an existing ENGRAM install is mechanically simple but has one well-kno
 
 **When NOT to use:**
 - Fresh install (no `~/.engram/knowledge.db`) — use `install.sh` instead
-- Skills- or agents-only update (no code changes in the alpha source) — Step 5 alone is sufficient; you don't need the full skill
+- Skills- or agents-only update (no code changes in the alpha source) — Step 6 alone is sufficient; you don't need the full skill
 - The MCP server has been actively crashing and you suspect data corruption — that's an `engram-surgical` call, not a routine upgrade
 
 ---
@@ -67,15 +67,79 @@ tools/deploy.sh --dry-run
 Read the planned changes back to the user. The output uses rsync's compact change-flag notation (`>fcst......` = regular file with checksum/size/time differing). The user should see what files would change before any change is applied.
 
 **Pay attention to** (deploy.sh emits up to TWO separate warnings):
-- `⚠ Install-time template changes since your last deploy` — template files (CLAUDE.md.template, settings.hooks.json.template, etc.) drifted; handled in Step 4 via inverse-merge
-- `⚠ agents/skills changed since last deploy` — agents/ and skills/ trees drifted; deploy.sh prints the EXACT cp commands to copy. Save these — they're the canonical source for Step 5 (don't re-derive them manually)
+- `⚠ Install-time template changes since your last deploy` — template files (CLAUDE.md.template, settings.hooks.json.template, etc.) drifted; handled in Step 5 via inverse-merge
+- `⚠ agents/skills changed since last deploy` — agents/ and skills/ trees drifted; deploy.sh prints the EXACT cp commands to copy. Save these — they're the canonical source for Step 6 (don't re-derive them manually)
 - Any file changes the user doesn't expect — surface them and pause for confirmation
 
-**Checkpoint**: dry-run output surfaced to user + user has either confirmed or asked for adjustments + any printed cp commands captured for Step 5.
+**Checkpoint**: dry-run output surfaced to user + user has either confirmed or asked for adjustments + any printed cp commands captured for Step 6.
 
 ---
 
-## Step 3 — Apply
+## Step 3 — Summarize what's about to land (pre-deploy review)
+
+Before running `tools/deploy.sh`, read the change set so you understand what
+you're applying. This runs BEFORE the deploy so you can flag concerns and abort
+before any mutation.
+
+1. Read the currently-deployed sha:
+
+   ```bash
+   DEPLOYED=$(grep '^alpha_sha=' ~/.engram/.deployed-version | cut -d= -f2)
+   ```
+
+   If `.deployed-version` is missing or the grep returns empty, fall back to
+   comparing the alpha repo's checked-out branch HEAD vs `origin/dev`. Note
+   the caveat to the user — the range may overcount if the local clone is
+   ahead of what's actually deployed.
+
+2. Fetch the latest remote state:
+
+   ```bash
+   git -C /path/to/engram-alpha fetch origin
+   ```
+
+3. Get the PR-merge commit list between deployed and remote tip:
+
+   ```bash
+   git -C /path/to/engram-alpha log --oneline "$DEPLOYED..origin/dev"
+   ```
+
+   Each line shows: `<short-sha> <PR title> (#<PR number>)`. The PR number
+   at the end of each title is your handle for any follow-up `gh pr view`
+   if you need depth on a specific change — do NOT loop over all PRs to
+   fetch bodies (token budget). You may run `gh pr view <N>` on at most ONE PR in this step. If you're considering a second, surface the summary as-is and proceed to Step 4.
+
+   **Edge cases:**
+   - Empty output means `$DEPLOYED == origin/dev` tip — no remote changes
+     exist. If the output is empty, surface to the user: 'No remote changes — deployed SHA matches origin/dev tip; nothing to upgrade.' Then exit the upgrade flow.
+   - If the range exceeds 50 PRs, cap the log with `-n 20` and append a
+     `"+ N older"` note. Group-summarize rather than enumerate.
+
+4. If the count is 20 or fewer, list each PR with its short title. If
+   the count exceeds 20, group by theme (e.g., "12 stats/calibration PRs
+   in the confidence-injection cohort", "3 viz refactors", "5 other").
+
+5. Write a concise summary (1 short paragraph, max 4 bullets) of the
+   change set's shape. What surfaces are touched? Any deploy-fragile
+   areas (`server.py` / hooks / migrations)? Any user-facing changes worth
+   flagging? Keep it tight — this is for the user to read in 30 seconds.
+   Per-upgrade input budget target: < 1500 tokens; output target: < 500 tokens.
+
+6. Surface the summary to the user. If anything looks concerning — a PR
+   touches something actively in-flight, a migration appears in the list,
+   anything you don't recognize — pause and discuss before proceeding to
+   Step 4.
+
+If you want depth on a specific PR after seeing its title, run
+`gh pr view <N>` on that one PR explicitly. Do NOT loop over all PRs to
+fetch bodies.
+
+**Checkpoint**: change-set summary surfaced to user + user has either confirmed
+"proceed" or raised a concern to resolve first.
+
+---
+
+## Step 4 — Apply
 
 ```bash
 tools/deploy.sh --yes
@@ -106,15 +170,15 @@ Expected output shape (abbreviated):
 
 ---
 
-## Step 4 — Handle the install-time template-changes warning (HARD GATE)
+## Step 5 — Handle the install-time template-changes warning (HARD GATE)
 
-If deploy.sh printed `⚠ Install-time template changes since your last deploy` followed by a list of template paths, **this is the load-bearing step of this skill**. Do NOT proceed to Step 5 until this is resolved.
+If deploy.sh printed `⚠ Install-time template changes since your last deploy` followed by a list of template paths, **this is the load-bearing step of this skill**. Do NOT proceed to Step 6 until this is resolved.
 
 Why this is a hard gate: `deploy.sh` does NOT touch `~/.claude/CLAUDE.md` or `~/.claude/settings.json` — they're rendered from templates at install-time. If templates changed since the last deploy, the live config is now out of sync with the alpha-intended config. Skipping the inverse-merge means new disciplines, hook fragments, or settings don't reach the running agent.
 
 **The "I'll come back to it" failure mode is real.** It happened 2026-05-16: deploy.sh nudged about CLAUDE.md template changes for PR #174's context-mode marker discipline; the agent context-impressioned "I'll merge it later"; the merge never landed; the drowsiness ceiling kept misfiring on 1M-context sessions until the gap was diagnosed days later.
 
-### Sub-step 4a — Identify what changed in each template
+### Sub-step 5a — Identify what changed in each template
 
 For each template path the warning lists:
 
@@ -125,7 +189,7 @@ diff /path/to/engram-alpha/settings.json.template ~/.claude/settings.json
 
 Read the diffs. Identify which sections are template-side additions you want to inverse-merge into the live file, vs which are agent-local customizations to keep.
 
-### Sub-step 4b — Inverse-merge
+### Sub-step 5b — Inverse-merge
 
 For each template-side addition that's identity- or discipline-forming (per Cross-Surface Persistence rule):
 - Add the section to the live file (`~/.claude/CLAUDE.md` or `~/.claude/settings.json`)
@@ -133,7 +197,7 @@ For each template-side addition that's identity- or discipline-forming (per Cros
 
 If the change is mechanical (new hook fragment, new permission), just copy it. If it's judgment-laden (new discipline section, conflict with existing local content), surface the diff to the user and decide together.
 
-### Sub-step 4c — Verify
+### Sub-step 5c — Verify
 
 After merging, re-check that the new content is actually in the live file. Grep alone can pass a stale partial merge (the phrase landed but surrounding context is wrong), so pair grep-presence with a re-diff:
 
@@ -148,7 +212,7 @@ The grep confirms the merge happened; the re-diff shows what drift remains. Read
 
 ---
 
-## Step 5 — Cross-surface: skills and agents (manual)
+## Step 6 — Cross-surface: skills and agents (manual)
 
 `tools/deploy.sh`'s manifest is scoped to `$ENGRAM_HOME` (`~/.engram/`). Skills and agents live outside it (`~/.claude/skills/`, `~/.claude/agents/`) and require manual copy:
 
@@ -167,7 +231,7 @@ cp -r /path/to/engram-alpha/agents/claude/* ~/.claude/agents/
 
 ---
 
-## Step 6 — Restart MCP server (user action)
+## Step 7 — Restart MCP server (user action)
 
 `tools/deploy.sh` wrote the new `server.py`, but the running MCP server is still the old version. Tell the user:
 
@@ -179,7 +243,7 @@ cp -r /path/to/engram-alpha/agents/claude/* ~/.claude/agents/
 
 ---
 
-## Step 7 — Verify version marker
+## Step 8 — Verify version marker
 
 ```bash
 cat ~/.engram/.deployed-version
@@ -191,7 +255,7 @@ The marker records the alpha commit SHA + timestamp. If the user reports a behav
 
 ---
 
-## Step 8 — Record the upgrade in ENGRAM
+## Step 9 — Record the upgrade in ENGRAM
 
 File a single observation capturing the upgrade so future-self can trace what code is actually running. Minimal recipe:
 
@@ -207,18 +271,18 @@ engram_add_observation(
 )
 ```
 
-**Checkpoint**: obs filed; SHA from the obs claim matches Step 7's marker.
+**Checkpoint**: obs filed; SHA from the obs claim matches Step 8's marker.
 
 ---
 
 ## Anti-patterns
 
 - **Context-impression that a step is done.** Each step has a checkpoint command for a reason — verify completion explicitly, not from memory of "I think I did that." This is the failure mode the skill exists to close.
-- **Skipping Step 4 because the warning "looked like it'd be fine."** The template-changes warning is the load-bearing step. If you defer it, write it to `~/.engram/ask-lei.md` immediately so it doesn't fall off. Silent defer is the failure pattern.
+- **Skipping Step 5 because the warning "looked like it'd be fine."** The template-changes warning is the load-bearing step. If you defer it, write it to `~/.engram/ask-lei.md` immediately so it doesn't fall off. Silent defer is the failure pattern.
 - **`install.sh --force` to "refresh" an existing install.** This archives the entire knowledge graph. Always upgrade with `tools/deploy.sh` for existing installs.
 - **Killing the MCP subprocess to "restart" it.** The stdio-MCP contract is user-restart only.
 - **Bundling unrelated source-tree changes into the deploy.** Step 1's `git status` check exists to catch this. If you've been editing alpha source while preparing the upgrade, commit the deploy-relevant changes and stash the rest first.
-- **Skipping the ENGRAM record (Step 8).** Without the record, "what version is my running ENGRAM at?" requires forensics. The .deployed-version file answers it for the filesystem, but the ENGRAM obs answers it for future-self in graph-context.
+- **Skipping the ENGRAM record (Step 9).** Without the record, "what version is my running ENGRAM at?" requires forensics. The .deployed-version file answers it for the filesystem, but the ENGRAM obs answers it for future-self in graph-context.
 
 ---
 
@@ -226,4 +290,4 @@ engram_add_observation(
 
 - **engram-self-improve** — Self-improvement may produce a code change that needs deploying; after committing the fix, this skill ships it.
 - **engram-surgical** — For data-corruption recovery, NOT routine upgrades. If `engram-surgical` is the right call, deploy.sh is not.
-- **engram-nap / engram-bedtime / engram-sleep** — An upgrade is a meaningful state-change worth a nap checkpoint if context permits (Step 8's obs IS the minimum record; a nap captures the wider session context).
+- **engram-nap / engram-bedtime / engram-sleep** — An upgrade is a meaningful state-change worth a nap checkpoint if context permits (Step 9's obs IS the minimum record; a nap captures the wider session context).
