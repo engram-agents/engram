@@ -234,3 +234,83 @@ def test_manifest_orphan_allowlist_entries_exist():
         f"MANIFEST_ORPHAN_ALLOWLIST references files that don't exist: "
         f"{sorted(missing)}. Remove the allowlist entry."
     )
+
+
+# ---------------------------------------------------------------------------
+# install.sh ↔ deploy.sh MANIFEST symmetry helpers + test
+# ---------------------------------------------------------------------------
+
+
+def _install_sh_py_files() -> set[str]:
+    """Return the set of .py filenames install.sh ships to $ENGRAM_HOME.
+
+    Reads install.sh, finds the denylist `case "$runtime_file" in <names>) continue ;;`
+    statement, computes (glob *.py in alpha root) - (denylist).
+    """
+    install_sh_path = os.path.join(REPO_ROOT, "install.sh")
+    with open(install_sh_path) as f:
+        content = f.read()
+
+    # Find the denylist case statement. The pattern is:
+    #   case "$runtime_file" in
+    #     name1.py|name2.py|name3.py) continue ;;
+    #   esac
+    # (Note: there's also a `case "$runtime_file" in *.py) chmod +x ...` later
+    # in the same loop — only the `continue` case is the denylist; the chmod
+    # case is unrelated to the shipping decision.)
+    pattern = re.compile(
+        r'case\s+"\$runtime_file"\s+in\s+'   # case "$runtime_file" in
+        r'([^)]+)\)\s+continue\s*;;',          # name1.py|name2.py) continue ;;
+        re.MULTILINE | re.DOTALL,
+    )
+    match = pattern.search(content)
+    if not match:
+        # Fallback: if the parser breaks, fail loudly rather than return wrong set.
+        raise AssertionError(
+            "install.sh parser could not find the denylist case statement. "
+            "This usually means install.sh's loop body was edited in a way the "
+            "test parser doesn't recognize. Update _install_sh_py_files() in "
+            f"{__file__} to match install.sh's new shape."
+        )
+
+    denylist = {name.strip() for name in match.group(1).split("|")}
+
+    # Effective shipping set: globbed *.py at alpha root minus denylist.
+    # _project_root_py_files returns stem names (without .py); rejoin for set match.
+    py_filenames = {name + ".py" for name in _project_root_py_files()}
+    return py_filenames - denylist
+
+
+def _deploy_manifest_py_files() -> set[str]:
+    """Return the set of .py filenames in deploy.sh's MANIFEST array.
+
+    Reuses the existing _parse_manifest_from_deploy_sh() parser and filters
+    to top-level .py entries only (no subpath entries like hooks/$TARGET:hooks).
+    """
+    manifest = _parse_manifest_from_deploy_sh()
+    return {
+        entry
+        for entry in manifest
+        if entry.endswith(".py") and "/" not in entry
+    }
+
+
+def test_install_sh_ships_same_py_set_as_deploy_manifest():
+    """install.sh and deploy.sh must ship the same set of .py runtime files.
+
+    install.sh uses glob + denylist; deploy.sh uses an enumerated MANIFEST.
+    Both must converge on the same set: a future top-level .py added to alpha
+    must either ship from BOTH paths (runtime module) or NEITHER (install-time
+    scaffolding, documented in MANIFEST_ORPHAN_ALLOWLIST).
+    """
+    install_sh_py = _install_sh_py_files()
+    deploy_manifest_py = _deploy_manifest_py_files()
+    assert install_sh_py == deploy_manifest_py, (
+        f"install.sh ships {install_sh_py - deploy_manifest_py} that deploy.sh does NOT, "
+        f"and deploy.sh ships {deploy_manifest_py - install_sh_py} that install.sh does NOT. "
+        f"Either:\n"
+        f"  - install.sh's denylist needs updating (likely if a new runtime module was added), or\n"
+        f"  - deploy.sh's MANIFEST needs updating, or\n"
+        f"  - MANIFEST_ORPHAN_ALLOWLIST needs a new entry (install-time scaffolding), "
+        f"in which case BOTH install.sh's denylist AND this test pass once allowlist updated."
+    )
