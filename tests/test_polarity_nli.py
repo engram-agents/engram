@@ -3,8 +3,7 @@
 Covers the *integration shape* — config gating, similarity floor, and
 POLARITY_ALERT prefix formatting — using a stubbed NLI scorer. The actual
 ModernCE-large-nli model integration is empirically validated upstream by
-the bake-off at kg/paper_research/nli_polarity_bakeoff_2026-05-10/
-(AUC 0.847, F1 0.889 at t=0.46).
+the 2026-05-10 NLI polarity bake-off (AUC 0.847, F1 0.889 at t=0.46).
 
 Default test runs use the stub — no 1.5GB model download. There is no
 real-model integration test in this file (would require a 1.5GB download

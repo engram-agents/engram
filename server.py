@@ -1861,7 +1861,6 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str):
 
 # ---------------------------------------------------------------------------
 # Empirical similarity thresholds — calibrated 2026-05-09 against live graph.
-# See kg/paper_research/threshold_calibration_2026-05-09/v4_tight_groups.py
 # (tight-semantic-group ROC AUC 0.984, peak F1 0.843 at t=0.41, peak F2
 # recall-weighted 0.868 at t=0.33). These DEFAULT constants encode the chosen
 # operating points; per-agent overrides live in ~/.engram/config.json under
@@ -1883,7 +1882,6 @@ ACTION_HINT_CORROBORATE_THRESHOLD = 0.65  # was 0.80; old tier fired on only 9.5
 ACTION_HINT_RELATED_THRESHOLD = 0.50      # was 0.60; recall-precision shift consistent with v4 F1 peak
 
 # NLI polarity-dedup defaults — calibrated 2026-05-10 (issue #56 bake-off).
-# See kg/paper_research/nli_polarity_bakeoff_2026-05-10/DECISION.md.
 # ModernCE-large-nli won the empirical bake-off (AUC 0.847, peak F1 0.889 at
 # t=0.46, recall 84%, precision 94%). All four sub-200M models fell to AUC
 # 0.66-0.75 — not viable. Threshold default is the peak-F1 operating point.
@@ -2006,7 +2004,7 @@ class _NLIClassifier:
             self._model = CrossEncoder(model_name, device=device)
             # ModernCE-large + EttinX use this label order; assume same for
             # other cross-encoder/nli-* models (verified empirically in
-            # kg/paper_research/nli_polarity_bakeoff_2026-05-10/).
+            # the 2026-05-10 NLI polarity bake-off).
             self._label_idx_contradiction = 0
             self._loaded = True
             self._load_failed = False
@@ -14705,15 +14703,14 @@ def _conn_total_count(where_clause: str, params: list) -> int:
 # contradiction_obsolescence_ready, stale_load_bearing, cornerstone_candidate,
 # tainted_still_valid, recent_resolution_echo. Three presets (high_precision /
 # balanced / high_recall) bundle the precision/recall tradeoff; balanced
-# defaults are v4-calibrated 2026-05-09 (kg/paper_research/threshold_calibration_2026-05-09).
+# defaults are v4-calibrated 2026-05-09.
 # Each call appends to ~/.engram/pattern_query_telemetry.jsonl for empirical
 # preset calibration per ls_0023's discipline. Dream-fairy agent definition
 # updated 2026-05-11 to use these as the primary surface for the six
 # well-supported scan categories (one-to-one pattern↔category mapping).
 
 PATTERN_QUERY_PRESETS: dict[str, dict[str, float | int]] = {
-    # "balanced" cosine_threshold v4-calibrated 2026-05-09 (see calibration
-    # study at kg/paper_research/threshold_calibration_2026-05-09/v4_tight_groups.py).
+    # "balanced" cosine_threshold v4-calibrated 2026-05-09.
     # high_precision / high_recall: ±0.10 symmetric deltas off balanced cosine,
     # set 2026-05-11 by principled-delta rationale rather than full pattern-
     # specific calibration study (see active-work/query-pattern-preset-rationale-

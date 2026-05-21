@@ -3,8 +3,7 @@
 These constants are the single source of truth for dedup tightness and
 action-hint tier thresholds. Drift in either direction would change recall
 or precision on every dedup call across the server. The calibration study
-is at kg/paper_research/threshold_calibration_2026-05-09/v4_tight_groups.py
-(tight-semantic-group ROC AUC 0.984, peak F1 0.843 at t=0.41).
+used tight-semantic-group ROC AUC analysis (0.984 AUC, peak F1 0.843 at t=0.41).
 
 If a future change wants to move these values, that change should:
   1. Re-run the calibration study (or a new equivalent) and update the

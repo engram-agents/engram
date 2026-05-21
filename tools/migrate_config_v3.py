@@ -2,11 +2,9 @@
 """migrate_config_v3 — one-shot migration of ~/.engram/config.json to schema v3.
 
 Schema v3 adds two top-level fields:
-  - thresholds: {...}  Empirical similarity thresholds (calibrated 2026-05-09;
-                       see kg/paper_research/threshold_calibration_2026-05-09).
+  - thresholds: {...}  Empirical similarity thresholds (calibrated 2026-05-09).
   - polarity:   {...}  NLI cross-encoder polarity-dedup config (added 2026-05-10
-                       after empirical bake-off; see kg/paper_research/
-                       nli_polarity_bakeoff_2026-05-10).
+                       after empirical bake-off).
 
 Like v2, this is a SCHEMA EXTENSION migration — existing keys passed through
 unchanged. Code that reads memory/embedding/cadence keeps working.
