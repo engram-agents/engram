@@ -7,7 +7,7 @@ Covers:
   3. engram_query summary_top_k >= result count returns all Tier 1 (summaries only)
   4. engram_query return_debug=True returns full legacy shape (composite_score key present)
   5. engram_query fallback: node without recall_summary uses truncated claim as summary
-  6. engram_query fallback: node without recall_keywords emits bare-id entry in Tier 2
+  6. engram_query fallback: node without recall_keywords emits {id, confidence} entry in Tier 2
   7. engram_query_pattern default returns tiered shape across two patterns
   8. engram_query_pattern preserves telemetry log writes
   9. summary_top_k=0 for engram_query_pattern returns all keywords
@@ -114,11 +114,12 @@ def test_query_default_tiered_shape():
         assert "id" in entry, f"Tier-2 entry missing 'id': {entry}"
         assert "summary" not in entry, f"Tier-2 entry should not have 'summary': {entry}"
 
-    # No score/position/type/confidence fields on any entry
+    # No score/position/type fields on any entry (confidence IS now included per PR-5)
     for entry in results:
         assert "score" not in entry, f"Score leaked into tiered result: {entry}"
         assert "composite_score" not in entry, f"composite_score leaked: {entry}"
         assert "position" not in entry, f"position leaked: {entry}"
+        assert "type" not in entry, f"type leaked into tiered result: {entry}"
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +254,7 @@ def test_query_fallback_long_claim_truncated_at_160():
 # ---------------------------------------------------------------------------
 
 def test_query_fallback_no_recall_keywords_bare_id():
-    """Tier-2 entries without recall_keywords emit bare-id (no 'keywords' key)."""
+    """Tier-2 entries without recall_keywords emit {id, confidence} — no 'keywords' key."""
     server = fresh_server()
     # Add multiple observations — first 3 will be tier-1 (summary), rest tier-2
     for i in range(5):
@@ -265,14 +266,16 @@ def test_query_fallback_no_recall_keywords_bare_id():
         query="keyword fallback test retrieval", top_k=5, summary_top_k=3
     ))
     results = r["results"]
-    # Tier-2 entries (if any) should be bare-id only
+    # Tier-2 entries (if any) should have id + confidence but no keywords
     for entry in results[3:]:
         assert "keywords" not in entry, (
-            f"Tier-2 entry without recall_keywords should be bare-id, got: {entry}"
+            f"Tier-2 entry without recall_keywords should not have 'keywords': {entry}"
         )
-        assert list(entry.keys()) == ["id"], (
-            f"Bare-id entry should have only 'id' key, got: {list(entry.keys())}"
+        assert "id" in entry, f"Tier-2 bare entry must have 'id' key: {entry}"
+        assert "confidence" in entry, (
+            f"Tier-2 bare entry must have 'confidence' key (PR-5 restoration): {entry}"
         )
+        assert "summary" not in entry, f"Tier-2 must not have 'summary': {entry}"
 
 
 # ---------------------------------------------------------------------------

@@ -5634,15 +5634,16 @@ def _build_tiered_results(
     tiered: list[dict] = []
     for i, node in enumerate(results):
         node_id = node.get("id", "")
+        confidence = node.get("confidence")
         if i < summary_top_k:
             # Tier 1: prefer recall_summary, fall back to truncated claim.
             summary = node.get("recall_summary") or None
             if not summary:
                 claim = node.get("claim") or ""
                 summary = (claim[:160] + "...") if len(claim) > 160 else claim
-            tiered.append({"id": node_id, "summary": summary})
+            tiered.append({"id": node_id, "confidence": confidence, "summary": summary})
         else:
-            # Tier 2: prefer recall_keywords; bare-ID if missing/empty.
+            # Tier 2: prefer recall_keywords; bare-ID (+ confidence) if missing/empty.
             kw = node.get("recall_keywords")
             # recall_keywords may arrive as a list (already parsed by _node_to_dict)
             # or as a JSON string if the node came from a pattern impl that does
@@ -5653,9 +5654,9 @@ def _build_tiered_results(
                 except (ValueError, json.JSONDecodeError):
                     kw = None
             if kw:
-                tiered.append({"id": node_id, "keywords": kw})
+                tiered.append({"id": node_id, "confidence": confidence, "keywords": kw})
             else:
-                tiered.append({"id": node_id})
+                tiered.append({"id": node_id, "confidence": confidence})
     return tiered
 
 
@@ -14062,13 +14063,13 @@ def engram_reflect(summary_top_k: int = 5) -> str:
                 thin_support.append({
                     "id": d["id"],
                     "claim": _reflect_rs_or_claim(d, "claim"),
+                    "confidence": d["confidence"],
                     "support_count": support_count,
                 })
             else:
                 # Tier 2: keyword-style (no "claim" key)
-                entry = {"id": d["id"], "support_count": support_count}
-                if d["confidence"] is not None:
-                    entry["confidence"] = d["confidence"]
+                entry = {"id": d["id"], "support_count": support_count,
+                         "confidence": d["confidence"]}  # may be None — consistent with tier-1
                 kws = _reflect_keywords(d)
                 if kws is not None:
                     entry["keywords"] = kws
