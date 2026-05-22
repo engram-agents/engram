@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -478,3 +479,107 @@ def test_bare_heading_body_uses_clean_title(engram_home, inter_agent_dir):
     assert "actual content here" in ctx, (
         "Actual body content should be used as the title"
     )
+
+
+# ---------------------------------------------------------------------------
+# Helpers for unit-testing _get_agent_name directly
+# ---------------------------------------------------------------------------
+
+def _load_hook_module():
+    """Load the hook as a module so we can call _get_agent_name directly."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "engram_inter_agent_hook",
+        Path(__file__).parent.parent / "hooks" / "claude" / "engram-inter-agent-prompt-hook.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# ---------------------------------------------------------------------------
+# Test 11: _get_agent_name fallback chain
+# ---------------------------------------------------------------------------
+
+class TestGetAgentName:
+    """Unit tests for _get_agent_name's priority chain."""
+
+    @pytest.fixture(autouse=True)
+    def _hook(self):
+        self.hook = _load_hook_module()
+
+    def test_get_agent_name_config_wins_over_env(self, monkeypatch):
+        """config.json agent_name wins even when $USER is set to something else."""
+        monkeypatch.setenv("USER", "agent-mallory")
+        result = self.hook._get_agent_name({"agent_name": "borges"})
+        assert result == "borges"
+
+    def test_get_agent_name_user_env_fallback(self, monkeypatch):
+        """No config field; $USER=agent-borges → returns 'borges'."""
+        monkeypatch.setenv("USER", "agent-borges")
+        monkeypatch.delenv("LOGNAME", raising=False)
+        result = self.hook._get_agent_name({})
+        assert result == "borges"
+
+    def test_get_agent_name_logname_when_user_empty(self, monkeypatch):
+        """$USER is empty; $LOGNAME=agent-borges → returns 'borges'.
+
+        This is the bug being fixed: Claude Code hook context populates
+        $LOGNAME but not $USER.
+        """
+        monkeypatch.setenv("USER", "")
+        monkeypatch.setenv("LOGNAME", "agent-borges")
+        result = self.hook._get_agent_name({})
+        assert result == "borges"
+
+    def test_get_agent_name_uid_fallback_when_both_env_empty(self, monkeypatch):
+        """$USER and $LOGNAME both empty; pwd lookup returns 'agent-borges' → 'borges'."""
+        monkeypatch.setenv("USER", "")
+        monkeypatch.setenv("LOGNAME", "")
+        mock_pw = unittest.mock.MagicMock()
+        mock_pw.pw_name = "agent-borges"
+        with unittest.mock.patch.object(self.hook.pwd, "getpwuid", return_value=mock_pw):
+            result = self.hook._get_agent_name({})
+        assert result == "borges"
+
+    def test_get_agent_name_returns_empty_when_all_paths_fail(self, monkeypatch):
+        """All fallback paths exhausted → returns empty string."""
+        monkeypatch.setenv("USER", "")
+        monkeypatch.setenv("LOGNAME", "")
+        with unittest.mock.patch.object(self.hook.pwd, "getpwuid", side_effect=KeyError("uid not found")):
+            result = self.hook._get_agent_name({})
+        assert result == ""
+
+    @pytest.mark.parametrize("envvar,value", [
+        ("USER", "agent-borges"),
+        ("LOGNAME", "agent-borges"),
+    ])
+    def test_get_agent_name_strips_agent_prefix_consistently(self, monkeypatch, envvar, value):
+        """All env-var paths strip the 'agent-' prefix the same way."""
+        # Blank out both env vars first, then set the one under test
+        monkeypatch.setenv("USER", "")
+        monkeypatch.setenv("LOGNAME", "")
+        monkeypatch.setenv(envvar, value)
+        result = self.hook._get_agent_name({})
+        assert result == "borges", (
+            f"Expected 'borges' from {envvar}={value!r}, got {result!r}"
+        )
+
+    def test_get_agent_name_strips_agent_prefix_in_uid_path(self, monkeypatch):
+        """pwd uid fallback also strips the 'agent-' prefix."""
+        monkeypatch.setenv("USER", "")
+        monkeypatch.setenv("LOGNAME", "")
+        mock_pw = unittest.mock.MagicMock()
+        mock_pw.pw_name = "agent-borges"
+        with unittest.mock.patch.object(self.hook.pwd, "getpwuid", return_value=mock_pw):
+            result = self.hook._get_agent_name({})
+        assert result == "borges"
+
+    def test_get_agent_name_returns_raw_username_when_no_agent_prefix(self, monkeypatch):
+        """$USER='localdev' (no agent- prefix): returns raw username 'localdev', not ''."""
+        monkeypatch.setenv("USER", "localdev")
+        monkeypatch.delenv("LOGNAME", raising=False)
+        result = self.hook._get_agent_name({})
+        assert result == "localdev", (
+            "Non-agent- username must be returned as-is (behavioral change from old impl)"
+        )

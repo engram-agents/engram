@@ -37,6 +37,7 @@ Design doc: borges-desk/projects/inter-agent-comms-v1/DESIGN.md
 
 import json
 import os
+import pwd
 import re
 import sys
 from datetime import datetime, timezone
@@ -72,19 +73,41 @@ def _get_agent_name(config: dict | None = None) -> str:
     """Resolve this agent's own name.
 
     Priority:
-      1. config.json["agent_name"] field.
-      2. Split Linux username agent-<name> → <name>.
-      3. Empty string (hook will see no matching letters — safe).
+      1. config.json["agent_name"] field (explicit; wins if set).
+      2. $USER env var, agent- prefix stripped.
+      3. $LOGNAME env var, agent- prefix stripped (Claude Code hook context
+         populates $LOGNAME but not $USER).
+      4. pwd.getpwuid(os.getuid()).pw_name, agent- prefix stripped.
+      5. Empty string (hook will see no matching letters — safe).
+
+    Username layers (USER, LOGNAME, pwd) return the raw username if it doesn't
+    start with `agent-` — caller (multi-agent mode) must validate via
+    counterparts list. Old `_get_agent_name` returned "" for non-agent
+    usernames; this is a deliberate behavioral change.
     """
     if config is None:
         config = _load_config()
     name = config.get("agent_name", "").strip()
     if name:
         return name
-    # Fall back to username splitting
-    username = os.environ.get("USER", "")
-    if username.startswith("agent-"):
-        return username[len("agent-"):]
+
+    def _strip_agent_prefix(username: str) -> str:
+        if username.startswith("agent-"):
+            return username[len("agent-"):]
+        return username
+
+    for envvar in ("USER", "LOGNAME"):
+        username = os.environ.get(envvar, "").strip()
+        if username:
+            return _strip_agent_prefix(username)
+
+    try:
+        username = pwd.getpwuid(os.getuid()).pw_name
+        if username:
+            return _strip_agent_prefix(username)
+    except KeyError:
+        pass
+
     return ""
 
 
