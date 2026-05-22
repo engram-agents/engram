@@ -548,7 +548,17 @@ fi
 # version with the literal-template version from alpha. Without this step, the
 # daemon launcher silently fails (literal `{{PYTHON}}` is not a valid command).
 # Source of truth: install.sh's sed lines.
-PYTHON_BIN="$(python3 -c 'import sys; print(sys.executable)' 2>/dev/null || echo "")"
+# Prefer the per-user venv python (created by agent-bootstrap during
+# spawn flow, or by the user during install). Without this preference,
+# deploy.sh run from a non-venv-activated shell resolves python3 to
+# whichever is on PATH (often /usr/bin/python3), which lacks the alpha
+# deps and produces a broken daemon launcher.
+HOME_VENV_PYTHON="$HOME/.engram-venv/bin/python3"
+if [[ -x "$HOME_VENV_PYTHON" ]]; then
+    PYTHON_BIN="$HOME_VENV_PYTHON"
+else
+    PYTHON_BIN="$(python3 -c 'import sys; print(sys.executable)' 2>/dev/null || echo "")"
+fi
 if [[ -n "$PYTHON_BIN" && -f "$ENGRAM_HOME/hooks/start-engram-daemon.sh" ]]; then
     # `-i.bak` is the BSD/GNU-portable form (works on both macOS and Linux);
     # plain `-i` without an extension argument breaks on macOS BSD sed.
