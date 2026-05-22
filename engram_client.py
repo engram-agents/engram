@@ -324,6 +324,24 @@ TOOL_SCHEMAS = {
             "message": {"type": "string", "description": "Summary of what was learned/changed across the cohort being closed by this turn advance.", "required": True},
         },
     },
+    "engram_scan_emergence": {
+        "description": "[Sleep cycle — invoked by dream-mode dispatch; do not call awake.] Scan the graph for emergent patterns that could become cornerstones. Surfaces candidate cornerstones, contradictions, and dormant-but-load-bearing nodes. All fields optional — empty payload runs the default scan. Single-payload signature — pass all fields as one JSON object string in payload_json.",
+        "parameters": {
+            "payload_json": {
+                "type": "string",
+                "description": (
+                    "Optional JSON object (as a string) with scan fields. "
+                    "All fields optional: "
+                    "min_cluster_size (int, default 3 — minimum cluster size to surface), "
+                    "similarity_threshold (float, default 0.55 — cosine similarity threshold for clustering; higher = stricter), "
+                    "focus (str, default 'self' — scope of the scan: 'self', 'all', or 'person:<pn_id>'), "
+                    "node_type_filter (str — comma-separated node types to include; "
+                    "default 'observation_factual,feeling_report,lesson,derivation,observation_predictive'). "
+                    "Empty payload '{}' or omitted payload runs the default scan."
+                ),
+            },
+        },
+    },
 }
 
 # Tools that only read from the graph (no mutations).
