@@ -444,13 +444,11 @@ def test_format_nudge_summary_only_no_kw_prefix():
     assert " · " not in output, f"Unexpected middot (keyword prefix) in output:\n{output}"
 
 
-def test_format_nudge_keywords_wrong_length_no_kw_prefix():
-    """Contract: keyword prefix renders ONLY when recall_keywords is a list of
-    exactly 3 strings (render_one_node_line path; Others-section path now uses >=1 per PR #235).
-    Anything else (2 or 4 items, non-list, empty) → no prefix, falls back to
-    summary-or-truncation. PR B's generation prompt is expected to always
-    produce 3 keywords; this test pins the defensive contract so a future drift
-    can't silently break the rendering invariant.
+def test_format_nudge_keywords_two_elements_renders_kw_prefix():
+    """Contract: keyword prefix renders for any non-empty recall_keywords list
+    (render_one_node_line path uses >=1 per PR #268, mirroring PR #235's fix
+    at the Others-section path).
+    A 2-element list renders `kw1` · `kw2` — <summary> on the output line.
     """
     hook = _load_hook_module()
 
@@ -459,23 +457,21 @@ def test_format_nudge_keywords_wrong_length_no_kw_prefix():
         claim="A short claim that wouldn't truncate.",
         confidence=0.70,
         recall_summary="Short summary for the fallback path.",
-        recall_keywords=["only", "two"],  # not 3 — should be ignored by the length-3 guard
+        recall_keywords=["only", "two"],  # 2 elements — now renders with >=1 guard
     )
     result = _make_result(top_claims=[claim_entry])
     output = hook.format_nudge(result)
 
-    # Summary used (recall_summary present, falls through correctly)
+    # Keyword prefix renders: `only` · `two` —
+    assert "`only`" in output, (
+        f"Expected backtick-quoted first keyword in output:\n{output}"
+    )
+    assert " · " in output, (
+        f"Expected middot separator in 2-element keyword prefix:\n{output}"
+    )
+    # Summary still used as body after keyword prefix
     assert "Short summary for the fallback path." in output, (
         f"Expected summary in output:\n{output}"
-    )
-    # No keyword prefix — the 2-element list was rejected by the length-3 guard
-    assert " · " not in output, (
-        f"Unexpected keyword-prefix middot in output (length-3 guard should "
-        f"have rejected the 2-element list):\n{output}"
-    )
-    # No raw keyword leak
-    assert "`only`" not in output, (
-        f"Unexpected raw keyword leak in output:\n{output}"
     )
 
 
@@ -571,35 +567,57 @@ def test_format_nudge_types_line_not_rendered():
     )
 
 
-# ---- Test 11: recall_keywords with fewer than 3 entries falls back to bare ID ----
+# ---- Test 11: recall_keywords rendering under >=1 contract (PR #268) ----
 
 
-def test_format_nudge_recall_keywords_fewer_than_three_no_prefix():
-    """When recall_keywords has != 3 entries (e.g. 0, 1, 2, or 4+), the
-    keyword prefix is dropped — the renderer requires exactly 3
-    (render_one_node_line path; Others-section path now uses >=1 per PR #235).
-    Documents the contract: PR B's writer must always emit exactly 3 keywords
-    or none."""
+def test_format_nudge_recall_keywords_empty_no_kw_prefix():
+    """Empty recall_keywords list → no keyword prefix (>=1 guard, PR #268).
+    Summary still renders as the body."""
     hook = _load_hook_module()
 
-    for bad_kw in ([], ["only-one"], ["one", "two"], ["one", "two", "three", "four"]):
+    claim_entry = _claim_entry(
+        node_id="ob_test",
+        claim="A claim long enough that the fallback would normally truncate it past the 120 character soft cap so we can see what renders here",
+        confidence=0.80,
+        recall_summary="A curated summary that should still appear since it is not None.",
+        recall_keywords=[],
+    )
+    result = _make_result(top_claims=[claim_entry])
+    output = hook.format_nudge(result)
+    # Empty list → no keyword prefix → no middot
+    assert " · " not in output, (
+        f"Expected no middot for empty keyword list, but output had it:\n{output}"
+    )
+    # Summary still renders
+    assert "A curated summary that should still appear" in output, (
+        f"Expected summary to still render with empty keyword list:\n{output}"
+    )
+
+
+def test_format_nudge_recall_keywords_nonempty_renders_kw_prefix():
+    """Non-empty recall_keywords (1, 2, or 4+ entries) → keyword prefix renders
+    (>=1 guard per PR #268, mirroring PR #235 at the Others-section path).
+    Summary is used as body after the keyword prefix."""
+    hook = _load_hook_module()
+
+    for kw in (["only-one"], ["one", "two"], ["one", "two", "three", "four"]):
         claim_entry = _claim_entry(
             node_id="ob_test",
             claim="A claim long enough that the fallback would normally truncate it past the 120 character soft cap so we can see what renders here",
             confidence=0.80,
             recall_summary="A curated summary that should still appear since it is not None.",
-            recall_keywords=bad_kw,
+            recall_keywords=kw,
         )
         result = _make_result(top_claims=[claim_entry])
         output = hook.format_nudge(result)
-        # No keyword prefix → no middot in the rendered line
-        # (em-dash also implies prefix in our format, so check middot)
-        assert " · " not in output, (
-            f"Expected no middot for keywords={bad_kw!r}, but output had it:\n{output}"
+        # Keywords render as backtick-quoted prefix
+        first_kw = kw[0]
+        assert f"`{first_kw}`" in output, (
+            f"Expected backtick-quoted first keyword for keywords={kw!r}:\n{output}"
         )
-        # Summary still renders
+        # Summary still renders as body after keyword prefix
         assert "A curated summary that should still appear" in output, (
-            f"Expected summary to still render with keywords={bad_kw!r}:\n{output}"
+            f"Expected summary to still render with keywords={kw!r}:\n{output}"
         )
 
 

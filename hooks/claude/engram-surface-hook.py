@@ -298,7 +298,7 @@ def render_one_node_line(entry: dict, *, conf_prefix: bool, type_tag: bool) -> s
     prefix = (" ".join(prefix_parts) + " ") if prefix_parts else ""
 
     # Build keyword prefix: `kw1` · `kw2` · `kw3` —
-    if isinstance(recall_keywords, list) and len(recall_keywords) == 3:
+    if isinstance(recall_keywords, list) and len(recall_keywords) >= 1:
         kw_prefix = " · ".join(f"`{kw}`" for kw in recall_keywords) + " — "
     else:
         kw_prefix = ""
