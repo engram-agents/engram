@@ -12415,6 +12415,23 @@ def _retract_impl(
                     "claim": target_node["claim"] if target_node else "",
                 })
 
+        # Audit trail: log each edge removal before the DELETE so the
+        # deletions are visible via engram_history mode=edits.
+        # Note: this runs AFTER the reopening loop above — that loop reads the
+        # edges to decide which targets to reopen; this deletion uses the same
+        # set of edges as its scope but issues them after the reads complete.
+        for re in resolution_edges:
+            # target_type omitted from data dict — JOIN against nodes at audit-read time
+            # if needed; avoids per-edge SELECT during retract cascade.
+            _log_edit(conn, "edge_removed", node_id, node["type"],
+                      {"relation": "resolves", "target_id": re["target_id"]})
+
+        # Delete the resolves edges sourced from the retracted node.
+        conn.execute(
+            "DELETE FROM edges WHERE source_id = ? AND relation = 'resolves'",
+            (node_id,),
+        )
+
         # 2. Find all downstream nodes (anything that derives_from or is supported by this node)
         tainted = []
         visited = set()
