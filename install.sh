@@ -335,6 +335,33 @@ for runtime_path in "$ALPHA_DIR"/*.py "$ALPHA_DIR/SKILL.md"; do
   fi
 done
 
+# Write the install-time version marker so future deploy.sh runs have a
+# baseline for 3-way comparisons + install-time template-changes warnings.
+# Match deploy.sh's format exactly (tools/deploy.sh:562-572) so they're
+# interoperable.
+if git -C "$ALPHA_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  ALPHA_SHA="$(git -C "$ALPHA_DIR" rev-parse --short HEAD)"
+  ALPHA_BRANCH="$(git -C "$ALPHA_DIR" rev-parse --abbrev-ref HEAD)"
+  if [ -n "$(git -C "$ALPHA_DIR" status --porcelain)" ]; then
+    ALPHA_DIRTY="dirty"
+  else
+    ALPHA_DIRTY="clean"
+  fi
+else
+  ALPHA_SHA="unknown"
+  ALPHA_BRANCH="unknown"
+  ALPHA_DIRTY="not-a-git-repo"
+fi
+INSTALL_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+cat > "$ENGRAM_HOME/.deployed-version" <<EOF
+alpha_sha=$ALPHA_SHA
+alpha_branch=$ALPHA_BRANCH
+alpha_dirty=$ALPHA_DIRTY
+deployed_at=$INSTALL_TS
+deployed_from=$ALPHA_DIR
+EOF
+echo "  .deployed-version → $ENGRAM_HOME/.deployed-version (baseline for future deploy.sh runs)"
+
 # Crontab template: staged into $ENGRAM_HOME so tools/sync-cron.sh can
 # read it post-install without reaching back into the alpha source tree.
 if [ -f "$ALPHA_DIR/templates/crontab.template" ]; then
