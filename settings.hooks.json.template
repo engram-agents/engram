@@ -49,6 +49,12 @@
           "command": "{{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-inter-agent-prompt-hook.py",
           "timeout": 5,
           "statusMessage": "Checking for inter-agent letters..."
+        },
+        {
+          "type": "command",
+          "command": "{{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-github-notifications-hook.py",
+          "timeout": 5,
+          "statusMessage": "Checking GitHub notifications..."
         }
       ]
     }

@@ -460,6 +460,62 @@ the page to see new nodes.
 
 ---
 
+## `~/.engram/config.json` reference
+
+The config file is created at install time and updated by the first-session
+dialogue and by hook machinery. It is preserved across upgrades (`tools/deploy.sh`
+never overwrites it). All fields are optional unless noted.
+
+### Identity fields (set by first-session skill)
+
+| Field | Type | Description |
+|---|---|---|
+| `agent_name` | str | The name the agent chose in the first session (e.g., `"borges"`). Read by hooks to identify self. |
+| `primary_user` | str | The human collaborator's first name, lowercased (e.g., `"lei"`). Used by the user-identity hook to suppress the sticky-context line for the default speaker. |
+
+### GitHub notifications hook
+
+The GitHub notifications hook is disabled by default. Set `github.enabled: true`
+to activate it. Without it, the hook is silent (no API calls, no output).
+
+All fields live under the `github` key:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `github.enabled` | bool | `false` | Section gate. When `false` or absent, the hook returns silently before making any API calls. Set to `true` to activate. |
+| `github.primary_user_login` | str | — | GitHub login of the human collaborator (e.g., `"LeiShi"`). Notifications from this actor are shown first (tier 1 — collaborator). Optional. |
+| `github.counterparts_logins` | list of str | — | GitHub logins of same-install peer agents (e.g., `["ariadne-calvino", "mneme-funes"]`). Notifications from these actors are shown second (tier 2 — peer agents). All other actors render as a count-only "from outside" line. Optional. |
+
+If `github.enabled` is `true` but both optional login fields are absent, the
+hook falls back to flat 2-tier rendering (self vs other) with a config-prompt note.
+
+> Note: GH login matching is case-insensitive (the hook normalizes both sides to lowercase), so `"LeiShi"`, `"leishi"`, and `"LEISHI"` all match the same user. Input the login as it appears on GitHub for clarity.
+
+Example after population:
+
+```json
+{
+  "agent_name": "borges",
+  "primary_user": "lei",
+  "github": {
+    "enabled": true,
+    "primary_user_login": "LeiShi",
+    "counterparts_logins": ["ariadne-calvino", "mneme-funes"]
+  }
+}
+```
+
+**Note for existing installs**: the `github` block is not set by `install.sh` or
+`tools/deploy.sh`. Add it manually after upgrade to enable the feature.
+Future first-session skill versions will prompt for it.
+
+**Note on cross-install portability**: `github.counterparts_logins` must
+reflect the agents on *this* install only. Agents belonging to other human
+users (e.g., `aleph-funes` if that agent belongs to a different user's
+install) are outside agents — do not include them in this list.
+
+---
+
 ## Troubleshooting
 
 **Install fails with "missing Python packages"**
