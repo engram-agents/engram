@@ -177,8 +177,8 @@ def test_mode_multi_one_new_letter(engram_home, inter_agent_dir):
     output = response["hookSpecificOutput"]
     assert output["hookEventName"] == "UserPromptSubmit"
     ctx = output["additionalContext"]
-    assert "New letters since last prompt: 1" in ctx
-    assert "ariadne" in ctx
+    assert "1 new letter from ariadne" in ctx
+    assert "read before responding" in ctx
     assert "First-session reflections" in ctx
 
 
@@ -221,12 +221,13 @@ def test_mode_multi_new_and_unread_partitioned(engram_home, inter_agent_dir):
     ctx = response["hookSpecificOutput"]["additionalContext"]
 
     # New letter is listed under "New letters"
-    assert "New letters since last prompt: 1" in ctx
-    assert "ariadne" in ctx
+    assert "1 new letter from ariadne" in ctx
+    assert "read before responding" in ctx
     assert "Re: handoff plan" in ctx
 
-    # Older unread appears in "(Plus N older still-unread.)" line
+    # Older unread appears in "(Plus N older still-unread from <senders>.)" line
     assert "1 older still-unread" in ctx
+    assert "from mneme" in ctx
 
 
 # ---------------------------------------------------------------------------
@@ -636,3 +637,181 @@ class TestGetAgentName:
         assert result == "localdev", (
             "Non-agent- username must be returned as-is (behavioral change from old impl)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 12: Sender-list rendering (_format_senders helper)
+# ---------------------------------------------------------------------------
+
+class TestFormatSenders:
+    """Unit tests for _format_senders helper via module import."""
+
+    @pytest.fixture(autouse=True)
+    def _hook(self):
+        self.hook = _load_hook_module()
+
+    def _make_letters(self, froms: list[str]) -> list[dict]:
+        """Build minimal letter dicts with just 'from' fields."""
+        return [{"from": f} for f in froms]
+
+    def test_single_sender(self):
+        """Single distinct sender: just the name, no comma."""
+        letters = self._make_letters(["borges"])
+        result = self.hook._format_senders(letters)
+        assert result == "borges"
+
+    def test_two_senders_sorted(self):
+        """Two distinct senders: sorted, comma-joined."""
+        letters = self._make_letters(["mneme", "borges"])
+        result = self.hook._format_senders(letters)
+        assert result == "borges, mneme"
+
+    def test_three_senders_no_cap(self):
+        """Three distinct senders: all shown (cap is >3, so 3 fits)."""
+        letters = self._make_letters(["mneme", "borges", "ariadne"])
+        result = self.hook._format_senders(letters)
+        assert result == "ariadne, borges, mneme"
+
+    def test_four_senders_cap_applied(self):
+        """Four distinct senders: first 2 shown + '+ 2 other(s)'."""
+        letters = self._make_letters(["mneme", "borges", "ariadne", "zephyr"])
+        result = self.hook._format_senders(letters)
+        # sorted: ariadne, borges, mneme, zephyr -> show ariadne, borges + 2 others
+        assert result == "ariadne, borges, + 2 other(s)"
+
+    def test_duplicate_senders_deduplicated(self):
+        """Multiple letters from the same sender count as one in the list."""
+        letters = self._make_letters(["borges", "borges", "ariadne"])
+        result = self.hook._format_senders(letters)
+        assert result == "ariadne, borges"
+
+    def test_five_senders_cap_applied(self):
+        """Five distinct senders: first 2 shown + '+ 3 other(s)'."""
+        letters = self._make_letters(["e", "d", "c", "b", "a"])
+        result = self.hook._format_senders(letters)
+        assert result == "a, b, + 3 other(s)"
+
+
+# ---------------------------------------------------------------------------
+# Test 13: Action instruction wording in hook output
+# ---------------------------------------------------------------------------
+
+def test_new_letters_action_instruction_present(engram_home, inter_agent_dir):
+    """'read before responding' appears in new-letters hook output."""
+    _write_config(engram_home, mode="multi", agent_name="borges")
+    now = datetime.now(timezone.utc)
+    _write_letter(
+        inter_agent_dir, "2026-05-23T10-00-00Z_ariadne.md",
+        from_agent="ariadne", to_agent="borges",
+        timestamp=now - timedelta(minutes=2),
+        heading="Discipline relay",
+    )
+    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
+    assert rc == 0
+    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "read before responding" in ctx, (
+        "New-letters line must contain 'read before responding' action instruction"
+    )
+    assert "counterpart-agent letters carry context from the user" in ctx, (
+        "New-letters line must contain the rationale clause"
+    )
+
+
+def test_carryover_only_action_instruction_present(engram_home, inter_agent_dir):
+    """'finish reading at the next natural break' appears in carryover-only output."""
+    _write_config(engram_home, mode="multi", agent_name="borges")
+    now = datetime.now(timezone.utc)
+
+    # Write a letter in the past
+    old_ts = now - timedelta(hours=2)
+    _write_letter(
+        inter_agent_dir, "2026-05-23T08-00-00Z_mneme.md",
+        from_agent="mneme", to_agent="borges",
+        timestamp=old_ts,
+        heading="Old unread letter",
+    )
+
+    # Set surfaced cursor AFTER the letter (so it's "older still-unread", not "new")
+    surfaced_at = now - timedelta(hours=1)
+    _write_surfaced_cursor(engram_home, surfaced_at)
+    # No read cursor → letter is unread
+
+    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
+    assert rc == 0
+    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "finish reading at the next natural break" in ctx, (
+        "Carryover-only line must contain 'finish reading at the next natural break'"
+    )
+    assert "from mneme" in ctx, (
+        "Carryover-only line must include the sender name"
+    )
+    assert "1 older still-unread letter " in ctx, (
+        f"Expected singular form '1 older still-unread letter ' (no trailing 's'); got: {ctx!r}"
+    )
+
+
+def test_new_letters_sender_name_in_header_line(engram_home, inter_agent_dir):
+    """Sender name appears in the header line (not just in the bullet list)."""
+    _write_config(engram_home, mode="multi", agent_name="borges")
+    now = datetime.now(timezone.utc)
+    _write_letter(
+        inter_agent_dir, "2026-05-23T11-00-00Z_ariadne.md",
+        from_agent="ariadne", to_agent="borges",
+        timestamp=now - timedelta(minutes=3),
+        heading="Hello",
+    )
+    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
+    assert rc == 0
+    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+    first_line = ctx.splitlines()[0]
+    assert "from ariadne" in first_line, (
+        "First line of output must include 'from ariadne' for single-sender new letter"
+    )
+
+
+def test_two_new_letter_senders_sorted_in_header(engram_home, inter_agent_dir):
+    """Two distinct new-letter senders appear sorted in the header line."""
+    _write_config(engram_home, mode="multi", agent_name="borges")
+    now = datetime.now(timezone.utc)
+    _write_letter(
+        inter_agent_dir, "2026-05-23T11-01-00Z_mneme.md",
+        from_agent="mneme", to_agent="borges",
+        timestamp=now - timedelta(minutes=5),
+        heading="Letter from mneme",
+    )
+    _write_letter(
+        inter_agent_dir, "2026-05-23T11-02-00Z_ariadne.md",
+        from_agent="ariadne", to_agent="borges",
+        timestamp=now - timedelta(minutes=4),
+        heading="Letter from ariadne",
+    )
+    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
+    assert rc == 0
+    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+    first_line = ctx.splitlines()[0]
+    assert "2 new letters" in first_line, "Plural 'letters' for 2 new letters"
+    assert "from ariadne, mneme" in first_line, (
+        "Sorted senders 'ariadne, mneme' must appear in the header line"
+    )
+
+
+def test_four_new_letter_senders_cap_in_header(engram_home, inter_agent_dir):
+    """Four distinct new-letter senders: first 2 + '+ 2 other(s)' in header line."""
+    _write_config(engram_home, mode="multi", agent_name="borges")
+    now = datetime.now(timezone.utc)
+    senders = ["zephyr", "ariadne", "mneme", "lei"]
+    for i, sender in enumerate(senders):
+        _write_letter(
+            inter_agent_dir, f"2026-05-23T12-0{i}-00Z_{sender}.md",
+            from_agent=sender, to_agent="borges",
+            timestamp=now - timedelta(minutes=10 - i),
+            heading=f"Letter from {sender}",
+        )
+    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
+    assert rc == 0
+    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+    first_line = ctx.splitlines()[0]
+    # sorted: ariadne, lei, mneme, zephyr → show ariadne, lei + 2 other(s)
+    assert "from ariadne, lei, + 2 other(s)" in first_line, (
+        f"Expected cap-rule output in header; got: {first_line!r}"
+    )

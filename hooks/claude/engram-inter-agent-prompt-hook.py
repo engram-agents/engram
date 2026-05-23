@@ -244,6 +244,20 @@ def _format_ts(ts: datetime) -> str:
     return ts.strftime("%Y-%m-%dT%H:%MZ")
 
 
+def _format_senders(letters: list[dict]) -> str:
+    """Return a comma-joined sender string from a list of letter dicts.
+
+    Extracts sorted distinct 'from' values. If more than 3 distinct senders,
+    shows first 2 followed by '+ K other(s)'.
+    """
+    senders = sorted({l["from"] for l in letters})
+    if len(senders) <= 3:
+        return ", ".join(senders)
+    shown = senders[:2]
+    rest = len(senders) - 2
+    return ", ".join(shown) + f", + {rest} other(s)"
+
+
 # ---------------------------------------------------------------------------
 # Letter scanning
 # ---------------------------------------------------------------------------
@@ -353,7 +367,13 @@ def main() -> None:
 
     n_new = len(new_letters)
     if n_new > 0:
-        lines.append(f"\U0001f4ec New letters since last prompt: {n_new}")
+        senders_new = _format_senders(new_letters)
+        letter_word = "letter" if n_new == 1 else "letters"
+        lines.append(
+            f"\U0001f4ec {n_new} new {letter_word} from {senders_new}"
+            f" — read before responding"
+            f" (counterpart-agent letters carry context from the user you'd otherwise miss)."
+        )
         if n_new <= LIST_CAP:
             for letter in new_letters:
                 ts_str = _format_ts(letter["timestamp"])
@@ -378,9 +398,14 @@ def main() -> None:
     n_unread = len(unread_letters)
     if n_unread > 0:
         if n_new > 0:
-            lines.append(f"  (Plus {n_unread} older still-unread.)")
+            senders_unread = _format_senders(unread_letters)
+            lines.append(f"  (Plus {n_unread} older still-unread from {senders_unread}.)")
         else:
-            lines.append(f"\U0001f4ec {n_unread} older still-unread letter{'s' if n_unread != 1 else ''}.")
+            senders_unread = _format_senders(unread_letters)
+            lines.append(
+                f"\U0001f4ec {n_unread} older still-unread letter{'s' if n_unread != 1 else ''}"
+                f" from {senders_unread} — finish reading at the next natural break."
+            )
 
     context = "\n".join(lines)
 
