@@ -248,13 +248,13 @@ def test_contradiction_neither_obsolete_visible_at_high_recall():
 
 def test_stale_load_bearing_surfaces_high_importance_low_recall():
     server = fresh_server()
-    # Add an observation; bump its importance manually via direct SQL since
+    # Add an observation; bump its importance_base manually via direct SQL since
     # engram_focus / cornerstone bumps are tested elsewhere.
     obs_id = _add_observation(server, "Important standalone claim about X")
     conn = server._get_db()
     try:
         conn.execute(
-            "UPDATE nodes SET importance_score=2.5, recall_count=0 WHERE id=?",
+            "UPDATE nodes SET importance_base=2.0, importance_score=2.0, recall_count=0 WHERE id=?",
             (obs_id,),
         )
         conn.commit()
@@ -272,7 +272,8 @@ def test_stale_load_bearing_surfaces_high_importance_low_recall():
     ids = [c["id"] for c in candidates]
     assert obs_id in ids
     cand = next(c for c in candidates if c["id"] == obs_id)
-    assert cand["importance"] >= 2.5
+    assert cand["importance_base"] >= 2.0
+    assert "inflation_gap" in cand
     assert cand["recall_count"] == 0
 
     # MCP: obs_id appears in results
@@ -351,13 +352,14 @@ def test_tainted_still_valid_surfaces_tainted_nodes():
 
 def test_cornerstone_candidate_requires_min_citations():
     server = fresh_server()
-    # An observation with high importance but no citations — should NOT
+    # An observation with high importance_base but no citations — should NOT
     # surface as a cornerstone candidate.
     isolated_id = _add_observation(server, "Isolated high-importance claim")
     conn = server._get_db()
     try:
         conn.execute(
-            "UPDATE nodes SET importance_score=3.0 WHERE id=?", (isolated_id,)
+            "UPDATE nodes SET importance_base=3.0, importance_score=3.0 WHERE id=?",
+            (isolated_id,),
         )
         conn.commit()
     finally:

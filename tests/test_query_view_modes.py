@@ -291,8 +291,12 @@ def test_query_pattern_cornerstone_candidate_tiered_shape():
     obs_id = _add_observation(server, "Load-bearing cornerstone candidate observation.")
     conn = server._get_db()
     try:
+        # importance_base=0.95 (from hard_data) is set explicitly here so the
+        # gate (importance_base > 0.7) is visibly satisfied. importance_score
+        # is set higher to simulate a heavily-recalled node — intentionally
+        # different from importance_base to show the inflation state.
         conn.execute(
-            "UPDATE nodes SET importance_score=3.0 WHERE id=?", (obs_id,)
+            "UPDATE nodes SET importance_base=0.95, importance_score=3.0 WHERE id=?", (obs_id,)
         )
         conn.commit()
     finally:
@@ -406,8 +410,15 @@ def test_query_pattern_summary_top_k_zero():
     obs_id = _add_observation(server, "Stale load bearing test observation for top_k zero.")
     conn = server._get_db()
     try:
+        # importance_base=0.95 (from hard_data) is set explicitly so the gate
+        # (importance_base > 0.7) is visibly satisfied. importance_score is set
+        # higher than importance_base to simulate an inflated node — the
+        # inflation_gap will be negative in a fresh DB (current_turn=0), so
+        # this node may not surface at the top of rankings; the test only
+        # verifies that summary keys are absent regardless.
         conn.execute(
-            "UPDATE nodes SET importance_score=2.5, recall_count=0 WHERE id=?", (obs_id,)
+            "UPDATE nodes SET importance_base=0.95, importance_score=2.5, recall_count=0 WHERE id=?",
+            (obs_id,),
         )
         conn.commit()
     finally:

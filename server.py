@@ -14941,40 +14941,56 @@ def _pattern_stale_load_bearing(
 ) -> list[dict]:
     """High-importance, low-recall non-cornerstone nodes — re-engagement candidates.
 
-    Heuristic score: importance / (recall_count + 1). High score means
-    important + rarely accessed = likely stale-but-still-load-bearing.
-    Cornerstones are excluded (they're anchored against forgetting by design).
+    Heuristic score: inflation_gap = importance_base * decay_base^current_turn
+    - importance_score. This measures how far behind the decay curve a node is
+    — i.e., how long since it was last recalled. Nodes with a large gap were
+    once important (high base) and haven't been re-recalled in many turns.
+    Cornerstones and feeling_reports are excluded.
 
-    Returns: list of {id, type, claim, score, importance, recall_count,
-    suggested_action}.
+    Returns: list of {id, type, claim, score, importance_base, inflation_gap,
+    recall_count, suggested_action}.
     """
     top_k = int(preset_params.get("top_k", 15))
-    importance_floor = 1.0  # only consider nodes above the typical median
+    importance_floor = 0.7  # gates on importance_base (time-invariant)
 
+    mem = _get_memory_config()
+    current_turn = mem.get("current_turn", 0)
+    decay_base = mem.get("decay_base", 1.014)
+
+    # Pre-sort heuristic: fetch top 200 by importance_base DESC, then re-sort
+    # by inflation_gap. A node with lower base but very old recall_turn could
+    # have a larger gap and be cut here — accepted as approximation cost since
+    # the final ranking is by gap and the pool is wide enough (200) to catch
+    # typical cases. If empirical signal shows misses, raise the limit.
     rows = conn.execute(
-        "SELECT id, type, claim, importance_score, recall_count "
+        "SELECT id, type, claim, importance_base, importance_score, recall_count "
         "FROM nodes "
-        "WHERE is_current=1 AND type != 'cornerstone' "
-        "AND COALESCE(importance_score, 0) > ? "
-        "ORDER BY importance_score DESC LIMIT 100",
+        "WHERE is_current=1 "
+        "AND type NOT IN ('cornerstone', 'feeling_report') "
+        "AND COALESCE(importance_base, 0) > ? "
+        "ORDER BY importance_base DESC LIMIT 200",
         (importance_floor,),
     ).fetchall()
 
     candidates: list[dict] = []
-    for nid, ntype, claim, imp, recalls in rows:
+    for nid, ntype, claim, imp_base, imp_score, recalls in rows:
         recalls = recalls or 0
-        imp = imp or 0
-        score = imp / (recalls + 1)
+        imp_base = imp_base or 0.0
+        imp_score = imp_score or imp_base  # if never recalled, score equals base
+        imp_if_now = imp_base * (decay_base ** current_turn)
+        gap = imp_if_now - imp_score  # how far behind the inflation curve
+        score = gap
         candidates.append({
             "id": nid,
             "type": ntype,
             "claim": (claim[:160] + "...") if claim and len(claim) > 160 else claim,
             "score": round(score, 3),
-            "importance": round(imp, 3),
+            "importance_base": round(imp_base, 3),
+            "inflation_gap": round(gap, 3),
             "recall_count": recalls,
             "suggested_action": (
                 f"Re-engage with {nid} (engram_inspect) or supersede if outdated. "
-                f"High importance + low recall suggests load-bearing-but-cold."
+                f"High importance_base + large inflation gap suggests load-bearing-but-cold."
             ),
         })
 
@@ -14989,24 +15005,27 @@ def _pattern_cornerstone_candidate(
 
     A cornerstone candidate is a node that has been load-bearing in the
     graph (cited by many derivations / observations) but isn't yet anchored
-    as a cornerstone. Score: importance × (1 + citation_count / 10).
+    as a cornerstone. Score: importance_base × (1 + citation_count / 10).
+    Gating uses importance_base (time-invariant) so the threshold is stable
+    across turns. Cornerstones and feeling_reports are excluded.
 
-    Returns: list of {id, type, claim, score, importance, citation_count,
+    Returns: list of {id, type, claim, score, importance_base, citation_count,
     recall_count, suggested_action}.
     """
     top_k = int(preset_params.get("top_k", 15))
     min_citations = 3  # below this, not load-bearing enough to anchor
 
     rows = conn.execute(
-        "SELECT id, type, claim, importance_score, recall_count "
+        "SELECT id, type, claim, importance_base, recall_count "
         "FROM nodes "
-        "WHERE is_current=1 AND type != 'cornerstone' "
-        "AND COALESCE(importance_score, 0) > 1.5 "
-        "ORDER BY importance_score DESC LIMIT 50"
+        "WHERE is_current=1 "
+        "AND type NOT IN ('cornerstone', 'feeling_report') "
+        "AND COALESCE(importance_base, 0) > 0.7 "
+        "ORDER BY importance_base DESC LIMIT 50"
     ).fetchall()
 
     candidates: list[dict] = []
-    for nid, ntype, claim, imp, recalls in rows:
+    for nid, ntype, claim, imp_base, recalls in rows:
         cite_count = conn.execute(
             "SELECT COUNT(*) FROM edges WHERE target_id=? "
             "AND relation IN ('supports', 'cites', 'derives_from')",
@@ -15014,14 +15033,14 @@ def _pattern_cornerstone_candidate(
         ).fetchone()[0]
         if cite_count < min_citations:
             continue
-        imp = imp or 0
-        score = imp * (1 + cite_count / 10.0)
+        imp_base = imp_base or 0.0
+        score = imp_base * (1 + cite_count / 10.0)
         candidates.append({
             "id": nid,
             "type": ntype,
             "claim": (claim[:160] + "...") if claim and len(claim) > 160 else claim,
             "score": round(score, 3),
-            "importance": round(imp, 3),
+            "importance_base": round(imp_base, 3),
             "citation_count": cite_count,
             "recall_count": recalls or 0,
             "suggested_action": (
