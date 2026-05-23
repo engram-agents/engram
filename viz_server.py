@@ -21,10 +21,24 @@ import argparse
 import json
 import os
 import sqlite3
+import sys
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+
+# config_schema lives in tools/ (sibling directory relative to this file).
+# Insert the parent of tools/ into sys.path so `from tools.config_schema import ...`
+# works whether this file is run from the repo root OR from ~/.engram/ (deployed).
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+try:
+    from tools.config_schema import annotate_schema  # noqa: E402
+    _CONFIG_SCHEMA_AVAILABLE = True
+except ImportError:
+    _CONFIG_SCHEMA_AVAILABLE = False
+    annotate_schema = None  # type: ignore[assignment]
 
 DEFAULT_DB = str(Path.home() / ".engram" / "knowledge.db")
 DEFAULT_PORT = 5001
@@ -532,6 +546,7 @@ HTML = r"""<!DOCTYPE html>
   <a href="/" style="font-weight:600;">Graph View</a>
   <a href="/health">Health Dashboard</a>
   <a href="/stats">Stats</a>
+  <a href="/config">Config</a>
 </div>
 
 <!-- ── Content row ──────────────────────────────────────────────────── -->
@@ -2447,6 +2462,7 @@ HEALTH_HTML = r"""<!DOCTYPE html>
     <a href="/">Graph View</a>
     <a href="/health" style="font-weight:600;">Health Dashboard</a>
     <a href="/stats">Stats</a>
+    <a href="/config">Config</a>
     <span id="agent-switcher" style="display:none;margin-left:auto;float:right;">
       <span style="color:#7ecfff;font-size:0.85em;margin-right:6px;">Agent:</span>
       <select id="agent-select-health" style="padding:4px 8px;background:#0d1b36;border:1px solid #1a4a8a;border-radius:4px;color:#e0e0e0;font-size:0.85em;outline:none;"></select>
@@ -2845,6 +2861,60 @@ def _resolve_agent_config(agent_name: str) -> dict:
         }
     except (OSError, ValueError, json.JSONDecodeError, TypeError):
         return defaults
+
+
+def _resolve_config_path(agent_name: str) -> str:
+    """Resolve agent_name to its config.json path. Returns empty string if not found."""
+    agent_meta = AGENTS.get(agent_name)
+    if not agent_meta:
+        return ""
+    db_path = agent_meta.get("db", "")
+    if not db_path:
+        return ""
+    engram_home = os.path.dirname(os.path.abspath(db_path))
+    return os.path.join(engram_home, "config.json")
+
+
+def get_config_data(agent_name: str) -> dict:
+    """Load and annotate config.json for /api/config.
+
+    Returns:
+      {
+        "agent": str,
+        "config_path": str,
+        "annotated": {"sections": [...]} | None,
+        "error": str (only present on failure),
+      }
+    Note: config_raw is intentionally NOT returned — Tier C keys must not
+    leak at the API layer even if they're excluded from the rendered UI.
+    """
+    config_path = _resolve_config_path(agent_name)
+    result: dict = {"agent": agent_name, "config_path": config_path}
+
+    if not config_path or not os.path.exists(config_path):
+        result["annotated"] = None
+        result["error"] = f"config.json not found at {config_path!r}"
+        return result
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config_raw = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        result["annotated"] = None
+        result["error"] = f"Failed to read config.json: {exc}"
+        return result
+
+    if _CONFIG_SCHEMA_AVAILABLE and annotate_schema is not None:
+        try:
+            result["annotated"] = annotate_schema(config_raw)
+        except Exception as exc:
+            result["annotated"] = None
+            result["error"] = f"Schema annotation failed: {exc}"
+    else:
+        result["annotated"] = None
+        result["error"] = "config_schema module not available"
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3264,6 +3334,7 @@ STATS_HTML = r"""<!DOCTYPE html>
     <a href="/">Graph View</a>
     <a href="/health">Health Dashboard</a>
     <a href="/stats" style="font-weight:600;">Stats</a>
+    <a href="/config">Config</a>
   </div>
   <h1>ENGRAM Stats Dashboard <span style="color:#7ecfff;font-size:0.7em;">(last 7 days unless noted)</span></h1>
   <div id="loading">Loading stats…</div>
@@ -3432,6 +3503,345 @@ STATS_HTML = r"""<!DOCTYPE html>
 
 
 # ---------------------------------------------------------------------------
+# Config tab HTML — read-only viewer over ~/.engram/config.json
+# ---------------------------------------------------------------------------
+
+CONFIG_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>ENGRAM Config</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+           background: #1a1a2e; color: #e0e0e0; padding: 24px; }
+    h1 { color: #00d4ff; font-size: 1.5em; margin-bottom: 16px; }
+    .nav { margin-bottom: 16px; }
+    .nav a { color: #00d4ff; text-decoration: none; margin-right: 16px; font-size: 0.9em; }
+    .nav a:hover { text-decoration: underline; }
+
+    /* Agent picker */
+    .agent-picker { display: none; margin-bottom: 18px; }
+    .agent-picker label { color: #7ecfff; font-size: 0.85em; margin-right: 6px; }
+    .agent-picker select { padding: 4px 8px; background: #0d1b36; border: 1px solid #1a4a8a;
+                            border-radius: 4px; color: #e0e0e0; font-size: 0.85em; outline: none; }
+
+    /* Section cards */
+    .section-card { background: #16213e; border-radius: 8px; padding: 16px;
+                    border: 1px solid #0f3460; margin-bottom: 14px; }
+    .section-card h3 { color: #00d4ff; font-size: 0.95em; margin-bottom: 12px; }
+    .section-gated { opacity: 0.5; pointer-events: none; }
+    .section-gated .gate-row { opacity: 1; pointer-events: auto; }
+
+    /* Rows */
+    .config-row { display: flex; align-items: flex-start; gap: 10px;
+                  padding: 6px 0; border-bottom: 1px solid #0f3460; font-size: 0.85em; }
+    .config-row:last-child { border-bottom: none; }
+    .row-label { color: #aaa; min-width: 200px; flex-shrink: 0; display: flex;
+                 align-items: center; gap: 4px; }
+    .row-control { flex: 1; }
+    .row-badges { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 2px; }
+
+    /* Badges */
+    .badge { font-size: 0.72em; padding: 1px 5px; border-radius: 3px;
+             white-space: nowrap; }
+    .badge-restart { background: #1a3a5c; color: #7ecfff; border: 1px solid #1a4a8a; }
+    .badge-legacy  { background: #3a2a0a; color: #ffb74d; border: 1px solid #7a4500; cursor: help; }
+
+    /* Controls — all disabled / read-only */
+    input[type="text"], input[type="number"] {
+      background: #0d1b36; border: 1px solid #1a4a8a; border-radius: 4px;
+      color: #e0e0e0; padding: 3px 7px; font-size: 0.85em; width: 100%;
+      outline: none; }
+    input:disabled { opacity: 0.7; cursor: not-allowed; }
+    input[type="checkbox"] { accent-color: #00d4ff; width: 15px; height: 15px;
+                              cursor: not-allowed; }
+
+    /* List display (read-only) */
+    .list-display { list-style: none; padding: 0; }
+    .list-display li { background: #0d1b36; border: 1px solid #1a4a8a; border-radius: 3px;
+                        padding: 2px 7px; margin-bottom: 3px; font-size: 0.82em; color: #ccc; }
+    .list-display li:empty { display: none; }
+    .list-empty { color: #555; font-style: italic; font-size: 0.82em; }
+
+    /* Null value */
+    .null-value { color: #555; font-style: italic; }
+
+    /* Tooltip */
+    .tooltip-icon { color: #7ecfff; cursor: help; font-size: 0.75em;
+                    border: 1px solid #7ecfff; border-radius: 50%; width: 14px; height: 14px;
+                    display: inline-flex; align-items: center; justify-content: center;
+                    flex-shrink: 0; position: relative; }
+    .tooltip-icon:hover::after {
+      content: attr(data-tip);
+      position: absolute;
+      background: #0d1b36; border: 1px solid #1a4a8a; border-radius: 4px;
+      color: #e0e0e0; font-size: 0.78em; padding: 6px 10px; max-width: 280px;
+      white-space: pre-wrap; z-index: 100; pointer-events: none;
+    }
+
+    /* Pulse animation for embedding.enabled == false */
+    @keyframes alertPulse {
+      0%   { border-color: #1a4a8a; }
+      50%  { border-color: #c62828; }
+      100% { border-color: #1a4a8a; }
+    }
+    .alert-pulse { animation: alertPulse 1.5s ease-in-out infinite; }
+
+    /* Advanced expander */
+    .advanced-expander { margin-top: 8px; }
+    .advanced-toggle { background: none; border: 1px solid #1a4a8a; border-radius: 4px;
+                        color: #7ecfff; cursor: pointer; font-size: 0.85em; padding: 6px 12px;
+                        display: flex; align-items: center; gap: 6px; width: 100%; text-align: left; }
+    .advanced-toggle:hover { background: #0d1b36; }
+    .advanced-toggle .arrow { transition: transform 0.2s; display: inline-block; }
+    .advanced-toggle.open .arrow { transform: rotate(90deg); }
+    .advanced-body { display: none; margin-top: 10px; }
+    .advanced-body.open { display: block; }
+
+    /* Footer */
+    .config-footer { margin-top: 24px; padding: 14px 16px; background: #16213e;
+                      border: 1px solid #0f3460; border-radius: 6px; color: #888;
+                      font-size: 0.8em; line-height: 1.6; }
+    .config-footer a { color: #7ecfff; text-decoration: none; }
+    .config-footer a:hover { text-decoration: underline; }
+
+    /* Loading / error */
+    #cfg-loading { color: #888; }
+    #cfg-error   { color: #f44336; }
+  </style>
+</head>
+<body>
+  <div class="nav">
+    <a href="/">Graph View</a>
+    <a href="/health">Health Dashboard</a>
+    <a href="/stats">Stats</a>
+    <a href="/config" style="font-weight:600;">Config</a>
+  </div>
+  <h1>ENGRAM Config</h1>
+
+  <div class="agent-picker" id="agent-picker">
+    <label for="agent-select-config">Agent:</label>
+    <select id="agent-select-config"></select>
+  </div>
+
+  <div id="cfg-loading">Loading config…</div>
+  <div id="cfg-error" style="display:none;"></div>
+  <div id="cfg-body" style="display:none;"></div>
+
+  <div class="config-footer">
+    ENGRAM has additional configuration parameters for protocol-level
+    tuning that aren&#39;t surfaced here. They live in ~/.engram/config.json
+    and are documented in the project <a href="https://github.com/engram-agents/engram-alpha/blob/dev/README.md" target="_blank">README</a>. Edit them only after
+    reading the calibration documentation.
+  </div>
+
+  <script>
+  function _currentAgent() {
+    return new URL(window.location.href).searchParams.get('agent');
+  }
+  function _setCurrentAgent(name) {
+    const url = new URL(window.location.href);
+    if (name) url.searchParams.set('agent', name);
+    else url.searchParams.delete('agent');
+    window.location.href = url.toString();
+  }
+  function _withAgent(path) {
+    const a = _currentAgent();
+    if (!a) return path;
+    return path + (path.includes('?') ? '&' : '?') + 'agent=' + encodeURIComponent(a);
+  }
+  function esc(s) {
+    if (s === null || s === undefined) return '';
+    return String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  // ── Agent picker ─────────────────────────────────────────────────────────
+  async function loadAgentPicker() {
+    try {
+      const res = await fetch('/api/agents');
+      const data = await res.json();
+      const agents = data.agents || [];
+      if (agents.length <= 1) return;
+      const picker = document.getElementById('agent-picker');
+      const sel = document.getElementById('agent-select-config');
+      sel.innerHTML = '';
+      agents.forEach(a => {
+        const opt = document.createElement('option');
+        opt.value = a.name;
+        opt.textContent = a.label + (a.available ? '' : ' (unavailable)');
+        sel.appendChild(opt);
+      });
+      let current = _currentAgent();
+      if (!current || !agents.find(a => a.name === current)) {
+        current = data.default || (agents[0] && agents[0].name);
+      }
+      if (current) sel.value = current;
+      picker.style.display = '';
+      sel.onchange = () => { _setCurrentAgent(sel.value); };
+    } catch (e) {
+      console.warn('agent picker failed:', e);
+    }
+  }
+
+  // ── Rendering helpers ────────────────────────────────────────────────────
+  function renderControl(row) {
+    const v = row.value;
+    const ctrl = row.control;
+    const alertPulse = (row.alert_when_false === true && v === false) ? ' alert-pulse' : '';
+
+    if (ctrl === 'checkbox') {
+      const checked = v ? 'checked' : '';
+      return `<input type="checkbox" ${checked} disabled class="${alertPulse.trim()}">`;
+    }
+    if (ctrl === 'text') {
+      if (v === null || v === undefined) {
+        return `<span class="null-value">(not set)</span>`;
+      }
+      return `<input type="text" value="${esc(String(v))}" disabled class="${alertPulse.trim()}">`;
+    }
+    if (ctrl === 'int' || ctrl === 'float') {
+      if (v === null || v === undefined) {
+        return `<span class="null-value">(not set — using code default)</span>`;
+      }
+      return `<input type="number" value="${esc(String(v))}" disabled class="${alertPulse.trim()}">`;
+    }
+    if (ctrl === 'list_display' || ctrl === 'list_edit') {
+      if (v === null || v === undefined || (Array.isArray(v) && v.length === 0)) {
+        return `<span class="list-empty">(empty)</span>`;
+      }
+      const items = Array.isArray(v) ? v : [v];
+      return '<ul class="list-display">' + items.map(item => `<li>${esc(String(item))}</li>`).join('') + '</ul>';
+    }
+    if (ctrl === 'yellow_domains_edit') {
+      if (v === null || v === undefined || (Array.isArray(v) && v.length === 0)) {
+        return `<span class="list-empty">(empty)</span>`;
+      }
+      const items = Array.isArray(v) ? v : [v];
+      return '<ul class="list-display">' + items.map(item => {
+        const domain = esc(item.domain || item);
+        const reason = item.reason ? ` — ${esc(item.reason)}` : '';
+        const node = item.engram_node ? ` [${esc(item.engram_node)}]` : '';
+        return `<li>${domain}${reason}${node}</li>`;
+      }).join('') + '</ul>';
+    }
+    // fallback
+    if (v === null || v === undefined) return `<span class="null-value">(not set)</span>`;
+    return `<input type="text" value="${esc(String(v))}" disabled>`;
+  }
+
+  function renderRow(row, isGated) {
+    const badges = [];
+    if (row.restart_required) {
+      badges.push(`<span class="badge badge-restart" title="Requires restart after change">&#x27F3; restart</span>`);
+    }
+    if (row.uses_legacy_path) {
+      const legPath = esc(row.value_source || '');
+      badges.push(`<span class="badge badge-legacy" title="Currently stored at ${legPath}; will canonicalize on next migration.">&#9888; legacy key</span>`);
+    }
+    const badgeHtml = badges.length ? `<div class="row-badges">${badges.join('')}</div>` : '';
+    const tipHtml = row.tooltip ? `<span class="tooltip-icon" data-tip="${esc(row.tooltip)}">?</span>` : '';
+    const gateRowClass = row.gates_section ? ' gate-row' : '';
+    return `<div class="config-row${gateRowClass}">
+      <div class="row-label">${esc(row.label)}${tipHtml}</div>
+      <div class="row-control">${renderControl(row)}${badgeHtml}</div>
+    </div>`;
+  }
+
+  function renderSection(sec) {
+    const gated = sec.section_gate && !sec.gate_open;
+    const bodyClass = gated ? ' section-gated' : '';
+    const rowsHtml = sec.rows.map(r => renderRow(r, gated)).join('');
+    return `<div class="section-card${bodyClass}" id="sec-${esc(sec.id)}">
+      <h3>${esc(sec.label)}</h3>
+      ${rowsHtml}
+    </div>`;
+  }
+
+  // ── Main load ────────────────────────────────────────────────────────────
+  async function loadConfig() {
+    document.getElementById('cfg-loading').style.display = '';
+    document.getElementById('cfg-body').style.display = 'none';
+    document.getElementById('cfg-error').style.display = 'none';
+    try {
+      const res = await fetch(_withAgent('/api/config'));
+      const data = await res.json();
+      document.getElementById('cfg-loading').style.display = 'none';
+
+      if (data.error && !data.annotated) {
+        document.getElementById('cfg-error').textContent = 'Error: ' + data.error;
+        document.getElementById('cfg-error').style.display = '';
+        return;
+      }
+
+      const body = document.getElementById('cfg-body');
+      body.style.display = '';
+
+      if (!data.annotated || !data.annotated.sections) {
+        body.innerHTML = '<p style="color:#888;">No config data available.</p>';
+        return;
+      }
+
+      const sections = data.annotated.sections;
+      const tierA = sections.filter(s => s.tier === 'daily');
+      const tierB = sections.filter(s => s.tier === 'advanced');
+
+      let html = '';
+
+      // Tier A sections
+      tierA.forEach(sec => { html += renderSection(sec); });
+
+      // Tier B — wrapped in advanced expander
+      if (tierB.length > 0) {
+        const advBody = tierB.map(sec => renderSection(sec)).join('');
+        html += `<div class="advanced-expander">
+          <button class="advanced-toggle" id="adv-toggle" onclick="toggleAdvanced()">
+            <span class="arrow">&#9658;</span>
+            Advanced (calibration-aware tuning)
+          </button>
+          <div class="advanced-body" id="adv-body">${advBody}</div>
+        </div>`;
+      }
+
+      body.innerHTML = html;
+
+      // Restore advanced expander state from localStorage
+      const advExpanded = localStorage.getItem('engram_config_advanced_expanded') === 'true';
+      if (advExpanded) {
+        const toggle = document.getElementById('adv-toggle');
+        const advBody = document.getElementById('adv-body');
+        if (toggle && advBody) {
+          toggle.classList.add('open');
+          advBody.classList.add('open');
+        }
+      }
+    } catch (e) {
+      document.getElementById('cfg-loading').style.display = 'none';
+      document.getElementById('cfg-error').textContent = 'Failed to load config: ' + e.message;
+      document.getElementById('cfg-error').style.display = '';
+    }
+  }
+
+  function toggleAdvanced() {
+    const toggle = document.getElementById('adv-toggle');
+    const body = document.getElementById('adv-body');
+    if (!toggle || !body) return;
+    const isOpen = toggle.classList.toggle('open');
+    body.classList.toggle('open', isOpen);
+    localStorage.setItem('engram_config_advanced_expanded', isOpen ? 'true' : 'false');
+  }
+
+  loadAgentPicker();
+  loadConfig();
+  </script>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 
@@ -3452,6 +3862,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/stats":
             self._html(STATS_HTML)
+            return
+        if path == "/config":
+            self._html(CONFIG_HTML)
             return
         if path == "/":
             self._html(HTML)
@@ -3506,6 +3919,9 @@ class Handler(BaseHTTPRequestHandler):
                 resp = get_calibration_data(db_path)
                 resp["agent"] = agent_name
                 self._json(resp)
+        elif path == "/api/config":
+            resp = get_config_data(agent_name)
+            self._json(resp)
         elif path == "/api/search":
             if not db_path:
                 self._json({"results": [], "error": f"Unknown agent: {agent_name!r}",
@@ -3582,6 +3998,7 @@ def main():
     server = HTTPServer((bind, args.port), Handler)
     print(f"ENGRAM Visualizer →  http://localhost:{args.port}")
     print(f"Health Dashboard  →  http://localhost:{args.port}/health")
+    print(f"Config tab        →  http://localhost:{args.port}/config")
     print("Agents registered:")
     for name, info in AGENTS.items():
         marker = " (default)" if name == DEFAULT_AGENT else ""
