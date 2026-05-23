@@ -358,7 +358,7 @@ echo
 BASELINE_SHA="$(_last_deployed_sha)"
 if [[ -n "$BASELINE_SHA" ]]; then
     if [[ "$TARGET" = "claude" ]]; then
-        nudge_paths=(agents/claude/ skills/claude/ skills/shared/)
+        nudge_paths=(agents/claude/ skills/claude/ skills/shared/ output-styles/claude/)
     else
         nudge_paths=(skills/gemini/ skills/shared/)
     fi
@@ -367,6 +367,7 @@ if [[ -n "$BASELINE_SHA" ]]; then
         # Split changed paths by top-level dir so we surface the right cp command(s).
         nudge_agents_changed=$(echo "$nudge_changed" | grep -E '^agents/' || true)
         nudge_skills_changed=$(echo "$nudge_changed" | grep -E '^skills/' || true)
+        nudge_output_styles_changed=$(echo "$nudge_changed" | grep -E '^output-styles/' || true)
 
         echo "⚠ agents/skills changed since last deploy ($BASELINE_SHA → $ALPHA_SHA):"
         echo
@@ -381,6 +382,9 @@ if [[ -n "$BASELINE_SHA" ]]; then
         echo
         if [[ -n "$nudge_agents_changed" && "$TARGET" = "claude" ]]; then
             echo "    cp -rL $ALPHA_DIR/agents/claude/* \$CLAUDE_HOME/agents/"
+        fi
+        if [[ -n "$nudge_output_styles_changed" && "$TARGET" = "claude" ]]; then
+            echo "    cp -r $ALPHA_DIR/output-styles/claude/* \$CLAUDE_HOME/output-styles/"
         fi
         if [[ -n "$nudge_skills_changed" ]]; then
             if [[ "$TARGET" = "claude" ]]; then

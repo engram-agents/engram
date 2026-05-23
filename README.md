@@ -420,10 +420,14 @@ the page to see new nodes.
 │   ├── engram-retract/               # error-correction protocol
 │   ├── engram-learn-from-error/      # incident-based lesson capture
 │   ├── engram-upgrade/               # step-by-step upgrade via tools/deploy.sh
+│   ├── internal-external-decision/   # disambiguation table for internal vs. consult-required actions
 │   └── ... (full list under skills/claude/ in the alpha tree)
-└── agents/
-    ├── engram-dream-fairy.md         # dispatched by engram-sleep for parallel consolidation-scan
-    └── engram-pr-reviewer.md         # dispatched for round-N PR review (per CLAUDE.md PR Workflow)
+├── agents/
+│   ├── engram-dream-fairy.md         # dispatched by engram-sleep for parallel consolidation-scan
+│   └── engram-pr-reviewer.md         # dispatched for round-N PR review (per CLAUDE.md PR Workflow)
+└── output-styles/
+    └── claude/
+        └── proactive-with-carveouts.md  # proactive for internal work; pauses on irreversible external actions
 
 ~/.engram/
 ├── knowledge.db                      # SQLite graph

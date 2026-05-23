@@ -225,8 +225,12 @@ mkdir -p "$ENGRAM_HOME/history/dream"
 [ -f "$ENGRAM_HOME/heartbeat-queue/from-heartbeat/inbox.md" ] || \
   echo "<!-- Heartbeat-to-foreground digests. Append-only. Foreground reads on next session. -->" \
   > "$ENGRAM_HOME/heartbeat-queue/from-heartbeat/inbox.md"
+# Bootstrap the ask-lei.md auto-load surface so session-start reads don't
+# silently no-op on a fresh install before the agent has written anything.
+touch "$ENGRAM_HOME/ask-lei.md"
 mkdir -p "$CLAUDE_HOME/skills"
 mkdir -p "$CLAUDE_HOME/agents"
+mkdir -p "$CLAUDE_HOME/output-styles"
 chmod 0700 "$ENGRAM_HOME/secrets"
 chmod 0700 "$ENGRAM_HOME/diary"
 
@@ -266,6 +270,11 @@ fi
 if [ -d "$ALPHA_DIR/agents/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/agents/claude" 2>/dev/null | grep -v '^\.gitkeep$' || true)" ]; then
   cp -rL "$ALPHA_DIR/agents/claude/"* "$CLAUDE_HOME/agents/"
   echo "  agents → $CLAUDE_HOME/agents/ (from agents/claude/)"
+fi
+
+if [ -d "$ALPHA_DIR/output-styles/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/output-styles/claude" 2>/dev/null | grep -v '^\.gitkeep$' || true)" ]; then
+  cp -r "$ALPHA_DIR/output-styles/claude/"* "$CLAUDE_HOME/output-styles/"
+  echo "  output-styles → $CLAUDE_HOME/output-styles/ (from output-styles/claude/)"
 fi
 
 if [ -d "$ALPHA_DIR/hooks/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/hooks/claude" 2>/dev/null | grep -v '^\.gitkeep$' || true)" ]; then
