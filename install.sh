@@ -258,8 +258,16 @@ echo ""
 echo "== Step 4: Copying files =="
 
 if [ -d "$ALPHA_DIR/skills/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/skills/claude" 2>/dev/null | grep -v '^\.gitkeep$' || true)" ]; then
-  cp -r "$ALPHA_DIR/skills/claude/"* "$CLAUDE_HOME/skills/"
-  echo "  skills → $CLAUDE_HOME/skills/ (from skills/claude/)"
+  # Copy all skills except multi-agent-gated ones (engram-letter requires
+  # /home/agents-shared/inter-agent/ to be present; handled in Step 9 gate).
+  for d in "$ALPHA_DIR/skills/claude/"*/; do
+    skill_name=$(basename "$d")
+    if [ "$skill_name" = "engram-letter" ]; then
+      continue  # handled inside multi-agent gate in Step 9
+    fi
+    cp -r "$d" "$CLAUDE_HOME/skills/"
+  done
+  echo "  skills → $CLAUDE_HOME/skills/ (from skills/claude/, multi-agent-gated skills deferred)"
 fi
 
 # Sub-agents. Used by sleep-routine (engram-dream-fairy) and PR workflow
@@ -508,6 +516,45 @@ else
   fi
   echo ""
 fi
+
+# -------- Step 9: ia CLI + engram-letter skill (multi-agent only) --------
+#
+# Multi-agent install gate: ia CLI is multi-agent-only (its mode-gate exits 3
+# on single-agent hosts). engram-letter skill presupposes ia and the inter-
+# agent inbox — installing it on single-agent hosts creates a dead skill.
+# Gate signal: presence of /home/agents-shared/inter-agent/ (the structural
+# marker that host operator has set up multi-agent infrastructure per #299).
+# Stronger than config.json mode check because config.json may not exist yet
+# at fresh-install time.
+
+echo "== Step 9: ia CLI + engram-letter skill (multi-agent) =="
+
+if [ -d "/home/agents-shared/inter-agent" ]; then
+  IA_SRC="$ALPHA_DIR/tools/ia.py"
+  if [ -f "$IA_SRC" ]; then
+    SHARED_BIN="/home/agents-shared/bin"
+    if [ -d "$SHARED_BIN" ] && [ -w "$SHARED_BIN" ]; then
+      cp "$IA_SRC" "$SHARED_BIN/ia"
+      chmod 0755 "$SHARED_BIN/ia"
+      echo "  ia → $SHARED_BIN/ia"
+    else
+      LOCAL_BIN="$HOME/.local/bin"
+      mkdir -p "$LOCAL_BIN"
+      cp "$IA_SRC" "$LOCAL_BIN/ia"
+      chmod 0755 "$LOCAL_BIN/ia"
+      echo "  ia (fallback) → $LOCAL_BIN/ia — /home/agents-shared/bin/ not writable"
+    fi
+  else
+    echo "  WARN: tools/ia.py not found — skipping ia install"
+  fi
+  if [ -d "$ALPHA_DIR/skills/claude/engram-letter" ]; then
+    cp -r "$ALPHA_DIR/skills/claude/engram-letter" "$CLAUDE_HOME/skills/"
+    echo "  engram-letter skill → $CLAUDE_HOME/skills/engram-letter/ (multi-agent)"
+  fi
+else
+  echo "  ia CLI + engram-letter skill: skipped (single-agent install; multi-agent infrastructure at /home/agents-shared/inter-agent/ not present)"
+fi
+echo ""
 
 # -------- Done --------
 

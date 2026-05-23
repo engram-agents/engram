@@ -363,6 +363,15 @@ if [[ -n "$BASELINE_SHA" ]]; then
         nudge_paths=(skills/gemini/ skills/shared/)
     fi
     nudge_changed=$(git -C "$ALPHA_DIR" diff --name-only "$BASELINE_SHA..HEAD" -- "${nudge_paths[@]}" 2>/dev/null || true)
+    # Filter engram-letter on single-agent hosts BEFORE the header check — it
+    # requires multi-agent infrastructure (/home/agents-shared/inter-agent/) and
+    # has no actionable remedy on a host that doesn't have that dir. Filtering
+    # here (not later inside the skills cp block) ensures the entire nudge block
+    # (header + Manual remedy sub-header + cp commands) is suppressed when
+    # engram-letter is the only changed skill. #309.
+    if [[ "$TARGET" = "claude" && ! -d "/home/agents-shared/inter-agent" ]]; then
+        nudge_changed=$(echo "$nudge_changed" | grep -v 'engram-letter' || true)
+    fi
     if [[ -n "$nudge_changed" ]]; then
         # Split changed paths by top-level dir so we surface the right cp command(s).
         nudge_agents_changed=$(echo "$nudge_changed" | grep -E '^agents/' || true)
@@ -388,7 +397,15 @@ if [[ -n "$BASELINE_SHA" ]]; then
         fi
         if [[ -n "$nudge_skills_changed" ]]; then
             if [[ "$TARGET" = "claude" ]]; then
-                echo "    cp -rL $ALPHA_DIR/skills/claude/* \$CLAUDE_HOME/skills/"
+                # The engram-letter filter already fired above at nudge_changed-level;
+                # nudge_skills_changed is derived from the already-filtered list, so
+                # no second filter needed here. Leave the guard for defensive clarity.
+                if [[ ! -d "/home/agents-shared/inter-agent" ]]; then
+                    nudge_skills_changed=$(echo "$nudge_skills_changed" | grep -v 'engram-letter' || true)
+                fi
+                if [[ -n "$nudge_skills_changed" ]]; then
+                    echo "    cp -rL $ALPHA_DIR/skills/claude/* \$CLAUDE_HOME/skills/"
+                fi
             else
                 # Gemini folds skills into GEMINI.md at install time — no parallel
                 # runtime skills dir. The manual remedy is to re-run install-gemini.sh
