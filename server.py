@@ -13,6 +13,7 @@ query (query, get_subgraph), version control (checkpoint, diff).
 import functools
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -2487,7 +2488,8 @@ def _semantic_search(
 
         scored.sort(key=lambda x: x["similarity"], reverse=True)
         return scored[:top_k]
-    except Exception:
+    except Exception as e:
+        logging.warning("_semantic_search failed: %s", e)
         return []
 
 
