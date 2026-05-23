@@ -11943,6 +11943,24 @@ def _resolve_impl(
         conn.close()
 
 
+def _add_stale_replacement(meta: dict, old_node_id: str, new_node_id: str) -> None:
+    """Add an entry to metadata.stale_replacement dict, upgrading from legacy
+    scalar if needed. Mutates meta in place.
+
+    Writers always emit dict-keyed form {old_node_id: new_node_id}. If a legacy
+    scalar exists (pre-PR #231), it is preserved under a "_legacy" sentinel key
+    so downstream readers can still surface it. Coexists indefinitely; no
+    one-shot migration. See issue #231.
+    """
+    stale_repl = meta.get("stale_replacement", {})
+    if isinstance(stale_repl, str):
+        stale_repl = {"_legacy": stale_repl}
+    elif not isinstance(stale_repl, dict):
+        stale_repl = {}
+    stale_repl[old_node_id] = new_node_id
+    meta["stale_replacement"] = stale_repl
+
+
 # Set of legitimate field names for the engram_supersede payload.
 _SUPERSEDE_FIELDS = frozenset({"old_node_id", "new_node_id", "supersede_reason"})
 
@@ -12029,7 +12047,7 @@ def _supersede_impl(
     dependents):
       - Derivation cascade: every node that derives_from / supports the
         old node gets marked stale_by_premise (metadata.stale_by includes
-        old_node_id, metadata.stale_replacement = new_node_id).
+        old_node_id, metadata.stale_replacement[old_node_id] = new_node_id).
       - Contradiction cascade (issue #229): every contradiction node that
         has old as a contradicting side gets marked stale_by_premise too.
         Dream-fairy-2 reviews each stale contradiction and decides whether
@@ -12200,7 +12218,7 @@ def _supersede_impl(
                 if old_node_id not in stale_by:
                     stale_by.append(old_node_id)
                 meta["stale_by"] = stale_by
-                meta["stale_replacement"] = new_node_id
+                _add_stale_replacement(meta, old_node_id, new_node_id)
                 conn.execute(
                     "UPDATE nodes SET metadata = ? WHERE id = ?",
                     (json.dumps(meta), did),
@@ -12249,7 +12267,7 @@ def _supersede_impl(
             if old_node_id not in stale_by:
                 stale_by.append(old_node_id)
             ct_meta["stale_by"] = stale_by
-            ct_meta["stale_replacement"] = new_node_id
+            _add_stale_replacement(ct_meta, old_node_id, new_node_id)
             conn.execute(
                 "UPDATE nodes SET metadata = ? WHERE id = ?",
                 (json.dumps(ct_meta), ct_id),
@@ -14318,13 +14336,30 @@ def engram_reflect(summary_top_k: int = 5) -> str:
         report["stale_nodes"] = []
         for s in stale_nodes:
             meta = json.loads(s["metadata"] or "{}")
+            _sr = meta.get("stale_replacement")
+            if isinstance(_sr, dict):
+                # Python 3.7+ dicts preserve insertion order, so reversed() returns
+                # the most-recent entry first. For re-supersede-same-key cases (same
+                # old_node_id cascaded twice), dict update behavior overwrites — only
+                # the latest replacement survives for that specific old_node_id. This
+                # is correct: the older cascade's replacement was itself superseded,
+                # so the chain naturally points to the most-recent.
+                _replacement_hint = next(reversed(_sr.values())) if _sr else None
+                _replacement_hints_all = _sr
+            elif isinstance(_sr, str):
+                _replacement_hint = _sr
+                _replacement_hints_all = {"_legacy": _sr}
+            else:
+                _replacement_hint = None
+                _replacement_hints_all = {}
             report["stale_nodes"].append({
                 "id": s["id"],
                 "type": s["type"],
                 "claim": s["claim"],
                 "confidence": s["confidence"],
                 "stale_by": meta.get("stale_by", []),
-                "replacement_hint": meta.get("stale_replacement"),
+                "replacement_hint": _replacement_hint,
+                "replacement_hints_all": _replacement_hints_all,
             })
 
         # 11. Retracted nodes (for audit visibility) — slim entries; the

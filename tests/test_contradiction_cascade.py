@@ -120,7 +120,9 @@ def test_supersede_same_type_marks_contradiction_stale():
     ct_meta = json.loads(ct_inspect["node"]["metadata"])
     assert "stale_by" in ct_meta
     assert ob_a in ct_meta["stale_by"]
-    assert ct_meta.get("stale_replacement") == ob_a_refined
+    stale_repl = ct_meta.get("stale_replacement")
+    assert isinstance(stale_repl, dict), f"stale_replacement should be dict, got {type(stale_repl)}"
+    assert stale_repl.get(ob_a) == ob_a_refined, f"expected {{{ob_a}: {ob_a_refined}}}, got {stale_repl}"
 
 
 def test_supersede_unrelated_node_does_not_flag_contradiction():
@@ -266,18 +268,17 @@ def test_ct_0006_shape_supersede_then_resolve():
     assert ct_inspect["node"]["status"] == "resolved"
 
 
-# ── Both-sides-superseded scalar-clobber documentation (issue #231) ───────
+# ── Both-sides-superseded dict-keyed behavior (issue #231 fixed) ──────────
 
 
-def test_both_sides_superseded_clobbers_stale_replacement():
-    """Document current behavior: when both contradicting sides of a ct are
-    superseded in sequence, metadata.stale_replacement is a scalar that gets
-    clobbered by the second supersede (only the second replacement pointer
-    survives). metadata.stale_by correctly appends both old IDs.
+def test_both_sides_superseded_preserves_all_replacements():
+    """When both contradicting sides of a ct are superseded in sequence,
+    metadata.stale_replacement must be dict-keyed so both replacements survive.
+    metadata.stale_by correctly appends both old IDs (was already correct
+    pre-fix). This test documents the fixed behavior from issue #231.
 
-    Tracked for fix in issue #231 (substrate: stale_replacement should be
-    dict-keyed by old_node_id). This test asserts CURRENT behavior so that
-    when issue #231 lands, the test must be updated as part of that change.
+    Previously named test_both_sides_superseded_clobbers_stale_replacement;
+    updated when issue #231 landed (PR: fix/stale-replacement-dict-keyed).
     """
     server = fresh_server()
     ob_a = _mk_obs(server, "Source A says X.")
@@ -301,12 +302,11 @@ def test_both_sides_superseded_clobbers_stale_replacement():
     ct_inspect = json.loads(server.engram_inspect(node_id=ct_id, view="deep", dream_mode=True))
     ct_meta = json.loads(ct_inspect["node"]["metadata"])
 
-    # stale_by correctly appends both old IDs
+    # stale_by correctly appends both old IDs (unchanged from pre-fix)
     assert set(ct_meta["stale_by"]) == {ob_a, ob_b}, ct_meta["stale_by"]
 
-    # CURRENT scalar-clobber behavior: only the SECOND replacement survives.
-    # Issue #231 tracks the fix to make this dict-keyed.
-    assert ct_meta["stale_replacement"] == ob_b_refined, (
-        f"Pre-#231 scalar behavior: expected {ob_b_refined} (last writer wins), "
-        f"got {ct_meta['stale_replacement']}"
-    )
+    # Fixed dict-keyed behavior: both replacements survive as separate entries.
+    stale_repl = ct_meta.get("stale_replacement")
+    assert isinstance(stale_repl, dict), f"stale_replacement should be dict, got {type(stale_repl)}"
+    assert stale_repl.get(ob_a) == ob_a_refined, f"entry for {ob_a} wrong: {stale_repl}"
+    assert stale_repl.get(ob_b) == ob_b_refined, f"entry for {ob_b} wrong: {stale_repl}"

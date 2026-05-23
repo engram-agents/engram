@@ -1061,7 +1061,11 @@ function selectNode(d) {
     try {
       const meta = typeof d.metadata === 'string' ? JSON.parse(d.metadata) : d.metadata;
       const by = meta.stale_by || [];
-      const repl = meta.stale_replacement || '?';
+      // stale_replacement is dict-keyed since PR #281 (multi-cascade safety).
+      // Legacy nodes may still have scalar form; handle both.
+      const repl = (meta.stale_replacement && typeof meta.stale_replacement === 'object')
+          ? Object.values(meta.stale_replacement).join(', ') || '?'
+          : (meta.stale_replacement || '?');
       body.insertAdjacentHTML('beforeend',
         `<div class="stale-badge">⚠ Stale — premise ${by.join(', ')} superseded by ${repl}</div>`);
     } catch(e) {

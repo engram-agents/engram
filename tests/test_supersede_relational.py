@@ -227,7 +227,9 @@ def test_supersede_relational():
             ds_row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (dv_downstream,)).fetchone()
             meta = json.loads(ds_row["metadata"])
             assert dv_upstream in meta.get("stale_by", []), f"T11: stale_by metadata missing"
-            assert meta.get("stale_replacement") == dv_upstream_v2, f"T11: stale_replacement wrong"
+            stale_repl = meta.get("stale_replacement")
+            assert isinstance(stale_repl, dict), f"T11: stale_replacement should be dict, got {type(stale_repl)}"
+            assert stale_repl.get(dv_upstream) == dv_upstream_v2, f"T11: stale_replacement dict wrong: {stale_repl}"
         finally:
             conn.close()
         print("  T11 PASS — stale cascade walks and stamps metadata on downstream")
