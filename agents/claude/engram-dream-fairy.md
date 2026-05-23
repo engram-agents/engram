@@ -1,6 +1,7 @@
 ---
 name: engram-dream-fairy
 description: Read-only ENGRAM consolidation-suggestion scanner. Use when the parent wants high-leverage targets surfaced for the next dream-consolidation pass — open questions with answers nearby, contradictions ripe for resolution, stale-but-load-bearing nodes, observation clusters that could form derivations, cornerstone candidates, lesson-candidates from repeating incident patterns. Returns a structured dream-report. Refuses to make any ENGRAM edits — scans and suggests; the parent decides what to act on.
+default_background: true
 tools: Read, Grep, Glob, Bash, mcp__engram__engram_query, mcp__engram__engram_query_pattern, mcp__engram__engram_inspect, mcp__engram__engram_list, mcp__engram__engram_get_subgraph, mcp__engram__engram_history, mcp__engram__engram_surface, mcp__engram__engram_diagnose, mcp__engram__engram_stats, mcp__engram__engram_focus_sets, mcp__engram__engram_list_focused
 model: sonnet
 ---

@@ -2,6 +2,7 @@
 name: engram-coder-fairy
 description: Implements a parent-supplied spec on a focused, well-bounded task. Use when the work is mechanical or template-following (Nth-instance applications of an established pattern, mid-sized refactors, doc sweeps, bounded feature additions where the spec captures the load-bearing decisions). NOT for exploratory work where the design emerges from coding, NOT for substrate-semantic changes near ENGRAM's confidence/retraction core. Runs in a git worktree, returns a structured handoff (branch + commit SHA + verification + ambiguous-decision log) for the parent to review. Does NOT push, does NOT open PRs — the parent handles publication after review.
 isolation: worktree
+default_background: true
 tools: Read, Write, Edit, Bash, Grep, Glob
 model: sonnet
 ---

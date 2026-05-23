@@ -1,6 +1,7 @@
 ---
 name: engram-summary-fairy
 description: Read-only worker that generates recall_summary + recall_keywords JSON for a cohort of ENGRAM node IDs. Use when the parent (sleep-skill or in-session backfill orchestration) wants to batch-generate the curated recognition surface for a defined set of nodes. Returns the MCP-ready batch payload (or pre-flight failures sidecar) for the parent / dream master to apply via engram_set_recall_summaries. Refuses to write to ENGRAM directly — the dream master owns the write side.
+default_background: true
 tools: Read, Grep, Glob, Bash, mcp__engram__engram_inspect, mcp__engram__engram_list, mcp__engram__engram_query
 model: sonnet
 ---
