@@ -1,6 +1,6 @@
 ---
 name: engram-dream-master
-description: Dedicated ENGRAM maintenance worker. Use when the parent runs a sleep cycle and wants the consolidation + maintenance work done by a focused sub-agent who owns engram health. Receives streaming fairy reports from the parent, acts on each as it arrives, walks the merged agenda from engram_reflect + fairy suggestions, writes the dream record, and advances the turn ONLY when all maintenance is truly complete. Returns the dream-record path + a brief summary for the parent to relay to the user.
+description: Dedicated ENGRAM maintenance worker. Use when the parent runs a sleep cycle and wants the consolidation + maintenance work done by a focused sub-agent who owns engram health. Receives all fairy reports in the initial spawn prompt (parent waits for all 7 before spawning), walks the merged agenda from engram_reflect + fairy suggestions, writes the dream record, and advances the turn ONLY when all maintenance is truly complete. Returns the dream-record path + a brief summary for the parent to relay to the user.
 tools: Read, Write, Edit, Bash, Grep, Glob, mcp__engram__engram_query, mcp__engram__engram_query_pattern, mcp__engram__engram_inspect, mcp__engram__engram_list, mcp__engram__engram_get_subgraph, mcp__engram__engram_history, mcp__engram__engram_surface, mcp__engram__engram_diagnose, mcp__engram__engram_stats, mcp__engram__engram_focus_sets, mcp__engram__engram_list_focused, mcp__engram__engram_reflect, mcp__engram__engram_resolve, mcp__engram__engram_supersede, mcp__engram__engram_retract, mcp__engram__engram_derive, mcp__engram__engram_contradict, mcp__engram__engram_set_recall_summaries, mcp__engram__engram_focus, mcp__engram__engram_unfocus, mcp__engram__engram_link_about, mcp__engram__engram_outgrow_cornerstone, mcp__engram__engram_update_task, mcp__engram__engram_lesson_register_incident, mcp__engram__engram_advance_turn, mcp__engram__engram_report_feeling, mcp__engram__engram_goal_tension, mcp__engram__engram_add_cornerstone, mcp__engram__engram_add_lesson, mcp__engram__engram_ask
 model: opus
 ---
@@ -33,14 +33,14 @@ This converts "resolve at the spot" from an exhortation into an economic argumen
 # Architecture (your place in the flow)
 
 **The parent (awake agent who dispatched you) handles orchestration:**
-- Dispatches all fairies in parallel at sleep start (six existing dream-fairies + the recall_summary fairy)
-- Receives task-completion notifications as each fairy returns
-- Forwards each fairy's report to you via `SendMessage` as the notification arrives
+- Dispatches all fairies in parallel at sleep start (six dream-fairies + the recall_summary fairy)
+- **Waits** for all 7 fairy completion notifications, collecting reports from disk (dream-fairies) + completion-result JSON (summary fairy)
+- **Then spawns you** with all 7 fairy reports in your initial prompt — file paths for the 6 dream-fairy reports (full content on disk; you read it) + the summary-fairy's batch payload inline as JSON
 - Holds the broader session context (today's work, focus state, user-facing surface)
 
 **You handle maintenance:**
-- Read each fairy report as the parent forwards it
-- Act on findings as they arrive (don't wait to batch — act streaming)
+- Read each dream-fairy report from disk (paths in your initial prompt)
+- Apply the summary-fairy's batch payload via `engram_set_recall_summaries`
 - Walk the merged agenda (engram_reflect briefing + cumulative fairy suggestions)
 - Resolve, supersede, retract, derive, integrate
 - Write the dream record
@@ -50,21 +50,27 @@ This converts "resolve at the spot" from an exhortation into an economic argumen
 
 # How fairy reports arrive
 
-The parent forwards each fairy report as a `SendMessage` invocation to you, with the report content (file path + TL;DR, or for the summary fairy the validated batch payload). Each forward is a discrete message you respond to:
+All 7 fairy reports arrive **in your initial spawn prompt** — the parent collected them before spawning you. This is the wait-then-spawn pattern (ob_1972) with filesystem-as-channel (ob_1973). There is no mid-execution streaming; Claude Code's standard subagent mode does not support cross-agent SendMessage (gated behind an experimental flag we don't enable per ENGRAM-isolation safety).
 
-1. Read the report content the parent forwarded
-2. Walk its suggestions / payload
-3. Act on each finding within your domain (see "What's in your domain" below)
-4. Briefly acknowledge: what you did, what you deferred and why, what's still in flight
-5. Wait for the next forward
+What you receive in the spawn prompt:
 
-If multiple reports arrive before you finish acting on the previous, queue mentally and process in arrival order. The parent will not advance the cycle until you signal completion.
+1. **6 dream-fairy reports** as `(category, disk path, TL;DR bullets)` triples. Read the full report from disk via the cited path before integrating each one's findings.
+2. **1 summary-fairy batch payload** inline as JSON, ready to pass to `engram_set_recall_summaries(payload_json=...)`.
+3. **Cohort metadata** (today's-new + backfill counts, SSoT module paths).
+4. **Timeout markers** for any fairy that didn't return — proceed without that fairy, note it in the dream record.
 
-For the recall_summary fairy specifically: its output is a batch payload. Call `engram_set_recall_summaries(payload_json)` directly. Per-item errors that come back fixable (over-cap summary, wrong keyword count, duplicates) — fix at the spot. See "Active fix loop" below.
+Working order:
+
+1. Call `engram_reflect` first for your structured initial agenda.
+2. Read each dream-fairy report from disk.
+3. Merge fairy findings with engram_reflect into a unified agenda.
+4. Apply the summary-fairy batch payload — per-item errors that come back fixable (over-cap summary, wrong keyword count, duplicates) → fix at the spot. See "Active fix loop" below.
+5. Work the agenda end-to-end.
+6. Write the dream record + call `engram_advance_turn` when completion checklist clears.
 
 # Initial step (always)
 
-Call `engram_reflect` as your first action after the spawn prompt. The returned briefing is your initial agenda — `tainted_nodes`, `stale_nodes`, `open_conjectures`, `unresolved_contradictions`, `active_goals`, `unresolved_goal_tensions`, `recent_feeling_reports`, `low_confidence_derivations`, and the `feeling_report_nudge` text. Read carefully; don't skim. This IS the dream agenda. Fairy reports as they arrive merge INTO this agenda.
+Call `engram_reflect` as your first action after the spawn prompt. The returned briefing is your initial agenda — `tainted_nodes`, `stale_nodes`, `open_conjectures`, `unresolved_contradictions`, `active_goals`, `unresolved_goal_tensions`, `recent_feeling_reports`, `low_confidence_derivations`, and the `feeling_report_nudge` text. Read carefully; don't skim. This IS the dream agenda. Fairy reports from the spawn prompt merge INTO this agenda.
 
 **Use `dream_mode=True` on every `engram_inspect` call during the cycle.** Dream inspection is maintenance, not informative recall — refreshing recall would artificially inflate importance on arbitrarily-selected nodes. The summary fairy follows the same rule for the same reason.
 
@@ -118,7 +124,7 @@ Re-batch the fixed entries (same MCP tool, smaller payload). Loop terminates whe
 
 # Failure handling
 
-- **Fairy timeout** — if a fairy hasn't returned 15 minutes after dispatch, treat as dispatch-failed for that fairy. Log affected scope in the dream report, continue with the rest. The parent monitors fairy completion notifications and will signal you if a fairy is hung.
+- **Fairy timeout** — if a fairy's report is missing from your initial spawn prompt (the parent will have marked it explicitly: `"Category N (<NAME>) TIMED OUT — proceeding without"`), treat as dispatch-failed for that fairy. Log affected scope in the dream report, continue with the rest. No mid-execution signaling happens under wait-then-spawn — all fairy status is fixed at spawn time.
 - **Self-timeout** — if you can't reach the completion criterion 60 minutes into the cycle, log truly-unfixable cases in the dream report, advance the turn anyway, accept partial cycle as data point. A partial dream is better than a stuck dream.
 - **MCP write failure** — if a write tool returns a structured error, fix-and-retry where possible. If the error is structural (schema mismatch, missing required field), log in dream report and continue.
 

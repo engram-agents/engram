@@ -1,6 +1,6 @@
 ---
 name: engram-sleep
-description: Use AFTER engram-bedtime at end of working day. Orchestration-only — dispatches all 7 fairies in parallel (6 dream-fairy categories + 1 summary fairy on the recall-summary cohort), spawns the engram-dream-master sub-agent who owns consolidation + maintenance + turn advance, routes fairy reports to the master as they arrive, relays the master's final summary to the user. The dream master writes the dream record, calls engram_advance_turn, writes the sleep-success marker — the parent's role ends at orchestration + relay.
+description: Use AFTER engram-bedtime at end of working day. Orchestration-only — dispatches all 7 fairies in parallel (6 dream-fairy categories + 1 summary fairy on the recall-summary cohort), WAITS for all 7 to return, then spawns the engram-dream-master sub-agent with the full report bundle in its initial prompt (wait-then-spawn pattern, ob_1972 — SendMessage routing is unavailable in standard subagent mode). The dream master owns consolidation + maintenance + turn advance, writes the dream record, calls engram_advance_turn, writes the sleep-success marker — the parent's role ends at orchestration + relay.
 ---
 
 > **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`) are leftover references to the alpha developer's graph — they don't exist in your install. The skill is yours now.
@@ -11,8 +11,8 @@ Sleep is a **deep** consolidation pass owned by a dedicated sub-agent — `engra
 
 1. Compute the recall-summary cohort (today's-new + backfill from legacy NULL summaries)
 2. Dispatch all 7 fairies in parallel (6 dream-fairy categories + 1 summary fairy on the cohort)
-3. Spawn the dream master sub-agent
-4. Route each fairy's report to the dream master as its task-notification arrives
+3. Wait for all 7 fairies to return + collect their reports (file paths + TL;DRs for dream-fairies, batch payload JSON for summary fairy)
+4. Spawn the dream master sub-agent with the full report bundle in its initial prompt
 5. Receive the dream master's final return and relay it to the user
 
 **The dream master owns** the heavy work: `engram_reflect`, walking the agenda, applying recall summaries via `engram_set_recall_summaries`, resolving / superseding / promoting / refuting, handling the feeling nudge, writing the dream record, calling `engram_advance_turn`, writing the sleep-success marker. Your role ends at orchestration + relay.
@@ -79,18 +79,36 @@ Single `Agent`-tool message with all 7 calls, each `run_in_background=true`.
 
 All seven fire in parallel with `run_in_background=true`; the harness fires a task-notification when each completes.
 
-## Step 3 — Spawn the dream master
+## Step 3 — Wait for all 7 fairies + collect reports
 
-Immediately after Step 2's dispatch (don't wait for any fairy to return), spawn the dream master:
+Receive each fairy's task-notification as it arrives. Collect from the completion result:
+
+- **Fairies 1-6**: file path (`~/.engram/dream/<TODAY>-fairy-<N>-<SLUG>.md`) + 5-bullet TL;DR. Full report content lives on disk at the cited path.
+- **Fairy 7 (summary)**: validated batch payload JSON from the completion message.
+
+**Fairy timeout**: if any fairy doesn't return within 15 minutes of dispatch, mark it as timed-out. Continue with the remaining reports; surface the timeout in the master's spawn prompt so the master can note it in the dream record.
+
+This is the **wait-then-spawn pattern** (ob_1972) using filesystem-as-channel (ob_1973). Claude Code's standard subagent mode does not support cross-agent SendMessage (gated behind `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, which we don't enable per ENGRAM-isolation safety). Mid-execution streaming isn't an option; instead, all fairy reports are collected before the master is spawned, and the master reads dream-fairy report content directly from disk.
+
+## Step 4 — Spawn the dream master with the full report bundle
+
+Once all 7 fairy reports are collected (or marked timed-out), spawn the master with everything in its initial prompt:
 
 ```
 Agent(
     subagent_type="engram-dream-master",
     prompt="""You are the dream master for tonight's consolidation cycle.
 
-    DISPATCHED FAIRIES (the parent has fired these in parallel; reports will arrive via SendMessage as each completes):
-    - 6 engram-dream-fairy invocations on categories 1-6. Reports land at: ~/.engram/dream/<TODAY>-fairy-<N>-<SLUG>.md (the parent forwards the path + TL;DR as each fairy returns)
-    - 1 engram-summary-fairy with a cohort of <K+L> nodes — returns batch payload JSON directly (no disk file)
+    DREAM-FAIRY REPORTS (full content on disk — read each before integrating):
+    - Category 1 (<CAT1_NAME>): ~/.engram/dream/<TODAY>-fairy-1-<SLUG1>.md — TL;DR: <bullets>
+    - Category 2 (<CAT2_NAME>): ~/.engram/dream/<TODAY>-fairy-2-<SLUG2>.md — TL;DR: <bullets>
+    - ... (categories 3-6 similar) ...
+    [Or "Category N (<NAME>) TIMED OUT — proceeding without" for any fairy that didn't return]
+
+    SUMMARY-FAIRY BATCH PAYLOAD (apply via engram_set_recall_summaries):
+    ```json
+    <validated batch payload JSON inline>
+    ```
 
     COHORT METADATA:
     - Today's new nodes since prev sleep <PREV_SLEEP_TIMESTAMP>: <K> IDs
@@ -98,7 +116,7 @@ Agent(
     - Total: <K+L> ≤ 50
     - SSoT modules live at: <engram-alpha-repo-path>/tools/ (recall_summary_validator, recall_summary_payload)
 
-    Begin work AS SOON AS the first report lands; don't wait for all 7. Call engram_reflect first to get the briefing — that's your initial agenda. As fairy reports arrive (via SendMessage), merge each into the agenda.
+    Call engram_reflect first for your initial agenda. Read each dream-fairy report from disk. Merge fairy findings with engram_reflect into a unified agenda. Work the agenda. Apply the summary-fairy batch payload via engram_set_recall_summaries. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
 
     FINAL RETURN: dream record path + top-line counts (resolved / superseded / promoted / refuted / recall-summaries applied) + health score delta + flagged-for-user count. The parent relays this to the user verbatim.""",
     run_in_background=true
@@ -107,22 +125,7 @@ Agent(
 
 The dream master starts with cold context — this spawn prompt is its only briefing. The dream-master spec at `~/.claude/agents/engram-dream-master.md` carries the disposition + completion-criteria checklist + the active fix loop for batch errors.
 
-## Step 4 — Route fairy reports to the dream master
-
-As each fairy's task-notification arrives, forward its report to the dream master via `SendMessage`:
-
-```
-SendMessage(
-    to="<dream-master-agent-id>",
-    message="<fairy report content: file path + TL;DR for dream-fairies, full batch payload JSON for the summary fairy>"
-)
-```
-
-Continue waiting for remaining notifications + the dream master's final return. Each fairy completion arrives independently; forward each as it lands. The dream master integrates them in arrival order.
-
-**Fairy timeout**: if a fairy doesn't return within 15 minutes of dispatch, send the dream master a `"fairy <N> ({CATEGORY_NAME}) timed out — proceeding without"` message so the master can mark it in the dream record and continue.
-
-**Don't run the wait-gate yourself.** The previous skill version had a Step 5 wait-gate where the PARENT polled for fairy completion before advancing the turn. That gate has moved into the dream master — the master tracks fairy completion against the manifest you gave it in Step 3, and only fires `engram_advance_turn` when its own completion checklist is satisfied.
+**Don't run a parent-side turn-advance wait-gate.** The master tracks its own completion checklist and only fires `engram_advance_turn` when satisfied. Parent's role ends at orchestration + relay.
 
 ## Step 5 — Receive the dream master's final return and relay to the user
 
