@@ -482,6 +482,59 @@ def test_bare_heading_body_uses_clean_title(engram_home, inter_agent_dir):
 
 
 # ---------------------------------------------------------------------------
+# Test 11: Malformed cursor (filename-format) logs to stderr + still surfaces
+# ---------------------------------------------------------------------------
+
+def test_malformed_cursor_logs_stderr_and_surfaces_letter(engram_home, inter_agent_dir):
+    """Cursor with filename-format value logs stderr warning and treats all letters as unread.
+
+    A v0-pattern cursor stores a filename like '2026-05-22T07-15-30Z_borges.md'
+    instead of an ISO-8601 timestamp. The hook must:
+      - Log a warning to stderr containing the diagnostic phrases.
+      - Exit with code 0 (no crash).
+      - Treat all letters as unread (None-cursor path), so the letter surfaces.
+    """
+    _write_config(engram_home, mode="multi", agent_name="borges")
+
+    # Write a filename-format value to the surfaced cursor file (v0 pattern)
+    malformed_cursor = "2026-05-22T07-15-30Z_borges.md"
+    (engram_home / "inter-agent-surfaced-cursor.txt").write_text(malformed_cursor + "\n")
+
+    # Write a letter addressed to us
+    now = datetime.now(timezone.utc)
+    _write_letter(
+        inter_agent_dir, "2026-05-22T07-35-00Z_ariadne.md",
+        from_agent="ariadne", to_agent="borges",
+        timestamp=now - timedelta(minutes=5),
+        heading="Test letter for cursor warning",
+    )
+
+    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
+
+    # Hook must exit cleanly
+    assert rc == 0, f"Hook must not crash on malformed cursor; stderr: {stderr}"
+
+    # Stderr must contain the diagnostic warning
+    assert "not an ISO-8601 timestamp" in stderr, (
+        f"Expected 'not an ISO-8601 timestamp' in stderr; got: {stderr!r}"
+    )
+    assert "2026-05-22T14:30:00Z" in stderr, (
+        f"Expected example format hint in stderr; got: {stderr!r}"
+    )
+    assert "README.md §4" in stderr, (
+        f"Expected README pointer in stderr; got: {stderr!r}"
+    )
+
+    # Letter must surface (None-cursor path treats everything as unread/new)
+    assert stdout.strip(), "Letter must surface when cursor is malformed (None-cursor path)"
+    response = json.loads(stdout)
+    ctx = response["hookSpecificOutput"]["additionalContext"]
+    assert "Test letter for cursor warning" in ctx, (
+        "Letter title must appear in output when cursor falls back to None"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Helpers for unit-testing _get_agent_name directly
 # ---------------------------------------------------------------------------
 

@@ -126,11 +126,20 @@ def _read_cursor(path: str) -> Optional[datetime]:
     """Read a cursor file; return UTC datetime or None if absent/invalid."""
     try:
         raw = Path(path).read_text().strip()
-        if not raw:
-            return None
+    except (OSError, ValueError):
+        return None
+    if not raw:
+        return None
+    try:
         # Normalize trailing Z to +00:00 for fromisoformat compat
         return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except (OSError, ValueError):
+    except ValueError:
+        print(
+            f"[engram-inter-agent-hook] cursor at {path} is not an ISO-8601 timestamp "
+            f"(got: {raw[:200]!r}) — treating all letters as unread. "
+            f"Expected format: '2026-05-22T14:30:00Z'. See inter-agent/README.md §4.",
+            file=sys.stderr,
+        )
         return None
 
 
