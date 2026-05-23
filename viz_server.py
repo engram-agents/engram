@@ -138,11 +138,11 @@ HTML = r"""<!DOCTYPE html>
     input[type=checkbox] { accent-color: #4a90d9; }
 
     /* ── Search box ─────────────────────────────────────────── */
-    #search-box {
+    #search-box, #semantic-search-box {
       display: flex;
       gap: 6px;
     }
-    #search-input {
+    #search-input, #semantic-search-input {
       flex: 1;
       padding: 5px 8px;
       background: #0d1b36;
@@ -153,9 +153,26 @@ HTML = r"""<!DOCTYPE html>
       font-family: 'Consolas', 'Menlo', monospace;
       outline: none;
     }
-    #search-input:focus { border-color: #4a90d9; }
-    #search-input::placeholder { color: #556; }
-    #search-input.not-found {
+    #search-input:focus, #semantic-search-input:focus { border-color: #4a90d9; }
+    #search-input::placeholder, #semantic-search-input::placeholder { color: #556; }
+
+    /* ── Semantic search results ─────────────────────────────── */
+    .search-result-item {
+      padding: 5px 7px;
+      margin-bottom: 4px;
+      background: #0d1b36;
+      border: 1px solid #1a4a8a;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 11px;
+      color: #ccd;
+    }
+    .search-result-item:hover { background: #1a4a8a; }
+    .search-result-id { font-family: monospace; color: #aaccff; font-size: 11px; }
+    .search-result-type { font-size: 9px; color: #7788aa; text-transform: uppercase; margin-left: 4px; }
+    .search-result-claim { color: #99aabb; font-size: 10px; margin-top: 2px; }
+    .search-result-conf { font-size: 9px; color: #6688aa; margin-top: 1px; }
+    #search-input.not-found, #semantic-search-input.not-found {
       border-color: #e05252;
       animation: shake 0.3s ease;
     }
@@ -550,6 +567,15 @@ HTML = r"""<!DOCTYPE html>
       <input type="text" id="search-input" placeholder="e.g. dv_0130" spellcheck="false" />
       <div class="btn" id="search-btn">Go</div>
     </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Semantic search</div>
+    <div id="semantic-search-box">
+      <input type="text" id="semantic-search-input" placeholder="e.g. calibration uncertainty" spellcheck="false" />
+      <div class="btn" id="semantic-search-btn">Search</div>
+    </div>
+    <div id="semantic-search-results" style="display:none;margin-top:8px;"></div>
   </div>
 
   <div class="section">
@@ -1083,6 +1109,24 @@ function selectNode(d) {
     );
   }
 
+  // ── Recall summary + keywords (shown at TOP, before type-specific fields) ──
+  if (d.recall_summary) {
+    body.insertAdjacentHTML('beforeend',
+      `<div class="detail-section">
+        <div class="detail-label">Summary</div>
+        <div class="detail-value" style="line-height:1.5">${escHtml(d.recall_summary)}</div>
+      </div>`
+    );
+  }
+  if (Array.isArray(d.recall_keywords) && d.recall_keywords.length > 0) {
+    body.insertAdjacentHTML('beforeend',
+      `<div class="detail-section">
+        <div class="detail-label">Keywords</div>
+        <div class="detail-value" style="color:#99ccff">${d.recall_keywords.map(k => escHtml(String(k))).join(' · ')}</div>
+      </div>`
+    );
+  }
+
   // Type-specific fields
   switch (d.type) {
     case 'evidence':
@@ -1177,6 +1221,84 @@ function selectNode(d) {
       if (d.reported_state) field('Reported state', d.reported_state);
       if (d.trigger_text) field('Trigger', d.trigger_text);
       if (d.nudge_source) field('Nudge source', d.nudge_source);
+      break;
+
+    case 'goal':
+      field('Claim', d.claim);
+      field('Status', d.status || 'open');
+      {
+        const meta = (() => { try { return typeof d.metadata === 'string' ? JSON.parse(d.metadata) : (d.metadata || {}); } catch(e) { return {}; } })();
+        if (meta.motivation) field('Motivation', meta.motivation);
+        else if (d.logical_chain) field('Motivation', d.logical_chain);
+      }
+      break;
+
+    case 'goal_tension':
+      field('Claim', d.claim);
+      field('Status', d.status || 'open');
+      {
+        // Linked goals are expressed as 'tensions' edges — surface from rawData.edges
+        const tensionsEdges = rawData.edges.filter(e => {
+          const src = e.source_id || (e.source?.id) || e.source;
+          return src === d.id && e.relation === 'tensions';
+        });
+        tensionsEdges.forEach((e, i) => {
+          const tgt = e.target_id || (e.target?.id) || e.target;
+          field(`Goal ${i + 1}`, tgt, true);
+        });
+        if (d.logical_chain) field('Analysis', d.logical_chain);
+      }
+      break;
+
+    case 'person':
+      {
+        const meta = (() => { try { return typeof d.metadata === 'string' ? JSON.parse(d.metadata) : (d.metadata || {}); } catch(e) { return {}; } })();
+        field('Name', meta.name || d.claim);
+        if (meta.role) field('Role', meta.role);
+        if (meta.is_self) field('Self', 'yes (agent self-anchor)');
+        if (meta.aliases && meta.aliases.length > 0) field('Aliases', meta.aliases.join(', '));
+        if (d.logical_chain) field('Background', d.logical_chain);
+        // Aboutness: count nodes that cite this person node
+        const aboutCount = rawData.edges.filter(e => {
+          const tgt = e.target_id || (e.target?.id) || e.target;
+          return tgt === d.id && (e.relation === 'about' || e.relation === 'cites');
+        }).length;
+        if (aboutCount > 0) field('Referenced by', `${aboutCount} node(s)`);
+      }
+      break;
+
+    case 'lesson':
+      field('Claim', d.claim);
+      if (d.confidence != null) confBar(body, d.confidence);
+      {
+        const meta = (() => { try { return typeof d.metadata === 'string' ? JSON.parse(d.metadata) : (d.metadata || {}); } catch(e) { return {}; } })();
+        if (meta.scaffolding_nudge) field('Nudge', meta.scaffolding_nudge);
+        // incident_count from metadata; fall back to counting exemplifies edges
+        const exemplifiesEdges = rawData.edges.filter(e => {
+          const tgt = e.target_id || (e.target?.id) || e.target;
+          return tgt === d.id && e.relation === 'exemplifies';
+        });
+        const incCount = meta.incident_count != null ? meta.incident_count : exemplifiesEdges.length;
+        if (incCount > 0) field('Incidents', incCount);
+      }
+      break;
+
+    case 'task':
+      field('Claim', d.claim);
+      field('Status', d.status || 'planned');
+      {
+        const meta = (() => { try { return typeof d.metadata === 'string' ? JSON.parse(d.metadata) : (d.metadata || {}); } catch(e) { return {}; } })();
+        if (meta.scope) field('Scope', meta.scope);
+        // parent_task_id: look for subtask_of edge from this node
+        const subtaskEdge = rawData.edges.find(e => {
+          const src = e.source_id || (e.source?.id) || e.source;
+          return src === d.id && e.relation === 'subtask_of';
+        });
+        if (subtaskEdge) {
+          const parentId = subtaskEdge.target_id || (subtaskEdge.target?.id) || subtaskEdge.target;
+          field('Parent task', parentId, true);
+        }
+      }
       break;
 
     default:
@@ -1519,6 +1641,73 @@ document.getElementById('search-btn').onclick = () => {
 };
 document.getElementById('search-input').onkeydown = (e) => {
   if (e.key === 'Enter') searchAndFocus(e.target.value);
+};
+
+// ═══════════════════════════════════════════════════════════════════
+// Semantic search — calls /api/search and renders result list
+// ═══════════════════════════════════════════════════════════════════
+
+async function runSemanticSearch(query) {
+  const input = document.getElementById('semantic-search-input');
+  const resultsEl = document.getElementById('semantic-search-results');
+  const q = query.trim();
+  if (!q) return;
+
+  resultsEl.style.display = '';
+  resultsEl.innerHTML = '<div style="color:#7788aa;font-size:11px">Searching…</div>';
+
+  try {
+    const baseUrl = withAgent('/api/search');
+    const url = baseUrl + (baseUrl.includes('?') ? '&' : '?') + 'q=' + encodeURIComponent(q);
+    const res = await fetch(url);
+    const data = await res.json();
+
+    if (data.error) {
+      resultsEl.innerHTML = `<div style="color:#e05252;font-size:11px">${escHtml(data.error)}</div>`;
+      return;
+    }
+
+    const results = data.results || [];
+    if (results.length === 0) {
+      resultsEl.innerHTML = '<div style="color:#7788aa;font-size:11px">No results.</div>';
+      input.classList.add('not-found');
+      setTimeout(() => input.classList.remove('not-found'), 600);
+      return;
+    }
+
+    resultsEl.innerHTML = `<div style="font-size:10px;color:#556;margin-bottom:4px">${results.length} result(s)</div>`;
+    results.forEach(r => {
+      const item = document.createElement('div');
+      item.className = 'search-result-item';
+      const conf = r.confidence != null ? `${(r.confidence * 100).toFixed(0)}%` : '';
+      item.innerHTML =
+        `<div><span class="search-result-id">${escHtml(r.id)}</span>` +
+        `<span class="search-result-type">${escHtml(r.type || '')}</span></div>` +
+        `<div class="search-result-claim">${escHtml(truncate(r.claim || '', 80))}</div>` +
+        (conf ? `<div class="search-result-conf">conf: ${conf}</div>` : '');
+      item.onclick = () => {
+        // Navigate to node in graph if it exists in rawData, else open detail via id-search
+        const node = rawData.nodes.find(n => n.id === r.id);
+        if (node) {
+          searchAndFocus(r.id);
+        } else {
+          // Node may be filtered — try to open detail panel by searching
+          document.getElementById('search-input').value = r.id;
+          searchAndFocus(r.id);
+        }
+      };
+      resultsEl.appendChild(item);
+    });
+  } catch (err) {
+    resultsEl.innerHTML = `<div style="color:#e05252;font-size:11px">Search failed: ${escHtml(String(err))}</div>`;
+  }
+}
+
+document.getElementById('semantic-search-btn').onclick = () => {
+  runSemanticSearch(document.getElementById('semantic-search-input').value);
+};
+document.getElementById('semantic-search-input').onkeydown = (e) => {
+  if (e.key === 'Enter') runSemanticSearch(e.target.value);
 };
 
 // Deselect on SVG background click — keep highlight active
@@ -1877,6 +2066,78 @@ def get_agents_meta() -> list:
 # Data access
 # ---------------------------------------------------------------------------
 
+def search_nodes(db_path: str, query: str, limit: int = 20) -> dict:
+    """FTS5-based node search for the /api/search endpoint.
+
+    Falls back to a LIKE scan when nodes_fts is unavailable (e.g. schema
+    version pre-dates FTS setup). Returns at most `limit` results ordered
+    by FTS rank (best match first) or by recency for the fallback path.
+
+    Result shape per node: {id, type, claim, confidence, status}.
+    """
+    if not os.path.exists(db_path):
+        return {"results": [], "error": f"Database not found: {db_path}"}
+    if not query or not query.strip():
+        return {"results": [], "error": "query is required"}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+
+        # Check whether nodes_fts exists
+        fts_exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='nodes_fts'"
+        ).fetchone() is not None
+
+        results = []
+        if fts_exists:
+            # FTS5 path — use MATCH with a simple token sanitization:
+            # strip non-alphanumeric chars that FTS5 doesn't handle well,
+            # append * for prefix matching on the last token.
+            import re as _re
+            tokens = _re.sub(r"[^\w\s]", " ", query).split()
+            if tokens:
+                fts_expr = " ".join(tokens[:-1] + [tokens[-1] + "*"])
+            else:
+                fts_expr = None
+
+            if fts_expr:
+                rows = conn.execute(
+                    """SELECT n.id, n.type, n.claim, n.confidence, n.status
+                       FROM nodes n
+                       JOIN nodes_fts f ON n.rowid = f.rowid
+                       WHERE f.nodes_fts MATCH ?
+                         AND n.is_current = 1
+                         AND (n.status IS NULL OR n.status NOT IN ('retracted'))
+                       ORDER BY rank
+                       LIMIT ?""",
+                    (fts_expr, limit),
+                ).fetchall()
+                results = [dict(r) for r in rows]
+
+        if not results:
+            # Fallback: LIKE scan on claim
+            like_pat = f"%{query.replace('%', '').replace('_', '')}%"
+            rows = conn.execute(
+                """SELECT id, type, claim, confidence, status
+                   FROM nodes
+                   WHERE claim LIKE ?
+                     AND is_current = 1
+                     AND (status IS NULL OR status NOT IN ('retracted'))
+                   ORDER BY created_at DESC
+                   LIMIT ?""",
+                (like_pat, limit),
+            ).fetchall()
+            results = [dict(r) for r in rows]
+
+        conn.close()
+        return {"results": results, "query": query}
+
+    except sqlite3.OperationalError as e:
+        return {"results": [], "error": str(e)}
+    except Exception as e:
+        return {"results": [], "error": str(e)}
+
+
 def get_graph(db_path: str) -> dict:
     if not os.path.exists(db_path):
         return {"nodes": [], "edges": [], "error": f"Database not found: {db_path}"}
@@ -1901,7 +2162,9 @@ def get_graph(db_path: str) -> dict:
                       "recall_count", "memory_status", "source_class", "utility_score",
                       # feeling_report-specific columns
                       "reported_state", "trigger_text", "categorical_tag",
-                      "intensity_hint", "nudge_source"]
+                      "intensity_hint", "nudge_source",
+                      # recall summary + keywords (added for detail panel top display)
+                      "recall_summary", "recall_keywords"]
         select_cols = base_cols + [c for c in extra_cols if c in col_names]
         cur.execute(f"SELECT {','.join(select_cols)} FROM nodes ORDER BY id")
         nodes = []
@@ -1909,6 +2172,12 @@ def get_graph(db_path: str) -> dict:
             n = dict(row)
             # Ensure booleans are plain Python ints for JSON
             n["is_current"] = int(n["is_current"]) if n["is_current"] is not None else 1
+            # Parse recall_keywords from JSON string to list so JS receives an array
+            if "recall_keywords" in n and n["recall_keywords"]:
+                try:
+                    n["recall_keywords"] = json.loads(n["recall_keywords"])
+                except (json.JSONDecodeError, TypeError):
+                    n["recall_keywords"] = []
             nodes.append(n)
 
         # All edges
@@ -3237,6 +3506,20 @@ class Handler(BaseHTTPRequestHandler):
                 resp = get_calibration_data(db_path)
                 resp["agent"] = agent_name
                 self._json(resp)
+        elif path == "/api/search":
+            if not db_path:
+                self._json({"results": [], "error": f"Unknown agent: {agent_name!r}",
+                            "agent": agent_name})
+            else:
+                qs = parse_qs(parsed.query or "")
+                query = (qs.get("q", [None])[0] or "").strip()
+                if not query:
+                    self._json({"results": [], "error": "q parameter is required",
+                                "agent": agent_name})
+                else:
+                    resp = search_nodes(db_path, query)
+                    resp["agent"] = agent_name
+                    self._json(resp)
         else:
             self.send_response(404)
             self.end_headers()
