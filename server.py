@@ -2348,6 +2348,7 @@ def _semantic_search(
     min_similarity: float = 0.3,
     type_filter: set = None,
     importance_threshold: float = 0.0,
+    include_superseded: bool = False,
 ) -> list[dict]:
     """Search nodes by embedding similarity.
 
@@ -2359,6 +2360,10 @@ def _semantic_search(
 
     Slow path (fallback): O(N) pure-Python cosine — only used when the
     sqlite-vec extension failed to load.
+
+    include_superseded: when True, allow non-current (superseded) nodes to
+    surface. Retracted nodes are always excluded regardless of this flag —
+    they were never valid (defense-in-depth, mirrors PR #280 FTS-side filter).
 
     Returns list of {"id", "type", "claim", "similarity", ...} sorted by
     similarity descending. Falls back to empty list on any error.
@@ -2402,10 +2407,19 @@ def _semantic_search(
 
                 ids = [k[0] for k in keep]
                 placeholders = ",".join("?" * len(ids))
+                # When include_superseded=False: require is_current=1 (excludes
+                # both superseded and retracted). When include_superseded=True:
+                # allow superseded (is_current=0) but always exclude retracted —
+                # retracted nodes were never valid (defense-in-depth).
+                where_parts = [f"id IN ({placeholders})"]
+                if not include_superseded:
+                    where_parts.append("is_current = 1")
+                where_parts.append("(status IS NULL OR status != 'retracted')")
+                where_parts.append("COALESCE(importance_score, 0) >= ?")
+                where_clause = " AND ".join(where_parts)
                 meta_rows = conn.execute(
                     f"SELECT id, type, claim, confidence, quote_type, importance_score "
-                    f"FROM nodes WHERE id IN ({placeholders}) AND is_current = 1 "
-                    f"AND COALESCE(importance_score, 0) >= ?",
+                    f"FROM nodes WHERE {where_clause}",
                     ids + [importance_threshold],
                 ).fetchall()
                 meta = {r["id"]: r for r in meta_rows}
@@ -2414,7 +2428,7 @@ def _semantic_search(
                 for node_id, sim in keep:
                     r = meta.get(node_id)
                     if r is None:
-                        continue  # filtered out (non-current / below threshold)
+                        continue  # filtered out (non-current / retracted / below threshold)
                     if type_filter and r["type"] not in type_filter:
                         continue
                     scored.append({
@@ -2432,12 +2446,24 @@ def _semantic_search(
                 pass  # fall through to Python cosine
 
         # ── Slow path: pure-Python O(N) cosine (legacy fallback) ──────────
-        sql = """SELECT id, type, claim, confidence, is_current, embedding,
-                        importance_score, quote_type
-                 FROM nodes
-                 WHERE is_current = 1
-                 AND embedding IS NOT NULL
-                 AND COALESCE(importance_score, 0) >= ?"""
+        # When include_superseded=False: require is_current=1 (excludes both
+        # superseded and retracted). When include_superseded=True: allow
+        # superseded but always exclude retracted (defense-in-depth).
+        if include_superseded:
+            sql = """SELECT id, type, claim, confidence, is_current, embedding,
+                            importance_score, quote_type
+                     FROM nodes
+                     WHERE (status IS NULL OR status != 'retracted')
+                     AND embedding IS NOT NULL
+                     AND COALESCE(importance_score, 0) >= ?"""
+        else:
+            sql = """SELECT id, type, claim, confidence, is_current, embedding,
+                            importance_score, quote_type
+                     FROM nodes
+                     WHERE is_current = 1
+                     AND (status IS NULL OR status != 'retracted')
+                     AND embedding IS NOT NULL
+                     AND COALESCE(importance_score, 0) >= ?"""
         rows = conn.execute(sql, (importance_threshold,)).fetchall()
 
         scored = []
@@ -5425,6 +5451,7 @@ def _search_nodes(
             min_similarity=FTS_SIM_FLOOR,
             type_filter=type_filter,
             importance_threshold=tier2_threshold,
+            include_superseded=include_superseded,
         )
         if return_debug:
             _dbg_semantic_candidate_count = len(sem_results)

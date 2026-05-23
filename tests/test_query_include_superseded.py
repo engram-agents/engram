@@ -5,18 +5,17 @@ Background (#191):
     flag in the FTS path but hardcoded is_current = 1 in the semantic path,
     silently dropping superseded matches on the semantic side.
 
-What is fixed (as of this PR):
+What is fixed (as of PR #272):
     server.py _search_nodes (line 5174): accepts include_superseded: bool = False.
     server.py FTS post-filter (line 5314): skips the is_current check when
         include_superseded=True, so superseded nodes surface in FTS results.
 
-What is NOT yet fixed (documented here for completeness):
-    The _semantic_search function (line 2283) does not accept include_superseded
-    and hardcodes is_current = 1 in both its KNN fast path and Python slow path.
-    The semantic path therefore still silently drops superseded nodes regardless
-    of the flag. Tests run with ENGRAM_NO_EMBEDDINGS=1 (semantic disabled) so
-    they only exercise the FTS path. A follow-up issue should fix _semantic_search
-    and add semantic-path coverage once that fix is in.
+What is fixed (as of PR #273 — this PR):
+    server.py _semantic_search now accepts include_superseded: bool = False.
+    Both the KNN fast path and Python slow path honor the flag — superseded
+    nodes surface on the semantic side when include_superseded=True.
+    Retracted nodes are always excluded on the semantic side regardless of the
+    flag (defense-in-depth). Test 5 exercises the slow path directly.
 
 Fixed in #274 (retracted-node FTS leak):
     Retracted nodes (status='retracted', is_current=0) previously surfaced when
@@ -38,6 +37,10 @@ Coverage (one item per test function):
        baseline: default call (no flag) excludes superseded, includes current.
     4. test_query_include_superseded_multiple_superseded_nodes — multiple
        superseded nodes in one query all surface with flag=True.
+    5. test_query_include_superseded_semantic_path — semantic-side regression
+       for issue #273: _semantic_search honors include_superseded + always
+       excludes retracted. Calls _semantic_search directly (slow path) with a
+       mock embedder and a tiny fake corpus to bypass ENGRAM_NO_EMBEDDINGS=1.
 """
 
 import json
@@ -294,6 +297,131 @@ def test_query_include_superseded_multiple_superseded_nodes():
     assert c_id in ids_true, f"C (current) should appear with flag=True: {ids_true}"
     assert d_id in ids_true, f"D (superseded) should appear with flag=True: {ids_true}"
     assert e_id in ids_true, f"E (current) should appear with flag=True: {ids_true}"
+
+
+# ---------------------------------------------------------------------------
+# Test 5: _semantic_search honors include_superseded + always excludes retracted
+# ---------------------------------------------------------------------------
+
+def test_query_include_superseded_semantic_path():
+    """Semantic path: _semantic_search honors include_superseded; retracted always excluded.
+
+    Issue #273 regression test: _semantic_search hardcoded is_current=1 in both
+    KNN fast-path and Python slow-path, silently dropping superseded nodes even
+    when include_superseded=True.
+
+    This test calls _semantic_search directly with a mock embedder (bypassing
+    ENGRAM_NO_EMBEDDINGS=1 which disables the real embedder) and a hand-built
+    fake corpus inserted directly into the DB. It exercises the pure-Python slow
+    path (the KNN fast-path requires sqlite-vec extension, not loaded in tests).
+
+    Fake corpus (3-dimensional unit vectors; cosine similarity is exact):
+      - current_id:     is_current=1, status=NULL,       emb=[1, 0, 0]
+      - superseded_id:  is_current=0, status=NULL,       emb=[1, 0, 0]  (superseded)
+      - retracted_id:   is_current=0, status='retracted', emb=[1, 0, 0]  (retracted)
+
+    Query vector: [1, 0, 0] — similarity 1.0 with all three nodes.
+
+    Expected behavior:
+      include_superseded=False: only current_id surfaces.
+      include_superseded=True:  current_id + superseded_id surface; retracted_id never does.
+    """
+    server = fresh_server()
+
+    conn = server._get_db()
+    now = "2026-01-01T00:00:00"
+    fake_emb = json.dumps([1.0, 0.0, 0.0])
+
+    try:
+        # Insert three nodes directly — bypassing the full API to avoid
+        # triggering embedding computation (which is disabled via ENGRAM_NO_EMBEDDINGS=1).
+        conn.execute(
+            "INSERT INTO nodes (id, type, claim, created_at, is_current, status, embedding, "
+            "confidence, importance_score, quote_type, metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            ("sem_cur_273", "observation_factual",
+             "current node sem273regression uniquemarkersem", now,
+             1, None, fake_emb, 0.85, 0.5, "hard_data", "{}"),
+        )
+        conn.execute(
+            "INSERT INTO nodes (id, type, claim, created_at, is_current, status, embedding, "
+            "confidence, importance_score, quote_type, metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            ("sem_sup_273", "observation_factual",
+             "superseded node sem273regression uniquemarkersem", now,
+             0, None, fake_emb, 0.85, 0.5, "hard_data", "{}"),
+        )
+        conn.execute(
+            "INSERT INTO nodes (id, type, claim, created_at, is_current, status, embedding, "
+            "confidence, importance_score, quote_type, metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            ("sem_ret_273", "observation_factual",
+             "retracted node sem273regression uniquemarkersem", now,
+             0, "retracted", fake_emb, 0.85, 0.5, "hard_data", "{}"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Mock embedder: is_available()=True, embed()=fake query vector, cosine_similarity=real.
+    class _MockEmbedder:
+        def is_available(self):
+            return True
+
+        def embed(self, text, model_name):
+            return [1.0, 0.0, 0.0]
+
+        @staticmethod
+        def cosine_similarity(a, b):
+            # Reuse real implementation — works on plain lists.
+            dot = sum(x * y for x, y in zip(a, b))
+            norm_a = sum(x * x for x in a) ** 0.5
+            norm_b = sum(x * x for x in b) ** 0.5
+            if norm_a == 0 or norm_b == 0:
+                return 0.0
+            return dot / (norm_a * norm_b)
+
+    original_embedder = server._embedder
+    server._embedder = _MockEmbedder()
+    try:
+        conn2 = server._get_db()
+        try:
+            # Default (include_superseded=False): only current node.
+            results_false = server._semantic_search(
+                conn2, "sem273regression uniquemarkersem",
+                top_k=10, min_similarity=0.5,
+                include_superseded=False,
+            )
+            ids_false = {r["id"] for r in results_false}
+            assert "sem_cur_273" in ids_false, (
+                f"Current node missing from include_superseded=False semantic results: {ids_false}"
+            )
+            assert "sem_sup_273" not in ids_false, (
+                f"Superseded node should not appear with include_superseded=False: {ids_false}"
+            )
+            assert "sem_ret_273" not in ids_false, (
+                f"Retracted node must never appear (include_superseded=False): {ids_false}"
+            )
+
+            # include_superseded=True: current + superseded; retracted still absent.
+            results_true = server._semantic_search(
+                conn2, "sem273regression uniquemarkersem",
+                top_k=10, min_similarity=0.5,
+                include_superseded=True,
+            )
+            ids_true = {r["id"] for r in results_true}
+            assert "sem_cur_273" in ids_true, (
+                f"Current node missing from include_superseded=True semantic results: {ids_true}"
+            )
+            assert "sem_sup_273" in ids_true, (
+                f"Superseded node should appear with include_superseded=True (semantic path). "
+                f"This is the PR #273 regression fix. Results: {ids_true}"
+            )
+            assert "sem_ret_273" not in ids_true, (
+                f"Retracted node must never appear regardless of include_superseded. "
+                f"(Defense-in-depth: retracted nodes were never valid.) Results: {ids_true}"
+            )
+        finally:
+            conn2.close()
+    finally:
+        server._embedder = original_embedder
 
 
 if __name__ == "__main__":
