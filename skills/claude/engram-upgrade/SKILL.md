@@ -208,7 +208,7 @@ diff /path/to/engram-alpha/CLAUDE.md.template ~/.claude/CLAUDE.md | head -50
 
 The grep confirms the merge happened; the re-diff shows what drift remains. Read the diff's remaining hunks: each one should be either (i) an agent-local customization you intend to preserve, or (ii) a template-side addition you intentionally chose not to merge. Any other drift means the merge was incomplete.
 
-**Checkpoint**: every template path the warning listed has either been inverse-merged with grep+diff-verified content OR explicitly deferred with the user's agreement AND tracked in `~/.engram/ask-lei.md` so it doesn't fall off. Never default to silent defer.
+**Checkpoint**: every template path the warning listed has either been inverse-merged with grep+diff-verified content OR explicitly deferred with the user's agreement AND tracked in `~/.engram/ask-{{USER_NAME}}.md` so it doesn't fall off. Never default to silent defer.
 
 ---
 
@@ -278,7 +278,7 @@ engram_add_observation(
 ## Anti-patterns
 
 - **Context-impression that a step is done.** Each step has a checkpoint command for a reason — verify completion explicitly, not from memory of "I think I did that." This is the failure mode the skill exists to close.
-- **Skipping Step 5 because the warning "looked like it'd be fine."** The template-changes warning is the load-bearing step. If you defer it, write it to `~/.engram/ask-lei.md` immediately so it doesn't fall off. Silent defer is the failure pattern.
+- **Skipping Step 5 because the warning "looked like it'd be fine."** The template-changes warning is the load-bearing step. If you defer it, write it to `~/.engram/ask-{{USER_NAME}}.md` immediately so it doesn't fall off. Silent defer is the failure pattern.
 - **`install.sh --force` to "refresh" an existing install.** This archives the entire knowledge graph. Always upgrade with `tools/deploy.sh` for existing installs.
 - **Killing the MCP subprocess to "restart" it.** The stdio-MCP contract is user-restart only.
 - **Bundling unrelated source-tree changes into the deploy.** Step 1's `git status` check exists to catch this. If you've been editing alpha source while preparing the upgrade, commit the deploy-relevant changes and stash the rest first.

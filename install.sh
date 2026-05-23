@@ -225,9 +225,10 @@ mkdir -p "$ENGRAM_HOME/history/dream"
 [ -f "$ENGRAM_HOME/heartbeat-queue/from-heartbeat/inbox.md" ] || \
   echo "<!-- Heartbeat-to-foreground digests. Append-only. Foreground reads on next session. -->" \
   > "$ENGRAM_HOME/heartbeat-queue/from-heartbeat/inbox.md"
-# Bootstrap the ask-lei.md auto-load surface so session-start reads don't
-# silently no-op on a fresh install before the agent has written anything.
-touch "$ENGRAM_HOME/ask-lei.md"
+# ask-{{USER_NAME}}.md auto-load surface — bootstrapped in engram-first-session
+# after USER_NAME is resolved, so the filename matches CLAUDE.md.template's
+# reference. Previously touched here as ask-lei.md (PR #297 round-4); moved
+# in PR for #302 once USER_NAME templating landed.
 mkdir -p "$CLAUDE_HOME/skills"
 mkdir -p "$CLAUDE_HOME/agents"
 mkdir -p "$CLAUDE_HOME/output-styles"
