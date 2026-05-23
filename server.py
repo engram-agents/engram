@@ -1095,11 +1095,72 @@ def _get_db() -> sqlite3.Connection:
             VALUES ('delete', old.rowid, old.claim, old.quoted_text, old.interpretation);
         END
         """,
+        # Retract trigger (#274, round-2 #280): remove retracted nodes from FTS.
+        # Fires on AFTER UPDATE OF status when status transitions INTO 'retracted',
+        # regardless of whether the node was current or already-superseded at the
+        # time of retraction. The COALESCE guard prevents double-delete on idempotent
+        # re-retracts (FTS5 'delete' magic-insert is NOT idempotent — double-delete
+        # raises "database disk image is malformed").
+        #
+        # Round-1 used OLD.is_current=1, which missed the supersede-then-retract
+        # path: if a node was superseded first (is_current→0) and then retracted,
+        # the trigger did not fire and the node leaked through FTS queries with
+        # include_superseded=True. Fixed by keying on status transition instead.
+        #
+        # Superseded nodes are intentionally NOT removed — they're past memories,
+        # still recallable via include_superseded=True (Lei's design call, 2026-05-22).
+        # FTS5 contentless-table mechanic: the 'delete' magic-insert requires
+        # OLD column values because the contentless table doesn't store them.
+        """
+        CREATE TRIGGER IF NOT EXISTS nodes_retract_remove_from_fts
+        AFTER UPDATE OF status ON nodes
+        WHEN NEW.status = 'retracted' AND COALESCE(OLD.status, '') != 'retracted'
+        BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation)
+            VALUES ('delete', OLD.rowid,
+                    COALESCE(OLD.claim, ''),
+                    COALESCE(OLD.quoted_text, ''),
+                    COALESCE(OLD.interpretation, ''));
+        END
+        """,
     ]:
         try:
             conn.execute(trigger_sql)
         except sqlite3.OperationalError:
             pass
+
+    # One-shot migration (#274): remove existing retracted nodes from the FTS
+    # index. Pre-existing retracted nodes were indexed before the trigger above
+    # existed and were never cleaned up.
+    #
+    # IMPORTANT: FTS5 'delete' magic-insert is NOT idempotent — attempting to
+    # delete a rowid that's already absent from the index raises
+    # "database disk image is malformed". We gate this migration with
+    # PRAGMA user_version so it runs exactly once (user_version 0 → 1).
+    # The trigger above handles all retractions going forward; this migration
+    # is only needed to clean up the pre-trigger state on upgrade.
+    # Superseded nodes are deliberately left in the index (Lei's design call).
+    current_user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if current_user_version < 1:
+        try:
+            conn.execute(
+                """
+                INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation)
+                SELECT 'delete', rowid,
+                       COALESCE(claim, ''),
+                       COALESCE(quoted_text, ''),
+                       COALESCE(interpretation, '')
+                FROM nodes
+                WHERE status = 'retracted'
+                """
+            )
+            # Bump version INSIDE the try block so that if the INSERT fails
+            # (OperationalError caught below), the gate stays at 0 and the
+            # migration can retry on the next startup rather than being
+            # permanently skipped.
+            conn.execute("PRAGMA user_version = 1")
+        except sqlite3.OperationalError:
+            pass  # nodes_fts not yet created — leave version at 0 for retry
 
     # ── Diagnostic suite tables (append-only logs) ──────────────────────────
     # edit_history: chronological audit trail of every graph mutation.
@@ -5310,6 +5371,13 @@ def _search_nodes(
 
         for r in fts_rows:
             if type_filter and r["type"] not in type_filter:
+                continue
+            # Retracted nodes never surface, regardless of include_superseded flag.
+            # Defense-in-depth: trigger removes them from FTS at retraction time,
+            # but if any leak through (pre-trigger DBs not yet migrated, the
+            # supersede-then-retract path before round-2 fix, or future
+            # contamination paths), this catches them.
+            if r["status"] == "retracted":
                 continue
             if not include_superseded and not r["is_current"]:
                 continue

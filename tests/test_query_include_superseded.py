@@ -18,22 +18,22 @@ What is NOT yet fixed (documented here for completeness):
     they only exercise the FTS path. A follow-up issue should fix _semantic_search
     and add semantic-path coverage once that fix is in.
 
-Known behavior gap documented by these tests:
-    Retracted nodes (status='retracted', is_current=0) also surface when
-    include_superseded=True. The FTS post-filter at line 5314 checks is_current
-    but not status, so retracted nodes pass through alongside superseded ones.
-    Test 2 below documents this gap explicitly so any future fix that correctly
-    excludes retracted nodes will need to update that test.
+Fixed in #274 (retracted-node FTS leak):
+    Retracted nodes (status='retracted', is_current=0) previously surfaced when
+    include_superseded=True because the FTS post-filter at line 5314 checked only
+    is_current, not status. The nodes_retract_remove_from_fts trigger (server.py,
+    #274) removes retracted nodes from nodes_fts at retraction time — so they are
+    absent from the FTS index and never appear in results regardless of the flag.
+    Test 2 below is updated to assert the corrected behavior.
 
 Coverage (one item per test function):
     1. test_query_include_superseded_fts_path — core #191 regression:
        - include_superseded=False excludes superseded nodes from FTS hits.
        - include_superseded=True includes them via FTS path.
        - Current (non-superseded) replacement node surfaces in both modes.
-    2. test_query_retracted_behavior_with_include_superseded_flag — known gap:
-       - include_superseded=True also surfaces retracted nodes (the FTS filter
-         checks is_current but not status='retracted'); test is written against
-         actual behavior with flip-instruction comment for when #274 is fixed.
+    2. test_query_retracted_behavior_with_include_superseded_flag — #274 fix:
+       - Retracted nodes do NOT surface with include_superseded=True (trigger
+         removes them from nodes_fts at retraction time).
     3. test_query_include_superseded_false_default_excludes_superseded — sanity
        baseline: default call (no flag) excludes superseded, includes current.
     4. test_query_include_superseded_multiple_superseded_nodes — multiple
@@ -157,23 +157,17 @@ def test_query_include_superseded_fts_path():
 # ---------------------------------------------------------------------------
 
 def test_query_retracted_behavior_with_include_superseded_flag():
-    """Document retracted-node behavior: currently surfaces with include_superseded=True.
+    """Retracted nodes must NOT surface even with include_superseded=True (#274 fix).
 
-    IMPORTANT: This test documents a KNOWN GAP in the current implementation.
-    The FTS post-filter at server.py:5314 checks is_current but not status,
-    so retracted nodes (is_current=0, status='retracted') also pass through
-    when include_superseded=True.
+    The nodes_retract_remove_from_fts trigger (server.py) removes retracted nodes
+    from nodes_fts at retraction time. This ensures retracted nodes are absent from
+    FTS results regardless of include_superseded — the trigger removes them from the
+    index entirely, so the post-filter at line 5314 never sees them.
 
-    The flag is named include_superseded but currently behaves as include_non_current.
-    A correct implementation would:
-      - include_superseded=True: surface superseded nodes, NOT retracted nodes.
-      - include_superseded=False: surface only current nodes (existing behavior).
-
-    When the retracted-exclusion fix lands, update this test to assert:
-        assert retracted_id not in ids_true  (instead of the current assertion)
-
-    This test is intentionally written against actual current behavior so it
-    passes as-is and documents the gap for the fix PR to correct.
+    Superseded nodes (is_current=0, status=NULL/unchanged) are intentionally kept in
+    nodes_fts per Lei's design call: "they're like past memories that still exist,
+    just the information is not accurate anymore." They continue to surface with
+    include_superseded=True (see test 1 and test 4).
     """
     server = fresh_server()
 
@@ -199,15 +193,14 @@ def test_query_retracted_behavior_with_include_superseded_flag():
         f"Results: {ids_false}"
     )
 
-    # With flag=True: retracted node CURRENTLY surfaces (documented gap).
-    # This assertion reflects actual behavior as of 2026-05-22.
-    # When the fix lands to properly exclude retracted nodes regardless of the flag,
-    # change this assertion to: assert x_id not in ids_true
+    # With flag=True: retracted node must NOT surface — #274 fix.
+    # The nodes_retract_remove_from_fts trigger (added in #274) removes retracted
+    # nodes from nodes_fts at retraction time, so they never appear in FTS results
+    # regardless of the include_superseded flag.
     ids_true = _query_ids(server, query, include_superseded=True)
-    assert x_id in ids_true, (
-        f"KNOWN GAP: Retracted node ({x_id}) expected to appear with include_superseded=True "
-        "(FTS post-filter does not distinguish retracted from superseded). "
-        "If this assertion fails, the gap has been fixed — update to assert NOT in. "
+    assert x_id not in ids_true, (
+        f"Retracted node ({x_id}) must not appear with include_superseded=True "
+        "after #274 fix (trigger removes retracted nodes from nodes_fts). "
         f"Results: {ids_true}"
     )
 
