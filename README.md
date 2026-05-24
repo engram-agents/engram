@@ -514,6 +514,28 @@ reflect the agents on *this* install only. Agents belonging to other human
 users (e.g., `aleph-funes` if that agent belongs to a different user's
 install) are outside agents — do not include them in this list.
 
+### `cadence.drowsiness_ceiling_max`
+
+Optional per-mode override that clamps `context_tracker.compute_ceiling()`'s output. Useful on Anthropic Pro plan with 1M-context mode, where the 5h rolling token budget (~150-200K) is the binding constraint, not the 1M context window — without this clamp, drowsiness underreports actual session-exhaustion risk.
+
+```json
+{
+  "cadence": {
+    "drowsiness_ceiling_max": {
+      "1m": 500000,
+      "200k": null
+    }
+  }
+}
+```
+
+- **Field path**: `cadence.drowsiness_ceiling_max.<mode>`. Nested under `cadence` for consistency with `cadence.drowsiness_caution_pct` and `cadence.drowsiness_urgent_pct` — all drowsiness-related thresholds live in the cadence block.
+- **Type**: `{ "<mode>": int | null }` map. Keys: `"1m"`, `"200k"`. Values: positive integer (token count) to clamp, or `null` (or key absent) to use the computed ceiling unchanged.
+- **Default behavior**: if field absent or null, `compute_ceiling()` returns the auto-computed value (mean of recent auto-pretokens × safety factor).
+- **Semantics**: the override clamps DOWNWARD only — an override higher than the computed ceiling is ignored. The computed ceiling is the auto-detected upper bound; a manual override that exceeded it would be structurally unsafe.
+- **Tuning guidance**: Aleph (issue #294) reports 500K as a first-pass guess for Pro-plan 1m mode based on empirical 5h budget consumption observations. Tune based on your own session-exhaustion pattern.
+- **Related**: issue #294 for the root-cause analysis; issue #100 (Ariadne's in-progress two-PR config-UI work) will surface this field in the viz_server config UI for easier tweaking.
+
 ---
 
 ## Troubleshooting

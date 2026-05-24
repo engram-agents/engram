@@ -260,12 +260,69 @@ def collect_auto_pretokens(
     return collected[-max_samples:]
 
 
+def _read_ceiling_override(mode: str) -> int | None:
+    """Read a per-mode ceiling clamp from config.json's cadence.drowsiness_ceiling_max field.
+
+    Returns the integer value at config["cadence"]["drowsiness_ceiling_max"][mode]
+    if it is present AND is a positive int; returns None otherwise.
+
+    Semantics (enforced by the caller, compute_ceiling):
+      The override clamps DOWNWARD only — an override higher than the
+      computed ceiling is ignored. The computed ceiling is the auto-detected
+      safety-factored upper bound; a higher override would be structurally
+      unsafe. This function returns the raw config value without applying
+      the clamp; the comparison is in compute_ceiling so the semantics are
+      visible at the call site.
+
+    Never raises. Config read failures, missing keys, wrong types, and
+    null values all return None, preserving the current compute_ceiling
+    behavior on any misconfig.
+
+    Config schema (all keys optional):
+      {
+        "cadence": {
+          "drowsiness_ceiling_max": {
+            "1m": 500000,
+            "200k": null
+          }
+        }
+      }
+    """
+    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    cadence_block = config.get("cadence")
+    if not isinstance(cadence_block, dict):
+        return None
+    override_map = cadence_block.get("drowsiness_ceiling_max")
+    if not isinstance(override_map, dict):
+        return None
+    value = override_map.get(mode)
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
 def compute_ceiling(mode: str = "200k", transcript_path: str | None = None) -> int:
     samples = collect_auto_pretokens(mode, transcript_path=transcript_path)
     if len(samples) < 2:
-        return int(FALLBACK_CEILING_BY_MODE[mode] * SAFETY_FACTOR)
-    mean = sum(samples) // len(samples)
-    return int(mean * SAFETY_FACTOR)
+        ceiling = int(FALLBACK_CEILING_BY_MODE[mode] * SAFETY_FACTOR)
+    else:
+        mean = sum(samples) // len(samples)
+        ceiling = int(mean * SAFETY_FACTOR)
+
+    # Per-mode config override (issue #294): on Pro-plan 1m mode, the 5h
+    # token budget caps out before context fills, so the computed ceiling
+    # underreports session-exhaustion risk. Users can clamp the ceiling
+    # to align drowsiness with the budget-bound reality.
+    override = _read_ceiling_override(mode)
+    if override is not None and override < ceiling:
+        ceiling = override
+
+    return ceiling
 
 
 def _last_compact_offset(jsonl_path: str) -> int | None:

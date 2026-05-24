@@ -248,5 +248,147 @@ class TestConfigOverride(unittest.TestCase):
             self.assertEqual(th, ct.DEFAULT_DROWSINESS_THRESHOLDS_BY_MODE["1m"])
 
 
+class TestCeilingOverride(unittest.TestCase):
+    """Tests for _read_ceiling_override and compute_ceiling's config clamp.
+
+    Mirrors TestConfigOverride pattern: tempfile.TemporaryDirectory +
+    patch.object(ct, "ENGRAM_HOME", tmp). When ENGRAM_HOME points to an
+    empty tmp dir, collect_auto_pretokens returns [] (no sessions/ marker,
+    no JSONL files) → compute_ceiling falls back to FALLBACK_CEILING_BY_MODE
+    * SAFETY_FACTOR. For 1m mode that is int(850_000 * 0.95) = 807_500.
+    """
+
+    FALLBACK_1M = int(ct.FALLBACK_CEILING_BY_MODE["1m"] * ct.SAFETY_FACTOR)  # 807_500
+
+    def _write_config(self, tmp: str, ceiling_max: dict) -> None:
+        config_path = os.path.join(tmp, "config.json")
+        with open(config_path, "w") as f:
+            json.dump({"cadence": {"drowsiness_ceiling_max": ceiling_max}}, f)
+
+    def test_override_below_ceiling_clamps(self):
+        """Override below computed ceiling → compute_ceiling returns the override."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_config(tmp, {"1m": 100_000})
+            with patch.object(ct, "ENGRAM_HOME", tmp):
+                result = ct.compute_ceiling("1m")
+        self.assertEqual(result, 100_000)
+
+    def test_override_above_ceiling_ignored(self):
+        """Override above computed ceiling → compute_ceiling returns computed (unclamped)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_config(tmp, {"1m": 2_000_000})
+            with patch.object(ct, "ENGRAM_HOME", tmp):
+                result = ct.compute_ceiling("1m")
+        self.assertEqual(result, self.FALLBACK_1M)
+
+    def test_no_config_no_clamp(self):
+        """No config.json present → compute_ceiling returns computed ceiling unchanged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            # No config.json written.
+            with patch.object(ct, "ENGRAM_HOME", tmp):
+                result = ct.compute_ceiling("1m")
+        self.assertEqual(result, self.FALLBACK_1M)
+
+    def test_null_value_no_clamp(self):
+        """null config value → _read_ceiling_override returns None → no clamp."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_config(tmp, {"1m": None})
+            with patch.object(ct, "ENGRAM_HOME", tmp):
+                override = ct._read_ceiling_override("1m")
+                result = ct.compute_ceiling("1m")
+        self.assertIsNone(override)
+        self.assertEqual(result, self.FALLBACK_1M)
+
+    def test_bool_true_rejected(self):
+        """bool True (int subclass, value=1) must be rejected — not treated as int 1.
+
+        Regression test for the Blocker: before the fix, isinstance(True, int)
+        returned True, so _read_ceiling_override returned True (= 1), and
+        compute_ceiling clamped to 1, producing astronomical usage_pct from
+        the first token of every session.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_config(tmp, {"1m": True})
+            with patch.object(ct, "ENGRAM_HOME", tmp):
+                override = ct._read_ceiling_override("1m")
+                result = ct.compute_ceiling("1m")
+        self.assertIsNone(override, "True must be rejected — bool is not a valid int ceiling")
+        self.assertEqual(result, self.FALLBACK_1M)
+
+    def test_bool_false_rejected(self):
+        """bool False (int subclass, value=0) must be rejected — not treated as int 0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_config(tmp, {"1m": False})
+            with patch.object(ct, "ENGRAM_HOME", tmp):
+                override = ct._read_ceiling_override("1m")
+                result = ct.compute_ceiling("1m")
+        self.assertIsNone(override, "False must be rejected — bool is not a valid int ceiling")
+        self.assertEqual(result, self.FALLBACK_1M)
+
+    def test_negative_int_rejected(self):
+        """Negative int → _read_ceiling_override returns None."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_config(tmp, {"1m": -1})
+            with patch.object(ct, "ENGRAM_HOME", tmp):
+                override = ct._read_ceiling_override("1m")
+                result = ct.compute_ceiling("1m")
+        self.assertIsNone(override)
+        self.assertEqual(result, self.FALLBACK_1M)
+
+    def test_string_rejected(self):
+        """String value → _read_ceiling_override returns None."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_config(tmp, {"1m": "500000"})
+            with patch.object(ct, "ENGRAM_HOME", tmp):
+                override = ct._read_ceiling_override("1m")
+                result = ct.compute_ceiling("1m")
+        self.assertIsNone(override)
+        self.assertEqual(result, self.FALLBACK_1M)
+
+    def test_missing_mode_no_clamp(self):
+        """Config has 200k entry but not 1m → 1m override is None, 200k is present."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_config(tmp, {"200k": 100_000})
+            with patch.object(ct, "ENGRAM_HOME", tmp):
+                override_1m = ct._read_ceiling_override("1m")
+                override_200k = ct._read_ceiling_override("200k")
+                result_1m = ct.compute_ceiling("1m")
+        self.assertIsNone(override_1m)
+        self.assertEqual(override_200k, 100_000)
+        self.assertEqual(result_1m, self.FALLBACK_1M)
+
+    def test_cadence_block_missing_no_clamp(self):
+        """No cadence block in config → _read_ceiling_override returns None.
+
+        Guards the new isinstance(cadence_block, dict) check: an empty config
+        (no 'cadence' key at all) should fall through gracefully.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "config.json")
+            with open(config_path, "w") as f:
+                json.dump({}, f)
+            with patch.object(ct, "ENGRAM_HOME", tmp):
+                override = ct._read_ceiling_override("1m")
+                result = ct.compute_ceiling("1m")
+        self.assertIsNone(override)
+        self.assertEqual(result, self.FALLBACK_1M)
+
+    def test_cadence_block_wrong_type_no_clamp(self):
+        """cadence is a non-dict value → _read_ceiling_override returns None.
+
+        Guards isinstance(cadence_block, dict) on a non-None-but-wrong-type case:
+        a string under 'cadence' should not crash or accidentally match.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "config.json")
+            with open(config_path, "w") as f:
+                json.dump({"cadence": "not_a_dict"}, f)
+            with patch.object(ct, "ENGRAM_HOME", tmp):
+                override = ct._read_ceiling_override("1m")
+                result = ct.compute_ceiling("1m")
+        self.assertIsNone(override)
+        self.assertEqual(result, self.FALLBACK_1M)
+
+
 if __name__ == "__main__":
     unittest.main()
