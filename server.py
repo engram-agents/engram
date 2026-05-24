@@ -15447,6 +15447,44 @@ def engram_query_pattern(
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _prewarm_embeddings(model_name: str) -> None:
+    """Pre-warm the embedding model from the HuggingFace local cache.
+
+    Called on a daemon thread at startup (#276). If the model is not cached,
+    semantic search is disabled for the session without blocking mcp.run().
+    If the model IS cached, it is loaded in the background so the first
+    engram_query call hits a warm model rather than paying the load cost.
+    """
+    import sys
+
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        cached = try_to_load_from_cache(
+            f"sentence-transformers/{model_name}", "config.json"
+        )
+        if cached is None:
+            print(
+                f"[engram] Embedding model '{model_name}' not cached locally. "
+                f"Disabling semantic search for this session.\n"
+                f"  To enable: run this in PowerShell first:\n"
+                f"  python -c \"from sentence_transformers import SentenceTransformer; "
+                f"SentenceTransformer('{model_name}')\"",
+                file=sys.stderr,
+            )
+            _embedder._failed_models.add(model_name)
+        else:
+            _embedder._load_model(model_name)
+            if _embedder._model is not None:
+                print(
+                    f"[engram] Embedding model '{model_name}' loaded (background).",
+                    file=sys.stderr,
+                )
+    except ImportError:
+        pass  # huggingface_hub not available, let it try normally
+    except Exception:
+        _embedder._failed_models.add(model_name)
+
+
 if __name__ == "__main__":
     _ensure_data_dir()
     # Initialize ~/.engram/.git for the durable version-controlled snapshot.
@@ -15454,35 +15492,23 @@ if __name__ == "__main__":
     # and engram_nap / engram_advance_turn will report version_control.git_committed=False.
     _init_git()
 
-    # Pre-warm embedding model if already cached locally.
-    # If not cached, disable embeddings to avoid blocking MCP with a download.
+    # Pre-warm embedding model on a daemon thread so mcp.run() can start
+    # serving connections immediately. On cold caches under concurrent system
+    # load, synchronous pre-warm can exceed Claude Code's 30s MCP connection
+    # timeout and leave all engram_* tools unavailable for the session (#276).
+    # If a query arrives during pre-warm, _load_model() handles the late-bind
+    # path via the existing lazy code path.
     if _embedder.is_available():
-        import sys
+        import sys, threading
+
         emb_config = _get_embedding_config()
         model_name = emb_config.get("model", DEFAULT_EMBEDDING_MODEL)
-        try:
-            from huggingface_hub import try_to_load_from_cache
-            cached = try_to_load_from_cache(
-                f"sentence-transformers/{model_name}", "config.json"
-            )
-            if cached is None:
-                print(
-                    f"[engram] Embedding model '{model_name}' not cached locally. "
-                    f"Disabling semantic search for this session.\n"
-                    f"  To enable: run this in PowerShell first:\n"
-                    f"  python -c \"from sentence_transformers import SentenceTransformer; "
-                    f"SentenceTransformer('{model_name}')\"",
-                    file=sys.stderr,
-                )
-                _embedder._failed_models.add(model_name)
-            else:
-                # Model is cached — safe to load without network
-                _embedder._load_model(model_name)
-                if _embedder._model is not None:
-                    print(f"[engram] Embedding model '{model_name}' loaded.", file=sys.stderr)
-        except ImportError:
-            pass  # huggingface_hub not available, let it try normally
-        except Exception:
-            _embedder._failed_models.add(model_name)
+
+        threading.Thread(
+            target=_prewarm_embeddings,
+            args=(model_name,),
+            daemon=True,
+            name="engram-prewarm",
+        ).start()
 
     mcp.run()
