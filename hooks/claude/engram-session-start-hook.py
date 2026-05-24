@@ -30,6 +30,7 @@ access≠presence gap (ob_1976). Sourced from engram_stats(sections=
 ["confidence"]) + engram_stats(mode="7-turn", sections=["confidence"]).
 Silent skip on any stats failure: hook never blocks session start.
 """
+import hashlib
 import json
 import os
 import re
@@ -493,6 +494,102 @@ def sleep_status_block() -> str:
     )
 
 
+def auto_sleep_cron_block() -> str:
+    """Emit a cron-registration nudge when cadence.auto_sleep_enabled is true.
+
+    Only fires for interactive role (cron is registered per-session by the
+    interactive agent; other roles don't carry it). Silent "" on any read/parse
+    error — hook must never block session start.
+
+    Reads cadence.auto_sleep_enabled (default False) and cadence.auto_sleep_time
+    (default "03:00") from ~/.engram/config.json. Computes a stable per-install
+    jitter so not every install fires on the same exact minute.
+
+    Returns:
+        Multi-line nudge string when enabled + interactive, otherwise "".
+    """
+    if SESSION_ROLE != "interactive":
+        return ""
+
+    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+        cadence = config.get("cadence", {})
+        enabled = cadence.get("auto_sleep_enabled", False)
+        if not enabled:
+            return ""
+        auto_sleep_time = cadence.get("auto_sleep_time", "03:00")
+    except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+        # TypeError/AttributeError guard valid-JSON-but-non-dict shapes:
+        # config.json containing `null` / `[]` / `"x"` makes config a
+        # non-dict, and `{"cadence": null}` makes cadence None — either makes
+        # the .get() calls above raise. The hook must never break session start.
+        return ""
+
+    # Guard: a present-but-null or non-string value would raise AttributeError
+    # on .split(). Treat any non-string as a missing/invalid value.
+    if not isinstance(auto_sleep_time, str):
+        return ""
+
+    # Parse HH:MM
+    try:
+        parts = auto_sleep_time.split(":")
+        hour = int(parts[0])
+        configured_minute = int(parts[1])
+    except (ValueError, IndexError):
+        return ""
+
+    # Range-validate parsed time — e.g. "99:99" passes int() but produces an
+    # invalid cron expression. Return "" rather than handing a bad expr to the agent.
+    if not (0 <= hour <= 23 and 0 <= configured_minute <= 59):
+        return ""
+
+    # Stable per-install jitter: 0–9 minutes derived from ENGRAM_HOME path hash.
+    # encode("utf-8", errors="replace") guards against surrogateescape paths from
+    # os.environ that would raise UnicodeEncodeError with the default strict encoder.
+    jitter = int(hashlib.sha256(ENGRAM_HOME.encode("utf-8", errors="replace")).hexdigest(), 16) % 10
+    minute = configured_minute + jitter
+    if minute >= 60:
+        minute = configured_minute
+    cron_expr = f"{minute} {hour} * * *"
+
+    return (
+        f"[Auto-sleep enabled] cadence.auto_sleep_enabled is true "
+        f"(nightly sleep ~{auto_sleep_time} local). On your FIRST prompt this "
+        "session, ensure the sleep cron is registered (idempotent):\n"
+        '  1. Call CronList. If any job\'s prompt contains "AUTO-SLEEP NIGHTLY",'
+        " it is already registered this session — skip to step 3.\n"
+        f'  2. Else call CronCreate with cron="{cron_expr}", recurring=true, '
+        "durable=false, and prompt set to the AUTO-SLEEP CRON-PROMPT below. "
+        "(durable:false is intentional — the cron dies with this session and is "
+        "re-registered every SessionStart, so the current session always carries "
+        "it and stale duplicates can't accumulate.)\n"
+        f'  3. Tell the user once: "Auto-sleep is on — I\'ll consolidate nightly '
+        f"around {auto_sleep_time}. Two things keep it clean: (a) wind down heavy "
+        f"work ~5h before {auto_sleep_time} so the cron gets a fresh token window, "
+        f"and (b) leave this session open and idle through {auto_sleep_time} — a "
+        "closed session can't fire the cron, and don't leave multiple sessions "
+        'idle overnight or each will try to sleep."\n'
+        "\n"
+        "AUTO-SLEEP CRON-PROMPT to register (use exactly this as the CronCreate prompt):\n"
+        '"AUTO-SLEEP NIGHTLY consolidation. Before consolidating: (1) Read '
+        "~/.engram/sessions/last-sleep-success.json; if a sleep completed recently "
+        "— within roughly the last work-cycle (~18-24h; use judgment) — tonight's "
+        "cohort is already consolidated, so STOP: do NOT run any sleep and do NOT "
+        "advance the turn (advance is IRREVERSIBLE), report 'auto-sleep skipped: "
+        "consolidated Nh ago', and exit. (2) Else claim tonight's lock: mkdir -p "
+        "~/.engram/sleep-locks, then atomically create "
+        "~/.engram/sleep-locks/$(date +%Y-%m-%d).lock with O_EXCL (python "
+        "open(path,'x') or bash 'set -C; >file'). If it already exists, another "
+        "idle session's cron is handling tonight — STOP and exit quietly. (3) If "
+        "you got the lock, run /engram-sleep (full end-of-day consolidation: Phase "
+        "A cohort completion + Phase B dream orchestration + turn advance + dream "
+        "record). The skill updates last-sleep-success.json on completion, making "
+        'step (1) idempotent for any later fire tonight."'
+    )
+
+
 def main() -> None:
     _t0 = time.perf_counter()
 
@@ -532,6 +629,9 @@ def main() -> None:
         sleep_block = sleep_status_block()
         if sleep_block:
             lines.append(sleep_block)
+        cron_block = auto_sleep_cron_block()
+        if cron_block:
+            lines.append(cron_block)
     else:
         lines.append(
             f"[Session start reading — re-read {WARM_BRIEFING_PATH} before "
