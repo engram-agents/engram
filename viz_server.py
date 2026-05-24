@@ -20,8 +20,10 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import sqlite3
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -34,11 +36,12 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 try:
-    from tools.config_schema import annotate_schema  # noqa: E402
+    from tools.config_schema import annotate_schema, SCHEMA as _CONFIG_SCHEMA  # noqa: E402
     _CONFIG_SCHEMA_AVAILABLE = True
 except ImportError:
     _CONFIG_SCHEMA_AVAILABLE = False
     annotate_schema = None  # type: ignore[assignment]
+    _CONFIG_SCHEMA = []  # type: ignore[assignment]
 
 DEFAULT_DB = str(Path.home() / ".engram" / "knowledge.db")
 DEFAULT_PORT = 5001
@@ -47,6 +50,12 @@ DEFAULT_PORT = 5001
 # Maps name -> {"name": str, "label": str, "db": str (resolved abs path)}.
 AGENTS: dict = {}
 DEFAULT_AGENT: str = ""
+
+# ---------------------------------------------------------------------------
+# Config write infrastructure — per-agent backup tracking.
+# Populated on first write per agent per server process: agent_name → backup path.
+# ---------------------------------------------------------------------------
+_CONFIG_WRITE_BACKUPS: dict = {}  # agent_name -> backup_path written this session
 
 # ---------------------------------------------------------------------------
 # HTML / JS / CSS  (embedded so the server is a single file)
@@ -2918,6 +2927,247 @@ def get_config_data(agent_name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Config write infrastructure — PUT /api/config/<key>
+#
+# Validation derives entirely from tools/config_schema.py SCHEMA — types,
+# ranges, allowed values, and restart_required are all schema-driven, not
+# hardcoded lists. Only editable=True keys may be written.
+#
+# Atomic-write pattern: temp file → os.rename. Backup-once-per-session per
+# agent. Read-after-write verify with rollback on failure.
+# ---------------------------------------------------------------------------
+
+
+def _schema_index() -> dict:
+    """Build key → schema_row dict for fast lookup. Returns {} if unavailable."""
+    return {row["key"]: row for row in _CONFIG_SCHEMA}
+
+
+def _validate_config_value(key: str, raw_value) -> tuple:
+    """Validate value against schema. Returns (coerced_value, error_str|None).
+
+    error_str is None on success. On failure, error_str describes the rejection.
+    Rejects unknown keys (not in schema) and non-editable keys.
+    Type coercion: string→int/float/bool is attempted when the inbound type is
+    JSON-compatible (e.g. JSON int 5 for schema type "integer" is accepted;
+    string "5" is also accepted for int/float for browser form tolerance).
+    For list/list_of_objects types, the value must already be a list.
+    """
+    index = _schema_index()
+    if not index:
+        return None, "config_schema not available — cannot validate"
+    if key not in index:
+        return None, f"Unknown config key: {key!r}"
+    row = index[key]
+    if not row.get("editable", False):
+        return None, f"Config key {key!r} is read-only"
+
+    expected_type = row.get("type", "")
+    v = raw_value
+
+    # Type coercion + check
+    if expected_type == "integer":
+        try:
+            v = int(v)
+        except (ValueError, TypeError):
+            return None, f"Key {key!r} expects integer, got {type(raw_value).__name__}: {raw_value!r}"
+    elif expected_type == "float":
+        try:
+            v = float(v)
+        except (ValueError, TypeError):
+            return None, f"Key {key!r} expects float, got {type(raw_value).__name__}: {raw_value!r}"
+    elif expected_type == "boolean":
+        if isinstance(v, bool):
+            pass
+        elif isinstance(v, int):
+            v = bool(v)
+        elif isinstance(v, str):
+            if v.lower() in ("true", "1", "yes"):
+                v = True
+            elif v.lower() in ("false", "0", "no"):
+                v = False
+            else:
+                return None, f"Key {key!r} expects boolean, got string {v!r}"
+        else:
+            return None, f"Key {key!r} expects boolean, got {type(raw_value).__name__}: {raw_value!r}"
+    elif expected_type == "string":
+        if not isinstance(v, str):
+            return None, f"Key {key!r} expects string, got {type(raw_value).__name__}: {raw_value!r}"
+    elif expected_type in ("list", "list_of_objects"):
+        if not isinstance(v, list):
+            return None, f"Key {key!r} expects list, got {type(raw_value).__name__}: {raw_value!r}"
+        if expected_type == "list_of_objects":
+            for i, item in enumerate(v):
+                if not isinstance(item, dict):
+                    return None, (
+                        f"Key {key!r}: item {i} must be a dict, "
+                        f"got {type(item).__name__}: {item!r}"
+                    )
+                if not isinstance(item.get("domain"), str) or not item["domain"]:
+                    return None, (
+                        f"Key {key!r}: item {i} must have a non-empty string 'domain' key"
+                    )
+    else:
+        # Unknown type in schema — accept as-is but flag
+        pass
+
+    # Range check (integer / float)
+    if expected_type in ("integer", "float"):
+        if "min" in row and v < row["min"]:
+            return None, f"Key {key!r}: value {v} is below minimum {row['min']}"
+        if "max" in row and v > row["max"]:
+            return None, f"Key {key!r}: value {v} exceeds maximum {row['max']}"
+
+    # Allowed-values check (present on some schema rows as "allowed_values")
+    if "allowed_values" in row and v not in row["allowed_values"]:
+        return None, (
+            f"Key {key!r}: value {v!r} not in allowed values "
+            f"{row['allowed_values']!r}"
+        )
+
+    return v, None
+
+
+def _set_nested(config: dict, key: str, value) -> None:
+    """Set a dotted-path key in config dict, creating intermediate dicts."""
+    parts = key.split(".")
+    obj = config
+    for part in parts[:-1]:
+        if part not in obj or not isinstance(obj[part], dict):
+            obj[part] = {}
+        obj = obj[part]
+    obj[parts[-1]] = value
+
+
+def _get_nested(config: dict, key: str):
+    """Get a dotted-path key from config dict. Returns _MISSING sentinel if absent."""
+    parts = key.split(".")
+    obj = config
+    for part in parts:
+        if not isinstance(obj, dict) or part not in obj:
+            return _MISSING
+        obj = obj[part]
+    return obj
+
+
+class _Missing:
+    """Sentinel for absent nested keys (distinct from None)."""
+    def __repr__(self):
+        return "<MISSING>"
+
+
+_MISSING = _Missing()
+
+
+def write_config_key(agent_name: str, key: str, raw_value) -> dict:
+    """Write a validated config key for the named agent.
+
+    Returns:
+      {"ok": True, "restart_required": bool, "validated_value": <value>}
+      or {"ok": False, "error": "<msg>"}
+
+    Guarantees:
+    - Validation (type + range) before any disk touch.
+    - Backup-once-per-session per agent.
+    - Atomic write (temp → os.rename).
+    - Read-after-write verify; rollback to backup on failure.
+    - Per-agent isolation: only touches the config.json for agent_name.
+    """
+    # Resolve config path using the same function as the GET path.
+    config_path = _resolve_config_path(agent_name)
+    if not config_path:
+        return {"ok": False, "error": f"Unknown agent: {agent_name!r}"}
+    if not os.path.exists(config_path):
+        return {"ok": False, "error": f"config.json not found at {config_path!r}"}
+
+    # Validate before touching disk.
+    validated_value, err = _validate_config_value(key, raw_value)
+    if err:
+        return {"ok": False, "error": err}
+
+    # Determine restart_required from schema metadata.
+    index = _schema_index()
+    row = index.get(key, {})
+    restart_required = bool(row.get("restart_required", False))
+
+    # Load current config.
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"ok": False, "error": f"Failed to read config.json: {exc}"}
+
+    # Backup once per agent per session.
+    if agent_name not in _CONFIG_WRITE_BACKUPS:
+        ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup_path = f"{config_path}.bak.{ts}"
+        try:
+            shutil.copy2(config_path, backup_path)
+            _CONFIG_WRITE_BACKUPS[agent_name] = backup_path
+        except OSError as exc:
+            return {"ok": False, "error": f"Failed to create backup: {exc}"}
+
+    backup_path = _CONFIG_WRITE_BACKUPS[agent_name]
+
+    # Apply the new value.
+    _set_nested(config, key, validated_value)
+
+    # Atomic write: temp file in same directory → os.rename.
+    config_dir = os.path.dirname(config_path)
+    try:
+        fd, tmp_path = _tempfile_in_dir(config_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        os.rename(tmp_path, config_path)
+    except OSError as exc:
+        return {"ok": False, "error": f"Write failed: {exc}"}
+
+    # Read-after-write verify.
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            written = json.load(f)
+        written_val = _get_nested(written, key)
+        if isinstance(written_val, _Missing) or written_val != validated_value:
+            # Verify failed — rollback from backup.
+            try:
+                shutil.copy2(backup_path, config_path)
+            except OSError:
+                pass
+            return {"ok": False, "error": "write verify failed, rolled back"}
+    except (OSError, json.JSONDecodeError) as exc:
+        # Can't verify — rollback.
+        try:
+            shutil.copy2(backup_path, config_path)
+        except OSError:
+            pass
+        return {"ok": False, "error": f"write verify failed (read error: {exc}), rolled back"}
+
+    return {
+        "ok": True,
+        "restart_required": restart_required,
+        "validated_value": validated_value,
+    }
+
+
+def _tempfile_in_dir(directory: str) -> tuple:
+    """Create a named temp file in directory. Returns (fd, path).
+
+    Using os.open + O_EXCL for atomic creation; avoids tempfile module's
+    automatic cleanup which can race with os.rename.
+    """
+    fd, path = tempfile.mkstemp(dir=directory, prefix=".config_write_", suffix=".tmp")
+    return fd, path
+
+
+# ---------------------------------------------------------------------------
 # Calibration data — confidence distribution across windows
 # Queries replicated from server.py:_compute_confidence_distribution.
 # viz_server.py is stdlib-only; importing server.py would pull in the full
@@ -3940,9 +4190,83 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def do_OPTIONS(self):
+        """CORS preflight — needed for PUT from a browser on a different origin."""
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, PUT, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_PUT(self):
+        """PUT /api/config/<key>?agent=<name>
+
+        Request body: JSON {"value": <new_value>}
+        Response (200 on success):
+          {"ok": true, "restart_required": bool, "validated_value": <val>}
+        Response (400 on validation error / unknown key):
+          {"ok": false, "error": "<msg>"}
+        Response (404 on path mismatch):
+          {"ok": false, "error": "not found"}
+        """
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        # Route: /api/config/<key>  (key may be dotted, e.g. cadence.drowsiness_caution_pct)
+        _PREFIX = "/api/config/"
+        if not path.startswith(_PREFIX):
+            self._json_status({"ok": False, "error": "not found"}, 404)
+            return
+
+        key = path[len(_PREFIX):]
+        if not key:
+            self._json_status({"ok": False, "error": "key required in path"}, 400)
+            return
+
+        # Parse request body.
+        content_length = int(self.headers.get("Content-Length", 0) or 0)
+        if content_length == 0:
+            self._json_status({"ok": False, "error": "request body required"}, 400)
+            return
+        try:
+            body_bytes = self.rfile.read(content_length)
+            body = json.loads(body_bytes)
+        except (json.JSONDecodeError, ValueError) as exc:
+            self._json_status({"ok": False, "error": f"invalid JSON body: {exc}"}, 400)
+            return
+
+        if "value" not in body:
+            self._json_status({"ok": False, "error": "'value' field required in body"}, 400)
+            return
+
+        # Resolve agent — same as GET.
+        agent_name, _db_path = _resolve_agent(parsed.query)
+
+        try:
+            result = write_config_key(agent_name, key, body["value"])
+        except OSError:
+            raise
+        except Exception as exc:
+            self._json_status(
+                {"ok": False, "error": f"internal error: {exc}"}, 500
+            )
+            return
+        status = 200 if result.get("ok") else 400
+        self._json_status(result, status)
+
     def _json(self, data: dict):
         body = json.dumps(data, default=str).encode()
         self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json_status(self, data: dict, status: int):
+        """Send JSON response with an explicit HTTP status code."""
+        body = json.dumps(data, default=str).encode()
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
