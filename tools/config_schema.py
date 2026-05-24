@@ -84,6 +84,19 @@ SCHEMA: list[dict] = [
      "tooltip": "Context-fill percentage where the drowsiness meter fires the urgent-level nudge.",
      "editable": True, "restart_required": False},
 
+    # Auto-sleep
+    {"key": "cadence.auto_sleep_enabled", "section": "auto_sleep", "tier": TIER_A,
+     "type": "boolean", "control": "checkbox",
+     "label": "Enable auto-sleep",
+     "tooltip": "When enabled, the SessionStart hook registers a nightly sleep cron at the configured time. Opt-in; default off. Takes effect next session.",
+     "editable": True, "restart_required": True},
+    {"key": "cadence.auto_sleep_time", "section": "auto_sleep", "tier": TIER_A,
+     "type": "string", "control": "text",
+     "label": "Auto-sleep time (HH:MM)",
+     "tooltip": "Local-time 24-hour clock when the nightly sleep cycle fires (e.g. '03:00'). Format: HH:MM, 00:00–23:59. Takes effect next session.",
+     "editable": True, "restart_required": True,
+     "depends_on": "cadence.auto_sleep_enabled"},
+
     # Domain trust
     {"key": "trust_pool", "section": "domain_trust", "tier": TIER_A, "type": "list",
      "control": "list_edit", "label": "Trust pool",
@@ -138,9 +151,10 @@ SECTIONS: list[dict] = [
     {"id": "github",       "label": "GitHub integration",      "tier": TIER_A, "order": 2, "section_gate": "github.enabled"},
     {"id": "embedding",    "label": "Embedding",               "tier": TIER_A, "order": 3},
     {"id": "drowsiness",   "label": "Drowsiness thresholds",   "tier": TIER_A, "order": 4},
-    {"id": "domain_trust", "label": "Domain trust & caution",  "tier": TIER_A, "order": 5},
-    {"id": "memory",       "label": "Memory",                  "tier": TIER_B, "order": 6},
-    {"id": "polarity",     "label": "Polarity-dedup (NLI)",    "tier": TIER_B, "order": 7, "section_gate": "polarity.enabled"},
+    {"id": "auto_sleep",   "label": "Auto-sleep",              "tier": TIER_A, "order": 5},
+    {"id": "domain_trust", "label": "Domain trust & caution",  "tier": TIER_A, "order": 6},
+    {"id": "memory",       "label": "Memory",                  "tier": TIER_B, "order": 7},
+    {"id": "polarity",     "label": "Polarity-dedup (NLI)",    "tier": TIER_B, "order": 8, "section_gate": "polarity.enabled"},
 ]
 
 

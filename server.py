@@ -687,6 +687,11 @@ def _ensure_data_dir():
                 "sleep_protected_window_minutes": 60,
                 "drowsiness_caution_pct": 80,
                 "drowsiness_urgent_pct": 90,
+                # Auto-sleep scheduler — consumed by SessionStart hook.
+                # Registers a nightly sleep cron at session start when enabled.
+                # Changes take effect next session (restart_required).
+                "auto_sleep_enabled": False,
+                "auto_sleep_time": "03:00",
             },
             # Inter-agent mode gate (inter-agent-comms-v1 PR 1).
             # Default: single. Flipped to "multi" by agentctl finalize-name
