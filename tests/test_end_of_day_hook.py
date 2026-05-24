@@ -1,4 +1,4 @@
-"""Tests for engram-end-of-day-hook.py — surfaces bedtime→sleep combo nudge.
+"""Tests for engram-end-of-day-hook.py — surfaces engram-sleep nudge.
 
 Covers phrase-matching positives, phrase-matching negatives, command-skip
 (prompts starting with `/` or `!`), and the sleep-marker freshness gate.
@@ -89,9 +89,8 @@ def test_positive_phrase_match_fires_nudge(phrase: str, engram_home: Path) -> No
     assert output["hookEventName"] == "UserPromptSubmit"
     context = output["additionalContext"]
     assert "End-of-day detected" in context
-    assert "engram-bedtime" in context
     assert "engram-sleep" in context
-    assert "dv_0636" in context
+    assert "Phase A" in context
 
 
 # ============================================================================

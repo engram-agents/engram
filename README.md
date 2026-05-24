@@ -447,8 +447,7 @@ the page to see new nodes.
 ├── skills/
 │   ├── engram-first-session/         # cold-start dialogue (runs on first session)
 │   ├── engram-nap/                   # mid-burst pre-compaction checkpoint
-│   ├── engram-bedtime/               # end-of-day awake-state handoff
-│   ├── engram-sleep/                 # end-of-day deep consolidation + turn-advance
+│   ├── engram-sleep/                 # end-of-day full routine (Phase A: cohort completion + Phase B: consolidation + turn-advance)
 │   ├── engram-curiosity/             # research-mode self-driven inquiry
 │   ├── engram-retract/               # error-correction protocol
 │   ├── engram-learn-from-error/      # incident-based lesson capture

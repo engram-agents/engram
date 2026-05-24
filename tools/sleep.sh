@@ -1,17 +1,18 @@
 #!/bin/bash
 # ENGRAM sleep — MANUAL CATCH-UP only as of 2026-05-14 (alpha #133 PR C).
 #
-# Sleep is now interactive-first: the agent runs `engram-bedtime` then
-# `engram-sleep` at end-of-day in the user's active session (typically
-# surfaced by the end-of-day-detector hook on wrap-up phrases). The cron-
+# Sleep is now interactive-first: the agent runs `engram-sleep` at
+# end-of-day in the user's active session (typically surfaced by the
+# end-of-day-detector hook on wrap-up phrases). The cron-
 # scheduled invocation that used to drive this script every night has been
 # removed (see templates/crontab.template and tools/render_cron.py).
 #
 # This script remains on disk for the catch-up case: if yesterday's sleep
 # was missed (host off at midnight, disconnected day, etc.), run this
 # manually to consolidate the accumulated cohort. It spawns a fresh
-# `claude -p` session that drives engram-bedtime + engram-sleep in
-# sequence with the new three-routine architecture (dv_0636).
+# `claude -p` session that drives engram-sleep (two-phase: Phase A cohort
+# completion then Phase B consolidation) per the two-routine architecture
+# (dv_0636).
 #
 # Required env (caller responsibility):
 #   AGENT_NAME       e.g. borges, mneme, aleph
@@ -105,19 +106,19 @@ SESSIONS_DIR="$ENGRAM_HOME/sessions"
 mkdir -p "$SESSIONS_DIR"
 echo "$SESSION_UUID" > "$SESSIONS_DIR/sleep-$TODAY.id"
 
-PROMPT="Run engram-bedtime then engram-sleep to consolidate today's work across all roles (interactive, heartbeat, telegram). This is the SINGLE turn-advance for $TODAY (NYC local) per the coordinated-sleep design — all other roles today used nap-mode only.
+PROMPT="Run engram-sleep to consolidate today's work across all roles (interactive, heartbeat, telegram). This is the SINGLE turn-advance for $TODAY (NYC local) per the coordinated-sleep design — all other roles today used nap-mode only.
 
 NOTE: This script is for MANUAL catch-up invocation only. The cron-scheduled path was removed 2026-05-14 (alpha #133 PR C — interactive sleep is now canonical). You're reading this because someone (you, presumably) invoked sleep.sh by hand, typically to consolidate a cohort whose end-of-day sleep was missed.
 
-PHASE 1 — engram-bedtime (pre-turn-advance, this-turn content):
+PHASE A — engram-sleep Phase A (pre-turn-advance, this-turn content):
   - Walk the day's full cohort via engram_history(mode='edits', action='created', since=<prev-sleep-timestamp>)
   - File any missed nodes (cross-burst derivations, late-day insights) — these belong to this turn
   - Rotate warm-briefing 'From this session' block comprehensively (full day arc)
   - Reconcile today's history file at \$ENGRAM_HOME/history/$TODAY.md + commit
-  - Strategically reconcile ask-lei.md (git-log walk + state verify; deferred items → ask-lei-backlog.md) + commit
-  - Hand off to sleep
+  - Strategically reconcile your blocked-on-user queue file (canonical filename \$ENGRAM_HOME/ask-<user>.md per the engram-sleep skill's Phase A Step 4) — git-log walk + state verify; deferred items → ask-<user>-backlog.md; commit alongside history (no-op if the file doesn't exist on this install)
+  - Hand off to Phase B
 
-PHASE 2 — engram-sleep (consolidation + turn-advance):
+PHASE B — engram-sleep Phase B (consolidation + turn-advance):
   - Step 0: dispatch dream-fairies in parallel (six fairies via Agent tool with subagent_type=engram-dream-fairy and run_in_background=true, one per scan category 1–6, each writing to a unique \$ENGRAM_HOME/dream/$TODAY-fairy-{N}-{slug}.md path)
   - Step 1: engram_reflect — read the dream agenda
   - Step 2: integrate fairy reports as they land

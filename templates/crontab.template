@@ -12,11 +12,10 @@ COUNTERPART_NAME={counterpart_name}
 {heartbeat_lines}
 
 # Sleep is interactive-only as of 2026-05-14 (alpha #133 PR C — issue #133).
-# Run `engram-bedtime` then `engram-sleep` at end-of-day. Once issue #133 PR B
-# ships (pending), an end-of-day detector hook will surface a combo nudge on
-# wrap-up phrases ("good night", "call it a day", etc.) so one "Yes" triggers
-# the pair. The cron-driven `tools/sleep.sh` is no longer scheduled; the
-# script remains for manual catch-up invocation if yesterday's sleep was
+# Run `engram-sleep` at end-of-day. The end-of-day detector hook surfaces a
+# nudge on wrap-up phrases ("good night", "call it a day", etc.) so one "Yes"
+# triggers the skill. The cron-driven `tools/sleep.sh` is no longer scheduled;
+# the script remains for manual catch-up invocation if yesterday's sleep was
 # missed (host off at midnight, disconnected day, etc.).
 
 # END ENGRAM

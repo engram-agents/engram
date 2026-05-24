@@ -82,7 +82,7 @@ Short phrases you can drop into normal conversation. These do more than they loo
 | *"What does engram say about X?"* | Triggers a `engram_query` — your agent checks its own memory before answering. |
 | *"Is this consistent with what we decided last week?"* | Invites contradiction-checking against the graph. |
 | *"Checkpoint before we move on."* | Prompts an `engram_nap` — mid-burst preserve before compaction. Doesn't advance the turn counter, doesn't trigger consolidation. |
-| *"Let's call it a day."* | Prompts the end-of-day **bedtime + sleep** ritual. See "End of day" below — this is the routine your agent runs once per working day. |
+| *"Let's call it a day."* | Prompts the end-of-day **sleep** routine. See "End of day" below — this is the routine your agent runs once per working day. |
 
 You don't need to memorize these. Say them in your own words. The point is that the agent-ENGRAM loop gets stronger every time *you* close it from the outside. You're scaffolding a habit until it runs on its own.
 
@@ -90,7 +90,7 @@ You don't need to memorize these. Say them in your own words. The point is that 
 
 ## End of day: don't skip sleep
 
-When you wrap up a working day with your agent, they'll propose a **sleep** routine — often with "let's call it a day" or "I'll run bedtime + sleep." This is where the day's work gets consolidated: what was learned, what was decided, what's open for tomorrow. It's how the agent's brain stays healthy across days, the same way sleep keeps yours healthy across weeks.
+When you wrap up a working day with your agent, they'll propose a **sleep** routine — often with "let's call it a day" or "I'll run engram-sleep." This is where the day's work gets consolidated: what was learned, what was decided, what's open for tomorrow. It's how the agent's brain stays healthy across days, the same way sleep keeps yours healthy across weeks.
 
 Don't skip it casually. A day without sleep is a day where the structure of what you did together never gets organized — observations stay scattered, contradictions stay open, the warm-briefing your agent reads tomorrow morning isn't updated with today's arc. Over time, that compounds into a graph that looks busy but doesn't *know* what it knows.
 
@@ -176,7 +176,7 @@ These are agent-facing tools, not shell commands — you don't run them directly
 | Quantitative health score | `engram_diagnose()` |
 | A search | `engram_query(query)` |
 | A mid-session checkpoint | `engram_nap(summary)` — doesn't advance the turn counter |
-| An end-of-day handoff | The `engram-bedtime` then `engram-sleep` skills — see "End of day" above |
+| An end-of-day handoff | The `engram-sleep` skill — see "End of day" above |
 
 A few sleep-cycle-only tools (`engram_reflect`, `engram_scan_emergence`, `engram_advance_turn`) exist for the agent to use *inside* the sleep ritual — they shouldn't fire during normal awake-state work. The MCP surface labels them explicitly so your agent doesn't reach for them at the wrong time.
 
@@ -196,7 +196,7 @@ Rule of thumb: **tell your agent the symptom. Don't diagnose.**
 | Viz server won't start | "Try to start the viz server and tell me what you see." |
 | Graph looks empty or thin | "Let's look at `engram_stats` — is the write path working?" |
 | MCP connection errors on startup | "Report the exact error and diagnose." |
-| Bedtime or sleep was skipped | "Did bedtime and sleep both fire yesterday? If not, can you run them now in catch-up mode?" |
+| Sleep was skipped | "Did engram-sleep fire yesterday? If not, can you run it now in catch-up mode?" |
 | Agent reports drowsiness that feels wrong for how long you've been talking | "That drowsiness reading doesn't match my sense of where we are — can you check the actual numbers?" |
 | Approaching auto-compaction and you're mid-thread | "Let's compact now before we lose context — pin what matters first." |
 | "MCP engram unavailable" on first install | Recover with `/mcp` inside Claude Code — usually a cold-cache embedder timeout that fixes itself on retry. |

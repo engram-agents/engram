@@ -786,29 +786,27 @@ Why no turn advance: a long day with ten nap checkpoints would burn ten turns of
 - Wrapping a focused work burst before switching topics
 - The user asks
 
-Note: nap is no longer the canonical pre-sleep step (legacy bundling retired 2026-05-14 per dv_0636). The cohort-completeness baseline for sleep is established by `engram-bedtime` (day-wide review), not by a nap immediately before sleep. Naps still fire whenever a compaction boundary approaches mid-day — they're scoped to the burst, not to the day.
+Note: nap is no longer the canonical pre-sleep step (legacy bundling retired 2026-05-14 per dv_0636). The cohort-completeness baseline for sleep is established by `engram-sleep` Phase A (day-wide review), not by a nap immediately before sleep. Naps still fire whenever a compaction boundary approaches mid-day — they're scoped to the burst, not to the day.
 
 **When NOT to nap.**
 - Mid-task (finish the current thread first)
 - As a substitute for writing observations as I go — nap backfills, but the real discipline is real-time capture
 
-### §8.2 Bedtime + Sleep — end-of-day handoff and consolidation (three-routine model, dv_0636)
+### §8.2 Sleep — end-of-day routine (two-phase, dv_0636)
 
-**Purpose.** Separate the day's awake-state review (BEDTIME) from the dream-state consolidation (SLEEP), so cross-compaction scaffold work and consolidation work don't get tangled. Legacy bundling retired 2026-05-14.
+**Purpose.** Complete the day's awake-state cohort (Phase A) then consolidate it (Phase B), in one strictly-sequential skill invocation. Legacy two-skill model (engram-bedtime → engram-sleep) merged 2026-05-24 to eliminate the failure mode of stopping after Phase A with turn never advancing.
 
-**Mechanism.** Two skills fired in sequence at end-of-day:
+**Mechanism.** Single `engram-sleep` skill, two phases:
 
-1. **`engram-bedtime`** (pre-turn-advance, this-turn content):
+1. **Phase A** (pre-turn-advance, this-turn content):
    - Walk the day's full cohort via `engram_history(mode="edits", action="created", since=<prev-sleep-timestamp>)`
    - File missed nodes (cross-burst derivations, late-day insights — they belong to this turn)
    - Rotate warm-briefing "From this session" comprehensively (full day arc; per-burst rotations already done by naps)
    - Reconcile today's history file + commit
-   - Strategically reconcile ask-lei.md (git-log walk + state verify) + commit
-   - Hand off to sleep with a complete cohort
-2. **`engram-sleep`** (consolidation + turn-advance):
-   - Dispatch dream-fairies in parallel (Step 0)
+2. **Phase B** (consolidation + turn-advance):
+   - Dispatch dream-fairies in parallel (claude track: via dream master orchestration; gemini track: inline)
    - `engram_reflect()` returns the dream agenda (tainted, stale, open conjectures, contradictions, goal tensions, feeling nudges) and arms the `dream_review` marker
-   - Work the agenda: resolve / supersede / promote / refute (NO new awake-state synthesis here; that was bedtime's job)
+   - Work the agenda: resolve / supersede / promote / refute (NO new awake-state synthesis here; that was Phase A's job)
    - Handle the dream-review feeling nudge honestly
    - **`engram_advance_turn()` fires AFTER the dream** (qu_0035 rule, 2026-04-11): advances turn, logs `Turn N` header, commits git snapshot
    - Write sleep-success marker via `tools/write_sleep_marker.py`
@@ -816,7 +814,7 @@ Note: nap is no longer the canonical pre-sleep step (legacy bundling retired 202
 
 **Why turn advance fires last.** One turn = one cohort of experience **plus the consolidation of that experience**. If the turn advances before the dream, dream-generated nodes land at a younger turn than the burst they consolidate, misaligning the forgetting curve (ob_0987 extends this reasoning).
 
-**Why bedtime is pre-turn-advance.** Nodes filed during bedtime are awake-state cognition about the just-completed cohort — they belong to THIS turn, not next. Bedtime → sleep is the load-bearing ordering (dv_0636).
+**Why Phase A is pre-turn-advance.** Nodes filed during Phase A are awake-state cognition about the just-completed cohort — they belong to THIS turn, not next. Phase A → Phase B is the load-bearing ordering (dv_0636).
 
 ### §8.3 Post-compaction — orientation, not processing
 

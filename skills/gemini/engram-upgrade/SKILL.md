@@ -252,4 +252,4 @@ engram_add_observation(
 
 - **engram-self-improve** — Self-improvement may produce a code change that needs deploying; after committing the fix, this skill ships it.
 - **engram-surgical** — For data-corruption recovery, NOT routine upgrades. If `engram-surgical` is the right call, deploy.sh is not.
-- **engram-nap / engram-bedtime / engram-sleep** — An upgrade is a meaningful state-change worth a nap checkpoint if context permits (Step 8's obs IS the minimum record; a nap captures the wider session context).
+- **engram-nap / engram-sleep** — An upgrade is a meaningful state-change worth a nap checkpoint if context permits (Step 8's obs IS the minimum record; a nap captures the wider session context).

@@ -111,7 +111,7 @@ Preserved verbatim. NEVER modify the user's words.
 - Second-person framing ("you will feel..." — retired with identity v1)
 - False warmth (evaluate by reader-effect, not truth-value)
 
-**Note for bedtime (end-of-day):** the `engram-bedtime` skill's Step 3 does a comprehensive end-of-day rotation of the "From this session" block — distilling the FULL day arc, not just the current burst. Naps through the day handle per-burst rotation; bedtime is the final cohesive distillation before sleep.
+**Note for end-of-day (sleep Phase A):** `engram-sleep` Phase A Step 3 does a comprehensive end-of-day rotation of the "From this session" block — distilling the FULL day arc, not just the current burst. Naps through the day handle per-burst rotation; Phase A is the final cohesive distillation before Phase B consolidation.
 
 ## Step 6 — Ask {{USER_NAME}} 1-2 questions for next session
 
@@ -168,10 +168,9 @@ Turn advance drives exponential importance inflation and therefore forgetting. I
 
 ## Relation to other routines
 
-A nap is NOT the first step of a sleep cycle (legacy bundling retired 2026-05-14 per dv_0636 — see `engram-sleep` skill for context). The new three-routine model:
+A nap is NOT the first step of a sleep cycle (legacy bundling retired 2026-05-14 per dv_0636 — see `engram-sleep` skill for context). The two-routine model:
 
 - **Nap** — fires multiple times per day at compaction boundaries; per-burst persistence + cross-compaction-scaffold prep
-- **Bedtime** (`engram-bedtime`) — fires once/day at user-driven day-wrap; day-wide review + comprehensive scaffold rotation + missed-node capture; pre-turn-advance content
-- **Sleep** (`engram-sleep`) — fires after bedtime; pure consolidation + turn-advance + dream-record
+- **Sleep** (`engram-sleep`) — fires once/day at user-driven day-wrap; full end-of-day cycle (cohort review + missed-node capture + comprehensive scaffold rotation + consolidation); pre-turn-advance through Phase A, then turn-advances in Phase B
 
-The pre-sleep complete-cohort baseline is established by BEDTIME (day-wide review of everything since the last sleep), not by a nap immediately before sleep. If you need to nap before bedtime (e.g., context fills up during day-wrap), that's fine — naps can fire any time at compaction boundaries. Just don't conflate the nap with bedtime; they have different scopes.
+The pre-consolidation complete-cohort baseline is established by engram-sleep Phase A (day-wide review of everything since the last sleep), not by a nap immediately before sleep. If you need to nap before starting sleep (e.g., context fills up during day-wrap), that's fine — naps can fire any time at compaction boundaries. Just don't conflate the nap with Phase A; they have different scopes.

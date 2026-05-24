@@ -209,7 +209,7 @@ mkdir -p "$ENGRAM_HOME/secrets"
 mkdir -p "$ENGRAM_HOME/heartbeat-queue/to-heartbeat"
 mkdir -p "$ENGRAM_HOME/heartbeat-queue/from-heartbeat"
 # history/ — awake-state milestone log (PRs shipped, decisions, features); one
-# file per day at YYYY-MM-DD.md, written by engram-bedtime Step 4.
+# file per day at YYYY-MM-DD.md, written by engram-sleep Phase A Step 4.
 # history/dream/ — sleep-cycle consolidation reports (turn N→N+1, resolutions,
 # supersedes, fairy contribution); one file per day at YYYY-MM-DD.md, written
 # by engram-sleep Step 6. Separation per dv_0636 (three-routine architecture)
@@ -525,8 +525,8 @@ echo ""
 # manually later.
 #
 # Sleep is NOT cron-scheduled as of 2026-05-14 (alpha #133 PR C). Sleep is
-# interactive-first: the agent runs `engram-bedtime` then `engram-sleep` at
-# end-of-day in the user's active session. `cadence.sleep_hour` /
+# interactive-first: the agent runs `engram-sleep` at end-of-day in the
+# user's active session. `cadence.sleep_hour` /
 # `cadence.sleep_minute` in config.json continue to define the heartbeat
 # protected window (preferred quiet slot for interactive bedtime + sleep).
 # Manual catch-up via `tools/sleep.sh` remains available if a day's sleep

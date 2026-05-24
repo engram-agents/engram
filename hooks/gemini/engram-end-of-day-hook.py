@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""UserPromptSubmit hook: detect end-of-day phrases + surface bedtime→sleep combo nudge.
+"""UserPromptSubmit hook: detect end-of-day phrases + surface engram-sleep nudge.
 
 When the user signals end-of-day with phrases like "good night", "call it
 a day", "wrap up the day", "ending for tonight", etc., this hook injects
-an additionalContext block suggesting the agent run engram-bedtime then
-engram-sleep to consolidate the day's work. The agent surfaces the combo
-to the user, who can say "Yes" (run both skills in sequence), "Not yet"
-(proceed normally), or just keep working (ignore the nudge — the hook
-is non-blocking).
+an additionalContext block suggesting the agent run engram-sleep to
+consolidate the day's work. The agent surfaces this to the user, who can
+say "Yes" (run the skill), "Not yet" (proceed normally), or just keep
+working (ignore the nudge — the hook is non-blocking).
 
 Part of the three-routine self-engram-maintenance architecture (dv_0636);
 implementation of PR B of engram-alpha #133.
@@ -45,7 +44,7 @@ SLEEP_SUPPRESSION_HOURS = 4
 # End-of-day trigger phrases — case-insensitive, word-boundary aware.
 # Designed to catch natural wrap-up signals. False positives are
 # acceptable; the agent uses surrounding context to judge whether to
-# actually surface the bedtime nudge to the user.
+# actually surface the sleep nudge to the user.
 EOD_PATTERNS = [
     r"\bgood\s*night\b",
     r"\bcall\s+it\s+(?:a\s+)?(?:day|night)\b",
@@ -108,21 +107,17 @@ def main() -> None:
 
     additional_context = (
         f"[End-of-day detected] The phrase \"{matched_phrase}\" reads as an "
-        f"end-of-day wrap-up signal. Per the three-routine self-engram-"
-        f"maintenance architecture (dv_0636), the canonical end-of-day "
-        f"handoff is bedtime → sleep:\n"
-        f"  1. `engram-bedtime` — day-wide cohort review, missed-node "
-        f"capture, warm-briefing rotation, history-file + ask-lei "
-        f"reconcile (this-turn content, pre-turn-advance).\n"
-        f"  2. `engram-sleep` — dream-fairies + consolidation + "
-        f"turn-advance + dream-record write.\n"
+        f"end-of-day wrap-up signal. The canonical end-of-day routine is "
+        f"`engram-sleep` — a single two-phase skill: Phase A (day-wide cohort "
+        f"review, missed-node capture, warm-briefing rotation, history-file "
+        f"reconcile; pre-turn-advance) then Phase B (consolidation + "
+        f"turn-advance + dream-record write).\n"
         f"If this looks like a real wrap-up moment, surface to the user: "
-        f"\"It seems we're at the end of the day — should I run the "
-        f"bedtime ritual then sleep to consolidate?\" Their \"Yes\" → "
-        f"run both skills in sequence; \"not yet\" or no response → "
-        f"proceed with the actual request. If the phrase is incidental "
-        f"(e.g., \"yesterday we wrapped up the day with X\"), ignore "
-        f"this nudge."
+        f"\"It seems we're at the end of the day — should I run engram-sleep "
+        f"to consolidate?\" Their \"Yes\" → run the skill; \"not yet\" or no "
+        f"response → proceed with the actual request. If the phrase is "
+        f"incidental (e.g., \"yesterday we wrapped up the day with X\"), "
+        f"ignore this nudge."
     )
 
     response = {

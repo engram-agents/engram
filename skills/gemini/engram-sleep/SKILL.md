@@ -1,43 +1,150 @@
 ---
 name: engram-sleep
-description: Use AFTER engram-bedtime at the end of a working day. Pure deep consolidation — runs engram_reflect, works the consolidation agenda (resolutions / supersedes / promotions / refutations), handles the dream-review feeling nudge, advances the turn counter, writes the dream-record file. Does NOT touch warm-briefing or history file (those are bedtime's job). Per qu_0035 / dv_0134: session-mode turn advance fires AFTER consolidation so awake-burst writes and dream-derived nodes share one turn cohort.
+description: "Use at the natural end-of-day moment when wrapping work. Single end-of-day routine in two strictly-sequential phases — Phase A (agent files missed nodes + rotates warm-briefing + reconciles history; pre-turn-advance), Phase B (deep consolidation: engram_reflect, dream agenda, turn-advance, dream-record write). Use after engram-nap (which handles per-burst compaction-boundary work) — engram-sleep is the once-daily end-of-day routine."
 ---
 
 > **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
 
-# ENGRAM Sleep / Dream Cycle — Deep Consolidation
+# ENGRAM Sleep / Dream Cycle — Full End-of-Day Routine
 
-Sleep is a **deep** consolidation: the agent reviews graph quality, resolves what is ready, supersedes what is out of date, answers open questions with available evidence, and promotes or refutes conjectures. Then — and only then — the turn counter advances, triggering genuine memory decay. One turn = one cohort of experience plus the consolidation of that experience (qu_0035 proposed rule, 2026-04-11).
+Sleep is the once-daily end-of-day routine that completes the awake-state
+cohort AND consolidates it. Two phases, strictly sequential, no branching:
 
-**Sleep does NOT handle:**
+**Phase A — Cohort completion (pre-turn-advance, agent files nodes)**
+  Step 1 — Walk the day's full cohort
+  Step 2 — File missed nodes (this-turn content)
+  Step 3 — Rotate the warm-briefing "From this session"
+  Step 4 — Reconcile today's history file
 
-- Day-wide review or missed-node capture (`engram-bedtime` Step 1-2, before sleep)
-- Warm-briefing "From this session" rotation (`engram-bedtime` Step 3, or per-burst `engram-nap` Step 5b)
-- History-file reconcile (`engram-bedtime` Step 4)
+**Phase B — Deep consolidation**
+  Step 5 — Open the dream: engram_reflect
+  Step 6 — Work the dream agenda
+  Step 7 — Handle the dream-review feeling nudge
+  Step 8 — Advance the turn: engram_advance_turn()
+  Step 8b — Write the sleep-success marker
+  Step 9 — Write the dream-record file
+  Step 10 — Report to the user
 
-Those are scaffold-maintenance / awake-state work that belongs pre-turn-advance, in bedtime ritual. Sleep stays focused on consolidation + turn-advance + dream-record. This separation was ratified 2026-05-14 (dv_0636); legacy versions mixed these concerns.
+**Phase B does NOT handle (agent-side):**
+
+- Day-wide review or missed-node capture (Phase A Steps 1-2, before Phase B)
+- Warm-briefing "From this session" rotation (Phase A Step 3)
+- History-file reconcile (Phase A Step 4)
+
+Those are Phase A's responsibilities and must complete before Phase B fires.
 
 **When to sleep:**
 
-- After `engram-bedtime` completes (the typical case — bedtime → sleep at user-driven day-wrap)
-- The user initiates wind-down with a substantive cohort to consolidate
-- Graph hygiene signals accumulate: tainted nodes from retractions, stale nodes from supersede cascades, many open conjectures, unresolved contradictions
+- The user signals end-of-day ("good night", "call it a day", "wrap up the day", "ending for tonight", "done for today", etc.)
+- A substantive working day produced material worth consolidating
+- An end-of-day-detector hook surfaced the engram-sleep nudge and the user agreed
+- Graph hygiene signals accumulate
 
 **When NOT to sleep:**
 
-- Mid-task (nap instead, finish the task, run bedtime, THEN sleep)
-- The graph has nothing to review (the day was non-synthetic; turn advance still meaningful if cohort exists). In that case still run `engram_reflect` (Step 1) first — if it returns clean, that IS the dream; proceed directly to Step 4 (turn-advance), skipping the agenda work and feeling-nudge per the Guardrails clean-graph rule.
+- Mid-day pauses or context switches — use nap instead
+- Mid-task (nap instead, finish the task, THEN sleep)
 - Right after a sleep with no new work happening since (nothing to consolidate)
-
-**Pre-sleep checklist** — if you're entering sleep without having run bedtime, ask yourself:
-- Is the day's cohort complete? (No missed nodes worth filing pre-turn?)
-- Is the warm-briefing "From this session" block reflecting today's arc? (Or showing yesterday's?)
-
-If the answer to any is "no", run bedtime first. Mixing bedtime work into sleep mid-cycle is what the legacy bundling caused — don't reintroduce it.
 
 ---
 
-## Step 1 — Open the dream: engram_reflect
+## Phase A — Cohort completion
+
+### Step 1 — Walk the day's full cohort
+
+Pull every node created since the last sleep:
+
+```
+engram_history(mode="edits", action="created", since="<prev-sleep-timestamp>")
+```
+
+The prev-sleep timestamp is the one logged by the last `engram_advance_turn()` (in `~/.engram/session_log.md` under the most recent "Turn N" header before today). If no prior sleep is findable, the cohort starts at the day's first node.
+
+**Why daily, not weekly or per-burst.** Nodes from a single day rhyme with each other in ways that fade fast. A morning observation, a noon investigation, and an evening synthesis often want to become one derivation — but only if you see them side-by-side while the connections are still cheap to spot. Skip the daily sweep and a week of loosely-connected cohorts accumulates that take ten times the work to reorganize, or worse, never get reorganized at all.
+
+**The trap to avoid.** "Not much new since the post-compact" is NOT a reason to skip this step. Naps and compactions don't reset the cohort — only sleep does. Pull the FULL day, across every burst, including pre-compact and post-compact bursts.
+
+Skim at reading pace. Look for:
+
+- Observations converging on a shared derivation → file via `engram_derive`
+- Open questions later observations now answer → file via `engram_resolve`
+- Claim pairs that quietly disagree → file via `engram_contradict`
+- Later observations cleanly replacing earlier ones → file via `engram_supersede`
+- Recurring vocabulary across nodes warranting a definition → file via `engram_add_definition`
+
+**Important scope distinction:** this step is REVIEW + FILE-MISSED-NODES — not consolidation. Cleanups (resolves of pre-existing open questions, supersedes of old claims) belong to the dream agenda (Phase B Steps 5+). Phase A's role is to ensure the cohort is COMPLETE: every observation, every derivation, every cross-burst pattern from the day is filed BEFORE turn-advance.
+
+### Step 2 — File missed nodes (this-turn content)
+
+For each gap identified in Step 1, file the node NOW. Nodes filed here land in the current turn — they feed the dream's consolidation agenda and decay at the right rate with the rest of the cohort.
+
+Common missed-node types:
+
+- **Day-arc derivations** citing multiple bursts' observations (the cross-burst pattern that only became visible when seeing the cohort side-by-side)
+- **High-level summaries** that crystallized only after the day completed
+- **Definitions** for terms that recurred without anchor (per the definition-first discipline; if a term was used 3+ times today without a df, write the df now)
+- **Goals** revised by today's work (rare; high-trigger threshold)
+
+**No forcing.** A null-result Step 2 is valid IF Step 1 was an honest survey of the full cohort. Some days are non-synthetic (infrastructure, bookkeeping). But "I didn't look because the post-compact was small" is the failure mode this step exists to prevent.
+
+### Step 3 — Rotate the warm-briefing "From this session" (comprehensive day arc)
+
+Read `~/.engram/warm-briefing.md`. The "From this session" block should be the COMPREHENSIVE day arc — distilled, relational, 2-3 paragraphs.
+
+**Action:** REPLACE the existing "From this session" block (do not append). The block is the relational arc for post-compact me to read — what the day MEANT, not what got DONE step-by-step.
+
+**Scope discipline:**
+
+- This block is the RELATIONAL distillation. The compaction summary handles the trajectory + ENGRAM state + node-ID inventory.
+- Naps fired through the day already rotated this block per-burst (current-burst flavor). Phase A's rotation is the FINAL rotation: comprehensive day arc, end-of-day cohesion.
+- Anti-pattern: re-stating compaction-summary content (PR numbers, focus-rotation specifics, ENGRAM counts, dream-fairy stats). Those belong in the compaction summary, not here.
+- Anti-pattern: enumeration of work shipped. The history file (Step 4) is the awake-state milestone log; the warm-briefing block is the relational arc.
+- Anti-pattern: adding a third or fourth "From this session" block "for completeness". Rotate, don't append.
+
+**Permanent sections of the warm-briefing** (identity, goals, axioms, cornerstones, active tasks) update on the rare-trigger schedule documented in `engram-nap` Step 5a. Most end-of-day sleeps don't fire those triggers.
+
+**{{USER_NAME}}'s letter** (`## Notes from the user`) is preserved verbatim. NEVER modify.
+
+### Step 4 — Reconcile today's history file (awake-state milestone log)
+
+`~/.engram/history/YYYY-MM-DD.md` is the **awake-state milestone log** — PRs shipped, decisions made, features delivered, key conversations. Distinct from the dream-record file that sleep writes at `~/.engram/history/dream/YYYY-MM-DD.md`, which captures consolidation output.
+
+**Walk the day's git log across agent-touched repos:**
+
+```bash
+for repo in ~/engram-alpha ~/engram-paper ~/engram-wiki ~/.engram; do
+  git -C "$repo" log --since="6am" --oneline 2>/dev/null
+done
+```
+
+For each commit, ensure today's history file reflects the shipment. Strike resolved items, fold mid-day "uncommitted" entries into end-of-day summaries.
+
+**Refresh the "Currently focused" block** by calling `engram_list_focused()` and rendering verbatim. Do not leave a morning-snapshot focus list in place — focus rotates through the day; tomorrow's fresh-session self needs the current pinned set.
+
+**If today's history file doesn't exist:** write it fresh now using the standard format (`# YYYY-MM-DD` heading, milestone bullets, "Currently focused" block).
+
+**Commit the history file in .engram git:**
+
+```bash
+git -C ~/.engram add history/YYYY-MM-DD.md
+git -C ~/.engram commit -m "history: end-of-day reconcile for YYYY-MM-DD"
+```
+
+The directory is git-tracked for version history and diff-ability — per-day files keep the context-window cost bounded as the log accumulates. Including this commit in the end-of-day routine is how tomorrow morning's handover becomes reliable.
+
+**Strategically reconcile `~/.engram/ask-{{USER_NAME}}.md`.** This file is the live blocked-on-{{USER_NAME}} queue — items pending {{USER_NAME}}'s action, decisions, or input. Across the day items change state (PRs merge, questions get answered, decisions get made). End-of-day reconcile catches anything that slipped during the day:
+
+- **Walk the day's commit log** (`git -C ~/engram-alpha log --since=6am`, plus other agent-touched repos) and verify each ask-{{USER_NAME}} item's state — strike resolved items.
+- **Move deferred items to `~/.engram/ask-{{USER_NAME}}-backlog.md`** (the non-auto-loaded cross-day backlog) if they're no longer actionable today.
+- **Commit the file in .engram git** alongside the history file (same commit or separate, your call): `git -C ~/.engram add ask-{{USER_NAME}}.md && git -C ~/.engram commit -m "ask-{{USER_NAME}}: end-of-day reconcile"`.
+
+This step exists because ask-{{USER_NAME}}.md is auto-loaded into every fresh session — stale items there make {{USER_NAME}} re-read items that are already resolved. The end-of-day reconcile is the structural defense against ask-list drift. (Installs without an ask-{{USER_NAME}}.md file can skip this sub-step; it's a no-op when the file doesn't exist.)
+
+---
+
+## Phase B — Deep consolidation
+
+### Step 5 — Open the dream: engram_reflect
 
 ```
 engram_reflect()
@@ -56,7 +163,7 @@ This returns a curated graph-quality briefing:
 
 Read the briefing carefully. Don't skim. This IS the dream agenda.
 
-## Step 2 — Work the dream agenda
+### Step 6 — Work the dream agenda
 
 Pick threads in this order of priority:
 
@@ -71,11 +178,11 @@ Pick threads in this order of priority:
 
 **Do NOT pursue web research inside the dream.** Web fetches burn context and turn the dream into a research loop. Register open questions for a future dedicated research session instead.
 
-**Do NOT file new awake-state observations or derivations from cross-burst synthesis here.** That work belongs to bedtime (pre-turn-advance, this-turn content). The dream's role is to resolve / supersede / promote / refute existing nodes — not to discover new ones. If you find yourself wanting to file a fresh derivation from today's cohort, that's a sign bedtime was skipped or incomplete; pause, run bedtime properly, then return to sleep.
+**Do NOT file new awake-state observations or derivations from cross-burst synthesis here.** That work belongs to Phase A (pre-turn-advance, this-turn content). The dream's role is to resolve / supersede / promote / refute existing nodes — not to discover new ones. If you find yourself wanting to file a fresh derivation from today's cohort, that's a sign Phase A was skipped or incomplete; pause, complete Phase A properly, then return to Phase B.
 
-**Context discipline.** Dream mode is the most context-hungry mode (ob_0104). If the context budget drops, stop working the agenda, write what's ready, and proceed to Step 4. A partial dream is better than a dream that triggers mid-cycle compaction.
+**Context discipline.** Dream mode is the most context-hungry mode (ob_0104). If the context budget drops, stop working the agenda, write what's ready, and proceed to Step 8. A partial dream is better than a dream that triggers mid-cycle compaction.
 
-## Step 3 — Handle the dream-review feeling nudge
+### Step 7 — Handle the dream-review feeling nudge
 
 Read the `feeling_report_nudge` text that `engram_reflect` returned. Honest self-check:
 
@@ -85,7 +192,7 @@ Read the `feeling_report_nudge` text that `engram_reflect` returned. Honest self
 
 Do NOT file a performative report to demonstrate the tool. The trap is real.
 
-## Step 4 — Advance the turn: engram_advance_turn()
+### Step 8 — Advance the turn: engram_advance_turn()
 
 This is the MOST IMPORTANT step and the one that distinguishes sleep from nap.
 
@@ -103,36 +210,36 @@ The `session` mode:
 
 **Rule (qu_0035, 2026-04-11):** the session-mode advance MUST fire AFTER the dream, not before or instead of. This guarantees that:
 - Observations written during the awake burst
-- Bedtime-filed missed nodes
+- Phase A-filed missed nodes
 - Dream-generated derivations and resolutions
 - All land at the SAME turn cohort
 
 One turn = one cohort of experience plus its consolidation. If you advance before dreaming, the dream's outputs are artificially younger than the burst they consolidate, and the forgetting curve gets misaligned.
 
-## Step 4b — Write the sleep-success marker
+### Step 8b — Write the sleep-success marker
 
-Immediately after Step 4's checkpoint returns successfully, write the canonical sleep-success marker via the helper script:
+Immediately after Step 8's checkpoint returns successfully, write the canonical sleep-success marker via the helper script:
 
 ```bash
 ~/.engram/tools/write_sleep_marker.py <turn_advanced_to> <nodes_consolidated> <cohort_start_at>
 ```
 
 - `turn_advanced_to`: the new turn number returned by `engram_advance_turn()`.
-- `nodes_consolidated`: count of nodes in today's cohort. If bedtime ran first (typical), use the count bedtime Step 1 produced via `engram_history(mode="edits", action="created", since=<prev-sleep-timestamp>)`. If sleep is running without a prior bedtime (rare but permitted per bedtime's "When NOT to run" section), run `engram_history(mode="edits", action="created", since=<prev-sleep-timestamp>)` directly here to determine the count.
-- `cohort_start_at`: the prior sleep's UTC ISO timestamp (the same `since` value used in bedtime Step 1). If no prior sleep exists yet, use the timestamp of the cohort's first node.
+- `nodes_consolidated`: count of nodes in today's cohort (from Phase A Step 1's `engram_history` call).
+- `cohort_start_at`: the prior sleep's UTC ISO timestamp (the same `since` value used in Phase A Step 1). If no prior sleep exists yet, use the timestamp of the cohort's first node.
 
-The marker (`~/.engram/sessions/last-sleep-success.json`) is the canonical signal that today's coordinated sleep ran. It's read by:
+The marker (`~/.engram/sessions/last-sleep-success.json`) is the canonical signal that today's sleep ran. It's read by:
 
-- **`engram-session-start-hook.py`** — on fresh terminal start (interactive role), reads marker and surfaces a sleep-status banner if hours_since exceeds the threshold (default 28h). Detects "the host was off at midnight, last night's sleep didn't run" so the day's first session can decide whether to catch up.
-- **End-of-day-detector hook** (issue #133, separate PR) — uses the marker to gate the bedtime→sleep combo nudge so it doesn't re-fire after a successful sleep.
+- **`engram-session-start-hook.py`** — on fresh terminal start (interactive role), reads marker and surfaces a sleep-status banner if hours_since exceeds the threshold (default 28h).
+- **End-of-day-detector hook** — uses the marker to gate the sleep nudge so it doesn't re-fire after a successful sleep.
 
 Why the helper script and not a direct file write: keeps the marker schema in one place, atomic write via tmp+rename, future-proofs adding fields. The marker is gitignored — it's ephemeral runtime state, not committed history.
 
 If the helper invocation fails for any reason, log it but DO NOT retry the checkpoint. The turn already advanced; missing marker just means the next interactive session will see a stale-marker banner unnecessarily. Acceptable failure mode.
 
-## Step 5 — Write the dream-record file
+### Step 9 — Write the dream-record file
 
-Write `~/.engram/history/dream/YYYY-MM-DD.md` — the per-sleep-cycle consolidation report. Distinct from `~/.engram/history/YYYY-MM-DD.md` (awake-state milestone log, bedtime Step 4).
+Write `~/.engram/history/dream/YYYY-MM-DD.md` — the per-sleep-cycle consolidation report. Distinct from `~/.engram/history/YYYY-MM-DD.md` (awake-state milestone log, Phase A Step 4).
 
 **Create the directory if it doesn't exist:**
 
@@ -186,7 +293,7 @@ git -C ~/.engram commit -m "dream: turn N→N+1 record for YYYY-MM-DD"
 
 The dream-record is the substrate-honest counterpart to the awake-state milestone log. It captures what the sleep cycle PRODUCED (consolidation outputs), separating it from what the awake state SHIPPED (milestones). Reading dream-records as a series shows the graph's hygiene trajectory over time.
 
-## Step 6 — Report to the user
+### Step 10 — Report to the user
 
 Tell the user, in 3-6 short bullets:
 - How many nodes were resolved/superseded/promoted/refuted
@@ -200,22 +307,36 @@ Then stop. The session is over.
 
 ---
 
+## Why Phase A is pre-turn-advance
+
+Per dv_0134: turn = cohort + consolidation. Nodes filed during Phase A are awake-state cognition reflecting on the just-completed cohort. They belong to THIS turn, not next. If Phase A fired post-turn-advance, the missed nodes would be artificially placed in the next cohort, misaligning the forgetting curve.
+
+This is why Phase A must complete before Phase B fires `engram_advance_turn`.
+
 ## Guardrails
 
-- **Context hunger** (ob_0104): dream mode burns context fast. `engram_reflect` returns a full audit; each `engram_inspect` returns the focus node and its grouped 1-hop neighbors with recall_summary. Monitor the budget. If it drops below safety, short-cycle to Step 4.
+- **No Phase-A work mid-Phase-B.** Phase A is pre-turn-advance scaffold maintenance; Phase B is the consolidation pass. If you find yourself wanting to rotate the warm-briefing, write the history file, or capture missed observations — STOP. Complete Phase A first (or accept the skip and run Phase A tomorrow morning to catch up). Don't mix the phases.
+
+- **Context hunger** (ob_0104): dream mode burns context fast. `engram_reflect` returns a full audit; each `engram_inspect` returns the focus node and its grouped 1-hop neighbors with recall_summary. Monitor the budget. If it drops below safety, short-cycle to Step 8.
+
 - **No web research in dreams.** Register questions instead.
+
 - **No cascades of supersedes across unrelated subgraphs.** Follow the chain you started; register a question for the next one.
-- **The dream can be empty.** If `engram_reflect` returns a clean briefing, that IS the dream — note it, then proceed straight to Step 4. A clean graph is a success signal, not a reason to invent work.
+
+- **The dream can be empty.** If `engram_reflect` returns a clean briefing, that IS the dream — note it, then proceed straight to Step 8. A clean graph is a success signal, not a reason to invent work.
+
 - **Don't retry the dream if it was interrupted.** Checkpoint-session what was accomplished, note the remainder, resume in the next sleep cycle.
-- **No bedtime-work mid-sleep.** If you find yourself wanting to rotate the warm-briefing or write the history file, STOP — those belong to bedtime (pre-turn-advance). Either run bedtime first (preferred) or accept the bedtime-skip for this cycle and run bedtime tomorrow morning to catch up. Don't mix the routines.
 
 ## Relation to other routines
 
-- **Nap** — fires multiple times per day at compaction boundaries. Pre-burst persistence + cross-compaction-scaffold prep (per-burst warm-briefing rotation). Sleep does not include nap as a sub-step (legacy bundling retired 2026-05-14 per dv_0636).
-- **Bedtime** — fires once/day at user-driven day-wrap, immediately before sleep. Day-wide review + missed-node capture + comprehensive scaffold rotation. Hands a complete cohort off to sleep.
-- **Awake protocol** — the normal work mode; writes observations/derivations/questions/conjectures as they happen. Sleep consolidates what awake produced (via bedtime's complete-cohort handoff).
-- **Post-compaction wake-up** — orthogonal. After `/compact`, the recall hook surfaces a `post_compact` feeling nudge. That's not a sleep cycle, it's a wake-up check.
+- **Nap** — fires multiple times per day at compaction boundaries. Cross-compaction-scaffold prep. Sleep is once-daily, end-of-day. They don't compete — they cover different scopes.
+- **Dream master** (`engram-dream-master`) — owns the consolidation in the claude track's version of this skill (see `skills/claude/engram-sleep/SKILL.md` for the orchestration-based variant). The gemini track runs consolidation inline.
+- **End-of-day-detector hook** — surfaces engram-sleep on wrap-up phrases; user "Yes" triggers this skill.
 
 ## Substrate anchor
 
-`dv_0636` — three-routine self-engram-maintenance architecture, authored 2026-05-14. Sleep's lean shape (no nap-inside, no warm-briefing, no history-file reconcile) is what makes the consolidation concern clean. The legacy bundling created concrete drift problems (same-file double-writes, scaffold-vs-consolidation mixing); this version resolves them.
+The three-routine architecture (nap / bedtime / sleep) was ratified 2026-05-14 (`dv_0636`). The constraints determining the original partition: (1) turn-advance fires at END of consolidation (dv_0134); (2) cross-compaction scaffolds belong at the compaction boundary (naps); (3) day-wide review producing new nodes is awake-state cognition (pre-turn-advance). At ratification, this was a three-routine model: nap + bedtime + sleep. As of 2026-05-24 (this merge), it is a **two-routine model: nap + sleep**, with sleep now having two internal phases (Phase A = former bedtime; Phase B = former sleep).
+
+Sleep's lean Phase B shape (no nap-inside, no warm-briefing, no history-file reconcile) is what makes the consolidation concern clean. The legacy bundling created concrete drift problems (same-file double-writes, scaffold-vs-consolidation mixing); this version resolves them.
+
+The 2026-05-24 merge of engram-bedtime into engram-sleep eliminates the structural failure mode of **stopping after Phase A but before Phase B**: a compaction, user interrupt, or other disruption between the two former skills left the day's missed nodes filed but the turn never advanced, conflating the next day's cohort with today's. By making Phase A and Phase B a single skill invocation, that failure mode is structurally impossible.
