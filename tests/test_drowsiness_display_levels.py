@@ -8,6 +8,13 @@ needs more buffer for nap headroom).
 
 These tests exercise the level-mapping function and the format_drowsiness
 renderer at every threshold boundary, for both 1M and 200K mode defaults.
+
+TestCeilingOverride covers the new cadence.drowsiness_ceiling_tokens
+single-value path plus the one-upgrade-cycle migration fallback from
+cadence.drowsiness_ceiling_max (the #314 per-mode shape). The bool-subclass-
+int regression tests are preserved — they guard against isinstance(True, int)
+returning True and clamping the ceiling to 1, producing astronomical
+usage_pct from the first token of every session.
 """
 
 import json
@@ -249,145 +256,180 @@ class TestConfigOverride(unittest.TestCase):
 
 
 class TestCeilingOverride(unittest.TestCase):
-    """Tests for _read_ceiling_override and compute_ceiling's config clamp.
+    """Tests for _read_drowsiness_ceiling_tokens and compute_ceiling.
 
     Mirrors TestConfigOverride pattern: tempfile.TemporaryDirectory +
-    patch.object(ct, "ENGRAM_HOME", tmp). When ENGRAM_HOME points to an
-    empty tmp dir, collect_auto_pretokens returns [] (no sessions/ marker,
-    no JSONL files) → compute_ceiling falls back to FALLBACK_CEILING_BY_MODE
-    * SAFETY_FACTOR. For 1m mode that is int(850_000 * 0.95) = 807_500.
+    patch.object(ct, "ENGRAM_HOME", tmp).
+
+    Also resets the module-level _migration_notice_emitted flag before each
+    test so migration-notice tests don't bleed into each other.
+
+    FALLBACK: when no cadence config is present, compute_ceiling returns
+    HARDCODED_FALLBACK_CEILING (152_000).
     """
 
-    FALLBACK_1M = int(ct.FALLBACK_CEILING_BY_MODE["1m"] * ct.SAFETY_FACTOR)  # 807_500
+    FALLBACK = ct.HARDCODED_FALLBACK_CEILING  # 152_000
 
-    def _write_config(self, tmp: str, ceiling_max: dict) -> None:
+    def setUp(self):
+        # Reset the one-time-emit flag so each test starts clean.
+        ct._migration_notice_emitted = False
+
+    def _write_config(self, tmp: str, cadence: dict) -> None:
         config_path = os.path.join(tmp, "config.json")
         with open(config_path, "w") as f:
-            json.dump({"cadence": {"drowsiness_ceiling_max": ceiling_max}}, f)
+            json.dump({"cadence": cadence}, f)
 
-    def test_override_below_ceiling_clamps(self):
-        """Override below computed ceiling → compute_ceiling returns the override."""
-        with tempfile.TemporaryDirectory() as tmp:
-            self._write_config(tmp, {"1m": 100_000})
-            with patch.object(ct, "ENGRAM_HOME", tmp):
-                result = ct.compute_ceiling("1m")
-        self.assertEqual(result, 100_000)
+    # ── Path 1: new single-value field ────────────────────────────────────────
 
-    def test_override_above_ceiling_ignored(self):
-        """Override above computed ceiling → compute_ceiling returns computed (unclamped)."""
+    def test_new_field_returns_value(self):
+        """cadence.drowsiness_ceiling_tokens present → compute_ceiling returns it."""
         with tempfile.TemporaryDirectory() as tmp:
-            self._write_config(tmp, {"1m": 2_000_000})
+            self._write_config(tmp, {"drowsiness_ceiling_tokens": 600_000})
             with patch.object(ct, "ENGRAM_HOME", tmp):
-                result = ct.compute_ceiling("1m")
-        self.assertEqual(result, self.FALLBACK_1M)
+                result = ct.compute_ceiling()
+        self.assertEqual(result, 600_000)
 
-    def test_no_config_no_clamp(self):
-        """No config.json present → compute_ceiling returns computed ceiling unchanged."""
+    def test_new_field_no_migration_notice(self):
+        """When new field is present, no migration notice is emitted."""
+        import io
         with tempfile.TemporaryDirectory() as tmp:
-            # No config.json written.
+            self._write_config(tmp, {"drowsiness_ceiling_tokens": 600_000})
             with patch.object(ct, "ENGRAM_HOME", tmp):
-                result = ct.compute_ceiling("1m")
-        self.assertEqual(result, self.FALLBACK_1M)
+                with patch("sys.stderr", new_callable=io.StringIO) as mock_err:
+                    ct.compute_ceiling()
+                    self.assertEqual(mock_err.getvalue(), "")
 
-    def test_null_value_no_clamp(self):
-        """null config value → _read_ceiling_override returns None → no clamp."""
+    # ── Path 2: migration fallback from #314 per-mode shape ──────────────────
+
+    def test_migration_fallback_prefers_1m(self):
+        """cadence.drowsiness_ceiling_max present (no new field) → uses 1m value."""
         with tempfile.TemporaryDirectory() as tmp:
-            self._write_config(tmp, {"1m": None})
+            self._write_config(tmp, {"drowsiness_ceiling_max": {"1m": 500_000, "200k": None}})
             with patch.object(ct, "ENGRAM_HOME", tmp):
-                override = ct._read_ceiling_override("1m")
-                result = ct.compute_ceiling("1m")
-        self.assertIsNone(override)
-        self.assertEqual(result, self.FALLBACK_1M)
+                result = ct.compute_ceiling()
+        self.assertEqual(result, 500_000)
+
+    def test_migration_fallback_emits_notice_once(self):
+        """Migration fallback emits a one-time stderr notice."""
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_config(tmp, {"drowsiness_ceiling_max": {"1m": 500_000}})
+            with patch.object(ct, "ENGRAM_HOME", tmp):
+                with patch("sys.stderr", new_callable=io.StringIO) as mock_err:
+                    ct.compute_ceiling()
+                    ct.compute_ceiling()  # second call — notice must NOT repeat
+                    stderr_text = mock_err.getvalue()
+        self.assertIn("drowsiness_ceiling_max is deprecated", stderr_text)
+        # Notice appears exactly once (not twice).
+        self.assertEqual(stderr_text.count("drowsiness_ceiling_max is deprecated"), 1)
+
+    def test_migration_fallback_falls_through_to_200k(self):
+        """When 1m value is null, migration falls back to 200k value."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_config(tmp, {"drowsiness_ceiling_max": {"1m": None, "200k": 140_000}})
+            with patch.object(ct, "ENGRAM_HOME", tmp):
+                result = ct.compute_ceiling()
+        self.assertEqual(result, 140_000)
+
+    def test_new_field_takes_precedence_over_legacy(self):
+        """When both new field and legacy map exist, new field wins."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_config(tmp, {
+                "drowsiness_ceiling_tokens": 700_000,
+                "drowsiness_ceiling_max": {"1m": 500_000},
+            })
+            with patch.object(ct, "ENGRAM_HOME", tmp):
+                result = ct.compute_ceiling()
+        self.assertEqual(result, 700_000)
+
+    # ── Path 3: hardcoded fallback ────────────────────────────────────────────
+
+    def test_no_config_returns_hardcoded_fallback(self):
+        """No config.json present → compute_ceiling returns HARDCODED_FALLBACK_CEILING."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(ct, "ENGRAM_HOME", tmp):
+                result = ct.compute_ceiling()
+        self.assertEqual(result, self.FALLBACK)
+
+    def test_empty_cadence_returns_hardcoded_fallback(self):
+        """Empty cadence block → compute_ceiling returns HARDCODED_FALLBACK_CEILING."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_config(tmp, {})
+            with patch.object(ct, "ENGRAM_HOME", tmp):
+                result = ct.compute_ceiling()
+        self.assertEqual(result, self.FALLBACK)
+
+    def test_missing_field_notice_emitted_once(self):
+        """No usable ceiling config → one-time notice asking user to set the field."""
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(ct, "ENGRAM_HOME", tmp):
+                with patch("sys.stderr", new_callable=io.StringIO) as mock_err:
+                    ct.compute_ceiling()
+                    ct.compute_ceiling()  # second call — notice must NOT repeat
+                    stderr_text = mock_err.getvalue()
+        self.assertIn("drowsiness_ceiling_tokens is not set", stderr_text)
+        self.assertEqual(stderr_text.count("drowsiness_ceiling_tokens is not set"), 1)
+
+    # ── Bool-subclass-int regression tests (preserved from #314) ─────────────
 
     def test_bool_true_rejected(self):
-        """bool True (int subclass, value=1) must be rejected — not treated as int 1.
+        """bool True (int subclass, value=1) must be rejected as a ceiling value.
 
         Regression test for the Blocker: before the fix, isinstance(True, int)
-        returned True, so _read_ceiling_override returned True (= 1), and
-        compute_ceiling clamped to 1, producing astronomical usage_pct from
-        the first token of every session.
+        returned True, so the config reader returned True (= 1), and the
+        ceiling was set to 1, producing astronomical usage_pct from the
+        first token of every session.
         """
         with tempfile.TemporaryDirectory() as tmp:
-            self._write_config(tmp, {"1m": True})
+            self._write_config(tmp, {"drowsiness_ceiling_tokens": True})
             with patch.object(ct, "ENGRAM_HOME", tmp):
-                override = ct._read_ceiling_override("1m")
-                result = ct.compute_ceiling("1m")
-        self.assertIsNone(override, "True must be rejected — bool is not a valid int ceiling")
-        self.assertEqual(result, self.FALLBACK_1M)
+                result = ct.compute_ceiling()
+        self.assertEqual(result, self.FALLBACK,
+                         "True must be rejected — bool is not a valid int ceiling")
 
     def test_bool_false_rejected(self):
         """bool False (int subclass, value=0) must be rejected — not treated as int 0."""
         with tempfile.TemporaryDirectory() as tmp:
-            self._write_config(tmp, {"1m": False})
+            self._write_config(tmp, {"drowsiness_ceiling_tokens": False})
             with patch.object(ct, "ENGRAM_HOME", tmp):
-                override = ct._read_ceiling_override("1m")
-                result = ct.compute_ceiling("1m")
-        self.assertIsNone(override, "False must be rejected — bool is not a valid int ceiling")
-        self.assertEqual(result, self.FALLBACK_1M)
+                result = ct.compute_ceiling()
+        self.assertEqual(result, self.FALLBACK,
+                         "False must be rejected — bool is not a valid int ceiling")
 
     def test_negative_int_rejected(self):
-        """Negative int → _read_ceiling_override returns None."""
+        """Negative int → falls through to hardcoded fallback."""
         with tempfile.TemporaryDirectory() as tmp:
-            self._write_config(tmp, {"1m": -1})
+            self._write_config(tmp, {"drowsiness_ceiling_tokens": -1})
             with patch.object(ct, "ENGRAM_HOME", tmp):
-                override = ct._read_ceiling_override("1m")
-                result = ct.compute_ceiling("1m")
-        self.assertIsNone(override)
-        self.assertEqual(result, self.FALLBACK_1M)
+                result = ct.compute_ceiling()
+        self.assertEqual(result, self.FALLBACK)
 
     def test_string_rejected(self):
-        """String value → _read_ceiling_override returns None."""
+        """String value → falls through to hardcoded fallback."""
         with tempfile.TemporaryDirectory() as tmp:
-            self._write_config(tmp, {"1m": "500000"})
+            self._write_config(tmp, {"drowsiness_ceiling_tokens": "600000"})
             with patch.object(ct, "ENGRAM_HOME", tmp):
-                override = ct._read_ceiling_override("1m")
-                result = ct.compute_ceiling("1m")
-        self.assertIsNone(override)
-        self.assertEqual(result, self.FALLBACK_1M)
+                result = ct.compute_ceiling()
+        self.assertEqual(result, self.FALLBACK)
 
-    def test_missing_mode_no_clamp(self):
-        """Config has 200k entry but not 1m → 1m override is None, 200k is present."""
+    def test_null_value_falls_through(self):
+        """null config value → falls through to hardcoded fallback."""
         with tempfile.TemporaryDirectory() as tmp:
-            self._write_config(tmp, {"200k": 100_000})
+            self._write_config(tmp, {"drowsiness_ceiling_tokens": None})
             with patch.object(ct, "ENGRAM_HOME", tmp):
-                override_1m = ct._read_ceiling_override("1m")
-                override_200k = ct._read_ceiling_override("200k")
-                result_1m = ct.compute_ceiling("1m")
-        self.assertIsNone(override_1m)
-        self.assertEqual(override_200k, 100_000)
-        self.assertEqual(result_1m, self.FALLBACK_1M)
+                result = ct.compute_ceiling()
+        self.assertEqual(result, self.FALLBACK)
 
-    def test_cadence_block_missing_no_clamp(self):
-        """No cadence block in config → _read_ceiling_override returns None.
-
-        Guards the new isinstance(cadence_block, dict) check: an empty config
-        (no 'cadence' key at all) should fall through gracefully.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            config_path = os.path.join(tmp, "config.json")
-            with open(config_path, "w") as f:
-                json.dump({}, f)
-            with patch.object(ct, "ENGRAM_HOME", tmp):
-                override = ct._read_ceiling_override("1m")
-                result = ct.compute_ceiling("1m")
-        self.assertIsNone(override)
-        self.assertEqual(result, self.FALLBACK_1M)
-
-    def test_cadence_block_wrong_type_no_clamp(self):
-        """cadence is a non-dict value → _read_ceiling_override returns None.
-
-        Guards isinstance(cadence_block, dict) on a non-None-but-wrong-type case:
-        a string under 'cadence' should not crash or accidentally match.
-        """
+    def test_cadence_block_wrong_type_no_crash(self):
+        """cadence is a non-dict value → falls through gracefully, returns fallback."""
         with tempfile.TemporaryDirectory() as tmp:
             config_path = os.path.join(tmp, "config.json")
             with open(config_path, "w") as f:
                 json.dump({"cadence": "not_a_dict"}, f)
             with patch.object(ct, "ENGRAM_HOME", tmp):
-                override = ct._read_ceiling_override("1m")
-                result = ct.compute_ceiling("1m")
-        self.assertIsNone(override)
-        self.assertEqual(result, self.FALLBACK_1M)
+                result = ct.compute_ceiling()
+        self.assertEqual(result, self.FALLBACK)
 
 
 if __name__ == "__main__":

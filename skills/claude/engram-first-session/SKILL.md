@@ -94,7 +94,45 @@ Tell the user, plainly:
 
 Ask if they have any questions about how ENGRAM works. Answer plainly; do not oversell.
 
-## Step 5 — Finalize (the substitution step)
+## Step 5 — Drowsiness ceiling configuration
+
+The drowsiness meter computes how close you are to the auto-compaction limit.
+It needs one explicit value from the user: the ceiling (the token count where
+compaction fires). Without it, the meter falls back to a conservative 152K
+default that produces frequent false warnings on 1M-context sessions.
+
+Do this step in a single short exchange:
+
+1. Ask the user to run `/context` in their Claude Code session and report
+   the auto-compaction limit shown. Example wording: "Quick setup: can you
+   run `/context` in Claude Code and tell me what it shows for the
+   auto-compaction limit? Something like '850K tokens'."
+
+2. Compute a suggested ceiling at ~5–10% below the reported value:
+   - 850K reported → suggest 800_000
+   - 500K reported → suggest 450_000
+   - 200K reported → suggest 180_000
+
+3. Write `cadence.drowsiness_ceiling_tokens` to `~/.engram/config.json`:
+
+   ```python
+   import json, os
+   CONFIG_PATH = os.path.expanduser("~/.engram/config.json")
+   with open(CONFIG_PATH) as f:
+       cfg = json.load(f)
+   cfg.setdefault("cadence", {})["drowsiness_ceiling_tokens"] = <computed_value>
+   with open(CONFIG_PATH, "w") as f:
+       json.dump(cfg, f, indent=2)
+   ```
+
+4. Tell the user: "Set to <value>. You can adjust this later by editing
+   `~/.engram/config.json` directly or via the viz-server config UI."
+
+If the user can't or doesn't want to run `/context` right now, skip this
+step — the meter falls back gracefully and will remind them at the next
+session via stderr notice. Do not block the session on it.
+
+## Step 6 — Finalize (the substitution step)
 
 Do this step LAST, only after the dialogue is genuinely complete. If the session aborts mid-dialogue, the marker file should still be present so the next session re-enters this skill.
 
@@ -112,7 +150,7 @@ Do this step LAST, only after the dialogue is genuinely complete. If the session
 6. Delete `~/.engram/first-run-pending`.
 7. Call `engram_advance_turn(message="First session with <USER_NAME>: named <AGENT_NAME>. Founding motivation: <one-line quote or summary>.")` — this is a real session checkpoint (advances turn counter), not a nap. The naming event is worth a turn.
 
-## Step 6 — Tell the user what's next
+## Step 7 — Tell the user what's next
 
 What you tell the user here depends on whether this install is single-agent or multi-agent. Check via `engram_client.is_multi_agent_mode()` (or read your `~/.engram/config.json` `mode` field if you don't have the helper in scope).
 

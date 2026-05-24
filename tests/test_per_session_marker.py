@@ -9,7 +9,10 @@ exercise the new code paths in context_tracker.py:
 - _resolve_jsonl(transcript_path, session_id) prefers explicit transcript_path.
 - _resolve_jsonl(None, session_id) falls back to per-session marker lookup.
 - _resolve_jsonl(None, None) returns None.
-- _detect_mode reads context_mode from the per-session marker.
+
+Note: _detect_mode tests were removed in the drowsiness-ceiling-tokens-respec
+PR — _detect_mode itself was retired when the mode-detection machinery was
+replaced by the single cadence.drowsiness_ceiling_tokens config field.
 
 The Gemini twin (hooks/gemini/context_tracker.py) carries identical logic;
 covering the Claude path here is enough to catch regressions to the design
@@ -114,35 +117,3 @@ def test_resolve_jsonl_returns_none_when_both_args_empty(tmp_path):
     assert ct._resolve_jsonl(None, None) is None
 
 
-def test_detect_mode_reads_context_mode_from_per_session_marker(tmp_path):
-    engram_home = tmp_path / "engram"
-    transcript = tmp_path / "t.jsonl"
-    transcript.write_text("{}\n")
-    _write_marker(engram_home, "sess-1m", str(transcript), context_mode="1m")
-    _write_marker(engram_home, "sess-200k", str(transcript), context_mode="200k")
-    ct = _load_context_tracker(engram_home)
-    # Without an env-var override, the per-session marker's context_mode wins.
-    os.environ.pop("ENGRAM_CONTEXT_MODE", None)
-    assert ct._detect_mode(current_tokens=1000, jsonl_path=None, session_id="sess-1m") == "1m"
-    assert ct._detect_mode(current_tokens=1000, jsonl_path=None, session_id="sess-200k") == "200k"
-
-
-def test_detect_mode_env_var_overrides_marker(tmp_path):
-    engram_home = tmp_path / "engram"
-    transcript = tmp_path / "t.jsonl"
-    transcript.write_text("{}\n")
-    _write_marker(engram_home, "sess-1", str(transcript), context_mode="200k")
-    ct = _load_context_tracker(engram_home)
-    os.environ["ENGRAM_CONTEXT_MODE"] = "1m"
-    try:
-        assert ct._detect_mode(current_tokens=1000, jsonl_path=None, session_id="sess-1") == "1m"
-    finally:
-        os.environ.pop("ENGRAM_CONTEXT_MODE", None)
-
-
-def test_detect_mode_no_session_id_falls_through(tmp_path):
-    """When no session_id provided, _detect_mode shouldn't crash; falls through to other signals."""
-    ct = _load_context_tracker(tmp_path / "engram")
-    os.environ.pop("ENGRAM_CONTEXT_MODE", None)
-    # With no signals, defaults to "200k" (the harness default per the existing logic).
-    assert ct._detect_mode(current_tokens=1000, jsonl_path=None, session_id=None) == "200k"

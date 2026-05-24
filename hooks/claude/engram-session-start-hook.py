@@ -340,9 +340,9 @@ def write_marker(hook_input: dict) -> dict | None:
         "role": SESSION_ROLE,
         "purpose": SESSION_PURPOSE or DEFAULT_PURPOSES.get(SESSION_ROLE, SESSION_ROLE),
     }
-    context_mode_env = os.environ.get("ENGRAM_CONTEXT_MODE", "").strip().lower()
-    if context_mode_env in ("200k", "1m"):
-        marker["context_mode"] = context_mode_env
+    # context_mode field retired: mode-string machinery replaced by
+    # cadence.drowsiness_ceiling_tokens (single explicit user-set value).
+    # Existing markers with context_mode are gracefully ignored on read.
     try:
         # Per-session marker keyed by session_id. Concurrent sessions own
         # their own files; the role field in the contents lets readers
@@ -621,7 +621,6 @@ def main() -> None:
                 "exit_code": 0,
                 "stdout_bytes": len(output_str.encode("utf-8")),
                 "stderr_bytes": 0,
-                "context_mode": os.environ.get("ENGRAM_CONTEXT_MODE", "") or None,
             },
         )
     except Exception:

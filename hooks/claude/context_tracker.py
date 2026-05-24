@@ -3,21 +3,21 @@
 ENGRAM Context Tracker — Drowsiness Monitor
 
 Measures context usage from per-message token counts in the Claude Code
-session JSONL, and calibrates the ceiling from auto-compaction samples.
+session JSONL, and reports drowsiness as a fraction of the user-configured
+ceiling.
 
 Algorithm:
-  ceiling = mean(last N compactMetadata.preTokens where trigger == "auto") * SAFETY_FACTOR
+  ceiling = cadence.drowsiness_ceiling_tokens (from config.json, user-set)
   current = (input + cache_read + cache_create) from last assistant usage record
   pct     = current / ceiling
 
-Only auto-trigger samples calibrate the ceiling — manual compactions
-reflect when the agent voluntarily napped, not where the harness cuts
-off, and mixing them compounds downward bias (ob_1003). Falls back to
-FALLBACK_CEILING when fewer than two auto samples are available across
-the project's JSONL files.
+The ceiling is a single explicit integer the user sets after checking their
+auto-compaction limit (via the /context slash-command). There is no JSONL
+scan, no mode detection, no auto-sampling. See the engram-first-session
+skill for the setup ritual.
 
 Stateless: no baseline file, no byte-to-token ratio, no cached state.
-Every call reads the JSONL fresh.
+Every call reads the JSONL and config.json fresh.
 """
 
 import glob
@@ -30,10 +30,18 @@ LAST_COMPACT_PATH = os.path.join(ENGRAM_HOME, "last-compact-at.json")
 LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
 WARM_BRIEFING_PATH = os.path.join(ENGRAM_HOME, "warm-briefing.md")
 
-SAFETY_FACTOR = 0.95            # Report 100% at 95% of mean auto ceiling
-AUTO_SAMPLE_WINDOW = 5          # Average of last N auto compactions
-FALLBACK_CEILING = 160_000      # Legacy alias; prefer FALLBACK_CEILING_BY_MODE
 TAIL_SCAN_BYTES = 5_000_000     # How far back to look for the latest usage
+
+# Fallback ceiling when cadence.drowsiness_ceiling_tokens is absent.
+# Conservative: the 200k-mode floor. Users who don't set the field will see
+# frequent drowsiness warnings, which is the correct nudge to configure the
+# field. Previous value (FALLBACK_CEILING_BY_MODE["200k"] * SAFETY_FACTOR)
+# was int(160_000 * 0.95) = 152_000; keeping the same number for continuity.
+HARDCODED_FALLBACK_CEILING = 152_000
+
+# Module-level flag: emit the migration notice at most once per process.
+# Prevents stderr spam when compute_ceiling is called multiple times per session.
+_migration_notice_emitted = False
 
 # Drowsiness display + warning thresholds. Calibrated for both 200K and 1M
 # context modes. Below the urgent threshold, the display shows a level word
@@ -80,34 +88,6 @@ DEFAULT_DROWSINESS_THRESHOLDS_BY_MODE = {
 # still fire at these thresholds for the multi-line warning text.
 DROWSY_THRESHOLD = 0.80
 VERY_DROWSY_THRESHOLD = 0.90
-
-# Two distinct context-window modes the harness supports:
-#   "200k" — default Anthropic API context (auto preTokens cluster ~150-200K)
-#   "1m"   — beta extended context (auto preTokens cluster ~800-1000K)
-# These produce ~5x different ceilings; mixing samples in the mean gives a
-# contaminated value and reports drowsiness wrong (ob_1473 — 2026-05-03 PM:
-# three 170K + one 967K averaged into ~370K, reported 29% drowsy when truth
-# was ~10%). The harness does not surface mode in JSONL message.model, so we
-# detect from current input_tokens and partition samples by magnitude class.
-SAMPLE_PARTITIONS = {
-    "200k": (0, 300_000),
-    "1m":   (300_000, 1_500_000),
-}
-FALLBACK_CEILING_BY_MODE = {
-    "200k": 160_000,
-    "1m":   850_000,
-}
-# 200k mode auto-compacts at ~160-165K preTokens. If current_tokens exceed
-# this AND no compact_boundary has fired in the session JSONL, the session
-# can only be 1m mode — 200k mode would have already compacted. Used by
-# _detect_mode path 3 (mid-session inference). Set above the 200k auto-
-# compact ceiling with a small buffer to avoid false-positive 1m detection
-# right at the 200k auto-compact point. Previously 300_000 (too high to
-# trigger in practice — most sessions never reach 300K input_tokens before
-# either compacting or napping). Lowered 2026-05-06 after a 1m-mode session
-# at 184K input_tokens was misclassified as 200k → reported 122% drowsy when
-# truly at ~23%.
-MODE_BOUNDARY = 175_000
 
 
 def find_active_jsonl(session_id: str | None = None) -> str | None:
@@ -168,161 +148,86 @@ def _project_jsonls(transcript_path: str | None = None) -> list[str]:
     return sorted(files, key=os.path.getmtime, reverse=True)
 
 
-def _detect_mode(current_tokens: int | None, jsonl_path: str | None, session_id: str | None = None) -> str:
-    """Detect this session's context-window mode from observable signals.
+def _read_drowsiness_ceiling_tokens() -> int:
+    """Read cadence.drowsiness_ceiling_tokens from config.json.
 
-    Order of precedence:
-      1. ENGRAM_CONTEXT_MODE env var override ("200k" or "1m") — explicit.
-      2. The session's per-session marker `context_mode` field — session
-         metadata written by SessionStart hook at
-         ~/.engram/sessions/<session_id>.json.
-      3. current input tokens > MODE_BOUNDARY → "1m" (200K-mode would have
-         auto-compacted by now).
-      4. Current JSONL has any prior compact_boundary > MODE_BOUNDARY → "1m".
-      5. Default "200k" (the harness default).
+    Single source of truth for the drowsiness denominator (the context-
+    window ceiling). User sets this once after checking their /context
+    slash-command's auto-compaction limit; recommended value is 5–10%
+    below that limit (e.g. 800_000 for an 850K reported limit).
 
-    Limitation: early 1M-mode sessions below MODE_BOUNDARY with no prior
-    boundary cannot be auto-detected from observable signals alone (the
-    system prompt's `[1m]` model tag is not surfaced in JSONL records).
-    The per-session marker `context_mode` field exists for that case —
-    the SessionStart hook should populate it whenever it can detect mode
-    from harness env vars or the system prompt content.
+    Migration path (one upgrade cycle from #314's per-mode shape):
+      If cadence.drowsiness_ceiling_tokens is absent, falls back to
+      cadence.drowsiness_ceiling_max map, preferring the "1m" value since
+      most users on the #314 shape were configuring 1m. Emits a one-time
+      stderr notice to prompt migration.
+
+    If neither field is present: returns HARDCODED_FALLBACK_CEILING
+    (152_000) and emits a notice asking the user to configure the field.
+
+    Return value is always a positive int. Never raises.
+
+    Defensive type guard: same isinstance(value, int) and not isinstance(
+    value, bool) and value > 0 pattern as the retired _read_ceiling_override
+    — prevents bool True (= 1) or False (= 0) JSON values from being treated
+    as a valid ceiling and producing astronomical drowsiness percentages.
     """
-    override = os.environ.get("ENGRAM_CONTEXT_MODE", "").strip().lower()
-    if override in SAMPLE_PARTITIONS:
-        return override
-    if session_id:
-        marker_path = os.path.join(ENGRAM_HOME, "sessions", f"{session_id}.json")
-        try:
-            with open(marker_path) as f:
-                marker = json.load(f)
-            marker_mode = (marker.get("context_mode") or "").strip().lower()
-            if marker_mode in SAMPLE_PARTITIONS:
-                return marker_mode
-        except (OSError, ValueError, json.JSONDecodeError):
-            pass
-    if current_tokens is not None and current_tokens > MODE_BOUNDARY:
-        return "1m"
-    if jsonl_path:
-        try:
-            with open(jsonl_path, "rb") as f:
-                for line in f:
-                    if b"compact_boundary" not in line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except (ValueError, json.JSONDecodeError):
-                        continue
-                    meta = obj.get("compactMetadata") or {}
-                    pt = meta.get("preTokens")
-                    if isinstance(pt, int) and pt > MODE_BOUNDARY:
-                        return "1m"
-        except OSError:
-            pass
-    return "200k"
+    global _migration_notice_emitted
 
-
-def collect_auto_pretokens(
-    mode: str = "200k",
-    max_samples: int = AUTO_SAMPLE_WINDOW,
-    transcript_path: str | None = None,
-) -> list[int]:
-    """Most recent auto-compaction preTokens in the given mode magnitude class.
-
-    Filters by SAMPLE_PARTITIONS[mode] to keep 200K-mode and 1M-mode samples
-    from contaminating each other's mean.
-    """
-    lo, hi = SAMPLE_PARTITIONS[mode]
-    collected: list[int] = []
-    for path in _project_jsonls(transcript_path):  # newest file first
-        file_samples: list[int] = []
-        try:
-            with open(path, "rb") as f:
-                for line in f:
-                    if b"compact_boundary" not in line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except (ValueError, json.JSONDecodeError):
-                        continue
-                    meta = obj.get("compactMetadata") or {}
-                    if meta.get("trigger") != "auto":
-                        continue
-                    pt = meta.get("preTokens")
-                    if isinstance(pt, int) and lo <= pt <= hi:
-                        file_samples.append(pt)
-        except OSError:
-            continue
-        # Older file → older samples → prepend.
-        collected = file_samples + collected
-        if len(collected) >= max_samples:
-            break
-    return collected[-max_samples:]
-
-
-def _read_ceiling_override(mode: str) -> int | None:
-    """Read a per-mode ceiling clamp from config.json's cadence.drowsiness_ceiling_max field.
-
-    Returns the integer value at config["cadence"]["drowsiness_ceiling_max"][mode]
-    if it is present AND is a positive int; returns None otherwise.
-
-    Semantics (enforced by the caller, compute_ceiling):
-      The override clamps DOWNWARD only — an override higher than the
-      computed ceiling is ignored. The computed ceiling is the auto-detected
-      safety-factored upper bound; a higher override would be structurally
-      unsafe. This function returns the raw config value without applying
-      the clamp; the comparison is in compute_ceiling so the semantics are
-      visible at the call site.
-
-    Never raises. Config read failures, missing keys, wrong types, and
-    null values all return None, preserving the current compute_ceiling
-    behavior on any misconfig.
-
-    Config schema (all keys optional):
-      {
-        "cadence": {
-          "drowsiness_ceiling_max": {
-            "1m": 500000,
-            "200k": null
-          }
-        }
-      }
-    """
     config_path = os.path.join(ENGRAM_HOME, "config.json")
     try:
         with open(config_path) as f:
             config = json.load(f)
     except (OSError, ValueError, json.JSONDecodeError):
-        return None
+        config = {}
+
     cadence_block = config.get("cadence")
-    if not isinstance(cadence_block, dict):
-        return None
-    override_map = cadence_block.get("drowsiness_ceiling_max")
-    if not isinstance(override_map, dict):
-        return None
-    value = override_map.get(mode)
-    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-        return value
-    return None
+
+    # Path 1: new single-value field.
+    if isinstance(cadence_block, dict):
+        value = cadence_block.get("drowsiness_ceiling_tokens")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+
+        # Path 2: migration fallback — old per-mode map from #314.
+        legacy_map = cadence_block.get("drowsiness_ceiling_max")
+        if isinstance(legacy_map, dict):
+            # Prefer "1m" value (most users who had the old shape were on 1m);
+            # fall through to "200k" if "1m" is null or missing.
+            for mode_key in ("1m", "200k"):
+                legacy_val = legacy_map.get(mode_key)
+                if isinstance(legacy_val, int) and not isinstance(legacy_val, bool) and legacy_val > 0:
+                    if not _migration_notice_emitted:
+                        _migration_notice_emitted = True
+                        print(
+                            "[engram] One-time notice: cadence.drowsiness_ceiling_max is "
+                            "deprecated. Migrate to cadence.drowsiness_ceiling_tokens "
+                            "(single int) — see README.",
+                            file=__import__("sys").stderr,
+                        )
+                    return legacy_val
+
+    # Path 3: no usable config — hardcoded fallback.
+    if not _migration_notice_emitted:
+        _migration_notice_emitted = True
+        print(
+            "[engram] Notice: cadence.drowsiness_ceiling_tokens is not set. "
+            "Falling back to 152,000 tokens. Run /context in Claude Code, note "
+            "the auto-compaction limit, and set cadence.drowsiness_ceiling_tokens "
+            "in ~/.engram/config.json to ~5-10% below that value.",
+            file=__import__("sys").stderr,
+        )
+    return HARDCODED_FALLBACK_CEILING
 
 
-def compute_ceiling(mode: str = "200k", transcript_path: str | None = None) -> int:
-    samples = collect_auto_pretokens(mode, transcript_path=transcript_path)
-    if len(samples) < 2:
-        ceiling = int(FALLBACK_CEILING_BY_MODE[mode] * SAFETY_FACTOR)
-    else:
-        mean = sum(samples) // len(samples)
-        ceiling = int(mean * SAFETY_FACTOR)
+def compute_ceiling() -> int:
+    """Return the drowsiness ceiling in tokens.
 
-    # Per-mode config override (issue #294): on Pro-plan 1m mode, the 5h
-    # token budget caps out before context fills, so the computed ceiling
-    # underreports session-exhaustion risk. Users can clamp the ceiling
-    # to align drowsiness with the budget-bound reality.
-    override = _read_ceiling_override(mode)
-    if override is not None and override < ceiling:
-        ceiling = override
-
-    return ceiling
+    Reads cadence.drowsiness_ceiling_tokens from config.json (the single
+    explicit user-set value). Falls back via _read_drowsiness_ceiling_tokens
+    migration path if the new field is absent.
+    """
+    return _read_drowsiness_ceiling_tokens()
 
 
 def _last_compact_offset(jsonl_path: str) -> int | None:
@@ -429,19 +334,23 @@ def estimate_usage(transcript_path: str | None = None, session_id: str | None = 
     missing, callers fall back to looking up the per-session marker at
     ~/.engram/sessions/<session_id>.json by session_id.
 
-    Note on triple-resolve: read_current_tokens() and compute_ceiling() each
-    re-call _resolve_jsonl(transcript_path, session_id) internally rather
-    than receiving the path resolved here. This is intentional — each
-    sub-function accepts both so it remains independently callable.
+    The ceiling is sourced from cadence.drowsiness_ceiling_tokens (see
+    compute_ceiling / _read_drowsiness_ceiling_tokens). Mode is derived
+    from the ceiling value: <= 250_000 → "200k", else "1m". This ensures
+    format_drowsiness picks per-mode display thresholds correctly rather
+    than always defaulting to the "1m" band (which silently ignores
+    drowsiness_display.200k config for low-ceiling users).
     """
-    jsonl = _resolve_jsonl(transcript_path, session_id)
     current = read_current_tokens(transcript_path)
     if current is None:
         return None
-    mode = _detect_mode(current, jsonl, session_id=session_id)
-    ceiling = compute_ceiling(mode, transcript_path=transcript_path)
+    ceiling = compute_ceiling()
     if ceiling <= 0:
         return None
+    # 200k-mode nominal ceiling is ~152k; 1m-mode is 800k+. 250_000 is the
+    # natural breakpoint — anything at or below it selects the tighter 200k
+    # display thresholds; anything above selects the 1m thresholds.
+    mode = "200k" if ceiling <= 250_000 else "1m"
     return {
         "estimated_tokens": current,
         "context_limit": ceiling,

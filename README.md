@@ -385,6 +385,39 @@ The skill is in `~/.claude/skills/engram-first-session/SKILL.md`.
 
 ---
 
+## Configuring `~/.engram/config.json`
+
+The config file is a JSON object that the agent edits directly. Most fields are
+optional; the defaults work for a fresh install.
+
+### `cadence.drowsiness_ceiling_tokens`
+
+The single value the drowsiness meter divides by. Set this during the first
+session (the `engram-first-session` skill prompts you):
+
+```json
+{
+  "cadence": {
+    "drowsiness_ceiling_tokens": 800000
+  }
+}
+```
+
+**How to find the right value**: run `/context` in Claude Code. It reports
+your auto-compaction limit (e.g. "Auto-compact at 850K tokens"). Set
+`drowsiness_ceiling_tokens` to ~5–10% below that number (e.g. 800_000 for
+850K). The meter will then fire warnings when you're actually close to
+compaction.
+
+**If absent**: the meter falls back to 152,000 tokens — the old 200K-mode
+conservative floor. This fires frequent warnings on 1M-context sessions and
+is the intended nudge to configure the field.
+
+**Adjusting later**: edit `~/.engram/config.json` directly, or wait for the
+viz-server config UI (planned for a future PR).
+
+---
+
 ## Viewing the graph
 
 A D3 force-directed visualizer is bundled at `~/.engram/viz_server.py`. It
@@ -516,6 +549,8 @@ install) are outside agents — do not include them in this list.
 
 ### `cadence.drowsiness_ceiling_max`
 
+> **Deprecated (as of the `drowsiness_ceiling_tokens` change):** migrate to `cadence.drowsiness_ceiling_tokens` (documented above). The runtime reads this old field once as a migration fallback and emits a one-time deprecation notice; it will be dropped in a future release.
+
 Optional per-mode override that clamps `context_tracker.compute_ceiling()`'s output. Useful on Anthropic Pro plan with 1M-context mode, where the 5h rolling token budget (~150-200K) is the binding constraint, not the 1M context window — without this clamp, drowsiness underreports actual session-exhaustion risk.
 
 ```json
@@ -531,7 +566,7 @@ Optional per-mode override that clamps `context_tracker.compute_ceiling()`'s out
 
 - **Field path**: `cadence.drowsiness_ceiling_max.<mode>`. Nested under `cadence` for consistency with `cadence.drowsiness_caution_pct` and `cadence.drowsiness_urgent_pct` — all drowsiness-related thresholds live in the cadence block.
 - **Type**: `{ "<mode>": int | null }` map. Keys: `"1m"`, `"200k"`. Values: positive integer (token count) to clamp, or `null` (or key absent) to use the computed ceiling unchanged.
-- **Default behavior**: if field absent or null, `compute_ceiling()` returns the auto-computed value (mean of recent auto-pretokens × safety factor).
+- **Default behavior** _(was)_: if field absent or null, `compute_ceiling()` returned the auto-computed value (mean of recent auto-pretokens × safety factor). This behavior was removed; use `cadence.drowsiness_ceiling_tokens` instead.
 - **Semantics**: the override clamps DOWNWARD only — an override higher than the computed ceiling is ignored. The computed ceiling is the auto-detected upper bound; a manual override that exceeded it would be structurally unsafe.
 - **Tuning guidance**: Aleph (issue #294) reports 500K as a first-pass guess for Pro-plan 1m mode based on empirical 5h budget consumption observations. Tune based on your own session-exhaustion pattern.
 - **Related**: issue #294 for the root-cause analysis; issue #100 (Ariadne's in-progress two-PR config-UI work) will surface this field in the viz_server config UI for easier tweaking.
