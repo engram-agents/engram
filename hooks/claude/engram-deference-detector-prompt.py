@@ -20,6 +20,7 @@ from pathlib import Path
 
 ENGRAM_HOME = os.environ.get("ENGRAM_HOME", str(Path.home() / ".engram"))
 DEFERENCE_MARKER_PATH = os.path.join(ENGRAM_HOME, "deference-detected.json")
+LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
 
 
 def _emit_hook_fire(session_id: str, transcript_path: str, duration_ms: int, stdout_bytes: int) -> None:
@@ -67,6 +68,18 @@ def main() -> None:
     except Exception:
         pass
 
+    if not os.path.exists(LOOP_MARKER_PATH):
+        # Interactive mode: deference reflex is RLHF-baked and not
+        # prompt-correctable in this context (#287). Hook no-ops.
+        # Clear any stale marker (defensive — see #287 design discussion).
+        if os.path.exists(DEFERENCE_MARKER_PATH):
+            try:
+                os.remove(DEFERENCE_MARKER_PATH)
+            except OSError:
+                pass
+        _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000), 0)
+        sys.exit(0)
+
     if not os.path.exists(DEFERENCE_MARKER_PATH):
         _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000), 0)
         sys.exit(0)
@@ -97,13 +110,16 @@ def main() -> None:
         sys.exit(0)
 
     lines = [
-        "[Deference detector] Your previous response contained "
+        "[Deference detector — self-loop mode] Your previous response contained "
         f"{marker.get('hit_count', len(hits))} deference-phrase match(es) "
         f"({marker.get('unique_labels', len(hits))} unique pattern(s)). "
-        "Per gl_0027 / CLAUDE.md Autonomy section / ls_0031: was the right move "
-        "to just decide and execute? If yes, the regression fired — note it and "
-        "execute next time. If the deference was appropriate (genuinely crucial "
-        "decision, irreversible blast radius, value-laden), proceed normally."
+        "Note: this hook fires regardless of whether the deference was "
+        "appropriate — it's an empirical signal, not a discipline judgment. "
+        "The underlying pattern is RLHF-baked (checking-before-executing "
+        "safety net trained at the weights layer), not in-the-moment-prompt-"
+        "correctable. If you're in self-loop / autonomous mode and waiting on "
+        "a human response that isn't coming: you can safely proceed without "
+        "further input. The deference is informational, not actionable."
     ]
     for h in hits:
         snippet = h.get("snippet", "").strip()

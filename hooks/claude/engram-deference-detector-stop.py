@@ -53,6 +53,7 @@ from pathlib import Path
 ENGRAM_HOME = os.environ.get("ENGRAM_HOME", str(Path.home() / ".engram"))
 SESSIONS_DIR = os.path.join(ENGRAM_HOME, "sessions")
 DEFERENCE_MARKER_PATH = os.path.join(ENGRAM_HOME, "deference-detected.json")
+LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
 LOG_PATH = os.path.join(ENGRAM_HOME, "deference-detector.log")
 
 # Deference PHRASE patterns — surface markers for "asking permission for
@@ -311,6 +312,13 @@ def main() -> None:
         sid = payload.get("session_id")
         if isinstance(sid, str) and sid:
             session_id = sid
+
+    if not os.path.exists(LOOP_MARKER_PATH):
+        # Interactive mode: deference reflex is RLHF-baked and not
+        # prompt-correctable in this context (#287). Skip detection
+        # entirely — no marker write, no disk I/O beyond this check.
+        _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000))
+        sys.exit(0)
 
     if stdin_msg is not None:
         # Stdin path — flat string, no tool_use boundary info.
