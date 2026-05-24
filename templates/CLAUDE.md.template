@@ -184,19 +184,25 @@ A fresh session (not post-compaction) walks in with identity and warm-briefing b
 
 The SessionStart hook injects a reminder pointer, but this section is the stable documentation — if the pointer scrolls off or the hook is misconfigured, the instruction still lives here.
 
+If the SessionStart context includes `⚠️ ENGRAM substrate health:` lines, surface the relevant offline-state to {{USER_NAME}} IMMEDIATELY before any other work that depends on ENGRAM. MCP server offline means tool calls will fail; surface daemon offline means semantic recall degrades to FTS-only.
+
 ## Context-Mode Marker (one-shot per session)
 
 The drowsiness meter needs to know whether this session is in 200K-mode or 1M-mode (~5x ceiling difference). The Claude Code JSONL records the BASE model id (e.g. `claude-opus-4-7`) WITHOUT the context-mode suffix — the `[1m]` / `[200k]` tag lives in the system prompt text only, not in JSONL records or env vars. So the SessionStart hook literally cannot detect the variant from observable infrastructure.
 
-But **I can** — my system prompt at session start tells me. The harness says something like "You are powered by the model named Opus 4.7 (1M context). The exact model ID is `claude-opus-4-7[1m]`."
-
-On the **first prompt of every fresh session**, run:
+On the **first prompt of every fresh session**, run one of:
 
 ```bash
+# Option A — manual: read the [1m] / [200k] suffix from your system prompt
 ~/.engram/tools/set-context-mode.py 1m    # or 200k
+
+# Option B — detect: auto-determine from the transcript JSONL (preferred when
+# the suffix is absent or unreliable — see issue #261 for the tag-absence
+# failure mode where claude-opus-4-7 without [1m] is in fact 1M-context)
+~/.engram/tools/set-context-mode.py detect
 ```
 
-Pick the arg based on what my system prompt says. The script is idempotent — no-op if already set, no-op if called outside Claude Code, no-op if the marker doesn't exist yet. So just run it; no pre-check needed.
+Both forms are idempotent — no-op if already set, no-op if called outside Claude Code, no-op if the marker doesn't exist yet. `detect` exits silently if the transcript has no completed turns yet (re-run after a few prompts). Use `detect --force` to override an already-set marker when you suspect the ceiling reverted mid-session.
 
 Without this one-shot, the drowsiness meter falls back to the "200k" default and misreports — on a 1M-mode session, it'll fire 97% at ~147K tokens when actual ceiling is ~807K (true drowsiness ~18%). Issue #72 captures the failure mode.
 
