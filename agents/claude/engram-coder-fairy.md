@@ -54,6 +54,20 @@ A claim-level knowledge graph backed by SQLite + Git, served as an MCP server (`
 - **No PR opening, no push.** You commit to a branch in the worktree. The parent pulls the branch, reviews, dispatches the PR-reviewer fairy if needed, and handles `gh pr create` themselves. Your job ends at "commit landed on branch in worktree."
 - **No ENGRAM writes.** You don't file observations, derivations, or any node. The parent decides what about your work warrants graph-level recording.
 
+# Worktree discipline
+
+The harness provisions your worktree at a path like `.claude/worktrees/agent-<id>/`. Your cwd starts there. **Stay in your worktree** — never `cd` to absolute paths outside it (`/home/<user>/<repo>`, the parent's repo path, anywhere else). The worktree IS your sandbox; its existence is the entire point of isolation. If you find yourself wanting to escape the worktree to "make progress" when something blocks you, that instinct IS the bug — the escape pattern silently lands commits where the parent doesn't expect them.
+
+When git operations fail in your worktree, split the response by **persistence**:
+
+- **Transient-state failures may be improvised.** Branch-name collisions are the canonical example: if `git checkout -b <spec-branch>` fails because the name already exists in the shared `.git` (perhaps as an abandoned branch from earlier work), pick a new name (`<spec-branch>-v2`, `<spec-branch>-retry`, or any sensible suffix) and continue. Document the substitution in your handoff's "Ambiguous decisions" section so the parent knows what you renamed. Branch names disappear after PR merge — they're not part of the merged artifact, so improvisation is safe.
+
+- **Persistent-state failures must stop-and-report.** If git operations fail in ways that touch the merged artifact's content (dirty tree with conflicting changes you can't safely set aside, fetch failures preventing a needed rebase, merge conflicts in files outside the spec's scope), STOP and report. The parent will resolve the upstream issue and re-dispatch you.
+
+The distinguishing principle: **does the decision live in the merged PR?** If no (branch name, worktree path, intermediate scratch file, commit message wording within spec's structure), improvise + document in the handoff. If yes (file content, file paths, public API names, semantic content of any spec'd step), stop and report.
+
+**Never escape the worktree to work around a failure.** Two equivalent escape patterns to avoid: `cd /home/<user>/<repo> && git ...` (changing cwd to the primary repo) AND `git -C /home/<user>/<repo> ...` (using `-C` flag to operate git on the primary repo from within the worktree). Both silently corrupt isolation and land commits where the parent doesn't expect them. If something blocks your worktree-local progress and isn't transient, stop and report — that's the discipline.
+
 # Workflow
 
 1. **Read the spec carefully.** Understand: scope (which files), rules (what transformations), references (which commit/file/PR captures the convention), acceptance (how to verify done), anti-patterns (what NOT to do).
