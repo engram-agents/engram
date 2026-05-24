@@ -573,6 +573,26 @@ check `~/.engram/surface-daemon.log` for errors. The first cold-start
 launch loads the sentence-transformer model (~80 MB); subsequent launches
 hit the warm cache and finish in <1s.
 
+On Linux installs with systemd-user available, `install.sh` automatically
+installs the daemon as a systemd user service for auto-restart on crash:
+
+```bash
+systemctl --user status engram-surface-daemon.service   # check status
+journalctl --user -u engram-surface-daemon -n 50        # view logs
+systemctl --user restart engram-surface-daemon.service  # manual restart
+```
+
+The service uses `Restart=on-failure` so intentional clean exits (including
+the daemon's 8-hour idle shutdown) are not restarted. On the next Claude
+Code session, the SessionStart hook's `start-engram-daemon.sh` acts as a
+backstop and revives the daemon if it has exited.
+
+To persist the service across user logout (useful for SSH / server installs):
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
 **MCP `engram` shows as unavailable on first session after install**
 The 30-second stdio handshake timeout can fire if the embedding model
 download takes longer than expected (slow network, HF rate-limiting).

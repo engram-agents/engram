@@ -318,6 +318,36 @@ if [ -d "$ALPHA_DIR/hooks/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/hooks/claude" 2
   echo "  hooks → $ENGRAM_HOME/hooks/ (from hooks/claude/)"
 fi
 
+# Optional: install surface daemon as systemd user service for auto-restart
+# (idempotent — skips silently if systemd-user not available or not running)
+# Detection: systemctl --user is-system-running returns 0 on "running"/"degraded",
+# which covers all systemd-user-bus-active states. Falls back to status
+# default.target so WSL2 distros that report "degraded" still succeed.
+# Non-systemd envs (macOS, WSL1, containers): command absent or bus inactive
+# → skip with no error. SessionStart shell-spawn remains as backstop.
+if command -v systemctl &>/dev/null && \
+   { systemctl --user --quiet is-system-running 2>/dev/null || \
+     systemctl --user --quiet status default.target 2>/dev/null; }; then
+  SERVICE_TEMPLATE="$ALPHA_DIR/templates/engram-surface-daemon.service.template"
+  SERVICE_DEST="$HOME/.config/systemd/user/engram-surface-daemon.service"
+
+  if [ -f "$SERVICE_TEMPLATE" ]; then
+    mkdir -p "$(dirname "$SERVICE_DEST")"
+    sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
+        -e "s|{{ENGRAM_HOOKS_DIR}}|$ENGRAM_HOME/hooks|g" \
+        -e "s|{{ENGRAM_HOME}}|$ENGRAM_HOME|g" \
+        "$SERVICE_TEMPLATE" > "$SERVICE_DEST"
+
+    systemctl --user daemon-reload
+    systemctl --user enable engram-surface-daemon.service
+    systemctl --user start engram-surface-daemon.service
+
+    echo "  systemd user service → $SERVICE_DEST (enabled + started)"
+    echo "  Note: For service persistence across user logout, run:"
+    echo "        sudo loginctl enable-linger $USER"
+  fi
+fi
+
 # Tools: heartbeat, sleep, dispatcher launchers, telegram bot, channel
 # helpers, sync-cron + render_cron, migrate_config_v2. Copied per-install
 # (not symlinked) so each agent's tools operate on their own $ENGRAM_HOME

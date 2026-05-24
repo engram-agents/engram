@@ -588,6 +588,23 @@ if [[ -n "$PYTHON_BIN" && -f "$ENGRAM_HOME/hooks/start-engram-daemon.sh" ]]; the
     echo "  ✓ Substituted {{PYTHON}} → $PYTHON_BIN in hooks/start-engram-daemon.sh"
 fi
 
+# Refresh systemd user service file if the user has the service installed
+# and the source template exists. Upgrade-only: re-renders content so
+# ExecStart / paths stay current after a deploy. Does NOT enable or start
+# the service (user manages lifecycle post-install). User may need to run
+# `systemctl --user daemon-reload` manually after this step if the service
+# file content changed — intentional; we avoid silent restarts on upgrade.
+SERVICE_DEST="$HOME/.config/systemd/user/engram-surface-daemon.service"
+SERVICE_TEMPLATE="$ALPHA_DIR/templates/engram-surface-daemon.service.template"
+if [[ -f "$SERVICE_DEST" && -f "$SERVICE_TEMPLATE" && -n "$PYTHON_BIN" ]]; then
+    sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
+        -e "s|{{ENGRAM_HOOKS_DIR}}|$ENGRAM_HOME/hooks|g" \
+        -e "s|{{ENGRAM_HOME}}|$ENGRAM_HOME|g" \
+        "$SERVICE_TEMPLATE" > "$SERVICE_DEST"
+    echo "  ✓ Refreshed systemd user service file → $SERVICE_DEST"
+    echo "    Run: systemctl --user daemon-reload  (if you want changes to take effect now)"
+fi
+
 # Stamp version marker for forensics + future "what version is running?" queries
 TS="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 cat > "$ENGRAM_HOME/.deployed-version" <<EOF
