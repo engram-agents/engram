@@ -6773,10 +6773,7 @@ def engram_nap(message: str) -> str:
 )
 def engram_advance_turn(message: str) -> str:
     """[Sleep cycle / first session only — DO NOT call awake.] End-of-day
-    session checkpoint that advances the turn counter + logs summary.
-
-    For pre-compaction / end-of-burst persistence in awake state, use
-    engram_nap instead — it persists without consuming the day's turn.
+    consolidation checkpoint: advances the turn counter + logs summary.
 
     Advances the global turn counter (drives the forgetting mechanism that
     inflates importance scores of fresh nodes relative to stale ones), logs
@@ -6784,12 +6781,12 @@ def engram_advance_turn(message: str) -> str:
     records a diagnostic snapshot. **This action is IRREVERSIBLE** — turn
     advances cannot be undone without direct DB intervention.
 
-    Coordinated multi-role discipline (per qu_0035): only the dedicated sleep
-    cron at end-of-day should call this from cron-fired sessions. Heartbeat
-    / telegram / dispatcher roles must use engram_nap instead. The user's
-    explicit sleep skill invocation also overrides cron coordination — but
-    state explicitly that the day's turn is being consumed so the cron knows
-    to skip its session-mode call.
+    Invariant: the turn is a DAILY resource — advance it at most once per
+    day. A second same-day advance over-inflates the forgetting curve,
+    irreversibly. This function does NOT self-guard against repeat calls;
+    ensuring exactly one advance per day is the CALLER's responsibility.
+    Every non-end-of-day checkpoint (pre-compaction, mid-burst, or any
+    background role) must use engram_nap instead.
 
     Args:
         message: Summary of what was learned/changed across the cohort
