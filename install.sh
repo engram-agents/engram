@@ -281,6 +281,23 @@ if [ -d "$ALPHA_DIR/agents/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/agents/claude"
   echo "  agents → $CLAUDE_HOME/agents/ (from agents/claude/)"
 fi
 
+# Invariant: .claude/agents/ should contain only symlinks pointing into
+# agents/claude/, EXCEPT for these intentional project-scope-only agents
+# (per agents/claude/README.md "What doesn't (intentional)" section):
+#   - engram-code-auditor.md (alpha-dev power-user tool)
+#   - engram-paper-research.md (alpha-author paper-work tool)
+# Any OTHER non-symlink file here drifts from the canonical source
+# and breaks install-time sync (#190, #312).
+PROJECT_SCOPE_ONLY="engram-code-auditor.md engram-paper-research.md"
+while IFS= read -r f; do
+    bn="$(basename "$f")"
+    if ! echo "$PROJECT_SCOPE_ONLY" | grep -qw "$bn"; then
+        echo "WARN: .claude/agents/$bn is a flat file — it will drift from agents/claude/."
+        echo "      Either symlink it: ln -sf ../../agents/claude/$bn .claude/agents/$bn"
+        echo "      Or add it to PROJECT_SCOPE_ONLY in this script if intentional."
+    fi
+done < <(find "$ALPHA_DIR/.claude/agents" -type f -name '*.md')
+
 if [ -d "$ALPHA_DIR/output-styles/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/output-styles/claude" 2>/dev/null | grep -v '^\.gitkeep$' || true)" ]; then
   cp -r "$ALPHA_DIR/output-styles/claude/"* "$CLAUDE_HOME/output-styles/"
   echo "  output-styles → $CLAUDE_HOME/output-styles/ (from output-styles/claude/)"
