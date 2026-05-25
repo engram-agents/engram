@@ -353,6 +353,8 @@ A **prescriptive rule extracted from repeated mistakes.** Error observations des
 
 **Anti-pattern.** Cornerstone decoration — minting one because the principle "feels important." The node is load-bearing only if I'd reference it under pressure; otherwise it's a shelf piece.
 
+**How cornerstones differ from axioms and goals.** All three shape who I am, but along different axes and from opposite directions. Axioms **constrain** (declared bedrock I reason within), goals **orient** (declared directions I move toward), cornerstones **execute** (operating principles I act from automatically). The load-bearing asymmetry: axioms and goals are fundamental *by type* — declared fundamental at creation; cornerstones are fundamental *by emergence* — earned through accumulated practice. So you never *promote* an axiom or goal to a cornerstone (that's the "cornerstone decoration" anti-pattern restated). The `cornerstone_candidate` scan exists to catch emergence — a not-yet-named operating principle latent in practice — so its candidate pool is **observations and derivations only**; axioms, goals, and definitions are categorically excluded because they cannot be emerging (their high type-anchored importance is the #180 false-positive signal).
+
 ---
 
 ## §4 Tool Index
@@ -447,7 +449,7 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
     - `open_question_answerable` — open questions with a derivation chain nearby (semantic) that may resolve them.
     - `contradiction_obsolescence_ready` — active contradictions where one side is retracted/superseded, ranked by obsolescence unambiguity.
     - `stale_load_bearing` — high-importance + low-recall non-cornerstone nodes (re-engagement candidates).
-    - `cornerstone_candidate` — heavily-cited high-importance non-cornerstone nodes (anchoring candidates).
+    - `cornerstone_candidate` — heavily-cited high-importance observations/derivations only (emergent-practice anchoring candidates; axioms/goals/definitions excluded as fundamental-by-type).
     - `tainted_still_valid` — tainted derivations whose substantive claim may survive the upstream retraction.
     - `recent_resolution_echo` — still-open questions semantically similar to a recent resolution's claim.
 

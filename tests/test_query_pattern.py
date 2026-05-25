@@ -376,6 +376,124 @@ def test_cornerstone_candidate_requires_min_citations():
     assert isolated_id not in ids  # zero citations < min_citations=3
 
 
+def test_cornerstone_candidate_excludes_axiom_goal_definition_includes_ob_dv():
+    """#180 regression: axioms/goals/definitions with high importance + ≥3 citations
+    must be EXCLUDED; an observation (and derivation) with the same profile must be INCLUDED.
+
+    Axioms, goals, and definitions are fundamental-by-type (declared at creation);
+    their high type-anchored importance_base is not an emergence signal.
+    The candidate pool is observations and derivations only — emergent-practice nodes.
+    See SKILL.md §2.17.
+    """
+    server = fresh_server()
+    now = "2026-05-25T00:00:00Z"
+
+    # Create three "citer" observations used only as edge sources
+    citer_a = _add_observation(server, "Citer A for citation fixture")
+    citer_b = _add_observation(server, "Citer B for citation fixture")
+    citer_c = _add_observation(server, "Citer C for citation fixture")
+
+    # Helper: insert 3 inbound 'supports' edges onto a target node
+    def _add_three_citations(target_id):
+        conn = server._get_db()
+        try:
+            for src in (citer_a, citer_b, citer_c):
+                conn.execute(
+                    "INSERT OR IGNORE INTO edges (source_id, target_id, relation, created_at)"
+                    " VALUES (?, ?, 'supports', ?)",
+                    (src, target_id, now),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    # Helper: boost importance_base above the 0.7 gate (2.0 = type-anchored value)
+    def _boost_importance(node_id):
+        conn = server._get_db()
+        try:
+            conn.execute(
+                "UPDATE nodes SET importance_base=2.0, importance_score=2.0 WHERE id=?",
+                (node_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    # — Axiom: high importance + 3 citations — must NOT appear
+    axiom_result = json.loads(server._add_axiom_impl(
+        claim="Honesty is non-negotiable in graph construction",
+        basis="Structural requirement for provenance integrity",
+    ))
+    axiom_id = axiom_result["axiom_id"]
+    _boost_importance(axiom_id)
+    _add_three_citations(axiom_id)
+
+    # — Goal: high importance + 3 citations — must NOT appear
+    goal_result = json.loads(server._add_goal_impl(
+        claim="Achieve calibrated epistemic humility",
+        motivation="The core aspiration driving ENGRAM development",
+    ))
+    goal_id = goal_result["goal_id"]
+    _boost_importance(goal_id)
+    _add_three_citations(goal_id)
+
+    # — Definition: high importance + 3 citations — must NOT appear
+    def_result = json.loads(server._add_definition_impl(
+        term="cornerstone",
+        definition="An identity-scaffold node representing an earned operating principle",
+    ))
+    def_id = def_result["definition_id"]
+    _boost_importance(def_id)
+    _add_three_citations(def_id)
+
+    # — Observation: high importance + 3 citations — MUST appear (emergent-practice node)
+    obs_id = _add_observation(server, "Emergent-practice claim: tool-first problem solving is load-bearing")
+    _boost_importance(obs_id)
+    _add_three_citations(obs_id)
+
+    # — Derivation: high importance + 3 citations — MUST appear (emergent-practice node)
+    # Covers the 'derivation' branch of the allowlist (type='derivation'); mirrors the
+    # observation setup exactly so both halves of the OR gate are exercised.
+    dv_result = json.loads(server.engram_derive(payload_json=json.dumps({
+        "claim": "Emergent-practice derivation: tool-first + citation-weight together predict cornerstone readiness",
+        "supporting_ids": f"{obs_id},{citer_a}",
+        "logical_chain": "obs_id establishes tool-first load-bearing; citer_a corroborates citation weight; together they predict cornerstone candidacy.",
+        "reasoning_type": "deductive_modus_ponens",
+    })))
+    dv_id = dv_result["derivation_id"]
+    _boost_importance(dv_id)
+    _add_three_citations(dv_id)
+
+    conn = server._get_db()
+    try:
+        params = dict(server.PATTERN_QUERY_PRESETS["balanced"])
+        params["top_k"] = 100  # ensure nothing is top-k truncated
+        candidates = server._pattern_cornerstone_candidate(conn, params)
+    finally:
+        conn.close()
+
+    result_ids = [c["id"] for c in candidates]
+
+    # Fundamental-by-type nodes must be excluded (the #180 false-positive)
+    assert axiom_id not in result_ids, f"axiom {axiom_id} must be excluded from cornerstone_candidate"
+    assert goal_id not in result_ids, f"goal {goal_id} must be excluded from cornerstone_candidate"
+    assert def_id not in result_ids, f"definition {def_id} must be excluded from cornerstone_candidate"
+
+    # Emergent-practice nodes must be included (both ob and dv branches of the allowlist)
+    assert obs_id in result_ids, f"observation {obs_id} must be included in cornerstone_candidate"
+    assert dv_id in result_ids, f"derivation {dv_id} must be included in cornerstone_candidate"
+
+    # MCP-facing: verify axiom/goal/def absent, observation and derivation present
+    r = json.loads(server.engram_query_pattern("cornerstone_candidate", preset="balanced",
+                                               top_k_override=100))
+    mcp_ids = [e["id"] for e in r["results"]]
+    assert axiom_id not in mcp_ids
+    assert goal_id not in mcp_ids
+    assert def_id not in mcp_ids
+    assert obs_id in mcp_ids
+    assert dv_id in mcp_ids, f"derivation {dv_id} must appear in MCP cornerstone_candidate results"
+
+
 # ── open_question_answerable + recent_resolution_echo ─────────────────────
 # Skipped from full coverage in this PR — they need semantic search via the
 # embedder, which requires a model load. Smoke-test the dispatch only.

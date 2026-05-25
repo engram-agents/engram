@@ -15225,13 +15225,20 @@ def _pattern_stale_load_bearing(
 def _pattern_cornerstone_candidate(
     conn, preset_params: dict, **_filters
 ) -> list[dict]:
-    """High-importance non-cornerstone nodes that are heavily cited.
+    """Heavily-cited observations/derivations that may warrant cornerstone anchoring.
+
+    Candidate pool is **observations and derivations only** — emergent-practice
+    nodes whose load-bearing role has accumulated through use. Axioms, goals,
+    and definitions are categorically excluded: they are fundamental *by type*
+    (declared at creation), so their high type-anchored importance_base is not
+    an emergence signal — nominating them was the #180 false-positive. See
+    SKILL.md §2.17 for the axiom/goal/cornerstone semantic distinctions.
 
     A cornerstone candidate is a node that has been load-bearing in the
     graph (cited by many derivations / observations) but isn't yet anchored
     as a cornerstone. Score: importance_base × (1 + citation_count / 10).
     Gating uses importance_base (time-invariant) so the threshold is stable
-    across turns. Cornerstones and feeling_reports are excluded.
+    across turns.
 
     Returns: list of {id, type, claim, score, importance_base, citation_count,
     recall_count, suggested_action}.
@@ -15243,7 +15250,7 @@ def _pattern_cornerstone_candidate(
         "SELECT id, type, claim, importance_base, recall_count "
         "FROM nodes "
         "WHERE is_current=1 "
-        "AND type NOT IN ('cornerstone', 'feeling_report') "
+        "AND (type LIKE 'observation%' OR type = 'derivation') "
         "AND COALESCE(importance_base, 0) > 0.7 "
         "ORDER BY importance_base DESC LIMIT 50"
     ).fetchall()
@@ -15447,8 +15454,10 @@ def engram_query_pattern(
               chain nearby (semantic) that may resolve them.
             - stale_load_bearing: high-importance + low-recall non-
               cornerstone nodes (re-engagement candidates).
-            - cornerstone_candidate: heavily-cited high-importance non-
-              cornerstone nodes (anchoring candidates).
+            - cornerstone_candidate: heavily-cited high-importance
+              observations/derivations only (emergent-practice anchoring
+              candidates; axioms/goals/definitions excluded as
+              fundamental-by-type — see SKILL.md §2.17 / #180).
             - tainted_still_valid: tainted derivations whose substantive
               claim may survive the upstream retraction.
             - recent_resolution_echo: still-open questions semantically
