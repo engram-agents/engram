@@ -498,5 +498,59 @@ class TestPutRouteHTTP(ConfigWriteBase):
             self.fail(f"OPTIONS returned error: {e.code}")
 
 
+class TestAutoSleepTimePatternValidation(ConfigWriteBase):
+    """cadence.auto_sleep_time enforces HH:MM 24h format via schema pattern."""
+
+    def test_valid_hhmm_accepted(self):
+        """'03:00' is a valid HH:MM value and must be accepted."""
+        result = viz_server.write_config_key("test", "cadence.auto_sleep_time", "03:00")
+        self.assertTrue(result["ok"], f"Expected ok=True for '03:00'; got: {result}")
+        self.assertEqual(result["validated_value"], "03:00")
+
+    def test_midnight_accepted(self):
+        """'00:00' (midnight) is a valid HH:MM value."""
+        result = viz_server.write_config_key("test", "cadence.auto_sleep_time", "00:00")
+        self.assertTrue(result["ok"], f"Expected ok=True for '00:00'; got: {result}")
+
+    def test_end_of_day_accepted(self):
+        """'23:59' (last minute of day) is a valid HH:MM value."""
+        result = viz_server.write_config_key("test", "cadence.auto_sleep_time", "23:59")
+        self.assertTrue(result["ok"], f"Expected ok=True for '23:59'; got: {result}")
+
+    def test_am_suffix_rejected(self):
+        """'03 am' (12h with suffix) must be rejected — not HH:MM 24h format."""
+        result = viz_server.write_config_key("test", "cadence.auto_sleep_time", "03 am")
+        self.assertFalse(result["ok"], "Expected ok=False for '03 am'")
+        self.assertIn("HH:MM", result.get("error", ""),
+                      f"Error should mention HH:MM format; got: {result.get('error')}")
+
+    def test_24h_format_rejected(self):
+        """'3:00' (single-digit hour) must be rejected — zero-padding required."""
+        result = viz_server.write_config_key("test", "cadence.auto_sleep_time", "3:00")
+        self.assertFalse(result["ok"], "Expected ok=False for '3:00' (no zero-pad)")
+
+    def test_invalid_hour_rejected(self):
+        """'25:00' (hour > 23) must be rejected."""
+        result = viz_server.write_config_key("test", "cadence.auto_sleep_time", "25:00")
+        self.assertFalse(result["ok"], "Expected ok=False for '25:00'")
+
+    def test_invalid_minute_rejected(self):
+        """'12:60' (minute > 59) must be rejected."""
+        result = viz_server.write_config_key("test", "cadence.auto_sleep_time", "12:60")
+        self.assertFalse(result["ok"], "Expected ok=False for '12:60'")
+
+    def test_free_text_rejected(self):
+        """'bedtime' (arbitrary string) must be rejected."""
+        result = viz_server.write_config_key("test", "cadence.auto_sleep_time", "bedtime")
+        self.assertFalse(result["ok"], "Expected ok=False for 'bedtime'")
+
+    def test_value_persists_on_valid_write(self):
+        """Valid write persists to config.json at cadence.auto_sleep_time."""
+        result = viz_server.write_config_key("test", "cadence.auto_sleep_time", "22:30")
+        self.assertTrue(result["ok"], result)
+        cfg = self._read_config()
+        self.assertEqual(cfg["cadence"]["auto_sleep_time"], "22:30")
+
+
 if __name__ == "__main__":
     unittest.main()

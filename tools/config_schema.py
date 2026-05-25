@@ -63,16 +63,21 @@ SCHEMA: list[dict] = [
      "depends_on": "github.enabled"},
 
     # Embedding (read-only)
-    {"key": "embedding.enabled", "section": "embedding", "tier": TIER_A, "type": "boolean",
+    {"key": "embedding.enabled", "section": "embedding", "tier": TIER_B, "type": "boolean",
      "control": "checkbox", "label": "Embedding enabled",
      "tooltip": "Semantic recall via sentence-transformer embeddings. Read-only here — disable/enable would orphan existing nodes' embeddings.",
      "editable": False, "restart_required": False, "alert_when_false": True},
-    {"key": "embedding.model", "section": "embedding", "tier": TIER_A, "type": "string",
+    {"key": "embedding.model", "section": "embedding", "tier": TIER_B, "type": "string",
      "control": "text", "label": "Embedding model",
      "tooltip": "Sentence-transformer model identifier. Read-only — switching models would invalidate existing embeddings.",
      "editable": False, "restart_required": False},
 
     # Drowsiness
+    {"key": "cadence.drowsiness_ceiling_tokens", "section": "drowsiness", "tier": TIER_A,
+     "type": "integer", "control": "int", "min": 50000, "max": 2000000,
+     "label": "Context ceiling (tokens)",
+     "tooltip": "Explicit context-window token ceiling the drowsiness meter measures fill against. Set per your session's context mode (~190000 for 200K mode, ~807000 for 1M mode). Read live by the context_tracker hook — no restart needed.",
+     "editable": True, "restart_required": False},
     {"key": "cadence.drowsiness_caution_pct", "section": "drowsiness", "tier": TIER_A,
      "type": "integer", "control": "int", "min": 0, "max": 100,
      "label": "Caution threshold (%)",
@@ -91,7 +96,8 @@ SCHEMA: list[dict] = [
      "tooltip": "When enabled, the SessionStart hook registers a nightly sleep cron at the configured time. Opt-in; default off. Takes effect next session.",
      "editable": True, "restart_required": True},
     {"key": "cadence.auto_sleep_time", "section": "auto_sleep", "tier": TIER_A,
-     "type": "string", "control": "text",
+     "type": "string", "control": "time_hm",
+     "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$",
      "label": "Auto-sleep time (HH:MM)",
      "tooltip": "Local-time 24-hour clock when the nightly sleep cycle fires (e.g. '03:00'). Format: HH:MM, 00:00–23:59. Takes effect next session.",
      "editable": True, "restart_required": True,
@@ -149,7 +155,7 @@ SCHEMA: list[dict] = [
 SECTIONS: list[dict] = [
     {"id": "identity",     "label": "Identity",                "tier": TIER_A, "order": 1},
     {"id": "github",       "label": "GitHub integration",      "tier": TIER_A, "order": 2, "section_gate": "github.enabled"},
-    {"id": "embedding",    "label": "Embedding",               "tier": TIER_A, "order": 3},
+    {"id": "embedding",    "label": "Embedding",               "tier": TIER_B, "order": 3},
     {"id": "drowsiness",   "label": "Drowsiness thresholds",   "tier": TIER_A, "order": 4},
     {"id": "auto_sleep",   "label": "Auto-sleep",              "tier": TIER_A, "order": 5},
     {"id": "domain_trust", "label": "Domain trust & caution",  "tier": TIER_A, "order": 6},
