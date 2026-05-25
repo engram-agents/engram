@@ -178,13 +178,14 @@ def _configure_paths(data_dir: str | Path) -> None:
     DATA_DIR and DB_PATH contaminated the production engram with 5 test nodes.
     """
     global DATA_DIR, DB_PATH, SNAPSHOT_PATH, CONFIG_PATH, LOG_PATH
-    global FEELING_NUDGE_MARKER
+    global FEELING_NUDGE_MARKER, ERROR_INCIDENTS_PATH
     DATA_DIR = Path(data_dir)
     DB_PATH = DATA_DIR / "knowledge.db"
     SNAPSHOT_PATH = DATA_DIR / "graph_snapshot.md"
     CONFIG_PATH = DATA_DIR / "config.json"
     LOG_PATH = DATA_DIR / "session_log.md"
     FEELING_NUDGE_MARKER = DATA_DIR / "feeling-nudge-active.json"
+    ERROR_INCIDENTS_PATH = str(DATA_DIR / "error_incidents.json")
 
 # Utility Q-update learning rate per USE action. Three tiers per Lei
 # 2026-05-19 design call. Numbers preserve the existing α scale.
@@ -10002,7 +10003,7 @@ def _goal_tension_impl(
 # Lesson nodes — error-learning loop (cognitive tripwire)
 # ---------------------------------------------------------------------------
 
-ERROR_INCIDENTS_PATH = os.path.expanduser("~/.engram/error_incidents.json")
+ERROR_INCIDENTS_PATH = str(DATA_DIR / "error_incidents.json")
 
 
 def _update_incident_index(lesson_id: str, lesson_claim: str,
@@ -10290,7 +10291,7 @@ def _add_lesson_impl(
 
 
 def _rebuild_incidents_cache() -> dict:
-    """Rebuild `~/.engram/error_incidents.json` from the graph.
+    """Rebuild the error_incidents.json cache from the graph.
 
     Walks all `exemplifies` edges (incident → lesson), pairs each incident
     with its lesson's claim + scaffolding_nudge from metadata, and writes
