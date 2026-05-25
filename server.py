@@ -7259,8 +7259,9 @@ def engram_diagnose() -> str:
 
     Side-effect-free: no memory refresh, no turn advance, no state mutation.
     Designed for both user and agent consumption. Returns machine-readable
-    metrics across six dimensions: graph structure, epistemic health, memory
-    health, provenance, agent experience, and calibration.
+    metrics across seven dimensions: graph structure, epistemic health, memory
+    health, provenance, agent experience, calibration, and read-tool
+    contention.
 
     Unlike engram_reflect (pre-dream briefing, action-oriented), this tool
     produces exhaustive quantitative metrics suitable for trend analysis and
@@ -7277,6 +7278,14 @@ def engram_diagnose() -> str:
           - this_turn: same shape, mode=1-turn
           - drift_by_type: per-type p50 delta between this_turn and corpus
             (only reported when this_turn has ≥3 samples in that type)
+
+        - read_tool_contention: Optional. Surfaces (hour_utc, tool_name) buckets
+          where read tools (engram_query/inspect/list/get_subgraph) exceeded
+          latency thresholds in the last 7 days — present only when any bucket
+          is flagged. total_flagged_buckets counts distinct (hour_utc, tool_name)
+          pairs that exceeded thresholds in the 7-day window — may be >
+          worst_hours_shown if more than 10 buckets are flagged. See
+          dv_0687/dv_0713/qu_0256 for context.
     """
     conn = _get_db()
     try:
@@ -7802,6 +7811,79 @@ def engram_diagnose() -> str:
             "error_calls": error_count,
             "per_tool": per_tool,
         }
+
+        # ── Read-Tool Contention Tripwire ────────────────────────────────
+        # Flags hour-buckets where read-tool latency exceeded thresholds
+        # (mean > 5s OR max > 15s) over the last 7 days.  Surface only when
+        # any hours are flagged — no false-positive noise in the clean case.
+        # Mechanism: dv_0687.  Dream-cycle mitigation: dv_0713.
+        # Open case (awake-burst): qu_0256.
+        _READ_TOOLS = (
+            "engram_query",
+            "engram_inspect",
+            "engram_list",
+            "engram_get_subgraph",
+        )
+        _CONTENTION_MEAN_THRESHOLD_MS = 5000
+        _CONTENTION_MAX_THRESHOLD_MS = 15000
+        _contention_cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=7)
+        ).isoformat()
+        _contention_placeholders = ",".join("?" * len(_READ_TOOLS))
+        # total_flagged_buckets: un-limited count of all flagged (hour, tool) buckets.
+        _total_flagged_buckets = conn.execute(
+            f"""
+            SELECT COUNT(*) AS c FROM (
+                SELECT 1
+                FROM tool_timing
+                WHERE timestamp >= ?
+                  AND tool_name IN ({_contention_placeholders})
+                GROUP BY SUBSTR(timestamp, 1, 13), tool_name
+                HAVING AVG(duration_ms) > ? OR MAX(duration_ms) > ?
+            )
+            """,
+            (_contention_cutoff, *_READ_TOOLS,
+             _CONTENTION_MEAN_THRESHOLD_MS, _CONTENTION_MAX_THRESHOLD_MS),
+        ).fetchone()["c"]
+        # worst_hours_shown: the up-to-10 worst rows (for display in "worst" list).
+        _contention_rows = conn.execute(
+            f"""
+            SELECT
+                SUBSTR(timestamp, 1, 13) AS hour_utc,
+                tool_name,
+                COUNT(*) AS calls,
+                CAST(ROUND(AVG(duration_ms), 0) AS INTEGER) AS mean_ms,
+                CAST(MAX(duration_ms) AS INTEGER) AS max_ms
+            FROM tool_timing
+            WHERE timestamp >= ?
+              AND tool_name IN ({_contention_placeholders})
+            GROUP BY hour_utc, tool_name
+            HAVING AVG(duration_ms) > ? OR MAX(duration_ms) > ?
+            ORDER BY mean_ms DESC, max_ms DESC
+            LIMIT 10
+            """,
+            (_contention_cutoff, *_READ_TOOLS,
+             _CONTENTION_MEAN_THRESHOLD_MS, _CONTENTION_MAX_THRESHOLD_MS),
+        ).fetchall()
+        if _contention_rows:
+            metrics["read_tool_contention"] = {
+                "total_flagged_buckets": _total_flagged_buckets,
+                "worst_hours_shown": len(_contention_rows),
+                "see": (
+                    "dv_0687 (mechanism), dv_0713 (dream-cycle mitigation), "
+                    "qu_0256 (open: awake-burst)"
+                ),
+                "worst": [
+                    {
+                        "hour": r["hour_utc"],
+                        "tool": r["tool_name"],
+                        "calls": r["calls"],
+                        "mean_ms": r["mean_ms"],
+                        "max_ms": r["max_ms"],
+                    }
+                    for r in _contention_rows
+                ],
+            }
 
         # ── Calibration ──────────────────────────────────────────────────
         # Use _compute_confidence_distribution directly (not engram_stats) so
