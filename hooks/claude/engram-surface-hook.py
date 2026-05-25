@@ -60,6 +60,16 @@ ERROR_PATTERNS_PATH = os.path.join(ENGRAM_HOME, "error_patterns.json")
 ERROR_INCIDENTS_PATH = os.path.join(ENGRAM_HOME, "error_incidents.json")
 KNOWLEDGE_DB_PATH = os.path.join(ENGRAM_HOME, "knowledge.db")
 
+def get_user_name() -> str:
+    """Read primary_user from $ENGRAM_HOME/config.json; fall back to 'the human'."""
+    try:
+        with open(os.path.join(ENGRAM_HOME, "config.json"), "r", encoding="utf-8") as f:
+            config = json.load(f)
+        return config.get("primary_user") or "the human"
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+        return "the human"
+
+
 # Prompt count thresholds for consolidation warnings
 NAP_WARN_THRESHOLD = 20   # Start suggesting nap
 NAP_URGENT_THRESHOLD = 25  # Escalate urgency
@@ -738,9 +748,12 @@ def main():
 
     # Warn if daemon is down (semantic search degraded)
     if not used_daemon:
+        user_name = get_user_name()
         parts.append(
-            f"[ENGRAM Recall: daemon not running — using FTS-only (no semantic matching)."
-            f"Restart daemon: bash {os.path.join(ENGRAM_HOME, 'hooks', 'start-engram-daemon.sh')}]"
+            f"[⚠️ ENGRAM CRITICAL — surface daemon offline; semantic recall "
+            f"DISABLED, ranking degraded to lexical-only. Notify {user_name} "
+            f"immediately — recall quality is severely impaired. "
+            f"Recovery: bash {os.path.join(ENGRAM_HOME, 'hooks', 'start-engram-daemon.sh')}]"
         )
 
     # ENGRAM recall nudge

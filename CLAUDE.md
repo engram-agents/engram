@@ -23,3 +23,14 @@ read-side tools (`engram_surface`, `engram_query`, `engram_inspect`,
 `engram_get_subgraph`, `engram_list`, `engram_history`, `engram_focus*`,
 `engram_query_pattern`) still carry multi-param signatures as of 2026-05-19
 and remain on the migration backlog.
+
+## Branching convention
+
+- **`dev`** is the default branch and the merge target for ALL feature/fix PRs.
+  Always open PRs against `dev` unless an explicit release-cut is happening.
+- **`master`** is the stable-release branch. It moves only on explicit release
+  cuts; routine PRs do NOT target master.
+- Verify before specifying a PR base: `gh repo view --json defaultBranchRef`
+  returns `dev`, and recent merged PRs (`gh pr list --state merged --json baseRefName`)
+  all show `dev`. The session-start banner's "Main branch: master" wording is
+  misleading — trust the repo state, not the banner.

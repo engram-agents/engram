@@ -386,13 +386,12 @@ def test_integration_cron_block_in_startup_context(tmp_path):
 
     with _mock_no_engram_client():
         with patch.object(mod, "_check_mcp_health", return_value=(True, None)):
-            with patch.object(mod, "_check_surface_daemon_health", return_value=(True, None)):
-                hook_input = {
-                    "session_id": "test-auto-sleep-startup",
-                    "transcript_path": str(tmp_path / "transcript.jsonl"),
-                    "source": "startup",
-                }
-                result = _run_hook_main(mod, hook_input)
+            hook_input = {
+                "session_id": "test-auto-sleep-startup",
+                "transcript_path": str(tmp_path / "transcript.jsonl"),
+                "source": "startup",
+            }
+            result = _run_hook_main(mod, hook_input)
 
     ctx = result["hookSpecificOutput"]["additionalContext"]
     assert "AUTO-SLEEP NIGHTLY" in ctx, (
@@ -414,13 +413,12 @@ def test_integration_cron_block_absent_on_compact(tmp_path):
 
     with _mock_no_engram_client():
         with patch.object(mod, "_check_mcp_health", return_value=(True, None)):
-            with patch.object(mod, "_check_surface_daemon_health", return_value=(True, None)):
-                hook_input = {
-                    "session_id": "test-auto-sleep-compact",
-                    "transcript_path": str(tmp_path / "transcript.jsonl"),
-                    "source": "compact",
-                }
-                result = _run_hook_main(mod, hook_input)
+            hook_input = {
+                "session_id": "test-auto-sleep-compact",
+                "transcript_path": str(tmp_path / "transcript.jsonl"),
+                "source": "compact",
+            }
+            result = _run_hook_main(mod, hook_input)
 
     ctx = result["hookSpecificOutput"]["additionalContext"]
     assert "AUTO-SLEEP NIGHTLY" not in ctx, (
@@ -437,13 +435,12 @@ def test_integration_cron_block_absent_when_disabled(tmp_path):
 
     with _mock_no_engram_client():
         with patch.object(mod, "_check_mcp_health", return_value=(True, None)):
-            with patch.object(mod, "_check_surface_daemon_health", return_value=(True, None)):
-                hook_input = {
-                    "session_id": "test-auto-sleep-disabled",
-                    "transcript_path": str(tmp_path / "transcript.jsonl"),
-                    "source": "startup",
-                }
-                result = _run_hook_main(mod, hook_input)
+            hook_input = {
+                "session_id": "test-auto-sleep-disabled",
+                "transcript_path": str(tmp_path / "transcript.jsonl"),
+                "source": "startup",
+            }
+            result = _run_hook_main(mod, hook_input)
 
     ctx = result["hookSpecificOutput"]["additionalContext"]
     assert "AUTO-SLEEP NIGHTLY" not in ctx

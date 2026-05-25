@@ -34,7 +34,6 @@ import hashlib
 import json
 import os
 import re
-import socket
 import sqlite3
 import subprocess
 import sys
@@ -102,42 +101,6 @@ def _check_mcp_health(engram_home: str) -> tuple[bool, str | None]:
         return False, "pgrep timed out"
     except Exception:
         # Advisory: probe errors are treated as ok to avoid blocking session start.
-        return True, None
-
-
-def _check_surface_daemon_health(engram_home: str) -> tuple[bool, str | None]:
-    """Check whether the ENGRAM surface daemon is accepting connections.
-
-    Performs a Unix socket connect test to $ENGRAM_HOME/recall-daemon.sock
-    with a 1s timeout. Mirrors the connect pattern from engram-surface-hook.py.
-    Any unexpected exception is treated as ok=True (advisory probe).
-
-    Returns:
-        (ok, reason): ok=True if connect succeeds or probe itself errors;
-                      ok=False with a reason string otherwise.
-    """
-    socket_path = os.path.join(engram_home, "recall-daemon.sock")
-    try:
-        if not os.path.exists(socket_path):
-            return False, "socket file not found"
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            sock.settimeout(1.0)
-            sock.connect(socket_path)
-            return True, None
-        except socket.timeout:
-            return False, "connect timeout"
-        except ConnectionRefusedError:
-            return False, "connect refused"
-        except OSError as exc:
-            return False, f"connect error: {exc}"
-        finally:
-            try:
-                sock.close()
-            except OSError:
-                pass
-    except Exception:
-        # Advisory: unexpected errors treated as ok to avoid blocking session start.
         return True, None
 
 
@@ -759,24 +722,22 @@ def main() -> None:
         pass
 
     # ── Substrate health probe ─────────────────────────────────────────────
-    # Check MCP server + surface daemon. Warn in additionalContext when either
-    # is offline so the agent surfaces the degradation to the user immediately
-    # (instead of discovering via mid-task tool failure). Probes are advisory:
-    # any unexpected exception is treated as ok=True — never block session start.
-    # Silent default: no extra lines when both probes pass. Closes #198,
-    # mitigates #248 Item 2.
+    # Check MCP server. Warn in additionalContext when offline so the agent
+    # surfaces the degradation to the user immediately (instead of discovering
+    # via mid-task tool failure). Probe is advisory: any unexpected exception
+    # is treated as ok=True — never block session start.
+    # Silent default: no extra line when probe passes. Closes #198.
+    # Note: surface-daemon health warning is intentionally NOT done here.
+    # A false alarm on startup (daemon not yet running) fires every session
+    # and trains the agent to ignore the warning. The warning fires at actual
+    # use-time from engram-surface-hook.py instead (closes #344).
     mcp_ok, mcp_reason = _check_mcp_health(ENGRAM_HOME)
-    daemon_ok, daemon_reason = _check_surface_daemon_health(ENGRAM_HOME)
 
-    if not (mcp_ok and daemon_ok):
+    if not mcp_ok:
         lines.append("")
         lines.append("⚠️  ENGRAM substrate health:")
-        if not mcp_ok:
-            lines.append(f"  MCP server: OFFLINE ({mcp_reason})")
-            lines.append("  → Tell the user immediately. ENGRAM tool calls will fail.")
-        if not daemon_ok:
-            lines.append(f"  Surface daemon: OFFLINE ({daemon_reason})")
-            lines.append("  → Semantic recall degrades to FTS-only fallback. Tell the user.")
+        lines.append(f"  MCP server: OFFLINE ({mcp_reason})")
+        lines.append("  → Tell the user immediately. ENGRAM tool calls will fail.")
 
     output_obj = {
         "hookSpecificOutput": {

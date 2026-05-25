@@ -237,12 +237,11 @@ class TestFairyPolicyHookIntegration:
 
         with _mock_no_engram_client():
             with patch.object(mod, "_check_mcp_health", return_value=(True, None)):
-                with patch.object(mod, "_check_surface_daemon_health", return_value=(True, None)):
-                    result = _run_hook_main(mod, {
-                        "session_id": "test-fairy-startup",
-                        "transcript_path": str(tmp_path / "t.jsonl"),
-                        "source": "startup",
-                    })
+                result = _run_hook_main(mod, {
+                    "session_id": "test-fairy-startup",
+                    "transcript_path": str(tmp_path / "t.jsonl"),
+                    "source": "startup",
+                })
 
         ctx = result["hookSpecificOutput"]["additionalContext"]
         assert "Coder fairy policy" in ctx, f"Coder policy line missing from startup context: {ctx!r}"
@@ -256,12 +255,11 @@ class TestFairyPolicyHookIntegration:
 
         with _mock_no_engram_client():
             with patch.object(mod, "_check_mcp_health", return_value=(True, None)):
-                with patch.object(mod, "_check_surface_daemon_health", return_value=(True, None)):
-                    result = _run_hook_main(mod, {
-                        "session_id": "test-fairy-startup",
-                        "transcript_path": str(tmp_path / "t.jsonl"),
-                        "source": "startup",
-                    })
+                result = _run_hook_main(mod, {
+                    "session_id": "test-fairy-startup",
+                    "transcript_path": str(tmp_path / "t.jsonl"),
+                    "source": "startup",
+                })
 
         ctx = result["hookSpecificOutput"]["additionalContext"]
         assert "Reviewer fairy policy" in ctx, f"Reviewer policy line missing from startup context: {ctx!r}"
@@ -275,12 +273,11 @@ class TestFairyPolicyHookIntegration:
 
         with _mock_no_engram_client():
             with patch.object(mod, "_check_mcp_health", return_value=(True, None)):
-                with patch.object(mod, "_check_surface_daemon_health", return_value=(True, None)):
-                    result = _run_hook_main(mod, {
-                        "session_id": "test-fairy-compact",
-                        "transcript_path": str(tmp_path / "t.jsonl"),
-                        "source": "compact",
-                    })
+                result = _run_hook_main(mod, {
+                    "session_id": "test-fairy-compact",
+                    "transcript_path": str(tmp_path / "t.jsonl"),
+                    "source": "compact",
+                })
 
         ctx = result["hookSpecificOutput"]["additionalContext"]
         assert "Coder fairy policy" not in ctx, (
@@ -299,12 +296,11 @@ class TestFairyPolicyHookIntegration:
 
         with _mock_no_engram_client():
             with patch.object(mod, "_check_mcp_health", return_value=(True, None)):
-                with patch.object(mod, "_check_surface_daemon_health", return_value=(True, None)):
-                    result = _run_hook_main(mod, {
-                        "session_id": "test-fairy-resume",
-                        "transcript_path": str(tmp_path / "t.jsonl"),
-                        "source": "resume",
-                    })
+                result = _run_hook_main(mod, {
+                    "session_id": "test-fairy-resume",
+                    "transcript_path": str(tmp_path / "t.jsonl"),
+                    "source": "resume",
+                })
 
         ctx = result["hookSpecificOutput"]["additionalContext"]
         assert "Coder fairy policy" not in ctx, (
@@ -324,12 +320,11 @@ class TestFairyPolicyHookIntegration:
         os.environ["ENGRAM_SESSION_ROLE"] = "interactive"
         with _mock_no_engram_client():
             with patch.object(mod, "_check_mcp_health", return_value=(True, None)):
-                with patch.object(mod, "_check_surface_daemon_health", return_value=(True, None)):
-                    result = _run_hook_main(mod, {
-                        "session_id": "test",
-                        "transcript_path": str(tmp_path / "t.jsonl"),
-                        "source": "startup",
-                    })
+                result = _run_hook_main(mod, {
+                    "session_id": "test",
+                    "transcript_path": str(tmp_path / "t.jsonl"),
+                    "source": "startup",
+                })
         return result["hookSpecificOutput"]["additionalContext"]
 
     def test_null_config_silent(self, tmp_path):
@@ -352,12 +347,11 @@ class TestFairyPolicyHookIntegration:
         os.environ["ENGRAM_SESSION_ROLE"] = "interactive"
         with _mock_no_engram_client():
             with patch.object(mod, "_check_mcp_health", return_value=(True, None)):
-                with patch.object(mod, "_check_surface_daemon_health", return_value=(True, None)):
-                    result = _run_hook_main(mod, {
-                        "session_id": "test",
-                        "transcript_path": str(tmp_path / "t.jsonl"),
-                        "source": "startup",
-                    })
+                result = _run_hook_main(mod, {
+                    "session_id": "test",
+                    "transcript_path": str(tmp_path / "t.jsonl"),
+                    "source": "startup",
+                })
         ctx = result["hookSpecificOutput"]["additionalContext"]
         assert isinstance(ctx, str)
 
@@ -369,12 +363,11 @@ class TestFairyPolicyHookIntegration:
         os.environ["ENGRAM_SESSION_ROLE"] = "interactive"
         with _mock_no_engram_client():
             with patch.object(mod, "_check_mcp_health", return_value=(True, None)):
-                with patch.object(mod, "_check_surface_daemon_health", return_value=(True, None)):
-                    result = _run_hook_main(mod, {
-                        "session_id": "test",
-                        "transcript_path": str(tmp_path / "t.jsonl"),
-                        "source": "startup",
-                    })
+                result = _run_hook_main(mod, {
+                    "session_id": "test",
+                    "transcript_path": str(tmp_path / "t.jsonl"),
+                    "source": "startup",
+                })
         ctx = result["hookSpecificOutput"]["additionalContext"]
         assert isinstance(ctx, str)
 
