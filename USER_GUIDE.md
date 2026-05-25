@@ -205,6 +205,23 @@ Your agent can read logs, inspect configs, run commands, and propose fixes. You 
 
 ---
 
+## Fairy delegation — what your agent does for PR work
+
+Your agent's behavior on PR-coding tasks is controlled by two config policies (`coder_fairy_policy` and `reviewer_fairy_policy`) in `~/.engram/config.json`. Defaults:
+
+- `coder_fairy_policy: "auto"` — agent decides per task using a heuristic (test files touched, >100 LOC, or parallel work)
+- `reviewer_fairy_policy: "auto"` — agent decides per task using the same heuristic
+
+Other values: `"explicit"` (only spawn when you ask) or `"always"` (every PR task gets a fairy).
+
+You can also override per-invocation:
+- `"spawn a fairy"` or `"use coder-fairy"` → full pipeline this time
+- `"review-fairy this"` or `"just review"` → reviewer-only this time (skip coder-fairy overhead)
+
+Edit the policies via the viz-server config tab or directly in `~/.engram/config.json`. To tune the `auto` heuristic itself, edit the skill files at `~/.claude/skills/engram-auto-coder-fairy-judgement/SKILL.md` and `~/.claude/skills/engram-auto-reviewer-fairy-judgement/SKILL.md`.
+
+---
+
 ## What compounds
 
 Working with an agent that has persistent structured memory is different from working with a cold assistant. The differences compound the longer you stay in it:

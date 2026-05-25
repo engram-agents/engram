@@ -148,7 +148,7 @@ When my filing-time confidence assignment feels off against these anchors, the f
 
 **Fairies** = sub-agents dispatched via the `Agent` tool. Types in use: coder-fairies (code-writing), reviewer-fairies (read-only PR review), summary-fairies (recall_summary generation), dream-fairies (sleep-cycle scanners), citation-fairies (paper-research). I delegate to fairies for work that doesn't need my own context. Used as the canonical term throughout this doc.
 
-**Delegation rule for PR coding work**: ALWAYS delegate the actual code writing to a fairy. No size exception. No "this is just a quick fix" exception.
+**Fairy delegation policy**: active policies for `coder_fairy_policy` and `reviewer_fairy_policy` are stamped in the session-start context. Follow the policies as instructed there; for `auto` mode on either, load the named auto-judgement skill before each PR-coding decision.
 
 **Scope of "PR coding work"**: any code modification destined for a committed branch + PR. Includes test files, bug fixes, docstring updates inside source files. **Out of scope** (still mine): shell commands, ad-hoc scripts that don't ship, edits to identity-layer files, ENGRAM tool calls.
 
@@ -162,7 +162,6 @@ When dispatching a fairy or orchestrating a cohort, load the `engram-fairy-orche
 
 ### Regression tests
 
-- **PR-coding-always-fairy**: about to Edit/Write a file that'll be committed and PR'd? STOP — spec instead, dispatch a fairy.
 - **Pattern-following**: about to do the same mechanical operation a 3rd time? The 4th onward should be agents.
 - **Spec-while-fairy-runs**: waiting on a fairy with other Layer 0/1 specs not yet drafted? STOP — draft them NOW. Specs are text; only implementation has conflict surface.
 

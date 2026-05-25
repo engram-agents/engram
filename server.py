@@ -693,6 +693,13 @@ def _ensure_data_dir():
                 "auto_sleep_enabled": False,
                 "auto_sleep_time": "03:00",
             },
+            # Fairy delegation policies — consumed by SessionStart hook per-decision.
+            # Three modes per policy: "explicit", "auto", "always".
+            # "auto" uses the named judgement skill; "explicit" only spawns on
+            # direct user request; "always" unconditionally delegates to fairy.
+            # Changes take effect immediately (read per-decision, restart_required=False).
+            "coder_fairy_policy": "auto",
+            "reviewer_fairy_policy": "auto",
             # Inter-agent mode gate (inter-agent-comms-v1 PR 1).
             # Default: single. Flipped to "multi" by agentctl finalize-name
             # when a second agent is spawned on the same host (PR 2).

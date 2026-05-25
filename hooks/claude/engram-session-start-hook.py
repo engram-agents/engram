@@ -590,6 +590,91 @@ def auto_sleep_cron_block() -> str:
     )
 
 
+def fairy_policy_block() -> str:
+    """Emit one mode-line per fairy policy on fresh-terminal startup.
+
+    Only fires for interactive role + source=="startup" (the startup guard is
+    applied at the call site in main()). Silent "" on any read/parse error —
+    hook must never block session start.
+
+    Reads coder_fairy_policy and reviewer_fairy_policy (both default "auto")
+    from ~/.engram/config.json. Emits two lines describing the active mode
+    for each policy so the agent knows which skill to load (if any) per decision.
+
+    Returns:
+        Two-line string when interactive+startup, "" otherwise.
+    """
+    if SESSION_ROLE != "interactive":
+        return ""
+
+    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+        coder_policy = config.get("coder_fairy_policy", "auto")
+        reviewer_policy = config.get("reviewer_fairy_policy", "auto")
+        # Substitute the user's name into the "explicit" mode text. Fall back
+        # to "you" when primary_user is absent or empty (e.g. pre-first-session
+        # installs where the cold-start dialogue hasn't filled it in yet).
+        primary_user = config.get("primary_user") or "you"
+    except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+        # TypeError/AttributeError guard valid-JSON-but-non-dict shapes:
+        # config.json containing `null` / `[]` / `"x"` makes config a
+        # non-dict and .get() raises. Hook must never break session start.
+        return ""
+
+    # Defensive: primary_user may be present-but-non-string (e.g. null or a
+    # number). Coerce to a safe default rather than letting str.format crash.
+    if not isinstance(primary_user, str):
+        primary_user = "you"
+
+    _POLICY_LINES = {
+        "explicit": (
+            f"[Coder fairy policy: explicit] Do PR coding work directly unless "
+            f"{primary_user} explicitly invokes a fairy. Mentally spec the change first."
+        ),
+        "always": (
+            "[Coder fairy policy: always] Every PR coding task gets a fairy — "
+            "no size exception, no quick-fix exception. Spec and dispatch."
+        ),
+        "auto": (
+            "[Coder fairy policy: auto] Use judgment per task. Before deciding on "
+            "PR-coding work, load engram-auto-coder-fairy-judgement skill — "
+            "its heuristic decides direct vs. dispatch."
+        ),
+    }
+    _REVIEWER_POLICY_LINES = {
+        "explicit": (
+            f"[Reviewer fairy policy: explicit] Do PR review work directly unless "
+            f"{primary_user} explicitly invokes a reviewer-fairy. Review inline."
+        ),
+        "always": (
+            "[Reviewer fairy policy: always] Every PR review task gets a "
+            "reviewer-fairy — no size exception, no quick-fix exception. Dispatch."
+        ),
+        "auto": (
+            "[Reviewer fairy policy: auto] Use judgment per task. Before deciding on "
+            "PR-review work, load engram-auto-reviewer-fairy-judgement skill — "
+            "its heuristic decides direct vs. dispatch."
+        ),
+    }
+
+    # Defensive: a policy value of any unhashable type (list, dict — from
+    # a hand-edited config.json) would crash dict.get() with TypeError.
+    # Coerce to "auto" rather than letting the hook break session start.
+    # Strings outside the allowed enum also coerce to "auto" via the dict
+    # default below — this just adds the unhashable-shape safety net.
+    if not isinstance(coder_policy, str):
+        coder_policy = "auto"
+    if not isinstance(reviewer_policy, str):
+        reviewer_policy = "auto"
+
+    # Fall back to "auto" for any unknown value (forward-compat for future modes).
+    coder_line = _POLICY_LINES.get(coder_policy, _POLICY_LINES["auto"])
+    reviewer_line = _REVIEWER_POLICY_LINES.get(reviewer_policy, _REVIEWER_POLICY_LINES["auto"])
+    return coder_line + "\n" + reviewer_line
+
+
 def main() -> None:
     _t0 = time.perf_counter()
 
@@ -632,6 +717,9 @@ def main() -> None:
         cron_block = auto_sleep_cron_block()
         if cron_block:
             lines.append(cron_block)
+        fairy_block = fairy_policy_block()
+        if fairy_block:
+            lines.append(fairy_block)
     else:
         lines.append(
             f"[Session start reading — re-read {WARM_BRIEFING_PATH} before "

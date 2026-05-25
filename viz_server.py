@@ -3844,6 +3844,13 @@ CONFIG_HTML = r"""<!DOCTYPE html>
     /* System-critical soft warning (tier B + restart_required) */
     .warn-critical { font-size: 0.75em; color: #ffb74d; margin-top: 3px; }
 
+    /* Select control (enum fields like coder_fairy_policy / reviewer_fairy_policy) */
+    select.cfg-select {
+      background: #0d1b36; border: 1px solid #1a4a8a; border-radius: 4px;
+      color: #e0e0e0; padding: 3px 7px; font-size: 0.85em; outline: none;
+      cursor: pointer; }
+    select.cfg-select:disabled { opacity: 0.7; cursor: not-allowed; }
+
     /* List display (read-only) */
     .list-display { list-style: none; padding: 0; }
     .list-display li { background: #0d1b36; border: 1px solid #1a4a8a; border-radius: 3px;
@@ -3976,6 +3983,25 @@ CONFIG_HTML = r"""<!DOCTYPE html>
     }
   }
 
+  // ── Config write (saveField) ─────────────────────────────────────────────
+  async function saveField(key, value) {
+    try {
+      const res = await fetch(_withAgent('/api/config/' + encodeURIComponent(key)), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value: value }),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        console.error('saveField error:', data.error);
+        alert('Save failed: ' + (data.error || 'unknown error'));
+      }
+    } catch (e) {
+      console.error('saveField fetch error:', e);
+      alert('Save failed: ' + e.message);
+    }
+  }
+
   // ── Rendering helpers ────────────────────────────────────────────────────
 
   // Returns the input element HTML for a field. When editable=true the
@@ -4080,6 +4106,18 @@ CONFIG_HTML = r"""<!DOCTYPE html>
         const node = item.engram_node ? ` [${esc(item.engram_node)}]` : '';
         return `<li>${domain}${reason}${node}</li>`;
       }).join('') + '</ul>';
+    }
+    if (ctrl === 'select') {
+      const editable = row.editable !== false;
+      const opts = (row.allowed_values || []).map(opt =>
+        `<option value="${esc(opt)}" ${opt === v ? 'selected' : ''}>${esc(opt)}</option>`
+      ).join('');
+      if (!editable) {
+        return `<select disabled class="cfg-select${alertPulse}">${opts}</select>`;
+      }
+      const key = row.key;
+      return `<select id="field-${esc(key)}" class="cfg-select${alertPulse}"
+                onchange="saveField('${esc(key)}', this.value)">${opts}</select>`;
     }
     // fallback (read-only)
     if (v === null || v === undefined) return `<span class="null-value">(not set)</span>`;

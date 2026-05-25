@@ -113,6 +113,50 @@ SCHEMA: list[dict] = [
      "tooltip": "Domains flagged for caution. Each entry has a domain, a reason, and an optional engram_node reference. Cited domains show as warning-level in evidence reports.",
      "editable": True, "restart_required": False},
 
+    # Fairy delegation policies
+    {
+        "key": "coder_fairy_policy",
+        "section": "fairy_policy",
+        "control": "select",
+        "label": "Coder-fairy delegation policy",
+        "tooltip": (
+            "How the agent decides between doing PR coding directly vs dispatching a coder-fairy. "
+            "Three modes:\n"
+            "  • explicit — agent ONLY uses coder-fairy when you explicitly ask.\n"
+            "  • auto — agent uses judgment per task according to the "
+            "`engram-auto-coder-fairy-judgement` skill "
+            "(edit that skill file to fine-tune the heuristic).\n"
+            "  • always — agent always uses coder-fairy for PR coding tasks "
+            "(no exceptions, maximum review-convergence discipline)."
+        ),
+        "editable": True,
+        "restart_required": False,
+        "tier": TIER_A,
+        "type": "string",
+        "allowed_values": ["explicit", "auto", "always"],
+    },
+    {
+        "key": "reviewer_fairy_policy",
+        "section": "fairy_policy",
+        "control": "select",
+        "label": "Reviewer-fairy delegation policy",
+        "tooltip": (
+            "How the agent decides between reviewing PR work directly vs dispatching a reviewer-fairy. "
+            "Three modes:\n"
+            "  • explicit — agent ONLY uses reviewer-fairy when you explicitly ask.\n"
+            "  • auto — agent uses judgment per task according to the "
+            "`engram-auto-reviewer-fairy-judgement` skill "
+            "(edit that skill file to fine-tune the heuristic).\n"
+            "  • always — agent always uses reviewer-fairy for PR review tasks "
+            "(no exceptions, maximum review-convergence discipline)."
+        ),
+        "editable": True,
+        "restart_required": False,
+        "tier": TIER_A,
+        "type": "string",
+        "allowed_values": ["explicit", "auto", "always"],
+    },
+
     # ---- Tier B ----
     {"key": "memory.tier1_max_nodes", "section": "memory", "tier": TIER_B,
      "type": "integer", "control": "int", "min": 50, "max": 10000,
@@ -159,8 +203,9 @@ SECTIONS: list[dict] = [
     {"id": "drowsiness",   "label": "Drowsiness thresholds",   "tier": TIER_A, "order": 4},
     {"id": "auto_sleep",   "label": "Auto-sleep",              "tier": TIER_A, "order": 5},
     {"id": "domain_trust", "label": "Domain trust & caution",  "tier": TIER_A, "order": 6},
-    {"id": "memory",       "label": "Memory",                  "tier": TIER_B, "order": 7},
-    {"id": "polarity",     "label": "Polarity-dedup (NLI)",    "tier": TIER_B, "order": 8, "section_gate": "polarity.enabled"},
+    {"id": "fairy_policy", "label": "Fairy Delegation Policies", "tier": TIER_A, "order": 7},
+    {"id": "memory",       "label": "Memory",                  "tier": TIER_B, "order": 8},
+    {"id": "polarity",     "label": "Polarity-dedup (NLI)",    "tier": TIER_B, "order": 9, "section_gate": "polarity.enabled"},
 ]
 
 

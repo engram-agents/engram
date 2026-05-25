@@ -39,6 +39,10 @@
   },
   "primary_user": "you",
 
+  "_comment_fairy_policy": "Fairy delegation policies — how the agent decides whether to spawn a fairy vs. do the work directly. Both default to 'auto'. Values: 'explicit' (spawn only when user asks), 'auto' (agent judges per-task using the named skill), 'always' (unconditionally delegate). In 'auto' mode the agent loads the skill engram-auto-coder-fairy-judgement or engram-auto-reviewer-fairy-judgement to decide; edit those skill files to tune the heuristic.",
+  "coder_fairy_policy": "auto",
+  "reviewer_fairy_policy": "auto",
+
   "cadence": {
     "_comment_cadence": "Cron + drowsiness tunables. heartbeat_minutes is a list of minute-of-hour values to fire heartbeat (e.g., [0, 30] = twice an hour). sleep_hour/minute is when the daily sleep cycle fires in user.timezone. sleep_protected_window_minutes is how wide a window around sleep that heartbeat avoids — render_cron.py computes per-slot skips from this window (no separate skip-list config). drowsiness_caution_pct/urgent_pct trigger context_tracker warnings.",
 
