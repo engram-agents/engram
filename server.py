@@ -6405,6 +6405,13 @@ def engram_inspect(
         conn.close()
 
 
+# Set of legitimate field names for the engram_query payload.
+_QUERY_FIELDS = frozenset({
+    "query", "types", "min_confidence", "include_superseded",
+    "top_k", "return_debug", "summary_top_k",
+})
+
+
 # DESIGN INTENT — engram_query
 # ----------------------------
 # First-class voluntary semantic-recall tool — the autonoetic intentional-search
@@ -6438,15 +6445,7 @@ def engram_inspect(
         "openWorldHint": False,
     },
 )
-def engram_query(
-    query: str,
-    types: str = "",
-    min_confidence: float = 0.0,
-    include_superseded: bool = False,
-    top_k: int = 10,
-    return_debug: bool = False,
-    summary_top_k: int = 3,
-) -> str:
+def engram_query(payload_json: str) -> str:
     """Search the knowledge graph by natural language query.
 
     Combines FTS5 keyword search with semantic (embedding) similarity. Keyword
@@ -6457,18 +6456,24 @@ def engram_query(
     when you just want ambient relevance hints without refreshing recall.
 
     Args:
-        query: Natural language search query.
-        types: Comma-separated node types to filter (e.g. 'derivation,observation_factual'). Empty = all types.
-        min_confidence: Only return nodes at or above this confidence threshold (0.0–1.0).
-        include_superseded: If True, include non-current (superseded) nodes. Default False.
-        top_k: Maximum results to return (default 10).
-        return_debug: If True, return the full legacy shape (all node fields, composite_score,
-            similarity, neighbor data, debug key with ranking internals). Default False.
-            Intended for retrieval diagnostics; never bloats normal responses.
-        summary_top_k: How many top results get a recall_summary (Tier 1). The remaining
-            results get recall_keywords only (Tier 2). Default 3. Clamped to [0, top_k].
-            Set to 0 for all-keywords; set >= top_k for all-summaries.
-            Ignored when return_debug=True (full shape returned instead).
+        payload_json: JSON object (as a string) with these fields:
+            query (str, required): Natural language search query.
+            types (str, optional): Comma-separated node types to filter
+                (e.g. 'derivation,observation_factual'). Empty = all types.
+            min_confidence (float, optional): Only return nodes at or above this
+                confidence threshold (0.0–1.0). Default 0.0.
+            include_superseded (bool, optional): If True, include non-current
+                (superseded) nodes. Default False.
+            top_k (int, optional): Maximum results to return. Default 10.
+            return_debug (bool, optional): If True, return the full legacy shape
+                (all node fields, composite_score, similarity, neighbor data,
+                debug key with ranking internals). Default False. Intended for
+                retrieval diagnostics; never bloats normal responses.
+            summary_top_k (int, optional): How many top results get a
+                recall_summary (Tier 1). The remaining results get
+                recall_keywords only (Tier 2). Default 3. Clamped to [0, top_k].
+                Set to 0 for all-keywords; set >= top_k for all-summaries.
+                Ignored when return_debug=True (full shape returned instead).
 
     Returns:
         Default (return_debug=False): tiered shape
@@ -6479,7 +6484,38 @@ def engram_query(
             Per-result debug entries include: id, match_type, bm25_raw, relevance_normalized,
             similarity, composite_score, utility_score, importance_score, importance_base,
             confidence, surprise_score, recall_turn, util_amp, imp_amp, imp_norm_factor.
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _query_impl for full semantics — kept callable with named kwargs for
+    in-server callers.
     """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _QUERY_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_QUERY_FIELDS)}"
+        })
+    if "query" not in params:
+        return json.dumps({"error": "payload_json must include required field 'query'"})
+    return _query_impl(**params)
+
+
+def _query_impl(
+    query: str,
+    types: str = "",
+    min_confidence: float = 0.0,
+    include_superseded: bool = False,
+    top_k: int = 10,
+    return_debug: bool = False,
+    summary_top_k: int = 3,
+) -> str:
+    """Impl for engram_query — callable with named kwargs for in-server callers."""
     conn = _get_db()
     try:
         search = _search_nodes(

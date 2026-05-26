@@ -93,7 +93,7 @@ def test_query_default_tiered_shape():
     for i, nid in enumerate(ids):
         _set_recall_fields(server, nid, f"Summary for node {i}.", [f"kw{i}a", f"kw{i}b"])
 
-    r = json.loads(server.engram_query(query="alpha protocol", top_k=5))
+    r = json.loads(server.engram_query(payload_json=json.dumps({"query": "alpha protocol", "top_k": 5})))
     assert "results" in r, f"'results' key missing: {r}"
     assert "query" in r, f"'query' key missing: {r}"
     assert "total_matches" in r, f"'total_matches' key missing: {r}"
@@ -132,9 +132,9 @@ def test_query_summary_top_k_zero_all_keywords():
     nid = _add_observation(server, "Claim about zero summary setting.")
     _set_recall_fields(server, nid, "Summary text.", ["keyword1", "keyword2"])
 
-    r = json.loads(server.engram_query(
-        query="zero summary setting", top_k=5, summary_top_k=0
-    ))
+    r = json.loads(server.engram_query(payload_json=json.dumps(
+        {"query": "zero summary setting", "top_k": 5, "summary_top_k": 0}
+    )))
     results = r["results"]
     assert len(results) > 0, "Expected results"
 
@@ -153,9 +153,9 @@ def test_query_summary_top_k_exceeds_results_all_summaries():
         nid = _add_observation(server, f"Claim {i} about full summary coverage scenario")
         _set_recall_fields(server, nid, f"Summary {i}.", [f"kw{i}"])
 
-    r = json.loads(server.engram_query(
-        query="full summary coverage scenario", top_k=10, summary_top_k=100
-    ))
+    r = json.loads(server.engram_query(payload_json=json.dumps(
+        {"query": "full summary coverage scenario", "top_k": 10, "summary_top_k": 100}
+    )))
     results = r["results"]
     assert len(results) > 0, "Expected results"
 
@@ -173,7 +173,7 @@ def test_query_return_debug_preserves_legacy_shape():
     server = fresh_server()
     _add_observation(server, "Debug mode legacy shape test claim.")
 
-    r = json.loads(server.engram_query(query="debug mode legacy shape", return_debug=True))
+    r = json.loads(server.engram_query(payload_json=json.dumps({"query": "debug mode legacy shape", "return_debug": True})))
     # Legacy shape keys
     assert "results" in r, f"'results' missing in debug mode: {r}"
     assert "query" in r
@@ -195,9 +195,9 @@ def test_query_return_debug_composite_score_present():
     server = fresh_server()
     _add_observation(server, "Composite score visibility test claim.")
 
-    r = json.loads(server.engram_query(
-        query="composite score visibility", return_debug=True
-    ))
+    r = json.loads(server.engram_query(payload_json=json.dumps(
+        {"query": "composite score visibility", "return_debug": True}
+    )))
     # The debug key should appear (even if no per_result entries when FTS/semantic return nothing)
     # At minimum, legacy 'count' field marks this as the debug path
     assert "count" in r
@@ -214,7 +214,7 @@ def test_query_fallback_no_recall_summary_uses_claim():
     nid = _add_observation(server, claim_text)
     # Do NOT set recall_summary — leave it null
 
-    r = json.loads(server.engram_query(query="fallback claim summary absent", summary_top_k=1))
+    r = json.loads(server.engram_query(payload_json=json.dumps({"query": "fallback claim summary absent", "summary_top_k": 1})))
     results = r["results"]
     assert len(results) > 0, "Expected results"
 
@@ -234,9 +234,9 @@ def test_query_fallback_long_claim_truncated_at_160():
     nid = _add_observation(server, long_claim)
     # No recall_summary set
 
-    r = json.loads(server.engram_query(
-        query="A" * 30, summary_top_k=1, top_k=5
-    ))
+    r = json.loads(server.engram_query(payload_json=json.dumps(
+        {"query": "A" * 30, "summary_top_k": 1, "top_k": 5}
+    )))
     results = r["results"]
     if not results:
         return  # FTS may not match all-letter queries with ENGRAM_NO_EMBEDDINGS
@@ -262,9 +262,9 @@ def test_query_fallback_no_recall_keywords_bare_id():
     # Set recall_summary on first 3 only (they'll land in tier-1 via summary fallback anyway)
     # Do NOT set recall_keywords on any node — test bare-id behavior
 
-    r = json.loads(server.engram_query(
-        query="keyword fallback test retrieval", top_k=5, summary_top_k=3
-    ))
+    r = json.loads(server.engram_query(payload_json=json.dumps(
+        {"query": "keyword fallback test retrieval", "top_k": 5, "summary_top_k": 3}
+    )))
     results = r["results"]
     # Tier-2 entries (if any) should have id + confidence but no keywords
     for entry in results[3:]:
@@ -445,7 +445,7 @@ def test_query_return_shape_keys():
     server = fresh_server()
     _add_observation(server, "Shape key test observation.")
 
-    r = json.loads(server.engram_query(query="shape key test"))
+    r = json.loads(server.engram_query(payload_json=json.dumps({"query": "shape key test"})))
     assert "results" in r
     assert "query" in r
     assert "total_matches" in r
@@ -480,9 +480,9 @@ def test_query_negative_summary_top_k_clamped():
     nid = _add_observation(server, "Negative top_k clamping test claim.")
     _set_recall_fields(server, nid, "Summary text.", ["kw1", "kw2"])
 
-    r = json.loads(server.engram_query(
-        query="negative top_k clamping", summary_top_k=-5
-    ))
+    r = json.loads(server.engram_query(payload_json=json.dumps(
+        {"query": "negative top_k clamping", "summary_top_k": -5}
+    )))
     results = r["results"]
     for entry in results:
         assert "summary" not in entry, (

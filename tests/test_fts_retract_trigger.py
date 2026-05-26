@@ -327,12 +327,12 @@ def test_query_post_retract_does_not_return_retracted():
     )
 
     def _query_ids(include_superseded: bool) -> set:
-        r = json.loads(server.engram_query(
-            query=token,
-            include_superseded=include_superseded,
-            top_k=20,
-            return_debug=True,
-        ))
+        r = json.loads(server.engram_query(payload_json=json.dumps({
+            "query": token,
+            "include_superseded": include_superseded,
+            "top_k": 20,
+            "return_debug": True,
+        })))
         return {n["id"] for n in r.get("results", [])}
 
     # Before retraction: node surfaces in both modes.
@@ -440,12 +440,12 @@ def test_supersede_then_retract_still_removes_from_fts():
     )
 
     # Also verify via end-to-end query: include_superseded=True must not return A.
-    query_result = json.loads(server.engram_query(
-        query=token_a,
-        include_superseded=True,
-        top_k=20,
-        return_debug=True,
-    ))
+    query_result = json.loads(server.engram_query(payload_json=json.dumps({
+        "query": token_a,
+        "include_superseded": True,
+        "top_k": 20,
+        "return_debug": True,
+    })))
     returned_ids = {n["id"] for n in query_result.get("results", [])}
     assert a_id not in returned_ids, (
         f"Retracted node {a_id} must not appear in engram_query with include_superseded=True "

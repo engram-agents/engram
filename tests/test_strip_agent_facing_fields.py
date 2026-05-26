@@ -481,10 +481,10 @@ class TestQueryDebugModeStripping:
         server = fresh_server()
         _add_obs(server, "Unique test claim for query debug match_type check.",
                  url="https://example.com/query-strip-test")
-        r = json.loads(server.engram_query(
-            query="unique test claim query debug",
-            return_debug=True,
-        ))
+        r = json.loads(server.engram_query(payload_json=json.dumps({
+            "query": "unique test claim query debug",
+            "return_debug": True,
+        })))
         assert "error" not in r, r
         results = r.get("results", [])
         assert results, "Expected at least one result in debug mode"
@@ -502,10 +502,10 @@ class TestQueryDebugModeStripping:
         server = fresh_server()
         _add_obs(server, "Query debug similarity field presence test.",
                  url="https://example.com/query-sim-test")
-        r = json.loads(server.engram_query(
-            query="query debug similarity presence",
-            return_debug=True,
-        ))
+        r = json.loads(server.engram_query(payload_json=json.dumps({
+            "query": "query debug similarity presence",
+            "return_debug": True,
+        })))
         # The debug key itself must be present (signals the debug path ran).
         assert "debug" in r, "debug key missing from return_debug=True response"
         per_result = r["debug"].get("per_result", [])
@@ -521,10 +521,10 @@ class TestQueryDebugModeStripping:
         server = fresh_server()
         _add_obs(server, "Confidence history query stripping test.",
                  url="https://example.com/query-conf-test")
-        r = json.loads(server.engram_query(
-            query="confidence history query stripping",
-            return_debug=True,
-        ))
+        r = json.loads(server.engram_query(payload_json=json.dumps({
+            "query": "confidence history query stripping",
+            "return_debug": True,
+        })))
         for node in r.get("results", []):
             assert "confidence_history" not in node, (
                 "confidence_history should be stripped from engram_query debug results"
@@ -535,10 +535,10 @@ class TestQueryDebugModeStripping:
         server = fresh_server()
         _add_obs(server, "Per-result debug match_type presence test.",
                  url="https://example.com/query-per-result-test")
-        r = json.loads(server.engram_query(
-            query="per result debug match type presence",
-            return_debug=True,
-        ))
+        r = json.loads(server.engram_query(payload_json=json.dumps({
+            "query": "per result debug match type presence",
+            "return_debug": True,
+        })))
         assert "debug" in r, "debug key missing"
         per_result = r["debug"].get("per_result", [])
         assert per_result, "Expected per_result entries in debug output"

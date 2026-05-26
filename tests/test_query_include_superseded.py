@@ -87,12 +87,12 @@ def _add_observation(server, claim: str, quoted_text: str = None, url: str = "ht
 
 def _query_ids(server, query: str, include_superseded: bool = False, top_k: int = 20) -> set:
     """Run engram_query in debug mode and return the set of result IDs."""
-    r = json.loads(server.engram_query(
-        query=query,
-        include_superseded=include_superseded,
-        top_k=top_k,
-        return_debug=True,
-    ))
+    r = json.loads(server.engram_query(payload_json=json.dumps({
+        "query": query,
+        "include_superseded": include_superseded,
+        "top_k": top_k,
+        "return_debug": True,
+    })))
     return {n["id"] for n in r.get("results", [])}
 
 
@@ -240,9 +240,9 @@ def test_query_include_superseded_false_default_excludes_superseded():
     query = "baseline191regression uniquemarkerZ"
 
     # Default call (no include_superseded kwarg at all) — same as False.
-    r_default = json.loads(server.engram_query(
-        query=query, top_k=20, return_debug=True
-    ))
+    r_default = json.loads(server.engram_query(payload_json=json.dumps(
+        {"query": query, "top_k": 20, "return_debug": True}
+    )))
     ids_default = {n["id"] for n in r_default.get("results", [])}
 
     assert old_id not in ids_default, (

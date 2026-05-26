@@ -266,7 +266,7 @@ def test_engram_query_does_not_bump_utility():
     (ax_id,) = _seed_axioms(server, n=1)
     before = _get_utility(server, ax_id)
 
-    server.engram_query(query="Axiom 0 for utility test")
+    server.engram_query(payload_json=json.dumps({"query": "Axiom 0 for utility test"}))
 
     after = _get_utility(server, ax_id)
     assert after == before, (

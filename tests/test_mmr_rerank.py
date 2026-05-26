@@ -354,7 +354,7 @@ def test_engram_query_uses_mmr_too():
     ob1 = _add_obs(srv, "photosynthesis converts sunlight to energy")
     ob2 = _add_obs(srv, "photosynthesis chlorophyll light reaction")
 
-    result = json.loads(srv.engram_query(query="photosynthesis"))
+    result = json.loads(srv.engram_query(payload_json=json.dumps({"query": "photosynthesis"})))
     assert "results" in result, f"engram_query returned unexpected shape: {result}"
     results = result["results"]
     assert len(results) >= 1, "Expected at least 1 result for photosynthesis query"

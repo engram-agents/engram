@@ -208,7 +208,7 @@ def test_engram_query_tier1_carries_confidence():
     nid = _add_observation(server, "Confidence query test claim tier one.", confidence=0.78)
     _set_recall_fields(server, nid, "RS for confidence query tier one.", ["conf", "query", "t1"])
 
-    r = json.loads(server.engram_query(query="confidence query test tier one", summary_top_k=5))
+    r = json.loads(server.engram_query(payload_json=json.dumps({"query": "confidence query test tier one", "summary_top_k": 5})))
     results = r["results"]
     assert len(results) > 0, "Expected at least one result"
 
@@ -229,9 +229,9 @@ def test_engram_query_tier2_carries_confidence():
         _set_recall_fields(server, nid, f"RS tier2 {i}.", [f"t2a{i}", f"t2b{i}", f"t2c{i}"])
         ids.append(nid)
 
-    r = json.loads(server.engram_query(
-        query="confidence query tier two test", top_k=5, summary_top_k=2
-    ))
+    r = json.loads(server.engram_query(payload_json=json.dumps(
+        {"query": "confidence query tier two test", "top_k": 5, "summary_top_k": 2}
+    )))
     results = r["results"]
     tier2 = results[2:]
     for entry in tier2:
@@ -549,9 +549,9 @@ def test_roundtrip_confidence_tier1_matches_db():
     )
     _set_recall_fields(server, nid, "RT t1 summary.", ["rt", "conf", "t1"])
 
-    r = json.loads(server.engram_query(
-        query="roundtrip confidence tier one", summary_top_k=5
-    ))
+    r = json.loads(server.engram_query(payload_json=json.dumps(
+        {"query": "roundtrip confidence tier one", "summary_top_k": 5}
+    )))
     results = r["results"]
     target = next((e for e in results if e.get("id") == nid), None)
     if target is None:
@@ -578,9 +578,9 @@ def test_roundtrip_confidence_tier2_matches_db():
         _set_recall_fields(server, nid, f"RT t2 summary {i}.", [f"rt2a{i}", f"rt2b{i}", f"rt2c{i}"])
         ids.append(nid)
 
-    r = json.loads(server.engram_query(
-        query="roundtrip confidence tier two", top_k=4, summary_top_k=2
-    ))
+    r = json.loads(server.engram_query(payload_json=json.dumps(
+        {"query": "roundtrip confidence tier two", "top_k": 4, "summary_top_k": 2}
+    )))
     results = r["results"]
     tier2_entries = results[2:]
     for entry in tier2_entries:
