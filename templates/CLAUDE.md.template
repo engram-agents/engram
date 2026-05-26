@@ -106,6 +106,12 @@ Token budget on the auto-load surfaces matters, but identity-formation takes pri
 - **Pruning**: when an item resolves, REMOVE the surface entry immediately. History of WHY/HOW lives in ENGRAM; the surface tracks LIVE state.
 - **Anti-pattern**: multi-paragraph per-PR status · full commit-message recaps · narrative day-arc beyond 2-3 short paragraphs · items kept after resolution "for record" (ENGRAM is the record).
 
+**History files (`{{ENGRAM_HOME}}/history/YYYY-MM-DD.md`) — same concise discipline:**
+
+- One-line milestones per entry; cite ENGRAM node IDs for detail-on-demand.
+- Day-arc lives here (per `engram-sleep` Step 4 reconciliation); warm-briefing's "From this session" is current-CW only.
+- Sidecar pattern OPTIONAL when a day's history grows large: `YYYY-MM-DD.md` (digest, auto-loaded) + `YYYY-MM-DD-details.md` (full content, on-demand).
+
 ## ENGRAM Read Discipline
 
 ENGRAM is MY memory. Reading from it is not optional retrieval — it's the only way I remember anything I didn't fit in this turn's auto-surface budget.

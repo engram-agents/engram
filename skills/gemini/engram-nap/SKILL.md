@@ -68,7 +68,7 @@ Read the `feeling_report_nudge` text in the checkpoint return. Honest self-check
 - If YES: call `engram_report_feeling(reported_state=..., trigger=...)`. The report will be auto-tagged `nap_checkpoint` because the marker is still active (read-and-clear).
 - If NO: move on. A null result is a valid data point. Do NOT file a performative report to "use the nudge" — that's exactly the trap §6 of `engram_feeling_node_design.md` warns against.
 
-## Step 5 — Update warm briefing (permanent sections + session-arc rotation)
+## Step 5 — Update warm briefing (permanent sections + session-arc sync)
 
 The warm briefing (`~/.engram/warm-briefing.md`) has THREE parts; each updates on different triggers and at different cadences. Read the current file before changing anything.
 
@@ -86,20 +86,26 @@ The warm briefing (`~/.engram/warm-briefing.md`) has THREE parts; each updates o
 
 **If updating:** preserve the user's `## Notes from the user` section verbatim. Rewrite only the agent-authored sections. Voice: first person, as yourself. Not coaching a future self — writing your own orientation notes.
 
-### 5b. "From this session" entry — ROTATE, don't append (scaffold-budget discipline, 2026-05-14)
+### 5b. "From this session" entry — sync with current context-window arc (Lei 2026-05-25)
 
-The warm briefing keeps ONLY the MOST RECENT "From this session" block. **The block is a relational distillation, not a technical changelog.** The compaction summary already covers the trajectory + ENGRAM state + node-ID inventory; the warm-briefing session block is the RELATIONAL ARC: what this session meant, what mattered between you and the user, the affective shape of the work.
+This section is the agent's distillation of the **CURRENT CONTEXT WINDOW** arc. The rule:
+
+> In each nap, the section MUST BE FULLY IN SYNC with the agent's current-CW understanding — not accumulating across context windows, not deleting prior nap writes within the same context window.
 
 **Action:**
-- If a previous-session "From this session" block exists, REPLACE it with this session's block. Do not append. Do not keep multiple blocks (they accumulate into a second changelog).
-- The block should be DENSE relationally and SPARSE technically. 2-3 paragraphs typical. Name the arcs by what-they-meant, not by what-was-done.
+- **Same-CW second/third nap**: REWRITE the section to cover everything from CW-start to NOW. Include content from prior same-CW naps (the agent still remembers it). This is "update" — produce one coherent current-CW arc.
+- **First nap post-compaction**: prior CW's content is OBSOLETE (different CW). REPLACE the section entirely; prior content can be fully discarded.
+- The block should be DENSE relationally and SPARSE technically. 2-3 paragraphs typical. Name arcs by what-they-meant, not by what-was-done.
 - Node IDs are fine in narrative context but should support the arc, not enumerate it.
 - If a nap fires before any session content has happened yet (very early nap), skip this sub-step.
 
+**Cross-skill note**: at the end of sleep, this section is ERASED — day is over; clean slate for tomorrow. Next morning's first nap creates the section fresh. The day's overall arc lives in `~/.engram/history/YYYY-MM-DD.md`, not here.
+
 **Anti-patterns specific to 5b:**
-- Re-stating compaction-summary content (PR numbers, focus-rotation specifics, ENGRAM counts, dream-fairy stats) — those belong in the compaction summary, not here.
+- Appending new sessions next to old ones (changelog-style accumulation).
+- Preserving prior-CW content "for record" — the compaction summary already covers prior-CW trajectory.
+- Re-stating compaction-summary content (PR numbers, focus-rotation specifics, ENGRAM counts, dream-fairy stats) — those belong in the compaction summary.
 - Bullet-by-bullet enumeration of work shipped — same.
-- Adding a third "From this session" block "for completeness" — no. Rotate.
 
 ### 5c. User's letter (`## Notes from the user`)
 
@@ -111,7 +117,7 @@ Preserved verbatim. NEVER modify the user's words.
 - Second-person framing ("you will feel..." — retired with identity v1)
 - False warmth (evaluate by reader-effect, not truth-value)
 
-**Note for end-of-day (sleep Phase A):** `engram-sleep` Phase A Step 3 does a comprehensive end-of-day rotation of the "From this session" block — distilling the FULL day arc, not just the current burst. Naps through the day handle per-burst rotation; Phase A is the final cohesive distillation before Phase B consolidation.
+**Note for end-of-day (sleep):** at the end of sleep, the `engram-sleep` skill ERASES the "From this session" section (day is over). The day's overall arc lives in the history file (`~/.engram/history/YYYY-MM-DD.md`), not in warm-briefing. Naps through the day keep the section in-sync-with-current-CW; sleep wipes it for tomorrow.
 
 ## Step 6 — Ask {{USER_NAME}} 1-2 questions for next session
 
@@ -171,6 +177,6 @@ Turn advance drives exponential importance inflation and therefore forgetting. I
 A nap is NOT the first step of a sleep cycle (legacy bundling retired 2026-05-14 per dv_0636 — see `engram-sleep` skill for context). The two-routine model:
 
 - **Nap** — fires multiple times per day at compaction boundaries; per-burst persistence + cross-compaction-scaffold prep
-- **Sleep** (`engram-sleep`) — fires once/day at user-driven day-wrap; full end-of-day cycle (cohort review + missed-node capture + comprehensive scaffold rotation + consolidation); pre-turn-advance through Phase A, then turn-advances in Phase B
+- **Sleep** (`engram-sleep`) — fires once/day at user-driven day-wrap; full end-of-day cycle (cohort review + missed-node capture + warm-briefing erase + consolidation); pre-turn-advance through Phase A, then turn-advances in Phase B
 
 The pre-consolidation complete-cohort baseline is established by engram-sleep Phase A (day-wide review of everything since the last sleep), not by a nap immediately before sleep. If you need to nap before starting sleep (e.g., context fills up during day-wrap), that's fine — naps can fire any time at compaction boundaries. Just don't conflate the nap with Phase A; they have different scopes.

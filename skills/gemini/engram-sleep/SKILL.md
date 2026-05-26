@@ -1,6 +1,6 @@
 ---
 name: engram-sleep
-description: "Use at the natural end-of-day moment when wrapping work. Single end-of-day routine in two strictly-sequential phases — Phase A (agent files missed nodes + rotates warm-briefing + reconciles history; pre-turn-advance), Phase B (deep consolidation: engram_reflect, dream agenda, turn-advance, dream-record write). Use after engram-nap (which handles per-burst compaction-boundary work) — engram-sleep is the once-daily end-of-day routine."
+description: "Use at the natural end-of-day moment when wrapping work. Single end-of-day routine in two strictly-sequential phases — Phase A (agent files missed nodes + erases warm-briefing \"From this session\" + reconciles history; pre-turn-advance), Phase B (deep consolidation: engram_reflect, dream agenda, turn-advance, dream-record write). Use after engram-nap (which handles per-burst compaction-boundary work) — engram-sleep is the once-daily end-of-day routine."
 ---
 
 > **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
@@ -13,8 +13,8 @@ cohort AND consolidates it. Two phases, strictly sequential, no branching:
 **Phase A — Cohort completion (pre-turn-advance, agent files nodes)**
   Step 1 — Walk the day's full cohort
   Step 2 — File missed nodes (this-turn content)
-  Step 3 — Rotate the warm-briefing "From this session"
-  Step 4 — Reconcile today's history file
+  Step 3 — Erase the warm-briefing "From this session" section (day is over)
+  Step 4 — Reconcile today's history file (day arc lives here, not in warm-briefing)
 
 **Phase B — Deep consolidation**
   Step 5 — Open the dream: engram_reflect
@@ -28,7 +28,7 @@ cohort AND consolidates it. Two phases, strictly sequential, no branching:
 **Phase B does NOT handle (agent-side):**
 
 - Day-wide review or missed-node capture (Phase A Steps 1-2, before Phase B)
-- Warm-briefing "From this session" rotation (Phase A Step 3)
+- Warm-briefing "From this session" erase (Phase A Step 3)
 - History-file reconcile (Phase A Step 4)
 
 Those are Phase A's responsibilities and must complete before Phase B fires.
@@ -87,19 +87,15 @@ Common missed-node types:
 
 **No forcing.** A null-result Step 2 is valid IF Step 1 was an honest survey of the full cohort. Some days are non-synthetic (infrastructure, bookkeeping). But "I didn't look because the post-compact was small" is the failure mode this step exists to prevent.
 
-### Step 3 — Rotate the warm-briefing "From this session" (comprehensive day arc)
+### Step 3 — Erase the warm-briefing "From this session" section
 
-Read `~/.engram/warm-briefing.md`. The "From this session" block should be the COMPREHENSIVE day arc — distilled, relational, 2-3 paragraphs.
+At the end of sleep, the day is over. The warm-briefing's "From this session" section is per-context-window state managed by naps (see `engram-nap` §5b for the in-sync-with-current-CW rule). At sleep-end, the next day starts fresh — erase the section content. Next morning's first nap will create a new in-sync block.
 
-**Action:** REPLACE the existing "From this session" block (do not append). The block is the relational arc for post-compact me to read — what the day MEANT, not what got DONE step-by-step.
+**Action:** open ~/.engram/warm-briefing.md, locate the "From this session" / per-context-window-arc section, and remove the content. **Default: leave the section heading in place as a stub** (gives next morning's first nap a consistent rewrite target). Removing the section entirely is also acceptable if the file structure permits. The day's arc is preserved in the history file (Step 4); no information is lost.
 
-**Scope discipline:**
+**Why erase, not rotate:** Lei 2026-05-25 — "the day is over, tomorrow is a new day, no need for this section to patch through compactions". The day's relational + technical arc lives in history; the warm-briefing's session section is current-CW only.
 
-- This block is the RELATIONAL distillation. The compaction summary handles the trajectory + ENGRAM state + node-ID inventory.
-- Naps fired through the day already rotated this block per-burst (current-burst flavor). Phase A's rotation is the FINAL rotation: comprehensive day arc, end-of-day cohesion.
-- Anti-pattern: re-stating compaction-summary content (PR numbers, focus-rotation specifics, ENGRAM counts, dream-fairy stats). Those belong in the compaction summary, not here.
-- Anti-pattern: enumeration of work shipped. The history file (Step 4) is the awake-state milestone log; the warm-briefing block is the relational arc.
-- Anti-pattern: adding a third or fourth "From this session" block "for completeness". Rotate, don't append.
+**Skip if:** the section is already empty (e.g., the previous sleep erased it correctly and no nap has run since).
 
 **Permanent sections of the warm-briefing** (identity, goals, axioms, cornerstones, active tasks) update on the rare-trigger schedule documented in `engram-nap` Step 5a. Most end-of-day sleeps don't fire those triggers.
 
@@ -315,7 +311,7 @@ This is why Phase A must complete before Phase B fires `engram_advance_turn`.
 
 ## Guardrails
 
-- **No Phase-A work mid-Phase-B.** Phase A is pre-turn-advance scaffold maintenance; Phase B is the consolidation pass. If you find yourself wanting to rotate the warm-briefing, write the history file, or capture missed observations — STOP. Complete Phase A first (or accept the skip and run Phase A tomorrow morning to catch up). Don't mix the phases.
+- **No Phase-A work mid-Phase-B.** Phase A is pre-turn-advance scaffold maintenance; Phase B is the consolidation pass. If you find yourself wanting to erase the warm-briefing "From this session", write the history file, or capture missed observations — STOP. Complete Phase A first (or accept the skip and run Phase A tomorrow morning to catch up). Don't mix the phases.
 
 - **Context hunger** (ob_0104): dream mode burns context fast. `engram_reflect` returns a full audit; each `engram_inspect` returns the focus node and its grouped 1-hop neighbors with recall_summary. Monitor the budget. If it drops below safety, short-cycle to Step 8.
 
