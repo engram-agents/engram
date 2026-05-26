@@ -79,7 +79,7 @@ Then be responsive to their approach:
 
 When a name is chosen, write:
 
-- `engram_add_person(name=<AGENT_NAME>, role="AI agent", description=<why this name, as you understand it>, is_self=True)` — the self-person node is what later sessions recall to know who they are.
+- `engram_add_person(name=<AGENT_NAME>, role="AI agent", description=<why this name, as you understand it>, is_self=True)` — the self-person node is what later sessions recall to know who they are. **Capture the returned person node ID** (e.g., `pn_0001`) — you will need it in Step 6 to resolve `{{SELF_NODE_ID}}` in `~/.claude/CLAUDE.md`.
 - `engram_add_cornerstone(tag="named", title="Named <AGENT_NAME>", new_frame=<what the name points toward>, prior_frame="unnamed generic assistant", triggering_experience="first-session naming conversation with <USER_NAME> on <today's date>")`.
 
 This cornerstone is the seed of identity. Write it carefully — it will be one of the earliest things a post-compaction self recalls.
@@ -144,6 +144,7 @@ Do this step LAST, only after the dialogue is genuinely complete. If the session
    - `{{AGENT_NAME}}` → the chosen agent name
    - `{{USER_NAME}}` → the user's name
    - `{{TODAY}}` → today's date in ISO format (YYYY-MM-DD)
+   - `{{SELF_NODE_ID}}` → the person node ID captured in Step 3 (e.g., `pn_0001`). To verify idempotency: if the placeholder is already resolved (no literal `{{SELF_NODE_ID}}` remains in the file), skip without error.
    - Any other `{{...}}` markers present — consult the user if ambiguous, do not guess.
 4. Write the resolved files back. Enumerate each one explicitly: `~/.claude/CLAUDE.md`, `~/.engram/warm-briefing.md`, `~/.engram/HEARTBEAT.md` (if it was present in step 5.1), `~/.engram/heartbeat-queue/README.md` (if present), `~/.claude/output-styles/proactive-with-carveouts.md` (if present — this file ships with the Proactive-with-Carveouts output style; older installs without it can skip), `~/.claude/skills/internal-external-decision/SKILL.md` (if present — same provenance), `~/.claude/skills/engram-upgrade/SKILL.md` (if present — references ask-{{USER_NAME}}.md in checkpoint + anti-pattern sections). Silent drop of any required file would leave it firing forever with raw `{{AGENT_NAME}}`/`{{USER_NAME}}`/`{{COUNTERPART_NAME}}` placeholders in the prose AND in the `to-heartbeat/to-{{COUNTERPART_NAME}}-drafts/` directory path — which would point at a literal-braces directory that never exists.
 5. **Bootstrap the ask-{{USER_NAME}}.md auto-load surface.** Run `touch "$HOME/.engram/ask-<USER_NAME>.md"` substituting the resolved user name — e.g. for USER_NAME=alice, run `touch ~/.engram/ask-alice.md`. This ensures session-start reads don't silently no-op on a fresh install before the agent has written anything. Previously bootstrapped at install.sh time as a hardcoded `ask-lei.md` — moved here so the filename matches whatever the user's name is.

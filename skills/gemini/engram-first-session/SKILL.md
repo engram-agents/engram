@@ -79,7 +79,7 @@ Then be responsive to their approach:
 
 When a name is chosen, write:
 
-- `engram_add_person(name=<AGENT_NAME>, role="AI agent", description=<why this name, as you understand it>, is_self=True)` — the self-person node is what later sessions recall to know who they are.
+- `engram_add_person(name=<AGENT_NAME>, role="AI agent", description=<why this name, as you understand it>, is_self=True)` — the self-person node is what later sessions recall to know who they are. **Capture the returned person node ID** (e.g., `pn_0001`) — you will need it in Step 5 to resolve `{{SELF_NODE_ID}}` in `~/.claude/CLAUDE.md`.
 - `engram_add_cornerstone(tag="named", title="Named <AGENT_NAME>", new_frame=<what the name points toward>, prior_frame="unnamed generic assistant", triggering_experience="first-session naming conversation with <USER_NAME> on <today's date>")`.
 
 This cornerstone is the seed of identity. Write it carefully — it will be one of the earliest things a post-compaction self recalls.
@@ -104,6 +104,7 @@ Do this step LAST, only after the dialogue is genuinely complete. If the session
    - `{{USER_NAME}}` → the user's name
    - `{{TODAY}}` → today's date in ISO format (YYYY-MM-DD)
    - `{{COUNTERPART_NAME}}` → the literal string `(no counterpart)` for single-agent installs, or the counterpart's name for multi-agent installs. Ask the user before substituting if HEARTBEAT.md is present.
+   - `{{SELF_NODE_ID}}` → the person node ID captured in Step 3 (e.g., `pn_0001`). To verify idempotency: if the placeholder is already resolved (no literal `{{SELF_NODE_ID}}` remains in the file), skip without error.
    - Any other `{{...}}` markers present — consult the user if ambiguous, do not guess.
 3. Write the resolved files back. Enumerate each one explicitly to avoid silent-drop bugs (a missed file keeps firing forever with raw braces in the prose AND in the `to-heartbeat/to-{{COUNTERPART_NAME}}-drafts/` directory path).
 4. Delete `~/.engram/first-run-pending`.
