@@ -7064,6 +7064,12 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
         conn.close()
 
 
+# Set of legitimate field names for the engram_nap payload.
+_NAP_FIELDS = frozenset({
+    "message",
+})
+
+
 # DESIGN INTENT — engram_nap
 # --------------------------
 # Shallow consolidation: persist context to ENGRAM without advancing the turn
@@ -7097,7 +7103,7 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
         "openWorldHint": False,
     },
 )
-def engram_nap(message: str) -> str:
+def engram_nap(payload_json: str) -> str:
     """Persist context to ENGRAM without advancing the turn counter.
 
     Use BEFORE compaction, at end of a work-burst, or whenever you want
@@ -7110,13 +7116,44 @@ def engram_nap(message: str) -> str:
     cannot accidentally promote a nap into a turn-advancing checkpoint.
 
     Args:
-        message: Summary of what was learned/changed in this work-burst.
+        payload_json: JSON object (as a string) with these fields:
+            message (str, required): Summary of what was learned/changed
+                in this work-burst.
 
     Returns:
         JSON with previous_turn (unchanged from current_turn since no
         advance), changes summary, graph stats, and memory tiers.
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _nap_impl for full semantics — kept callable with named kwargs for
+    in-server callers.
     """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _NAP_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_NAP_FIELDS)}"
+        })
+    if "message" not in params:
+        return json.dumps({"error": "payload_json must include required field 'message'"})
+    return _nap_impl(**params)
+
+
+def _nap_impl(message: str) -> str:
+    """Impl for engram_nap — callable with named kwargs for in-server callers."""
     return _checkpoint_internal(message, advance_turn=False)
+
+
+# Set of legitimate field names for the engram_advance_turn payload.
+_ADVANCE_TURN_FIELDS = frozenset({
+    "message",
+})
 
 
 # DESIGN INTENT — engram_advance_turn
@@ -7152,7 +7189,7 @@ def engram_nap(message: str) -> str:
         "openWorldHint": False,
     },
 )
-def engram_advance_turn(message: str) -> str:
+def engram_advance_turn(payload_json: str) -> str:
     """[Sleep cycle / first session only — DO NOT call awake.] End-of-day
     consolidation checkpoint: advances the turn counter + logs summary.
 
@@ -7165,13 +7202,37 @@ def engram_advance_turn(message: str) -> str:
     roles): use engram_nap instead — same lossless persistence, no turn-advance.
 
     Args:
-        message: Summary of what was learned/changed across the cohort
-                 being closed by this turn advance.
+        payload_json: JSON object (as a string) with these fields:
+            message (str, required): Summary of what was learned/changed
+                across the cohort being closed by this turn advance.
 
     Returns:
         JSON with new turn number, changes summary, graph stats, and memory
         tiers.
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _advance_turn_impl for full semantics — kept callable with named kwargs
+    for in-server callers.
     """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _ADVANCE_TURN_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ADVANCE_TURN_FIELDS)}"
+        })
+    if "message" not in params:
+        return json.dumps({"error": "payload_json must include required field 'message'"})
+    return _advance_turn_impl(**params)
+
+
+def _advance_turn_impl(message: str) -> str:
+    """Impl for engram_advance_turn — callable with named kwargs for in-server callers."""
     return _checkpoint_internal(message, advance_turn=True)
 
 
