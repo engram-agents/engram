@@ -16,6 +16,7 @@ Coverage:
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 
@@ -81,6 +82,20 @@ def test_payload_json_status_transitions_rebalance_importance():
     assert r2.get("scope") == "routine"
 
 
+def _get_metadata_from_db(server, node_id):
+    """Read node metadata directly from the DB (bypasses MCP-level stripping)."""
+    conn = sqlite3.connect(str(server.DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        if row is None:
+            return {}
+        raw = row["metadata"] or "{}"
+        return json.loads(raw)
+    finally:
+        conn.close()
+
+
 def test_payload_json_note_round_trips_to_status_history():
     server = fresh_server()
     task_id = _seed_task(server)
@@ -90,12 +105,8 @@ def test_payload_json_note_round_trips_to_status_history():
         "note": "Waiting on Lei's decision about scope.",
     })))
     assert "error" not in r, r
-    # Inspect the task to verify the note was stored in status_history.
-    inspect = json.loads(server.engram_inspect(node_id=task_id))
-    node = inspect.get("node", {})
-    meta = node.get("parsed_metadata") or node.get("metadata", {})
-    if isinstance(meta, str):
-        meta = json.loads(meta)
+    # Read metadata directly from DB (parsed_metadata stripped from MCP returns per #358).
+    meta = _get_metadata_from_db(server, task_id)
     history = meta.get("status_history", [])
     assert len(history) == 1, history
     assert history[0]["note"] == "Waiting on Lei's decision about scope."
@@ -173,18 +184,15 @@ def test_payload_json_no_note_status_history_unchanged():
     r = json.loads(server.engram_update_task(payload_json=json.dumps(payload)))
     assert "error" not in r, r
     assert r.get("status") == "updated"
-    # Inspect the task — status_history should be absent or empty.
-    inspect = json.loads(server.engram_inspect(node_id=task_id))
-    # parsed_metadata is available in both recall and deep views.
-    meta = inspect["node"].get("parsed_metadata") or {}
+    # Read metadata from DB (parsed_metadata stripped from MCP returns per #358).
+    meta = _get_metadata_from_db(server, task_id)
     history = meta.get("status_history", [])
     assert history == [], f"Expected empty status_history for note-free transition, got: {history}"
     # Now transition WITH note — status_history should grow by 1.
     payload2 = {"task_id": task_id, "new_status": "done", "note": "with note"}
     r2 = json.loads(server.engram_update_task(payload_json=json.dumps(payload2)))
     assert "error" not in r2, r2
-    inspect2 = json.loads(server.engram_inspect(node_id=task_id))
-    meta2 = inspect2["node"].get("parsed_metadata") or {}
+    meta2 = _get_metadata_from_db(server, task_id)
     history2 = meta2.get("status_history", [])
     assert len(history2) == 1, f"Expected 1 entry after with-note transition, got {len(history2)}: {history2}"
     assert history2[0]["note"] == "with note"

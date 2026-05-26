@@ -14,6 +14,7 @@ Covers:
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 
@@ -47,6 +48,20 @@ def test_goal_creation():
     assert "confidence" not in r or r.get("confidence") is None
 
 
+def _get_metadata_from_db(goal_id):
+    """Read node metadata from DB directly (parsed_metadata stripped from MCP returns per #358)."""
+    import server as _server
+    conn = sqlite3.connect(str(_server.DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (goal_id,)).fetchone()
+        if row is None:
+            return {}
+        return json.loads(row["metadata"] or "{}")
+    finally:
+        conn.close()
+
+
 def test_goal_has_motivation_in_metadata():
     """Goal motivation should be stored in metadata."""
     client = fresh_client()
@@ -54,8 +69,8 @@ def test_goal_has_motivation_in_metadata():
         "claim": "Test goal",
         "motivation": "Test motivation",
     })
-    node = client.call("engram_inspect", {"node_id": r["goal_id"]})
-    meta = node["node"]["parsed_metadata"]
+    # Read metadata from DB (parsed_metadata is stripped from MCP returns per #358).
+    meta = _get_metadata_from_db(r["goal_id"])
     assert meta.get("motivation") == "Test motivation"
 
 

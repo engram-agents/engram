@@ -24,6 +24,7 @@ Covers:
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 
@@ -306,16 +307,30 @@ def test_feeling_dedup_exempt():
 
 # ── Metadata flags ────────────────────────────────────────────────────
 
+
+def _get_metadata_from_db(server, node_id):
+    """Read node metadata from DB directly (parsed_metadata stripped from MCP returns per #358)."""
+    conn = sqlite3.connect(str(server.DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        if row is None:
+            return {}
+        return json.loads(row["metadata"] or "{}")
+    finally:
+        conn.close()
+
+
 def test_feeling_metadata_flags():
     """is_self_report / epistemic_status / disclaimer must all be present."""
-    client, _ = fresh_client()
+    client, server = fresh_client()
     r = client.call("engram_report_feeling", {
         "reported_state": "Test state.",
         "trigger": "Test trigger.",
         "categorical_tag": "curiosity",
     })
-    node = client.call("engram_inspect", {"node_id": r["feeling_id"]})
-    meta = node["node"].get("parsed_metadata") or {}
+    # Read metadata from DB (parsed_metadata is stripped from MCP returns per #358).
+    meta = _get_metadata_from_db(server, r["feeling_id"])
     assert meta.get("is_self_report") is True
     assert meta.get("epistemic_status") == "report_event_not_state_truth"
     assert meta.get("categorical_tag_disclaimer") == "best_approximation_not_truth_claim"
@@ -323,13 +338,13 @@ def test_feeling_metadata_flags():
 
 def test_feeling_no_tag_no_disclaimer():
     """When categorical_tag is omitted, the disclaimer field should also be omitted."""
-    client, _ = fresh_client()
+    client, server = fresh_client()
     r = client.call("engram_report_feeling", {
         "reported_state": "Test state.",
         "trigger": "Test trigger.",
     })
-    node = client.call("engram_inspect", {"node_id": r["feeling_id"]})
-    meta = node["node"].get("parsed_metadata") or {}
+    # Read metadata from DB (parsed_metadata is stripped from MCP returns per #358).
+    meta = _get_metadata_from_db(server, r["feeling_id"])
     assert "categorical_tag_disclaimer" not in meta
     assert meta.get("is_self_report") is True
 

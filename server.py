@@ -4230,6 +4230,90 @@ def _log_engram_tool_event(
         print(f"[engram-tool-event] _log_engram_tool_event({tool_name}) failed: {exc!r}", file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------
+# Agent-facing response stripping (issue #358 / qu_0016)
+#
+# Certain fields are opaque to agent reasoning and bloat the context window
+# with no semantic gain: embeddings (384-float arrays), content hashes, git
+# SHAs, parsed_metadata (pure redundancy with the raw metadata string), raw
+# match_type + similarity inside similar_existing blocks (action_hint already
+# encodes the actionable summary), and confidence_history (forensics-only).
+#
+# CRITICAL: strip at the AGENT-RETURN boundary only. Internal computation
+# paths (dedup reads embedding/similarity, verifier reads content_hash) must
+# remain intact. Only the JSON string that goes to the MCP client is cleaned.
+#
+# Diagnostic access to stripped fields: tools/inspect_raw.py <node_id>
+# ---------------------------------------------------------------------------
+_AGENT_STRIP_KEYS: frozenset[str] = frozenset({
+    "embedding",
+    # content_hash and git_sha are stored inside the metadata JSON blob, not
+    # surfaced as top-level keys by _node_to_dict, so they never appear at
+    # the top level of a response dict. Kept here as dead-code documentation
+    # — they have no effect on the recursive strip but clarify intent.
+    # "content_hash",  # dead: stored in metadata blob, not a top-level key
+    # "git_sha",       # dead: stored in metadata blob, not a top-level key
+    "parsed_metadata",
+    "confidence_history",
+})
+
+# Keys stripped specifically from similar_existing / similar_existing_lessons
+# entries. These are RAW search-pipeline signals opaque to agent reasoning;
+# action_hint (which encodes the actionable summary) is KEPT.
+#
+# IMPORTANT: these keys are NOT in _AGENT_STRIP_KEYS and are NOT stripped
+# globally/recursively. They are removed only at the specific assembly points
+# for similar_existing / similar_existing_lessons via _strip_similar_block().
+# This preserves similarity + match_type in engram_query(return_debug=True)
+# result nodes and debug.per_result entries (eval-harness contract, §6348).
+_SIMILAR_STRIP_KEYS: frozenset[str] = frozenset({
+    "match_type",
+    "similarity",
+})
+
+
+def _strip_agent_facing(obj: object) -> object:
+    """Recursively remove opaque-to-agent-reasoning keys from dicts/lists.
+
+    Applied at every @mcp.tool return boundary (post-DB-fetch, pre-json.dumps)
+    to remove fields that bloat context without providing semantic value to the
+    agent. The source data in the DB is never touched — only the response copy.
+
+    Strips globally: embedding, parsed_metadata, confidence_history.
+
+    Does NOT strip match_type or similarity globally — those are raw
+    search-pipeline signals that ARE meaningful in engram_query(return_debug=True)
+    result nodes and debug.per_result entries (eval-harness contract). They are
+    removed only from similar_existing / similar_existing_lessons sub-blocks
+    via _strip_similar_block(), applied at the write-tool assembly sites.
+    """
+    if isinstance(obj, dict):
+        return {
+            k: _strip_agent_facing(v)
+            for k, v in obj.items()
+            if k not in _AGENT_STRIP_KEYS
+        }
+    if isinstance(obj, list):
+        return [_strip_agent_facing(item) for item in obj]
+    return obj
+
+
+def _strip_similar_block(entries: list[dict]) -> list[dict]:
+    """Strip match_type + similarity from similar_existing / similar_existing_lessons entries.
+
+    These raw search-pipeline signals are opaque to agent reasoning for dedup
+    decisions; action_hint encodes the actionable summary and is KEPT.
+
+    Applied ONLY at the assembly points for similar_existing and
+    similar_existing_lessons blocks (engram_add_observation, engram_add_lesson),
+    NOT globally — preserving these fields in engram_query debug-mode results.
+    """
+    return [
+        {k: v for k, v in entry.items() if k not in _SIMILAR_STRIP_KEYS}
+        for entry in entries
+    ]
+
+
 _original_mcp_tool = mcp.tool
 
 
@@ -4948,7 +5032,7 @@ def _add_observation_impl(
                 if polarity_prefix:
                     m["action_hint"] = polarity_prefix + m["action_hint"]
 
-            result["similar_existing"] = similar_matches
+            result["similar_existing"] = _strip_similar_block(similar_matches)
             result["similar_count"] = len(similar_matches)
             result["dedup_guidance"] = (
                 "Similarity-graded matches. Action hints account for source type "
@@ -4991,7 +5075,7 @@ def _add_observation_impl(
                 ),
             },
         )
-        return json.dumps(result)
+        return json.dumps(_strip_agent_facing(result))
     finally:
         conn.close()
 
@@ -5216,7 +5300,7 @@ def _add_observation_batch_impl(
         },
     )
 
-    return json.dumps(batch_result)
+    return json.dumps(_strip_agent_facing(batch_result))
 
 
 # ---- MMR diversity reranker helpers (alpha #178 area 2) ----
@@ -6154,7 +6238,7 @@ def engram_surface(
                 ),
             }
 
-        return json.dumps(summary)
+        return json.dumps(_strip_agent_facing(summary))
     finally:
         conn.close()
 
@@ -6253,7 +6337,9 @@ def engram_inspect(
             # edges view is pure-topology browsing: the early-return here is intentional —
             # it skips the question-node last_assessed_at bump below (pure-topology calls
             # should not carry assessment side-effects).
-            return json.dumps(_build_inspect_edges_view(conn, node_id, node_type))
+            return json.dumps(_strip_agent_facing(
+                _build_inspect_edges_view(conn, node_id, node_type)
+            ))
 
         # recall + deep: build the full node dict.
         node = _node_to_dict(row)
@@ -6296,13 +6382,13 @@ def engram_inspect(
             conn.commit()
 
         if view == "recall":
-            return json.dumps(
+            return json.dumps(_strip_agent_facing(
                 _build_inspect_recall_view(conn, node, node_id, dream_mode, warnings)
-            )
+            ))
         else:  # view == "deep"
-            return json.dumps(
+            return json.dumps(_strip_agent_facing(
                 _build_inspect_deep_view(conn, node, node_id, dream_mode, warnings)
-            )
+            ))
     finally:
         conn.close()
 
@@ -6444,18 +6530,18 @@ def engram_query(
             }
             if "debug" in search:
                 response_body["debug"] = search["debug"]
-            return json.dumps(response_body)
+            return json.dumps(_strip_agent_facing(response_body))
 
         # Default path: tiered summary/keywords shape (Wave C recall_summary rollout).
         # Clamp summary_top_k to [0, len(output)] so callers don't have to worry
         # about off-by-one edge cases.
         effective_top_k = max(0, min(summary_top_k, len(output)))
         tiered = _build_tiered_results(output, effective_top_k)
-        return json.dumps({
+        return json.dumps(_strip_agent_facing({
             "results": tiered,
             "query": query,
             "total_matches": len(output),
-        })
+        }))
     finally:
         conn.close()
 
@@ -6676,7 +6762,7 @@ def engram_get_subgraph(
         if content is not None:
             response["content"] = content
 
-        return json.dumps(response)
+        return json.dumps(_strip_agent_facing(response))
     finally:
         conn.close()
 
@@ -10736,14 +10822,14 @@ def _add_lesson_impl(
         }
 
         if similar_lessons:
-            result["similar_existing_lessons"] = similar_lessons
+            result["similar_existing_lessons"] = _strip_similar_block(similar_lessons)
             result["consolidation_hint"] = (
                 "Similar lesson(s) found. Consider superseding the existing lesson "
                 "and linking all incidents to the new, consolidated version. "
                 "More incidents = more matching surface area."
             )
 
-        return json.dumps(result)
+        return json.dumps(_strip_agent_facing(result))
     finally:
         conn.close()
 
@@ -15459,7 +15545,7 @@ def engram_reflect(summary_top_k: int = 5) -> str:
 
         _write_feeling_nudge("dream_review")
 
-        return json.dumps(_slim_reflect_briefing(report))
+        return json.dumps(_strip_agent_facing(_slim_reflect_briefing(report)))
     finally:
         conn.close()
 
@@ -15797,7 +15883,7 @@ def engram_list(
     # shape for backward compat with any callers that read that field.
     if not structured_mode:
         response["filters"] = {"type": node_type or "all", "status": status or "all"}
-    return json.dumps(response)
+    return json.dumps(_strip_agent_facing(response))
 
 
 def _conn_total_count(where_clause: str, params: list) -> int:
@@ -16011,6 +16097,8 @@ def _pattern_open_question_answerable(
                 "claim": (best["claim"][:160] + "...") if best["claim"] and len(best["claim"]) > 160 else best["claim"],
                 "confidence": best["confidence"],
             },
+            # NOTE: alternates/candidate_resolution/suggested_action are discarded by
+            # _build_tiered_results; they survive only in _pattern_telemetry_log (see #366).
             "alternates": [
                 {"id": m["id"], "similarity": m["similarity"]}
                 for m in matches[1:]
@@ -16415,12 +16503,12 @@ def engram_query_pattern(
     effective_top_k = max(0, min(summary_top_k, len(candidates)))
     tiered = _build_tiered_results(candidates, effective_top_k)
 
-    return json.dumps({
+    return json.dumps(_strip_agent_facing({
         "pattern_name": pattern_name,
         "preset": preset,
         "results": tiered,
         "total_matches": len(candidates),
-    })
+    }))
 
 
 # ---------------------------------------------------------------------------

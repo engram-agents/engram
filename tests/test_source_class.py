@@ -15,6 +15,7 @@ Tests cover:
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 
@@ -220,6 +221,23 @@ def test_batch_with_source_class():
     assert results[2]["source_class"] == "user_stated"
 
 
+def _get_confidence_history_from_db(client, node_id):
+    """Read confidence_history from DB (stripped from MCP returns per #358)."""
+    import server as _server
+    conn = sqlite3.connect(str(_server.DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT confidence_history FROM nodes WHERE id = ?", (node_id,)
+        ).fetchone()
+        if row is None:
+            return []
+        raw = row["confidence_history"] or "[]"
+        return json.loads(raw)
+    finally:
+        conn.close()
+
+
 def test_confidence_history_records_source_class():
     """Confidence history should note source_class when not external."""
     client = fresh_client()
@@ -233,11 +251,8 @@ def test_confidence_history_records_source_class():
         "source_class": "introspective",
     })
     assert r["status"] == "created"
-    insp = client.call("engram_inspect", {"node_id": r["observation_id"], "view": "deep"})
-    node = insp["node"]
-    history = node.get("confidence_history", "[]")
-    if isinstance(history, str):
-        history = json.loads(history)
+    # Read confidence_history from DB (stripped from MCP returns per #358).
+    history = _get_confidence_history_from_db(client, r["observation_id"])
     assert len(history) > 0
     assert "introspective" in history[0]["reason"]
 

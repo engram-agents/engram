@@ -504,6 +504,25 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
 - **engram_advance_turn** — End-of-day session checkpoint: commits session and advances the global turn counter (drives the forgetting mechanism). IRREVERSIBLE. Per qu_0035, only the dedicated sleep cron should call this from cron-fired sessions.
   `(message)`
 
+### Diagnostic CLI — stripped fields
+
+Several fields are stripped from MCP tool returns because they are opaque to agent reasoning (issue #358): `embedding` (384-float array), `confidence_history`, `content_hash`, `git_sha`, `parsed_metadata`. When these are genuinely needed for debugging, use the diagnostic CLI via Bash:
+
+```bash
+# List available stripped fields for a node
+ENGRAM_DATA_DIR=~/.engram python ~/.engram/tools/inspect_raw.py ob_0001
+
+# Read a specific stripped field
+python ~/.engram/tools/inspect_raw.py ob_0001 --field confidence_history
+python ~/.engram/tools/inspect_raw.py ob_0007 --field embedding
+python ~/.engram/tools/inspect_raw.py ob_0042 --field content_hash
+
+# JSON output for piping
+python ~/.engram/tools/inspect_raw.py dv_0010 --field parsed_metadata --json
+```
+
+The DB is never modified — this is a read-only diagnostic tool. `ENGRAM_DATA_DIR` must point at the correct data directory (defaults to `~/.engram`).
+
 ---
 
 ## §5 Workflows
