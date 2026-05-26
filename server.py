@@ -516,6 +516,18 @@ VALID_ERROR_TYPES = {
 # Below this, the target is marked "partially_resolved" and remains visible in reflection.
 DEFAULT_RESOLUTION_THRESHOLD = 0.7
 
+# Discipline hint returned when the threshold gate fires on engram_resolve.
+# Surfaces in the result JSON as "discipline_hint" alongside "note" to guide
+# callers away from chain-dilution and toward legitimate paths forward.
+_THRESHOLD_GATE_DISCIPLINE_HINT = (
+    "Do NOT refile another low-confidence resolution — that's chain dilution. "
+    "Either (a) deepen supporting nodes' confidence first, "
+    "(b) file a task tracking the structural blocker "
+    "(e.g. needs primary source / needs human decision / needs empirical replication), "
+    "or (c) accept partial-resolution as the calibrated state. "
+    "Best practice: inspect-first before composing resolution."
+)
+
 # Type prefixes for human-readable IDs
 TYPE_PREFIX = {
     "evidence": "ev",
@@ -12563,6 +12575,8 @@ def engram_resolve(payload_json: str) -> str:
     Returns:
         JSON with the wired edge, target status flip, and resolving node's
         confidence. On payload-parsing failure, returns {"error": "..."}.
+        When partial_resolution is due to threshold gate, includes
+        discipline_hint advising against chain dilution.
 
     See _resolve_impl for full semantics — kept callable with named kwargs
     for in-server callers.
@@ -12766,6 +12780,13 @@ def _resolve_impl(
             "confidence": confidence,
             "resolution_status": resolution_status,
         }
+        # Safety: predictions and conjectures cannot reach this branch with
+        # resolution_status == "partially_resolved". Their status is set from
+        # prediction_outcome (lines above), which is validated against
+        # VALID_PREDICTION_OUTCOMES / VALID_CONJECTURE_OUTCOMES — neither set
+        # contains "partially_resolved". The discipline_hint is threshold-gate
+        # specific and only applies to question/contradiction/goal_tension types
+        # that use the MAX(confidence) >= threshold path (the else branch above).
         if resolution_status == "partially_resolved":
             result["note"] = (
                 f"No current resolver of '{target_id}' reaches the resolution "
@@ -12774,6 +12795,7 @@ def _resolve_impl(
                 f"via engram_derive that cites high-confidence root nodes, "
                 f"then call engram_resolve again to wire it."
             )
+            result["discipline_hint"] = _THRESHOLD_GATE_DISCIPLINE_HINT
 
         return json.dumps(result)
     finally:

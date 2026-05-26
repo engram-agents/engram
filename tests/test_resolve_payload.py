@@ -250,7 +250,7 @@ def test_weaker_later_resolver_cannot_downgrade_status():
 
     Setup:
       - Strong resolve: hard_data (0.95) × authority_expert (0.95) = 0.9025 → resolved
-      - Weak resolve: attributed_analysis (0.70) × inductive_analogy (0.70) = 0.49 → below threshold
+      - Weak resolve: attributed_analysis (0.70) × inductive_statistical (0.90) = 0.63 → below threshold
     After both wired, status MUST stay 'resolved' because max-of-resolves picks 0.9025.
     """
     server = fresh_server()
@@ -274,7 +274,7 @@ def test_weaker_later_resolver_cannot_downgrade_status():
         "claim": "Weak analogical argument for Y.",
         "supporting_ids": weak_ob["observation_id"],
         "logical_chain": "Loose analogy between Y and similar cases.",
-        "reasoning_type": "inductive_analogy",
+        "reasoning_type": "inductive_statistical",
     })))
 
     r = json.loads(server.engram_resolve(payload_json=json.dumps({
@@ -359,3 +359,144 @@ def test_impl_callable_with_kwargs():
         resolving_node_id=dv_id,
     ))
     assert r.get("status") == "resolution_created", r
+
+
+# ── 9. discipline_hint on threshold-gate partial resolution (issue #386) ──
+
+
+def _seed_weak_resolution(server):
+    """Create observation, question, and a below-threshold resolving derivation.
+
+    Returns (question_id, derivation_id).
+    The derivation confidence is well below the 0.7 threshold:
+    attributed_analysis observation (0.70) × inductive_analogy discount (0.70)
+    = 0.49 — below the 0.70 resolution threshold.
+    """
+    obs_payload = {
+        "url": "https://example.com/weak-source",
+        "title": "Weak Source",
+        "quoted_text": "An analyst speculates Z might be loosely plausible.",
+        "interpretation": "Weakly attributed speculation about Z.",
+        "claim": "Z is loosely plausible (speculative).",
+        "quote_type": "attributed_analysis",
+    }
+    ob = json.loads(server.engram_add_observation(payload_json=json.dumps(obs_payload)))
+    ob_id = ob["observation_id"]
+
+    q = json.loads(server.engram_ask(payload_json=json.dumps({"question": "Is Z the case?"})))
+    q_id = q["question_id"]
+
+    dv = json.loads(server.engram_derive(payload_json=json.dumps({
+        "claim": "Z might hold based on loose analogy.",
+        "supporting_ids": ob_id,
+        "logical_chain": "Loose analogy between Z and similar weak cases.",
+        "reasoning_type": "inductive_statistical",
+    })))
+    return q_id, dv["derivation_id"]
+
+
+def test_threshold_gate_partial_resolution_includes_discipline_hint():
+    """When threshold gate fires (no resolver meets 0.70), discipline_hint must be present."""
+    server = fresh_server()
+    q_id, weak_dv_id = _seed_weak_resolution(server)
+
+    r = json.loads(server.engram_resolve(payload_json=json.dumps({
+        "target_id": q_id,
+        "resolving_node_id": weak_dv_id,
+    })))
+
+    assert r.get("status") == "resolution_created", r
+    assert r["resolution_status"] == "partially_resolved", (
+        f"Expected partially_resolved for below-threshold resolver; got {r}"
+    )
+    assert "discipline_hint" in r, (
+        f"discipline_hint must be present on threshold-gate partial_resolution; got {r}"
+    )
+    assert r["discipline_hint"] == server._THRESHOLD_GATE_DISCIPLINE_HINT, (
+        f"discipline_hint must match the module-level constant; got {r['discipline_hint']!r}"
+    )
+    # Spot-check key phrases from the verbatim spec text
+    assert "chain dilution" in r["discipline_hint"], r["discipline_hint"]
+    assert "inspect-first before composing resolution" in r["discipline_hint"], r["discipline_hint"]
+
+
+def test_strong_resolution_does_not_include_discipline_hint():
+    """When resolution_status is 'resolved' (above threshold), discipline_hint must be absent."""
+    server = fresh_server()
+    q_id, _, strong_dv_id = _seed_strong_resolution(server)
+
+    r = json.loads(server.engram_resolve(payload_json=json.dumps({
+        "target_id": q_id,
+        "resolving_node_id": strong_dv_id,
+    })))
+
+    assert r.get("status") == "resolution_created", r
+    assert r["resolution_status"] == "resolved", (
+        f"Expected resolved for above-threshold resolver; got {r}"
+    )
+    assert "discipline_hint" not in r, (
+        f"discipline_hint must NOT be present on a full resolution; got {r}"
+    )
+
+
+def test_prediction_partial_resolution_does_not_include_discipline_hint():
+    """Prediction path cannot produce discipline_hint — two safety layers:
+    (1) VALID_PREDICTION_OUTCOMES excludes 'partially_resolved', so passing it
+        is rejected before reaching the threshold gate;
+    (2) valid outcomes (confirmed/partially_confirmed/refuted/partially_refuted)
+        set resolution_status directly from prediction_outcome, which is never
+        'partially_resolved', so the threshold-gate hint block is unreachable.
+    This test confirms layer (1): passing 'partially_resolved' as prediction_outcome
+    is an error, never a discipline_hint surface.
+    """
+    server = fresh_server()
+
+    # Create a predictive observation to seed a prediction node
+    obs = json.loads(server.engram_add_observation(payload_json=json.dumps({
+        "url": "https://example.com/pred-test",
+        "title": "Prediction test",
+        "quoted_text": "Event P will occur by Q3.",
+        "interpretation": "Prediction: event P will occur.",
+        "claim": "Event P will occur by Q3.",
+        "quote_type": "editorial",
+        "is_predictive": True,
+        "predicted_event": "Event P occurs by Q3",
+    })))
+    assert "prediction_id" in obs, obs
+    pred_id = obs["prediction_id"]
+
+    # Create a resolving derivation (weak, below threshold — makes no difference
+    # for predictions since they bypass the threshold gate entirely)
+    ob_id = obs["observation_id"]
+    dv = json.loads(server.engram_derive(payload_json=json.dumps({
+        "claim": "Event P did not occur by Q3 based on Q3 results.",
+        "supporting_ids": ob_id,
+        "logical_chain": "Q3 passed without P occurring.",
+        "reasoning_type": "inductive_statistical",
+    })))
+    dv_id = dv["derivation_id"]
+
+    # Attempt to pass 'partially_resolved' as prediction_outcome — must be rejected
+    r = json.loads(server.engram_resolve(payload_json=json.dumps({
+        "target_id": pred_id,
+        "resolving_node_id": dv_id,
+        "prediction_outcome": "partially_resolved",
+    })))
+    assert "error" in r, (
+        f"'partially_resolved' is not a valid prediction_outcome and must be rejected; got {r}"
+    )
+    assert "discipline_hint" not in r, (
+        f"discipline_hint must NOT appear on a prediction resolution error; got {r}"
+    )
+
+    # Also confirm a valid prediction outcome does not produce discipline_hint
+    r2 = json.loads(server.engram_resolve(payload_json=json.dumps({
+        "target_id": pred_id,
+        "resolving_node_id": dv_id,
+        "prediction_outcome": "refuted",
+    })))
+    assert r2.get("status") == "resolution_created", r2
+    assert r2["resolution_status"] == "refuted", r2
+    assert "discipline_hint" not in r2, (
+        f"discipline_hint must NOT be present on a prediction resolution; got {r2}"
+    )
