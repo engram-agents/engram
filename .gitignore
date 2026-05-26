@@ -15,6 +15,17 @@ xet/
 *.swp
 *~
 
+# Ephemeral fairy worktrees — Claude Code's Agent tool with
+# isolation:"worktree" creates one git worktree per sub-agent dispatch
+# under .claude/worktrees/agent-<id>/. They're cleaned up after each fairy
+# returns; ignoring them keeps the repo clean if a cleanup is ever missed
+# or while a fairy is mid-run. Ignore ONLY the worktrees subdir —
+# .claude/agents/*.md are tracked and must stay so.
+.claude/worktrees/
+
+# Playwright MCP scratch dir (browser-driven verification sessions).
+.playwright-mcp/
+
 # Local working-notes desk — per Lei 2026-05-14: active-work/ is for
 # in-flight notes (audits, plans, drafts) that don't need versioning.
 # Tracked-by-default policy proved noisy: PRs of pure-doc working notes
