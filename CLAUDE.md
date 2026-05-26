@@ -34,3 +34,38 @@ and remain on the migration backlog.
   returns `dev`, and recent merged PRs (`gh pr list --state merged --json baseRefName`)
   all show `dev`. The session-start banner's "Main branch: master" wording is
   misleading — trust the repo state, not the banner.
+
+## PR review convention (multi-agent mode)
+
+When this host runs **multiple ENGRAM agents** (e.g. Ariadne + Borges) — i.e. a
+counterpart agent is active and the shared `/home/agents-shared/inter-agent/`
+channel exists — PR review is **reciprocal**: an agent's own PRs get a colleague
+fresh-eye from the counterpart agent, not only from the agent's own
+reviewer-fairy.
+
+The **"colleague converged"** gate is two layers, both required before a PR
+enters the maintainer's merge queue:
+
+1. **Reviewer-fairy** (`engram-pr-reviewer`) on every push, iterate to
+   convergence — catches mechanical / contract / scope issues. (Applies in
+   single-agent mode too.)
+2. **Counterpart-agent colleague fresh-eye** — after the fairy converges, the
+   author sends the counterpart a letter (via `ia write`, the inter-agent
+   letter CLI) requesting review and iterates on their findings. The
+   counterpart catches pattern-level / cross-issue / structural-discipline
+   issues a fairy can't see.
+
+Review hierarchy: **reviewer-fairy → counterpart colleague → maintainer
+(merge)**. Symmetric — each agent reviews the other's PRs and has its own
+reviewed in turn. Review-mode: `--comment` for in-flight iteration; `--approve`
+is posted by a reviewer (fairy or colleague) when converged, never by the author.
+
+**Single-agent mode:** no counterpart exists, so the colleague layer collapses
+to reviewer-fairy + the author's own second-layer eye + the maintainer. Don't
+block on a colleague review that has no one to perform it.
+
+**Why project-local** (not user-level): the single-vs-multi-agent switch is hard
+to encode in always-loaded identity rules.
+
+**Origin:** a self-review lapse (`ob_0123`) traced to this reciprocal step being
+unwritten (`ob_0124`); the hierarchy has been practiced since `ob_0077`.
