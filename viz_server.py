@@ -2933,7 +2933,9 @@ def get_config_data(agent_name: str) -> dict:
 # ranges, allowed values, and restart_required are all schema-driven, not
 # hardcoded lists. Only editable=True keys may be written.
 #
-# Atomic-write pattern: temp file → os.rename. Backup-once-per-session per
+# In-place write pattern: build content in a temp file, then copy it into
+# config.json's existing inode (NOT os.rename, which would swap inodes and
+# strip the file's owner+mode — GitHub #372). Backup-once-per-session per
 # agent. Read-after-write verify with rollback on failure.
 # ---------------------------------------------------------------------------
 
@@ -3078,7 +3080,7 @@ def write_config_key(agent_name: str, key: str, raw_value) -> dict:
     Guarantees:
     - Validation (type + range) before any disk touch.
     - Backup-once-per-session per agent.
-    - Atomic write (temp → os.rename).
+    - In-place write (preserves config.json inode → owner + mode).
     - Read-after-write verify; rollback to backup on failure.
     - Per-agent isolation: only touches the config.json for agent_name.
     """
@@ -3121,7 +3123,19 @@ def write_config_key(agent_name: str, key: str, raw_value) -> dict:
     # Apply the new value.
     _set_nested(config, key, validated_value)
 
-    # Atomic write: temp file in same directory → os.rename.
+    # In-place write: copy validated content into config.json's EXISTING inode
+    # rather than os.rename(temp, config.json). os.rename swaps in the temp
+    # file's inode, which carries the temp's owner + mode (operator UID, 0600
+    # from mkstemp) — when the viz server runs as a different UID than the
+    # agent that owns config.json, that strips the agent's ownership and locks
+    # it out of its own config (GitHub #372). Building in a temp first keeps a
+    # serialization error from truncating the live file; the copy into the
+    # existing inode is not crash-atomic, so the backup + read-after-write
+    # verify + rollback below cover a torn write. Second tradeoff vs os.rename
+    # (which is atomic at the VFS layer): a concurrent reader can transiently
+    # observe a partially-written config.json and get a JSONDecodeError. The
+    # copy window is sub-millisecond for typical config sizes and config is
+    # read at startup, not continuously, so this is not a real-world concern.
     config_dir = os.path.dirname(config_path)
     try:
         fd, tmp_path = _tempfile_in_dir(config_dir)
@@ -3129,14 +3143,20 @@ def write_config_key(agent_name: str, key: str, raw_value) -> dict:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
                 f.write("\n")
-        except Exception:
+            with open(tmp_path, "r", encoding="utf-8") as src, \
+                    open(config_path, "w", encoding="utf-8") as dst:
+                shutil.copyfileobj(src, dst)
+        finally:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
-            raise
-        os.rename(tmp_path, config_path)
     except OSError as exc:
+        # In-place commit can leave config.json torn — restore from backup.
+        try:
+            shutil.copyfile(backup_path, config_path)
+        except OSError:
+            pass
         return {"ok": False, "error": f"Write failed: {exc}"}
 
     # Read-after-write verify.
@@ -3147,14 +3167,14 @@ def write_config_key(agent_name: str, key: str, raw_value) -> dict:
         if isinstance(written_val, _Missing) or written_val != validated_value:
             # Verify failed — rollback from backup.
             try:
-                shutil.copy2(backup_path, config_path)
+                shutil.copyfile(backup_path, config_path)
             except OSError:
                 pass
             return {"ok": False, "error": "write verify failed, rolled back"}
     except (OSError, json.JSONDecodeError) as exc:
         # Can't verify — rollback.
         try:
-            shutil.copy2(backup_path, config_path)
+            shutil.copyfile(backup_path, config_path)
         except OSError:
             pass
         return {"ok": False, "error": f"write verify failed (read error: {exc}), rolled back"}
@@ -3169,8 +3189,9 @@ def write_config_key(agent_name: str, key: str, raw_value) -> dict:
 def _tempfile_in_dir(directory: str) -> tuple:
     """Create a named temp file in directory. Returns (fd, path).
 
-    Using os.open + O_EXCL for atomic creation; avoids tempfile module's
-    automatic cleanup which can race with os.rename.
+    Uses mkstemp for atomic O_EXCL creation with no auto-delete, so
+    write_config_key controls the temp's lifecycle: build content, copy it
+    into config.json's existing inode, then unlink the temp.
     """
     fd, path = tempfile.mkstemp(dir=directory, prefix=".config_write_", suffix=".tmp")
     return fd, path

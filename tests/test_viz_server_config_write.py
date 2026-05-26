@@ -371,6 +371,81 @@ class TestWriteConfigKeyAtomicity(ConfigWriteBase):
         cfg = self._read_config()
         self.assertEqual(cfg["cadence"]["drowsiness_caution_pct"], 80)
 
+    def test_rollback_restores_config_on_torn_write(self):
+        """#372 regression: the in-place write is not crash-atomic — if the
+        copy into config.json's existing inode tears the file mid-write, the
+        write-block OSError handler must restore it from backup so the agent
+        never inherits a corrupt/unreadable config (the lockout class #372 is
+        about). Without that rollback, config.json would be left as invalid
+        JSON and self._read_config() (json.loads) would raise.
+
+        Note: we fail only the FIRST copyfileobj call (the in-place commit)
+        and delegate the rest to the real implementation, because the rollback
+        path (shutil.copyfile) may itself call copyfileobj internally — a
+        blanket patch would break the very rollback under test."""
+        real_copyfileobj = shutil.copyfileobj
+        state = {"calls": 0}
+
+        def torn_then_real(src, dst, *args, **kwargs):
+            state["calls"] += 1
+            if state["calls"] == 1:
+                dst.write('{"torn')  # leave genuinely invalid JSON, then fail
+                raise OSError("simulated disk-full mid-copy")
+            return real_copyfileobj(src, dst, *args, **kwargs)
+
+        shutil.copyfileobj = torn_then_real
+        try:
+            result = viz_server.write_config_key(
+                "test", "cadence.drowsiness_caution_pct", 99
+            )
+        finally:
+            shutil.copyfileobj = real_copyfileobj
+            viz_server._CONFIG_WRITE_BACKUPS.pop("test", None)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Write failed", result["error"])
+        # config.json must be valid JSON again, restored to the original value.
+        cfg = self._read_config()
+        self.assertEqual(cfg["cadence"]["drowsiness_caution_pct"], 80)
+
+
+class TestWriteConfigKeyPreservesInode(ConfigWriteBase):
+    """Regression test for #372: write must preserve config.json's inode
+    (hence owner + mode). os.rename swapped inodes → stripped agent ownership
+    → operator:operator 0600 lockout. In-place write preserves the inode."""
+
+    def test_inode_preserved_across_write(self):
+        st_before = os.stat(str(self.config_path))
+        result = viz_server.write_config_key(
+            "test", "cadence.drowsiness_caution_pct", 70
+        )
+        self.assertTrue(result["ok"], result)
+        st_after = os.stat(str(self.config_path))
+        self.assertEqual(
+            st_before.st_ino, st_after.st_ino,
+            "config.json inode changed — write swapped the file (os.rename "
+            "regression); in-place write must preserve the inode so the "
+            "owning agent keeps ownership (#372)",
+        )
+
+    def test_mode_preserved_across_write(self):
+        os.chmod(str(self.config_path), 0o600)
+        st_before = os.stat(str(self.config_path))
+        result = viz_server.write_config_key(
+            "test", "cadence.drowsiness_caution_pct", 71
+        )
+        self.assertTrue(result["ok"], result)
+        st_after = os.stat(str(self.config_path))
+        self.assertEqual(
+            st_before.st_mode, st_after.st_mode,
+            "config.json mode changed across write (#372)",
+        )
+
+    def test_value_still_persists_with_inplace_write(self):
+        viz_server.write_config_key("test", "cadence.drowsiness_caution_pct", 72)
+        cfg = self._read_config()
+        self.assertEqual(cfg["cadence"]["drowsiness_caution_pct"], 72)
+
 
 # ---------------------------------------------------------------------------
 # HTTP integration tests for PUT /api/config/<key>
