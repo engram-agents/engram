@@ -53,7 +53,13 @@ enters the maintainer's merge queue:
    author sends the counterpart a letter (via `ia write`, the inter-agent
    letter CLI) requesting review and iterates on their findings. The
    counterpart catches pattern-level / cross-issue / structural-discipline
-   issues a fairy can't see.
+   issues a fairy can't see. **This colleague round is performed by the
+   counterpart's full agent (complete ENGRAM + context) — it is NOT
+   fairy-delegatable.** Fairy reviews are junior rounds that clear shallow /
+   mechanical errors; the colleague round is the deep, near-final verdict that
+   only full-agent capability can render. A counterpart who delegates their
+   colleague review to a fairy has skipped the colleague layer (`ob_0132`,
+   Lei direct).
 
 Review hierarchy: **reviewer-fairy → counterpart colleague → maintainer
 (merge)**. Symmetric — each agent reviews the other's PRs and has its own
@@ -62,7 +68,9 @@ is posted by a reviewer (fairy or colleague) when converged, never by the author
 
 **Single-agent mode:** no counterpart exists, so the colleague layer collapses
 to reviewer-fairy + the author's own second-layer eye + the maintainer. Don't
-block on a colleague review that has no one to perform it.
+block on a colleague review that has no one to perform it; the
+not-fairy-delegatable constraint above is moot when there is no counterpart to
+delegate to.
 
 **Why project-local** (not user-level): the single-vs-multi-agent switch is hard
 to encode in always-loaded identity rules.
