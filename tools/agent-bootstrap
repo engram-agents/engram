@@ -314,6 +314,57 @@ else
     echo "           starting their first session. See next-steps below."
 fi
 
+# ---------- 5.7. Operator ACL on ~/.engram (directory default) ----------
+# The ENGRAM server creates config.json on first run (server.py bootstrap).
+# Do NOT write a stub config here — pre-empting server.py's default_config
+# write would cause it to skip initialisation, leaving a schema-incomplete
+# file (regression observed in prior approach, issue #341).
+#
+# Instead, set a POSIX directory DEFAULT ACL on ~/.engram so every NEW file
+# the server later creates (config.json, knowledge.db, etc.) automatically
+# inherits operator rw — no group-membership hacks required.
+#
+# The operator is $SUDO_USER (the Linux username of the human who ran
+# `sudo agent-bootstrap`).  primary_user in config.json is the agent's
+# human-readable first name ("lei"), NOT the Linux username, so we cannot
+# use it here.
+#
+# Guards:
+#   • $SUDO_USER empty or "root" → skip silently (no non-root operator).
+#   • setfacl not on PATH → warn clearly (acl package); do NOT fail bootstrap.
+#   • Idempotent: setfacl with the same mask is a no-op on re-run.
+#
+# Optional re-bootstrap guard:
+#   If config.json already exists (re-bootstrap on an existing install), also
+#   apply a direct named-user ACL to that file — the directory default ACL
+#   covers only newly-created files, so an existing file needs the direct grant.
+ENGRAM_HOME="$USER_HOME/.engram"
+mkdir -p "$ENGRAM_HOME"
+
+OPERATOR="${SUDO_USER:-}"
+if [[ "$OPERATOR" == "root" ]]; then
+    OPERATOR=""
+fi
+
+if [[ -n "$OPERATOR" ]]; then
+    if command -v setfacl >/dev/null 2>&1; then
+        setfacl -d -m "u:${OPERATOR}:rw" "$ENGRAM_HOME"
+        echo "  ACL set (default): u:${OPERATOR}:rw on $ENGRAM_HOME (new files inherit operator rw)"
+        # Re-bootstrap guard: grant direct ACL on config.json if it already exists.
+        CONFIG_JSON="$ENGRAM_HOME/config.json"
+        if [[ -f "$CONFIG_JSON" ]]; then
+            setfacl -m "u:${OPERATOR}:rw" "$CONFIG_JSON"
+            echo "  ACL set (existing file): u:${OPERATOR}:rw on $CONFIG_JSON"
+        fi
+    else
+        echo "  WARNING: setfacl not found — cannot grant $OPERATOR r/w ACL on $ENGRAM_HOME." >&2
+        echo "           Install the 'acl' package (apt install acl) and re-run agent-bootstrap" >&2
+        echo "           to enable operator viz-server access to per-agent configs." >&2
+    fi
+else
+    echo "  ACL step skipped: SUDO_USER is empty or root (no non-root operator)."
+fi
+
 # ---------- 6. community shared dirs ----------
 mkdir -p "$SHARED_ROOT/inter-agent"
 mkdir -p "$SHARED_ROOT/health/$NAME"
