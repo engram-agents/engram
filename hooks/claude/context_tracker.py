@@ -444,9 +444,11 @@ def format_drowsiness(usage: dict) -> str:
     urgent, render the raw percentage so the agent has the calibration
     signal exactly when it's structurally warranted.
 
-    In loop mode ($ENGRAM_HOME/loop-mode.json present), warnings are
-    suppressed; the urgent-level percentage is still reported but
-    nap/stop directives are not issued.
+    In loop mode ($ENGRAM_HOME/loop-mode.json present), at urgent the agent
+    is instructed to nap ONCE (engram_nap) to stage the window for
+    auto-compaction, then keep working and ride auto-compaction — no manual
+    compaction wait, no re-nap before it fires. Below urgent, loop mode is
+    silent: the banner is identical to non-loop mode (calm level word only).
     """
     pct = usage["usage_pct"]
     est_tokens = usage["estimated_tokens"]
@@ -459,10 +461,19 @@ def format_drowsiness(usage: dict) -> str:
     loop_mode = os.path.exists(LOOP_MARKER_PATH)
 
     if loop_mode:
-        # Loop mode: surface the percentage at urgent, level word otherwise.
+        # Loop mode: at urgent, nap ONCE to stage the window for compaction,
+        # then keep pace and ride auto-compaction (don't wait for a manual
+        # compaction, don't re-nap each turn before it fires). Below urgent
+        # there's nothing loop-specific to say — render the calm level word
+        # exactly like non-loop mode, so the banner isn't a per-prompt alarm.
         if urgent:
-            return f"[Drowsiness: needs a nap: {pct:.0%} — loop mode, compaction will auto-fire]"
-        return f"[Drowsiness: {drowsiness_level(pct, thresholds)} — loop mode, compaction will auto-fire]"
+            return (
+                f"[Drowsiness: {pct:.0%} — loop mode: nap ONCE (engram_nap) to "
+                f"stage this window for compaction (skip if you already napped "
+                f"this burst), then keep working and ride auto-compaction — "
+                f"don't slow down for a manual compaction.]"
+            )
+        return f"[Drowsiness: {drowsiness_level(pct, thresholds)}]"
 
     if urgent:
         return (

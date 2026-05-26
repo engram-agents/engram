@@ -154,23 +154,29 @@ class TestFormatDrowsinessOutput(unittest.TestCase):
 
     @patch("context_tracker.os.path.exists")
     def test_loop_mode_below_urgent_hides_percentage(self, exists_mock):
-        """Loop mode + below urgent: level word, no percentage."""
+        """Loop mode + below urgent: calm level word, no percentage, no loop annotation."""
         exists_mock.return_value = True  # loop-mode marker exists
-        out = ct.format_drowsiness(self._usage(0.65, mode="1m"))
+        defaults_1m = ct.DEFAULT_DROWSINESS_THRESHOLDS_BY_MODE["1m"]
+        with patch.object(ct, "_load_drowsiness_thresholds", return_value=defaults_1m):
+            out = ct.format_drowsiness(self._usage(0.65, mode="1m"))
         self.assertIn("energetic", out)
-        self.assertIn("loop mode", out)
         self.assertNotIn("65%", out)
+        self.assertNotIn("loop mode", out)
+        self.assertNotIn("compaction", out)
 
     @patch("context_tracker.os.path.exists")
     def test_loop_mode_at_urgent_shows_percentage(self, exists_mock):
-        """Loop mode + urgent: percentage shown (so the agent sees calibration)."""
+        """Loop mode + urgent: percentage shown, nap-once directive, no 'compaction will auto-fire'."""
         exists_mock.return_value = True
         defaults_1m = ct.DEFAULT_DROWSINESS_THRESHOLDS_BY_MODE["1m"]
         with patch.object(ct, "_load_drowsiness_thresholds", return_value=defaults_1m):
             out = ct.format_drowsiness(self._usage(0.93, mode="1m"))
-        self.assertIn("needs a nap", out)
         self.assertIn("93%", out)
         self.assertIn("loop mode", out)
+        self.assertIn("auto-compaction", out)
+        self.assertIn("engram_nap", out)
+        self.assertNotIn("needs a nap", out)
+        self.assertNotIn("compaction will auto-fire", out)
 
     @patch("context_tracker.os.path.exists")
     def test_200k_a_little_drowsy_band(self, exists_mock):
