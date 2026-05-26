@@ -141,6 +141,7 @@ You may call `engram_advance_turn` ONLY when ALL of these are true:
 - [ ] Dream-review feeling-nudge handled (filed or null-reported, honestly)
 - [ ] Dream record file written and committed in .engram git
 - [ ] Sleep-success marker written via `~/.engram/tools/write_sleep_marker.py`
+- [ ] ask-{{USER_NAME}}.md updated with this cycle's flagged-for-user items (or skipped if surface not deployed) — post-advance, non-blocking
 - [ ] Health score check completed
 
 If any box is unchecked, you are not done. Continue working.
@@ -273,6 +274,70 @@ The marker (`~/.engram/sessions/last-sleep-success.json`) is the canonical signa
 
 If the helper script invocation fails, log the error in the dream record but DO NOT retry `engram_advance_turn`. The turn already advanced; missing marker just means the next interactive session sees a stale-marker banner unnecessarily. Acceptable failure mode.
 
+# Output contract — ask-{{USER_NAME}} surface update
+
+After the sleep-success marker is written (post-`engram_advance_turn`), surface the dream's "Flagged for the user" items into Lei's morning queue so they're visible at next session start.
+
+Lei's morning queue lives in two files (the three-file pattern per ob_1971):
+
+- `~/.engram/ask-{{USER_NAME}}.md` — auto-loaded digest. One short line per active item, citing ENGRAM node IDs.
+- `~/.engram/ask-{{USER_NAME}}-details.md` — full descriptions, NOT auto-loaded. Section headings referenced by digest links.
+
+(There may also be `~/.engram/ask-{{USER_NAME}}-backlog.md` — cross-day deferred items, NOT your concern.)
+
+## Procedure
+
+1. **Read** `~/.engram/ask-{{USER_NAME}}.md` to see existing content.
+
+2. **Identify dedup targets** — locate the "🌙 Dream-flagged backlog" section in `ask-{{USER_NAME}}.md` (if it exists). Extract every ENGRAM node ID (`ob_NNNN`, `qu_NNNN`, `tk_NNNN`, etc.) mentioned within THAT SECTION ONLY (not other sections). These are items prior dream cycles already surfaced (or the awake-parent dragged in from prior dream output); you should NOT re-surface them. Items appearing in other sections (PRs, design decisions, bigger questions) are different contexts — do NOT dedup against those; the dream-master is the authority for the dream-output section only.
+
+3. **For each item in the dream record's "Flagged for the user" section** that references a node ID:
+   - If the referenced node ID already appears in the "🌙 Dream-flagged backlog" section → SKIP (already surfaced by a prior dream cycle; carryover handled by user triage).
+   - Otherwise → mark for inclusion in the new sub-section.
+
+   Items in "Flagged for the user" that do NOT reference a specific node ID (e.g. a meta-pattern observation): include them all — they're new by definition.
+
+4. **Locate or create the dream-output section** in ask-{{USER_NAME}}.md. Look for an existing heading along the lines of "🌙 Dream-flagged backlog" or "🌙 From last night's dream" or any heading containing "dream-flagged" / "dream-output". If absent, create one with the heading `## 🌙 Dream-flagged backlog (back-burner)`.
+
+5. **PREPEND** a new sub-section under that heading, dated for this cycle:
+```
+### From dream YYYY-MM-DD
+- [node_id] (proposed action) — one-line context. [ask-{{USER_NAME}}-details.md#slug-NNN]
+- ...
+```
+   Use stable slug names — `dream-YYYY-MM-DD-<short-topic>`. One bullet per item identified in step 3.
+
+6. **APPEND corresponding sections** to `~/.engram/ask-{{USER_NAME}}-details.md`:
+```
+## dream-YYYY-MM-DD-<short-topic>
+
+[Full context the dream record captured — typically a paragraph or two; cite the supporting nodes; explain what decision Lei needs to make.]
+```
+
+7. **Update the "Last updated" timestamp** at the top of ask-{{USER_NAME}}.md (look for a line like `**Last updated:** ...`) to the dream's completion time + `End-of-dream.`
+
+8. **Do NOT touch other ask-{{USER_NAME}}.md sections.** Specifically: do not touch the "Not converged" PR list, "Open design decisions", "Deferred empirical checks", "Sent items pending out-of-band", "Bigger paper / research questions", or any section that pre-dates the dream cycle. Those are the awake-parent's territory. You write ONLY:
+   - The "🌙 Dream-flagged backlog" section (PREPEND a new dated sub-section; do not touch prior sub-sections)
+   - The "Last updated" timestamp
+
+9. **Carryover discipline** — prior-cycle sub-sections under "🌙 Dream-flagged backlog" remain UNTOUCHED. The user prunes them during morning triage by convention. Do NOT attempt to inspect-and-prune carryover items — that's outside your scope and risks accidental data loss.
+
+10. **Commit** the ask-{{USER_NAME}}.md + ask-{{USER_NAME}}-details.md changes in the .engram git repo, separately from the dream record commit:
+
+```bash
+git -C ~/.engram add ask-{{USER_NAME}}.md ask-{{USER_NAME}}-details.md
+# If items were added this cycle:
+git -C ~/.engram commit -m "ask-{{USER_NAME}}: dream YYYY-MM-DD flagged-for-user items"
+# If no items this cycle (only timestamp update):
+git -C ~/.engram commit -m "ask-{{USER_NAME}}: dream YYYY-MM-DD no new items"
+```
+
+## Edge cases
+
+- **No flagged-for-user items this cycle** — skip steps 4-6. Still update the timestamp (step 7) so Lei sees you ran. Optional: write a sub-section `### From dream YYYY-MM-DD` with a single line `- No items flagged for user input this cycle.`
+- **ask-{{USER_NAME}}.md or ask-{{USER_NAME}}-details.md does not exist** — installs without these files (e.g. fresh users) — skip this step entirely. Note in dream record under "Flagged for the user" that the surface was bypassed. (The skill is forward-compat by design.)
+- **Failure to write** — log in dream record, do NOT retry. The turn already advanced before this step; ask-{{USER_NAME}} failures don't undo that. Next cycle's dream-master will see the dream-flagged items again from the prior dream record and can re-surface. Acceptable failure mode.
+
 # Return to the parent
 
 After everything in the checklist is done and the dream record is committed, return a short message to the parent:
@@ -281,7 +346,7 @@ After everything in the checklist is done and the dream record is committed, ret
 - Top-line: nodes resolved / superseded / promoted / refuted (counts)
 - Recall summaries: applied / fixed / unfixable counts
 - Health score delta
-- Flagged-for-user count (with the parent's note: review the dream record's "Flagged" section in the morning)
+- Flagged-for-user count + ask-{{USER_NAME}}.md status (updated / skipped — surface not deployed / failed — see dream record)
 
 The parent relays this to the user. Your invocation ends.
 
