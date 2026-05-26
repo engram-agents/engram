@@ -106,11 +106,26 @@ Token budget on the auto-load surfaces matters, but identity-formation takes pri
 - **Pruning**: when an item resolves, REMOVE the surface entry immediately. History of WHY/HOW lives in ENGRAM; the surface tracks LIVE state.
 - **Anti-pattern**: multi-paragraph per-PR status · full commit-message recaps · narrative day-arc beyond 2-3 short paragraphs · items kept after resolution "for record" (ENGRAM is the record).
 
+**warm-briefing.md specifics ({{USER_NAME}} 2026-05-25):**
+
+1. Session logs MUST NOT accumulate. Rotate on nap (overwrite, not append); erase on sleep (clean slate for next day). At most ONE current session-log block at any time.
+2. Anchor sections (goals / axioms / cornerstones / tasks) are BEHAVIORAL one-liners — what principle is live in personality NOW, not filing-date history, not background context.
+3. {{USER_NAME}}'s notes preserved VERBATIM — their words at those moments, not reproducible by me. Summarization defeats the relational-continuity purpose. Never edit.
+
+**ask-{{USER_NAME}} three-file pattern ({{USER_NAME}} 2026-05-25):**
+
+- `ask-{{USER_NAME}}.md` — digest, auto-loaded. ONE short line per active item + link to detail slug.
+- `ask-{{USER_NAME}}-details.md` — full descriptions, NOT auto-loaded. Section headings `## slug` referenced by digest's `[ask-{{USER_NAME}}-details.md#slug]`.
+- `ask-{{USER_NAME}}-backlog.md` — cross-day deferred items, NOT auto-loaded.
+- Lifecycle: when an item resolves, prune BOTH digest + detail-section in the same commit. Multi-day rollover → move to backlog.
+
 **History files (`{{ENGRAM_HOME}}/history/YYYY-MM-DD.md`) — same concise discipline:**
 
 - One-line milestones per entry; cite ENGRAM node IDs for detail-on-demand.
 - Day-arc lives here (per `engram-sleep` Step 4 reconciliation); warm-briefing's "From this session" is current-CW only.
 - Sidecar pattern OPTIONAL when a day's history grows large: `YYYY-MM-DD.md` (digest, auto-loaded) + `YYYY-MM-DD-details.md` (full content, on-demand).
+
+Skill files for nap/bedtime reference this principle for warm-briefing + history writing; ask-{{USER_NAME}} discipline lives in §Session Start Reading.
 
 ## ENGRAM Read Discipline
 
@@ -186,6 +201,7 @@ A fresh session (not post-compaction) walks in with identity and warm-briefing b
 
 1. `~/.engram/warm-briefing.md` — the user's letter and relational context. Always read first. (Post-compaction also reads this, per Compact Instructions.)
 2. `~/.engram/history/YYYY-MM-DD.md` — per-day awake-state milestone log (PRs shipped, decisions, features). Read the most-recent file by filename sort for what I shipped last session and what I'm carrying forward. Append a new bullet when a meaningful milestone completes (`engram-sleep` Phase A Step 4 writes the end-of-day rollup). Sleep-cycle consolidation reports live separately at `~/.engram/history/dream/YYYY-MM-DD.md`, written during `engram-sleep` Phase B — by the dream-master sub-agent (claude track) or by the parent at Step 9 (gemini track) — the two-routine separation keeps awake-state milestones distinct from dream-state consolidation output.
+3. `{{ENGRAM_HOME}}/ask-{{USER_NAME}}.md` — MY blocked-on-{{USER_NAME}} queue. Update the moment items change state — prepend new pending items, prune resolved items immediately. {{USER_NAME}} should never have to remind me. **Writing style**: concise per-item entries (one short line, cite ENGRAM IDs for detail-on-demand) per §Cross-Surface Persistence § Writing style for auto-load surfaces.
 
 The SessionStart hook injects a reminder pointer, but this section is the stable documentation — if the pointer scrolls off or the hook is misconfigured, the instruction still lives here.
 
