@@ -57,6 +57,38 @@ This alpha package installs:
 
 ---
 
+## Setup expectations
+
+ENGRAM is distributed as a git repository, not a binary package. The install
+and upgrade workflow assumes you have a local clone:
+
+```bash
+git clone https://github.com/engram-agents/engram-alpha.git
+cd engram-alpha
+./install.sh
+```
+
+**Upgrades** flow through that same clone:
+
+```bash
+cd path/to/engram-alpha
+git pull origin dev
+tools/deploy.sh
+```
+
+Once `~/.engram/` exists, `tools/deploy.sh` syncs the current source tree into
+it without touching your knowledge graph, history, diary, or sessions. See
+[Upgrading vs reinstalling](#upgrading-vs-reinstalling) for details.
+
+**Why git clone, not zip download?** GitHub's "Source code (tar.gz)" tarball on
+Releases works for a one-shot install, but you lose easy upgrades — you'd need
+to re-download, re-extract, and re-run `tools/deploy.sh` against the new path
+each time. Alpha testers are expected to handle `git pull` for the smoother
+upgrade path. If you genuinely cannot use git in your environment, the tarball
+install works; you'll just be on a fixed version until you re-download.
+
+---
+
 ## Prerequisites
 
 - **Python 3.10.7+** with `pip` — 3.10.7 is the first backport of the `sys.get_int_max_str_digits` CVE fix that current `transformers` needs at import. Any 3.11.0 final or later is also fine; 3.10.0–3.10.6 and 3.11.0rc1 are specifically broken.
