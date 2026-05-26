@@ -328,7 +328,7 @@ def test_engram_surface_top_claims_preserves_mmr_order():
     ob_a = _add_obs(srv, "xylophone musical instrument rhythm")
     ob_b = _add_obs(srv, "xylophone xylophone unique rare percussion")
 
-    result = json.loads(srv.engram_surface(query="xylophone"))
+    result = json.loads(srv.engram_surface(payload_json=json.dumps({"query": "xylophone"})))
     assert "top_claims" in result, "engram_surface result missing top_claims"
 
     # Verify no crash, top_claims is present and not empty

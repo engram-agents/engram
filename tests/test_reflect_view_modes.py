@@ -178,7 +178,7 @@ def test_default_summary_top_k_tiers_weakly_grounded():
         _set_recall_fields(server, ob_id, f"RS for obs {i}.", [f"kw{i}a", f"kw{i}b", f"kw{i}c"])
         ids.append(ob_id)
 
-    result = json.loads(server.engram_reflect())
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({})))
     assert "error" not in result, f"unexpected error: {result}"
 
     entries = _get_entries(result, "weakly_grounded")
@@ -205,7 +205,7 @@ def test_summary_top_k_zero_all_keyword_style():
         )
         _set_recall_fields(server, ob_id, f"RS {i}.", [f"a{i}", f"b{i}", f"c{i}"])
 
-    result = json.loads(server.engram_reflect(summary_top_k=0))
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({"summary_top_k": 0})))
     assert "error" not in result, f"unexpected error: {result}"
 
     entries = _get_entries(result, "weakly_grounded")
@@ -232,7 +232,7 @@ def test_summary_top_k_large_all_summary_style():
         )
         _set_recall_fields(server, ob_id, f"Summary for obs {i}.", [f"x{i}", f"y{i}", f"z{i}"])
 
-    result = json.loads(server.engram_reflect(summary_top_k=20))
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({"summary_top_k": 20})))
     assert "error" not in result, f"unexpected error: {result}"
 
     entries = _get_entries(result, "weakly_grounded")
@@ -254,7 +254,7 @@ def test_low_volume_conjecture_uses_recall_summary():
     cj_id = _add_conjecture(server, "Original conjecture claim text.")
     _set_recall_fields(server, cj_id, "Recall summary for conjecture.", ["cj", "summary", "test"])
 
-    result = json.loads(server.engram_reflect())
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({})))
     assert "error" not in result, f"unexpected error: {result}"
 
     conjectures = _get_entries(result, "open_conjectures")
@@ -270,7 +270,7 @@ def test_low_volume_conjecture_fallback_to_claim():
     server = fresh_server()
     cj_id = _add_conjecture(server, "Conjecture with no recall summary set.")
 
-    result = json.loads(server.engram_reflect())
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({})))
     assert "error" not in result, f"unexpected error: {result}"
 
     conjectures = _get_entries(result, "open_conjectures")
@@ -287,7 +287,7 @@ def test_low_volume_goal_uses_recall_summary():
     gl_id = _add_goal(server, "Original goal claim text for recall test.")
     _set_recall_fields(server, gl_id, "Goal recall summary.", ["goal", "recall", "test"])
 
-    result = json.loads(server.engram_reflect())
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({})))
     assert "error" not in result, f"unexpected error: {result}"
 
     goals = _get_entries(result, "active_goals")
@@ -304,7 +304,7 @@ def test_low_volume_question_uses_recall_summary():
     qu_id = _ask(server, "What is the question we want to recall?")
     _set_recall_fields(server, qu_id, "Question recall summary.", ["question", "recall", "test"])
 
-    result = json.loads(server.engram_reflect())
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({})))
     assert "error" not in result, f"unexpected error: {result}"
 
     questions = _get_entries(result, "open_questions")
@@ -321,7 +321,7 @@ def test_low_volume_lesson_uses_recall_summary():
     ls_id = _add_lesson(server, "Original lesson claim for recall test.")
     _set_recall_fields(server, ls_id, "Lesson recall summary.", ["lesson", "recall", "test"])
 
-    result = json.loads(server.engram_reflect())
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({})))
     assert "error" not in result, f"unexpected error: {result}"
 
     lessons = _get_entries(result, "active_lessons")
@@ -343,7 +343,7 @@ def test_high_volume_claim_truncated_to_160_when_no_recall_summary():
     ob_id = _make_low_confidence_obs(server, long_claim, url="https://example.com/long")
     # No recall_summary set
 
-    result = json.loads(server.engram_reflect(summary_top_k=50))
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({"summary_top_k": 50})))
     assert "error" not in result, f"unexpected error: {result}"
 
     entries = _get_entries(result, "weakly_grounded")
@@ -363,7 +363,7 @@ def test_low_volume_claim_truncated_to_160_when_no_recall_summary():
     long_claim = "C" * 200
     cj_id = _add_conjecture(server, long_claim)
 
-    result = json.loads(server.engram_reflect())
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({})))
     assert "error" not in result, f"unexpected error: {result}"
 
     conjectures = _get_entries(result, "open_conjectures")
@@ -402,7 +402,7 @@ def test_missing_recall_keywords_produces_bare_id_entry():
         ids.append(ob_id)
 
     # summary_top_k=1: first entry (highest importance) is Tier 1; second is Tier 2
-    result = json.loads(server.engram_reflect(summary_top_k=1))
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({"summary_top_k": 1})))
     assert "error" not in result, f"unexpected error: {result}"
 
     entries = _get_entries(result, "weakly_grounded")
@@ -431,7 +431,7 @@ def test_untouched_categories_preserve_shape():
     when entries don't exist (not present in output but count=0 in summary).
     """
     server = fresh_server()
-    result = json.loads(server.engram_reflect())
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({})))
     assert "error" not in result, f"unexpected error: {result}"
 
     # Summary counts are always present
@@ -477,7 +477,7 @@ def test_high_importance_nodes_get_tier1():
     _set_importance(server, low_imp_id, 0.1)
 
     # summary_top_k=1: only the highest-importance node should be Tier 1
-    result = json.loads(server.engram_reflect(summary_top_k=1))
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({"summary_top_k": 1})))
     assert "error" not in result, f"unexpected error: {result}"
 
     entries = _get_entries(result, "weakly_grounded")
@@ -517,7 +517,7 @@ def test_uncited_observations_tiered():
         obs.append(ob_id)
 
     # summary_top_k=1: first is Tier 1, second is Tier 2
-    result = json.loads(server.engram_reflect(summary_top_k=1))
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({"summary_top_k": 1})))
     assert "error" not in result, f"unexpected error: {result}"
 
     entries = _get_entries(result, "uncited_observations")
@@ -547,7 +547,7 @@ def test_thin_support_derivations_tiered():
         dvs.append(dv_id)
 
     # summary_top_k=1: first is Tier 1, second is Tier 2
-    result = json.loads(server.engram_reflect(summary_top_k=1))
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({"summary_top_k": 1})))
     assert "error" not in result, f"unexpected error: {result}"
 
     entries = _get_entries(result, "thin_support_derivations")
@@ -586,7 +586,7 @@ def test_whitespace_only_recall_summary_falls_back_to_claim():
     finally:
         conn.close()
 
-    result = json.loads(server.engram_reflect())
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({})))
     assert "error" not in result, f"unexpected error: {result}"
 
     conjectures = _get_entries(result, "open_conjectures")
@@ -626,7 +626,7 @@ def test_schema_has_summary_top_k():
 def test_calibration_snapshot_key_present():
     """engram_reflect always returns a calibration_snapshot key at top level."""
     server = fresh_server()
-    result = json.loads(server.engram_reflect())
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({})))
     assert "error" not in result, f"unexpected error: {result}"
     assert "calibration_snapshot" in result, (
         f"calibration_snapshot key missing from reflect output; keys: {list(result.keys())}"
@@ -656,7 +656,7 @@ def test_calibration_snapshot_subkeys_when_data_exists():
     })))
     assert r.get("status") == "created", f"observation creation failed: {r}"
 
-    result = json.loads(server.engram_reflect())
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({})))
     assert "error" not in result, f"unexpected error: {result}"
 
     snap = result["calibration_snapshot"]
@@ -713,7 +713,7 @@ def test_calibration_snapshot_graceful_on_stats_error():
 
     server.engram_stats = _broken_stats
     try:
-        result = json.loads(server.engram_reflect())
+        result = json.loads(server.engram_reflect(payload_json=json.dumps({})))
         # The overall reflect call must succeed (no top-level "error" key)
         assert "error" not in result, (
             f"reflect must not fail when engram_stats raises; got: {result}"

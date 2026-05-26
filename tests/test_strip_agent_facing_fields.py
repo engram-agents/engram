@@ -235,7 +235,7 @@ class TestInspectRecallStripping:
     def test_parsed_metadata_absent_from_recall_view(self):
         server = fresh_server()
         obs_id = _add_obs(server, "Test claim for recall inspect.")
-        r = json.loads(server.engram_inspect(node_id=obs_id, view="recall"))
+        r = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": obs_id, "view": "recall"})))
         assert "error" not in r, r
         node = r["node"]
         assert "parsed_metadata" not in node, (
@@ -245,7 +245,7 @@ class TestInspectRecallStripping:
     def test_confidence_history_absent_from_recall_view(self):
         server = fresh_server()
         obs_id = _add_obs(server, "Another test claim for recall.")
-        r = json.loads(server.engram_inspect(node_id=obs_id, view="recall"))
+        r = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": obs_id, "view": "recall"})))
         node = r["node"]
         assert "confidence_history" not in node, (
             "confidence_history should be absent from recall view node"
@@ -256,7 +256,7 @@ class TestInspectRecallStripping:
         but confirmed end-to-end at the MCP return boundary too)."""
         server = fresh_server()
         obs_id = _add_obs(server, "Embedding-free recall view test.")
-        r = json.loads(server.engram_inspect(node_id=obs_id, view="recall"))
+        r = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": obs_id, "view": "recall"})))
         node = r["node"]
         assert "embedding" not in node
 
@@ -269,7 +269,7 @@ class TestInspectDeepStripping:
     def test_parsed_metadata_absent_from_deep_view(self):
         server = fresh_server()
         obs_id = _add_obs(server, "Deep view test claim.")
-        r = json.loads(server.engram_inspect(node_id=obs_id, view="deep"))
+        r = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": obs_id, "view": "deep"})))
         assert "error" not in r, r
         node = r["node"]
         assert "parsed_metadata" not in node, (
@@ -280,7 +280,7 @@ class TestInspectDeepStripping:
         """confidence_history should be stripped from deep view (previously present)."""
         server = fresh_server()
         obs_id = _add_obs(server, "Confidence history deep view test.")
-        r = json.loads(server.engram_inspect(node_id=obs_id, view="deep"))
+        r = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": obs_id, "view": "deep"})))
         node = r["node"]
         assert "confidence_history" not in node, (
             "confidence_history should be stripped from deep view node"
@@ -289,7 +289,7 @@ class TestInspectDeepStripping:
     def test_embedding_absent_from_deep_view(self):
         server = fresh_server()
         obs_id = _add_obs(server, "Embedding deep view test.")
-        r = json.loads(server.engram_inspect(node_id=obs_id, view="deep"))
+        r = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": obs_id, "view": "deep"})))
         node = r["node"]
         assert "embedding" not in node
 
@@ -596,7 +596,7 @@ class TestDbIntegrityAfterStripping:
         server = fresh_server()
         obs_id = _add_obs(server, "DB immutability after inspect strip test.")
         # Call inspect to trigger strip at MCP boundary
-        r = json.loads(server.engram_inspect(node_id=obs_id, view="deep"))
+        r = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": obs_id, "view": "deep"})))
         assert "confidence_history" not in r["node"]
         # Verify DB is untouched
         conn = sqlite3.connect(_db_path(server))

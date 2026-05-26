@@ -78,7 +78,7 @@ def _add_active_contradiction(server, claim_a: str, claim_b: str) -> tuple[str, 
 
 def test_unknown_pattern_name_errors():
     server = fresh_server()
-    r = json.loads(server.engram_query_pattern("nonexistent_pattern"))
+    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({"pattern_name": "nonexistent_pattern"})))
     assert "error" in r
     assert "nonexistent_pattern" in r["error"]
     assert "contradiction_obsolescence_ready" in r["error"]
@@ -86,9 +86,9 @@ def test_unknown_pattern_name_errors():
 
 def test_unknown_preset_errors():
     server = fresh_server()
-    r = json.loads(server.engram_query_pattern(
-        "contradiction_obsolescence_ready", preset="ultra_precision"
-    ))
+    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "contradiction_obsolescence_ready", "preset": "ultra_precision",
+    })))
     assert "error" in r
     assert "ultra_precision" in r["error"]
 
@@ -105,9 +105,9 @@ def test_preset_bundle_resolution():
     assert high_precision["cosine_threshold"] == 0.65
 
     # MCP tool: verify the preset is echoed in the response
-    r = json.loads(server.engram_query_pattern(
-        "contradiction_obsolescence_ready", preset="high_precision"
-    ))
+    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "contradiction_obsolescence_ready", "preset": "high_precision",
+    })))
     assert r["preset"] == "high_precision"
     # New shape: results + total_matches (no params_used on the top level)
     assert "results" in r
@@ -126,12 +126,12 @@ def test_preset_overrides_apply():
     assert params["min_confidence"] == 0.50
 
     # MCP smoke-test: overrides accepted without error
-    r = json.loads(server.engram_query_pattern(
-        "contradiction_obsolescence_ready",
-        preset="balanced",
-        top_k_override=42,
-        cosine_threshold_override=0.10,
-    ))
+    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "contradiction_obsolescence_ready",
+        "preset": "balanced",
+        "top_k_override": 42,
+        "cosine_threshold_override": 0.10,
+    })))
     assert "error" not in r
     assert "results" in r
 
@@ -163,9 +163,9 @@ def test_contradiction_one_side_obsolete_scores_high():
     assert "engram_resolve" in cand["suggested_action"]
 
     # MCP-facing: tiered shape includes ct_id and uses 'results' key
-    r = json.loads(server.engram_query_pattern(
-        "contradiction_obsolescence_ready", preset="balanced"
-    ))
+    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "contradiction_obsolescence_ready", "preset": "balanced",
+    })))
     assert r["total_matches"] == 1
     assert r["results"][0]["id"] == ct_id
     assert "summary" in r["results"][0]  # Tier 1 (default summary_top_k=3)
@@ -199,14 +199,14 @@ def test_contradiction_both_sides_obsolete_scores_medium():
     assert len(candidates_bal) == 0
 
     # MCP: high_recall surfaces it; balanced does not
-    r_hr = json.loads(server.engram_query_pattern(
-        "contradiction_obsolescence_ready", preset="high_recall"
-    ))
+    r_hr = json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "contradiction_obsolescence_ready", "preset": "high_recall",
+    })))
     assert r_hr["total_matches"] == 1
 
-    r_bal = json.loads(server.engram_query_pattern(
-        "contradiction_obsolescence_ready", preset="balanced"
-    ))
+    r_bal = json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "contradiction_obsolescence_ready", "preset": "balanced",
+    })))
     assert r_bal["total_matches"] == 0
 
 
@@ -215,9 +215,9 @@ def test_contradiction_neither_obsolete_filtered_at_balanced_threshold():
     _add_active_contradiction(server, "Z is alpha", "Z is beta")
     # Both sides current; score = 0.0; balanced threshold = 0.55 → filtered out
 
-    r = json.loads(server.engram_query_pattern(
-        "contradiction_obsolescence_ready", preset="balanced"
-    ))
+    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "contradiction_obsolescence_ready", "preset": "balanced",
+    })))
     assert r["total_matches"] == 0
 
 
@@ -226,11 +226,11 @@ def test_contradiction_neither_obsolete_visible_at_high_recall():
     # high_recall threshold is 0.45, score=0.0 still filtered. Confirm explicit override admits it.
     _add_active_contradiction(server, "W is square", "W is round")
 
-    r = json.loads(server.engram_query_pattern(
-        "contradiction_obsolescence_ready",
-        preset="high_recall",
-        cosine_threshold_override=0.0,
-    ))
+    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "contradiction_obsolescence_ready",
+        "preset": "high_recall",
+        "cosine_threshold_override": 0.0,
+    })))
     assert r["total_matches"] == 1
     # Score no longer visible in tiered output — verify via internal function
     conn = server._get_db()
@@ -277,7 +277,9 @@ def test_stale_load_bearing_surfaces_high_importance_low_recall():
     assert cand["recall_count"] == 0
 
     # MCP: obs_id appears in results
-    r = json.loads(server.engram_query_pattern("stale_load_bearing", preset="balanced"))
+    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "stale_load_bearing", "preset": "balanced",
+    })))
     result_ids = [e["id"] for e in r["results"]]
     assert obs_id in result_ids
 
@@ -342,7 +344,9 @@ def test_tainted_still_valid_surfaces_tainted_nodes():
     assert cand["confidence"] > 0
 
     # MCP: deriv_id appears in tiered results
-    r = json.loads(server.engram_query_pattern("tainted_still_valid", preset="balanced"))
+    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "tainted_still_valid", "preset": "balanced",
+    })))
     result_ids = [e["id"] for e in r["results"]]
     assert deriv_id in result_ids
 
@@ -484,8 +488,9 @@ def test_cornerstone_candidate_excludes_axiom_goal_definition_includes_ob_dv():
     assert dv_id in result_ids, f"derivation {dv_id} must be included in cornerstone_candidate"
 
     # MCP-facing: verify axiom/goal/def absent, observation and derivation present
-    r = json.loads(server.engram_query_pattern("cornerstone_candidate", preset="balanced",
-                                               top_k_override=100))
+    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "cornerstone_candidate", "preset": "balanced", "top_k_override": 100,
+    })))
     mcp_ids = [e["id"] for e in r["results"]]
     assert axiom_id not in mcp_ids
     assert goal_id not in mcp_ids
@@ -501,9 +506,9 @@ def test_cornerstone_candidate_excludes_axiom_goal_definition_includes_ob_dv():
 
 def test_open_question_answerable_dispatches_cleanly():
     server = fresh_server()
-    r = json.loads(server.engram_query_pattern(
-        "open_question_answerable", preset="balanced"
-    ))
+    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "open_question_answerable", "preset": "balanced",
+    })))
     assert "results" in r
     assert "total_matches" in r
     assert isinstance(r["results"], list)
@@ -511,9 +516,9 @@ def test_open_question_answerable_dispatches_cleanly():
 
 def test_recent_resolution_echo_dispatches_cleanly():
     server = fresh_server()
-    r = json.loads(server.engram_query_pattern(
-        "recent_resolution_echo", preset="balanced"
-    ))
+    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "recent_resolution_echo", "preset": "balanced",
+    })))
     assert "results" in r
     assert "total_matches" in r
     assert isinstance(r["results"], list)
@@ -526,8 +531,8 @@ def test_telemetry_log_writes_entry_per_call():
     if os.path.exists(log_path):
         os.remove(log_path)
 
-    json.loads(server.engram_query_pattern("contradiction_obsolescence_ready"))
-    json.loads(server.engram_query_pattern("contradiction_obsolescence_ready", preset="high_precision"))
+    json.loads(server.engram_query_pattern(payload_json=json.dumps({"pattern_name": "contradiction_obsolescence_ready"})))
+    json.loads(server.engram_query_pattern(payload_json=json.dumps({"pattern_name": "contradiction_obsolescence_ready", "preset": "high_precision"})))
 
     assert os.path.exists(log_path)
     with open(log_path) as f:

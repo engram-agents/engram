@@ -249,7 +249,7 @@ def test_engram_surface_does_not_bump_utility():
     (ax_id,) = _seed_axioms(server, n=1)
     before = _get_utility(server, ax_id)
 
-    server.engram_surface(query="Axiom 0 for utility test")
+    server.engram_surface(payload_json=json.dumps({"query": "Axiom 0 for utility test"}))
 
     after = _get_utility(server, ax_id)
     assert after == before, (
@@ -284,7 +284,7 @@ def test_engram_inspect_bumps_target():
     (ax_id,) = _seed_axioms(server, n=1)
     before = _get_utility(server, ax_id)
 
-    result = json.loads(server.engram_inspect(node_id=ax_id))
+    result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": ax_id})))
     assert "error" not in result, f"engram_inspect failed: {result}"
 
     after = _get_utility(server, ax_id)
@@ -315,7 +315,7 @@ def test_engram_get_subgraph_bumps_seed_only():
     # Note: derive already bumped both ax_seed and ax_neighbor (both are supporting_ids).
     # The test checks the *incremental* change from subgraph, not absolute values.
 
-    result = json.loads(server.engram_get_subgraph(node_id=ax_seed))
+    result = json.loads(server.engram_get_subgraph(payload_json=json.dumps({"node_id": ax_seed})))
     assert "error" not in result, f"engram_get_subgraph failed: {result}"
     # Verify ax_neighbor appears in topology (i.e., it IS a neighbor)
     assert ax_neighbor in result["topology"] or dv_id in result["topology"], (

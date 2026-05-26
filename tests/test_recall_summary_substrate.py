@@ -215,7 +215,7 @@ def test_engram_surface_top_claims_include_recall_fields():
     keyword = "pulsar"
     _add_obs(srv, f"{keyword} rotating neutron star radio emission recall surface test")
 
-    result = json.loads(srv.engram_surface(query=keyword, top_k=10, semantic=False))
+    result = json.loads(srv.engram_surface(payload_json=json.dumps({"query": keyword, "top_k": 10, "semantic": False})))
     top_claims = result.get("top_claims", [])
     assert top_claims, "Expected at least one top_claim"
 
@@ -234,7 +234,7 @@ def test_engram_surface_special_nodes_include_recall_fields():
     keyword = "blazar"
     _add_axiom(srv, f"{keyword} jet aligned relativistic emission recall surface test")
 
-    result = json.loads(srv.engram_surface(query=keyword, top_k=10, semantic=False))
+    result = json.loads(srv.engram_surface(payload_json=json.dumps({"query": keyword, "top_k": 10, "semantic": False})))
     special_nodes = result.get("special_nodes", [])
     assert special_nodes, "Expected at least one special_node (axiom)"
 
@@ -272,7 +272,7 @@ def test_engram_surface_recall_keywords_is_list_when_populated():
     finally:
         conn.close()
 
-    result = json.loads(srv.engram_surface(query=keyword, top_k=10, semantic=False))
+    result = json.loads(srv.engram_surface(payload_json=json.dumps({"query": keyword, "top_k": 10, "semantic": False})))
     top_claims = result.get("top_claims", [])
     match = next((c for c in top_claims if c["id"] == obs_id), None)
     assert match is not None, f"Node {obs_id} not found in top_claims"
@@ -298,7 +298,7 @@ def test_engram_surface_recall_keywords_none_when_null():
     keyword = "tachyon"
     _add_obs(srv, f"{keyword} hypothetical faster than light particle recall null test")
 
-    result = json.loads(srv.engram_surface(query=keyword, top_k=10, semantic=False))
+    result = json.loads(srv.engram_surface(payload_json=json.dumps({"query": keyword, "top_k": 10, "semantic": False})))
     top_claims = result.get("top_claims", [])
     assert top_claims, "Expected at least one top_claim"
 

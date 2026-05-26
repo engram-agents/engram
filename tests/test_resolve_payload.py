@@ -99,7 +99,7 @@ def test_resolve_flips_target_status_to_resolved():
         "target_id": q_id,
         "resolving_node_id": dv_id,
     })))
-    q_inspect = json.loads(server.engram_inspect(node_id=q_id, dream_mode=True))
+    q_inspect = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": q_id, "dream_mode": True})))
     assert q_inspect["node"]["status"] == "resolved", q_inspect["node"]
 
 
@@ -288,7 +288,7 @@ def test_weaker_later_resolver_cannot_downgrade_status():
     )
 
     # And target status field stays resolved
-    q_inspect = json.loads(server.engram_inspect(node_id=q_id, dream_mode=True))
+    q_inspect = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": q_id, "dream_mode": True})))
     assert q_inspect["node"]["status"] == "resolved", q_inspect["node"]
 
 

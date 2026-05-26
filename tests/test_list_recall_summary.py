@@ -95,7 +95,7 @@ def test_triage_claim_sources_from_recall_summary_when_populated():
     summary = "Curated dense summary for triage recognition purposes."
     _set_recall_fields(srv, ob_id, summary, ["curated", "dense", "summary"])
 
-    result = json.loads(srv.engram_list(node_type="observation_factual"))
+    result = json.loads(srv.engram_list(payload_json=json.dumps({"node_type": "observation_factual"})))
     assert result["status"] == "ok"
 
     match = next((n for n in result["nodes"] if n["id"] == ob_id), None)
@@ -132,7 +132,7 @@ def test_triage_claim_falls_back_to_truncated_claim_when_no_summary():
     ob_id = _add_observation(srv, long_claim)
     # No recall_summary written — this is the legacy/unfilled node path.
 
-    result = json.loads(srv.engram_list(node_type="observation_factual"))
+    result = json.loads(srv.engram_list(payload_json=json.dumps({"node_type": "observation_factual"})))
     assert result["status"] == "ok"
 
     match = next((n for n in result["nodes"] if n["id"] == ob_id), None)
@@ -156,7 +156,7 @@ def test_triage_claim_short_claim_no_truncation_when_no_summary():
 
     ob_id = _add_observation(srv, short_claim)
 
-    result = json.loads(srv.engram_list(node_type="observation_factual"))
+    result = json.loads(srv.engram_list(payload_json=json.dumps({"node_type": "observation_factual"})))
     assert result["status"] == "ok"
 
     match = next((n for n in result["nodes"] if n["id"] == ob_id), None)
@@ -179,10 +179,10 @@ def test_fields_json_recall_summary_projection():
     summary = "Projection test summary."
     _set_recall_fields(srv, ob_id, summary, ["proj", "test", "field"])
 
-    result = json.loads(srv.engram_list(
-        filters_json=json.dumps({"field": "type", "op": "eq", "value": "observation_factual"}),
-        fields_json=json.dumps(["id", "recall_summary"]),
-    ))
+    result = json.loads(srv.engram_list(payload_json=json.dumps({
+        "filters_json": json.dumps({"field": "type", "op": "eq", "value": "observation_factual"}),
+        "fields_json": json.dumps(["id", "recall_summary"]),
+    })))
     assert result["status"] == "ok", f"Unexpected error: {result.get('error')}"
     assert result["nodes"], "Expected at least one node in projection result"
 
@@ -211,10 +211,10 @@ def test_fields_json_recall_keywords_projection():
     keywords = ["kw-alpha", "kw-beta", "kw-gamma"]
     _set_recall_fields(srv, ob_id, "Some summary.", keywords)
 
-    result = json.loads(srv.engram_list(
-        filters_json=json.dumps({"field": "type", "op": "eq", "value": "observation_factual"}),
-        fields_json=json.dumps(["id", "recall_keywords"]),
-    ))
+    result = json.loads(srv.engram_list(payload_json=json.dumps({
+        "filters_json": json.dumps({"field": "type", "op": "eq", "value": "observation_factual"}),
+        "fields_json": json.dumps(["id", "recall_keywords"]),
+    })))
     assert result["status"] == "ok", f"Unexpected error: {result.get('error')}"
     assert result["nodes"], "Expected at least one node in projection result"
 
@@ -251,13 +251,13 @@ def test_filters_json_recall_summary_contains():
     _add_observation(srv, "unrelated claim without the sentinel phrase",
                      url="https://example.com/other")
 
-    result = json.loads(srv.engram_list(
-        filters_json=json.dumps({
+    result = json.loads(srv.engram_list(payload_json=json.dumps({
+        "filters_json": json.dumps({
             "field": "recall_summary",
             "op": "contains",
             "value": "xyzzy42",
-        })
-    ))
+        }),
+    })))
     assert result["status"] == "ok", (
         f"Unexpected error from recall_summary filter: {result.get('error')}"
     )
@@ -285,12 +285,12 @@ def test_filters_json_recall_keywords_is_not_null():
     _set_recall_fields(srv, ob_with_kw, "Summary for kw node.", ["alpha", "beta", "gamma"])
     # ob_without_kw intentionally left unfilled.
 
-    result = json.loads(srv.engram_list(
-        filters_json=json.dumps({
+    result = json.loads(srv.engram_list(payload_json=json.dumps({
+        "filters_json": json.dumps({
             "field": "recall_keywords",
             "op": "is_not_null",
-        })
-    ))
+        }),
+    })))
     assert result["status"] == "ok", (
         f"Unexpected error from recall_keywords filter: {result.get('error')}"
     )
@@ -334,7 +334,7 @@ def test_triage_oversize_recall_summary_truncated_with_ellipsis():
     finally:
         conn.close()
 
-    result = json.loads(srv.engram_list(node_type="observation_factual"))
+    result = json.loads(srv.engram_list(payload_json=json.dumps({"node_type": "observation_factual"})))
     assert result["status"] == "ok"
 
     match = next((n for n in result["nodes"] if n["id"] == ob_id), None)

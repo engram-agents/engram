@@ -5959,6 +5959,11 @@ def _build_tiered_results(
 #
 # semantic=False is the fast keyword-only path — useful in latency-sensitive
 # hooks. Default semantic=True for full recall quality.
+_SURFACE_FIELDS = frozenset({
+    "query", "top_k", "semantic", "embed_query",
+})
+
+
 @mcp.tool(
     name="engram_surface",
     annotations={
@@ -5969,12 +5974,7 @@ def _build_tiered_results(
         "openWorldHint": False,
     },
 )
-def engram_surface(
-    query: str,
-    top_k: int = 10,
-    semantic: bool = True,
-    embed_query: str | None = None,
-) -> str:
+def engram_surface(payload_json: str) -> str:
     """Shallow recall: search the KG and return a compact summary nudge.
 
     "This sounds familiar" layer — quick scan, no memory refresh. Use this to
@@ -5982,22 +5982,52 @@ def engram_surface(
     engram_get_subgraph (full evidence chain).
 
     Args:
-        query: Natural language search query (used for FTS keyword matching,
-            and as the default semantic query when embed_query is None).
-        top_k: Maximum nodes to scan (default 10).
-        semantic: Whether to include semantic (embedding) search. Set False
-            for fast keyword-only recall (useful in hooks where latency
-            matters). Default True.
-        embed_query: Optional separate semantic-search string. When provided,
-            semantic search uses embed_query while FTS still uses query.
-            Designed for the auto-surface hook to prepend prev-response-tail
-            for short prompts without polluting FTS keyword matching.
-            See alpha #177 area 1.
+        payload_json: JSON object (as a string) with these fields:
+            query (str, required): Natural language search query (used for FTS
+                keyword matching, and as the default semantic query when
+                embed_query is None).
+            top_k (int, optional): Maximum nodes to scan (default 10).
+            semantic (bool, optional): Whether to include semantic (embedding)
+                search. Set False for fast keyword-only recall (useful in hooks
+                where latency matters). Default True.
+            embed_query (str, optional): Optional separate semantic-search
+                string. When provided, semantic search uses embed_query while
+                FTS still uses query. Designed for the auto-surface hook to
+                prepend prev-response-tail for short prompts without polluting
+                FTS keyword matching. See alpha #177 area 1.
 
     Returns:
         JSON with compact summary: type counts, special nodes, top claims,
         age range, stale/tainted counts, and matched node IDs for follow-up.
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _surface_impl for full semantics — kept callable with named kwargs for
+    in-server callers.
     """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _SURFACE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_SURFACE_FIELDS)}"
+        })
+    if "query" not in params:
+        return json.dumps({"error": "payload_json must include required field 'query'"})
+    return _surface_impl(**params)
+
+
+def _surface_impl(
+    query: str,
+    top_k: int = 10,
+    semantic: bool = True,
+    embed_query: str | None = None,
+) -> str:
+    """Impl for engram_surface — callable with named kwargs for in-server callers."""
     conn = _get_db()
     try:
         search = _search_nodes(conn, query, top_k=top_k, use_semantic=semantic,
@@ -6255,16 +6285,6 @@ def engram_surface(
         conn.close()
 
 
-@mcp.tool(
-    name="engram_inspect",
-    annotations={
-        "title": "Inspect Single Node",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
 # DESIGN INTENT — engram_inspect
 # ------------------------------
 # The "let me think about that" layer: brings ONE node into full focus with its
@@ -6293,11 +6313,22 @@ def engram_surface(
 # Pairs with engram_surface (notice-this-is-relevant) and engram_get_subgraph
 # (trace multi-hop chains). engram_inspect refreshes only the TARGET node's
 # recall, not neighbors — the chain itself is engram_get_subgraph's job.
-def engram_inspect(
-    node_id: str,
-    view: str = "recall",
-    dream_mode: bool = False,
-) -> str:
+_INSPECT_FIELDS = frozenset({
+    "node_id", "view", "dream_mode",
+})
+
+
+@mcp.tool(
+    name="engram_inspect",
+    annotations={
+        "title": "Inspect Single Node",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_inspect(payload_json: str) -> str:
     """Read the full content of a given node along with its immediate connections.
 
     Three view modes:
@@ -6316,14 +6347,43 @@ def engram_inspect(
       lateral    — contradicts, tensions, exemplifies, retracts
 
     Args:
-        node_id: The node ID to inspect (e.g. 'dv_0010').
-        view: One of "recall" (default), "deep", "edges".
-        dream_mode: If True, skip memory refresh and importance-score boost.
-            Use during dream/audit cycles. Default False.
+        payload_json: JSON object (as a string) with these fields:
+            node_id (str, required): The node ID to inspect (e.g. 'dv_0010').
+            view (str, optional): One of "recall" (default), "deep", "edges".
+            dream_mode (bool, optional): If True, skip memory refresh and
+                importance-score boost. Use during dream/audit cycles.
+                Default False.
 
     Returns:
         JSON shaped by the chosen view mode (see above for per-mode shape).
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _inspect_impl for full semantics — kept callable with named kwargs for
+    in-server callers.
     """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _INSPECT_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_INSPECT_FIELDS)}"
+        })
+    if "node_id" not in params:
+        return json.dumps({"error": "payload_json must include required field 'node_id'"})
+    return _inspect_impl(**params)
+
+
+def _inspect_impl(
+    node_id: str,
+    view: str = "recall",
+    dream_mode: bool = False,
+) -> str:
+    """Impl for engram_inspect — callable with named kwargs for in-server callers."""
     _VALID_VIEWS = {"recall", "deep", "edges"}
     if view not in _VALID_VIEWS:
         return json.dumps({
@@ -6620,6 +6680,11 @@ def _query_impl(
 # Topology dict is keyed by source node ID; each value is a list of
 # {to, relation, direction} entries. Only edges where BOTH endpoints are in
 # the subgraph are included — boundary edges to unseen nodes are dropped.
+_SUBGRAPH_FIELDS = frozenset({
+    "node_id", "depth", "direction", "view", "dream_mode",
+})
+
+
 @mcp.tool(
     name="engram_get_subgraph",
     annotations={
@@ -6630,13 +6695,7 @@ def _query_impl(
         "openWorldHint": False,
     },
 )
-def engram_get_subgraph(
-    node_id: str,
-    depth: int = 2,
-    direction: str = "both",
-    view: str = "recall",
-    dream_mode: bool = False,
-) -> str:
+def engram_get_subgraph(payload_json: str) -> str:
     """Browse a node's connection topology within N hops.
 
     BROWSING tool (not content tool). The caller is assumed to already know the
@@ -6654,18 +6713,51 @@ def engram_get_subgraph(
     the subgraph are included. view='deep' is rejected — use engram_inspect instead.
 
     Args:
-        node_id: Root node to explore (e.g. 'dv_0686').
-        depth: How many hops to traverse from the root (default 2).
-        direction: 'up' (toward evidence/sources), 'down' (toward derivations
-            that cite this), or 'both' (default).
-        view: 'recall' (default) or 'edges'. 'deep' is rejected.
-        dream_mode: If True, skip recall_refresh on neighbour nodes. Root node
-            always receives a utility bump regardless. Default False.
+        payload_json: JSON object (as a string) with these fields:
+            node_id (str, required): Root node to explore (e.g. 'dv_0686').
+            depth (int, optional): How many hops to traverse from the root
+                (default 2).
+            direction (str, optional): 'up' (toward evidence/sources), 'down'
+                (toward derivations that cite this), or 'both' (default).
+            view (str, optional): 'recall' (default) or 'edges'. 'deep' is
+                rejected.
+            dream_mode (bool, optional): If True, skip recall_refresh on
+                neighbour nodes. Root node always receives a utility bump
+                regardless. Default False.
 
     Returns:
         JSON with topology (adjacency map keyed by node ID) and, for
         view='recall', a content dict with per-node summaries.
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _subgraph_impl for full semantics — kept callable with named kwargs for
+    in-server callers.
     """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _SUBGRAPH_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_SUBGRAPH_FIELDS)}"
+        })
+    if "node_id" not in params:
+        return json.dumps({"error": "payload_json must include required field 'node_id'"})
+    return _subgraph_impl(**params)
+
+
+def _subgraph_impl(
+    node_id: str,
+    depth: int = 2,
+    direction: str = "both",
+    view: str = "recall",
+    dream_mode: bool = False,
+) -> str:
+    """Impl for engram_get_subgraph — callable with named kwargs for in-server callers."""
     if view not in ("recall", "edges"):
         if view == "deep":
             return json.dumps({
@@ -8315,6 +8407,11 @@ def engram_diagnose() -> str:
 #
 # Limit cap (max 200): keeps response bounded; for full-history dives, page
 # via since= cutoffs.
+_HISTORY_FIELDS = frozenset({
+    "mode", "node_id", "action", "since", "limit",
+})
+
+
 @mcp.tool(
     name="engram_history",
     annotations={
@@ -8325,13 +8422,7 @@ def engram_diagnose() -> str:
         "openWorldHint": False,
     },
 )
-def engram_history(
-    mode: str = "edits",
-    node_id: str = "",
-    action: str = "",
-    since: str = "",
-    limit: int = 50,
-) -> str:
+def engram_history(payload_json: str) -> str:
     """Browse the edit history and diagnostic snapshots.
 
     Side-effect-free. Two modes:
@@ -8342,16 +8433,48 @@ def engram_history(
       the last N snapshots with health scores for trend analysis.
 
     Args:
-        mode: "edits" or "diagnostics" (default "edits").
-        node_id: Filter edits to a specific node (edits mode only).
-        action: Filter by action type: created, superseded, retracted,
-            resolved, tainted, stale_flagged, reopened (edits mode only).
-        since: ISO timestamp — return only entries after this time.
-        limit: Max entries to return (default 50, max 200).
+        payload_json: JSON object (as a string) with these fields:
+            mode (str, optional): "edits" or "diagnostics" (default "edits").
+            node_id (str, optional): Filter edits to a specific node
+                (edits mode only).
+            action (str, optional): Filter by action type: created,
+                superseded, retracted, resolved, tainted, stale_flagged,
+                reopened (edits mode only).
+            since (str, optional): ISO timestamp — return only entries after
+                this time.
+            limit (int, optional): Max entries to return (default 50,
+                max 200).
 
     Returns:
         JSON with the requested history entries.
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _history_impl for full semantics — kept callable with named kwargs for
+    in-server callers.
     """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _HISTORY_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_HISTORY_FIELDS)}"
+        })
+    return _history_impl(**params)
+
+
+def _history_impl(
+    mode: str = "edits",
+    node_id: str = "",
+    action: str = "",
+    since: str = "",
+    limit: int = 50,
+) -> str:
+    """Impl for engram_history — callable with named kwargs for in-server callers."""
     limit = min(max(limit, 1), 200)
     conn = _get_db()
     try:
@@ -15021,6 +15144,11 @@ def _reflect_keywords(row) -> list | None:
 # calibration_snapshot field (added later): corpus + this_turn confidence
 # distributions. Lets the dream master see filing-pattern shape alongside
 # topic-selection candidates — drives calibration-aware dream agenda.
+_REFLECT_FIELDS = frozenset({
+    "summary_top_k",
+})
+
+
 @mcp.tool(
     name="engram_reflect",
     annotations={
@@ -15031,7 +15159,7 @@ def _reflect_keywords(row) -> list | None:
         "openWorldHint": False,
     },
 )
-def engram_reflect(summary_top_k: int = 5) -> str:
+def engram_reflect(payload_json: str = "{}") -> str:
     """[Sleep cycle — pre-dream briefing.] Structured self-audit of the
     knowledge graph; opens the dream cycle for the engram-sleep skill.
 
@@ -15046,18 +15174,40 @@ def engram_reflect(summary_top_k: int = 5) -> str:
     Use awake? No — use engram_diagnose. This is sleep-cycle scoped.
 
     Args:
-        summary_top_k: How many top-importance entries in each high-volume
-            category receive summary-style rendering (claim from recall_summary).
-            The remainder get keyword-style. Default 5. Clamped to >= 0.
-            0 = all high-volume entries are keyword-style.
-            If >= category size, all are summary-style.
+        payload_json: JSON object (as a string) with these fields:
+            summary_top_k (int, optional): How many top-importance entries in
+                each high-volume category receive summary-style rendering
+                (claim from recall_summary). The remainder get keyword-style.
+                Default 5. Clamped to >= 0. 0 = all high-volume entries are
+                keyword-style. If >= category size, all are summary-style.
 
     Returns:
         JSON report with categorized issues and recommended actions.
         - calibration_snapshot (new): Two-key dict with `corpus` (mode=all) and `this_turn`
           (mode=1-turn) confidence-distribution data from engram_stats. Lets dream-master
           see filing-pattern shape alongside topic-selection candidates.
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _reflect_impl for full semantics — kept callable with named kwargs for
+    in-server callers.
     """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _REFLECT_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_REFLECT_FIELDS)}"
+        })
+    return _reflect_impl(**params)
+
+
+def _reflect_impl(summary_top_k: int = 5) -> str:
+    """Impl for engram_reflect — callable with named kwargs for in-server callers."""
     summary_top_k = max(0, int(summary_top_k))
     conn = _get_db()
     try:
@@ -15638,6 +15788,12 @@ def engram_reflect(summary_top_k: int = 5) -> str:
 #
 # Max-depth-8 nesting on filter trees: practical safety, prevents arbitrary-
 # depth queries from bloating the SQL. Top-level bare list = implicit AND.
+_LIST_FIELDS = frozenset({
+    "node_type", "status", "sort_by", "limit", "filters_json",
+    "fields_json", "unlimited", "include_superseded",
+})
+
+
 @mcp.tool(
     name="engram_list",
     annotations={
@@ -15648,16 +15804,7 @@ def engram_reflect(summary_top_k: int = 5) -> str:
         "openWorldHint": False,
     },
 )
-def engram_list(
-    node_type: str = "",
-    status: str = "",
-    sort_by: str = "id",
-    limit: int = 100,
-    filters_json: str = "",
-    fields_json: str = "",
-    unlimited: bool = False,
-    include_superseded: bool = False,
-) -> str:
+def engram_list(payload_json: str = "{}") -> str:
     """List nodes — single-field shorthand OR full structured filter.
 
     Two modes, mutually exclusive:
@@ -15714,40 +15861,64 @@ def engram_list(
         fields_json = '["id", "claim", "evidence_id"]'
 
     Args:
-        node_type: Single-field filter by node type. Empty = all types.
-            Conflicts with a 'type' field in filters_json (errors loudly).
-        status: Single-field filter by status. Empty = all statuses.
-            Conflicts with a 'status' field in filters_json (errors loudly).
-        sort_by: Sort order — 'id' (default), 'created' (newest first),
-            'importance' (highest first), 'recalls' (most recalled first).
-        limit: Cap on rows returned. Default 100. Set to 0 for a metadata-
-            only response (total_matched without rows). Ignored if
-            unlimited=True. Hard ceiling 500 in single-field mode (legacy);
-            no ceiling in structured-filter mode (rely on filter narrowing).
-        filters_json: JSON-encoded condition tree. A dict (Compound or
-            Atomic) or list (implicit AND shorthand at top level). Empty
-            string = use single-field mode.
-        fields_json: JSON-encoded list of column names to project.
-            Empty = return the default compact triage shape.
-        unlimited: If True, return all matched rows regardless of limit.
-            Mutually exclusive with limit > 0 (set limit=0 and unlimited=True
-            for the same effect, or just unlimited=True).
-        include_superseded: If True, scan non-current (superseded) nodes too.
-            Default False (the common case — list reflects the current
-            revision of the graph). Set True to scan the historical layer,
-            e.g., for text-layer leak audits where a stale claim persisted
-            in the text of a superseded node (Mao-Cao incident, ob_1492 /
-            ls_0020 prototype). Replaces the audit_string `include_superseded`
-            capability that retired with #123. Note: passing a manual
-            `{"field": "is_current", "op": "eq", "value": 0}` in filters_json
-            while leaving `include_superseded=False` is a no-op (compounds
-            with the default `is_current = 1` → impossible conjunction →
-            zero rows). Use the `include_superseded=True` kwarg instead.
+        payload_json: JSON object (as a string) with these fields (all optional):
+            node_type (str, optional): Single-field filter by node type.
+                Empty = all types. Conflicts with a 'type' field in
+                filters_json (errors loudly).
+            status (str, optional): Single-field filter by status.
+                Empty = all statuses. Conflicts with a 'status' field in
+                filters_json (errors loudly).
+            sort_by (str, optional): Sort order — 'id' (default), 'created'
+                (newest first), 'importance' (highest first), 'recalls'
+                (most recalled first).
+            limit (int, optional): Cap on rows returned. Default 100. Set to
+                0 for a metadata-only response (total_matched without rows).
+                Ignored if unlimited=True. Hard ceiling 500 in single-field
+                mode (legacy); no ceiling in structured-filter mode.
+            filters_json (str, optional): JSON-encoded condition tree. A dict
+                (Compound or Atomic) or list (implicit AND shorthand at top
+                level). Empty string = use single-field mode.
+            fields_json (str, optional): JSON-encoded list of column names to
+                project. Empty = return the default compact triage shape.
+            unlimited (bool, optional): If True, return all matched rows
+                regardless of limit.
+            include_superseded (bool, optional): If True, scan non-current
+                (superseded) nodes too. Default False.
 
     Returns JSON:
         {status, total_matched, shown, truncated, sort_by, nodes,
          mode: "single_field" | "structured"}
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _list_impl for full semantics — kept callable with named kwargs for
+    in-server callers.
     """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _LIST_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_LIST_FIELDS)}"
+        })
+    return _list_impl(**params)
+
+
+def _list_impl(
+    node_type: str = "",
+    status: str = "",
+    sort_by: str = "id",
+    limit: int = 100,
+    filters_json: str = "",
+    fields_json: str = "",
+    unlimited: bool = False,
+    include_superseded: bool = False,
+) -> str:
+    """Impl for engram_list — callable with named kwargs for in-server callers."""
     from engram_filter import (
         FilterError,
         parse_filters,
@@ -16447,6 +16618,12 @@ PATTERN_QUERY_REGISTRY: dict[str, callable] = {
 # Registered patterns are dream-fairy scan primitives — each implements one of
 # the six dream-cycle categories. Calibration of preset thresholds is empirical
 # (the telemetry log is the data source).
+_QUERY_PATTERN_FIELDS = frozenset({
+    "pattern_name", "preset", "cosine_threshold_override",
+    "top_k_override", "min_confidence_override", "summary_top_k",
+})
+
+
 @mcp.tool(
     name="engram_query_pattern",
     annotations={
@@ -16457,7 +16634,73 @@ PATTERN_QUERY_REGISTRY: dict[str, callable] = {
         "openWorldHint": False,
     },
 )
-def engram_query_pattern(
+def engram_query_pattern(payload_json: str) -> str:
+    """Run a named compositional graph-pattern query.
+
+    Mechanical traversal + ranking; agent applies judgment to results. Calls
+    are logged to ~/.engram/pattern_query_telemetry.jsonl for preset calibration.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            pattern_name (str, required): One of the registered patterns:
+                - contradiction_obsolescence_ready: active contradictions
+                  where one side is retracted/superseded, ranked by how
+                  unambiguous the obsolescence signal is.
+                - open_question_answerable: open questions with a derivation
+                  chain nearby (semantic) that may resolve them.
+                - stale_load_bearing: high-importance + low-recall non-
+                  cornerstone nodes (re-engagement candidates).
+                - cornerstone_candidate: heavily-cited high-importance
+                  observations/derivations only (emergent-practice anchoring
+                  candidates; axioms/goals/definitions excluded as
+                  fundamental-by-type — see SKILL.md §2.17 / #180).
+                - tainted_still_valid: tainted derivations whose substantive
+                  claim may survive the upstream retraction.
+                - recent_resolution_echo: still-open questions semantically
+                  similar to a recent resolution's claim (echo candidates).
+            preset (str, optional): One of high_precision / balanced (default)
+                / high_recall. Bundles (cosine_threshold, top_k,
+                min_confidence). Override individual parameters with the
+                *_override fields.
+            cosine_threshold_override (float, optional): If >= 0, overrides
+                the preset's cosine_threshold. Default -1 (use preset).
+            top_k_override (int, optional): If >= 0, overrides the preset's
+                top_k. Default -1.
+            min_confidence_override (float, optional): If >= 0, overrides the
+                preset's min_confidence. Default -1.
+            summary_top_k (int, optional): How many top candidates get a
+                recall_summary (Tier 1). The remaining candidates get
+                recall_keywords only (Tier 2). Default 3. Clamped to
+                [0, candidate_count].
+
+    Returns:
+        JSON with {pattern_name, preset, results, total_matches}.
+        Tier 1 (top summary_top_k entries): {"id": ..., "summary": ...}
+        Tier 2 (remainder): {"id": ..., "keywords": [...]} or {"id": ...}
+        Telemetry log writes are unaffected by the tier transformation.
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _query_pattern_impl for full semantics — kept callable with named
+    kwargs for in-server callers.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _QUERY_PATTERN_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_QUERY_PATTERN_FIELDS)}"
+        })
+    if "pattern_name" not in params:
+        return json.dumps({"error": "payload_json must include required field 'pattern_name'"})
+    return _query_pattern_impl(**params)
+
+
+def _query_pattern_impl(
     pattern_name: str,
     preset: str = "balanced",
     cosine_threshold_override: float = -1.0,
@@ -16465,47 +16708,7 @@ def engram_query_pattern(
     min_confidence_override: float = -1.0,
     summary_top_k: int = 3,
 ) -> str:
-    """Run a named compositional graph-pattern query.
-
-    Mechanical traversal + ranking; agent applies judgment to results. Calls
-    are logged to ~/.engram/pattern_query_telemetry.jsonl for preset calibration.
-
-    Args:
-        pattern_name: One of the registered patterns:
-            - contradiction_obsolescence_ready: active contradictions
-              where one side is retracted/superseded, ranked by how
-              unambiguous the obsolescence signal is.
-            - open_question_answerable: open questions with a derivation
-              chain nearby (semantic) that may resolve them.
-            - stale_load_bearing: high-importance + low-recall non-
-              cornerstone nodes (re-engagement candidates).
-            - cornerstone_candidate: heavily-cited high-importance
-              observations/derivations only (emergent-practice anchoring
-              candidates; axioms/goals/definitions excluded as
-              fundamental-by-type — see SKILL.md §2.17 / #180).
-            - tainted_still_valid: tainted derivations whose substantive
-              claim may survive the upstream retraction.
-            - recent_resolution_echo: still-open questions semantically
-              similar to a recent resolution's claim (echo candidates).
-        preset: One of high_precision / balanced (default) / high_recall.
-            Bundles (cosine_threshold, top_k, min_confidence). The
-            placeholder values are deferred for calibration discussion;
-            override individual parameters with the *_override args.
-        cosine_threshold_override: If >= 0, overrides the preset's
-            cosine_threshold. Default -1 (use preset).
-        top_k_override: If >= 0, overrides the preset's top_k. Default -1.
-        min_confidence_override: If >= 0, overrides the preset's
-            min_confidence. Default -1.
-        summary_top_k: How many top candidates get a recall_summary (Tier 1).
-            The remaining candidates get recall_keywords only (Tier 2). Default 3.
-            Clamped to [0, candidate_count].
-
-    Returns:
-        JSON with {pattern_name, preset, results, total_matches}.
-        Tier 1 (top summary_top_k entries): {"id": ..., "summary": ...}
-        Tier 2 (remainder): {"id": ..., "keywords": [...]} or {"id": ...}
-        Telemetry log writes are unaffected by the tier transformation.
-    """
+    """Impl for engram_query_pattern — callable with named kwargs for in-server callers."""
     if pattern_name not in PATTERN_QUERY_REGISTRY:
         return json.dumps({
             "error": f"Unknown pattern_name '{pattern_name}'. "

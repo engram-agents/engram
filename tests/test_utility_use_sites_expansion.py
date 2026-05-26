@@ -346,10 +346,10 @@ def test_engram_history_with_node_id_bumps_target():
 
     before = _get_utility(server, ax_id)
 
-    result = json.loads(server.engram_history(
-        mode="edits",
-        node_id=ax_id,
-    ))
+    result = json.loads(server.engram_history(payload_json=json.dumps({
+        "mode": "edits",
+        "node_id": ax_id,
+    })))
     assert "error" not in result, f"engram_history failed: {result}"
     assert result["mode"] == "edits"
 
@@ -367,10 +367,10 @@ def test_engram_history_without_node_id_does_not_bump():
 
     before = _get_utility(server, ax_id)
 
-    result = json.loads(server.engram_history(
-        mode="edits",
-        node_id="",
-    ))
+    result = json.loads(server.engram_history(payload_json=json.dumps({
+        "mode": "edits",
+        "node_id": "",
+    })))
     assert "error" not in result, f"engram_history failed: {result}"
 
     after = _get_utility(server, ax_id)

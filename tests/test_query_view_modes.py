@@ -311,9 +311,9 @@ def test_query_pattern_cornerstone_candidate_tiered_shape():
             "reasoning_type": "deductive_modus_ponens",
         })))
 
-    r = json.loads(server.engram_query_pattern(
-        "cornerstone_candidate", preset="balanced"
-    ))
+    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "cornerstone_candidate", "preset": "balanced",
+    })))
     assert "results" in r, f"'results' key missing: {r}"
     assert "pattern_name" in r
     assert "preset" in r
@@ -352,9 +352,9 @@ def test_query_pattern_contradiction_obsolescence_tiered_shape():
         reason="test fixture: simulating retraction for view modes"
     )
 
-    r = json.loads(server.engram_query_pattern(
-        "contradiction_obsolescence_ready", preset="balanced"
-    ))
+    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "contradiction_obsolescence_ready", "preset": "balanced",
+    })))
     assert "results" in r
     assert "total_matches" in r
     results = r["results"]
@@ -382,12 +382,12 @@ def test_query_pattern_telemetry_preserved_after_tier_transform():
     if os.path.exists(log_path):
         os.remove(log_path)
 
-    json.loads(server.engram_query_pattern(
-        "stale_load_bearing", preset="balanced"
-    ))
-    json.loads(server.engram_query_pattern(
-        "cornerstone_candidate", preset="high_precision"
-    ))
+    json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "stale_load_bearing", "preset": "balanced",
+    })))
+    json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "cornerstone_candidate", "preset": "high_precision",
+    })))
 
     assert os.path.exists(log_path), "Telemetry log should have been created"
     with open(log_path) as f:
@@ -425,9 +425,9 @@ def test_query_pattern_summary_top_k_zero():
         conn.close()
     _set_recall_fields(server, obs_id, "Load-bearing summary.", ["load-bearing", "stale"])
 
-    r = json.loads(server.engram_query_pattern(
-        "stale_load_bearing", preset="balanced", summary_top_k=0
-    ))
+    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "stale_load_bearing", "preset": "balanced", "summary_top_k": 0,
+    })))
     results = r["results"]
     # With summary_top_k=0, no entry should have 'summary'
     for entry in results:
@@ -459,7 +459,7 @@ def test_query_pattern_return_shape_keys():
     """engram_query_pattern default return has the required top-level keys."""
     server = fresh_server()
 
-    r = json.loads(server.engram_query_pattern("stale_load_bearing"))
+    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({"pattern_name": "stale_load_bearing"})))
     assert "results" in r
     assert "pattern_name" in r
     assert "preset" in r

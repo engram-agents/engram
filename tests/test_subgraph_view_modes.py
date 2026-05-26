@@ -100,7 +100,7 @@ def test_view_recall_default_shape():
     ob_id = _add_observation(server, "Observation for subgraph test.")
     dv_id = _derive(server, "Derived from axiom and obs.", [ax_id, ob_id])
 
-    result = json.loads(server.engram_get_subgraph(node_id=dv_id, depth=2, direction="both"))
+    result = json.loads(server.engram_get_subgraph(payload_json=json.dumps({"node_id": dv_id, "depth": 2, "direction": "both"})))
     assert "error" not in result, f"unexpected error: {result}"
 
     # Required top-level keys
@@ -136,7 +136,7 @@ def test_view_edges_no_content():
     ob_id = _add_observation(server, "Obs for edges-view test.")
     dv_id = _derive(server, "Derived for edges-view test.", [ax_id, ob_id])
 
-    result = json.loads(server.engram_get_subgraph(node_id=dv_id, view="edges"))
+    result = json.loads(server.engram_get_subgraph(payload_json=json.dumps({"node_id": dv_id, "view": "edges"})))
     assert "error" not in result, f"unexpected error: {result}"
     assert result["view"] == "edges"
     assert "topology" in result, "topology key missing"
@@ -162,7 +162,7 @@ def test_hop_2_nodes_keywords_only():
     _set_recall_fields(server, dv2, "Summary for dv2", ["kw2a", "kw2b", "kw2c"])
 
     # Root at dv2, direction=up, depth=2 → dv2 (hop 0), dv1 (hop 1), ob0 (hop 2)
-    result = json.loads(server.engram_get_subgraph(node_id=dv2, depth=2, direction="up", view="recall"))
+    result = json.loads(server.engram_get_subgraph(payload_json=json.dumps({"node_id": dv2, "depth": 2, "direction": "up", "view": "recall"})))
     assert "error" not in result, f"unexpected error: {result}"
     content = result["content"]
 
@@ -191,7 +191,7 @@ def test_recall_summary_absent_when_not_written():
     server = fresh_server()
     ax_id = _add_axiom(server, "Axiom with no recall_summary.")
 
-    result = json.loads(server.engram_get_subgraph(node_id=ax_id, depth=1, view="recall"))
+    result = json.loads(server.engram_get_subgraph(payload_json=json.dumps({"node_id": ax_id, "depth": 1, "view": "recall"})))
     assert "error" not in result
     entry = result["content"][ax_id]
     # recall_summary should be absent (not present) or omitted — never None
@@ -207,7 +207,7 @@ def test_invalid_view_rejected():
     server = fresh_server()
     ax_id = _add_axiom(server, "Axiom for invalid-view test.")
 
-    result = json.loads(server.engram_get_subgraph(node_id=ax_id, view="full"))
+    result = json.loads(server.engram_get_subgraph(payload_json=json.dumps({"node_id": ax_id, "view": "full"})))
     assert "error" in result, f"Expected error for view='full', got: {result}"
     assert "full" in result["error"]
 
@@ -221,7 +221,7 @@ def test_view_deep_rejected_with_hint():
     server = fresh_server()
     ax_id = _add_axiom(server, "Axiom for view-deep test.")
 
-    result = json.loads(server.engram_get_subgraph(node_id=ax_id, view="deep"))
+    result = json.loads(server.engram_get_subgraph(payload_json=json.dumps({"node_id": ax_id, "view": "deep"})))
     assert "error" in result
     assert "engram_inspect" in result["error"], (
         f"Error should mention engram_inspect: {result['error']}"
@@ -243,9 +243,9 @@ def test_dream_mode_skips_neighbour_recall_refresh():
     before_ax = _get_recall_turn(server, ax_id)
 
     # Call with dream_mode=True — neighbours should NOT get recall_refresh
-    result = json.loads(server.engram_get_subgraph(
-        node_id=dv_id, depth=1, direction="up", dream_mode=True
-    ))
+    result = json.loads(server.engram_get_subgraph(payload_json=json.dumps(
+        {"node_id": dv_id, "depth": 1, "direction": "up", "dream_mode": True}
+    )))
     assert "error" not in result
     assert result["dream_mode"] is True
 
@@ -266,9 +266,9 @@ def test_normal_mode_refreshes_neighbour_recall():
 
     before_ax = _get_recall_turn(server, ax_id)
 
-    result = json.loads(server.engram_get_subgraph(
-        node_id=dv_id, depth=1, direction="up", dream_mode=False
-    ))
+    result = json.loads(server.engram_get_subgraph(payload_json=json.dumps(
+        {"node_id": dv_id, "depth": 1, "direction": "up", "dream_mode": False}
+    )))
     assert "error" not in result
     assert result["dream_mode"] is False
 
@@ -291,7 +291,7 @@ def test_direction_up_traverses_toward_evidence():
     dv_id = _derive(server, "Derivation citing obs.", [ob_id])
 
     # direction=up from dv_id should reach ob_id (dv derives_from ob)
-    result = json.loads(server.engram_get_subgraph(node_id=dv_id, depth=1, direction="up"))
+    result = json.loads(server.engram_get_subgraph(payload_json=json.dumps({"node_id": dv_id, "depth": 1, "direction": "up"})))
     assert "error" not in result
     assert ob_id in result["topology"], "direction=up should include the cited observation"
 
@@ -303,7 +303,7 @@ def test_direction_down_traverses_toward_dependents():
     dv_id = _derive(server, "Derivation citing obs for down test.", [ob_id])
 
     # direction=down from ob_id should reach dv_id (dv derives_from ob, so ob is target)
-    result = json.loads(server.engram_get_subgraph(node_id=ob_id, depth=1, direction="down"))
+    result = json.loads(server.engram_get_subgraph(payload_json=json.dumps({"node_id": ob_id, "depth": 1, "direction": "down"})))
     assert "error" not in result
     assert dv_id in result["topology"], "direction=down should include the dependent derivation"
 
@@ -316,7 +316,7 @@ def test_direction_both_includes_all():
     dv2 = _derive(server, "Derivation 2 citing dv1.", [dv1])
 
     # Start from dv1 with both: should get ob_id (up) and dv2 (down)
-    result = json.loads(server.engram_get_subgraph(node_id=dv1, depth=1, direction="both"))
+    result = json.loads(server.engram_get_subgraph(payload_json=json.dumps({"node_id": dv1, "depth": 1, "direction": "both"})))
     assert "error" not in result
     assert ob_id in result["topology"], "direction=both should include up-neighbour (obs)"
     assert dv2 in result["topology"], "direction=both should include down-neighbour (dv2)"
@@ -335,7 +335,7 @@ def test_topology_truncation_at_depth_boundary():
     dv2 = _derive(server, "Hop-2 deriv for truncation test.", [dv1])
 
     # Root at dv2, depth=1, direction=up → dv2 (hop 0) + dv1 (hop 1); ob0 beyond depth
-    result = json.loads(server.engram_get_subgraph(node_id=dv2, depth=1, direction="up"))
+    result = json.loads(server.engram_get_subgraph(payload_json=json.dumps({"node_id": dv2, "depth": 1, "direction": "up"})))
     assert "error" not in result
     assert dv2 in result["topology"]
     assert dv1 in result["topology"]
@@ -362,7 +362,7 @@ def test_node_and_edge_counts_match_topology():
     ob_id = _add_observation(server, "Obs for count test.")
     dv_id = _derive(server, "Derivation for count test.", [ob_id])
 
-    result = json.loads(server.engram_get_subgraph(node_id=dv_id, depth=1, direction="up"))
+    result = json.loads(server.engram_get_subgraph(payload_json=json.dumps({"node_id": dv_id, "depth": 1, "direction": "up"})))
     assert "error" not in result
 
     # node_count == number of keys in topology
@@ -386,7 +386,7 @@ def test_invalid_direction_rejected():
     server = fresh_server()
     ax_id = _add_axiom(server, "Axiom for invalid-direction test.")
 
-    result = json.loads(server.engram_get_subgraph(node_id=ax_id, direction="sideways"))
+    result = json.loads(server.engram_get_subgraph(payload_json=json.dumps({"node_id": ax_id, "direction": "sideways"})))
     assert "error" in result, f"Expected error for direction='sideways', got: {result}"
     assert "sideways" in result["error"]
 
@@ -402,7 +402,7 @@ def test_adjacency_map_direction_labels():
     dv_id = _derive(server, "Derivation citing obs for direction-label test.", [ob_id])
 
     # depth=1, direction=both from dv_id
-    result = json.loads(server.engram_get_subgraph(node_id=dv_id, depth=1, direction="up"))
+    result = json.loads(server.engram_get_subgraph(payload_json=json.dumps({"node_id": dv_id, "depth": 1, "direction": "up"})))
     assert "error" not in result
 
     # From dv_id's perspective, the derives_from edge to ob_id is outgoing

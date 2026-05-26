@@ -68,7 +68,7 @@ def _mk_ct(server, node_a: str, node_b: str, description: str) -> str:
 
 def _get_meta(server, node_id: str) -> dict:
     """Fetch a node's metadata dict via engram_inspect."""
-    r = json.loads(server.engram_inspect(node_id=node_id, view="deep", dream_mode=True))
+    r = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": node_id, "view": "deep", "dream_mode": True})))
     assert "node" in r, f"engram_inspect response missing 'node' key — contract changed: {r}"
     raw = r["node"].get("metadata")
     return json.loads(raw) if raw else {}
@@ -256,7 +256,7 @@ def test_stale_replacement_reader_handles_both_forms():
         conn.close()
 
     # Call engram_reflect to exercise the reader.
-    reflect_r = json.loads(server.engram_reflect())
+    reflect_r = json.loads(server.engram_reflect(payload_json=json.dumps({})))
     stale_nodes = {sn["id"]: sn for sn in reflect_r.get("stale_nodes", [])}
 
     # (a) dict form: replacement_hint should be the last value in the dict

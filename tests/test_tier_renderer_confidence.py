@@ -258,7 +258,7 @@ def test_engram_query_pattern_tier1_carries_confidence():
     finally:
         conn.close()
 
-    r = json.loads(server.engram_query_pattern("stale_load_bearing", summary_top_k=5))
+    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({"pattern_name": "stale_load_bearing", "summary_top_k": 5})))
     results = r["results"]
     if not results:
         return  # pattern returned no candidates — skip (not a conf failure)
@@ -287,9 +287,9 @@ def test_engram_query_pattern_tier2_carries_confidence():
         finally:
             conn.close()
 
-    r = json.loads(server.engram_query_pattern(
-        "stale_load_bearing", summary_top_k=1
-    ))
+    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({
+        "pattern_name": "stale_load_bearing", "summary_top_k": 1,
+    })))
     results = r["results"]
     tier2 = results[1:]
     for entry in tier2:
@@ -305,7 +305,7 @@ def test_engram_list_includes_confidence_when_present():
     server = fresh_server()
     nid = _add_observation(server, "Engram list confidence test claim.", confidence=0.75)
 
-    r = json.loads(server.engram_list(node_type="observation_factual"))
+    r = json.loads(server.engram_list(payload_json=json.dumps({"node_type": "observation_factual"})))
     assert r["status"] == "ok", f"engram_list error: {r}"
     nodes = r["nodes"]
     target = next((n for n in nodes if n["id"] == nid), None)
@@ -332,7 +332,7 @@ def test_engram_list_omits_confidence_for_null_confidence():
     finally:
         conn.close()
 
-    r = json.loads(server.engram_list(node_type="observation_factual"))
+    r = json.loads(server.engram_list(payload_json=json.dumps({"node_type": "observation_factual"})))
     assert r["status"] == "ok", f"engram_list error: {r}"
     nodes = r["nodes"]
     target = next((n for n in nodes if n["id"] == ob_id), None)
@@ -362,7 +362,7 @@ def test_engram_get_subgraph_recall_content_shape():
     # Link ob → ax via derives_from so they're connected
     _derive(server, "Subgraph derived claim.", [ax_id])
 
-    r = json.loads(server.engram_get_subgraph(ax_id, depth=2, view="recall"))
+    r = json.loads(server.engram_get_subgraph(payload_json=json.dumps({"node_id": ax_id, "depth": 2, "view": "recall"})))
     assert "content" in r, f"Subgraph recall should have 'content': {r.keys()}"
     content = r["content"]
     assert ax_id in content, f"Root {ax_id} missing from subgraph content"
@@ -389,7 +389,7 @@ def test_engram_reflect_weakly_grounded_tier1_carries_confidence():
     _set_recall_fields(server, nid, "WG tier-1 summary.", ["wg", "conf", "tier1"])
     _set_importance(server, nid, 1.5)
 
-    result = json.loads(server.engram_reflect(summary_top_k=5))
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({"summary_top_k": 5})))
     assert "error" not in result, f"unexpected error: {result}"
 
     entries = _get_entries(result, "weakly_grounded")
@@ -417,7 +417,7 @@ def test_engram_reflect_weakly_grounded_tier2_carries_confidence():
         _set_importance(server, nid, 1.5 - i * 0.1)
         ids.append(nid)
 
-    result = json.loads(server.engram_reflect(summary_top_k=1))
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({"summary_top_k": 1})))
     assert "error" not in result, f"unexpected error: {result}"
 
     entries = _get_entries(result, "weakly_grounded")
@@ -438,7 +438,7 @@ def test_engram_reflect_uncited_obs_tier1_carries_confidence():
     _set_recall_fields(server, nid, "Uncited t1 summary.", ["unc", "conf", "t1"])
     _set_importance(server, nid, 1.5)
 
-    result = json.loads(server.engram_reflect(summary_top_k=5))
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({"summary_top_k": 5})))
     assert "error" not in result, f"unexpected error: {result}"
 
     entries = _get_entries(result, "uncited_observations")
@@ -464,7 +464,7 @@ def test_engram_reflect_thin_support_tier1_carries_confidence():
         conn.close()
     _set_recall_fields(server, dv_id, "Thin support t1 summary.", ["thin", "conf", "t1"])
 
-    result = json.loads(server.engram_reflect(summary_top_k=5))
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({"summary_top_k": 5})))
     assert "error" not in result, f"unexpected error: {result}"
 
     entries = _get_entries(result, "thin_support_derivations")
@@ -518,7 +518,7 @@ def test_engram_reflect_thin_support_tier2_carries_confidence():
     _set_recall_fields(server, dv_ids[0], "Thin t2 tier1 summary.", ["thin", "t2", "t1"])
     _set_recall_fields(server, dv_ids[1], "Thin t2 tier2 summary.", ["thin", "t2", "t2kw"])
 
-    result = json.loads(server.engram_reflect(summary_top_k=1))
+    result = json.loads(server.engram_reflect(payload_json=json.dumps({"summary_top_k": 1})))
     assert "error" not in result, f"unexpected error: {result}"
 
     entries = _get_entries(result, "thin_support_derivations")

@@ -547,7 +547,7 @@ def test_engram_surface_routes_person_definition_goal_to_special_nodes():
                                     f"A {keyword} is an interstellar cloud of gas and dust.")
     goal_id = _add_goal(srv, f"Map all visible {keyword} clouds in the local group surface test")
 
-    result = json.loads(srv.engram_surface(query=keyword, top_k=15, semantic=False))
+    result = json.loads(srv.engram_surface(payload_json=json.dumps({"query": keyword, "top_k": 15, "semantic": False})))
 
     special_ids = [n["id"] for n in result.get("special_nodes", [])]
     top_claim_ids = [n["id"] for n in result.get("top_claims", [])]

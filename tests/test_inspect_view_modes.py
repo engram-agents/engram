@@ -128,7 +128,7 @@ def test_view_recall_default_shape():
     ob_id = _add_observation(server, "Observation for inspect recall test.")
     dv_id = _derive(server, "Derived from axiom and obs for recall view.", [ax_id, ob_id])
 
-    result = json.loads(server.engram_inspect(node_id=dv_id))
+    result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": dv_id})))
     assert "error" not in result, f"unexpected error: {result}"
 
     assert result["view"] == "recall"
@@ -144,7 +144,7 @@ def test_view_recall_logical_neighbor_grouping():
     ax_id = _add_axiom(server, "Axiom for grouping test.")
     dv_id = _derive(server, "Derivation citing axiom for grouping test.", [ax_id])
 
-    result = json.loads(server.engram_inspect(node_id=dv_id, view="recall"))
+    result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": dv_id, "view": "recall"})))
     assert "error" not in result, f"unexpected error: {result}"
 
     ln = result["logical_neighbors"]
@@ -165,7 +165,7 @@ def test_view_recall_recall_summary_on_focal_node():
     ax_id = _add_axiom(server, "Axiom with recall summary for inspect test.")
     _set_recall_fields(server, ax_id, "This axiom is about testing.", ["test", "axiom", "recall"])
 
-    result = json.loads(server.engram_inspect(node_id=ax_id, view="recall"))
+    result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": ax_id, "view": "recall"})))
     assert "error" not in result, f"unexpected error: {result}"
 
     node = result["node"]
@@ -184,7 +184,7 @@ def test_recall_omit_fields_stripped():
     server = fresh_server()
     ax_id = _add_axiom(server, "Axiom for _RECALL_OMIT stripping test.")
 
-    result = json.loads(server.engram_inspect(node_id=ax_id, view="recall"))
+    result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": ax_id, "view": "recall"})))
     assert "error" not in result, f"unexpected error: {result}"
 
     node = result["node"]
@@ -204,7 +204,7 @@ def test_view_deep_full_node_fields():
     server = fresh_server()
     ax_id = _add_axiom(server, "Axiom for deep-view field test.")
 
-    result = json.loads(server.engram_inspect(node_id=ax_id, view="deep"))
+    result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": ax_id, "view": "deep"})))
     assert "error" not in result, f"unexpected error: {result}"
 
     assert result["view"] == "deep"
@@ -224,7 +224,7 @@ def test_view_deep_topology_shape():
     ob_id = _add_observation(server, "Obs for deep-view topology test.")
     dv_id = _derive(server, "Derivation for deep-view topology test.", [ob_id])
 
-    result = json.loads(server.engram_inspect(node_id=dv_id, view="deep"))
+    result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": dv_id, "view": "deep"})))
     assert "error" not in result, f"unexpected error: {result}"
 
     topology = result["topology"]
@@ -259,7 +259,7 @@ def test_view_edges_no_node_payload():
     server = fresh_server()
     ax_id = _add_axiom(server, "Axiom for edges-view no-payload test.")
 
-    result = json.loads(server.engram_inspect(node_id=ax_id, view="edges"))
+    result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": ax_id, "view": "edges"})))
     assert "error" not in result, f"unexpected error: {result}"
 
     assert result["view"] == "edges"
@@ -275,7 +275,7 @@ def test_view_edges_topology_shape():
     ob_id = _add_observation(server, "Obs for edges-view shape test.")
     dv_id = _derive(server, "Derivation for edges-view shape test.", [ob_id])
 
-    result = json.loads(server.engram_inspect(node_id=dv_id, view="edges"))
+    result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": dv_id, "view": "edges"})))
     assert "error" not in result, f"unexpected error: {result}"
 
     topology = result["topology"]
@@ -300,7 +300,7 @@ def test_view_edges_skips_question_node_assessment_bump():
 
     before = _get_last_assessed_at(server, qu_id)
 
-    result = json.loads(server.engram_inspect(node_id=qu_id, view="edges"))
+    result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": qu_id, "view": "edges"})))
     assert "error" not in result, f"unexpected error: {result}"
 
     after = _get_last_assessed_at(server, qu_id)
@@ -317,7 +317,7 @@ def test_view_recall_bumps_question_node_assessment():
 
     before = _get_last_assessed_at(server, qu_id)
 
-    result = json.loads(server.engram_inspect(node_id=qu_id, view="recall"))
+    result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": qu_id, "view": "recall"})))
     assert "error" not in result, f"unexpected error: {result}"
 
     after = _get_last_assessed_at(server, qu_id)
@@ -339,7 +339,7 @@ def test_dream_mode_skips_recall_refresh():
 
     before = _get_recall_turn(server, ax_id)
 
-    result = json.loads(server.engram_inspect(node_id=ax_id, view="recall", dream_mode=True))
+    result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": ax_id, "view": "recall", "dream_mode": True})))
     assert "error" not in result, f"unexpected error: {result}"
     assert result["dream_mode"] is True
 
@@ -356,7 +356,7 @@ def test_normal_mode_does_refresh_recall():
 
     before = _get_recall_turn(server, ax_id)
 
-    result = json.loads(server.engram_inspect(node_id=ax_id, view="recall", dream_mode=False))
+    result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": ax_id, "view": "recall", "dream_mode": False})))
     assert "error" not in result, f"unexpected error: {result}"
     assert result["dream_mode"] is False
 
@@ -376,7 +376,7 @@ def test_invalid_view_rejected():
     server = fresh_server()
     ax_id = _add_axiom(server, "Axiom for invalid-view test.")
 
-    result = json.loads(server.engram_inspect(node_id=ax_id, view="bogus"))
+    result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": ax_id, "view": "bogus"})))
     assert "error" in result, f"Expected error for view='bogus', got: {result}"
     assert "bogus" in result["error"], (
         f"Error message should name the bad view; got: {result['error']}"
@@ -403,7 +403,7 @@ def test_recall_grouping_cap_fires():
         ax_ids,
     )
 
-    result = json.loads(server.engram_inspect(node_id=dv_id, view="recall"))
+    result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": dv_id, "view": "recall"})))
     assert "error" not in result, f"unexpected error: {result}"
 
     ln = result["logical_neighbors"]

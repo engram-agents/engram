@@ -374,7 +374,7 @@ class TestEngramListStructured:
     def test_backward_compat_single_field(self):
         server = fresh_server()
         ob_id = _add_observation(server, "test claim one")
-        result = json.loads(server.engram_list(node_type="observation_factual"))
+        result = json.loads(server.engram_list(payload_json=json.dumps({"node_type": "observation_factual"})))
         assert result["status"] == "ok"
         assert result["mode"] == "single_field"
         assert any(n["id"] == ob_id for n in result["nodes"])
@@ -382,34 +382,34 @@ class TestEngramListStructured:
     def test_structured_mode_flag(self):
         server = fresh_server()
         _add_observation(server, "test claim one")
-        result = json.loads(server.engram_list(
-            filters_json=json.dumps({"field": "type", "op": "eq", "value": "observation_factual"})
-        ))
+        result = json.loads(server.engram_list(payload_json=json.dumps({
+            "filters_json": json.dumps({"field": "type", "op": "eq", "value": "observation_factual"}),
+        })))
         assert result["status"] == "ok"
         assert result["mode"] == "structured"
         assert result["total_matched"] >= 1
 
     def test_filters_with_invalid_json_errors(self):
         server = fresh_server()
-        result = json.loads(server.engram_list(filters_json="{not valid json"))
+        result = json.loads(server.engram_list(payload_json=json.dumps({"filters_json": "{not valid json"})))
         assert result["status"] == "error"
         assert "invalid JSON" in result["error"]
 
     def test_filters_unknown_field_errors(self):
         server = fresh_server()
-        result = json.loads(server.engram_list(
-            filters_json=json.dumps({"field": "nonexistent", "op": "eq", "value": "x"})
-        ))
+        result = json.loads(server.engram_list(payload_json=json.dumps({
+            "filters_json": json.dumps({"field": "nonexistent", "op": "eq", "value": "x"}),
+        })))
         assert result["status"] == "error"
         assert "unknown field" in result["error"]
 
     def test_field_projection(self):
         server = fresh_server()
         _add_observation(server, "test for projection")
-        result = json.loads(server.engram_list(
-            filters_json=json.dumps({"field": "type", "op": "eq", "value": "observation_factual"}),
-            fields_json=json.dumps(["id", "claim"]),
-        ))
+        result = json.loads(server.engram_list(payload_json=json.dumps({
+            "filters_json": json.dumps({"field": "type", "op": "eq", "value": "observation_factual"}),
+            "fields_json": json.dumps(["id", "claim"]),
+        })))
         assert result["status"] == "ok"
         for node in result["nodes"]:
             assert set(node.keys()) == {"id", "claim"}
@@ -418,10 +418,10 @@ class TestEngramListStructured:
         server = fresh_server()
         for i in range(3):
             _add_observation(server, f"claim {i}", url=f"https://example.com/test{i}")
-        result = json.loads(server.engram_list(
-            filters_json=json.dumps({"field": "type", "op": "eq", "value": "observation_factual"}),
-            limit=0,
-        ))
+        result = json.loads(server.engram_list(payload_json=json.dumps({
+            "filters_json": json.dumps({"field": "type", "op": "eq", "value": "observation_factual"}),
+            "limit": 0,
+        })))
         assert result["status"] == "ok"
         assert result["total_matched"] >= 3
         assert result["shown"] == 0
@@ -431,26 +431,26 @@ class TestEngramListStructured:
         server = fresh_server()
         for i in range(5):
             _add_observation(server, f"claim {i}", url=f"https://example.com/test{i}")
-        result = json.loads(server.engram_list(
-            filters_json=json.dumps({"field": "type", "op": "eq", "value": "observation_factual"}),
-            unlimited=True,
-        ))
+        result = json.loads(server.engram_list(payload_json=json.dumps({
+            "filters_json": json.dumps({"field": "type", "op": "eq", "value": "observation_factual"}),
+            "unlimited": True,
+        })))
         assert result["status"] == "ok"
         assert result["shown"] == result["total_matched"]
         assert result["truncated"] == 0
 
     def test_negative_limit_errors(self):
         server = fresh_server()
-        result = json.loads(server.engram_list(limit=-5))
+        result = json.loads(server.engram_list(payload_json=json.dumps({"limit": -5})))
         assert result["status"] == "error"
 
     def test_node_type_conflict_with_filters_type(self):
         server = fresh_server()
         _add_observation(server, "claim")
-        result = json.loads(server.engram_list(
-            node_type="observation_factual",
-            filters_json=json.dumps({"field": "type", "op": "eq", "value": "derivation"}),
-        ))
+        result = json.loads(server.engram_list(payload_json=json.dumps({
+            "node_type": "observation_factual",
+            "filters_json": json.dumps({"field": "type", "op": "eq", "value": "derivation"}),
+        })))
         assert result["status"] == "error"
         assert "conflict" in result["error"]
 
@@ -458,7 +458,7 @@ class TestEngramListStructured:
         # Per the backward-compat alias in the return shape.
         server = fresh_server()
         _add_observation(server, "claim for alias check")
-        result = json.loads(server.engram_list(node_type="observation_factual"))
+        result = json.loads(server.engram_list(payload_json=json.dumps({"node_type": "observation_factual"})))
         assert result["total_matched"] == result["total_matching"]
 
     def test_recursive_and_or_compound(self):
@@ -466,8 +466,8 @@ class TestEngramListStructured:
         _add_observation(server, "alpha")
         _add_observation(server, "beta")
         # Find observations whose claim contains alpha OR beta.
-        result = json.loads(server.engram_list(
-            filters_json=json.dumps({
+        result = json.loads(server.engram_list(payload_json=json.dumps({
+            "filters_json": json.dumps({
                 "logic": "AND",
                 "conditions": [
                     {"field": "type", "op": "eq", "value": "observation_factual"},
@@ -479,8 +479,8 @@ class TestEngramListStructured:
                         ],
                     },
                 ],
-            })
-        ))
+            }),
+        })))
         assert result["status"] == "ok"
         assert result["total_matched"] >= 2
 
@@ -491,11 +491,11 @@ class TestEngramListStructured:
             ids.append(_add_observation(server, f"claim {i}", url=f"https://example.com/r{i}"))
         # Between the first and third id.
         low, high = sorted(ids)[0], sorted(ids)[2]
-        result = json.loads(server.engram_list(
-            filters_json=json.dumps({
-                "field": "id", "op": "between", "value": [low, high]
-            })
-        ))
+        result = json.loads(server.engram_list(payload_json=json.dumps({
+            "filters_json": json.dumps({
+                "field": "id", "op": "between", "value": [low, high],
+            }),
+        })))
         assert result["status"] == "ok"
         assert result["total_matched"] >= 3
 
@@ -528,9 +528,9 @@ class TestEngramListStructured:
         )
         conn.commit()
 
-        result = json.loads(server.engram_list(
-            filters_json=json.dumps({"field": "id", "op": "starts_with", "value": "ob_"})
-        ))
+        result = json.loads(server.engram_list(payload_json=json.dumps({
+            "filters_json": json.dumps({"field": "id", "op": "starts_with", "value": "ob_"}),
+        })))
         ids_returned = {n["id"] for n in result["nodes"]}
         assert "ob_test001" in ids_returned, "expected literal ob_ match missing"
         assert "obX0001" not in ids_returned, (
@@ -555,9 +555,9 @@ class TestEngramListStructured:
 
         # contains "100%" should match the literal-percent row only, not the
         # "100 ANYTHING" wildcard-trap.
-        result = json.loads(server.engram_list(
-            filters_json=json.dumps({"field": "claim", "op": "contains", "value": "100%"})
-        ))
+        result = json.loads(server.engram_list(payload_json=json.dumps({
+            "filters_json": json.dumps({"field": "claim", "op": "contains", "value": "100%"}),
+        })))
         ids_returned = {n["id"] for n in result["nodes"]}
         assert "ob_x001" in ids_returned
         assert "ob_x002" not in ids_returned, (
@@ -608,11 +608,11 @@ class TestEngramListIncludeSuperseded:
     def test_default_excludes_superseded(self):
         server = fresh_server()
         self._seed_current_and_superseded(server)
-        result = json.loads(server.engram_list(
-            filters_json=json.dumps(
+        result = json.loads(server.engram_list(payload_json=json.dumps({
+            "filters_json": json.dumps(
                 {"field": "claim", "op": "contains", "value": "Mao-Cao"}
-            )
-        ))
+            ),
+        })))
         ids = {n["id"] for n in result["nodes"]}
         assert "ob_s001" in ids
         assert "ob_s002" not in ids, "superseded should be excluded by default"
@@ -620,12 +620,12 @@ class TestEngramListIncludeSuperseded:
     def test_include_superseded_true_scans_historical_layer(self):
         server = fresh_server()
         self._seed_current_and_superseded(server)
-        result = json.loads(server.engram_list(
-            filters_json=json.dumps(
+        result = json.loads(server.engram_list(payload_json=json.dumps({
+            "filters_json": json.dumps(
                 {"field": "claim", "op": "contains", "value": "Mao-Cao"}
             ),
-            include_superseded=True,
-        ))
+            "include_superseded": True,
+        })))
         ids = {n["id"] for n in result["nodes"]}
         assert "ob_s001" in ids
         assert "ob_s002" in ids, (
@@ -639,7 +639,7 @@ class TestEngramListIncludeSuperseded:
         sentinel preserves a valid query shape."""
         server = fresh_server()
         self._seed_current_and_superseded(server)
-        result = json.loads(server.engram_list(include_superseded=True))
+        result = json.loads(server.engram_list(payload_json=json.dumps({"include_superseded": True})))
         assert result["status"] == "ok"
         ids = {n["id"] for n in result["nodes"]}
         assert "ob_s001" in ids
@@ -649,7 +649,7 @@ class TestEngramListIncludeSuperseded:
         """Passing include_superseded=False explicitly matches the default."""
         server = fresh_server()
         self._seed_current_and_superseded(server)
-        result = json.loads(server.engram_list(include_superseded=False))
+        result = json.loads(server.engram_list(payload_json=json.dumps({"include_superseded": False})))
         ids = {n["id"] for n in result["nodes"]}
         assert "ob_s001" in ids
         assert "ob_s002" not in ids
