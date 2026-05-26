@@ -48,7 +48,28 @@ Six well-supported categories you scan for, plus two heuristic categories you ca
 
 3. **Stale-but-load-bearing nodes.** `engram_query_pattern(pattern_name='stale_load_bearing')` as primary; or inline: cross-reference `engram_list(sort_by='recalls', limit=200)` ascending with `sort_by='importance', limit=50` descending. Nodes appearing in both sets are high-importance + low-recent-recall — candidates for the parent to either re-engage with or supersede. Distinguish *cornerstone* nodes (which by design are anchored against forgetting and should not be flagged as stale) from *non-cornerstone* high-importance nodes via the focused-list cross-check.
 
-4. **Cornerstone candidates.** `engram_query_pattern(pattern_name='cornerstone_candidate')` as primary; or inline: run `engram_list_focused()` and `engram_focus_sets()` for the current cornerstone surface, run `engram_list(sort_by='importance', limit=20)`. Nominate candidates ONLY from emergent-practice nodes — **observations and derivations** — where a not-yet-named operating principle has become load-bearing through use. NEVER nominate axioms, goals, or definitions: they are already fundamental-by-type (declared at creation, not earned through practice), so their high importance_base is not an emergence signal — reaffirming them is the #180 false-positive (see SKILL.md §2.17). Suggest action for qualifying ob/dv candidates: `engram_add_cornerstone` or `engram_focus`.
+4. **Cornerstone candidates.** `engram_query_pattern(pattern_name='cornerstone_candidate')` as primary; or inline: run `engram_list_focused()` and `engram_focus_sets()` for the current cornerstone surface, run `engram_list(sort_by='importance', limit=20)`.
+
+   **A cornerstone candidate is a node expressing a PRINCIPLE that affects how the agent executes or makes decisions, typically emerging from repeated practice.**
+
+   Evaluation criterion: does this node's claim articulate an execution-rule, decision-heuristic, or operational disposition that has emerged from the agent's cumulative practice? Reframing-shape (prior_frame → new_frame) is a PROPERTY some cornerstones have, but NOT the classification test — stable principles that never shifted (e.g., a principle like "use over imagination, as default mode of learning" is a valid cornerstone with no shift history) are valid cornerstones.
+
+   Fail-by-category (no need to evaluate the principle test):
+   - **Person nodes (`pn_*`)** — entities, not principles
+   - **Evidence nodes (`ev_*`)** — citations, not principles
+   - **Goal nodes (`gl_*`)** — directions, not execution-rules (they tell WHAT not HOW)
+   - **Axiom nodes (`ax_*`)** — declared bedrock commitments, not emerged execution-principles (different axis, not a tier)
+   - **Definition nodes (`df_*`)** — conventions, not execution-rules
+   - **Task nodes (`tk_*`)** — completable actions, not principles
+   - **Conjecture nodes (`cj_*`)** — speculative hypotheses, not yet earned operating principles
+   - **Lesson nodes (`ls_*`)** — already named principles in the lesson register; tripwire mechanism, not cornerstone
+   - **Feeling-report nodes (`fl_*`)** — introspective state-reports, not execution-rules
+   - **Contradiction nodes (`ct_*`)** — structural-conflict markers, not principles
+   - **Question nodes (`qu_*`)** — open inquiries, not earned principles
+   - **Goal-tension nodes (`gt_*`)** — value-conflict markers, not execution-rules
+   - **Theory nodes (`th_*`)** — research-level constructs; if confirmed, candidates promote past cornerstone via a different path
+
+   Evaluate obs/dv claim text against the principle-guides-execution test. The `engram_query_pattern("cornerstone_candidate")` MCP tool surfaces candidates via proxy-scoring (importance × recall × load-bearing) and is type-filtered to obs/dv — your job is the semantic evaluation against the test above. When using the inline fallback (`engram_list(sort_by='importance', limit=20)`), the type gate does NOT apply — the fail-by-category list above covers all non-obs/dv types that can surface via that path. Suggest action for qualifying candidates: `engram_add_cornerstone` or `engram_focus`.
 
 5. **Tainted-but-still-valid derivations.** `engram_query_pattern(pattern_name='tainted_still_valid')` as primary; or inline: `engram_list(status='tainted')`, for each tainted derivation inspect the retraction-source it cites via `tainted_by`. Some tainted derivations may still be valid under the corrected/superseded version of their premises (the cascade fired correctly but the substantive claim survives). Flag candidates for the parent to either re-derive cleanly or supersede with a fresh statement.
 
@@ -96,7 +117,8 @@ Use this format:
 ... or "None this scan."
 
 ## Category 4 — Cornerstone candidates
-- [node_id] (pattern-match) high-importance + high-recall + load-bearing for <thread> — suggested action: anchor as cornerstone via `engram_add_cornerstone` or `engram_focus`.
+- [node_id] (verified: principle-test passed) high-importance + high-recall + load-bearing for <thread> — suggested action: anchor as cornerstone via `engram_add_cornerstone` or `engram_focus`.
+  <!-- pattern-match is not used here: the principle-guides-execution test IS the semantic-verification step, so a candidate that passes it is verified, not merely pattern-matched. -->
 ... or "None this scan."
 
 ## Category 5 — Tainted-but-still-valid derivations
