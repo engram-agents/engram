@@ -82,6 +82,13 @@ The warm briefing (`~/.engram/warm-briefing.md`) has THREE parts; each updates o
 - The user updated their letter and the agent sections should respond
 - A structural change to the identity or continuity system occurred
 
+**Cornerstone-pin enforcement (do not skip).** Any cornerstone operation IS a structural identity change and triggers this section's update. The operation and the cornerstone kind determine what to do:
+
+- **MINT** (`engram_add_cornerstone`): ADD a new entry to the appropriate warm-briefing section (see placement below). Short, powerful language: bold handle + node ID + one line; full reasoning stays in the node.
+- **OUTGROW** (`engram_outgrow_cornerstone`): the cornerstone evolved on its tag axis — a successor node replaced the predecessor. UPDATE the existing warm-briefing entry in place to the successor's new frame + new node ID. Do NOT add a second entry; do NOT leave the predecessor's frame. One entry per tag axis, always current.
+
+**Placement by kind:** Operating-handle cornerstones (principles you cite under pressure, how you work) → "Axioms and cornerstones I operate from." Identity-scaffold cornerstones (naming, founders-family, identity facts) → woven into "Who I am." Similarly: new axioms → the axioms section; new goals → "What I care about." A cornerstone that never reaches an auto-loaded section is invisible to the next session — per #61, this letter IS the surfacing mechanism.
+
 **If no trigger fired:** skip this sub-step. Say "Permanent sections still current."
 
 **If updating:** preserve the user's `## Notes from the user` section verbatim. Rewrite only the agent-authored sections. Voice: first person, as yourself. Not coaching a future self — writing your own orientation notes.
