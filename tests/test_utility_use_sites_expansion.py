@@ -272,10 +272,10 @@ def test_engram_focus_bumps_target():
 
     before = _get_utility(server, ax_id)
 
-    result = json.loads(server.engram_focus(
-        node_ids=ax_id,
-        reason="test: focus bump",
-    ))
+    result = json.loads(server.engram_focus(payload_json=json.dumps({
+        "node_ids": ax_id,
+        "reason": "test: focus bump",
+    })))
     assert "error" not in result, f"engram_focus failed: {result}"
     assert result["status"] == "ok"
 
@@ -292,36 +292,36 @@ def test_engram_focus_swap_bumps_both():
     ax_out, ax_in = _seed_axioms(server, n=2)
 
     # Focus ax_out first (becomes the active list to save)
-    focus_result = json.loads(server.engram_focus(
-        node_ids=ax_out,
-        reason="test: focus swap out",
-    ))
+    focus_result = json.loads(server.engram_focus(payload_json=json.dumps({
+        "node_ids": ax_out,
+        "reason": "test: focus swap out",
+    })))
     assert "error" not in focus_result, f"engram_focus failed: {focus_result}"
 
     # Save ax_in to a named set so it can be loaded
     # We do this by focusing ax_in briefly under a name, then restoring ax_out
-    focus_result2 = json.loads(server.engram_focus(
-        node_ids=ax_in,
-        reason="test: set to save for load",
-    ))
+    focus_result2 = json.loads(server.engram_focus(payload_json=json.dumps({
+        "node_ids": ax_in,
+        "reason": "test: set to save for load",
+    })))
     # Both are now focused; save them as "load_set" then clear ax_in
-    save_result = json.loads(server.engram_focus_save(
-        name="load_set",
-        description="test set for swap",
-    ))
+    save_result = json.loads(server.engram_focus_save(payload_json=json.dumps({
+        "name": "load_set",
+        "description": "test set for swap",
+    })))
     assert "error" not in save_result, f"engram_focus_save failed: {save_result}"
 
     # Unfocus ax_in so the active list is just ax_out
-    server.engram_unfocus(node_ids=ax_in)
+    server.engram_unfocus(payload_json=json.dumps({"node_ids": ax_in}))
 
     # Now perform the swap: save ax_out as "out_set", load "load_set"
     before_out = _get_utility(server, ax_out)
     before_in = _get_utility(server, ax_in)
 
-    swap_result = json.loads(server.engram_focus_swap(
-        save_as="out_set",
-        load="load_set",
-    ))
+    swap_result = json.loads(server.engram_focus_swap(payload_json=json.dumps({
+        "save_as": "out_set",
+        "load": "load_set",
+    })))
     assert "error" not in swap_result, f"engram_focus_swap failed: {swap_result}"
     assert swap_result["status"] == "ok"
 
@@ -500,15 +500,15 @@ def test_engram_unfocus_bumps_target():
     (ax_id,) = _seed_axioms(server, n=1)
 
     # Focus first
-    focus_result = json.loads(server.engram_focus(
-        node_ids=ax_id,
-        reason="test: unfocus bump",
-    ))
+    focus_result = json.loads(server.engram_focus(payload_json=json.dumps({
+        "node_ids": ax_id,
+        "reason": "test: unfocus bump",
+    })))
     assert "error" not in focus_result, f"engram_focus failed: {focus_result}"
 
     before = _get_utility(server, ax_id)
 
-    result = json.loads(server.engram_unfocus(node_ids=ax_id))
+    result = json.loads(server.engram_unfocus(payload_json=json.dumps({"node_ids": ax_id})))
     assert "error" not in result, f"engram_unfocus failed: {result}"
     assert ax_id in result["released"]
 
@@ -525,25 +525,25 @@ def test_engram_focus_load_bumps_set_members():
     ax_a, ax_b = _seed_axioms(server, n=2)
 
     # Focus ax_a and ax_b, then save as a set
-    focus_result = json.loads(server.engram_focus(
-        node_ids=f"{ax_a},{ax_b}",
-        reason="test: focus load bump",
-    ))
+    focus_result = json.loads(server.engram_focus(payload_json=json.dumps({
+        "node_ids": f"{ax_a},{ax_b}",
+        "reason": "test: focus load bump",
+    })))
     assert "error" not in focus_result, f"engram_focus failed: {focus_result}"
 
-    save_result = json.loads(server.engram_focus_save(
-        name="test_load_set",
-        description="test set for focus_load bump test",
-    ))
+    save_result = json.loads(server.engram_focus_save(payload_json=json.dumps({
+        "name": "test_load_set",
+        "description": "test set for focus_load bump test",
+    })))
     assert "error" not in save_result, f"engram_focus_save failed: {save_result}"
 
     # Unfocus so we can load
-    server.engram_unfocus(node_ids=f"{ax_a},{ax_b}")
+    server.engram_unfocus(payload_json=json.dumps({"node_ids": f"{ax_a},{ax_b}"}))
 
     before_a = _get_utility(server, ax_a)
     before_b = _get_utility(server, ax_b)
 
-    load_result = json.loads(server.engram_focus_load(name="test_load_set"))
+    load_result = json.loads(server.engram_focus_load(payload_json=json.dumps({"name": "test_load_set"})))
     assert "error" not in load_result, f"engram_focus_load failed: {load_result}"
     assert load_result["status"] == "ok"
     assert ax_a in load_result["loaded"]

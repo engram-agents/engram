@@ -13907,6 +13907,11 @@ def _clear_active_set_name_if_diverged(conn):
 # (capture current set under a name), engram_focus_load / focus_swap (restore /
 # switch saved sets), engram_focus_sets (list available sets), engram_list_focused
 # (pure-read inspection, no refresh).
+_FOCUS_FIELDS = frozenset({
+    "node_ids", "reason",
+})
+
+
 @mcp.tool(
     name="engram_focus",
     annotations={
@@ -13917,7 +13922,7 @@ def _clear_active_set_name_if_diverged(conn):
         "openWorldHint": False,
     },
 )
-def engram_focus(node_ids: str, reason: str) -> str:
+def engram_focus(payload_json: str) -> str:
     """Pin nodes as focused — they MUST appear in the next compaction summary.
 
     Focus is the deterministic channel for load-bearing knowledge to cross
@@ -13929,14 +13934,42 @@ def engram_focus(node_ids: str, reason: str) -> str:
     focused IDs — unfocus stale ones first.
 
     Args:
-        node_ids: Comma-separated node IDs to pin. Already-focused IDs are
-            treated as a no-op (their focused_at is refreshed and reason updated).
-        reason: Short phrase explaining why focused (e.g., "cn04 L2 yellow-cost
-            cornerstone"). Renders into the compaction summary alongside the ID.
+        payload_json: JSON object (as a string) with these fields:
+            node_ids (str, required): Comma-separated node IDs to pin.
+                Already-focused IDs are treated as a no-op (their focused_at
+                is refreshed and reason updated).
+            reason (str, required): Short phrase explaining why focused (e.g.,
+                "cn04 L2 yellow-cost cornerstone"). Renders into the compaction
+                summary alongside the ID.
 
     Returns:
         JSON with focused IDs, any rejections, and current focus-list size.
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _focus_impl for full semantics — kept callable with named kwargs for
+    in-server callers.
     """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _FOCUS_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_FOCUS_FIELDS)}"
+        })
+    if "node_ids" not in params:
+        return json.dumps({"error": "payload_json must include required field 'node_ids'"})
+    if "reason" not in params:
+        return json.dumps({"error": "payload_json must include required field 'reason'"})
+    return _focus_impl(**params)
+
+
+def _focus_impl(node_ids: str, reason: str) -> str:
+    """Impl for engram_focus — callable with named kwargs for in-server callers."""
     ids = [s.strip() for s in node_ids.split(",") if s.strip()]
     if not ids:
         return json.dumps({"status": "error", "error": "No node IDs provided"})
@@ -14038,6 +14071,11 @@ def engram_focus(node_ids: str, reason: str) -> str:
 #
 # Idempotent: unfocusing an already-unfocused node returns `already_unfocused`
 # (success), not error. Safe to call defensively over a mixed-state set.
+_UNFOCUS_FIELDS = frozenset({
+    "node_ids",
+})
+
+
 @mcp.tool(
     name="engram_unfocus",
     annotations={
@@ -14048,7 +14086,7 @@ def engram_focus(node_ids: str, reason: str) -> str:
         "openWorldHint": False,
     },
 )
-def engram_unfocus(node_ids: str) -> str:
+def engram_unfocus(payload_json: str) -> str:
     """Release nodes from focus — they no longer appear in compaction summary.
 
     Unfocus when a node is no longer load-bearing for active work (task done,
@@ -14056,12 +14094,37 @@ def engram_unfocus(node_ids: str) -> str:
     Idempotent: non-focused IDs return `already_unfocused` (success).
 
     Args:
-        node_ids: Comma-separated node IDs to release. Non-focused IDs are
-            treated as a no-op and returned in `already_unfocused`.
+        payload_json: JSON object (as a string) with these fields:
+            node_ids (str, required): Comma-separated node IDs to release.
+                Non-focused IDs are treated as a no-op and returned in
+                `already_unfocused`.
 
     Returns:
         JSON with released IDs and current focus-list size.
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _unfocus_impl for full semantics — kept callable with named kwargs for
+    in-server callers.
     """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _UNFOCUS_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_UNFOCUS_FIELDS)}"
+        })
+    if "node_ids" not in params:
+        return json.dumps({"error": "payload_json must include required field 'node_ids'"})
+    return _unfocus_impl(**params)
+
+
+def _unfocus_impl(node_ids: str) -> str:
+    """Impl for engram_unfocus — callable with named kwargs for in-server callers."""
     ids = [s.strip() for s in node_ids.split(",") if s.strip()]
     if not ids:
         return json.dumps({"status": "error", "error": "No node IDs provided"})
@@ -14184,16 +14247,6 @@ def engram_list_focused() -> str:
         conn.close()
 
 
-@mcp.tool(
-    name="engram_focus_save",
-    annotations={
-        "title": "Snapshot Current Active Focus List Under a Name",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False,
-    },
-)
 # DESIGN INTENT — engram_focus_save
 # ---------------------------------
 # Named-set bookmark of the current active focus list. Lets the agent capture
@@ -14214,23 +14267,63 @@ def engram_list_focused() -> str:
 # Name validation: ^[a-z0-9_-]{1,50}$ — strict to keep set names URL/CLI
 # safe + readable. No spaces, no uppercase. Description is optional; used as
 # default focus_reason when loading.
-def engram_focus_save(name: str, description: str = "", overwrite: bool = False) -> str:
+_FOCUS_SAVE_FIELDS = frozenset({
+    "name", "description", "overwrite",
+})
+
+
+@mcp.tool(
+    name="engram_focus_save",
+    annotations={
+        "title": "Snapshot Current Active Focus List Under a Name",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_focus_save(payload_json: str) -> str:
     """Snapshot the current active focus list under `name`.
 
     Bookmark, not rotation: active list unchanged. Cascade resolution
     (supersede auto-follow, retract drop) happens at load time, not save time.
 
     Args:
-        name: Set name. Must match ^[a-z0-9_-]{1,50}$ (lowercase alphanumerics,
-            underscore, hyphen; 1–50 chars). No spaces, no uppercase.
-        description: Optional one-line purpose. Used as the default focus_reason
-            when the set is later loaded.
-        overwrite: If True, replace an existing set with this name. Default
-            False errors on name collision.
+        payload_json: JSON object (as a string) with these fields:
+            name (str, required): Set name. Must match ^[a-z0-9_-]{1,50}$
+                (lowercase alphanumerics, underscore, hyphen; 1–50 chars).
+                No spaces, no uppercase.
+            description (str, optional): One-line purpose. Used as the default
+                focus_reason when the set is later loaded.
+            overwrite (bool, optional): If True, replace an existing set with
+                this name. Default False errors on name collision.
 
     Returns:
         JSON with saved IDs, node count, and active_set_name.
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _focus_save_impl for full semantics — kept callable with named kwargs
+    for in-server callers.
     """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _FOCUS_SAVE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_FOCUS_SAVE_FIELDS)}"
+        })
+    if "name" not in params:
+        return json.dumps({"error": "payload_json must include required field 'name'"})
+    return _focus_save_impl(**params)
+
+
+def _focus_save_impl(name: str, description: str = "", overwrite: bool = False) -> str:
+    """Impl for engram_focus_save — callable with named kwargs for in-server callers."""
     name = name.strip()
     if not FOCUS_SET_NAME_PATTERN.match(name):
         return json.dumps({
@@ -14322,6 +14415,11 @@ def engram_focus_save(name: str, description: str = "", overwrite: bool = False)
 # stay live across graph evolution. A set saved months ago, where some nodes
 # have been superseded, will load the up-to-date replacements via the supersede
 # edges.
+_FOCUS_LOAD_FIELDS = frozenset({
+    "name", "if_active",
+})
+
+
 @mcp.tool(
     name="engram_focus_load",
     annotations={
@@ -14332,7 +14430,7 @@ def engram_focus_save(name: str, description: str = "", overwrite: bool = False)
         "openWorldHint": False,
     },
 )
-def engram_focus_load(name: str, if_active: str = "error") -> str:
+def engram_focus_load(payload_json: str) -> str:
     """Load a saved focus set into the active list.
 
     Default errors if active list is non-empty (use if_active="overwrite" or
@@ -14341,15 +14439,39 @@ def engram_focus_load(name: str, if_active: str = "error") -> str:
     with reports.
 
     Args:
-        name: Name of the saved set to load.
-        if_active: "error" (default) to refuse loading when active is non-empty;
-            "overwrite" to unfocus current first. For save-then-load atomicity,
-            use engram_focus_swap instead.
+        payload_json: JSON object (as a string) with these fields:
+            name (str, required): Name of the saved set to load.
+            if_active (str, optional): "error" (default) to refuse loading
+                when active is non-empty; "overwrite" to unfocus current
+                first. For save-then-load atomicity, use engram_focus_swap.
 
     Returns:
         JSON with loaded IDs, cascade resolution report (auto_followed_supersede,
         dropped_retracted, dropped_missing), and active_set_name.
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _focus_load_impl for full semantics — kept callable with named kwargs
+    for in-server callers.
     """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _FOCUS_LOAD_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_FOCUS_LOAD_FIELDS)}"
+        })
+    if "name" not in params:
+        return json.dumps({"error": "payload_json must include required field 'name'"})
+    return _focus_load_impl(**params)
+
+
+def _focus_load_impl(name: str, if_active: str = "error") -> str:
+    """Impl for engram_focus_load — callable with named kwargs for in-server callers."""
     name = name.strip()
     if if_active not in {"error", "overwrite"}:
         return json.dumps({
@@ -14510,6 +14632,11 @@ def engram_focus_load(name: str, if_active: str = "error") -> str:
 # Use case: "I'm switching from paper-sprint to dream-cost investigation."
 # engram_focus_swap(save_as="paper_sprint", load="dream_cost") — paper-sprint
 # anchors captured, dream-cost anchors active, all atomic.
+_FOCUS_SWAP_FIELDS = frozenset({
+    "save_as", "load", "description",
+})
+
+
 @mcp.tool(
     name="engram_focus_swap",
     annotations={
@@ -14520,22 +14647,46 @@ def engram_focus_load(name: str, if_active: str = "error") -> str:
         "openWorldHint": False,
     },
 )
-def engram_focus_swap(save_as: str, load: str = "", description: str = "") -> str:
+def engram_focus_swap(payload_json: str) -> str:
     """Atomic save-current + optionally-load-other. The canonical pivot op.
 
     Both halves in one transaction: if the load target doesn't exist, the
     save rolls back too. save_as == load is a no-op (returns already_active).
 
     Args:
-        save_as: Name to save current active list under. Overwrites if it
-            already exists.
-        load: Name of the set to load after saving. Empty string means
-            save-only (active_set_name is set to save_as).
-        description: Optional description for save_as.
+        payload_json: JSON object (as a string) with these fields:
+            save_as (str, required): Name to save current active list under.
+                Overwrites if it already exists.
+            load (str, optional): Name of the set to load after saving. Empty
+                string means save-only (active_set_name is set to save_as).
+            description (str, optional): Optional description for save_as.
 
     Returns:
         JSON with both save and load summaries, and active_set_name.
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _focus_swap_impl for full semantics — kept callable with named kwargs
+    for in-server callers.
     """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _FOCUS_SWAP_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_FOCUS_SWAP_FIELDS)}"
+        })
+    if "save_as" not in params:
+        return json.dumps({"error": "payload_json must include required field 'save_as'"})
+    return _focus_swap_impl(**params)
+
+
+def _focus_swap_impl(save_as: str, load: str = "", description: str = "") -> str:
+    """Impl for engram_focus_swap — callable with named kwargs for in-server callers."""
     save_as = save_as.strip()
     load = load.strip()
     if not FOCUS_SET_NAME_PATTERN.match(save_as):
@@ -14788,6 +14939,11 @@ def engram_focus_sets() -> str:
 # Use case: archival cleanup of stale named sets identified via
 # engram_focus_sets (low load_count + old last_loaded_at). Bookmark removal,
 # not focus removal.
+_FOCUS_DELETE_SET_FIELDS = frozenset({
+    "name",
+})
+
+
 @mcp.tool(
     name="engram_focus_delete_set",
     annotations={
@@ -14798,19 +14954,43 @@ def engram_focus_sets() -> str:
         "openWorldHint": False,
     },
 )
-def engram_focus_delete_set(name: str) -> str:
+def engram_focus_delete_set(payload_json: str) -> str:
     """Remove a saved focus set. Active list (focused nodes) unaffected.
 
     Drops the bookmark, not the tab — focused nodes stay focused even if the
     deleted set was active (active_set_name just clears to NULL).
 
     Args:
-        name: Name of the saved set to delete.
+        payload_json: JSON object (as a string) with these fields:
+            name (str, required): Name of the saved set to delete.
 
     Returns:
         JSON with deleted name, node_count it contained, and whether it was
         the active set.
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _focus_delete_set_impl for full semantics — kept callable with named
+    kwargs for in-server callers.
     """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _FOCUS_DELETE_SET_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_FOCUS_DELETE_SET_FIELDS)}"
+        })
+    if "name" not in params:
+        return json.dumps({"error": "payload_json must include required field 'name'"})
+    return _focus_delete_set_impl(**params)
+
+
+def _focus_delete_set_impl(name: str) -> str:
+    """Impl for engram_focus_delete_set — callable with named kwargs for in-server callers."""
     name = name.strip()
     conn = _get_db()
     try:
