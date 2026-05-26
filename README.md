@@ -192,7 +192,8 @@ Expected terminal output (abbreviated):
 == Step 5: Seed graph + template resolution ==
   Creating seed graph...
     {{AX_HONESTY}} = ax_0001
-    {{AX_PROVENANCE}} = ax_0002
+    {{AX_HONESTY_DISCRETION}} = ax_0002
+    {{AX_PROVENANCE}} = ax_0003
     {{DF_ENGRAM}} = df_0001
     {{DF_EPISTEMIC_IDENTITY}} = df_0002
     {{GL_EPISTEMIC_HUMILITY}} = gl_0001

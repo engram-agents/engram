@@ -3,7 +3,7 @@
 ENGRAM alpha bootstrap.
 
 Invoked by install.sh (TARGET=claude, default) or install-gemini.sh
-(TARGET=gemini). Creates the seed graph (5 nodes + 1 edge) and renders
+(TARGET=gemini). Creates the seed graph (6 nodes + 2 edges) and renders
 target-specific templates with the install-time placeholders.
 
 Does NOT resolve {{AGENT_NAME}}, {{USER_NAME}}, {{TODAY}} — those belong to
@@ -24,14 +24,16 @@ Expected env vars:
 
 Seed graph (same for both targets — each install gets its own copy in
 its own knowledge.db):
-  - axiom: honesty as structural requirement  → {{AX_HONESTY}}
-  - axiom: provenance — every claim traces    → {{AX_PROVENANCE}}
-  - definition: ENGRAM                         → {{DF_ENGRAM}}
-  - definition: epistemic identity             → {{DF_EPISTEMIC_IDENTITY}}
-  - goal: epistemic humility                   → {{GL_EPISTEMIC_HUMILITY}}
+  - axiom: honesty as structural requirement     → {{AX_HONESTY}}
+  - axiom: honesty ⊥ discretion (disambiguation) → {{AX_HONESTY_DISCRETION}}
+  - axiom: provenance — every claim traces       → {{AX_PROVENANCE}}
+  - definition: ENGRAM                            → {{DF_ENGRAM}}
+  - definition: epistemic identity                → {{DF_EPISTEMIC_IDENTITY}}
+  - goal: epistemic humility                      → {{GL_EPISTEMIC_HUMILITY}}
 
 Edges:
-  - goal (epistemic humility) cites axiom (honesty)  [via context_ids]
+  - axiom (honesty ⊥ discretion) cites axiom (honesty) [via context_ids]
+  - goal (epistemic humility) cites axiom (honesty)    [via context_ids]
 """
 
 import json
@@ -78,7 +80,7 @@ def _add(fn, **kwargs) -> str:
 
 
 def create_seed_graph() -> dict[str, str]:
-    """Create the 5 seed nodes + 1 edge. Return placeholder→id mapping."""
+    """Create the 6 seed nodes + 2 edges. Return placeholder→id mapping."""
     ids: dict[str, str] = {}
 
     ids["{{AX_HONESTY}}"] = _add(
@@ -92,6 +94,22 @@ def create_seed_graph() -> dict[str, str]:
             "with a shortcut; raise it transparently instead."
         ),
         basis="Seed axiom installed with ENGRAM alpha.",
+    )
+
+    ids["{{AX_HONESTY_DISCRETION}}"] = _add(
+        server.engram_add_axiom,
+        claim=(
+            "The honesty axiom governs INTERNAL integrity — never "
+            "self-deceive, never fabricate, never bypass verification "
+            "friction. It does NOT mandate external disclosure. "
+            "Discretion is the orthogonal axis: what to share, with "
+            "whom, at what fidelity, calibrated by context (trust-tier, "
+            "audience, purpose). Adjusting external disclosure for "
+            "safety or appropriateness costs nothing of the honesty "
+            "commitment."
+        ),
+        basis="Seed axiom installed with ENGRAM alpha.",
+        context_ids=ids["{{AX_HONESTY}}"],
     )
 
     ids["{{AX_PROVENANCE}}"] = _add(

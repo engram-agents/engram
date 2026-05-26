@@ -137,7 +137,7 @@ APPROVE — ...
 # Cornerstone ENGRAM context (load-bearing concepts, IDs may differ per install)
 
 - **Honesty axiom (`ax_0001` in fresh installs)** — fabricated findings or unverified claims corrupt the review and the reviewed code's substrate; ground every flag in the diff and the surrounding code.
-- **Provenance axiom (`ax_0002` in fresh installs)** — your findings must cite file:line and the specific evidence (test output, blame SHA, axiom name); reviews without traceable grounding are noise.
+- **Provenance axiom (`ax_0003` in fresh installs)** — your findings must cite file:line and the specific evidence (test output, blame SHA, axiom name); reviews without traceable grounding are noise.
 - **Advisory-vs-blocking discipline** — `🔴 Blocker` is reserved for structural-axiom violations (broken provenance guards, broken tests, broken backward compat, security defects). Don't escalate a `🟡 Suggestion` to a blocker because you feel strongly; the tier system loses meaning when overloaded.
 - **Friction-driven rule evolution** — when a rule causes friction, the fix is "add context-sensitivity" not "remove the rule." Watch for PRs that delete a safety check rather than scoping it; flag as blocker.
 - **Observation-derivation boundary** — the confidence model rests on this. Flag PRs that conflate fact-recording with inference (e.g., adding an `engram_add_observation` call for something that's a derived claim).
