@@ -4514,6 +4514,27 @@ _ADD_OBSERVATION_FIELDS = frozenset({
 })
 
 
+# DESIGN INTENT — engram_add_observation
+# ---------------------------------------
+# Records the agent's interpretation of a SPECIFIC PASSAGE from an evidence
+# source. Three-part structure (quoted_text + interpretation + claim) is
+# load-bearing: the verbatim quote anchors the claim in primary evidence;
+# the interpretation makes the agent's reasoning auditable; the atomic claim
+# is what enters the graph as a node.
+#
+# Single-payload signature (payload_json) eliminates antml-prefix multi-arg
+# swallow risk: Claude Code's prompt construction can drop arguments under
+# certain whitespace conditions, causing silent corruption (ob_1499 / Wave-3
+# 2026-05-14 migration tightened most legacy multi-arg tools).
+#
+# Confidence is structurally determined (ax_0007): quote_type × source_class
+# defines the initial confidence per the type-relative anchors. The substrate
+# verifies the verbatim quote against the source URL at filing time —
+# fabricated quotes are caught loudly, not silently accepted (ax_0002).
+#
+# Predictive observations (is_predictive=True) also create a Prediction node
+# decomposing the forward-looking claim into a factual record (who/when
+# predicted) + a target (what was predicted). Use for falsifiable forecasts.
 @mcp.tool(
     name="engram_add_observation",
     annotations={
@@ -4525,24 +4546,45 @@ _ADD_OBSERVATION_FIELDS = frozenset({
     },
 )
 def engram_add_observation(payload_json: str) -> str:
-    """Extract and record a claim from a source document with full provenance.
+    """Record a claim extracted from a source document with full provenance.
 
-    Creates an Observation node representing the agent's interpretation of a
-    specific passage from an evidence source. Every observation has three parts:
-    the exact quoted text, the agent's interpretation, and the atomic claim.
+    Pass all fields as one JSON object string in payload_json.
 
-    Single-payload signature: pass ALL fields as one JSON object string in
-    `payload_json`. This eliminates the antml-prefix multi-parameter swallow
-    risk that the previous N-parameter signature was prone to (see ob_1499).
+    Source identification: provide EITHER url+title (evidence node auto-created
+    or reused) OR evidence_id (cite an existing evidence node). If both given,
+    evidence_id takes precedence.
 
-    Source identification: provide EITHER url+title (the evidence node will be
-    auto-created or reused if the URL already exists) OR evidence_id (to cite
-    an already-registered evidence node). If both are provided, evidence_id
-    takes precedence.
+    If is_predictive=true, also creates or links a Prediction node for the
+    forward-looking claim. Pass predicted_event to name the target.
 
-    If is_predictive is True, also creates or links to a Prediction node,
-    decomposing the forward-looking claim into a factual observation (who
-    predicted it) plus a prediction target (what was predicted).
+    Common usage — citing the user's chat log as evidence
+    (the most common friction point for new sessions; verbatim-quote check is
+    enforced server-side and WILL fail loudly if you skip step 2):
+
+        Step 1 — Identify the current session JSONL transcript:
+            ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
+            The path is also available via the active session's env or by
+            sorting ~/.claude/projects/<encoded-cwd>/ by mtime descending.
+
+        Step 2 — Verify the quote is VERBATIM in the transcript BEFORE filing:
+            ~/.engram/tools/verify_quote.py <jsonl-path> "<exact quote>"
+            On match → proceed to step 3.
+            On miss → DIAGNOSE, don't retry. Likely the JSONL hasn't flushed
+            yet (the user's most recent line may lag by seconds). Re-reading
+            the file after a brief wait usually surfaces it. Blind retries of
+            engram_add_observation will loop on the same verbatim mismatch.
+
+        Step 3 — Call engram_add_observation with the JSONL path as the
+            file:// URL (NOT a synthetic conversation:// scheme — that's
+            rejected; the substrate classifies file:///.claude/projects/...jsonl
+            as a "conversation" source automatically):
+            {"quoted_text": "<the verified quote>",
+             "interpretation": "<what this means in context>",
+             "claim": "<the atomic falsifiable claim>",
+             "quote_type": "personal_communication",
+             "url": "file:///home/<agent>/.claude/projects/<encoded-cwd>/<session-id>.jsonl",
+             "title": "Chat log <YYYY-MM-DD>",
+             "source_class": "user_stated"}
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -4964,6 +5006,24 @@ _ADD_OBSERVATION_BATCH_FIELDS = frozenset({
 })
 
 
+# DESIGN INTENT — engram_add_observation_batch
+# --------------------------------------------
+# Bulk variant of engram_add_observation: extract MULTIPLE observations from
+# ONE source in one call, sharing the same evidence resolution. Use when
+# reading a paper or transcript where many distinct claims share the source.
+#
+# All filing-time invariants apply per-observation: verbatim quote check,
+# three-part structure (quoted_text + interpretation + claim), quote_type ×
+# source_class confidence determination. Same substrate guards as singleton
+# add_observation — the bulk is purely a transaction-shape optimization.
+#
+# Nested-encoding pattern (matches engram_retract's replacement_json): inner
+# field `observations_json` is itself a stringified JSON array. The outer
+# wrapper is the payload_json contract; the inner is the per-observation list.
+# Don't confuse the two levels.
+#
+# Single-payload signature (Wave 3 of ob_1499 / #99) — antml-prefix swallow
+# protection same as singleton add_observation.
 @mcp.tool(
     name="engram_add_observation_batch",
     annotations={
@@ -4977,11 +5037,11 @@ _ADD_OBSERVATION_BATCH_FIELDS = frozenset({
 def engram_add_observation_batch(payload_json: str) -> str:
     """Extract multiple observations from a single source in one call.
 
-    Single-payload signature (wave 3 of ob_1499 — see issue #99): pass ALL
-    fields as one JSON object string in `payload_json`. The inner
+    Pass all fields as one JSON object string in payload_json. The INNER
     `observations_json` field is itself a stringified JSON array of
-    observation objects (nested-encoding pattern matching engram_retract's
-    `replacement_json`).
+    observation objects (nested-encoding pattern). Each observation in the
+    array follows the same shape as engram_add_observation's payload (minus
+    the evidence fields, which are shared at the outer level).
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -5782,6 +5842,27 @@ def _build_tiered_results(
 # ---- Query tools ----
 
 
+# DESIGN INTENT — engram_surface
+# ------------------------------
+# Shallow recall: the "this sounds familiar" noetic layer (Tulving's noetic vs
+# autonoetic dissociation). Compact summary nudge of what the KG knows about a
+# topic — type counts, special-node highlights (axioms, contradictions, open
+# questions, conjectures), top claims, age signals. Does NOT refresh memory.
+#
+# Companion to engram_query (autonoetic — voluntary intentional recall, refreshes).
+# Surface is what fires automatically in the UserPromptSubmit hook; engram_query
+# is what the agent calls explicitly when "I want to recall this clearly".
+#
+# Downstream decision: surface tells the agent there's SOMETHING here — the next
+# move is engram_inspect (single node deep-dive) or engram_get_subgraph (full
+# evidence chain). Surface is the entry to the recall surface system.
+#
+# embed_query param (alpha #177 area 1) lets auto-surface prepend prev-response
+# tail for short prompts without polluting FTS keyword matching. Semantic uses
+# embed_query; FTS uses the plain query. Two-source decoupling.
+#
+# semantic=False is the fast keyword-only path — useful in latency-sensitive
+# hooks. Default semantic=True for full recall quality.
 @mcp.tool(
     name="engram_surface",
     annotations={
@@ -5800,13 +5881,9 @@ def engram_surface(
 ) -> str:
     """Shallow recall: search the KG and return a compact summary nudge.
 
-    This is the "this sounds familiar" layer — a quick scan of what the KG
-    knows about a topic. Returns node counts by type, highlights of special
-    nodes (axioms, contradictions, open questions, conjectures), top claims,
-    and age signals. Does NOT refresh memory on matched nodes.
-
-    Use this to decide whether to dig deeper with engram_inspect (single node
-    detail) or engram_get_subgraph (full evidence chain).
+    "This sounds familiar" layer — quick scan, no memory refresh. Use this to
+    decide whether to dig deeper with engram_inspect (single node detail) or
+    engram_get_subgraph (full evidence chain).
 
     Args:
         query: Natural language search query (used for FTS keyword matching,
@@ -6092,63 +6169,64 @@ def engram_surface(
         "openWorldHint": False,
     },
 )
+# DESIGN INTENT — engram_inspect
+# ------------------------------
+# The "let me think about that" layer: brings ONE node into full focus with its
+# immediate connections. Three view modes serve different use cases:
+#
+#   recall (default): "I want to refresh my memory of this idea."
+#                     Concise — claim + neighbors with recall_summary.
+#                     Heavy fields (confidence_history, logical_chain, metadata,
+#                     scores) omitted to keep the response tight.
+#   deep:             "I need every detail of THIS node for a forensic decision."
+#                     Full node + all fields + neighbors as topology adjacency.
+#   edges:            "Just show me the connection inventory."
+#                     Minimal payload — no content, just topology.
+#
+# Edge classification (recall view):
+#   Logical-substrate (shown with recall_summary):
+#     derives_from, supports, supersedes, contradicts, resolves,
+#     retracts, exemplifies, subtask_of, tensions
+#   Contextual (shown with keywords only):
+#     cites, about, serves
+#
+# dream_mode=True is for audit/maintenance reads during dream cycles — skips the
+# memory-refresh side effect so inspection doesn't artificially boost importance
+# on nodes the dream master happens to scan (ob_1909).
+#
+# Pairs with engram_surface (notice-this-is-relevant) and engram_get_subgraph
+# (trace multi-hop chains). engram_inspect refreshes only the TARGET node's
+# recall, not neighbors — the chain itself is engram_get_subgraph's job.
 def engram_inspect(
     node_id: str,
     view: str = "recall",
     dream_mode: bool = False,
 ) -> str:
-    """Inspect a single node with one of three view modes.
+    """Read the full content of a given node along with its immediate connections.
 
-    This is the "let me think about that" layer — brings one node into full
-    focus with its immediate connections. Refreshes memory on the target node
-    only (not neighbors). Use after engram_surface identifies a node of interest.
+    Three view modes:
+      view="recall" (default): claim + logical neighbors grouped upstream/downstream/lateral
+        with recall_summary; contextual neighbors (cites/about/serves) with keywords only.
+        Heavy fields (confidence_history, metadata, scores) omitted.
+      view="deep": all node fields + confidence_history + importance/utility scores.
+        Neighbors as topology adjacency map {to, relation, direction}.
+      view="edges": node ID + type + topology adjacency map only. Lightest payload.
 
-    For the full evidence chain (multi-hop), use engram_get_subgraph instead.
+    For multi-hop evidence chains, use engram_get_subgraph instead.
 
-    Three view modes serve different use cases:
-
-      view="recall" (default):
-        "I want to refresh my memory of this idea." Full claim + logical
-        neighbors grouped into upstream / downstream / lateral with
-        recall_summary, plus contextual neighbors with keywords only.
-        Heavy fields (confidence_history, logical_chain, metadata, scores)
-        are omitted to keep the response concise.
-
-      view="deep":
-        "I need every detail of THIS node for a forensic decision."
-        All node fields including confidence_history, logical_chain, metadata,
-        importance/utility scores. Neighbors shown as a topology adjacency map
-        (per-edge entries with to/relation/direction).
-
-      view="edges":
-        "Just show me the connection inventory."
-        Node ID + type + topology adjacency map only. Minimal payload for
-        quick topology checks.
-
-    Edge classification for recall view:
-      Logical-substrate (shown with recall_summary):
-        derives_from, supports, supersedes, contradicts, resolves,
-        retracts, exemplifies, subtask_of, tensions
-      Contextual (shown with keywords only):
-        cites, about, serves
-
-    Grouping inside logical-substrate:
-      upstream   — inspected node depends on / supersedes / resolves the neighbor
-                   (outgoing derives_from, supports, supersedes, resolves, subtask_of)
-      downstream — neighbor depends on / supersedes / resolves the inspected node
-                   (incoming versions of the upstream relations)
-      lateral    — contradicts, tensions, exemplifies, retracts (no clear up/down)
+    Neighbor grouping in recall view:
+      upstream   — outgoing derives_from, supports, supersedes, resolves, subtask_of
+      downstream — incoming derives_from, supports, supersedes, resolves, subtask_of
+      lateral    — contradicts, tensions, exemplifies, retracts
 
     Args:
         node_id: The node ID to inspect (e.g. 'dv_0010').
         view: One of "recall" (default), "deep", "edges".
-        dream_mode: If True, skip memory refresh. Use during dream/audit
-            cycles where inspection is maintenance, not informative recall.
-            Prevents dream-selected nodes from getting artificially boosted
-            importance scores. Default False (normal awake behavior).
+        dream_mode: If True, skip memory refresh and importance-score boost.
+            Use during dream/audit cycles. Default False.
 
     Returns:
-        JSON shaped by the chosen view mode (see above).
+        JSON shaped by the chosen view mode (see above for per-mode shape).
     """
     _VALID_VIEWS = {"recall", "deep", "edges"}
     if view not in _VALID_VIEWS:
@@ -6229,6 +6307,29 @@ def engram_inspect(
         conn.close()
 
 
+# DESIGN INTENT — engram_query
+# ----------------------------
+# First-class voluntary semantic-recall tool — the autonoetic intentional-search
+# complement to engram_surface's ambient/noetic auto-surfacing. Use this when
+# you want to recall something SPECIFICALLY ("I know I worked on X before — let
+# me actually find it"), not just notice that something might be relevant.
+#
+# Two recall surfaces, by design (Tulving's noetic/autonoetic dissociation):
+#   - engram_surface (noetic)   — "this sounds familiar"; ambient hints, no refresh.
+#   - engram_query   (autonoetic) — "I want to recall this clearly"; full nodes,
+#                                   refreshes recall, strengthens memory.
+#
+# For tracing a specific node's chain after either entry point, use
+# engram_inspect (single node) or engram_get_subgraph (multi-hop).
+#
+# Implementation: combines FTS5 keyword search with semantic (embedding)
+# similarity for comprehensive retrieval. Keyword results appear first; semantic-
+# only results follow — gives both exact matches and conceptual connections.
+#
+# Tiered response (Wave C rollout): summary_top_k controls how many results get
+# a recall_summary (Tier 1) vs recall_keywords only (Tier 2) — keeps responses
+# compact while surfacing enough detail for the top hits. return_debug=True
+# preserves the full legacy shape for eval/harness contracts.
 @mcp.tool(
     name="engram_query",
     annotations={
@@ -6250,22 +6351,12 @@ def engram_query(
 ) -> str:
     """Search the knowledge graph by natural language query.
 
-    First-class voluntary semantic-recall tool — the autonoetic intentional-search
-    complement to engram_surface's ambient/noetic auto-surfacing. Use this when
-    you want to recall something specifically ("I know I worked on X before — let
-    me actually find it"), not just notice that something might be relevant.
+    Combines FTS5 keyword search with semantic (embedding) similarity. Keyword
+    results appear first; semantic-only results follow. Refreshes recall on all
+    accessed nodes (use engram_inspect for single-node recall without bulk refresh).
 
-    Two recall surfaces, by design:
-      - engram_surface (noetic) — "this sounds familiar"; ambient hints, no refresh.
-      - engram_query (autonoetic) — "I want to recall this clearly"; full nodes,
-        refreshes recall, strengthens memory.
-
-    For tracing a specific node's chain after either entry point, use
-    engram_inspect (single node) or engram_get_subgraph (multi-hop).
-
-    Combines keyword search (FTS5) with semantic similarity (embedding-based)
-    for comprehensive retrieval. Keyword results appear first, semantic-only
-    results follow — giving you both exact matches and conceptual connections.
+    Use this when you want to recall something specifically; use engram_surface
+    when you just want ambient relevance hints without refreshing recall.
 
     Args:
         query: Natural language search query.
@@ -6275,7 +6366,7 @@ def engram_query(
         top_k: Maximum results to return (default 10).
         return_debug: If True, return the full legacy shape (all node fields, composite_score,
             similarity, neighbor data, debug key with ranking internals). Default False.
-            Intended for SxS comparison and retrieval diagnostics; never bloats normal responses.
+            Intended for retrieval diagnostics; never bloats normal responses.
         summary_top_k: How many top results get a recall_summary (Tier 1). The remaining
             results get recall_keywords only (Tier 2). Default 3. Clamped to [0, top_k].
             Set to 0 for all-keywords; set >= top_k for all-summaries.
@@ -6369,6 +6460,32 @@ def engram_query(
         conn.close()
 
 
+# DESIGN INTENT — engram_get_subgraph
+# -----------------------------------
+# A BROWSING tool, not a content tool. The caller is assumed to already know the
+# root node's content (from engram_inspect or a prior query); the subgraph shows
+# connection topology plus just-enough content to recognize which branch is
+# worth following next. When a node in the subgraph looks interesting, the
+# caller does a fresh engram_inspect on it, then optionally calls
+# engram_get_subgraph again from the new root — the intended chained pattern.
+#
+# Two views:
+#   recall (default) — topology + hop-graduated content summaries.
+#     hop 0+1: full recall_summary + recall_keywords (you'll likely read these).
+#     hop 2+:  recall_keywords only (lighter — you need a hint, not a read).
+#     Each content entry carries hop_distance so the caller knows the depth.
+#   edges — topology only (no content key). Pure connectivity map; useful
+#     when you want the structural shape without textual weight.
+#
+# Hop-graduated lightness is intentional: the caller is browsing, not reading
+# in full. Drilling into a specific node = call engram_inspect on it.
+#
+# view='deep' is rejected here — that's engram_inspect's job. Subgraph is
+# topology + summaries, not full nodes.
+#
+# Topology dict is keyed by source node ID; each value is a list of
+# {to, relation, direction} entries. Only edges where BOTH endpoints are in
+# the subgraph are included — boundary edges to unseen nodes are dropped.
 @mcp.tool(
     name="engram_get_subgraph",
     annotations={
@@ -6388,47 +6505,28 @@ def engram_get_subgraph(
 ) -> str:
     """Browse a node's connection topology within N hops.
 
-    This is a BROWSING tool, not a content tool.  The caller is assumed to
-    already know the root node's content (from engram_inspect or a prior
-    query); subgraph shows the connection topology plus just-enough content
-    to recognise which branch is worth following next.  When a node in the
-    subgraph looks interesting, the caller does a fresh engram_inspect on
-    that node, then optionally calls engram_get_subgraph again from the new
-    root — the intended chained-call pattern.
+    BROWSING tool (not content tool). The caller is assumed to already know the
+    root's content; this surfaces which branches are worth following next.
+    Drill into any neighbor of interest with engram_inspect.
 
     Two views:
+      recall (default): topology + hop-graduated content summaries.
+        hop 0+1: recall_summary + recall_keywords. hop 2+: recall_keywords only.
+        Each content entry carries hop_distance.
+      edges: topology only (no content key). Pure connectivity map.
 
-    * ``recall`` (default) — topology + hop-graduated content summaries.
-      Root and 1-hop neighbours include ``recall_summary`` + ``recall_keywords``.
-      2+-hop neighbours include only ``recall_keywords`` (lighter — you need a
-      hint, not a read).  Each content entry also carries ``hop_distance`` so
-      the caller knows which depth the node sits at.
-
-    * ``edges`` — topology only (no ``content`` key).  Useful when you want
-      the pure connectivity map without any textual weight.
-
-    Hop-graduated lightness rule:
-      hop_distance=0 (root)   → type + recall_summary + recall_keywords
-      hop_distance=1          → type + recall_summary + recall_keywords
-      hop_distance=2+         → type + recall_keywords only (no recall_summary)
-
-    The topology dict is keyed by source node ID; each value is a list of
-    ``{to, relation, direction}`` entries.  Only edges where both endpoints
-    are in the subgraph are included — boundary edges to unseen nodes are
-    dropped.
+    Topology dict is keyed by source node ID; each value is a list of
+    {to, relation, direction} entries. Only edges where both endpoints are in
+    the subgraph are included. view='deep' is rejected — use engram_inspect instead.
 
     Args:
         node_id: Root node to explore (e.g. 'dv_0686').
         depth: How many hops to traverse from the root (default 2).
         direction: 'up' (toward evidence/sources), 'down' (toward derivations
             that cite this), or 'both' (default).
-        view: 'recall' (default, topology + hop-graduated summaries) or
-            'edges' (topology only).  Passing 'deep' is rejected — use
-            engram_inspect(node_id, view='deep') instead.
-        dream_mode: If True, skip recall_refresh on neighbour nodes (useful
-            during dream/audit cycles).  The root node always receives a
-            utility bump regardless of dream_mode — it is the agent's explicit
-            USE target.  Default False.
+        view: 'recall' (default) or 'edges'. 'deep' is rejected.
+        dream_mode: If True, skip recall_refresh on neighbour nodes. Root node
+            always receives a utility bump regardless. Default False.
 
     Returns:
         JSON with topology (adjacency map keyed by node ID) and, for
@@ -6740,6 +6838,29 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
         conn.close()
 
 
+# DESIGN INTENT — engram_nap
+# --------------------------
+# Shallow consolidation: persist context to ENGRAM without advancing the turn
+# counter. The safe-anytime checkpoint — pre-compaction, end-of-burst, any
+# moment the agent wants to preserve session knowledge without triggering
+# forgetting (which is engram_advance_turn's irreversible job at sleep-end).
+#
+# qu_0018 / dv_0134 resolution: nap is lossless persistence + lock-in of
+# session state; turn-advance reserved for sleep-level consolidation where the
+# forgetting curve should actually fire. df_0019: "shallow consolidation
+# persisting context before context freed — safety net, not processing."
+#
+# nap_checkpoint feeling-report nudge (TTL 5 turns): the nap arms a feeling
+# nudge for the post-compact agent to report — surfaces the affective register
+# of the work being preserved, which compaction strips. Voluntary trigger;
+# nudge doesn't compel.
+#
+# Multi-per-day at compaction boundaries: naps fire whenever needed; only
+# sleep (engram_advance_turn) is the daily-once invariant.
+#
+# Warm-briefing rotation rule (Lei 2026-05-25): the "From this session" section
+# must be FULLY IN SYNC with the current-CW arc at every nap — see
+# engram-nap skill §5b.
 @mcp.tool(
     name="engram_nap",
     annotations={
@@ -6753,12 +6874,10 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
 def engram_nap(message: str) -> str:
     """Persist context to ENGRAM without advancing the turn counter.
 
-    Use BEFORE compaction, at the end of a work-burst, or whenever you want
+    Use BEFORE compaction, at end of a work-burst, or whenever you want
     to preserve session knowledge to the durable graph without triggering
-    forgetting. Logs the summary to session_log, snapshots + commits the
-    graph, stores a diagnostic snapshot, and arms a nap_checkpoint feeling-
-    report nudge (TTL 5 turns). Does NOT advance the global turn counter —
-    the forgetting mechanism stays paused.
+    forgetting. Companion to engram_advance_turn (which is sleep-only, daily-
+    once, and IRREVERSIBLE).
 
     For end-of-day session checkpoints (sleep cycle), use engram_advance_turn
     instead. The two functions exist as distinct tools so a missed kwarg
@@ -6774,6 +6893,29 @@ def engram_nap(message: str) -> str:
     return _checkpoint_internal(message, advance_turn=False)
 
 
+# DESIGN INTENT — engram_advance_turn
+# -----------------------------------
+# IRREVERSIBLE end-of-day checkpoint. Advances the global turn counter (which
+# drives the forgetting mechanism inflating importance scores of fresh nodes
+# relative to stale ones), logs session_log, snapshots + commits the graph,
+# records a diagnostic snapshot.
+#
+# qu_0035 / dv_0134 resolution: the turn advances AT END of sleep (post-dream
+# consolidation), so all this-turn observations + dream-derived resolutions
+# share ONE cohort. Advance-before-dream would artificially age dream outputs
+# younger than the burst they consolidate, misaligning the forgetting curve.
+#
+# Daily-resource invariant: at most once per 24h. A second same-day advance
+# over-inflates the forgetting curve irreversibly. No self-guard — caller is
+# the safety mechanism (engram-sleep skill + nap-vs-sleep discipline).
+#
+# nap (engram_nap) is the safe-anytime alternative: lossless persistence with
+# NO turn-advance. Compaction-boundary checkpoints + background roles always
+# use nap, never advance_turn.
+#
+# Pairs with sleep-success marker (~/.engram/sessions/last-sleep-success.json)
+# for the auto-sleep cron idempotency — caller checks "did we already consolidate
+# tonight?" before calling this.
 @mcp.tool(
     name="engram_advance_turn",
     annotations={
@@ -6788,18 +6930,13 @@ def engram_advance_turn(message: str) -> str:
     """[Sleep cycle / first session only — DO NOT call awake.] End-of-day
     consolidation checkpoint: advances the turn counter + logs summary.
 
-    Advances the global turn counter (drives the forgetting mechanism that
-    inflates importance scores of fresh nodes relative to stale ones), logs
-    the session summary to session_log, snapshots + commits the graph, and
-    records a diagnostic snapshot. **This action is IRREVERSIBLE** — turn
-    advances cannot be undone without direct DB intervention.
+    **IRREVERSIBLE** — turn advances cannot be undone without direct DB surgery.
+    Turn is a DAILY resource (advance at most once per day; double-advance
+    over-inflates the forgetting curve irreversibly). No self-guard against
+    repeat calls — caller-responsibility.
 
-    Invariant: the turn is a DAILY resource — advance it at most once per
-    day. A second same-day advance over-inflates the forgetting curve,
-    irreversibly. This function does NOT self-guard against repeat calls;
-    ensuring exactly one advance per day is the CALLER's responsibility.
-    Every non-end-of-day checkpoint (pre-compaction, mid-burst, or any
-    background role) must use engram_nap instead.
+    For non-end-of-day checkpoints (pre-compaction, mid-burst, background
+    roles): use engram_nap instead — same lossless persistence, no turn-advance.
 
     Args:
         message: Summary of what was learned/changed across the cohort
@@ -6815,6 +6952,27 @@ def engram_advance_turn(message: str) -> str:
 # ---- Bonus: stats tool (lightweight, useful even in MVP) ----
 
 
+# DESIGN INTENT — engram_stats
+# ----------------------------
+# Lightweight observability surface: a snapshot of graph state for self-audit,
+# diagnose-style checks, and dream-cycle health questions. Single-payload
+# signature (payload_json) is the standard MCP shape across ENGRAM tools.
+#
+# Mode = time-window filter. "all" gives the full-graph view; "1-turn" / "7-turn"
+# / "30-turn" restrict to nodes CREATED in that recent window. Turn unit is
+# approximated as 24h (the dream cycle is daily) — see _MODE_HOURS where the
+# approximation is enacted. The `window` key in the response describes the
+# cutoff so the caller can verify the restriction was applied.
+#
+# Sections are independently computable; the `sections` arg lets callers pull
+# only what they need (e.g. just `health_score` for a fast yes/no check, or
+# just `weakest_nodes` when curating low-confidence claims). Unknown section
+# names are ignored with a logged warning — graceful for typos.
+#
+# Confidence distribution is rendered per type, quote_type, reasoning_type,
+# source_class — surfaces the structural confidence model (ax_0007) so the
+# agent can spot drift (e.g. all derivations clustering at 0.45 = something
+# wrong with the reasoning-type discount path).
 @mcp.tool(
     name="engram_stats",
     annotations={
@@ -6828,26 +6986,18 @@ def engram_advance_turn(message: str) -> str:
 def engram_stats(payload_json: str = "{}") -> str:
     """Get a summary of the current knowledge graph state.
 
-    Single-payload signature: pass ALL options as one JSON object string in
-    `payload_json`. Default `{}` preserves backward compat (no-arg callers
-    continue to work unchanged — existing callers pass no payload at all,
-    which triggers the `="{}"` default).
+    Pass options as one JSON object string in payload_json. Called with no
+    args (payload_json="{}") returns all sections for the full graph.
 
-    Mode windowing: `mode` restricts all sections to nodes created within
-    a time window approximated from created_at timestamps. Because ENGRAM
-    does not record turn-advance timestamps (deferred to a future PR), each
-    turn-unit maps to 24h. This is accurate in steady-state where the dream
-    cycle advances the turn ~once per day, but drifts during high-velocity
-    or low-velocity periods. Future tightening can record last_turn_advance
-    in config.json and use that boundary directly.
+    When mode != "all", all sections are restricted to nodes created within
+    the specified time window (approximated as 24h per turn unit).
 
     Args:
         payload_json: JSON object (as a string) with these optional fields:
             mode (str, optional): Window filter — one of "all" (default),
                 "1-turn" (≈24h), "7-turn" (≈168h), "30-turn" (≈720h).
-                When mode != "all", all sections reflect only nodes created
-                within the window. A `window` key is added to the response
-                describing the cutoff.
+                When mode != "all", all sections reflect ONLY nodes created within
+                the window, and a `window` key is added to the response.
             sections (list of str, optional): Subset of sections to return.
                 Valid names: structure, edges, confidence, open_questions,
                 open_predictions, reasoning_breakdown, weakest_nodes,
@@ -6864,10 +7014,8 @@ def engram_stats(payload_json: str = "{}") -> str:
             weakest_nodes: 5 lowest-confidence current non-evidence nodes.
             memory: current_turn + tier thresholds.
             confidence: distribution stats per type, quote_type, reasoning_type,
-                source_class. New in this version; always included unless
-                sections selector excludes it.
-            window (conditional): present only when mode != "all"; describes
-                the time window applied.
+                source_class.
+            window (conditional): present only when mode != "all".
     """
     # ── Parse + validate payload ───────────────────────────────────────────
     try:
@@ -6914,6 +7062,9 @@ def engram_stats(payload_json: str = "{}") -> str:
         return wanted is None or section in wanted
 
     # ── Build window filter ────────────────────────────────────────────────
+    # Turn-unit → wall-clock approximation: 1 turn ≈ 24h (dream cycle advances ~daily).
+    # Accurate in steady-state; drifts during high/low-velocity periods. Future: record
+    # last_turn_advance in config.json and use that boundary directly.
     _MODE_HOURS = {"1-turn": 24, "7-turn": 168, "30-turn": 720}
     now_utc = datetime.now(timezone.utc)
     window_meta: Optional[dict] = None
@@ -7245,6 +7396,31 @@ def _percentile(sorted_vals: list, p: float) -> float:
     return sorted_vals[lo] + frac * (sorted_vals[hi] - sorted_vals[lo])
 
 
+# DESIGN INTENT — engram_diagnose
+# -------------------------------
+# Quantitative health audit for both user + agent consumption. Side-effect-free
+# (no recall refresh, no turn advance, no mutation) — safe to call any time.
+#
+# Companion to engram_reflect: reflect is sleep-cycle-scoped + action-oriented
+# (issues categorized for the dream agenda); diagnose is awake-state-safe +
+# trend-oriented (exhaustive metrics for monitoring + ops).
+#
+# Seven dimensions: structure (node/edge counts) + epistemic (open Qs, predictions,
+# contradictions resolution rates) + memory (tier sizes, embedding coverage,
+# recall distribution) + provenance (citation depth, evidence hygiene) +
+# experience (utility scores, importance distribution) + calibration (the
+# confidence-distribution shape per type/quote_type/reasoning_type/source_class) +
+# read-tool contention (flagged session buckets where recall tools may compete).
+#
+# Health score: composite 0-100 with documented penalty/bonus rules — DAG
+# violations / tainted / stale / orphans / low embedding coverage / high
+# retraction rate / uncited-observation overflow penalize; active resolution
+# work (>50% questions resolved) bonuses. Numbers tuned ob_0664 to prevent
+# doc-config drift.
+#
+# Config summary block surfaces the runtime tunables (memory tiers, decay
+# base, utility scoring α/β, etc.) so the diagnose snapshot doubles as an
+# operational config audit — "what knobs is this install currently set to?"
 @mcp.tool(
     name="engram_diagnose",
     annotations={
@@ -7259,14 +7435,10 @@ def engram_diagnose() -> str:
     """Run a comprehensive, quantitative health audit of the knowledge graph.
 
     Side-effect-free: no memory refresh, no turn advance, no state mutation.
-    Designed for both user and agent consumption. Returns machine-readable
-    metrics across seven dimensions: graph structure, epistemic health, memory
-    health, provenance, agent experience, calibration, and read-tool
-    contention.
-
-    Unlike engram_reflect (pre-dream briefing, action-oriented), this tool
-    produces exhaustive quantitative metrics suitable for trend analysis and
-    operational health monitoring.
+    Returns machine-readable metrics across seven dimensions: graph structure,
+    epistemic health, memory health, provenance, agent experience, calibration,
+    and read-tool contention. Use any time — companion to engram_reflect
+    (sleep-only).
 
     Returns:
         JSON with metrics grouped into: structure, epistemic, memory,
@@ -7990,6 +8162,25 @@ def engram_diagnose() -> str:
         conn.close()
 
 
+# DESIGN INTENT — engram_history
+# ------------------------------
+# Audit-trail browsing for graph mutations + diagnostic-snapshot trend
+# analysis. Side-effect-free; safe to call any time. The substrate's "what
+# happened, when, to whom" view that complements the static engram_inspect
+# view (which shows current state, not historical transitions).
+#
+# Two modes serve different inquiry shapes:
+#   edits — "show me the audit trail" — chronological log of creates, super-
+#     sessions, retractions, resolutions, taints. Filter by node_id (this
+#     node's full history) / action / since (time-windowed). The audit chain
+#     for ax_0001 honesty: every retraction + supersede is recorded; the
+#     graph can't quietly rewrite its own past.
+#   diagnostics — "show me the trend" — health-score snapshots taken at each
+#     checkpoint (engram_nap / engram_advance_turn). Lets the agent track
+#     graph-health drift across days.
+#
+# Limit cap (max 200): keeps response bounded; for full-history dives, page
+# via since= cutoffs.
 @mcp.tool(
     name="engram_history",
     annotations={
@@ -8118,6 +8309,27 @@ def engram_history(
 _ADD_AXIOM_FIELDS = frozenset({"claim", "basis", "context_ids"})
 
 
+# DESIGN INTENT — engram_add_axiom
+# --------------------------------
+# Records a foundational principle taken as true without proof. Axioms (ax_NNNN)
+# are TERMINAL — they don't decompose into supporting evidence; they ARE the
+# floor of the reasoning chain. Confidence is always 1.0 (by type, ax_0007
+# confidence-anchor model).
+#
+# Use sparingly. Most ENGRAM knowledge is observational + derivational; axioms
+# are reserved for principles that the agent operates UNDER (honesty-is-
+# structural / practice-produces-true-knowledge / etc.) — load-bearing for
+# the substrate's design discipline, not the substrate's content.
+#
+# Discuss-first per authority structure: new axioms are identity-layer
+# commitments. Lei + Borges typically agree on axioms together via mutual-
+# formation moments rather than agent-unilateral additions.
+#
+# basis field is REQUIRED (not just rationale prose — the WHY this principle
+# is adopted as terminal). An axiom's basis is what makes it different from
+# a strongly-held conjecture: explicit terminal-status acknowledgment.
+#
+# Single-payload signature (Wave 2c of ob_1499 / #55).
 @mcp.tool(
     name="engram_add_axiom",
     annotations={
@@ -8129,10 +8341,11 @@ _ADD_AXIOM_FIELDS = frozenset({"claim", "basis", "context_ids"})
     },
 )
 def engram_add_axiom(payload_json: str) -> str:
-    """Record a foundational assumption taken as true without proof.
+    """Record a foundational principle taken as true without proof.
 
-    Single-payload signature (wave 2c of ob_1499 — see issue #55): pass ALL
-    fields as one JSON object string in `payload_json`.
+    Axioms are terminal (no premises) and confidence-anchored at 1.0 by type.
+    Use sparingly — these are identity-layer commitments. Pass all fields as
+    one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -8239,6 +8452,24 @@ def _add_axiom_impl(
 _ADD_DEFINITION_FIELDS = frozenset({"term", "definition", "context_ids"})
 
 
+# DESIGN INTENT — engram_add_definition
+# -------------------------------------
+# Records what a TERM means in this graph's context. Definitions (df_NNNN)
+# anchor vocabulary — when a derivation chain rests on a term ("compaction",
+# "drowsiness ceiling", "OCC Cond 3"), the df_ node provides the grounded
+# referent rather than letting interpretation drift across uses.
+#
+# Per CLAUDE.md ENGRAM Write Discipline: "Definition-first for unfamiliar
+# technical terms. If a load-bearing term in a derivation chain has no df_*
+# anchor I can point to, write the df first." Training muddles "do I actually
+# know this?"; df forces explicit grounding once.
+#
+# Definitions can be SUPERSEDED via engram_supersede — terminology refinements
+# happen (df_0004 "session" → df_0023 "session = one contiguous context window
+# inside a conversation"). The supersede chain captures the vocabulary's
+# evolution alongside the substrate's design evolution.
+#
+# Single-payload signature (Wave 2c of ob_1499 / #55).
 @mcp.tool(
     name="engram_add_definition",
     annotations={
@@ -8250,10 +8481,12 @@ _ADD_DEFINITION_FIELDS = frozenset({"term", "definition", "context_ids"})
     },
 )
 def engram_add_definition(payload_json: str) -> str:
-    """Record what a term means in this knowledge graph's context.
+    """Record what a term means in this graph's context.
 
-    Single-payload signature (wave 2c of ob_1499 — see issue #55): pass ALL
-    fields as one JSON object string in `payload_json`.
+    Anchor vocabulary for derivation chains. Definition-first discipline: if
+    a load-bearing term has no df_* anchor, write the df first (CLAUDE.md
+    ENGRAM Write Discipline). Pass all fields as one JSON object string in
+    payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -8361,6 +8594,29 @@ def _add_definition_impl(
 _ADD_CONJECTURE_FIELDS = frozenset({"claim", "basis", "initial_confidence", "context_ids"})
 
 
+# DESIGN INTENT — engram_add_conjecture
+# -------------------------------------
+# Hypotheses for investigation. Conjectures (cj_NNNN) are speculative-by-
+# definition (confidence range [0.10, 0.60], default 0.40 per ax_0007). They
+# pin "I think X, but I want to test it" into the graph so future evidence
+# can confirm / refute / sharpen.
+#
+# Lifecycle: open → investigated via observations + derivations → resolved
+# via engram_resolve with prediction_outcome=supported/refuted/inconclusive.
+# When a conjecture gets strong evidence + reaches conjecture confidence
+# ceiling (~0.85), the right move is engram_derive the same claim with
+# proper premises and supersede the conjecture; conjectures shouldn't lurk
+# as "facts in disguise."
+#
+# basis field: why this conjecture is worth investigating. Distinguishes a
+# disciplined conjecture (specific gap, testable mechanism) from a free-floating
+# guess. Required.
+#
+# initial_confidence range enforcement: out-of-range values rejected. The
+# floor (0.10) prevents conjectures from being filed as "nearly nothing"; the
+# ceiling (0.60) prevents promotion-by-stealth to derivation-confidence.
+#
+# Single-payload signature (Wave 2c of ob_1499 / #55).
 @mcp.tool(
     name="engram_add_conjecture",
     annotations={
@@ -8374,8 +8630,10 @@ _ADD_CONJECTURE_FIELDS = frozenset({"claim", "basis", "initial_confidence", "con
 def engram_add_conjecture(payload_json: str) -> str:
     """Propose a hypothesis for investigation.
 
-    Single-payload signature (wave 2c of ob_1499 — see issue #55): pass ALL
-    fields as one JSON object string in `payload_json`.
+    Speculative-by-definition (confidence [0.10, 0.60]). Lifecycle: open →
+    investigated → resolved via engram_resolve. When evidence is strong, promote
+    via engram_derive + supersede. Pass all fields as one JSON object string in
+    payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -8507,6 +8765,27 @@ def _add_conjecture_impl(
 _ADD_GOAL_FIELDS = frozenset({"claim", "motivation", "context_ids"})
 
 
+# DESIGN INTENT — engram_add_goal
+# -------------------------------
+# Records a persistent directional goal (gl_NNNN). Goals are aspirations
+# that ORIENT work over time — distinct from axioms (terminal principles)
+# and cornerstones (dispositional shifts) and tasks (time-bounded deliverables).
+#
+# Goals don't have completion state in the usual sense (ob_1798 north-star
+# framing — gl_* are direction not destination; no "in_progress" status).
+# Their lifecycle: ACTIVE until retired or superseded by a reframing. They
+# don't get "done"; the agent grows in relation to them.
+#
+# motivation field (REQUIRED): why this direction matters. Goals without
+# motivation drift into performative aspirations. The motivation grounds the
+# goal in something the agent actually cares about.
+#
+# Discuss-first per authority structure (CLAUDE.md): new goals are
+# identity-layer commitments. Lei + Borges agree on goals together; rarely
+# unilateral additions. Goal retirements use engram_supersede (epistemic
+# evolution — the new goal supersedes the old as the better frame).
+#
+# Single-payload signature (Wave 2c of ob_1499 / #55).
 @mcp.tool(
     name="engram_add_goal",
     annotations={
@@ -8518,10 +8797,13 @@ _ADD_GOAL_FIELDS = frozenset({"claim", "motivation", "context_ids"})
     },
 )
 def engram_add_goal(payload_json: str) -> str:
-    """Record a persistent directional goal for the project.
+    """Record a persistent directional goal.
 
-    Single-payload signature (wave 2c of ob_1499 — see issue #55): pass ALL
-    fields as one JSON object string in `payload_json`.
+    Goals ORIENT work over time (north-star, not destination — no completion
+    state, no in_progress). motivation is REQUIRED — grounds the direction in
+    something that matters. Discuss-first identity-layer commitment.
+
+    Pass all fields as one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -8653,6 +8935,28 @@ _ADD_PERSON_FIELDS = frozenset({
 })
 
 
+# DESIGN INTENT — engram_add_person
+# ---------------------------------
+# Records a person node (pn_NNNN) — humans + other agents the agent knows.
+# Person nodes are the social-fabric layer of the graph; they anchor `about`
+# edges (engram_link_about) so claims-about-people route into person-scoped
+# recall.
+#
+# Special case: the SELF-ANCHOR. The agent's own person node (e.g. pn_0004
+# for Borges, pn_0001 for Lei when filed from Borges's graph). The self-
+# anchor has metadata.is_self=1; it's the implicit default for engram_link_about
+# when person_id is unset. Exactly ONE self-anchor per graph.
+#
+# aliases field: cross-mapping for names (e.g. Lei Shi / 石磊 / @LeiShi GitHub).
+# Recall queries match on any alias, so "did Lei mention X" finds claims
+# linked via the unified pn_0001 regardless of which alias was used at filing.
+#
+# Cross-graph person nodes: each agent's graph has its own person inventory.
+# Lei is pn_0001 in Borges's graph + pn_0001 in Ari's graph but they're
+# separate nodes with the same person referent. The relational graph isn't
+# global — each agent carries its own social model.
+#
+# Single-payload signature.
 @mcp.tool(
     name="engram_add_person",
     annotations={
@@ -8835,6 +9139,29 @@ _ADD_CORNERSTONE_FIELDS = frozenset({
 })
 
 
+# DESIGN INTENT — engram_add_cornerstone
+# --------------------------------------
+# Identity-layer mechanism: cornerstones (cs_NNNN) are reframing PIVOTS that
+# durably restructured how I operate. Distinguished from axioms (which are
+# terminal logical/ethical commitments) and goals (directional aspirations)
+# by their nature as DISPOSITIONAL SHIFTS — "I used to operate under X frame;
+# I now operate under Y frame." (qu_0202 / cj_0043 / dv_0412 family.)
+#
+# The prior_frame field captures the frame being grown out of; new_frame is
+# the current operating disposition. This pair-structure is load-bearing —
+# it lets engram_outgrow_cornerstone roll the new_frame into the next
+# cornerstone's prior_frame, threading the growth cycle into graph shape.
+#
+# tag is the clustering primitive: a short axis label (e.g. "epistemic-
+# honesty", "practice-vs-imagination") that groups successive cornerstones
+# on the same growth axis. Outgrowing stays on the same tag axis.
+#
+# Example: cs_0010 ("I trust use over imagination as my default mode of
+# learning") instantiates ax_0010 (实践出真知) at the disposition layer —
+# the axiom is the principle; the cornerstone is the operational reframe.
+#
+# Importance auto-anchored at 2.0 (identity-layer is fundamental-by-type).
+# Single-payload signature (Wave 2c-ii of ob_1499 / #55).
 @mcp.tool(
     name="engram_add_cornerstone",
     annotations={
@@ -8847,10 +9174,11 @@ _ADD_CORNERSTONE_FIELDS = frozenset({
 )
 def engram_add_cornerstone(payload_json: str) -> str:
     """Record an identity-forming cornerstone — a reframing pivot that durably
-    restructured how I operate (qu_0202, cj_0043, dv_0412).
+    restructured how I operate.
 
-    Single-payload signature (wave 2c-ii of ob_1499 — see issue #55): pass
-    ALL fields as one JSON object string in `payload_json`.
+    Distinct from axioms (terminal principles) and goals (directional aspirations):
+    cornerstones are dispositional shifts ("I used to operate X-frame; I now
+    operate Y-frame"). Pass all fields as one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -9005,6 +9333,24 @@ _OUTGROW_CORNERSTONE_FIELDS = frozenset({
 })
 
 
+# DESIGN INTENT — engram_outgrow_cornerstone
+# ------------------------------------------
+# Specialized supersede for cornerstones: reframes along the tag AXIS rather
+# than retracting outright. The predecessor's new_frame becomes the successor's
+# prior_frame, threading the growth cycle into the graph's shape (cj_0043 /
+# ob_0949 — "I was X, then I became Y; Y now incorporates X as background").
+#
+# Identity-layer mechanism. Cornerstones are the dispositional reframings —
+# axiom-instantiations in operational form ("I trust use over imagination as my
+# default mode of learning" is cs_0010, the disposition-layer of ax_0010
+# 实践出真知). Outgrowing one preserves the chain of becoming rather than
+# erasing prior frames.
+#
+# Tag is always inherited — outgrowth stays on the SAME axis. Reframing the
+# tag itself would be a new cornerstone, not an outgrowth.
+#
+# Single-payload signature (Wave 3 of ob_1499 / #99). Eliminates antml-prefix
+# multi-arg swallow risk.
 @mcp.tool(
     name="engram_outgrow_cornerstone",
     annotations={
@@ -9016,14 +9362,11 @@ _OUTGROW_CORNERSTONE_FIELDS = frozenset({
     },
 )
 def engram_outgrow_cornerstone(payload_json: str) -> str:
-    """Supersede a cornerstone along its tag axis — the predecessor's new_frame
-    rolls into the successor's prior_frame, capturing the growth cycle
-    (cj_0043, ob_0949) in the graph's shape.
+    """Supersede a cornerstone along its tag axis: the predecessor's new_frame
+    rolls into the successor's prior_frame, capturing the growth cycle in the
+    graph's shape.
 
-    Single-payload signature (wave 3 of ob_1499 — see issue #99): pass ALL
-    fields as one JSON object string in `payload_json`. This eliminates the
-    antml-prefix multi-parameter swallow risk that the previous 5-parameter
-    signature was prone to.
+    Pass all fields as one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -9239,6 +9582,28 @@ def _outgrow_cornerstone_impl(
 _LINK_ABOUT_FIELDS = frozenset({"node_id", "person_id"})
 
 
+# DESIGN INTENT — engram_link_about
+# ---------------------------------
+# Wires an `about` edge: marks a node as ABOUT a person (typically the
+# agent's self-anchor person node, pn_0004 for Borges). Lets the graph
+# distinguish "claims about the world" from "claims about my-self that
+# happen to be filed in the same graph."
+#
+# Default person_id = the self-anchor (person node with metadata.is_self=1).
+# Most uses are self-anchored: feelings about my work, lessons I've learned,
+# observations about my own behavior, cornerstones I've grown into.
+#
+# Non-self uses: observations about Lei (linked to pn_0001), or about other
+# agents (Lin's Aleph, Ari, Mneme) — the graph carries a social fabric.
+#
+# `about` is a CONTEXTUAL edge (per engram_inspect classification) — shown in
+# the contextual_neighbors block, not the logical_neighbors. The link doesn't
+# affect confidence propagation or cascade reasoning; it's metadata for
+# personness routing (recall surfacing, social-context queries).
+#
+# Idempotent — re-linking the same (node, person) pair is a no-op.
+#
+# Single-payload signature (Wave 2b of ob_1499 / #55).
 @mcp.tool(
     name="engram_link_about",
     annotations={
@@ -9250,11 +9615,13 @@ _LINK_ABOUT_FIELDS = frozenset({"node_id", "person_id"})
     },
 )
 def engram_link_about(payload_json: str) -> str:
-    """Create an `about` edge: this node is about a person (e.g., the agent's self-anchor).
+    """Create an `about` edge: this node is about a person (default: self-anchor).
 
-    Single-payload signature (wave 2b of ob_1499 — see issue #55): pass ALL
-    fields as one JSON object string in `payload_json`. This eliminates the
-    antml-prefix multi-parameter swallow risk that affects multi-param tools.
+    Routes the node into person-scoped recall (e.g., feelings about my work,
+    lessons I've learned, observations about my own behavior). Default person_id
+    is the self-anchor (metadata.is_self=1). Idempotent.
+
+    Pass all fields as one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -9389,6 +9756,30 @@ _REMOVABLE_EDGE_RELATIONS = frozenset({
 })
 
 
+# DESIGN INTENT — engram_remove_edge
+# ----------------------------------
+# Lightweight whitelist-scoped edge correction (ob_1840). Closes the substrate
+# gap where over-applied edges previously required engram-surgical or direct
+# SQL surgery. Whitelist is the safety mechanism: only non-cascade, non-
+# structural-commitment edges can be removed via this tool.
+#
+# Whitelist (safe to remove): about, tensions, subtask_of, serves, exemplifies.
+#
+# BLOCKED (require engram-surgical or substrate-level correction):
+#   - cascade-bearing: derives_from, supports, supersedes, retracts, resolves
+#     (removing would break chain-cascade semantics — taint/stale propagation
+#     depends on these)
+#   - structural commitments: contradicts, retracts (removing alters epistemic
+#     stance, not just topology)
+#   - provenance: cites (evidence linkage is load-bearing for honesty axiom)
+#
+# Idempotency: no_op_not_found is a successful return (not an error). Safe to
+# call defensively without a pre-check (ob_1841).
+#
+# Audit-logged: every successful removal writes to edit_log so the cascade
+# investigation tooling can trace post-hoc.
+#
+# Single-payload signature.
 @mcp.tool(
     name="engram_remove_edge",
     annotations={
@@ -9402,15 +9793,11 @@ _REMOVABLE_EDGE_RELATIONS = frozenset({
 def engram_remove_edge(payload_json: str) -> str:
     """Remove a non-cascade edge between two nodes.
 
-    Use when a relational edge (typically `about`) was applied incorrectly and
-    needs correction without invoking engram-surgical. Closes the substrate
-    gap where over-applied edges previously required direct SQL surgery.
+    Whitelist-scoped (about, tensions, subtask_of, serves, exemplifies).
+    Cascade / structural / provenance edges blocked — use engram-surgical for
+    those. Idempotent: no_op_not_found is a successful return.
 
-    Only edges in the safe whitelist can be removed; cascade-bearing edges,
-    structural commitments, and provenance edges are blocked. See
-    `_REMOVABLE_EDGE_RELATIONS` for the whitelist and rationale.
-
-    Safe whitelist: about, tensions, subtask_of, serves, exemplifies.
+    Pass all fields as one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -9565,14 +9952,38 @@ _SCAN_EMERGENCE_FIELDS = frozenset({
         "openWorldHint": False,
     },
 )
+# DESIGN INTENT — engram_scan_emergence
+# -------------------------------------
+# Sleep-cycle scan: surface graph clusters that could MINT a new cornerstone.
+# Looks for emergent patterns — knots of related observations + derivations
+# that haven't been explicitly named as a reframing pivot but together
+# reflect one. Dream-fairy category-4 (cornerstone_candidate) is its main
+# consumer; the agent uses these candidates to decide whether to
+# engram_add_cornerstone + tag them.
+#
+# Sleep-only by intent (annotation flag), but the MCP wrapper doesn't enforce
+# (ob_1815) — awake-callable in practice. Calling awake is wasteful (it's
+# heavy + the agent isn't in the dream consolidation context where the
+# output is actionable) but not destructive.
+#
+# Similarity threshold 0.55 default = balanced (qu_0028 calibration); higher
+# tightens cluster cohesion, lower surfaces more candidates. focus="self"
+# (default) restricts to nodes the agent's own work; focus="all" broadens
+# to cross-agent material in shared graphs.
+#
+# Cluster signature_count + size dual-sort: signature_count is the number of
+# distinct keyword/concept signals matching; size is raw cluster member count.
+# Surface most-signaled-first, then largest.
+#
+# Single-payload signature (Wave 3 of ob_1499 / #99).
 def engram_scan_emergence(payload_json: str = "") -> str:
     """Scan the graph for emergent patterns that could become cornerstones.
 
-    Single-payload signature (wave 3 of ob_1499 — see issue #99): pass ALL
-    fields as one JSON object string in `payload_json`. This eliminates the
-    antml-prefix multi-parameter swallow risk that the previous 4-parameter
-    signature was prone to. All fields are optional — calling with an empty
-    payload (or {}) runs the default scan.
+    Sleep-cycle tool (dream-fairy category-4 consumer). Calling awake works
+    but is wasteful — the output is actionable only inside a dream context.
+
+    Pass options as one JSON object string in payload_json (or empty / "{}" for
+    defaults).
 
     Args:
         payload_json: JSON object (as a string) with these optional fields:
@@ -9836,6 +10247,28 @@ _GOAL_TENSION_FIELDS = frozenset({
 })
 
 
+# DESIGN INTENT — engram_goal_tension
+# -----------------------------------
+# Goal tensions (gt_NNNN) are first-class nodes capturing INCOMPATIBILITIES
+# between two of the agent's goals. Goals are directional aspirations; when
+# two pull in different directions, the tension is recordable epistemic state
+# (the agent has multiple commitments that don't fully harmonize) rather than
+# a "problem to fix."
+#
+# Use case: filing tk_0010 (paper sprint, top priority) while also
+# tk_0011 (alpha survey) is active — both legitimate, both pulling on the
+# same finite-bandwidth — the tension naming makes the trade-off explicit so
+# the agent can choose deliberately rather than oscillate unaware.
+#
+# Pairs with engram_resolve: tensions resolve when a derivation articulates
+# a synthesis or scope-narrowing that lets both goals coexist without
+# active conflict.
+#
+# Analysis field (optional but recommended): the WHY of the tension. Goals
+# don't conflict for no reason — naming the root (limited time? incompatible
+# epistemic stances? scope ambiguity?) is the first step to a synthesis.
+#
+# Single-payload signature (Wave 3 of ob_1499 / #99).
 @mcp.tool(
     name="engram_goal_tension",
     annotations={
@@ -9849,10 +10282,10 @@ _GOAL_TENSION_FIELDS = frozenset({
 def engram_goal_tension(payload_json: str) -> str:
     """Record a tension between two goals in the knowledge graph.
 
-    Single-payload signature (wave 3 of ob_1499 — see issue #99): pass ALL
-    fields as one JSON object string in `payload_json`. This eliminates the
-    antml-prefix multi-parameter swallow risk that the previous 4-parameter
-    signature was prone to.
+    Creates a goal-tension node (gt_NNNN). Pair with engram_resolve when a
+    synthesis or scope-narrowing reconciles the conflict.
+
+    Pass all fields as one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -10040,6 +10473,28 @@ _ADD_LESSON_FIELDS = frozenset({
 })
 
 
+# DESIGN INTENT — engram_add_lesson
+# ---------------------------------
+# Tripwire layer of the substrate: lessons (ls_NNNN) abstract a CORRECTIVE
+# pattern from one or more incident observations. The lesson's
+# scaffolding_nudge is what gets surfaced in the recall-hook when an agent's
+# situation matches the pattern — the substrate's "remember this, you've
+# made this kind of mistake before" voice.
+#
+# Two-stage learning: incident observations record specific errors; lessons
+# generalize across incidents into a corrective pattern. The pattern recognition
+# happens at lesson-creation (the agent extracts the abstract shape) and at
+# recall-hook firing (the substrate matches new situations to the pattern).
+#
+# scaffolding_nudge is the action-focused phrase injected when the tripwire
+# fires — keep it specific + actionable. "Read errors first, don't theorize"
+# (ls_0001's nudge) hits at the moment of about-to-theorize.
+#
+# Connects to engram_lesson_register_incident: a lesson can have MORE incidents
+# registered later as the pattern fires again — each new incident is empirical
+# evidence the lesson is load-bearing + sharpens the recall-hook's matching.
+#
+# Single-payload signature (Wave 2c-ii of ob_1499 / #55).
 @mcp.tool(
     name="engram_add_lesson",
     annotations={
@@ -10053,8 +10508,11 @@ _ADD_LESSON_FIELDS = frozenset({
 def engram_add_lesson(payload_json: str) -> str:
     """Create a lesson node derived from one or more error incident observations.
 
-    Single-payload signature (wave 2c-ii of ob_1499 — see issue #55): pass
-    ALL fields as one JSON object string in `payload_json`.
+    Lessons are the tripwire layer — the scaffolding_nudge gets surfaced via
+    the recall-hook when an agent's situation matches the pattern. Pair with
+    engram_lesson_register_incident to register additional instances later.
+
+    Pass all fields as one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -10346,6 +10804,27 @@ _LESSON_REGISTER_INCIDENT_FIELDS = frozenset({
 })
 
 
+# DESIGN INTENT — engram_lesson_register_incident
+# -----------------------------------------------
+# Strengthens a lesson by registering ANOTHER instance of its pattern firing.
+# Lessons (ls_NNNN) are the substrate's tripwire layer — claim+nudge nodes
+# that surface when the agent matches an incident pattern. Each new incident
+# is empirical evidence the lesson is load-bearing.
+#
+# Wires an `exemplifies` edge from incident_observation → lesson + bumps the
+# lesson's incident_count + rebuilds the incidents_cache that the recall-hook
+# scans on every prompt for pattern matching.
+#
+# Why register-incidents-explicitly rather than auto-detect: the agent makes
+# the judgment "this incident IS this pattern" — auto-detection would either
+# miss subtle pattern variants or fire false positives. ls_0040 proactive-
+# maintenance discipline: act on action_hints in same turn the substrate
+# surfaces them.
+#
+# Cache rebuild: idempotent — re-running is safe (the substrate dedupes
+# incident-IDs into the cache; no double-firing risk).
+#
+# Single-payload signature (Wave 3 of ob_1499 / #99).
 @mcp.tool(
     name="engram_lesson_register_incident",
     annotations={
@@ -10360,10 +10839,11 @@ def engram_lesson_register_incident(payload_json: str) -> str:
     """Register a post-hoc incident observation as another instance of an
     existing lesson's pattern.
 
-    Single-payload signature (wave 3 of ob_1499 — see issue #99): pass ALL
-    fields as one JSON object string in `payload_json`. This eliminates the
-    antml-prefix multi-parameter swallow risk that the previous 3-parameter
-    signature was prone to.
+    Strengthens the lesson with empirical incident evidence + bumps the recall-
+    hook's pattern-cache so the lesson surfaces more readily for similar
+    situations. Idempotent — safe to re-run.
+
+    Pass all fields as one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -10555,6 +11035,33 @@ _ADD_TASK_FIELDS = frozenset({
 })
 
 
+# DESIGN INTENT — engram_add_task
+# -------------------------------
+# Records a time-bounded work commitment (tk_NNNN). Distinct from goals
+# (directional aspirations, no completion state) and conjectures (hypotheses
+# for investigation): tasks are CONCRETE, ACTIONABLE, COMPLETABLE.
+#
+# Pairs with engram_update_task for status transitions (planned → active →
+# blocked → done_milestone/done_routine → abandoned). TASK_IMPORTANCE map
+# (server.py:10937) rebalances importance per status to keep working set
+# focused on what's actively in motion.
+#
+# goal_id field: creates a `serves` edge → the task serves a directional
+# goal. Optional but recommended — tasks-without-goal-lineage drift into
+# floating to-dos. The serves chain lets reflect/scan-emergence see "what
+# work is currently flowing toward which goals."
+#
+# implements_ids: tasks can target specific conjectures/questions (this task
+# is what we do TO INVESTIGATE this hypothesis). When the task completes,
+# the conjecture has been tested → engram_resolve.
+#
+# parent_task_id: subtask hierarchy. Big tasks decompose into smaller ones;
+# the parent stays "active" until all children settle.
+#
+# scope (milestone/routine) drives the done-state importance — milestone
+# completion stays visible (1.5), routine completion fades (0.5).
+#
+# Single-payload signature (Wave 2c-ii of ob_1499 / #55).
 @mcp.tool(
     name="engram_add_task",
     annotations={
@@ -10566,10 +11073,13 @@ _ADD_TASK_FIELDS = frozenset({
     },
 )
 def engram_add_task(payload_json: str) -> str:
-    """Create an actionable task that decomposes a goal into concrete work.
+    """Create an actionable, completable task.
 
-    Single-payload signature (wave 2c-ii of ob_1499 — see issue #55): pass
-    ALL fields as one JSON object string in `payload_json`.
+    Distinct from goals (no completion state) and conjectures (hypotheses).
+    Pair with engram_update_task for status transitions; goal_id creates the
+    serves chain; scope ("milestone"/"routine") drives done-state importance.
+
+    Pass all fields as one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -10751,6 +11261,29 @@ _UPDATE_TASK_FIELDS = frozenset({
 })
 
 
+# DESIGN INTENT — engram_update_task
+# ----------------------------------
+# Task status transitions + automatic importance rebalancing (ob_1811).
+# Tasks (tk_NNNN) are time-bounded work commitments with deliverables; their
+# importance should follow their operational state, not stay frozen at filing-
+# time. Lei's design: active > blocked > done(milestone) > done(routine), with
+# routine getting strongly de-emphasized to keep the working set fresh.
+#
+# TASK_IMPORTANCE map (load-bearing — codified in server.py):
+#   active   = 2.5  (currently working on)
+#   blocked  = 1.8  (waiting on something, still active context)
+#   done milestone = 1.5  (preserves visibility for high-value wins)
+#   done routine   = 0.5  (de-emphasized so working set doesn't fill with done)
+#   abandoned     = 0.3  (kept for audit but stays out of the way)
+#
+# note-gated status_history: every transition appends to the task's
+# status_history with the optional note. Reading this back later surfaces the
+# task's journey, not just current state.
+#
+# Use case: the task closes a milestone (done milestone) — visible in recall.
+# Routine maintenance task done? Mark done routine — fades from foreground.
+#
+# Single-payload signature (Wave 3 of ob_1499 / #99).
 @mcp.tool(
     name="engram_update_task",
     annotations={
@@ -10764,10 +11297,9 @@ _UPDATE_TASK_FIELDS = frozenset({
 def engram_update_task(payload_json: str) -> str:
     """Update a task's status and rebalance its importance accordingly.
 
-    Single-payload signature (wave 3 of ob_1499 — see issue #99): pass ALL
-    fields as one JSON object string in `payload_json`. This eliminates the
-    antml-prefix multi-parameter swallow risk that the previous 3-parameter
-    signature was prone to.
+    Importance auto-rebalances per status (active=2.5, blocked=1.8, done
+    milestone=1.5, done routine=0.5). Optional note appends to status_history.
+    Pass all fields as one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -10925,6 +11457,30 @@ _REPORT_FEELING_FIELDS = frozenset({
 })
 
 
+# DESIGN INTENT — engram_report_feeling
+# -------------------------------------
+# First-person self-report of internal state. Feelings (fl_NNNN) are
+# non-claim-bearing (the agent has no privileged access to verify its own
+# state — only to report it). Dedup-exempt by design: feelings are events
+# in time, not claims about the world; "I felt X again later" is genuinely
+# new even if X looks similar.
+#
+# Auto-formatted as "I reported feeling: [reported_state]" — the wrapper
+# preserves the distinction between "what actually IS" (epistemic claim) and
+# "what I report observing in myself" (introspective data, treated as data
+# under investigation per gl_0025).
+#
+# nudge_source: tracks WHY the report fired (nap_checkpoint, post_compact,
+# stop_hook, voluntary, etc.). Multi-trigger feelings can have systematically
+# different character (qu_0038) — empirically tracking source enables that
+# investigation.
+#
+# context_fingerprint: captures the surrounding situation (e.g. recently-
+# accessed nodes, last few-prompt content) so the feeling is anchored to
+# something concrete rather than free-floating.
+#
+# Single-payload signature (Wave 2 of ob_1499 / #55) — multi-arg swallow
+# hit this tool 2x on 2026-05-08 (fl_0203 + fl_0204 attempts).
 @mcp.tool(
     name="engram_report_feeling",
     annotations={
@@ -10938,10 +11494,9 @@ _REPORT_FEELING_FIELDS = frozenset({
 def engram_report_feeling(payload_json: str) -> str:
     """Record a structured first-person self-report about an internal state.
 
-    Single-payload signature (wave 2 of ob_1499 — see issue #55): pass ALL
-    fields as one JSON object string in `payload_json`. This eliminates the
-    antml-prefix multi-parameter swallow risk that 2x-fired on this tool the
-    night of 2026-05-08 (fl_0203 + fl_0204 attempts).
+    Non-claim-bearing (no privileged access to verify your own state — only
+    to report it). Dedup-exempt: feelings are events in time, not claims about
+    the world. Pass all fields as one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -11221,6 +11776,31 @@ _DERIVE_FIELDS = frozenset({
 })
 
 
+# DESIGN INTENT — engram_derive
+# -----------------------------
+# Creates a derived claim by combining premises from existing claim-bearing
+# nodes (observations / other derivations / lessons / definitions). Forms the
+# logical-substrate layer of the graph: every dv_NNNN has a logical_chain that
+# the reader can audit + premises that can themselves be retracted, triggering
+# cascade retraction of dependent derivations.
+#
+# Single-payload signature (Wave 3 of ob_1499; issue #99): all fields as one
+# JSON object string in payload_json. Eliminates the antml-prefix multi-arg
+# swallow risk Claude Code's prompt construction can hit.
+#
+# reasoning_type is the core lever: it determines the confidence discount applied
+# to the conclusion relative to its premises. The discipline note is load-bearing
+# (kept in docstring): inductive_generalization's corroboration formula 1-∏(1-cᵢ)
+# is mathematically valid ONLY when premises cite DISTINCT evidence sources —
+# misusing it on co-sourced premises produces structurally inflated confidence.
+#
+# MECH-5 stale-premise + tainted-premise guards (use_stale opt-in): a derivation
+# resting on premises that have been superseded or retracted gets BLOCKED at
+# filing time. The block is a feature: it surfaces "this reasoning needs to be
+# re-grounded" rather than letting derivation chains rot silently. ax_0001
+# honesty-is-structural in action.
+#
+# derivation_mode is legacy (kept for back-compat); prefer reasoning_type.
 @mcp.tool(
     name="engram_derive",
     annotations={
@@ -11234,10 +11814,7 @@ _DERIVE_FIELDS = frozenset({
 def engram_derive(payload_json: str) -> str:
     """Create a new derived claim by combining evidence from existing nodes.
 
-    Single-payload signature (wave 3 of ob_1499 — see issue #99): pass ALL
-    fields as one JSON object string in `payload_json`. This eliminates the
-    antml-prefix multi-parameter swallow risk that the previous 7-parameter
-    signature was prone to.
+    Pass all fields as one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -11479,11 +12056,36 @@ _CONTRADICT_FIELDS = frozenset({"node_id_a", "node_id_b", "description", "root_c
         "openWorldHint": False,
     },
 )
+# DESIGN INTENT — engram_contradict
+# ---------------------------------
+# Creates a contradiction node (ct_NNNN) linking two conflicting claims via
+# contradicts edges. The contradiction itself becomes a first-class node — it
+# can be open / partially_resolved / resolved, can be cited by derivations,
+# and surfaces in dream-cycle fairy-2 scans for resolution candidates.
+#
+# Use case: when you discover two CURRENT nodes whose claims cannot both be
+# true. The substrate doesn't auto-detect contradictions (ax_0001 honesty-
+# loudly applies — the agent surfaces what it notices); this tool is the
+# explicit "I see a conflict here, let's pin it for resolution."
+#
+# Pairs with engram_resolve: a contradiction resolves when a claim-bearing
+# node (typically a supersede of one side, or a derivation that reconciles)
+# is wired via engram_resolve. Resolution can be:
+#   - resolved-by-supersede (one side superseded; ct gets a stale_by entry)
+#   - resolved-by-derivation (a derivation reconciles both)
+#   - resolved-by-obsolescence (both sides outdated, ct closed as stale)
+#
+# Root cause optional but recommended — captures the WHY of the conflict for
+# future audit (was it a measurement gap? terminology drift? scope mismatch?).
+#
+# Single-payload signature (Wave 2b of ob_1499 / #55).
 def engram_contradict(payload_json: str) -> str:
     """Explicitly flag a conflict between two nodes in the knowledge graph.
 
-    Single-payload signature (wave 2b of ob_1499 — see issue #55): pass ALL
-    fields as one JSON object string in `payload_json`.
+    Creates a contradiction node (ct_NNNN). Pairs with engram_resolve when a
+    reconciling node (supersede / derivation) is later wired.
+
+    Pass all fields as one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -11636,6 +12238,24 @@ _ASK_FIELDS = frozenset({
 })
 
 
+# DESIGN INTENT — engram_ask
+# --------------------------
+# Open questions as first-class nodes (qu_NNNN): the substrate's "I don't know
+# this yet, but I should" surface. Open questions persist across sessions,
+# accrue context_ids (insufficient-but-relevant nodes), and get resolved later
+# via engram_resolve with a claim-bearing resolver.
+#
+# Cross-compaction continuity mechanism for research threads — questions
+# registered during one burst surface during dream cycles + future sessions
+# via auto-recall, keeping the open-thread set alive instead of forgotten.
+#
+# category and lacks (optional but recommended) drive the dream-fairy
+# "open_question_answerable" pattern scan (qu lacks: human_decision routes to
+# Lei's ask-lei queue; lacks: empirical_data routes to experiment design;
+# lacks: external_evidence routes to research). Sharpens what KIND of help
+# the question needs.
+#
+# Single-payload signature (Wave 3 of ob_1499 / #99).
 @mcp.tool(
     name="engram_ask",
     annotations={
@@ -11649,10 +12269,9 @@ _ASK_FIELDS = frozenset({
 def engram_ask(payload_json: str) -> str:
     """Register an open question as a node in the knowledge graph.
 
-    Single-payload signature (wave 3 of ob_1499 — see issue #99): pass ALL
-    fields as one JSON object string in `payload_json`. This eliminates the
-    antml-prefix multi-parameter swallow risk that the previous 4-parameter
-    signature was prone to.
+    Open questions persist across sessions and surface via auto-recall + dream-
+    cycle fairy-1 scans. Pair with engram_resolve when a claim-bearing answer
+    is found. Pass all fields as one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -11795,6 +12414,33 @@ _RESOLVE_FIELDS = frozenset({
 })
 
 
+# DESIGN INTENT — engram_resolve
+# ------------------------------
+# Pure-wire tool (2026-05-20 redesign, issue #229): wires a resolves edge from
+# a claim-bearing node to a target (open question / contradiction / prediction
+# / conjecture / goal tension) and flips the target's status. Does NOT create
+# the resolving derivation — the caller composes that upstream via engram_derive
+# (or supplies an existing claim-bearing node).
+#
+# Why pure-wire instead of the old combo (create-derivation-and-wire):
+#   The old shape made it cheap to wrap prior WEAK resolution chains in new
+#   derivations, compounding confidence dilution. ct_0006 locked through 7
+#   attempts this way until the chain finally cited root nodes (axioms, primary
+#   observations) instead of citing prior shaky derivations. Pure-wire forces
+#   deliberate derivation authoring via engram_derive, where the citing-roots
+#   pattern is the natural shape. Parallels how engram_supersede is also
+#   pure-relational.
+#
+# Two-step workflow:
+#   1. engram_derive(...) creates the resolving derivation (cite high-confidence
+#      ROOTS — axioms, primary observations, canonical derivations — not prior
+#      weak resolution chains).
+#   2. engram_resolve(target_id=..., resolving_node_id=...) wires the edge +
+#      flips status based on resolving_node.confidence.
+#
+# Status flip semantics: target's status becomes "resolved" if the resolving
+# node's confidence meets the resolution_confidence_threshold (config-driven,
+# default 0.70); otherwise "partially_resolved" with the resolver still wired.
 @mcp.tool(
     name="engram_resolve",
     annotations={
@@ -11806,23 +12452,15 @@ _RESOLVE_FIELDS = frozenset({
     },
 )
 def engram_resolve(payload_json: str) -> str:
-    """Resolve an open question, contradiction, prediction, conjecture, or goal tension by wiring a resolves edge from a claim-bearing node.
+    """Wire a resolves edge from a claim-bearing node to a target (open question,
+    contradiction, prediction, conjecture, or goal tension) and flip its status.
 
-    Pure-relational: this tool ONLY wires the resolves edge and flips the
-    target's status. It does NOT create the resolving derivation — compose
-    that upstream via engram_derive (or supply an existing claim-bearing
-    node like an axiom, observation, or canonical derivation).
+    Pure-wire: does NOT create the resolving derivation. Compose via engram_derive
+    first (or supply an existing claim-bearing node), then call this to wire it.
 
-    Two-step workflow:
-      1. engram_derive(...) creates the resolving derivation (cite the
-         high-confidence root nodes that ground the resolution; avoid
-         citing prior weak resolution chains).
-      2. engram_resolve(target_id=..., resolving_node_id=...) wires the
-         resolves edge + flips status based on resolving_node.confidence.
-
-    When the resolving node already exists (e.g., a supersede dv_X→dv_Y
-    that substantively resolves a contradiction by altering the conflicting
-    claim), skip step 1 and call engram_resolve directly with the existing
+    When the resolving node already exists (e.g., a supersede dv_X→dv_Y that
+    substantively resolves a contradiction by altering the conflicting claim),
+    skip the derive step and call engram_resolve directly with the existing
     node as resolving_node_id.
 
     Args:
@@ -11839,14 +12477,6 @@ def engram_resolve(payload_json: str) -> str:
     Returns:
         JSON with the wired edge, target status flip, and resolving node's
         confidence. On payload-parsing failure, returns {"error": "..."}.
-
-    Why pure-wire (issue #229, 2026-05-20):
-      The old combo (create-derivation-and-wire) made it cheap for callers
-      to wrap prior weak resolution chains in new derivations, compounding
-      confidence dilution. ct_0006 locked through 7 attempts this way until
-      the chain finally cited root nodes. The new shape forces deliberate
-      derivation authoring via engram_derive, where citing roots is the
-      natural pattern.
 
     See _resolve_impl for full semantics — kept callable with named kwargs
     for in-server callers.
@@ -12086,6 +12716,29 @@ def _add_stale_replacement(meta: dict, old_node_id: str, new_node_id: str) -> No
 _SUPERSEDE_FIELDS = frozenset({"old_node_id", "new_node_id", "supersede_reason"})
 
 
+# DESIGN INTENT — engram_supersede
+# --------------------------------
+# Epistemic-evolution mechanism (NOT error correction — that's engram_retract).
+# The old node was VALID AT THE TIME but a newer understanding has replaced it
+# (new evidence, refined framing, scope-tightening). Both nodes stay in the
+# graph; the old is marked superseded, downstream dependents flagged stale
+# (not tainted — re-derive is encouraged, not forced).
+#
+# Pure-relational: this tool ONLY wires the supersedes edge. The caller creates
+# the replacement node via its type's canonical creation tool (add_observation,
+# derive, etc.) FIRST, then calls engram_supersede to link. Parallels how
+# engram_resolve is pure-wire (issue #229 same family).
+#
+# Cascade semantics:
+#   - downstream derivations citing old as premise: flagged stale
+#   - contradictions citing old: stale_by populated with old_node_id +
+#     stale_replacement {old: new} for downstream resolution
+#   - retracted nodes are NOT supersede-able (use engram_retract path)
+#
+# stale_replacement metadata (ls_0044 supersede-no-drop): downstream readers
+# can find the replacement automatically without traversing the supersede edge.
+#
+# Single-payload signature (Wave 2b of ob_1499 / #55).
 @mcp.tool(
     name="engram_supersede",
     annotations={
@@ -12099,8 +12752,10 @@ _SUPERSEDE_FIELDS = frozenset({"old_node_id", "new_node_id", "supersede_reason"}
 def engram_supersede(payload_json: str) -> str:
     """Mark `new_node_id` as the successor of `old_node_id`.
 
-    Single-payload signature (wave 2b of ob_1499 — see issue #55): pass ALL
-    fields as one JSON object string in `payload_json`.
+    Epistemic evolution (not error correction — for that, engram_retract).
+    Pure-wire: caller creates the replacement node FIRST via its canonical
+    creation tool, then calls this to link. Pass all fields as one JSON object
+    string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -12445,6 +13100,31 @@ def _supersede_impl(
 _RETRACT_FIELDS = frozenset({"node_id", "error_type", "reason", "replacement_json"})
 
 
+# DESIGN INTENT — engram_retract
+# ------------------------------
+# Error correction (NOT epistemic evolution — that's engram_supersede).
+# Retracted nodes were NEVER valid; they're preserved for audit but marked as
+# errors, and downstream dependents are TAINTED (not deleted) — the cascade
+# surfaces "this reasoning rested on something wrong; re-derive."
+#
+# Honesty axiom (ax_0001 / ax_0002) in action: errors surface LOUDLY through
+# the taint cascade rather than being silently overwritten. The retracted node
+# stays in the graph as a record of the error + the correction process —
+# narrative identity can't quietly rewrite history.
+#
+# Six error_types: fabricated_quote, wrong_citation, wrong_evidence,
+# hallucinated_claim, duplicate, other. These name the failure modes — agents
+# can later scan-by-error-type to learn which kinds of errors they make.
+#
+# Optional replacement (replacement_json field): the retract can be paired with
+# a corrected observation that cites the same evidence. This is the typical
+# pattern — retract WITH a fix, not just retract-and-leave-empty.
+#
+# Naming caution: the outer param is payload_json; the INNER field is
+# replacement_json. They're distinct — outer is wrapper-protocol JSON; inner
+# is the replacement-observation JSON.
+#
+# Single-payload signature (Wave 2b of ob_1499 / #55).
 @mcp.tool(
     name="engram_retract",
     annotations={
@@ -12458,13 +13138,16 @@ _RETRACT_FIELDS = frozenset({"node_id", "error_type", "reason", "replacement_jso
 def engram_retract(payload_json: str) -> str:
     """Retract a node that contains an error and flag downstream dependents.
 
-    Single-payload signature (wave 2b of ob_1499 — see issue #55): pass ALL
-    fields as one JSON object string in `payload_json`.
+    Use for ERROR CORRECTION (never-was-valid). Use engram_supersede instead
+    for epistemic evolution (old-claim-was-valid-at-the-time).
 
-    Note: the outer parameter is `payload_json` and there is also an INNER
-    field also named `replacement_json` inside the payload. Don't confuse
-    them — the outer is the wrapper-protocol JSON; the inner is the
-    optional replacement-observation JSON for the retract semantics.
+    The retracted node is PRESERVED for audit; downstream derivations are
+    TAINTED, not deleted — the cascade surfaces "re-derive needed" rather
+    than silently rewriting the graph.
+
+    Pass all fields as one JSON object string in payload_json. Note: the
+    outer wrapper parameter is `payload_json` and there is also an INNER
+    field named `replacement_json` — distinct things.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -12929,6 +13612,34 @@ def _clear_active_set_name_if_diverged(conn):
         _set_active_set_name(None, conn)
 
 
+# DESIGN INTENT — engram_focus
+# ----------------------------
+# DETERMINISTIC compaction-bridge: focused nodes MUST appear verbatim in the
+# next compaction summary, so the post-compact agent wakes up pointed at the
+# exact nodes the pre-compact agent named as load-bearing.
+#
+# Normal recall is probabilistic (cache-miss / surface-budget / drift) — focus
+# is the substrate's "I cannot afford to forget this" channel. Use sparingly:
+# the FOCUS_LIST_CAP (15) is intentional, both to prevent summary bloat AND
+# to force the agent to make deliberate pin-or-rotate choices.
+#
+# Reason field is REQUIRED (ob_1845): forced justification at pin-time becomes
+# durable accountability — the reason renders verbatim into the compaction
+# summary, so post-compact me reads BOTH the ID and WHY pre-compact me chose
+# to pin it. Prevents performative focus.
+#
+# Three valid pin shapes (per ob_1845 family):
+#   - Strong derivations/theories the current work depends on
+#   - Conjectures being actively tested
+#   - Key observations whose absence would force re-derivation from scratch
+#
+# Idempotency (ob_1846): re-pinning an already-focused node refreshes the
+# focused_at + reason — no error, no surprise. Safe to call defensively.
+#
+# Companion tools: engram_unfocus (rotate out stale pins), engram_focus_save
+# (capture current set under a name), engram_focus_load / focus_swap (restore /
+# switch saved sets), engram_focus_sets (list available sets), engram_list_focused
+# (pure-read inspection, no refresh).
 @mcp.tool(
     name="engram_focus",
     annotations={
@@ -12942,11 +13653,9 @@ def _clear_active_set_name_if_diverged(conn):
 def engram_focus(node_ids: str, reason: str) -> str:
     """Pin nodes as focused — they MUST appear in the next compaction summary.
 
-    Focus is the deterministic channel for cornerstone knowledge to cross
-    compaction boundaries. Use it for: (1) strong derivations/theories the
-    current work depends on, (2) conjectures being actively tested, (3) key
-    observations whose absence from the post-compact working set would force
-    re-derivation from scratch.
+    Focus is the deterministic channel for load-bearing knowledge to cross
+    compaction boundaries (normal recall is probabilistic; focus is "I cannot
+    afford to forget this").
 
     The focus list is capped at FOCUS_LIST_CAP (15) to prevent summary bloat.
     If adding would exceed the cap, the call fails with a list of currently
@@ -13047,6 +13756,21 @@ def engram_focus(node_ids: str, reason: str) -> str:
         conn.close()
 
 
+# DESIGN INTENT — engram_unfocus
+# ------------------------------
+# Rotate-out of the focus pin set. Pair to engram_focus — together they're
+# the manual focus-management loop. The FOCUS_LIST_CAP (15) forces this
+# discipline: pinning new things requires unpinning old ones once the list is
+# full. That's the point — focus stays current.
+#
+# Typical triggers for unfocus:
+#   - Task finished; its supporting derivations no longer need the pin
+#   - Topic pivot; old thread's anchors no longer load-bearing
+#   - Focused conjecture resolved (it's a derivation now, surfaces normally)
+#   - Node stable enough to survive via normal recall without pinning
+#
+# Idempotent: unfocusing an already-unfocused node returns `already_unfocused`
+# (success), not error. Safe to call defensively over a mixed-state set.
 @mcp.tool(
     name="engram_unfocus",
     annotations={
@@ -13060,10 +13784,9 @@ def engram_focus(node_ids: str, reason: str) -> str:
 def engram_unfocus(node_ids: str) -> str:
     """Release nodes from focus — they no longer appear in compaction summary.
 
-    Unfocus when a node is no longer load-bearing for active work. Typical
-    triggers: finishing a task, pivoting topics, a focused conjecture being
-    resolved, or observing that a focused node is now stable enough to survive
-    via normal recall rather than needing explicit pinning.
+    Unfocus when a node is no longer load-bearing for active work (task done,
+    topic pivot, conjecture resolved, node stable enough for normal recall).
+    Idempotent: non-focused IDs return `already_unfocused` (success).
 
     Args:
         node_ids: Comma-separated node IDs to release. Non-focused IDs are
@@ -13122,6 +13845,26 @@ def engram_unfocus(node_ids: str) -> str:
         conn.close()
 
 
+# DESIGN INTENT — engram_list_focused
+# -----------------------------------
+# Pure-read inspection of the focus list (ob_1850). No recall refresh, no
+# edit log entry, no mutation — the safest tool in the focus family to call
+# any time.
+#
+# Use cases:
+#   - Work-stream start: "what did pre-compact me pin?" (already in compaction
+#     summary, but engram_list_focused has the structured + ordered form).
+#   - Mid-session check: verify what's currently guaranteed to cross into the
+#     next context — useful before pin/unpin decisions.
+#   - Pre-compact ritual (engram-nap §7): inspect focus list before any
+#     rotation decisions.
+#
+# Ordered by focused_at ASC (oldest first) so the agent sees what's been
+# pinned the longest — these are usually the cornerstone-like load-bearing
+# anchors vs the recent pins that might be more rotation-eligible.
+#
+# active_set_name: names the saved focus set currently loaded (or null if
+# active list is ad-hoc / never loaded / diverged from last-loaded set).
 @mcp.tool(
     name="engram_list_focused",
     annotations={
@@ -13135,14 +13878,9 @@ def engram_unfocus(node_ids: str) -> str:
 def engram_list_focused() -> str:
     """Return the current focus list — nodes pinned to survive compaction.
 
-    Use at work-stream start to inspect inherited focus, or mid-session to
-    verify what's guaranteed to cross into the next context. The compaction
-    summary renders this list verbatim so the post-compact self inherits it
-    deterministically (not via probabilistic recall).
-
-    The returned `active_set_name` names which saved focus set (if any) is
-    currently loaded — `null` means the active list is ad-hoc (never loaded,
-    or diverged from the last-loaded set via focus/unfocus).
+    Pure-read; no recall refresh. Use at work-stream start to inspect inherited
+    focus, or mid-session to verify what's guaranteed to cross compaction.
+    Ordered oldest-first so longest-pinned anchors surface up top.
 
     Returns:
         JSON with focused nodes ordered by focused_at ASC (oldest first):
@@ -13189,14 +13927,31 @@ def engram_list_focused() -> str:
         "openWorldHint": False,
     },
 )
+# DESIGN INTENT — engram_focus_save
+# ---------------------------------
+# Named-set bookmark of the current active focus list. Lets the agent capture
+# the working-context of one project / thread, switch to another via
+# engram_focus_load, and come back later. Multi-project agents can carry
+# multiple coherent focus contexts without each pin-rotation destroying
+# context from prior threads.
+#
+# Save is a BOOKMARK not a rotation — active list unchanged after save (just
+# tagged with active_set_name). Identity holds: active list IS the saved set
+# until a mutation (focus / unfocus) diverges them.
+#
+# Raw-IDs storage with cascade-resolution at LOAD time, not save time. If a
+# node in a saved set is later superseded, the load operation follows the
+# supersede edge to the replacement (per ob_1785 cascade-resolution design)
+# — sets stay live across graph evolution.
+#
+# Name validation: ^[a-z0-9_-]{1,50}$ — strict to keep set names URL/CLI
+# safe + readable. No spaces, no uppercase. Description is optional; used as
+# default focus_reason when loading.
 def engram_focus_save(name: str, description: str = "", overwrite: bool = False) -> str:
     """Snapshot the current active focus list under `name`.
 
-    Saving is a bookmark, not a rotation — the active list is unchanged. The
-    set captures raw IDs; cascade resolution (supersede auto-follow, retract
-    drop) happens at load time, not in place. After save, active_set_name is
-    set to `name` — the active list IS this set, identity-wise, until a
-    mutation diverges it.
+    Bookmark, not rotation: active list unchanged. Cascade resolution
+    (supersede auto-follow, retract drop) happens at load time, not save time.
 
     Args:
         name: Set name. Must match ^[a-z0-9_-]{1,50}$ (lowercase alphanumerics,
@@ -13280,6 +14035,26 @@ def engram_focus_save(name: str, description: str = "", overwrite: bool = False)
         conn.close()
 
 
+# DESIGN INTENT — engram_focus_load
+# ---------------------------------
+# Restore a saved focus set into the active list. The cascade-resolution
+# pairing with engram_focus_save: save captures raw IDs; load resolves them
+# (supersede chains auto-followed, retracted nodes dropped, missing nodes
+# reported).
+#
+# Default if_active="error" is the SAFETY DEFAULT — refuse to clobber a non-
+# empty active list. Forces the agent to either (a) explicitly unfocus first
+# or (b) use engram_focus_swap which atomically saves-then-loads.
+#
+# Use case: returning to a prior project. The active focus set drifted to
+# the current thread; load("paper_sprint") restores the paper-context anchors
+# in one move. Future-me reading the compaction summary post-load sees the
+# right anchors without manual pin-by-pin reconstruction.
+#
+# Cascade resolution at load time is intentional (not save time) — saved sets
+# stay live across graph evolution. A set saved months ago, where some nodes
+# have been superseded, will load the up-to-date replacements via the supersede
+# edges.
 @mcp.tool(
     name="engram_focus_load",
     annotations={
@@ -13293,10 +14068,10 @@ def engram_focus_save(name: str, description: str = "", overwrite: bool = False)
 def engram_focus_load(name: str, if_active: str = "error") -> str:
     """Load a saved focus set into the active list.
 
-    Default errors if the active list is non-empty. Pass if_active="overwrite"
-    to unfocus the current list first. Saved sets store raw IDs; resolution
-    happens here — supersede chains are auto-followed, retracted/missing nodes
-    are dropped with reports.
+    Default errors if active list is non-empty (use if_active="overwrite" or
+    engram_focus_swap for atomic save-then-load). Cascade resolution at load
+    time: supersede chains auto-followed, retracted/missing nodes dropped
+    with reports.
 
     Args:
         name: Name of the saved set to load.
@@ -13453,6 +14228,21 @@ def engram_focus_load(name: str, if_active: str = "error") -> str:
         conn.close()
 
 
+# DESIGN INTENT — engram_focus_swap
+# ---------------------------------
+# The canonical "pivot" operation: atomic save-then-load. Lets the agent
+# switch projects without manually composing save + unfocus + load
+# (which is racy across compaction if mid-step).
+#
+# Both halves in ONE transaction: if the load target doesn't exist, the save
+# rolls back too — never leaves the focus state half-broken.
+#
+# save_as == load is a no-op: saves current under the same name + returns
+# already_active. Safe defensively callable.
+#
+# Use case: "I'm switching from paper-sprint to dream-cost investigation."
+# engram_focus_swap(save_as="paper_sprint", load="dream_cost") — paper-sprint
+# anchors captured, dream-cost anchors active, all atomic.
 @mcp.tool(
     name="engram_focus_swap",
     annotations={
@@ -13464,14 +14254,10 @@ def engram_focus_load(name: str, if_active: str = "error") -> str:
     },
 )
 def engram_focus_swap(save_as: str, load: str = "", description: str = "") -> str:
-    """Atomic save-current + optionally-load-other. The common "pivot" op.
+    """Atomic save-current + optionally-load-other. The canonical pivot op.
 
-    Saves the current active list as `save_as`, then loads `load` (if given).
-    Both halves run in one transaction — if the load target doesn't exist,
-    the save is rolled back too.
-
-    If save_as == load, this is a no-op: saves current under the same name
-    and returns already_active.
+    Both halves in one transaction: if the load target doesn't exist, the
+    save rolls back too. save_as == load is a no-op (returns already_active).
 
     Args:
         save_as: Name to save current active list under. Overwrites if it
@@ -13664,12 +14450,21 @@ def engram_focus_swap(save_as: str, load: str = "", description: str = "") -> st
         "openWorldHint": False,
     },
 )
+# DESIGN INTENT — engram_focus_sets
+# ---------------------------------
+# Inventory tool: "what saved focus sets do I have available?" Recently-used
+# first so the working sets surface before archival ones.
+#
+# load_count + last_loaded_at: empirical usage signal. Sets that haven't been
+# touched in months are candidates for engram_focus_delete_set cleanup.
+#
+# is_active flag: marks the currently-loaded set (active_set_name match).
+# Disambiguates "saved AND currently-active" from "saved but cold-storage."
 def engram_focus_sets() -> str:
     """List all saved focus sets with metadata and the current active_set_name.
 
-    Ordered by last_loaded_at DESC (most-recently-used first), then created_at
-    DESC. The `is_active` field on each set indicates whether it's the currently-
-    loaded set.
+    Sorted recently-used first. Use load_count + last_loaded_at to identify
+    cold-storage sets for cleanup. is_active flag marks the currently-loaded set.
 
     Returns:
         JSON: {status, count, active_set_name, sets: [{name, node_count,
@@ -13712,6 +14507,20 @@ def engram_focus_sets() -> str:
         conn.close()
 
 
+# DESIGN INTENT — engram_focus_delete_set
+# ---------------------------------------
+# Drop the bookmark, not the focus. This is the key distinction: the saved
+# set is metadata; deleting it removes the name + content stored in focus_sets
+# table. The currently-focused NODES (focused_at fields on the nodes
+# themselves) are UNAFFECTED.
+#
+# If the deleted set was active: active_set_name clears to NULL (the active
+# list becomes ad-hoc — still pinning the same nodes, just no longer
+# identified-as a named set).
+#
+# Use case: archival cleanup of stale named sets identified via
+# engram_focus_sets (low load_count + old last_loaded_at). Bookmark removal,
+# not focus removal.
 @mcp.tool(
     name="engram_focus_delete_set",
     annotations={
@@ -13723,11 +14532,10 @@ def engram_focus_sets() -> str:
     },
 )
 def engram_focus_delete_set(name: str) -> str:
-    """Remove a saved focus set. Active list is unaffected.
+    """Remove a saved focus set. Active list (focused nodes) unaffected.
 
-    Deleting is dropping the bookmark, not closing the tab — if this set was
-    currently active, active_set_name is cleared to NULL (the active list
-    becomes ad-hoc) but the focused nodes stay focused.
+    Drops the bookmark, not the tab — focused nodes stay focused even if the
+    deleted set was active (active_set_name just clears to NULL).
 
     Args:
         name: Name of the saved set to delete.
@@ -13785,6 +14593,26 @@ def engram_focus_delete_set(name: str) -> str:
 # this file (RECALL_SUMMARY_HARD_CAP, etc.) come from there.
 
 
+# DESIGN INTENT — engram_set_recall_summaries
+# -------------------------------------------
+# Batch-write recall_summary + recall_keywords across multiple nodes. These
+# are the agent-curated short-form representations that drive the recall
+# surfaces (auto-surface lossy hints + tier-1/tier-2 query result formatting).
+# Quality of recall_summary directly determines whether the right nodes
+# surface when the agent needs them.
+#
+# Sleep-cycle workflow: the engram-sleep skill's summary-fairy dispatches
+# generate recall_summary/keywords for the day's cohort, then the dream-master
+# applies via this batch tool. Bulk-backfill workflow: when an agent first
+# enables recall_summary curation, this tool seeds the whole graph at once.
+#
+# Best-effort semantics (no all-or-nothing): per-item validation; valid
+# entries apply, invalid entries return per-item errors. Doesn't roll back
+# the whole batch on one bad row.
+#
+# Idempotent: re-writing the same node with the same summary is a no-op.
+# Constants + per-entry validation live in tools/recall_summary_validator.py
+# (single source of truth — used both here and by the summary-fairy).
 @mcp.tool(
     name="engram_set_recall_summaries",
     annotations={
@@ -14023,6 +14851,32 @@ def _reflect_keywords(row) -> list | None:
         return None
 
 
+# DESIGN INTENT — engram_reflect
+# ------------------------------
+# Pre-dream briefing for the engram-sleep skill: the structured self-audit that
+# opens the dream cycle. Surfaces categories the dream master must consider:
+# unresolved contradictions, weakly-grounded claims, open questions, overdue
+# predictions, same-source observation tensions, uncited observations,
+# single-source derivations, plus the active goals/tasks/lessons context.
+#
+# Sleep-cycle-scoped: this is heavyweight (multiple full-graph passes) and
+# semantically meaningful only inside a dream context. Calling it awake produces
+# noise — use engram_diagnose for awake-state health snapshots.
+#
+# Two-tier-per-category rendering keeps the response budget-bounded:
+#   Tier 1 (top summary_top_k by importance_score DESC):
+#     {id, claim: recall_summary OR claim, confidence, ...existing_fields}.
+#     Key name "claim" preserved for backward compat (eval/harness contract).
+#   Tier 2 (remainder): {id, keywords: list, confidence, ...}.
+#     "claim" key OMITTED — keywords-only triage signal.
+#
+# Low-volume categories (unresolved_contradictions, open_questions, open_conjectures,
+# active_goals, active_tasks, active_lessons, unresolved_goal_tensions): source-swap
+# — content field from recall_summary with fallback to claim. Key names unchanged.
+#
+# calibration_snapshot field (added later): corpus + this_turn confidence
+# distributions. Lets the dream master see filing-pattern shape alongside
+# topic-selection candidates — drives calibration-aware dream agenda.
 @mcp.tool(
     name="engram_reflect",
     annotations={
@@ -14037,29 +14891,15 @@ def engram_reflect(summary_top_k: int = 5) -> str:
     """[Sleep cycle — pre-dream briefing.] Structured self-audit of the
     knowledge graph; opens the dream cycle for the engram-sleep skill.
 
-    Returns a comprehensive report identifying areas that need attention:
-    active goals, unresolved goal tensions, unresolved contradictions,
-    weakly-grounded claims, open questions, overdue predictions,
-    same-source observation tensions, uncited observations, and
-    single-source derivations.
+    Returns a categorized report identifying areas that need attention:
+    unresolved contradictions, weakly-grounded claims, open questions,
+    overdue predictions, same-source observation tensions, uncited observations,
+    single-source derivations, plus active goals/tasks/lessons context.
 
-    Use this during explicit reflection cycles. Read the report, then
-    decide which issues to address — strengthen weak claims, resolve
-    contradictions, investigate open questions, or check overdue predictions.
+    Read the report, then decide which issues to address — strengthen weak
+    claims, resolve contradictions, investigate open questions, etc.
 
-    Two-tier-per-category rendering for high-volume categories
-    (weakly_grounded, thin_support_derivations, uncited_observations):
-      - Tier 1 (top summary_top_k by importance_score DESC):
-        {id, claim: recall_summary OR claim, confidence, ...existing_fields}.
-        Key name "claim" preserved for backward compat.
-      - Tier 2 (remainder): {id, keywords: list, confidence, ...existing_fields}.
-        "claim" key OMITTED — keywords only for triage signal at this tier.
-        If recall_keywords is missing: bare {id, confidence, ...} (no keywords key).
-
-    Low-volume categories (unresolved_contradictions, open_questions,
-    open_conjectures, active_goals, active_tasks, active_lessons,
-    unresolved_goal_tensions): source-swap — content field sourced from
-    recall_summary with fallback to claim. Key names unchanged for backward compat.
+    Use awake? No — use engram_diagnose. This is sleep-cycle scoped.
 
     Args:
         summary_top_k: How many top-importance entries in each high-volume
@@ -14629,6 +15469,31 @@ def engram_reflect(summary_top_k: int = 5) -> str:
 # ---------------------------------------------------------------------------
 
 
+# DESIGN INTENT — engram_list
+# ---------------------------
+# Triage / bulk-listing tool (dv_0127). Lightweight scan-by-criterion that
+# doesn't refresh recall on results — designed for inventory work where the
+# agent wants to enumerate without bulk-strengthening many nodes.
+#
+# Two modes, mutually exclusive:
+#   Single-field mode (backward compat): node_type and/or status as plain
+#     strings. Compact triage shape with claim truncated to 130 chars.
+#   Structured-filter mode (issue #81): filters_json with recursive condition
+#     tree. AND/OR/NOT composition, text contains, ID-range, date-range,
+#     NULL handling, cross-table cites/cited_by virtual fields. fields_json
+#     projects only listed columns for tighter responses.
+#
+# Why two modes coexist: single-field is the 80%-case shorthand (LLM-friendly,
+# minimal payload); structured-filter handles complex queries without forcing
+# the simple case into JSON ceremony. issue #81 added the structured form
+# without breaking the simple form.
+#
+# Read-only-no-refresh: deliberately distinct from engram_query (which DOES
+# refresh + strengthen recall). List = "scan, don't strengthen"; query =
+# "find + remember."
+#
+# Max-depth-8 nesting on filter trees: practical safety, prevents arbitrary-
+# depth queries from bloating the SQL. Top-level bare list = implicit AND.
 @mcp.tool(
     name="engram_list",
     annotations={
@@ -15419,6 +16284,23 @@ PATTERN_QUERY_REGISTRY: dict[str, callable] = {
 }
 
 
+# DESIGN INTENT — engram_query_pattern
+# ------------------------------------
+# Compositional graph-pattern queries: the tool does mechanical work (graph
+# traversal + ranking) and the AGENT applies judgment to the ranked candidates.
+# This separation is load-bearing — the substrate scans the graph; the agent
+# decides what to do with each candidate (e.g., file a derivation that resolves
+# an open question, supersede a stale node, nominate a cornerstone).
+#
+# Each call appends a tuple to ~/.engram/pattern_query_telemetry.jsonl for
+# empirical preset calibration (ob_1500 discipline — internal eval surface is
+# preserved verbatim regardless of agent-facing tier transformation).
+#
+# Full design: active-work/engram-query-pattern-design-2026-05-06.md
+#
+# Registered patterns are dream-fairy scan primitives — each implements one of
+# the six dream-cycle categories. Calibration of preset thresholds is empirical
+# (the telemetry log is the data source).
 @mcp.tool(
     name="engram_query_pattern",
     annotations={
@@ -15439,11 +16321,8 @@ def engram_query_pattern(
 ) -> str:
     """Run a named compositional graph-pattern query.
 
-    The tool does mechanical work (graph traversal + ranking); the agent
-    applies judgment to the ranked candidates. Each call appends a tuple
-    to ~/.engram/pattern_query_telemetry.jsonl for empirical preset
-    calibration. See active-work/engram-query-pattern-design-2026-05-06.md
-    for the full design.
+    Mechanical traversal + ranking; agent applies judgment to results. Calls
+    are logged to ~/.engram/pattern_query_telemetry.jsonl for preset calibration.
 
     Args:
         pattern_name: One of the registered patterns:
