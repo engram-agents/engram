@@ -8,8 +8,11 @@ scheme restrictions, and honesty axiom reminder presence.
 import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -75,6 +78,7 @@ def test_no_tld_other_fabrications():
 
 # ── DNS resolution ───────────────────────────────────────────────────────────
 
+@pytest.mark.real_dns
 def test_dns_failure_rejected():
     """Domain with TLD but no DNS record should be rejected."""
     server = _setup()
@@ -83,6 +87,7 @@ def test_dns_failure_rejected():
     assert "DNS resolution failed" in r["error"]
 
 
+@pytest.mark.real_dns
 def test_real_domain_accepted():
     """A real, resolvable domain should be accepted."""
     server = _setup()
@@ -90,6 +95,7 @@ def test_real_domain_accepted():
     assert r.get("status") in ("created", "already_exists"), f"Expected success, got {r}"
 
 
+@pytest.mark.real_dns
 def test_real_domain_with_subdomain():
     """Subdomains of real domains should work."""
     server = _setup()
@@ -123,7 +129,7 @@ def test_axiom_reminder_in_web_url_errors():
     assert "ax_0002" in r.get("error", ""), "Missing axiom reminder in no-TLD error"
 
     # DNS failure
-    r = _add_evidence(server, "https://fake-domain-xyz999.com/x")
+    r = _add_evidence(server, "https://totally-fake-domain-xyz999.com/x")
     assert "ax_0002" in r.get("error", ""), "Missing axiom reminder in DNS error"
 
 
@@ -173,6 +179,50 @@ def test_observation_with_real_url_succeeds():
         quote_type="editorial",
     )
     assert r.get("status") == "created", f"Expected created, got {r}"
+
+
+# ── DNS errno discrimination ─────────────────────────────────────────────────
+
+@pytest.mark.real_dns
+def test_dns_eai_again_passes_silently(monkeypatch):
+    """EAI_AGAIN (transient DNS failure) should not block evidence creation."""
+    server = _setup()
+
+    def raise_eai_again(host, *args, **kwargs):
+        raise socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+
+    monkeypatch.setattr("socket.getaddrinfo", raise_eai_again)
+    r = _add_evidence(server, "https://example.com/dns-errno-eai-again-test")
+    assert "error" not in r, f"EAI_AGAIN should not block, got {r}"
+    assert r.get("status") in ("created", "already_exists"), f"Expected success, got {r}"
+
+
+@pytest.mark.real_dns
+def test_dns_eai_fail_passes_silently(monkeypatch):
+    """EAI_FAIL (non-recoverable DNS server failure) should not block evidence creation."""
+    server = _setup()
+
+    def raise_eai_fail(host, *args, **kwargs):
+        raise socket.gaierror(socket.EAI_FAIL, "Non-recoverable failure in name resolution")
+
+    monkeypatch.setattr("socket.getaddrinfo", raise_eai_fail)
+    r = _add_evidence(server, "https://example.com/dns-errno-eai-fail-test")
+    assert "error" not in r, f"EAI_FAIL should not block, got {r}"
+    assert r.get("status") in ("created", "already_exists"), f"Expected success, got {r}"
+
+
+@pytest.mark.real_dns
+def test_dns_eai_noname_still_blocks(monkeypatch):
+    """EAI_NONAME (definitive name-not-found) should still block evidence creation."""
+    server = _setup()
+
+    def raise_eai_noname(host, *args, **kwargs):
+        raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+
+    monkeypatch.setattr("socket.getaddrinfo", raise_eai_noname)
+    r = _add_evidence(server, "https://example.com/dns-errno-eai-noname-test")
+    assert "error" in r, f"EAI_NONAME should block, got {r}"
+    assert "DNS resolution failed" in r["error"], f"Expected DNS error message, got {r}"
 
 
 # ── Run all tests ────────────────────────────────────────────────────────────

@@ -4555,13 +4555,22 @@ def _add_evidence_impl(
             # A DNS failure almost certainly means a fabricated or hallucinated domain.
             try:
                 socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-            except socket.gaierror:
-                return json.dumps({
-                    "error": f"DNS resolution failed for '{hostname}' — this domain does not exist. "
-                    "The URL may be fabricated or hallucinated. Verify you have the correct URL "
-                    "from a real source before citing it as evidence."
-                    + _HONESTY_REMINDER
-                })
+            except socket.gaierror as e:
+                # Only block on definitive name-not-found errnos.
+                # EAI_AGAIN / EAI_FAIL = transient DNS infra; treat like timeout (pass).
+                # EAI_NONAME / EAI_NODATA = the domain truly doesn't exist.
+                NXDOMAIN_ERRNOS = {
+                    socket.EAI_NONAME,
+                    getattr(socket, "EAI_NODATA", -5),  # not defined on all platforms
+                }
+                if e.errno in NXDOMAIN_ERRNOS:
+                    return json.dumps({
+                        "error": f"DNS resolution failed for '{hostname}' — this domain does not exist. "
+                        "The URL may be fabricated or hallucinated. Verify you have the correct URL "
+                        "from a real source before citing it as evidence."
+                        + _HONESTY_REMINDER
+                    })
+                # Transient — fall through to silent pass (same as the OSError branch).
             except (socket.timeout, OSError):
                 # Network issues — warn but don't block, since the domain might be real
                 pass
