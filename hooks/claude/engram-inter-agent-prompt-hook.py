@@ -407,6 +407,13 @@ def main() -> None:
                 f" from {senders_unread} — finish reading at the next natural break."
             )
 
+    # Footer: name the CLI so the natural-affordance path IS the cursor-aware one.
+    lines.append(
+        "Tools: `ia read <filename>` (read + advance cursor) · "
+        "`ia write --re <filename>` (reply with reference) · "
+        "`ia status` (show cursor + counts)."
+    )
+
     context = "\n".join(lines)
 
     response = {

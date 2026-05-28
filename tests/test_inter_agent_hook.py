@@ -815,3 +815,110 @@ def test_four_new_letter_senders_cap_in_header(engram_home, inter_agent_dir):
     assert "from ariadne, lei, + 2 other(s)" in first_line, (
         f"Expected cap-rule output in header; got: {first_line!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 14: ia CLI footer in surfacing output
+# ---------------------------------------------------------------------------
+
+_IA_FOOTER = (
+    "Tools: `ia read <filename>` (read + advance cursor) · "
+    "`ia write --re <filename>` (reply with reference) · "
+    "`ia status` (show cursor + counts)."
+)
+
+
+def test_footer_present_with_new_letter(engram_home, inter_agent_dir):
+    """Footer naming the ia CLI appears when there is 1 new letter."""
+    _write_config(engram_home, mode="multi", agent_name="borges")
+    now = datetime.now(timezone.utc)
+    _write_letter(
+        inter_agent_dir, "2026-05-28T10-00-00Z_ariadne.md",
+        from_agent="ariadne", to_agent="borges",
+        timestamp=now - timedelta(minutes=2),
+        heading="Footer test — new letter",
+    )
+    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
+    assert rc == 0
+    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+    assert _IA_FOOTER in ctx, (
+        f"ia CLI footer must appear when there are new letters; got:\n{ctx}"
+    )
+    # Footer must be the last line
+    assert ctx.splitlines()[-1] == _IA_FOOTER, (
+        "ia CLI footer must be the last line of additionalContext"
+    )
+
+
+def test_footer_present_with_older_unread_only(engram_home, inter_agent_dir):
+    """Footer naming the ia CLI appears when there are only older-unread letters."""
+    _write_config(engram_home, mode="multi", agent_name="borges")
+    now = datetime.now(timezone.utc)
+
+    old_ts = now - timedelta(hours=2)
+    _write_letter(
+        inter_agent_dir, "2026-05-28T08-00-00Z_mneme.md",
+        from_agent="mneme", to_agent="borges",
+        timestamp=old_ts,
+        heading="Footer test — older unread",
+    )
+    # Set surfaced cursor after the letter so it falls into "older still-unread"
+    _write_surfaced_cursor(engram_home, now - timedelta(hours=1))
+
+    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
+    assert rc == 0
+    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+    assert _IA_FOOTER in ctx, (
+        f"ia CLI footer must appear for older-unread-only scenario; got:\n{ctx}"
+    )
+    assert ctx.splitlines()[-1] == _IA_FOOTER, (
+        "ia CLI footer must be the last line of additionalContext"
+    )
+
+
+def test_footer_absent_when_no_letters(engram_home, inter_agent_dir):
+    """No letters → hook exits silently (no stdout, so no footer to check)."""
+    _write_config(engram_home, mode="multi", agent_name="borges")
+    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
+    assert rc == 0
+    assert stdout.strip() == "", (
+        "No letters → hook must produce no stdout; ia footer must not appear in isolation"
+    )
+
+
+def test_footer_present_with_new_and_older_unread(engram_home, inter_agent_dir):
+    """Footer appears when both new letters and older-unread letters are present."""
+    _write_config(engram_home, mode="multi", agent_name="borges")
+    now = datetime.now(timezone.utc)
+
+    # Older letter (unread)
+    old_ts = now - timedelta(hours=2)
+    _write_letter(
+        inter_agent_dir, "2026-05-28T08-00-00Z_mneme.md",
+        from_agent="mneme", to_agent="borges",
+        timestamp=old_ts,
+        heading="Old unread letter",
+    )
+    _write_surfaced_cursor(engram_home, now - timedelta(hours=1))
+
+    # New letter (after surfaced cursor)
+    _write_letter(
+        inter_agent_dir, "2026-05-28T10-30-00Z_ariadne.md",
+        from_agent="ariadne", to_agent="borges",
+        timestamp=now - timedelta(minutes=5),
+        heading="New letter",
+    )
+
+    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
+    assert rc == 0
+    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+    assert _IA_FOOTER in ctx, (
+        f"ia CLI footer must appear when both new and older-unread present; got:\n{ctx}"
+    )
+    assert ctx.splitlines()[-1] == _IA_FOOTER, (
+        "ia CLI footer must be the last line when both buckets are non-empty"
+    )
+    # Footer appears exactly once
+    assert ctx.count(_IA_FOOTER) == 1, (
+        "ia CLI footer must appear exactly once even when both buckets are non-empty"
+    )
