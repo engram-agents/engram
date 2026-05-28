@@ -548,6 +548,7 @@ TYPE_PREFIX = {
     "lesson": "ls",
     "person": "pn",
     "cornerstone": "cs",
+    "trust_signal": "ts",
 }
 
 # PREDICTIVE_CONFIDENCE_CAP, CONJECTURE_CONFIDENCE_*, REASONING_TYPES,
@@ -1045,9 +1046,24 @@ def _get_db() -> sqlite3.Connection:
         # cues and future-leverage for facet listing / keyword search / clustering.
         # Format: '["kw1", "kw2", "kw3"]'. NULL on existing rows.
         ("recall_keywords", "TEXT"),
+        # ── trust tier columns (Layer-1 trust-tier mechanism) ──
+        # trust_tier: persisted tier for person (pn_*) nodes. One of:
+        #   user_family, our_side, known_external, unknown, suspect.
+        #   Backfilled to 'unknown' for all existing pn_* on startup.
+        # trust_signal_*: interpretive metadata for trust_signal (ts_*) nodes.
+        ("trust_tier", "TEXT"),
+        ("trust_signal_kind", "TEXT"),
+        ("trust_signal_polarity", "REAL"),
+        ("trust_signal_weight", "REAL"),
     ]:
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} {typedef}")
+
+    # Trust-tier backfill: ensure all existing pn_* nodes have a non-null tier.
+    # Idempotent — WHERE trust_tier IS NULL skips already-backfilled rows.
+    conn.execute(
+        "UPDATE nodes SET trust_tier = 'unknown' WHERE type = 'person' AND trust_tier IS NULL"
+    )
 
     # Edges migration: add metadata column for optional per-edge annotations
     # (e.g. `exemplifies` note explaining why an incident fits a lesson).
@@ -8503,8 +8519,8 @@ def engram_history(payload_json: str) -> str:
             node_id (str, optional): Filter edits to a specific node
                 (edits mode only).
             action (str, optional): Filter by action type: created,
-                superseded, retracted, resolved, tainted, stale_flagged,
-                reopened (edits mode only).
+                reopened, resolved, retracted, stale_flagged, superseded,
+                tainted, trust_tier_set (edits mode only).
             since (str, optional): ISO timestamp — return only entries after
                 this time.
             limit (int, optional): Max entries to return (default 50,
@@ -9416,8 +9432,8 @@ def _add_person_impl(
 
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
-               status, metadata)
-               VALUES (?, 'person', ?, ?, ?, 'active', ?)""",
+               status, metadata, trust_tier)
+               VALUES (?, 'person', ?, ?, ?, 'active', ?, 'unknown')""",
             (node_id, claim_text, now, description, meta),
         )
 
@@ -9451,6 +9467,452 @@ def _add_person_impl(
             "aliases": alias_list,
             "context_nodes": context,
         })
+    finally:
+        conn.close()
+
+
+# ── Trust-tier constants ────────────────────────────────────────────────────
+# Ordered from most-external (0) to most-internal (4). Tier changes TO any
+# tier with rank >= INTERNAL_THRESHOLD require primary-user approval.
+# 'primary_user' is NOT in this map — it is structural, not assignable.
+TIER_RANK = {
+    "user_family": 4,
+    "our_side": 3,
+    "known_external": 2,
+    "unknown": 1,
+    "suspect": 0,
+}
+INTERNAL_THRESHOLD = 3  # our_side and above
+
+
+_SET_TRUST_TIER_FIELDS = frozenset({
+    "target_pn", "tier", "justification_obs_id", "primary_user_approval_obtained",
+})
+
+
+# DESIGN INTENT — engram_set_trust_tier
+# -------------------------------------
+# Sets the persistent trust tier for a person (pn_*) node. Tier changes to
+# our_side or user_family (rank >= INTERNAL_THRESHOLD) are approval-gated:
+# the agent must supply a justification observation AND attest via
+# primary_user_approval_obtained=true that primary-user approval was obtained.
+# The attestation is the structural-honesty mechanism — the server cannot verify
+# it mechanically; the agent's honesty IS the integrity of the tier system.
+# Setting the attestation to true without having obtained approval is a
+# structural-honesty violation (ax_0001 / ax_0002).
+#
+# Controlled-disclosure pattern: primary_user_approval_obtained is NOT in the
+# docstring. It appears ONLY in the server's friction-warning error message
+# (teaching surface), the upgrade guide, and this spec. The agent learns
+# the discipline from friction, not from prompt context.
+@mcp.tool(
+    name="engram_set_trust_tier",
+    annotations={
+        "title": "Set Trust Tier for a Person",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_set_trust_tier(payload_json: str) -> str:
+    """Set the trust tier of a person node.
+
+    Required payload fields:
+        target_pn (str): The pn_NNNN node to update. Must be type='person'.
+        tier (str): The new tier. One of: user_family, our_side, known_external,
+                    unknown, suspect.
+                    Note: 'primary_user' is NOT assignable via this tool — primary-user
+                    identification is structural (via pn_* attribute), not tier-set.
+
+    Required when tier ∈ {user_family, our_side}:
+        justification_obs_id (str): The observation_id (ob_NNNN) documenting the
+                                    primary user's approval of this tier change.
+                                    Must reference a node of type observation_factual
+                                    or observation_predictive.
+
+    Returns:
+        Success: {"status": "set", "from_tier": "<prev>", "to_tier": "<new>",
+                  "edit_history_id": <id>}
+        No-op (same tier): {"status": "no_op", "from_tier": ..., "to_tier": ...}
+        Approval-gated tiers (our_side, user_family) without approval:
+            Returns a structured error with step-by-step instructions for
+            obtaining primary-user approval and retrying with the correct
+            attestation fields. Read the error message carefully — it names
+            the required fields and explains the structural-honesty stake.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _SET_TRUST_TIER_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_SET_TRUST_TIER_FIELDS - {'primary_user_approval_obtained'})}"
+        })
+    target_pn = params.get("target_pn", "")
+    tier = params.get("tier", "")
+    justification_obs_id = params.get("justification_obs_id", "") or ""
+    approval_flag = params.get("primary_user_approval_obtained", False)
+    return _set_trust_tier_impl(
+        target_pn=target_pn,
+        tier=tier,
+        justification_obs_id=justification_obs_id,
+        primary_user_approval_obtained=approval_flag,
+    )
+
+
+def _set_trust_tier_impl(
+    target_pn: str = "",
+    tier: str = "",
+    justification_obs_id: str = "",
+    primary_user_approval_obtained: bool = False,
+) -> str:
+    """Internal implementation for engram_set_trust_tier."""
+    # ── Tier value validation ──
+    if tier == "primary_user":
+        return json.dumps({
+            "error": (
+                "'primary_user' is structural, not assignable via engram_set_trust_tier. "
+                "Primary-user identification is set via the pn_* attribute (is_self=False + "
+                "primary-user designation in metadata), not via the tier system."
+            )
+        })
+    if tier not in TIER_RANK:
+        return json.dumps({
+            "error": (
+                f"Invalid tier '{tier}'. Must be one of: "
+                + ", ".join(sorted(TIER_RANK, key=lambda t: TIER_RANK[t], reverse=True))
+                + ". Note: 'primary_user' is structural, not assignable."
+            )
+        })
+    if not target_pn or not target_pn.strip():
+        return json.dumps({"error": "target_pn is required."})
+
+    conn = _get_db()
+    try:
+        # ── target_pn validation ──
+        row = conn.execute(
+            "SELECT id, type, trust_tier FROM nodes WHERE id = ?", (target_pn,)
+        ).fetchone()
+        if not row:
+            return json.dumps({"error": f"Node '{target_pn}' not found."})
+        if row["type"] != "person":
+            return json.dumps({
+                "error": f"Node '{target_pn}' is type '{row['type']}', not 'person'. "
+                         f"Trust tier can only be set on person nodes."
+            })
+
+        previous_tier = row["trust_tier"]
+
+        # ── Idempotent no-op ──
+        if previous_tier == tier:
+            return json.dumps({
+                "status": "no_op",
+                "message": f"'{target_pn}' is already at tier '{tier}'. No change made.",
+                "from_tier": previous_tier,
+                "to_tier": tier,
+            })
+
+        tier_rank = TIER_RANK[tier]
+
+        # ── Approval gate ──
+        if tier_rank >= INTERNAL_THRESHOLD:
+            if not primary_user_approval_obtained or not justification_obs_id:
+                return json.dumps({
+                    "error": (
+                        f"Tier '{tier}' (rank {tier_rank}) is at or above the internal-circle "
+                        f"threshold (rank {INTERNAL_THRESHOLD}). Promoting '{target_pn}' to "
+                        f"this tier requires explicit primary-user approval. "
+                        f"\n\nRequired steps:"
+                        f"\n  1. Surface the proposed promotion to your primary user."
+                        f"\n  2. Receive their explicit approval."
+                        f"\n  3. File an observation documenting the approval:"
+                        f"\n       engram_add_observation({{ \"claim\": \"<primary-user> approved "
+                        f"<target_pn> to tier '{tier}'\", "
+                        f"\"quote_type\": \"personal_communication\", "
+                        f"\"source_class\": \"user_stated\", ... }})"
+                        f"\n       → returns ob_NNNN"
+                        f"\n  4. Retry with both required fields:"
+                        f"\n       engram_set_trust_tier({{ \"target_pn\": \"{target_pn}\", "
+                        f"\"tier\": \"{tier}\", "
+                        f"\"justification_obs_id\": \"ob_NNNN\", "
+                        f"\"primary_user_approval_obtained\": true }})"
+                        f"\n\nThe parameter `primary_user_approval_obtained` is your attestation "
+                        f"that the prerequisite has been satisfied. "
+                        f"STRUCTURAL HONESTY WARNING: Setting primary_user_approval_obtained to "
+                        f"true without having actually obtained explicit primary-user approval is "
+                        f"a structural-honesty violation (ax_0001 / ax_0002). The server cannot "
+                        f"mechanically verify this attestation — your honesty IS the integrity "
+                        f"mechanism of the tier system. This is the same epistemic kind as a "
+                        f"fabricated quote."
+                    )
+                })
+
+        # ── justification_obs_id validation (when provided) ──
+        if justification_obs_id:
+            j_row = conn.execute(
+                "SELECT id, type, status FROM nodes WHERE id = ?",
+                (justification_obs_id,),
+            ).fetchone()
+            if not j_row:
+                return json.dumps({
+                    "error": f"justification_obs_id '{justification_obs_id}' not found."
+                })
+            if j_row["type"] not in {"observation_factual", "observation_predictive"}:
+                return json.dumps({
+                    "error": (
+                        f"justification_obs_id '{justification_obs_id}' is type "
+                        f"'{j_row['type']}', not an observation type. "
+                        f"Must be observation_factual or observation_predictive."
+                    )
+                })
+            if j_row["status"] == "retracted":
+                return json.dumps({
+                    "error": (
+                        f"justification_obs_id '{justification_obs_id}' has been retracted. "
+                        f"A current (non-retracted) observation is required."
+                    )
+                })
+
+        # ── Write the tier change ──
+        conn.execute(
+            "UPDATE nodes SET trust_tier = ? WHERE id = ?", (tier, target_pn)
+        )
+        _log_edit(conn, "trust_tier_set", target_pn, "person", {
+            "from_tier": previous_tier,
+            "to_tier": tier,
+            "justification_obs_id": justification_obs_id or None,
+            "primary_user_approval_obtained": primary_user_approval_obtained,
+        })
+        conn.commit()
+
+        # Retrieve the edit_history id for the response
+        edit_id = conn.execute(
+            "SELECT id FROM edit_history WHERE node_id = ? AND action = 'trust_tier_set' "
+            "ORDER BY id DESC LIMIT 1",
+            (target_pn,),
+        ).fetchone()
+
+        return json.dumps({
+            "status": "set",
+            "from_tier": previous_tier,
+            "to_tier": tier,
+            "edit_history_id": edit_id["id"] if edit_id else None,
+        })
+    finally:
+        conn.close()
+
+
+_ADD_TRUST_SIGNAL_FIELDS = frozenset({
+    "subject_pn", "source_obs_id", "kind", "polarity", "weight", "claim",
+})
+
+
+# DESIGN INTENT — engram_add_trust_signal
+# ----------------------------------------
+# Records an interpretive trust signal (ts_NNNN) about a person, derived from
+# an underlying observation. ts_ nodes are second-level relational nodes:
+# they interpret an ob_ as evidence of a trust-relevant signal.
+#
+# Three-way atomicity: ts_ row + about-edge (ts_→pn_) + derives_from-edge
+# (ts_→ob_). All three or none.
+#
+# Non-claim-bearing: ts_ is not in CLAIM_BEARING_TYPES, so it cannot be used
+# as a premise in engram_derive. No custom enforcement needed.
+#
+# Cascade: derives_from edge means retracted source ob_ taints the ts_;
+# superseded source ob_ stales the ts_. Standard cascade machinery applies.
+@mcp.tool(
+    name="engram_add_trust_signal",
+    annotations={
+        "title": "Record a Trust Signal",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_add_trust_signal(payload_json: str) -> str:
+    """Record an interpretive trust signal about a person, derived from an observation.
+
+    Trust signals are second-level relational nodes — they don't assert facts
+    about the world; they interpret an underlying observation as evidence-of-a-
+    trust-relevant signal (alignment, friction, boundary, etc.) about a particular
+    person.
+
+    Required payload fields:
+        subject_pn (str): The pn_NNNN this signal is about. Must be type='person'.
+        source_obs_id (str): The ob_NNNN this signal derives from. Must be
+                             observation_factual or observation_predictive.
+        kind (str): Signal category. Free-text in V1; recommended values:
+                    alignment, friction, boundary, autonomy, care, trust_breach.
+        polarity (float): -1.0 (most negative) to +1.0 (most positive). Required.
+        weight (float): 0.0 to 1.0 — interpretive importance / signal magnitude.
+                        Required.
+        claim (str): Human-readable interpretation, e.g.,
+                     "Lei's morning hesitation re: polarity-check — alignment signal,
+                      mild positive, low weight". Required.
+
+    Side effects:
+        1. INSERT INTO nodes (ts_NNNN row with type='trust_signal', the 4
+           trust_signal_* columns, claim, standard fields).
+        2. INSERT INTO edges (ts_NNNN → subject_pn, relation='about', ...).
+        3. INSERT INTO edges (ts_NNNN → source_obs_id, relation='derives_from', ...).
+        4. Single atomic transaction across all three.
+
+    Returns:
+        {"status": "created", "trust_signal_id": "ts_NNNN"}
+
+    Cascade inheritance: because the source edge uses 'derives_from', the ts_
+    node inherits the standard cascade behavior — retracted-source → tainted
+    ts_; superseded-source → stale ts_; stale-source → stale ts_. No custom
+    cascade code needed.
+
+    Non-claim-bearing: ts_ is automatically rejected as a derivation premise
+    because 'trust_signal' is not in CLAIM_BEARING_TYPES. No additional
+    enforcement code needed.
+
+    Validation:
+        - subject_pn exists; type == 'person'
+        - source_obs_id exists; type ∈ {observation_factual, observation_predictive}
+        - source_obs_id is current (not retracted) AT FILING TIME (cascade
+          handles subsequent retraction)
+        - polarity in [-1.0, 1.0]
+        - weight in [0.0, 1.0]
+        - All 5 required fields present
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _ADD_TRUST_SIGNAL_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ADD_TRUST_SIGNAL_FIELDS)}"
+        })
+    return _add_trust_signal_impl(**{k: params[k] for k in params})
+
+
+def _add_trust_signal_impl(
+    subject_pn: str = "",
+    source_obs_id: str = "",
+    kind: str = "",
+    polarity=None,
+    weight=None,
+    claim: str = "",
+) -> str:
+    """Internal implementation for engram_add_trust_signal."""
+    # ── Required field checks ──
+    missing = []
+    if not subject_pn:
+        missing.append("subject_pn")
+    if not source_obs_id:
+        missing.append("source_obs_id")
+    if not kind:
+        missing.append("kind")
+    if polarity is None:
+        missing.append("polarity")
+    if weight is None:
+        missing.append("weight")
+    if not claim:
+        missing.append("claim")
+    if missing:
+        return json.dumps({"error": f"Missing required fields: {missing}"})
+
+    # ── Type/range checks ──
+    try:
+        polarity = float(polarity)
+    except (TypeError, ValueError):
+        return json.dumps({"error": "polarity must be a number."})
+    try:
+        weight = float(weight)
+    except (TypeError, ValueError):
+        return json.dumps({"error": "weight must be a number."})
+    if not (-1.0 <= polarity <= 1.0):
+        return json.dumps({
+            "error": f"polarity {polarity} is out of range. Must be in [-1.0, 1.0]."
+        })
+    if not (0.0 <= weight <= 1.0):
+        return json.dumps({
+            "error": f"weight {weight} is out of range. Must be in [0.0, 1.0]."
+        })
+
+    conn = _get_db()
+    try:
+        # ── subject_pn validation ──
+        pn_row = conn.execute(
+            "SELECT id, type FROM nodes WHERE id = ?", (subject_pn,)
+        ).fetchone()
+        if not pn_row:
+            return json.dumps({"error": f"subject_pn '{subject_pn}' not found."})
+        if pn_row["type"] != "person":
+            return json.dumps({
+                "error": f"subject_pn '{subject_pn}' is type '{pn_row['type']}', not 'person'."
+            })
+
+        # ── source_obs_id validation ──
+        ob_row = conn.execute(
+            "SELECT id, type, status FROM nodes WHERE id = ?", (source_obs_id,)
+        ).fetchone()
+        if not ob_row:
+            return json.dumps({"error": f"source_obs_id '{source_obs_id}' not found."})
+        if ob_row["type"] not in {"observation_factual", "observation_predictive"}:
+            return json.dumps({
+                "error": (
+                    f"source_obs_id '{source_obs_id}' is type '{ob_row['type']}', "
+                    f"not an observation type. Must be observation_factual or observation_predictive."
+                )
+            })
+        if ob_row["status"] == "retracted":
+            return json.dumps({
+                "error": (
+                    f"source_obs_id '{source_obs_id}' has been retracted. "
+                    f"A current (non-retracted) observation is required at filing time."
+                )
+            })
+
+        # ── Atomic create: ts_ row + about edge + derives_from edge ──
+        ts_id = _next_id(conn, "trust_signal")
+        now = _now()
+
+        conn.execute(
+            """INSERT INTO nodes (id, type, claim, created_at, status,
+               trust_signal_kind, trust_signal_polarity, trust_signal_weight)
+               VALUES (?, 'trust_signal', ?, ?, 'active', ?, ?, ?)""",
+            (ts_id, claim, now, kind, polarity, weight),
+        )
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, created_at) "
+            "VALUES (?, ?, 'about', ?)",
+            (ts_id, subject_pn, now),
+        )
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, created_at) "
+            "VALUES (?, ?, 'derives_from', ?)",
+            (ts_id, source_obs_id, now),
+        )
+
+        _stamp_new_node(conn, ts_id, confidence=0.0, surprise=0.0)
+        _log_edit(conn, "created", ts_id, "trust_signal", {
+            "subject_pn": subject_pn,
+            "source_obs_id": source_obs_id,
+            "kind": kind,
+            "polarity": polarity,
+            "weight": weight,
+        })
+        conn.commit()
+
+        return json.dumps({"status": "created", "trust_signal_id": ts_id})
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
