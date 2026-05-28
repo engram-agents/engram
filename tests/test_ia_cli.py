@@ -369,6 +369,27 @@ class TestValidation:
         assert rc == 1
         assert "to" in stderr.lower() and ("empty" in stderr.lower() or "recipient" in stderr.lower())
 
+    def test_write_no_to_no_reply_rejected(self, engram_home, inter_agent_dir):
+        """Guard fires when neither --to nor --reply is passed."""
+        _write_config(engram_home, "multi", "ariadne")
+        now = datetime.now(timezone.utc)
+        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        letter_content = (
+            "---\n"
+            "from: ariadne\n"
+            "to: borges\n"
+            f"timestamp: {ts_str}\n"
+            "---\n\n"
+            "Body.\n"
+        )
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "write", "--from-stdin",
+            stdin_text=letter_content,
+        )
+        assert rc == 1
+        assert "--to" in stderr and "--reply" in stderr
+
 
 # ===========================================================================
 # CATEGORY 3: Cursor tests
@@ -928,3 +949,368 @@ class TestIntegration:
         assert rc == 0
         assert "no unread" in stdout
         assert "no unread" not in stderr
+
+
+# ===========================================================================
+# CATEGORY 7: REPLIED marker tests
+# ===========================================================================
+
+class TestRepliedMarker:
+    """REPLIED marker: _scan_replied_filenames, cmd_list display, --reply convenience,
+    cmd_status unreplied count."""
+
+    # -----------------------------------------------------------------------
+    # _scan_replied_filenames unit tests
+    # -----------------------------------------------------------------------
+
+    def test_scan_replied_empty_when_no_outgoing(self, engram_home, inter_agent_dir):
+        """_scan_replied_filenames returns empty set when no outgoing letters exist."""
+        from tools.ia import _scan_replied_filenames
+        # Only incoming letters (to ariadne, from borges) — none outgoing from ariadne
+        _write_letter(
+            inter_agent_dir, "2026-05-28T10-00-00Z_borges.md",
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-30),
+        )
+        result = _scan_replied_filenames("ariadne", inter_agent_dir)
+        assert result == set()
+
+    def test_scan_replied_collects_re_values(self, engram_home, inter_agent_dir):
+        """_scan_replied_filenames collects re: values from multiple outgoing letters."""
+        from tools.ia import _scan_replied_filenames
+        incoming1 = "2026-05-28T09-00-00Z_borges.md"
+        incoming2 = "2026-05-28T10-00-00Z_borges.md"
+        # Outgoing letter referencing incoming1
+        _write_letter(
+            inter_agent_dir, "2026-05-28T11-00-00Z_ariadne.md",
+            from_agent="ariadne", to_agent="borges",
+            timestamp=_ts(-10), re_field=incoming1,
+        )
+        # Outgoing letter referencing incoming2
+        _write_letter(
+            inter_agent_dir, "2026-05-28T12-00-00Z_ariadne.md",
+            from_agent="ariadne", to_agent="borges",
+            timestamp=_ts(-5), re_field=incoming2,
+        )
+        result = _scan_replied_filenames("ariadne", inter_agent_dir)
+        assert result == {incoming1, incoming2}
+
+    def test_scan_replied_skips_malformed_letters(self, engram_home, inter_agent_dir):
+        """_scan_replied_filenames skips malformed letters gracefully."""
+        from tools.ia import _scan_replied_filenames
+        # Write a malformed .md file alongside a valid outgoing letter
+        (inter_agent_dir / "malformed-outgoing.md").write_text("no frontmatter here\n")
+        incoming1 = "2026-05-28T09-00-00Z_borges.md"
+        _write_letter(
+            inter_agent_dir, "2026-05-28T11-00-00Z_ariadne.md",
+            from_agent="ariadne", to_agent="borges",
+            timestamp=_ts(-10), re_field=incoming1,
+        )
+        # Should not raise; should still collect re: from the valid outgoing letter
+        result = _scan_replied_filenames("ariadne", inter_agent_dir)
+        assert result == {incoming1}
+
+    def test_scan_replied_ignores_outgoing_without_re(self, engram_home, inter_agent_dir):
+        """_scan_replied_filenames ignores outgoing letters with no re: field."""
+        from tools.ia import _scan_replied_filenames
+        # Outgoing letter without re: (cold start letter, not a reply)
+        _write_letter(
+            inter_agent_dir, "2026-05-28T11-00-00Z_ariadne.md",
+            from_agent="ariadne", to_agent="borges",
+            timestamp=_ts(-10),
+        )
+        result = _scan_replied_filenames("ariadne", inter_agent_dir)
+        assert result == set()
+
+    # -----------------------------------------------------------------------
+    # cmd_list REPLIED display tests
+    # -----------------------------------------------------------------------
+
+    def test_list_shows_replied_marker(self, engram_home, inter_agent_dir):
+        """cmd_list shows [REPLIED] on a letter when an outgoing re: points at it."""
+        _write_config(engram_home, "multi", "ariadne")
+        incoming_filename = "2026-05-28T09-00-00Z_borges.md"
+        _write_letter(
+            inter_agent_dir, incoming_filename,
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-60), heading="Original question",
+        )
+        # Outgoing reply that references the incoming letter
+        _write_letter(
+            inter_agent_dir, "2026-05-28T10-00-00Z_ariadne.md",
+            from_agent="ariadne", to_agent="borges",
+            timestamp=_ts(-30), re_field=incoming_filename,
+        )
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list", "--all")
+        assert rc == 0
+        assert "[REPLIED]" in stdout
+        assert "Original question" in stdout
+
+    def test_list_no_replied_marker_without_re(self, engram_home, inter_agent_dir):
+        """cmd_list does NOT show [REPLIED] when no outgoing letter references the incoming."""
+        _write_config(engram_home, "multi", "ariadne")
+        incoming_filename = "2026-05-28T09-00-00Z_borges.md"
+        _write_letter(
+            inter_agent_dir, incoming_filename,
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-60), heading="Unreplied letter",
+        )
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list", "--all")
+        assert rc == 0
+        assert "[REPLIED]" not in stdout
+        assert "Unreplied letter" in stdout
+
+    def test_list_replied_marker_only_on_correct_letter(self, engram_home, inter_agent_dir):
+        """[REPLIED] appears only on the specific letter referenced, not others."""
+        _write_config(engram_home, "multi", "ariadne")
+        incoming_replied = "2026-05-28T08-00-00Z_borges.md"
+        incoming_unreplied = "2026-05-28T09-00-00Z_borges.md"
+        _write_letter(
+            inter_agent_dir, incoming_replied,
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-90), heading="Replied letter",
+        )
+        _write_letter(
+            inter_agent_dir, incoming_unreplied,
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-60), heading="Unreplied letter",
+        )
+        # Outgoing letter replies to incoming_replied only
+        _write_letter(
+            inter_agent_dir, "2026-05-28T10-00-00Z_ariadne.md",
+            from_agent="ariadne", to_agent="borges",
+            timestamp=_ts(-30), re_field=incoming_replied,
+        )
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list", "--all")
+        assert rc == 0
+        # Exactly one [REPLIED] marker in output
+        assert stdout.count("[REPLIED]") == 1
+        # "Replied letter" line has the marker
+        for line in stdout.splitlines():
+            if "Replied letter" in line:
+                assert "[REPLIED]" in line
+            if "Unreplied letter" in line:
+                assert "[REPLIED]" not in line
+
+    # -----------------------------------------------------------------------
+    # ia write --reply FILENAME tests
+    # -----------------------------------------------------------------------
+
+    def test_write_reply_autofills_to_and_re(self, engram_home, inter_agent_dir):
+        """ia write --reply FILENAME auto-fills to: from source's from: and sets re:."""
+        _write_config(engram_home, "multi", "ariadne")
+        now = datetime.now(timezone.utc)
+        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        incoming_filename = "2026-05-28T09-00-00Z_borges.md"
+        _write_letter(
+            inter_agent_dir, incoming_filename,
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-30), heading="Please reply to this",
+        )
+        # Write a reply via --reply (body provided via stdin)
+        letter_content = (
+            "---\n"
+            "from: ariadne\n"
+            "to: borges\n"
+            f"timestamp: {ts_str}\n"
+            f"re: {incoming_filename}\n"
+            "---\n\n"
+            "# Reply\n\n"
+            "Here is my reply.\n"
+        )
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "write", "--reply", incoming_filename, "--from-stdin",
+            stdin_text=letter_content,
+        )
+        assert rc == 0, f"write --reply failed; stderr: {stderr}"
+        # Find the written letter (the outgoing one, from ariadne)
+        md_files = [f for f in inter_agent_dir.glob("*.md") if f.name != incoming_filename]
+        assert md_files, "Expected an outgoing letter to be written"
+        content = md_files[0].read_text()
+        assert "to: borges" in content
+        assert f"re: {incoming_filename}" in content
+
+    def test_write_reply_to_conflict_rejected(self, engram_home, inter_agent_dir):
+        """ia write --reply FILENAME --to OTHER (OTHER != source's from) is rejected."""
+        _write_config(engram_home, "multi", "ariadne")
+        incoming_filename = "2026-05-28T09-00-00Z_borges.md"
+        _write_letter(
+            inter_agent_dir, incoming_filename,
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-30), heading="From borges",
+        )
+        now = datetime.now(timezone.utc)
+        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        letter_content = (
+            "---\n"
+            "from: ariadne\n"
+            "to: mneme\n"
+            f"timestamp: {ts_str}\n"
+            f"re: {incoming_filename}\n"
+            "---\n\n"
+            "Body.\n"
+        )
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "write", "--reply", incoming_filename, "--to", "mneme", "--from-stdin",
+            stdin_text=letter_content,
+        )
+        assert rc == 1, "Expected rejection when --to conflicts with source's from:"
+        assert "conflict" in stderr.lower() and "borges" in stderr and "mneme" in stderr
+
+    def test_write_reply_to_matching_accepted(self, engram_home, inter_agent_dir):
+        """ia write --reply FILENAME --to borges (matches source's from:) is accepted."""
+        _write_config(engram_home, "multi", "ariadne")
+        incoming_filename = "2026-05-28T09-00-00Z_borges.md"
+        _write_letter(
+            inter_agent_dir, incoming_filename,
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-30), heading="From borges",
+        )
+        now = datetime.now(timezone.utc)
+        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        letter_content = (
+            "---\n"
+            "from: ariadne\n"
+            "to: borges\n"
+            f"timestamp: {ts_str}\n"
+            f"re: {incoming_filename}\n"
+            "---\n\n"
+            "Body.\n"
+        )
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "write", "--reply", incoming_filename, "--to", "borges", "--from-stdin",
+            stdin_text=letter_content,
+        )
+        assert rc == 0, f"Expected acceptance when --to matches source's from:; stderr: {stderr}"
+
+    def test_write_reply_nonexistent_source_rejected(self, engram_home, inter_agent_dir):
+        """ia write --reply NONEXISTENT → exit 1 with clear error."""
+        _write_config(engram_home, "multi", "ariadne")
+        now = datetime.now(timezone.utc)
+        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        letter_content = (
+            "---\n"
+            "from: ariadne\n"
+            "to: borges\n"
+            f"timestamp: {ts_str}\n"
+            "---\n\nBody.\n"
+        )
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "write", "--reply", "nonexistent-letter.md", "--from-stdin",
+            stdin_text=letter_content,
+        )
+        assert rc == 1
+        assert "not found" in stderr.lower() or "nonexistent" in stderr.lower()
+
+    def test_write_reply_results_in_re_and_to_in_file(self, engram_home, inter_agent_dir):
+        """Written reply letter has correct to: and re: fields in the file."""
+        _write_config(engram_home, "multi", "ariadne")
+        incoming_filename = "2026-05-28T09-00-00Z_borges.md"
+        _write_letter(
+            inter_agent_dir, incoming_filename,
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-30), heading="Source letter",
+        )
+        now = datetime.now(timezone.utc)
+        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        letter_content = (
+            "---\n"
+            "from: ariadne\n"
+            "to: borges\n"
+            f"timestamp: {ts_str}\n"
+            f"re: {incoming_filename}\n"
+            "---\n\n"
+            "# Reply\n\nReply body here.\n"
+        )
+        rc, _, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "write", "--reply", incoming_filename, "--from-stdin",
+            stdin_text=letter_content,
+        )
+        assert rc == 0, f"stderr: {stderr}"
+        # Check the written file
+        written = [f for f in inter_agent_dir.glob("*.md") if f.name != incoming_filename]
+        assert written, "Expected a written reply file"
+        content = written[0].read_text()
+        from tools.ia import _parse_frontmatter
+        fields, _ = _parse_frontmatter(content)
+        assert fields.get("to") == "borges"
+        assert fields.get("re") == incoming_filename
+
+    # -----------------------------------------------------------------------
+    # cmd_status unreplied count tests
+    # -----------------------------------------------------------------------
+
+    def test_status_shows_unreplied_when_present(self, engram_home, inter_agent_dir):
+        """cmd_status shows unreplied count when there are unresponded letters."""
+        _write_config(engram_home, "multi", "ariadne")
+        _write_letter(
+            inter_agent_dir, "2026-05-28T09-00-00Z_borges.md",
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-60), heading="Needs a reply",
+        )
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "status")
+        assert rc == 0
+        assert "unreplied" in stdout
+        assert "1" in stdout
+
+    def test_status_omits_unreplied_when_zero(self, engram_home, inter_agent_dir):
+        """cmd_status omits unreplied line when all incoming letters have been replied to."""
+        _write_config(engram_home, "multi", "ariadne")
+        incoming_filename = "2026-05-28T09-00-00Z_borges.md"
+        _write_letter(
+            inter_agent_dir, incoming_filename,
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-60), heading="Already replied",
+        )
+        # Outgoing reply
+        _write_letter(
+            inter_agent_dir, "2026-05-28T10-00-00Z_ariadne.md",
+            from_agent="ariadne", to_agent="borges",
+            timestamp=_ts(-30), re_field=incoming_filename,
+        )
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "status")
+        assert rc == 0
+        # Check that no "unreplied:" label line is emitted (the label is only shown > 0).
+        # Note: the inter-agent-dir path in the output may contain "unreplied" if the
+        # pytest tmp dir name includes it — check for the specific label pattern instead.
+        output_lines = stdout.splitlines()
+        unreplied_label_lines = [ln for ln in output_lines if ln.strip().startswith("unreplied:")]
+        assert unreplied_label_lines == [], f"Expected no unreplied: line; got: {unreplied_label_lines}"
+
+    def test_status_json_includes_unreplied_field(self, engram_home, inter_agent_dir):
+        """cmd_status --format json includes unreplied_letters field."""
+        _write_config(engram_home, "multi", "ariadne")
+        _write_letter(
+            inter_agent_dir, "2026-05-28T09-00-00Z_borges.md",
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-60),
+        )
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "status", "--format", "json")
+        assert rc == 0
+        data = json.loads(stdout)
+        assert "unreplied_letters" in data
+        assert data["unreplied_letters"] == 1
+
+    def test_status_json_unreplied_zero_when_all_replied(self, engram_home, inter_agent_dir):
+        """cmd_status --format json shows unreplied_letters=0 when all replied."""
+        _write_config(engram_home, "multi", "ariadne")
+        incoming_filename = "2026-05-28T09-00-00Z_borges.md"
+        _write_letter(
+            inter_agent_dir, incoming_filename,
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-60),
+        )
+        _write_letter(
+            inter_agent_dir, "2026-05-28T10-00-00Z_ariadne.md",
+            from_agent="ariadne", to_agent="borges",
+            timestamp=_ts(-30), re_field=incoming_filename,
+        )
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "status", "--format", "json")
+        assert rc == 0
+        data = json.loads(stdout)
+        assert data["unreplied_letters"] == 0

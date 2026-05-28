@@ -444,6 +444,38 @@ def _filter_unread(letters: list, read_cursor: Optional[datetime]) -> list:
     return [l for l in letters if l["timestamp"] > read_cursor]
 
 
+def _scan_replied_filenames(agent_name: str, inter_agent_dir: Path) -> set:
+    """Scan inter_agent_dir for outgoing letters (from: agent_name) with a re: field.
+
+    Returns the set of all filenames referenced by `re:` across outgoing letters.
+    Graceful on malformed letters (skips silently — frontmatter errors are not
+    load-bearing for this scan).
+    """
+    if not inter_agent_dir.is_dir():
+        return set()
+
+    replied = set()
+    for md_file in inter_agent_dir.glob("*.md"):
+        try:
+            text = md_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        fields, _ = _parse_frontmatter(text)
+        if not fields:
+            continue
+
+        from_field = fields.get("from", "").strip().lower()
+        if not agent_name or from_field != agent_name.lower():
+            continue
+
+        re_field = fields.get("re", "").strip()
+        if re_field:
+            replied.add(re_field)
+
+    return replied
+
+
 # ---------------------------------------------------------------------------
 # $EDITOR helpers  (DESIGN §9.2)
 # ---------------------------------------------------------------------------
@@ -510,6 +542,9 @@ def cmd_list(args: argparse.Namespace, config: dict, agent_name: str) -> None:
             )
         return
 
+    # Compute which incoming letters have been replied to (outgoing re: references)
+    replied_set = _scan_replied_filenames(agent_name, inter_agent_dir)
+
     # Human format
     label = "ALL" if args.all else "UNREAD"
     count = len(all_letters)
@@ -519,7 +554,8 @@ def cmd_list(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         print(f"{label} ({count}):")
         for l in all_letters:
             ts_str = _format_ts(l["timestamp"])
-            print(f"  {ts_str}  {l['from']:<12}  \"{l['title']}\"")
+            replied_marker = "  [REPLIED]" if l["filename"] in replied_set else ""
+            print(f"  {ts_str}  {l['from']:<12}  \"{l['title']}\"{replied_marker}")
             print(f"    {l['filename']}")
 
     if skipped_count > 0:
@@ -604,6 +640,61 @@ def cmd_read(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
 def cmd_write(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     inter_agent_dir = Path(INTER_AGENT_DIR)
+
+    # Handle --reply FILENAME: resolve source, auto-fill --to, set --re
+    if args.reply:
+        reply_filename = args.reply
+        reply_path = inter_agent_dir / reply_filename
+        if not reply_path.exists():
+            print(
+                f"ia write: --reply: source letter '{reply_filename}' not found "
+                f"(looked in {inter_agent_dir}). "
+                f"Use 'ia list --all' to see available letters.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        try:
+            reply_text = reply_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            print(f"ia write: --reply: cannot read '{reply_path}': {e}", file=sys.stderr)
+            sys.exit(EXIT_IO)
+        reply_fields, _ = _parse_frontmatter(reply_text)
+        if not reply_fields:
+            print(
+                f"ia write: --reply: cannot parse frontmatter from '{reply_filename}'. "
+                f"See inter-agent/README.md §2.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        source_from = reply_fields.get("from", "").strip()
+        if not source_from:
+            print(
+                f"ia write: --reply: source letter '{reply_filename}' has no `from:` field.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        # If --to was explicitly given, verify it matches the source's sender
+        if args.to is not None and args.to != source_from:
+            print(
+                f"ia write: --reply conflict: source letter is from '{source_from}' "
+                f"but --to '{args.to}' was also specified. "
+                f"Remove --to to reply to '{source_from}', or use "
+                f"'--re {reply_filename} --to {args.to}' to reference the letter "
+                f"while writing to a different recipient.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        # Auto-fill --to from source and set --re
+        args.to = source_from
+        args.re = reply_filename
+
+    # Guard: --to must be set by now (either directly or via --reply)
+    if not args.to:
+        print(
+            "ia write: --to is required (or use --reply FILENAME to auto-fill from source).",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
 
     # Build the timestamp for the new letter
     now = datetime.now(timezone.utc)
@@ -863,9 +954,16 @@ def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         all_letters, _ = _scan_letters(agent_name, inter_agent_dir)
         unread = _filter_unread(all_letters, read_cursor)
         unread_count = len(unread)
+        # Unreplied: all incoming letters (any time) with no outgoing re: reference
+        replied_set = _scan_replied_filenames(agent_name, inter_agent_dir)
+        unreplied_count = sum(
+            1 for l in all_letters if l["filename"] not in replied_set
+        )
     else:
         all_letters = []
         unread_count = 0
+        replied_set = set()
+        unreplied_count = 0
 
     # Unique senders seen in letters to me (recently-active proxy; DESIGN §9.3 note)
     active_correspondents: list = []
@@ -898,6 +996,7 @@ def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
             "read_cursor": _cursor_str(read_cursor),
             "surfaced_cursor": _cursor_str(surfaced_cursor),
             "unread_letters": unread_count,
+            "unreplied_letters": unreplied_count,
             "active_correspondents": active_correspondents,
         }
         print(json.dumps(output, indent=2))
@@ -910,6 +1009,8 @@ def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     print(f"read cursor:     {_cursor_str(read_cursor)}{_age_str(read_cursor)}")
     print(f"surfaced cursor: {_cursor_str(surfaced_cursor)}{_age_str(surfaced_cursor)}")
     print(f"unread letters:  {unread_count}")
+    if unreplied_count > 0:
+        print(f"unreplied:       {unreplied_count}")
     if active_correspondents:
         print(f"correspondents:  {', '.join(active_correspondents)}")
     else:
@@ -1007,12 +1108,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_write.add_argument(
-        "--to", required=True, metavar="AGENT",
-        help="Recipient's canonical agent name",
+        "--to", required=False, default=None, metavar="AGENT",
+        help=(
+            "Recipient's canonical agent name. "
+            "Required unless --reply is used (which auto-fills --to from the source letter)."
+        ),
     )
     p_write.add_argument(
         "--re", metavar="FILENAME",
         help="Filename of the letter being replied to (must exist in inter-agent/)",
+    )
+    p_write.add_argument(
+        "--reply", metavar="FILENAME",
+        help=(
+            "Convenience shorthand: reply to a specific letter by filename. "
+            "Auto-fills --to from the source letter's `from:` field and populates `re:`. "
+            "If --to is also given, it must match the source's sender or the command errors out."
+        ),
     )
     p_write.add_argument(
         "--title", metavar="TEXT",
