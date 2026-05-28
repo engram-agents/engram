@@ -256,7 +256,7 @@ def _get_downstream_nodes(conn: sqlite3.Connection, node_id: str) -> list[str]:
     """Get all nodes that depend on this node (follow edges in reverse: target→source)."""
     rows = conn.execute(
         "SELECT source_id FROM edges WHERE target_id = ? AND relation IN "
-        "('derives_from', 'cites', 'supports')",
+        "('derives_from', 'cites', 'supported_by')",
         (node_id,),
     ).fetchall()
     return [r["source_id"] for r in rows]
@@ -573,7 +573,7 @@ def edge_add(phase: str, source_id: str, target_id: str, relation: str,
              reason: str, bug_ref: str, token: str = "") -> dict:
     """Add a missing edge between two nodes."""
     ALLOWED_RELATIONS = {
-        "cites", "supports", "contradicts", "resolves",
+        "cites", "supported_by", "contradicts", "resolves",
         "derives_from", "supersedes", "retracts", "tensions",
     }
     if relation not in ALLOWED_RELATIONS:

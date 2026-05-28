@@ -397,14 +397,14 @@ def test_cornerstone_candidate_excludes_axiom_goal_definition_includes_ob_dv():
     citer_b = _add_observation(server, "Citer B for citation fixture")
     citer_c = _add_observation(server, "Citer C for citation fixture")
 
-    # Helper: insert 3 inbound 'supports' edges onto a target node
+    # Helper: insert 3 inbound 'supported_by' edges onto a target node
     def _add_three_citations(target_id):
         conn = server._get_db()
         try:
             for src in (citer_a, citer_b, citer_c):
                 conn.execute(
                     "INSERT OR IGNORE INTO edges (source_id, target_id, relation, created_at)"
-                    " VALUES (?, ?, 'supports', ?)",
+                    " VALUES (?, ?, 'supported_by', ?)",
                     (src, target_id, now),
                 )
             conn.commit()

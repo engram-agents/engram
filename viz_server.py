@@ -684,7 +684,7 @@ const NODE_TYPES = {
 
 const EDGE_COLORS = {
   cites:         '#7799bb',
-  supports:      '#5cb85c',
+  supported_by:  '#5cb85c',
   contradicts:   '#e05252',
   resolves:      '#4a90d9',
   derives_from:  '#b05ce6',
@@ -1577,7 +1577,7 @@ function edgeDirectionLabel(relation, isOutgoing) {
   const labels = {
     derives_from: ['derives from', 'derived by'],
     cites:        ['cites', 'cited by'],
-    supports:     ['supports', 'supported by'],
+    supported_by: ['supported by', 'supports'],
     contradicts:  ['contradicts', 'contradicted by'],
     resolves:     ['resolves', 'resolved by'],
     supersedes:   ['supersedes', 'superseded by'],

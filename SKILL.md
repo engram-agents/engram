@@ -27,6 +27,41 @@ Source → Observation → Derivation → Theory. Each step adds uncertainty.
 - **Dedup-exempt** (skip similarity check at write): feeling reports only.
 - **Resolvable** (have a close-loop mechanism): questions (via `resolve`), conjectures (promote/refute), contradictions (via superseding claim), predictions (via outcome), goal tensions (via synthesis/prioritization/dissolution).
 
+### Edge-relation glossary
+
+All edges are `(source_id, target_id, relation)`. The convention for dependency
+edges is: **source depends on target** — same direction as `derives_from`.
+Taint and stale cascades follow this convention: retracting or superseding a
+target node propagates to the source (dependent), never the reverse.
+
+| Relation | Direction | Meaning | Taint/stale propagates |
+|---|---|---|---|
+| `derives_from` | source ← target | source is inferred from target | target retracted/superseded → source tainted/stale |
+| `supported_by` | source ← target | source is grounded in target; source depends on target | target retracted/superseded → source tainted/stale |
+| `supersedes` | source → old | source replaces old | — |
+| `cites` | source → evidence | source is grounded in evidence node | — (provenance, not cascade) |
+| `contradicts` | lateral | epistemic conflict between two nodes | — |
+| `retracts` | source → retracted | source records an error correction | — |
+| `resolves` | source → target | source closes a question/prediction/contradiction | — |
+| `about` | source → person | source is about a person (symmetric/DAG-exempt) | — |
+| `tensions` | lateral | goal-level tension | — |
+| `subtask_of` | source → parent | source is a sub-task | — |
+| `serves` | source → goal | source serves a goal | — |
+| `exemplifies` | incident → lesson | incident illustrates the lesson (DAG-exempt) | — |
+
+**`supported_by` convention (fixes direction bug, PR #406):**
+`(source, target, 'supported_by')` means "source is supported_by target":
+source is the *dependent* node (cornerstone, prediction), target is the
+*premise* node (observation, derivation). The taint cascade fires the same
+way as `derives_from` — retracting the target/premise taints the
+source/dependent. The old `supports` relation had an inconsistent direction
+across code paths; `supported_by` unifies the convention.
+
+- **Cornerstone path:** `(cornerstone, supporting_obs, 'supported_by')` —
+  the cornerstone (dependent) is supported by the observation (premise).
+- **Prediction path:** `(prediction, creating_obs, 'supported_by')` —
+  the prediction (dependent) is supported by the observation that spawned it.
+
 ---
 
 ### §2.1 Axioms (`ax_`)

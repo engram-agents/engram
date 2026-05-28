@@ -475,7 +475,7 @@ CLAIM_BEARING_TYPES = {
 
 VALID_RELATIONS = {
     "cites",
-    "supports",
+    "supported_by",
     "contradicts",
     "resolves",
     "derives_from",
@@ -2593,7 +2593,7 @@ def _get_neighbors(conn: sqlite3.Connection, node_id: str) -> list[dict]:
 # recall_summary in the recall view.
 _LOGICAL_SUBSTRATE_RELATIONS = frozenset({
     "derives_from",
-    "supports",
+    "supported_by",
     "supersedes",
     "contradicts",
     "resolves",
@@ -2691,7 +2691,7 @@ def _build_inspect_recall_view(
 
     # Sort logical neighbors into upstream / downstream / lateral.
     # Upstream: outgoing edges — the inspected node uses/cites/resolves/supersedes
-    #   the neighbor (outgoing derives_from, supports, supersedes, resolves, subtask_of).
+    #   the neighbor (outgoing derives_from, supported_by, supersedes, resolves, subtask_of).
     # Downstream: incoming edges — the neighbor uses/cites/resolves/supersedes the
     #   inspected node (incoming versions of the same relations, including incoming
     #   subtask_of children).
@@ -2701,7 +2701,7 @@ def _build_inspect_recall_view(
     lateral: list[dict] = []
 
     _UPSTREAM_OUTGOING = frozenset({
-        "derives_from", "supports", "supersedes", "resolves", "subtask_of"
+        "derives_from", "supported_by", "supersedes", "resolves", "subtask_of"
     })
     _LATERAL_RELATIONS = frozenset({
         "contradicts", "tensions", "exemplifies", "retracts"
@@ -3331,7 +3331,7 @@ def _trace_evidence_roots(conn: sqlite3.Connection, node_id: str, max_depth: int
 
         # Follow citation edges backward
         edges = conn.execute(
-            "SELECT target_id FROM edges WHERE source_id = ? AND relation IN ('cites', 'derives_from', 'supports')",
+            "SELECT target_id FROM edges WHERE source_id = ? AND relation IN ('cites', 'derives_from', 'supported_by')",
             (current,),
         ).fetchall()
         for e in edges:
@@ -3824,13 +3824,16 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                 lines.append(f"Claim: {n['claim']}")
                 quote_preview = (n["quoted_text"] or "")[:120]
                 lines.append(f"Source: {n['evidence_id']} | Quote: \"{quote_preview}\"")
-                # Show edges
+                # Show predictions that depend on this observation (incoming
+                # supported_by; post-direction-fix, observations are targets of
+                # supported_by edges sourced from the predictions they ground).
                 edges = conn.execute(
-                    "SELECT target_id, relation FROM edges WHERE source_id = ? AND relation = 'supports'",
+                    "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'supported_by' "
+                    "AND source_id IN (SELECT id FROM nodes WHERE type = 'prediction')",
                     (n["id"],),
                 ).fetchall()
                 for e in edges:
-                    lines.append(f"Supports: {e['target_id']}")
+                    lines.append(f"Depended on by: {e['source_id']}")
             elif ntype == "prediction":
                 lines.append(f"### {n['id']} [{n['status']}] [{status_tag}]")
                 lines.append(f"Event: {n['predicted_event']}")
@@ -4923,11 +4926,11 @@ def _add_observation_impl(
                 _log_edit(conn, "created", prediction_id, "prediction",
                           {"predicted_event": predicted_event[:200]})
 
-            # Edge: observation supports prediction
+            # Edge: prediction supported_by observation
             try:
                 conn.execute(
-                    "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'supports', ?)",
-                    (node_id, prediction_id, now),
+                    "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'supported_by', ?)",
+                    (prediction_id, node_id, now),
                 )
             except sqlite3.IntegrityError:
                 pass
@@ -6301,7 +6304,7 @@ def _surface_impl(
 #
 # Edge classification (recall view):
 #   Logical-substrate (shown with recall_summary):
-#     derives_from, supports, supersedes, contradicts, resolves,
+#     derives_from, supported_by, supersedes, contradicts, resolves,
 #     retracts, exemplifies, subtask_of, tensions
 #   Contextual (shown with keywords only):
 #     cites, about, serves
@@ -6342,8 +6345,8 @@ def engram_inspect(payload_json: str) -> str:
     For multi-hop evidence chains, use engram_get_subgraph instead.
 
     Neighbor grouping in recall view:
-      upstream   — outgoing derives_from, supports, supersedes, resolves, subtask_of
-      downstream — incoming derives_from, supports, supersedes, resolves, subtask_of
+      upstream   — outgoing derives_from, supported_by, supersedes, resolves, subtask_of
+      downstream — incoming derives_from, supported_by, supersedes, resolves, subtask_of
       lateral    — contradicts, tensions, exemplifies, retracts
 
     Args:
@@ -7924,12 +7927,13 @@ def engram_diagnose() -> str:
               AND NOT EXISTS (
                   SELECT 1 FROM edges e
                   WHERE e.target_id = n.id
-                    AND e.relation IN ('derives_from', 'supports')
+                    AND e.relation IN ('derives_from', 'supported_by')
                     AND e.source_id IN (SELECT id FROM nodes WHERE type IN ('derivation', 'theory'))
               )
               AND NOT EXISTS (
                   SELECT 1 FROM edges e
-                  WHERE e.source_id = n.id AND e.relation = 'supports'
+                  WHERE e.target_id = n.id AND e.relation = 'supported_by'
+                    AND e.source_id IN (SELECT id FROM nodes WHERE type = 'prediction')
               )
         """).fetchone()["c"]
         epistemic["uncited_observations"] = uncited
@@ -9577,7 +9581,7 @@ def _add_cornerstone_impl(
                                the reframe. Optional but usually load-bearing.
         supporting_ids: Comma-separated IDs of supporting nodes (feeling
                         reports, observations, derivations, prior cornerstones).
-                        Creates `supports` edges from cornerstone → supporting.
+                        Creates `supported_by` edges from cornerstone → supporting.
 
     Returns:
         JSON with the new cornerstone node ID and linked supporting nodes.
@@ -9615,7 +9619,7 @@ def _add_cornerstone_impl(
             if exists:
                 try:
                     conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'supports', ?)",
+                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'supported_by', ?)",
                         (node_id, sid, now),
                     )
                     linked.append(sid)
@@ -9811,12 +9815,12 @@ def _outgrow_cornerstone_impl(
             (new_id, title, now, new_meta, old_cornerstone_id),
         )
 
-        # Inherit supports edges from the predecessor; the outgrowth is still
+        # Inherit supported_by edges from the predecessor; the outgrowth is still
         # grounded in the same underlying experience-nodes unless explicitly
         # replaced. Also preserve `about` edges (person-anchors, e.g.,
         # the self-anchor) — the outgrowth is still about the same person.
         inherited_supports = conn.execute(
-            "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'supports'",
+            "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'supported_by'",
             (old_cornerstone_id,),
         ).fetchall()
         inherited_about = conn.execute(
@@ -9838,7 +9842,7 @@ def _outgrow_cornerstone_impl(
                 continue
             try:
                 conn.execute(
-                    "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'supports', ?)",
+                    "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'supported_by', ?)",
                     (new_id, sid, now),
                 )
                 linked_supports.append(sid)
@@ -9983,7 +9987,7 @@ def _link_about_impl(
 
     The `about` relation is bidirectional / aboutness-based — symmetric and
     DAG-exempt. It can be added retroactively regardless of node creation
-    order, which normal dependency edges (`derives_from`, `supports`, `cites`)
+    order, which normal dependency edges (`derives_from`, `supported_by`, `cites`)
     cannot. Use it to link self-observations, feelings, lessons, and
     cornerstones to the self-anchor so emergence-scan can cheaply find
     identity-forming patterns (qu_0202).
@@ -10055,7 +10059,7 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # Whitelist of edge relations that engram_remove_edge can delete.
 #
 # Excluded by design:
-#   - Cascade-bearing edges (derives_from, supports, supersedes, retracts) —
+#   - Cascade-bearing edges (derives_from, supported_by, supersedes, retracts) —
 #     removing them would silently undo retraction taint walks, supersede
 #     stale walks, or confidence-propagation that already cascaded.
 #   - Structural commitments (contradicts, resolves) — they record a stance
@@ -10084,7 +10088,7 @@ _REMOVABLE_EDGE_RELATIONS = frozenset({
 # Whitelist (safe to remove): about, tensions, subtask_of, serves, exemplifies.
 #
 # BLOCKED (require engram-surgical or substrate-level correction):
-#   - cascade-bearing: derives_from, supports, supersedes, retracts, resolves
+#   - cascade-bearing: derives_from, supported_by, supersedes, retracts, resolves
 #     (removing would break chain-cascade semantics — taint/stale propagation
 #     depends on these)
 #   - structural commitments: contradicts, retracts (removing alters epistemic
@@ -10167,7 +10171,7 @@ def _remove_edge_impl(
             "error": (
                 f"Relation '{relation}' is not removable via engram_remove_edge. "
                 f"Allowed: {sorted(_REMOVABLE_EDGE_RELATIONS)}. "
-                f"Cascade-bearing edges (derives_from, supports, supersedes, "
+                f"Cascade-bearing edges (derives_from, supported_by, supersedes, "
                 f"retracts), structural commitments (contradicts, resolves), "
                 f"and provenance (cites) are blocked. Use engram-surgical if "
                 f"removal is truly required."
@@ -13149,7 +13153,7 @@ def _supersede_impl(
 
     Cascade behavior (parallel cascades for derivation and contradiction
     dependents):
-      - Derivation cascade: every node that derives_from / supports the
+      - Derivation cascade: every node that derives_from / supported_by the
         old node gets marked stale_by_premise (metadata.stale_by includes
         old_node_id, metadata.stale_replacement[old_node_id] = new_node_id).
       - Contradiction cascade (issue #229): every contradiction node that
@@ -13304,7 +13308,7 @@ def _supersede_impl(
                 return
             visited.add(nid)
             dependents = conn.execute(
-                "SELECT source_id FROM edges WHERE target_id = ? AND relation IN ('derives_from', 'supports')",
+                "SELECT source_id FROM edges WHERE target_id = ? AND relation IN ('derives_from', 'supported_by')",
                 (nid,),
             ).fetchall()
             for d in dependents:
@@ -13529,7 +13533,7 @@ def _retract_impl(
     tainted so they can be reviewed and corrected.
 
     Cascade behavior:
-      - Derivation cascade: every node that derives_from / supports the
+      - Derivation cascade: every node that derives_from / supported_by the
         retracted node gets marked tainted_by (metadata.tainted_by includes
         the retracted node id).
       - Contradiction cascade (issue #229): every contradiction node that
@@ -13650,7 +13654,7 @@ def _retract_impl(
             (node_id,),
         )
 
-        # 2. Find all downstream nodes (anything that derives_from or is supported by this node)
+        # 2. Find all downstream nodes (anything that derives_from or is supported_by this node)
         tainted = []
         visited = set()
 
@@ -13660,7 +13664,7 @@ def _retract_impl(
             visited.add(nid)
             downstream = conn.execute(
                 """SELECT source_id FROM edges
-                   WHERE target_id = ? AND relation IN ('derives_from', 'supports')""",
+                   WHERE target_id = ? AND relation IN ('derives_from', 'supported_by')""",
                 (nid,),
             ).fetchall()
             for d in downstream:
@@ -15779,12 +15783,13 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
                AND COALESCE(n.importance_score, 0) >= ?
                AND NOT EXISTS (
                    SELECT 1 FROM edges e
-                   WHERE e.target_id = n.id AND e.relation IN ('derives_from', 'supports')
+                   WHERE e.target_id = n.id AND e.relation IN ('derives_from', 'supported_by')
                    AND e.source_id IN (SELECT id FROM nodes WHERE type IN ('derivation', 'theory'))
                )
                AND NOT EXISTS (
                    SELECT 1 FROM edges e
-                   WHERE e.source_id = n.id AND e.relation = 'supports'
+                   WHERE e.target_id = n.id AND e.relation = 'supported_by'
+                   AND e.source_id IN (SELECT id FROM nodes WHERE type = 'prediction')
                )
                ORDER BY imp DESC, n.id ASC
                LIMIT 15""",
@@ -16079,7 +16084,7 @@ def engram_list(payload_json: str = "{}") -> str:
         is_null, is_not_null             — NULL checks (no value)
 
     Virtual fields (cross-table edges lookup, ops: eq/ne/in/not_in):
-        cites: <id>     — this node has an outgoing cites/supports/derives_from edge to <id>
+        cites: <id>     — this node has an outgoing cites/supported_by/derives_from edge to <id>
         cited_by: <id>  — this node is cited by <id> (incoming edge)
 
     Atomic field whitelist: id, type, claim, created_at, evidence_id,
@@ -16682,7 +16687,7 @@ def _pattern_cornerstone_candidate(
     for nid, ntype, claim, imp_base, recalls in rows:
         cite_count = conn.execute(
             "SELECT COUNT(*) FROM edges WHERE target_id=? "
-            "AND relation IN ('supports', 'cites', 'derives_from')",
+            "AND relation IN ('supported_by', 'cites', 'derives_from')",
             (nid,),
         ).fetchone()[0]
         if cite_count < min_citations:
