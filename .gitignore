@@ -23,6 +23,12 @@ xet/
 # .claude/agents/*.md are tracked and must stay so.
 .claude/worktrees/
 
+# Sleep-cycle cohort scratch space — dream-cohort-YYYY-MM-DD dirs written
+# by cohort_dispatch.py prepare live here. Project-internal so fairy
+# Read/Write access works without per-folder settings.json allowlist config.
+# Gitignored because these are ephemeral sleep-cycle artifacts.
+.claude/agent-scratch/
+
 # Playwright MCP scratch dir (browser-driven verification sessions).
 .playwright-mcp/
 

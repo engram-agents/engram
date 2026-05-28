@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 """cohort_dispatch.py — Batch-summary cohort orchestration for the sleep cycle.
 
-Three subcommands drive the validate/retry loop that replaces the serial
+Five subcommands drive the mechanical pipeline that replaces the serial
 engram-summary-fairy pattern:
 
-  prepare         Sample/chunk a cohort into per-chunk prompt + payload files.
+  prepare         Sample/chunk a cohort into per-chunk payload files.
+  verify-in       Pre-flight integrity checks on a cohort before dispatch.
   validate        Validate per-chunk agent output; split clean vs failures.
-  incorporate-retry  Merge a retry fairy's output into the final payload.
+                  On exit 0 (no failures): auto-writes final_payload.json.
+                  On exit 1 (failures): auto-writes retry_payload.json with
+                  previous_error fields for the retry fairy.
+  incorporate     Merge retry fairy output → final_payload.json.
+                  When still_failing is non-empty: writes retry_payload.json
+                  (same schema as validate's, for the next retry round).
+                  When still_failing is empty: DELETES retry_payload.json so
+                  the SKILL.md retry loop exits on [ -f retry_payload.json ].
+                  Also writes unfixable.json + increments attempt_count.
+  incorporate-retry  Alias for incorporate (backward compat).
 
 Architecture rationale (Lei 2026-05-27):
   - Validation failures are retried by re-dispatching a fairy, NOT by
@@ -16,6 +26,9 @@ Architecture rationale (Lei 2026-05-27):
   - This script does NOT modify LLM output. It validates, packages retry
     context, and packages the final payload. All content modification is
     done by the LLM (initial fairy or retry fairy).
+  - Fairies receive a short dispatch prompt naming input/output file paths;
+    they Read the payload file and Write the output file. No inline payload
+    embedding in the prompt.
 
 Empirical basis: N=15 worst-case batch at 37K tokens / 1 sub-agent turn
 produces summaries with cosine similarity within in-sample variance of the
@@ -25,8 +38,9 @@ Token reduction vs serial: ~95% for a 50-node / 4-chunk cohort.
 Usage:
     python -m tools.cohort_dispatch prepare --ids <comma-sep-ids> --out <dir>
     python -m tools.cohort_dispatch prepare --ids-file <path> --out <dir> [--chunk-size 15]
+    python -m tools.cohort_dispatch verify-in --out <dir>
     python -m tools.cohort_dispatch validate --out <dir>
-    python -m tools.cohort_dispatch incorporate-retry --retry-output <path> --out <dir>
+    python -m tools.cohort_dispatch incorporate --retry-output <path> --out <dir>
 """
 
 from __future__ import annotations
@@ -51,7 +65,8 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tools.recall_summary_validator import validate_summary_entry  # noqa: E402
 from tools.recall_summary_payload import PayloadBuilder  # noqa: E402
-from tools.recall_summary_prompts import TYPE_GUIDANCE, DEFAULT_GUIDANCE, KEYWORD_GUIDANCE  # noqa: E402
+# (recall_summary_prompts TYPE_GUIDANCE/KEYWORD_GUIDANCE no longer needed in
+# dispatch prompts — guidance now lives exclusively in the fairy's agent spec)
 
 # ---------------------------------------------------------------------------
 # Default ENGRAM DB path (overridable via --db)
@@ -103,157 +118,76 @@ def _build_payload_entry(node: dict) -> dict:
 # Prompt builder
 # ---------------------------------------------------------------------------
 
-_TYPE_GUIDANCE_BLOCK = "\n".join(
-    f"- **{t}**: {g}" for t, g in TYPE_GUIDANCE.items()
-)
 
-_DEFAULT_GUIDANCE_LINE = DEFAULT_GUIDANCE
+def _build_initial_prompt(payload_path: str, output_path: str) -> str:
+    """Build the short dispatch prompt for a fresh batch-summary-fairy.
 
+    The prompt names the input payload file to Read and the output file to
+    Write. Per-type guidance, summary rules, keyword rules, and output schema
+    live in the fairy's agent spec (engram-batch-summary-fairy.md) — this
+    prompt does NOT duplicate them.
 
-def _build_initial_prompt(payload: list[dict]) -> str:
-    """Build the Markdown prompt for a fresh batch-summary-fairy dispatch.
-
-    The prompt is self-contained: all type guidance, summary rules, keyword
-    rules, output format, and the payload are embedded. The fairy needs no
-    tool access.
+    Size: ~200 tokens regardless of cohort/payload size (no inline payload).
     """
-    n = len(payload)
-    payload_block = json.dumps(payload, indent=2, ensure_ascii=False)
-
     return textwrap.dedent(f"""\
-        # Task: Batch-generate recall_summary + recall_keywords for {n} ENGRAM nodes
+        You are dispatched as `engram-batch-summary-fairy`.
 
-        You are a one-shot batch summary generator dispatched as `engram-batch-summary-fairy`.
-        Receive {n} node payloads below. For each node, produce ONE recall_summary
-        (≤120 char target, ≤200 char hard cap) plus 3–5 recall_keywords. Emit ALL
-        {n} entries in ONE JSON object, no tool calls, no intermediate reasoning
-        text in the output — just the final JSON.
+        1. Read your input payload from: {payload_path}
+        2. Follow all rules in your agent spec (engram-batch-summary-fairy.md) to generate
+           recall_summary + recall_keywords for each node in the payload.
+        3. Write your output JSON to: {output_path}
 
-        ## Per-type guidance
-
-        For each node, look up the guidance by the `type` field:
-
-        {_TYPE_GUIDANCE_BLOCK}
-
-        If the type is not listed, fall back to: {_DEFAULT_GUIDANCE_LINE}
-
-        ## Summary rules
-
-        - Single line, ≤120 characters (target). Hard cap ≤200.
-        - Active voice. No hedging. No meta-language ("this node says...").
-        - Keep technical terms verbatim if load-bearing.
-        - No quotation marks unless part of the term.
-        - Don't pad to fill the budget — shorter is fine for simple claims.
-
-        ## Keyword rules
-
-        {KEYWORD_GUIDANCE}
-
-        - Output 3 to 5 keywords per node (NOT exactly 3, NOT exactly 5 — as many as carry distinct signal)
-        - Each keyword ≤ 30 characters
-        - DO NOT use ENGRAM node IDs (e.g. ob_1234, dv_0500) as keywords
-        - DO NOT use generic words: node, claim, observation, derivation, agent, system
-
-        ## Output format
-
-        Emit EXACTLY this JSON shape (no other text, no markdown fences):
-
-        {{"items": [{{"node_id": "<id>", "recall_summary": "<summary>", "recall_keywords": ["kw1", "kw2", "kw3"]}}, ...]}}
-
-        Self-check before output:
-        - items array length must equal {n}
-        - each recall_summary ≤200 chars
-        - each recall_keywords array between 3 and 5 entries, no duplicates, each ≤30 chars
-        - no ENGRAM node IDs in any keyword list
-        - IDs in items must come from the payload below — do not invent IDs
-
-        ## Payload ({n} nodes)
-
-        ```json
-        {payload_block}
-        ```
-
-        Emit the JSON now. One turn only. Do NOT call any tools.
+        The output must be a single JSON object: {{"items": [...]}}
+        Write it to the output path above. Return a brief confirmation naming
+        both paths when done.
     """)
 
 
 def _build_retry_prompt(
+    retry_payload_path: str,
+    output_path: str,
     failures: list[dict],
 ) -> str:
-    """Build the Markdown prompt for a retry dispatch targeting failed nodes.
+    """Build the short dispatch prompt for a retry batch-summary-fairy.
 
-    Each entry in `failures` has: node_id, payload (dict), error (str).
-    The retry fairy receives the same type guidance + rules PLUS a
-    "Previous attempt failed" section with verbatim validator errors.
+    The prompt names the retry payload file to Read (contains only the failed
+    nodes) and the output file to Write. Per-type guidance + rules live in the
+    fairy's agent spec. The failure context (node IDs + errors) is included
+    inline so the fairy knows what to avoid.
+
+    Each entry in `failures` has: node_id, error (str), previous_error (str, optional).
+    Size: short stub + failure list, still much smaller than the old inline-payload prompt.
     """
     n = len(failures)
-    payload = [f["payload"] for f in failures]
-    payload_block = json.dumps(payload, indent=2, ensure_ascii=False)
-
     failure_lines = []
     for f in failures:
+        error_text = f.get("previous_error") or f.get("error", "unknown error")
         failure_lines.append(
             f"- node_id: {f['node_id']}\n"
-            f"  error: {f['error']}\n"
-            f"  original_payload: {json.dumps(f['payload'], ensure_ascii=False)}"
+            f"  previous_error: {error_text}"
         )
     failure_block = "\n\n".join(failure_lines)
 
     return textwrap.dedent(f"""\
-        # Task: Retry — batch-generate recall_summary + recall_keywords for {n} ENGRAM nodes
+        You are dispatched as `engram-batch-summary-fairy` on a RETRY pass.
 
-        You are a one-shot batch summary generator dispatched as `engram-batch-summary-fairy`
-        on a RETRY pass. The previous attempt produced output that failed validation for the
-        nodes listed below. Regenerate ONLY those nodes, avoiding the cited errors.
+        The previous attempt produced output that failed validation for {n} node(s).
+        Regenerate ONLY those nodes, avoiding the cited errors.
 
-        ## Previous attempt failed for these nodes
+        ## Previous attempt failures
 
         {failure_block}
 
-        ## Per-type guidance
+        ## Instructions
 
-        For each node, look up the guidance by the `type` field:
+        1. Read the retry payload from: {retry_payload_path}
+           (Contains only the failed nodes, each with a `previous_error` field showing what to avoid.)
+        2. Follow all rules in your agent spec (engram-batch-summary-fairy.md) to regenerate
+           recall_summary + recall_keywords for each node, avoiding the previous errors.
+        3. Write your output JSON to: {output_path}
 
-        {_TYPE_GUIDANCE_BLOCK}
-
-        If the type is not listed, fall back to: {_DEFAULT_GUIDANCE_LINE}
-
-        ## Summary rules
-
-        - Single line, ≤120 characters (target). Hard cap ≤200.
-        - Active voice. No hedging. No meta-language ("this node says...").
-        - Keep technical terms verbatim if load-bearing.
-        - No quotation marks unless part of the term.
-        - Don't pad to fill the budget — shorter is fine for simple claims.
-
-        ## Keyword rules
-
-        {KEYWORD_GUIDANCE}
-
-        - Output 3 to 5 keywords per node (NOT exactly 3, NOT exactly 5 — as many as carry distinct signal)
-        - Each keyword ≤ 30 characters
-        - DO NOT use ENGRAM node IDs (e.g. ob_1234, dv_0500) as keywords
-        - DO NOT use generic words: node, claim, observation, derivation, agent, system
-
-        ## Output format
-
-        Emit EXACTLY this JSON shape (no other text, no markdown fences) for the {n} retried nodes:
-
-        {{"items": [{{"node_id": "<id>", "recall_summary": "<summary>", "recall_keywords": ["kw1", "kw2", "kw3"]}}, ...]}}
-
-        Self-check before output:
-        - items array length must equal {n} (ONLY the failed nodes above — do not include others)
-        - each recall_summary ≤200 chars
-        - each recall_keywords array between 3 and 5 entries, no duplicates, each ≤30 chars
-        - no ENGRAM node IDs in any keyword list
-
-        ## Payload ({n} nodes — same content as original_payload above)
-
-        ```json
-        {payload_block}
-        ```
-
-        Emit the JSON now. One turn only. Do NOT call any tools.
+        The output must be a single JSON object: {{"items": [...]}} with only the {n} retried entries.
+        Write it to the output path above. Return a brief confirmation naming both paths when done.
     """)
 
 
@@ -263,9 +197,11 @@ def _build_retry_prompt(
 
 
 def cmd_prepare(args: argparse.Namespace) -> int:
-    """Sample/chunk a cohort; write per-chunk payload + prompt files.
+    """Sample/chunk a cohort; write per-chunk payload files.
 
     Outputs to stdout a JSON manifest listing chunk directories.
+    No prompt.md is written — the dispatcher constructs the short prompt inline
+    at dispatch time using paths from the manifest.
     Exit code: 0.
     """
     # Resolve node IDs
@@ -319,12 +255,10 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         chunk_dir.mkdir(parents=True, exist_ok=True)
 
         payload = [_build_payload_entry(n) for n in chunk]
-        prompt = _build_initial_prompt(payload)
 
         (chunk_dir / "payload.json").write_text(
             json.dumps(payload, indent=2, ensure_ascii=False)
         )
-        (chunk_dir / "prompt.md").write_text(prompt)
 
         manifest_chunks.append({
             "chunk_index": idx,
@@ -332,7 +266,6 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             "node_ids": [n["id"] for n in chunk],
             "chunk_dir": str(chunk_dir),
             "payload_path": str(chunk_dir / "payload.json"),
-            "prompt_path": str(chunk_dir / "prompt.md"),
         })
 
     manifest = {
@@ -340,6 +273,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         "total_chunks": len(chunks),
         "chunk_size": chunk_size,
         "out_dir": str(out_dir),
+        "attempt_count": 0,
         "chunks": manifest_chunks,
     }
     manifest_path = out_dir / "manifest.json"
@@ -347,6 +281,236 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 
     # Print manifest to stdout so parent agent can read it
     print(json.dumps(manifest, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: verify-in
+# ---------------------------------------------------------------------------
+
+_VERIFY_REQUIRED_FIELDS = ("id", "type", "claim")
+_VERIFY_MAX_CHUNK_SIZE = 15
+
+
+def cmd_verify_in(args: argparse.Namespace) -> int:
+    """Pre-flight integrity checks on a cohort before dispatch.
+
+    For each chunk's payload.json:
+      1. Valid JSON.
+      2. Every entry has required fields: id (str), type (str), claim (str).
+      3. Every id resolves to a current DB row whose claim matches the payload
+         (race-window check — guards against node retraction between cohort
+         selection and dispatch).
+      4. No duplicate IDs within a chunk OR across chunks.
+      5. Chunk size <= 15.
+
+    Exit codes:
+      0 — all checks pass
+      1 — one or more checks failed (structured JSON error to stdout)
+      2 — missing cohort dir or manifest
+    """
+    out_dir = Path(args.out)
+    if not out_dir.exists():
+        print(f"error: output directory not found: {out_dir}", file=sys.stderr)
+        return 2
+
+    manifest_path = out_dir / "manifest.json"
+    if not manifest_path.exists():
+        print(f"error: manifest.json not found at {manifest_path}", file=sys.stderr)
+        return 2
+
+    manifest = json.loads(manifest_path.read_text())
+    db_path = Path(args.db)
+
+    errors: list[dict] = []
+    all_ids_seen: dict[str, str] = {}  # id -> "chunk-N" where first seen
+
+    for chunk_meta in manifest["chunks"]:
+        chunk_idx = chunk_meta["chunk_index"]
+        chunk_label = f"chunk-{chunk_idx}"
+        payload_path = Path(chunk_meta["payload_path"])
+
+        # Check 1: valid JSON
+        if not payload_path.exists():
+            errors.append({
+                "chunk": chunk_label,
+                "check": "json_valid",
+                "error": f"payload.json not found at {payload_path}",
+            })
+            continue
+
+        try:
+            entries = json.loads(payload_path.read_text())
+        except json.JSONDecodeError as exc:
+            errors.append({
+                "chunk": chunk_label,
+                "check": "json_valid",
+                "error": f"payload.json is not valid JSON: {exc}",
+            })
+            continue
+
+        if not isinstance(entries, list):
+            errors.append({
+                "chunk": chunk_label,
+                "check": "json_valid",
+                "error": f"payload.json must be a JSON array, got {type(entries).__name__}",
+            })
+            continue
+
+        # Check 5: chunk size
+        if len(entries) > _VERIFY_MAX_CHUNK_SIZE:
+            errors.append({
+                "chunk": chunk_label,
+                "check": "chunk_size",
+                "error": (
+                    f"chunk has {len(entries)} entries, exceeds max "
+                    f"{_VERIFY_MAX_CHUNK_SIZE}"
+                ),
+                "got": len(entries),
+                "max": _VERIFY_MAX_CHUNK_SIZE,
+            })
+
+        for entry_idx, entry in enumerate(entries):
+            entry_label = f"{chunk_label}/entry[{entry_idx}]"
+
+            # Check 2: required fields
+            for field in _VERIFY_REQUIRED_FIELDS:
+                if field not in entry or not isinstance(entry[field], str) or not entry[field].strip():
+                    errors.append({
+                        "chunk": chunk_label,
+                        "check": "required_fields",
+                        "error": (
+                            f"{entry_label} missing or empty required field: '{field}'"
+                        ),
+                        "field": field,
+                        "entry_index": entry_idx,
+                    })
+                    break
+
+            else:
+                node_id = entry["id"]
+
+                # Check 4: no duplicate IDs across chunks
+                if node_id in all_ids_seen:
+                    errors.append({
+                        "chunk": chunk_label,
+                        "check": "no_duplicates",
+                        "error": (
+                            f"duplicate id '{node_id}' in {chunk_label} also seen in "
+                            f"{all_ids_seen[node_id]}"
+                        ),
+                        "node_id": node_id,
+                        "first_seen_in": all_ids_seen[node_id],
+                    })
+                else:
+                    all_ids_seen[node_id] = chunk_label
+
+    # Check 4b: intra-chunk duplicates — targeted per-chunk pass to complement the
+    # cross-chunk pass above (which catches the first occurrence in a different chunk
+    # but cannot flag duplicates that appear twice within the same chunk).
+    for chunk_meta in manifest["chunks"]:
+        chunk_idx = chunk_meta["chunk_index"]
+        chunk_label = f"chunk-{chunk_idx}"
+        payload_path = Path(chunk_meta["payload_path"])
+        if not payload_path.exists():
+            continue
+        try:
+            entries = json.loads(payload_path.read_text())
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entries, list):
+            continue
+        seen_in_chunk: set[str] = set()
+        for entry_idx, entry in enumerate(entries):
+            if not isinstance(entry, dict) or "id" not in entry:
+                continue
+            nid = entry["id"]
+            if nid in seen_in_chunk:
+                # Only add if not already reported from the cross-chunk pass
+                already_reported = any(
+                    e.get("check") == "no_duplicates" and e.get("node_id") == nid
+                    for e in errors
+                )
+                if not already_reported:
+                    errors.append({
+                        "chunk": chunk_label,
+                        "check": "no_duplicates",
+                        "error": (
+                            f"duplicate id '{nid}' appears more than once within {chunk_label}"
+                        ),
+                        "node_id": nid,
+                    })
+            else:
+                seen_in_chunk.add(nid)
+
+    # Check 3: content integrity — every id resolves to a DB row with matching claim
+    if all_ids_seen and not db_path.exists():
+        print(
+            f"warning: DB path {db_path} not found — content-integrity check skipped",
+            file=sys.stderr,
+        )
+    if all_ids_seen and db_path.exists():
+        id_list = list(all_ids_seen.keys())
+        try:
+            db_nodes = _fetch_nodes(db_path, id_list)
+        except FileNotFoundError as exc:
+            errors.append({
+                "chunk": "all",
+                "check": "db_access",
+                "error": str(exc),
+            })
+            db_nodes = []
+
+        db_by_id = {n["id"]: n for n in db_nodes}
+
+        # Build payload claim lookup: node_id -> (chunk, claim)
+        payload_claims: dict[str, tuple[str, str]] = {}
+        for chunk_meta in manifest["chunks"]:
+            chunk_idx = chunk_meta["chunk_index"]
+            chunk_label = f"chunk-{chunk_idx}"
+            payload_path = Path(chunk_meta["payload_path"])
+            if not payload_path.exists():
+                continue
+            try:
+                entries = json.loads(payload_path.read_text())
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if isinstance(entry, dict) and "id" in entry and "claim" in entry:
+                    payload_claims[entry["id"]] = (chunk_label, entry.get("claim", ""))
+
+        for node_id, (chunk_label, payload_claim) in payload_claims.items():
+            if node_id not in db_by_id:
+                errors.append({
+                    "chunk": chunk_label,
+                    "check": "content_integrity",
+                    "error": f"id '{node_id}' not found in DB — may have been retracted",
+                    "node_id": node_id,
+                })
+            else:
+                db_claim = db_by_id[node_id].get("claim") or ""
+                if db_claim.strip() != payload_claim.strip():
+                    errors.append({
+                        "chunk": chunk_label,
+                        "check": "content_integrity",
+                        "error": (
+                            f"claim mismatch for '{node_id}': payload claim does not "
+                            f"match DB claim (race-window: node may have been updated)"
+                        ),
+                        "node_id": node_id,
+                        "payload_claim_prefix": payload_claim[:80],
+                        "db_claim_prefix": db_claim[:80],
+                    })
+
+    if errors:
+        result = {"passed": False, "error_count": len(errors), "errors": errors}
+        print(json.dumps(result, indent=2))
+        return 1
+
+    result = {"passed": True, "error_count": 0, "errors": []}
+    print(json.dumps(result, indent=2))
     return 0
 
 
@@ -542,12 +706,21 @@ def cmd_validate(args: argparse.Namespace) -> int:
         "failures_path": str(out_dir / "failures.json"),
     }, indent=2))
 
-    # Write retry prompt if there are failures
+    # Write retry_payload.json if there are failures (retryable items)
+    # retry_payload.json is in the same schema as input payload.json so it can
+    # be fed straight to a re-dispatched fairy. Each item gets a previous_error
+    # field so the retry fairy knows what to avoid.
     if failures:
-        retry_prompt = _build_retry_prompt(failures)
-        retry_prompt_path = out_dir / "retry_prompt.md"
-        retry_prompt_path.write_text(retry_prompt)
-        print(f"\nRetry needed: {len(failures)} nodes. Retry prompt: {retry_prompt_path}",
+        retry_payload = []
+        for f in failures:
+            payload_entry = dict(f.get("payload", {"id": f["node_id"]}))
+            payload_entry["previous_error"] = f["error"]
+            retry_payload.append(payload_entry)
+        retry_payload_path = out_dir / "retry_payload.json"
+        retry_payload_path.write_text(
+            json.dumps(retry_payload, indent=2, ensure_ascii=False)
+        )
+        print(f"\nRetry needed: {len(failures)} nodes. retry_payload.json: {retry_payload_path}",
               file=sys.stderr)
         return 1
 
@@ -575,14 +748,20 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
 
 def cmd_incorporate_retry(args: argparse.Namespace) -> int:
-    """Merge retry output + prior failures into final_payload.json.
+    """Merge retry output + prior failures into final artifacts.
 
     Reads:
       --retry-output  path to the retry fairy's agent_output.json (or raw JSON)
       --out           directory containing failures.json + clean_items.json
 
     Writes:
-      <out-dir>/final_payload.json  — engram_set_recall_summaries-ready payload
+      <out-dir>/final_payload.json   — engram_set_recall_summaries-ready payload
+      <out-dir>/retry_payload.json   — items still failing (structurally retryable);
+                                       same schema as input payload.json + previous_error
+      <out-dir>/unfixable.json       — items that failed in structurally non-retryable ways
+                                       (fairy invented IDs, malformed output beyond recovery)
+    Updates:
+      <out-dir>/manifest.json        — increments attempt_count
 
     Exit code: 0.
     """
@@ -606,16 +785,47 @@ def cmd_incorporate_retry(args: argparse.Namespace) -> int:
         return 2
 
     raw = retry_output_path.read_text()
+
+    # Build a set of known node IDs from the prior failures so we can detect
+    # invented IDs in the retry output.
+    known_ids: set[str] = {f["node_id"] for f in prior_failures}
+
     try:
         retry_items = _parse_agent_output(raw)
+        parse_failed = False
     except (json.JSONDecodeError, ValueError) as exc:
         print(f"error: could not parse retry output: {exc}", file=sys.stderr)
-        return 2
+        parse_failed = True
+        retry_items = []
 
-    # Index retry items by node_id
-    retry_by_id: dict[str, dict] = {item.get("node_id", ""): item for item in retry_items}
+    # Index retry items by node_id; detect invented IDs (unfixable)
+    retry_by_id: dict[str, dict] = {}
+    unfixable_items: list[dict] = []
+
+    if parse_failed:
+        # Entire output is malformed — all prior failures go to unfixable
+        for f in prior_failures:
+            unfixable_items.append({
+                "node_id": f["node_id"],
+                "reason": "retry output JSON malformed beyond per-item recovery",
+            })
+    else:
+        for item in retry_items:
+            nid = item.get("node_id", "")
+            if not nid or nid not in known_ids:
+                # Fairy invented an ID or returned an empty node_id — unfixable
+                unfixable_items.append({
+                    "node_id": nid or "<empty>",
+                    "reason": (
+                        f"fairy produced output for unknown node_id {nid!r} "
+                        "(not in retry payload — invented ID)"
+                    ),
+                })
+            else:
+                retry_by_id[nid] = item
 
     builder = PayloadBuilder()
+    still_failing: list[dict] = []  # retryable (validator error, not structural)
 
     # Carry forward all previously clean items
     for item in prior_clean:
@@ -629,6 +839,12 @@ def cmd_incorporate_retry(args: argparse.Namespace) -> int:
     # For each prior failure, check if the retry fixed it
     for failure in prior_failures:
         node_id = failure["node_id"]
+
+        # Skip if already classified as unfixable (structural parse failure)
+        if any(u["node_id"] == node_id for u in unfixable_items):
+            builder.add_failure(node_id, "retry output malformed beyond recovery")
+            continue
+
         if node_id in retry_by_id:
             retry_item = retry_by_id[node_id]
             err = validate_summary_entry(retry_item)
@@ -643,27 +859,70 @@ def cmd_incorporate_retry(args: argparse.Namespace) -> int:
                         node_id,
                         f"validation failed after one retry: {add_err['error']}",
                     )
+                    # Still validator-fixable — goes to retry_payload for next round
+                    still_failing.append({
+                        **failure.get("payload", {"id": node_id}),
+                        "previous_error": add_err["error"],
+                    })
             else:
                 builder.add_failure(
                     node_id,
                     f"validation failed after one retry: {err['error']}",
                 )
+                # Still validator-fixable — goes to retry_payload for next round
+                still_failing.append({
+                    **failure.get("payload", {"id": node_id}),
+                    "previous_error": err["error"],
+                })
         else:
             # Retry fairy did not produce output for this node
             builder.add_failure(
                 node_id,
-                f"validation failed after one retry: no output produced by retry fairy",
+                "validation failed after one retry: no output produced by retry fairy",
             )
+            # No output = potentially recoverable (fairy may have skipped it) — retryable
+            still_failing.append({
+                **failure.get("payload", {"id": node_id}),
+                "previous_error": "no output produced by retry fairy",
+            })
 
     final_payload = builder.to_json()
     final_payload_path = out_dir / "final_payload.json"
     final_payload_path.write_text(final_payload)
 
+    # Write or delete retry_payload.json.
+    # File-presence semantic: retry_payload.json exists ⟺ items left to retry.
+    # The SKILL.md retry loop uses [ -f retry_payload.json ] as its exit condition;
+    # writing an empty list would cause the loop to run to MAX_RETRIES unnecessarily.
+    retry_payload_path = out_dir / "retry_payload.json"
+    if still_failing:
+        retry_payload_path.write_text(json.dumps(still_failing, indent=2, ensure_ascii=False))
+    else:
+        retry_payload_path.unlink(missing_ok=True)
+
+    # Write unfixable.json
+    unfixable_path = out_dir / "unfixable.json"
+    unfixable_path.write_text(json.dumps(unfixable_items, indent=2, ensure_ascii=False))
+
+    # Increment attempt_count in manifest.json
+    manifest_path = out_dir / "manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+            manifest["attempt_count"] = manifest.get("attempt_count", 0) + 1
+            manifest_path.write_text(json.dumps(manifest, indent=2))
+        except (json.JSONDecodeError, KeyError):
+            pass  # manifest update is best-effort
+
     payload_data = json.loads(final_payload)
     print(json.dumps({
         "summaries": len(payload_data.get("summaries", [])),
         "failures": len(payload_data.get("failures", [])),
+        "still_retryable": len(still_failing),
+        "unfixable": len(unfixable_items),
         "final_payload_path": str(final_payload_path),
+        "retry_payload_path": str(retry_payload_path),
+        "unfixable_path": str(unfixable_path),
     }, indent=2))
     return 0
 
@@ -681,7 +940,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # --- prepare ---
-    p_prepare = sub.add_parser("prepare", help="Chunk a cohort into prompt + payload files")
+    p_prepare = sub.add_parser("prepare", help="Chunk a cohort into payload files")
     p_prepare.add_argument("--ids", help="Comma-separated node IDs")
     p_prepare.add_argument("--ids-file", help="Path to a file with one node ID per line")
     p_prepare.add_argument(
@@ -694,6 +953,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "--db", default=str(DEFAULT_DB), help="Path to ENGRAM SQLite database"
     )
 
+    # --- verify-in ---
+    p_verify = sub.add_parser(
+        "verify-in",
+        help="Pre-flight integrity checks on a cohort before dispatch",
+    )
+    p_verify.add_argument(
+        "--out", required=True, help="Directory containing manifest.json + chunk-N/payload.json"
+    )
+    p_verify.add_argument(
+        "--db", default=str(DEFAULT_DB), help="Path to ENGRAM SQLite database"
+    )
+
     # --- validate ---
     p_validate = sub.add_parser(
         "validate", help="Validate chunk agent outputs; write clean_items + failures"
@@ -702,19 +973,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--out", required=True, help="Directory containing chunk-N/agent_output.json files"
     )
 
-    # --- incorporate-retry ---
-    p_retry = sub.add_parser(
-        "incorporate-retry",
-        help="Merge retry fairy output into final_payload.json",
-    )
-    p_retry.add_argument(
-        "--retry-output",
-        required=True,
-        help="Path to retry fairy's agent_output.json",
-    )
-    p_retry.add_argument(
-        "--out", required=True, help="Directory containing failures.json + clean_items.json"
-    )
+    # --- incorporate / incorporate-retry (alias) ---
+    for cmd_name, cmd_help in [
+        ("incorporate", "Merge retry fairy output; auto-build retry_payload + unfixable artifacts"),
+        ("incorporate-retry", "Alias for incorporate (backward compat)"),
+    ]:
+        p_retry = sub.add_parser(cmd_name, help=cmd_help)
+        p_retry.add_argument(
+            "--retry-output",
+            required=True,
+            help="Path to retry fairy's agent_output.json",
+        )
+        p_retry.add_argument(
+            "--out", required=True,
+            help="Directory containing failures.json + clean_items.json",
+        )
 
     return parser
 
@@ -725,9 +998,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "prepare":
         return cmd_prepare(args)
+    elif args.command == "verify-in":
+        return cmd_verify_in(args)
     elif args.command == "validate":
         return cmd_validate(args)
-    elif args.command == "incorporate-retry":
+    elif args.command in ("incorporate", "incorporate-retry"):
         return cmd_incorporate_retry(args)
     else:
         parser.print_help()

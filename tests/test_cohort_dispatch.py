@@ -4,10 +4,17 @@ Covers:
 
   prepare subcommand:
     1. Given 30 node IDs and chunk-size=15, produces 2 chunks with correct contents.
-    2. Chunk files (payload.json, prompt.md) exist and have correct structure.
-    3. Manifest JSON lists both chunks with correct metadata.
+    2. Chunk dirs exist with payload.json; no prompt.md (new: dispatcher builds prompt inline).
+    3. Manifest JSON lists both chunks with correct metadata (including attempt_count=0).
     4. Nodes not found in DB are silently skipped with a warning.
     15. Duplicate IDs in input are deduplicated with a warning.
+
+  verify-in subcommand:
+    18. Happy path: valid cohort → exit 0, JSON output {"passed": true}.
+    19. Schema-fail: missing required field → exit non-zero, error mentions chunk + field.
+    20. Content-integrity-fail: DB claim differs from payload claim → exit non-zero.
+    21. No-duplicates-fail: same ID in two chunks → exit non-zero.
+    22. Chunk-size-fail: chunk with 16 entries → exit non-zero.
 
   validate subcommand:
     5. Valid item → goes to clean_items.json.
@@ -17,12 +24,19 @@ Covers:
     9. Exit code 0 on no failures, 1 on failures.
     10. Missing agent_output.json for a chunk → payload IDs surface in failures.json.
     16. Agent output with preamble text parses correctly (brace-scanner robustness).
+    23. Validate failure path writes retry_payload.json with previous_error field.
 
-  incorporate-retry subcommand:
+  incorporate / incorporate-retry subcommand:
     11. Retry that fixes all failures → final_payload with all summaries, no failures.
     12. Retry that fixes some failures → fixed go to summaries, unfixed go to failures.
     13. Retry that produces no output for a node → "no output" failure message.
     14. Previously clean items always appear in final_payload summaries.
+    24. incorporate auto-builds retry_payload.json for retryable failures.
+    25. incorporate auto-builds unfixable.json for invented-ID (non-retryable) failures.
+    26. attempt_count increments in manifest.json across retry rounds.
+
+  Dispatch prompt size regression:
+    27. _build_initial_prompt returns a short string (<1000 chars) regardless of payload size.
 """
 
 from __future__ import annotations
@@ -45,7 +59,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from tools.cohort_dispatch import main as dispatch_main  # noqa: E402
-from tools.cohort_dispatch import _parse_agent_output  # noqa: E402
+from tools.cohort_dispatch import _parse_agent_output, _build_initial_prompt  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +148,11 @@ def test_prepare_30_ids_chunk_size_15_produces_2_chunks():
 
 
 def test_prepare_chunk_dirs_and_files_exist():
-    """prepare creates chunk-0/ and chunk-1/ with payload.json + prompt.md."""
+    """prepare creates chunk-0/ and chunk-1/ with payload.json (no prompt.md).
+
+    The dispatcher builds the prompt inline at dispatch time using the paths
+    in the manifest — no per-chunk prompt.md is written.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
         node_ids = [f"ob_{str(i).zfill(4)}" for i in range(1, 31)]
@@ -153,7 +171,10 @@ def test_prepare_chunk_dirs_and_files_exist():
             chunk_dir = out_dir / f"chunk-{chunk_idx}"
             assert chunk_dir.exists(), f"chunk-{chunk_idx}/ not created"
             assert (chunk_dir / "payload.json").exists(), f"chunk-{chunk_idx}/payload.json missing"
-            assert (chunk_dir / "prompt.md").exists(), f"chunk-{chunk_idx}/prompt.md missing"
+            # No prompt.md — prompt is constructed inline by the dispatcher
+            assert not (chunk_dir / "prompt.md").exists(), (
+                f"chunk-{chunk_idx}/prompt.md should NOT exist (dispatcher builds prompt inline)"
+            )
 
         # Verify payload.json structure and counts
         payload_0 = json.loads((out_dir / "chunk-0" / "payload.json").read_text())
@@ -170,8 +191,8 @@ def test_prepare_chunk_dirs_and_files_exist():
             assert "recall_keywords" not in entry, "recall_keywords must not be in payload"
 
 
-def test_prepare_prompt_md_contains_type_guidance():
-    """prepare writes a prompt.md that contains per-type guidance text."""
+def test_prepare_manifest_has_attempt_count_and_no_prompt_path():
+    """Manifest has attempt_count=0 (new field) and no prompt_path (removed field)."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
         node_ids = [f"ob_{str(i).zfill(4)}" for i in range(1, 4)]
@@ -185,15 +206,16 @@ def test_prepare_prompt_md_contains_type_guidance():
             "--db", str(db_path),
         ])
 
-        prompt = (out_dir / "chunk-0" / "prompt.md").read_text()
-        # Must contain per-type guidance for known types
-        assert "observation_factual" in prompt
-        assert "derivation" in prompt
-        assert "axiom" in prompt
-        # Must contain output format spec
-        assert '"items"' in prompt
-        # Must contain the payload
-        assert node_ids[0] in prompt
+        manifest = json.loads((out_dir / "manifest.json").read_text())
+        assert "attempt_count" in manifest, "manifest missing 'attempt_count'"
+        assert manifest["attempt_count"] == 0, (
+            f"attempt_count should be 0 after prepare, got {manifest['attempt_count']}"
+        )
+        # prompt_path should not be in chunk metadata (no prompt.md written)
+        for chunk in manifest["chunks"]:
+            assert "prompt_path" not in chunk, (
+                f"chunk metadata should not have 'prompt_path' (no prompt.md written): {chunk}"
+            )
 
 
 def test_prepare_unequal_chunks_remainder():
@@ -235,7 +257,7 @@ def _write_agent_output(chunk_dir: Path, items: list[dict]) -> None:
     (chunk_dir / "agent_output.json").write_text(output)
 
 
-def _write_manifest(out_dir: Path, chunks: list[Path]) -> None:
+def _write_manifest(out_dir: Path, chunks: list[Path], attempt_count: int = 0) -> None:
     """Write a minimal manifest.json pointing to given chunk dirs."""
     chunk_manifests = []
     for i, chunk_dir in enumerate(chunks):
@@ -245,13 +267,13 @@ def _write_manifest(out_dir: Path, chunks: list[Path]) -> None:
             "node_ids": [],
             "chunk_dir": str(chunk_dir),
             "payload_path": str(chunk_dir / "payload.json"),
-            "prompt_path": str(chunk_dir / "prompt.md"),
         })
     manifest = {
         "total_nodes": 0,
         "total_chunks": len(chunks),
         "chunk_size": 15,
         "out_dir": str(out_dir),
+        "attempt_count": attempt_count,
         "chunks": chunk_manifests,
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest))
@@ -509,6 +531,14 @@ def test_incorporate_retry_all_fixed():
         summary_ids = {s["node_id"] for s in final["summaries"]}
         assert summary_ids == {"ob_0001", "ob_0002", "ob_0003"}
 
+        # B1 regression: when all failures are resolved, retry_payload.json must NOT exist.
+        # The SKILL.md loop exits on [ -f retry_payload.json ]; an empty file (2 bytes "[]")
+        # would keep the loop running to MAX_RETRIES unnecessarily.
+        assert not (out_dir / "retry_payload.json").exists(), (
+            "retry_payload.json should not exist when all failures are resolved — "
+            "file presence is the loop-exit signal"
+        )
+
 
 def test_incorporate_retry_some_still_fail():
     """Retry that fixes some but not all → correct split in final_payload."""
@@ -693,6 +723,7 @@ def test_validate_missing_agent_output_surfaces_ids_in_failures():
             "total_chunks": 2,
             "chunk_size": 15,
             "out_dir": str(out_dir),
+            "attempt_count": 0,
             "chunks": [
                 {
                     "chunk_index": 0,
@@ -700,7 +731,6 @@ def test_validate_missing_agent_output_surfaces_ids_in_failures():
                     "node_ids": ["ob_0001"],
                     "chunk_dir": str(chunk_0),
                     "payload_path": str(chunk_0 / "payload.json"),
-                    "prompt_path": str(chunk_0 / "prompt.md"),
                 },
                 {
                     "chunk_index": 1,
@@ -708,7 +738,6 @@ def test_validate_missing_agent_output_surfaces_ids_in_failures():
                     "node_ids": ["ob_0010", "ob_0011"],
                     "chunk_dir": str(chunk_1),
                     "payload_path": str(chunk_1 / "payload.json"),
-                    "prompt_path": str(chunk_1 / "prompt.md"),
                 },
             ],
         }
@@ -735,3 +764,327 @@ def test_validate_missing_agent_output_surfaces_ids_in_failures():
             assert "missing" in f["error"].lower(), (
                 f"Expected 'missing' in failure error, got: {f['error']!r}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Test 18–22: verify-in subcommand
+# ---------------------------------------------------------------------------
+
+
+def _make_cohort_dir(
+    tmp_dir: Path,
+    chunks_payloads: list[list[dict]],
+    db_path: Path | None = None,
+) -> Path:
+    """Write a minimal cohort dir (manifest + per-chunk payload.json files).
+
+    chunks_payloads: list of lists — each inner list is the payload for one chunk.
+    db_path: if None, use a non-existent path (content-integrity checks will error).
+    """
+    out_dir = tmp_dir / "cohort"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    chunk_metas = []
+    for idx, entries in enumerate(chunks_payloads):
+        chunk_dir = out_dir / f"chunk-{idx}"
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        payload_path = chunk_dir / "payload.json"
+        payload_path.write_text(json.dumps(entries))
+        chunk_metas.append({
+            "chunk_index": idx,
+            "node_count": len(entries),
+            "node_ids": [e["id"] for e in entries if "id" in e],
+            "chunk_dir": str(chunk_dir),
+            "payload_path": str(payload_path),
+        })
+
+    manifest = {
+        "total_nodes": sum(len(p) for p in chunks_payloads),
+        "total_chunks": len(chunks_payloads),
+        "chunk_size": 15,
+        "out_dir": str(out_dir),
+        "attempt_count": 0,
+        "chunks": chunk_metas,
+    }
+    (out_dir / "manifest.json").write_text(json.dumps(manifest))
+    return out_dir
+
+
+def test_verify_in_happy_path():
+    """Valid cohort → exit 0, JSON output has passed=true."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        node_ids = ["ob_0001", "ob_0002", "ob_0003"]
+        db_path = _make_sqlite_db(node_ids, tmp_dir)
+
+        # Build payload using exactly the DB's claim strings
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(str(db_path))
+        conn.row_factory = _sqlite3.Row
+        rows = {r["id"]: dict(r) for r in conn.execute("SELECT id, type, claim FROM nodes").fetchall()}
+        conn.close()
+
+        payload = [
+            {"id": nid, "type": rows[nid]["type"], "claim": rows[nid]["claim"]}
+            for nid in node_ids
+        ]
+        cohort_dir = _make_cohort_dir(tmp_dir, [payload], db_path=db_path)
+
+        exit_code = _run(["verify-in", "--out", str(cohort_dir), "--db", str(db_path)])
+        assert exit_code == 0, f"Expected exit 0 (all pass), got {exit_code}"
+
+
+def test_verify_in_schema_fail_missing_field():
+    """Missing required field → exit non-zero, error mentions chunk + field."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        # Entry missing 'claim' field
+        bad_entry = {"id": "ob_0001", "type": "observation_factual"}  # no 'claim'
+        cohort_dir = _make_cohort_dir(tmp_dir, [[bad_entry]])
+
+        # Use a non-existent db so content-integrity doesn't confuse the failure
+        fake_db = tmp_dir / "fake.db"
+        exit_code = _run(["verify-in", "--out", str(cohort_dir), "--db", str(fake_db)])
+        assert exit_code == 1, f"Expected exit 1 (schema failure), got {exit_code}"
+
+
+def test_verify_in_content_integrity_fail():
+    """DB claim differs from payload claim → exit non-zero (race-window check)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        node_ids = ["ob_0001"]
+        db_path = _make_sqlite_db(node_ids, tmp_dir)
+
+        # Tamper with the claim in the payload (simulate race window)
+        tampered_payload = [
+            {
+                "id": "ob_0001",
+                "type": "observation_factual",
+                "claim": "TAMPERED CLAIM — does not match DB",
+            }
+        ]
+        cohort_dir = _make_cohort_dir(tmp_dir, [tampered_payload], db_path=db_path)
+
+        exit_code = _run(["verify-in", "--out", str(cohort_dir), "--db", str(db_path)])
+        assert exit_code == 1, (
+            f"Expected exit 1 (content integrity failure), got {exit_code}"
+        )
+
+
+def test_verify_in_no_duplicates_fail():
+    """Same ID in two chunks → exit non-zero."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        # ob_0001 appears in both chunk-0 and chunk-1
+        chunk_0 = [{"id": "ob_0001", "type": "observation_factual", "claim": "claim A"}]
+        chunk_1 = [
+            {"id": "ob_0001", "type": "observation_factual", "claim": "claim A"},  # dup
+            {"id": "ob_0002", "type": "observation_factual", "claim": "claim B"},
+        ]
+        cohort_dir = _make_cohort_dir(tmp_dir, [chunk_0, chunk_1])
+
+        fake_db = tmp_dir / "fake.db"
+        exit_code = _run(["verify-in", "--out", str(cohort_dir), "--db", str(fake_db)])
+        assert exit_code == 1, f"Expected exit 1 (duplicate ID), got {exit_code}"
+
+
+def test_verify_in_chunk_size_fail():
+    """Chunk with 16 entries (> max 15) → exit non-zero."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        # 16 entries — exceeds chunk size limit
+        big_chunk = [
+            {"id": f"ob_{str(i).zfill(4)}", "type": "observation_factual", "claim": f"claim {i}"}
+            for i in range(1, 17)
+        ]
+        cohort_dir = _make_cohort_dir(tmp_dir, [big_chunk])
+
+        fake_db = tmp_dir / "fake.db"
+        exit_code = _run(["verify-in", "--out", str(cohort_dir), "--db", str(fake_db)])
+        assert exit_code == 1, f"Expected exit 1 (chunk too large), got {exit_code}"
+
+
+# ---------------------------------------------------------------------------
+# Test 23: validate failure path writes retry_payload.json
+# ---------------------------------------------------------------------------
+
+
+def test_validate_failure_writes_retry_payload():
+    """Validate with failures writes retry_payload.json with previous_error field."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp) / "out"
+        out_dir.mkdir()
+        chunk_dir = out_dir / "chunk-0"
+
+        overcap_item = {
+            "node_id": "ob_0002",
+            "recall_summary": "A" * 201,  # 201 chars — exceeds hard cap
+            "recall_keywords": ["kw1", "kw2", "kw3"],
+        }
+        _write_agent_output(chunk_dir, [overcap_item])
+        _write_manifest(out_dir, [chunk_dir])
+
+        exit_code = _run(["validate", "--out", str(out_dir)])
+        assert exit_code == 1, "Expected exit code 1 (failures present)"
+
+        # retry_payload.json must exist
+        retry_payload_path = out_dir / "retry_payload.json"
+        assert retry_payload_path.exists(), "retry_payload.json not written on failure path"
+
+        retry_payload = json.loads(retry_payload_path.read_text())
+        assert isinstance(retry_payload, list), "retry_payload.json must be a JSON array"
+        assert len(retry_payload) == 1, f"Expected 1 retry item, got {len(retry_payload)}"
+
+        retry_item = retry_payload[0]
+        assert retry_item.get("id") == "ob_0002", (
+            f"retry_payload item missing correct id (schema uses 'id'): {retry_item}"
+        )
+        assert "previous_error" in retry_item, (
+            "retry_payload item must have 'previous_error' field so retry fairy knows what to avoid"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 24–26: incorporate subcommand new artifacts
+# ---------------------------------------------------------------------------
+
+
+def test_incorporate_writes_retry_payload_for_retryable_failures():
+    """incorporate auto-builds retry_payload.json for still-failing (retryable) items."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+
+        prior_clean: list[dict] = []
+        prior_failures = [
+            {
+                "node_id": "ob_0002",
+                "payload": {"id": "ob_0002", "type": "observation_factual", "claim": "test"},
+                "error": "overcap",
+            },
+        ]
+        # Retry still fails (still overcap)
+        retry_items = [
+            {"node_id": "ob_0002", "recall_summary": "E" * 201, "recall_keywords": ["kw1", "kw2", "kw3"]},
+        ]
+
+        out_dir, retry_path = _setup_incorporate_retry(tmp_dir, prior_clean, prior_failures, retry_items)
+        _write_manifest(out_dir, [])  # minimal manifest for attempt_count tracking
+
+        exit_code = _run(["incorporate", "--retry-output", str(retry_path), "--out", str(out_dir)])
+        assert exit_code == 0
+
+        # retry_payload.json must exist and contain the still-failing item
+        retry_payload_path = out_dir / "retry_payload.json"
+        assert retry_payload_path.exists(), "retry_payload.json not written by incorporate"
+        retry_payload = json.loads(retry_payload_path.read_text())
+        assert len(retry_payload) == 1, f"Expected 1 retryable item, got {len(retry_payload)}"
+        assert retry_payload[0]["id"] == "ob_0002", (
+            f"retryable item should be ob_0002, got: {retry_payload[0]}"
+        )
+        assert "previous_error" in retry_payload[0], (
+            "retryable item in retry_payload.json must have 'previous_error' field"
+        )
+
+
+def test_incorporate_writes_unfixable_for_invented_id():
+    """incorporate auto-builds unfixable.json when fairy invents an unknown node_id."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+
+        prior_clean: list[dict] = []
+        prior_failures = [
+            {
+                "node_id": "ob_0002",
+                "payload": {"id": "ob_0002", "type": "observation_factual", "claim": "test"},
+                "error": "overcap",
+            },
+        ]
+        # Retry fairy returned output for a DIFFERENT (invented) node ID
+        retry_items = [
+            _valid_item("ob_INVENTED_9999"),  # not in the original failure set
+        ]
+
+        out_dir, retry_path = _setup_incorporate_retry(tmp_dir, prior_clean, prior_failures, retry_items)
+        _write_manifest(out_dir, [])
+
+        exit_code = _run(["incorporate", "--retry-output", str(retry_path), "--out", str(out_dir)])
+        assert exit_code == 0
+
+        unfixable_path = out_dir / "unfixable.json"
+        assert unfixable_path.exists(), "unfixable.json not written by incorporate"
+        unfixable = json.loads(unfixable_path.read_text())
+        assert len(unfixable) == 1, f"Expected 1 unfixable item (invented ID), got {len(unfixable)}"
+        assert "INVENTED" in unfixable[0]["node_id"] or "INVENTED" in str(unfixable[0]), (
+            f"unfixable item should reference the invented ID: {unfixable[0]}"
+        )
+        assert "invented" in unfixable[0]["reason"].lower() or "unknown" in unfixable[0]["reason"].lower(), (
+            f"unfixable reason should mention invented/unknown ID: {unfixable[0]['reason']}"
+        )
+
+
+def test_incorporate_increments_attempt_count():
+    """attempt_count in manifest.json increments correctly across retry rounds."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+
+        # Round 1: prior state has 1 failure
+        prior_clean: list[dict] = []
+        prior_failures = [
+            {
+                "node_id": "ob_0002",
+                "payload": {"id": "ob_0002", "type": "observation_factual", "claim": "test"},
+                "error": "overcap",
+            },
+        ]
+        retry_items = [
+            {"node_id": "ob_0002", "recall_summary": "F" * 201, "recall_keywords": ["kw1", "kw2", "kw3"]},
+        ]
+
+        out_dir, retry_path = _setup_incorporate_retry(tmp_dir, prior_clean, prior_failures, retry_items)
+        _write_manifest(out_dir, [], attempt_count=0)
+
+        # Round 1 incorporate
+        _run(["incorporate", "--retry-output", str(retry_path), "--out", str(out_dir)])
+        manifest_after_round1 = json.loads((out_dir / "manifest.json").read_text())
+        assert manifest_after_round1["attempt_count"] == 1, (
+            f"attempt_count should be 1 after first incorporate, got {manifest_after_round1['attempt_count']}"
+        )
+
+        # Round 2: re-run incorporate (simulate a second retry round)
+        # Need to reset failures.json and clean_items.json for round 2
+        (out_dir / "failures.json").write_text(json.dumps(prior_failures))
+        (out_dir / "clean_items.json").write_text(json.dumps(prior_clean))
+        retry_path.write_text(json.dumps({"items": retry_items}))
+
+        _run(["incorporate", "--retry-output", str(retry_path), "--out", str(out_dir)])
+        manifest_after_round2 = json.loads((out_dir / "manifest.json").read_text())
+        assert manifest_after_round2["attempt_count"] == 2, (
+            f"attempt_count should be 2 after second incorporate, got {manifest_after_round2['attempt_count']}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 27: dispatch prompt size regression
+# ---------------------------------------------------------------------------
+
+
+def test_build_initial_prompt_is_short():
+    """_build_initial_prompt returns <1000 chars regardless of payload size.
+
+    This is a regression guard against re-embedding payload content inline.
+    The new contract: the prompt names file paths only; all content lives in
+    the payload file the fairy Reads at dispatch time.
+    """
+    # Simulate a 15-node payload (worst-case chunk size)
+    fake_payload_path = "/some/cohort/chunk-0/payload.json"
+    fake_output_path = "/some/cohort/chunk-0/agent_output.json"
+
+    prompt = _build_initial_prompt(fake_payload_path, fake_output_path)
+    assert len(prompt) < 1000, (
+        f"_build_initial_prompt returned {len(prompt)} chars — "
+        f"expected < 1000 (no inline payload embedding). "
+        f"First 200 chars: {prompt[:200]!r}"
+    )
+    # Must mention both paths
+    assert fake_payload_path in prompt, "Prompt must reference the input payload path"
+    assert fake_output_path in prompt, "Prompt must reference the output path"
