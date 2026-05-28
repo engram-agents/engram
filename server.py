@@ -11822,6 +11822,204 @@ def _lesson_register_incident_impl(
     })
 
 
+_REGISTER_CORNERSTONE_EXEMPLAR_FIELDS = frozenset({
+    "cornerstone_id", "exemplar_id", "note",
+})
+
+
+# DESIGN INTENT — engram_register_cornerstone_exemplar
+# -----------------------------------------------------
+# Strengthens a cornerstone by registering ANOTHER instance of its pattern
+# surfacing. Cornerstones (cs_NNNN) are identity-scaffold operating principles
+# — each new exemplar is empirical evidence the principle is load-bearing.
+#
+# Mirrors engram_lesson_register_incident for the cornerstone case: wires an
+# `exemplifies` edge from exemplar → cornerstone (DAG-exempt). Unlike the
+# lesson path, there is no error_incidents.json cache for cornerstones (no
+# surface hook needs it today), so no cache rebuild step here.
+#
+# The `_detect_zero_support` helper (PR #421) already queries incoming
+# `exemplifies` edges for both lessons AND cornerstones — the new edges
+# created here feed that detection path without code changes.
+#
+# Single-payload signature (per engram-alpha CLAUDE.md convention).
+@mcp.tool(
+    name="engram_register_cornerstone_exemplar",
+    annotations={
+        "title": "Register Exemplar on Existing Cornerstone",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_register_cornerstone_exemplar(payload_json: str) -> str:
+    """Register a post-hoc observation/derivation as another instance
+    supporting an existing cornerstone's pattern.
+
+    Strengthens the cornerstone with empirical exemplar evidence. Mirrors
+    engram_lesson_register_incident for the lesson case; semantic is the
+    same (accumulating votes for an emerged pattern), the target type
+    differs.
+
+    Pass all fields as one JSON object string in payload_json.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            cornerstone_id (str, required): ID of an existing cornerstone
+                (type='cornerstone', is_current=1).
+            exemplar_id (str, required): ID of the exemplar
+                observation/derivation. Must be claim-bearing.
+            note (str, optional): Brief annotation of why this exemplar
+                fits the cornerstone — stored on the edge's metadata.
+
+    Returns:
+        JSON with status + the new edge's source/target, the cornerstone's
+        current exemplar count, plus the cornerstone's claim for verification.
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _register_cornerstone_exemplar_impl for full semantics — kept
+    callable with named kwargs for in-server callers.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _REGISTER_CORNERSTONE_EXEMPLAR_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_REGISTER_CORNERSTONE_EXEMPLAR_FIELDS)}"
+        })
+
+    return _register_cornerstone_exemplar_impl(**params)
+
+
+def _register_cornerstone_exemplar_impl(
+    cornerstone_id: str = "",
+    exemplar_id: str = "",
+    note: str = "",
+) -> str:
+    """Internal implementation — see engram_register_cornerstone_exemplar MCP
+    tool for the public payload schema. Kept callable with named kwargs for
+    in-server callers.
+
+    Register a post-hoc exemplar as another instance of an existing
+    cornerstone's pattern.
+
+    Post-hoc path for cornerstone growth: when a new observation or derivation
+    surfaces that exemplifies a cornerstone already in the graph, attach it
+    with one call instead of superseding the cornerstone. Writes one
+    `exemplifies` edge (exemplar → cornerstone, DAG-exempt).
+
+    Unlike the lesson path, there is no per-cornerstone incident cache to
+    refresh (cornerstones have no surface hook today). The `exemplifies` edge
+    created here feeds `_detect_zero_support` (PR #421) which already queries
+    incoming exemplifies edges for cornerstones.
+
+    Args:
+        cornerstone_id: ID of an existing cornerstone node (type='cornerstone',
+            is_current=1).
+        exemplar_id: ID of the exemplar node. Must be claim-bearing
+            (observation_factual, observation_predictive, derivation, theory,
+            axiom, conjecture).
+        note: Optional brief annotation of why this exemplar fits the
+            cornerstone — stored on the edge's metadata field for audit.
+
+    Returns:
+        JSON with status + the new edge's source/target, the cornerstone's
+        current exemplar count, and the cornerstone's claim for verification.
+    """
+    if not cornerstone_id or not cornerstone_id.strip():
+        return json.dumps({"error": "cornerstone_id is required and cannot be empty."})
+    if not exemplar_id or not exemplar_id.strip():
+        return json.dumps({"error": "exemplar_id is required and cannot be empty."})
+    conn = _get_db()
+    try:
+        cs_row = conn.execute(
+            "SELECT id, type, claim, is_current FROM nodes WHERE id = ?",
+            (cornerstone_id,),
+        ).fetchone()
+        if not cs_row:
+            return json.dumps({"error": f"Cornerstone node not found: {cornerstone_id}"})
+        if cs_row["type"] != "cornerstone":
+            return json.dumps({
+                "error": f"Target must be a cornerstone node. {cornerstone_id} has type '{cs_row['type']}'.",
+            })
+        if not cs_row["is_current"]:
+            return json.dumps({
+                "error": f"Target cornerstone {cornerstone_id} is superseded (is_current=0). "
+                         f"Register against its current replacement.",
+            })
+
+        exemplar_row = conn.execute(
+            "SELECT id, type FROM nodes WHERE id = ?",
+            (exemplar_id,),
+        ).fetchone()
+        if not exemplar_row:
+            return json.dumps({"error": f"Exemplar node not found: {exemplar_id}"})
+        if exemplar_row["type"] not in CLAIM_BEARING_TYPES:
+            return json.dumps({
+                "error": f"Exemplar must be claim-bearing. {exemplar_id} has type "
+                         f"'{exemplar_row['type']}'.",
+            })
+
+        # Idempotent — report existing edge as already_exists rather than error.
+        existing = conn.execute(
+            """SELECT id FROM edges
+               WHERE source_id = ? AND target_id = ? AND relation = 'exemplifies'""",
+            (exemplar_id, cornerstone_id),
+        ).fetchone()
+        if existing:
+            count_row = conn.execute(
+                """SELECT COUNT(*) AS c FROM edges
+                   WHERE target_id = ? AND relation = 'exemplifies'""",
+                (cornerstone_id,),
+            ).fetchone()
+            return json.dumps({
+                "status": "already_exists",
+                "edge": {"source": exemplar_id, "target": cornerstone_id, "relation": "exemplifies"},
+                "cornerstone_id": cornerstone_id,
+                "cornerstone_claim": cs_row["claim"],
+                "cornerstone_exemplar_count": count_row["c"] if count_row else None,
+            })
+
+        now = _now()
+        edge_meta = json.dumps({"note": note}) if note else None
+        conn.execute(
+            """INSERT INTO edges (source_id, target_id, relation, created_at, metadata)
+               VALUES (?, ?, 'exemplifies', ?, ?)""",
+            (exemplar_id, cornerstone_id, now, edge_meta),
+        )
+        _utility_reward(conn, [cornerstone_id], action="lesson_incident")
+        conn.commit()
+
+        count_row = conn.execute(
+            """SELECT COUNT(*) AS c FROM edges
+               WHERE target_id = ? AND relation = 'exemplifies'""",
+            (cornerstone_id,),
+        ).fetchone()
+        exemplar_count = count_row["c"] if count_row else None
+    finally:
+        conn.close()
+
+    return json.dumps({
+        "status": "created",
+        "edge": {
+            "source": exemplar_id,
+            "target": cornerstone_id,
+            "relation": "exemplifies",
+            "note": note or None,
+        },
+        "cornerstone_id": cornerstone_id,
+        "cornerstone_claim": cs_row["claim"],
+        "cornerstone_exemplar_count": exemplar_count,
+    })
+
+
 # ── Task importance constants ──
 TASK_IMPORTANCE = {
     "active": 2.5,    # Highest — current work in progress
@@ -13524,6 +13722,51 @@ def _add_stale_replacement(meta: dict, old_node_id: str, new_node_id: str) -> No
     meta["stale_replacement"] = stale_repl
 
 
+# ---------------------------------------------------------------------------
+# Shared cascade walker (PR-AA — cascade-walker SSoT refactor)
+# ---------------------------------------------------------------------------
+
+
+def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
+    """Walk downstream from node_id following derives_from / supported_by
+    edges. Visits each downstream node at most once. For each live non-cs/ls
+    node visited, calls on_live_node(node) — the caller decides what to
+    write. Stops cascade at retracted/superseded nodes (node not is_current)
+    AND at cornerstones/lessons (vote-accumulator semantics — §2.0 of
+    PR-A-SPEC).
+
+    Visit pattern (Lei 2026-05-28): visited check is at the top of the call,
+    BEFORE on_live_node fires. This guarantees on_live_node fires exactly
+    once per downstream node regardless of how many paths reach it. The
+    caller seeds the cascade root into `visited` before calling so the root
+    isn't re-processed.
+    """
+    if node_id in visited:
+        return
+    visited.add(node_id)
+
+    node = conn.execute(
+        "SELECT id, type, claim, metadata FROM nodes "
+        "WHERE id = ? AND is_current = 1",
+        (node_id,),
+    ).fetchone()
+    if not node:
+        return  # retracted/superseded — stop cascade (parity with old _flag_stale)
+    if node["type"] in ("cornerstone", "lesson"):
+        return  # cs/ls skip rule (PR-A-SPEC §2.0)
+
+    on_live_node(node)
+
+    dependents = conn.execute(
+        "SELECT source_id FROM edges "
+        "WHERE target_id = ? AND relation IN ('derives_from', 'supported_by')",
+        (node_id,),
+    ).fetchall()
+    for d in dependents:
+        _walk_cascade_downstream(conn, d["source_id"],
+                                 visited=visited, on_live_node=on_live_node)
+
+
 # Set of legitimate field names for the engram_supersede payload.
 _SUPERSEDE_FIELDS = frozenset({"old_node_id", "new_node_id", "supersede_reason"})
 
@@ -13780,52 +14023,40 @@ def _supersede_impl(
         )
 
         # Flag downstream dependents of the old node as stale.
-        visited = set()
+        # Uses shared walker (_walk_cascade_downstream) — PR-AA SSoT refactor.
+        visited = {old_node_id}  # seed superseded node so walker won't process it
+        visited.add(new_node_id)  # also don't process the replacement
         stale = []
 
-        def _flag_stale(nid):
-            if nid in visited:
-                return
-            visited.add(nid)
-            dependents = conn.execute(
-                "SELECT source_id FROM edges WHERE target_id = ? AND relation IN ('derives_from', 'supported_by')",
-                (nid,),
-            ).fetchall()
-            for d in dependents:
-                did = d["source_id"]
-                if did == new_node_id:
-                    continue  # Don't flag the replacement itself
-                dep = conn.execute(
-                    "SELECT id, type, claim, metadata FROM nodes WHERE id = ? AND is_current = 1",
-                    (did,),
-                ).fetchone()
-                if not dep:
-                    continue
-                # §2.2 cascade skip rule: cornerstones and lessons accumulate
-                # instance-votes — superseding one premise does not stale the
-                # pattern. Skip stale marking AND recursion for these types.
-                if dep["type"] in ("cornerstone", "lesson"):
-                    continue  # skip stale + skip recursion
-                meta = json.loads(dep["metadata"]) if dep["metadata"] else {}
-                stale_by = meta.get("stale_by", [])
-                if old_node_id not in stale_by:
-                    stale_by.append(old_node_id)
-                meta["stale_by"] = stale_by
-                _add_stale_replacement(meta, old_node_id, new_node_id)
-                conn.execute(
-                    "UPDATE nodes SET metadata = ? WHERE id = ?",
-                    (json.dumps(meta), did),
-                )
-                stale.append({
-                    "id": did,
-                    "type": dep["type"],
-                    "claim": dep["claim"],
-                    "stale_premise": old_node_id,
-                    "replacement": new_node_id,
-                })
-                _flag_stale(did)
+        def _on_live_for_supersede(dep):
+            meta = json.loads(dep["metadata"]) if dep["metadata"] else {}
+            stale_by = meta.get("stale_by", [])
+            if old_node_id not in stale_by:
+                stale_by.append(old_node_id)
+            meta["stale_by"] = stale_by
+            _add_stale_replacement(meta, old_node_id, new_node_id)
+            conn.execute(
+                "UPDATE nodes SET metadata = ? WHERE id = ?",
+                (json.dumps(meta), dep["id"]),
+            )
+            stale.append({
+                "id": dep["id"],
+                "type": dep["type"],
+                "claim": dep["claim"],
+                "stale_premise": old_node_id,
+                "replacement": new_node_id,
+            })
 
-        _flag_stale(old_node_id)
+        # Walk direct dependents of the superseded node.
+        direct = conn.execute(
+            "SELECT source_id FROM edges "
+            "WHERE target_id = ? AND relation IN ('derives_from', 'supported_by')",
+            (old_node_id,),
+        ).fetchall()
+        for d in direct:
+            _walk_cascade_downstream(conn, d["source_id"],
+                                     visited=visited,
+                                     on_live_node=_on_live_for_supersede)
 
         # Cascade to contradiction nodes that have old as a contradicting side
         # (issue #229): mark each affected contradiction as stale_by_premise
@@ -14259,51 +14490,36 @@ def _retract_impl(
         )
 
         # 2. Find all downstream nodes (anything that derives_from or is supported_by this node)
+        # Uses shared walker (_walk_cascade_downstream) — PR-AA SSoT refactor.
         tainted = []
-        visited = set()
+        visited = {node_id}  # seed retracted node so walker won't process it
 
-        def _find_downstream(nid):
-            if nid in visited:
-                return
-            visited.add(nid)
-            downstream = conn.execute(
-                """SELECT source_id FROM edges
-                   WHERE target_id = ? AND relation IN ('derives_from', 'supported_by')""",
-                (nid,),
-            ).fetchall()
-            for d in downstream:
-                did = d["source_id"]
-                if did == node_id:
-                    continue  # Don't flag the retracted node itself
-                # §2.1 cascade skip rule: cornerstones and lessons accumulate
-                # instance-votes — retracting one instance does not invalidate
-                # the pattern. Skip taint marking AND recursion for these types.
-                # Fetch type + metadata in one SELECT (mirrors _flag_stale shape).
-                d_node = conn.execute(
-                    "SELECT id, type, claim, metadata FROM nodes WHERE id = ? AND is_current = 1",
-                    (did,),
-                ).fetchone()
-                if d_node and d_node["type"] in ("cornerstone", "lesson"):
-                    continue  # skip taint + skip recursion
-                # Mark as tainted
-                if d_node:
-                    meta = json.loads(d_node["metadata"] or "{}")
-                    tainted_by = meta.get("tainted_by", [])
-                    if node_id not in tainted_by:
-                        tainted_by.append(node_id)
-                    meta["tainted_by"] = tainted_by
-                    conn.execute(
-                        "UPDATE nodes SET metadata = ? WHERE id = ?",
-                        (json.dumps(meta), did),
-                    )
-                    tainted.append({
-                        "id": did,
-                        "type": d_node["type"],
-                        "claim": d_node["claim"],
-                    })
-                _find_downstream(did)
+        def _on_live_for_retract(dep):
+            meta = json.loads(dep["metadata"] or "{}")
+            tainted_by = meta.get("tainted_by", [])
+            if node_id not in tainted_by:
+                tainted_by.append(node_id)
+            meta["tainted_by"] = tainted_by
+            conn.execute(
+                "UPDATE nodes SET metadata = ? WHERE id = ?",
+                (json.dumps(meta), dep["id"]),
+            )
+            tainted.append({
+                "id": dep["id"],
+                "type": dep["type"],
+                "claim": dep["claim"],
+            })
 
-        _find_downstream(node_id)
+        # Walk direct dependents of the retracted node.
+        direct = conn.execute(
+            "SELECT source_id FROM edges "
+            "WHERE target_id = ? AND relation IN ('derives_from', 'supported_by')",
+            (node_id,),
+        ).fetchall()
+        for d in direct:
+            _walk_cascade_downstream(conn, d["source_id"],
+                                     visited=visited,
+                                     on_live_node=_on_live_for_retract)
 
         # Cascade to contradiction nodes that have the retracted node as a
         # contradicting side (issue #229): mark each affected contradiction

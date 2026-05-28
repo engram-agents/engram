@@ -851,3 +851,167 @@ def test_skip_rule_does_not_recurse_through_cs_or_ls():
     assert cs_down not in tainted_ids, (
         "cs_down must not appear in tainted_downstream — cascade did not recurse through cs_mid"
     )
+
+
+# ---------------------------------------------------------------------------
+# §6.2-6.4 PR-AA — cascade-walker SSoT regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_diamond_cascade_retract_visits_each_node_exactly_once():
+    """Diamond-shape: dv_Z reachable from ob_X via two paths; retract ob_X.
+
+    Graph shape:
+      ob_X → dv_A (derives_from → ob_X)
+      ob_X → dv_B (derives_from → ob_X)
+      dv_Z derives_from → dv_A  AND  dv_Z derives_from → dv_B
+
+    Before the PR-AA fix, _find_downstream would append dv_Z to `tainted`
+    twice (once via dv_A path, once via dv_B path). After the fix, the shared
+    walker's visited-set deduplication ensures dv_Z appears exactly once.
+    """
+    server = fresh_server()
+    ob_x = _seed_ob(server, "Root observation X.")
+    dv_a = _seed_dv(server, "Derivation A — from X.", ob_x)
+    dv_b = _seed_dv(server, "Derivation B — from X.", ob_x)
+    # dv_Z cites both dv_A and dv_B (diamond shape).
+    dv_z = _seed_dv(server, "Derivation Z — from A and B.", [dv_a, dv_b])
+
+    ret = json.loads(server._retract_impl(
+        node_id=ob_x,
+        error_type="hallucinated_claim",
+        reason="ob_x was fabricated.",
+    ))
+    assert "error" not in ret, ret
+
+    # dv_Z should appear exactly once in tainted_downstream.
+    tainted_ids = [t["id"] for t in ret.get("tainted_downstream", [])]
+    dv_z_count = tainted_ids.count(dv_z)
+    assert dv_z_count == 1, (
+        f"dv_Z {dv_z} must appear exactly once in tainted_downstream, "
+        f"got {dv_z_count} (diamond-shape dedup failure). Full list: {tainted_ids}"
+    )
+
+    # Metadata write is still correct.
+    assert _is_tainted(server, dv_z, ob_x), (
+        f"dv_Z {dv_z} must be tainted_by {ob_x}"
+    )
+
+
+def test_diamond_cascade_supersede_visits_each_node_exactly_once():
+    """Diamond-shape: dv_Z reachable from ob_old via two paths; supersede ob_old.
+
+    Graph shape:
+      ob_old → dv_A (derives_from → ob_old)
+      ob_old → dv_B (derives_from → ob_old)
+      dv_Z derives_from → dv_A  AND  dv_Z derives_from → dv_B
+
+    Before the PR-AA fix, _flag_stale would append dv_Z to `stale` twice.
+    After the fix, the shared walker's visited-set deduplication ensures
+    dv_Z appears exactly once in stale_downstream.
+    """
+    server = fresh_server()
+    ob_old = _seed_ob(server, "Old root observation.")
+    ob_new = _seed_ob(server, "Refined root observation.")
+    dv_a = _seed_dv(server, "Derivation A — from old root.", ob_old)
+    dv_b = _seed_dv(server, "Derivation B — from old root.", ob_old)
+    # dv_Z cites both dv_A and dv_B (diamond shape).
+    dv_z = _seed_dv(server, "Derivation Z — from A and B.", [dv_a, dv_b])
+
+    ret = json.loads(server._supersede_impl(ob_old, ob_new))
+    assert "error" not in ret, ret
+
+    # dv_Z should appear exactly once in stale_downstream.
+    stale_ids = [s["id"] for s in ret.get("stale_downstream", [])]
+    dv_z_count = stale_ids.count(dv_z)
+    assert dv_z_count == 1, (
+        f"dv_Z {dv_z} must appear exactly once in stale_downstream, "
+        f"got {dv_z_count} (diamond-shape dedup failure). Full list: {stale_ids}"
+    )
+
+    # Metadata write is still correct.
+    assert _is_stale(server, dv_z, ob_old), (
+        f"dv_Z {dv_z} must be stale_by {ob_old}"
+    )
+
+
+def test_three_path_cascade_visits_node_once():
+    """Three-parent diamond: dv_Z reachable via 3 paths; retract ob_X.
+
+    Graph shape:
+      ob_X → dv_A, dv_B, dv_C  (all derives_from → ob_X)
+      dv_Z derives_from → dv_A, dv_B, dv_C
+
+    dv_Z must appear exactly once in tainted_downstream regardless of the
+    path count.
+    """
+    server = fresh_server()
+    ob_x = _seed_ob(server, "Root observation for 3-parent test.")
+    dv_a = _seed_dv(server, "Derivation A (3-parent).", ob_x)
+    dv_b = _seed_dv(server, "Derivation B (3-parent).", ob_x)
+    dv_c = _seed_dv(server, "Derivation C (3-parent).", ob_x)
+    dv_z = _seed_dv(server, "Derivation Z — from A, B, and C.", [dv_a, dv_b, dv_c])
+
+    ret = json.loads(server._retract_impl(
+        node_id=ob_x,
+        error_type="hallucinated_claim",
+        reason="ob_x fabricated — 3-parent test.",
+    ))
+    assert "error" not in ret, ret
+
+    tainted_ids = [t["id"] for t in ret.get("tainted_downstream", [])]
+    dv_z_count = tainted_ids.count(dv_z)
+    assert dv_z_count == 1, (
+        f"dv_Z {dv_z} must appear exactly once even with 3 parents, "
+        f"got {dv_z_count}. Full list: {tainted_ids}"
+    )
+    assert _is_tainted(server, dv_z, ob_x), (
+        f"dv_Z {dv_z} must still be tainted_by {ob_x}"
+    )
+
+
+def test_cascade_stops_at_retracted_downstream_node():
+    """Parity guard: walker stops at retracted mid-chain nodes (is_current=0).
+
+    Graph shape:
+      ob_X → dv_A (dv_A is already retracted, is_current=0)
+      dv_A → dv_B (dv_B depends on dv_A)
+
+    When ob_X is retracted:
+    - dv_A has is_current=0 → walker stops there, dv_A NOT in tainted list.
+    - dv_B is downstream of dv_A, which is not visited → dv_B NOT in tainted list.
+
+    Before the PR-AA fix, _find_downstream would recurse through dv_A even
+    when dv_A was retracted (the recursive call was outside the `if d_node:`
+    guard). The shared walker's stop-at-retracted semantics fix this asymmetry.
+    """
+    server = fresh_server()
+    ob_x = _seed_ob(server, "Root observation for parity guard test.")
+    dv_a = _seed_dv(server, "Mid-chain derivation A.", ob_x)
+    dv_b = _seed_dv(server, "Terminal derivation B — derives from A.", dv_a)
+
+    # Pre-retract dv_A so it has is_current=0 before ob_X is retracted.
+    pre = json.loads(server._retract_impl(
+        node_id=dv_a,
+        error_type="hallucinated_claim",
+        reason="dv_a pre-retracted to set up parity test.",
+    ))
+    assert "error" not in pre, pre
+
+    # Now retract ob_X. The cascade should not include dv_A (already retracted)
+    # or dv_B (unreachable because walker stops at dv_A).
+    ret = json.loads(server._retract_impl(
+        node_id=ob_x,
+        error_type="hallucinated_claim",
+        reason="ob_x retracted — parity guard test.",
+    ))
+    assert "error" not in ret, ret
+
+    tainted_ids = {t["id"] for t in ret.get("tainted_downstream", [])}
+    assert dv_a not in tainted_ids, (
+        f"dv_A {dv_a} must NOT be in tainted_downstream — is_current=0, walker stops here"
+    )
+    assert dv_b not in tainted_ids, (
+        f"dv_B {dv_b} must NOT be in tainted_downstream — cascade must not recurse through "
+        f"retracted dv_A"
+    )
