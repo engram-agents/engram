@@ -17,12 +17,8 @@ swallow surface.
 Applies to: every new MCP tool, every existing-tool migration. Check existing
 tools (`engram_add_observation`, `engram_derive`, etc.) for the canonical shape.
 
-Lapses to fix on sight: any tool with multiple positional/keyword params
-should be migrated. Wave-3 (2026-05-14) tightened most; a handful of legacy
-read-side tools (`engram_surface`, `engram_query`, `engram_inspect`,
-`engram_get_subgraph`, `engram_list`, `engram_history`, `engram_focus*`,
-`engram_query_pattern`) still carry multi-param signatures as of 2026-05-19
-and remain on the migration backlog.
+Wave-3 migration (2026-05-14) completed the corpus — all tools are now on
+the unified payload_json signature as of 2026-05-27.
 
 ## Branching convention
 
