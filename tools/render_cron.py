@@ -6,7 +6,7 @@ ENGRAM` markers, followed by a trailing newline. The block is what
 tools/sync-cron.sh splices into the user's crontab.
 
 This script READS config.json's `cadence` block (added by schema v2; see
-tools/migrate_config_v2.py for the migration) and computes per-minute
+tools/migration/migrate_config_v2.py for the migration) and computes per-minute
 heartbeat schedules, dynamically skipping (hour, minute) slots that fall
 inside the sleep protected window. The sleep time + protected-window width
 are the single source of truth for which heartbeat fires get suppressed —
@@ -120,7 +120,7 @@ def render(config: dict, template_text: str, *, agent_name: str,
     cadence = config.get("cadence")
     if not cadence:
         raise ValueError(
-            "config has no 'cadence' block — run tools/migrate_config_v2.py first"
+            "config has no 'cadence' block — run tools/migration/migrate_config_v2.py first"
         )
 
     timezone = config.get("user", {}).get("timezone", "local time")

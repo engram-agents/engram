@@ -2,7 +2,7 @@
 # tools/sync-cron.sh — splice the ENGRAM cron block into the user's crontab.
 #
 # Reads $ENGRAM_HOME/config.json (cadence block; install via
-# tools/migrate_config_v2.py) and the crontab template, renders the ENGRAM
+# tools/migration/migrate_config_v2.py) and the crontab template, renders the ENGRAM
 # block via tools/render_cron.py, then splices it into the current
 # crontab using `# BEGIN ENGRAM` / `# END ENGRAM` markers.
 #

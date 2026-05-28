@@ -24,7 +24,7 @@ Migration rules (applied per edge with relation='supports'):
 Idempotent: running twice is a no-op (no 'supports' edges remain after first run).
 
 Usage:
-    python tools/migrate_supports_to_supported_by.py [--db PATH] [--apply]
+    python tools/migration/migrate_supports_to_supported_by.py [--db PATH] [--apply]
 
 Flags:
     --db PATH   Path to knowledge.db (default: $ENGRAM_DATA_DIR/knowledge.db

@@ -23,7 +23,7 @@ SCHEMA EXTENSION migration, not a SHAPE REORGANIZATION — code that
 reads existing keys keeps working.
 
 Usage:
-    python tools/migrate_config_v2.py [--config PATH] [--dry-run] [--force]
+    python tools/migration/migrate_config_v2.py [--config PATH] [--dry-run] [--force]
 
 Flags:
     --config PATH   Path to config.json (default: $ENGRAM_HOME/config.json

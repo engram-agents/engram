@@ -19,9 +19,10 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Add tools/ to sys.path so we can import the migration script.
+# Add tools/migration/ to sys.path so we can import the migration script.
 TOOLS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
-sys.path.insert(0, TOOLS_DIR)
+MIGRATION_DIR = os.path.join(TOOLS_DIR, "migration")
+sys.path.insert(0, MIGRATION_DIR)
 
 
 TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_supported_by")
@@ -95,17 +96,21 @@ def _node_status(server, node_id):
 # ── 1. Taint cascade: retracting target taints source ──────────────────────
 
 
-def test_retract_target_taints_source_via_supported_by():
-    """Retracting the TARGET of a supported_by edge taints the SOURCE (dependent).
+def test_retract_target_does_NOT_taint_cornerstone_source():
+    """Retracting the TARGET of a supported_by edge from a CORNERSTONE does NOT taint it.
+
+    Cascade skip rule (§2.1): cornerstones accumulate instance-votes. Retracting
+    one supporting observation does NOT mark the cornerstone tainted — the pattern
+    may still hold via remaining supporters.
 
     Setup: cornerstone (source) --supported_by--> observation (target/premise).
-    Retracting the observation should taint the cornerstone.
+    Retracting the observation must NOT taint the cornerstone.
     """
     server = fresh_server()
 
-    # Create the observation (premise)
-    obs_id = _seed_observation(server, url="https://example.com/premise",
-                               claim="Premise observation.")
+    # Create the observation (premise). Use the default evidence URL to avoid
+    # multiple DNS lookups in the test environment when tests run in sequence.
+    obs_id = _seed_observation(server, claim="Premise observation.")
 
     # Create a cornerstone and link it to the observation via supported_by
     cs_r = json.loads(server.engram_add_cornerstone(payload_json=json.dumps({
@@ -130,9 +135,19 @@ def test_retract_target_taints_source_via_supported_by():
     ))
     assert "error" not in ret, ret
 
-    # The cornerstone (source / dependent) must now be tainted
-    assert _is_tainted(server, cs_id, obs_id), (
-        f"Expected cornerstone {cs_id} to be tainted_by {obs_id} after retraction"
+    # The cornerstone (source) must NOT be tainted — cascade skip rule applies.
+    assert not _is_tainted(server, cs_id, obs_id), (
+        f"Cornerstone {cs_id} must NOT be tainted_by {obs_id}: "
+        f"cascade skip rule applies to cornerstones (instance-vote semantics)."
+    )
+
+    # The cornerstone should appear in support_lost (only one supporter existed).
+    assert ret.get("support_lost_count", 0) == 1, (
+        f"Expected support_lost_count=1, got: {ret}"
+    )
+    support_lost_ids = [n["id"] for n in ret.get("support_lost", [])]
+    assert cs_id in support_lost_ids, (
+        f"Expected {cs_id} in support_lost list, got: {support_lost_ids}"
     )
 
 

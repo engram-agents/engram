@@ -657,7 +657,7 @@ def _ensure_data_dir():
     if not CONFIG_PATH.exists():
         default_config = {
             # Schema v2 (2026-05-05): adds cadence block. Migration from
-            # v1 → v2 is in tools/migrate_config_v2.py for existing installs.
+            # v1 → v2 is in tools/migration/migrate_config_v2.py for existing installs.
             "schema_version": 2,
             "trust_pool": [
                 "reuters.com",
@@ -694,7 +694,7 @@ def _ensure_data_dir():
                 # tools/sync-cron.sh to render the user's crontab from.
                 # Defaults match the production Borges crontab cadence.
                 # Multi-agent stagger: each agent edits its own config —
-                # no auto-offset (see tools/migrate_config_v2.py header).
+                # no auto-offset (see tools/migration/migrate_config_v2.py header).
                 "heartbeat_minutes": [0, 30],
                 "sleep_hour": 20,
                 "sleep_minute": 30,
@@ -1978,7 +1978,7 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str):
 # (tight-semantic-group ROC AUC 0.984, peak F1 0.843 at t=0.41, peak F2
 # recall-weighted 0.868 at t=0.33). These DEFAULT constants encode the chosen
 # operating points; per-agent overrides live in ~/.engram/config.json under
-# the `thresholds` section (schema v3 — see tools/migrate_config_v3.py).
+# the `thresholds` section (schema v3 — see tools/migration/migrate_config_v3.py).
 #
 # Downstream code references the *_get_thresholds_config()*-returned dict
 # rather than these constants directly, so a config edit takes effect on the
@@ -2007,7 +2007,7 @@ POLARITY_DEFAULT_MIN_SIMILARITY_FOR_CHECK = 0.30  # below this cosine, skip NLI 
 def _get_thresholds_config() -> dict:
     """Get similarity-threshold config (config.json `thresholds` section).
 
-    Returns a dict with the keys defined in tools/migrate_config_v3.py
+    Returns a dict with the keys defined in tools/migration/migrate_config_v3.py
     DEFAULT_THRESHOLDS. Falls back to module-level constants if the config
     file is absent or the section is missing.
 
@@ -7938,6 +7938,15 @@ def engram_diagnose() -> str:
         ).fetchone()["c"]
         epistemic["stale_nodes"] = stale_count
 
+        # Support-lost cornerstones/lessons (§2.3)
+        support_lost_count = conn.execute(
+            """SELECT COUNT(*) as c FROM nodes
+               WHERE is_current = 1
+                 AND type IN ('cornerstone', 'lesson')
+                 AND metadata LIKE '%\"support_lost\"%'"""
+        ).fetchone()["c"]
+        epistemic["support_lost_nodes"] = support_lost_count
+
         # Retracted nodes
         retracted_count = conn.execute(
             "SELECT COUNT(*) as c FROM nodes WHERE status = 'retracted'"
@@ -13792,6 +13801,11 @@ def _supersede_impl(
                 ).fetchone()
                 if not dep:
                     continue
+                # §2.2 cascade skip rule: cornerstones and lessons accumulate
+                # instance-votes — superseding one premise does not stale the
+                # pattern. Skip stale marking AND recursion for these types.
+                if dep["type"] in ("cornerstone", "lesson"):
+                    continue  # skip stale + skip recursion
                 meta = json.loads(dep["metadata"]) if dep["metadata"] else {}
                 stale_by = meta.get("stale_by", [])
                 if old_node_id not in stale_by:
@@ -13863,6 +13877,11 @@ def _supersede_impl(
                       {"stale_premise": old_node_id, "replacement": new_node_id,
                        "cascade_via": "contradicts_edge"})
 
+        # §2.3 Zero-support detection: after cascade settles, check cs/ls
+        # nodes that lost a supporting edge. If total live support = 0, mark
+        # support_lost (distinct from stale — audit signal, not cascade).
+        support_lost_cs_ls = _detect_zero_support(conn, old_node_id)
+
         _log_edit(conn, "superseded", old_node_id, old["type"],
                   {"replaced_by": new_node_id, "reason": supersede_reason or None})
         for s in stale:
@@ -13885,7 +13904,7 @@ def _supersede_impl(
             },
         )
 
-        return json.dumps({
+        result = {
             "status": "superseded",
             "old_node_id": old_node_id,
             "new_node_id": new_node_id,
@@ -13894,9 +13913,123 @@ def _supersede_impl(
             "stale_count": len(stale),
             "stale_contradictions": stale_contradictions,
             "stale_contradiction_count": len(stale_contradictions),
-        })
+        }
+        if support_lost_cs_ls:
+            result["support_lost"] = support_lost_cs_ls
+            result["support_lost_count"] = len(support_lost_cs_ls)
+        return json.dumps(result)
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Zero-support detection helper (§2.3)
+# ---------------------------------------------------------------------------
+
+
+def _detect_zero_support(conn: sqlite3.Connection, affected_node_id: str) -> list[dict]:
+    """Find cornerstones/lessons that lost all live support due to a cascade operation.
+
+    After a retract or supersede settles (affected node is already is_current=0),
+    check each cs/ls that had an edge to/from the affected node. If the total count
+    of live supporting nodes (via supported_by TARGET or exemplifies SOURCE) is zero,
+    mark the cs/ls as support_lost in metadata and log the event.
+
+    Edge direction (§3):
+      - supported_by: cs/ls ─[supported_by]→ premise. COUNT where TARGET is_current=1.
+      - exemplifies:  premise ─[exemplifies]→ cs/ls. COUNT where SOURCE is_current=1.
+
+    Args:
+        conn: Open DB connection with write access (caller commits).
+        affected_node_id: The node that was retracted or superseded (already is_current=0).
+
+    Returns:
+        List of dicts [{id, type, claim}] for each cs/ls newly marked support_lost.
+    """
+    # Step 1: find all cs/ls that may be affected.
+    # Case 1: affected node was the TARGET of a supported_by edge (cs/ls → affected).
+    case1 = conn.execute(
+        """SELECT e.source_id
+           FROM edges e
+           JOIN nodes n ON n.id = e.source_id
+           WHERE e.target_id = ?
+             AND e.relation = 'supported_by'
+             AND n.type IN ('cornerstone', 'lesson')""",
+        (affected_node_id,),
+    ).fetchall()
+
+    # Case 2: affected node was the SOURCE of an exemplifies edge (affected → cs/ls).
+    case2 = conn.execute(
+        """SELECT e.target_id
+           FROM edges e
+           JOIN nodes n ON n.id = e.target_id
+           WHERE e.source_id = ?
+             AND e.relation = 'exemplifies'
+             AND n.type IN ('cornerstone', 'lesson')""",
+        (affected_node_id,),
+    ).fetchall()
+
+    affected_cs_ls_ids = set()
+    for row in case1:
+        affected_cs_ls_ids.add(row["source_id"])
+    for row in case2:
+        affected_cs_ls_ids.add(row["target_id"])
+
+    if not affected_cs_ls_ids:
+        return []
+
+    # Step 2: for each affected cs/ls, recount live support.
+    newly_support_lost = []
+    for cs_ls_id in affected_cs_ls_ids:
+        cs_ls_node = conn.execute(
+            "SELECT id, type, claim, metadata, is_current FROM nodes WHERE id = ?",
+            (cs_ls_id,),
+        ).fetchone()
+        if not cs_ls_node or not cs_ls_node["is_current"]:
+            continue  # Only count live cs/ls nodes
+
+        # Outgoing supported_by edges — count where TARGET is_current=1.
+        supported_by_live = conn.execute(
+            """SELECT COUNT(*) as c
+               FROM edges e
+               JOIN nodes n ON n.id = e.target_id
+               WHERE e.source_id = ?
+                 AND e.relation = 'supported_by'
+                 AND n.is_current = 1""",
+            (cs_ls_id,),
+        ).fetchone()["c"]
+
+        # Incoming exemplifies edges — count where SOURCE is_current=1.
+        exemplifies_live = conn.execute(
+            """SELECT COUNT(*) as c
+               FROM edges e
+               JOIN nodes n ON n.id = e.source_id
+               WHERE e.target_id = ?
+                 AND e.relation = 'exemplifies'
+                 AND n.is_current = 1""",
+            (cs_ls_id,),
+        ).fetchone()["c"]
+
+        total_live = supported_by_live + exemplifies_live
+
+        if total_live == 0:
+            # Mark support_lost in metadata.
+            meta = json.loads(cs_ls_node["metadata"] or "{}")
+            if not meta.get("support_lost"):
+                meta["support_lost"] = True
+                conn.execute(
+                    "UPDATE nodes SET metadata = ? WHERE id = ?",
+                    (json.dumps(meta), cs_ls_id),
+                )
+                _log_edit(conn, "support_lost", cs_ls_id, cs_ls_node["type"],
+                          {"trigger": affected_node_id})
+                newly_support_lost.append({
+                    "id": cs_ls_id,
+                    "type": cs_ls_node["type"],
+                    "claim": cs_ls_node["claim"],
+                })
+
+    return newly_support_lost
 
 
 # Set of legitimate field names for the engram_retract payload.
@@ -14142,12 +14275,19 @@ def _retract_impl(
                 did = d["source_id"]
                 if did == node_id:
                     continue  # Don't flag the retracted node itself
-                # Mark as tainted
-                d_meta = conn.execute(
-                    "SELECT metadata FROM nodes WHERE id = ?", (did,)
+                # §2.1 cascade skip rule: cornerstones and lessons accumulate
+                # instance-votes — retracting one instance does not invalidate
+                # the pattern. Skip taint marking AND recursion for these types.
+                # Fetch type + metadata in one SELECT (mirrors _flag_stale shape).
+                d_node = conn.execute(
+                    "SELECT id, type, claim, metadata FROM nodes WHERE id = ? AND is_current = 1",
+                    (did,),
                 ).fetchone()
-                if d_meta:
-                    meta = json.loads(d_meta["metadata"] or "{}")
+                if d_node and d_node["type"] in ("cornerstone", "lesson"):
+                    continue  # skip taint + skip recursion
+                # Mark as tainted
+                if d_node:
+                    meta = json.loads(d_node["metadata"] or "{}")
                     tainted_by = meta.get("tainted_by", [])
                     if node_id not in tainted_by:
                         tainted_by.append(node_id)
@@ -14156,13 +14296,10 @@ def _retract_impl(
                         "UPDATE nodes SET metadata = ? WHERE id = ?",
                         (json.dumps(meta), did),
                     )
-                    d_node = conn.execute(
-                        "SELECT type, claim FROM nodes WHERE id = ?", (did,)
-                    ).fetchone()
                     tainted.append({
                         "id": did,
-                        "type": d_node["type"] if d_node else "unknown",
-                        "claim": d_node["claim"] if d_node else "",
+                        "type": d_node["type"],
+                        "claim": d_node["claim"],
                     })
                 _find_downstream(did)
 
@@ -14210,6 +14347,11 @@ def _retract_impl(
             })
             _log_edit(conn, "tainted", ct_id, "contradiction",
                       {"tainted_by": node_id, "cascade_via": "contradicts_edge"})
+
+        # §2.3 Zero-support detection: after cascade settles, check cs/ls
+        # nodes that lost a supporting edge. If total live support = 0, mark
+        # support_lost (distinct from tainted — audit signal, not cascade).
+        support_lost_cs_ls = _detect_zero_support(conn, node_id)
 
         # Log retraction and taint events
         _log_edit(conn, "retracted", node_id, node["type"],
@@ -14273,6 +14415,9 @@ def _retract_impl(
             "tainted_contradictions": tainted_contradictions,
             "tainted_contradiction_count": len(tainted_contradictions),
         }
+        if support_lost_cs_ls:
+            result["support_lost"] = support_lost_cs_ls
+            result["support_lost_count"] = len(support_lost_cs_ls)
         if reopened_targets:
             result["reopened_targets"] = reopened_targets
             result["reopened_count"] = len(reopened_targets)
@@ -15716,6 +15861,7 @@ _REFLECT_TOP_N = {
     "unresolved_contradictions": 5,
     "tainted_nodes": 5,
     "stale_nodes": 5,
+    "support_lost_nodes": 5,
     "overdue_predictions": 5,
     "open_conjectures": 5,
     "recent_feeling_reports": 5,
@@ -15736,7 +15882,8 @@ _REFLECT_TRUNC_FIELDS = {
 _REFLECT_LIST_ORDER = [
     "active_goals", "active_tasks", "active_lessons",
     "unresolved_goal_tensions", "unresolved_contradictions",
-    "tainted_nodes", "stale_nodes", "overdue_predictions", "open_conjectures",
+    "tainted_nodes", "stale_nodes", "support_lost_nodes",
+    "overdue_predictions", "open_conjectures",
     "recent_feeling_reports",
     "weakly_grounded", "thin_support_derivations", "open_questions",
     "uncited_observations", "same_source_review", "retracted_nodes",
@@ -16349,6 +16496,21 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
                 "error_type": meta.get("error_type", "unknown"),
             })
 
+        # 12. Support-lost cornerstones/lessons (§2.4) — primary channel for
+        # dream-master to find cs/ls that lost all live empirical support.
+        # Trivial rewires handled inside the dream; non-trivial cases surface
+        # to awake state via the flagged-for-user mechanism.
+        support_lost_rows = conn.execute(
+            """SELECT id, type, claim FROM nodes
+               WHERE is_current = 1
+                 AND type IN ('cornerstone', 'lesson')
+                 AND metadata LIKE '%"support_lost"%'"""
+        ).fetchall()
+        report["support_lost_nodes"] = [
+            {"id": r["id"], "type": r["type"], "claim": r["claim"]}
+            for r in support_lost_rows
+        ]
+
         # Summary counts
         total_current = conn.execute(
             "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1"
@@ -16377,6 +16539,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
             "tainted_nodes": len(report["tainted_nodes"]),
             "stale_nodes": len(report["stale_nodes"]),
             "retracted_nodes": len(report["retracted_nodes"]),
+            "support_lost_nodes": len(report["support_lost_nodes"]),
             "recent_feeling_reports": len(report["recent_feeling_reports"]),
         }
         report["memory_tiers"] = {
@@ -16432,6 +16595,11 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
             actions.append("Review stale nodes — their premises were superseded. Consider superseding these too with updated reasoning.")
         if report["retracted_nodes"]:
             actions.append("Audit retracted nodes — check if all downstream effects have been addressed.")
+        if report["support_lost_nodes"]:
+            actions.append(
+                "Review support-lost cornerstones/lessons — each has lost all live empirical support. "
+                "Either link new exemplifying instances, or retract the pattern if it no longer holds."
+            )
         report["recommended_actions"] = actions
 
         # Dream-cycle feeling-report nudge (§6 Marker file protocol). The

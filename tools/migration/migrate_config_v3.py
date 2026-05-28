@@ -12,7 +12,7 @@ unchanged. Code that reads memory/embedding/cadence keeps working.
 Hard-cut migration with prod-safety guards (dry-run, atomic backup, idempotent).
 
 Usage:
-    python tools/migrate_config_v3.py [--config PATH] [--dry-run] [--force]
+    python tools/migration/migrate_config_v3.py [--config PATH] [--dry-run] [--force]
 
 Flags:
     --config PATH   Path to config.json (default: $ENGRAM_HOME/config.json

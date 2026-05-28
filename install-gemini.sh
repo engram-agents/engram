@@ -359,7 +359,7 @@ else
           echo "      crontab manually to remove them, then re-run:"
           echo "        AGENT_NAME=$CRON_AGENT_NAME $ENGRAM_HOME/tools/sync-cron.sh --apply --agent-cli gemini"
           echo "    - config.json missing 'cadence' block. Run:"
-          echo "        $ENGRAM_HOME/tools/migrate_config_v2.py"
+          echo "        $ENGRAM_HOME/tools/migration/migrate_config_v2.py"
         }
   else
     echo "  sync-cron.sh not staged (unexpected); skipping cron install"
