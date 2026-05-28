@@ -58,6 +58,109 @@ DEFAULT_AGENT: str = ""
 _CONFIG_WRITE_BACKUPS: dict = {}  # agent_name -> backup_path written this session
 
 # ---------------------------------------------------------------------------
+# Shared top-nav helper — single source of truth for the top navigation bar
+# rendered on every tab page.  Called at module load to build the HTML
+# constants; avoids per-tab duplication and keeps the agent selector ID/CSS
+# canonical.
+# ---------------------------------------------------------------------------
+
+_NAV_TABS = [
+    ("graph",  "/",        "Graph View"),
+    ("health", "/health",  "Health Dashboard"),
+    ("stats",  "/stats",   "Stats"),
+    ("config", "/config",  "Config"),
+]
+
+# CSS rules injected into every page's <style> block.
+_NAV_SHARED_CSS = """\
+    .nav-agent-label { color: #7ecfff; font-size: 0.85em; margin-right: 6px; }
+    .nav-agent-select { padding: 4px 8px; background: #0d1b36; border: 1px solid #1a4a8a;
+                        border-radius: 4px; color: #e0e0e0; font-size: 0.85em; outline: none; }
+    #nav-agent-wrapper { display: none; margin-left: auto; }"""
+
+
+def _render_nav(active_tab: str) -> str:
+    """Return the HTML fragment for the shared top nav bar.
+
+    Includes tab links (active tab bold) and the global agent-selector
+    dropdown.  The dropdown is hidden until the shared nav script populates
+    it (single-agent mode keeps it hidden permanently).
+
+    active_tab: one of {"graph", "health", "stats", "config"}
+    """
+    links = []
+    for tab_key, href, label in _NAV_TABS:
+        if tab_key == active_tab:
+            links.append(f'  <a href="{href}" style="font-weight:600;">{label}</a>')
+        else:
+            links.append(f'  <a href="{href}">{label}</a>')
+    links.append(
+        '  <span id="nav-agent-wrapper">'
+        '<span class="nav-agent-label">Agent:</span>'
+        '<select id="agent-select-nav" class="nav-agent-select"></select>'
+        "</span>"
+    )
+    return "<div class=\"nav\">\n" + "\n".join(links) + "\n</div>"
+
+
+# Shared JS block injected just before </body> on every tab page.
+# Handles: populating the agent selector from /api/agents, hiding it in
+# single-agent mode, rewriting tab links to preserve ?agent=, and
+# navigating on change.
+_NAV_SCRIPT = """\
+<script>
+(function () {
+  var sel = document.getElementById('agent-select-nav');
+  if (!sel) return;
+  var wrapper = document.getElementById('nav-agent-wrapper');
+
+  fetch('/api/agents').then(function(r) { return r.json(); }).then(function(data) {
+    var agents = data.agents || [];
+    var defaultAgent = data.default || (agents[0] && agents[0].name);
+    if (agents.length <= 1) return;  // single-agent mode: keep selector hidden
+
+    var currentAgent = new URL(window.location.href).searchParams.get('agent');
+    if (!currentAgent || !agents.find(function(a) { return a.name === currentAgent; })) {
+      currentAgent = defaultAgent;
+    }
+
+    sel.innerHTML = '';
+    agents.forEach(function(a) {
+      var opt = document.createElement('option');
+      opt.value = a.name;
+      var status = a.available ? '(' + a.current_node_count + ')' : '(unavailable)';
+      opt.textContent = a.label + ' ' + status;
+      if (!a.available && a.error) opt.title = a.error;
+      sel.appendChild(opt);
+    });
+    sel.value = currentAgent;
+    if (wrapper) wrapper.style.display = 'inline-flex';
+
+    // Rewrite all same-origin tab links to preserve the agent param.
+    document.querySelectorAll('.nav a').forEach(function(link) {
+      var href = link.getAttribute('href');
+      if (!href || !href.startsWith('/')) return;
+      var u = new URL(href, window.location.origin);
+      u.searchParams.set('agent', currentAgent);
+      link.setAttribute('href', u.toString());
+    });
+
+    sel.onchange = function() {
+      var u = new URL(window.location.href);
+      u.searchParams.set('agent', sel.value);
+      window.location.href = u.toString();
+    };
+  }).catch(function() {});
+}());
+</script>"""
+
+# Sentinel strings used inside each HTML constant; replaced at module load.
+_NAV_PLACEHOLDER = "<!--NAV_PLACEHOLDER-->"
+_NAV_SCRIPT_PLACEHOLDER = "<!--NAV_SCRIPT_PLACEHOLDER-->"
+_NAV_CSS_PLACEHOLDER = "<!--NAV_CSS_PLACEHOLDER-->"
+
+
+# ---------------------------------------------------------------------------
 # HTML / JS / CSS  (embedded so the server is a single file)
 # ---------------------------------------------------------------------------
 
@@ -540,9 +643,11 @@ HTML = r"""<!DOCTYPE html>
 
     /* ── Top nav ────────────────────────────────────────────────────── */
     .nav { margin-bottom: 0; padding: 8px 16px; background: #0f3460;
-           border-bottom: 1px solid #1a4a8a; flex-shrink: 0; }
+           border-bottom: 1px solid #1a4a8a; flex-shrink: 0;
+           display: flex; align-items: center; }
     .nav a { color: #00d4ff; text-decoration: none; margin-right: 16px; font-size: 0.9em; }
     .nav a:hover { text-decoration: underline; }
+<!--NAV_CSS_PLACEHOLDER-->
 
     /* ── Content row (sidebar + graph + detail) ─────────────────────── */
     #content-row { display: flex; flex: 1; overflow: hidden; }
@@ -551,12 +656,7 @@ HTML = r"""<!DOCTYPE html>
 <body>
 
 <!-- ── Top nav ──────────────────────────────────────────────────────── -->
-<div class="nav">
-  <a href="/" style="font-weight:600;">Graph View</a>
-  <a href="/health">Health Dashboard</a>
-  <a href="/stats">Stats</a>
-  <a href="/config">Config</a>
-</div>
+<!--NAV_PLACEHOLDER-->
 
 <!-- ── Content row ──────────────────────────────────────────────────── -->
 <div id="content-row">
@@ -567,11 +667,6 @@ HTML = r"""<!DOCTYPE html>
     ENGRAM Visualizer
     <small id="db-path-label"></small>
   </header>
-
-  <div class="section" id="agent-section" style="display:none;">
-    <div class="section-title">Agent</div>
-    <select id="agent-select" style="width:100%;padding:5px 8px;background:#0d1b36;border:1px solid #1a4a8a;border-radius:4px;color:#e0e0e0;font-size:12px;outline:none;"></select>
-  </div>
 
   <div class="section">
     <div id="status-line">Nodes: <span id="stat-nodes">—</span> &nbsp; Edges: <span id="stat-edges">—</span></div>
@@ -1805,52 +1900,39 @@ function withAgent(path) {
 }
 
 async function loadAgents() {
+  // Ensure the URL carries the correct ?agent= param before the first
+  // fetchGraph() call, and sync memory-tier config for the active agent.
+  // The nav-bar agent selector (shared across all tabs) handles switching
+  // via full-page reload; we only need to set the URL default here.
   try {
     const res = await fetch('/api/agents');
     const data = await res.json();
     const agents = data.agents || [];
     const defaultAgent = data.default || (agents[0] && agents[0].name);
     if (agents.length <= 1) {
-      // Single-agent mode — keep dropdown hidden, no URL param needed.
-      return;
+      // Single-agent mode — no URL param or dropdown needed.
+    } else {
+      let current = currentAgent();
+      if (!current || !agents.find(a => a.name === current)) {
+        current = defaultAgent;
+        setCurrentAgent(current);
+      }
     }
-    const sel = document.getElementById('agent-select');
-    sel.innerHTML = '';
-    agents.forEach(a => {
-      const opt = document.createElement('option');
-      opt.value = a.name;
-      const status = a.available ? `(${a.current_node_count})` : '(unavailable)';
-      opt.textContent = `${a.label} ${status}`;
-      if (!a.available && a.error) opt.title = a.error;
-      sel.appendChild(opt);
-    });
-    let current = currentAgent();
-    if (!current || !agents.find(a => a.name === current)) {
-      current = defaultAgent;
-      setCurrentAgent(current);
-    }
-    sel.value = current;
-    document.getElementById('agent-section').style.display = '';
-    sel.onchange = () => {
-      setCurrentAgent(sel.value);
-      fetchGraph();
-      // Refresh the db-path-label AND re-sync memory tier thresholds
-      // for the newly-selected agent. Different agents can have different
-      // config.json values; without this re-sync, switching agents in
-      // multi-agent mode would leave the prior agent's TIER1_MAX/TIER2_MAX
-      // active and compute tiers wrong. Round-4 fairy caught this gap.
-      fetch(withAgent('/api/meta')).then(r => r.json()).then(m => {
-        document.getElementById('db-path-label').textContent = m.db_path || '';
-        if (m.memory_config) {
-          if (typeof m.memory_config.tier1_max_nodes === 'number') {
-            TIER1_MAX = m.memory_config.tier1_max_nodes;
-          }
-          if (typeof m.memory_config.tier2_max_nodes === 'number') {
-            TIER2_MAX = m.memory_config.tier2_max_nodes;
-          }
+    // Always fetch meta to populate db-path-label and sync tier thresholds.
+    // Different agents can have different config.json values; without this
+    // re-sync, switching agents would leave the prior agent's TIER1_MAX/
+    // TIER2_MAX active and compute tiers wrong.
+    fetch(withAgent('/api/meta')).then(r => r.json()).then(m => {
+      document.getElementById('db-path-label').textContent = m.db_path || '';
+      if (m.memory_config) {
+        if (typeof m.memory_config.tier1_max_nodes === 'number') {
+          TIER1_MAX = m.memory_config.tier1_max_nodes;
         }
-      }).catch(() => {});
-    };
+        if (typeof m.memory_config.tier2_max_nodes === 'number') {
+          TIER2_MAX = m.memory_config.tier2_max_nodes;
+        }
+      }
+    }).catch(() => {});
   } catch (err) {
     console.warn('Failed to load agents:', err);
   }
@@ -2004,9 +2086,12 @@ loadAgents().then(() => {
   autoRefreshInterval = setInterval(fetchGraph, 10000);
 });
 </script>
+<!--NAV_SCRIPT_PLACEHOLDER-->
 </body>
 </html>
-"""
+""".replace(_NAV_PLACEHOLDER, _render_nav("graph")).replace(
+    _NAV_SCRIPT_PLACEHOLDER, _NAV_SCRIPT
+).replace(_NAV_CSS_PLACEHOLDER, _NAV_SHARED_CSS)
 
 # ---------------------------------------------------------------------------
 # Agent registry helpers
@@ -2464,19 +2549,12 @@ HEALTH_HTML = r"""<!DOCTYPE html>
                       border-bottom: 1px solid #0f3460; padding-bottom: 4px; margin-bottom: 4px; }
     .cal-col-row { font-size: 0.75em; text-align: center; padding: 2px 0; color: #d0d0d0; }
     .cal-col-type { font-size: 0.72em; color: #aaa; text-align: left; padding: 2px 0; }
+    .nav { display: flex; align-items: center; }
+<!--NAV_CSS_PLACEHOLDER-->
   </style>
 </head>
 <body>
-  <div class="nav">
-    <a href="/">Graph View</a>
-    <a href="/health" style="font-weight:600;">Health Dashboard</a>
-    <a href="/stats">Stats</a>
-    <a href="/config">Config</a>
-    <span id="agent-switcher" style="display:none;margin-left:auto;float:right;">
-      <span style="color:#7ecfff;font-size:0.85em;margin-right:6px;">Agent:</span>
-      <select id="agent-select-health" style="padding:4px 8px;background:#0d1b36;border:1px solid #1a4a8a;border-radius:4px;color:#e0e0e0;font-size:0.85em;outline:none;"></select>
-    </span>
-  </div>
+  <!--NAV_PLACEHOLDER-->
   <h1>ENGRAM Health Dashboard</h1>
   <div id="loading">Loading health data...</div>
   <div id="dashboard" style="display:none;">
@@ -2486,12 +2564,6 @@ HEALTH_HTML = r"""<!DOCTYPE html>
   <script>
   function _currentAgent() {
     return new URL(window.location.href).searchParams.get('agent');
-  }
-  function _setCurrentAgent(name) {
-    const url = new URL(window.location.href);
-    if (name) url.searchParams.set('agent', name);
-    else url.searchParams.delete('agent');
-    window.history.replaceState(null, '', url);
   }
   function _withAgent(path) {
     const a = _currentAgent();
@@ -2523,33 +2595,10 @@ HEALTH_HTML = r"""<!DOCTYPE html>
       });
   }
 
-  // Wire agent dropdown if multi-agent.
-  fetch('/api/agents').then(r => r.json()).then(data => {
-    const agents = data.agents || [];
-    const defaultAgent = data.default || (agents[0] && agents[0].name);
-    if (agents.length <= 1) {
-      loadHealth();
-      return;
-    }
-    const sel = document.getElementById('agent-select-health');
-    agents.forEach(a => {
-      const opt = document.createElement('option');
-      opt.value = a.name;
-      const status = a.available ? `(${a.current_node_count})` : '(unavailable)';
-      opt.textContent = `${a.label} ${status}`;
-      if (!a.available && a.error) opt.title = a.error;
-      sel.appendChild(opt);
-    });
-    let current = _currentAgent();
-    if (!current || !agents.find(a => a.name === current)) {
-      current = defaultAgent;
-      _setCurrentAgent(current);
-    }
-    sel.value = current;
-    document.getElementById('agent-switcher').style.display = '';
-    sel.onchange = () => { _setCurrentAgent(sel.value); loadHealth(); };
-    loadHealth();
-  }).catch(() => loadHealth());
+  // Agent switching is handled by the shared top-nav selector (see
+  // _NAV_SCRIPT); loadHealth() reads _currentAgent() from the URL on each
+  // page load, so no per-tab wiring is needed here.
+  loadHealth();
 
   function render(d) {
     const cards = document.getElementById('cards');
@@ -2826,8 +2875,11 @@ HEALTH_HTML = r"""<!DOCTYPE html>
     cards.innerHTML += cardHtml;
   }
   </script>
+<!--NAV_SCRIPT_PLACEHOLDER-->
 </body>
-</html>"""
+</html>""".replace(_NAV_PLACEHOLDER, _render_nav("health")).replace(
+    _NAV_SCRIPT_PLACEHOLDER, _NAV_SCRIPT
+).replace(_NAV_CSS_PLACEHOLDER, _NAV_SHARED_CSS)
 
 
 # ---------------------------------------------------------------------------
@@ -3607,15 +3659,12 @@ STATS_HTML = r"""<!DOCTYPE html>
     .nav a { color: #00d4ff; text-decoration: none; margin-right: 16px; font-size: 0.9em; }
     .nav a:hover { text-decoration: underline; }
     .privacy-note { color: #888; font-size: 0.75em; margin-top: 24px; text-align: center; font-style: italic; }
+    .nav { display: flex; align-items: center; }
+<!--NAV_CSS_PLACEHOLDER-->
   </style>
 </head>
 <body>
-  <div class="nav">
-    <a href="/">Graph View</a>
-    <a href="/health">Health Dashboard</a>
-    <a href="/stats" style="font-weight:600;">Stats</a>
-    <a href="/config">Config</a>
-  </div>
+  <!--NAV_PLACEHOLDER-->
   <h1>ENGRAM Stats Dashboard <span style="color:#7ecfff;font-size:0.7em;">(last 7 days unless noted)</span></h1>
   <div id="loading">Loading stats…</div>
   <div id="dashboard" style="display:none;">
@@ -3778,8 +3827,11 @@ STATS_HTML = r"""<!DOCTYPE html>
 
   loadStats();
   </script>
+<!--NAV_SCRIPT_PLACEHOLDER-->
 </body>
-</html>"""
+</html>""".replace(_NAV_PLACEHOLDER, _render_nav("stats")).replace(
+    _NAV_SCRIPT_PLACEHOLDER, _NAV_SCRIPT
+).replace(_NAV_CSS_PLACEHOLDER, _NAV_SHARED_CSS)
 
 
 # ---------------------------------------------------------------------------
@@ -3797,15 +3849,10 @@ CONFIG_HTML = r"""<!DOCTYPE html>
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
            background: #1a1a2e; color: #e0e0e0; padding: 24px; }
     h1 { color: #00d4ff; font-size: 1.5em; margin-bottom: 16px; }
-    .nav { margin-bottom: 16px; }
+    .nav { margin-bottom: 16px; display: flex; align-items: center; }
     .nav a { color: #00d4ff; text-decoration: none; margin-right: 16px; font-size: 0.9em; }
     .nav a:hover { text-decoration: underline; }
-
-    /* Agent picker */
-    .agent-picker { display: none; margin-bottom: 18px; }
-    .agent-picker label { color: #7ecfff; font-size: 0.85em; margin-right: 6px; }
-    .agent-picker select { padding: 4px 8px; background: #0d1b36; border: 1px solid #1a4a8a;
-                            border-radius: 4px; color: #e0e0e0; font-size: 0.85em; outline: none; }
+<!--NAV_CSS_PLACEHOLDER-->
 
     /* Section cards */
     .section-card { background: #16213e; border-radius: 8px; padding: 16px;
@@ -3927,18 +3974,8 @@ CONFIG_HTML = r"""<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <div class="nav">
-    <a href="/">Graph View</a>
-    <a href="/health">Health Dashboard</a>
-    <a href="/stats">Stats</a>
-    <a href="/config" style="font-weight:600;">Config</a>
-  </div>
+  <!--NAV_PLACEHOLDER-->
   <h1>ENGRAM Config</h1>
-
-  <div class="agent-picker" id="agent-picker">
-    <label for="agent-select-config">Agent:</label>
-    <select id="agent-select-config"></select>
-  </div>
 
   <div id="cfg-loading">Loading config…</div>
   <div id="cfg-error" style="display:none;"></div>
@@ -3958,12 +3995,6 @@ CONFIG_HTML = r"""<!DOCTYPE html>
   function _currentAgent() {
     return new URL(window.location.href).searchParams.get('agent');
   }
-  function _setCurrentAgent(name) {
-    const url = new URL(window.location.href);
-    if (name) url.searchParams.set('agent', name);
-    else url.searchParams.delete('agent');
-    window.location.href = url.toString();
-  }
   function _withAgent(path) {
     const a = _currentAgent();
     if (!a) return path;
@@ -3976,33 +4007,8 @@ CONFIG_HTML = r"""<!DOCTYPE html>
       .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
-  // ── Agent picker ─────────────────────────────────────────────────────────
-  async function loadAgentPicker() {
-    try {
-      const res = await fetch('/api/agents');
-      const data = await res.json();
-      const agents = data.agents || [];
-      if (agents.length <= 1) return;
-      const picker = document.getElementById('agent-picker');
-      const sel = document.getElementById('agent-select-config');
-      sel.innerHTML = '';
-      agents.forEach(a => {
-        const opt = document.createElement('option');
-        opt.value = a.name;
-        opt.textContent = a.label + (a.available ? '' : ' (unavailable)');
-        sel.appendChild(opt);
-      });
-      let current = _currentAgent();
-      if (!current || !agents.find(a => a.name === current)) {
-        current = data.default || (agents[0] && agents[0].name);
-      }
-      if (current) sel.value = current;
-      picker.style.display = '';
-      sel.onchange = () => { _setCurrentAgent(sel.value); };
-    } catch (e) {
-      console.warn('agent picker failed:', e);
-    }
-  }
+  // Agent switching is handled by the shared top-nav selector (_NAV_SCRIPT);
+  // no per-tab selector wiring needed here.
 
   // ── Config write (saveField) ─────────────────────────────────────────────
   async function saveField(key, value) {
@@ -4375,11 +4381,13 @@ CONFIG_HTML = r"""<!DOCTYPE html>
     }
   }
 
-  loadAgentPicker();
   loadConfig();
   </script>
+<!--NAV_SCRIPT_PLACEHOLDER-->
 </body>
-</html>"""
+</html>""".replace(_NAV_PLACEHOLDER, _render_nav("config")).replace(
+    _NAV_SCRIPT_PLACEHOLDER, _NAV_SCRIPT
+).replace(_NAV_CSS_PLACEHOLDER, _NAV_SHARED_CSS)
 
 
 # ---------------------------------------------------------------------------
