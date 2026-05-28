@@ -203,7 +203,8 @@ USE_ALPHA = {
     "supersede":       0.15,
     "contradict":      0.15,
     "resolve":         0.15,
-    "lesson_incident": 0.15,
+    "lesson_incident":   0.15,  # legacy key; preserved for backward-compat
+    "register_exemplar": 0.15,  # unified key (used by engram_register_exemplar)
     # Tier 2 — moderate engagement
     "inspect":         0.10,
     "subgraph":        0.10,
@@ -10687,22 +10688,29 @@ def _remove_edge_impl(
         )
 
         # `exemplifies` is the only whitelist relation with metadata + filesystem
-        # side effects (engram_lesson_register_incident bumps lesson.incident_count
-        # + appends to error_incidents.json). Mirror the reverse inside the same
-        # transaction so the lesson's surface-rendered count stays honest. The
-        # error_incidents.json rebuild happens outside the transaction (best-
-        # effort, never blocks the edge write — matches register_incident's
-        # treatment at line ~8400).
-        if relation == "exemplifies" and target["type"] == "lesson":
-            lesson_row = conn.execute(
+        # side effects (engram_register_exemplar bumps target.exemplar_count
+        # + appends to error_incidents.json for lessons). Mirror the reverse
+        # inside the same transaction so the surface-rendered count stays
+        # honest. The error_incidents.json rebuild happens outside the
+        # transaction (best-effort, never blocks the edge write — matches
+        # register_exemplar's treatment).
+        #
+        # Counter-field migration (PR #434): read `exemplar_count` (canonical
+        # post-unification) with fallback to legacy `incident_count`; write
+        # `exemplar_count` and clear `incident_count` — mirror the write path
+        # so the two sides stay symmetric. Applies to BOTH lesson and
+        # cornerstone targets since the unified tool writes to both.
+        if relation == "exemplifies" and target["type"] in ("lesson", "cornerstone"):
+            tgt_row = conn.execute(
                 "SELECT metadata FROM nodes WHERE id = ?", (target_id,)
             ).fetchone()
             try:
-                meta = json.loads(lesson_row["metadata"]) if lesson_row and lesson_row["metadata"] else {}
+                meta = json.loads(tgt_row["metadata"]) if tgt_row and tgt_row["metadata"] else {}
             except (TypeError, json.JSONDecodeError):
                 meta = {}
-            current = int(meta.get("incident_count", 0))
-            meta["incident_count"] = max(0, current - 1)
+            existing = int(meta.get("exemplar_count", meta.get("incident_count", 0)))
+            meta["exemplar_count"] = max(0, existing - 1)
+            meta.pop("incident_count", None)  # clear legacy
             conn.execute(
                 "UPDATE nodes SET metadata = ? WHERE id = ?",
                 (json.dumps(meta), target_id),
@@ -11638,12 +11646,10 @@ _LESSON_REGISTER_INCIDENT_FIELDS = frozenset({
     },
 )
 def engram_lesson_register_incident(payload_json: str) -> str:
-    """Register a post-hoc incident observation as another instance of an
-    existing lesson's pattern.
-
-    Strengthens the lesson with empirical incident evidence + bumps the recall-
-    hook's pattern-cache so the lesson surfaces more readily for similar
-    situations. Idempotent — safe to re-run.
+    """Backward-compat alias for engram_register_exemplar (lesson case).
+    New code should use engram_register_exemplar with target_id/exemplar_id.
+    Preserves the lesson-specific field names (lesson_id, incident_id) for
+    historical callers in skills, tests, and prior session scaffolding.
 
     Pass all fields as one JSON object string in payload_json.
 
@@ -11658,11 +11664,11 @@ def engram_lesson_register_incident(payload_json: str) -> str:
 
     Returns:
         JSON with status + the new edge's source/target, the lesson's
-        current incident count, and cache rebuild result. On
+        current exemplar count, and cache rebuild result. On
         payload-parsing failure, returns {"error": "..."}.
 
-    See _lesson_register_incident_impl for full semantics — kept callable
-    with named kwargs for in-server callers.
+    See _lesson_register_incident_impl for direct named-kwarg access.
+    Delegates to _register_exemplar_impl internally.
     """
     try:
         params = json.loads(payload_json)
@@ -11678,208 +11684,94 @@ def engram_lesson_register_incident(payload_json: str) -> str:
                      f"Allowed: {sorted(_LESSON_REGISTER_INCIDENT_FIELDS)}"
         })
 
-    return _lesson_register_incident_impl(**params)
-
-
-def _lesson_register_incident_impl(
-    lesson_id: str = "",
-    incident_id: str = "",
-    note: str = "",
-) -> str:
-    """Internal implementation — see engram_lesson_register_incident MCP tool
-    for the public payload schema. Kept callable with named kwargs for
-    in-server callers.
-
-    Register a post-hoc incident observation as another instance of an
-    existing lesson's pattern.
-
-    Post-hoc path for lesson growth: when a new error incident surfaces that
-    exemplifies a lesson already in the graph, attach it with one call
-    instead of superseding the lesson. Writes one `exemplifies` edge
-    (incident → lesson, DAG-exempt) and refreshes the error_incidents.json
-    cache so the surface hook picks it up without code changes.
-
-    This is the distinct-cognitive-act path (ob_1235): recognizing that a
-    fresh error matches a known lesson is its own moment, worth a dedicated
-    call. The initial-creation path (incidents known at lesson birth) stays
-    on `engram_add_lesson(..., incident_ids=[...])`.
-
-    Args:
-        lesson_id: ID of an existing lesson node (type='lesson', is_current=1).
-        incident_id: ID of the incident observation. Must be claim-bearing
-            (observation_factual, observation_predictive, derivation, theory,
-            axiom, conjecture).
-        note: Optional brief annotation of why this incident exemplifies the
-            lesson — stored on the edge's metadata field for audit.
-
-    Returns:
-        JSON with status + the new edge's source/target, the lesson's
-        current incident count, and cache rebuild result.
-    """
-    if not lesson_id or not lesson_id.strip():
+    # Validate required fields using alias field names for backward-compat
+    # error messages that callers may depend on.
+    if "lesson_id" not in params or not (params.get("lesson_id") or "").strip():
         return json.dumps({"error": "lesson_id is required and cannot be empty."})
-    if not incident_id or not incident_id.strip():
+    if "incident_id" not in params or not (params.get("incident_id") or "").strip():
         return json.dumps({"error": "incident_id is required and cannot be empty."})
-    conn = _get_db()
+
+    # Field translation: lesson_id → target_id, incident_id → exemplar_id
+    unified_params: dict = {
+        "target_id": params["lesson_id"],
+        "exemplar_id": params["incident_id"],
+    }
+    if "note" in params:
+        unified_params["note"] = params["note"]
+
+    raw = _register_exemplar_impl(**unified_params)
+    # Backward-compat: translate "already_exists" → "noop" for lesson callers
+    # that depend on the original lesson-tool idempotency contract.
     try:
-        lesson_row = conn.execute(
-            "SELECT id, type, claim, metadata, is_current FROM nodes WHERE id = ?",
-            (lesson_id,),
-        ).fetchone()
-        if not lesson_row:
-            return json.dumps({"error": f"Lesson node not found: {lesson_id}"})
-        if lesson_row["type"] != "lesson":
-            return json.dumps({
-                "error": f"Target must be a lesson node. {lesson_id} has type '{lesson_row['type']}'.",
-            })
-        if not lesson_row["is_current"]:
-            return json.dumps({
-                "error": f"Target lesson {lesson_id} is superseded (is_current=0). "
-                         f"Register against its current replacement.",
-            })
-
-        incident_row = conn.execute(
-            "SELECT id, type FROM nodes WHERE id = ?",
-            (incident_id,),
-        ).fetchone()
-        if not incident_row:
-            return json.dumps({"error": f"Incident node not found: {incident_id}"})
-        if incident_row["type"] not in CLAIM_BEARING_TYPES:
-            return json.dumps({
-                "error": f"Incident must be claim-bearing. {incident_id} has type "
-                         f"'{incident_row['type']}'.",
-            })
-
-        # Idempotent — report existing edge as no-op rather than error.
-        existing = conn.execute(
-            """SELECT id FROM edges
-               WHERE source_id = ? AND target_id = ? AND relation = 'exemplifies'""",
-            (incident_id, lesson_id),
-        ).fetchone()
-        if existing:
-            count_row = conn.execute(
-                """SELECT COUNT(*) AS c FROM edges
-                   WHERE target_id = ? AND relation = 'exemplifies'""",
-                (lesson_id,),
-            ).fetchone()
-            return json.dumps({
-                "status": "noop",
-                "reason": "edge already exists",
-                "edge": {"source": incident_id, "target": lesson_id, "relation": "exemplifies"},
-                "lesson_incident_count": count_row["c"] if count_row else None,
-            })
-
-        now = _now()
-        edge_meta = json.dumps({"note": note}) if note else None
-        conn.execute(
-            """INSERT INTO edges (source_id, target_id, relation, created_at, metadata)
-               VALUES (?, ?, 'exemplifies', ?, ?)""",
-            (incident_id, lesson_id, now, edge_meta),
-        )
-
-        # Bump the lesson's incident_count in metadata so engram_reflect / inspect
-        # rendering stays consistent without a full count requery every time.
-        try:
-            meta = json.loads(lesson_row["metadata"]) if lesson_row["metadata"] else {}
-        except (TypeError, json.JSONDecodeError):
-            meta = {}
-        meta["incident_count"] = int(meta.get("incident_count", 0)) + 1
-        conn.execute(
-            "UPDATE nodes SET metadata = ? WHERE id = ?",
-            (json.dumps(meta), lesson_id),
-        )
-        _utility_reward(conn, [lesson_id], action="lesson_incident")
-        conn.commit()
-
-        count_row = conn.execute(
-            """SELECT COUNT(*) AS c FROM edges
-               WHERE target_id = ? AND relation = 'exemplifies'""",
-            (lesson_id,),
-        ).fetchone()
-        incident_count = count_row["c"] if count_row else None
-    finally:
-        conn.close()
-
-    # Refresh the JSON cache from the graph (outside the transaction —
-    # best-effort, never blocks the edge write).
-    try:
-        cache_result = _rebuild_incidents_cache()
-    except Exception as exc:
-        cache_result = {"status": "error", "detail": str(exc)}
-
-    return json.dumps({
-        "status": "created",
-        "edge": {
-            "source": incident_id,
-            "target": lesson_id,
-            "relation": "exemplifies",
-            "note": note or None,
-        },
-        "lesson_id": lesson_id,
-        "lesson_claim": lesson_row["claim"],
-        "lesson_incident_count": incident_count,
-        "cache_rebuild": cache_result,
-    })
+        result = json.loads(raw)
+        if isinstance(result, dict) and result.get("status") == "already_exists":
+            result["status"] = "noop"
+            result["reason"] = "edge already exists"
+            raw = json.dumps(result)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return raw
 
 
-_REGISTER_CORNERSTONE_EXEMPLAR_FIELDS = frozenset({
-    "cornerstone_id", "exemplar_id", "note",
+_REGISTER_EXEMPLAR_FIELDS = frozenset({
+    "target_id", "exemplar_id", "note",
 })
 
+_VALID_EXEMPLAR_TARGET_TYPES = frozenset({"lesson", "cornerstone"})
 
-# DESIGN INTENT — engram_register_cornerstone_exemplar
-# -----------------------------------------------------
-# Strengthens a cornerstone by registering ANOTHER instance of its pattern
-# surfacing. Cornerstones (cs_NNNN) are identity-scaffold operating principles
-# — each new exemplar is empirical evidence the principle is load-bearing.
+
+# DESIGN INTENT — engram_register_exemplar
+# -----------------------------------------
+# Unified exemplar-registration tool that handles BOTH lesson AND cornerstone
+# targets. Eliminates the redundant type-specific split that previously existed
+# (two ~95% identical tool bodies, same edge semantics, same idempotency contract).
+# engram_lesson_register_incident is retained as a backward-compat alias.
 #
-# Mirrors engram_lesson_register_incident for the cornerstone case: wires an
-# `exemplifies` edge from exemplar → cornerstone (DAG-exempt). Unlike the
-# lesson path, there is no error_incidents.json cache for cornerstones (no
-# surface hook needs it today), so no cache rebuild step here.
+# For lesson targets: fires the tripwire cache rebuild (error_incidents.json)
+# that the surface hook scans on every prompt.
+# For cornerstone targets: no cache rebuild today (room reserved for a future
+# cornerstone-tripwire mechanism per Lei's design intent).
 #
-# The `_detect_zero_support` helper (PR #421) already queries incoming
-# `exemplifies` edges for both lessons AND cornerstones — the new edges
-# created here feed that detection path without code changes.
+# The `exemplifies` edge written here (exemplar → target, DAG-exempt) feeds
+# `_detect_zero_support` for both types without code changes (PR #421).
+#
+# Backward compat: engram_lesson_register_incident remains as a thin alias
+# that translates lesson_id/incident_id field names and delegates here.
 #
 # Single-payload signature (per engram-alpha CLAUDE.md convention).
 @mcp.tool(
-    name="engram_register_cornerstone_exemplar",
+    name="engram_register_exemplar",
     annotations={
-        "title": "Register Exemplar on Existing Cornerstone",
+        "title": "Register Exemplar on Lesson or Cornerstone",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
     },
 )
-def engram_register_cornerstone_exemplar(payload_json: str) -> str:
-    """Register a post-hoc observation/derivation as another instance
-    supporting an existing cornerstone's pattern.
-
-    Strengthens the cornerstone with empirical exemplar evidence. Mirrors
-    engram_lesson_register_incident for the lesson case; semantic is the
-    same (accumulating votes for an emerged pattern), the target type
-    differs.
+def engram_register_exemplar(payload_json: str) -> str:
+    """Register an exemplar (claim-bearing observation/derivation) against
+    an emergent-pattern node (lesson OR cornerstone). Writes one `exemplifies`
+    edge (exemplar → target, DAG-exempt) and refreshes any tripwire cache
+    the target type supports.
 
     Pass all fields as one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
-            cornerstone_id (str, required): ID of an existing cornerstone
-                (type='cornerstone', is_current=1).
-            exemplar_id (str, required): ID of the exemplar
-                observation/derivation. Must be claim-bearing.
-            note (str, optional): Brief annotation of why this exemplar
-                fits the cornerstone — stored on the edge's metadata.
+            target_id (str, required): ID of an existing lesson or cornerstone,
+                type in {'lesson', 'cornerstone'}, is_current=1.
+            exemplar_id (str, required): ID of an existing claim-bearing node
+                (observation/derivation/theory/axiom/conjecture).
+            note (str, optional): Brief annotation stored on edge metadata.
 
     Returns:
-        JSON with status + the new edge's source/target, the cornerstone's
-        current exemplar count, plus the cornerstone's claim for verification.
+        JSON with status + edge source/target + target's current exemplar count.
+        If target is a lesson, also refreshes error_incidents.json cache.
+        If target is a cornerstone, no cache refresh (no cornerstone cache today;
+        room reserved for future cornerstone-tripwire mechanism per Lei's
+        design intent).
         On payload-parsing failure, returns {"error": "..."}.
-
-    See _register_cornerstone_exemplar_impl for full semantics — kept
-    callable with named kwargs for in-server callers.
     """
     try:
         params = json.loads(payload_json)
@@ -11888,71 +11780,75 @@ def engram_register_cornerstone_exemplar(payload_json: str) -> str:
     if not isinstance(params, dict):
         return json.dumps({"error": "payload_json must be a JSON object"})
 
-    unknown = set(params.keys()) - _REGISTER_CORNERSTONE_EXEMPLAR_FIELDS
+    unknown = set(params.keys()) - _REGISTER_EXEMPLAR_FIELDS
     if unknown:
         return json.dumps({
             "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
-                     f"Allowed: {sorted(_REGISTER_CORNERSTONE_EXEMPLAR_FIELDS)}"
+                     f"Allowed: {sorted(_REGISTER_EXEMPLAR_FIELDS)}"
         })
 
-    return _register_cornerstone_exemplar_impl(**params)
+    return _register_exemplar_impl(**params)
 
 
-def _register_cornerstone_exemplar_impl(
-    cornerstone_id: str = "",
+def _register_exemplar_impl(
+    target_id: str = "",
     exemplar_id: str = "",
     note: str = "",
 ) -> str:
-    """Internal implementation — see engram_register_cornerstone_exemplar MCP
-    tool for the public payload schema. Kept callable with named kwargs for
+    """Internal implementation — see engram_register_exemplar MCP tool
+    for the public payload schema. Kept callable with named kwargs for
     in-server callers.
 
     Register a post-hoc exemplar as another instance of an existing
-    cornerstone's pattern.
+    lesson or cornerstone's pattern.
 
-    Post-hoc path for cornerstone growth: when a new observation or derivation
-    surfaces that exemplifies a cornerstone already in the graph, attach it
-    with one call instead of superseding the cornerstone. Writes one
-    `exemplifies` edge (exemplar → cornerstone, DAG-exempt).
+    Post-hoc path for pattern-node growth: when a new observation or
+    derivation surfaces that exemplifies a lesson or cornerstone already
+    in the graph, attach it with one call instead of superseding the
+    target. Writes one `exemplifies` edge (exemplar → target, DAG-exempt).
 
-    Unlike the lesson path, there is no per-cornerstone incident cache to
-    refresh (cornerstones have no surface hook today). The `exemplifies` edge
-    created here feeds `_detect_zero_support` (PR #421) which already queries
-    incoming exemplifies edges for cornerstones.
+    For lesson targets, refreshes the error_incidents.json cache that the
+    surface hook scans on every prompt.
 
     Args:
-        cornerstone_id: ID of an existing cornerstone node (type='cornerstone',
-            is_current=1).
+        target_id: ID of an existing lesson or cornerstone node
+            (is_current=1).
         exemplar_id: ID of the exemplar node. Must be claim-bearing
             (observation_factual, observation_predictive, derivation, theory,
             axiom, conjecture).
         note: Optional brief annotation of why this exemplar fits the
-            cornerstone — stored on the edge's metadata field for audit.
+            target — stored on the edge's metadata field for audit.
 
     Returns:
-        JSON with status + the new edge's source/target, the cornerstone's
-        current exemplar count, and the cornerstone's claim for verification.
+        JSON with status + the new edge's source/target, the target's
+        current exemplar count, and the target's claim for verification.
+        For lesson targets, also includes cache_rebuild result.
     """
-    if not cornerstone_id or not cornerstone_id.strip():
-        return json.dumps({"error": "cornerstone_id is required and cannot be empty."})
+    if not target_id or not target_id.strip():
+        return json.dumps({"error": "target_id is required and cannot be empty."})
     if not exemplar_id or not exemplar_id.strip():
         return json.dumps({"error": "exemplar_id is required and cannot be empty."})
     conn = _get_db()
     try:
-        cs_row = conn.execute(
-            "SELECT id, type, claim, is_current FROM nodes WHERE id = ?",
-            (cornerstone_id,),
+        target_row = conn.execute(
+            "SELECT id, type, claim, metadata, is_current FROM nodes WHERE id = ?",
+            (target_id,),
         ).fetchone()
-        if not cs_row:
-            return json.dumps({"error": f"Cornerstone node not found: {cornerstone_id}"})
-        if cs_row["type"] != "cornerstone":
+        if not target_row:
+            return json.dumps({"error": f"Target node not found: {target_id}"})
+        if target_row["type"] not in _VALID_EXEMPLAR_TARGET_TYPES:
             return json.dumps({
-                "error": f"Target must be a cornerstone node. {cornerstone_id} has type '{cs_row['type']}'.",
+                "error": (
+                    f"Target must be a lesson or cornerstone node. "
+                    f"{target_id} has type '{target_row['type']}'."
+                ),
             })
-        if not cs_row["is_current"]:
+        if not target_row["is_current"]:
             return json.dumps({
-                "error": f"Target cornerstone {cornerstone_id} is superseded (is_current=0). "
-                         f"Register against its current replacement.",
+                "error": (
+                    f"Target {target_id} is superseded (is_current=0). "
+                    f"Register against its current replacement."
+                ),
             })
 
         exemplar_row = conn.execute(
@@ -11963,28 +11859,30 @@ def _register_cornerstone_exemplar_impl(
             return json.dumps({"error": f"Exemplar node not found: {exemplar_id}"})
         if exemplar_row["type"] not in CLAIM_BEARING_TYPES:
             return json.dumps({
-                "error": f"Exemplar must be claim-bearing. {exemplar_id} has type "
-                         f"'{exemplar_row['type']}'.",
+                "error": (
+                    f"Exemplar must be claim-bearing. {exemplar_id} has type "
+                    f"'{exemplar_row['type']}'."
+                ),
             })
 
         # Idempotent — report existing edge as already_exists rather than error.
         existing = conn.execute(
             """SELECT id FROM edges
                WHERE source_id = ? AND target_id = ? AND relation = 'exemplifies'""",
-            (exemplar_id, cornerstone_id),
+            (exemplar_id, target_id),
         ).fetchone()
         if existing:
             count_row = conn.execute(
                 """SELECT COUNT(*) AS c FROM edges
                    WHERE target_id = ? AND relation = 'exemplifies'""",
-                (cornerstone_id,),
+                (target_id,),
             ).fetchone()
             return json.dumps({
                 "status": "already_exists",
-                "edge": {"source": exemplar_id, "target": cornerstone_id, "relation": "exemplifies"},
-                "cornerstone_id": cornerstone_id,
-                "cornerstone_claim": cs_row["claim"],
-                "cornerstone_exemplar_count": count_row["c"] if count_row else None,
+                "edge": {"source": exemplar_id, "target": target_id, "relation": "exemplifies"},
+                "target_id": target_id,
+                "target_claim": target_row["claim"],
+                "exemplar_count": count_row["c"] if count_row else None,
             })
 
         now = _now()
@@ -11992,32 +11890,63 @@ def _register_cornerstone_exemplar_impl(
         conn.execute(
             """INSERT INTO edges (source_id, target_id, relation, created_at, metadata)
                VALUES (?, ?, 'exemplifies', ?, ?)""",
-            (exemplar_id, cornerstone_id, now, edge_meta),
+            (exemplar_id, target_id, now, edge_meta),
         )
-        _utility_reward(conn, [cornerstone_id], action="lesson_incident")
+
+        # Bump the exemplar_count in metadata so engram_reflect / inspect
+        # rendering stays consistent without a full count requery every time.
+        # Backward compat: read incident_count if present (existing lessons),
+        # write under the new canonical name exemplar_count, and clear the
+        # old incident_count key to avoid drift.
+        try:
+            meta = json.loads(target_row["metadata"]) if target_row["metadata"] else {}
+        except (TypeError, json.JSONDecodeError):
+            meta = {}
+        # Migrate: prefer exemplar_count, fall back to incident_count for old lessons.
+        existing_count = meta.get("exemplar_count", meta.get("incident_count", 0))
+        meta["exemplar_count"] = int(existing_count) + 1
+        # Clear old key if present to avoid drift.
+        meta.pop("incident_count", None)
+        conn.execute(
+            "UPDATE nodes SET metadata = ? WHERE id = ?",
+            (json.dumps(meta), target_id),
+        )
+        _utility_reward(conn, [target_id], action="register_exemplar")
         conn.commit()
 
         count_row = conn.execute(
             """SELECT COUNT(*) AS c FROM edges
                WHERE target_id = ? AND relation = 'exemplifies'""",
-            (cornerstone_id,),
+            (target_id,),
         ).fetchone()
         exemplar_count = count_row["c"] if count_row else None
     finally:
         conn.close()
 
-    return json.dumps({
+    result = {
         "status": "created",
         "edge": {
             "source": exemplar_id,
-            "target": cornerstone_id,
+            "target": target_id,
             "relation": "exemplifies",
             "note": note or None,
         },
-        "cornerstone_id": cornerstone_id,
-        "cornerstone_claim": cs_row["claim"],
-        "cornerstone_exemplar_count": exemplar_count,
-    })
+        "target_id": target_id,
+        "target_claim": target_row["claim"],
+        "exemplar_count": exemplar_count,
+    }
+
+    # Tripwire cache refresh: only fires for lesson targets.
+    # For cornerstone targets, no cache today — future cornerstone-tripwire
+    # mechanism may extend this.
+    if target_row["type"] == "lesson":
+        try:
+            cache_result = _rebuild_incidents_cache()
+        except Exception as exc:
+            cache_result = {"status": "error", "detail": str(exc)}
+        result["cache_rebuild"] = cache_result
+
+    return json.dumps(result)
 
 
 # ── Task importance constants ──

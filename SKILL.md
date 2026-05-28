@@ -426,10 +426,10 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
   `(claim, basis, [initial_confidence, context_ids])`
 - **engram_add_lesson** — Rule learned from an incident, with scaffolding nudge. Incidents are linked with `exemplifies` edges (incident → lesson, DAG-exempt).
   `(claim, incident_ids, scaffolding_nudge, logical_chain, [reasoning_type, context_ids])`
-- **engram_lesson_register_incident** — Attach a post-hoc incident to an existing lesson. Writes one `exemplifies` edge and refreshes the surface-hook cache. Use when a fresh error surfaces that matches a lesson already in the graph — avoids supersede churn. Idempotent.
+- **engram_register_exemplar** — Unified exemplar registration for lessons AND cornerstones. Writes one `exemplifies` edge (exemplar → target, DAG-exempt); for lesson targets, also refreshes the surface-hook cache. Use when a new observation or derivation surfaces that reinforces a lesson's pattern or a cornerstone's principle — avoids supersede churn. Feeds `_detect_zero_support` live-support counting. Idempotent.
+  `(target_id, exemplar_id, [note])`
+- **engram_lesson_register_incident** — Backward-compat alias for `engram_register_exemplar` (lesson case). New code should use `engram_register_exemplar` with `target_id`/`exemplar_id`. Accepts legacy field names `lesson_id`/`incident_id`. Idempotent.
   `(lesson_id, incident_id, [note])`
-- **engram_register_cornerstone_exemplar** — Attach a post-hoc exemplar to an existing cornerstone. Writes one `exemplifies` edge (exemplar → cornerstone, DAG-exempt). Use when a new observation or derivation surfaces that reinforces a cornerstone's pattern — avoids supersede churn. Feeds `_detect_zero_support` live-support counting. Idempotent.
-  `(cornerstone_id, exemplar_id, [note])`
 
 ### Write — structural
 

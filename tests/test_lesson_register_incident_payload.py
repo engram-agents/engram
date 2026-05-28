@@ -149,13 +149,19 @@ def test_payload_json_nonexistent_lesson_rejected():
 
 
 def test_impl_callable_with_kwargs():
-    """In-server callers should be able to call _lesson_register_incident_impl directly."""
+    """In-server callers should be able to call the unified impl directly.
+
+    PR #434 collapsed the lesson-specific impl into the unified
+    _register_exemplar_impl. The kwargs path now uses target_id/exemplar_id
+    (unified field names); the lesson-specific kwargs (lesson_id/incident_id)
+    are translated by the engram_lesson_register_incident alias wrapper.
+    """
     server = fresh_server()
     lesson_id = _seed_lesson(server)
     new_inc = _seed_axiom(server, "Direct-impl test incident.")
-    r = json.loads(server._lesson_register_incident_impl(
-        lesson_id=lesson_id,
-        incident_id=new_inc,
+    r = json.loads(server._register_exemplar_impl(
+        target_id=lesson_id,
+        exemplar_id=new_inc,
         note="Direct-impl smoke test.",
     ))
     assert "error" not in r, r
