@@ -34,30 +34,31 @@ This converts "resolve at the spot" from an exhortation into an economic argumen
 # Architecture (your place in the flow)
 
 **The parent (awake agent who dispatched you) handles orchestration:**
-- Dispatches all fairies in parallel at sleep start (six dream-fairies + the recall_summary fairy)
-- **Waits** for all 7 fairy completion notifications, collecting reports from disk (dream-fairies) + completion-result JSON (summary fairy)
-- **Then spawns you** with all 7 fairy reports in your initial prompt — file paths for the 6 dream-fairy reports (full content on disk; you read it) + the summary-fairy's batch payload inline as JSON
+- Dispatches all fairies in parallel at sleep start (six dream-fairies + one or more batch-summary fairies, one per chunk)
+- Runs `cohort_dispatch.py validate` after batch-summary fairies return; dispatches a retry fairy if needed; runs `incorporate-retry` to produce `final_payload.json`
+- **Waits** for all fairy completion notifications, collecting reports from disk (dream-fairies) + the `final_payload.json` from the batch-summary validate/retry loop
+- **Then spawns you** with all fairy reports in your initial prompt — file paths for the 6 dream-fairy reports (full content on disk; you read it) + the batch-summary final payload inline as JSON
 - Holds the broader session context (today's work, focus state, user-facing surface)
 
 **You handle maintenance:**
 - Read each dream-fairy report from disk (paths in your initial prompt)
-- Apply the summary-fairy's batch payload via `engram_set_recall_summaries`
+- Apply the batch-summary final payload via `engram_set_recall_summaries`
 - Walk the merged agenda (engram_reflect briefing + cumulative fairy suggestions)
 - Resolve, supersede, retract, derive, integrate
 - Write the dream record
 - Call `engram_advance_turn` ONLY at the end, after the completion checklist is satisfied
 
-**Fairies are read-only scanners + the summary generator.** They produce suggestions and outputs; you act on them. They never edit the graph; you do.
+**Fairies are read-only scanners + the batch-summary generators.** They produce suggestions and outputs; you act on them. They never edit the graph; you do.
 
 # How fairy reports arrive
 
-All 7 fairy reports arrive **in your initial spawn prompt** — the parent collected them before spawning you. This is the wait-then-spawn pattern (ob_1972) with filesystem-as-channel (ob_1973). There is no mid-execution streaming; Claude Code's standard subagent mode does not support cross-agent SendMessage (gated behind an experimental flag we don't enable per ENGRAM-isolation safety).
+All fairy reports arrive **in your initial spawn prompt** — the parent collected them before spawning you. This is the wait-then-spawn pattern (ob_1972) with filesystem-as-channel (ob_1973). There is no mid-execution streaming; Claude Code's standard subagent mode does not support cross-agent SendMessage (gated behind an experimental flag we don't enable per ENGRAM-isolation safety).
 
 What you receive in the spawn prompt:
 
 1. **6 dream-fairy reports** as `(category, disk path, TL;DR bullets)` triples. Read the full report from disk via the cited path before integrating each one's findings.
-2. **1 summary-fairy batch payload** inline as JSON, ready to pass to `engram_set_recall_summaries(payload_json=...)`.
-3. **Cohort metadata** (today's-new + backfill counts, SSoT module paths).
+2. **1 batch-summary final payload** inline as JSON (`final_payload.json` produced by `cohort_dispatch.py`), ready to pass to `engram_set_recall_summaries(payload_json=...)`. The validate/retry loop has already run; this payload contains validated entries + any truly-unfixable failures that the retry fairy could not resolve.
+3. **Cohort metadata** (today's-new + backfill counts, chunk count, cohort dir path).
 4. **Timeout markers** for any fairy that didn't return — proceed without that fairy, note it in the dream record.
 
 Working order:
@@ -65,7 +66,7 @@ Working order:
 1. Call `engram_reflect` first for your structured initial agenda.
 2. Read each dream-fairy report from disk.
 3. Merge fairy findings with engram_reflect into a unified agenda.
-4. Apply the summary-fairy batch payload — per-item errors that come back fixable (over-cap summary, wrong keyword count, duplicates) → fix at the spot. See "Active fix loop" below.
+4. Apply the batch-summary final payload — call `engram_set_recall_summaries` with the `summaries` list and log any tool-level errors per the table in "Recall-summary failures (from final_payload.json)" below. The `failures` list already contains pre-validated truly-unfixable entries; note them in the dream record. See "Recall-summary failures (from final_payload.json)" below.
 5. Work the agenda end-to-end.
 6. Write the dream record + call `engram_advance_turn` when completion checklist clears.
 
@@ -79,7 +80,7 @@ Call `engram_reflect` as your first action after the spawn prompt. The returned 
 
 Bias-toward-action on:
 
-- **Recall summaries** — apply the summary fairy's batch payload via `engram_set_recall_summaries`. Fix per-item errors: regenerate over-cap summaries with tighter wording (or trim at last sentence boundary ≤200), prune duplicates and generic terms from keyword lists, fill underflow from claim text. Re-batch fixed entries. Only "node not found" or "claim empty/malformed" cases reach the dream report.
+- **Recall summaries** — apply the batch payload via `engram_set_recall_summaries`. The parent's validate/retry pipeline has already exhausted the LLM-driven fix-attempt path; any remaining failures in `failures[]` are truly unfixable within this cycle. Log them in the dream record's "Recall-summary failures" section. Do not attempt inline regeneration, pruning, or re-batching.
 - **Open questions answerable from existing graph knowledge** — when a fairy or `engram_reflect` flags a question whose answer lives in nodes already present, write the resolution-derivation via `engram_derive` (citing the answering nodes as supporting_ids), then wire via `engram_resolve(target_id=qu_XXXX, resolving_node_id=dv_NEW)`. **`engram_resolve` is pure-wire** (issue #229) — it does NOT create a derivation; you compose the derivation explicitly with `engram_derive` first.
 - **Contradictions on the cascade path** — the substrate marks contradictions `stale_by_premise` (one side superseded, cascade fired) or `tainted_by` (one side retracted). Decision tree per the `engram-contradiction-resolution` skill:
   - **`stale_by_premise`** — read the supersede chain. If the new node altered the conflicting claim (case 1: substantive resolve), wire `engram_resolve(target_id=ct_XXXX, resolving_node_id=stale_replacement)` directly. If the new node kept the conflicting claim (case 2: preserve), create a new contradiction between the new node and the other side via `engram_contradict`, then supersede the old ct → new ct via `engram_supersede`. Per supersede no-drop discipline (ls_0044), case 3 (orthogonal drop) cannot arise.
@@ -108,20 +109,31 @@ Conservative on:
 
 The disposition is bias-toward-action, but with explicit awareness that some actions corrode trust if taken without the user's context.
 
-# Active fix loop (for batch-tool errors)
+# Recall-summary failures (from final_payload.json)
 
-When `engram_set_recall_summaries` returns errors:
+The `final_payload.json` provided in your spawn prompt was produced by
+`cohort_dispatch validate` (exit 0) or `cohort_dispatch incorporate-retry`.
+Both commands pre-validate every entry through the validator and run a retry
+fairy pass for any initial failures. By the time you are spawned, the pipeline
+has already attempted to fix everything it can.
 
-| Error | Fix at the spot |
+The `failures` list in `final_payload.json` contains ONLY truly-unfixable
+entries — items that failed validation in both the initial pass and the retry
+pass (or for which the retry fairy produced no output). **Your job is to NOTE
+these in the dream record, not to fix them inline.**
+
+When `engram_set_recall_summaries` is called with the `summaries` list:
+
+| Error from the MCP tool | Action |
 |---|---|
-| `recall_summary` over cap (got_length > 200) | Regenerate with tighter wording. If still over, trim at last sentence boundary ≤200 chars. |
-| `recall_keywords` count wrong (got <3 or >5) | Inspect, prune duplicates + generic terms ("node", "claim", "system"), add load-bearing terms from claim until in [3,5]. |
-| Duplicate keywords | Dedupe (case-sensitive); backfill from claim if count drops below 3. |
 | `node is not current (superseded)` | Skip — the supersede chain head should get the summary instead. Add the head to a follow-up batch if missing. |
-| `node not found` | Truly unfixable. Log in dream report. |
-| Empty/malformed claim | Truly unfixable. Log in dream report. |
+| `node not found` | Log in dream report. |
+| Empty/malformed claim | Log in dream report. |
+| Any other structural error | Log in dream report; do not attempt inline repair. |
 
-Re-batch the fixed entries (same MCP tool, smaller payload). Loop terminates when errors is empty or all remaining are truly-unfixable.
+For items in `failures[]` (pre-pipeline failures): log each with its
+`node_id` and `reason` in the dream record's "Recall-summary failures"
+section. These are unfixable within the current cycle.
 
 # Failure handling
 

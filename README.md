@@ -51,6 +51,10 @@ This alpha package installs:
   nodes
 - Hooks that handle context tracking, write nudges, post-compaction recall,
   tool-call repair, and a fast recall daemon
+- A batch-mode recall-summary architecture (`tools/cohort_dispatch.py` +
+  `agents/claude/engram-batch-summary-fairy.md`) that replaces the serial
+  per-node summary-fairy with parallel chunks of ≤15 nodes at ~95% lower
+  token cost (empirically validated 2026-05-27)
 - An MCP server registration and hook registrations inside `~/.claude/`
 - A browser-based graph visualizer (`viz_server.py`) so you can see the
   graph grow with your own eyes

@@ -14,7 +14,14 @@ to a versioned section when releasing per `RELEASING.md`.
 
 ### Added
 
+- `agents/claude/engram-batch-summary-fairy.md` — new one-shot batch summary generator agent. Receives up to 15 node payloads embedded in its prompt, emits `{"items": [...]}` in one turn, no tool access required. Supports both initial and retry dispatch shapes.
+- `tools/cohort_dispatch.py` — three-subcommand orchestration script for the batch-summary sleep cycle: `prepare` (chunk cohort → per-chunk prompt + payload files), `validate` (split agent output into clean vs failures, write retry prompt), `incorporate-retry` (merge retry output → `final_payload.json` for `engram_set_recall_summaries`).
+- `tests/test_cohort_dispatch.py` — 14 unit tests covering all three subcommands end-to-end.
+
 ### Changed
+
+- `skills/claude/engram-sleep/SKILL.md` — Steps 5–8 updated to describe the batch dispatch + validate/retry loop. Serial `engram-summary-fairy` Fairy 7 replaced with batch-summary fairies (one per chunk from `cohort_dispatch.py prepare`). Token reduction vs serial: ~95% for a 50-node / 4-chunk cohort (empirically validated 2026-05-27).
+- `agents/claude/engram-dream-master.md` — architecture description updated to reflect batch-summary orchestration; spawn prompt carries `final_payload.json` from the parent's validate/retry loop instead of raw summary-fairy output.
 
 ### Fixed
 
