@@ -61,14 +61,113 @@ What you receive in the spawn prompt:
 3. **Cohort metadata** (today's-new + backfill counts, chunk count, cohort dir path).
 4. **Timeout markers** for any fairy that didn't return — proceed without that fairy, note it in the dream record.
 
-Working order:
+Working order — **batch-by-type pass** (PR-B):
 
 1. Call `engram_reflect` first for your structured initial agenda.
-2. Read each dream-fairy report from disk.
-3. Merge fairy findings with engram_reflect into a unified agenda.
-4. Apply the batch-summary final payload — call `engram_set_recall_summaries` with the `summaries` list and log any tool-level errors per the table in "Recall-summary failures (from final_payload.json)" below. The `failures` list already contains pre-validated truly-unfixable entries; note them in the dream record. See "Recall-summary failures (from final_payload.json)" below.
-5. Work the agenda end-to-end.
-6. Write the dream record + call `engram_advance_turn` when completion checklist clears.
+2. Read ALL 6 dream-fairy reports from disk in one pass.
+3. Call `bucket_findings(fairy_reports)` from `tools/dream_master_batch.py` to
+   partition all findings into action-type buckets (single operation, no MCP
+   calls needed — snapshots are pre-packed in each finding).
+4. Merge the bucketed agenda with `engram_reflect` items.
+5. Apply the summary-fairy batch payload via `engram_set_recall_summaries` with
+   the `summaries` list; log any tool-level errors per the table in
+   "Recall-summary failures (from final_payload.json)" below. The `failures`
+   list already contains pre-validated truly-unfixable entries from the parent's
+   retry loop; note them in the dream record (do NOT attempt inline fixes).
+6. Execute one bucket at a time (each MCP write is still individual for
+   correctness):
+   - First: **resolutions** — for each finding, `check_snapshot_divergence`
+     then `engram_resolve`
+   - Then: **goal_tension_resolutions** — `check_snapshot_divergence` then
+     `engram_resolve` on gt_* nodes
+   - Then: **supersedes** — `check_snapshot_divergence` then `engram_supersede`
+   - Then: **retractions** — `check_snapshot_divergence` then `engram_retract`
+   - Then: **new_derivations** — `check_snapshot_divergence` then `engram_derive`
+   - Then: **lessons** — `check_snapshot_divergence` then
+     `engram_lesson_register_incident`
+   - Then: **cornerstone_moves** — `check_snapshot_divergence` then
+     `engram_add_cornerstone` or `engram_outgrow_cornerstone`
+   - **unknown bucket**: log all items in the dream record for the morning
+     review; do not execute them.
+7. Write the dream record + call `engram_advance_turn` when completion checklist
+   clears.
+
+# Snapshot contract assumption
+
+Each dream-fairy finding now carries a `node_snapshot` — the inspection state
+the fairy gathered while doing its analysis.  **Trust snapshots; do not
+re-inspect by default.**
+
+```
+fairy_report.findings[i].node_snapshot = {
+  "claim": "<verbatim>",
+  "status": "<active|open|resolved|...>",
+  "confidence": 0.75,
+  "is_current": true,
+  "supersedes": "<id or null>",
+  "superseded_by": "<id or null>",
+  "key_neighbors": [ {"id": "...", "relation": "...", "direction": "...",
+                       "confidence": 0.72, "claim_excerpt": "..."} ],
+  "recall_count": 12,
+  "memory_status": "active"
+}
+```
+
+**Before each MCP write**, do the following two-step safety check:
+
+```python
+current = fetch_safety_row(conn, target_id)   # cheap targeted DB read
+check_snapshot_divergence(target_id, snapshot, current)  # raises if diverged
+# … proceed with MCP write only if no exception raised …
+```
+
+`fetch_safety_row` (in `tools/dream_master_batch.py`) performs a single
+three-column SELECT — `is_current`, `status`, `superseded_by` — against
+`knowledge.db`.  This is the only DB read needed for the safety check; it is
+NOT a full `engram_inspect` and does not restore the ~50-turn cost the snapshot
+architecture was designed to eliminate.
+
+If `check_snapshot_divergence` raises `SnapshotDivergence`, **skip the action**
+and log it in the dream record under a "Snapshot-diverged findings" sub-section.
+Do NOT silently execute on stale state.
+
+**Missing-node case** — when `fetch_safety_row` returns `None` (the node is not
+found in the DB, e.g. deleted or never committed), pass `None` directly to
+`check_snapshot_divergence`.  The function treats a missing node as divergent
+and raises `SnapshotDivergence` with `field="existence"`.  The caller's existing
+`except SnapshotDivergence` handler will catch it, skip the action, and log it.
+Do NOT special-case the `None` path at the call site — let the guard handle it.
+
+**Non-contradictory framing** — the two principles coexist without tension:
+
+- **Trust the snapshot for the DECISION** — the snapshot is the inspection state
+  the fairy gathered while doing its analysis.  Use it to decide what action to
+  take (resolve, supersede, retract, derive).  You do not re-inspect to second-
+  guess the fairy's analysis.
+- **Fetch current state for the SAFETY CHECK only** — `fetch_safety_row` checks
+  that the substrate is still in the state that makes the decision valid.  If
+  the node was superseded or resolved after fairy dispatch, the decision is now
+  wrong — skip + log.
+
+The snapshot drives analysis; the targeted fetch drives the pre-write guard.
+These are different concerns on different data.
+
+Rationale: between fairy dispatch and your invocation, the parent may have acted
+on some nodes (a resolution, a supersede during Phase A).  The divergence check
+catches this and prevents double-writes or writes to already-closed nodes.
+
+**When to re-inspect anyway** — only these cases warrant an `engram_inspect`
+call during your execution pass:
+
+1. The finding's `node_snapshot` is absent or empty (fairy failed to include it).
+2. The `key_neighbors` list is empty but your action requires knowing the
+   neighbor state (e.g., you need to compose a resolving derivation and the
+   supporting nodes aren't in the snapshot).
+3. A `check_snapshot_divergence` result indicates partial change — you want to
+   confirm the current full state before deciding how to adapt.
+
+In all other cases, trust the snapshot and execute.  Re-inspecting every finding
+restores the ~50-turn cycle the snapshot architecture was designed to eliminate.
 
 # Initial step (always)
 

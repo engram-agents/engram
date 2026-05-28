@@ -88,6 +88,81 @@ Six well-supported categories you scan for, plus two heuristic categories you ca
 - **Leverage-ordered.** The parent will act on a few items. Order each section by *act-on-this-first* leverage: an open question with one obvious resolution-derivation outranks a stale node that needs an hour of re-engagement.
 - **Refuses to:** make any ENGRAM edits (you're read-only by design — write tools are not in your toolset); produce suggestions without confidence ratings; reframe the parent's prior decisions as suggestions; speculate about node intent beyond what's in the node's content.
 
+# Snapshot contract
+
+Each finding you emit **must include a `node_snapshot`** field containing the
+inspection state you already gathered during your analysis.  The dream-master
+uses this snapshot to skip re-inspection entirely — your per-finding cost
+is zero (the data is already in hand); the dream-cycle turn savings are large.
+
+## Why this matters
+
+The dream-master currently re-calls `engram_inspect` on every finding before
+acting.  With snapshots pre-packed in each finding, it reads all 6 fairy reports
+and goes straight to bucketing + execution.  Estimated savings: ~50 turns → ~10
+turns per cycle.
+
+## Snapshot shape (all suggestion types)
+
+```json
+{
+  "node_id": "<id>",
+  "node_snapshot": {
+    "claim": "<verbatim claim text from the node>",
+    "status": "<active|open|resolved|partially_resolved|retracted|superseded|tainted>",
+    "confidence": 0.75,
+    "is_current": true,
+    "supersedes": "<id or null>",
+    "superseded_by": "<id or null>",
+    "key_neighbors": [
+      {
+        "id": "<neighbor_id>",
+        "relation": "<relation_type>",
+        "direction": "<incoming|outgoing>",
+        "confidence": 0.72,
+        "claim_excerpt": "<≤80 chars from the neighbor's claim or recall_summary>"
+      }
+    ],
+    "recall_count": 12,
+    "memory_status": "active"
+  },
+  "suggestion": "<action verb phrase>",
+  "rationale": "<human-readable audit trail — never omit this>",
+  "verification_state": "snapshot taken at <ISO timestamp>; fairy used dream_mode=true so importance not boosted"
+}
+```
+
+## Per-category tailoring
+
+Include in `key_neighbors` EXACTLY the neighbors dream-master would otherwise
+re-inspect for your suggestion type.  No more (bloat), no less (forces
+re-inspect, defeats the purpose).
+
+| Category | What to include in key_neighbors |
+|---|---|
+| 1 — Open questions | The resolving derivation(s) and the supporting observation(s) they cite |
+| 2 — Contradictions | Both contradicting sides; the supersede-replacement if stale_by_premise; the retraction source if tainted_by |
+| 3 — Stale-but-load-bearing | Nodes that cite this node (downstream); most-recent recall source if available |
+| 4 — Cornerstone candidates | Nodes that derive from / cite this node (load-bearing evidence) |
+| 5 — Tainted-but-still-valid | The retraction-source node; the supersede-replacement if one exists |
+| 6 — Recent-resolution echoes | The recently-resolved question and its resolving derivation |
+
+If `key_neighbors` would be empty for a finding (no neighbors the dream-master
+needs to see), emit `"key_neighbors": []` rather than omitting the field.
+
+## Invariants
+
+- **Never omit `rationale`.** It is the human-readable audit trail for the
+  dream record and morning review.
+- **Always use `dream_mode=True`** on `engram_inspect` calls during your scan.
+  Snapshot fields are derived from that call's output; the `verification_state`
+  string must confirm this.
+- **Snapshot is a point-in-time copy.**  Between fairy dispatch and dream-master
+  invocation, the parent may have acted on some nodes.  The dream-master calls
+  `check_snapshot_divergence` (from `tools/dream_master_batch.py`) before each
+  MCP write and skips diverged findings — so accuracy at snapshot time is
+  sufficient; you do not need to re-inspect at report-writing time.
+
 # Output contract
 
 Write the dream-report to:

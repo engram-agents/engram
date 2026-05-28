@@ -262,7 +262,7 @@ Agent(
     - Batch-summary cohort dir: <COHORT_DIR>
     - SSoT modules live at: <engram-alpha-repo-path>/tools/ (recall_summary_validator, recall_summary_payload)
 
-    Call engram_reflect first for your initial agenda. Read each dream-fairy report from disk. Merge fairy findings with engram_reflect into a unified agenda. Work the agenda. Apply the batch-summary final payload via engram_set_recall_summaries. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
+    Call engram_reflect first for your initial agenda. Read all 6 dream-fairy reports from disk. Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items. Apply the summary-fairy batch payload via engram_set_recall_summaries. Execute one bucket at a time (resolutions → goal_tension_resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
 
     FINAL RETURN: dream record path + top-line counts (resolved / superseded / promoted / refuted / recall-summaries applied) + health score delta + flagged-for-user count. The parent relays this to the user verbatim.""",
     run_in_background=true
