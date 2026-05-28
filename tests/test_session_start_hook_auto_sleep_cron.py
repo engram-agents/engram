@@ -497,6 +497,113 @@ def test_auto_sleep_time_out_of_range_returns_empty(tmp_path):
     assert result == "", f"Expected '' for out-of-range '99:99', got: {result!r}"
 
 
+# ---------------------------------------------------------------------------
+# 11. Cron prompt template contains stale-lock detection phrases
+# ---------------------------------------------------------------------------
+
+def test_cron_prompt_contains_mtime_check(tmp_path):
+    """Cron prompt instructs the cron-fired session to check the lock file mtime."""
+    engram_home = _make_engram_home(tmp_path)
+    _write_config(engram_home, {"auto_sleep_enabled": True, "auto_sleep_time": "03:00"})
+
+    mod = _load_hook_module(engram_home, session_role="interactive")
+    result = mod.auto_sleep_cron_block()
+
+    assert "check its mtime" in result, (
+        f"Expected 'check its mtime' in cron prompt for freshness gate: {result!r}"
+    )
+
+
+def test_cron_prompt_contains_2_hours_threshold(tmp_path):
+    """Cron prompt specifies the 2-hour freshness threshold for stale-lock detection."""
+    engram_home = _make_engram_home(tmp_path)
+    _write_config(engram_home, {"auto_sleep_enabled": True, "auto_sleep_time": "03:00"})
+
+    mod = _load_hook_module(engram_home, session_role="interactive")
+    result = mod.auto_sleep_cron_block()
+
+    assert "2 hours" in result, (
+        f"Expected '2 hours' threshold in cron prompt: {result!r}"
+    )
+
+
+def test_cron_prompt_contains_stale_lock(tmp_path):
+    """Cron prompt uses the phrase 'stale lock' to name the recovery-path condition."""
+    engram_home = _make_engram_home(tmp_path)
+    _write_config(engram_home, {"auto_sleep_enabled": True, "auto_sleep_time": "03:00"})
+
+    mod = _load_hook_module(engram_home, session_role="interactive")
+    result = mod.auto_sleep_cron_block()
+
+    assert "stale lock" in result, (
+        f"Expected 'stale lock' in cron prompt: {result!r}"
+    )
+
+
+def test_cron_prompt_contains_recovered_from_stale_lock(tmp_path):
+    """Cron prompt instructs logging 'recovered from stale lock' on the recovery path."""
+    engram_home = _make_engram_home(tmp_path)
+    _write_config(engram_home, {"auto_sleep_enabled": True, "auto_sleep_time": "03:00"})
+
+    mod = _load_hook_module(engram_home, session_role="interactive")
+    result = mod.auto_sleep_cron_block()
+
+    assert "recovered from stale lock" in result, (
+        f"Expected 'recovered from stale lock' in cron prompt: {result!r}"
+    )
+
+
+def test_cron_prompt_still_contains_auto_sleep_nightly(tmp_path):
+    """Regression: stale-lock fix does not remove the AUTO-SLEEP NIGHTLY marker."""
+    engram_home = _make_engram_home(tmp_path)
+    _write_config(engram_home, {"auto_sleep_enabled": True, "auto_sleep_time": "03:00"})
+
+    mod = _load_hook_module(engram_home, session_role="interactive")
+    result = mod.auto_sleep_cron_block()
+
+    assert "AUTO-SLEEP NIGHTLY" in result, (
+        f"Expected 'AUTO-SLEEP NIGHTLY' still present after stale-lock fix: {result!r}"
+    )
+
+
+def test_cron_prompt_still_contains_last_sleep_success(tmp_path):
+    """Regression: stale-lock fix does not remove last-sleep-success.json reference."""
+    engram_home = _make_engram_home(tmp_path)
+    _write_config(engram_home, {"auto_sleep_enabled": True, "auto_sleep_time": "03:00"})
+
+    mod = _load_hook_module(engram_home, session_role="interactive")
+    result = mod.auto_sleep_cron_block()
+
+    assert "last-sleep-success.json" in result, (
+        f"Expected 'last-sleep-success.json' still present after stale-lock fix: {result!r}"
+    )
+
+
+def test_cron_prompt_no_spurious_backslash_escapes(tmp_path):
+    """Verify the emitted cron prompt has no literal-backslash-before-apostrophe sequences.
+
+    Regression guard for B1 (PR #428 round-2): the template previously emitted
+    session\\'s (backslash + apostrophe) due to double-quoted string escaping.
+    """
+    engram_home = _make_engram_home(tmp_path)
+    _write_config(engram_home, {"auto_sleep_enabled": True, "auto_sleep_time": "03:00"})
+
+    mod = _load_hook_module(engram_home, session_role="interactive")
+    result = mod.auto_sleep_cron_block()
+
+    # The two-char sequence \' (backslash + apostrophe) must NOT appear.
+    assert "\\'" not in result, (
+        f"Found literal-backslash-before-apostrophe in prompt: {result!r}"
+    )
+    # Explicitly verify the apostrophes that previously regressed:
+    assert "session's" in result, (
+        f"Expected 'session\\'s' (no backslash) in prompt: {result!r}"
+    )
+    assert "tonight's" in result, (
+        f"Expected 'tonight\\'s' (no backslash) in prompt: {result!r}"
+    )
+
+
 def test_encode_with_errors_replace_does_not_raise(tmp_path):
     """BLOCKER fix: jitter hash encode uses errors='replace', not strict.
 

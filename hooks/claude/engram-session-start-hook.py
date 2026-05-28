@@ -541,15 +541,22 @@ def auto_sleep_cron_block() -> str:
         "— within roughly the last work-cycle (~18-24h; use judgment) — tonight's "
         "cohort is already consolidated, so STOP: do NOT run any sleep and do NOT "
         "advance the turn (advance is IRREVERSIBLE), report 'auto-sleep skipped: "
-        "consolidated Nh ago', and exit. (2) Else claim tonight's lock: mkdir -p "
-        "~/.engram/sleep-locks, then atomically create "
-        "~/.engram/sleep-locks/$(date +%Y-%m-%d).lock with O_EXCL (python "
-        "open(path,'x') or bash 'set -C; >file'). If it already exists, another "
-        "idle session's cron is handling tonight — STOP and exit quietly. (3) If "
-        "you got the lock, run /engram-sleep (full end-of-day consolidation: Phase "
-        "A cohort completion + Phase B dream orchestration + turn advance + dream "
-        "record). The skill updates last-sleep-success.json on completion, making "
-        'step (1) idempotent for any later fire tonight."'
+        "consolidated Nh ago', and exit. (2) Else check for tonight's lock at "
+        "~/.engram/sleep-locks/$(date +%Y-%m-%d).lock. If it does NOT exist: "
+        "mkdir -p ~/.engram/sleep-locks, then atomically create it (O_EXCL via "
+        "python open(path,'x') or bash 'set -C; >file'), then proceed to step (3). "
+        "If the atomic create fails (race: another session created the lock between "
+        "our check and create), treat the result as the DOES-exist path and check mtime. "
+        "If it DOES exist: check its mtime. If mtime is recent (< 2 hours ago): "
+        "another idle session's cron just started — STOP and exit quietly with "
+        "'auto-sleep skipped: another session's cron started Nm ago'. If mtime "
+        "is stale (>= 2 hours ago): the lock is from a crashed run. Take over: "
+        "delete the stale lock, re-create it atomically, log a warning "
+        "('recovered from stale lock from <timestamp>'), then proceed to step (3). "
+        "(3) If you got the lock, run /engram-sleep (full end-of-day "
+        "consolidation: Phase A cohort completion + Phase B dream orchestration + "
+        "turn advance + dream record). The skill updates last-sleep-success.json "
+        'on completion, making step (1) idempotent for any later fire tonight."'
     )
 
 
