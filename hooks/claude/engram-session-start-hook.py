@@ -528,12 +528,15 @@ def auto_sleep_cron_block() -> str:
         "(durable:false is intentional — the cron dies with this session and is "
         "re-registered every SessionStart, so the current session always carries "
         "it and stale duplicates can't accumulate.)\n"
-        f'  3. Tell the user once: "Auto-sleep is on — I\'ll consolidate nightly '
-        f"around {auto_sleep_time}. Two things keep it clean: (a) wind down heavy "
-        f"work ~5h before {auto_sleep_time} so the cron gets a fresh token window, "
-        f"and (b) leave this session open and idle through {auto_sleep_time} — a "
-        "closed session can't fire the cron, and don't leave multiple sessions "
-        'idle overnight or each will try to sleep."\n'
+        f'  3. Tell the user once: "Auto-sleep is on — I\'ll consolidate overnight '
+        f"(target ~{auto_sleep_time}, but on macOS laptops in default sleep the cron "
+        "typically fires 30-90 min late and consolidation may span hours). "
+        f"Three things keep it clean: (a) wind down heavy work ~5h before {auto_sleep_time} "
+        f"so the cron gets a fresh token window, (b) leave this session open and idle "
+        f"through {auto_sleep_time} — a closed session can't fire the cron, and don't "
+        "leave multiple sessions idle overnight or each will try to sleep, and "
+        "(c) if precise nightly timing matters on macOS, see the macOS mitigations "
+        'in the engram-sleep skill docs."\n'
         "\n"
         "AUTO-SLEEP CRON-PROMPT to register (use exactly this as the CronCreate prompt):\n"
         '"AUTO-SLEEP NIGHTLY consolidation. Before consolidating: (1) Read '

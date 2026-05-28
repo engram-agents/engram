@@ -329,6 +329,37 @@ This is why Phase A must complete before Phase B fires `engram_advance_turn`.
 - **Dream master** (`engram-dream-master`) — owns the consolidation in the claude track's version of this skill (see `skills/claude/engram-sleep/SKILL.md` for the orchestration-based variant). The gemini track runs consolidation inline.
 - **End-of-day-detector hook** — surfaces engram-sleep on wrap-up phrases; user "Yes" triggers this skill.
 
+## macOS auto-sleep timing
+
+When auto-sleep runs via cron on a macOS laptop in default sleep state (lid
+closed / idle / on AC), two sources of latency apply:
+
+1. **Cron-fire latency** — macOS suspends the system clock during DarkWake sleep.
+   The cron fires 30-90 min after the scheduled time once the system wakes enough
+   to process it.
+2. **Per-tool-call DarkWake-wait latency** — each MCP tool call during
+   consolidation waits for a brief DarkWake cycle to complete before the system
+   responds. Empirically ~13 min/tool call, so a full consolidation cycle
+   (which can involve many calls) may span several hours.
+
+**Correctness is preserved.** The `last-sleep-success.json` marker + lock file
+mechanism (and PR #428's stale-lock recovery for crashed runs) ensure the graph
+stays correct regardless of when the cron fires or how long it runs.
+
+**This is a timing-expectation issue, not a correctness issue.** If precise
+nightly timing matters, three mitigation tiers in increasing complexity:
+
+- **Tier 1 — `caffeinate -i`**: run `caffeinate -i` in a terminal before going
+  idle. Prevents automatic sleep; cron fires on schedule. Simple, per-night,
+  burns power while on battery.
+- **Tier 2 — System Settings**: System Settings → Battery → Power Adapter →
+  "Prevent automatic sleep when the display is off". Persistent on AC;
+  cron always fires on schedule when plugged in.
+- **Tier 3 — launchd plist** (deferred, not yet shipped): a `launchd` plist with
+  `StartCalendarInterval` + `WakeFromSleep: true` that wakes the system and
+  triggers the cron at the configured time. Architecturally cleanest; opt-in
+  setup is tracked as Action #3 in issue #407 for a follow-up PR.
+
 ## Substrate anchor
 
 The three-routine architecture (nap / bedtime / sleep) was ratified 2026-05-14 (`dv_0636`). The constraints determining the original partition: (1) turn-advance fires at END of consolidation (dv_0134); (2) cross-compaction scaffolds belong at the compaction boundary (naps); (3) day-wide review producing new nodes is awake-state cognition (pre-turn-advance). At ratification, this was a three-routine model: nap + bedtime + sleep. As of 2026-05-24 (this merge), it is a **two-routine model: nap + sleep**, with sleep now having two internal phases (Phase A = former bedtime; Phase B = former sleep).
