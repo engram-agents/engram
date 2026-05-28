@@ -69,9 +69,19 @@ def run_migration(db_path: Path, dry_run: bool) -> int:
 
         # Determine what needs doing
         cols_to_add = [(col, td) for col, td in NEW_COLUMNS if col not in existing_cols]
-        pn_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE type = 'person' AND trust_tier IS NULL"
-        ).fetchone()["c"]
+        # Gate the pn_count query on column existence: on a fresh DB (before
+        # ALTER TABLE runs) the column doesn't exist yet, so querying
+        # "WHERE trust_tier IS NULL" would raise OperationalError.  If the
+        # column is absent every pn_* row will be backfilled after ALTER TABLE,
+        # so the count is simply the total number of person nodes.
+        if "trust_tier" in existing_cols:
+            pn_count = conn.execute(
+                "SELECT COUNT(*) as c FROM nodes WHERE type = 'person' AND trust_tier IS NULL"
+            ).fetchone()["c"]
+        else:
+            pn_count = conn.execute(
+                "SELECT COUNT(*) as c FROM nodes WHERE type = 'person'"
+            ).fetchone()["c"]
 
         # Report planned changes
         print(f"== DB migration: Layer-1 trust-tier ==")
