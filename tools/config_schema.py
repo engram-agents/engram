@@ -10,7 +10,7 @@ directly for the protocol-level surface; the README/docs explain what
 each does.
 
 The schema is decoupled from physical config storage: a key with dot
-notation (e.g. `github.enabled`) describes the canonical nested location;
+notation (e.g. `embedding.enabled`) describes the canonical nested location;
 the `legacy_paths` field lists fallback flat-keys for backward-compat
 reads while migration is pending.
 """
@@ -43,24 +43,6 @@ SCHEMA: list[dict] = [
      "control": "list_display", "label": "Counterparts",
      "tooltip": "Peer agents on this host. Set by agentctl.",
      "editable": False, "restart_required": False},
-
-    # GitHub (gated section)
-    {"key": "github.enabled", "section": "github", "tier": TIER_A, "type": "boolean",
-     "control": "checkbox", "label": "Enable GitHub integration",
-     "tooltip": "Surfaces GitHub notifications from your collaborator and peer agents.",
-     "editable": True, "restart_required": False, "gates_section": True},
-    {"key": "github.primary_user_login", "section": "github", "tier": TIER_A, "type": "string",
-     "control": "text", "label": "Your GitHub login",
-     "tooltip": "Your GitHub username — used to identify your activity in notification streams.",
-     "editable": True, "restart_required": False,
-     "legacy_paths": ["primary_user_github_login"],
-     "depends_on": "github.enabled"},
-    {"key": "github.counterparts_logins", "section": "github", "tier": TIER_A, "type": "list",
-     "control": "list_edit", "label": "Counterpart GitHub logins",
-     "tooltip": "GitHub usernames of peer agents on this host. You set these — agentctl manages agent names but not their GitHub handles.",
-     "editable": True, "restart_required": False,
-     "legacy_paths": ["counterparts_github_logins"],
-     "depends_on": "github.enabled"},
 
     # Embedding (read-only)
     {"key": "embedding.enabled", "section": "embedding", "tier": TIER_B, "type": "boolean",
@@ -198,7 +180,6 @@ SCHEMA: list[dict] = [
 
 SECTIONS: list[dict] = [
     {"id": "identity",     "label": "Identity",                "tier": TIER_A, "order": 1},
-    {"id": "github",       "label": "GitHub integration",      "tier": TIER_A, "order": 2, "section_gate": "github.enabled"},
     {"id": "embedding",    "label": "Embedding",               "tier": TIER_B, "order": 3},
     {"id": "drowsiness",   "label": "Drowsiness thresholds",   "tier": TIER_A, "order": 4},
     {"id": "auto_sleep",   "label": "Auto-sleep",              "tier": TIER_A, "order": 5},

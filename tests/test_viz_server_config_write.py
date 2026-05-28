@@ -126,11 +126,11 @@ class TestWriteConfigKeyRoundTrip(ConfigWriteBase):
         self.assertAlmostEqual(cfg["memory"]["decay_base"], 1.05)
 
     def test_boolean_key_round_trips(self):
-        result = viz_server.write_config_key("test", "github.enabled", True)
+        result = viz_server.write_config_key("test", "cadence.auto_sleep_enabled", True)
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["validated_value"], True)
         cfg = self._read_config()
-        self.assertEqual(cfg["github"]["enabled"], True)
+        self.assertEqual(cfg["cadence"]["auto_sleep_enabled"], True)
 
     def test_string_key_round_trips(self):
         result = viz_server.write_config_key("test", "primary_user", "alice")
