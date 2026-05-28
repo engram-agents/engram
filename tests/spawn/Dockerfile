@@ -48,12 +48,10 @@ COPY tests/spawn/claude-stub.sh /usr/local/bin/claude
 RUN chmod +x /usr/local/bin/claude
 
 # Spawn-flow scripts. agent-bootstrap is the production target referenced
-# by agentctl spawn; agentctl is the day-to-day driver. v0.1 of agentctl
-# isn't yet vendored in alpha (issue #50), so the test harness vendors a
-# snapshot via tests/spawn/agentctl-snapshot.
+# by agentctl spawn; agentctl is the canonical vendored tool (issue #50).
 COPY tools/agent-bootstrap /usr/local/sbin/agent-bootstrap
 RUN chmod 0755 /usr/local/sbin/agent-bootstrap
-COPY tests/spawn/agentctl-snapshot /usr/local/bin/agentctl
+COPY tools/agentctl /usr/local/bin/agentctl
 RUN chmod 0755 /usr/local/bin/agentctl
 
 # Pre-warm sentence-transformers cache so install.sh's seed-graph step

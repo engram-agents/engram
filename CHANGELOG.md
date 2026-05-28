@@ -14,6 +14,10 @@ to a versioned section when releasing per `RELEASING.md`.
 
 ### Added
 
+- `tools/agentctl` — vendored canonical agentctl (Lei's operational version,
+  May 21 build; includes spawn-debug fixes absent from the old snapshot).
+  `tests/spawn/Dockerfile` now copies from `tools/agentctl`; the stale
+  `tests/spawn/agentctl-snapshot` has been removed. Closes #50.
 - Layer-1 trust-tier mechanism V1: persistent per-person trust categorization
   with explicit elevation discipline, evidence-trail audit, and structural-honesty
   attestation at the API surface (`engram_set_trust_tier`, `engram_add_trust_signal`).

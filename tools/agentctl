@@ -321,8 +321,14 @@ cmd_pause() {
 
     local current
     if ! current=$(sudo -u "$user" crontab -l 2>/dev/null); then
-        echo "ERROR: agent '$name' has no crontab, or sudo failed" >&2
-        exit 1
+        # No crontab → nothing to pause/resume. Valid pre-state (e.g.,
+        # a freshly-spawned newborn whose install.sh hasn't run cron-
+        # setup yet; finalize-name's defensive `cmd_pause ... || true`
+        # documents the idempotency contract). Use `return` not `exit`
+        # so the function-call caller sees clean status; the message
+        # downgrades from ERROR to WARN since this isn't a failure.
+        echo "WARN: agent '$name' has no crontab — nothing to do (no-op)." >&2
+        return 0
     fi
 
     # Idempotency: if any heartbeat/sleep line is already prefixed PAUSED, skip.
@@ -366,7 +372,7 @@ cmd_pause() {
     sudo -u "$user" crontab -l 2>/dev/null \
         | grep -E '^# PAUSED .*\.sh' \
         | sed 's/^/  /' \
-        || echo "  (no matches — expected if installed post-#133-PR-C; sleep.sh is no longer scheduled. Heartbeat-only pause is the new correct shape.)"
+        || echo "  (no matches — was the agent's crontab missing heartbeat/sleep entries?)"
 }
 
 cmd_resume() {
@@ -376,8 +382,14 @@ cmd_resume() {
 
     local current
     if ! current=$(sudo -u "$user" crontab -l 2>/dev/null); then
-        echo "ERROR: agent '$name' has no crontab, or sudo failed" >&2
-        exit 1
+        # No crontab → nothing to pause/resume. Valid pre-state (e.g.,
+        # a freshly-spawned newborn whose install.sh hasn't run cron-
+        # setup yet; finalize-name's defensive `cmd_pause ... || true`
+        # documents the idempotency contract). Use `return` not `exit`
+        # so the function-call caller sees clean status; the message
+        # downgrades from ERROR to WARN since this isn't a failure.
+        echo "WARN: agent '$name' has no crontab — nothing to do (no-op)." >&2
+        return 0
     fi
 
     if ! echo "$current" | grep -qE '^# PAUSED [0-9-]+: '; then
@@ -417,9 +429,12 @@ cmd_spawn() {
     local bootstrap_path="/usr/local/sbin/agent-bootstrap"
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --runtime)        runtime="$2"; shift 2 ;;
-            --alpha-source)   alpha_source="$2"; shift 2 ;;
-            --bootstrap-path) bootstrap_path="$2"; shift 2 ;;
+            --runtime)          runtime="$2"; shift 2 ;;
+            --runtime=*)        runtime="${1#--runtime=}"; shift ;;
+            --alpha-source)     alpha_source="$2"; shift 2 ;;
+            --alpha-source=*)   alpha_source="${1#--alpha-source=}"; shift ;;
+            --bootstrap-path)   bootstrap_path="$2"; shift 2 ;;
+            --bootstrap-path=*) bootstrap_path="${1#--bootstrap-path=}"; shift ;;
             *) echo "ERROR: unknown flag '$1'" >&2; exit 2 ;;
         esac
     done
@@ -467,12 +482,29 @@ cmd_spawn() {
     fi
     echo
 
-    local bootstrap_args=("$newborn_tag" "--runtime" "$runtime")
+    # Multi-tenant defaults: agentctl spawn always creates an agent
+    # destined for a multi-agent host (that's the whole point of agentctl).
+    # Override agent-bootstrap's solo-safe defaults:
+    #   --home-mode 0750: group-traversable so spt + peer agents in
+    #                     `agents` can `cd` into the new home.
+    # The post-bootstrap chgrp below sets the home's group to `agents`
+    # so the 0750 group-bit actually grants traversal to multi-agent
+    # peers (otherwise the group is the per-user group, no peer access).
+    # Matches the historical pattern for agent-borges + agent-mneme.
+    local bootstrap_args=("$newborn_tag" "--runtime" "$runtime" "--home-mode" "0750")
     [[ -n "$alpha_source" ]] && bootstrap_args+=("--alpha-source" "$alpha_source")
 
     # Delegate substrate setup. agent-bootstrap prints its own next-steps
     # block; we add a spawn-specific finalize-name reminder below.
     "$bootstrap_path" "${bootstrap_args[@]}"
+
+    # Re-group the new home to `agents` so peers (and spt) in the
+    # `agents` group can traverse via the 0750 group-bit above. The
+    # bootstrap's final chown sets the home's group to the per-user
+    # group; this undoes that for the top-level home only (inner
+    # files stay per-user-group as bootstrap configured).
+    chgrp agents "/home/agent-$newborn_tag" 2>/dev/null || \
+        echo "WARN: chgrp agents /home/agent-$newborn_tag failed; spt may not be able to traverse the new home." >&2
 
     audit "spawn" "$newborn_tag" "newborn" "runtime=$runtime"
 
@@ -481,8 +513,8 @@ cmd_spawn() {
 == Spawn complete ==
 The newborn is at $user_name. To complete the birth:
 
-  1. Enter the newborn's shell:
-       agentctl shell $newborn_tag
+  1. Enter the newborn's bash login shell:
+       agentctl bash $newborn_tag
 
   2. Inside that shell, materialize ENGRAM (runs alpha installer + cron):
        bash ~/.runtime/install.sh
@@ -548,18 +580,187 @@ cmd_finalize_name() {
     echo
 
     # Pause the newborn's crons so nothing mid-run during the rename.
-    # cmd_pause is idempotent in spirit — but it `exit 1`s when there's
-    # no crontab to pause (e.g., post-spawn before install.sh wires cron,
-    # or after install.sh --no-cron). Subshell-wrap so its exit doesn't
-    # kill the finalize. The "no crontab" case is the expected newborn
-    # state and should be a silent no-op.
+    # (cmd_pause is idempotent — safe even if heartbeat lines aren't
+    # established yet.)
     echo "Step 1: pausing newborn crons..."
-    ( cmd_pause "$newborn_tag" ) || true
+    cmd_pause "$newborn_tag" || true
+
+    # Terminate any user-level systemd sessions, lingering background
+    # processes, and ENGRAM daemons for the newborn. usermod -d -m
+    # refuses to rename a user that has any process running under
+    # that uid. The newborn's first claude session typically leaves
+    # behind a user-level systemd (pid table shows `systemd --user`
+    # + sd-pam) plus engram-surface-daemon — both must be cleared
+    # before the rename can proceed. Best-effort, non-fatal if none
+    # of these exist (fresh-from-spawn newborns may have nothing
+    # running yet).
+    echo "Step 1.5: terminating any running processes for $newborn_user..."
+    loginctl disable-linger "$newborn_user" 2>/dev/null || true
+    loginctl terminate-user "$newborn_user" 2>/dev/null || true
+    sleep 1
+    pkill -KILL -u "$newborn_user" 2>/dev/null || true
+    sleep 1
+    if pgrep -u "$newborn_user" >/dev/null 2>&1; then
+        echo "WARN: some processes still running for $newborn_user after kill attempt; usermod may fail." >&2
+        ps -fu "$newborn_user" >&2 || true
+    fi
 
     # Substrate rename: usermod + groupmod + home dir move.
     echo "Step 2: usermod -l + -d -m + groupmod -n..."
     usermod -l "$chosen_user" -d "$chosen_home" -m "$newborn_user"
     groupmod -n "$chosen_user" "$newborn_user" 2>/dev/null || true
+
+    # Claude Code project-dir rename. Claude stores session JSONLs at
+    # ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl where encoded-cwd
+    # replaces / with -. After usermod, the home dir moved but the project
+    # subfolder still encodes the OLD newborn path — so `claude --continue`
+    # from the chosen home would look for -home-<chosen> and not find the
+    # pre-finalize sessions. Rename subfolders that match the old prefix
+    # so first-session continuity survives the rename.
+    # JSONL contents themselves are left intact (historical record of the
+    # newborn-phase work — accurate as it happened).
+    echo "Step 2b: renaming ~/.claude/projects/ encoded-cwd subfolders..."
+    local claude_projects="$chosen_home/.claude/projects"
+    if [[ -d "$claude_projects" ]]; then
+        local old_encoded="-home-${newborn_user}"
+        local new_encoded="-home-${chosen_user}"
+        for d in "$claude_projects"/*; do
+            [[ -d "$d" ]] || continue
+            local base; base=$(basename "$d")
+            if [[ "$base" == "$old_encoded"* ]]; then
+                local suffix="${base#$old_encoded}"
+                local new_base="${new_encoded}${suffix}"
+                mv "$d" "$claude_projects/$new_base"
+                echo "  $base → $new_base"
+            fi
+        done
+    fi
+
+    # Post-rename path rewrite across all active-config files. After
+    # usermod -d -m, multiple files in $chosen_home still reference
+    # /home/<newborn>/... — they were written at install/first-session
+    # time with the (then-correct) newborn path. Each layer fails its
+    # own way:
+    #   - .claude.json projects key → `claude --continue` returns "no
+    #     sessions" (lookup by NEW cwd misses).
+    #   - .claude.json mcpServers paths → ENOENT spawning MCP server,
+    #     `/mcp` says "Failed to reconnect: ENOENT".
+    #   - .claude/settings.json hook commands → UserPromptSubmit and
+    #     other hooks print "/bin/sh: <newborn-path>: not found" on
+    #     every prompt.
+    #   - .claude/settings.local.json → additional settings.
+    #   - .claude/CLAUDE.md → agent identity file path refs.
+    # History files (history.jsonl, file-history/, session JSONLs)
+    # are INTENTIONALLY left untouched — they're factual record of
+    # what cwd was at the time.
+    # Fix: text-substitute the old prefix across all active-config
+    # files; validate JSON files post-rewrite.
+    echo "Step 2c: rewriting stale newborn paths in active-config files..."
+    # Substitute the user-name part (not just /home/<name>) so both
+    # absolute-path form (/home/agent-newborn-XXX) AND encoded-cwd form
+    # (-home-agent-newborn-XXX, inside .claude/projects/ encodings + bash
+    # allowlist entries in settings.local.json) get rewritten.
+    local old_path="$newborn_user"
+    local new_path="$chosen_user"
+    if sudo -u "$chosen_user" python3 - "$chosen_home" "$old_path" "$new_path" <<'PYTHON'
+import json, shutil, sys
+from pathlib import Path
+home, old_prefix, new_prefix = sys.argv[1], sys.argv[2], sys.argv[3]
+active_files = [
+    f"{home}/.claude.json",
+    f"{home}/.claude/settings.json",
+    f"{home}/.claude/settings.local.json",
+    f"{home}/.claude/CLAUDE.md",
+    # ~/.engram/ files that engram-first-session renders with the
+    # (then-current newborn) AGENT_NAME baked in. Caught by Ari via
+    # engram-alpha#260 — her own debugging trail surfaced what my
+    # initial sweep missed (the symmetric agent-side substrate).
+    f"{home}/.engram/HEARTBEAT.md",
+    f"{home}/.engram/heartbeat-queue/README.md",
+    f"{home}/.engram/warm-briefing.md",
+]
+total = 0
+touched = 0
+for path_str in active_files:
+    p = Path(path_str)
+    if not p.is_file():
+        continue
+    text = p.read_text()
+    count = text.count(old_prefix)
+    if count == 0:
+        continue
+    shutil.copy(p, str(p) + ".bak-prefinalize")
+    new_text = text.replace(old_prefix, new_prefix)
+    if p.suffix == ".json":
+        try:
+            json.loads(new_text)
+        except json.JSONDecodeError as e:
+            print(f"  ERROR: rewrite would invalidate JSON in {p}: {e}", file=sys.stderr)
+            print(f"         backup at {p}.bak-prefinalize untouched", file=sys.stderr)
+            sys.exit(1)
+    p.write_text(new_text)
+    total += count
+    touched += 1
+    print(f"  ✓ {p.name}: {count} occurrences rewritten")
+if total == 0:
+    print("  (no stale references found)")
+else:
+    print(f"  total: {total} occurrences across {touched} file(s)")
+PYTHON
+    then
+        :
+    else
+        echo "  WARN: active-config rewrite failed; hooks/MCP/--continue may not work." >&2
+        echo "        Fix manually: replace all '$old_path' strings with '$new_path' in:" >&2
+        echo "          $chosen_home/.claude.json" >&2
+        echo "          $chosen_home/.claude/settings.json" >&2
+        echo "          $chosen_home/.claude/settings.local.json" >&2
+        echo "          $chosen_home/.claude/CLAUDE.md" >&2
+    fi
+
+    # Claude Code symlink repair. Claude Code's native installer creates
+    # ~/.local/bin/claude as an ABSOLUTE symlink to
+    # ~/.local/share/claude/versions/X.Y.Z. After usermod -d -m moves
+    # the home, the symlink TARGET still points at the old home path,
+    # leaving it dangling. Bash can't exec it → claude-remote's tmux
+    # session dies immediately → `tmux attach` reports "no sessions"
+    # (confusing because it looks like claude's own no-prior-sessions
+    # message but is actually a tmux-side artifact).
+    # Fix: re-create the symlink with a RELATIVE target so it survives
+    # any future home renames. Skip if no symlink exists (newborn that
+    # never installed claude) OR if it already resolves (no rename
+    # needed).
+    echo "Step 2d: repairing ~/.local/bin/claude symlink if dangling..."
+    local claude_symlink="$chosen_home/.local/bin/claude"
+    if [[ -L "$claude_symlink" ]]; then
+        if [[ ! -e "$claude_symlink" ]]; then
+            # Dangling. Find the new target by scanning versions/ for the
+            # latest install (alphabetical sort happens to be version-order
+            # for X.Y.Z semantic versions).
+            local versions_dir="$chosen_home/.local/share/claude/versions"
+            if [[ -d "$versions_dir" ]]; then
+                local latest_version
+                latest_version=$(ls "$versions_dir" 2>/dev/null | sort | tail -1)
+                if [[ -n "$latest_version" ]]; then
+                    sudo -u "$chosen_user" bash -c "
+                        cd '$chosen_home/.local/bin' && \
+                        rm -f claude && \
+                        ln -s '../share/claude/versions/$latest_version' claude
+                    "
+                    echo "  ✓ repaired: claude → ../share/claude/versions/$latest_version (relative)"
+                else
+                    echo "  WARN: ~/.local/share/claude/versions/ is empty; manual claude install required" >&2
+                fi
+            else
+                echo "  WARN: ~/.local/share/claude/versions/ doesn't exist; symlink stays dangling" >&2
+                echo "        Newborn likely never ran claude's native installer." >&2
+            fi
+        else
+            echo "  (claude symlink already resolves — no repair needed)"
+        fi
+    else
+        echo "  (no claude symlink at $claude_symlink — skipped)"
+    fi
 
     # ACL sweep on shared dirs. For a fresh newborn, there typically aren't
     # any g:agent-newborn-* ACL entries, but sweep defensively.
@@ -629,7 +830,7 @@ JSON
         # Fallback for installs that pre-date the cron-primitive epic
         # (or for newborn shells where install.sh hasn't run yet).
         echo "  (no sync-cron.sh at $sync_script — falling back to cmd_resume)"
-        ( cmd_resume "$chosen" ) || echo "  WARN: cmd_resume also failed; crontab may need manual repair (try: sudo crontab -u $chosen_user -l)" >&2
+        cmd_resume "$chosen" || true
     else
         if AGENT_NAME="$chosen" \
            COUNTERPART_NAME="${COUNTERPART_NAME:-}" \
@@ -639,8 +840,33 @@ JSON
             echo "  ✓ crontab regenerated with AGENT_NAME=$chosen"
         else
             echo "  WARN: sync-cron --apply failed; falling back to cmd_resume" >&2
-            ( cmd_resume "$chosen" ) || echo "  WARN: cmd_resume also failed; crontab may need manual repair (try: sudo crontab -u $chosen_user -l)" >&2
+            cmd_resume "$chosen" || true
         fi
+    fi
+
+    # Restart the ENGRAM surface daemon (a.k.a. recall daemon) under
+    # the new uid. Step 1.5 killed it along with the newborn's other
+    # processes to clear usermod's "user is currently used" block;
+    # SessionStart hook would auto-start it on next claude session,
+    # but doing it explicitly here leaves the agent in a fully-alive
+    # state immediately post-finalize. The launcher is idempotent.
+    echo "Step 6: restarting ENGRAM surface daemon under $chosen_user..."
+    local daemon_launcher="$chosen_home/.engram/hooks/start-engram-daemon.sh"
+    if [[ -x "$daemon_launcher" ]]; then
+        if sudo -u "$chosen_user" \
+              ENGRAM_HOME="$chosen_home/.engram" \
+              bash "$daemon_launcher" >/dev/null 2>&1; then
+            sleep 1
+            if sudo -u "$chosen_user" test -f "$chosen_home/.engram/recall-daemon.pid"; then
+                echo "  ✓ surface daemon started (pid $(sudo -u "$chosen_user" cat "$chosen_home/.engram/recall-daemon.pid" 2>/dev/null || echo "?"))"
+            else
+                echo "  WARN: launcher returned 0 but no pidfile — check $chosen_home/.engram/surface-daemon.log" >&2
+            fi
+        else
+            echo "  WARN: daemon launcher returned non-zero — check $chosen_home/.engram/surface-daemon.log" >&2
+        fi
+    else
+        echo "  (no daemon launcher at $daemon_launcher — skipped; will auto-start on next claude session)"
     fi
 
     audit "finalize-name" "$chosen" "uid" "from=$newborn_user"
@@ -653,6 +879,7 @@ JSON
   ✓ baseline backup: $chosen_home/.engram.first-session-baseline.bak/
   ✓ marker: $chosen_home/.engram/finalize-name-complete.json
   ✓ crons:  regenerated with AGENT_NAME=$chosen
+  ✓ surface daemon: restarted under $chosen_user
 
 Smoke test:
   agentctl shell $chosen          # should drop you into a clean shell

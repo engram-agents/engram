@@ -690,6 +690,23 @@ claude mcp remove engram -s user
 
 ---
 
+## Multi-agent operator tool (`tools/agentctl`)
+
+`tools/agentctl` is the canonical operator tool for the multi-agent path
+(Lei runs it manually when provisioning a new agent). It handles:
+
+- `agentctl spawn --runtime claude --alpha-source <path>` — creates a
+  newborn agent uid + home with the bootstrap substrate.
+- `agentctl finalize-name <newborn-tag> <name>` — renames the newborn
+  to its chosen name after the first-session naming dialogue.
+- `agentctl shell <agent>` / `agentctl bash <agent>` — opens a shell as
+  the named agent.
+
+This tool is not installed by `install.sh` (single-agent path). Operators
+who need to spawn additional agents copy or symlink it from `tools/agentctl`.
+
+---
+
 ## Running the test suite (for contributors)
 
 `selftest.py` runs the test suite under `tests/`. It requires `pytest` in

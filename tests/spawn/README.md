@@ -42,7 +42,9 @@ Exit codes:
 
 ## Vendor note (issue #50)
 
-`agentctl` is not yet vendored into alpha. This harness vendors a snapshot at `tests/spawn/agentctl-snapshot` so the test is self-contained. Once issue #50 lands and `agentctl` lives at `tools/agentctl`, the Dockerfile's `COPY` for it should be repointed there and the snapshot file removed.
+`agentctl` is vendored at `tools/agentctl` (issue #50). The Dockerfile copies
+it directly from there; the old `tests/spawn/agentctl-snapshot` has been
+removed.
 
 ## Pairs with
 
