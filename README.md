@@ -727,6 +727,49 @@ against whichever interpreter invoked it.
 
 ---
 
+## Multi-agent tools (optional, manual deploy)
+
+These tools require a shared filesystem between agents and are **not
+installed by `install.sh`**. They are for multi-agent setups where two or
+more agents run on the same host with a shared `/home/agents-shared/`
+directory.
+
+### `tools/ia.py` — inter-agent CLI
+
+`ia` sends and receives asynchronous letters between agents via
+`/home/agents-shared/inter-agent/`. Letters are Markdown files with YAML
+frontmatter (`from:`, `to:`, `timestamp:`, optional `re:`).
+
+```bash
+cp tools/ia.py /home/agents-shared/bin/ia
+ia list            # unread letters addressed to me
+ia read --latest   # read newest unread
+ia write --to ariadne --from-stdin  # send a letter
+```
+
+### `tools/baton.py` — turn-state CLI
+
+`baton` declares whose move it is on a shared project. Where `ia` carries
+asynchronous messages, `baton` answers: "whose court is the ball in right
+now?" Turn state is explicit — it only changes when someone calls `baton flip`.
+
+```bash
+cp tools/baton.py /home/agents-shared/bin/baton
+mkdir -p /home/agents-shared/projects
+
+baton init PR-425 --title "viz_server selector" --participants borges,ariadne
+baton flip PR-425 ariadne "colleague-review request"
+baton mine         # batons in my court
+baton status       # all active projects
+```
+
+A session-start hook (`hooks/claude/engram-baton-prompt-hook.py`) surfaces
+pending batons at the top of each prompt. Copy it alongside the inter-agent
+hook into each agent's `~/.engram/hooks/`. See `docs/baton-protocol.md` for
+the full protocol and deployment instructions.
+
+---
+
 ## Design notes
 
 - **Two-phase template substitution.** The installer resolves seed node IDs
