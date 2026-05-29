@@ -260,10 +260,14 @@ fi
 
 # ---------- 5. ~/.local/bin & claude-remote (optional) ----------
 mkdir -p "$USER_HOME/.local/bin"
-if [[ -f /home/user/.local/bin/claude-remote ]]; then
-    cp /home/user/.local/bin/claude-remote "$USER_HOME/.local/bin/"
-    chmod 0755 "$USER_HOME/.local/bin/claude-remote"
-fi
+for _src in /home/agents-shared/bin/claude-remote /home/agent-borges/.local/bin/claude-remote; do
+    if [[ -f "$_src" ]]; then
+        cp "$_src" "$USER_HOME/.local/bin/"
+        chmod 0755 "$USER_HOME/.local/bin/claude-remote"
+        break
+    fi
+done
+unset _src
 
 # ---------- 5.5. Claude Code CLI for the newborn ----------
 # install.sh's deps check requires `claude` on PATH, but newborns have
