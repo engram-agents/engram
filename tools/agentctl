@@ -678,6 +678,18 @@ active_files = [
     f"{home}/.engram/HEARTBEAT.md",
     f"{home}/.engram/heartbeat-queue/README.md",
     f"{home}/.engram/warm-briefing.md",
+    # Hook scripts with install-time absolute-path substitutions.
+    # install.sh:315 substitutes {{PYTHON}} → $PYTHON_BIN here;
+    # rename invalidates the absolute venv path. Without this:
+    # surface daemon fails to start, recall falls back to FTS-only.
+    f"{home}/.engram/hooks/start-engram-daemon.sh",
+    # Per-user systemd surface daemon service file.
+    # install.sh:336-338 substitutes {{PYTHON}}, {{ENGRAM_HOOKS_DIR}},
+    # and {{ENGRAM_HOME}} into the template; rename strands all three.
+    # (PR #469's cross-install detect-and-skip is orthogonal — it
+    # prevents one install clobbering another's service file; #260
+    # is about rewriting THIS install's service file post-rename.)
+    f"{home}/.config/systemd/user/engram-surface-daemon.service",
 ]
 total = 0
 touched = 0
