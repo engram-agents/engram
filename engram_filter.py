@@ -84,6 +84,9 @@ ALLOWED_NODE_COLUMNS: frozenset[str] = frozenset(
         "trust_signal_kind",
         "trust_signal_polarity",
         "trust_signal_weight",
+        # Question-specific
+        "question_category",
+        "question_lacks",
     }
 )
 

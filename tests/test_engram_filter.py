@@ -338,6 +338,12 @@ class TestValidateFields:
         # None means "no projection, return default columns"
         assert validate_fields(None) == []
 
+    def test_question_columns_recognized(self):
+        # Regression for #459: question_category and question_lacks must be in
+        # the allowlist so engram_list fields_json doesn't reject them.
+        result = validate_fields(["question_category", "question_lacks"])
+        assert result == ["question_category", "question_lacks"]
+
     def test_trust_tier_columns_recognized(self):
         # Regression for #452: trust-tier columns added by PR #413 must be in
         # the allowlist so engram_list fields_json doesn't reject them.
@@ -427,6 +433,26 @@ class TestEngramListStructured:
         assert result["status"] == "ok"
         for node in result["nodes"]:
             assert set(node.keys()) == {"id", "claim"}
+
+    def test_fields_json_question_columns_end_to_end(self):
+        """Regression for #459: fields_json=["id","claim","question_category","question_lacks"]
+        on node_type="question" must not return 'unknown field' error."""
+        server = fresh_server()
+        r = json.loads(server.engram_ask(payload_json=json.dumps({
+            "question": "What is the optimal confidence threshold for resolution?",
+            "category": "design",
+            "lacks": "empirical_data",
+        })))
+        assert "question_id" in r, f"engram_ask failed: {r}"
+        result = json.loads(server.engram_list(payload_json=json.dumps({
+            "node_type": "question",
+            "fields_json": json.dumps(["id", "claim", "question_category", "question_lacks"]),
+        })))
+        assert result["status"] == "ok", f"engram_list error: {result.get('error')}"
+        assert result["total_matched"] >= 1
+        for node in result["nodes"]:
+            assert "question_category" in node
+            assert "question_lacks" in node
 
     def test_limit_zero_returns_count_only(self):
         server = fresh_server()
