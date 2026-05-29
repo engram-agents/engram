@@ -37,7 +37,7 @@ def _load_engram_config() -> dict:
     Returns an empty dict if the file is absent or unparseable. Callers
     use .get() with defaults so missing keys degrade gracefully.
     """
-    engram_home = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
+    engram_home = os.environ.get("ENGRAM_HOME") or os.environ.get("ENGRAM_DATA_DIR") or os.path.expanduser("~/.engram")
     config_path = Path(engram_home) / "config.json"
     if config_path.exists():
         try:

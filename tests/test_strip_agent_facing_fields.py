@@ -42,6 +42,23 @@ INSPECT_RAW = os.path.join(REPO_ROOT, "tools", "inspect_raw.py")
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_strip_agent_facing_")
 atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
+# fresh_server() mutates these env vars process-wide; capture their pre-test
+# values and restore them at module teardown so they don't leak into later test
+# modules. Without this, ENGRAM_DATA_DIR=TEST_DIR leaks and — under the canonical
+# ENGRAM_HOME > ENGRAM_DATA_DIR precedence (#489 / PR1) — a later test that sets
+# neither var would resolve to the leaked TEST_DIR instead of its real default.
+# The leaker restoring its own mutation is the fix; well-behaved scoped patch.dict
+# victims need no change.
+_ORIG_ENV = {k: os.environ.get(k) for k in ("ENGRAM_DATA_DIR", "ENGRAM_NO_EMBEDDINGS")}
+
+
+def teardown_module(module):
+    for _k, _v in _ORIG_ENV.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+
 
 def fresh_server():
     if os.path.exists(TEST_DIR):

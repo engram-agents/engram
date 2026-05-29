@@ -58,7 +58,7 @@ from pathlib import Path
 
 
 def default_db_path() -> Path:
-    base = os.environ.get("ENGRAM_DATA_DIR") or os.path.expanduser("~/.engram")
+    base = os.environ.get("ENGRAM_HOME") or os.environ.get("ENGRAM_DATA_DIR") or os.path.expanduser("~/.engram")
     return Path(base) / "knowledge.db"
 
 

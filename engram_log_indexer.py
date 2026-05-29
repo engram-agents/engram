@@ -30,7 +30,7 @@ from typing import Optional
 # Default logs directory — can be overridden by environment variable or
 # by passing logs_dir explicitly to run_once() / full_rebuild().
 def _default_logs_dir() -> Path:
-    engram_home = Path(os.environ.get("ENGRAM_HOME", str(Path.home() / ".engram")))
+    engram_home = Path(os.environ.get("ENGRAM_HOME") or os.environ.get("ENGRAM_DATA_DIR") or str(Path.home() / ".engram"))
     return engram_home / "logs"
 
 

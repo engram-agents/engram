@@ -44,7 +44,7 @@ from engram_confidence import (
     ABDUCTIVE_CONFIDENCE_CAP,
 )
 
-DATA_DIR = Path(os.environ.get("ENGRAM_DATA_DIR", os.path.expanduser("~/.engram")))
+DATA_DIR = Path(os.environ.get("ENGRAM_HOME") or os.environ.get("ENGRAM_DATA_DIR") or os.path.expanduser("~/.engram"))
 DB_PATH = DATA_DIR / "knowledge.db"
 SNAPSHOT_PATH = DATA_DIR / "graph_snapshot.md"
 GIT_EXE = "git"

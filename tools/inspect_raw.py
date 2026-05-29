@@ -39,7 +39,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-DATA_DIR = Path(os.environ.get("ENGRAM_DATA_DIR", os.path.expanduser("~/.engram")))
+DATA_DIR = Path(os.environ.get("ENGRAM_HOME") or os.environ.get("ENGRAM_DATA_DIR") or os.path.expanduser("~/.engram"))
 DB_PATH = DATA_DIR / "knowledge.db"
 
 # Columns that exist as top-level fields in the nodes table.

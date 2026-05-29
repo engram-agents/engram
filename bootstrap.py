@@ -43,7 +43,7 @@ from pathlib import Path
 
 ALPHA_DIR = Path(os.environ["ALPHA_DIR"])
 TEMPLATES_DIR = Path(os.environ["ALPHA_TEMPLATES_DIR"])
-ENGRAM_HOME = Path(os.environ["ENGRAM_DATA_DIR"])
+ENGRAM_HOME = Path(os.environ.get("ENGRAM_HOME") or os.environ["ENGRAM_DATA_DIR"])
 TARGET = os.environ.get("TARGET", "claude").lower()
 
 if TARGET not in ("claude", "gemini"):
