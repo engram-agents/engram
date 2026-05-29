@@ -10,7 +10,7 @@
 # happen in alpha and propagate via this script. (Lei + Borges, 2026-05-04.)
 #
 # Usage:
-#   tools/deploy.sh [--yes|-y] [--dry-run|-n] [--delete] [--help|-h]
+#   tools/deploy.sh [--yes|-y] [--dry-run|-n] [--delete] [--allow-dirty] [--help|-h]
 #
 # Environment:
 #   ENGRAM_HOME — where to deploy to (default: $HOME/.engram)
@@ -21,6 +21,12 @@
 #   --delete    For directories in the manifest, remove files in target
 #               that don't exist in source. Off by default — safer, but
 #               leaves stale code behind when alpha removes a file.
+#   --allow-dirty
+#               Deploy from a dirty working tree (uncommitted/staged
+#               changes). Off by default — refuses to deploy. Use only
+#               when intentionally testing local changes. Also required
+#               when combining with --dry-run on a dirty tree — the
+#               dirty-tree gate runs before the manifest preview.
 #
 # What gets deployed (manifest at the bottom of this script):
 #   - Runtime Python: server.py, engram_client.py, engram_confidence.py,
@@ -52,6 +58,7 @@ ALPHA_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
 YES=0
 DRY_RUN=0
+ALLOW_DIRTY=0
 
 # Detect target model platform if not set
 if [[ -z "${TARGET:-}" ]]; then
@@ -72,6 +79,7 @@ while [[ $# -gt 0 ]]; do
         --yes|-y)     YES=1; shift ;;
         --dry-run|-n) DRY_RUN=1; shift ;;
         --delete)     DELETE=1; shift ;;
+        --allow-dirty) ALLOW_DIRTY=1; shift ;;
         -h|--help)    usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
     esac
@@ -101,7 +109,7 @@ fi
 if git -C "$ALPHA_DIR" rev-parse --git-dir >/dev/null 2>&1; then
     ALPHA_SHA="$(git -C "$ALPHA_DIR" rev-parse --short HEAD)"
     ALPHA_BRANCH="$(git -C "$ALPHA_DIR" rev-parse --abbrev-ref HEAD)"
-    if [[ -n "$(git -C "$ALPHA_DIR" status --porcelain)" ]]; then
+    if [[ -n "$(git -C "$ALPHA_DIR" status --porcelain --untracked-files=no)" ]]; then
         ALPHA_DIRTY="dirty"
     else
         ALPHA_DIRTY="clean"
@@ -148,8 +156,17 @@ echo "  source:  $ALPHA_DIR ($ALPHA_BRANCH @ $ALPHA_SHA, $ALPHA_DIRTY)"
 echo "  target:  $ENGRAM_HOME"
 echo "  delete:  $([[ $DELETE = 1 ]] && echo yes || echo "no (use --delete to remove stale files)")"
 echo "  mode:    $([[ $DRY_RUN = 1 ]] && echo "dry-run (no changes)" || echo "live (will apply)")"
-if [[ "$ALPHA_DIRTY" = "dirty" ]]; then
-    echo "  warning: alpha working tree has uncommitted changes — deploying them anyway"
+if [[ "$ALPHA_DIRTY" = "dirty" && $ALLOW_DIRTY = 0 ]]; then
+    echo "  ✗ alpha working tree has uncommitted/staged changes — refusing to deploy."
+    echo "    Commit or stash them first, OR re-run with --allow-dirty to deploy"
+    echo "    the working-tree state (rare; usually a dev-loop choice)."
+    echo
+    echo "    Affected files:"
+    git -C "$ALPHA_DIR" status --porcelain --untracked-files=no | sed 's/^/      /'
+    exit 1
+fi
+if [[ "$ALPHA_DIRTY" = "dirty" && $ALLOW_DIRTY = 1 ]]; then
+    echo "  ⚠ Deploying from dirty working tree (--allow-dirty)."
 fi
 echo
 
