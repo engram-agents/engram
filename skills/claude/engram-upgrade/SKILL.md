@@ -41,12 +41,23 @@ Wait for affirmative user response before continuing to Step 1. Upgrade is conse
 
 ---
 
-## Step 1 — Source-tree pre-flight
+## Step 1 — Locate the source tree + pre-flight
 
-`tools/deploy.sh` deploys whatever the source tree is currently at. Verify the source tree is at the intended commit before deploying:
+The clone to deploy from is recorded in the version marker — resolve it from there rather than assuming a path:
 
 ```bash
-cd /path/to/engram-alpha   # the source-tree clone
+SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)
+echo "source tree: $SOURCE_DIR"
+```
+
+`deployed_from` is written by `install.sh` and **refreshed by `tools/deploy.sh` on every deploy**, so once you've installed/deployed once it stays current. If `.deployed-version` is missing or `deployed_from` is empty (an install predating the marker), ask the user for the clone path.
+
+> **Why each later block re-derives this:** each Bash tool call is a fresh shell, so `$SOURCE_DIR` does NOT persist across calls. Rather than rely on you remembering to re-run it, every block below that needs the path re-derives it inline — self-sufficient, not memory-dependent.
+
+`tools/deploy.sh` deploys whatever the source tree is currently at. Verify it's at the intended commit before deploying:
+
+```bash
+cd "$SOURCE_DIR"            # the source-tree clone (resolved above)
 git status --short          # working tree should be clean (or only the changes you intend to deploy)
 git log --oneline -1        # confirm the commit SHA matches what the user wants
 git branch --show-current   # confirm the branch
@@ -81,10 +92,11 @@ Before running `tools/deploy.sh`, read the change set so you understand what
 you're applying. This runs BEFORE the deploy so you can flag concerns and abort
 before any mutation.
 
-1. Read the currently-deployed sha:
+1. Read the currently-deployed sha (and re-resolve the source tree — fresh shell, so `$SOURCE_DIR` from Step 1 is gone):
 
    ```bash
-   DEPLOYED=$(grep '^alpha_sha=' ~/.engram/.deployed-version | cut -d= -f2)
+   DEPLOYED=$(grep '^alpha_sha=' ~/.engram/.deployed-version | cut -d= -f2-)
+   SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)
    ```
 
    If `.deployed-version` is missing or the grep returns empty, fall back to
@@ -95,13 +107,13 @@ before any mutation.
 2. Fetch the latest remote state:
 
    ```bash
-   git -C /path/to/engram-alpha fetch origin
+   git -C "$SOURCE_DIR" fetch origin
    ```
 
 3. Get the PR-merge commit list between deployed and remote tip:
 
    ```bash
-   git -C /path/to/engram-alpha log --oneline "$DEPLOYED..origin/dev"
+   git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/dev"
    ```
 
    Each line shows: `<short-sha> <PR title> (#<PR number>)`. The PR number
@@ -149,7 +161,7 @@ Expected output shape (abbreviated):
 
 ```
 === ENGRAM deploy ===
-  source:  /path/to/engram-alpha (BRANCH @ COMMIT)
+  source:  /home/USER/engram-alpha (BRANCH @ COMMIT)
   target:  /home/USER/.engram
   delete:  no (use --delete to remove stale files)
   mode:    live (will apply)
@@ -183,8 +195,9 @@ Why this is a hard gate: `deploy.sh` does NOT touch `~/.claude/CLAUDE.md` or `~/
 For each template path the warning lists:
 
 ```bash
-diff /path/to/engram-alpha/CLAUDE.md.template ~/.claude/CLAUDE.md
-diff /path/to/engram-alpha/settings.json.template ~/.claude/settings.json
+SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)   # fresh shell — re-resolve
+diff "$SOURCE_DIR"/CLAUDE.md.template ~/.claude/CLAUDE.md
+diff "$SOURCE_DIR"/settings.json.template ~/.claude/settings.json
 ```
 
 Read the diffs. Identify which sections are template-side additions you want to inverse-merge into the live file, vs which are agent-local customizations to keep.
@@ -202,8 +215,9 @@ If the change is mechanical (new hook fragment, new permission), just copy it. I
 After merging, re-check that the new content is actually in the live file. Grep alone can pass a stale partial merge (the phrase landed but surrounding context is wrong), so pair grep-presence with a re-diff:
 
 ```bash
+SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)   # fresh shell — re-resolve
 grep -n "<key phrase from the new section>" ~/.claude/CLAUDE.md
-diff /path/to/engram-alpha/CLAUDE.md.template ~/.claude/CLAUDE.md | head -50
+diff "$SOURCE_DIR"/CLAUDE.md.template ~/.claude/CLAUDE.md | head -50
 ```
 
 The grep confirms the merge happened; the re-diff shows what drift remains. Read the diff's remaining hunks: each one should be either (i) an agent-local customization you intend to preserve, or (ii) a template-side addition you intentionally chose not to merge. Any other drift means the merge was incomplete.
@@ -217,8 +231,9 @@ The grep confirms the merge happened; the re-diff shows what drift remains. Read
 `tools/deploy.sh`'s manifest is scoped to `$ENGRAM_HOME` (`~/.engram/`). Skills and agents live outside it (`~/.claude/skills/`, `~/.claude/agents/`) and require manual copy:
 
 ```bash
-cp -r /path/to/engram-alpha/skills/claude/* ~/.claude/skills/
-cp -r /path/to/engram-alpha/agents/claude/* ~/.claude/agents/
+SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)   # fresh shell — re-resolve
+cp -r "$SOURCE_DIR"/skills/claude/* ~/.claude/skills/
+cp -r "$SOURCE_DIR"/agents/claude/* ~/.claude/agents/
 ```
 
 (Use `gemini` instead of `claude` if the agent runs under Gemini.)
