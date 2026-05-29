@@ -1013,7 +1013,58 @@ def test_cascade_stops_at_retracted_downstream_node():
     assert dv_a not in tainted_ids, (
         f"dv_A {dv_a} must NOT be in tainted_downstream — is_current=0, walker stops here"
     )
+    # Note: dv_b may already be tainted_by dv_a from the step-1 pre-retract; this asserts only that it
+    #  does not appear in ob_x's cascade (walker stopped at retracted dv_a).
     assert dv_b not in tainted_ids, (
         f"dv_B {dv_b} must NOT be in tainted_downstream — cascade must not recurse through "
         f"retracted dv_A"
+    )
+
+
+def test_supersede_stops_at_superseded_downstream_node():
+    """Parity guard: walker stops at superseded mid-chain nodes (is_current=0).
+
+    Graph shape:
+      ob_X → dv_A (dv_A is already superseded, is_current=0)
+      dv_A → dv_B (dv_B depends on dv_A)
+
+    When ob_X is superseded:
+    - dv_A has is_current=0 → walker stops there, dv_A NOT in stale_downstream.
+    - dv_B is downstream of dv_A, which is not visited → dv_B NOT in stale_downstream.
+
+    Mirror of test_cascade_stops_at_retracted_downstream_node for the supersede path.
+    The shared walker's stop-at-non-current semantics apply symmetrically to both
+    retract (is_current=0 via retraction) and supersede (is_current=0 via supersession).
+    """
+    server = fresh_server()
+    ob_x = _seed_ob(server, "Root observation for supersede parity guard test.")
+    dv_a = _seed_dv(server, "Mid-chain derivation A.", ob_x)
+    dv_b = _seed_dv(server, "Terminal derivation B — derives from A.", dv_a)
+
+    # Pre-supersede dv_A so it has is_current=0 before ob_X is superseded.
+    dv_a_replacement = _seed_dv(server, "Replacement for mid-chain derivation A.", ob_x)
+    pre = json.loads(server._supersede_impl(dv_a, dv_a_replacement))
+    assert "superseded" in pre.get("status", ""), pre
+
+    # Now supersede ob_X. The cascade should not include dv_A (already superseded)
+    # or dv_B (unreachable because walker stops at dv_A).
+    ob_x_replacement = _seed_ob(server, "Replacement for root observation.")
+    ret = json.loads(server._supersede_impl(ob_x, ob_x_replacement))
+    assert "superseded" in ret.get("status", ""), ret
+
+    stale_ids = {s["id"] for s in ret.get("stale_downstream", [])}
+    # Positive guard against a vacuous pass: dv_a_replacement is a live dependent of ob_x,
+    # so it MUST land in ob_x's cascade — confirms stale_downstream is non-empty and the
+    # dv_a/dv_b absences below are real stops, not an empty result.
+    assert dv_a_replacement in stale_ids, (
+        f"dv_A_replacement {dv_a_replacement} SHOULD be in stale_downstream — live dependent of ob_x"
+    )
+    assert dv_a not in stale_ids, (
+        f"dv_A {dv_a} must NOT be in stale_downstream — is_current=0, walker stops here"
+    )
+    # Note: dv_b may already be stale_by dv_a from the step-1 pre-supersede; this asserts only that it
+    #  does not appear in ob_x's cascade (walker stopped at superseded dv_a).
+    assert dv_b not in stale_ids, (
+        f"dv_B {dv_b} must NOT be in stale_downstream — cascade must not recurse through "
+        f"superseded dv_A"
     )

@@ -8003,16 +8003,18 @@ def engram_diagnose() -> str:
 
         # Stale nodes
         stale_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND metadata LIKE '%\"stale_by\"%'"
+            # Anchor to JSON list opening — metadata written with default json.dumps separators.
+            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND metadata LIKE '%\"stale_by\": [%'"
         ).fetchone()["c"]
         epistemic["stale_nodes"] = stale_count
 
         # Support-lost cornerstones/lessons (§2.3)
         support_lost_count = conn.execute(
+            # Anchor to serialized boolean — metadata written with default json.dumps separators.
             """SELECT COUNT(*) as c FROM nodes
                WHERE is_current = 1
                  AND type IN ('cornerstone', 'lesson')
-                 AND metadata LIKE '%\"support_lost\"%'"""
+                 AND metadata LIKE '%\"support_lost\": true%'"""
         ).fetchone()["c"]
         epistemic["support_lost_nodes"] = support_lost_count
 
@@ -16661,8 +16663,9 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
 
         # 9. Tainted nodes (downstream of retracted nodes)
         tainted_nodes = conn.execute(
+            # Anchor to JSON list opening — metadata written with default json.dumps separators.
             """SELECT id, type, claim, confidence, metadata FROM nodes
-               WHERE is_current = 1 AND metadata LIKE '%"tainted_by"%'"""
+               WHERE is_current = 1 AND metadata LIKE '%"tainted_by": [%'"""
         ).fetchall()
         report["tainted_nodes"] = []
         for t in tainted_nodes:
@@ -16677,8 +16680,9 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
 
         # 10. Stale nodes (downstream of superseded premises)
         stale_nodes = conn.execute(
+            # Anchor to JSON list opening — metadata written with default json.dumps separators.
             """SELECT id, type, claim, confidence, metadata FROM nodes
-               WHERE is_current = 1 AND metadata LIKE '%"stale_by"%'"""
+               WHERE is_current = 1 AND metadata LIKE '%"stale_by": [%'"""
         ).fetchall()
         report["stale_nodes"] = []
         for s in stale_nodes:
@@ -16729,10 +16733,11 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         # Trivial rewires handled inside the dream; non-trivial cases surface
         # to awake state via the flagged-for-user mechanism.
         support_lost_rows = conn.execute(
+            # Anchor to serialized boolean — metadata written with default json.dumps separators.
             """SELECT id, type, claim FROM nodes
                WHERE is_current = 1
                  AND type IN ('cornerstone', 'lesson')
-                 AND metadata LIKE '%"support_lost"%'"""
+                 AND metadata LIKE '%"support_lost": true%'"""
         ).fetchall()
         report["support_lost_nodes"] = [
             {"id": r["id"], "type": r["type"], "claim": r["claim"]}
