@@ -445,7 +445,7 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
   `(description, [goal_id, implements_ids, parent_task_id, scope])`
 - **engram_add_person** — Person in the world-model; set `is_self=True` exactly once.
   `(name, role, [description, aliases, is_self, context_ids])`
-- **engram_set_trust_tier** — Set the persistent trust tier for a person node. Tiers: `user_family`, `our_side`, `known_external`, `unknown`, `suspect`. Tiers at or above `our_side` (rank ≥ 3) require a `justification_obs_id` plus primary-user approval attestation. The approval parameter name is disclosed in the server's friction-warning — follow that message's steps. Idempotent (same-tier no-op). Writes to `edit_history` on change.
+- **engram_set_trust_tier** — Set the persistent trust tier for a person node. Tiers (descending rank): `self`, `primary_user`, `user_family`, `our_side`, `known_external`, `unknown`, `suspect`. `self` is singleton, gated by `metadata.is_self`; `primary_user` and `user_family` require a `justification_obs_id` plus primary-user approval attestation. The approval parameter name is disclosed in the server's friction-warning — follow that message's steps. Idempotent (same-tier no-op). Writes to `edit_history` on change.
   `(target_pn, tier, [justification_obs_id])`
 - **engram_add_trust_signal** — Record an interpretive trust signal (ts_NNNN) about a person, derived from an observation. Non-claim-bearing (cannot be used as a derivation premise). Creates ts_ node + about-edge + derives_from-edge atomically. Cascade-inherited: retracted source ob_ taints ts_; superseded source ob_ stales ts_.
   `(subject_pn, source_obs_id, kind, polarity, weight, claim)`

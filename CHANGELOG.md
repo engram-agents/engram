@@ -14,6 +14,17 @@ to a versioned section when releasing per `RELEASING.md`.
 
 ### Added
 
+- `skills/claude/engram-trust-tier/SKILL.md` — ported trust-tier discipline skill
+  to alpha source (was deploy-only); updated for 7-tier reality (`self` + `primary_user`
+  added above `user_family`); table now lists all seven tiers with rank and default
+  behavior. (PR #413 oversight)
+- `upgrade-guides/v1-trust-tier.md` — ported upgrade guide to alpha source (was
+  deploy-only); Step 4 tier table updated for 7 tiers; new Step 6 documents the
+  self-tier backfill migration; primary_user blessing notes added to Step 4c.
+  (PR #413 oversight)
+- `templates/CLAUDE.md.template` — added `### External interactions` subsection
+  with `engram-trust-tier` skill-loading trigger for interactions crossing the
+  primary_user/family boundary. (PR #444 oversight)
 - `tools/agentctl` — vendored canonical agentctl (Lei's operational version,
   May 21 build; includes spawn-debug fixes absent from the old snapshot).
   `tests/spawn/Dockerfile` now copies from `tools/agentctl`; the stale
@@ -37,6 +48,14 @@ to a versioned section when releasing per `RELEASING.md`.
 - `agents/claude/engram-dream-master.md` — architecture description updated to reflect batch-summary orchestration; spawn prompt carries `final_payload.json` from the parent's validate/retry loop instead of raw summary-fairy output.
 
 ### Fixed
+
+- `tools/migration/migrate_trust_tier_self_backfill.py` — `plan()` now adds
+  `AND is_current = 1` to the WHERE clause, preventing superseded self-anchors
+  (is_self=true, is_current=0) from being picked up and causing a silent
+  singleton violation post-migration. (PR #444 reviewer S1)
+- `SKILL.md` line 448 — `engram_set_trust_tier` tier list updated from 5 tiers
+  to 7 (`self` and `primary_user` added; `self` documented as singleton /
+  is_self-gated). (PR #444 reviewer S2)
 
 ### Removed
 

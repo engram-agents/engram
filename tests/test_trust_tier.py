@@ -8,8 +8,10 @@ Coverage (17 tests):
       literal "primary_user_approval_obtained".
   5.  engram_set_trust_tier — at/above threshold with approval → succeeds, writes
       edit_history row.
-  6.  engram_set_trust_tier — primary_user tier → structural error.
-  7.  engram_set_trust_tier — invalid tier → allowlist error.
+  6.  engram_set_trust_tier — primary_user tier without approval → approval-gate error
+      (primary_user is now assignable; this test verifies the approval gate fires, not
+      a structural rejection).
+  7.  engram_set_trust_tier — invalid tier → allowlist error (7-tier list, no trailer).
   8.  engram_set_trust_tier — invalid justification_obs_id (non-existent, wrong type,
       retracted).
   9.  engram_set_trust_tier — same-tier no-op → no edit_history row.
@@ -261,25 +263,35 @@ def test_set_trust_tier_above_threshold_with_approval():
     assert row["trust_tier"] == "our_side", row
 
 
-# ── Test 6: set_trust_tier — primary_user tier ────────────────────────────
+# ── Test 6: set_trust_tier — primary_user tier (approval-gated) ───────────
 
-def test_set_trust_tier_primary_user_rejected():
-    """'primary_user' tier must be rejected with a structural error."""
+def test_set_trust_tier_primary_user_approval_gate():
+    """'primary_user' is now an assignable tier (rank 5). Without approval it must
+    hit the approval gate error, NOT a structural rejection."""
     server = fresh_server()
-    pn_id = _mk_person(server, "StructuralTest")
+    pn_id = _mk_person(server, "PrimaryUserGateTest")
 
     r = json.loads(server.engram_set_trust_tier(payload_json=json.dumps({
         "target_pn": pn_id,
         "tier": "primary_user",
     })))
     assert "error" in r, r
-    assert "structural" in r["error"].lower() or "primary_user" in r["error"], r
+    # Must hit the approval gate (not a structural rejection)
+    assert "primary_user_approval_obtained" in r["error"], (
+        f"primary_user without approval should hit approval-gate error naming "
+        f"'primary_user_approval_obtained'. Got:\n{r['error']}"
+    )
+    # Must NOT claim it is structural / not assignable
+    assert "structural" not in r["error"].lower() or "structural-honesty" in r["error"].lower(), (
+        f"primary_user is now assignable; error must not claim it is structural. "
+        f"Got:\n{r['error']}"
+    )
 
 
 # ── Test 7: set_trust_tier — invalid tier value ────────────────────────────
 
 def test_set_trust_tier_invalid_tier():
-    """Unrecognized tier values are rejected with an allowlist error."""
+    """Unrecognized tier values are rejected with an allowlist error listing all 7 tiers."""
     server = fresh_server()
     pn_id = _mk_person(server, "TierTest")
 
@@ -290,6 +302,10 @@ def test_set_trust_tier_invalid_tier():
     assert "error" in r, r
     # Error should mention the invalid tier or the allowlist
     assert "totally_made_up_tier" in r["error"] or "tier" in r["error"].lower(), r
+    # Must NOT claim 'primary_user' is not assignable (it is now)
+    assert "primary_user' is structural" not in r["error"], (
+        f"Invalid-tier error must not claim primary_user is structural. Got:\n{r['error']}"
+    )
 
 
 # ── Test 8: set_trust_tier — invalid justification_obs_id ─────────────────

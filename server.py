@@ -9491,15 +9491,20 @@ def _add_person_impl(
 
 
 # ── Trust-tier constants ────────────────────────────────────────────────────
-# Ordered from most-external (0) to most-internal (4). Tier changes TO any
-# tier with rank >= INTERNAL_THRESHOLD require primary-user approval.
-# 'primary_user' is NOT in this map — it is structural, not assignable.
+# Ordered from most-external (0) to most-internal (6). Tier changes TO any
+# tier with rank >= INTERNAL_THRESHOLD require primary-user approval, EXCEPT
+# 'self' (rank 6) which is gated by metadata.is_self=true instead.
+# 'primary_user' (rank 5) inherits the standard approval gate; multiple pn_*
+# nodes may simultaneously hold this tier (team-serving case).
+# 'self' is singleton-enforced at set-time (mirrors the is_self invariant).
 TIER_RANK = {
-    "user_family": 4,
-    "our_side": 3,
+    "self":           6,
+    "primary_user":   5,
+    "user_family":    4,
+    "our_side":       3,
     "known_external": 2,
-    "unknown": 1,
-    "suspect": 0,
+    "unknown":        1,
+    "suspect":        0,
 }
 INTERNAL_THRESHOLD = 3  # our_side and above
 
@@ -9539,22 +9544,30 @@ def engram_set_trust_tier(payload_json: str) -> str:
 
     Required payload fields:
         target_pn (str): The pn_NNNN node to update. Must be type='person'.
-        tier (str): The new tier. One of: user_family, our_side, known_external,
+        tier (str): The new tier. One of (highest to lowest):
+                    self, primary_user, user_family, our_side, known_external,
                     unknown, suspect.
-                    Note: 'primary_user' is NOT assignable via this tool — primary-user
-                    identification is structural (via pn_* attribute), not tier-set.
 
-    Required when tier ∈ {user_family, our_side}:
+    Required when tier ∈ {primary_user, user_family, our_side}:
         justification_obs_id (str): The observation_id (ob_NNNN) documenting the
                                     primary user's approval of this tier change.
                                     Must reference a node of type observation_factual
                                     or observation_predictive.
 
+    Special rules:
+        tier='self': Requires the target node to have metadata.is_self=true.
+                     Only ONE pn_* node may hold tier='self' at a time.
+                     Does NOT require the standard approval gate — the is_self
+                     attribute IS the structural attestation.
+        tier='primary_user': Multiple pn_* nodes may simultaneously hold this
+                             tier (team-serving case). Inherits the standard
+                             approval gate (justification + attestation required).
+
     Returns:
         Success: {"status": "set", "from_tier": "<prev>", "to_tier": "<new>",
                   "edit_history_id": <id>}
         No-op (same tier): {"status": "no_op", "from_tier": ..., "to_tier": ...}
-        Approval-gated tiers (our_side, user_family) without approval:
+        Approval-gated tiers (our_side, user_family, primary_user) without approval:
             Returns a structured error with step-by-step instructions for
             obtaining primary-user approval and retrying with the correct
             attestation fields. Read the error message carefully — it names
@@ -9592,20 +9605,11 @@ def _set_trust_tier_impl(
 ) -> str:
     """Internal implementation for engram_set_trust_tier."""
     # ── Tier value validation ──
-    if tier == "primary_user":
-        return json.dumps({
-            "error": (
-                "'primary_user' is structural, not assignable via engram_set_trust_tier. "
-                "Primary-user identification is set via the pn_* attribute (is_self=False + "
-                "primary-user designation in metadata), not via the tier system."
-            )
-        })
     if tier not in TIER_RANK:
         return json.dumps({
             "error": (
                 f"Invalid tier '{tier}'. Must be one of: "
                 + ", ".join(sorted(TIER_RANK, key=lambda t: TIER_RANK[t], reverse=True))
-                + ". Note: 'primary_user' is structural, not assignable."
             )
         })
     if not target_pn or not target_pn.strip():
@@ -9615,7 +9619,7 @@ def _set_trust_tier_impl(
     try:
         # ── target_pn validation ──
         row = conn.execute(
-            "SELECT id, type, trust_tier FROM nodes WHERE id = ?", (target_pn,)
+            "SELECT id, type, trust_tier, metadata FROM nodes WHERE id = ?", (target_pn,)
         ).fetchone()
         if not row:
             return json.dumps({"error": f"Node '{target_pn}' not found."})
@@ -9638,8 +9642,44 @@ def _set_trust_tier_impl(
 
         tier_rank = TIER_RANK[tier]
 
-        # ── Approval gate ──
-        if tier_rank >= INTERNAL_THRESHOLD:
+        # ── Self-tier gate (replaces the standard approval gate for tier='self') ──
+        if tier == "self":
+            # Gate 1: target node must have metadata.is_self=true
+            meta = json.loads(row["metadata"] or "{}")
+            if not meta.get("is_self"):
+                return json.dumps({
+                    "error": (
+                        f"Tier 'self' can only be assigned to a node with metadata.is_self=true. "
+                        f"'{target_pn}' does not have is_self=true in its metadata. "
+                        f"Create the self-anchor via engram_add_person(..., is_self=True) and "
+                        f"then call engram_set_trust_tier with tier='self'."
+                    )
+                })
+            # Gate 2: singleton — only one pn_* may hold tier='self' at a time.
+            # is_current=1 guard: a superseded pn_* retains trust_tier='self' in the
+            # column (supersede pathway does not clear it) but is no longer the live
+            # self-anchor. Without this guard, a dead pn_X row would falsely block
+            # assigning tier='self' to its successor pn_Y. Canonical pattern from
+            # _add_person_impl (L9430).
+            existing_self_tier = conn.execute(
+                "SELECT id FROM nodes WHERE type = 'person' AND trust_tier = 'self' "
+                "AND is_current = 1 AND id != ?",
+                (target_pn,),
+            ).fetchone()
+            if existing_self_tier:
+                return json.dumps({
+                    "error": (
+                        f"Tier 'self' is already assigned to '{existing_self_tier['id']}'. "
+                        f"Only one pn_* node may hold tier='self' at a time (mirrors the "
+                        f"is_self singleton invariant). Retract or re-tier the existing "
+                        f"self-tier node before assigning tier='self' to '{target_pn}'."
+                    )
+                })
+            # Self-tier does NOT require the standard approval gate — is_self IS
+            # the structural attestation. Skip to write.
+
+        # ── Standard approval gate (all other tiers at or above INTERNAL_THRESHOLD) ──
+        elif tier_rank >= INTERNAL_THRESHOLD:
             if not primary_user_approval_obtained or not justification_obs_id:
                 return json.dumps({
                     "error": (
@@ -9667,7 +9707,9 @@ def _set_trust_tier_impl(
                         f"a structural-honesty violation (ax_0001 / ax_0002). The server cannot "
                         f"mechanically verify this attestation — your honesty IS the integrity "
                         f"mechanism of the tier system. This is the same epistemic kind as a "
-                        f"fabricated quote."
+                        f"fabricated quote. This is especially load-bearing on the first "
+                        f"primary_user assignment, where no prior tier-holder exists to "
+                        f"delegate-attest."
                     )
                 })
 
