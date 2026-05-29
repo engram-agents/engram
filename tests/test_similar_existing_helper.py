@@ -17,6 +17,7 @@ extra metadata keys correctly per caller.
 
 import atexit
 import json
+import logging
 import os
 import shutil
 import sys
@@ -156,3 +157,34 @@ def test_helper_empty_type_filter_returns_empty():
         type_filter=set(),
     )
     assert matches == []
+
+
+def test_helper_exception_logs_warning_and_returns_empty(caplog):
+    """#307 regression: an injected failure in _similar_existing_matches
+    must log a warning (not swallow silently) and still return [].
+
+    Guards the fix in server.py: `except Exception as e:
+    logging.warning(...)` replacing the bare `except Exception: return []`.
+    """
+    server = fresh_server()
+    conn = server._get_db()
+
+    def _boom(conn, tier):
+        raise RuntimeError("injected failure for test")
+
+    original = server._get_tier_threshold
+    server._get_tier_threshold = _boom
+    try:
+        with caplog.at_level(logging.WARNING, logger="root"):
+            matches = server._similar_existing_matches(
+                conn, "any query",
+                type_filter={"observation_factual"},
+            )
+    finally:
+        server._get_tier_threshold = original
+
+    assert matches == [], f"Expected [] on failure, got: {matches}"
+    assert any(
+        "_similar_existing_matches failed" in r.message
+        for r in caplog.records
+    ), f"Expected warning log, got records: {[r.message for r in caplog.records]}"

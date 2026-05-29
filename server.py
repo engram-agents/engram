@@ -2386,7 +2386,8 @@ def _similar_existing_matches(
                             for key in extra_metadata_keys:
                                 rec[key] = meta.get(key, "")
                 matches.append(rec)
-    except Exception:
+    except Exception as e:
+        logging.warning("_similar_existing_matches failed: %s", e)
         return []
     return matches
 
@@ -6227,9 +6228,11 @@ def _surface_impl(
         for n in results:
             meta_str = n.get("metadata", "")
             if isinstance(meta_str, str) and meta_str:
-                if '"stale_by"' in meta_str:
+                # Anchored to the serialized JSON list shape to avoid
+                # false positives from claim text containing these phrases.
+                if '"stale_by": [' in meta_str:
                     stale_count += 1
-                if '"tainted_by"' in meta_str:
+                if '"tainted_by": [' in meta_str:
                     tainted_count += 1
             w = _extract_warnings(meta_str, conn)
             if w:
