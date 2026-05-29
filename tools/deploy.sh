@@ -659,12 +659,36 @@ fi
 SERVICE_DEST="$HOME/.config/systemd/user/engram-surface-daemon.service"
 SERVICE_TEMPLATE="$ALPHA_DIR/templates/engram-surface-daemon.service.template"
 if [[ -f "$SERVICE_DEST" && -f "$SERVICE_TEMPLATE" && -n "$PYTHON_BIN" ]]; then
-    sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
-        -e "s|{{ENGRAM_HOOKS_DIR}}|$ENGRAM_HOME/hooks|g" \
-        -e "s|{{ENGRAM_HOME}}|$ENGRAM_HOME|g" \
-        "$SERVICE_TEMPLATE" > "$SERVICE_DEST"
-    echo "  ✓ Refreshed systemd user service file → $SERVICE_DEST"
-    echo "    Run: systemctl --user daemon-reload  (if you want changes to take effect now)"
+    # Cross-install detection: if existing service file points at a different
+    # ENGRAM_HOME, refuse to clobber. This prevents the multi-install
+    # cross-clobber footgun (#458) — last deploy wins, other install's
+    # daemon silently misconfigured.
+    #
+    # Detection via the `Environment=ENGRAM_HOME=` line — the template
+    # renders `{{ENGRAM_HOME}}` there as a Key=Value pair, making it the
+    # most discriminating extractable anchor in the deployed file.
+    # Fall back: empty string if not found = treat as first-deploy (proceed).
+    # Note: [^[:space:]]+ truncates at the first whitespace, so an ENGRAM_HOME
+    # containing a space will be extracted incorrectly — the comparison will
+    # mismatch and the deploy will skip (conservative false-positive).
+    # Intentional: skip-on-doubt is safe-on-the-wrong-side; clobber-vs-skip favors skip.
+    EXISTING_HOME="$(grep -oE 'Environment=ENGRAM_HOME=[^[:space:]]+' "$SERVICE_DEST" | head -1 | sed 's|Environment=ENGRAM_HOME=||' || true)"
+    if [[ -n "$EXISTING_HOME" && "$EXISTING_HOME" != "$ENGRAM_HOME" ]]; then
+        echo "  ⚠ Skipping systemd service refresh — existing $SERVICE_DEST points at $EXISTING_HOME, NOT the current deploy ($ENGRAM_HOME)."
+        echo "    Multi-install detected. Refusing to cross-clobber the other install's daemon config."
+        echo "    To run a per-install daemon for this install, either:"
+        echo "      (a) Use a different system user, or"
+        echo "      (b) Wait for per-install service-naming (issue #458 follow-up: Option 1)."
+        echo "    The fall-through path (hooks/in-process FTS) still works for this install."
+    else
+        # Existing or first-deploy match — refresh as before.
+        sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
+            -e "s|{{ENGRAM_HOOKS_DIR}}|$ENGRAM_HOME/hooks|g" \
+            -e "s|{{ENGRAM_HOME}}|$ENGRAM_HOME|g" \
+            "$SERVICE_TEMPLATE" > "$SERVICE_DEST"
+        echo "  ✓ Refreshed systemd user service file → $SERVICE_DEST"
+        echo "    Run: systemctl --user daemon-reload  (if you want changes to take effect now)"
+    fi
 fi
 
 # Stamp version marker for forensics + future "what version is running?" queries
