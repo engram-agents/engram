@@ -10794,35 +10794,6 @@ def _remove_edge_impl(
             (source_id, target_id, relation),
         )
 
-        # `exemplifies` is the only whitelist relation with metadata + filesystem
-        # side effects (engram_register_exemplar bumps target.exemplar_count
-        # + appends to error_incidents.json for lessons). Mirror the reverse
-        # inside the same transaction so the surface-rendered count stays
-        # honest. The error_incidents.json rebuild happens outside the
-        # transaction (best-effort, never blocks the edge write — matches
-        # register_exemplar's treatment).
-        #
-        # Counter-field migration (PR #434): read `exemplar_count` (canonical
-        # post-unification) with fallback to legacy `incident_count`; write
-        # `exemplar_count` and clear `incident_count` — mirror the write path
-        # so the two sides stay symmetric. Applies to BOTH lesson and
-        # cornerstone targets since the unified tool writes to both.
-        if relation == "exemplifies" and target["type"] in ("lesson", "cornerstone"):
-            tgt_row = conn.execute(
-                "SELECT metadata FROM nodes WHERE id = ?", (target_id,)
-            ).fetchone()
-            try:
-                meta = json.loads(tgt_row["metadata"]) if tgt_row and tgt_row["metadata"] else {}
-            except (TypeError, json.JSONDecodeError):
-                meta = {}
-            existing = int(meta.get("exemplar_count", meta.get("incident_count", 0)))
-            meta["exemplar_count"] = max(0, existing - 1)
-            meta.pop("incident_count", None)  # clear legacy
-            conn.execute(
-                "UPDATE nodes SET metadata = ? WHERE id = ?",
-                (json.dumps(meta), target_id),
-            )
-
         _log_edit(conn, "edge_removed", source_id, source["type"], {
             "target_id": target_id,
             "target_type": target["type"],
@@ -11584,7 +11555,6 @@ def _add_lesson_impl(
             "reasoning_type": reasoning_type,
             "reasoning_class": rclass,
             "scaffolding_nudge": scaffolding_nudge,
-            "incident_count": len(ids),
         }
 
         conn.execute(
@@ -11728,9 +11698,10 @@ _LESSON_REGISTER_INCIDENT_FIELDS = frozenset({
 # that surface when the agent matches an incident pattern. Each new incident
 # is empirical evidence the lesson is load-bearing.
 #
-# Wires an `exemplifies` edge from incident_observation → lesson + bumps the
-# lesson's incident_count + rebuilds the incidents_cache that the recall-hook
-# scans on every prompt for pattern matching.
+# Wires an `exemplifies` edge from incident_observation → lesson + rebuilds
+# the incidents_cache that the recall-hook scans on every prompt for pattern
+# matching. Exemplar count is live-computed via _count_live_exemplars (SSoT,
+# no cached metadata field — closes #442).
 #
 # Why register-incidents-explicitly rather than auto-detect: the agent makes
 # the judgment "this incident IS this pattern" — auto-detection would either
@@ -11979,17 +11950,12 @@ def _register_exemplar_impl(
             (exemplar_id, target_id),
         ).fetchone()
         if existing:
-            count_row = conn.execute(
-                """SELECT COUNT(*) AS c FROM edges
-                   WHERE target_id = ? AND relation = 'exemplifies'""",
-                (target_id,),
-            ).fetchone()
             return json.dumps({
                 "status": "already_exists",
                 "edge": {"source": exemplar_id, "target": target_id, "relation": "exemplifies"},
                 "target_id": target_id,
                 "target_claim": target_row["claim"],
-                "exemplar_count": count_row["c"] if count_row else None,
+                "exemplar_count": _count_live_exemplars(conn, target_id, target_row["type"]),
             })
 
         now = _now()
@@ -12000,33 +11966,11 @@ def _register_exemplar_impl(
             (exemplar_id, target_id, now, edge_meta),
         )
 
-        # Bump the exemplar_count in metadata so engram_reflect / inspect
-        # rendering stays consistent without a full count requery every time.
-        # Backward compat: read incident_count if present (existing lessons),
-        # write under the new canonical name exemplar_count, and clear the
-        # old incident_count key to avoid drift.
-        try:
-            meta = json.loads(target_row["metadata"]) if target_row["metadata"] else {}
-        except (TypeError, json.JSONDecodeError):
-            meta = {}
-        # Migrate: prefer exemplar_count, fall back to incident_count for old lessons.
-        existing_count = meta.get("exemplar_count", meta.get("incident_count", 0))
-        meta["exemplar_count"] = int(existing_count) + 1
-        # Clear old key if present to avoid drift.
-        meta.pop("incident_count", None)
-        conn.execute(
-            "UPDATE nodes SET metadata = ? WHERE id = ?",
-            (json.dumps(meta), target_id),
-        )
         _utility_reward(conn, [target_id], action="register_exemplar")
         conn.commit()
 
-        count_row = conn.execute(
-            """SELECT COUNT(*) AS c FROM edges
-               WHERE target_id = ? AND relation = 'exemplifies'""",
-            (target_id,),
-        ).fetchone()
-        exemplar_count = count_row["c"] if count_row else None
+        # Live count via SSoT helper — no cached field needed (closes #442).
+        exemplar_count = _count_live_exemplars(conn, target_id, target_row["type"])
     finally:
         conn.close()
 
@@ -14190,6 +14134,51 @@ def _supersede_impl(
 
 
 # ---------------------------------------------------------------------------
+# Live-exemplar count helper (SSoT for exemplar_count surface) (closes #442)
+# ---------------------------------------------------------------------------
+
+
+def _count_live_exemplars(conn: sqlite3.Connection, target_id: str, target_type: str) -> int:
+    """Count live exemplars supporting a cornerstone or lesson.
+
+    Live = source/target node with is_current=1.
+
+    For lessons (target_type='lesson'):
+        - Count incoming `exemplifies` edges where source.is_current=1.
+
+    For cornerstones (target_type='cornerstone'):
+        - Count incoming `exemplifies` edges where source.is_current=1, PLUS
+        - Count outgoing `supported_by` edges where target.is_current=1
+          (the pre-PR-#431 cornerstone exemplar wiring pattern, kept by
+          Lei's 2026-05-28 design call: coexisting schemas, both counted).
+    """
+    exemplifies_live = conn.execute(
+        """SELECT COUNT(*) AS c
+           FROM edges e
+           JOIN nodes n ON n.id = e.source_id
+           WHERE e.target_id = ?
+             AND e.relation = 'exemplifies'
+             AND n.is_current = 1""",
+        (target_id,),
+    ).fetchone()["c"]
+
+    if target_type != "cornerstone":
+        return exemplifies_live
+
+    supported_by_live = conn.execute(
+        """SELECT COUNT(*) AS c
+           FROM edges e
+           JOIN nodes n ON n.id = e.target_id
+           WHERE e.source_id = ?
+             AND e.relation = 'supported_by'
+             AND n.is_current = 1""",
+        (target_id,),
+    ).fetchone()["c"]
+
+    return exemplifies_live + supported_by_live
+
+
+# ---------------------------------------------------------------------------
 # Zero-support detection helper (§2.3)
 # ---------------------------------------------------------------------------
 
@@ -14255,29 +14244,7 @@ def _detect_zero_support(conn: sqlite3.Connection, affected_node_id: str) -> lis
         if not cs_ls_node or not cs_ls_node["is_current"]:
             continue  # Only count live cs/ls nodes
 
-        # Outgoing supported_by edges — count where TARGET is_current=1.
-        supported_by_live = conn.execute(
-            """SELECT COUNT(*) as c
-               FROM edges e
-               JOIN nodes n ON n.id = e.target_id
-               WHERE e.source_id = ?
-                 AND e.relation = 'supported_by'
-                 AND n.is_current = 1""",
-            (cs_ls_id,),
-        ).fetchone()["c"]
-
-        # Incoming exemplifies edges — count where SOURCE is_current=1.
-        exemplifies_live = conn.execute(
-            """SELECT COUNT(*) as c
-               FROM edges e
-               JOIN nodes n ON n.id = e.source_id
-               WHERE e.target_id = ?
-                 AND e.relation = 'exemplifies'
-                 AND n.is_current = 1""",
-            (cs_ls_id,),
-        ).fetchone()["c"]
-
-        total_live = supported_by_live + exemplifies_live
+        total_live = _count_live_exemplars(conn, cs_ls_id, cs_ls_node["type"])
 
         if total_live == 0:
             # Mark support_lost in metadata.
@@ -16489,8 +16456,14 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         for ls in lessons:
             ls_meta = json.loads(ls["metadata"]) if ls["metadata"] else {}
             # Incidents point AT the lesson via `exemplifies` (incident → lesson).
+            # Filter to is_current=1 sources so the list matches exemplar_count
+            # semantics (live exemplars only; superseded source nodes excluded).
             incident_edges = conn.execute(
-                "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'exemplifies'",
+                """SELECT e.source_id
+                   FROM edges e
+                   JOIN nodes n ON n.id = e.source_id
+                   WHERE e.target_id = ? AND e.relation = 'exemplifies'
+                     AND n.is_current = 1""",
                 (ls["id"],),
             ).fetchall()
             active_lessons.append({
@@ -16498,7 +16471,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
                 "claim": _reflect_rs_or_claim(ls, "claim"),
                 "confidence": ls["confidence"],
                 "scaffolding_nudge": ls_meta.get("scaffolding_nudge", ""),
-                "incident_count": len(incident_edges),
+                "exemplar_count": _count_live_exemplars(conn, ls["id"], "lesson"),
                 "incidents": [e["source_id"] for e in incident_edges],
                 "since": ls["created_at"],
             })

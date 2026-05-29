@@ -9,8 +9,8 @@ Coverage:
      to cornerstones count as live support in _detect_zero_support.
   §4 Lesson alias backward-compat — lesson_id/incident_id field names route
      correctly via engram_lesson_register_incident.
-  §5 metadata.incident_count → metadata.exemplar_count migration — lesson
-     with pre-existing incident_count gets updated correctly.
+  §5 Live-count SSoT — exemplar_count is live-computed via _count_live_exemplars,
+     no longer cached in node metadata (closes #442).
 
 Axioms are used to seed claim-bearing exemplars (no DNS dependency).
 """
@@ -180,6 +180,11 @@ def test_register_exemplar_cornerstone_idempotent():
 
     r2 = json.loads(server.engram_register_exemplar(payload_json=payload))
     assert r2.get("status") == "already_exists", r2
+    # Pin new SSoT behavior: exemplar_count = 1 exemplifies (exemplar→cs) +
+    # 1 supported_by (cs→sup, live). Pre-PR this was exemplifies-only (=1).
+    assert r2.get("exemplar_count") == 2, (
+        f"Expected exemplar_count=2 (1 exemplifies + 1 supported_by), got {r2.get('exemplar_count')!r}"
+    )
 
     # Only one edge in DB.
     conn = server._get_db()
@@ -606,135 +611,108 @@ def test_lesson_alias_accepts_cornerstone_target_via_unified():
 
 
 # ---------------------------------------------------------------------------
-# §5 metadata.incident_count → metadata.exemplar_count migration
+# §5 live-count SSoT — exemplar_count is no longer cached in metadata (closes #442)
 # ---------------------------------------------------------------------------
 
 
-def test_exemplar_count_migration_from_incident_count():
-    """A lesson with pre-existing incident_count=5 reads correctly after registration.
-
-    After the unified tool fires:
-    - exemplar_count should be 6 (5+1)
-    - incident_count should be cleared (set to None / absent)
-    """
+def test_response_exemplar_count_matches_live_count():
+    """The response exemplar_count matches the SSoT helper after registration."""
     server = fresh_server()
-    inc = _seed_axiom(server, "Incident for migration test.")
-    ls_id = _seed_ls(server, "Migration test lesson.", incident_id=inc)
+    inc = _seed_axiom(server, "Incident for live-count test.")
+    ls_id = _seed_ls(server, "Live-count test lesson.", incident_id=inc)
 
-    # Manually set incident_count=5 on the lesson to simulate pre-existing state.
-    conn = server._get_db()
-    try:
-        row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (ls_id,)).fetchone()
-        meta = json.loads(row["metadata"] or "{}") if row else {}
-        meta["incident_count"] = 5
-        # Clear exemplar_count if present (fresh lesson may have it from creation)
-        meta.pop("exemplar_count", None)
-        conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?",
-                     (json.dumps(meta), ls_id))
-        conn.commit()
-    finally:
-        conn.close()
-
-    new_exemplar = _seed_axiom(server, "New exemplar triggering migration.")
+    new_exemplar = _seed_axiom(server, "New exemplar for live-count verification.")
     r = json.loads(server.engram_register_exemplar(
         payload_json=json.dumps({"target_id": ls_id, "exemplar_id": new_exemplar})
     ))
     assert "error" not in r, r
     assert r.get("status") == "created", r
 
-    # Verify metadata after registration.
-    updated_meta = _get_meta(server, ls_id)
-    assert updated_meta.get("exemplar_count") == 6, (
-        f"Expected exemplar_count=6 (5 legacy + 1 new), got: {updated_meta}"
-    )
-    assert "incident_count" not in updated_meta, (
-        f"incident_count should be cleared after migration, got: {updated_meta}"
-    )
-
-
-def test_new_lesson_uses_exemplar_count_not_incident_count():
-    """A newly-registered exemplar on a lesson with no prior incident_count uses exemplar_count."""
-    server = fresh_server()
-    inc = _seed_axiom(server, "Incident for new-count test.")
-    ls_id = _seed_ls(server, "New count test lesson.", incident_id=inc)
-
-    # Clear any metadata that may have been set.
     conn = server._get_db()
     try:
-        conn.execute("UPDATE nodes SET metadata = NULL WHERE id = ?", (ls_id,))
-        conn.commit()
+        live_count = server._count_live_exemplars(conn, ls_id, "lesson")
     finally:
         conn.close()
 
-    new_exemplar = _seed_axiom(server, "First post-creation exemplar.")
-    r = json.loads(server.engram_register_exemplar(
-        payload_json=json.dumps({"target_id": ls_id, "exemplar_id": new_exemplar})
-    ))
-    assert r.get("status") == "created", r
-
-    updated_meta = _get_meta(server, ls_id)
-    assert updated_meta.get("exemplar_count") == 1
-    assert "incident_count" not in updated_meta
+    assert r["exemplar_count"] == live_count, (
+        f"Response exemplar_count {r['exemplar_count']} != live helper {live_count}"
+    )
+    # No cached exemplar_count / incident_count field in metadata (retired).
+    meta = _get_meta(server, ls_id)
+    assert "exemplar_count" not in meta, f"exemplar_count should not be cached: {meta}"
+    assert "incident_count" not in meta, f"incident_count should not be cached: {meta}"
 
 
-def test_remove_exemplifies_edge_decrements_exemplar_count_lesson():
-    """Regression: edge-removal must decrement exemplar_count + clear legacy
-    incident_count (PR #434 round-3 fix per Borges colleague-review blocker).
-
-    Before this fix, the edge-removal path read/decremented `incident_count`
-    only — so removing an exemplifies edge while the lesson's metadata had
-    `exemplar_count` would leave `exemplar_count` stale + write a bogus
-    `incident_count: 0`.
-    """
+def test_new_lesson_metadata_has_no_cached_count():
+    """A freshly-created lesson has no exemplar_count / incident_count in metadata."""
     server = fresh_server()
-    inc = _seed_axiom(server, "Edge-removal regression incident.")
-    ls_id = _seed_ls(server, "Edge-removal regression lesson.", incident_id=inc)
+    inc = _seed_axiom(server, "Incident for no-cache metadata test.")
+    ls_id = _seed_ls(server, "No-cached-count lesson.", incident_id=inc)
 
-    # Register an exemplar via the unified tool (writes exemplar_count).
+    meta = _get_meta(server, ls_id)
+    assert "exemplar_count" not in meta, f"Should not be cached on creation: {meta}"
+    assert "incident_count" not in meta, f"Should not be cached on creation: {meta}"
+
+
+def test_remove_exemplifies_edge_live_count_lesson():
+    """Live count decreases after edge removal — SSoT helper verifies (closes #442)."""
+    server = fresh_server()
+    inc = _seed_axiom(server, "Edge-removal live-count incident.")
+    ls_id = _seed_ls(server, "Edge-removal live-count lesson.", incident_id=inc)
+
+    # Register an additional exemplar — now 2 live exemplars.
     new_exemplar = _seed_axiom(server, "Exemplar to be removed.")
     r = json.loads(server.engram_register_exemplar(
         payload_json=json.dumps({"target_id": ls_id, "exemplar_id": new_exemplar})
     ))
     assert r.get("status") == "created", r
-    pre_meta = _get_meta(server, ls_id)
-    assert pre_meta.get("exemplar_count") == 2, pre_meta  # 1 from seed + 1 new
 
-    # Remove the edge via engram_remove_edge.
+    conn = server._get_db()
+    try:
+        pre_count = server._count_live_exemplars(conn, ls_id, "lesson")
+    finally:
+        conn.close()
+    assert pre_count == 2, f"Expected 2 before removal, got {pre_count}"
+
+    # Remove the edge.
     r = json.loads(server.engram_remove_edge(payload_json=json.dumps({
         "source_id": new_exemplar, "target_id": ls_id, "relation": "exemplifies",
     })))
     assert "error" not in r, r
 
-    # Post-removal: exemplar_count decremented, incident_count gone.
-    post_meta = _get_meta(server, ls_id)
-    assert post_meta.get("exemplar_count") == 1, (
-        f"Expected exemplar_count=1 after removal, got: {post_meta}"
-    )
-    assert "incident_count" not in post_meta, (
-        f"incident_count should be absent (cleared), got: {post_meta}"
-    )
+    conn = server._get_db()
+    try:
+        post_count = server._count_live_exemplars(conn, ls_id, "lesson")
+    finally:
+        conn.close()
+    assert post_count == 1, f"Expected 1 after removal, got {post_count}"
 
 
-def test_remove_exemplifies_edge_decrements_exemplar_count_cornerstone():
-    """Mirror test for cornerstone targets — edge-removal path now handles
-    both lesson and cornerstone (PR #434 round-3 fix)."""
+def test_remove_exemplifies_edge_live_count_cornerstone():
+    """Live count decreases after edge removal for cornerstone targets (closes #442)."""
     server = fresh_server()
-    cs_id = _seed_cs(server, "Cornerstone for edge-removal test.")
+    cs_id = _seed_cs(server, "Cornerstone for edge-removal live-count test.")
     ex = _seed_axiom(server, "Cornerstone exemplar to be removed.")
     r = json.loads(server.engram_register_exemplar(
         payload_json=json.dumps({"target_id": cs_id, "exemplar_id": ex})
     ))
     assert r.get("status") == "created", r
-    pre_meta = _get_meta(server, cs_id)
-    assert pre_meta.get("exemplar_count") == 1, pre_meta
+
+    conn = server._get_db()
+    try:
+        pre_count = server._count_live_exemplars(conn, cs_id, "cornerstone")
+    finally:
+        conn.close()
+    assert pre_count == 1, f"Expected 1 before removal, got {pre_count}"
 
     r = json.loads(server.engram_remove_edge(payload_json=json.dumps({
         "source_id": ex, "target_id": cs_id, "relation": "exemplifies",
     })))
     assert "error" not in r, r
 
-    post_meta = _get_meta(server, cs_id)
-    assert post_meta.get("exemplar_count") == 0, (
-        f"Expected exemplar_count=0 after removal, got: {post_meta}"
-    )
-    assert "incident_count" not in post_meta, post_meta
+    conn = server._get_db()
+    try:
+        post_count = server._count_live_exemplars(conn, cs_id, "cornerstone")
+    finally:
+        conn.close()
+    assert post_count == 0, f"Expected 0 after removal, got {post_count}"

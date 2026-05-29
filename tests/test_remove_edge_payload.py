@@ -278,18 +278,18 @@ def test_impl_callable_with_kwargs():
 
 # ── 9. `exemplifies` side-effects (fairy round-1 PR #126 blockers) ─────────
 #
-# `exemplifies` is the only whitelist relation with metadata + filesystem
-# coupling: register_incident bumps lesson.metadata.incident_count AND
-# appends to error_incidents.json. Removing such an edge must reverse both
-# or the lesson's scaffolding tripwire keeps firing for the removed incident.
+# `exemplifies` is the only whitelist relation with filesystem side-effects:
+# it appends to error_incidents.json (rebuilt on add/remove). Removing such an
+# edge must rebuild the cache or the lesson's scaffolding tripwire keeps firing
+# for the removed incident. The metadata counter (incident_count) was retired
+# in favour of a live-count SSoT helper (closes #442).
 
 
 def _seed_lesson_with_two_incidents(server, error_incidents_tmp_path):
     """Create two incidents and a lesson, both incidents linked via exemplifies.
     Returns (lesson_id, incident_a_id, incident_b_id).
 
-    The lesson's metadata.incident_count starts at 2; error_incidents.json
-    is freshly rebuilt to reflect both incidents on disk.
+    error_incidents.json is freshly rebuilt to reflect both incidents on disk.
     """
     # Redirect the cache file to a test path so we don't pollute ~/.engram/.
     server.ERROR_INCIDENTS_PATH = str(error_incidents_tmp_path)
@@ -342,20 +342,16 @@ def test_remove_exemplifies_happy_path(tmp_path):
     assert r["cache_rebuild"]["status"] != "error", r["cache_rebuild"]
 
 
-def test_remove_exemplifies_decrements_incident_count(tmp_path):
-    """Lesson's metadata.incident_count goes from 2 → 1 after removal."""
+def test_remove_exemplifies_decrements_live_count(tmp_path):
+    """Live exemplar count goes from 2 → 1 after edge removal (SSoT helper, closes #442)."""
     server = fresh_server()
     cache_path = tmp_path / "error_incidents.json"
     lesson_id, inc_a, _ = _seed_lesson_with_two_incidents(server, cache_path)
 
-    # Verify starting state — incident_count == 2.
+    # Verify starting state — 2 live exemplars.
     conn = server._get_db()
     try:
-        row = conn.execute(
-            "SELECT metadata FROM nodes WHERE id = ?", (lesson_id,)
-        ).fetchone()
-        meta = json.loads(row["metadata"])
-        assert meta["incident_count"] == 2, meta
+        assert server._count_live_exemplars(conn, lesson_id, "lesson") == 2
     finally:
         conn.close()
 
@@ -367,11 +363,7 @@ def test_remove_exemplifies_decrements_incident_count(tmp_path):
 
     conn = server._get_db()
     try:
-        row = conn.execute(
-            "SELECT metadata FROM nodes WHERE id = ?", (lesson_id,)
-        ).fetchone()
-        meta = json.loads(row["metadata"])
-        assert meta["incident_count"] == 1, meta
+        assert server._count_live_exemplars(conn, lesson_id, "lesson") == 1
     finally:
         conn.close()
 
@@ -401,35 +393,27 @@ def test_remove_exemplifies_rebuilds_error_incidents_cache(tmp_path):
     assert inc_b in cache_after, cache_after
 
 
-def test_remove_exemplifies_floor_at_zero(tmp_path):
-    """incident_count won't go below 0 even if the cached value is somehow stale."""
+def test_remove_exemplifies_live_count_after_all_removed(tmp_path):
+    """Live exemplar count reaches 0 after all exemplifies edges are removed (no floor needed)."""
     server = fresh_server()
     cache_path = tmp_path / "error_incidents.json"
     lesson_id, inc_a, inc_b = _seed_lesson_with_two_incidents(server, cache_path)
 
-    # Force the cached count to 0 to simulate a stale-cache scenario.
-    conn = server._get_db()
-    try:
-        row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (lesson_id,)).fetchone()
-        meta = json.loads(row["metadata"])
-        meta["incident_count"] = 0
-        conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?",
-                     (json.dumps(meta), lesson_id))
-        conn.commit()
-    finally:
-        conn.close()
-
+    # Remove both edges — live count should reach exactly 0.
     json.loads(server.engram_remove_edge(payload_json=json.dumps({
         "source_id": inc_a,
+        "target_id": lesson_id,
+        "relation": "exemplifies",
+    })))
+    json.loads(server.engram_remove_edge(payload_json=json.dumps({
+        "source_id": inc_b,
         "target_id": lesson_id,
         "relation": "exemplifies",
     })))
 
     conn = server._get_db()
     try:
-        row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (lesson_id,)).fetchone()
-        meta = json.loads(row["metadata"])
-        assert meta["incident_count"] == 0, f"floor at 0 not enforced: {meta}"
+        assert server._count_live_exemplars(conn, lesson_id, "lesson") == 0
     finally:
         conn.close()
 
