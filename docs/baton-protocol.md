@@ -167,7 +167,9 @@ Projects are sorted oldest-first (most overdue at the top).
 ## Manual deployment for multi-agent operators
 
 Baton is not installed by `install.sh` — it requires a shared filesystem
-between agents, which only exists in multi-agent setups.
+between agents, which only exists in multi-agent setups. See also
+`templates/CLAUDE.md.multi-agent.template` for the CLAUDE.md additions that
+activate the `ia` and `baton` skill-loading triggers in an agent's live config.
 
 ```bash
 # Copy baton CLI to shared bin (both agents must be able to run it)

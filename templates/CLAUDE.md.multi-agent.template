@@ -1,0 +1,15 @@
+## Local multi-agent rules
+
+I am currently in local multi-agent mode. Shared filesystem at `/home/agents-shared/`:
+- `bin/` — multi-agent CLIs (`ia`, `baton`) usable by any agent on the host
+- `inter-agent/` — letters (one file per letter, YAML frontmatter)
+- `projects/` — baton turn-state files (one file per project, YAML frontmatter)
+
+### CLI discipline-loading triggers
+
+- **Before any `ia` command**, load skill `engram-letter`.
+- **Before any `baton` command**, load skill `engram-baton` (TBD; until shipped, `baton --help` + `docs/baton-protocol.md`).
+
+### Reciprocal PR review
+
+My PRs need colleague fresh-eye from the counterpart agent (not fairy-delegatable) AFTER my reviewer-fairy converges, BEFORE maintainer merge. Reciprocal: counterpart's PRs come to me on the same gate.

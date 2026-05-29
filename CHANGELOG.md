@@ -25,6 +25,16 @@ to a versioned section when releasing per `RELEASING.md`.
 - `templates/CLAUDE.md.template` — added `### External interactions` subsection
   with `engram-trust-tier` skill-loading trigger for interactions crossing the
   primary_user/family boundary. (PR #444 oversight)
+- `templates/CLAUDE.md.multi-agent.template` — multi-agent-only CLAUDE.md additions
+  (shared filesystem layout, CLI discipline-loading triggers, reciprocal PR review gate).
+  Appended at end of agent's live `~/.claude/CLAUDE.md` as `## Local multi-agent rules`
+  section on first multi-agent setup; never rendered by single-agent installs.
+- `tools/deploy.sh` — multi-agent drift-warning: when both `/home/agents-shared/`
+  exists and `config.json` has `multi_agent: true` (AND-detection, load-bearing),
+  deploy.sh computes a SHA of the template and warns when it changed vs the last
+  tracked SHA (`$ENGRAM_HOME/.deployed-multi-agent-template-sha`). Marker created
+  lazily on first multi-agent deploy. Single-agent installs see zero overhead.
+  Closes the dormancy gap from ob_2092 / ia-silent-fail incident ob_2093.
 - `tools/agentctl` — vendored canonical agentctl (Lei's operational version,
   May 21 build; includes spawn-debug fixes absent from the old snapshot).
   `tests/spawn/Dockerfile` now copies from `tools/agentctl`; the stale
@@ -56,6 +66,12 @@ to a versioned section when releasing per `RELEASING.md`.
 - `SKILL.md` line 448 — `engram_set_trust_tier` tier list updated from 5 tiers
   to 7 (`self` and `primary_user` added; `self` documented as singleton /
   is_self-gated). (PR #444 reviewer S2)
+- `tools/deploy.sh` — multi-agent marker write now gated on `DRY_RUN=0`;
+  previously `--dry-run` wrote the marker even though no rsync was applied,
+  silencing the drift warning on all subsequent invocations.
+- `tools/deploy.sh` — SHA computation for the multi-agent template now uses
+  Python `hashlib` instead of `sha256sum` (Linux-only); cross-platform on
+  macOS and any host with Python 3 (already a project dependency).
 
 ### Removed
 

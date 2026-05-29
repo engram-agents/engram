@@ -475,6 +475,68 @@ if [[ -n "$BASELINE_SHA" ]]; then
     fi
 fi
 
+# Multi-agent CLAUDE.md drift detection (issue #448, PR ships template + detection).
+# Fires only when BOTH signals are present: shared filesystem exists AND config flag
+# is true. AND-detection is load-bearing — see PR description for why OR is wrong.
+# Template file: templates/CLAUDE.md.multi-agent.template
+# Marker file:   $ENGRAM_HOME/.deployed-multi-agent-template-sha (created lazily)
+# Action on drift: agent manually merges updates into ~/.claude/CLAUDE.md as an
+#   appended '## Local multi-agent rules' section.
+multi_agent_detected=false
+# Read multi_agent flag from config.json using jq if available, else Python
+# (Python is guaranteed present for this project; jq is optional on some hosts).
+_read_multi_agent_flag() {
+    local cfg="$ENGRAM_HOME/config.json"
+    if command -v jq >/dev/null 2>&1; then
+        jq -r '.multi_agent // false' "$cfg" 2>/dev/null
+    else
+        python3 -c "
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+    print('true' if data.get('multi_agent', False) else 'false')
+except Exception:
+    print('false')
+" "$cfg" 2>/dev/null
+    fi
+}
+# Detection: BOTH signals required (AND, not OR). /home/agents-shared/ alone
+# could be leftover from manually-turned-off multi-agent OR a mid-failed spawn;
+# config flag alone could be a manual override without provisioning. The
+# /home/agents-shared/ path is the alpha-project convention for the shared
+# inter-agent FS; if a future deployment needs a different location, parametrize
+# this and the BATON_PROJECTS_DIR / similar consumers together.
+if [[ -d /home/agents-shared/ ]] && \
+   [[ "$(_read_multi_agent_flag)" == "true" ]]; then
+    multi_agent_detected=true
+fi
+
+if [[ "$multi_agent_detected" == "true" ]]; then
+    MULTI_AGENT_TEMPLATE_PATH="$ALPHA_DIR/templates/CLAUDE.md.multi-agent.template"
+    if [[ -f "$MULTI_AGENT_TEMPLATE_PATH" ]]; then
+        MULTI_AGENT_SHA=$(python3 -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$MULTI_AGENT_TEMPLATE_PATH")
+        MULTI_AGENT_MARKER="$ENGRAM_HOME/.deployed-multi-agent-template-sha"
+        LAST_MULTI_AGENT_SHA=""
+        if [[ -f "$MULTI_AGENT_MARKER" ]]; then
+            LAST_MULTI_AGENT_SHA=$(cat "$MULTI_AGENT_MARKER")
+        fi
+        if [[ "$MULTI_AGENT_SHA" != "$LAST_MULTI_AGENT_SHA" ]]; then
+            echo "⚠ Multi-agent CLAUDE.md template changed since last deploy."
+            echo "  Source: $MULTI_AGENT_TEMPLATE_PATH"
+            echo "  Action: merge updates into ~/.claude/CLAUDE.md as the"
+            echo "          appended '## Local multi-agent rules' section."
+            if [[ $DRY_RUN = 0 ]]; then
+                echo "  Tracked SHA updated; warning will not re-fire until next change."
+            else
+                echo "  (dry-run: marker not updated; warning will re-fire on next run)"
+            fi
+        fi
+        if [[ $DRY_RUN = 0 ]]; then
+            echo "$MULTI_AGENT_SHA" > "$MULTI_AGENT_MARKER"
+        fi
+    fi
+fi
+
 if [[ $CHANGES -eq 0 ]]; then
     echo "No changes needed. ENGRAM_HOME is up to date with alpha @ $ALPHA_SHA."
     exit 0
