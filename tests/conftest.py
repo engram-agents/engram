@@ -23,7 +23,7 @@ def mock_dns_resolution(request, monkeypatch):
     Tests that exercise the DNS-validation code path explicitly opt out via
     @pytest.mark.real_dns marker (test_url_validation.py's DNS-checking tests).
 
-    Default behavior: fake hostnames with 'totally-fake-domain' or 'fake-test'
+    Default behavior: fake hostnames with 'totally-fake-domain'
     in them raise gaierror (EAI_NONAME) to preserve fabricated-URL test coverage;
     everything else resolves to 127.0.0.1.
     """
@@ -31,7 +31,7 @@ def mock_dns_resolution(request, monkeypatch):
         return
 
     def fake_getaddrinfo(host, *args, **kwargs):
-        if "totally-fake-domain" in host or "fake-test" in host:
+        if "totally-fake-domain" in host:
             raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
         return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 0))]
 

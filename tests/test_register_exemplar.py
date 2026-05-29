@@ -64,8 +64,7 @@ def _seed_cs(server, supporting_ids, tag="cs-tag"):
 
 def _seed_ls(server, claim="Lesson pattern.", incident_id=None):
     if incident_id is None:
-        incident_id = _seed_axiom(server, f"Placeholder incident for: {claim}",
-                                  url="https://example.com/placeholder")
+        incident_id = _seed_axiom(server, f"Placeholder incident for: {claim}")
     r = json.loads(server.engram_add_lesson(payload_json=json.dumps({
         "claim": claim,
         "incident_ids": incident_id,
@@ -277,7 +276,7 @@ def test_register_exemplar_rejects_observation_target():
     assert "error" in r, r
     # Error should name the type constraint.
     err = r["error"].lower()
-    assert "lesson" in err or "cornerstone" in err, r
+    assert "lesson" in err and "cornerstone" in err, r
 
 
 def test_register_exemplar_rejects_lesson_target_if_exemplar_is_feeling():

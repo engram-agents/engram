@@ -750,6 +750,13 @@ def _ensure_data_dir():
 
 VALID_SOURCE_TYPES = {"document", "conversation", "file", "web_page"}
 
+# DNS errno values that indicate a domain definitively does not exist.
+# Computed once at import time — errno codes are fixed constants, not runtime state.
+NXDOMAIN_ERRNOS = {
+    socket.EAI_NONAME,
+    getattr(socket, "EAI_NODATA", -5),  # not defined on all platforms
+}
+
 
 def _infer_source_type(url: str) -> str:
     """Infer source_type from a URL/path pattern.
@@ -4613,12 +4620,8 @@ def _add_evidence_impl(
                 socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
             except socket.gaierror as e:
                 # Only block on definitive name-not-found errnos.
-                # EAI_AGAIN / EAI_FAIL = transient DNS infra; treat like timeout (pass).
                 # EAI_NONAME / EAI_NODATA = the domain truly doesn't exist.
-                NXDOMAIN_ERRNOS = {
-                    socket.EAI_NONAME,
-                    getattr(socket, "EAI_NODATA", -5),  # not defined on all platforms
-                }
+                # EAI_AGAIN / EAI_FAIL = transient DNS infra; treat like timeout (pass).
                 if e.errno in NXDOMAIN_ERRNOS:
                     return json.dumps({
                         "error": f"DNS resolution failed for '{hostname}' — this domain does not exist. "
