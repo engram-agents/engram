@@ -30,6 +30,16 @@ def _mk_observation(claim: str, quote_type: str = "attributed_analysis") -> str:
     return result["observation_id"]
 
 
+def _mk_person(name: str, role: str = "test collaborator") -> str:
+    """Create a person node via the canonical tool and return its ID."""
+    result = json.loads(server.engram_add_person(payload_json=json.dumps({
+        "name": name,
+        "role": role,
+    })))
+    assert "person_id" in result, f"person creation failed: {result}"
+    return result["person_id"]
+
+
 def _mk_derivation(claim: str, support_ids: list[str], reasoning_type: str = "deductive_hypothetical_syllogism") -> str:
     result = json.loads(server.engram_derive(payload_json=json.dumps({
         "claim": claim,
@@ -294,5 +304,107 @@ def test_supersede_relational():
     assert failed == 0, f"{failed} sub-test(s) failed"
 
 
+def test_supersede_person_migrates_about_edges():
+    passed = 0
+    failed = 0
+
+    with server.engram_sandbox():
+
+        # ---- Test A: person supersede migrates incoming about-edges ----
+        pn_a = _mk_person("Person A")
+        ob_x = _mk_observation("Observation about person A")
+        link_r = json.loads(server.engram_link_about(payload_json=json.dumps({
+            "node_id": ob_x,
+            "person_id": pn_a,
+        })))
+        assert link_r.get("status") in ("linked", "already_linked"), f"TA link_about failed: {link_r}"
+        pn_b = _mk_person("Person B")
+        sup_r = json.loads(server._supersede_impl(pn_a, pn_b, supersede_reason="test person supersede"))
+        assert sup_r["status"] == "superseded", f"TA supersede failed: {sup_r}"
+
+        conn = server._get_db()
+        try:
+            # ob_x now has an about-edge to pn_b (the new current node)
+            new_edge = conn.execute(
+                "SELECT 1 FROM edges WHERE source_id = ? AND target_id = ? AND relation = 'about'",
+                (ob_x, pn_b),
+            ).fetchone()
+            assert new_edge is not None, f"TA: about edge {ob_x}→{pn_b} not found after person supersede"
+            # ob_x's original about-edge to pn_a is still present (audit trail)
+            old_edge = conn.execute(
+                "SELECT 1 FROM edges WHERE source_id = ? AND target_id = ? AND relation = 'about'",
+                (ob_x, pn_a),
+            ).fetchone()
+            assert old_edge is not None, f"TA: original about edge {ob_x}→{pn_a} should remain (audit trail)"
+        finally:
+            conn.close()
+        print("  TA  PASS — person supersede migrates about-edges to new node; old edge preserved")
+        passed += 1
+
+        # ---- Test B: duplicate guard — about-edge already on new node is not doubled ----
+        pn_c = _mk_person("Person C")
+        ob_y = _mk_observation("Observation about person C")
+        pn_d = _mk_person("Person D")
+        # Pre-link ob_y to BOTH pn_c and pn_d before superseding
+        json.loads(server.engram_link_about(payload_json=json.dumps({"node_id": ob_y, "person_id": pn_c})))
+        json.loads(server.engram_link_about(payload_json=json.dumps({"node_id": ob_y, "person_id": pn_d})))
+        sup_r2 = json.loads(server._supersede_impl(pn_c, pn_d))
+        assert sup_r2["status"] == "superseded", f"TB supersede failed: {sup_r2}"
+
+        conn = server._get_db()
+        try:
+            # Exactly one about-edge from ob_y to pn_d (no duplicate)
+            about_edges = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM edges WHERE source_id = ? AND target_id = ? AND relation = 'about'",
+                (ob_y, pn_d),
+            ).fetchone()
+            assert about_edges["cnt"] == 1, f"TB: expected 1 about edge {ob_y}→{pn_d}, got {about_edges['cnt']}"
+        finally:
+            conn.close()
+        print("  TB  PASS — duplicate guard: pre-existing about-edge on new node not doubled")
+        passed += 1
+
+        # ---- Test C: non-person supersede does NOT create about-edges spuriously ----
+        ob_p = _mk_observation("Claim P")
+        ob_q = _mk_observation("Claim Q")
+        # Set up a migratable incoming about-edge on ob_p so this guard is
+        # non-vacuous: if the (observation) supersede wrongly ran the person
+        # migration, it would create an about-edge TARGETING ob_q.
+        _setup = server._get_db()
+        try:
+            _setup.execute(
+                "INSERT INTO edges (source_id, target_id, relation, created_at)"
+                " VALUES (?, ?, 'about', ?)",
+                (ob_q, ob_p, "2026-01-01T00:00:00Z"),
+            )
+            _setup.commit()
+        finally:
+            _setup.close()
+
+        sup_r3 = json.loads(server._supersede_impl(ob_p, ob_q))
+        assert sup_r3["status"] == "superseded", f"TC supersede failed: {sup_r3}"
+
+        conn = server._get_db()
+        try:
+            # Gate is type=='person'; ob_p is an observation, so the migration
+            # must NOT fire — no about-edge migrated ONTO ob_q. Direction matters:
+            # the migration writes edges with target_id=new_node, not source_id.
+            about_edges_q = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM edges WHERE target_id = ? AND relation = 'about'",
+                (ob_q,),
+            ).fetchone()
+            assert about_edges_q["cnt"] == 0, f"TC: non-person supersede spuriously migrated about-edges: {about_edges_q['cnt']}"
+        finally:
+            conn.close()
+        print("  TC  PASS — non-person supersede does not create spurious about-edges")
+        passed += 1
+
+    print(f"\n{'='*56}")
+    print(f"  {passed} passed, {failed} failed")
+    print('='*56)
+    assert failed == 0, f"{failed} sub-test(s) failed"
+
+
 if __name__ == "__main__":
     test_supersede_relational()
+    test_supersede_person_migrates_about_edges()

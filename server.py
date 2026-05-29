@@ -14010,6 +14010,38 @@ def _supersede_impl(
             (new_node_id, old_node_id),
         )
 
+        # Person-supersede: migrate incoming `about` edges to the new node.
+        # When superseding a person node, any observation (or other node)
+        # linked about→old_node becomes stranded after old is marked non-current.
+        # Option A: old edge stays (audit trail); a live edge is inserted on the
+        # current node for each source that doesn't already point at new_node.
+        # Scope: `about` is the recall-routing person-edge. (A `cites`→person
+        # edge via context_ids is annotation-only and intentionally NOT migrated.)
+        # Gate on old type only — new is guaranteed the same type by the
+        # type-equality validation above.
+        if old["type"] == "person":
+            about_sources = conn.execute(
+                "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'about'",
+                (old_node_id,),
+            ).fetchall()
+            for row in about_sources:
+                src = row["source_id"]
+                already = conn.execute(
+                    "SELECT 1 FROM edges WHERE source_id = ? AND target_id = ? AND relation = 'about'",
+                    (src, new_node_id),
+                ).fetchone()
+                if not already:
+                    conn.execute(
+                        "INSERT INTO edges (source_id, target_id, relation, created_at)"
+                        " VALUES (?, ?, 'about', ?)",
+                        (src, new_node_id, now),
+                    )
+                    # Provenance: record the migrated edge in the audit trail so a
+                    # later about-edge on new_node is explainable (mirrors the
+                    # stale-cascade _log_edit calls below).
+                    _log_edit(conn, "about_migrated", new_node_id, new["type"],
+                              {"about_source_id": src, "migrated_from": old_node_id})
+
         # Flag downstream dependents of the old node as stale.
         # Uses shared walker (_walk_cascade_downstream) — PR-AA SSoT refactor.
         visited = {old_node_id}  # seed superseded node so walker won't process it
