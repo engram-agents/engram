@@ -25,7 +25,14 @@ IDLE_TIMEOUT = 28800  # 8 hours without queries -> exit
 
 def _resolve_engram_home() -> str:
     """Per-install data dir: knowledge.db, sockets, briefing, history."""
-    return os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram"))
+    # Multi-install precedence: prefer ENGRAM_DATA_DIR (server's canonical), fall back
+    # to ENGRAM_HOME (the conventional name), then default. Resolves the multi-install
+    # split-brain where operator sets one var but not the other (#354).
+    return (
+        os.environ.get("ENGRAM_DATA_DIR")
+        or os.environ.get("ENGRAM_HOME")
+        or os.path.expanduser("~/.engram")
+    )
 
 
 def _resolve_runtime_dir(engram_home: str) -> str:
@@ -52,10 +59,10 @@ PROJECT_DIR = _resolve_runtime_dir(ENGRAM_HOME)
 SOCKET_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.sock")
 PID_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.pid")
 
-# Bridge: server.py reads ENGRAM_DATA_DIR; if only ENGRAM_HOME was set
-# (e.g., per-surface hook env), inherit the same value so the embedded
-# EngramClient opens the right knowledge.db.
+# Bridge for downstream callers: ensure both ENGRAM_HOME and ENGRAM_DATA_DIR
+# are set to the resolved value, so any sibling process inherits both.
 os.environ.setdefault("ENGRAM_DATA_DIR", ENGRAM_HOME)
+os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
 
 _last_activity = time.time()
 _shutdown = threading.Event()

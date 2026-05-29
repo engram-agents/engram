@@ -25,7 +25,14 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import find_active_jsonl, write_baseline
 
-ENGRAM_HOME = os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram"))
+# Multi-install precedence: prefer ENGRAM_DATA_DIR (server's canonical), fall back
+# to ENGRAM_HOME (the conventional name), then default. Resolves the multi-install
+# split-brain where operator sets one var but not the other (#354).
+ENGRAM_HOME = (
+    os.environ.get("ENGRAM_DATA_DIR")
+    or os.environ.get("ENGRAM_HOME")
+    or os.path.expanduser("~/.engram")
+)
 MARKER_PATH = os.path.join(ENGRAM_HOME, "last-compact-at.json")
 
 

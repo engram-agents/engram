@@ -24,7 +24,14 @@ import glob
 import json
 import os
 
-ENGRAM_HOME = os.environ.get("ENGRAM_HOME", os.path.expanduser("~/.engram"))
+# Multi-install precedence: prefer ENGRAM_DATA_DIR (server's canonical), fall back
+# to ENGRAM_HOME (the conventional name), then default. Resolves the multi-install
+# split-brain where operator sets one var but not the other (#354).
+ENGRAM_HOME = (
+    os.environ.get("ENGRAM_DATA_DIR")
+    or os.environ.get("ENGRAM_HOME")
+    or os.path.expanduser("~/.engram")
+)
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")  # legacy; unused
 LAST_COMPACT_PATH = os.path.join(ENGRAM_HOME, "last-compact-at.json")
 LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
