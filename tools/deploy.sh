@@ -691,6 +691,49 @@ if [[ -f "$SERVICE_DEST" && -f "$SERVICE_TEMPLATE" && -n "$PYTHON_BIN" ]]; then
     fi
 fi
 
+# -------- Refresh /home/agents-shared/bin/ia if it exists and has drifted (#301) --------
+# `ia` is the multi-agent inter-agent CLI shared across all agents on the host.
+# install.sh Step 9 places it at /home/agents-shared/bin/ia at fresh-install time;
+# deploys must keep it in sync with tools/ia.py to prevent version-drift between
+# co-resident agents.
+SHARED_IA="/home/agents-shared/bin/ia"
+IA_SRC="$ALPHA_DIR/tools/ia.py"
+if [[ -f "$SHARED_IA" && -f "$IA_SRC" ]]; then
+    if ! cmp -s "$IA_SRC" "$SHARED_IA"; then
+        # Content drift detected.
+        if [[ -w "$SHARED_IA" ]]; then
+            cp "$IA_SRC" "$SHARED_IA"
+            chmod 0755 "$SHARED_IA"
+            echo "  ✓ Refreshed shared multi-agent ia → $SHARED_IA"
+        else
+            echo "  ⚠ Drift detected: $SHARED_IA differs from $IA_SRC but not writable by current user."
+            echo "    Operator: refresh manually with"
+            echo "      sudo cp $IA_SRC $SHARED_IA && sudo chmod 0755 $SHARED_IA"
+        fi
+    fi
+fi
+
+# -------- Refresh /home/agents-shared/bin/baton if it exists and has drifted --------
+# `baton` is the multi-agent turn-state CLI shared across all agents on the host.
+# Same shared-multi-agent-CLI-drift class as `ia` above; sibling block added per
+# Ari colleague-review completeness suggestion (round-2).
+SHARED_BATON="/home/agents-shared/bin/baton"
+BATON_SRC="$ALPHA_DIR/tools/baton.py"
+if [[ -f "$SHARED_BATON" && -f "$BATON_SRC" ]]; then
+    if ! cmp -s "$BATON_SRC" "$SHARED_BATON"; then
+        # Content drift detected.
+        if [[ -w "$SHARED_BATON" ]]; then
+            cp "$BATON_SRC" "$SHARED_BATON"
+            chmod 0755 "$SHARED_BATON"
+            echo "  ✓ Refreshed shared multi-agent baton → $SHARED_BATON"
+        else
+            echo "  ⚠ Drift detected: $SHARED_BATON differs from $BATON_SRC but not writable by current user."
+            echo "    Operator: refresh manually with"
+            echo "      sudo cp $BATON_SRC $SHARED_BATON && sudo chmod 0755 $SHARED_BATON"
+        fi
+    fi
+fi
+
 # Stamp version marker for forensics + future "what version is running?" queries
 TS="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 cat > "$ENGRAM_HOME/.deployed-version" <<EOF
