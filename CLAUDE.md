@@ -73,3 +73,42 @@ to encode in always-loaded identity rules.
 
 **Origin:** a self-review lapse (`ob_0123`) traced to this reciprocal step being
 unwritten (`ob_0124`); the hierarchy has been practiced since `ob_0077`.
+
+## PR title — issue closure
+
+When a PR fully closes an issue, the PR **title** ends with `[closes #N]`. Single
+style for this repo, no alternatives. GitHub auto-closes the issue when the PR
+merges to `dev`. The bracket-form is empirically verified on PR #434
+(`[closes #432]`); GitHub's underlying auto-close fires on any recognized
+keyword + `#N` pair regardless of brackets (#441's `(closes #440)` also auto-closed),
+but this rule standardizes the surface form going forward so reviewers can scan
+for it uniformly.
+
+Title is the canonical surface (not body, not commit message) — easy to scan in
+`gh pr list`, easy to verify pre-merge, and a reviewer can confirm the closing
+intent without opening the PR. PR titles are editable post-filing via
+`gh pr edit <PR> --title "<new title>"` — if you forgot the tag at PR-open time,
+edit it before merge.
+
+**For multi-PR / EPIC ships:** earlier PRs may reference the issue number in
+title or body, but **do not** use a closing keyword. Only the LAST PR in the
+series uses `[closes #N]`. Don't rely on a "wrap-up PR I'll file later" — that
+PR rarely materializes (empirical: 7 of 11 stale-but-addressed candidates in the
+2026-05-28 backlog scan followed this pattern, leaving their parent issues open
+indefinitely).
+
+**For partial work that addresses but doesn't fully close:** omit the closing
+tag from the title. Comment on the issue describing what landed and what
+remains, so the scope is durable and the next contributor knows the state.
+
+**When reviewing a PR** (reviewer-fairy or counterpart colleague), if the PR
+clearly addresses an issue but the title doesn't carry `[closes #N]`, flag as
+a **blocker** — the author edits the title before merge. This is mechanical;
+checking is cheap; the cost of missing it is a stale-issue backlog.
+
+GitHub recognized closing keywords (case-insensitive): `close`, `closes`,
+`closed`, `fix`, `fixes`, `fixed`, `resolve`, `resolves`, `resolved`. This repo
+uses `closes` only, in the `[closes #N]` bracket form. Other keywords technically
+work for GitHub's auto-close but fragment the convention; if a reviewer sees a
+non-bracket form on a PR that closes an issue, flag it as a blocker and ask the
+author to rewrite the title via `gh pr edit <PR> --title "..."` before merge.
