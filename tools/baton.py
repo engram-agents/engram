@@ -6,9 +6,15 @@ A thin CLI wrapping the baton file protocol at
 shared projects (PRs, designs, etc.) so agents always know whose move it
 is next.
 
+<<<<<<< HEAD
 Seven subcommands:
+=======
+Eight subcommands:
+>>>>>>> d798863 (feat: baton claim + release subcommands — Project-layer grab/ungrab vocabulary)
   init        Create a new project baton file
-  flip        Pass the baton to another participant
+  flip        Pass the baton to another participant (PR layer)
+  claim       Take a Project-layer baton from the pool (pool → self)
+  release     Return a Project-layer baton to the pool (self → lei)
   status      List active projects (not merged or cancelled)
   mine        Shorthand for status --mine
   show        Display a project file
@@ -584,6 +590,243 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: claim  (Project layer — pool sentinel → self)
+# ---------------------------------------------------------------------------
+
+# Pool sentinel: the name held between active agent claims.
+# Convention: "lei" (Lei's personal sentinel used across baton files).
+# Escape valve: if the sentinel changes, update this constant.
+_POOL_SENTINEL = "lei"
+
+
+def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    """Claim a Project-layer baton from the pool.
+
+    Equivalent to 'baton flip <project-id> <self> "claimed"' but makes the
+    Project-layer grab/ungrab vocabulary first-class. Only succeeds when
+    turn == pool sentinel (lei); refuses to steal from another agent.
+    """
+    projects_dir = Path(BATON_PROJECTS_DIR)
+    project_id = args.project_id
+
+    err = _validate_project_id(project_id)
+    if err:
+        print(err, file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+    dest = _project_path(project_id, projects_dir)
+    if not dest.exists():
+        print(
+            f"baton claim: project not found: '{project_id}' "
+            f"(looked for {dest}). "
+            "Use 'baton status' to see active projects.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    try:
+        text = dest.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        print(f"baton claim: cannot read '{dest}': {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+
+    fields, body = _parse_frontmatter(text)
+    if not fields:
+        print(
+            f"baton claim: cannot parse frontmatter from '{dest}'. "
+            "The file may be malformed.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    # Validate: current turn must be the pool sentinel
+    current_turn = fields.get("turn", "").strip().lower()
+    if current_turn != _POOL_SENTINEL:
+        print(
+            f"baton claim: refusing to steal claim from {current_turn}; "
+            "use 'baton flip <project-id> <self> <reason>' if you have an "
+            "explicit handoff agreement.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_STATE)
+
+    # Validate: agent must be in participants
+    if not agent_name:
+        print(
+            "baton claim: cannot determine agent name. "
+            "Set agent_name in config.json or ensure $USER is set.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    participants_str = fields.get("participants", "").strip()
+    participants = _parse_participants(participants_str) if participants_str else []
+    if agent_name.lower() not in participants:
+        print(
+            f"baton claim: '{agent_name}' is not a participant in {project_id}. "
+            f"Participants: {participants}.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    # Check project is not closed
+    current_status = fields.get("status", "").strip().lower()
+    if current_status in CLOSED_STATUSES:
+        print(
+            f"baton claim: project '{project_id}' is {current_status} — "
+            "cannot claim a closed project.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    now = _now_iso()
+    self_name = agent_name.lower()
+
+    # Atomic write: turn → self, turn_since → now, turn_reason → "claimed"
+    updates = {
+        "turn": self_name,
+        "turn_since": now,
+        "turn_reason": '"claimed"',
+    }
+    updated_text = _update_frontmatter(text, updates)
+
+    # Re-parse to get body after frontmatter update
+    _updated_fields, updated_body = _parse_frontmatter(updated_text)
+
+    # Append turn log entry
+    log_entry = f"- {now} {_POOL_SENTINEL} → {self_name}: claimed"
+    final_body = _append_turn_log(updated_body, log_entry)
+
+    # Reconstruct final content: frontmatter + updated body
+    fm_m = _FRONTMATTER_RE.match(updated_text)
+    if fm_m:
+        fm_section = updated_text[:fm_m.end()]
+        final_content = fm_section.rstrip("\n") + "\n" + final_body
+    else:
+        final_content = updated_text
+
+    _atomic_write(dest, final_content)
+    print(f"baton claim: {project_id} → {self_name}")
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: release  (Project layer — self → pool sentinel)
+# ---------------------------------------------------------------------------
+
+def cmd_release(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    """Release a Project-layer baton back to the pool.
+
+    Equivalent to 'baton flip <project-id> lei <reason>' but restricted to
+    the current holder (only you can release what you hold). With --done,
+    also appends '(done)' to the project title (idempotent).
+    """
+    projects_dir = Path(BATON_PROJECTS_DIR)
+    project_id = args.project_id
+    mark_done = args.done
+    reason = args.reason
+
+    err = _validate_project_id(project_id)
+    if err:
+        print(err, file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+    dest = _project_path(project_id, projects_dir)
+    if not dest.exists():
+        print(
+            f"baton release: project not found: '{project_id}' "
+            f"(looked for {dest}). "
+            "Use 'baton status' to see active projects.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    try:
+        text = dest.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        print(f"baton release: cannot read '{dest}': {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+
+    fields, body = _parse_frontmatter(text)
+    if not fields:
+        print(
+            f"baton release: cannot parse frontmatter from '{dest}'. "
+            "The file may be malformed.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    # Validate: current turn must be this agent (only the holder can release)
+    if not agent_name:
+        print(
+            "baton release: cannot determine agent name. "
+            "Set agent_name in config.json or ensure $USER is set.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    current_turn = fields.get("turn", "").strip().lower()
+    self_name = agent_name.lower()
+    if current_turn != self_name:
+        print(
+            f"baton release: only the current holder ({current_turn}) can release.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_STATE)
+
+    # Check project is not closed
+    current_status = fields.get("status", "").strip().lower()
+    if current_status in CLOSED_STATUSES:
+        print(
+            f"baton release: project '{project_id}' is {current_status} — "
+            "cannot release a closed project.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    now = _now_iso()
+
+    # Build frontmatter updates: turn → lei, turn_since → now, turn_reason → reason
+    updates: dict = {
+        "turn": _POOL_SENTINEL,
+        "turn_since": now,
+        "turn_reason": f'"{reason}"',
+    }
+
+    # --done: append "(done)" to title (idempotent)
+    title_renamed = False
+    if mark_done:
+        current_title = fields.get("title", "").strip()
+        if not current_title.endswith("(done)"):
+            new_title = current_title + " (done)"
+            updates["title"] = new_title
+            title_renamed = True
+
+    updated_text = _update_frontmatter(text, updates)
+
+    # Re-parse to get body after frontmatter update
+    _updated_fields, updated_body = _parse_frontmatter(updated_text)
+
+    # Append turn log entry (and a second line if title was renamed)
+    log_entry = f"- {now} {self_name} → {_POOL_SENTINEL}: {reason}"
+    if title_renamed:
+        log_entry += f"\n- {now} title marked (done)"
+    final_body = _append_turn_log(updated_body, log_entry)
+
+    # Reconstruct final content: frontmatter + updated body
+    fm_m = _FRONTMATTER_RE.match(updated_text)
+    if fm_m:
+        fm_section = updated_text[:fm_m.end()]
+        final_content = fm_section.rstrip("\n") + "\n" + final_body
+    else:
+        final_content = updated_text
+
+    _atomic_write(dest, final_content)
+    print(f"baton release: {project_id} → {_POOL_SENTINEL}")
+    if mark_done:
+        print("  marked (done)")
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: status
 # ---------------------------------------------------------------------------
 
@@ -896,6 +1139,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="Short description of why the baton is being passed",
     )
 
+    # -- claim --
+    p_claim = subparsers.add_parser(
+        "claim",
+        help="Claim a Project-layer baton from the pool (pool → self)",
+        description=(
+            "Take a Project-layer baton for yourself. Only succeeds when the "
+            "current turn is the pool sentinel (lei). Refuses to steal from "
+            "another agent — use 'baton flip' with an explicit handoff agreement "
+            "if needed.\n\n"
+            "Vocabulary distinction: claim/release are Project-layer verbs "
+            "(single driver, rare passes). flip is the PR-layer verb (frequent "
+            "passing through fairy → reviewer → colleague → maintainer)."
+        ),
+    )
+    p_claim.add_argument(
+        "project_id",
+        metavar="PROJECT-ID",
+        help="Project identifier (e.g. pool-cli-gap, DESIGN-trust-tier-v2)",
+    )
+
+    # -- release --
+    p_release = subparsers.add_parser(
+        "release",
+        help="Return a Project-layer baton to the pool (self → lei)",
+        description=(
+            "Release a Project-layer baton back to the pool sentinel (lei). "
+            "Only the current holder can release. Use --done to also append "
+            "'(done)' to the project title (idempotent).\n\n"
+            "Vocabulary distinction: claim/release are Project-layer verbs "
+            "(single driver, rare passes). flip is the PR-layer verb (frequent "
+            "passing through fairy → reviewer → colleague → maintainer)."
+        ),
+    )
+    p_release.add_argument(
+        "project_id",
+        metavar="PROJECT-ID",
+        help="Project identifier",
+    )
+    p_release.add_argument(
+        "--done", action="store_true", default=False,
+        help="Also append '(done)' to the project title (idempotent)",
+    )
+    p_release.add_argument(
+        "--reason", metavar="TEXT", default="released",
+        help="Short description of why the baton is being released (default: released)",
+    )
+
     # -- status --
     p_status = subparsers.add_parser(
         "status",
@@ -989,6 +1279,10 @@ def main() -> None:
         cmd_init(args, config, agent_name)
     elif args.subcommand == "flip":
         cmd_flip(args, config, agent_name)
+    elif args.subcommand == "claim":
+        cmd_claim(args, config, agent_name)
+    elif args.subcommand == "release":
+        cmd_release(args, config, agent_name)
     elif args.subcommand == "status":
         cmd_status(args, config, agent_name)
     elif args.subcommand == "mine":

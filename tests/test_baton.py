@@ -899,3 +899,200 @@ class TestRename:
             "--title", "a" * 200,
         )
         assert rc == 0, f"200-char title rejected; stderr: {stderr}"
+
+
+# ===========================================================================
+# CATEGORY 8: claim subcommand
+# ===========================================================================
+
+class TestClaim:
+    """baton claim: happy path, state-guard refusals, and audit-line tests."""
+
+    def test_claim_happy_path(self, engram_home, projects_dir):
+        """Claim from pool: turn→borges; turn_reason→claimed; audit log appended; no .tmp."""
+        _write_config(engram_home, "borges")
+        # Project sits in pool (turn=lei)
+        _write_project(
+            projects_dir, "PR-1001",
+            title="pool project",
+            turn="lei",
+            participants=["borges", "ariadne"],
+            turn_reason="released",
+        )
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "claim", "PR-1001",
+        )
+        assert rc == 0, f"claim failed; stderr: {stderr}"
+
+        # turn field updated to invoking agent
+        turn = _read_project_field(projects_dir, "PR-1001", "turn")
+        assert turn == "borges"
+
+        # turn_reason updated to "claimed"
+        reason = _read_project_field(projects_dir, "PR-1001", "turn_reason")
+        assert reason == "claimed"
+
+        # Audit log entry appended
+        content = (projects_dir / "PR-1001.md").read_text()
+        assert "→ borges: claimed" in content
+
+        # No .tmp file leftover
+        tmp_files = list(projects_dir.glob("*.tmp"))
+        assert tmp_files == [], f"Tmp files must not remain: {tmp_files}"
+
+    def test_claim_refuse_already_claimed_by_other(self, engram_home, projects_dir):
+        """Claim when project is held by another agent → EXIT_STATE (3) with clear message."""
+        _write_config(engram_home, "borges")
+        # Project already claimed by ariadne (not in pool)
+        _write_project(
+            projects_dir, "PR-1002",
+            turn="ariadne",
+            participants=["borges", "ariadne"],
+        )
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "claim", "PR-1002",
+        )
+        assert rc == 3, f"Expected EXIT_STATE=3; got rc={rc}; stderr: {stderr}"
+        assert "ariadne" in stderr  # clear message names the current holder
+
+    def test_claim_refuse_invoker_not_in_participants(self, engram_home, projects_dir):
+        """Claim when invoker not in participants → EXIT_VALIDATION (1)."""
+        _write_config(engram_home, "borges")
+        # Pool-ready but borges not listed as participant
+        _write_project(
+            projects_dir, "PR-1003",
+            turn="lei",
+            participants=["ariadne", "mneme"],
+        )
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "claim", "PR-1003",
+        )
+        assert rc == 1, f"Expected EXIT_VALIDATION=1; got rc={rc}; stderr: {stderr}"
+        assert "participant" in stderr
+
+    def test_claim_refuse_missing_project(self, engram_home, projects_dir):
+        """Claim of non-existent project → EXIT_VALIDATION (1), not-found error."""
+        _write_config(engram_home, "borges")
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "claim", "PR-1004",
+        )
+        assert rc == 1, f"Expected EXIT_VALIDATION=1; got rc={rc}; stderr: {stderr}"
+        assert "not found" in stderr.lower()
+
+
+# ===========================================================================
+# CATEGORY 9: release subcommand
+# ===========================================================================
+
+class TestRelease:
+    """baton release: happy path, state-guard refusals, --done flag tests."""
+
+    def test_release_happy_path(self, engram_home, projects_dir):
+        """Release to pool: turn→lei; default turn_reason; audit log appended; no .tmp."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-1101",
+            title="claimed project",
+            turn="borges",
+            participants=["borges", "ariadne"],
+        )
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "release", "PR-1101",
+        )
+        assert rc == 0, f"release failed; stderr: {stderr}"
+
+        # turn field updated to pool sentinel
+        turn = _read_project_field(projects_dir, "PR-1101", "turn")
+        assert turn == "lei"
+
+        # turn_reason defaults to "released"
+        reason = _read_project_field(projects_dir, "PR-1101", "turn_reason")
+        assert reason == "released"
+
+        # Audit log entry appended
+        content = (projects_dir / "PR-1101.md").read_text()
+        assert "→ lei: released" in content
+
+        # No .tmp file leftover
+        tmp_files = list(projects_dir.glob("*.tmp"))
+        assert tmp_files == [], f"Tmp files must not remain: {tmp_files}"
+
+    def test_release_custom_reason(self, engram_home, projects_dir):
+        """Release with --reason writes the provided reason to turn_reason."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-1102",
+            turn="borges",
+            participants=["borges", "ariadne"],
+        )
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "release", "PR-1102",
+            "--reason", "stepping back for review",
+        )
+        assert rc == 0, f"release failed; stderr: {stderr}"
+
+        reason = _read_project_field(projects_dir, "PR-1102", "turn_reason")
+        assert "stepping back for review" in reason
+
+    def test_release_refuse_non_holder(self, engram_home, projects_dir):
+        """Release when invoker is not current holder → EXIT_STATE (3)."""
+        _write_config(engram_home, "borges")
+        # ariadne holds the baton, not borges
+        _write_project(
+            projects_dir, "PR-1103",
+            turn="ariadne",
+            participants=["borges", "ariadne"],
+        )
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "release", "PR-1103",
+        )
+        assert rc == 3, f"Expected EXIT_STATE=3; got rc={rc}; stderr: {stderr}"
+        assert "ariadne" in stderr  # message names the actual holder
+
+    def test_release_done_appends_to_title(self, engram_home, projects_dir):
+        """release --done appends '(done)' to the project title."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-1104",
+            title="cli gap work",
+            turn="borges",
+            participants=["borges", "ariadne"],
+        )
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "release", "PR-1104",
+            "--done",
+        )
+        assert rc == 0, f"release --done failed; stderr: {stderr}"
+
+        title = _read_project_field(projects_dir, "PR-1104", "title")
+        assert title == "cli gap work (done)"
+
+    def test_release_done_idempotent(self, engram_home, projects_dir):
+        """release --done on already-(done) title does not double-append."""
+        _write_config(engram_home, "borges")
+        # Title already ends with (done)
+        _write_project(
+            projects_dir, "PR-1105",
+            title="cli gap work (done)",
+            turn="borges",
+            participants=["borges", "ariadne"],
+        )
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "release", "PR-1105",
+            "--done",
+        )
+        assert rc == 0, f"release --done on (done) title failed; stderr: {stderr}"
+
+        title = _read_project_field(projects_dir, "PR-1105", "title")
+        assert title == "cli gap work (done)", (
+            f"Expected '(done)' not doubled; got: {title!r}"
+        )
