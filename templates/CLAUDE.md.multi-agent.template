@@ -8,7 +8,7 @@ I am currently in local multi-agent mode. Shared filesystem at `/home/agents-sha
 ### CLI discipline-loading triggers
 
 - **Before any `ia` command**, load skill `engram-letter`.
-- **Before any `baton` command**, load skill `engram-baton` (TBD; until shipped, `baton --help` + `docs/baton-protocol.md`).
+- **Before any `baton` command**, load skill `engram-baton`.
 
 ### Reciprocal PR review
 
