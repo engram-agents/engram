@@ -5,6 +5,7 @@ Layer 1: Prevention — quoted_text must exist in file:// evidence sources
 Layer 2: Correction — kg_retract marks errors, cascades taint to downstream nodes
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -13,7 +14,8 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_retract")
+TEST_DIR = tempfile.mkdtemp(prefix="engram_test_retract_")
+atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 THIS_FILE = os.path.abspath(__file__)
 
 

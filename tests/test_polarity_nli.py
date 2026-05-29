@@ -12,6 +12,7 @@ real-model integration test in this file (would require a 1.5GB download
 the marker in pyproject.toml or conftest.py first.
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -23,7 +24,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_polarity")
+TEST_DIR = tempfile.mkdtemp(prefix="engram_test_polarity_")
+atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 def fresh_server(*, polarity_enabled: bool, nli_score: float | None = None):

@@ -16,6 +16,7 @@ semantic path is skipped and FTS behavior is deterministic.
 
 from __future__ import annotations
 
+import atexit
 import json
 import math
 import os
@@ -29,7 +30,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_bm25_relevance")
+TEST_DIR = tempfile.mkdtemp(prefix="engram_test_bm25_relevance_")
+atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 def fresh_server():

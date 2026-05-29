@@ -25,6 +25,7 @@ Coverage (17 tests):
   17. Cascade — supersede source ob_ → ts_ is staled.
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -37,7 +38,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Add tools/ to path so we can import the migration script.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 
-TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_trust_tier")
+TEST_DIR = tempfile.mkdtemp(prefix="engram_test_trust_tier_")
+atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 def fresh_server():

@@ -26,6 +26,7 @@ Covers all new call sites added in the use-sites-expansion PR:
     - engram_outgrow_cornerstone → target retains current utility
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -37,7 +38,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_utility_use_sites_expansion")
+TEST_DIR = tempfile.mkdtemp(prefix="engram_test_utility_use_sites_expansion_")
+atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 def fresh_server():

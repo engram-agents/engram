@@ -11,6 +11,7 @@ Two test classes:
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import shutil
@@ -28,7 +29,8 @@ from engram_filter import (  # noqa: E402
     ALLOWED_NODE_COLUMNS,
 )
 
-TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_filter")
+TEST_DIR = tempfile.mkdtemp(prefix="engram_test_filter_")
+atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ Coverage:
   6. Missing required field 'reason' — payload without 'reason' returns {"error": ...}.
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -21,7 +22,8 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_focus_payload")
+TEST_DIR = tempfile.mkdtemp(prefix="engram_test_focus_payload_")
+atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 def fresh_server():

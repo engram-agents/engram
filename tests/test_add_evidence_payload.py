@@ -16,6 +16,7 @@ Coverage:
   4. Internal helper — _add_evidence_impl callable with named kwargs.
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -25,7 +26,8 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_payload_add_evidence")
+TEST_DIR = tempfile.mkdtemp(prefix="engram_test_payload_add_evidence_")
+atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 TEST_FILE = os.path.join(tempfile.gettempdir(), "engram_test_add_evidence_source.md")
 
 

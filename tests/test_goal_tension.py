@@ -12,6 +12,7 @@ Covers:
 8. Goal tension with analysis stored in logical_chain
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -20,7 +21,8 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_goal_tension")
+TEST_DIR = tempfile.mkdtemp(prefix="engram_test_goal_tension_")
+atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 def fresh_client():

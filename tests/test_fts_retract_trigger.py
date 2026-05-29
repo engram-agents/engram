@@ -30,6 +30,7 @@ Coverage:
        still be removed from FTS. Round-2 trigger fix (status transition gate).
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -39,7 +40,8 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_fts_retract_trigger")
+TEST_DIR = tempfile.mkdtemp(prefix="engram_test_fts_retract_trigger_")
+atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 def fresh_server():

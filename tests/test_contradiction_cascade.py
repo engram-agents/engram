@@ -12,6 +12,7 @@ has shifted, then decide whether to wire engram_resolve (case 1) or
 new-contradict + supersede-old-contradict (case 2).
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -21,7 +22,8 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_ct_cascade")
+TEST_DIR = tempfile.mkdtemp(prefix="engram_test_ct_cascade_")
+atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 def fresh_server():

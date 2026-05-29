@@ -10,6 +10,7 @@ Coverage:
      'supports' edges migrated correctly; idempotent on second run.
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -25,7 +26,8 @@ MIGRATION_DIR = os.path.join(TOOLS_DIR, "migration")
 sys.path.insert(0, MIGRATION_DIR)
 
 
-TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_supported_by")
+TEST_DIR = tempfile.mkdtemp(prefix="engram_test_supported_by_")
+atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 def fresh_server():

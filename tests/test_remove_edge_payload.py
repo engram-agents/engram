@@ -17,6 +17,7 @@ Coverage:
   8. Internal helper — _remove_edge_impl works with named kwargs.
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -26,7 +27,8 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_payload_remove_edge")
+TEST_DIR = tempfile.mkdtemp(prefix="engram_test_payload_remove_edge_")
+atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 def fresh_server():

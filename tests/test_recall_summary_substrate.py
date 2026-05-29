@@ -20,6 +20,7 @@ Hook rendering (format_nudge end-to-end with synthetic result dicts):
 
 from __future__ import annotations
 
+import atexit
 import importlib.util
 import json
 import os
@@ -40,7 +41,8 @@ sys.path.insert(0, PROJECT_ROOT)
 # Server sandbox helpers (same pattern as test_special_type_bypass.py)
 # ---------------------------------------------------------------------------
 
-TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_recall_summary_substrate")
+TEST_DIR = tempfile.mkdtemp(prefix="engram_test_recall_summary_substrate_")
+atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 def fresh_server():

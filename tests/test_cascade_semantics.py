@@ -9,6 +9,7 @@ Coverage:
   §5.6 Reflect surfacing (support_lost_nodes in engram_reflect output)
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -24,7 +25,8 @@ TOOLS_MIGRATION_DIR = os.path.join(
 )
 sys.path.insert(0, TOOLS_MIGRATION_DIR)
 
-TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_cascade_semantics")
+TEST_DIR = tempfile.mkdtemp(prefix="engram_test_cascade_semantics_")
+atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 # ---------------------------------------------------------------------------
