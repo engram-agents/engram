@@ -13,10 +13,15 @@ surfaced/read cursor mechanism needed; the baton file IS the state.
 Anti-patterns guarded:
   - Single-agent guard: if projects directory doesn't exist, exits silently.
     Single-agent users (Lin, Chenni) see zero behavior change.
-  - No LLM calls, no network, no DB — file-system reads only.
-    Timeout budget: 5 seconds max.
+  - No LLM calls, no DB — file-system reads and optional gh calls only.
+    Per-gh-call timeout 4s; worst case one gh call per in-court baton on a
+    full cache miss (N_batons calls). The 30s-TTL status cache makes the
+    steady-state cost ~0 — most prompts hit cache and call gh zero times.
   - Missing/malformed project files are silently skipped (hook must
     not crash on corrupted state).
+  - gh absent / auth failure / timeout: degrades gracefully to today's
+    behavior (turn_reason only). The live-status block is wrapped in
+    try/except so it can NEVER crash the hook.
 
 Part of the baton turn-state system (PR baton). Mirrors the structure
 of engram-inter-agent-prompt-hook.py.
@@ -29,7 +34,10 @@ import json
 import os
 import pwd
 import re
+import shutil
+import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -47,9 +55,21 @@ BATON_PROJECTS_DIR = os.environ.get("BATON_PROJECTS_DIR", "/home/agents-shared/p
 # Statuses that mean "closed" — these projects don't surface
 CLOSED_STATUSES = {"merged", "cancelled"}
 
+# Cache TTL in seconds — entries younger than this are reused without a gh call
+_CACHE_TTL = 30
+
+# Per-gh-call timeout in seconds — quick-fail so the hook stays fast
+_GH_TIMEOUT = 4
+
+# GitHub Project owner (used for project-anchor queries)
+_GH_OWNER = os.environ.get("BATON_GH_OWNER", "engram-agents")
+
 # Frontmatter parsing (same regex as ia.py / inter-agent hook)
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):\s*(.*)$", re.MULTILINE)
+
+# PR-ID fallback pattern: "PR-NNN"
+_PR_ID_RE = re.compile(r"^PR-(\d+)$")
 
 
 # ---------------------------------------------------------------------------
@@ -157,13 +177,222 @@ def _parse_iso(ts_str: str) -> Optional[datetime]:
 
 
 # ---------------------------------------------------------------------------
+# GitHub anchor resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_anchor(project_id: str, github_field: str) -> Optional[str]:
+    """Resolve the GitHub anchor for a baton.
+
+    Resolution order (per spec):
+      1. Explicit ``github:`` frontmatter field — value ``pr/<N>`` or
+         ``project/<N>``.
+      2. Fallback: if project_id matches ``^PR-(\\d+)$`` → ``pr/<N>``.
+      3. No anchor → return None.
+
+    Returns a canonical anchor string like ``"pr/455"`` or
+    ``"project/4"``, or None.
+    """
+    if github_field:
+        val = github_field.strip().lower()
+        if val.startswith("pr/") or val.startswith("project/"):
+            return val
+    # Fallback: PR-NNN project_id
+    m = _PR_ID_RE.match(project_id)
+    if m:
+        return f"pr/{m.group(1)}"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+def _cache_path() -> Path:
+    """Return the path to the baton status cache file."""
+    return Path(ENGRAM_HOME) / "baton-status-cache.json"
+
+
+def _load_cache() -> dict:
+    """Load the cache from disk. Returns {} on any failure."""
+    path = _cache_path()
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def _save_cache(cache: dict) -> None:
+    """Write cache to disk. Silently ignores write failures."""
+    path = _cache_path()
+    try:
+        path.write_text(json.dumps(cache), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _cache_get(cache: dict, anchor: str) -> Optional[str]:
+    """Return a cached render string if the entry is fresh (<TTL), else None."""
+    entry = cache.get(anchor)
+    if not entry:
+        return None
+    fetched_at = entry.get("fetched_at", 0)
+    if (time.time() - fetched_at) < _CACHE_TTL:
+        return entry.get("render", "")
+    return None
+
+
+def _cache_set(cache: dict, anchor: str, render: str) -> None:
+    """Store a render string in the cache (mutates cache in place)."""
+    cache[anchor] = {"fetched_at": time.time(), "render": render}
+
+
+# ---------------------------------------------------------------------------
+# Live GitHub status fetch
+# ---------------------------------------------------------------------------
+
+def _gh_available() -> bool:
+    """Return True if the ``gh`` CLI is on PATH."""
+    return shutil.which("gh") is not None
+
+
+def _fetch_pr_status(pr_num: str) -> Optional[str]:
+    """Call ``gh pr view`` and return a short render string, or None on error.
+
+    Returns strings like ``"MERGED"``, ``"OPEN · review:APPROVED"``,
+    ``"OPEN · review:REVIEW_REQUIRED"``, etc.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "gh", "pr", "view", pr_num,
+                "--json", "state,reviewDecision,title",
+                "--jq", "[.state, .reviewDecision] | join(\"|\")",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_GH_TIMEOUT,
+        )
+        if result.returncode != 0:
+            return None
+        raw = result.stdout.strip()
+        parts = raw.split("|")
+        state = parts[0] if parts else ""
+        review = parts[1] if len(parts) > 1 else ""
+        if not state:
+            return None
+        if state == "MERGED":
+            return "MERGED"
+        if state == "CLOSED":
+            return "CLOSED"
+        # OPEN
+        if review:
+            return f"OPEN · review:{review}"
+        return "OPEN"
+    except Exception:
+        # Degrade-to-None helper: any gh/parse failure → omit the clause.
+        # The outer _get_live_status also guards, but catching here keeps the
+        # render path clean. (Not the #307 swallow anti-pattern — returning
+        # None on any fetch problem IS this helper's contract.)
+        return None
+
+
+def _fetch_project_status(project_num: str) -> Optional[str]:
+    """Call ``gh project item-list`` and return a tally render string, or None.
+
+    Returns strings like ``"2 Done · 1 In Progress · 2 Blocked"``.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "gh", "project", "item-list", project_num,
+                "--owner", _GH_OWNER,
+                "--format", "json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_GH_TIMEOUT,
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout)
+        # gh project item-list --format json returns {"items": [...]}
+        # Each item has a "status" field (or similar). Tally by status.
+        items = data.get("items", [])
+        if not items:
+            return None
+        counts: dict = {}
+        for item in items:
+            # Status field may be under "status", "fieldValues", etc.
+            # The simplest shape: item["status"] is a string.
+            status = item.get("status", "")
+            if not status:
+                # Try nested fieldValues if present
+                for fv in item.get("fieldValues", []):
+                    if isinstance(fv, dict) and fv.get("field", {}).get("name", "").lower() == "status":
+                        status = fv.get("name", "") or fv.get("text", "") or ""
+                        break
+            if status:
+                counts[status] = counts.get(status, 0) + 1
+        if not counts:
+            return None
+        parts = [f"{v} {k}" for k, v in sorted(counts.items(), key=lambda x: -x[1])]
+        return " · ".join(parts)
+    except Exception:
+        # Degrade-to-None: covers gh failure/timeout, malformed JSON, AND an
+        # unexpected JSON shape (e.g. a top-level list → AttributeError on
+        # .get). Same degrade-to-None contract as _fetch_pr_status.
+        return None
+
+
+def _get_live_status(anchor: str, cache: dict) -> str:
+    """Return a live status string for the given anchor.
+
+    Uses cache if fresh; otherwise calls gh. On any gh failure/timeout,
+    falls back to the cached render (even if stale) or returns "".
+
+    This function NEVER raises — all exceptions are swallowed.
+    """
+    try:
+        # Check cache first
+        cached = _cache_get(cache, anchor)
+        if cached is not None:
+            return cached
+
+        # Need a fresh fetch — wrap in its own try so exceptions still
+        # reach the stale-cache fallback below.
+        render: Optional[str] = None
+        try:
+            if anchor.startswith("pr/"):
+                pr_num = anchor[3:]
+                render = _fetch_pr_status(pr_num)
+            elif anchor.startswith("project/"):
+                project_num = anchor[8:]
+                render = _fetch_project_status(project_num)
+        except Exception:
+            render = None  # fall through to stale-cache check
+
+        if render is not None:
+            _cache_set(cache, anchor, render)
+            return render
+
+        # gh failed — fall back to stale cache if any
+        stale = cache.get(anchor, {}).get("render", "")
+        return stale if stale else ""
+    except Exception:  # belt-and-suspenders: swallow everything
+        return ""
+
+
+# ---------------------------------------------------------------------------
 # Project scanning
 # ---------------------------------------------------------------------------
 
 def _scan_my_batons(agent_name: str) -> list:
     """Scan BATON_PROJECTS_DIR for projects where turn == agent_name.
 
-    Returns list of dicts: {project_id, title, status, turn_since, turn_reason}.
+    Returns list of dicts:
+        {project_id, title, status, turn_since, turn_reason, github_anchor}.
     Files that don't parse cleanly are silently skipped.
     Sorted by turn_since ascending (oldest baton first = most overdue first).
     """
@@ -204,12 +433,17 @@ def _scan_my_batons(agent_name: str) -> list:
             turn_reason = turn_reason[1:-1]
         turn_since = _parse_iso(turn_since_str)
 
+        # Resolve GitHub anchor (may be None)
+        github_field = fields.get("github", "").strip()
+        github_anchor = _resolve_anchor(project_id, github_field)
+
         my_batons.append({
             "project_id": project_id,
             "title": title,
             "status": status,
             "turn_since": turn_since,
             "turn_reason": turn_reason,
+            "github_anchor": github_anchor,
         })
 
     # Oldest baton first (most overdue = highest urgency)
@@ -241,6 +475,17 @@ def main() -> None:
     if not my_batons:
         sys.exit(0)
 
+    # ── Detect gh availability once (don't retry per baton) ──────────────────
+    gh_ok = _gh_available()
+
+    # ── Load cache (once for all batons) ─────────────────────────────────────
+    cache: dict = {}
+    if gh_ok:
+        try:
+            cache = _load_cache()
+        except Exception:
+            cache = {}
+
     # ── Build injection block ─────────────────────────────────────────────────
     n = len(my_batons)
     baton_word = "baton" if n == 1 else "batons"
@@ -252,6 +497,7 @@ def main() -> None:
         pid = b["project_id"]
         turn_since = b["turn_since"]
         turn_reason = b["turn_reason"]
+        github_anchor = b["github_anchor"]
 
         # Format: since HH:MMZ, Xh ago
         if turn_since:
@@ -263,10 +509,28 @@ def main() -> None:
             since_str = ""
 
         reason_part = f" — {turn_reason}" if turn_reason else ""
+
+        # Live GitHub status clause (best-effort; never blocks or raises)
+        live_clause = ""
+        if gh_ok and github_anchor:
+            try:
+                live_status = _get_live_status(github_anchor, cache)
+                if live_status:
+                    live_clause = f" [{live_status}]"
+            except Exception:
+                pass
+
         if since_str:
-            lines.append(f"  - {pid} ({since_str}){reason_part}")
+            lines.append(f"  - {pid} ({since_str}){reason_part}{live_clause}")
         else:
-            lines.append(f"  - {pid}{reason_part}")
+            lines.append(f"  - {pid}{reason_part}{live_clause}")
+
+    # ── Persist updated cache ─────────────────────────────────────────────────
+    if gh_ok and cache:
+        try:
+            _save_cache(cache)
+        except Exception:
+            pass
 
     context = "\n".join(lines)
 
