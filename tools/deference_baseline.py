@@ -37,7 +37,14 @@ from collections import Counter, defaultdict
 from datetime import date, datetime
 from pathlib import Path
 
-ENGRAM_HOME = Path(os.environ.get("ENGRAM_HOME", str(Path.home() / ".engram")))
+# Multi-install precedence: prefer ENGRAM_DATA_DIR (server's canonical), fall back
+# to ENGRAM_HOME (the conventional name), then default. Resolves the multi-install
+# split-brain where operator sets one var but not the other (#471, follow-up to #354).
+ENGRAM_HOME = Path(
+    os.environ.get("ENGRAM_DATA_DIR")
+    or os.environ.get("ENGRAM_HOME")
+    or str(Path.home() / ".engram")
+)
 LOG_PATH = Path(
     os.environ.get("ENGRAM_DEFERENCE_LOG", str(ENGRAM_HOME / "deference-detector.log"))
 )
