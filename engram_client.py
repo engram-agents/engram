@@ -91,43 +91,25 @@ TOOL_SCHEMAS = {
     "engram_surface": {
         "description": "Shallow surface: search KG and return a compact summary nudge (type counts, special nodes, top claims, age signal). No memory refresh — ambient awareness, not deliberate recall. Use to decide whether to dig deeper with engram_inspect or engram_get_subgraph.",
         "parameters": {
-            "query": {"type": "string", "description": "Natural language search query.", "required": True},
-            "top_k": {"type": "integer", "description": "Max nodes to scan (default 10)."},
-            "semantic": {"type": "boolean", "description": "Include semantic (embedding) search. False for fast keyword-only. Default True."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with surface fields. Required: query (str — natural language search query, used for FTS keyword matching and as the default semantic query). Optional: top_k (int — max nodes to scan, default 10), semantic (bool — include semantic/embedding search; False for fast keyword-only, default True), embed_query (str — separate semantic-search string; when provided, semantic search uses embed_query while FTS still uses query).", "required": True},
         },
     },
     "engram_inspect": {
         "description": "Inspect a single node with three view modes: 'recall' (default — full focus claim + grouped logical-substrate neighbors with recall_summary + contextual neighbors with recall_keywords; the 'refresh my memory of this idea' view), 'deep' (all focus-node fields including confidence_history + 1-hop neighbors as adjacency map; for forensic / retract / supersede decisions), 'edges' (adjacency-map topology only, no node content; for graph-shape audits). dream_mode=True skips the recall-refresh side effect during maintenance / dream-cycle inspection.",
         "parameters": {
-            "node_id": {"type": "string", "description": "The node ID to inspect (e.g. 'dv_0010').", "required": True},
-            "view": {"type": "string", "description": "Optional. One of 'recall' (default), 'deep', or 'edges'. Controls the shape of returned data.", "enum": ["recall", "deep", "edges"]},
-            "dream_mode": {"type": "boolean", "description": "Optional. If True, skips the recall-refresh side effect. Use during maintenance / dream-cycle inspection."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with inspect fields. Required: node_id (str — the node ID to inspect, e.g. 'dv_0010'). Optional: view (str — one of 'recall' (default), 'deep', or 'edges'; controls the shape of returned data), dream_mode (bool — if True, skips the recall-refresh side effect and importance-score boost; use during maintenance / dream-cycle inspection, default False), include_superseded (bool — if True, include neighbors whose is_current=0 in topology and neighbor lists; default False).", "required": True},
         },
     },
     "engram_query": {
         "description": "First-class voluntary semantic-recall (autonoetic intentional-search complement to engram_surface's ambient/noetic auto-surfacing). Use when you want to recall something specifically. Combines FTS5 keyword + semantic similarity; returns tiered {id,summary}/{id,keywords} shape; refreshes recall on matched nodes. Use engram_inspect for full content on any result.",
         "parameters": {
-            "query": {"type": "string", "description": "Search query.", "required": True},
-            "types": {"type": "string", "description": "Comma-separated node types to filter by."},
-            "min_confidence": {"type": "number", "description": "Minimum confidence threshold (0.0-1.0)."},
-            "include_superseded": {"type": "boolean", "description": "Include superseded nodes."},
-            "top_k": {"type": "integer", "description": "Max results (default 10)."},
-            "summary_top_k": {"type": "integer", "description": "Top-N results returned with recall_summary (Tier 1); remainder get recall_keywords only (Tier 2). Default 3. Ignored when return_debug=True."},
-            "return_debug": {
-                "type": "boolean",
-                "description": "If True, return the full legacy shape with composite_score and ranking internals (eval/harness use only). Suppresses tiered render. Default False."
-            },
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with query fields. Required: query (str — natural language search query). Optional: types (str — comma-separated node types to filter, e.g. 'derivation,observation_factual'; empty = all types), min_confidence (float — minimum confidence threshold 0.0–1.0, default 0.0), include_superseded (bool — include non-current/superseded nodes, default False), top_k (int — max results to return, default 10), summary_top_k (int — top-N results returned with recall_summary (Tier 1); remainder get recall_keywords only (Tier 2); default 3; ignored when return_debug=True), return_debug (bool — if True, return full legacy shape with composite_score and ranking internals for eval/harness use; suppresses tiered render; default False).", "required": True},
         },
     },
     "engram_query_pattern": {
         "description": "Run a named compositional graph-pattern query (KnowQL-inspired). Returns tiered {id,summary}/{id,keywords} shape. Six patterns: contradiction_obsolescence_ready, open_question_answerable, stale_load_bearing, cornerstone_candidate, tainted_still_valid, recent_resolution_echo. Three presets: high_precision / balanced (default) / high_recall. Telemetry logged per call.",
         "parameters": {
-            "pattern_name": {"type": "string", "description": "One of: contradiction_obsolescence_ready, open_question_answerable, stale_load_bearing, cornerstone_candidate, tainted_still_valid, recent_resolution_echo.", "required": True},
-            "preset": {"type": "string", "description": "high_precision / balanced (default) / high_recall.", "enum": ["high_precision", "balanced", "high_recall"]},
-            "cosine_threshold_override": {"type": "number", "description": "Override preset cosine_threshold (>= 0 to apply). Default -1."},
-            "top_k_override": {"type": "integer", "description": "Override preset top_k (>= 0 to apply). Default -1."},
-            "min_confidence_override": {"type": "number", "description": "Override preset min_confidence (>= 0 to apply). Default -1."},
-            "summary_top_k": {"type": "integer", "description": "Top-N candidates returned with recall_summary (Tier 1); remainder get recall_keywords only (Tier 2). Default 3."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with query_pattern fields. Required: pattern_name (str — one of: contradiction_obsolescence_ready, open_question_answerable, stale_load_bearing, cornerstone_candidate, tainted_still_valid, recent_resolution_echo). Optional: preset (str — one of high_precision / balanced (default) / high_recall; bundles cosine_threshold, top_k, min_confidence), cosine_threshold_override (float — if >= 0, overrides preset's cosine_threshold; default -1), top_k_override (int — if >= 0, overrides preset's top_k; default -1), min_confidence_override (float — if >= 0, overrides preset's min_confidence; default -1), summary_top_k (int — top-N candidates returned with recall_summary (Tier 1); remainder get recall_keywords only (Tier 2); default 3).", "required": True},
         },
     },
     "engram_get_subgraph": {
@@ -140,11 +122,7 @@ TOOL_SCHEMAS = {
             "Chained-call pattern: subgraph → spot interesting node → engram_inspect that node → subgraph from there."
         ),
         "parameters": {
-            "node_id": {"type": "string", "description": "Root node to explore.", "required": True},
-            "depth": {"type": "integer", "description": "How many hops to traverse from root (default 2)."},
-            "direction": {"type": "string", "description": "Traversal direction: 'up' (toward evidence), 'down' (toward dependents), or 'both' (default).", "enum": ["up", "down", "both"]},
-            "view": {"type": "string", "description": "'recall' (default, topology + hop-graduated summaries) or 'edges' (topology only).", "enum": ["recall", "edges"]},
-            "dream_mode": {"type": "boolean", "description": "If True, skip recall_refresh on neighbours (default False)."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with get_subgraph fields. Required: node_id (str — root node to explore, e.g. 'dv_0686'). Optional: depth (int — how many hops to traverse from root, default 2), direction (str — 'up' (toward evidence/sources), 'down' (toward derivations that cite this), or 'both' (default)), view (str — 'recall' (default, topology + hop-graduated summaries) or 'edges' (topology only; 'deep' is rejected)), dream_mode (bool — if True, skip recall_refresh on neighbour nodes; default False).", "required": True},
         },
     },
     "engram_derive": {
@@ -264,10 +242,7 @@ TOOL_SCHEMAS = {
     "engram_reflect": {
         "description": "[Sleep cycle — pre-dream briefing.] Structured self-audit of the graph (contradictions, open questions, weak claims, overdue predictions, uncited observations, tainted and retracted nodes). Opens the dream cycle for the engram-sleep skill. Not a tool to reach for during awake-state work. High-volume categories (weakly_grounded, thin_support_derivations, uncited_observations) are tiered: top summary_top_k entries get full claim text (from recall_summary if set, else claim); the remainder get keyword-style entries (recall_keywords list, no claim key). Low-volume categories source-swap their content field from recall_summary with claim fallback.",
         "parameters": {
-            "summary_top_k": {
-                "type": "integer",
-                "description": "How many top-importance entries in each high-volume category receive summary-style rendering (claim from recall_summary). Remainder get keyword-style. Default 5. Clamped to >= 0. Set to 0 for all keyword-style; set high (e.g. 50) for all summary-style.",
-            },
+            "payload_json": {"type": "string", "description": "Optional JSON object (as a string) with reflect fields. Optional: summary_top_k (int — how many top-importance entries in each high-volume category receive summary-style rendering; remainder get keyword-style; default 5; clamped to >= 0; set 0 for all keyword-style; set high e.g. 50 for all summary-style). Empty payload '{}' or omitted payload runs the default reflect."},
         },
     },
     "engram_diagnose": {
@@ -277,11 +252,7 @@ TOOL_SCHEMAS = {
     "engram_history": {
         "description": "Browse edit history and diagnostic snapshots. Side-effect-free.",
         "parameters": {
-            "mode": {"type": "string", "description": "One of: edits, diagnostics. Default: edits.", "enum": ["edits", "diagnostics"]},
-            "node_id": {"type": "string", "description": "Filter edits to a specific node (edits mode only)."},
-            "action": {"type": "string", "description": "Filter by action type: created, superseded, retracted, resolved, tainted, stale_flagged, reopened."},
-            "since": {"type": "string", "description": "ISO timestamp — return only entries after this time."},
-            "limit": {"type": "integer", "description": "Max entries (default 50, max 200)."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with history fields. All optional: mode (str — 'edits' (default) or 'diagnostics'; edits = chronological audit trail of mutations; diagnostics = metric snapshots at each checkpoint), node_id (str — filter edits to a specific node; edits mode only), action (str — filter by action type: created, reopened, resolved, retracted, stale_flagged, superseded, tainted, trust_tier_set; edits mode only), since (str — ISO timestamp — return only entries after this time), limit (int — max entries to return, default 50, max 200).", "required": True},
         },
     },
     "engram_list_focused": {
@@ -291,11 +262,7 @@ TOOL_SCHEMAS = {
     "engram_list": {
         "description": "List nodes in compact triage format. No neighbor data, no memory refresh. Supports structured filters via filters_json (recursive AND/OR/NOT with contains/starts_with/ends_with operators). Default scans current-revision only; set include_superseded=True to scan the historical layer (text-layer leak audits).",
         "parameters": {
-            "node_type": {"type": "string", "description": "Filter by node type (e.g. 'question', 'observation_factual')."},
-            "status": {"type": "string", "description": "Filter by status (e.g. 'open', 'resolved', 'active')."},
-            "sort_by": {"type": "string", "description": "Sort order: id, created, importance, recalls.", "enum": ["id", "created", "importance", "recalls"]},
-            "limit": {"type": "integer", "description": "Max results (default 100, max 500)."},
-            "include_superseded": {"type": "boolean", "description": "If True, scan non-current (superseded) nodes too. Default False (current-revision only)."},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with list fields. All optional: node_type (str — filter by node type, e.g. 'question', 'observation_factual'; empty = all types; conflicts with 'type' field in filters_json), status (str — filter by status, e.g. 'open', 'resolved', 'active'; conflicts with 'status' field in filters_json), sort_by (str — sort order: 'id' (default), 'created' (newest first), 'importance' (highest first), 'recalls' (most recalled first)), limit (int — max results, default 100; set 0 for metadata-only; ignored if unlimited=True; hard ceiling 500 in single-field mode), filters_json (str — JSON-encoded recursive condition tree with AND/OR/NOT logic and eq/ne/gt/gte/lt/lte/in/not_in/between/contains/starts_with/ends_with/is_null/is_not_null operators; empty string = use single-field mode), fields_json (str — JSON-encoded list of column names to project; empty = default compact triage shape), unlimited (bool — if True, return all matched rows regardless of limit), include_superseded (bool — if True, scan non-current/superseded nodes too; default False).", "required": True},
         },
     },
     "engram_stats": {

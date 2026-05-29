@@ -314,8 +314,10 @@ def test_retract_with_replacement():
     assert "replacement_id" in ret, f"Expected replacement_id, got {ret}"
     repl_id = ret["replacement_id"]
 
-    # Verify replacement exists and cites same evidence
-    insp = client.call("engram_inspect", {"node_id": repl_id})
+    # Verify replacement exists and cites same evidence.
+    # include_superseded=True because the retracted node (is_current=0) is the
+    # target of the retracts edge; without it the default neighbor filter hides it.
+    insp = client.call("engram_inspect", {"node_id": repl_id, "include_superseded": True})
     repl_node = insp["node"]
     assert repl_node["claim"] == "Correct claim"
     # Check retracts edge exists (inspect recall view exposes 1-hop logical neighbours in grouped dict)
