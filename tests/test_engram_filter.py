@@ -338,6 +338,18 @@ class TestValidateFields:
         # None means "no projection, return default columns"
         assert validate_fields(None) == []
 
+    def test_trust_tier_columns_recognized(self):
+        # Regression for #452: trust-tier columns added by PR #413 must be in
+        # the allowlist so engram_list fields_json doesn't reject them.
+        trust_cols = [
+            "trust_tier",
+            "trust_signal_kind",
+            "trust_signal_polarity",
+            "trust_signal_weight",
+        ]
+        result = validate_fields(trust_cols)
+        assert result == trust_cols
+
 
 # ---------------------------------------------------------------------------
 # Integration tests — engram_list with structured filters end-to-end
@@ -655,3 +667,21 @@ class TestEngramListIncludeSuperseded:
         ids = {n["id"] for n in result["nodes"]}
         assert "ob_s001" in ids
         assert "ob_s002" not in ids
+
+    def test_fields_json_trust_tier_end_to_end(self):
+        """Regression for #452: fields_json=["id","claim","trust_tier"] on
+        node_type="person" must not return 'unknown field trust_tier' error."""
+        server = fresh_server()
+        r = json.loads(server.engram_add_person(payload_json=json.dumps({
+            "name": "Alice",
+            "role": "test subject",
+        })))
+        assert "person_id" in r, f"engram_add_person failed: {r}"
+        result = json.loads(server.engram_list(payload_json=json.dumps({
+            "node_type": "person",
+            "fields_json": json.dumps(["id", "claim", "trust_tier"]),
+        })))
+        assert result["status"] == "ok", f"engram_list error: {result.get('error')}"
+        assert result["total_matched"] >= 1
+        for node in result["nodes"]:
+            assert "trust_tier" in node

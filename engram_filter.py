@@ -79,6 +79,11 @@ ALLOWED_NODE_COLUMNS: frozenset[str] = frozenset(
         "categorical_tag",
         "intensity_hint",
         "nudge_source",
+        # Trust-tier (added in PR #413; closes #452)
+        "trust_tier",
+        "trust_signal_kind",
+        "trust_signal_polarity",
+        "trust_signal_weight",
     }
 )
 
