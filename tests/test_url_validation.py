@@ -22,13 +22,20 @@ atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 def _setup():
-    """Reset test DB and reimport server module."""
+    """Reset test DB and reimport server module.
+
+    Uses _configure_paths(TEST_DIR) — the canonical isolation pattern — instead of
+    the ENGRAM_DB_DIR env var (a no-op: server reads ENGRAM_DATA_DIR).  See
+    test_cascade_semantics.py::fresh_server() for the reference implementation.
+    """
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
-    os.environ["ENGRAM_DB_DIR"] = TEST_DIR
     if "server" in sys.modules:
         del sys.modules["server"]
     import server
+    server._configure_paths(TEST_DIR)
+    server._ensure_data_dir()
+    os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
     return server
 
 
