@@ -49,9 +49,9 @@ For each candidate, write NOW. Don't defer. Don't batch mentally. Use the right 
 ## Step 3 — Call engram_nap()
 
 ```
-engram_nap(
-    message="<1-3 sentence summary of what this burst covered and what was written>",
-)
+engram_nap(payload_json=json.dumps({
+    "message": "<1-3 sentence summary of what this burst covered and what was written>",
+}))
 ```
 
 The `nap` mode:

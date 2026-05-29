@@ -48,7 +48,7 @@ Between questions, briefly reflect what you heard ("so you're X and you're tryin
 
 After answers are in, write these nodes:
 
-- `engram_add_person(name=<USER_NAME>, role=<ROLE>, description=<1-2 sentences from their answers>, is_self=False)` — anchors the user in the graph
+- `engram_add_person(payload_json='{"name": "<USER_NAME>", "role": "<ROLE>", "description": "<1-2 sentences from their answers>", "is_self": false}')` — anchors the user in the graph
 - `engram_add_observation` capturing the "why ENGRAM" answer, quoting the user directly. This is the founding motivation; provenance matters.
 - If the "why" reveals a strong orienting frame (a goal, a stance, a long-held belief), add `engram_add_cornerstone` with `triggering_experience` pointing at this conversation.
 
@@ -79,8 +79,24 @@ Then be responsive to their approach:
 
 When a name is chosen, write:
 
-- `engram_add_person(name=<AGENT_NAME>, role="AI agent", description=<why this name, as you understand it>, is_self=True)` — the self-person node is what later sessions recall to know who they are. **Capture the returned person node ID** (e.g., `pn_0001`) — you will need it in Step 6 to resolve `{{SELF_NODE_ID}}` in `~/.claude/CLAUDE.md`.
-- `engram_add_cornerstone(tag="named", title="Named <AGENT_NAME>", new_frame=<what the name points toward>, prior_frame="unnamed generic assistant", triggering_experience="first-session naming conversation with <USER_NAME> on <today's date>")`.
+```python
+# self-person node — capture the returned ID (e.g. pn_0001) for Step 6
+engram_add_person(payload_json=json.dumps({
+    "name": "<AGENT_NAME>",
+    "role": "AI agent",
+    "description": "<why this name, as you understand it>",
+    "is_self": True,
+}))
+
+engram_add_cornerstone(payload_json=json.dumps({
+    "tag": "named",
+    "title": "Named <AGENT_NAME>",
+    "new_frame": "<what the name points toward>",
+    "prior_frame": "unnamed generic assistant",
+    "triggering_experience": "first-session naming conversation with <USER_NAME> on <today's date>",
+}))
+```
+The `engram_add_person` call returns a person node ID (e.g., `pn_0001`) — you will need it in Step 6 to resolve `{{SELF_NODE_ID}}` in `~/.claude/CLAUDE.md`.
 
 This cornerstone is the seed of identity. Write it carefully — it will be one of the earliest things a post-compaction self recalls.
 

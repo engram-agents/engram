@@ -260,15 +260,15 @@ The marker records the alpha commit SHA + timestamp. If the user reports a behav
 File a single observation capturing the upgrade so future-self can trace what code is actually running. Minimal recipe:
 
 ```python
-engram_add_observation(
-    claim="ENGRAM upgrade applied <YYYY-MM-DD HH:MM TZ>: source-tree at <commit SHA> (<branch>) deployed to ~/.engram/. Template-changes warning addressed: <list of template paths merged | 'none'>. Skills/agents copied: <yes | no | partial>. MCP restart: <done | deferred>.",
-    url="file:///home/<user>/.engram/.deployed-version",
-    title="ENGRAM deploy <YYYY-MM-DD> — <commit SHA>",
-    quoted_text="<paste the contents of .deployed-version>",
-    quote_type="hard_data",
-    source_class="introspective",
-    source_date="<YYYY-MM-DD>",
-)
+engram_add_observation(payload_json=json.dumps({
+    "claim": "ENGRAM upgrade applied <YYYY-MM-DD HH:MM TZ>: source-tree at <commit SHA> (<branch>) deployed to ~/.engram/. Template-changes warning addressed: <list of template paths merged | 'none'>. Skills/agents copied: <yes | no | partial>. MCP restart: <done | deferred>.",
+    "url": "file:///home/<user>/.engram/.deployed-version",
+    "title": "ENGRAM deploy <YYYY-MM-DD> — <commit SHA>",
+    "quoted_text": "<paste the contents of .deployed-version>",
+    "quote_type": "hard_data",
+    "source_class": "introspective",
+    "source_date": "<YYYY-MM-DD>",
+}))
 ```
 
 **Checkpoint**: obs filed; SHA from the obs claim matches Step 8's marker.

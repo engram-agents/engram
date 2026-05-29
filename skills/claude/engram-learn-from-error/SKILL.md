@@ -67,14 +67,14 @@ Extract the reusable pattern following Gollwitzer's implementation intention for
 Create the lesson using `engram_add_lesson`:
 
 ```
-engram_add_lesson(
-    claim="When diagnosing errors, read the error output before forming any hypothesis about the cause.",
-    incident_ids="ob_XXXX",  # The incident observation from Step 2
-    scaffolding_nudge="Read the error output, stack trace, or logs BEFORE forming any hypothesis about the cause.",
-    logical_chain="[How the specific incident(s) generalize to this pattern]",
-    reasoning_type="inductive_generalization",
-    context_ids="dv_0273,dv_0275"  # Implementation intention theory nodes
-)
+engram_add_lesson(payload_json=json.dumps({
+    "claim": "When diagnosing errors, read the error output before forming any hypothesis about the cause.",
+    "incident_ids": "ob_XXXX",  # The incident observation from Step 2
+    "scaffolding_nudge": "Read the error output, stack trace, or logs BEFORE forming any hypothesis about the cause.",
+    "logical_chain": "[How the specific incident(s) generalize to this pattern]",
+    "reasoning_type": "inductive_generalization",
+    "context_ids": "dv_0273,dv_0275",  # Implementation intention theory nodes
+}))
 ```
 
 **Check for consolidation:** The tool returns `similar_existing_lessons` if a similar lesson already exists. If so:

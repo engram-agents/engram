@@ -51,8 +51,13 @@ When you see `dv_X.tainted_by = [ob_Y]` (ob_Y was retracted) or
    - The `tainted_by` / `stale_by` marker clears automatically when dv_X
      becomes `is_current=0`
 4. If NO (claim depends on the invalid premise and cannot stand alone):
-   - `engram_retract(dv_X, error_type="hallucinated_claim",
-     reason="premise retracted; claim no longer supported")`
+   - ```
+     engram_retract(payload_json=json.dumps({
+         "node_id": "dv_X",
+         "error_type": "hallucinated_claim",
+         "reason": "premise retracted; claim no longer supported",
+     }))
+     ```
    - The marker clears automatically on retraction
 
 The cascade auto-clears: once dv_X is either superseded or retracted, the
@@ -70,11 +75,11 @@ When you see `cs_X.support_lost = true` or `ls_X.support_lost = true`:
 
    3a. Register the exemplar against the pattern node:
        ```
-       engram_register_exemplar(
-           target_id=<cs_X or ls_X>,
-           exemplar_id=<ob_or_dv_id>,
-           note="<why this instance fits the pattern>"
-       )
+       engram_register_exemplar(payload_json=json.dumps({
+           "target_id": "<cs_X or ls_X>",
+           "exemplar_id": "<ob_or_dv_id>",
+           "note": "<why this instance fits the pattern>",
+       }))
        ```
        The tool handles both cornerstones and lessons; for lesson targets,
        the tripwire cache refresh fires automatically.

@@ -193,9 +193,9 @@ Do NOT file a performative report to demonstrate the tool. The trap is real.
 This is the MOST IMPORTANT step and the one that distinguishes sleep from nap.
 
 ```
-engram_advance_turn(
-    message="<summary of the dream: what was resolved, superseded, promoted, refuted, questions registered, feelings filed>",
-)
+engram_advance_turn(payload_json=json.dumps({
+    "message": "<summary of the dream: what was resolved, superseded, promoted, refuted, questions registered, feelings filed>",
+}))
 ```
 
 The `session` mode:

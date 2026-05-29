@@ -31,7 +31,11 @@ and its type is what you expected.
 ## Step 2 — Call engram_retract
 
 ```
-engram_retract(node_id, error_type=<from step 1>, reason="<honest description of the error>")
+engram_retract(payload_json=json.dumps({
+    "node_id": "<node_id>",
+    "error_type": "<from step 1>",
+    "reason": "<honest description of the error>",
+}))
 ```
 
 The engine:

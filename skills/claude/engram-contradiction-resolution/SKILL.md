@@ -44,12 +44,12 @@ The contradicting nodes carry the disagreement. Some patterns:
 ### Step 3 — Compose the resolving derivation
 
 ```
-engram_derive(payload_json={
-  "claim": "<the resolution claim>",
-  "supporting_ids": "<root-anchor IDs, comma-separated>",
-  "logical_chain": "<explicit reasoning>",
-  "reasoning_type": "<deductive_modus_ponens / abductive_best_explanation / etc.>"
-})
+engram_derive(payload_json=json.dumps({
+    "claim": "<the resolution claim>",
+    "supporting_ids": "<root-anchor IDs, comma-separated>",
+    "logical_chain": "<explicit reasoning>",
+    "reasoning_type": "<deductive_modus_ponens / abductive_best_explanation / etc.>",
+}))
 ```
 
 **Critical**: cite **root-anchor nodes** (the original contradicting observations or canonical derivations), NOT prior resolution attempts. Citing prior resolution attempts is the chain-dilution mechanism that broke ct_0006 — each step diluted confidence further from threshold.
@@ -59,10 +59,10 @@ If a high-confidence canonical node already exists that resolves the contradicti
 ### Step 4 — Wire the resolves edge
 
 ```
-engram_resolve(payload_json={
-  "target_id": ct_id,
-  "resolving_node_id": <dv_id from step 3 OR existing canonical node>
-})
+engram_resolve(payload_json=json.dumps({
+    "target_id": ct_id,
+    "resolving_node_id": "<dv_id from step 3 OR existing canonical node>",
+}))
 ```
 
 `engram_resolve` is now pure-wire (issue #229) — it only writes the resolves edge and flips status. No derivation creation, no confidence recomputation. Status flips to `resolved` if the resolving node's confidence is ≥ 0.7 (default threshold), else `partially_resolved`.
@@ -107,10 +107,10 @@ Per the supersede no-drop discipline (ls_0044), the new node MUST have either **
 The new node no longer contradicts the other side — the supersede already did the philosophical work. Action: wire `engram_resolve` from the new node to the contradiction.
 
 ```
-engram_resolve(payload_json={
-  "target_id": ct_id,
-  "resolving_node_id": stale_replacement_id
-})
+engram_resolve(payload_json=json.dumps({
+    "target_id": ct_id,
+    "resolving_node_id": stale_replacement_id,
+}))
 ```
 
 This is the ct_0006 case: dv_0570 → dv_0599 altered the bifurcation framing from "strict Kahl satisfaction" to "our owned extension"; dv_0599 no longer contradicted ob_1598's strict-text reading.
@@ -120,17 +120,17 @@ This is the ct_0006 case: dv_0570 → dv_0599 altered the bifurcation framing fr
 The contradiction persists, just with the new node as the contradicting side. Action: create a new contradiction between the new node and the other side, then supersede the old contradiction → new contradiction.
 
 ```
-new_ct = engram_contradict(payload_json={
-  "node_id_a": stale_replacement_id,
-  "node_id_b": other_side_id,
-  "description": "<updated description reflecting new framing>"
-})
+new_ct = engram_contradict(payload_json=json.dumps({
+    "node_id_a": stale_replacement_id,
+    "node_id_b": other_side_id,
+    "description": "<updated description reflecting new framing>",
+}))
 
-engram_supersede(payload_json={
-  "old_node_id": ct_id,
-  "new_node_id": new_ct["contradiction_id"],
-  "supersede_reason": "Re-wired after <old_side> was superseded by <new_side>; conflict preserved with updated framing."
-})
+engram_supersede(payload_json=json.dumps({
+    "old_node_id": ct_id,
+    "new_node_id": new_ct["contradiction_id"],
+    "supersede_reason": "Re-wired after <old_side> was superseded by <new_side>; conflict preserved with updated framing.",
+}))
 ```
 
 The old contradiction is now `is_current=0`; the new contradiction carries the live conflict forward. Continue with the standard resolution path on `new_ct` if you want to drive it to closure.
@@ -165,17 +165,17 @@ The retracted side was never valid. The other side may or may not still be in ge
 There's no longer a contradiction — the conflict was illusory. Action: explicitly close the contradiction by writing a derivation that acknowledges this and wiring it via `engram_resolve`. The claim should be something like "Contradiction dissolved: the contradicting node (ID) was retracted as (error_type); the other side stands without challenge."
 
 ```
-dv = engram_derive(payload_json={
-  "claim": "ct_X dissolved: contradicting side was retracted as <error_type>; <other_side> stands.",
-  "supporting_ids": "<other_side_id>",
-  "logical_chain": "Retracted node was never valid evidence; the other side has no remaining challenge.",
-  "reasoning_type": "deductive_modus_tollens"
-})
+dv = engram_derive(payload_json=json.dumps({
+    "claim": "ct_X dissolved: contradicting side was retracted as <error_type>; <other_side> stands.",
+    "supporting_ids": "<other_side_id>",
+    "logical_chain": "Retracted node was never valid evidence; the other side has no remaining challenge.",
+    "reasoning_type": "deductive_modus_tollens",
+}))
 
-engram_resolve(payload_json={
-  "target_id": ct_id,
-  "resolving_node_id": dv["derivation_id"]
-})
+engram_resolve(payload_json=json.dumps({
+    "target_id": ct_id,
+    "resolving_node_id": dv["derivation_id"],
+}))
 ```
 
 **Sub-case B: a replacement observation was created (engram_retract with replacement_json).**

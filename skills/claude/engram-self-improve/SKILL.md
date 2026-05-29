@@ -120,12 +120,12 @@ Does this change affect how observations or derivations work? If it touches conf
 Record your design as an ENGRAM derivation citing the gap observation/question and the principles you're following. This makes the reasoning durable — a future self can trace why the change was made.
 
 ```
-engram_derive(
-    claim="<the planned change and its rationale>",
-    supporting_ids="<gap node, relevant principles, code observations>",
-    logical_chain="<how the gap + principles lead to this specific design>",
-    reasoning_type="abductive_best_explanation",
-)
+engram_derive(payload_json=json.dumps({
+    "claim": "<the planned change and its rationale>",
+    "supporting_ids": "<gap node, relevant principles, code observations>",
+    "logical_chain": "<how the gap + principles lead to this specific design>",
+    "reasoning_type": "abductive_best_explanation",
+}))
 ```
 
 ---
@@ -156,14 +156,14 @@ Commit the code change before recording it in ENGRAM (git versioning enforcement
 Write the design decision to ENGRAM:
 
 ```
-engram_add_observation(
-    url="file:///path/to/changed/file.py",
-    title="<file> — <what changed>",
-    quoted_text="<the key code change, verbatim>",
-    interpretation="<why this change was made, what gap it addresses, what principle it follows>",
-    claim="<the design fact as a falsifiable statement>",
-    quote_type="hard_data",
-)
+engram_add_observation(payload_json=json.dumps({
+    "url": "file:///path/to/changed/file.py",
+    "title": "<file> — <what changed>",
+    "quoted_text": "<the key code change, verbatim>",
+    "interpretation": "<why this change was made, what gap it addresses, what principle it follows>",
+    "claim": "<the design fact as a falsifiable statement>",
+    "quote_type": "hard_data",
+}))
 ```
 
 ### 4e. Update documentation
@@ -182,18 +182,18 @@ Resolve the original question or observation that triggered the improvement. Two
 
 ```
 # Step 1: compose the resolving derivation
-dv = engram_derive(
-    claim="<how the gap was addressed>",
-    supporting_ids="<the design derivation, the new code observation>",
-    logical_chain="<gap → design → implementation → resolution>",
-    reasoning_type="deductive_modus_ponens",
-)
+dv = engram_derive(payload_json=json.dumps({
+    "claim": "<how the gap was addressed>",
+    "supporting_ids": "<the design derivation, the new code observation>",
+    "logical_chain": "<gap → design → implementation → resolution>",
+    "reasoning_type": "deductive_modus_ponens",
+}))
 
 # Step 2: wire it to the gap node
-engram_resolve(
-    target_id="<the gap node>",
-    resolving_node_id=dv["derivation_id"],
-)
+engram_resolve(payload_json=json.dumps({
+    "target_id": "<the gap node>",
+    "resolving_node_id": dv["derivation_id"],
+}))
 ```
 
 ### 5b. Verify the friction is gone
@@ -205,9 +205,7 @@ If the friction recurs or the fix introduced new friction — record that as a n
 ### 5c. Nap checkpoint
 
 ```
-engram_nap(
-    message="<summary: gap addressed, change made, principles followed, tests passed>",
-)
+engram_nap(payload_json=json.dumps({"message": "<summary: gap addressed, change made, principles followed, tests passed>"}))
 ```
 
 ---

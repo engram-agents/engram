@@ -284,9 +284,9 @@ mv ~/.engram/loop-scratch.md ~/.engram/reports/scratch_$(date +%Y-%m-%d_%H%M%S).
 ### 4. Checkpoint
 
 ```
-engram_nap(
-    message="School day complete: [N] cycles, [summary of key findings]",
-)
+engram_nap(payload_json=json.dumps({
+    "message": "School day complete: [N] cycles, [summary of key findings]",
+}))
 ```
 
 ### 5. Report to user
