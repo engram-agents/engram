@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_payload_obs_batch_")
 atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
-TEST_FILE = os.path.join(tempfile.gettempdir(), "engram_test_obs_batch_source.md")
+TEST_FILE = os.path.join(TEST_DIR, "obs_batch_source.md")
 
 
 def fresh_server():

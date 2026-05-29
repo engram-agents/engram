@@ -19,7 +19,7 @@ atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 THIS_FILE = os.path.abspath(__file__)
 
 
-EVIDENCE_FILE = os.path.join(tempfile.gettempdir(), "engram_test_evidence_source.txt")
+EVIDENCE_FILE = os.path.join(TEST_DIR, "evidence_source.txt")
 
 
 def _ensure_evidence_file():
@@ -33,6 +33,7 @@ def _ensure_evidence_file():
 def fresh_client():
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
+    os.makedirs(TEST_DIR, exist_ok=True)
     if "server" in sys.modules:
         del sys.modules["server"]
     _ensure_evidence_file()
@@ -89,13 +90,12 @@ def test_quote_check_skipped_for_https():
 
 def test_quote_in_jsonl_file():
     """JSONL files should be searchable for quotes within JSON values."""
-    # Create a temp JSONL file
-    jsonl_path = os.path.join(tempfile.gettempdir(), "test_evidence.jsonl")
+    # fresh_client() resets TEST_DIR; create the JSONL file after so it survives.
+    client = fresh_client()
+    jsonl_path = os.path.join(TEST_DIR, "test_evidence.jsonl")
     with open(jsonl_path, "w") as f:
         f.write(json.dumps({"type": "user", "message": {"content": "The deadline is March 15"}}) + "\n")
         f.write(json.dumps({"type": "assistant", "message": {"content": "I'll note that deadline"}}) + "\n")
-
-    client = fresh_client()
     r = client.call("engram_add_observation", {
         "url": f"file://{jsonl_path}",
         "title": "Test JSONL transcript",
