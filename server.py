@@ -2636,10 +2636,16 @@ _INSPECT_RECALL_GROUP_CAP = 10
 def _get_neighbors_enriched(
     conn: sqlite3.Connection,
     node_id: str,
-) -> list[dict]:
+    include_superseded: bool = False,
+) -> tuple[list[dict], int]:
     """Fetch 1-hop neighbors with recall_summary + recall_keywords columns.
 
-    Returns a list of flat dicts with keys:
+    Returns (neighbors, filtered_count) where filtered_count is the number of
+    non-current neighbors that were suppressed (useful for the
+    truncated_superseded_count hint). When include_superseded=True, filtered_count
+    is always 0.
+
+    Each neighbor dict has keys:
         id, type, relation, direction, recall_summary, recall_keywords,
         importance_score, recall_count
     (recall_count and importance_score are used for capping downstream groups)
@@ -2651,7 +2657,8 @@ def _get_neighbors_enriched(
                n.recall_summary   AS neighbor_recall_summary,
                n.recall_keywords  AS neighbor_recall_keywords,
                n.importance_score AS neighbor_importance_score,
-               n.recall_count     AS neighbor_recall_count
+               n.recall_count     AS neighbor_recall_count,
+               n.is_current       AS neighbor_is_current
         FROM edges e
         LEFT JOIN nodes n ON (
             CASE WHEN e.source_id = ? THEN e.target_id ELSE e.source_id END
@@ -2662,8 +2669,17 @@ def _get_neighbors_enriched(
     ).fetchall()
 
     result = []
+    filtered_count = 0
     for e in edges:
         neighbor_id = e["target_id"] if e["source_id"] == node_id else e["source_id"]
+        # Filter non-current neighbors unless include_superseded=True.
+        # A NULL is_current (orphan edge with no matching node row) is treated as
+        # current — the LEFT JOIN means the neighbor may be missing from nodes, but
+        # we don't silently drop the edge in that case.
+        neighbor_is_current = e["neighbor_is_current"]
+        if not include_superseded and neighbor_is_current is not None and neighbor_is_current == 0:
+            filtered_count += 1
+            continue
         direction = "outgoing" if e["source_id"] == node_id else "incoming"
         kw_raw = e["neighbor_recall_keywords"]
         try:
@@ -2680,7 +2696,7 @@ def _get_neighbors_enriched(
             "importance_score": e["neighbor_importance_score"],
             "recall_count": e["neighbor_recall_count"],
         })
-    return result
+    return result, filtered_count
 
 
 def _build_inspect_recall_view(
@@ -2689,9 +2705,12 @@ def _build_inspect_recall_view(
     node_id: str,
     dream_mode: bool,
     warnings: Optional[dict],
+    include_superseded: bool = False,
 ) -> dict:
     """Build the recall-view response for engram_inspect."""
-    neighbors = _get_neighbors_enriched(conn, node_id)
+    neighbors, filtered_superseded_count = _get_neighbors_enriched(
+        conn, node_id, include_superseded=include_superseded
+    )
 
     # Partition into logical vs contextual.
     logical: list[dict] = []
@@ -2811,37 +2830,62 @@ def _build_inspect_recall_view(
     }
     if contextual_remainder:
         response["truncated_contextual_count"] = contextual_remainder
+    if filtered_superseded_count:
+        response["truncated_superseded_count"] = filtered_superseded_count
     if warnings:
         response["warnings"] = warnings
     return response
 
 
 def _build_topology_entries(
-    conn: sqlite3.Connection, node_id: str
-) -> tuple[dict[str, list[dict]], int]:
+    conn: sqlite3.Connection,
+    node_id: str,
+    include_superseded: bool = False,
+) -> tuple[dict[str, list[dict]], int, int]:
     """Build the adjacency-map topology entries + edge count for a focal node.
 
     Used by both view='deep' and view='edges' on engram_inspect to produce the
     `{source_id: [{to, relation, direction}, ...]}` shape.
+
+    Returns (topology, total_included, filtered_superseded_count).
+    filtered_superseded_count is the number of non-current neighbor edges that were
+    suppressed when include_superseded=False. Orphan edges (neighbor not in nodes
+    table) are always included — a missing JOIN row means is_current is NULL, and
+    we never silently drop an edge on an orphan.
     """
     edges = conn.execute(
-        "SELECT relation, source_id, target_id FROM edges WHERE source_id = ? OR target_id = ?",
-        (node_id, node_id),
+        """
+        SELECT e.relation, e.source_id, e.target_id,
+               n.is_current AS neighbor_is_current
+        FROM edges e
+        LEFT JOIN nodes n ON (
+            CASE WHEN e.source_id = ? THEN e.target_id ELSE e.source_id END
+        ) = n.id
+        WHERE e.source_id = ? OR e.target_id = ?
+        """,
+        (node_id, node_id, node_id),
     ).fetchall()
 
     # Build adjacency map keyed by focus node id.
     # Per-edge entry: {to, relation, direction}.
     edge_entries: list[dict] = []
     total = 0
+    filtered_count = 0
     for e in edges:
         neighbor_id = e["target_id"] if e["source_id"] == node_id else e["source_id"]
+        neighbor_is_current = e["neighbor_is_current"]
+        # Filter non-current neighbors unless include_superseded=True.
+        # NULL is_current (orphan edge — neighbor not in nodes table) is always included.
+        if not include_superseded and neighbor_is_current is not None and neighbor_is_current == 0:
+            filtered_count += 1
+            continue
         direction = "outgoing" if e["source_id"] == node_id else "incoming"
         rel = e["relation"]
         entry: dict = {"to": neighbor_id, "relation": rel, "direction": direction}
         edge_entries.append(entry)
         total += 1
 
-    return {node_id: edge_entries}, total
+    return {node_id: edge_entries}, total, filtered_count
 
 
 def _build_inspect_deep_view(
@@ -2850,9 +2894,12 @@ def _build_inspect_deep_view(
     node_id: str,
     dream_mode: bool,
     warnings: Optional[dict],
+    include_superseded: bool = False,
 ) -> dict:
     """Build the deep-view response for engram_inspect."""
-    topology, total = _build_topology_entries(conn, node_id)
+    topology, total, filtered_superseded_count = _build_topology_entries(
+        conn, node_id, include_superseded=include_superseded
+    )
 
     response: dict = {
         "node": node,
@@ -2861,6 +2908,8 @@ def _build_inspect_deep_view(
         "topology": topology,
         "neighbor_count": total,
     }
+    if filtered_superseded_count:
+        response["truncated_superseded_count"] = filtered_superseded_count
     if warnings:
         response["warnings"] = warnings
     return response
@@ -2870,17 +2919,23 @@ def _build_inspect_edges_view(
     conn: sqlite3.Connection,
     node_id: str,
     node_type: str,
+    include_superseded: bool = False,
 ) -> dict:
     """Build the edges-view response for engram_inspect."""
-    topology, total = _build_topology_entries(conn, node_id)
+    topology, total, filtered_superseded_count = _build_topology_entries(
+        conn, node_id, include_superseded=include_superseded
+    )
 
-    return {
+    response: dict = {
         "node_id": node_id,
         "node_type": node_type,
         "view": "edges",
         "topology": topology,
         "neighbor_count": total,
     }
+    if filtered_superseded_count:
+        response["truncated_superseded_count"] = filtered_superseded_count
+    return response
 
 
 # Excerpt length for warning surfacing (claim + retraction_reason).
@@ -6343,7 +6398,7 @@ def _surface_impl(
 # (trace multi-hop chains). engram_inspect refreshes only the TARGET node's
 # recall, not neighbors — the chain itself is engram_get_subgraph's job.
 _INSPECT_FIELDS = frozenset({
-    "node_id", "view", "dream_mode",
+    "node_id", "view", "dream_mode", "include_superseded",
 })
 
 
@@ -6382,6 +6437,12 @@ def engram_inspect(payload_json: str) -> str:
             dream_mode (bool, optional): If True, skip memory refresh and
                 importance-score boost. Use during dream/audit cycles.
                 Default False.
+            include_superseded (bool, optional): If True, include neighbors
+                whose is_current=0 (superseded or retracted nodes) in the
+                topology and neighbor lists. Default False — only is_current=1
+                neighbors are shown. When neighbors are filtered, the response
+                includes truncated_superseded_count: N at the top level so
+                callers know something was hidden.
 
     Returns:
         JSON shaped by the chosen view mode (see above for per-mode shape).
@@ -6411,6 +6472,7 @@ def _inspect_impl(
     node_id: str,
     view: str = "recall",
     dream_mode: bool = False,
+    include_superseded: bool = False,
 ) -> str:
     """Impl for engram_inspect — callable with named kwargs for in-server callers."""
     _VALID_VIEWS = {"recall", "deep", "edges"}
@@ -6439,7 +6501,8 @@ def _inspect_impl(
             # it skips the question-node last_assessed_at bump below (pure-topology calls
             # should not carry assessment side-effects).
             return json.dumps(_strip_agent_facing(
-                _build_inspect_edges_view(conn, node_id, node_type)
+                _build_inspect_edges_view(conn, node_id, node_type,
+                                         include_superseded=include_superseded)
             ))
 
         # recall + deep: build the full node dict.
@@ -6484,11 +6547,13 @@ def _inspect_impl(
 
         if view == "recall":
             return json.dumps(_strip_agent_facing(
-                _build_inspect_recall_view(conn, node, node_id, dream_mode, warnings)
+                _build_inspect_recall_view(conn, node, node_id, dream_mode, warnings,
+                                           include_superseded=include_superseded)
             ))
         else:  # view == "deep"
             return json.dumps(_strip_agent_facing(
-                _build_inspect_deep_view(conn, node, node_id, dream_mode, warnings)
+                _build_inspect_deep_view(conn, node, node_id, dream_mode, warnings,
+                                         include_superseded=include_superseded)
             ))
     finally:
         conn.close()
