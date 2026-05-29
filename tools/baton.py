@@ -6,13 +6,14 @@ A thin CLI wrapping the baton file protocol at
 shared projects (PRs, designs, etc.) so agents always know whose move it
 is next.
 
-Six subcommands:
+Seven subcommands:
   init        Create a new project baton file
   flip        Pass the baton to another participant
   status      List active projects (not merged or cancelled)
   mine        Shorthand for status --mine
   show        Display a project file
   close       Mark a project merged or cancelled
+  rename      Update the human-readable project title
 
 Design: Lei + Borges, 2026-05-28 (solving the dv_0038-shaped misalignment
 incident where Borges and Ariadne disagreed about whose court PR #425 was in).
@@ -720,6 +721,102 @@ def cmd_close(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: rename
+# ---------------------------------------------------------------------------
+
+def cmd_rename(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    projects_dir = Path(BATON_PROJECTS_DIR)
+    project_id = args.project_id
+    new_title = args.title
+
+    err = _validate_project_id(project_id)
+    if err:
+        print(err, file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+    # Validate title before touching the filesystem
+    stripped_title = new_title.strip()
+    if not stripped_title:
+        print(
+            "baton rename: --title must be non-empty.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+    if len(stripped_title) > 200:
+        print(
+            f"baton rename: --title too long ({len(stripped_title)} chars); "
+            "max 200. Did you accidentally paste a large block?",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+    if "\n" in stripped_title or "\r" in stripped_title:
+        print(
+            "baton rename: --title must not contain newlines (YAML safety).",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    dest = _project_path(project_id, projects_dir)
+    if not dest.exists():
+        print(
+            f"baton rename: project not found: '{project_id}' "
+            f"(looked for {dest}). "
+            "Use 'baton status' to see active projects.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    try:
+        text = dest.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        print(f"baton rename: cannot read '{dest}': {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+
+    fields, body = _parse_frontmatter(text)
+    if not fields:
+        print(
+            f"baton rename: cannot parse frontmatter from '{dest}'. "
+            "The file may be malformed.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    if "title" not in fields:
+        print(
+            f"baton rename: 'title' field absent in '{dest}' — "
+            "refusing to write to a possibly corrupted file.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    old_title = fields["title"]
+
+    # Update frontmatter (preserves field order via _update_frontmatter)
+    updated_text = _update_frontmatter(text, {"title": stripped_title})
+
+    # Re-parse to get body after frontmatter update
+    _updated_fields, updated_body = _parse_frontmatter(updated_text)
+
+    # Append audit line to turn log
+    now = _now_iso()
+    log_entry = (
+        f'- {now} renamed: title from "{old_title}" to "{stripped_title}"'
+    )
+    final_body = _append_turn_log(updated_body, log_entry)
+
+    # Reconstruct final content: frontmatter + updated body
+    fm_m = _FRONTMATTER_RE.match(updated_text)
+    if fm_m:
+        fm_section = updated_text[:fm_m.end()]
+        final_content = fm_section.rstrip("\n") + "\n" + final_body
+    else:
+        final_content = updated_text
+
+    _atomic_write(dest, final_content)
+    print(f'baton rename: {project_id} title → "{stripped_title}"')
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -853,6 +950,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Final status: merged or cancelled",
     )
 
+    # -- rename --
+    p_rename = subparsers.add_parser(
+        "rename",
+        help="Update the human-readable project title",
+        description=(
+            "Replace the title: field in the project frontmatter with a new "
+            "value, atomically. Appends an audit line to the turn log. "
+            "Does not change the project ID or file name."
+        ),
+    )
+    p_rename.add_argument(
+        "project_id",
+        metavar="PROJECT-ID",
+        help="Project identifier",
+    )
+    p_rename.add_argument(
+        "--title", metavar="TEXT", required=True,
+        help="New human-readable title (max 200 chars, no newlines)",
+    )
+
     return parser
 
 
@@ -880,6 +997,8 @@ def main() -> None:
         cmd_show(args, config, agent_name)
     elif args.subcommand == "close":
         cmd_close(args, config, agent_name)
+    elif args.subcommand == "rename":
+        cmd_rename(args, config, agent_name)
     else:
         parser.print_help()
         sys.exit(EXIT_VALIDATION)

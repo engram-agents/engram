@@ -756,3 +756,146 @@ class TestIntegration:
         )
         assert rc == 0, f"DESIGN-ID init failed; stderr: {stderr}"
         assert (projects_dir / "DESIGN-trust-tier-v2.md").exists()
+
+
+# ===========================================================================
+# CATEGORY 7: rename subcommand
+# ===========================================================================
+
+class TestRename:
+    """baton rename: round-trip, validation, and audit-line tests."""
+
+    def test_rename_round_trip(self, engram_home, projects_dir):
+        """Round-trip: init → rename → show, title updated, other fields unchanged."""
+        _write_config(engram_home, "borges")
+        # Init a project
+        rc, _, stderr = _run_baton(
+            engram_home, projects_dir,
+            "init", "PR-901",
+            "--title", "original title",
+            "--participants", "borges,ariadne",
+        )
+        assert rc == 0, f"init failed; stderr: {stderr}"
+
+        # Capture pre-rename state of non-title fields
+        status_before = _read_project_field(projects_dir, "PR-901", "status")
+        turn_before = _read_project_field(projects_dir, "PR-901", "turn")
+        participants_before = _read_project_field(projects_dir, "PR-901", "participants")
+
+        # Rename
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "rename", "PR-901",
+            "--title", "new shiny title",
+        )
+        assert rc == 0, f"rename failed; stderr: {stderr}"
+        assert '"new shiny title"' in stdout
+
+        # Verify title updated
+        title_after = _read_project_field(projects_dir, "PR-901", "title")
+        assert title_after == "new shiny title"
+
+        # Verify other fields unchanged
+        assert _read_project_field(projects_dir, "PR-901", "status") == status_before
+        assert _read_project_field(projects_dir, "PR-901", "turn") == turn_before
+        assert _read_project_field(projects_dir, "PR-901", "participants") == participants_before
+
+        # baton show should reflect new title
+        rc, show_out, _ = _run_baton(engram_home, projects_dir, "show", "PR-901")
+        assert rc == 0
+        assert "new shiny title" in show_out
+
+    def test_rename_audit_line_appended(self, engram_home, projects_dir):
+        """After rename, the last body entry is the timestamped rename audit line."""
+        _write_config(engram_home, "borges")
+        _write_project(projects_dir, "PR-902", title="before rename")
+        rc, _, stderr = _run_baton(
+            engram_home, projects_dir,
+            "rename", "PR-902",
+            "--title", "after rename",
+        )
+        assert rc == 0, f"rename failed; stderr: {stderr}"
+        content = (projects_dir / "PR-902.md").read_text()
+        # Audit line must be present somewhere in the body
+        assert 'renamed: title from "before rename" to "after rename"' in content
+
+    def test_rename_refuse_missing_project(self, engram_home, projects_dir):
+        """Rename of non-existent project exits non-zero with clear error."""
+        _write_config(engram_home, "borges")
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "rename", "PR-NONE",
+            "--title", "foo",
+        )
+        assert rc != 0
+        assert "not found" in stderr.lower() or "PR-NONE" in stderr
+
+    def test_rename_refuse_empty_title(self, engram_home, projects_dir):
+        """Rename with empty title exits non-zero."""
+        _write_config(engram_home, "borges")
+        _write_project(projects_dir, "PR-903", title="original")
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "rename", "PR-903",
+            "--title", "",
+        )
+        assert rc != 0
+        assert "empty" in stderr.lower() or "non-empty" in stderr.lower()
+
+    def test_rename_refuse_whitespace_only_title(self, engram_home, projects_dir):
+        """Rename with whitespace-only title exits non-zero (strip then validate)."""
+        _write_config(engram_home, "borges")
+        _write_project(projects_dir, "PR-904", title="original")
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "rename", "PR-904",
+            "--title", "   ",
+        )
+        assert rc != 0
+
+    def test_rename_refuse_title_with_newline(self, engram_home, projects_dir):
+        """Rename with newline in title exits non-zero (YAML safety)."""
+        _write_config(engram_home, "borges")
+        _write_project(projects_dir, "PR-905", title="original")
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "rename", "PR-905",
+            "--title", "line1\nline2",
+        )
+        assert rc != 0
+        assert "newline" in stderr.lower()
+
+    def test_rename_refuse_title_too_long(self, engram_home, projects_dir):
+        """Rename with title > 200 chars exits non-zero."""
+        _write_config(engram_home, "borges")
+        _write_project(projects_dir, "PR-906", title="original")
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "rename", "PR-906",
+            "--title", "x" * 201,
+        )
+        assert rc != 0
+        assert "long" in stderr.lower() or "200" in stderr
+
+    def test_rename_no_tmp_remains(self, engram_home, projects_dir):
+        """After rename, no .tmp file remains (atomic write hygiene)."""
+        _write_config(engram_home, "borges")
+        _write_project(projects_dir, "PR-907", title="original")
+        _run_baton(
+            engram_home, projects_dir,
+            "rename", "PR-907",
+            "--title", "renamed",
+        )
+        tmp_files = list(projects_dir.glob("*.tmp"))
+        assert tmp_files == [], f"Tmp files must not remain: {tmp_files}"
+
+    def test_rename_exact_200_char_title_accepted(self, engram_home, projects_dir):
+        """Title of exactly 200 chars is accepted (boundary: inclusive)."""
+        _write_config(engram_home, "borges")
+        _write_project(projects_dir, "PR-908", title="original")
+        rc, _, stderr = _run_baton(
+            engram_home, projects_dir,
+            "rename", "PR-908",
+            "--title", "a" * 200,
+        )
+        assert rc == 0, f"200-char title rejected; stderr: {stderr}"
