@@ -17,12 +17,21 @@ The empirical record this skill rests on: ob_1755 (fairy contractor principle), 
 
 Per ob_1755 — fairies are contractors, not colleagues. The spec is the contract. A fairy has no access to your mind, conversation history, ENGRAM, or accumulated context. Anything load-bearing must be in the spec.
 
+- **Pre-spec coordination check** (BEFORE drafting the spec). If the spec names an issue number, verify no open PR already addresses it. Two checks, both cheap (substitute the actual issue / PR number for `NN` in each):
+    - `gh pr list --search 'in:title "#NN"' --state open` — catches a counterpart's open PR with the issue number in its title.
+    - `ls /home/agents-shared/projects/ 2>/dev/null | grep -E '#NN|PR-NN'` — multi-agent mode only; surfaces a counterpart's in-flight baton for that issue or PR.
+  - Skipping this is the failure mode that produced PR-517 (issue #486) on 2026-05-30 — a duplicate of the counterpart's PR-502, which had already converged. Same lines, guaranteed merge conflict. The pre-check would have caught it in 5 seconds.
+  - Single-agent mode: only the `gh pr list` check applies. Shared-projects path doesn't exist.
 - **Self-contained prompt.** Include repo path, branch baseline, template commit/PR to read, scope, validation step. Inline (don't link to) any node IDs or context-laden references the fairy needs.
 - **Hard scope bounds.** Explicit "DO NOT modify X" for adjacent surfaces. Anti-patterns enumerated. Stop conditions named.
 - **Escape valve.** Always include some form of: *"if you hit anything that doesn't match the template, STOP and report back."* Silent improvisation is the failure mode.
 - **Always run in background** (`run_in_background: true`). Never wait synchronously. Completion notifications arrive automatically and re-invoke you.
 - **Suggest branch name.** Spec should name the branch. Anticipate collisions — if your suggested name might exist remote, note that the fairy can use a `-v2` fallback.
 - **Output contract.** Reference the fairy's `# Output contract` section. Demand verification (test results, syntax check, `git diff --stat` scope check) + ambiguous-decision log. Without verification claims, the report can't be trusted.
+- **Post-creation handoff** (AFTER `gh pr create` returns the PR number — the **dispatching agent** runs this, not the fairy; fairies don't have shared-projects access). Open a baton for the PR — this is the channel by which the counterpart and the user see your PR is in flight; skipping it means the auto-pull hook can't surface the work.
+    - `baton init PR-N --title "<short>" --participants <list> --turn <next-actor> --status in-progress --github pr/N`
+    - See the `engram-baton` skill (§"PR layer — `flip`") for the full PR-cursor lifecycle.
+    - Single-agent mode: the baton is still useful as a per-PR cursor through fairy → maintainer, but the multi-agent coord surface is absent.
 
 ---
 
