@@ -175,7 +175,7 @@ Expected terminal output (abbreviated):
 
 ```
 == ENGRAM Alpha Install ==
-  Repo:    /path/to/engram-alpha
+  Repo:    /home/USER/engram-alpha
   ENGRAM:  /home/USER/.engram
   Claude:  /home/USER/.claude
 
@@ -307,7 +307,7 @@ Expected terminal output (abbreviated):
 
 ```
 === ENGRAM deploy ===
-  source:  /path/to/engram-alpha (BRANCH @ COMMIT)
+  source:  /home/USER/engram-alpha (BRANCH @ COMMIT)
   target:  /home/USER/.engram
   delete:  no (use --delete to remove stale files)
   mode:    live (will apply)
@@ -354,8 +354,8 @@ Expected terminal output (abbreviated):
   `tools/deploy.sh`'s manifest is scoped to `$ENGRAM_HOME` (skills and
   agents live outside it). If you need to update them on an existing
   install, the safe path is a targeted manual copy:
-  `cp -r /path/to/engram-alpha/skills/claude/* ~/.claude/skills/` and
-  `cp -r /path/to/engram-alpha/agents/claude/* ~/.claude/agents/`. Do
+  `cp -r /home/USER/engram-alpha/skills/claude/* ~/.claude/skills/` and
+  `cp -r /home/USER/engram-alpha/agents/claude/* ~/.claude/agents/`. Do
   NOT re-run `install.sh --force` to "refresh" — that archives the
   user's entire knowledge graph.
 

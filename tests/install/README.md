@@ -28,7 +28,7 @@ The harness verifies that `install.sh` on a clean Ubuntu 22.04 + Python 3.11 + g
 # Build the image (one-time per change to Dockerfile or Python deps).
 # Pre-warms the sentence-transformers MiniLM cache during build, so first
 # install run doesn't pay the model-download tax.
-cd /path/to/engram-alpha
+cd /home/USER/engram-alpha
 docker build -t engram-install-test:latest -f tests/install/Dockerfile .
 
 # Run the test (mounts current alpha tree read-only, exits 0 on pass).
