@@ -293,7 +293,6 @@ def _emit_hook_fire(session_id: str | None, transcript_path: str | None, duratio
                 "exit_code": 0,
                 "stdout_bytes": 0,
                 "stderr_bytes": 0,
-                "context_mode": os.environ.get("ENGRAM_CONTEXT_MODE", "") or None,
             },
         )
     except Exception:

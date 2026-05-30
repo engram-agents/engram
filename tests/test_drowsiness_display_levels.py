@@ -438,5 +438,43 @@ class TestCeilingOverride(unittest.TestCase):
         self.assertEqual(result, self.FALLBACK)
 
 
+class TestEstimateUsageModeDerivation(unittest.TestCase):
+    """Direct coverage for the mode-derivation step in estimate_usage().
+
+    estimate_usage() at hooks/claude/context_tracker.py:360 sets:
+        mode = "200k" if ceiling <= 250_000 else "1m"
+
+    End-to-end path through format_drowsiness is covered elsewhere; this class
+    exercises the assignment itself by mocking compute_ceiling() and
+    read_current_tokens() so the only live code path is the mode assignment.
+    """
+
+    def _call_with_ceiling(self, ceiling: int) -> dict:
+        """Call estimate_usage() with a controlled ceiling and a non-zero token count."""
+        with patch.object(ct, "compute_ceiling", return_value=ceiling):
+            with patch.object(ct, "read_current_tokens", return_value=1000):
+                return ct.estimate_usage()
+
+    def test_200k_typical_ceiling(self):
+        # 152_000 = post-safety-factor 200k ceiling
+        result = self._call_with_ceiling(152_000)
+        self.assertEqual(result["mode"], "200k")
+
+    def test_200k_inclusive_boundary(self):
+        # 250_000 is the inclusive boundary — still 200k
+        result = self._call_with_ceiling(250_000)
+        self.assertEqual(result["mode"], "200k")
+
+    def test_1m_just_above_boundary(self):
+        # 250_001 — first value that flips to 1m
+        result = self._call_with_ceiling(250_001)
+        self.assertEqual(result["mode"], "1m")
+
+    def test_1m_typical_ceiling(self):
+        # 807_500 = typical 1m mode ceiling after old safety factor
+        result = self._call_with_ceiling(807_500)
+        self.assertEqual(result["mode"], "1m")
+
+
 if __name__ == "__main__":
     unittest.main()

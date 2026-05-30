@@ -220,7 +220,6 @@ def _emit_hook_fire(
                 "exit_code": 0,
                 "stdout_bytes": stdout_bytes,
                 "stderr_bytes": 0,
-                "context_mode": os.environ.get("ENGRAM_CONTEXT_MODE", "") or None,
             },
         )
     except Exception:

@@ -306,7 +306,6 @@ def main() -> None:
                 "mentioned_count": stats["mentioned_count"],
                 "updated_count": stats["updated_count"],
                 "alpha_mention": ALPHA_MENTION,
-                "context_mode": os.environ.get("ENGRAM_CONTEXT_MODE", "") or None,
             },
         )
     except Exception:

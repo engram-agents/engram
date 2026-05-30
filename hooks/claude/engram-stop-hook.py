@@ -65,7 +65,6 @@ def main() -> None:
                 "exit_code": 0,
                 "stdout_bytes": len(output.encode("utf-8")),
                 "stderr_bytes": 0,
-                "context_mode": os.environ.get("ENGRAM_CONTEXT_MODE", "") or None,
             },
         )
     except Exception:
