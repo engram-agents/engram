@@ -145,8 +145,9 @@ def test_credit_mentions_alpha_matches_server_use_alpha():
     # snapshot, not the worktree under test. Re-prioritize REPO_ROOT here
     # so the assertion checks THIS branch's server.py.
     sys.path.insert(0, str(REPO_ROOT))
-    if "server" in sys.modules:
-        del sys.modules["server"]
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     import server  # heavy import OK at test time, NOT at hook fire
     assert hook.ALPHA_MENTION == server.USE_ALPHA["mention"], (
         f"Hook's ALPHA_MENTION={hook.ALPHA_MENTION} drifted from "

@@ -48,8 +48,9 @@ def _reload_server(monkeypatch: pytest.MonkeyPatch, tmp_dir: str) -> object:
     """Reload server module under patched env, then call _configure_paths."""
     # Ensure no embeddings overhead in tests
     monkeypatch.setenv("ENGRAM_NO_EMBEDDINGS", "1")
-    if "server" in sys.modules:
-        del sys.modules["server"]
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     import server  # type: ignore[import]
     server._configure_paths(tmp_dir)
     server._ensure_data_dir()
@@ -158,8 +159,9 @@ class TestServerDataDirResolution:
         monkeypatch.setenv("ENGRAM_DATA_DIR", str(data_dir))
         monkeypatch.setenv("ENGRAM_NO_EMBEDDINGS", "1")
 
-        if "server" in sys.modules:
-            del sys.modules["server"]
+        for key in list(sys.modules):
+            if key == "server" or key.startswith("engram_"):
+                del sys.modules[key]
         import server  # type: ignore[import]
         # DATA_DIR is set at import time from the env
         assert server.DATA_DIR == Path(home_dir), (
@@ -175,8 +177,9 @@ class TestServerDataDirResolution:
         monkeypatch.setenv("ENGRAM_DATA_DIR", str(data_dir))
         monkeypatch.setenv("ENGRAM_NO_EMBEDDINGS", "1")
 
-        if "server" in sys.modules:
-            del sys.modules["server"]
+        for key in list(sys.modules):
+            if key == "server" or key.startswith("engram_"):
+                del sys.modules[key]
         import server  # type: ignore[import]
         assert server.DATA_DIR == Path(data_dir), (
             f"Expected DATA_DIR={data_dir}; got {server.DATA_DIR}"
@@ -195,8 +198,9 @@ class TestServerDataDirResolution:
 
         monkeypatch.setattr(os.path, "expanduser", fake_expanduser)
 
-        if "server" in sys.modules:
-            del sys.modules["server"]
+        for key in list(sys.modules):
+            if key == "server" or key.startswith("engram_"):
+                del sys.modules[key]
         import server  # type: ignore[import]
         assert server.DATA_DIR == Path(tmp_path / "default_engram"), (
             f"Expected DATA_DIR to use expanduser default; got {server.DATA_DIR}"

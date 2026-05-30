@@ -36,8 +36,9 @@ atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 def fresh_server():
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
-    if "server" in sys.modules:
-        del sys.modules["server"]
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     import server
     server._configure_paths(TEST_DIR)
     server._ensure_data_dir()
@@ -177,8 +178,9 @@ def test_client_call_legacy_dict_autowrapped():
     callers working without each having to know about the JSON shape."""
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
-    if "server" in sys.modules:
-        del sys.modules["server"]
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     from engram_client import EngramClient
     client = EngramClient(db_dir=TEST_DIR)
 
@@ -198,8 +200,9 @@ def test_client_call_explicit_payload_json_passthrough():
     """When the caller already passes payload_json, don't double-wrap."""
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
-    if "server" in sys.modules:
-        del sys.modules["server"]
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     from engram_client import EngramClient
     client = EngramClient(db_dir=TEST_DIR)
 

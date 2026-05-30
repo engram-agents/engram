@@ -52,8 +52,9 @@ def fresh_client():
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if sys.path[0] != repo_root:
         sys.path.insert(0, repo_root)
-    for mod in ("server", "engram_client"):
-        sys.modules.pop(mod, None)
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     from engram_client import EngramClient
     client = EngramClient(db_dir=TEST_DIR)
     server = client._server

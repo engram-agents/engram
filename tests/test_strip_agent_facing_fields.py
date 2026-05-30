@@ -63,8 +63,9 @@ def teardown_module(module):
 def fresh_server():
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
-    if "server" in sys.modules:
-        del sys.modules["server"]
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
     os.environ["ENGRAM_DATA_DIR"] = TEST_DIR
     import server

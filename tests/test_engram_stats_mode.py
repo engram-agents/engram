@@ -36,8 +36,9 @@ def fresh_server():
     """Return a freshly initialised server module with an empty test DB."""
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
-    if "server" in sys.modules:
-        del sys.modules["server"]
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     import server
     server._configure_paths(TEST_DIR)
     server._ensure_data_dir()

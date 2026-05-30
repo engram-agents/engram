@@ -44,8 +44,9 @@ class _DirectClient:
     """
 
     def __init__(self, db_dir):
-        if "server" in sys.modules:
-            del sys.modules["server"]
+        for key in list(sys.modules):
+            if key == "server" or key.startswith("engram_"):
+                del sys.modules[key]
         import server
         server._configure_paths(db_dir)
         server._ensure_data_dir()

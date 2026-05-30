@@ -30,8 +30,9 @@ def _setup():
     """
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
-    if "server" in sys.modules:
-        del sys.modules["server"]
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     import server
     server._configure_paths(TEST_DIR)
     server._ensure_data_dir()
@@ -51,8 +52,9 @@ def _add_evidence(server, url, title="Test"):
 
 def _add_observation(db_dir, **kwargs):
     """Call engram_add_observation via EngramClient."""
-    if "server" in sys.modules:
-        del sys.modules["server"]
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     from engram_client import EngramClient
     client = EngramClient(db_dir=db_dir)
     return client.call("engram_add_observation", kwargs)

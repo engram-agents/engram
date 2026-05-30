@@ -31,8 +31,9 @@ atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 def fresh_server(*, polarity_enabled: bool, nli_score: float | None = None):
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
-    if "server" in sys.modules:
-        del sys.modules["server"]
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     if polarity_enabled:
         os.environ.pop("ENGRAM_NO_POLARITY", None)
     else:
@@ -475,8 +476,9 @@ def test_polarity_defaults():
     model=ModernCE-large-nli, threshold=0.46."""
     if "ENGRAM_NO_POLARITY" in os.environ:
         del os.environ["ENGRAM_NO_POLARITY"]
-    if "server" in sys.modules:
-        del sys.modules["server"]
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
     import server

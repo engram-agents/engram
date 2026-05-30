@@ -39,8 +39,9 @@ MODEL = "all-MiniLM-L6-v2"
 
 def _import_server_no_embeddings():
     """Import server with embeddings disabled (clean module state)."""
-    if "server" in sys.modules:
-        del sys.modules["server"]
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
     import server
     return server
@@ -53,8 +54,9 @@ def _import_server_with_embeddings():
     We patch is_available() to return True for tests that exercise the
     embedding code path, but the import-time module state is set here.
     """
-    if "server" in sys.modules:
-        del sys.modules["server"]
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     os.environ.pop("ENGRAM_NO_EMBEDDINGS", None)
     import server
     return server

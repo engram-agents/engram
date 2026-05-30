@@ -59,9 +59,9 @@ def fresh_server():
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
     # Remove any cached server module so constants re-evaluate.
-    for mod in list(sys.modules.keys()):
-        if mod == "server" or mod.startswith("server."):
-            del sys.modules[mod]
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
     import server
     server._configure_paths(TEST_DIR)

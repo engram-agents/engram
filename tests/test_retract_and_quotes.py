@@ -34,8 +34,9 @@ def fresh_client():
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
     os.makedirs(TEST_DIR, exist_ok=True)
-    if "server" in sys.modules:
-        del sys.modules["server"]
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     _ensure_evidence_file()
     from engram_client import EngramClient
     return EngramClient(db_dir=TEST_DIR)

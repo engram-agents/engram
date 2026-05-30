@@ -28,8 +28,9 @@ atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 def fresh_server():
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
-    if "server" in sys.modules:
-        del sys.modules["server"]
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     # Disable real embeddings + polarity by default — tests opt back in via
     # monkeypatch. Keep the embedding env-var unset for the action-hint
     # branch to fire (the "if _embedder.is_available()" gate).

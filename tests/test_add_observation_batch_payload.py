@@ -31,8 +31,9 @@ TEST_FILE = os.path.join(TEST_DIR, "obs_batch_source.md")
 def fresh_server():
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
-    if "server" in sys.modules:
-        del sys.modules["server"]
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     import server
     server._configure_paths(TEST_DIR)
     server._ensure_data_dir()

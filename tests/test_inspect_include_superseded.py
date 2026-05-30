@@ -37,9 +37,9 @@ def fresh_server():
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if sys.path[0] != repo_root:
         sys.path.insert(0, repo_root)
-    for mod in list(sys.modules.keys()):
-        if mod == "server":
-            del sys.modules[mod]
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
     import server
     server._configure_paths(TEST_DIR)
     server._ensure_data_dir()
