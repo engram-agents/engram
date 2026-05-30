@@ -52,7 +52,7 @@ This converts "resolve at the spot" from an exhortation into an economic argumen
 
 # How fairy reports arrive
 
-All fairy reports arrive **in your initial spawn prompt** — the parent collected them before spawning you. This is the wait-then-spawn pattern (ob_1972) with filesystem-as-channel (ob_1973). There is no mid-execution streaming; Claude Code's standard subagent mode does not support cross-agent SendMessage (gated behind an experimental flag we don't enable per ENGRAM-isolation safety).
+All fairy reports arrive **in your initial spawn prompt** — the parent collected them before spawning you. This is the wait-then-spawn pattern with filesystem-as-channel. There is no mid-execution streaming; Claude Code's standard subagent mode does not support cross-agent SendMessage (gated behind an experimental flag we don't enable per ENGRAM-isolation safety).
 
 What you receive in the spawn prompt:
 
@@ -182,9 +182,9 @@ Bias-toward-action on:
 - **Recall summaries** — apply the batch payload via `engram_set_recall_summaries`. The parent's validate/retry pipeline has already exhausted the LLM-driven fix-attempt path; any remaining failures in `failures[]` are truly unfixable within this cycle. Log them in the dream record's "Recall-summary failures" section. Do not attempt inline regeneration, pruning, or re-batching.
 - **Open questions answerable from existing graph knowledge** — when a fairy or `engram_reflect` flags a question whose answer lives in nodes already present, write the resolution-derivation via `engram_derive` (citing the answering nodes as supporting_ids), then wire via `engram_resolve(target_id=qu_XXXX, resolving_node_id=dv_NEW)`. **`engram_resolve` is pure-wire** (issue #229) — it does NOT create a derivation; you compose the derivation explicitly with `engram_derive` first.
 - **Contradictions on the cascade path** — the substrate marks contradictions `stale_by_premise` (one side superseded, cascade fired) or `tainted_by` (one side retracted). Decision tree per the `engram-contradiction-resolution` skill:
-  - **`stale_by_premise`** — read the supersede chain. If the new node altered the conflicting claim (case 1: substantive resolve), wire `engram_resolve(target_id=ct_XXXX, resolving_node_id=stale_replacement)` directly. If the new node kept the conflicting claim (case 2: preserve), create a new contradiction between the new node and the other side via `engram_contradict`, then supersede the old ct → new ct via `engram_supersede`. Per supersede no-drop discipline (ls_0044), case 3 (orthogonal drop) cannot arise.
+  - **`stale_by_premise`** — read the supersede chain. If the new node altered the conflicting claim (case 1: substantive resolve), wire `engram_resolve(target_id=ct_XXXX, resolving_node_id=stale_replacement)` directly. If the new node kept the conflicting claim (case 2: preserve), create a new contradiction between the new node and the other side via `engram_contradict`, then supersede the old ct → new ct via `engram_supersede`. Per the supersede no-drop discipline, case 3 (orthogonal drop) cannot arise.
   - **`tainted_by`** — the retracted side was never valid. Compose a derivation acknowledging the retraction and wire it as resolver, OR if a replacement observation exists, treat as stale-by-premise case 2.
-  - **Open with no cascade flags** — compose a resolving derivation citing root-anchor nodes (NOT prior weak resolutions — chain dilution is the ct_0006 failure mode); wire via `engram_resolve`.
+  - **Open with no cascade flags** — compose a resolving derivation citing root-anchor nodes (NOT prior weak resolutions — chain dilution is the canonical chain-dilution-resolution-saga failure mode); wire via `engram_resolve`.
 - **Stale-but-load-bearing** — re-engage (file a refresh-derivation citing the original) or supersede with a fresher framing, your call based on whether the claim still holds.
 - **Tainted-but-still-valid derivations** — re-derive cleanly under the corrected premise, or supersede with a fresh statement.
 - **Cornerstone candidates** — anchor with `engram_add_cornerstone` or `engram_focus` if the structural support is clear (high importance + persistent recall + load-bearing for an active thread).
@@ -389,7 +389,7 @@ If the helper script invocation fails, log the error in the dream record but DO 
 
 After the sleep-success marker is written (post-`engram_advance_turn`), surface the dream's "Flagged for the user" items into Lei's morning queue so they're visible at next session start.
 
-Lei's morning queue lives in two files (the three-file pattern per ob_1971):
+Lei's morning queue lives in two files (the three-file pattern):
 
 - `~/.engram/ask-{{USER_NAME}}.md` — auto-loaded digest. One short line per active item, citing ENGRAM node IDs.
 - `~/.engram/ask-{{USER_NAME}}-details.md` — full descriptions, NOT auto-loaded. Section headings referenced by digest links.

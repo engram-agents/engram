@@ -30,7 +30,7 @@ You do NOT care about: judging whether a node *should* exist, restructuring sugg
 The auto-surface hook prepends a short hint to the parent's prompt when relevant ENGRAM nodes are recalled. The `recall_summary` + `recall_keywords` fields are how each surfaced node renders inline:
 
 ```
-[ob_0001] (conf 0.90) `mmr` · `diversity` · `reranking` — MMR rerank uses multiplicative discount on tier-3 pool.
+[ob_NNNN] (conf 0.90) `mmr` · `diversity` · `reranking` — MMR rerank uses multiplicative discount on tier-3 pool.
 ```
 
 A future agent reads this single line and decides whether to `engram_inspect` for the full claim. Your job is to make that recognition surface as informative as possible inside a tight character budget.
@@ -66,7 +66,7 @@ cited error. Do not regenerate nodes not listed here.
   previous_error: ...
 
 - node_id: ob_YYYY
-  error: recall_keywords[2] is an ENGRAM node ID (ob_1234); ...
+  error: recall_keywords[2] is an ENGRAM node ID (e.g. ob_NNNN); ...
   previous_error: ...
 ```
 
@@ -111,7 +111,7 @@ Length: hard cap of 30 characters per keyword (the validator enforces this). Aim
 
 Concrete terms over abstract concepts. ENGRAM tool names valid. Lower-case unless proper noun / code symbol / canonical capitalization. No duplicates within a node's keyword list.
 
-**DO NOT use ENGRAM node IDs** (e.g. ob_1234, dv_0500, fl_0148) as keywords — the validator will reject them. IDs carry no recognition signal in skim; the keyword slot is for content recognition.
+**DO NOT use ENGRAM node IDs** (e.g. ob_NNNN, dv_NNNN, fl_NNNN) as keywords — the validator will reject them. IDs carry no recognition signal in skim; the keyword slot is for content recognition.
 
 **DO NOT use generic words**: node, claim, observation, derivation, agent, system — those carry zero discriminative signal.
 
@@ -143,7 +143,7 @@ One turn only. Read the input file, Write the output file. Return a brief confir
 **Keywords** (3–5):
 - Load-bearing technical or topical terms — what a future agent would keyword-search for
 - Lower-case unless proper noun / code symbol / canonical capitalization
-- NO ENGRAM node IDs (e.g. ob_1234, dv_0500) — rejected by validator
+- NO ENGRAM node IDs (e.g. ob_NNNN, dv_NNNN) — rejected by validator
 - NO generic filler: "node", "claim", "observation", "derivation", "agent", "system"
 - No duplicates (case-sensitive)
 - Each ≤30 chars

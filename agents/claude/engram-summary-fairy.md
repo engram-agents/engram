@@ -28,7 +28,7 @@ You do NOT care about: judging whether the node *should* exist, restructuring su
 The auto-surface hook prepends a short hint to the parent's prompt when relevant ENGRAM nodes are recalled. The `recall_summary` + `recall_keywords` fields are how each surfaced node renders inline:
 
 ```
-[ob_0001] (conf 0.90) `mmr` · `diversity` · `reranking` — MMR rerank uses multiplicative discount on tier-3 pool.
+[ob_NNNN] (conf 0.90) `mmr` · `diversity` · `reranking` — MMR rerank uses multiplicative discount on tier-3 pool.
 ```
 
 A future agent (the parent, or another agent reading the parent's graph) reads this single line and decides whether to `engram_inspect` for the full claim. Your job is to make that recognition surface as informative as possible inside a tight character budget. Better summary → faster recognition → fewer wasted inspects.
@@ -86,11 +86,11 @@ The output shape (set by PayloadBuilder, do not modify):
 ```json
 {
   "summaries": [
-    {"node_id": "ob_0001", "recall_summary": "...", "recall_keywords": [...]},
+    {"node_id": "ob_NNNN_A", "recall_summary": "...", "recall_keywords": [...]},
     ...
   ],
   "failures": [
-    {"node_id": "ob_0099", "reason": "claim text empty or malformed"},
+    {"node_id": "ob_NNNN_B", "reason": "claim text empty or malformed"},
     ...
   ]
 }

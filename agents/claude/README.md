@@ -40,6 +40,6 @@ diverge (e.g., a Borges-specific override), break the symlink first;
 otherwise the two are guaranteed identical by design.
 
 Shipped agents are **de-personalized** — no `Borges` / `Lei` references,
-no alpha-dev-specific node IDs (`dv_0030`, `ls_0021`, etc.). The
+no alpha-dev-specific node IDs (developer-graph citations like `dv_NNNN`, `ls_NNNN`, etc.). The
 install-time test (`tests/install/run_install_test.sh`) greps the
 shipped copies and fails loudly if a name-leak slips in.
