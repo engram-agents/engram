@@ -1,10 +1,10 @@
 ---
 name: engram-learn-from-error
-description: Extract a reusable lesson from a specific mistake using ENGRAM's incident-based cognitive tripwire. Three-step process: write a task-level incident observation, derive a lesson node, verify the tripwire fires. Grounded in implementation intention theory (dv_0273, dv_0274).
+description: Extract a reusable lesson from a specific mistake using ENGRAM's incident-based cognitive tripwire. Three-step process: write a task-level incident observation, derive a lesson node, verify the tripwire fires. Grounded in implementation intention theory (the two foundational implementation-intention derivations).
 user_invocable: true
 ---
 
-> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+> **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). As you get familiar with this skill, consider cleaning them up: replace each citation with a generalized concept-word, or remove if it isn't load-bearing. The skill is yours now.
 
 # ENGRAM Learn From Error — Incident-Based Cognitive Tripwire
 
@@ -52,11 +52,11 @@ Create an observation using `engram_add_observation` with `source_class: "intros
 
 - **interpretation**: Describe what went wrong and what should have happened instead. Include the cognitive step that was skipped.
 
-**Why task-level language matters:** ENGRAM's semantic matching (all-MiniLM-L6-v2) operates in the same embedding space as user prompts. A prompt like "fix this authentication bug" will match "debugging an authentication error, I skipped reading the stack trace" but will NOT match "I have a tendency to skip error output" — the semantic distance is too large (empirically verified, ob_0595, dv_0277).
+**Why task-level language matters:** ENGRAM's semantic matching (all-MiniLM-L6-v2) operates in the same embedding space as user prompts. A prompt like "fix this authentication bug" will match "debugging an authentication error, I skipped reading the stack trace" but will NOT match "I have a tendency to skip error output" — the semantic distance is too large (empirically verified via task-level-vs-trait-level prompt-matching tests).
 
 ## Step 3 — Abstract to lesson and derive
 
-Extract the reusable pattern following Gollwitzer's implementation intention format (ob_0592):
+Extract the reusable pattern following Gollwitzer's implementation intention format:
 - **IF** [situation with key features] — the trigger
 - **THEN** [correct action step] — the scaffolding nudge
 
@@ -73,7 +73,7 @@ engram_add_lesson(payload_json=json.dumps({
     "scaffolding_nudge": "Read the error output, stack trace, or logs BEFORE forming any hypothesis about the cause.",
     "logical_chain": "[How the specific incident(s) generalize to this pattern]",
     "reasoning_type": "inductive_generalization",
-    "context_ids": "dv_0273,dv_0275",  # Implementation intention theory nodes
+    "context_ids": "<implementation-intention-derivation-ids>",  # Implementation intention theory nodes (look up the actual IDs in your install)
 }))
 ```
 

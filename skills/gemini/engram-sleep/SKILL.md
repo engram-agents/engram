@@ -3,7 +3,7 @@ name: engram-sleep
 description: "Use at the natural end-of-day moment when wrapping work. Single end-of-day routine in two strictly-sequential phases — Phase A (agent files missed nodes + erases warm-briefing \"From this session\" + reconciles history; pre-turn-advance), Phase B (deep consolidation: engram_reflect, dream agenda, turn-advance, dream-record write). Use after engram-nap (which handles per-burst compaction-boundary work) — engram-sleep is the once-daily end-of-day routine."
 ---
 
-> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+> **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). As you get familiar with this skill, consider cleaning them up: replace each citation with a generalized concept-word, or remove if it isn't load-bearing. The skill is yours now.
 
 # ENGRAM Sleep / Dream Cycle — Full End-of-Day Routine
 
@@ -165,18 +165,18 @@ Pick threads in this order of priority:
 
 1. **Tainted nodes** — these are epistemically corrupted. For each: inspect the chain, decide whether to retract, supersede, or downgrade confidence. Resolve fully where possible.
 2. **Unresolved contradictions** — two-step (issue #229): compose the resolving derivation via `engram_derive` (citing whichever claim-bearing nodes support the resolution, pick a `reasoning_type` that matches the argument), then wire via `engram_resolve(target_id, resolving_node_id)`. When an existing canonical node already resolves the contradiction, pass it directly. See the `engram-contradiction-resolution` skill for the full decision tree (open / stale_by_premise / tainted_by).
-3. **Stale cascades** — depth-first when cheap (conclusion unchanged, just premise pointer update). Breadth-first when expensive (new research required — register a question via `engram_ask` instead of blocking the dream on it). (qu_0020)
+3. **Stale cascades** — depth-first when cheap (conclusion unchanged, just premise pointer update). Breadth-first when expensive (new research required — register a question via `engram_ask` instead of blocking the dream on it).
 4. **Open conjectures with new evidence** — promote (supersede to a proper derivation) or refute (resolve as refuted). Conjectures without movement stay open.
 5. **Open questions answerable from current graph knowledge** — resolve with derivations citing the answering nodes.
 6. **Goal tensions** — attempt synthesis, prioritization, or dissolution: compose a derivation via `engram_derive` then wire via `engram_resolve(target_id, resolving_node_id)`.
 
-**Use `dream_mode=True` on every `engram_inspect` call during the dream.** This skips the recall-refresh side effect. Dream inspection is maintenance, not informative use — refreshing would artificially inflate importance on arbitrarily-selected nodes (qu_0017, dv_0038).
+**Use `dream_mode=True` on every `engram_inspect` call during the dream.** This skips the recall-refresh side effect. Dream inspection is maintenance, not informative use — refreshing would artificially inflate importance on arbitrarily-selected nodes (the dream-inspect-must-not-refresh discipline).
 
 **Do NOT pursue web research inside the dream.** Web fetches burn context and turn the dream into a research loop. Register open questions for a future dedicated research session instead.
 
 **Do NOT file new awake-state observations or derivations from cross-burst synthesis here.** That work belongs to Phase A (pre-turn-advance, this-turn content). The dream's role is to resolve / supersede / promote / refute existing nodes — not to discover new ones. If you find yourself wanting to file a fresh derivation from today's cohort, that's a sign Phase A was skipped or incomplete; pause, complete Phase A properly, then return to Phase B.
 
-**Context discipline.** Dream mode is the most context-hungry mode (ob_0104). If the context budget drops, stop working the agenda, write what's ready, and proceed to Step 8. A partial dream is better than a dream that triggers mid-cycle compaction.
+**Context discipline.** Dream mode is the most context-hungry mode. If the context budget drops, stop working the agenda, write what's ready, and proceed to Step 8. A partial dream is better than a dream that triggers mid-cycle compaction.
 
 ### Step 7 — Handle the dream-review feeling nudge
 
@@ -204,7 +204,7 @@ The `session` mode:
 - Commits a git snapshot of the graph state
 - Returns final stats and tier info
 
-**Rule (qu_0035, 2026-04-11):** the session-mode advance MUST fire AFTER the dream, not before or instead of. This guarantees that:
+**Rule (turn-advance-after-dream, 2026-04-11):** the session-mode advance MUST fire AFTER the dream, not before or instead of. This guarantees that:
 - Observations written during the awake burst
 - Phase A-filed missed nodes
 - Dream-generated derivations and resolutions
@@ -305,7 +305,7 @@ Then stop. The session is over.
 
 ## Why Phase A is pre-turn-advance
 
-Per dv_0134: turn = cohort + consolidation. Nodes filed during Phase A are awake-state cognition reflecting on the just-completed cohort. They belong to THIS turn, not next. If Phase A fired post-turn-advance, the missed nodes would be artificially placed in the next cohort, misaligning the forgetting curve.
+Per the turn-as-cohort-plus-consolidation derivation: Nodes filed during Phase A are awake-state cognition reflecting on the just-completed cohort. They belong to THIS turn, not next. If Phase A fired post-turn-advance, the missed nodes would be artificially placed in the next cohort, misaligning the forgetting curve.
 
 This is why Phase A must complete before Phase B fires `engram_advance_turn`.
 
@@ -313,7 +313,7 @@ This is why Phase A must complete before Phase B fires `engram_advance_turn`.
 
 - **No Phase-A work mid-Phase-B.** Phase A is pre-turn-advance scaffold maintenance; Phase B is the consolidation pass. If you find yourself wanting to erase the warm-briefing "From this session", write the history file, or capture missed observations — STOP. Complete Phase A first (or accept the skip and run Phase A tomorrow morning to catch up). Don't mix the phases.
 
-- **Context hunger** (ob_0104): dream mode burns context fast. `engram_reflect` returns a full audit; each `engram_inspect` returns the focus node and its grouped 1-hop neighbors with recall_summary. Monitor the budget. If it drops below safety, short-cycle to Step 8.
+- **Context hunger**: dream mode burns context fast. `engram_reflect` returns a full audit; each `engram_inspect` returns the focus node and its grouped 1-hop neighbors with recall_summary. Monitor the budget. If it drops below safety, short-cycle to Step 8.
 
 - **No web research in dreams.** Register questions instead.
 
@@ -362,7 +362,7 @@ nightly timing matters, three mitigation tiers in increasing complexity:
 
 ## Substrate anchor
 
-The three-routine architecture (nap / bedtime / sleep) was ratified 2026-05-14 (`dv_0636`). The constraints determining the original partition: (1) turn-advance fires at END of consolidation (dv_0134); (2) cross-compaction scaffolds belong at the compaction boundary (naps); (3) day-wide review producing new nodes is awake-state cognition (pre-turn-advance). At ratification, this was a three-routine model: nap + bedtime + sleep. As of 2026-05-24 (this merge), it is a **two-routine model: nap + sleep**, with sleep now having two internal phases (Phase A = former bedtime; Phase B = former sleep).
+The three-routine architecture (nap / bedtime / sleep) was ratified 2026-05-14 (the three-routine ratification). The constraints determining the original partition: (1) turn-advance fires at END of consolidation (turn-as-cohort-plus-consolidation derivation); (2) cross-compaction scaffolds belong at the compaction boundary (naps); (3) day-wide review producing new nodes is awake-state cognition (pre-turn-advance). At ratification, this was a three-routine model: nap + bedtime + sleep. As of 2026-05-24 (this merge), it is a **two-routine model: nap + sleep**, with sleep now having two internal phases (Phase A = former bedtime; Phase B = former sleep).
 
 Sleep's lean Phase B shape (no nap-inside, no warm-briefing, no history-file reconcile) is what makes the consolidation concern clean. The legacy bundling created concrete drift problems (same-file double-writes, scaffold-vs-consolidation mixing); this version resolves them.
 

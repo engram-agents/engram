@@ -4,7 +4,7 @@ description: Top-level autonomous session — freely choose between research, bu
 user_invocable: true
 ---
 
-> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+> **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). As you get familiar with this skill, consider cleaning them up: replace each citation with a generalized concept-word, or remove if it isn't load-bearing. The skill is yours now.
 
 # ENGRAM Meta-Loop — Autonomous Goal-Driven Session
 
@@ -49,13 +49,13 @@ cat > ~/.engram/loop-scratch.md << 'SCRATCH'
 ## ENGRAM Friction Log
 Track every friction point encountered during the session — tool issues, workflow
 awkwardness, missing features, confusing behavior. Each entry: one line, timestamp,
-what happened. This list feeds the final friction-design iteration (ob_0656).
+what happened. This list feeds the final friction-design iteration.
 
 SCRATCH
 sed -i "s/\$(date -I)/$(date -I)/" ~/.engram/loop-scratch.md
 ```
 
-The scratch log accumulates decision forks, friction points, surprises, and modality switches across the entire session. It feeds the session briefing at the end. The dedicated **ENGRAM Friction Log** section collects tool/workflow friction throughout — this is the input for the mandatory friction-design iteration at session end (ob_0656).
+The scratch log accumulates decision forks, friction points, surprises, and modality switches across the entire session. It feeds the session briefing at the end. The dedicated **ENGRAM Friction Log** section collects tool/workflow friction throughout — this is the input for the mandatory friction-design iteration at session end.
 
 ---
 
@@ -75,7 +75,7 @@ Consider:
 
 ### Step 2 — Choose modality
 
-Six modalities, matching the existing loop mode taxonomy (dv_0245):
+Six modalities, matching the existing loop mode taxonomy (per the modes-of-iteration derivation):
 
 | Mode | When | Primary output |
 |------|------|----------------|
@@ -191,7 +191,7 @@ At iteration 50, the session ends. No exceptions. No "just one more."
 
 ## Friction Design Iteration (penultimate iteration)
 
-Before the final consolidation, dedicate one iteration to the ENGRAM friction log (ob_0656). This is mandatory if the friction log has 2+ entries.
+Before the final consolidation, dedicate one iteration to the ENGRAM friction log (the friction-design iteration). This is mandatory if the friction log has 2+ entries.
 
 1. **Read the `## ENGRAM Friction Log` section** from the scratch log
 2. **Rank frictions by impact** — which one, if solved, would save the most time or prevent the most errors across future sessions?
@@ -211,7 +211,7 @@ If the friction log has 0-1 entries, skip this and note "minimal friction this s
 
 Whether stopped by hard limit, user return, step-back decision, satisfaction, **or informal session end** (user says goodbye, switches to unrelated work, says "see you soon", or any signal that the loop is no longer the active task):
 
-**CRITICAL: Always run cleanup (step 4) even on informal endings.** The loop-mode.json file MUST be removed. If it persists, post-compaction agents will re-execute the stale loop (ob_0684). When in doubt about whether the user is ending the loop, ask — but never leave loop-mode.json behind.
+**CRITICAL: Always run cleanup (step 4) even on informal endings.** The loop-mode.json file MUST be removed. If it persists, post-compaction agents will re-execute the stale loop (the stale-marker misfire failure mode). When in doubt about whether the user is ending the loop, ask — but never leave loop-mode.json behind.
 
 ### 1. Final consolidation
 Run one last consolidation round to digest any remaining raw material.

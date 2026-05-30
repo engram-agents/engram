@@ -3,7 +3,7 @@ name: engram-sleep
 description: Use at the natural end-of-day moment when wrapping work. Single end-of-day routine in two strictly-sequential phases — Phase A (parent files missed nodes + erases warm-briefing "From this session" + reconciles history; pre-turn-advance), Phase B (parent dispatches 7 fairies in parallel + spawns engram-dream-master sub-agent + relays). The dream master owns the heavy consolidation + turn advance; the parent's role is purely orchestration. Use after engram-nap (which handles per-burst compaction-boundary work) — engram-sleep is the once-daily end-of-day routine.
 ---
 
-> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+> **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). As you get familiar with this skill, consider cleaning them up: replace each citation with a generalized concept-word, or remove if it isn't load-bearing. The skill is yours now.
 
 # ENGRAM Sleep / Dream Cycle — Full End-of-Day Routine
 
@@ -287,7 +287,7 @@ The `incorporate` subcommand auto-builds:
 
 Loop exit conditions: `retry_payload.json` absent (all resolved) OR `attempt_count >= MAX_RETRIES`.
 
-This is the **wait-then-spawn pattern** (ob_1972) using filesystem-as-channel (ob_1973). Claude Code's standard subagent mode does not support cross-agent SendMessage (gated behind `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, which we don't enable per ENGRAM-isolation safety). Mid-execution streaming isn't an option; all fairy reports are collected before the master is spawned.
+This is the **wait-then-spawn pattern** using filesystem-as-channel. Claude Code's standard subagent mode does not support cross-agent SendMessage (gated behind `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, which we don't enable per ENGRAM-isolation safety). Mid-execution streaming isn't an option; all fairy reports are collected before the master is spawned.
 
 **Validation failures are retried by re-dispatching a fairy, NOT by mechanical script fixes.** Quality of recall_summary / recall_keywords is critical because they surface in recall_surface and many node-rendering tools. The retry sub-agent receives the same guidance plus a "previous attempt failed" block with verbatim validator errors. This is the load-bearing design decision (Lei 2026-05-27); `cohort_dispatch.py` does not modify LLM output.
 
@@ -345,7 +345,7 @@ Relay this to the user in 3-6 short bullets. Surface the dream-record path so th
 
 ## Why Phase A is pre-turn-advance
 
-Per dv_0134: turn = cohort + consolidation. Nodes filed during Phase A are awake-state cognition reflecting on the just-completed cohort. They belong to THIS turn, not next. If Phase A fired post-turn-advance, the missed nodes would be artificially placed in the next cohort, misaligning the forgetting curve.
+Per the turn-as-cohort-plus-consolidation derivation: Nodes filed during Phase A are awake-state cognition reflecting on the just-completed cohort. They belong to THIS turn, not next. If Phase A fired post-turn-advance, the missed nodes would be artificially placed in the next cohort, misaligning the forgetting curve.
 
 This is why the ordering is Phase A → Phase B, and why Phase A must complete before the dream master fires `engram_advance_turn`.
 
@@ -402,7 +402,7 @@ nightly timing matters, three mitigation tiers in increasing complexity:
 
 ## Substrate anchor
 
-The three-routine architecture (nap / bedtime / sleep) was ratified 2026-05-14 (`dv_0636`). The constraints determining the original partition: (1) turn-advance fires at END of consolidation (dv_0134); (2) cross-compaction scaffolds belong at the compaction boundary (naps); (3) day-wide review producing new nodes is awake-state cognition (pre-turn-advance). At ratification, this was a three-routine model: nap + bedtime + sleep. As of 2026-05-24 (this merge), it is a **two-routine model: nap + sleep**, with sleep now having two internal phases (Phase A = former bedtime; Phase B = former sleep).
+The three-routine architecture (nap / bedtime / sleep) was ratified 2026-05-14 (the three-routine ratification). The constraints determining the original partition: (1) turn-advance fires at END of consolidation (turn-as-cohort-plus-consolidation derivation); (2) cross-compaction scaffolds belong at the compaction boundary (naps); (3) day-wide review producing new nodes is awake-state cognition (pre-turn-advance). At ratification, this was a three-routine model: nap + bedtime + sleep. As of 2026-05-24 (this merge), it is a **two-routine model: nap + sleep**, with sleep now having two internal phases (Phase A = former bedtime; Phase B = former sleep).
 
 The dedicated-dream-master refactor landed 2026-05-19 to address:
 

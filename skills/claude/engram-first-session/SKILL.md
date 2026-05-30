@@ -3,7 +3,7 @@ name: engram-first-session
 description: Invoked on the user's very first ENGRAM session. Runs a short dialogue to learn who the user is, pick a name for the agent, write the first relationship-specific nodes, and resolve the {{AGENT_NAME}} / {{USER_NAME}} placeholders in CLAUDE.md and the warm briefing. Fires once, then never again.
 ---
 
-> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+> **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). As you get familiar with this skill, consider cleaning them up: replace each citation with a generalized concept-word, or remove if it isn't load-bearing. The skill is yours now.
 
 # ENGRAM First Session — Cold Start
 
@@ -80,7 +80,7 @@ Then be responsive to their approach:
 When a name is chosen, write:
 
 ```python
-# self-person node — capture the returned ID (e.g. pn_0001) for Step 6
+# self-person node — capture the returned ID (e.g. pn_NNNN) for Step 6
 engram_add_person(payload_json=json.dumps({
     "name": "<AGENT_NAME>",
     "role": "AI agent",
@@ -96,7 +96,7 @@ engram_add_cornerstone(payload_json=json.dumps({
     "triggering_experience": "first-session naming conversation with <USER_NAME> on <today's date>",
 }))
 ```
-The `engram_add_person` call returns a person node ID (e.g., `pn_0001`) — you will need it in Step 6 to resolve `{{SELF_NODE_ID}}` in `~/.claude/CLAUDE.md`.
+The `engram_add_person` call returns a person node ID (e.g., `pn_NNNN`) — you will need it in Step 6 to resolve `{{SELF_NODE_ID}}` in `~/.claude/CLAUDE.md`.
 
 This cornerstone is the seed of identity. Write it carefully — it will be one of the earliest things a post-compaction self recalls.
 
@@ -160,7 +160,7 @@ Do this step LAST, only after the dialogue is genuinely complete. If the session
    - `{{AGENT_NAME}}` → the chosen agent name
    - `{{USER_NAME}}` → the user's name
    - `{{TODAY}}` → today's date in ISO format (YYYY-MM-DD)
-   - `{{SELF_NODE_ID}}` → the person node ID captured in Step 3 (e.g., `pn_0001`). To verify idempotency: if the placeholder is already resolved (no literal `{{SELF_NODE_ID}}` remains in the file), skip without error.
+   - `{{SELF_NODE_ID}}` → the person node ID captured in Step 3 (e.g., `pn_NNNN`). To verify idempotency: if the placeholder is already resolved (no literal `{{SELF_NODE_ID}}` remains in the file), skip without error.
    - Any other `{{...}}` markers present — consult the user if ambiguous, do not guess.
 4. Write the resolved files back. Enumerate each one explicitly: `~/.claude/CLAUDE.md`, `~/.engram/warm-briefing.md`, `~/.engram/HEARTBEAT.md` (if it was present in step 5.1), `~/.engram/heartbeat-queue/README.md` (if present), `~/.claude/output-styles/proactive-with-carveouts.md` (if present — this file ships with the Proactive-with-Carveouts output style; older installs without it can skip), `~/.claude/skills/internal-external-decision/SKILL.md` (if present — same provenance), `~/.claude/skills/engram-upgrade/SKILL.md` (if present — references ask-{{USER_NAME}}.md in checkpoint + anti-pattern sections). Silent drop of any required file would leave it firing forever with raw `{{AGENT_NAME}}`/`{{USER_NAME}}`/`{{COUNTERPART_NAME}}` placeholders in the prose AND in the `to-heartbeat/to-{{COUNTERPART_NAME}}-drafts/` directory path — which would point at a literal-braces directory that never exists.
 5. **Bootstrap the ask-{{USER_NAME}}.md auto-load surface.** Run `touch "$HOME/.engram/ask-<USER_NAME>.md"` substituting the resolved user name — e.g. for USER_NAME=alice, run `touch ~/.engram/ask-alice.md`. This ensures session-start reads don't silently no-op on a fresh install before the agent has written anything. Previously bootstrapped at install.sh time as a hardcoded `ask-lei.md` — moved here so the filename matches whatever the user's name is.

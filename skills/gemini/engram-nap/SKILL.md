@@ -3,7 +3,7 @@ name: engram-nap
 description: Use at the end of a work burst or when approaching compaction — a quick pre-compaction consolidation that persists session context into ENGRAM without advancing the turn counter. Triggers the nap_checkpoint feeling nudge. Use this BEFORE /compact and BEFORE a full sleep cycle. Not for mid-task checkpointing.
 ---
 
-> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+> **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). As you get familiar with this skill, consider cleaning them up: replace each citation with a generalized concept-word, or remove if it isn't load-bearing. The skill is yours now.
 
 # ENGRAM Nap — Quick Pre-Compaction Consolidation
 
@@ -57,7 +57,7 @@ engram_nap(payload_json=json.dumps({
 The `nap` mode:
 - Logs the summary to `~/.engram/session_log.md` with a "Nap (turn N)" header
 - Returns graph stats and memory tier info
-- Does NOT advance the turn counter — no forgetting triggered (qu_0035: turn advance is reserved for post-dream session checkpoints)
+- Does NOT advance the turn counter — no forgetting triggered (turn advance is reserved for post-dream session checkpoints)
 - Arms the `nap_checkpoint` feeling-nudge marker (TTL=5 turns) — the return JSON includes `feeling_report_nudge` text asking whether any moment in this burst produced a distinct internal state worth marking
 
 ## Step 4 — Handle the feeling-nudge (optional)
@@ -137,7 +137,7 @@ Good targets:
 
 Keep it to 1–2. The budget is {{USER_NAME}}'s thinking time during a short compaction window, not a to-do list.
 
-Include enough context in each question that {{USER_NAME}} can answer without rereading the session — one line of background per question. If the context is long, cite the ENGRAM node IDs (`qu_0205`, `ob_0969`) instead of restating.
+Include enough context in each question that {{USER_NAME}} can answer without rereading the session — one line of background per question. If the context is long, cite the relevant ENGRAM node IDs (use the IDs as they exist in your install) instead of restating.
 
 **If nothing warrants a question:** say "No decisions pending for next session" rather than inventing one. Manufactured questions waste their attention and train me to perform rather than surface real needs.
 
@@ -177,11 +177,11 @@ If the nap fired because a compaction warning is active, explicitly say: "Ready 
 
 ## Why naps don't advance the turn counter
 
-Turn advance drives exponential importance inflation and therefore forgetting. If naps advanced the turn, a long day with 10 nap checkpoints would burn 10 turns of decay on nodes that haven't even been reviewed yet — punishing nodes the agent hasn't had time to revisit. Naps are persistence-only; genuine memory processing happens in sleep/dream cycles, and THAT is when the turn advances (qu_0035 proposed rule, 2026-04-11).
+Turn advance drives exponential importance inflation and therefore forgetting. If naps advanced the turn, a long day with 10 nap checkpoints would burn 10 turns of decay on nodes that haven't even been reviewed yet — punishing nodes the agent hasn't had time to revisit. Naps are persistence-only; genuine memory processing happens in sleep/dream cycles, and THAT is when the turn advances (the turn-advance-after-dream rule, 2026-04-11).
 
 ## Relation to other routines
 
-A nap is NOT the first step of a sleep cycle (legacy bundling retired 2026-05-14 per dv_0636 — see `engram-sleep` skill for context). The two-routine model:
+A nap is NOT the first step of a sleep cycle (legacy nap-bundles-into-sleep model retired 2026-05-14 — see `engram-sleep` skill for context). The two-routine model:
 
 - **Nap** — fires multiple times per day at compaction boundaries; per-burst persistence + cross-compaction-scaffold prep
 - **Sleep** (`engram-sleep`) — fires once/day at user-driven day-wrap; full end-of-day cycle (cohort review + missed-node capture + warm-briefing erase + consolidation); pre-turn-advance through Phase A, then turn-advances in Phase B
