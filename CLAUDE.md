@@ -218,6 +218,29 @@ clearly addresses an issue but the title doesn't carry `[closes #N]`, flag as
 a **blocker** — the author edits the title before merge. This is mechanical;
 checking is cheap; the cost of missing it is a stale-issue backlog.
 
+### Body-text discipline (avoid the auto-close trap)
+
+**The parser sees keyword + `#N` regardless of negation, brackets, or backticks.**
+- `"this PR does NOT close #N"` → auto-closes #N on merge (the NOT is invisible to the regex).
+- `"the final scrub PR uses [closes #N]"` → auto-closes #N (brackets don't escape; `closes #N` is matched literally — empirically verified PR #441's `(closes #440)` auto-closed).
+- `"the final scrub PR uses \`[closes #N]\`"` → auto-closes #N (backticks don't escape either).
+
+**Empirical (same-day n=2, 2026-05-30):** PR #516 auto-closed #510 via body text "this PR does NOT close #510" (caught manually + reopened); PR #537 round-1/2 body had two trap occurrences (caught pre-merge by counterpart-colleague review). Both authors were consciously trying to follow this rule.
+
+**Safe-paraphrase shapes** (when the body legitimately needs to reference an issue number without triggering auto-close):
+
+| Trap (DO NOT write this in the body) | Safe paraphrase |
+|---------------------------------------|-----------------|
+| "this PR does NOT close #N" | "first slice of #N's EPIC — umbrella stays open" |
+| "the final scrub PR uses `[closes #N]`" | "the final scrub PR carries the closing tag in its title" |
+| "addresses #N (will close in follow-up)" | "addresses #N — follow-up PR carries the close-tag" |
+| "fixes #N partially" | "addresses one slice of #N; remainder tracked in next PR" |
+| "resolves #N" (in body, not title) | drop entirely; only the title carries the closing tag |
+
+**The rule reduces to:** keyword + `#N` belongs ONLY in the PR title. Body references the issue number without close-keyword preceding it (`#N`, `issue #N`, `umbrella #N`, `part of #N`, `addresses #N`, `relates to #N` — none of these trip the parser).
+
+**Verification before pushing the PR body:** `gh pr view <N> --json body -q .body | grep -iE '\b(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\s+#?[0-9]+'` — empty output means the body is clean; any match is a trap to rewrite via `gh pr edit <N> --body "..."`.
+
 GitHub recognized closing keywords (case-insensitive): `close`, `closes`,
 `closed`, `fix`, `fixes`, `fixed`, `resolve`, `resolves`, `resolved`. This repo
 uses `closes` only, in the `[closes #N]` bracket form. Other keywords technically
