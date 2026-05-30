@@ -27,7 +27,7 @@ agents skip this step entirely.)
 
 The repo separates the **engine layer** (genuinely shared across all
 runtimes) from **adapter layers** that are inherently model-aware. Per
-`dv_0557` (Lei + Borges, 2026-05-04):
+the layered-sidecar design Lei + Borges agreed on 2026-05-04:
 
 ```
 engram-alpha/
@@ -55,9 +55,10 @@ counterpart agent (Borges for claude PRs, Mneme for gemini PRs) tests
 the change on their own platform before merge approval.
 
 **While `hooks/gemini/` is empty** (Mneme hasn't yet mirrored): the
-gemini installer falls back to `hooks/claude/` since per ob_1354 the
-hook event JSON shape is mostly compatible between the two CLIs. Replace
-the fallback once Mneme has populated her sidecar with intentional
+gemini installer falls back to `hooks/claude/` since the hook event JSON
+shape is mostly compatible between the two CLIs (empirically verified
+when the sidecar layout was first introduced). Replace the fallback
+once Mneme has populated her sidecar with intentional
 divergence.
 
 ## Where engine vs adapter code lives
