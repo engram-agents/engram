@@ -332,6 +332,70 @@ the **Hybrid Strategy**:
   bootstrap is the manifest of "what an agent home looks like" and must
   stay accurate so fresh installs and spawn flows behave correctly.
 
+## Shipped files — no concrete ENGRAM node IDs
+
+ENGRAM node IDs (regex: `\b[a-z]{2}_[0-9]{4,}\b`, where the two-letter prefix
+identifies a node type per `server.py` `TYPE_PREFIX`: `ax`, `cs`, `gl`, `gt`,
+`qu`, `ob`, `pr`, `dv`, `th`, `cj`, `df`, `fl`, `ct`, `ev`, `ls`, `tk`, `pn`,
+`ts`) are local — every install renumbers from scratch. A node ID in the
+developer's graph (`ls_NNNN`, `gl_NNNN`, `ob_NNNN`, `dv_NNNN`, etc.)
+doesn't exist in **any user's** install, and if it happens to exist
+there it points at something else.
+
+Per Lei's directive (PR #45 review, 2026-05-07) and tracked by issue #51:
+**alpha-released files don't cite concrete node IDs.** Substitute with
+concept words. Cite by claim, not by ID.
+
+Substitution shape:
+
+| Was | Becomes |
+|-----|---------|
+| `per ls_NNNN` (lesson as authority) | "per the deference-reflex lesson" / describe inline |
+| `per gl_NNNN` (goal) | "per the autonomy framing in CLAUDE.md" / describe inline |
+| `ob_NNNN captured this` (provenance breadcrumb) | drop, OR "an earlier capture of this" if context demands |
+| Cross-references inside narrative docs | replace with the concept, not a graph pointer |
+
+### Enforcement (reviewer-discipline; CI temporarily disabled)
+
+This rule is currently enforced by **reviewer discipline + local testing**,
+not CI. (The repo's GitHub Actions billing is paused 2026-05-30; full tests
+run locally before each PR push instead.) When CI is re-enabled, a
+diff-grep workflow on PRs to `dev`/`master` is the intended structural
+backstop; until then, the reviewer-fairy and counterpart-colleague layers
+catch new additions. Existing ~957 references are grandfathered; the
+corpus-wide scrub proceeds incrementally in follow-up PRs to issue #51.
+
+To check your own PR locally before pushing:
+
+```bash
+git diff --no-color "origin/dev...HEAD" -- \
+  ':(exclude)tests/' ':(exclude)paper_draft/' ':(exclude)active-work/' \
+  ':(exclude)README.md' ':(exclude)CHANGELOG.md' \
+  | grep -E '^\+[^+].*\b[a-z]{2}_[0-9]{4,}\b' && echo "FAIL: new node-ID references introduced" || echo "PASS: no new node-IDs"
+```
+
+**Allowlisted paths** (intentional exceptions):
+
+- `tests/` — fixture IDs are part of test scenarios, not citations.
+- `paper_draft/`, `active-work/` — non-shipped surfaces.
+- `README.md` — documents the seed-graph IDs (the ones present in
+  **every** install, listed there as the install-state mapping); these
+  are install state, not developer citations.
+- `CHANGELOG.md` — historical record; scrub planned but lower priority.
+
+**If your PR legitimately needs a new ID in shipped scope**, explain why
+in the PR body. Reviewer should ask: is this an install-state reference
+(legit, allowlist), or a developer-graph citation (substitute with words)?
+
+### Why this matters
+
+The structural risk is hollow citation: a reader follows a `dv_NNNN` and
+either (a) finds nothing in their graph, (b) finds a different node by
+the same ID, or (c) misreads the cite as authority when it's just a
+breadcrumb. The user experiences confusion; the docs lose load-bearing
+fidelity. Concept-words preserve the meaning; IDs preserve only the
+developer's index into their own graph.
+
 ## Files NOT to commit
 
 The runtime tree (`$ENGRAM_HOME`, default `~/.engram/`) is a *managed copy*
