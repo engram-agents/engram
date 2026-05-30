@@ -2,7 +2,7 @@
 """inter_agent_pulse — liveness pulse mechanism for the v0.1 inter-agent channel.
 
 Spec: active-work/v0.1-liveness-marker-design-2026-04-28.md
-Resolves: ob_1384 (silent-ack cumulative drift).
+Resolves: ob_NNNN (silent-ack cumulative drift).
 
 Each agent's heartbeat calls `tick` once per fire after processing inbox.
 The script tracks silent cycles since the counterpart's last substance message

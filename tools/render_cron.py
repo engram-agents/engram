@@ -18,7 +18,7 @@ Sleep is interactive-only as of 2026-05-14 (alpha #133 PR C). The
 an autonomous sleep cron — they only define the heartbeat protected window
 (the user's preferred quiet slot for interactive bedtime + sleep). The
 `tools/sleep.sh` script remains on disk for manual catch-up invocation but
-is no longer rendered into the crontab. See dv_0636 for the two-routine
+is no longer rendered into the crontab. See dv_NNNN for the two-routine
 self-engram-maintenance architecture (nap + sleep) and skills/claude/engram-sleep/.
 
 Compression: heartbeat hour ranges are minimised to standard cron syntax

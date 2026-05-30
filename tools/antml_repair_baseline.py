@@ -6,7 +6,7 @@ Reads two JSONL files written by the engram-toolcall-repair hook:
   - ~/.engram/toolcall-repairs.jsonl      (only calls that needed repair)
 
 Computes baseline repair rates per tool and per day so that a future
-migration (e.g. ls_0023's antml-fix per-tool single-JSON reshape) can be
+migration (e.g. the telemetry-discipline lesson's antml-fix per-tool single-JSON reshape) can be
 empirically validated against pre-migration error rates.
 
 Usage:

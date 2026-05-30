@@ -683,7 +683,7 @@ HTML = r"""<!DOCTYPE html>
   <div class="section">
     <div class="section-title">Find node</div>
     <div id="search-box">
-      <input type="text" id="search-input" placeholder="e.g. dv_0130" spellcheck="false" />
+      <input type="text" id="search-input" placeholder="e.g. dv_NNNN" spellcheck="false" />
       <div class="btn" id="search-btn">Go</div>
     </div>
   </div>
@@ -2825,7 +2825,7 @@ HEALTH_HTML = r"""<!DOCTYPE html>
         qtHtml += `<tr><td>${esc(qt)}</td><td style="text-align:right">${s.n}</td><td style="text-align:right">${s.mean.toFixed(3)}</td></tr>`;
       }
       qtHtml += '</tbody></table>';
-      qtHtml += '<p class="cal-caption">ax_0007 structural anchoring — see ob_1977 for the 2D matrix design.</p>';
+      qtHtml += '<p class="cal-caption">the structural-confidence-determination axiom — structural anchoring — see ob_NNNN for the 2D matrix design.</p>';
     }
 
     // ── Per-reasoning_type table ──────────────────────────────────────────

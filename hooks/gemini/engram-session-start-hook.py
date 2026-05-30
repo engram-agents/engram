@@ -8,10 +8,10 @@ Reading-reminder injection is source-conditional:
   - source=="compact"/"resume" (or anything else): warm-briefing only. The
     history file is skipped because the compaction summary carries
     work-thread continuity, and re-reading today's active-day log mid-day
-    introduces "yesterday/today" framing confusion (ob_1264, 2026-04-24).
+    introduces "yesterday/today" framing confusion (ob_NNNN, 2026-04-24).
 
 The history/git-log bundle is Piece C of the three-piece session-handover
-fix (dv_0478): on startup the agent cross-checks pending-status claims
+fix: on startup the agent cross-checks pending-status claims
 ("MECH-N deferred", "still uncommitted") against the git log before
 reporting to the user.
 

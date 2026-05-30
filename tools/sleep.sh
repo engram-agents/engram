@@ -12,7 +12,7 @@
 # manually to consolidate the accumulated cohort. It spawns a fresh
 # `claude -p` session that drives engram-sleep (two-phase: Phase A cohort
 # completion then Phase B consolidation) per the two-routine architecture
-# (dv_0636).
+# (the two-phase sleep ratification).
 #
 # Required env (caller responsibility):
 #   AGENT_NAME       e.g. borges, mneme, aleph
@@ -43,7 +43,7 @@ cd "$ALPHA_DIR" || exit 1
 # OAuth/Max-subscription auth (~/.claude/.credentials.json) instead of the
 # API-key path. Without this, headless spawns bill against API Tier 1
 # (30K ITPM) instead of the Max 20x pool the interactive session uses.
-# Permanent lesson: ls_0018 — every headless claude -p launcher MUST strip
+# Permanent lesson — the ANTHROPIC_API_KEY-stripping discipline — every headless claude -p launcher MUST strip
 # this key. (Burned 2026-04-29 PM by exactly this trap.)
 unset ANTHROPIC_API_KEY
 

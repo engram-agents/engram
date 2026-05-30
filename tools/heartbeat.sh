@@ -24,7 +24,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/linuxbrew/.linuxbrew/bin/python3}"
 # Run from alpha so CLAUDE.md context loads correctly.
 cd "$ALPHA_DIR" || exit 1
 
-# Strip ANTHROPIC_API_KEY before any claude -p invocation (per ls_0018).
+# Strip ANTHROPIC_API_KEY before any claude -p invocation (per the ANTHROPIC_API_KEY-stripping discipline).
 # Cron's bare env doesn't have it, but ad-hoc manual runs from a shell that
 # does — `unset` makes the symmetry uniform across all four launchers.
 unset ANTHROPIC_API_KEY
@@ -81,7 +81,7 @@ echo "Perform your heartbeat routine. Read \$ENGRAM_HOME/HEARTBEAT.md and act on
         --add-dir "$INTER_AGENT_DIR"
 
 # Liveness pulse — single one-shot per fire, post inbox processing.
-# Resolves ob_1384 (silent-ack cumulative drift). Threshold-based: at most
+# Resolves the silent-ack-cumulative-drift incident. Threshold-based: at most
 # one pulse per silent stretch, decoupling liveness from substance.
 AGENT_NAME="$AGENT_NAME" \
 COUNTERPART_NAME="$COUNTERPART_NAME" \

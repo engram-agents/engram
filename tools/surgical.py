@@ -4,7 +4,7 @@
 These tools fix data corruption caused by identified server bugs. They are
 NOT for convenience edits, schema migrations, or routine operations.
 
-Design principles (ob_0679, ob_0680):
+Design principles:
   - Two-phase: preview (read-only) then execute (with confirmation token)
   - Git snapshot before every mutation
   - edit_history entry for every change

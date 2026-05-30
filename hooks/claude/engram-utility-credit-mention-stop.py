@@ -15,14 +15,14 @@ Mechanism (V1.2 — simplified in PR #215 after #214 retired recall_window; Lei 
 ---------
 1. Read `last_assistant_message` from Claude Code's Stop-hook stdin
    payload (synchronous, not subject to the JSONL flush race that bit
-   the deference-detector pre-2026-05-07 per ob_1540 / ls_0029).
+   the deference-detector pre-2026-05-07 per ob_NNNN / ls_NNNN).
 2. Collect all assistant text blocks from the current turn via JSONL
    walk (collect_turn_text).
 3. Extract node-shaped tokens via engram_ids.find_node_ids (SSoT
    regex shipped in PR #212, supports \\d{4,} past 9999).
 4. Apply Q-update: `Q_new = Q_old + α(1 - Q_old)` with ALPHA_MENTION
    = 0.10 (matches USE_ALPHA["mention"] in server.py). If the DB has
-   the ID it bumps; if not (e.g. `in_1234` shape-false-positive), the
+   the ID it bumps; if not (e.g. `in_NNNN` shape-false-positive), the
    row-missing guard in bump_utility silently skips.
 
 Note: the original V1.0 hook intersected mentioned IDs with a
@@ -87,7 +87,7 @@ def bump_utility(
 
     Returns the count of nodes actually updated. IDs not present in
     `nodes` are silently skipped (the shape-regex can match non-node
-    tokens like `in_1234` per engram_ids docstring).
+    tokens like `in_NNNN` per engram_ids docstring).
     """
     if not node_ids:
         return 0

@@ -8,7 +8,7 @@ consolidate the day's work. The agent surfaces this to the user, who can
 say "Yes" (run the skill), "Not yet" (proceed normally), or just keep
 working (ignore the nudge — the hook is non-blocking).
 
-Part of the three-routine self-engram-maintenance architecture (dv_0636);
+Part of the three-routine self-engram-maintenance architecture;
 implementation of PR B of engram-alpha #133.
 
 Gates:

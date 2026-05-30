@@ -8,10 +8,10 @@ Reading-reminder injection is source-conditional:
   - source=="compact"/"resume" (or anything else): warm-briefing only. The
     history file is skipped because the compaction summary carries
     work-thread continuity, and re-reading today's active-day log mid-day
-    introduces "yesterday/today" framing confusion (ob_1264, 2026-04-24).
+    introduces "yesterday/today" framing confusion (ob_NNNN, 2026-04-24).
 
 The history/git-log bundle is Piece C of the three-piece session-handover
-fix (dv_0478): on startup the agent cross-checks pending-status claims
+fix: on startup the agent cross-checks pending-status claims
 ("MECH-N deferred", "still uncommitted") against the git log before
 reporting to the user.
 
@@ -26,7 +26,7 @@ per-session file by session_id.
 A compact [ENGRAM Calibration] block is injected on every SessionStart
 (both startup and compact/resume) so fresh-wake context has actual
 distribution anchors present — not just semantic labels. Closes the
-access≠presence gap (ob_1976). Sourced from engram_stats(sections=
+access≠presence gap. Sourced from engram_stats(sections=
 ["confidence"]) + engram_stats(mode="7-turn", sections=["confidence"]).
 Silent skip on any stats failure: hook never blocks session start.
 """
@@ -711,7 +711,7 @@ def main() -> None:
     # ── ENGRAM Calibration block ───────────────────────────────────────────
     # Inject per-type distribution anchors on every SessionStart so fresh-wake
     # context has actual quantile data present (not just semantic labels).
-    # Closes the access≠presence gap (ob_1976). Silent skip on any failure —
+    # Closes the access≠presence gap. Silent skip on any failure —
     # hook must never block session start.
     try:
         _runtime_dir = _resolve_runtime_dir(ENGRAM_HOME)

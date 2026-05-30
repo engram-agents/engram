@@ -19,7 +19,7 @@ Eleven subcommands:
   rename      Update the human-readable project title
   anchor      Set or update the github: anchor on an existing baton
 
-Design: Lei + Borges, 2026-05-28 (solving the dv_0038-shaped misalignment
+Design: Lei + Borges, 2026-05-28 (solving the importance-inflation-derivation-shaped misalignment
 incident where Borges and Ariadne disagreed about whose court PR #425 was in).
 
 Protocol ref: docs/baton-protocol.md

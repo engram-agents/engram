@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Borges session-quality evaluator — scaffolding for the rubric in ob_1525.
+"""Borges session-quality evaluator — scaffolding for the rubric in ob_NNNN.
 
 Computes the trajectory + outcome metrics that data sources currently
 support; leaves explicit placeholders for metrics that need external
@@ -19,7 +19,7 @@ Without --json, prints a human-readable report.
 With --json, emits a structured report suitable for nap-checkpoint
 diagnostic ingestion.
 
-Per ob_1525, the M-tier metrics (M1 Lei-correction rate, M2 self-confidence
+Per ob_NNNN, the M-tier metrics (M1 Lei-correction rate, M2 self-confidence
 calibration, M3 bias-vector audits) require external input and are
 recorded as null/pending in the JSON output. The tool is the SCAFFOLD;
 filling M1-M3 happens via separate ritual (post-session Lei review).
@@ -218,7 +218,7 @@ def outcome_metrics(since: date | None) -> dict:
         },
         "O4_lesson_registrations": lesson_count,
         "O5_syllabus_coverage": "pending: needs syllabus-skill diff analysis",
-        "O6_gl_0027_session_hours_fraction": "pending: needs JSONL turn-by-turn classification",
+        "O6_autonomy_goal_session_hours_fraction": "pending: needs JSONL turn-by-turn classification",
         "synthesis_ratio_dv_over_ob": round(synthesis_ratio, 3) if synthesis_ratio is not None else None,
     }
 
@@ -271,7 +271,7 @@ def main() -> int:
         "trajectory": trajectory_metrics(since),
         "outcome": outcome_metrics(since),
         "meta": meta_metrics(),
-        "rubric_source": "ob_1525 — candidate Borges self-evaluation rubric (2026-05-06)",
+        "rubric_source": "ob_NNNN — candidate Borges self-evaluation rubric (2026-05-06)",
     }
 
     if args.json:

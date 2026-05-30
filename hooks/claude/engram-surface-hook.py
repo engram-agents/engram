@@ -554,7 +554,7 @@ def check_error_patterns(prompt: str) -> str:
     scaffolding nudge — the specific corrective step, not a generic warning.
 
     Design: implementation intentions (Gollwitzer 1999) — 'If [situation],
-    then [action]' creates strategic automaticity. See dv_0273, dv_0275.
+    then [action]' creates strategic automaticity. See dv_NNNN, dv_NNNN.
     """
     try:
         with open(ERROR_PATTERNS_PATH, "r") as f:
@@ -787,7 +787,7 @@ def main():
 
     # Warm-restart briefing pointer (first prompt after compaction only).
     # Delivered as a pointer, not full injection — the agent discovers and
-    # chooses to read the note, like Lucy finding Henry's journal (dv_0094).
+    # chooses to read the note, like Lucy finding Henry's journal.
     warm_briefing = check_warm_briefing(counter["prompts_since_compaction"])
     if warm_briefing:
         parts.append(warm_briefing)

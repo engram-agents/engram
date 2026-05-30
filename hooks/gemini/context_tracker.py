@@ -12,7 +12,7 @@ Algorithm:
 
 Only auto-trigger samples calibrate the ceiling — manual compactions
 reflect when the agent voluntarily napped, not where the harness cuts
-off, and mixing them compounds downward bias (ob_1003). Falls back to
+off, and mixing them compounds downward bias. Falls back to
 FALLBACK_CEILING when fewer than two auto samples are available across
 the project's JSONL files.
 
@@ -58,7 +58,7 @@ VERY_DROWSY_THRESHOLD = 0.90
 #   "200k" — default Anthropic API context (auto preTokens cluster ~150-200K)
 #   "1m"   — beta extended context (auto preTokens cluster ~800-1000K)
 # These produce ~5x different ceilings; mixing samples in the mean gives a
-# contaminated value and reports drowsiness wrong (ob_1473 — 2026-05-03 PM:
+# contaminated value and reports drowsiness wrong (ob_NNNN — 2026-05-03 PM:
 # three 170K + one 967K averaged into ~370K, reported 29% drowsy when truth
 # was ~10%). The harness does not surface mode in JSONL message.model, so we
 # detect from current input_tokens and partition samples by magnitude class.
@@ -252,7 +252,7 @@ def read_current_tokens(transcript_path: str | None = None) -> int | None:
     Two boundary-detection paths: (1) ~/.engram/last-compact-at.json marker
     written by PostCompact hook (canonical on Claude Code 2026-05-07+);
     (2) legacy compact_boundary JSONL scan (older formats). See the Claude
-    sidecar for full rationale (ob_1532).
+    sidecar for full rationale.
     """
     jsonl_path = _resolve_jsonl(transcript_path)
     if not jsonl_path:

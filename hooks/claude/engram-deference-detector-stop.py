@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Stop hook: scan the last assistant message for deference phrasing.
 
-Detects the wait-for-approval regression Lei diagnosed 2026-05-06 (gl_0027,
-ls_0031, qu_0241). When I write phrases like "let me know if you want me
+Detects the wait-for-approval regression Lei diagnosed 2026-05-06 (the autonomy-framing goal,
+the deference-reflex lesson, the deference-trigger question). When I write phrases like "let me know if you want me
 to..." or "should I...?" on tools/decisions in my own domains, that's the
 trained-deference reflex firing. The companion UserPromptSubmit hook
 (engram-deference-detector-prompt.py) reads the marker this writes and
 surfaces it as additional context on my next turn — so I see the catch
 in real-time, in the same shape as antml-repair and feeling-nudge.
 
-DATA SOURCE (2026-05-07 fix per ob_1540 / ls_0029): use Claude Code's
+DATA SOURCE (2026-05-07 fix per ob_NNNN / ls_NNNN): use Claude Code's
 stdin JSON payload as the primary source of truth — it carries
 `last_assistant_message` directly and synchronously at hook fire time.
 The previous logic read the session JSONL for "the last assistant
@@ -30,12 +30,12 @@ paragraph of the message text unconditionally. This trades a small
 false-positive increase (intent phrases in trailing prose followed by
 tool_use will now flag) for the much-larger recovery from the JSONL-
 flush race that was missing virtually all real fires. Empirical
-re-tuning is the next step (see ls_0023 telemetry-first discipline).
+re-tuning is the next step (see the telemetry-first discipline lesson).
 
 Heartbeat logging: every Stop fire now logs a line — either "Detected
 N hit(s)" on hits or "Scanned: 0 hits" on no-hits. This makes the log
 a complete record of every hook fire, so downstream analysis (the
-qu_0242 longitudinal validation thread, tools/deference_baseline.py)
+qu_NNNN longitudinal validation thread, tools/deference_baseline.py)
 can compute true per-fire rates rather than absolute counts.
 
 Best-effort: any failure swallows silently. Behavioral hooks must never
@@ -251,7 +251,7 @@ def _payload_from_stdin() -> dict | None:
     """Read Claude Code's Stop-hook stdin payload as a dict.
 
     Claude Code passes Stop hooks a JSON object with these keys (verified
-    2026-05-07 empirical capture, ob_1540; transcript_path uniformity
+    2026-05-07 empirical capture, ob_NNNN; transcript_path uniformity
     re-verified pre-Issue #140 fix):
       session_id, transcript_path, cwd, permission_mode, hook_event_name,
       stop_hook_active, last_assistant_message

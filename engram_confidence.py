@@ -9,7 +9,7 @@ Confidence is ALWAYS derived, never arbitrarily assigned:
   - Axioms: definitionally 1.0
   - Definitions/questions/goals/etc: None (not claim-bearing)
 
-See ax_0007 (the load-bearing boundary) for why this separation matters.
+See the structural-confidence-determination axiom (the load-bearing boundary) for why this separation matters.
 """
 
 # ── Observation confidence: quote_type → base confidence ──────────────────

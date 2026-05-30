@@ -10,7 +10,7 @@ read). Without it, read_current_tokens iterates back to the latest pre-
 compact usage record and reports the pre-compact token count — the meter
 shows ~100% drowsy on a freshly-compacted session.
 
-Fix (2026-05-07, ob_1532): the PostCompact hook records the JSONL byte
+Fix (2026-05-07, ob_NNNN): the PostCompact hook records the JSONL byte
 offset AT POST-COMPACT TIME into ~/.engram/last-compact-at.json. The
 tracker then reads only the post-offset portion of the JSONL to compute
 current_tokens, and falls back to the legacy compact_boundary scan if the

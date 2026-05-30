@@ -97,7 +97,7 @@ ALLOWED_NODE_COLUMNS: frozenset[str] = frozenset(
 # claim-citation relation family.
 VIRTUAL_FIELDS: dict[str, dict[str, Any]] = {
     # Outgoing edges: this node CITES the value. Matches the
-    # "find derivations that cite ob_0218" use case.
+    # "find derivations that cite ob_NNNN" use case.
     "cites": {
         "direction": "outgoing",  # source = candidate, target = value
         "relations": ("cites", "supports", "derives_from"),

@@ -186,7 +186,7 @@ def discover_chat_ids() -> list:
 
 
 def populate_chat_id() -> dict:
-    """Discover chat_id from pending updates and write to secrets value-blind (per ls_0016)."""
+    """Discover chat_id from pending updates and write to secrets value-blind."""
     chats = discover_chat_ids()
     if not chats:
         return {"status": "no_pending",
@@ -230,7 +230,7 @@ def main() -> int:
             err = {"ok": False, "description": result.get("description", "unknown")}
             print(json.dumps(err, indent=2), file=sys.stderr)
             return 1
-        # Per ls_0016: don't echo chat_id in CLI output.
+        # Per ls_NNNN: don't echo chat_id in CLI output.
         print(json.dumps({"sent": True,
                           "message_id": result["result"]["message_id"]}, indent=2))
         return 0

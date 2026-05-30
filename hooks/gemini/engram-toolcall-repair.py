@@ -121,7 +121,7 @@ PROTECTED_TOOLS = {
     # engram_add_lesson, engram_add_task) were migrated to single-payload
     # signature in wave 2c-ii — repair-hook must ONLY include "payload_json"
     # so SWALLOW_RE cannot match XML-like patterns inside payload_json content
-    # and silently inject spurious top-level keys (ax_0005-adjacent corruption
+    # and silently inject spurious top-level keys (the blocking-guards-over-advisory-nudges axiom-adjacent corruption
     # risk per PR #63 fairy blocker).
     "mcp__engram__engram_add_person": {
         "payload_json",
@@ -180,7 +180,7 @@ PROTECTED_TOOLS = {
     # Migrated to single-payload signature in wave 2a (PR #63). Repair-hook
     # must NOT include the old multi-field names — otherwise SWALLOW_RE could
     # match XML-like patterns inside payload_json content and silently inject
-    # spurious top-level keys (ax_0005-adjacent corruption risk per PR #63
+    # spurious top-level keys (the blocking-guards-over-advisory-nudges axiom-adjacent corruption risk per PR #63
     # fairy blocker).
     "mcp__engram__engram_report_feeling": {
         "payload_json",
@@ -362,7 +362,7 @@ def format_additional_context(tool_name: str, repairs: list[str]) -> str:
         "Root cause: a parameter's closing tag was emitted without the "
         "antml: prefix, so the harness parser swallowed the next "
         "parameter's opening tag and value into the previous parameter. "
-        "See ob_0216 for mechanics."
+        "See ob_NNNN for mechanics."
     )
     return "\n".join(lines)
 

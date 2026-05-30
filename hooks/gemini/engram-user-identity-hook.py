@@ -2,7 +2,7 @@
 """
 UserPromptSubmit hook: detect speaker identity from name-prefix convention.
 
-Uses sticky session context (ob_0681): a name prefix like "<Name>:" switches
+Uses sticky session context: a name prefix like "<Name>:" switches
 the active user, and all subsequent messages are attributed to that user
 until a different prefix overrides it. The marker file (current_user.json)
 is cleared on SessionStart so identity doesn't leak across sessions.

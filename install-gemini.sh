@@ -191,7 +191,7 @@ echo "== Step 4: Copying files =="
 # break the other), and the scripts are path-aware via $ENGRAM_HOME so they
 # operate on this install's data dir.
 # Hooks: deploy from hooks/gemini/ if populated; fall back to hooks/claude/
-# while Mneme hasn't yet mirrored gemini-side sidecar versions. Per ob_1354,
+# while Mneme hasn't yet mirrored gemini-side sidecar versions. Per ob_NNNN,
 # the hook surface JSON shape is mostly compatible between the two CLIs, so
 # the claude hooks are usable as-is on gemini until divergence is forced.
 GEMINI_HOOKS_SRC="$ALPHA_DIR/hooks/gemini"

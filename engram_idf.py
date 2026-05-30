@@ -102,6 +102,9 @@ STOPWORDS: frozenset[str] = STANDARD_STOPWORDS | DISCOURSE_MARKERS
 # [a-z]{2,}[a-z0-9_]* is the minimal tightening that satisfies all spec examples:
 #   - tokenize("Hello, EEC on C1's 'bound'.") → ['hello', 'eec', 'on', 'bound']
 #   - tokenize("ax_0006 supersedes ax_0001")  → ['ax_0006', 'supersedes', 'ax_0001']
+# NOTE: schema-illustration exception — the example IDs above are intentional
+# regex-pattern illustrations, not citations of developer-graph nodes (per
+# the issue #51 release-scrub policy, schema-defining modules are exempt).
 _TOKEN_RE = re.compile(r"[a-z]{2,}[a-z0-9_]*")
 
 
@@ -117,7 +120,7 @@ def tokenize(text: str) -> list[str]:
     tokens must start with at least two letters, so pure numbers, single-letter
     fragments (e.g. bare ``s`` from apostrophe-s possessives), and
     single-letter-then-digit tokens (e.g. ``c1`` from ``C1's``) are excluded.
-    Node IDs like ``ax_0006`` or ``dv_0628`` survive intact because their
+    Node IDs like ``the calibration axiom`` or ``dv_NNNN`` survive intact because their
     alphabetic prefix is at least two letters.
 
     Returns a list of tokens preserving input order.

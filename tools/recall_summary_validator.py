@@ -21,7 +21,7 @@ RECALL_KEYWORDS_MIN = 3
 RECALL_KEYWORDS_MAX = 5
 RECALL_KEYWORD_MAX_LEN = 30
 
-# Pattern matching ENGRAM node IDs (e.g. ob_1234, dv_0500, fl_0148, ax_0010).
+# Pattern matching ENGRAM node IDs (e.g. ob_NNNN, dv_NNNN, fl_NNNN, the curation-discipline axiom).
 # 2-3 lowercase letters + underscore + 4+ digits. Keywords matching this
 # pattern are rejected because IDs carry no recognition signal in the
 # auto-surface skim — the keyword slot is for content recognition; graph

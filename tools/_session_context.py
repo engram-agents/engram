@@ -5,7 +5,7 @@ session-context files at `inter-agent/session_<id>.json` track active design
 threads with TTL-based hot-seat eligibility. Schema:
 
     {
-      "session_id": "string (e.g., cj_0001 or hot-seat-design)",
+      "session_id": "string (e.g., cj_NNNN or hot-seat-design)",
       "status": "active" | "paused" | "archived",
       "participants": ["mneme", "borges", "lei"],
       "last_activity_at": "ISO8601",

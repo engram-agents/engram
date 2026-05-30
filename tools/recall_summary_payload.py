@@ -8,9 +8,9 @@ Usage::
     from tools.recall_summary_payload import PayloadBuilder
 
     builder = PayloadBuilder()
-    err = builder.add_summary("ob_0001", "Short curated summary.", ["kw1", "kw2", "kw3"])
+    err = builder.add_summary("ob_NNNN", "Short curated summary.", ["kw1", "kw2", "kw3"])
     if err is not None:
-        builder.add_failure("ob_0001", f"validation rejected: {err['error']}")
+        builder.add_failure("ob_NNNN", f"validation rejected: {err['error']}")
 
     payload_json = builder.to_json()
     # pass payload_json to engram_set_recall_summaries(payload_json=...)

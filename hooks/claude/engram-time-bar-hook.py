@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-engram-time-bar-hook.py (MECH-1 of the time-awareness design, dv_0472)
+engram-time-bar-hook.py (MECH-1 of the time-awareness design, the time-awareness derivation)
 
 Prepends a one-line ambient time bar to the UserPromptSubmit output so Borges
 has real-world temporal grounding on every turn without having to query it.
-Closes the Welcome-Back failure mode (qu_0223) and the FROZEN-NOW-IN-
-COMPACTION-SUMMARY risk (dv_0469) by re-rendering every turn against wall-clock.
+Closes the Welcome-Back failure mode and the FROZEN-NOW-IN-
+COMPACTION-SUMMARY risk (the CLOCK-DRIFT-hygiene derivation) by re-rendering every turn against wall-clock.
 
 Output (one line, prepended to the injected context):
   [Time: <UTC_iso_zulu> (<weekday>) | <tz_label> <local_iso> | session started <hms> ago | last user msg <hms> ago]

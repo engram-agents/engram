@@ -3,8 +3,8 @@
 Validated against the v4.2 pilot (10 nodes / 5 dv + 5 ob) on 2026-05-19 PM
 with Sonnet 4.6. The 3-5 keyword count was chosen after a follow-up
 calibration test confirmed: pure-strict-3 caps signal density on complex
-nodes (ob_1954 wanted 5 keywords to cover all load-bearing terms);
-pure-flexible-1-5 drops signal on simple nodes (ob_0535 chose 2 keywords
+nodes (ob_NNNN wanted 5 keywords to cover all load-bearing terms);
+pure-flexible-1-5 drops signal on simple nodes (ob_NNNN chose 2 keywords
 but the third was load-bearing). Min 3 max 5 is the sweet spot.
 """
 
@@ -104,7 +104,7 @@ of coining descriptions.
 Concrete terms over abstract concepts. ENGRAM tool names valid. Lower-case
 unless proper noun / code symbol / canonical capitalization. No duplicates.
 
-DO NOT use ENGRAM node IDs (e.g., ob_1234, dv_0500, fl_0148) as keywords.
+DO NOT use ENGRAM node IDs (e.g., ob_NNNN, dv_NNNN, fl_NNNN) as keywords.
 IDs carry no recognition signal in skim — the keyword slot is for *content
 recognition*. Graph navigation (acts-on relationships, citations, references)
 lives in edges and is accessed via engram_inspect. Even for nodes that

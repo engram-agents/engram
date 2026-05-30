@@ -8,7 +8,7 @@ type prefix + underscore + zero-padded numeric counter:
 
 The :04d format guarantees a 4-digit minimum width but does NOT cap the
 width: once a type-counter passes 9999 the IDs become 5-digit
-(`ob_10000` and so on). Any regex that hard-codes `\\d{4}` will silently
+(`ob_NNNN` and so on). Any regex that hard-codes `\\d{4}` will silently
 miss those IDs as the graph grows. NODE_ID_RE uses `\\d{4,}` to keep
 current zero-padding semantics while allowing unbounded growth.
 
@@ -19,7 +19,7 @@ prefix is exact two-letter (today's TYPE_PREFIX values are all 2-letter
 across observation/derivation/axiom/etc.; widening to `{2,}` would let
 arbitrary `xxx_NNNN` tokens through). Note the false-positive surface:
 any `xx_NNNN` token matches even if `xx` isn't a real TYPE_PREFIX
-(e.g. `in_1234` in URL fragments). Consumers that need
+(e.g. `in_NNNN` in URL fragments). Consumers that need
 prefix-validation (is this a known node type?) should layer it on top
 of the regex — typically by intersecting matches with `recall_window`
 or by joining against the substrate's TYPE_PREFIX set.
@@ -31,6 +31,12 @@ Examples
     ['ob_1234', 'dv_0567']
     >>> find_node_ids("ob_1234 then ob_1234 then ax_0001")
     ['ob_1234', 'ax_0001']
+
+    # NOTE: this file is the schema-defining module — doctests above must
+    # demonstrate the actual function behavior on regex-matching inputs.
+    # The literal IDs here are intentional illustrations of the regex
+    # pattern, NOT citations of developer-graph nodes (per issue #51
+    # release-scrub policy, schema-illustration is the documented exception).
 
 Use sites:
   - tools/mine_prompts.py — prompt-history mining

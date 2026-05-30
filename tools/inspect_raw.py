@@ -27,9 +27,9 @@ Honors ENGRAM_DATA_DIR environment variable (same pattern as server.py).
 Does NOT honor the #348 hardcoded-path bug — uses the env-var correctly.
 
 Examples:
-    ENGRAM_DATA_DIR=/tmp/test-engram python inspect_raw.py ob_0001
-    python inspect_raw.py dv_0042 --field confidence_history
-    python inspect_raw.py ob_0007 --field embedding | python -c "import json,sys; v=json.load(sys.stdin); print(f'len={len(v)}, first5={v[:5]}')"
+    ENGRAM_DATA_DIR=/tmp/test-engram python inspect_raw.py ob_NNNN
+    python inspect_raw.py dv_NNNN --field confidence_history
+    python inspect_raw.py ob_NNNN --field embedding | python -c "import json,sys; v=json.load(sys.stdin); print(f'len={len(v)}, first5={v[:5]}')"
 """
 
 import argparse
@@ -157,7 +157,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("node_id", help="Node ID to inspect (e.g. ob_0001, dv_0042)")
+    parser.add_argument("node_id", help="Node ID to inspect (e.g. ob_NNNN, dv_NNNN)")
     parser.add_argument(
         "--field", "-f",
         choices=sorted(ALL_STRIPPED_FIELDS),

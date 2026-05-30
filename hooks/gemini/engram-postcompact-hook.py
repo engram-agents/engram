@@ -2,7 +2,7 @@
 """Post-compact: write the last-compact-at marker so the context tracker can
 correctly compute drowsiness against the post-compact byte-offset.
 
-See hooks/claude/engram-postcompact-hook.py for the full rationale (ob_1532).
+See hooks/claude/engram-postcompact-hook.py for the full rationale.
 Mirrored here for the Gemini sidecar.
 """
 import json

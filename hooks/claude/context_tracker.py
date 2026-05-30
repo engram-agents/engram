@@ -52,9 +52,9 @@ _migration_notice_emitted = False
 
 # Drowsiness display + warning thresholds. Calibrated for both 200K and 1M
 # context modes. Below the urgent threshold, the display shows a level word
-# only — no raw percentage. This is the cj_0054 / Lei 2026-05-12 PM design
+# only — no raw percentage. This is the cj_NNNN / Lei 2026-05-12 PM design
 # change: raw numbers were producing an affective tiredness-response that
-# the structural warning words did not fully recalibrate (dv_0623 / ob_1683
+# the structural warning words did not fully recalibrate (dv_NNNN / ob_NNNN
 # wrap-up-framing pattern). Replacing numbers with level words below the
 # urgent threshold lets the agent operate against the threshold semantics
 # rather than against an implicit "60% tired" feel.
@@ -271,7 +271,7 @@ def read_current_tokens(transcript_path: str | None = None) -> int | None:
        portion of the file is scanned — pre-compact usage records are
        structurally invisible. This is the canonical path on Claude Code
        versions that no longer write compact_boundary JSONL entries
-       (~2026-05-07 onward; ob_1532).
+       (~2026-05-07 onward; ob_NNNN).
 
     2. Fallback: scan the last TAIL_SCAN_BYTES of the JSONL in reverse.
        If a `compact_boundary` event appears before any usage record,
@@ -281,7 +281,7 @@ def read_current_tokens(transcript_path: str | None = None) -> int | None:
     Returns None when the post-compact window has no usage record yet —
     the correct behavior in the turn between /compact and the first
     post-compact assistant message (which prevents the bogus drowsiness
-    spike documented in ob_1013 and ob_1532).
+    spike documented in ob_NNNN and ob_NNNN).
     """
     jsonl_path = _resolve_jsonl(transcript_path)
     if not jsonl_path:
@@ -429,7 +429,7 @@ def _load_drowsiness_thresholds(mode: str) -> dict:
 def drowsiness_level(pct: float, thresholds: dict) -> str:
     """Map a drowsiness percentage to a level word.
 
-    Per cj_0054 conjecture (Lei 2026-05-12 PM): below the urgent threshold,
+    Per cj_NNNN conjecture (Lei 2026-05-12 PM): below the urgent threshold,
     only a level word is shown; raw percentage is hidden. At or above
     urgent, the caller renders the percentage explicitly. Thresholds are
     strict-less-than for the first three levels; urgent is at-or-above.
@@ -446,7 +446,7 @@ def drowsiness_level(pct: float, thresholds: dict) -> str:
 def format_drowsiness(usage: dict) -> str:
     """Generate drowsiness banner. Returns the banner line(s).
 
-    Per cj_0054 conjecture + Lei 2026-05-12 design: hide raw percentages
+    Per cj_NNNN conjecture + Lei 2026-05-12 design: hide raw percentages
     below the urgent threshold; show level words instead. At or above
     urgent, render the raw percentage so the agent has the calibration
     signal exactly when it's structurally warranted.

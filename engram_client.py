@@ -71,7 +71,7 @@ def get_counterparts() -> list[str]:
 
 TOOL_SCHEMAS = {
     "engram_add_evidence": {
-        "description": "Register a source document (webpage, article, data release). Returns existing node if URL matches. Per-observation versioning (dv_0547): file content_hash and git_sha live on each observation, not the evidence node. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: url, title.",
+        "description": "Register a source document (webpage, article, data release). Returns existing node if URL matches. Per-observation versioning (the evidence-block refactor derivation): file content_hash and git_sha live on each observation, not the evidence node. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: url, title.",
         "parameters": {
             "payload_json": {"type": "string", "description": "JSON object (as a string) with evidence fields. Required: url (canonical URL of the source — for local files use 'file://path/to/file'), title (article or page title). Optional: domain (auto-extracted from URL if omitted), source_date (ISO format, e.g. '2026-03-20'), content_snippet (truncated excerpt for offline re-reading).", "required": True},
         },
@@ -97,7 +97,7 @@ TOOL_SCHEMAS = {
     "engram_inspect": {
         "description": "Inspect a single node with three view modes: 'recall' (default — full focus claim + grouped logical-substrate neighbors with recall_summary + contextual neighbors with recall_keywords; the 'refresh my memory of this idea' view), 'deep' (all focus-node fields including confidence_history + 1-hop neighbors as adjacency map; for forensic / retract / supersede decisions), 'edges' (adjacency-map topology only, no node content; for graph-shape audits). dream_mode=True skips the recall-refresh side effect during maintenance / dream-cycle inspection.",
         "parameters": {
-            "payload_json": {"type": "string", "description": "JSON object (as a string) with inspect fields. Required: node_id (str — the node ID to inspect, e.g. 'dv_0010'). Optional: view (str — one of 'recall' (default), 'deep', or 'edges'; controls the shape of returned data), dream_mode (bool — if True, skips the recall-refresh side effect and importance-score boost; use during maintenance / dream-cycle inspection, default False), include_superseded (bool — if True, include neighbors whose is_current=0 in topology and neighbor lists; default False).", "required": True},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with inspect fields. Required: node_id (str — the node ID to inspect, e.g. 'dv_NNNN'). Optional: view (str — one of 'recall' (default), 'deep', or 'edges'; controls the shape of returned data), dream_mode (bool — if True, skips the recall-refresh side effect and importance-score boost; use during maintenance / dream-cycle inspection, default False), include_superseded (bool — if True, include neighbors whose is_current=0 in topology and neighbor lists; default False).", "required": True},
         },
     },
     "engram_query": {
@@ -122,7 +122,7 @@ TOOL_SCHEMAS = {
             "Chained-call pattern: subgraph → spot interesting node → engram_inspect that node → subgraph from there."
         ),
         "parameters": {
-            "payload_json": {"type": "string", "description": "JSON object (as a string) with get_subgraph fields. Required: node_id (str — root node to explore, e.g. 'dv_0686'). Optional: depth (int — how many hops to traverse from root, default 2), direction (str — 'up' (toward evidence/sources), 'down' (toward derivations that cite this), or 'both' (default)), view (str — 'recall' (default, topology + hop-graduated summaries) or 'edges' (topology only; 'deep' is rejected)), dream_mode (bool — if True, skip recall_refresh on neighbour nodes; default False).", "required": True},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with get_subgraph fields. Required: node_id (str — root node to explore, e.g. 'dv_NNNN'). Optional: depth (int — how many hops to traverse from root, default 2), direction (str — 'up' (toward evidence/sources), 'down' (toward derivations that cite this), or 'both' (default)), view (str — 'recall' (default, topology + hop-graduated summaries) or 'edges' (topology only; 'deep' is rejected)), dream_mode (bool — if True, skip recall_refresh on neighbour nodes; default False).", "required": True},
         },
     },
     "engram_derive": {
@@ -356,7 +356,7 @@ class EngramClient:
 
         # Redirect ALL module-level paths via the centralized function.
         # This guarantees every path constant (including any newly added ones)
-        # points to the sandbox directory. Manual patching is fragile — ls_0004
+        # points to the sandbox directory. Manual patching is fragile — the test-isolation lesson
         # documents a contamination incident caused by missing one path.
         if resolved_dir:
             _server._configure_paths(resolved_dir)
@@ -674,7 +674,7 @@ if __name__ == "__main__":
 
         r = client.call("engram_add_observation", {
             "payload_json": json.dumps({
-                "evidence_id": "ev_0001",
+                "evidence_id": "ev_NNNN",
                 "quoted_text": "Gold fell 9.6%",
                 "interpretation": "Worst weekly decline in 15 years",
                 "claim": "Gold fell 9.6% in the week ending March 20, 2026",

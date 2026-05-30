@@ -3,7 +3,7 @@
 
 Reads the append-only text log written by the engram-deference-detector-stop
 hook (~/.engram/deference-detector.log) and reports per-fire rates over time
-so the qu_0242 longitudinal validation thread (~30-day window) has a
+so the qu_NNNN longitudinal validation thread (~30-day window) has a
 queryable view of the wait-for-approval reflex's trajectory.
 
 Usage:
@@ -16,7 +16,7 @@ Log format (two line shapes):
   No-hit fires: [TS] Scanned: 0 hits  (also: descriptive variants)
 
 The no-hit "heartbeat" form was added 2026-05-07 alongside the stdin-based
-JSONL-flush-race fix in the hook (ob_1540 / ls_0029). Entries logged BEFORE
+JSONL-flush-race fix in the hook (ob_NNNN / ls_NNNN). Entries logged BEFORE
 2026-05-07 only contain hit lines, so per-fire rates are only computable
 from data on/after 2026-05-07. For older windows, the script still reports
 absolute hit counts.
