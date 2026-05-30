@@ -149,6 +149,12 @@ PROTECTED_TOOLS = {
     "mcp__engram__engram_lesson_register_incident": {
         "payload_json",
     },
+    # Single-payload from the start (PR #434). New canonical tool for exemplar
+    # registration (lessons AND cornerstones); engram_lesson_register_incident
+    # is its backward-compat alias.
+    "mcp__engram__engram_register_exemplar": {
+        "payload_json",
+    },
     # Migrated to single-payload signature in wave 2b (PR #66) — see comment
     # on engram_report_feeling above for the corruption risk this prevents.
     "mcp__engram__engram_link_about": {
