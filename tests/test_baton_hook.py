@@ -17,12 +17,15 @@ Each test invokes the hook as a subprocess with a fake ENGRAM_HOME +
 fake BATON_PROJECTS_DIR to run end-to-end filesystem path.
 """
 
+import importlib
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -383,3 +386,228 @@ def test_age_formatting_shown(engram_home, projects_dir):
     assert "PR-950" in ctx
     # Age should be present (h ago / min ago pattern)
     assert "ago" in ctx
+
+
+# ---------------------------------------------------------------------------
+# Module-level loader helper (used by auto-archive tests below)
+# ---------------------------------------------------------------------------
+
+def _load_hook_module(engram_home: Path, projects_dir: Path):
+    """Import the hook as a live module with env vars patched to tmp dirs."""
+    spec = importlib.util.spec_from_file_location(
+        "engram_baton_prompt_hook", HOOK_PATH
+    )
+    mod = importlib.util.module_from_spec(spec)
+    with patch.dict(os.environ, {
+        "ENGRAM_HOME": str(engram_home),
+        "BATON_PROJECTS_DIR": str(projects_dir),
+    }):
+        spec.loader.exec_module(mod)
+    return mod
+
+
+# ---------------------------------------------------------------------------
+# Tests 13–17: Auto-archive on MERGED detection
+# ---------------------------------------------------------------------------
+
+class TestAutoArchiveOnMerged:
+    """Auto-archive PR-batons when live GitHub status is MERGED."""
+
+    # ------------------------------------------------------------------
+    # Test 13: triggers baton close when live status is MERGED
+    # ------------------------------------------------------------------
+
+    def test_auto_archive_pr_baton_when_merged(self, engram_home, projects_dir):
+        """baton close is called when a PR-baton's live status returns MERGED."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-1100",
+            turn="borges",
+            status="in-progress",
+            turn_reason="fix pushed, awaiting merge",
+        )
+
+        mod = _load_hook_module(engram_home, projects_dir)
+
+        with patch.dict(os.environ, {
+            "ENGRAM_HOME": str(engram_home),
+            "BATON_PROJECTS_DIR": str(projects_dir),
+        }):
+            with patch.object(mod, "_fetch_pr_status", return_value="MERGED"):
+                with patch.object(mod, "subprocess") as mock_subproc:
+                    # subprocess.run is called for baton close; ensure it
+                    # doesn't raise so the hook completes.
+                    mock_subproc.run.return_value = type(
+                        "CompletedProcess", (), {"returncode": 0}
+                    )()
+                    mod.main()
+
+        # Verify baton close was called exactly once with the expected args
+        # (assert_called_once_with also catches accidental double-fire regressions
+        # — _fetch_pr_status is patched so no subprocess.run for gh is invoked;
+        # the only subprocess.run in this code path is the baton close call.)
+        mock_subproc.run.assert_called_once_with(
+            ["baton", "close", "PR-1100", "--status", "merged"],
+            capture_output=True,
+            text=True,
+            timeout=mod._GH_TIMEOUT,
+        )
+
+    # ------------------------------------------------------------------
+    # Test 14: no baton close when live status is OPEN
+    # ------------------------------------------------------------------
+
+    def test_skip_archive_pr_baton_when_open(self, engram_home, projects_dir):
+        """baton close is NOT called when the live status is OPEN."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-1200",
+            turn="borges",
+            status="in-review",
+            turn_reason="needs review",
+        )
+
+        mod = _load_hook_module(engram_home, projects_dir)
+
+        baton_close_calls = []
+
+        def _fake_run(args, **kwargs):
+            if args[:2] == ["baton", "close"]:
+                baton_close_calls.append(args)
+            return type("CompletedProcess", (), {"returncode": 0})()
+
+        with patch.dict(os.environ, {
+            "ENGRAM_HOME": str(engram_home),
+            "BATON_PROJECTS_DIR": str(projects_dir),
+        }):
+            with patch.object(mod, "_fetch_pr_status", return_value="OPEN"):
+                with patch.object(mod, "subprocess") as mock_subproc:
+                    mock_subproc.run.side_effect = _fake_run
+                    mod.main()
+
+        assert baton_close_calls == [], (
+            "baton close must not be called when live status is OPEN"
+        )
+
+    # ------------------------------------------------------------------
+    # Test 15: no baton close for project-anchor batons (project/N)
+    # ------------------------------------------------------------------
+
+    def test_skip_archive_project_baton(self, engram_home, projects_dir):
+        """baton close is NOT called for project/N batons, even if MERGED-like."""
+        _write_config(engram_home, "borges")
+        # Use a non-PR-N project_id so _PR_ID_RE does not match
+        _write_project(
+            projects_dir, "pool-42",
+            turn="borges",
+            status="in-review",
+            turn_reason="pool work",
+        )
+
+        mod = _load_hook_module(engram_home, projects_dir)
+
+        baton_close_calls = []
+
+        def _fake_run(args, **kwargs):
+            if args[:2] == ["baton", "close"]:
+                baton_close_calls.append(args)
+            return type("CompletedProcess", (), {"returncode": 0})()
+
+        with patch.dict(os.environ, {
+            "ENGRAM_HOME": str(engram_home),
+            "BATON_PROJECTS_DIR": str(projects_dir),
+        }):
+            # Even if we somehow get MERGED back (no anchor resolves for pool-42,
+            # so _fetch_pr_status won't actually be called), ensure the guard holds.
+            with patch.object(mod, "_fetch_pr_status", return_value="MERGED"):
+                with patch.object(mod, "subprocess") as mock_subproc:
+                    mock_subproc.run.side_effect = _fake_run
+                    mod.main()
+
+        assert baton_close_calls == [], (
+            "baton close must not be called for non-PR-N project IDs"
+        )
+
+    # ------------------------------------------------------------------
+    # Test 16: subprocess failure does not crash the hook
+    # ------------------------------------------------------------------
+
+    def test_archive_subprocess_failure_does_not_crash_hook(
+        self, engram_home, projects_dir
+    ):
+        """If baton close subprocess raises, hook completes normally."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-1300",
+            turn="borges",
+            status="in-review",
+            turn_reason="awaiting merge",
+        )
+
+        mod = _load_hook_module(engram_home, projects_dir)
+
+        def _exploding_run(args, **kwargs):
+            if args[:2] == ["baton", "close"]:
+                raise OSError("baton not found")
+            return type("CompletedProcess", (), {"returncode": 0})()
+
+        captured_output = []
+
+        def _fake_print(data):
+            captured_output.append(data)
+
+        with patch.dict(os.environ, {
+            "ENGRAM_HOME": str(engram_home),
+            "BATON_PROJECTS_DIR": str(projects_dir),
+        }):
+            with patch.object(mod, "_fetch_pr_status", return_value="MERGED"):
+                with patch.object(mod, "subprocess") as mock_subproc:
+                    mock_subproc.run.side_effect = _exploding_run
+                    with patch("builtins.print", side_effect=_fake_print):
+                        # Should not raise despite OSError in baton close
+                        mod.main()
+
+        # Hook must have produced a JSON output (not crashed silently)
+        assert len(captured_output) == 1
+        response = json.loads(captured_output[0])
+        assert "hookSpecificOutput" in response
+        ctx = response["hookSpecificOutput"]["additionalContext"]
+        assert "PR-1300" in ctx
+
+    # ------------------------------------------------------------------
+    # Test 17: already-merged baton never reaches auto-archive (filter gate)
+    # ------------------------------------------------------------------
+
+    def test_archive_skipped_when_baton_already_merged(
+        self, engram_home, projects_dir
+    ):
+        """Baton with status==merged is excluded by CLOSED_STATUSES filter.
+
+        The auto-archive code path is never reached because _scan_my_batons
+        skips closed-status projects before they enter the rendering loop.
+        This test verifies the filter is the gate — not the b["status"] guard
+        in the auto-archive block — by confirming no closed baton surfaces.
+        """
+        _write_config(engram_home, "borges")
+        # Write a baton that is already merged — should be filtered out by
+        # _scan_my_batons before reaching the auto-archive check
+        _write_project(
+            projects_dir, "PR-1400",
+            turn="borges",
+            status="merged",
+            turn_reason="already closed",
+        )
+
+        mod = _load_hook_module(engram_home, projects_dir)
+
+        with patch.dict(os.environ, {
+            "ENGRAM_HOME": str(engram_home),
+            "BATON_PROJECTS_DIR": str(projects_dir),
+        }):
+            batons = mod._scan_my_batons("borges")
+
+        # CLOSED_STATUSES filter excludes merged batons entirely
+        assert batons == [], (
+            "Merged baton must be excluded by _scan_my_batons — "
+            "auto-archive code path never reached for already-closed batons"
+        )

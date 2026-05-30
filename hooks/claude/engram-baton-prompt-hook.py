@@ -512,11 +512,31 @@ def main() -> None:
 
         # Live GitHub status clause (best-effort; never blocks or raises)
         live_clause = ""
+        live_status = ""
         if gh_ok and github_anchor:
             try:
                 live_status = _get_live_status(github_anchor, cache)
                 if live_status:
                     live_clause = f" [{live_status}]"
+            except Exception:
+                pass
+
+        # Auto-archive: if a PR-baton's underlying PR is now MERGED, close the
+        # baton via `baton close <pid> --status merged`.  Conditions:
+        #   1. live_status == "MERGED"
+        #   2. project_id matches ^PR-\d+$ (PR-batons only; not project/N)
+        #   3. baton's own status is not already "merged" (idempotency gate)
+        # Silently ignores any failure — degrade-to-silent same as gh calls.
+        # Does NOT change the rendered output for this prompt; the [MERGED]
+        # clause still appears.  Next prompt scan will exclude the closed baton.
+        if live_status == "MERGED" and _PR_ID_RE.match(b["project_id"]) and b["status"] != "merged":
+            try:
+                subprocess.run(
+                    ["baton", "close", b["project_id"], "--status", "merged"],
+                    capture_output=True,
+                    text=True,
+                    timeout=_GH_TIMEOUT,
+                )
             except Exception:
                 pass
 
