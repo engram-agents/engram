@@ -253,17 +253,13 @@ RETRY_OUTPUT="$COHORT_DIR/retry_output_attempt_${ATTEMPT}.json"
 
 **Dispatch step (Claude tool call — not shell):** Build the retry prompt and dispatch one retry batch-summary fairy:
 
-```
-retry_prompt = _build_retry_prompt(
-    retry_payload_path="$COHORT_DIR/retry_payload.json",
-    output_path=RETRY_OUTPUT,
-    failures=<list from failures.json>,
-)
-Agent(
-    subagent_type="engram-batch-summary-fairy",
-    prompt=retry_prompt,
-)
-```
+1. Build the retry prompt by calling `_build_retry_prompt` with:
+   - `retry_payload_path`: `"$COHORT_DIR/retry_payload.json"`
+   - `output_path`: `RETRY_OUTPUT`
+   - `failures`: the list of failure dicts from `failures.json`
+2. Use the `Agent` tool with:
+   - `subagent_type`: `"engram-batch-summary-fairy"`
+   - `prompt`: the retry prompt from step 1
 
 The fairy Reads `retry_payload.json` (nodes with `previous_error` fields) and Writes its output to `RETRY_OUTPUT`. Wait for the fairy to complete before proceeding.
 

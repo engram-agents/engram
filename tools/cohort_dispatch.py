@@ -308,6 +308,15 @@ def cmd_verify_in(args: argparse.Namespace) -> int:
       0 — all checks pass
       1 — one or more checks failed (structured JSON error to stdout)
       2 — missing cohort dir or manifest
+
+    Known limitations:
+        - Whitespace normalization: only strips leading/trailing whitespace.
+          A node's claim re-saved with internal whitespace normalization
+          (collapsed newlines/double-spaces) fires a false-positive
+          integrity-check failure. Operator regenerates the cohort to recover.
+        - Race window: integrity check is at verify-in time; fairy dispatch
+          fires later. A retraction in the verify-in → dispatch window is
+          still possible. Window is narrower than pre-verify-in but non-zero.
     """
     out_dir = Path(args.out)
     if not out_dir.exists():
@@ -921,7 +930,7 @@ def cmd_incorporate_retry(args: argparse.Namespace) -> int:
         "still_retryable": len(still_failing),
         "unfixable": len(unfixable_items),
         "final_payload_path": str(final_payload_path),
-        "retry_payload_path": str(retry_payload_path),
+        "retry_payload_path": str(retry_payload_path) if retry_payload_path.exists() else None,
         "unfixable_path": str(unfixable_path),
     }, indent=2))
     return 0

@@ -37,6 +37,7 @@ Covers:
 
   Dispatch prompt size regression:
     27. _build_initial_prompt returns a short string (<1000 chars) regardless of payload size.
+    28. _build_retry_prompt stays under bounded ceiling (15 × max-error items).
 """
 
 from __future__ import annotations
@@ -59,7 +60,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from tools.cohort_dispatch import main as dispatch_main  # noqa: E402
-from tools.cohort_dispatch import _parse_agent_output, _build_initial_prompt  # noqa: E402
+from tools.cohort_dispatch import _parse_agent_output, _build_initial_prompt, _build_retry_prompt  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -1087,4 +1088,44 @@ def test_build_initial_prompt_is_short():
     )
     # Must mention both paths
     assert fake_payload_path in prompt, "Prompt must reference the input payload path"
+    assert fake_output_path in prompt, "Prompt must reference the output path"
+
+
+# ---------------------------------------------------------------------------
+# Test 28: retry prompt size regression
+# ---------------------------------------------------------------------------
+
+
+def test_build_retry_prompt_bounded():
+    """Worst-case retry prompt stays under bounded ceiling.
+
+    The retry path includes failure-count overhead (node_id + error +
+    previous_error per item), so its upper bound is looser than the
+    initial prompt's. This test guards the parent-never-embeds-bulk-
+    content property against future _build_retry_prompt refactors.
+
+    Ceiling rationale: 15 failures × ~219 chars each (node_id ~7 chars +
+    previous_error 200 chars + per-item markup) + 14 separators + ~450 chars
+    of static template overhead ≈ 4519 chars measured. Ceiling of 6000 gives
+    ~33% headroom above the realistic worst-case while still catching a
+    regression where _build_retry_prompt accidentally embeds bulk content.
+    """
+    fake_retry_payload_path = "/some/cohort/retry_payload.json"
+    fake_output_path = "/some/cohort/retry_output_attempt_1.json"
+    fakes = [
+        {"node_id": f"ob_{i:04d}", "error": "X" * 200, "previous_error": "Y" * 200}
+        for i in range(15)
+    ]
+    prompt = _build_retry_prompt(
+        retry_payload_path=fake_retry_payload_path,
+        output_path=fake_output_path,
+        failures=fakes,
+    )
+    assert len(prompt) < 6000, (
+        f"Retry prompt too large: {len(prompt)} chars — "
+        f"expected < 6000 (no inline bulk-content embedding). "
+        f"First 200 chars: {prompt[:200]!r}"
+    )
+    # Must mention both paths
+    assert fake_retry_payload_path in prompt, "Prompt must reference the retry payload path"
     assert fake_output_path in prompt, "Prompt must reference the output path"
