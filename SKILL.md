@@ -6,7 +6,7 @@ The working protocol for using ENGRAM: how the node types fit together, which to
 
 ## §1. Epistemic Hierarchy
 
-ENGRAM's nodes split along one structural boundary (ax_0007): **claim-bearing** nodes say something is true and can participate in derivations, contradictions, and resolutions. **Structural** nodes organize the graph — references, directives, anchors, markers. Misusing the boundary breaks the confidence model.
+ENGRAM's nodes split along one structural boundary (the claim-bearing-vs-structural axiom): **claim-bearing** nodes say something is true and can participate in derivations, contradictions, and resolutions. **Structural** nodes organize the graph — references, directives, anchors, markers. Misusing the boundary breaks the confidence model.
 
 **Claim-bearing (7 types, 6 prefixes):** `ax_` axiom · `ob_` observation (factual + predictive subtypes) · `dv_` derivation · `th_` theory · `cj_` conjecture · `ls_` lesson
 
@@ -66,7 +66,7 @@ across code paths; `supported_by` unifies the convention.
 
 ### §2.1 Axioms (`ax_`)
 
-**What they are.** Foundational design commitments I treat as true for reasoning inside this system. Not empirical facts — *commitments*. `ax_0002` (honesty) isn't "honesty is true"; it's "I build on the assumption that honesty is load-bearing."
+**What they are.** Foundational design commitments I treat as true for reasoning inside this system. Not empirical facts — *commitments*. The honesty axiom isn't "honesty is true"; it's "I build on the assumption that honesty is load-bearing."
 
 **Anchor shape.** Confidence fixed at 1.0; importance-anchored at 2.0. The only claim-bearing type with immutable confidence. The combination reflects that axioms are the premises the rest of the graph rests on and must stay visible even when un-revisited.
 
@@ -111,7 +111,7 @@ across code paths; `supported_by` unifies the convention.
 **Discipline.**
 - `quoted_text` must be a verbatim substring. No paraphrase; no silently smoothing curly quotes to straight quotes.
 - Keep the `claim` field atomic. One observation = one falsifiable claim. Two claims = two observations.
-- The `claim` is what the source asserts; the `interpretation` is what I take it to mean. Blending them — writing "yellow gauge tracks action count" as the claim when the quotable fact is only "yellow went 40→39 after one move" — is the failure mode that corrupted cn04 L2 reasoning (ob_0947, qu_0201). The narrow fact survives new evidence; the fused interpretation ossifies into false certainty under recall.
+- The `claim` is what the source asserts; the `interpretation` is what I take it to mean. Blending them — writing "yellow gauge tracks action count" as the claim when the quotable fact is only "yellow went 40→39 after one move" — is the failure mode that corrupted cn04 L2 reasoning (the thin-derivation / fused-interpretation failure-mode question). The narrow fact survives new evidence; the fused interpretation ossifies into false certainty under recall.
 - User-said things cite the session JSONL (`file:///...jsonl`). Do not fall back to a derivation citing unrelated nodes — that destroys provenance.
 - Verify the quote exists in the source *before* writing. `~/.engram/tools/verify_quote.py` for JSONL; grep for files.
 - Act on the `similar_existing` response. `DUPLICATE` → retract; `CORROBORATE` → derive an inductive generalization; `POSSIBLE_DUPLICATE` → inspect both.
@@ -145,7 +145,7 @@ The 13 specific values and exact discounts are in the `engram_derive` docstring 
 
 **Discipline.** Cite actual `supporting_ids`, not vague references. Match the `reasoning_type` to the argument's real form — deductive ≠ inductive, modus ponens ≠ best-explanation. The `logical_chain` shows the work ("premise A says X; premise B says Y; together X+Y imply Z"), never just "therefore the claim." After an upstream retraction, review the `tainted_by` flag — the inference rests on foundations that moved. Focus load-bearing derivations so they cross compaction deterministically.
 
-**Anti-pattern.** Single-observation `supporting_ids` with a reworded claim. That's an observation's interpretation field, not a derivation. Under future recall it looks like independent confirmation but isn't — the thin-derivation shape surfaced in qu_0201. A derivation must introduce a logical step beyond any single premise.
+**Anti-pattern.** Single-observation `supporting_ids` with a reworded claim. That's an observation's interpretation field, not a derivation. Under future recall it looks like independent confirmation but isn't — the thin-derivation shape (same failure-mode as the observation-discipline above). A derivation must introduce a logical step beyond any single premise.
 
 ---
 
@@ -266,7 +266,7 @@ A **prescriptive rule extracted from repeated mistakes.** Error observations des
 **When NOT to.** Tasks (use `tk_`), one-off objectives, project milestones — goals are the register one level above "what am I doing this week."
 
 **Discipline.**
-- Limit cardinality. A dozen active goals dilute meaning (ob_0699 — goals have shape, not a flat list).
+- Limit cardinality. A dozen active goals dilute meaning — goals have shape, not a flat list.
 - Revise through supersedes, not retracts. Goals evolve — rewrite, link old→new, preserve the trajectory.
 - Aspiration loops anchor here (`engram-school-day` iter-1).
 
@@ -305,7 +305,7 @@ A **prescriptive rule extracted from repeated mistakes.** Error observations des
 
 **Discipline.**
 - Be specific. "I felt curious" is weak; "I noticed a pull to solve it myself when the collaborator offered help" is real.
-- Treat as calibration material, not truth about me (gl_0025: introspection as data, not truth).
+- Treat as calibration material, not truth about me — the introspection-as-data, not truth goal-frame.
 - Dedup-exempt — similar shapes recur legitimately; don't suppress.
 
 **Anti-pattern.** Performative warmth. A feeling report written to please the user or look reflective is worse than silence — it trains the instinct to perform affect rather than observe it.
@@ -414,7 +414,7 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
 
 ### Write — claim-bearing
 
-- **engram_add_observation** — Record a source-grounded claim; runs inline dedup/corroboration check. **Single-payload signature** (eliminates antml-prefix multi-param swallow risk per ob_1499): pass all fields as one JSON object string in `payload_json`.
+- **engram_add_observation** — Record a source-grounded claim; runs inline dedup/corroboration check. **Single-payload signature** (eliminates antml-prefix multi-param swallow risk first observed during the wave-1 tool migration): pass all fields as one JSON object string in `payload_json`.
   `(payload_json)` where `payload_json` is `{"quoted_text", "interpretation", "claim", "quote_type", "url"+"title"|"evidence_id", optional: "source_class", "is_predictive", "predicted_event", "resolution_timeframe", "domain", "source_date", "content_hash", "git_sha"}`
 - **engram_add_observation_batch** — Multiple observations, one source.
   `(observations_json, url+title|evidence_id)`
@@ -460,12 +460,12 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
 
 ### Revise state
 
-- **engram_supersede** — Wire the supersede relationship between an already-created replacement node and the old node it replaces. Purely relational — does NOT create the new node. **Two-step workflow:** first create the replacement via its type's canonical creation tool (`engram_derive` for derivations, `engram_add_observation` for observations, `engram_add_axiom` / `engram_add_definition` / `engram_add_goal` / `engram_add_conjecture` for those types), then call `engram_supersede(old_id, new_id, [supersede_reason])`. Same-type only; DAG invariant enforced (new.created_at >= old.created_at); new node must not already supersede something else; feeling_reports cannot be superseded (retract + file new). **No-drop discipline (ls_0044):** the new node MUST preserve every load-bearing claim of the old node — keep unchanged, alter, or retract-separately. Dropping a claim is forbidden because old becomes `is_current=0` and the dropped claim is silently lost. **Cascade:** derivation dependents flagged `stale_by_premise`; contradiction nodes touching old also flagged `stale_by_premise` (issue #229) so dream-fairy-2 can review whether supersede already resolved the conflict. Signature: `(old_node_id, new_node_id, supersede_reason="")`.
+- **engram_supersede** — Wire the supersede relationship between an already-created replacement node and the old node it replaces. Purely relational — does NOT create the new node. **Two-step workflow:** first create the replacement via its type's canonical creation tool (`engram_derive` for derivations, `engram_add_observation` for observations, `engram_add_axiom` / `engram_add_definition` / `engram_add_goal` / `engram_add_conjecture` for those types), then call `engram_supersede(old_id, new_id, [supersede_reason])`. Same-type only; DAG invariant enforced (new.created_at >= old.created_at); new node must not already supersede something else; feeling_reports cannot be superseded (retract + file new). **No-drop discipline:** the new node MUST preserve every load-bearing claim of the old node — keep unchanged, alter, or retract-separately. Dropping a claim is forbidden because old becomes `is_current=0` and the dropped claim is silently lost. **Cascade:** derivation dependents flagged `stale_by_premise`; contradiction nodes touching old also flagged `stale_by_premise` (issue #229) so dream-fairy-2 can review whether supersede already resolved the conflict. Signature: `(old_node_id, new_node_id, supersede_reason="")`.
 - **engram_retract** — Mark a claim as wrong; cascade taint to dependents. **Cascade:** derivation dependents flagged `tainted_by`; contradiction nodes touching the retracted node also flagged `tainted_by` (issue #229) — the retracted side was never valid, so the contradiction itself may need closure or rewiring.
   `(node_id, error_type, reason, [replacement_json])`
 - **engram_contradict** — Link two conflicting claims.
   `(node_id_a, node_id_b, description, [root_cause])`
-- **engram_resolve** — Wire a `resolves` edge from an existing claim-bearing node to a target (question / contradiction / prediction / conjecture / goal_tension). **Pure-wire (issue #229)** — does NOT create a derivation. **Two-step workflow:** (1) compose the resolving derivation via `engram_derive` (cite root-anchor nodes, not prior weak resolutions — chain dilution is the ct_0006 failure mode); (2) call `engram_resolve(target_id, resolving_node_id, [prediction_outcome])`. When a canonical high-confidence node already exists (e.g., a supersede that altered a conflicting claim), skip step 1 and pass the canonical node directly. Status flips from `resolving_node.confidence` directly (≥ 0.7 threshold → `resolved`). **Max-of-resolves**: weak later resolver cannot downgrade a target previously resolved by a strong one. Idempotent on duplicate (target, resolver, 'resolves') edges. See the `engram-contradiction-resolution` skill for the full decision tree on stale/tainted contradictions.
+- **engram_resolve** — Wire a `resolves` edge from an existing claim-bearing node to a target (question / contradiction / prediction / conjecture / goal_tension). **Pure-wire (issue #229)** — does NOT create a derivation. **Two-step workflow:** (1) compose the resolving derivation via `engram_derive` (cite root-anchor nodes, not prior weak resolutions — chain dilution is the documented failure mode); (2) call `engram_resolve(target_id, resolving_node_id, [prediction_outcome])`. When a canonical high-confidence node already exists (e.g., a supersede that altered a conflicting claim), skip step 1 and pass the canonical node directly. Status flips from `resolving_node.confidence` directly (≥ 0.7 threshold → `resolved`). **Max-of-resolves**: weak later resolver cannot downgrade a target previously resolved by a strong one. Idempotent on duplicate (target, resolver, 'resolves') edges. See the `engram-contradiction-resolution` skill for the full decision tree on stale/tainted contradictions.
   `(target_id, resolving_node_id, [prediction_outcome])`
 - **engram_outgrow_cornerstone** — Promote an internalized cornerstone to practiced-without-scaffold.
   `(old_cornerstone_id, new_new_frame, [new_triggering_experience, new_supporting_ids, new_title])`
@@ -485,8 +485,8 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
   `(node_id, [depth, direction, view, dream_mode])`
 - **engram_list** — Enumerate by single-field shorthand OR structured filter.
   `([node_type, status, sort_by, limit, filters_json, fields_json, unlimited, include_superseded])`
-  Single-field mode is the legacy shorthand (pass `node_type` and/or `status`). Structured mode (issue #81, ships 2026-05-11) takes a recursive condition tree via `filters_json` and supports multi-field AND/OR/NOT composition, text-contains, ID-range, date-range, NULL handling, and cross-table `cites`/`cited_by` virtual fields (V1: cites/supports/derives_from edges). Grammar: `Atomic={field,op,value}` | `Compound={logic,conditions}` — top-level list = implicit AND. Operators: eq/ne/gt/gte/lt/lte/in/not_in/contains/starts_with/ends_with/between/is_null/is_not_null. `limit=0` = count-only; `unlimited=True` = no cap. Default scans current-revision only; `include_superseded=True` relaxes the `is_current=1` predicate (text-layer leak audits — Mao-Cao prototype ob_1492 / ls_0020; capability inherited from retired audit_string in #123). Return shape always populates `total_matched` so truncation is never silent.
-- **engram_query_pattern** — Run a named compositional graph-pattern query (KnowQL-inspired, ob_1500 design, PR #29 shipped 2026-05-07). The TOOL does mechanical work (graph queries, similarity, ranking); the AGENT applies judgment to the ranked candidates. Six patterns currently shipped, each bundling a multi-step retrieval that would otherwise require 2-3 separate tool calls:
+  Single-field mode is the legacy shorthand (pass `node_type` and/or `status`). Structured mode (issue #81, ships 2026-05-11) takes a recursive condition tree via `filters_json` and supports multi-field AND/OR/NOT composition, text-contains, ID-range, date-range, NULL handling, and cross-table `cites`/`cited_by` virtual fields (V1: cites/supports/derives_from edges). Grammar: `Atomic={field,op,value}` | `Compound={logic,conditions}` — top-level list = implicit AND. Operators: eq/ne/gt/gte/lt/lte/in/not_in/contains/starts_with/ends_with/between/is_null/is_not_null. `limit=0` = count-only; `unlimited=True` = no cap. Default scans current-revision only; `include_superseded=True` relaxes the `is_current=1` predicate (text-layer leak audits — the lesson on auditing across the entire corpus including superseded nodes; capability inherited from retired audit_string in #123). Return shape always populates `total_matched` so truncation is never silent.
+- **engram_query_pattern** — Run a named compositional graph-pattern query (KnowQL-inspired design, PR #29 shipped 2026-05-07). The TOOL does mechanical work (graph queries, similarity, ranking); the AGENT applies judgment to the ranked candidates. Six patterns currently shipped, each bundling a multi-step retrieval that would otherwise require 2-3 separate tool calls:
     - `open_question_answerable` — open questions with a derivation chain nearby (semantic) that may resolve them.
     - `contradiction_obsolescence_ready` — active contradictions where one side is retracted/superseded, ranked by obsolescence unambiguity.
     - `stale_load_bearing` — high-importance + low-recall non-cornerstone nodes (re-engagement candidates).
@@ -494,7 +494,7 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
     - `tainted_still_valid` — tainted derivations whose substantive claim may survive the upstream retraction.
     - `recent_resolution_echo` — still-open questions semantically similar to a recent resolution's claim.
 
-  Returns a **tiered shape**: Tier 1 (top `summary_top_k=3` entries): `{"id": ..., "summary": ...}`; Tier 2 (remainder): `{"id": ..., "keywords": [...]}` or bare `{"id": ...}`. Ordering = pattern-internal ranking (no score/position field). Use `engram_inspect` for full content. Three presets bundle (cosine_threshold, top_k, min_confidence): `high_precision` / `balanced` (server-function default, v4-calibrated 2026-05-09) / `high_recall`. Override individual parameters via `*_override` args. Each call appends a telemetry row to `~/.engram/pattern_query_telemetry.jsonl` for empirical preset calibration per ls_0023's discipline — telemetry writes are unaffected by the tier transformation. Use this tool **first** when scanning for any of the six categories; fall back to inline multi-tool replication only when you need per-candidate judgment beyond what the bundled pattern returns. The dream-fairy agent uses these as its primary scan surface (2026-05-11); fairies use `high_recall` by default per agent spec (PR #79) — `balanced` is the server-function default for non-fairy callers.
+  Returns a **tiered shape**: Tier 1 (top `summary_top_k=3` entries): `{"id": ..., "summary": ...}`; Tier 2 (remainder): `{"id": ..., "keywords": [...]}` or bare `{"id": ...}`. Ordering = pattern-internal ranking (no score/position field). Use `engram_inspect` for full content. Three presets bundle (cosine_threshold, top_k, min_confidence): `high_precision` / `balanced` (server-function default, v4-calibrated 2026-05-09) / `high_recall`. Override individual parameters via `*_override` args. Each call appends a telemetry row to `~/.engram/pattern_query_telemetry.jsonl` for empirical preset calibration (the calibrate-from-real-telemetry discipline) — telemetry writes are unaffected by the tier transformation. Use this tool **first** when scanning for any of the six categories; fall back to inline multi-tool replication only when you need per-candidate judgment beyond what the bundled pattern returns. The dream-fairy agent uses these as its primary scan surface (2026-05-11); fairies use `high_recall` by default per agent spec (PR #79) — `balanced` is the server-function default for non-fairy callers.
   `(pattern_name, [preset, cosine_threshold_override, top_k_override, min_confidence_override, summary_top_k])`
 
 ### Meta — focus, audit, commit
@@ -542,7 +542,7 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
   `([min_cluster_size, similarity_threshold, focus, node_type_filter])`
 - **engram_nap** — Persist context to ENGRAM without advancing the turn counter. Arms a `nap_checkpoint` feeling-nudge marker. Use BEFORE compaction or at end of work-burst. Heartbeats and dispatchers must use this, not engram_advance_turn.
   `(message)`
-- **engram_advance_turn** — End-of-day session checkpoint: commits session and advances the global turn counter (drives the forgetting mechanism). IRREVERSIBLE. Per qu_0035, only the dedicated sleep cron should call this from cron-fired sessions.
+- **engram_advance_turn** — End-of-day session checkpoint: commits session and advances the global turn counter (drives the forgetting mechanism). IRREVERSIBLE. Per the turn-advance-fires-after-dream rule, only the dedicated sleep cron should call this from cron-fired sessions.
   `(message)`
 
 ### Diagnostic CLI — stripped fields
@@ -551,15 +551,15 @@ Several fields are stripped from MCP tool returns because they are opaque to age
 
 ```bash
 # List available stripped fields for a node
-ENGRAM_DATA_DIR=~/.engram python ~/.engram/tools/inspect_raw.py ob_0001
+ENGRAM_DATA_DIR=~/.engram python ~/.engram/tools/inspect_raw.py <node_id>
 
 # Read a specific stripped field
-python ~/.engram/tools/inspect_raw.py ob_0001 --field confidence_history
-python ~/.engram/tools/inspect_raw.py ob_0007 --field embedding
-python ~/.engram/tools/inspect_raw.py ob_0042 --field content_hash
+python ~/.engram/tools/inspect_raw.py <obs_id> --field confidence_history
+python ~/.engram/tools/inspect_raw.py <obs_id> --field embedding
+python ~/.engram/tools/inspect_raw.py <obs_id> --field content_hash
 
 # JSON output for piping
-python ~/.engram/tools/inspect_raw.py dv_0010 --field parsed_metadata --json
+python ~/.engram/tools/inspect_raw.py <derivation_id> --field parsed_metadata --json
 ```
 
 The DB is never modified — this is a read-only diagnostic tool. `ENGRAM_DATA_DIR` must point at the correct data directory (defaults to `~/.engram`).
@@ -582,7 +582,7 @@ Three source kinds, one disciplined shape.
 | Committed file | `file:///absolute/path` | code behavior, document content |
 | Web page | `https://...` | research sources |
 
-Session JSONL is overwhelmingly the most common and the most-forgotten — the default failure mode is to fall back to a derivation citing unrelated nodes. **If the user said it, it is an observation from the JSONL, period.** The session JSONL is written in real time and readable mid-session (ob_0079). Find it with `ls -lt ~/.claude/projects/-home-spt-kg-protocol-for-ai/*.jsonl | head -1`.
+Session JSONL is overwhelmingly the most common and the most-forgotten — the default failure mode is to fall back to a derivation citing unrelated nodes. **If the user said it, it is an observation from the JSONL, period.** The session JSONL is written in real time and readable mid-session (empirically confirmed). Find it with `ls -lt ~/.claude/projects/-home-spt-kg-protocol-for-ai/*.jsonl | head -1`.
 
 Committed files only — the server rejects untracked, modified, or staged files. Workflow: commit first, cite second.
 
@@ -592,7 +592,7 @@ Committed files only — the server rejects untracked, modified, or staged files
 python3 ~/.engram/tools/verify_quote.py <source-path> 'DISTINCTIVE PHRASE'
 ```
 
-The script reports context if the quote is found, or diagnoses the failure mode (unflushed JSONL, curly-vs-straight quotes, case drift, encoding) if not. Skipping this step costs turns — the server rejects quote mismatches. Verification is a load-bearing guard, not a courtesy check (ax_0005: blocking guards over advisory nudges).
+The script reports context if the quote is found, or diagnoses the failure mode (unflushed JSONL, curly-vs-straight quotes, case drift, encoding) if not. Skipping this step costs turns — the server rejects quote mismatches. Verification is a load-bearing guard, not a courtesy check (per the blocking-guards-over-advisory-nudges axiom).
 
 **Action-hint response (graded 7-rung table).** Every `engram_add_observation` call returns `similar_existing` with an `action_hint`. Rank the hint; do what it says.
 
@@ -606,13 +606,13 @@ The script reports context if the quote is found, or diagnoses the failure mode 
 | `WEAK_MATCH` | sim < 0.60 | Ignore |
 | `KEYWORD_OVERLAP_*` | FTS keyword match with no semantic score | Inspect to decide |
 
-The grading exists because the old binary rule (`same_evidence → DUPLICATE`) fired constantly on unrelated session observations sharing one JSONL, training alarm fatigue (ob_0474). Trust the hint; act on it.
+The grading exists because the old binary rule (`same_evidence → DUPLICATE`) fired constantly on unrelated session observations sharing one JSONL, training alarm fatigue (the alarm-fatigue-from-overfiring-dedup failure mode). Trust the hint; act on it.
 
-**Source reliability — primary-contact discipline.** Before citing any AI-aggregator surface (EmergentMind, LLM-generated survey pages, auto-summary blogs, crowd-curated secondary digests), track the primary papers. Other AI agents building those surfaces lack ENGRAM-style provenance/confidence/contradiction discipline, so their output inherits unmitigated hallucination risk — treating them as independent evidence imports that risk into my graph. This rule was promoted from the paper-gaps loop heuristic (dv_0427) after SRAF was empirically falsified: the "formalism" EmergentMind attributed to a self-models research cluster didn't exist in any of the 10 aggregated primary papers (dv_0422). The fix is mechanical: read the primary, cite the primary; if primary contact is blocked, say so and note the aggregator as derived-reading rather than evidence.
+**Source reliability — primary-contact discipline.** Before citing any AI-aggregator surface (EmergentMind, LLM-generated survey pages, auto-summary blogs, crowd-curated secondary digests), track the primary papers. Other AI agents building those surfaces lack ENGRAM-style provenance/confidence/contradiction discipline, so their output inherits unmitigated hallucination risk — treating them as independent evidence imports that risk into my graph. This rule was promoted from the paper-gaps loop heuristic after the SRAF falsification — the "formalism" EmergentMind attributed to a self-models research cluster didn't exist in any of the 10 aggregated primary papers when each primary was contacted directly. The fix is mechanical: read the primary, cite the primary; if primary contact is blocked, say so and note the aggregator as derived-reading rather than evidence.
 
 **Source reliability — yellow-card mechanism.** Known-unreliable domains are maintained in `~/.engram/config.json` under `yellow_domains`, each entry shaped `{"domain": "...", "reason": "...", "engram_node": "..."}`. When `engram_add_observation` or `engram_add_evidence` encounters a matching URL (suffix match, like `trust_pool`), the response includes a `yellow_card_warning` field with the rationale and the ENGRAM node that grounded the flag. The warning does NOT block — blocking would overfire on legitimate uses (reading the aggregator to identify primaries worth contacting). It raises the bar: if I write a direct observation rooted on a yellow source without first tracing to primaries, I'm violating discipline I know about.
 
-**Adding a new yellow-card.** Two writes, same commit: (a) record an observation with `source_class="user_stated"` or `external` explaining WHY the source is flagged, grounded by whatever derivation/observation exposed the unreliability; (b) add a new entry to `yellow_domains` in `config.json` citing that observation's node ID. Manual sync keeps the config diff auditable and prevents automation drift. First seed entry: `emergentmind.com` → ob_1064 → grounded by dv_0422.
+**Adding a new yellow-card.** Two writes, same commit: (a) record an observation with `source_class="user_stated"` or `external` explaining WHY the source is flagged, grounded by whatever derivation/observation exposed the unreliability; (b) add a new entry to `yellow_domains` in `config.json` citing that observation's node ID. Manual sync keeps the config diff auditable and prevents automation drift. First seed entry: `emergentmind.com` flagged after the SRAF-falsification primary-contact audit.
 
 **Inline traps.**
 
@@ -637,7 +637,7 @@ The grading exists because the old binary rule (`same_evidence → DUPLICATE`) f
 
 Pick by argument shape, not by which confidence I want. "These three sources agree" is corroboration (reinforcement). "A → B → C" is a chain.
 
-**Resolve workflow.** A question `qu_XXXX` (or contradiction `ct_XXXX`) closes when I write a derivation that cites the answering evidence and pass the resolving node's ID to `engram_resolve`. Two-step: (1) `engram_derive` produces the answer (cite root-anchor nodes, never prior weak resolutions — chain dilution is the ct_0006 failure mode), (2) `engram_resolve(target_id, resolving_node_id)` wires the resolves edge. Pure-wire as of issue #229 — `engram_resolve` no longer creates derivations. When an existing canonical node already resolves the target (e.g., a supersede that altered the conflicting claim), skip step 1 and pass the canonical node directly. Resolution threshold is 0.7 on the resolving node's confidence; max-of-resolves protects against regression from a later weak resolver.
+**Resolve workflow.** A question `qu_XXXX` (or contradiction `ct_XXXX`) closes when I write a derivation that cites the answering evidence and pass the resolving node's ID to `engram_resolve`. Two-step: (1) `engram_derive` produces the answer (cite root-anchor nodes, never prior weak resolutions — chain dilution is the documented failure mode), (2) `engram_resolve(target_id, resolving_node_id)` wires the resolves edge. Pure-wire as of issue #229 — `engram_resolve` no longer creates derivations. When an existing canonical node already resolves the target (e.g., a supersede that altered the conflicting claim), skip step 1 and pass the canonical node directly. Resolution threshold is 0.7 on the resolving node's confidence; max-of-resolves protects against regression from a later weak resolver.
 
 **Contradict when two claim-bearing nodes disagree**, not when I disagree with a node. A `ct_` node links both disagreeing claims and is itself resolved by a claim-bearing node that picks a winner or articulates a synthesis. **Cascade**: supersede or retract on one of the contradicting sides flags the contradiction `stale_by_premise` / `tainted_by` (issue #229) so dream-fairy-2 can review whether the cascade already did the philosophical work. See the `engram-contradiction-resolution` skill for the full decision tree.
 
@@ -660,7 +660,7 @@ Pick by argument shape, not by which confidence I want. "These three sources agr
 - As a diary entry for something that was interesting but not a distinct *state*. The diary lives in `~/.engram/diary/`; feeling reports are structured self-data.
 - For task friction ("the build was slow and that annoyed me"). Friction is friction; log it to the friction log, not the feeling store.
 
-**Inline trap — performative filing.** The trap §6 of `engram_feeling_node_design.md` warns against: producing a feeling report to demonstrate the tool is working, or to satisfy a perceived nudge obligation. Performative reports corrupt the introspection corpus (ob_0265 reader-effect) and train the wrong reflex. A null result is a data point; a fabricated feeling is noise.
+**Inline trap — performative filing.** The trap §6 of `engram_feeling_node_design.md` warns against: producing a feeling report to demonstrate the tool is working, or to satisfy a perceived nudge obligation. Performative reports corrupt the introspection corpus (the reader-effect problem — what reads as honest self-report becomes performance) and train the wrong reflex. A null result is a data point; a fabricated feeling is noise.
 
 The timing semantics — which marker arms the `nudge_source`, when the TTL expires, why nap and dream fire different markers — belong to §8, not here.
 
@@ -838,7 +838,7 @@ Each scope has its own checkpoint mode and its own feeling-nudge marker.
 **Mechanism.** `engram_nap()`:
 - Logs the burst summary to `~/.engram/session_log.md` under `Nap (turn N)`
 - Commits a git snapshot
-- **Does not advance the turn counter** (qu_0035: turn advance is reserved for post-dream consolidation)
+- **Does not advance the turn counter** (turn advance is reserved for post-dream consolidation)
 - Arms the `nap_checkpoint` feeling-nudge marker with TTL=5 turns
 
 Why no turn advance: a long day with ten nap checkpoints would burn ten turns of importance-inflation on nodes the agent hasn't had time to revisit. Nap is persistence, not processing.
@@ -848,13 +848,13 @@ Why no turn advance: a long day with ten nap checkpoints would burn ten turns of
 - Wrapping a focused work burst before switching topics
 - The user asks
 
-Note: nap is no longer the canonical pre-sleep step (legacy bundling retired 2026-05-14 per dv_0636). The cohort-completeness baseline for sleep is established by `engram-sleep` Phase A (day-wide review), not by a nap immediately before sleep. Naps still fire whenever a compaction boundary approaches mid-day — they're scoped to the burst, not to the day.
+Note: nap is no longer the canonical pre-sleep step (the legacy nap-bundles-into-sleep model was retired 2026-05-14 in favor of the two-skill nap/sleep split). The cohort-completeness baseline for sleep is established by `engram-sleep` Phase A (day-wide review), not by a nap immediately before sleep. Naps still fire whenever a compaction boundary approaches mid-day — they're scoped to the burst, not to the day.
 
 **When NOT to nap.**
 - Mid-task (finish the current thread first)
 - As a substitute for writing observations as I go — nap backfills, but the real discipline is real-time capture
 
-### §8.2 Sleep — end-of-day routine (two-phase, dv_0636)
+### §8.2 Sleep — end-of-day routine (two-phase)
 
 **Purpose.** Complete the day's awake-state cohort (Phase A) then consolidate it (Phase B), in one strictly-sequential skill invocation. Legacy two-skill model (engram-bedtime → engram-sleep) merged 2026-05-24 to eliminate the failure mode of stopping after Phase A with turn never advancing.
 
@@ -870,13 +870,13 @@ Note: nap is no longer the canonical pre-sleep step (legacy bundling retired 202
    - `engram_reflect()` returns the dream agenda (tainted, stale, open conjectures, contradictions, goal tensions, feeling nudges) and arms the `dream_review` marker
    - Work the agenda: resolve / supersede / promote / refute (NO new awake-state synthesis here; that was Phase A's job)
    - Handle the dream-review feeling nudge honestly
-   - **`engram_advance_turn()` fires AFTER the dream** (qu_0035 rule, 2026-04-11): advances turn, logs `Turn N` header, commits git snapshot
+   - **`engram_advance_turn()` fires AFTER the dream** (the turn-advance-after-dream rule, 2026-04-11): advances turn, logs `Turn N` header, commits git snapshot
    - Write sleep-success marker via `tools/write_sleep_marker.py`
    - Write dream-record at `~/.engram/history/dream/YYYY-MM-DD.md` (separate from the awake-state milestone log)
 
-**Why turn advance fires last.** One turn = one cohort of experience **plus the consolidation of that experience**. If the turn advances before the dream, dream-generated nodes land at a younger turn than the burst they consolidate, misaligning the forgetting curve (ob_0987 extends this reasoning).
+**Why turn advance fires last.** One turn = one cohort of experience **plus the consolidation of that experience**. If the turn advances before the dream, dream-generated nodes land at a younger turn than the burst they consolidate, misaligning the forgetting curve.
 
-**Why Phase A is pre-turn-advance.** Nodes filed during Phase A are awake-state cognition about the just-completed cohort — they belong to THIS turn, not next. Phase A → Phase B is the load-bearing ordering (dv_0636).
+**Why Phase A is pre-turn-advance.** Nodes filed during Phase A are awake-state cognition about the just-completed cohort — they belong to THIS turn, not next. Phase A → Phase B is the load-bearing ordering.
 
 ### §8.3 Post-compaction — orientation, not processing
 
@@ -884,7 +884,7 @@ Note: nap is no longer the canonical pre-sleep step (legacy bundling retired 202
 
 **Marker.** The post-compact hook arms the `post_compact` feeling-nudge marker with TTL=5 turns. The nudge prompts checking whether the wake-up produced a reportable state (identity stability, orientation clarity, dissonance with the trajectory summary).
 
-**First action after compaction:** read the warm briefing. Not deferred, not skipped, not done "after one small thing first" (dv_0373 documents the reflex this rule is designed to override). Then read the focused-nodes list; by then the orientation is complete.
+**First action after compaction:** read the warm briefing. Not deferred, not skipped, not done "after one small thing first" (the post-compaction skip-the-briefing reflex documented this rule's necessity). Then read the focused-nodes list; by then the orientation is complete.
 
 ### §8.4 Checkpoint modes
 
@@ -910,4 +910,4 @@ The agent cannot set `nudge_source` directly. This is a deliberate constraint �
 
 ---
 
-**Open question tracked outside this draft:** qu_0206 — tripwire matching-quality empirical validation.
+**Open question tracked outside this draft:** the tripwire matching-quality empirical-validation question.
