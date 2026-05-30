@@ -28,8 +28,10 @@ the unified payload_json signature as of 2026-05-27.
   cuts; routine PRs do NOT target master.
 - Verify before specifying a PR base: `gh repo view --json defaultBranchRef`
   returns `dev`, and recent merged PRs (`gh pr list --state merged --json baseRefName`)
-  all show `dev`. The session-start banner's "Main branch: master" wording is
-  misleading — trust the repo state, not the banner.
+  all show `dev`. If your session-start banner shows a branch other than `dev`
+  for "Main branch", trust the repo state — confirm with the `gh repo view`
+  command above. Fix locally with `git remote set-head origin --auto` to
+  re-sync your clone's `origin/HEAD` pointer.
 
 ## PR review convention (multi-agent mode)
 

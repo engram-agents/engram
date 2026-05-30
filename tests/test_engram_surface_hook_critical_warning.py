@@ -1,0 +1,175 @@
+"""Tests for the daemon-offline CRITICAL warning path in engram-surface-hook.py.
+
+Issue #356 follow-up: PR #347 added the CRITICAL warning when daemon is
+unreachable, but no test asserted the path fires + templates correctly.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import io
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ---------------------------------------------------------------------------
+# Helper: load the hook module (hyphenated filename)
+# ---------------------------------------------------------------------------
+
+
+def _load_hook_module():
+    """Import the surface hook as a module despite the hyphenated filename."""
+    hook_path = PROJECT_ROOT / "hooks" / "claude" / "engram-surface-hook.py"
+    spec = importlib.util.spec_from_file_location("engram_surface_hook", hook_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _make_hook_input(prompt: str = "hello, what's next?") -> str:
+    """Build a minimal JSON hook-input payload for sys.stdin."""
+    return json.dumps({"prompt": prompt})
+
+
+def _run_main_capture(hook, hook_input_json: str) -> str:
+    """Run hook.main() with mocked stdin; return the captured stdout text.
+
+    Patches query_daemon → None (daemon offline) and query_fts_fallback → {}
+    so the CRITICAL warning fires and the rest of main() degrades gracefully.
+    Catches SystemExit(0) which main() always raises on success.
+    Returns the raw text printed to stdout.
+    """
+    output_buf = io.StringIO()
+
+    with patch.object(hook, "query_daemon", return_value=None), \
+         patch.object(hook, "query_fts_fallback", return_value={}), \
+         patch("sys.stdin", io.StringIO(hook_input_json)), \
+         patch("sys.stdout", output_buf):
+        try:
+            hook.main()
+        except SystemExit:
+            pass
+
+    return output_buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Tests for get_user_name()
+# ---------------------------------------------------------------------------
+
+
+class TestGetUserName(unittest.TestCase):
+    """Unit tests for get_user_name() — the helper that supplies {user_name}
+    in the CRITICAL warning template."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_critical_test_")
+        self.hook = _load_hook_module()
+        # Override ENGRAM_HOME so config reads come from our tmp dir.
+        self.hook.ENGRAM_HOME = self.tmp
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_config(self, data: dict) -> None:
+        config_path = os.path.join(self.tmp, "config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    def test_user_name_renders_from_primary_user(self):
+        """config.json = {"primary_user": "Lei"} → get_user_name() returns "Lei"."""
+        self._write_config({"primary_user": "Lei"})
+        result = self.hook.get_user_name()
+        self.assertEqual(result, "Lei")
+
+    def test_fallback_when_primary_user_unset(self):
+        """config.json with no primary_user key → get_user_name() returns "the human"."""
+        self._write_config({})
+        result = self.hook.get_user_name()
+        self.assertEqual(result, "the human")
+
+    def test_fallback_when_config_absent(self):
+        """No config.json file in ENGRAM_HOME → get_user_name() returns "the human"."""
+        # setUp creates a clean temp dir with no config.json
+        result = self.hook.get_user_name()
+        self.assertEqual(result, "the human")
+
+    def test_fallback_when_primary_user_non_string(self):
+        """config.json = {"primary_user": 42} → str() coercion → returns "42".
+
+        Item 2 of issue #356: the str() wrap in get_user_name() ensures that
+        a truthy non-string value (e.g., integer 42) is returned as a string,
+        not the raw int. Without str(), the f-string would still render "42"
+        but the return type would be int — type-impure.
+        """
+        self._write_config({"primary_user": 42})
+        result = self.hook.get_user_name()
+        self.assertIsInstance(result, str, "get_user_name() must return str, not int")
+        self.assertEqual(result, "42")
+
+
+# ---------------------------------------------------------------------------
+# Integration test: CRITICAL warning fires when used_daemon=False
+# ---------------------------------------------------------------------------
+
+
+class TestCriticalWarningIntegration(unittest.TestCase):
+    """The ⚠️ ENGRAM CRITICAL warning fires in main() when used_daemon=False."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_critical_integration_test_")
+        # Write a config.json with primary_user set so the full template fires.
+        config_path = os.path.join(self.tmp, "config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump({"primary_user": "Lei"}, f)
+        # Load the hook and redirect ENGRAM_HOME to our temp dir.
+        self.hook = _load_hook_module()
+        self.hook.ENGRAM_HOME = self.tmp
+        self.hook.SOCKET_PATH = os.path.join(self.tmp, "recall-daemon.sock")
+        self.hook.KNOWLEDGE_DB_PATH = os.path.join(self.tmp, "knowledge.db")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_critical_text_fires_when_daemon_unreachable(self):
+        """CRITICAL warning fires and templates user_name when daemon returns None.
+
+        query_daemon is mocked to return None (simulates daemon offline).
+        The output must contain the CRITICAL warning header and "Notify Lei".
+        """
+        raw_output = _run_main_capture(self.hook, _make_hook_input())
+        self.assertTrue(
+            raw_output.strip(),
+            "main() produced no stdout — expected a JSON response with CRITICAL warning",
+        )
+        # Parse the JSON response
+        response = json.loads(raw_output.strip())
+        additional_context = (
+            response
+            .get("hookSpecificOutput", {})
+            .get("additionalContext", "")
+        )
+        self.assertIn(
+            "⚠️ ENGRAM CRITICAL",
+            additional_context,
+            "CRITICAL warning text must appear in additionalContext when daemon is offline",
+        )
+        self.assertIn(
+            "Notify Lei",
+            additional_context,
+            "CRITICAL warning must include 'Notify Lei' when primary_user is 'Lei'",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

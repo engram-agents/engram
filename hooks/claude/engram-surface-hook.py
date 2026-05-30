@@ -72,7 +72,7 @@ def get_user_name() -> str:
     try:
         with open(os.path.join(ENGRAM_HOME, "config.json"), "r", encoding="utf-8") as f:
             config = json.load(f)
-        return config.get("primary_user") or "the human"
+        return str(config.get("primary_user") or "the human")
     except (OSError, json.JSONDecodeError, AttributeError, TypeError):
         return "the human"
 
