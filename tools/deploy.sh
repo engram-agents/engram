@@ -720,7 +720,7 @@ if [[ -f "$SHARED_IA" && -f "$IA_SRC" ]]; then
         # Content drift detected.
         if [[ -w "$SHARED_IA" ]]; then
             cp "$IA_SRC" "$SHARED_IA"
-            chmod 0755 "$SHARED_IA"
+            [[ -O "$SHARED_IA" ]] && chmod 0755 "$SHARED_IA"   # owner-only: chmod needs ownership, cp already refreshed content
             echo "  ✓ Refreshed shared multi-agent ia → $SHARED_IA"
         else
             echo "  ⚠ Drift detected: $SHARED_IA differs from $IA_SRC but not writable by current user."
@@ -741,7 +741,7 @@ if [[ -f "$SHARED_BATON" && -f "$BATON_SRC" ]]; then
         # Content drift detected.
         if [[ -w "$SHARED_BATON" ]]; then
             cp "$BATON_SRC" "$SHARED_BATON"
-            chmod 0755 "$SHARED_BATON"
+            [[ -O "$SHARED_BATON" ]] && chmod 0755 "$SHARED_BATON"   # owner-only: chmod needs ownership, cp already refreshed content
             echo "  ✓ Refreshed shared multi-agent baton → $SHARED_BATON"
         else
             echo "  ⚠ Drift detected: $SHARED_BATON differs from $BATON_SRC but not writable by current user."

@@ -157,6 +157,8 @@ fetch bodies.
 tools/deploy.sh --yes
 ```
 
+**`--yes` is mandatory for an agent-run deploy, not optional.** Bare `tools/deploy.sh` opens an interactive confirm prompt; in a non-interactive shell (the agent's Bash tool) that prompt gets EOF, and `set -euo pipefail` turns the failed read into `exit 1`. The deploy bails — and a *partial* deploy is possible (the rsync can apply before the abort while `.deployed-version` does not write). Always pass `--yes` once you've reviewed the dry-run.
+
 Expected output shape (abbreviated):
 
 ```
