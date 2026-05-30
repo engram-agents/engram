@@ -599,6 +599,15 @@ DAG_EXEMPT_RELATIONS = frozenset(
     r for r, c in EDGE_CLASSIFICATIONS.items() if not c["dag_check"]
 )
 
+# Relations permitted for after-creation edge addition via engram_add_edge.
+# Derived from the addable_after_creation flag in EDGE_CLASSIFICATIONS.
+# Currently equals _REMOVABLE_EDGE_RELATIONS (about, exemplifies, serves,
+# subtask_of, tensions) — coincidental; PR 3 will diverge them by adding the
+# new relevance-marker relation. Do NOT collapse into a single constant.
+_ADDABLE_AFTER_CREATION_RELATIONS = frozenset(
+    r for r, c in EDGE_CLASSIFICATIONS.items() if c["addable_after_creation"]
+)
+
 VALID_ERROR_TYPES = {
     "fabricated_quote",   # quoted_text not in evidence source
     "wrong_citation",     # claim doesn't follow from the quote
@@ -10919,6 +10928,214 @@ def _remove_edge_impl(
             "source_id": source_id,
             "target_id": target_id,
             "relation": relation,
+        }
+        if cache_rebuild is not None:
+            result["cache_rebuild"] = cache_rebuild
+        return json.dumps(result)
+    finally:
+        conn.close()
+
+
+# Set of legitimate field names for the engram_add_edge payload.
+_ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
+
+
+# DESIGN INTENT — engram_add_edge
+# --------------------------------
+# Lightweight whitelist-scoped after-creation edge addition — the add-side
+# complement to engram_remove_edge (ob_2117). Closes the substrate gap where
+# adding non-cascade relational edges (e.g. relevance-marker edges, subtask
+# groupings) previously required engram-surgical or an engram_supersede call.
+#
+# Whitelist (safe to add): about, exemplifies, serves, subtask_of, tensions.
+# All are non-cascade, non-structural-commitment, non-provenance relations.
+#
+# BLOCKED (require node-add-time payload or dedicated mutation tool):
+#   - Cascade-bearing: derives_from, supported_by, supersedes, retracts
+#     (adding after creation would silently re-trigger or contradict cascades
+#     that already propagated at creation time)
+#   - Structural commitments: contradicts, resolves (record an epistemic
+#     stance; the stance must be established through the node's payload)
+#   - Provenance: cites (evidence linkage must exist at creation time; a
+#     post-hoc cites edge would orphan the provenance chain from its
+#     temporal context)
+#
+# Idempotency: no_op_already_exists is a successful return (not an error).
+# Safe to call defensively without a pre-check.
+#
+# Audit-logged: every successful addition writes to edit_history so mutation
+# tooling can trace the edge's origin post-hoc.
+#
+# DAG guard: fires today for `serves`, `subtask_of`, and `tensions` (all three
+# have dag_check=True AND addable_after_creation=True in EDGE_CLASSIFICATIONS).
+# It also protects any future addable relations that gain dag_check=True. The
+# guard enforces the temporal-DAG invariant (source newer than target) for any
+# dag_check relation that reaches the addable set.
+#
+# Single-payload signature.
+@mcp.tool(
+    name="engram_add_edge",
+    annotations={
+        "title": "Add a Non-Cascade Edge Between Nodes",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_add_edge(payload_json: str) -> str:
+    """Add a non-cascade edge between two existing nodes.
+
+    Whitelist-scoped (about, exemplifies, serves, subtask_of, tensions).
+    Cascade / structural / provenance edges blocked — those must be created
+    at node-add time (via the source node's payload) or via the dedicated
+    mutation tool (supersede / retract). Generic add-edge is only for
+    non-claim-bearing topological edges.
+
+    Idempotent: no_op_already_exists is a successful return.
+
+    Pass all fields as one JSON object string in payload_json.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            source_id (str, required): The source node of the edge.
+            target_id (str, required): The target node of the edge.
+            relation (str, required): The edge relation to add. Must be
+                one of the addable-whitelist relations above.
+
+    Returns:
+        JSON with `status`:
+          - 'created': edge did not exist, was inserted; audit-logged.
+          - 'no_op_already_exists': edge already existed; idempotent success.
+          - 'error': payload invalid, nodes missing, or relation not whitelisted.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _ADD_EDGE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ADD_EDGE_FIELDS)}"
+        })
+
+    return _add_edge_impl(**params)
+
+
+def _add_edge_impl(
+    source_id: str = "",
+    target_id: str = "",
+    relation: str = "",
+) -> str:
+    """Internal implementation — see engram_add_edge MCP tool for the public
+    payload schema. Kept callable with named kwargs for in-server callers.
+    """
+    if not source_id or not source_id.strip():
+        return json.dumps({"error": "source_id is required and cannot be empty."})
+    if not target_id or not target_id.strip():
+        return json.dumps({"error": "target_id is required and cannot be empty."})
+    if not relation or not relation.strip():
+        return json.dumps({"error": "relation is required and cannot be empty."})
+
+    if relation not in _ADDABLE_AFTER_CREATION_RELATIONS:
+        return json.dumps({
+            "error": (
+                f"Relation '{relation}' is not addable via engram_add_edge. "
+                f"Allowed: {sorted(_ADDABLE_AFTER_CREATION_RELATIONS)}. "
+                f"Cascade-bearing edges (derives_from, supported_by, supersedes, "
+                f"retracts), structural commitments (contradicts, resolves), "
+                f"and provenance (cites) are blocked from after-creation addition. "
+                f"Edges that participate in cascade semantics or carry structural "
+                f"epistemic stance must be created at node-add time via the "
+                f"source node's payload, or via the dedicated mutation tool."
+            )
+        })
+
+    conn = _get_db()
+    try:
+        source = conn.execute(
+            "SELECT id, type, created_at FROM nodes WHERE id = ?", (source_id,)
+        ).fetchone()
+        if not source:
+            return json.dumps({"error": f"Source node '{source_id}' not found."})
+        target = conn.execute(
+            "SELECT id, type, created_at FROM nodes WHERE id = ?", (target_id,)
+        ).fetchone()
+        if not target:
+            return json.dumps({"error": f"Target node '{target_id}' not found."})
+
+        # DAG guard: `serves`, `subtask_of`, and `tensions` all have dag_check=True
+        # AND addable_after_creation=True, so this guard fires today for those three.
+        # It also covers any future addable relations that gain dag_check=True.
+        # Convention (from startup check at _ensure_data_dir and engram_inspect):
+        # a violation is source.created_at < target.created_at — i.e. the source
+        # is OLDER than the target. Valid edges have source newer-or-equal.
+        classification = EDGE_CLASSIFICATIONS.get(relation, {})
+        if classification.get("dag_check", False):
+            if source["created_at"] < target["created_at"]:
+                return json.dumps({
+                    "error": (
+                        f"DAG-time invariant violation: source '{source_id}' "
+                        f"created_at {source['created_at']} < target '{target_id}' "
+                        f"created_at {target['created_at']}. Source must be created "
+                        f"at or after target for DAG-bearing relations. Use "
+                        f"engram-surgical if truly required."
+                    )
+                })
+
+        existing = conn.execute(
+            "SELECT id FROM edges WHERE source_id = ? AND target_id = ? AND relation = ?",
+            (source_id, target_id, relation),
+        ).fetchone()
+
+        if existing:
+            return json.dumps({
+                "status": "no_op_already_exists",
+                "source_id": source_id,
+                "target_id": target_id,
+                "relation": relation,
+                "message": (
+                    f"'{relation}' edge from {source_id} to {target_id} "
+                    f"already exists — idempotent no-op."
+                ),
+            })
+
+        created_at = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, ?, ?)",
+            (source_id, target_id, relation, created_at),
+        )
+
+        _log_edit(conn, "edge_added", source_id, source["type"], {
+            "target_id": target_id,
+            "target_type": target["type"],
+            "relation": relation,
+        })
+        conn.commit()
+
+        # Best-effort cache rebuild for the exemplifies side-effect surface.
+        # Outside the transaction so a JSON-write failure can't roll back the
+        # edge insert. Mirrors engram_remove_edge's pattern (server.py ~10907)
+        # — error_incidents.json is the hot-path cache the surface-hook scans
+        # every prompt for lesson tripwires, so it must stay in sync when an
+        # exemplifies edge is added too, not only on remove.
+        cache_rebuild = None
+        if relation == "exemplifies":
+            try:
+                cache_rebuild = _rebuild_incidents_cache()
+            except Exception as exc:
+                cache_rebuild = {"status": "error", "detail": str(exc)}
+
+        result = {
+            "status": "created",
+            "source_id": source_id,
+            "target_id": target_id,
+            "relation": relation,
+            "created_at": created_at,
         }
         if cache_rebuild is not None:
             result["cache_rebuild"] = cache_rebuild
