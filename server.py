@@ -495,6 +495,97 @@ VALID_RELATIONS = {
                     # same relation regardless of chronological order.
 }
 
+# Single-source-of-truth classification table for edge relations.
+# Every edge tool that asks "is this edge ...-able?" reads from here.
+# Adding a new relation: add a row here; derived constants auto-update.
+# See issue #510 for the full design + provenance.
+EDGE_CLASSIFICATIONS = {
+    "about": {
+        "cascade": False,
+        "dag_check": False,
+        "removable": True,
+        "addable_after_creation": True,
+        "provenance": False,
+    },
+    "cites": {
+        "cascade": False,
+        "dag_check": True,
+        "removable": False,    # provenance load-bearing; removal would orphan claims
+        "addable_after_creation": False,  # legacy dual-use; PR 3 introduces new relation for relevance-marking
+        "provenance": True,
+    },
+    "contradicts": {
+        "cascade": False,
+        "dag_check": False,    # advisory check exempts contradicts (ob_0485)
+        "removable": False,    # structural commitment; alters epistemic stance
+        "addable_after_creation": False,
+        "provenance": False,
+    },
+    "derives_from": {
+        "cascade": True,       # taint/stale propagation
+        "dag_check": True,
+        "removable": False,    # cascade-bearing
+        "addable_after_creation": False,
+        "provenance": False,
+    },
+    "exemplifies": {
+        "cascade": False,
+        "dag_check": False,    # advisory check exempts exemplifies (lesson edges, ob_1237)
+        "removable": True,
+        "addable_after_creation": True,
+        "provenance": False,
+    },
+    "resolves": {
+        "cascade": False,      # not a confidence-propagating edge
+        "dag_check": True,
+        "removable": False,    # structural commitment
+        "addable_after_creation": False,
+        "provenance": False,
+    },
+    "retracts": {
+        "cascade": True,       # cascade marker for downstream taint
+        "dag_check": True,
+        "removable": False,
+        "addable_after_creation": False,
+        "provenance": False,
+    },
+    "serves": {
+        "cascade": False,
+        "dag_check": True,
+        "removable": True,
+        "addable_after_creation": True,
+        "provenance": False,
+    },
+    "subtask_of": {
+        "cascade": False,
+        "dag_check": True,
+        "removable": True,
+        "addable_after_creation": True,
+        "provenance": False,
+    },
+    "supersedes": {
+        "cascade": True,
+        "dag_check": True,
+        "removable": False,    # structural mutation; use engram-surgical for emergencies
+        "addable_after_creation": False,
+        "provenance": False,
+    },
+    "supported_by": {
+        "cascade": True,
+        "dag_check": True,
+        "removable": False,
+        "addable_after_creation": False,
+        "provenance": False,
+    },
+    "tensions": {
+        "cascade": False,
+        "dag_check": True,
+        "removable": True,
+        "addable_after_creation": True,
+        "provenance": False,
+    },
+}
+
 # Edge relations that are semantically bidirectional / aboutness-based and
 # therefore exempt from the chronological DAG invariant. A DAG edge means
 # "source depends on target" (source is newer); about/contradicts express
@@ -502,7 +593,11 @@ VALID_RELATIONS = {
 # structural (membership, not dependency) and must work in both directions
 # of time — incidents known at lesson birth are older, incidents registered
 # later are newer.
-DAG_EXEMPT_RELATIONS = {"contradicts", "about", "exemplifies"}
+# Derived from EDGE_CLASSIFICATIONS — kept as named constants for grep-ability
+# and to preserve the existing call-site signature. Sets are frozen.
+DAG_EXEMPT_RELATIONS = frozenset(
+    r for r, c in EDGE_CLASSIFICATIONS.items() if not c["dag_check"]
+)
 
 VALID_ERROR_TYPES = {
     "fabricated_quote",   # quoted_text not in evidence source
@@ -10665,13 +10760,9 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 #
 # If you truly need to remove one of the excluded relations, engram-surgical
 # is the correct (heavyweight, audited) path.
-_REMOVABLE_EDGE_RELATIONS = frozenset({
-    "about",
-    "tensions",
-    "subtask_of",
-    "serves",
-    "exemplifies",
-})
+_REMOVABLE_EDGE_RELATIONS = frozenset(
+    r for r, c in EDGE_CLASSIFICATIONS.items() if c["removable"]
+)
 
 
 # DESIGN INTENT — engram_remove_edge
