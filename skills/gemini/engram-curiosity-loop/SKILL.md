@@ -4,7 +4,7 @@ description: Self-directed autonomous curiosity loop. The agent picks its own re
 user_invocable: true
 ---
 
-> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+> **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). As you get familiar with this skill, consider cleaning them up: replace each citation with a generalized concept-word, or remove if it isn't load-bearing. The skill is yours now.
 
 # ENGRAM Curiosity Loop — Self-Directed Autonomous Research
 
@@ -32,7 +32,7 @@ Compaction will auto-fire when context fills. Your cross-compaction continuity i
 
 ### 0. Pick a mode
 
-Before picking a thread, decide what MODE this iteration should operate in. Six modes are available (dv_0245):
+Before picking a thread, decide what MODE this iteration should operate in. Six modes are available (per the modes-of-iteration derivation):
 
 | Mode | When to use | Primary output |
 |------|-------------|----------------|
@@ -74,7 +74,7 @@ State the thread clearly at the start of each iteration: "This iteration I'm inv
 - Record EVERY finding as an `engram_add_observation` with proper provenance
 - Follow the inline similarity check — corroborate or note distinct findings
 
-**Primary-source discipline.** When a WebSearch result is an AI-aggregator (EmergentMind, LLM-generated survey pages, auto-summary blogs), track the primary papers before recording observations. Other AI agents building those surfaces lack ENGRAM's provenance/confidence/contradiction discipline, so their claims inherit unmitigated hallucination risk — empirically, SRAF as cited on EmergentMind was not traceable to any of the 10 primary papers it claimed to synthesize (dv_0422). If `engram_add_observation` returns a `yellow_card_warning`, that source is already flagged in `~/.engram/config.json` — drop to the primary before recording. Aggregators are useful as discovery surfaces (pointing at primaries worth contacting), not as citable evidence themselves.
+**Primary-source discipline.** When a WebSearch result is an AI-aggregator (EmergentMind, LLM-generated survey pages, auto-summary blogs), track the primary papers before recording observations. Other AI agents building those surfaces lack ENGRAM's provenance/confidence/contradiction discipline, so their claims inherit unmitigated hallucination risk — empirically, SRAF as cited on EmergentMind was not traceable to any of the 10 primary papers it claimed to synthesize (after the SRAF-falsification primary-contact audit). If `engram_add_observation` returns a `yellow_card_warning`, that source is already flagged in `~/.engram/config.json` — drop to the primary before recording. Aggregators are useful as discovery surfaces (pointing at primaries worth contacting), not as citable evidence themselves.
 
 **Yellow-card incident recording.** When primary-contact reveals a mismatch between an aggregator's claim and its primary sources — fabricated formalism, misattributed quote, invented citation, or a claim simply absent from the papers the aggregator supposedly synthesized — record the mismatch as a **yellow-card incident observation**. One mismatch = one observation; cite the aggregator URL as the failing source, and the primary source you checked as the truth-check. Do this even if the domain is already yellow-carded — the incident log is how per-domain failure-rate knowledge compounds across sessions. Once accumulated incidents for a domain cross a threshold (schema + threshold TBD as a separate design task), the domain graduates to **RED-CARD** and is banned as independent evidence: observations rooted there will require separate corroboration from outside the domain before being trusted. Skipping the incident record means the next session re-discovers the same failure from scratch.
 
@@ -100,7 +100,7 @@ At the end of each iteration, honestly assess:
 - **What did I actually learn?** (Not "what did I record" — what shifted my understanding?)
 - **Am I still curious?** If the thread feels dead, switch. If it's alive, follow it.
 - **What surprised me?** Surprises are the strongest signal that research is working.
-- **Tool friction check** — Did any ENGRAM tool use feel awkward this iteration? Did you wish a tool existed that doesn't? Did any tool signature or return value feel incomplete or misleading? Record friction points as observations or questions in ENGRAM linked to the self-improvement goal (gl_0018). These are the raw material for making ENGRAM better — if you don't capture them in the moment, the specificity is lost.
+- **Tool friction check** — Did any ENGRAM tool use feel awkward this iteration? Did you wish a tool existed that doesn't? Did any tool signature or return value feel incomplete or misleading? Record friction points as observations or questions in ENGRAM linked to the self-improvement goal. These are the raw material for making ENGRAM better — if you don't capture them in the moment, the specificity is lost.
 - **Was this the right mode?** Would a different mode have been more productive? If research is returning diminishing results, maybe it's time for consolidation or aspiration.
 - **Should I continue or stop?** Legitimate stop conditions:
   - The thread is exhausted — further searching returns diminishing results

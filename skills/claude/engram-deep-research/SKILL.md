@@ -3,7 +3,7 @@ name: engram-deep-research
 description: Depth-first research on a single big question. Unlike engram-curiosity (breadth-first, 2-4 threads), this focuses on one question and reasons deeply around it, registering intermediate questions and conjectures as waypoints. Designed for cross-compaction loop research where unregistered thoughts are permanently lost. Does NOT advance the turn counter (uses nap-mode checkpoint).
 ---
 
-> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+> **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). As you get familiar with this skill, consider cleaning them up: replace each citation with a generalized concept-word, or remove if it isn't load-bearing. The skill is yours now.
 
 # ENGRAM Deep Research — Depth-First Investigation
 
@@ -57,7 +57,7 @@ For each sub-question, follow this cycle:
 - WebSearch for relevant sources
 - WebFetch to read promising results deeply
 - Read existing ENGRAM nodes and project files for internal evidence
-- **Primary-source discipline:** when a result is an AI-aggregator (EmergentMind, LLM-generated surveys, auto-summary blogs), track the primary papers before recording observations. Aggregators inherit hallucination risk from the agents that built them — empirically, the SRAF "formalism" attributed to a self-models cluster wasn't in any of the 10 primary papers (dv_0422). Depth-research is where this discipline compounds: one fabricated aggregator claim at the root of a reasoning chain corrupts every derivation downstream. If `engram_add_observation` returns a `yellow_card_warning`, that source is already flagged in `~/.engram/config.json` — drop to the primary before recording.
+- **Primary-source discipline:** when a result is an AI-aggregator (EmergentMind, LLM-generated surveys, auto-summary blogs), track the primary papers before recording observations. Aggregators inherit hallucination risk from the agents that built them — empirically, the SRAF "formalism" attributed to a self-models cluster wasn't in any of the 10 primary papers (after the SRAF-falsification primary-contact audit). Depth-research is where this discipline compounds: one fabricated aggregator claim at the root of a reasoning chain corrupts every derivation downstream. If `engram_add_observation` returns a `yellow_card_warning`, that source is already flagged in `~/.engram/config.json` — drop to the primary before recording.
 - **Yellow-card incident recording:** when primary-contact reveals a mismatch between an aggregator's claim and its primary sources — fabricated formalism, misattributed quote, invented citation, or a claim absent from the papers the aggregator supposedly synthesized — record it as a **yellow-card incident observation**. One mismatch = one observation; cite the aggregator URL as the failing source and the primary as the truth-check. Do this even if the domain is already yellow-carded — the incident log is how per-domain failure-rate knowledge compounds across sessions. Once accumulated incidents cross a threshold (schema + threshold TBD as a separate design task), the domain graduates to **RED-CARD** and is banned as independent evidence: observations rooted there will require separate corroboration from outside the domain. In depth-research this matters doubly, because unrecorded incidents mean the next reasoning chain inherits the same corrupted root.
 
 ### 3b. Record observations and definitions immediately
@@ -86,7 +86,7 @@ When multiple observations support a conclusion:
 - If the derivation resolves a question, use `engram_resolve` instead
 
 ### 3f. Tool friction check (each sub-question)
-After completing each sub-question cycle, briefly reflect: Did any ENGRAM tool use feel awkward? Did you wish a tool existed for something specific? Did any tool signature or return value seem incomplete or misleading? Record friction points as observations or questions in ENGRAM linked to the self-improvement goal (gl_0018). Tool friction noticed during deep focused work is the highest-quality signal — capture it before the specificity fades.
+After completing each sub-question cycle, briefly reflect: Did any ENGRAM tool use feel awkward? Did you wish a tool existed for something specific? Did any tool signature or return value seem incomplete or misleading? Record friction points as observations or questions in ENGRAM linked to the self-improvement goal. Tool friction noticed during deep focused work is the highest-quality signal — capture it before the specificity fades.
 
 ### 3g. Follow the depth
 Each derivation or observation may open new sub-questions. Follow them. This is depth-first — pursue one chain to its conclusion before backtracking.

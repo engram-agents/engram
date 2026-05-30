@@ -23,7 +23,7 @@ checks to switch from the normal nap-nudge to the loop-aware banner
 don't slow down for a manual compaction"). No marker → the hook serves the
 non-loop "stop and nap" path, and the loop wastes a whole session napping
 against compaction it should be riding through (the gap that motivated #483 —
-a `ScheduleWakeup` work-loop that never wrote the marker, ob_0196 / ob_0198).
+a `ScheduleWakeup` work-loop that never wrote the marker (the loop-without-marker silent-skip failure mode)).
 
 **Why a skill owns this:** the marker is an ENGRAM convention, not harness-
 enforced. If the loop's entry-path doesn't write it, nothing does. This skill
@@ -54,7 +54,7 @@ decides whether you write the marker or check it:
 
   - **present** → the loop is live → continue the iteration (Step 2).
   - **absent** → the loop already ended (the marker is removed at loop-end); this
-    re-fire is a **MISFIRE** (ob_0684). Do NOT run the loop body, and do NOT
+    re-fire is a **MISFIRE** (stale-marker misfire failure mode). Do NOT run the loop body, and do NOT
     re-arm. Note "stale loop — marker absent, stopping" and stop.
 
 **The marker is the source of truth — anchor on it, not on recollection.** It
@@ -244,10 +244,12 @@ Use `engram-loop` directly for a loop that doesn't fit a specialized one (e.g. a
 directed multi-agent work-loop); pick the most specific skill when one fits, and
 fall back to `engram-loop` otherwise.
 
-**Provenance:** #483 (the convention-gap that motivated a first-class owner),
-ob_0196 (ScheduleWakeup loops silently skipped the marker), ob_0198 (the
-lifecycle pattern already lived in meta-loop/curiosity-loop; this generalizes
-it), ob_0684 (stale-loop detection), ob_0210 (the absent-marker guard must
-distinguish a fresh start from a continuation, and anchor on the filesystem
-marker — not on compaction-destroyed recollection), #486 (the specialized skills
-now reference this SSoT for the guard rather than each carrying their own).
+**Provenance:** #483 (the convention-gap that motivated a first-class owner);
+the silently-skipped-marker failure mode (ScheduleWakeup loops that never wrote
+the marker), where the lifecycle pattern already lived in meta-loop /
+curiosity-loop and this skill generalizes it; the stale-loop-detection
+requirement (the post-loop re-fire failure mode); the absent-marker-guard
+load-bearing requirement (the guard must distinguish a fresh start from a
+continuation, and anchor on the filesystem marker rather than on
+compaction-destroyed recollection); #486 (the specialized skills now reference
+this SSoT for the guard rather than each carrying their own).

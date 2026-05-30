@@ -4,7 +4,7 @@ description: Post-loop diagnostic analysis of an autonomous curiosity loop sessi
 user_invocable: true
 ---
 
-> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+> **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). As you get familiar with this skill, consider cleaning them up: replace each citation with a generalized concept-word, or remove if it isn't load-bearing. The skill is yours now.
 
 # ENGRAM Loop Diagnose — Post-Session Quality Analysis
 
@@ -188,7 +188,7 @@ Based on the remaining questions and the stopping behavior, what modes would hav
 - **Reflection mode** — deep graph analysis, consolidation without external research
 - **Dialogue-prep mode** — prepare questions and options for the user
 - **Experimentation mode** — run ENGRAM operations, measure behavior, test hypotheses
-- **Aspiration mode** — start from active goals, gap-analyze current ENGRAM knowledge against what the goals require, and raise new questions. This is the *generative* mode — all others consume existing questions; aspiration produces them. (dv_0245)
+- **Aspiration mode** — start from active goals, gap-analyze current ENGRAM knowledge against what the goals require, and raise new questions. This is the *generative* mode — all others consume existing questions; aspiration produces them. (the modes-of-iteration derivation)
 
 ---
 
@@ -218,7 +218,7 @@ Record the most significant diagnostic findings as ENGRAM observations:
 - **Stopping diagnosis** — why the loop stopped, classified by the taxonomy above
 - **Novel patterns** — anything unexpected in the data
 
-Use `source_class: "introspective"` and cite `ev_0123` (overnight loop session data) or create a new evidence node for the diagnostic report if the loop ran on a different date.
+Use `source_class: "introspective"` and cite the relevant evidence node for the loop-session data, or create a new evidence node for the diagnostic report if the loop ran on a different date.
 
 ---
 

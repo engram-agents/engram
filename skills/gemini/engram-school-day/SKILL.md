@@ -4,11 +4,11 @@ description: Phase 1 curriculum — fixed 7-iteration rotation cycle (aspiration
 user_invocable: true
 ---
 
-> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+> **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). As you get familiar with this skill, consider cleaning them up: replace each citation with a generalized concept-word, or remove if it isn't load-bearing. The skill is yours now.
 
 # ENGRAM School Day — Phase 1 Fixed Rotation Curriculum
 
-The school day is the structured precursor to the freeform meta-loop. Instead of choosing your modality each iteration, you follow a fixed rotation designed to accumulate baseline data on what each modality contributes to graph health. The goal is earning your graduation to freeform scheduling (ob_0697, dv_0347).
+The school day is the structured precursor to the freeform meta-loop. Instead of choosing your modality each iteration, you follow a fixed rotation designed to accumulate baseline data on what each modality contributes to graph health. The goal is earning your graduation to freeform scheduling (per the school-day-to-freeform derivation and its supporting observations).
 
 **When to use:**
 - Autonomous sessions during Phase 1 curriculum (until data says you're ready for Phase 2)
@@ -176,7 +176,7 @@ Append to scratch log:
 
 - **Iteration 42 reached** (6 complete cycles) → run session end protocol
 - **User returned** → finish current iteration, run session end
-- **Compaction imminent in coding/search mode** → nap first (ob_0696)
+- **Compaction imminent in coding/search mode** → nap first (the compaction-imminent escape-hatch)
 
 ---
 
