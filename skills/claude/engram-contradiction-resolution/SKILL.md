@@ -24,7 +24,7 @@ When a contradiction is genuinely open and you want to resolve it.
 ### Step 1 — Inspect both sides + existing resolution attempts
 
 ```
-engram_inspect(ct_id, dream_mode=True)
+engram_inspect(payload_json=json.dumps({"node_id": ct_id, "dream_mode": True}))
 ```
 
 Read:
@@ -72,7 +72,7 @@ engram_resolve(payload_json=json.dumps({
 ### Step 5 — Verify
 
 ```
-engram_inspect(ct_id, dream_mode=True)
+engram_inspect(payload_json=json.dumps({"node_id": ct_id, "dream_mode": True}))
 ```
 
 Confirm `status == "resolved"`. If still `partially_resolved`, the resolving node's confidence is below threshold — strengthen by composing a derivation citing stronger evidence (step 3 again) and wiring it (step 4).
@@ -86,14 +86,14 @@ A contradiction is `stale_by_premise` when one of its contradicting nodes was su
 ### Step 1 — Inspect the contradiction and the supersede chain
 
 ```
-engram_inspect(ct_id, dream_mode=True)
+engram_inspect(payload_json=json.dumps({"node_id": ct_id, "dream_mode": True}))
 ```
 
 Read `metadata.stale_by` (list of superseded contradicting nodes) and `metadata.stale_replacement` (the new node that supersedes the old). Then:
 
 ```
-engram_inspect(stale_replacement_id, dream_mode=True)
-engram_inspect(other_side_id, dream_mode=True)
+engram_inspect(payload_json=json.dumps({"node_id": stale_replacement_id, "dream_mode": True}))
+engram_inspect(payload_json=json.dumps({"node_id": other_side_id, "dream_mode": True}))
 ```
 
 The "other side" is the contradicting node that WASN'T superseded.
@@ -150,8 +150,8 @@ A contradiction is `tainted_by` when one of its contradicting nodes was retracte
 ### Step 1 — Inspect the contradiction and the retracted node
 
 ```
-engram_inspect(ct_id, dream_mode=True)
-engram_inspect(retracted_node_id, dream_mode=True)
+engram_inspect(payload_json=json.dumps({"node_id": ct_id, "dream_mode": True}))
+engram_inspect(payload_json=json.dumps({"node_id": retracted_node_id, "dream_mode": True}))
 ```
 
 Read `metadata.tainted_by` to confirm which node was retracted. Read the retracted node's `metadata.error_type` and `metadata.retraction_reason` to understand WHY it was invalidated.
