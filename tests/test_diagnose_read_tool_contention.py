@@ -9,6 +9,7 @@ Coverage:
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import shutil
@@ -20,9 +21,8 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-TEST_DIR = os.path.join(
-    tempfile.gettempdir(), "engram_test_diagnose_read_tool_contention"
-)
+TEST_DIR = tempfile.mkdtemp(prefix="engram_test_diagnose_read_tool_contention_")
+atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 def fresh_server():

@@ -11,6 +11,7 @@ Coverage (4 tests mirroring the migrate_db_trust_tier test pattern):
       (returns 0, no edit_history rows added on the second run).
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -25,7 +26,8 @@ sys.path.insert(0, os.path.join(
     "tools", "migration",
 ))
 
-TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_migrate_tt_self")
+TEST_DIR = tempfile.mkdtemp(prefix="engram_test_migrate_tt_self_")
+atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 def fresh_server():

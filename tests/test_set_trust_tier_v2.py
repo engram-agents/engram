@@ -28,6 +28,7 @@ Coverage (9 tests):
         is_current=1 only.
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -37,7 +38,8 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TEST_DIR = os.path.join(tempfile.gettempdir(), "engram_test_trust_tier_v2")
+TEST_DIR = tempfile.mkdtemp(prefix="engram_test_trust_tier_v2_")
+atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 def fresh_server():

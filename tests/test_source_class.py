@@ -336,7 +336,8 @@ def test_file_evidence_per_observation_versioning():
     not triggered — outside-git files are allowed without versioning, but
     explicit content_hash/git_sha args still get stored on the observation.
     """
-    version_file = os.path.join(tempfile.gettempdir(), "engram_test_versioned_source.txt")
+    fd, version_file = tempfile.mkstemp(prefix="engram_test_versioned_source_", suffix=".txt")
+    os.close(fd)
     with open(version_file, "w") as f:
         f.write("Line alpha from version one.\n")
         f.write("Line beta from version one.\n")
@@ -423,7 +424,7 @@ def test_git_enforcement_uncommitted_file_rejected():
     """File evidence in a git repo must be committed before it can be cited."""
     import subprocess
 
-    git_dir = os.path.join(tempfile.gettempdir(), "engram_test_git_enforce")
+    git_dir = tempfile.mkdtemp(prefix="engram_test_git_enforce_")
     _init_git_repo(git_dir)
 
     # Need at least one commit for HEAD to exist
@@ -492,7 +493,7 @@ def test_git_enforcement_modified_file_rejected():
     """Modified but uncommitted file in git repo should be rejected."""
     import subprocess
 
-    git_dir = os.path.join(tempfile.gettempdir(), "engram_test_git_modify")
+    git_dir = tempfile.mkdtemp(prefix="engram_test_git_modify_")
     _init_git_repo(git_dir)
 
     # Create and commit a file
@@ -528,7 +529,7 @@ def test_git_enforcement_bad_sha_rejected():
     """Providing a git_sha where the file doesn't exist should be rejected."""
     import subprocess
 
-    git_dir = os.path.join(tempfile.gettempdir(), "engram_test_git_badsha")
+    git_dir = tempfile.mkdtemp(prefix="engram_test_git_badsha_")
     _init_git_repo(git_dir)
 
     # Make an initial commit without our file
