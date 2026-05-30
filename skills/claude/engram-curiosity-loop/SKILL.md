@@ -14,17 +14,15 @@ The distinction from a regular curiosity session: nobody is steering. You choose
 
 ---
 
+> **Loop formality → [engram-loop](../engram-loop/SKILL.md).** This skill is a KIND of self-paced loop; the marker lifecycle (entry-guard, write-on-start, remove-on-end) and loop-mode drowsiness behavior live in engram-loop (the SSoT). Follow it for all loop formality — below is only this skill's own style.
+
+---
+
 ## Loop Setup (first iteration only)
 
 ### Activate loop mode
 
-Write the loop-mode marker to suppress drowsiness nap/stop directives:
-
-```bash
-echo '{"activated": "'$(date -Iseconds)'", "skill": "curiosity-loop"}' > ~/.engram/loop-mode.json
-```
-
-Compaction will auto-fire when context fills. Your cross-compaction continuity is stable — keep researching through compaction boundaries. The key discipline is **writing findings to ENGRAM as you go** so nothing is lost when compaction fires.
+Write the loop marker per **engram-loop** Step 1 (`kind=research`). The key discipline is **writing findings to ENGRAM as you go** so nothing is lost when compaction fires.
 
 ---
 
@@ -122,14 +120,12 @@ At the end of each iteration, honestly assess:
 
 This skill is designed to run inside a `/loop` (dynamic self-pacing via ScheduleWakeup). Each wake-up is one iteration.
 
-**Context budget discipline:**
-In loop mode (marker active), drowsiness warnings are informational only — compaction auto-fires and cross-compaction continuity is stable. The discipline is **writing to ENGRAM continuously** so nothing is lost when compaction fires, not stopping before it happens.
+**Context budget discipline:** See **engram-loop** Step 4 for loop-mode drowsiness behavior.
 
 **Iteration pacing:** Research iterations are context-heavy (web fetches, long reads). Use 60-90s delays between iterations to stay in the cache window while giving each iteration time to breathe.
 
-**Loop cleanup:** When the loop ends:
+**Loop cleanup:** When the loop ends, remove the loop marker per **engram-loop** Step 3, then:
 ```bash
-rm -f ~/.engram/loop-mode.json
 mv ~/.engram/loop-scratch.md ~/.engram/reports/scratch_$(date +%Y-%m-%d_%H%M%S).md 2>/dev/null || true
 ```
 

@@ -21,18 +21,7 @@ The meta-loop is the highest-level autonomous session. Unlike specialized loops 
 
 ---
 
-## Staleness Guard (every entry, including post-compaction)
-
-Before doing anything, check whether this is a live loop or a stale invocation:
-
-```bash
-cat ~/.engram/loop-mode.json 2>/dev/null
-```
-
-- **If the file exists** → this is a live loop. Continue to the next iteration.
-- **If the file does NOT exist** → this is a stale invocation. The loop ended in a previous session but the /loop skill context persisted across compaction (ob_0684). **Do not execute.** Tell the user: "Stale loop detected — loop-mode.json is absent, skipping." Then stop.
-
-This guard prevents post-compaction agents from re-executing loops that already ended.
+> **Loop formality → [engram-loop](../engram-loop/SKILL.md).** This skill is a KIND of self-paced loop; the marker lifecycle (entry-guard, write-on-start, remove-on-end) and loop-mode drowsiness behavior live in engram-loop (the SSoT). Follow it for all loop formality — below is only this skill's own style.
 
 ---
 
@@ -40,9 +29,7 @@ This guard prevents post-compaction agents from re-executing loops that already 
 
 ### 1. Activate loop mode
 
-```bash
-echo '{"activated": "'$(date -Iseconds)'", "skill": "meta-loop"}' > ~/.engram/loop-mode.json
-```
+Write the loop marker per **engram-loop** Step 1 (`kind=autonomous`, `topic=<this session's anchor goals, one line>`, `instructions=<choose a modality each iteration per the brief below>`).
 
 ### 2. Choose 1-3 goals
 
@@ -250,8 +237,10 @@ Write a detailed verification report to `~/.engram/reports/meta_loop_YYYY-MM-DD_
 8. **Remaining work** — prioritized by goal
 
 ### 4. Cleanup
+
+Remove the loop marker per **engram-loop** Step 3.
+
 ```bash
-rm -f ~/.engram/loop-mode.json
 # Archive the scratch log — raw session data is a goldmine for loop-diagnose and calibration
 mv ~/.engram/loop-scratch.md ~/.engram/reports/scratch_$(date +%Y-%m-%d_%H%M%S).md 2>/dev/null || true
 ```

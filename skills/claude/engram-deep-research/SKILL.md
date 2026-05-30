@@ -24,15 +24,13 @@ The critical behavioral discipline: **register questions and conjectures the mom
 
 ---
 
+> **Loop formality → [engram-loop](../engram-loop/SKILL.md).** This skill is a KIND of self-paced loop; the marker lifecycle (entry-guard, write-on-start, remove-on-end) and loop-mode drowsiness behavior live in engram-loop (the SSoT). Follow it for all loop formality — below is only this skill's own style.
+
+---
+
 ## Step 0 — Activate loop mode
 
-If running as a loop (autonomous or `/loop`-invoked), write the loop-mode marker:
-
-```bash
-echo '{"activated": "'$(date -Iseconds)'", "skill": "deep-research"}' > ~/.engram/loop-mode.json
-```
-
-This suppresses drowsiness nap/stop directives — compaction will auto-fire and your cross-compaction continuity is stable. The marker is removed when the loop ends (Step 6).
+If running as a loop (autonomous or `/loop`-invoked), write the loop marker per **engram-loop** Step 1 (`kind=research`). The marker is removed when the loop ends (Step 6).
 
 ## Step 1 — Commit to one question
 
@@ -95,7 +93,7 @@ Each derivation or observation may open new sub-questions. Follow them. This is 
 
 ## Step 4 — Context budget awareness
 
-**In loop mode (marker file active):** Ignore drowsiness percentages. Compaction will auto-fire when context fills, and your cross-compaction continuity is stable. Keep researching — register intermediate findings to ENGRAM as you go so nothing is lost if compaction fires mid-thought. The key discipline is not *stopping before compaction* but *writing before compaction* — every finding recorded to ENGRAM survives; everything only in context does not.
+**In loop mode (marker file active):** See **engram-loop** Step 4 for loop-mode drowsiness behavior.
 
 **In interactive mode (no marker):** Follow normal nap discipline (see `SKILL.md` §8.1) — nap when approaching a compaction boundary or when the drowsiness nudge suggests it. Wrap the current research thread before napping so the cohort stays coherent.
 
@@ -121,10 +119,7 @@ If running as a cross-compaction loop, update the `### Autonomous Loop State` se
 
 When the research session is complete (user stops the loop or research question is resolved):
 
-**Remove the loop-mode marker** (if it exists):
-```bash
-rm -f ~/.engram/loop-mode.json
-```
+**Remove the loop-mode marker** (if it exists) per **engram-loop** Step 3.
 
 **Write a verification report** to disk at `~/.engram/reports/`. Create the directory if it doesn't exist.
 

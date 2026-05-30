@@ -1,16 +1,17 @@
 ---
 name: engram-loop
 description: >
-  Generic self-paced loop convention. Owns the ~/.engram/loop-mode.json marker
-  lifecycle (write-on-start / stale-detect / remove-on-end) so ANY self-paced
-  loop — a directed work-loop, a research sweep, an autonomous session — gets
-  the loop-aware drowsiness behavior (ride auto-compaction, don't slow down for
-  a manual one). Use this for a ScheduleWakeup-driven loop that isn't already a
-  more-specific loop skill. The specialized loops (engram-curiosity-loop,
-  engram-meta-loop) are kinds of this; they own the same marker lifecycle.
+  Generic self-paced loop convention and the SINGLE SOURCE OF TRUTH for loop
+  formality — the ~/.engram/loop-mode.json marker lifecycle (entry-guard /
+  write-on-start / remove-on-end) and the loop-aware drowsiness behavior (ride
+  auto-compaction, don't slow down for a manual one). Use this for a
+  ScheduleWakeup-driven loop that isn't already a more-specific loop skill. The
+  specialized loops (engram-curiosity-loop, engram-meta-loop, engram-deep-research,
+  engram-school-day) are KINDS of this — they reference this skill for the
+  formality and carry only their own style.
 ---
 
-# ENGRAM Loop — the self-paced-loop convention
+# ENGRAM Loop — the self-paced-loop convention (SSoT for loop formality)
 
 A "loop" is any self-paced sequence of work bursts the agent paces itself
 through (via `ScheduleWakeup`), rather than turn-by-turn with the user. The
@@ -26,24 +27,81 @@ a `ScheduleWakeup` work-loop that never wrote the marker, ob_0196 / ob_0198).
 
 **Why a skill owns this:** the marker is an ENGRAM convention, not harness-
 enforced. If the loop's entry-path doesn't write it, nothing does. This skill
-makes the write+remove a first-class ritual so it can't be silently skipped.
+makes the write+remove a first-class ritual so it can't be silently skipped —
+and it is the ONE place the formality is defined. Specialized loop skills point
+here; they do not restate the marker syntax or the guard.
 
 ---
 
-## Step 1 — Loop START: write the marker
+## Step 0 — On entry: are you STARTING or CONTINUING?
 
-The FIRST action when entering any self-paced loop:
+Every loop entry is one of two kinds. Decide which before anything else — it
+decides whether you write the marker or check it:
 
+- **A fresh START** — the USER just asked you to begin this loop *this turn* (a
+  user-typed `/loop …`, `/meta-loop`, `/curiosity-loop`, etc.). → Go to **Step 1**:
+  write the marker, then run. Do NOT run the stale-check on a fresh start —
+  there's no marker yet *because you're about to write it*.
+
+- **A CONTINUATION** — you re-entered on your own: a `ScheduleWakeup` fired (its
+  prompt is the formalized stub from Step 2 — *"read the marker; if absent,
+  stop"*), or a `/loop` prompt persisted across compaction. You were NOT freshly
+  asked. → Run the stale-check:
+
+  ```bash
+  cat ~/.engram/loop-mode.json 2>/dev/null
+  ```
+
+  - **present** → the loop is live → continue the iteration (Step 2).
+  - **absent** → the loop already ended (the marker is removed at loop-end); this
+    re-fire is a **MISFIRE** (ob_0684). Do NOT run the loop body, and do NOT
+    re-arm. Note "stale loop — marker absent, stopping" and stop.
+
+**The marker is the source of truth — anchor on it, not on recollection.** It
+lives on the filesystem, so it survives compaction; your memory of "did I
+already start this loop?" does not. A fresh start and a continuation are
+distinct events — and with the formalized stub (Step 2), textually distinct too:
+a START is a real `/loop <topic>` from the user; a CONTINUATION is the stub whose
+own first instruction is "read the marker; if absent, stop." You never have to
+tell them apart from memory: a START writes the marker (Step 1), a CONTINUATION
+reads it (above). Both paths converge on the marker, which is why the guard is
+robust across compaction.
+
+---
+
+## Step 1 — Loop START: write the marker (the marker IS the loop's state)
+
+The FIRST action on a fresh start (Step 0), before arming any wakeup. The marker
+holds the loop's full state — topic, the per-iteration brief, and the live
+pending-work — not just an "I'm looping" flag:
+
+```bash
+cat > ~/.engram/loop-mode.json <<JSON
+{
+  "activated": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "kind": "work|research|autonomous",
+  "topic": "<one-line loop topic>",
+  "instructions": "<what to do each iteration — the loop's standing brief>",
+  "state": "<live handoff: pending work, in-flight fairies, key node IDs, next step>",
+  "cadence_seconds": 270,
+  "pacer": "scheduleWakeup"
+}
+JSON
 ```
-echo '{"activated":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","kind":"<work|research|autonomous>","task":"<one line>","pacer":"scheduleWakeup"}' > ~/.engram/loop-mode.json
-```
 
-- `kind` — what this loop is (a directed work-loop, a research sweep, an
-  autonomous session). Informational; the hook only checks existence.
-- Content is informational — existence is the trigger. But record `task` so a
-  post-compaction self (or a teammate reading it) knows what loop is live.
+- `kind` — informational; the drowsiness hook only checks the marker's existence.
+- `topic` / `instructions` — the standing brief, written once at start.
+- `state` — the live handoff, **rewritten each iteration** (Step 2.3) so the
+  marker always reflects where the loop is. This is what a post-compaction self
+  (or a teammate) reads to resume.
 
-From the next prompt, the drowsiness banner flips to loop-mode.
+**Why the marker carries the state, not the wakeup prompt:** it makes the armed
+prompt a tiny self-declaring stub (Step 2), and keeps the canonical loop state on
+the durable filesystem rather than only in a prompt. Writing the marker before
+arming the first wakeup is also what makes Step 0's guard sound: by the time any
+wakeup can fire, the marker exists — so a continuation that finds it absent is
+unambiguously a misfire. From the next prompt, the drowsiness banner flips to
+loop-mode.
 
 ---
 
@@ -52,14 +110,30 @@ From the next prompt, the drowsiness banner flips to loop-mode.
 1. **Pace with `ScheduleWakeup`.** 270s is the calibrated sweet spot for
    active work (cache-warm + responsive to a counterpart's inter-agent inbox).
    Use a longer fallback (1200–1800s) only at a genuine idle lull.
-2. **Pass the loop's state forward** in each `ScheduleWakeup` prompt — the
-   prompt is what survives compaction. Treat it as the handoff to the next
-   iteration (and the post-compaction self): pending work, in-flight fairies,
-   key node IDs, the marker-removal reminder.
-3. **ENGRAM-write findings as they happen** — the loop crosses compaction
+2. **The armed prompt is a minimal, formalized STUB — the marker carries the
+   state.** Don't pack the loop's brief into the `ScheduleWakeup` prompt; point
+   at the marker. Arm every wakeup with the same self-declaring stub:
+
+   > *Loop continuation. Read `~/.engram/loop-mode.json` for the loop topic,
+   > instructions, and current state. **If the file is absent → the loop already
+   > ended; STOP, do not execute, do not re-arm.** If present → continue per its
+   > contents.*
+
+   This makes the Step-0 guard the prompt's FIRST instruction (nothing to
+   detect), and makes a continuation-stub textually distinct from a fresh user
+   start (`/loop <real topic>`) — which is what removes the fresh-vs-misfire
+   ambiguity at the root. (A UserPromptSubmit hook emitting the same misfire line
+   on an absent marker is an optional deterministic backstop — not needed given
+   the self-declaring stub.)
+3. **Update the marker's `state` before re-arming, every iteration.** The marker
+   is the canonical handoff across compaction; if you don't refresh `state`, the
+   next iteration resumes on stale context. Re-`cat >` the marker (or patch the
+   `state` field) with the current pending-work / in-flight fairies / key node
+   IDs / next step.
+4. **ENGRAM-write findings as they happen** — the loop crosses compaction
    boundaries; an unwritten finding is lost.
-4. **Drowsiness in loop-mode** (Step 4 below) — nap ONCE, then keep working.
-5. **Don't manufacture work.** When the queue genuinely drains, hold for the
+5. **Drowsiness in loop-mode** (Step 4) — nap ONCE, then keep working.
+6. **Don't manufacture work.** When the queue genuinely drains, hold for the
    user rather than invent tasks; the loop's steady state can be a quiet
    heartbeat or a clean stop, not perpetual grinding.
 
@@ -69,7 +143,7 @@ From the next prompt, the drowsiness banner flips to loop-mode.
 
 Remove the marker the moment the loop ends:
 
-```
+```bash
 rm -f ~/.engram/loop-mode.json
 ```
 
@@ -77,22 +151,10 @@ rm -f ~/.engram/loop-mode.json
 the wheel back / says stop · a sleep cycle (engram-sleep removes it as part of
 day-close) · any explicit end-of-session.
 
-**Stale-loop detection (ob_0684).** A loop's `ScheduleWakeup` prompt can
-persist and re-fire after the loop has ended (esp. across compaction). On every
-loop-wake, FIRST check the marker:
-
-```
-cat ~/.engram/loop-mode.json 2>/dev/null
-```
-
-- **Absent** → the loop already ended; this is a stale re-fire. Do NOT execute
-  the loop body. Note "stale loop — marker absent, stopping" and stop.
-- **Present** → the loop is live; proceed.
-
 **Never leave the marker behind.** A stranded marker makes the next non-loop
-session falsely read as in-loop (wrong drowsiness path) AND can cause a
-post-compaction self to re-execute a dead loop. When in doubt whether the user
-is ending the loop, ask — but never strand the marker.
+session falsely read as in-loop (wrong drowsiness path) AND lets a
+post-compaction continuation read a dead loop as live (defeating Step 0). When
+in doubt whether the user is ending the loop, ask — but never strand the marker.
 
 ---
 
@@ -114,15 +176,23 @@ With the marker present, the hook tells you the right thing; the discipline is:
 ## Relation to the specialized loop skills
 
 `engram-curiosity-loop` (breadth-first research), `engram-meta-loop` (autonomous
-top-level), `engram-deep-research` (depth-first), `engram-school-day` (fixed
-curriculum) are KINDS of self-paced loop. They **all** write/remove the same
-`loop-mode.json` — this skill is the generic convention they instantiate.
-Stale-detection coverage is currently **partial** across the family:
-`engram-meta-loop` and `engram-school-day` carry the Step-3 stale-guard;
-`engram-curiosity-loop` and `engram-deep-research` write/remove the marker but
-do **not** yet carry it (tracked in #486 — they should adopt the guard, since a
-persisted `ScheduleWakeup` re-fire after the loop ends would execute the body
-against an absent marker, the `ob_0684` failure this skill's Step 3 prevents).
+top-level), `engram-deep-research` (depth-first), and `engram-school-day` (fixed
+curriculum) are KINDS of self-paced loop. **The loop FORMALITY — the marker
+lifecycle (Steps 0–3) and the loop-mode drowsiness behavior (Step 4) — lives
+HERE, as the single source of truth.** Specialized skills reference this one for
+the formality and carry only their own STYLE: what to work on, how to pace
+iterations, what to register, what to report. Do NOT duplicate the marker syntax
+or the stale-guard into them — point here, so the formality drifts in exactly
+one place when it evolves.
+
+**Migration status:** `engram-curiosity-loop`, `engram-meta-loop`, and
+`engram-deep-research` reference this SSoT (migrated). `engram-school-day` is
+also a kind of self-paced loop but is **not yet migrated** — it still carries
+its own marker write/remove and a pre-rescope stale-guard, and it uses the
+marker for school-day-specific cycle/iteration state (the careful part).
+Migration is tracked in #507; until it lands, school-day is the one place the
+formality is duplicated.
+
 Use `engram-loop` directly for a loop that doesn't fit a specialized one (e.g. a
 directed multi-agent work-loop); pick the most specific skill when one fits, and
 fall back to `engram-loop` otherwise.
@@ -130,4 +200,7 @@ fall back to `engram-loop` otherwise.
 **Provenance:** #483 (the convention-gap that motivated a first-class owner),
 ob_0196 (ScheduleWakeup loops silently skipped the marker), ob_0198 (the
 lifecycle pattern already lived in meta-loop/curiosity-loop; this generalizes
-it), ob_0684 (stale-loop detection, the hard-won cleanup discipline).
+it), ob_0684 (stale-loop detection), ob_0210 (the absent-marker guard must
+distinguish a fresh start from a continuation, and anchor on the filesystem
+marker — not on compaction-destroyed recollection), #486 (the specialized skills
+now reference this SSoT for the guard rather than each carrying their own).
