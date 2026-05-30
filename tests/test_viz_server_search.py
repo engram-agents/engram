@@ -21,6 +21,7 @@ import threading
 import unittest
 from http.server import HTTPServer
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -221,8 +222,11 @@ class TestSearchEndpointHTTP(unittest.TestCase):
 
     def _get(self, path: str):
         url = f"http://127.0.0.1:{self.port}{path}"
-        with urlopen(url, timeout=5) as resp:
-            return resp.status, json.loads(resp.read())
+        try:
+            with urlopen(url, timeout=5) as resp:
+                return resp.status, json.loads(resp.read())
+        except HTTPError as e:
+            return e.code, json.loads(e.read())
 
     def test_search_returns_200(self):
         status, body = self._get("/api/search?agent=test_agent&q=calibration")
@@ -241,12 +245,23 @@ class TestSearchEndpointHTTP(unittest.TestCase):
         self.assertIn("ob_001", ids, f"ob_001 must be in search results: {ids}")
 
     def test_search_missing_q_returns_error(self):
-        _, body = self._get("/api/search?agent=test_agent")
+        status, body = self._get("/api/search?agent=test_agent")
+        self.assertEqual(status, 400)
         self.assertIn("error", body)
 
     def test_search_unknown_agent_returns_error(self):
-        _, body = self._get("/api/search?agent=no_such_agent&q=calibration")
+        status, body = self._get("/api/search?agent=no_such_agent&q=calibration")
+        self.assertEqual(status, 404)
         self.assertIn("error", body)
+
+    def test_search_unknown_agent_status_404_and_error_message(self):
+        """Confirm GET error response carries non-200 status + meaningful error body."""
+        status, body = self._get("/api/search?agent=no_such_agent&q=calibration")
+        self.assertEqual(status, 404)
+        self.assertTrue(
+            body["error"].startswith("Unknown agent"),
+            f"Expected 'Unknown agent' prefix, got: {body['error']!r}",
+        )
 
     def test_search_result_items_have_required_fields(self):
         _, body = self._get("/api/search?agent=test_agent&q=calibration")

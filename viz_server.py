@@ -4446,7 +4446,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/health":
             if not db_path:
                 self._json({"error": f"Unknown agent: {agent_name!r}",
-                            "agent": agent_name})
+                            "agent": agent_name}, status=404)
             else:
                 resp = get_health_data(db_path)
                 resp["agent"] = agent_name
@@ -4454,7 +4454,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/stats":
             if not db_path:
                 self._json({"error": f"Unknown agent: {agent_name!r}",
-                            "agent": agent_name})
+                            "agent": agent_name}, status=404)
             else:
                 index_db_path = _resolve_logs_index(agent_name)
                 resp = get_stats_data(index_db_path)
@@ -4463,7 +4463,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/calibration":
             if not db_path:
                 self._json({"error": f"Unknown agent: {agent_name!r}",
-                            "agent": agent_name})
+                            "agent": agent_name}, status=404)
             else:
                 resp = get_calibration_data(db_path)
                 resp["agent"] = agent_name
@@ -4474,13 +4474,13 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/search":
             if not db_path:
                 self._json({"results": [], "error": f"Unknown agent: {agent_name!r}",
-                            "agent": agent_name})
+                            "agent": agent_name}, status=404)
             else:
                 qs = parse_qs(parsed.query or "")
                 query = (qs.get("q", [None])[0] or "").strip()
                 if not query:
                     self._json({"results": [], "error": "q parameter is required",
-                                "agent": agent_name})
+                                "agent": agent_name}, status=400)
                 else:
                     resp = search_nodes(db_path, query)
                     resp["agent"] = agent_name
@@ -4514,28 +4514,28 @@ class Handler(BaseHTTPRequestHandler):
         # Route: /api/config/<key>  (key may be dotted, e.g. cadence.drowsiness_caution_pct)
         _PREFIX = "/api/config/"
         if not path.startswith(_PREFIX):
-            self._json_status({"ok": False, "error": "not found"}, 404)
+            self._json({"ok": False, "error": "not found"}, status=404)
             return
 
         key = path[len(_PREFIX):]
         if not key:
-            self._json_status({"ok": False, "error": "key required in path"}, 400)
+            self._json({"ok": False, "error": "key required in path"}, status=400)
             return
 
         # Parse request body.
         content_length = int(self.headers.get("Content-Length", 0) or 0)
         if content_length == 0:
-            self._json_status({"ok": False, "error": "request body required"}, 400)
+            self._json({"ok": False, "error": "request body required"}, status=400)
             return
         try:
             body_bytes = self.rfile.read(content_length)
             body = json.loads(body_bytes)
         except (json.JSONDecodeError, ValueError) as exc:
-            self._json_status({"ok": False, "error": f"invalid JSON body: {exc}"}, 400)
+            self._json({"ok": False, "error": f"invalid JSON body: {exc}"}, status=400)
             return
 
         if "value" not in body:
-            self._json_status({"ok": False, "error": "'value' field required in body"}, 400)
+            self._json({"ok": False, "error": "'value' field required in body"}, status=400)
             return
 
         # Resolve agent — same as GET.
@@ -4546,24 +4546,16 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             raise
         except Exception as exc:
-            self._json_status(
-                {"ok": False, "error": f"internal error: {exc}"}, 500
+            self._json(
+                {"ok": False, "error": f"internal error: {exc}"}, status=500
             )
             return
         status = 200 if result.get("ok") else 400
-        self._json_status(result, status)
+        self._json(result, status=status)
 
-    def _json(self, data: dict):
-        body = json.dumps(data, default=str).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _json_status(self, data: dict, status: int):
-        """Send JSON response with an explicit HTTP status code."""
+    def _json(self, data: dict, status: int = 200):
+        """Send JSON response. status defaults to 200 (preserves the historical
+        no-status callsite shape); pass an explicit status for error responses."""
         body = json.dumps(data, default=str).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")

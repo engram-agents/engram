@@ -19,6 +19,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -249,8 +250,11 @@ class TestCalibrationEndpointHTTP(unittest.TestCase):
 
     def _get(self, path: str):
         url = f"http://127.0.0.1:{self.port}{path}"
-        with urlopen(url, timeout=5) as resp:
-            return resp.status, json.loads(resp.read())
+        try:
+            with urlopen(url, timeout=5) as resp:
+                return resp.status, json.loads(resp.read())
+        except HTTPError as e:
+            return e.code, json.loads(e.read())
 
     def test_calibration_endpoint_returns_200(self):
         status, body = self._get("/api/calibration?agent=test_agent")
@@ -263,7 +267,8 @@ class TestCalibrationEndpointHTTP(unittest.TestCase):
             self.assertIn(key, body, f"Missing key: {key}")
 
     def test_calibration_endpoint_unknown_agent_returns_error(self):
-        _, body = self._get("/api/calibration?agent=no_such_agent")
+        status, body = self._get("/api/calibration?agent=no_such_agent")
+        self.assertEqual(status, 404)
         self.assertIn("error", body)
 
     def test_health_page_contains_calibration_card_text(self):

@@ -30,9 +30,9 @@ def mock_dns_resolution(request, monkeypatch):
     if request.node.get_closest_marker("real_dns"):
         return
 
-    def fake_getaddrinfo(host, *args, **kwargs):
+    def fake_getaddrinfo(host, port=None, *args, **kwargs):
         if "totally-fake-domain" in host:
             raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
-        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 0))]
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", port or 0))]
 
     monkeypatch.setattr("socket.getaddrinfo", fake_getaddrinfo)

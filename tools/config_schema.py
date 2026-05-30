@@ -55,6 +55,10 @@ SCHEMA: list[dict] = [
      "editable": False, "restart_required": False},
 
     # Drowsiness
+    # Note: the legacy `drowsiness_ceiling_max` field is intentionally omitted
+    # from SCHEMA. PR #324 retired it in favor of cadence.drowsiness_ceiling_tokens
+    # (the typed token-count above). Don't surface the deprecated field via the
+    # config UI — surfacing would confuse users about which knob is current.
     {"key": "cadence.drowsiness_ceiling_tokens", "section": "drowsiness", "tier": TIER_A,
      "type": "integer", "control": "int", "min": 50000, "max": 2000000,
      "label": "Context ceiling (tokens)",
