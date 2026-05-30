@@ -3231,6 +3231,13 @@ def write_config_key(agent_name: str, key: str, raw_value) -> dict:
             pass
         return {"ok": False, "error": f"write verify failed (read error: {exc}), rolled back"}
 
+    # After verify success: refresh backup so any later same-session rollback
+    # lands on last-good (this written value) rather than session-start.
+    try:
+        shutil.copyfile(config_path, backup_path)
+    except OSError:
+        pass
+
     return {
         "ok": True,
         "restart_required": restart_required,

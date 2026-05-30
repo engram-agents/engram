@@ -273,12 +273,14 @@ class TestWriteConfigKeyBackup(ConfigWriteBase):
         backup_path = viz_server._CONFIG_WRITE_BACKUPS["test"]
         self.assertTrue(os.path.exists(backup_path), "Backup file should exist")
 
-    def test_backup_contains_original_value(self):
+    def test_backup_contains_last_good_value_after_write(self):
+        # After a successful write (80 → 70), the backup is refreshed to the
+        # written value (70) so a later rollback lands on last-good, not session-start.
+        # (#380 backup-refresh fix)
         viz_server.write_config_key("test", "cadence.drowsiness_caution_pct", 70)
         backup_path = viz_server._CONFIG_WRITE_BACKUPS["test"]
         backup_cfg = json.loads(Path(backup_path).read_text())
-        # Original value was 80 from _make_config()
-        self.assertEqual(backup_cfg["cadence"]["drowsiness_caution_pct"], 80)
+        self.assertEqual(backup_cfg["cadence"]["drowsiness_caution_pct"], 70)
 
     def test_backup_created_only_once(self):
         viz_server.write_config_key("test", "cadence.drowsiness_caution_pct", 70)
@@ -296,6 +298,75 @@ class TestWriteConfigKeyBackup(ConfigWriteBase):
         # Should end with something like 20260524T120000Z
         self.assertTrue(Path(backup_path).name.endswith("Z"),
                         f"Unexpected backup name: {Path(backup_path).name}")
+
+    def test_backup_refreshed_after_successful_write(self):
+        """After write A succeeds, backup must reflect A's value (not session-start).
+
+        Regression test for #380: backup was written only once per session at the
+        START of the session, so a later rollback would restore to session-start
+        instead of last-good.
+        """
+        # Session-start value for drowsiness_caution_pct is 80 (_make_config).
+        # Write A: set to 70.
+        result_a = viz_server.write_config_key(
+            "test", "cadence.drowsiness_caution_pct", 70
+        )
+        self.assertTrue(result_a["ok"], result_a)
+
+        # After successful write A, backup must contain A's value (70), not 80.
+        backup_path = viz_server._CONFIG_WRITE_BACKUPS["test"]
+        backup_cfg = json.loads(Path(backup_path).read_text())
+        self.assertEqual(
+            backup_cfg["cadence"]["drowsiness_caution_pct"], 70,
+            "Backup must refresh to last-good (70) after successful write; "
+            "found session-start value instead.",
+        )
+
+    def test_rollback_after_second_write_restores_last_good(self):
+        """Torn write #2 rolls back to last-good (write #1), not session-start.
+
+        Without the backup-refresh fix (#380): rollback of write #2 would land on
+        session-start (80), discarding write #1's value (70).
+        With the fix: backup is refreshed after write #1 succeeds, so rollback of
+        write #2 correctly restores 70.
+        """
+        # Write A succeeds: caution_pct 80 → 70.
+        result_a = viz_server.write_config_key(
+            "test", "cadence.drowsiness_caution_pct", 70
+        )
+        self.assertTrue(result_a["ok"], result_a)
+
+        # Write B torn: mock shutil.copyfileobj to simulate a mid-copy disk error
+        # on the second invocation (matching test_rollback_restores_config_on_torn_write
+        # pattern from PR #376).
+        real_copyfileobj = shutil.copyfileobj
+        state = {"calls": 0}
+
+        def torn_then_real(src, dst, *args, **kwargs):
+            state["calls"] += 1
+            if state["calls"] == 1:
+                dst.write('{"torn')  # leave genuinely invalid JSON, then fail
+                raise OSError("simulated disk-full mid-copy")
+            return real_copyfileobj(src, dst, *args, **kwargs)
+
+        shutil.copyfileobj = torn_then_real
+        try:
+            result_b = viz_server.write_config_key(
+                "test", "cadence.drowsiness_urgent_pct", 95
+            )
+        finally:
+            shutil.copyfileobj = real_copyfileobj
+
+        self.assertFalse(result_b["ok"])
+        self.assertIn("Write failed", result_b["error"])
+
+        # Rollback of write B must restore write A's value (70), NOT session-start (80).
+        cfg = self._read_config()
+        self.assertEqual(
+            cfg["cadence"]["drowsiness_caution_pct"], 70,
+            "Rollback after torn write B must restore last-good (write A = 70), "
+            "not session-start (80). Backup-refresh fix #380 is missing.",
+        )
 
 
 class TestWriteConfigKeyRestartRequired(ConfigWriteBase):
