@@ -2,7 +2,7 @@
 
 How to drive a contradiction (ct_XXXX) to a clean substrate state. Focused on the **ENGRAM operation sequence**, not the philosophical logic of the resolution itself — the latter is yours to author; this skill describes which tools to call in what order.
 
-The skill exists because the ct_0006 saga (2026-05-09 to 2026-05-20, seven resolution attempts) revealed two failure patterns:
+The skill exists because the chain-dilution contradiction-resolution saga (2026-05-09 to 2026-05-20, seven resolution attempts) revealed two failure patterns:
 1. **Chain dilution**: each resolution attempt cited the prior resolution chain, compounding confidence drop until threshold-based status couldn't fire.
 2. **Substrate blindness to supersede**: a contradiction whose contradicting node had already been superseded continued to read as `open` / `partially_resolved` because the substrate didn't cascade supersede to the contradiction node.
 
@@ -52,9 +52,9 @@ engram_derive(payload_json=json.dumps({
 }))
 ```
 
-**Critical**: cite **root-anchor nodes** (the original contradicting observations or canonical derivations), NOT prior resolution attempts. Citing prior resolution attempts is the chain-dilution mechanism that broke ct_0006 — each step diluted confidence further from threshold.
+**Critical**: cite **root-anchor nodes** (the original contradicting observations or canonical derivations), NOT prior resolution attempts. Citing prior resolution attempts is the chain-dilution mechanism that broke the canonical saga — each step diluted confidence further from threshold.
 
-If a high-confidence canonical node already exists that resolves the contradiction (e.g., dv_0599 in the ct_0006 case), **skip step 3** and use that node directly as the resolving_node_id in step 4.
+If a high-confidence canonical node already exists that resolves the contradiction (e.g., the canonical resolving derivation that closed the chain-dilution saga), **skip step 3** and use that node directly as the resolving_node_id in step 4.
 
 ### Step 4 — Wire the resolves edge
 
@@ -100,7 +100,7 @@ The "other side" is the contradicting node that WASN'T superseded.
 
 ### Step 2 — Decide: substantive-resolve vs preserve-and-rewire
 
-Per the supersede no-drop discipline (ls_0044), the new node MUST have either **kept** or **altered** the conflicting claim from the old node — drop is forbidden. So exactly one of two cases applies:
+Per the supersede no-drop discipline, the new node MUST have either **kept** or **altered** the conflicting claim from the old node — drop is forbidden. So exactly one of two cases applies:
 
 **Case 1 (substantive resolve): the new node altered the conflicting claim.**
 
@@ -113,7 +113,7 @@ engram_resolve(payload_json=json.dumps({
 }))
 ```
 
-This is the ct_0006 case: dv_0570 → dv_0599 altered the bifurcation framing from "strict Kahl satisfaction" to "our owned extension"; dv_0599 no longer contradicted ob_1598's strict-text reading.
+This is the canonical chain-dilution case: an earlier derivation was superseded by a later one that altered the bifurcation framing from "strict Kahl satisfaction" to "our owned extension"; the superseding derivation no longer contradicted the strict-text-reading observation.
 
 **Case 2 (preserve and rewire): the new node kept the conflicting claim.**
 
@@ -201,7 +201,7 @@ This is rare and usually means the area shifted significantly. Consider whether 
 
 ---
 
-## Anti-patterns the ct_0006 saga taught
+## Anti-patterns the chain-dilution saga taught
 
 1. **Citing the prior resolution chain in your new resolving derivation.** Chain dilution. Always cite root nodes.
 2. **Wrapping an existing canonical node in another derivation to "make the resolve work."** Unnecessary. With pure-wire `engram_resolve`, you can pass the canonical node directly as `resolving_node_id`.

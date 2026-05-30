@@ -67,18 +67,18 @@ taint-clearing it is never the right tool.
 **Worked example:**
 
 ```
-t0  ob_0100  "X measured at 5.0"          (premise)
-t1  dv_0200  derives_from ob_0100 → "Y"   (conclusion)
-t2  ob_0100 retracted (wrong_evidence); replacement ob_0101 "X = 7.0" filed at t2
-    → dv_0200 now carries tainted_by: ob_0100
+t0  ob_X    "X measured at 5.0"         (premise)
+t1  dv_Y    derives_from ob_X → "Y"     (conclusion)
+t2  ob_X retracted (wrong_evidence); replacement ob_X_new "X = 7.0" filed at t2
+    → dv_Y now carries tainted_by: ob_X
 ```
 
-WRONG (surgery): re-point `dv_0200 → ob_0101`. But `dv_0200` (t1) is *earlier*
-than `ob_0101` (t2) → backwards causal edge → DAG violation.
+WRONG (surgery): re-point `dv_Y → ob_X_new`. But `dv_Y` (t1) is *earlier*
+than `ob_X_new` (t2) → backwards causal edge → DAG violation.
 
-RIGHT (native): at t3, file `dv_0250` deriving from `ob_0101` → "Y′", then
-`engram_supersede(dv_0200, dv_0250, reason)`. `dv_0250` (t3) is later than
-`ob_0101` (t2) → valid. `dv_0200`'s `tainted_by` clears when it goes
+RIGHT (native): at t3, file `dv_Y_new` deriving from `ob_X_new` → "Y′", then
+`engram_supersede(dv_Y, dv_Y_new, reason)`. `dv_Y_new` (t3) is later than
+`ob_X_new` (t2) → valid. `dv_Y`'s `tainted_by` clears when it goes
 non-current; both old nodes are preserved as the audit trail.
 
 # Decision tree by target type

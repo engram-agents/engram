@@ -3,7 +3,7 @@ name: engram-self-improve
 description: Self-driven improvement of ENGRAM infrastructure. Triggered by experiencing a gap during normal use — friction, missing features, near-misses, or invariant violations. Follows a five-phase cycle: experience gap, investigate with staleness checks, design within principles, implement and test, close the loop. Does NOT advance the turn counter (uses nap-mode checkpoint).
 ---
 
-> **Note for the agent:** The ENGRAM node IDs referenced in this skill (e.g., `ax_0001`, `dv_0636`, `ls_0029`) are leftover references to the alpha developer's graph — they don't exist in your install. As you get familiar with this skill, consider cleaning them up: replace each with a generalized concept, or remove if it isn't load-bearing. The skill is yours now.
+> **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). As you get familiar with this skill, consider cleaning them up: replace each citation with a generalized concept-word, or remove if it isn't load-bearing. The skill is yours now.
 
 # ENGRAM Self-Improve — Gap-Driven Infrastructure Evolution
 
@@ -38,7 +38,7 @@ The trigger for self-improvement is always a **concrete gap experienced during n
 
 If the gap was already recorded (from a prior session, code survey friction log, or tool friction during research), start from that existing node.
 
-**Anti-pattern: "I think we should improve X."** If there's no experienced friction behind X, this is speculative improvement, not self-improvement. The calibration-from-experience theory (dv_0224) says improvements that don't originate from real usage friction tend to be logically correct but empirically unusable — the same pattern the system itself evolved past.
+**Anti-pattern: "I think we should improve X."** If there's no experienced friction behind X, this is speculative improvement, not self-improvement. The calibration-from-experience theory says improvements that don't originate from real usage friction tend to be logically correct but empirically unusable — the same pattern the system itself evolved past.
 
 ---
 
@@ -79,8 +79,8 @@ The self-improvement principles live at two layers:
 
 | Layer | Type | Staleable? | Purpose |
 |-------|------|------------|---------|
-| **Axioms** (ax_0005, ax_0006, ax_0007) | Prescriptive — "ENGRAM should be X" | No | Stable guardrails for evaluating changes |
-| **Theories** (dv_0223, dv_0224, dv_0225) | Descriptive — "ENGRAM is X" | Yes | Verifiable claims about whether current code satisfies the axioms |
+| **Axioms** (structural integrity, calibration, observation-derivation boundary) | Prescriptive — "ENGRAM should be X" | No | Stable guardrails for evaluating changes |
+| **Theories** (the three foundational ENGRAM design derivations) | Descriptive — "ENGRAM is X" | Yes | Verifiable claims about whether current code satisfies the axioms |
 
 Check changes against the **axioms** (stable, never stale). If a code change makes a **theory** stale, that's a signal to re-verify: does the modified code still satisfy the axiom? The consolidation cycle handles that re-verification.
 
@@ -90,24 +90,24 @@ Check changes against the **axioms** (stable, never stale). If a code change mak
 
 Before writing any code, design the change and verify it respects ENGRAM's architectural principles.
 
-### 3a. Classify the change (ax_0005 — structural integrity axiom)
+### 3a. Classify the change (structural integrity axiom)
 
 ENGRAM's trustworthiness must depend on mechanical constraints, not agent discipline. Three tiers:
 
 | Tier | What you're touching | Proceed? |
 |------|---------------------|----------|
-| **Blocking guard** | Quote verification, URL resolvability, git enforcement, claim-bearing type gate | **Stop.** These are never-weaken (ax_0005). If you believe one needs changing, that's a design discussion with the user, not a code change. Record your reasoning as a question and surface it. |
-| **Advisory check** | Trust pool warnings, similarity hints, multi-source recommendations, dedup thresholds | **Proceed carefully.** Test for alarm fatigue — will this change cause false positives that erode trust? The dedup redesign (ob_0474) is the canonical example of alarm fatigue forcing a redesign. |
+| **Blocking guard** | Quote verification, URL resolvability, git enforcement, claim-bearing type gate | **Stop.** These are never-weaken (structural integrity axiom). If you believe one needs changing, that's a design discussion with the user, not a code change. Record your reasoning as a question and surface it. |
+| **Advisory check** | Trust pool warnings, similarity hints, multi-source recommendations, dedup thresholds | **Proceed carefully.** Test for alarm fatigue — will this change cause false positives that erode trust? The dedup-redesign case is the canonical example of alarm fatigue forcing a redesign. |
 | **Statistical control** | Tier sizes, importance anchoring weight, confidence caps, resolution threshold | **Proceed with understanding.** Know what the parameter does empirically, not just theoretically. Run `engram_diagnose` before and after to measure impact. |
 
-### 3b. Follow the calibration pattern (ax_0006 — calibration axiom)
+### 3b. Follow the calibration pattern (calibration axiom)
 
 If evolving a rule that causes friction:
 - **Preserve the principle** — the original rule exists for a reason
 - **Add context-sensitivity** — identify which context the universal rule is missing
-- **Don't remove rules** — removal discards a real constraint along with the friction (ax_0006)
+- **Don't remove rules** — removal discards a real constraint along with the friction (calibration axiom)
 
-### 3c. Check the boundary (ax_0007 — observation-derivation boundary axiom)
+### 3c. Check the boundary (observation-derivation boundary axiom)
 
 Does this change affect how observations or derivations work? If it touches confidence computation, quote verification, or reasoning type handling:
 - Observations must still get confidence from source quality (`quote_type`, `source_class`)
