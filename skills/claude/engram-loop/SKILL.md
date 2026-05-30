@@ -138,6 +138,23 @@ loop-mode.
    any counterpart agent waiting on a reply. Skipping a re-arm "to drain
    stale wake-queue" is the same lapse class as self-selecting a longer
    cadence: never agent-side, never an idle-state optimization.
+
+   **Check before arm — end-of-iteration invariant: exactly ONE pending wake.**
+   `ScheduleWakeup` is additive (each call adds a new pending wake; it does NOT
+   replace existing ones). Without a guard, user-typed `/loop` continuations +
+   natural wake fires both re-arm, growing the queue. At the end of every
+   iteration, BEFORE calling `ScheduleWakeup`:
+
+   1. `CronList` first.
+   2. If a pending wake (one-shot, /loop body) already exists → DON'T re-arm.
+      The existing wake IS the heartbeat; lifeline rule satisfied.
+   3. If no pending wake exists → arm one (per the 270s default above).
+
+   Lifeline rule + check-before-arm compose to: "exactly one pending wake at
+   iteration end." Achieve via check-then-arm, not blind-arm. Verified
+   empirically 2026-05-30 — without the check, `CronList` showed 2-3 pending
+   wakes at peak during rapid user-continuation patterns, with stale fires
+   every 30-60s instead of the calibrated 270s.
 2. **The armed prompt is a minimal, formalized STUB — the marker carries the
    state.** Don't pack the loop's brief into the `ScheduleWakeup` prompt; point
    at the marker. Arm every wakeup with the same self-declaring stub:
