@@ -32,6 +32,55 @@ status when walking edges. Removing `exemplifies` / `supported_by` edges is
 unnecessary and discouraged; the retracted node carries its own status, and
 traversal respects it.
 
+# Why derive-new + supersede — and never surgery
+
+Every resolution pattern below clears a marker by **derive-new + supersede** (or
+by retracting the dependent node), never by an in-place edit or a surgical /
+raw-DB fix. The reason is structural, and it's what makes the rule stick:
+
+ENGRAM's graph is a **time-ordered causal DAG** — a node may only depend on
+nodes created *before* it. When you retract premise `P` and replace it with `P'`
+(created **now**), the replacement `P'` is *later* than the downstream
+derivation `D` you're repairing. So you cannot simply re-point `D` at `P'`: that
+makes an earlier node (`D`) depend on a later one (`P'`) — a causal edge
+pointing backwards in time, a DAG violation. The guarantee that "every belief
+rests only on evidence that already existed when the belief was formed" would
+break silently. Deriving a **new** node `D'` *now* (so `D'` is later than `P'`),
+citing the live/corrected premises, and superseding `D` with `D'` keeps the
+ordering valid and preserves `D` as an honest audit trail.
+
+⛔ **Do NOT use `tools/surgical.py` or raw `knowledge.db` edits to clear a
+marker.** Two traps:
+
+- **Re-pointing an edge** to a newer replacement creates the backwards-in-time
+  DAG violation above — the very thing the native flow exists to prevent.
+- **Just deleting a `tainted_by` flag** without re-establishing the conclusion
+  hides the problem instead of fixing it: the node still rests on evidence
+  you've disowned. That converts a *loud* failure (a visible taint marker) into
+  a *silent* one (a confident-looking node built on sand) — exactly the
+  corruption the honesty axiom warns against.
+
+Surgery bypasses every guardrail the MCP layer enforces (DAG validity, taint
+cascade, supersede semantics, type preservation, confidence propagation). For
+taint-clearing it is never the right tool.
+
+**Worked example:**
+
+```
+t0  ob_0100  "X measured at 5.0"          (premise)
+t1  dv_0200  derives_from ob_0100 → "Y"   (conclusion)
+t2  ob_0100 retracted (wrong_evidence); replacement ob_0101 "X = 7.0" filed at t2
+    → dv_0200 now carries tainted_by: ob_0100
+```
+
+WRONG (surgery): re-point `dv_0200 → ob_0101`. But `dv_0200` (t1) is *earlier*
+than `ob_0101` (t2) → backwards causal edge → DAG violation.
+
+RIGHT (native): at t3, file `dv_0250` deriving from `ob_0101` → "Y′", then
+`engram_supersede(dv_0200, dv_0250, reason)`. `dv_0250` (t3) is later than
+`ob_0101` (t2) → valid. `dv_0200`'s `tainted_by` clears when it goes
+non-current; both old nodes are preserved as the audit trail.
+
 # Decision tree by target type
 
 For each node with a cascade marker, the resolution path depends on the
