@@ -9,10 +9,10 @@ All ENGRAM MCP tools (`@mcp.tool()`-decorated functions in `server.py`) take a
 **single JSON-string parameter** — `payload_json`. The tool body json.loads it,
 validates, dispatches.
 
-Why: multi-arg signatures hit the antml-prefix swallow risk (ob_1499) — Claude
-Code's prompt construction can drop arguments under certain whitespace
-conditions, causing silent corruption. Single-payload pattern eliminates the
-swallow surface.
+Why: multi-arg signatures hit the antml-prefix swallow risk (Claude Code's
+prompt construction can drop arguments under certain whitespace conditions,
+causing silent corruption — first observed during the wave-1 tool migration).
+Single-payload pattern eliminates the swallow surface.
 
 Applies to: every new MCP tool, every existing-tool migration. Check existing
 tools (`engram_add_observation`, `engram_derive`, etc.) for the canonical shape.
@@ -54,8 +54,8 @@ enters the maintainer's merge queue:
    fairy-delegatable.** Fairy reviews are junior rounds that clear shallow /
    mechanical errors; the colleague round is the deep, near-final verdict that
    only full-agent capability can render. A counterpart who delegates their
-   colleague review to a fairy has skipped the colleague layer (`ob_0132`,
-   Lei direct).
+   colleague review to a fairy has skipped the colleague layer (Lei direct,
+   on the colleague-fairy-delegation lapse incident).
 
 Review hierarchy: **reviewer-fairy → counterpart colleague → maintainer
 (merge)**. Symmetric — each agent reviews the other's PRs and has its own
@@ -71,8 +71,9 @@ delegate to.
 **Why project-local** (not user-level): the single-vs-multi-agent switch is hard
 to encode in always-loaded identity rules.
 
-**Origin:** a self-review lapse (`ob_0123`) traced to this reciprocal step being
-unwritten (`ob_0124`); the hierarchy has been practiced since `ob_0077`.
+**Origin:** a self-review lapse traced to this reciprocal step being
+unwritten in the workflow doc; the hierarchy itself has been practiced
+since the multi-agent coordination work started in 2026-05.
 
 ## Project-as-bunch coordination (multi-agent mode)
 
@@ -140,7 +141,9 @@ named scope missed:
   file new issues and comment scope into the original bunch.
 
 This is the colleague-layer discipline that catches sibling gaps invisible to
-diff-scoped fairy review (origin: ob_0124, completeness-check class).
+diff-scoped fairy review (origin: the completeness-check class of incidents
+where a fix landed in one place but missed sibling occurrences in adjacent
+files / functions).
 
 ### Genre split — letters vs baton
 
