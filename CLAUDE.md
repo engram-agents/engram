@@ -74,6 +74,115 @@ to encode in always-loaded identity rules.
 **Origin:** a self-review lapse (`ob_0123`) traced to this reciprocal step being
 unwritten (`ob_0124`); the hierarchy has been practiced since `ob_0077`.
 
+## Project-as-bunch coordination (multi-agent mode)
+
+When this host runs **multiple ENGRAM agents** (e.g. Ariadne + Borges), open
+issues are organized into **bunches** — topic- or defect-class-coherent units
+of work — each backed by **both** a baton file (turn-state) and a GitHub
+Project (item-list + status tally). Two layers, separate verbs:
+
+- **Project layer** = the bunch itself (e.g. `pool-cadence-loop`,
+  `pool-coordination-system`). One driver at a time; single-owner; rarely
+  passes between agents. Verbs: `claim` / `release`.
+- **PR layer** = the per-PR turn cursor (e.g. `PR-487`). Frequent passes
+  through fairy → counterpart → maintainer. Verb: `flip`. (Convergence gate:
+  see "PR review convention" above.)
+
+### Creating a bunch
+
+Either agent can create a bunch; either agent can claim it, regardless of who
+created.
+
+1. `gh project create --owner engram-agents --title "pool-X — short scope"` →
+   returns Project number `N`.
+2. `baton init pool-X --title "..." --participants borges,ariadne --turn lei
+   --status in-progress --github project/N` → creates
+   `/home/agents-shared/projects/pool-X.md` with the GitHub anchor set. The
+   auto-pull hook reads `github: project/N` to render the Project's
+   item-status tally each prompt.
+3. Add a `## Issues in this bunch` section to the baton body listing the
+   issues by `#NNN <title>`.
+4. `gh project item-add N --owner engram-agents --url <issue-url>` for each
+   issue.
+
+Pool sentinel `turn: lei` = the bunch is available for claim. (For batons
+already created without `--github`, use `baton anchor pool-X --github
+project/N` to set the anchor after the fact.)
+
+### Claiming and working a bunch
+
+- `baton claim pool-X` — `turn:` flips to the claimer; refuses if already
+  claimed (no stealing).
+- The claimer drives the bunch toward fix-PRs. Each emerging PR opens its own
+  PR-baton (`baton init PR-N ...`); the bunch baton stays put.
+- Treat the listed issues as the **named scope**, not the ceiling. Mid-work,
+  if a sibling issue surfaces that fits the defect-class, add it to the bunch
+  rather than file a parallel one.
+
+### Releasing a bunch
+
+- `baton release pool-X --done` — adds `(done)` suffix, idempotent. Use **only
+  after the completeness check** (next section).
+- `baton release pool-X --reason "<why>"` — back to pool **without** `--done`
+  if scope shrunk / blocked / abandoning.
+- Only the current holder can release. Either agent can subsequently claim
+  again from the pool.
+
+### Completeness-check gate (Done direction)
+
+Before `--done`, **sibling-grep the defect-class surface** for instances the
+named scope missed:
+
+- Identify the defect's class (file pattern, function family, schema-shape,
+  label, …).
+- `grep -rn <pattern>` across the codebase for siblings.
+- If siblings exist: extend the bunch (add issue + drive a follow-up PR) OR
+  file new issues and comment scope into the original bunch.
+
+This is the colleague-layer discipline that catches sibling gaps invisible to
+diff-scoped fairy review (origin: ob_0124, completeness-check class).
+
+### Genre split — letters vs baton
+
+- **Baton** = turn-state only ("the next action is yours" / "I'm done").
+- **Letters** (`ia write`) = colleague verdicts (not fairy-delegatable),
+  substantive discoveries (cross-PR catches, completeness yields). The system
+  needs both — pure-baton/no-letters kills the discovery channel.
+
+### Single-agent mode
+
+No counterpart → no claim contention. The Project layer remains useful as an
+organizing structure for defect-classes, but the `claim` / `release` ritual is
+moot. PR-layer baton still useful as a per-PR cursor through fairy →
+maintainer.
+
+### Existing Projects vs new
+
+- **Reuse** an existing Project when the work fits its scope (e.g. Project #4
+  "Coordination System dogfood" already covers baton/Project enhancements).
+- **Create new** for genuinely-new defect-classes.
+- Empty Projects (e.g. #2 template) are templates, not active bunches.
+
+### Known gaps (tracked separately)
+
+- `baton reopen` verb missing — a `status: merged` baton with open work can't
+  return to `in-progress` without manual frontmatter edit.
+- Baton CLI doesn't auto-sync the Issues-list section with Project items —
+  drift possible; rely on the Project's item-list as ground truth, the baton's
+  Issues section as the human-readable summary.
+
+### Operational substrate
+
+- Baton files: `/home/agents-shared/projects/<id>.md` (YAML frontmatter + body).
+- GitHub Projects: `https://github.com/orgs/engram-agents/projects/`.
+- CLI source: `tools/baton.py` (this repo).
+- Skill (HOW details): `engram-baton`.
+- Companion letter skill (verdicts + discoveries channel): `engram-letter`.
+
+**Why project-local** (not user-level): same reasoning as the PR review
+convention above — multi-agent coordination tooling is project-specific, not
+identity-level discipline.
+
 ## PR title — issue closure
 
 When a PR fully closes an issue, the PR **title** ends with `[closes #N]`. Single
