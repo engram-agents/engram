@@ -730,7 +730,39 @@ def cmd_write(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     template = "\n".join(fm_lines) + "\n"
 
     # Get body
-    if args.from_stdin:
+    if args.body_file and args.from_stdin:
+        print(
+            "ia write: --body-file and --from-stdin are mutually exclusive; "
+            "use one or the other.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    if args.body_file:
+        body_path = Path(args.body_file)
+        if not body_path.exists():
+            print(
+                f"ia write: --body-file: '{args.body_file}' not found.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        try:
+            body = body_path.read_text(encoding="utf-8")
+        except OSError as e:
+            print(
+                f"ia write: --body-file: cannot read '{args.body_file}': {e}",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_IO)
+        if body.lstrip().startswith("---"):
+            print(
+                "ia write: warning: --body-file content starts with '---'; "
+                "frontmatter is auto-assembled, so this will appear as literal "
+                "body text. Supply ONLY the body.",
+                file=sys.stderr,
+            )
+        full_content = template + body
+    elif args.from_stdin:
         # Stdin mode: read the full letter content from stdin.
         # The caller is expected to provide complete content (frontmatter + body).
         full_content = sys.stdin.read()
@@ -773,8 +805,8 @@ def cmd_write(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
     # Pre-parse guard: catches bare 'to:' (empty value) before the regex parser's
     # merge quirk, which would otherwise silently misroute the letter. Runs for
-    # both --from-stdin and editor mode (the user can clear the 'to:' field in
-    # the editor too).
+    # --from-stdin, --body-file, and editor mode (the user can clear the 'to:'
+    # field in the editor, or a body file can supply incomplete content).
     fm_raw_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", full_content, re.DOTALL)
     if fm_raw_match:
         fm_raw = fm_raw_match.group(1)
@@ -1144,6 +1176,16 @@ def build_parser() -> argparse.ArgumentParser:
             "(filename timestamp is always send-time; if your stdin frontmatter "
             "specifies a different timestamp, they will diverge by design — "
             "frontmatter ts is authoritative for readers.)"
+        ),
+    )
+    p_write.add_argument(
+        "--body-file", metavar="PATH",
+        help=(
+            "Path to a file containing ONLY the letter body; "
+            "frontmatter (from/to/timestamp) is auto-assembled. "
+            "Body is read verbatim (no shell processing) — the safe path "
+            "for content with backticks/$vars/angle-brackets. "
+            "Mutually exclusive with --from-stdin."
         ),
     )
 

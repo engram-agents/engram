@@ -1314,3 +1314,172 @@ class TestRepliedMarker:
         assert rc == 0
         data = json.loads(stdout)
         assert data["unreplied_letters"] == 0
+
+
+# ===========================================================================
+# CATEGORY 8: --body-file tests
+# ===========================================================================
+
+class TestBodyFile:
+    """ia write --body-file: auto-assembled frontmatter, verbatim body, error cases."""
+
+    def test_body_file_exits_0_and_sends(self, engram_home, inter_agent_dir, tmp_path):
+        """ia write --body-file exits 0 and creates a letter."""
+        _write_config(engram_home, "multi", "ariadne")
+        body_file = tmp_path / "body.md"
+        body_file.write_text("Hello Borges, this is the body.\n", encoding="utf-8")
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "write", "--to", "borges", "--body-file", str(body_file),
+        )
+        assert rc == 0, f"write --body-file failed; stderr: {stderr}"
+        assert "sent" in stdout
+
+    def test_body_file_frontmatter_auto_filled(self, engram_home, inter_agent_dir, tmp_path):
+        """Written letter has correct auto-filled from, to, and valid timestamp."""
+        _write_config(engram_home, "multi", "ariadne")
+        body_file = tmp_path / "body.md"
+        body_file.write_text("Body content here.\n", encoding="utf-8")
+        before = datetime.now(timezone.utc).replace(microsecond=0)
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "write", "--to", "borges", "--body-file", str(body_file),
+        )
+        after = datetime.now(timezone.utc)
+        assert rc == 0, f"stderr: {stderr}"
+        md_files = list(inter_agent_dir.glob("*.md"))
+        assert md_files, "Expected a written .md file"
+        from tools.ia import _parse_frontmatter
+        content = md_files[0].read_text()
+        fields, _ = _parse_frontmatter(content)
+        assert fields.get("from") == "ariadne", f"from: should be agent name; got {fields.get('from')!r}"
+        assert fields.get("to") == "borges", f"to: should be borges; got {fields.get('to')!r}"
+        ts_str = fields.get("timestamp", "")
+        assert ts_str, "timestamp: should be present"
+        ts_dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        assert before <= ts_dt <= after, f"timestamp {ts_str!r} not in expected range"
+
+    def test_body_file_re_and_title_honored(self, engram_home, inter_agent_dir, tmp_path):
+        """--re and --title flags are honored when using --body-file."""
+        _write_config(engram_home, "multi", "ariadne")
+        # Create the referenced letter so re: validation passes
+        ref_filename = "2026-05-28T09-00-00Z_borges.md"
+        _write_letter(
+            inter_agent_dir, ref_filename,
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-60),
+        )
+        body_file = tmp_path / "body.md"
+        body_file.write_text("Reply body content.\n", encoding="utf-8")
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "write", "--to", "borges",
+            "--re", ref_filename,
+            "--title", "My Reply",
+            "--body-file", str(body_file),
+        )
+        assert rc == 0, f"stderr: {stderr}"
+        md_files = [f for f in inter_agent_dir.glob("*.md") if f.name != ref_filename]
+        assert md_files, "Expected an outgoing letter"
+        from tools.ia import _parse_frontmatter
+        content = md_files[0].read_text()
+        fields, body_text = _parse_frontmatter(content)
+        assert fields.get("re") == ref_filename, f"re: field should be set; got {fields.get('re')!r}"
+        assert "# My Reply" in content, "Title heading should appear in letter"
+
+    def test_body_file_backtick_roundtrip(self, engram_home, inter_agent_dir, tmp_path):
+        """Body with backticks/$vars/angle-brackets/YAML-special chars survives verbatim."""
+        _write_config(engram_home, "multi", "ariadne")
+        # This is the load-bearing test: all the problem chars that shell heredocs mangle
+        tricky_body = (
+            "Here is a shell command: `gh project copy <template>`\n"
+            "A variable: $TS\n"
+            "Angle brackets: <angle-brackets>\n"
+            "YAML-special: key: value: with colons\n"
+            "Another YAML-special: [list, of, items]\n"
+            "Backtick in context: run `echo $HOME` to see your home dir.\n"
+        )
+        body_file = tmp_path / "tricky_body.md"
+        body_file.write_text(tricky_body, encoding="utf-8")
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "write", "--to", "borges", "--body-file", str(body_file),
+        )
+        assert rc == 0, f"write with tricky body failed; stderr: {stderr}"
+        md_files = list(inter_agent_dir.glob("*.md"))
+        assert md_files, "Expected a written .md file"
+        content = md_files[0].read_text()
+        # Every tricky substring must appear verbatim in the written letter
+        assert "`gh project copy <template>`" in content, \
+            "Backtick command with angle-brackets did not survive verbatim"
+        assert "$TS" in content, "$TS variable did not survive verbatim"
+        assert "<angle-brackets>" in content, "Angle brackets did not survive verbatim"
+        assert "key: value: with colons" in content, "YAML colon content did not survive verbatim"
+        assert "[list, of, items]" in content, "YAML list syntax did not survive verbatim"
+        assert "`echo $HOME`" in content, "Nested backtick+var did not survive verbatim"
+
+    def test_from_stdin_back_compat(self, engram_home, inter_agent_dir):
+        """--from-stdin still works (back-compat retained)."""
+        _write_config(engram_home, "multi", "ariadne")
+        now = datetime.now(timezone.utc)
+        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        letter_content = (
+            "---\n"
+            "from: ariadne\n"
+            "to: borges\n"
+            f"timestamp: {ts_str}\n"
+            "---\n\n"
+            "Back-compat stdin body.\n"
+        )
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "write", "--to", "borges", "--from-stdin",
+            stdin_text=letter_content,
+        )
+        assert rc == 0, f"--from-stdin back-compat failed; stderr: {stderr}"
+        assert "sent" in stdout
+
+    def test_body_file_and_from_stdin_mutually_exclusive(self, engram_home, inter_agent_dir, tmp_path):
+        """--body-file and --from-stdin together → clear error, non-zero exit."""
+        _write_config(engram_home, "multi", "ariadne")
+        body_file = tmp_path / "body.md"
+        body_file.write_text("Some body.\n", encoding="utf-8")
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "write", "--to", "borges",
+            "--body-file", str(body_file),
+            "--from-stdin",
+            stdin_text="stdin content",
+        )
+        assert rc != 0, "Expected non-zero exit when both --body-file and --from-stdin are passed"
+        assert "mutually exclusive" in stderr.lower() or "body-file" in stderr
+
+    def test_body_file_nonexistent_path(self, engram_home, inter_agent_dir):
+        """--body-file pointing at a nonexistent path → clear error, non-zero exit."""
+        _write_config(engram_home, "multi", "ariadne")
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "write", "--to", "borges",
+            "--body-file", "/tmp/definitely-does-not-exist-ia-body-file-test.md",
+        )
+        assert rc != 0, "Expected non-zero exit for missing body-file"
+        assert "not found" in stderr or "body-file" in stderr
+
+    def test_body_file_unreadable_permission_denied(self, engram_home, inter_agent_dir, tmp_path):
+        """--body-file pointing at an unreadable file (permission denied) → clear error, non-zero exit."""
+        if os.geteuid() == 0:
+            pytest.skip("Running as root — file permission checks are bypassed")
+        _write_config(engram_home, "multi", "ariadne")
+        body_file = tmp_path / "unreadable_body.md"
+        body_file.write_text("Some body content.\n", encoding="utf-8")
+        os.chmod(body_file, 0o000)
+        try:
+            rc, stdout, stderr = _run_ia(
+                engram_home, inter_agent_dir,
+                "write", "--to", "borges",
+                "--body-file", str(body_file),
+            )
+            assert rc != 0, "Expected non-zero exit for unreadable body-file"
+            assert "cannot read" in stderr or "body-file" in stderr
+        finally:
+            os.chmod(body_file, 0o644)
