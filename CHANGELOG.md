@@ -34,7 +34,7 @@ to a versioned section when releasing per `RELEASING.md`.
   deploy.sh computes a SHA of the template and warns when it changed vs the last
   tracked SHA (`$ENGRAM_HOME/.deployed-multi-agent-template-sha`). Marker created
   lazily on first multi-agent deploy. Single-agent installs see zero overhead.
-  Closes the dormancy gap from ob_2092 / ia-silent-fail incident ob_2093.
+  Closes the ia-silent-fail dormancy-gap incident pair.
 - `tools/agentctl` — vendored canonical agentctl (Lei's operational version,
   May 21 build; includes spawn-debug fixes absent from the old snapshot).
   `tests/spawn/Dockerfile` now copies from `tools/agentctl`; the stale
