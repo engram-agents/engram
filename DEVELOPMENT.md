@@ -363,8 +363,9 @@ not CI. (The repo's GitHub Actions billing is paused 2026-05-30; full tests
 run locally before each PR push instead.) When CI is re-enabled, a
 diff-grep workflow on PRs to `dev`/`master` is the intended structural
 backstop; until then, the reviewer-fairy and counterpart-colleague layers
-catch new additions. Existing ~957 references are grandfathered; the
-corpus-wide scrub proceeds incrementally in follow-up PRs to issue #51.
+catch new additions. The 2026-05-30 scrub wave (issue #51, ten incremental
+PRs) cleared the alpha-released-scope corpus; new PRs should not introduce
+new concrete IDs in shipped files.
 
 To check your own PR locally before pushing:
 
@@ -382,7 +383,27 @@ git diff --no-color "origin/dev...HEAD" -- \
 - `README.md` — documents the seed-graph IDs (the ones present in
   **every** install, listed there as the install-state mapping); these
   are install state, not developer citations.
-- `CHANGELOG.md` — historical record; scrub planned but lower priority.
+- `CHANGELOG.md` — historical record; scrub deferred (low-priority).
+
+**Schema-illustration exception** (the small carve-out the scrub wave
+surfaced):
+
+- `engram_ids.py` — the SCHEMA module defining `NODE_ID_RE`. Its doctests
+  MUST use regex-matching literal IDs (the doctest's expected output IS
+  the IDs in input, so schematic placeholders would make the doctest
+  fail). Reviewers should treat literal IDs in this file's `Examples`
+  doctest block as schema illustrations, not citations.
+- `engram_idf.py` — the tokenizer module. Its docstring example for
+  `_TOKEN_RE` requires literal-shape tokens to demonstrate that the
+  regex extracts them as single tokens (the regex's empirical claim
+  depends on real-shape inputs). Reviewers should treat literal IDs
+  in this file's tokenize example as schema illustrations, not
+  citations.
+
+These two modules are exempt because their docstrings are not citations
+of developer-graph nodes — they are regex-pattern demonstrations whose
+output must match the regex they describe. Reviewers should NOT scrub
+literal IDs from these files' docstring examples.
 
 **If your PR legitimately needs a new ID in shipped scope**, explain why
 in the PR body. Reviewer should ask: is this an install-state reference
