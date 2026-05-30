@@ -6,11 +6,7 @@ A thin CLI wrapping the baton file protocol at
 shared projects (PRs, designs, etc.) so agents always know whose move it
 is next.
 
-<<<<<<< HEAD
-Seven subcommands:
-=======
-Eight subcommands:
->>>>>>> d798863 (feat: baton claim + release subcommands — Project-layer grab/ungrab vocabulary)
+Ten subcommands:
   init        Create a new project baton file
   flip        Pass the baton to another participant (PR layer)
   claim       Take a Project-layer baton from the pool (pool → self)
@@ -20,6 +16,7 @@ Eight subcommands:
   show        Display a project file
   close       Mark a project merged or cancelled
   rename      Update the human-readable project title
+  anchor      Set or update the github: anchor on an existing baton
 
 Design: Lei + Borges, 2026-05-28 (solving the dv_0038-shaped misalignment
 incident where Borges and Ariadne disagreed about whose court PR #425 was in).
@@ -216,6 +213,9 @@ def _age_str(ts: Optional[datetime]) -> str:
 # ---------------------------------------------------------------------------
 
 _PROJECT_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*-[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+# GitHub anchor value validation: pr/<N> or project/<N>
+_GITHUB_ANCHOR_RE = re.compile(r"^(pr|project)/\d+$")
 
 
 def _validate_project_id(project_id: str) -> Optional[str]:
@@ -456,6 +456,18 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_VALIDATION)
 
+    # Validate --github anchor value if provided
+    github_anchor = getattr(args, "github", None)
+    if github_anchor is not None:
+        github_anchor = github_anchor.strip().lower()
+        if not _GITHUB_ANCHOR_RE.match(github_anchor):
+            print(
+                f"baton init: invalid --github value '{github_anchor}'. "
+                "Expected pr/<N> or project/<N> (e.g. pr/490, project/4).",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+
     now = _now_iso()
     participants_str = _format_participants(participants)
     title = args.title or project_id
@@ -472,6 +484,10 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         f"turn_since: {now}",
         f'turn_reason: "{init_reason}"',
         f"participants: {participants_str}",
+    ]
+    if github_anchor:
+        content_lines.append(f"github: {github_anchor}")
+    content_lines += [
         "---",
         "",
         f"# {project_id} — {title}",
@@ -491,6 +507,8 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     print(f"  participants: {', '.join(participants)}")
     print(f"  turn:         {initial_turn}")
     print(f"  status:       {status}")
+    if github_anchor:
+        print(f"  github:       {github_anchor}")
 
 
 # ---------------------------------------------------------------------------
@@ -1060,6 +1078,89 @@ def cmd_rename(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: anchor
+# ---------------------------------------------------------------------------
+
+def cmd_anchor(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    """Set or update the github: anchor on an existing baton.
+
+    Mirrors cmd_rename's atomic frontmatter-update pattern:
+    read → validate → _update_frontmatter → atomic write → audit line.
+    """
+    projects_dir = Path(BATON_PROJECTS_DIR)
+    project_id = args.project_id
+    github_anchor = args.github.strip().lower()
+
+    err = _validate_project_id(project_id)
+    if err:
+        print(err, file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+    # Validate anchor value
+    if not _GITHUB_ANCHOR_RE.match(github_anchor):
+        print(
+            f"baton anchor: invalid --github value '{github_anchor}'. "
+            "Expected pr/<N> or project/<N> (e.g. pr/490, project/4).",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    dest = _project_path(project_id, projects_dir)
+    if not dest.exists():
+        print(
+            f"baton anchor: project not found: '{project_id}' "
+            f"(looked for {dest}). "
+            "Use 'baton status' to see active projects.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    try:
+        text = dest.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        print(f"baton anchor: cannot read '{dest}': {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+
+    fields, body = _parse_frontmatter(text)
+    if not fields:
+        print(
+            f"baton anchor: cannot parse frontmatter from '{dest}'. "
+            "The file may be malformed.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    old_anchor = fields.get("github", "").strip()
+
+    # Update (or add) the github: field in frontmatter
+    updated_text = _update_frontmatter(text, {"github": github_anchor})
+
+    # Re-parse to get body after frontmatter update
+    _updated_fields, updated_body = _parse_frontmatter(updated_text)
+
+    # Append audit line to turn log
+    now = _now_iso()
+    if old_anchor:
+        log_entry = (
+            f'- {now} anchor updated: github from "{old_anchor}" to "{github_anchor}"'
+        )
+    else:
+        log_entry = f'- {now} anchor set: github → {github_anchor}'
+    final_body = _append_turn_log(updated_body, log_entry)
+
+    # Reconstruct final content: frontmatter + updated body
+    fm_m = _FRONTMATTER_RE.match(updated_text)
+    if fm_m:
+        fm_section = updated_text[:fm_m.end()]
+        final_content = fm_section.rstrip("\n") + "\n" + final_body
+    else:
+        final_content = updated_text
+
+    _atomic_write(dest, final_content)
+    print(f"baton anchor: {project_id} github → {github_anchor}")
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -1111,6 +1212,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument(
         "--turn", metavar="AGENT",
         help="Who holds the baton initially (default: invoking agent if in participants)",
+    )
+    p_init.add_argument(
+        "--github", metavar="ANCHOR",
+        help=(
+            "GitHub anchor for live status in the auto-pull hook. "
+            "Format: pr/<N> or project/<N> (e.g. pr/490, project/4). "
+            "Without this, only batons named PR-<N> resolve automatically."
+        ),
     )
 
     # -- flip --
@@ -1260,6 +1369,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="New human-readable title (max 200 chars, no newlines)",
     )
 
+    # -- anchor --
+    p_anchor = subparsers.add_parser(
+        "anchor",
+        help="Set or update the github: anchor on an existing baton",
+        description=(
+            "Set or replace the github: frontmatter field on an existing baton "
+            "file, enabling live GitHub status in the auto-pull hook. "
+            "Atomically updates the field and appends an audit line. "
+            "Use this for batons already created without --github, or to "
+            "correct an existing anchor."
+        ),
+    )
+    p_anchor.add_argument(
+        "project_id",
+        metavar="PROJECT-ID",
+        help="Project identifier",
+    )
+    p_anchor.add_argument(
+        "--github", metavar="ANCHOR", required=True,
+        help=(
+            "GitHub anchor value: pr/<N> or project/<N> (e.g. pr/490, project/4)"
+        ),
+    )
+
     return parser
 
 
@@ -1293,6 +1426,8 @@ def main() -> None:
         cmd_close(args, config, agent_name)
     elif args.subcommand == "rename":
         cmd_rename(args, config, agent_name)
+    elif args.subcommand == "anchor":
+        cmd_anchor(args, config, agent_name)
     else:
         parser.print_help()
         sys.exit(EXIT_VALIDATION)

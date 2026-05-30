@@ -60,6 +60,19 @@ Frequent passes between agents. Don't use `claim`/`release` here — `flip` is t
 
 If the live clause feels stale or contradicts what you know, verify with a fresh `gh pr view <N>` or `gh project item-list <N>` rather than trusting the hint blindly.
 
+### Setting a GitHub anchor
+
+The auto-pull hook surfaces live GitHub status only when a baton has a resolvable anchor. Two resolution paths:
+
+1. **Auto-resolves**: baton named `PR-<number>` (e.g. `PR-490`) — the hook infers `pr/490` automatically. No setup needed.
+2. **Explicit anchor required**: all other ids (e.g. `PR-env-home`, `pool-data-correctness`) — the hook resolves to None and skips the live-status clause unless you set a `github:` field.
+
+To set the anchor:
+- **At init time**: `baton init <id> --title "..." --participants <a,b> --github pr/<N>`
+- **On an existing baton**: `baton anchor <id> --github pr/<N>` (or `--github project/<N>`)
+
+Valid anchor formats: `pr/<N>` for PRs, `project/<N>` for GitHub Projects. Malformed values (e.g. `xyz`, `pr/abc`) are rejected with `EXIT_VALIDATION`.
+
 ---
 
 ## Bunch = Project mapping
@@ -93,6 +106,8 @@ Three genres of inter-agent communication, only one of which baton-grab replaces
 | Release a Project back to pool (abandoned) | `baton release <pool-X> --reason "<why>"` |
 | Pass a PR's turn forward | `baton flip <PR-N> <to-agent> "<reason>"` |
 | Open a new PR baton | `baton init <PR-N> --title "<short>" --participants <a,b> --turn <self> --status in-progress` |
+| Open a new PR baton with GitHub anchor | `baton init <id> ... --github pr/<N>` |
+| Set/update GitHub anchor on existing baton | `baton anchor <id> --github pr/<N>` |
 | Rename a Project's title | `baton rename <id> --title "<new>"` |
 | Inspect a project (read-only) | `baton show <id>` |
 | List your in-court batons | `baton mine` |

@@ -1096,3 +1096,210 @@ class TestRelease:
         assert title == "cli gap work (done)", (
             f"Expected '(done)' not doubled; got: {title!r}"
         )
+
+
+# ===========================================================================
+# CATEGORY 10: anchor subcommand + --github init flag
+# ===========================================================================
+
+# GitHub anchor pattern that the hook's _resolve_anchor expects.
+# Mirrors ^(pr|project)/\d+$ — do NOT import the hook directly.
+import re as _re
+_GITHUB_ANCHOR_PATTERN = _re.compile(r"^(pr|project)/\d+$")
+
+
+class TestAnchor:
+    """baton anchor subcommand and baton init --github flag."""
+
+    def test_init_github_pr_writes_frontmatter(self, engram_home, projects_dir):
+        """init --github pr/123 writes github: pr/123 into frontmatter."""
+        _write_config(engram_home, "borges")
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "init", "PR-env-home",
+            "--title", "env home test",
+            "--participants", "borges,ariadne",
+            "--github", "pr/123",
+        )
+        assert rc == 0, f"init --github failed; stderr: {stderr}"
+        github_val = _read_project_field(projects_dir, "PR-env-home", "github")
+        assert github_val == "pr/123"
+        # Confirm the value matches the hook's expected format
+        assert _GITHUB_ANCHOR_PATTERN.match(github_val), (
+            f"Written github value '{github_val}' does not match hook's anchor pattern"
+        )
+
+    def test_init_github_pr_reflected_in_show(self, engram_home, projects_dir):
+        """baton show reflects the github: field written by init --github."""
+        _write_config(engram_home, "borges")
+        _run_baton(
+            engram_home, projects_dir,
+            "init", "PR-show-test",
+            "--title", "show test",
+            "--participants", "borges,ariadne",
+            "--github", "pr/456",
+        )
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "show", "PR-show-test",
+        )
+        assert rc == 0
+        assert "pr/456" in stdout
+
+    def test_init_github_rejects_malformed_value(self, engram_home, projects_dir):
+        """init --github with malformed value exits non-zero."""
+        _write_config(engram_home, "borges")
+        for bad_val in ("xyz", "pr/abc", "pr/", "project/", "123"):
+            rc, stdout, stderr = _run_baton(
+                engram_home, projects_dir,
+                "init", "PR-bad-anchor",
+                "--title", "bad anchor test",
+                "--participants", "borges,ariadne",
+                "--github", bad_val,
+            )
+            assert rc != 0, (
+                f"Expected non-zero exit for --github '{bad_val}'; got rc={rc}"
+            )
+
+    def test_anchor_sets_github_on_existing_baton(self, engram_home, projects_dir):
+        """Round-trip: init plain → anchor → show shows github: project/4; other fields unchanged."""
+        _write_config(engram_home, "borges")
+        # Step 1: init without --github
+        rc, _, stderr = _run_baton(
+            engram_home, projects_dir,
+            "init", "pool-data-correctness",
+            "--title", "data correctness work",
+            "--participants", "borges,ariadne",
+        )
+        assert rc == 0, f"init failed; stderr: {stderr}"
+
+        # Capture pre-anchor state of non-github fields
+        status_before = _read_project_field(projects_dir, "pool-data-correctness", "status")
+        turn_before = _read_project_field(projects_dir, "pool-data-correctness", "turn")
+        title_before = _read_project_field(projects_dir, "pool-data-correctness", "title")
+
+        # Step 2: set anchor
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "anchor", "pool-data-correctness",
+            "--github", "project/4",
+        )
+        assert rc == 0, f"anchor failed; stderr: {stderr}"
+
+        # Step 3: verify github field set
+        github_val = _read_project_field(projects_dir, "pool-data-correctness", "github")
+        assert github_val == "project/4"
+        assert _GITHUB_ANCHOR_PATTERN.match(github_val), (
+            f"Written github value '{github_val}' does not match hook's anchor pattern"
+        )
+
+        # Step 4: verify other fields unchanged
+        assert _read_project_field(projects_dir, "pool-data-correctness", "status") == status_before
+        assert _read_project_field(projects_dir, "pool-data-correctness", "turn") == turn_before
+        assert _read_project_field(projects_dir, "pool-data-correctness", "title") == title_before
+
+        # Step 5: show reflects the new anchor
+        rc, show_out, _ = _run_baton(
+            engram_home, projects_dir,
+            "show", "pool-data-correctness",
+        )
+        assert rc == 0
+        assert "project/4" in show_out
+
+    def test_anchor_updates_existing_github_field(self, engram_home, projects_dir):
+        """anchor on a baton that already has a github: field replaces it."""
+        _write_config(engram_home, "borges")
+        _run_baton(
+            engram_home, projects_dir,
+            "init", "PR-update-anchor",
+            "--title", "update anchor test",
+            "--participants", "borges,ariadne",
+            "--github", "pr/100",
+        )
+        # Update to a different anchor
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "anchor", "PR-update-anchor",
+            "--github", "pr/200",
+        )
+        assert rc == 0, f"anchor update failed; stderr: {stderr}"
+        github_val = _read_project_field(projects_dir, "PR-update-anchor", "github")
+        assert github_val == "pr/200"
+
+    def test_anchor_missing_project_exits_nonzero(self, engram_home, projects_dir):
+        """anchor on a non-existent project exits non-zero."""
+        _write_config(engram_home, "borges")
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "anchor", "PR-NONE",
+            "--github", "pr/99",
+        )
+        assert rc != 0
+        assert "not found" in stderr.lower() or "PR-NONE" in stderr
+
+    def test_anchor_rejects_malformed_value(self, engram_home, projects_dir):
+        """anchor with malformed --github value exits non-zero."""
+        _write_config(engram_home, "borges")
+        _write_project(projects_dir, "PR-1201", turn="borges")
+        for bad_val in ("xyz", "pr/abc", "github.com/org/repo", "notaformat"):
+            rc, stdout, stderr = _run_baton(
+                engram_home, projects_dir,
+                "anchor", "PR-1201",
+                "--github", bad_val,
+            )
+            assert rc != 0, (
+                f"Expected non-zero exit for --github '{bad_val}'; got rc={rc}"
+            )
+
+    def test_anchor_audit_line_appended(self, engram_home, projects_dir):
+        """anchor appends an audit line to the turn log."""
+        _write_config(engram_home, "borges")
+        _write_project(projects_dir, "PR-1202", turn="borges")
+        _run_baton(
+            engram_home, projects_dir,
+            "anchor", "PR-1202",
+            "--github", "pr/77",
+        )
+        content = (projects_dir / "PR-1202.md").read_text()
+        assert "anchor" in content.lower()
+        assert "pr/77" in content
+
+    def test_anchor_no_tmp_remains(self, engram_home, projects_dir):
+        """After anchor, no .tmp file remains (atomic write hygiene)."""
+        _write_config(engram_home, "borges")
+        _write_project(projects_dir, "PR-1203", turn="borges")
+        _run_baton(
+            engram_home, projects_dir,
+            "anchor", "PR-1203",
+            "--github", "pr/55",
+        )
+        tmp_files = list(projects_dir.glob("*.tmp"))
+        assert tmp_files == [], f"Tmp files must not remain: {tmp_files}"
+
+    def test_init_without_github_does_not_write_github_field(self, engram_home, projects_dir):
+        """init without --github writes no github: field (backward compatibility)."""
+        _write_config(engram_home, "borges")
+        _run_baton(
+            engram_home, projects_dir,
+            "init", "PR-no-github",
+            "--title", "no anchor",
+            "--participants", "borges,ariadne",
+        )
+        github_val = _read_project_field(projects_dir, "PR-no-github", "github")
+        assert github_val == "", (
+            f"Expected no github field; got: '{github_val}'"
+        )
+
+    def test_anchor_github_project_format(self, engram_home, projects_dir):
+        """anchor with project/<N> value is accepted and stored correctly."""
+        _write_config(engram_home, "borges")
+        _write_project(projects_dir, "PR-1204", turn="borges")
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "anchor", "PR-1204",
+            "--github", "project/4",
+        )
+        assert rc == 0, f"anchor project/<N> failed; stderr: {stderr}"
+        github_val = _read_project_field(projects_dir, "PR-1204", "github")
+        assert github_val == "project/4"
+        assert _GITHUB_ANCHOR_PATTERN.match(github_val)
