@@ -1303,3 +1303,203 @@ class TestAnchor:
         github_val = _read_project_field(projects_dir, "PR-1204", "github")
         assert github_val == "project/4"
         assert _GITHUB_ANCHOR_PATTERN.match(github_val)
+
+
+# ===========================================================================
+# CATEGORY 11: reopen subcommand
+# ===========================================================================
+
+class TestReopen:
+    """baton reopen: happy path, state-guard refusals, audit-line, and argparse tests."""
+
+    def test_reopen_merged_baton_to_in_progress(self, engram_home, projects_dir):
+        """Reopen a merged baton: status → in-progress; audit log appended; no .tmp."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-1301",
+            title="reopened project",
+            status="merged",
+            turn="borges",
+            participants=["borges", "ariadne"],
+        )
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "reopen", "PR-1301",
+        )
+        assert rc == 0, f"reopen merged→in-progress failed; stderr: {stderr}"
+
+        # status field updated to in-progress
+        status = _read_project_field(projects_dir, "PR-1301", "status")
+        assert status == "in-progress"
+
+        # Audit log entry appended
+        content = (projects_dir / "PR-1301.md").read_text()
+        assert "reopened" in content
+        assert "merged" in content
+        assert "in-progress" in content
+
+        # No .tmp file leftover
+        tmp_files = list(projects_dir.glob("*.tmp"))
+        assert tmp_files == [], f"Tmp files must not remain: {tmp_files}"
+
+    def test_reopen_cancelled_baton_to_in_progress(self, engram_home, projects_dir):
+        """Reopen a cancelled baton: status → in-progress."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-1302",
+            status="cancelled",
+            turn="borges",
+            participants=["borges", "ariadne"],
+        )
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "reopen", "PR-1302",
+        )
+        assert rc == 0, f"reopen cancelled→in-progress failed; stderr: {stderr}"
+
+        status = _read_project_field(projects_dir, "PR-1302", "status")
+        assert status == "in-progress"
+
+    def test_reopen_with_explicit_status_flag(self, engram_home, projects_dir):
+        """Reopen with --status in-review sets status to in-review."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-1303",
+            status="merged",
+            turn="borges",
+            participants=["borges", "ariadne"],
+        )
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "reopen", "PR-1303", "--status", "in-review",
+        )
+        assert rc == 0, f"reopen --status in-review failed; stderr: {stderr}"
+
+        status = _read_project_field(projects_dir, "PR-1303", "status")
+        assert status == "in-review"
+
+    def test_reopen_refuses_already_active(self, engram_home, projects_dir):
+        """Reopen on already-active baton → exit 1 with message naming current status."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-1304",
+            status="in-progress",
+            turn="borges",
+            participants=["borges", "ariadne"],
+        )
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "reopen", "PR-1304",
+        )
+        assert rc == 1, f"Expected exit 1 for already-active baton; got rc={rc}"
+        assert "in-progress" in stderr
+        assert "not closed" in stderr or "already" in stderr.lower() or "flip" in stderr
+
+    def test_reopen_refuses_invalid_target_status(self, engram_home, projects_dir):
+        """Reopen with --status merged (closed status) → argparse rejects."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-1305",
+            status="merged",
+            turn="borges",
+            participants=["borges", "ariadne"],
+        )
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "reopen", "PR-1305", "--status", "merged",
+        )
+        # argparse rejects invalid choices; stderr names the bad value
+        assert rc != 0
+        assert "invalid choice" in stderr or "merged" in stderr
+
+    def test_reopen_with_status_planning(self, engram_home, projects_dir):
+        """Reopen with --status planning succeeds (completes 3-value matrix)."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-1306",
+            status="merged",
+            turn="borges",
+            participants=["borges", "ariadne"],
+        )
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "reopen", "PR-1306", "--status", "planning",
+        )
+        assert rc == 0, f"exit {rc}, stderr={stderr!r}"
+        baton_path = projects_dir / "PR-1306.md"
+        assert "status: planning" in baton_path.read_text()
+
+    def test_reopen_refuses_missing_file(self, engram_home, projects_dir):
+        """Reopen of non-existent project → exit 1 with not-found error."""
+        _write_config(engram_home, "borges")
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "reopen", "PR-NONE",
+        )
+        assert rc == 1, f"Expected exit 1 for missing project; got rc={rc}"
+        assert "not found" in stderr.lower() or "PR-NONE" in stderr
+
+    def test_reopen_appends_audit_log(self, engram_home, projects_dir):
+        """Reopen appends an audit-log line (not replacing) with correct format."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-1306",
+            status="merged",
+            turn="borges",
+            participants=["borges", "ariadne"],
+            turn_reason="merged successfully",
+        )
+        # Count "reopened" occurrences before (should be zero)
+        before_content = (projects_dir / "PR-1306.md").read_text()
+        before_reopen_count = before_content.count("reopened")
+
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "reopen", "PR-1306",
+        )
+        assert rc == 0, f"reopen failed; stderr: {stderr}"
+
+        after_content = (projects_dir / "PR-1306.md").read_text()
+
+        # Exactly one "reopened" audit line appended (not replacing)
+        assert after_content.count("reopened") == before_reopen_count + 1
+
+        # Audit line has expected format: "reopened → <agent>: status was <prev> → <new>"
+        assert "reopened → borges" in after_content
+        assert "status was merged → in-progress" in after_content
+
+        # Original content still present (append, not overwrite)
+        assert "merged successfully" in after_content
+
+    def test_reopen_no_tmp_remains(self, engram_home, projects_dir):
+        """After reopen, no .tmp file remains (atomic write hygiene)."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-1307",
+            status="cancelled",
+            turn="borges",
+            participants=["borges", "ariadne"],
+        )
+        _run_baton(
+            engram_home, projects_dir,
+            "reopen", "PR-1307",
+        )
+        tmp_files = list(projects_dir.glob("*.tmp"))
+        assert tmp_files == [], f"Tmp files must not remain: {tmp_files}"
+
+    def test_reopen_output_message_style(self, engram_home, projects_dir):
+        """reopen prints a confirmation line in the style of other subcommands."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-1308",
+            status="merged",
+            turn="borges",
+            participants=["borges", "ariadne"],
+        )
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "reopen", "PR-1308",
+        )
+        assert rc == 0, f"reopen failed; stderr: {stderr}"
+        assert "PR-1308" in stdout
+        assert "in-progress" in stdout

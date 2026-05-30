@@ -6,7 +6,7 @@ A thin CLI wrapping the baton file protocol at
 shared projects (PRs, designs, etc.) so agents always know whose move it
 is next.
 
-Ten subcommands:
+Eleven subcommands:
   init        Create a new project baton file
   flip        Pass the baton to another participant (PR layer)
   claim       Take a Project-layer baton from the pool (pool → self)
@@ -15,6 +15,7 @@ Ten subcommands:
   mine        Shorthand for status --mine
   show        Display a project file
   close       Mark a project merged or cancelled
+  reopen      Flip a closed baton back to an active status (inverse of close)
   rename      Update the human-readable project title
   anchor      Set or update the github: anchor on an existing baton
 
@@ -982,6 +983,94 @@ def cmd_close(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: reopen
+# ---------------------------------------------------------------------------
+
+# Active statuses that reopen can target (complement of CLOSED_STATUSES).
+ACTIVE_STATUSES = {"planning", "in-progress", "in-review"}
+
+
+def cmd_reopen(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    """Flip a closed baton back to an active status.
+
+    Inverse of cmd_close. Only operates on batons with status: merged or
+    cancelled. Refuses if the baton is already in a non-closed status.
+    """
+    projects_dir = Path(BATON_PROJECTS_DIR)
+    project_id = args.project_id
+    new_status = args.status.strip().lower()
+
+    err = _validate_project_id(project_id)
+    if err:
+        print(err, file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+    if new_status not in ACTIVE_STATUSES:
+        print(
+            f"baton reopen: --status must be one of: {', '.join(sorted(ACTIVE_STATUSES))}. "
+            f"Got: '{new_status}'. Use 'baton close' for merged/cancelled transitions.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    dest = _project_path(project_id, projects_dir)
+    if not dest.exists():
+        print(
+            f"baton reopen: project not found: '{project_id}' "
+            f"(looked for {dest}).",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    try:
+        text = dest.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        print(f"baton reopen: cannot read '{dest}': {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+
+    fields, _body = _parse_frontmatter(text)
+    if not fields:
+        print(
+            f"baton reopen: cannot parse frontmatter from '{dest}'.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    current_status = fields.get("status", "").strip().lower()
+    if current_status not in CLOSED_STATUSES:
+        print(
+            f"baton reopen: project {project_id} is not closed (status: {current_status}); "
+            "use 'baton flip' to change turn or 'baton close' to archive.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    now = _now_iso()
+    invoker = agent_name or "unknown"
+
+    # Update status in frontmatter
+    updated_text = _update_frontmatter(text, {"status": new_status})
+
+    # Re-parse to get body after frontmatter update
+    _updated_fields, updated_body = _parse_frontmatter(updated_text)
+
+    # Append audit-log entry
+    log_entry = f"- {now} reopened → {invoker}: status was {current_status} → {new_status}"
+    final_body = _append_turn_log(updated_body, log_entry)
+
+    # Reconstruct final content: frontmatter + updated body
+    fm_m = _FRONTMATTER_RE.match(updated_text)
+    if fm_m:
+        fm_section = updated_text[:fm_m.end()]
+        final_content = fm_section.rstrip("\n") + "\n" + final_body
+    else:
+        final_content = updated_text
+
+    _atomic_write(dest, final_content)
+    print(f"baton reopen: {project_id} → {new_status}")
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: rename
 # ---------------------------------------------------------------------------
 
@@ -1349,6 +1438,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Final status: merged or cancelled",
     )
 
+    # -- reopen --
+    p_reopen = subparsers.add_parser(
+        "reopen",
+        help="Flip a closed baton back to an active status (inverse of close)",
+        description=(
+            "Flip a closed baton (status: merged or cancelled) back to an active status.\n"
+            "Inverse of 'baton close'. Refuses if the baton is already active — use\n"
+            "'baton flip' instead."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_reopen.add_argument(
+        "project_id",
+        metavar="PROJECT-ID",
+        help="Project identifier",
+    )
+    p_reopen.add_argument(
+        "--status",
+        choices=sorted(ACTIVE_STATUSES),
+        default="in-progress",
+        help="Active status to set (default: in-progress)",
+    )
+
     # -- rename --
     p_rename = subparsers.add_parser(
         "rename",
@@ -1424,6 +1536,8 @@ def main() -> None:
         cmd_show(args, config, agent_name)
     elif args.subcommand == "close":
         cmd_close(args, config, agent_name)
+    elif args.subcommand == "reopen":
+        cmd_reopen(args, config, agent_name)
     elif args.subcommand == "rename":
         cmd_rename(args, config, agent_name)
     elif args.subcommand == "anchor":
