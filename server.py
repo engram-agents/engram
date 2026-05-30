@@ -2948,7 +2948,7 @@ def _build_topology_entries(
     """Build the adjacency-map topology entries + edge count for a focal node.
 
     Used by both view='deep' and view='edges' on engram_inspect to produce the
-    `{source_id: [{to, relation, direction}, ...]}` shape.
+    `{source_id: [{src, dst, relation}, ...]}` shape.
 
     Returns (topology, total_included, filtered_superseded_count).
     filtered_superseded_count is the number of non-current neighbor edges that were
@@ -2970,7 +2970,7 @@ def _build_topology_entries(
     ).fetchall()
 
     # Build adjacency map keyed by focus node id.
-    # Per-edge entry: {to, relation, direction}.
+    # Per-edge entry: {src, dst, relation}.
     edge_entries: list[dict] = []
     total = 0
     filtered_count = 0
@@ -2984,7 +2984,11 @@ def _build_topology_entries(
             continue
         direction = "outgoing" if e["source_id"] == node_id else "incoming"
         rel = e["relation"]
-        entry: dict = {"to": neighbor_id, "relation": rel, "direction": direction}
+        if direction == "outgoing":
+            src, dst = node_id, neighbor_id
+        else:  # incoming
+            src, dst = neighbor_id, node_id
+        entry: dict = {"src": src, "dst": dst, "relation": rel}
         edge_entries.append(entry)
         total += 1
 
@@ -6521,7 +6525,7 @@ def engram_inspect(payload_json: str) -> str:
         with recall_summary; contextual neighbors (cites/about/serves) with keywords only.
         Heavy fields (confidence_history, metadata, scores) omitted.
       view="deep": all node fields + confidence_history + importance/utility scores.
-        Neighbors as topology adjacency map {to, relation, direction}.
+        Neighbors as topology adjacency map {src, dst, relation}.
       view="edges": node ID + type + topology adjacency map only. Lightest payload.
 
     For multi-hop evidence chains, use engram_get_subgraph instead.

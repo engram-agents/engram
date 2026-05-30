@@ -115,7 +115,10 @@ def _get_neighbor_ids_from_result(result: dict, view: str) -> set:
         topology = result.get("topology", {})
         for entries in topology.values():
             for entry in entries:
-                ids.add(entry["to"])
+                # src and dst together represent both endpoints; collect both
+                # so any neighbor node ID is discoverable regardless of direction.
+                ids.add(entry["src"])
+                ids.add(entry["dst"])
     return ids
 
 

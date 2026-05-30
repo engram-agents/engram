@@ -11,6 +11,8 @@ Covers:
   6. Recall grouping cap — with N > cap neighbors, cap fires and truncated_* key
      appears
   7. _RECALL_OMIT stripping — specific fields are absent from recall view
+  8. Topology entry shape — src/dst encoding: outgoing/incoming produce correct src/dst;
+     old to/direction fields are absent
 """
 
 import atexit
@@ -236,17 +238,16 @@ def test_view_deep_topology_shape():
     entries = topology[dv_id]
     assert isinstance(entries, list), "topology entries should be a list"
 
-    # Each entry has to/relation/direction
+    # Each entry has src/dst/relation — no to/direction fields
     for entry in entries:
-        assert "to" in entry, f"entry missing 'to': {entry}"
+        assert "src" in entry, f"entry missing 'src': {entry}"
+        assert "dst" in entry, f"entry missing 'dst': {entry}"
         assert "relation" in entry, f"entry missing 'relation': {entry}"
-        assert "direction" in entry, f"entry missing 'direction': {entry}"
-        assert entry["direction"] in ("outgoing", "incoming"), (
-            f"direction must be 'outgoing' or 'incoming'; got {entry['direction']}"
-        )
+        assert "to" not in entry, f"old 'to' field must not appear: {entry}"
+        assert "direction" not in entry, f"old 'direction' field must not appear: {entry}"
 
-    # ob_id should appear as a neighbor
-    neighbor_ids = [e["to"] for e in entries]
+    # ob_id should appear as a neighbor (dv derives_from ob: src=dv_id, dst=ob_id)
+    neighbor_ids = [e["dst"] for e in entries]
     assert ob_id in neighbor_ids, (
         f"ob_id {ob_id} should appear in deep topology entries; got {neighbor_ids}"
     )
@@ -285,11 +286,13 @@ def test_view_edges_topology_shape():
 
     entries = topology[dv_id]
     for entry in entries:
-        assert "to" in entry
-        assert "relation" in entry
-        assert "direction" in entry
+        assert "src" in entry, f"entry missing 'src': {entry}"
+        assert "dst" in entry, f"entry missing 'dst': {entry}"
+        assert "relation" in entry, f"entry missing 'relation': {entry}"
+        assert "to" not in entry, f"old 'to' field must not appear: {entry}"
+        assert "direction" not in entry, f"old 'direction' field must not appear: {entry}"
 
-    neighbor_ids = [e["to"] for e in entries]
+    neighbor_ids = [e["dst"] for e in entries]
     assert ob_id in neighbor_ids, (
         f"ob_id {ob_id} should appear in edges topology; got {neighbor_ids}"
     )
@@ -422,3 +425,86 @@ def test_recall_grouping_cap_fires():
     assert ln["truncated_upstream_count"] > 0, (
         f"truncated_upstream_count should be positive; got {ln['truncated_upstream_count']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 8. Topology entry shape — src/dst encoding (#279)
+# ---------------------------------------------------------------------------
+
+def test_inspect_topology_outgoing_uses_src_dst():
+    """Outgoing edge (focal derives_from premise) produces src=focal, dst=premise."""
+    server = fresh_server()
+    ob_id = _add_observation(server, "Premise observation for outgoing src/dst test.")
+    dv_id = _derive(server, "Derivation for outgoing src/dst test.", [ob_id])
+
+    result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": dv_id, "view": "deep"})))
+    assert "error" not in result, f"unexpected error: {result}"
+
+    entries = result["topology"][dv_id]
+    derives_from_entries = [e for e in entries if e["relation"] == "derives_from"]
+    assert len(derives_from_entries) >= 1, (
+        f"expected at least one derives_from entry; got entries: {entries}"
+    )
+    outgoing = derives_from_entries[0]
+    assert outgoing["src"] == dv_id, (
+        f"outgoing derives_from: src must be focal node {dv_id!r}; got {outgoing['src']!r}"
+    )
+    assert outgoing["dst"] == ob_id, (
+        f"outgoing derives_from: dst must be premise {ob_id!r}; got {outgoing['dst']!r}"
+    )
+
+
+def test_inspect_topology_incoming_uses_src_dst():
+    """Incoming edge (another node derives_from the focal node) produces src=other, dst=focal."""
+    server = fresh_server()
+    ob_id = _add_observation(server, "Premise for incoming src/dst test.")
+    dv_id = _derive(server, "Derivation that cites the premise — incoming on ob_id.", [ob_id])
+
+    # Inspect the PREMISE: the dv_id→ob_id derives_from edge appears as incoming on ob_id.
+    result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": ob_id, "view": "deep"})))
+    assert "error" not in result, f"unexpected error: {result}"
+
+    entries = result["topology"][ob_id]
+    derives_from_entries = [e for e in entries if e["relation"] == "derives_from"]
+    assert len(derives_from_entries) >= 1, (
+        f"expected at least one derives_from entry on ob_id; got entries: {entries}"
+    )
+    incoming = derives_from_entries[0]
+    assert incoming["src"] == dv_id, (
+        f"incoming derives_from: src must be the citing node {dv_id!r}; got {incoming['src']!r}"
+    )
+    assert incoming["dst"] == ob_id, (
+        f"incoming derives_from: dst must be focal node {ob_id!r}; got {incoming['dst']!r}"
+    )
+
+
+def test_inspect_topology_does_not_emit_direction_field():
+    """Topology entries must not contain the old 'direction' field."""
+    server = fresh_server()
+    ob_id = _add_observation(server, "Obs for no-direction-field test.")
+    dv_id = _derive(server, "Derivation for no-direction-field test.", [ob_id])
+
+    for view in ("deep", "edges"):
+        result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": dv_id, "view": view})))
+        assert "error" not in result, f"unexpected error on view={view!r}: {result}"
+        for node_key, entries in result["topology"].items():
+            for entry in entries:
+                assert "direction" not in entry, (
+                    f"view={view!r}: old 'direction' field must not appear in topology entry: {entry}"
+                )
+
+
+def test_inspect_topology_does_not_emit_to_field():
+    """Topology entries must not contain the old 'to' field."""
+    server = fresh_server()
+    ob_id = _add_observation(server, "Obs for no-to-field test.")
+    dv_id = _derive(server, "Derivation for no-to-field test.", [ob_id])
+
+    for view in ("deep", "edges"):
+        result = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": dv_id, "view": view})))
+        assert "error" not in result, f"unexpected error on view={view!r}: {result}"
+        for node_key, entries in result["topology"].items():
+            for entry in entries:
+                assert "to" not in entry, (
+                    f"view={view!r}: old 'to' field must not appear in topology entry: {entry}"
+                )
