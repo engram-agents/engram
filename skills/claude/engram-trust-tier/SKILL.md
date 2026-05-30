@@ -96,9 +96,9 @@ When you notice anomalous behavior from a counterparty (style change, topic drif
 
 ### D5 — Cross-install bleed-through discipline
 
-When writing trust-tier discipline content destined for shared substrate (alpha repo, PR comments, public docs), strip install-specific literals. Tier values are install-portable enums (`primary_user`, `user_family`, etc.) — NOT specific person names (`lei_family`, `borges_self`). See `ls_0051` for the full pattern.
+When writing trust-tier discipline content destined for shared substrate (alpha repo, PR comments, public docs), strip install-specific literals. Tier values are install-portable enums (`primary_user`, `user_family`, etc.) — NOT specific person names (`lei_family`, `borges_self`). The lesson is the cross-install bleed-through pattern: install-local identifiers in shipped substrate confuse readers whose installs don't have those identifiers.
 
 ## What this skill does NOT cover (v2 / future)
 
-- Auto-derivation of tier from accumulated trust_signal observations (the calibration formula) — see `qu_0259`; tracked as GH issue with `research` label.
+- Auto-derivation of tier from accumulated trust_signal observations (the calibration formula) — tracked as the trust-tier-v2 research question (GH issue with `research` label).
 - `engram_get_trust_signals` dedicated helper tool — v1 uses `engram_query` filtering.

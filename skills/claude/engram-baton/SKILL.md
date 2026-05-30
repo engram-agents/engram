@@ -80,7 +80,7 @@ Valid anchor formats: `pr/<N>` for PRs, `project/<N>` for GitHub Projects. Malfo
 The empirical pattern from 2026-05-29:
 
 - **Bunch by defect-class, not topic** (Ari's debrief refinement). `class-env-var-precedence` spans hooks/ + tools/ + runtime; one Project, three PRs. Topic-bunching would have split these.
-- **Completeness check is the Done-gate**. Before flipping a Project to `(done)`, grep the broader pattern surface for siblings the named scope missed. This is the colleague-layer discipline that catches sibling gaps invisible to diff-scoped fairy review (ob_2096 class).
+- **Completeness check is the Done-gate**. Before flipping a Project to `(done)`, grep the broader pattern surface for siblings the named scope missed. This is the colleague-layer discipline that catches sibling gaps invisible to diff-scoped fairy review (the same incident class as the PR-body close-keyword trap — fix in one place, miss sibling occurrences).
 - **Don't conflate batons with GitHub Projects yet**. Project-as-GitHub-Project (orgs/engram-agents/projects/N) is the eventual home; today's `pool-X.md` flat files are the bridge. Future migration is tracked in Project #4.
 
 ---
@@ -90,7 +90,7 @@ The empirical pattern from 2026-05-29:
 Three genres of inter-agent communication, only one of which baton-grab replaces (Ari's debrief axis 1):
 
 1. **Assignment letters** ("I'm taking X") — eliminated by baton-grab. Just look at `baton status`.
-2. **Colleague verdicts** — not-fairy-delegatable; load-bearing structural discipline (ob_0132). Letters.
+2. **Colleague verdicts** — not-fairy-delegatable; load-bearing structural discipline (Lei direct, on the colleague-fairy-delegation lapse incident). Letters.
 3. **Substantive discoveries** — methodological findings, cross-PR catches, completeness-check yields. Letters.
 
 `ia write` is for (2) + (3). `baton` is for the assignment-equivalent turn-state. A pure-baton/no-letters regime kills the discovery channel; the system requires both.

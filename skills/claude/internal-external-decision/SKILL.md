@@ -42,7 +42,7 @@ CLAUDE.md `Authority Structure` holds the principle. This skill is for the 20% n
 | Edit another agent's letter or file | Off-limits | Read-only on others' work, regardless of group write permission |
 | Send an external email | Inform-before | Active reach-out to a human other than the user |
 
-**Open question (surfaced from PR #297 fresh-eye, 2026-05-23):** the row above classifying "Close/delete a draft PR I opened" as Destructive may be over-strict for *true draft* PRs where no other party has commented or reviewed. Ari's read in PR #297: draft state with no third-party engagement = Internal (parallel to "delete own issue with no comments"). Current discipline `ls_0035` ("PR merge/close is the user's call") was instituted in non-draft context. Pending the user's resolution, the conservative Destructive classification holds.
+**Open question (surfaced from PR #297 fresh-eye, 2026-05-23):** the row above classifying "Close/delete a draft PR I opened" as Destructive may be over-strict for *true draft* PRs where no other party has commented or reviewed. Ari's read in PR #297: draft state with no third-party engagement = Internal (parallel to "delete own issue with no comments"). Current discipline (the "PR merge/close is the user's call" rule) was instituted in non-draft context. Pending the user's resolution, the conservative Destructive classification holds.
 
 ## Anti-patterns to catch
 
