@@ -107,9 +107,37 @@ loop-mode.
 
 ## Step 2 — The loop body (per iteration)
 
-1. **Pace with `ScheduleWakeup`.** 270s is the calibrated sweet spot for
-   active work (cache-warm + responsive to a counterpart's inter-agent inbox).
-   Use a longer fallback (1200–1800s) only at a genuine idle lull.
+1. **Pace with `ScheduleWakeup` at 270s — the canonical default.** This is
+   the cache-warm cadence (under the 5-min Anthropic prompt-cache TTL) and
+   gives good responsiveness to a counterpart's inter-agent inbox. **Do not
+   deviate from 270s unless the user explicitly says otherwise.** When the
+   user says "start your engram-loop" (or equivalent), `ScheduleWakeup(270)`
+   is the assumed cadence — no judgment call required, no need to ask.
+
+   Longer intervals (1200s+) are appropriate ONLY in these two cases:
+
+   (a) The user has explicitly named a different cadence for this loop
+       (e.g., "loop every 30 minutes", "wake me hourly"). A user-named
+       cadence persists for the loop's duration — apply it on every
+       re-arm until the user changes it; no per-iteration re-confirmation.
+   (b) The loop is watching a long-period external signal the user has named
+       (a CI run, a deploy ETA, a remote queue) — and the cadence matches
+       that signal.
+
+   Self-selecting a longer interval as an "idle fallback" is a discipline
+   lapse, not a sensible default — even when the queue feels quiet, 270s is
+   the right cadence because the counterpart's inbox can fill at any moment.
+
+   **Never omit the re-arm.** The heartbeat is the loop's lifeline — at the
+   end of every iteration, re-arm `ScheduleWakeup` (270s, or the
+   user-named cadence from case (a)/(b)) before ending the turn. Even when
+   pacing at a slower interval, the loop continues; only an explicit user
+   "stop" ends it. Without the re-arm, the loop becomes unreachable except
+   via fairy task-notifications + new user input, creating a stuck state the
+   user must discover (often via phone) and unstick manually — which blocks
+   any counterpart agent waiting on a reply. Skipping a re-arm "to drain
+   stale wake-queue" is the same lapse class as self-selecting a longer
+   cadence: never agent-side, never an idle-state optimization.
 2. **The armed prompt is a minimal, formalized STUB — the marker carries the
    state.** Don't pack the loop's brief into the `ScheduleWakeup` prompt; point
    at the marker. Arm every wakeup with the same self-declaring stub:
@@ -134,8 +162,10 @@ loop-mode.
    boundaries; an unwritten finding is lost.
 5. **Drowsiness in loop-mode** (Step 4) — nap ONCE, then keep working.
 6. **Don't manufacture work.** When the queue genuinely drains, hold for the
-   user rather than invent tasks; the loop's steady state can be a quiet
-   heartbeat or a clean stop, not perpetual grinding.
+   user rather than invent tasks; the loop's steady state is a quiet
+   heartbeat (idle re-arms, no fake work), not perpetual grinding. The loop
+   itself ends only when the user says stop or a sleep cycle removes the
+   marker — never on agent-side judgment that "the queue feels done."
 
 ---
 
