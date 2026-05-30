@@ -52,7 +52,7 @@ decides whether you write the marker or check it:
   cat ~/.engram/loop-mode.json 2>/dev/null
   ```
 
-  - **present** → the loop is live → continue the iteration (Step 2).
+  - **present** → the loop is live → continue the iteration via Step 1.5 (staleness sanity check) then Step 2 (loop body).
   - **absent** → the loop already ended (the marker is removed at loop-end); this
     re-fire is a **MISFIRE** (stale-marker misfire failure mode). Do NOT run the loop body, and do NOT
     re-arm. Note "stale loop — marker absent, stopping" and stop.
@@ -102,6 +102,29 @@ arming the first wakeup is also what makes Step 0's guard sound: by the time any
 wakeup can fire, the marker exists — so a continuation that finds it absent is
 unambiguously a misfire. From the next prompt, the drowsiness banner flips to
 loop-mode.
+
+---
+
+## Step 1.5 — Top-of-iteration staleness sanity (CONTINUATION only)
+
+**After Step 0 confirms the marker is present AND you are on a CONTINUATION
+(not a fresh START — START goes through Step 1's write, skip this step)**,
+spot-check its `state` field against your in-context understanding of where
+the work is. If they diverge — the marker is stale FROM the PREVIOUS
+iteration's failure to run the update-then-arm ritual (Step 2.3) — fix it
+now before proceeding so this iteration's actions get recorded properly.
+
+```bash
+cat ~/.engram/loop-mode.json | jq -r .state | head -20
+```
+
+The most likely cause of staleness is the previous iteration skipped Step 2.3.
+Investigate briefly: is the wake prompt carrying state the marker doesn't have?
+That's the failure mode. Reconcile by moving that state into the marker's
+`state` field before doing any iteration work.
+
+*(Skip this step on a fresh START — the marker was just written in Step 1 and
+cannot be stale.)*
 
 ---
 
@@ -170,11 +193,15 @@ loop-mode.
    ambiguity at the root. (A UserPromptSubmit hook emitting the same misfire line
    on an absent marker is an optional deterministic backstop — not needed given
    the self-declaring stub.)
-3. **Update the marker's `state` before re-arming, every iteration.** The marker
-   is the canonical handoff across compaction; if you don't refresh `state`, the
-   next iteration resumes on stale context. Re-`cat >` the marker (or patch the
-   `state` field) with the current pending-work / in-flight fairies / key node
-   IDs / next step.
+3. **Update-then-arm ritual (every iteration end, in this order):**
+
+   a. **Compose current state**: pending work, in-flight fairies, key node IDs, next step.
+   b. **Rewrite the marker's `state` field** via `cat > ~/.engram/loop-mode.json` or `jq` patch with the composed content. The marker file is the CANONICAL HANDOFF; the wake prompt is just a pointer.
+   c. **Verify the marker reflects reality**: `cat ~/.engram/loop-mode.json | jq -r .state | head -20` — does it match what you want the next iteration to see? If still stale, fix it now.
+   d. **`CronList`** — if a pending wake already exists, DON'T re-arm (check-before-arm).
+   e. **If queue empty**, `ScheduleWakeup` with a MINIMAL STUB prompt (per §2 above). Do NOT stuff state into the prompt — the marker carries it.
+
+   **Drift signal**: if you find yourself writing more than 1-2 lines in the wake prompt, you're drifting — the state belongs in the marker. Stop, move it to the marker's `state` field, re-arm with the minimal stub.
 4. **ENGRAM-write findings as they happen** — the loop crosses compaction
    boundaries; an unwritten finding is lost.
 5. **Drowsiness in loop-mode** (Step 4) — nap ONCE, then keep working.
