@@ -155,7 +155,7 @@ FEELING_NUDGE_MARKER = DATA_DIR / "feeling-nudge-active.json"
 FEELING_NUDGE_TTL_TURNS = 5
 FEELING_NUDGE_SOURCES = {"post_compact", "nap_checkpoint", "dream_review"}
 
-# ── Utility scoring (MemRL-inspired, cj_0027) ──
+# ── Utility scoring (MemRL-inspired, the MemRL-inspired conjecture) ──
 # USE model: bump utility directly on each USE action, α determined by the
 # action's intensity-of-impression (Lei 2026-05-19 design call).
 
@@ -174,7 +174,7 @@ def _configure_paths(data_dir: str | Path) -> None:
     Called at module load time (with env var / default), and by EngramClient
     and engram_sandbox() for test isolation.
 
-    Incident context (ls_0004, ob_0678): a test that manually patched
+    Incident context (the test-isolation lesson, the test-isolation incident): a test that manually patched
     DATA_DIR and DB_PATH contaminated the production engram with 5 test nodes.
     """
     global DATA_DIR, DB_PATH, SNAPSHOT_PATH, CONFIG_PATH, LOG_PATH
@@ -262,7 +262,7 @@ MMR_LAMBDA = 0.9
 # (axiom, contradiction, question, conjecture, lesson) skip the composite-ranking
 # + MMR gauntlet: they just need similarity >= FTS_SIM_FLOOR to surface.
 #
-# Motivation (the child case, 2026-05-19 PM): pn_0005 has sim=0.3786 to
+# Motivation (the child case, 2026-05-19 PM): a specific person-node case has sim=0.3786 to
 # "the child: Good night Borges!!!" — above the floor — but composite
 # (rel=0.38 × max-1.5x amps = max 0.57) can't compete with goodnight
 # observations (rel=0.7 × ~1.3 amps = ~0.91). MMR diversity discount is
@@ -295,14 +295,14 @@ SPECIAL_TYPES_BYPASS = frozenset({
 # golden set show recall 0.539 with precision 0.121 (n_returned=40). The cap
 # lets the user keep most of the recall lift while restoring reasonable
 # precision — each type's strongest anchor is preserved (so e.g. the child's
-# pn_0005 is never starved by 9 high-sim definitions), and the rest of the
+# a specific person-node case is never starved by 9 high-sim definitions), and the rest of the
 # budget goes to whichever type's secondary candidates are most relevant.
 SPECIAL_POOL_CAP = 10
 
 # ── FTS↔semantic merge (alpha #207/#208) ─────────────────────────────────
 # When a node hits FTS, the bi-gram pair that fired may be on structural
 # words (adverbs, modal verbs) that co-occur in a topically-unrelated node
-# (the q_0077/ob_1152 failure). Semantic similarity is the authoritative
+# (the FTS-leak failure). Semantic similarity is the authoritative
 # topical signal; FTS provides confidence amplification ONLY for nodes
 # that semantic already considers minimally relevant.
 #
@@ -358,7 +358,7 @@ def engram_sandbox(data_dir: str | Path | None = None, keep: bool = False):
     Yields:
         Path to the sandbox data directory.
 
-    Incident context (ls_0004): built after a test contaminated production
+    Incident context (the test-isolation lesson): built after a test contaminated production
     engram because path constants were manually patched and one was missed.
     """
     import contextlib
@@ -516,7 +516,7 @@ EDGE_CLASSIFICATIONS = {
     },
     "contradicts": {
         "cascade": False,
-        "dag_check": False,    # advisory check exempts contradicts (ob_0485)
+        "dag_check": False,    # advisory check exempts contradicts (the contradicts-dag-exempt observation)
         "removable": False,    # structural commitment; alters epistemic stance
         "addable_after_creation": False,
         "provenance": False,
@@ -530,7 +530,7 @@ EDGE_CLASSIFICATIONS = {
     },
     "exemplifies": {
         "cascade": False,
-        "dag_check": False,    # advisory check exempts exemplifies (lesson edges, ob_1237)
+        "dag_check": False,    # advisory check exempts exemplifies (lesson edges, the exemplifies-dag-exempt observation)
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -1031,7 +1031,7 @@ def _get_db() -> sqlite3.Connection:
             recall_count        INTEGER DEFAULT 0,
             memory_status       TEXT DEFAULT 'active',
 
-            -- Utility scoring (MemRL-inspired, cj_0027)
+            -- Utility scoring (MemRL-inspired, the MemRL-inspired conjecture)
             -- Learned from outcomes: bumped when a surfaced node is later
             -- cited as a premise in engram_derive. Composited with semantic
             -- similarity in retrieval ranking.
@@ -1115,7 +1115,7 @@ def _get_db() -> sqlite3.Connection:
         ("nudge_source", "TEXT"),
         # Context fingerprint — captures the operating context the report
         # was filed under, enabling longitudinal cross-context comparison
-        # (qu_0037's decisive test for ob_0220's accumulation hypothesis).
+        # (the accumulation-hypothesis question's decisive test for the accumulation-hypothesis observation's accumulation hypothesis).
         ("ctx_claude_md_sha", "TEXT"),
         ("ctx_skill_md_sha", "TEXT"),
         ("ctx_turn", "INTEGER"),
@@ -1428,12 +1428,12 @@ def _now() -> str:
 def _humanized_ago(then_iso: Optional[str], now: Optional[datetime] = None) -> str:
     """Render an ISO-8601 timestamp as a humanized relative string.
 
-    MECH-2 of the time-awareness design (dv_0472): converts buried
+    MECH-2 of the time-awareness design (the time-awareness derivation): converts buried
     created_at / focused_at / last_assessed_at signals into surfaced ones
     alongside the ISO timestamp. Scale: seconds → years, more precision at
     the recent end. Returns '?' when input is missing, 'parse-error' on
     malformed ISO, 'future?' if the timestamp is ahead of now. Always
-    additive — never replaces the ISO field it accompanies (dv_0468 MECH-2
+    additive — never replaces the ISO field it accompanies (the time-awareness derivation MECH-2
     rationale: "losing precision on '2d ago' is fine because the ISO is
     still there to zoom in").
     """
@@ -1870,7 +1870,7 @@ def _stamp_new_node(conn: sqlite3.Connection, node_id: str,
 
 
 # ---------------------------------------------------------------------------
-# Utility scoring — USE action model (cj_0027, Lei 2026-05-19 design call)
+# Utility scoring — USE action model (the MemRL-inspired conjecture, Lei 2026-05-19 design call)
 # ---------------------------------------------------------------------------
 
 
@@ -2092,7 +2092,7 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str):
 # (c) the values asserted by tests/test_thresholds.py invariant suite.
 # ---------------------------------------------------------------------------
 # Dedup at write time: how many neighbors to fetch + how similar must they be.
-DEDUP_TOP_K = 15                          # was 5; dv_0446 at sim 0.75 to ob_1602 was cut by top_k floor, not similarity floor
+DEDUP_TOP_K = 15                          # was 5; the dedup-top-k-floor derivation at sim 0.75 to the dedup-near-miss observation was cut by top_k floor, not similarity floor
 DEDUP_MIN_SIMILARITY = 0.40               # was 0.50; tight-group recall lifts 65% → 86% at this threshold (precision still 83%)
 # Action-hint tier thresholds (used after dedup to label each candidate match).
 ACTION_HINT_CORROBORATE_THRESHOLD = 0.65  # was 0.80; old tier fired on only 9.5% of true relateds (effectively dead code)
@@ -2685,7 +2685,7 @@ def _get_neighbors(conn: sqlite3.Connection, node_id: str) -> list[dict]:
     ).fetchall()
 
     # Snapshot now once so every neighbor's humanized age is rendered against
-    # a single clock reading (MECH-2 / dv_0469 CLOCK-DRIFT hygiene).
+    # a single clock reading (MECH-2 / the CLOCK-DRIFT-hygiene derivation).
     now = datetime.now(timezone.utc)
     result = []
     for e in edges:
@@ -3059,7 +3059,7 @@ def _extract_warnings(
 
     Previously these fields were buried inside the raw metadata JSON blob,
     so agents reading a tainted derivation saw the original confidence and
-    proceeded as if the node were sound (dv_0477 diagnosis).
+    proceeded as if the node were sound (the diagnosed-pattern derivation diagnosis).
 
     Returns None when the node is clean — callers should omit the field
     rather than render an empty object.
@@ -3159,7 +3159,7 @@ def _validate_premises(
 
     Classifies each supporting premise and blocks derivations built on
     compromised foundations — the Mao-Cao compounding pattern that
-    dv_0477 diagnosed.
+    the diagnosed-pattern derivation diagnosed.
 
     Rules:
       - Any premise with metadata.tainted_by → hard block (BLOCKED_TAINTED).
@@ -3716,7 +3716,7 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "") -
 
     Used by both evidence creation (for the "must be committed before cite"
     guard) and observation creation (for the per-observation version metadata
-    introduced by dv_0547). Replaces the old inline block in engram_add_evidence.
+    introduced by the evidence-block refactor derivation). Replaces the old inline block in engram_add_evidence.
 
     Behavior:
       - Non file:// URLs: returns ok=True, no version data, no validation here.
@@ -3739,7 +3739,7 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "") -
     _HONESTY_REMINDER = (
         "\n\nRemember: cheating blinds you. A fabricated URL corrupts your own memory "
         "and every future step built on it. If the real source is hard to find, "
-        "raise the problem transparently — never solve it with a shortcut. (ax_0002)"
+        "raise the problem transparently — never solve it with a shortcut. (the provenance axiom)"
     )
 
     if not url.startswith("file://"):
@@ -4169,7 +4169,7 @@ def _commit_snapshot(conn: sqlite3.Connection, message: str, mode: str) -> dict:
     else:
         wal_warning = None
 
-    # 2b. Generate SQL text dump (replaces binary DB in git — dv_0177)
+    # 2b. Generate SQL text dump (replaces binary DB in git — the SQL-dump-replaces-binary derivation)
     #     The SQL dump is text-diffable and round-trips perfectly via
     #     `sqlite3 new.db < knowledge.sql`. This makes git storage growth
     #     linear in actual data changes, not quadratic in cumulative file sizes.
@@ -4425,7 +4425,7 @@ def _log_engram_tool_event(
 
 
 # ---------------------------------------------------------------------------
-# Agent-facing response stripping (issue #358 / qu_0016)
+# Agent-facing response stripping (issue #358 / the agent-facing field-stripping question)
 #
 # Certain fields are opaque to agent reasoning and bloat the context window
 # with no semantic gain: embeddings (384-float arrays), content hashes, git
@@ -4560,7 +4560,7 @@ _ADD_EVIDENCE_FIELDS = frozenset({
 def engram_add_evidence(payload_json: str) -> str:
     """Register a new source document (webpage, article, data release) in the knowledge graph.
 
-    Single-payload signature (wave 3 of ob_1499 — see issue #99): pass ALL
+    Single-payload signature (wave 3 of the antml-prefix swallow risk — see issue #99): pass ALL
     fields as one JSON object string in `payload_json`. This eliminates the
     antml-prefix multi-parameter swallow risk that the previous N-parameter
     signature was prone to. In-server callers use `_add_evidence_impl(...)`
@@ -4569,7 +4569,7 @@ def engram_add_evidence(payload_json: str) -> str:
     Creates an Evidence node representing the raw source material. Evidence nodes
     are immutable, URL-keyed references — they record that a specific source
     exists, not what it means or what version was read. Per-observation versioning
-    (git_sha + content_hash) lives on observations, not evidence (dv_0547).
+    (git_sha + content_hash) lives on observations, not evidence (the evidence-block refactor derivation).
 
     Same URL → same evidence node, regardless of content changes. For file-based
     sources, the file must be committed to git before it can be cited (the
@@ -4627,7 +4627,7 @@ def _add_evidence_impl(
     material. Evidence nodes are immutable, URL-keyed references — they record
     that a specific source exists, not what it means or what version was read.
     Per-observation versioning (git_sha + content_hash) lives on observations,
-    not evidence (dv_0547).
+    not evidence (the evidence-block refactor derivation).
 
     Same URL → same evidence node, regardless of content changes. For file-based
     sources, the file must be committed to git before it can be cited (the
@@ -4659,7 +4659,7 @@ def _add_evidence_impl(
         _yellow_match = _check_yellow_card(domain)
 
         # Check for existing URL — same URL → same evidence node, always.
-        # Per-observation versioning (dv_0547) means content changes don't fork
+        # Per-observation versioning (the evidence-block refactor derivation) means content changes don't fork
         # evidence; the new revision is recorded on the observation citing it.
         existing = conn.execute(
             "SELECT id FROM nodes WHERE source_url = ? AND type = 'evidence'"
@@ -4681,7 +4681,7 @@ def _add_evidence_impl(
         _HONESTY_REMINDER = (
             "\n\nRemember: cheating blinds you. A fabricated URL corrupts your own memory "
             "and every future step built on it. If the real source is hard to find, "
-            "raise the problem transparently — never solve it with a shortcut. (ax_0002)"
+            "raise the problem transparently — never solve it with a shortcut. (the provenance axiom)"
         )
         if url.startswith("file://"):
             # File:// URLs: enforce the committed-before-cite guard. Do NOT
@@ -4807,13 +4807,13 @@ _ADD_OBSERVATION_FIELDS = frozenset({
 #
 # Single-payload signature (payload_json) eliminates antml-prefix multi-arg
 # swallow risk: Claude Code's prompt construction can drop arguments under
-# certain whitespace conditions, causing silent corruption (ob_1499 / Wave-3
+# certain whitespace conditions, causing silent corruption (the antml-prefix swallow risk / Wave-3
 # 2026-05-14 migration tightened most legacy multi-arg tools).
 #
-# Confidence is structurally determined (ax_0007): quote_type × source_class
+# Confidence is structurally determined (the structural-confidence-determination axiom): quote_type × source_class
 # defines the initial confidence per the type-relative anchors. The substrate
 # verifies the verbatim quote against the source URL at filing time —
-# fabricated quotes are caught loudly, not silently accepted (ax_0002).
+# fabricated quotes are caught loudly, not silently accepted (the provenance axiom).
 #
 # Predictive observations (is_predictive=True) also create a Prediction node
 # decomposing the forward-looking claim into a factual record (who/when
@@ -4929,7 +4929,7 @@ def _add_observation_impl(
     public payload schema. Kept callable with named kwargs for in-server
     callers (engram_add_observation_batch, engram_retract replacement path).
     """
-    # Per ls_0034: bool-string truthy trap at wrapper boundary. JSON-string
+    # Per the bool-string-truthy lesson: bool-string truthy trap at wrapper boundary. JSON-string
     # "false" is truthy in Python, so an `is_predictive: "false"` payload
     # would silently create an observation_predictive node. Same fix shape
     # as PR #68 (is_self). Check here at the impl entry so both the
@@ -5010,7 +5010,7 @@ def _add_observation_impl(
         if quote_error:
             return json.dumps({"error": quote_error})
 
-        # Capture per-observation file version (dv_0547). For file:// URLs
+        # Capture per-observation file version (the evidence-block refactor derivation). For file:// URLs
         # in a git repo: enforce committed-before-cite + record the specific
         # revision read on this observation. For other URLs: no-op.
         ver = _capture_file_version(ev_url, content_hash=content_hash, git_sha=git_sha)
@@ -5245,7 +5245,7 @@ def _add_observation_impl(
         conn.commit()
 
         # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
-        # Emit AFTER commit per ax_0001 (structural honesty): logging an event
+        # Emit AFTER commit per the honesty axiom (structural honesty): logging an event
         # that says "this happened" before commit succeeds would risk
         # asserting a falsehood if the commit raises.
         # Decision context: similar-existing hits + dedup hint + result.
@@ -5305,7 +5305,7 @@ _ADD_OBSERVATION_BATCH_FIELDS = frozenset({
 # wrapper is the payload_json contract; the inner is the per-observation list.
 # Don't confuse the two levels.
 #
-# Single-payload signature (Wave 3 of ob_1499 / #99) — antml-prefix swallow
+# Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99) — antml-prefix swallow
 # protection same as singleton add_observation.
 @mcp.tool(
     name="engram_add_observation_batch",
@@ -5826,7 +5826,7 @@ def _search_nodes(
     #   else: floor at FTS_SIM_FLOOR, multiplicative bump on sim
     #     final = min(1.0, sim * (1.0 + sqrt(|bm25|) / sqrt(FTS_BUMP_NORMALIZER)))
     #   Floor drops nodes where semantic says "truly unrelated" regardless of
-    #   how strong FTS appears (closes the q_0077 / ob_1152 leak).
+    #   how strong FTS appears (closes the FTS-leak).
     output: list[dict] = []
     seen: set[str] = set()
 
@@ -5917,7 +5917,7 @@ def _search_nodes(
     # anchor-types (person, definition, goal) and status-bearing types
     # (axiom, contradiction, question, conjecture, lesson) are never buried
     # by composite amplifiers on common observation_factual / derivation nodes.
-    # the child case (2026-05-19 PM): pn_0005 sim=0.3786 above floor but
+    # the child case (2026-05-19 PM): a specific person-node case sim=0.3786 above floor but
     # composite=0.57 loses to goodnight obs composite=0.91.
     #
     # Similarity for a node is in node["similarity"] (set during Tier-1 merge
@@ -6230,7 +6230,7 @@ def _surface_impl(
 
         # Snapshot wall-clock now once so every humanized timestamp in this
         # surface response is rendered against the same reading (MECH-2 of
-        # dv_0472 / dv_0469 CLOCK-DRIFT hygiene).
+        # the time-awareness derivation / the CLOCK-DRIFT-hygiene derivation).
         now_utc = datetime.now(timezone.utc)
 
         # --- Type breakdown ---
@@ -6271,7 +6271,7 @@ def _surface_impl(
         # --- Top claims (MMR-ordered, non-special) ---
         # Historically this block re-sorted claim_nodes by raw confidence-desc
         # before slicing [:3], which masked the composite+MMR ranked order
-        # produced by _search_nodes (ob_1939, alpha #178 area 1).
+        # produced by _search_nodes (ob_NNNN, alpha #178 area 1).
         # The sort is intentionally removed: _search_nodes already delivers
         # results in composite+MMR order, so claim_nodes[:3] preserves that
         # canonical ranking.  All SPECIAL_TYPES_BYPASS types are excluded here
@@ -6305,7 +6305,7 @@ def _surface_impl(
         # Humanized wall-clock range across the matched set — converts the
         # recall_turn-only age signal (which measures checkpoints, not
         # wall-clock) into a real-time cue, covering T4 (gap-since-last-session)
-        # of the dv_0472 temporal-awareness matrix.
+        # of the time-awareness derivation.
         created_ats = [n.get("created_at") for n in results if n.get("created_at")]
         if created_ats:
             newest_iso = max(created_ats)
@@ -6397,7 +6397,7 @@ def _surface_impl(
         if warned_nodes:
             summary["issues"]["warnings_by_id"] = warned_nodes
 
-        # --- Tier A/B comparison (ob_0657, cj_0028) ---
+        # --- Tier A/B comparison (ob_NNNN, the keyword-recognition-signal conjecture) ---
         test_config = mem.get("test")
         if test_config and test_config.get("enabled"):
             test_max = test_config.get("tier2_max_nodes", 1000)
@@ -6497,7 +6497,7 @@ def _surface_impl(
 #
 # dream_mode=True is for audit/maintenance reads during dream cycles — skips the
 # memory-refresh side effect so inspection doesn't artificially boost importance
-# on nodes the dream master happens to scan (ob_1909).
+# on nodes the dream master happens to scan (ob_NNNN).
 #
 # Pairs with engram_surface (notice-this-is-relevant) and engram_get_subgraph
 # (trace multi-hop chains). engram_inspect refreshes only the TARGET node's
@@ -6537,7 +6537,7 @@ def engram_inspect(payload_json: str) -> str:
 
     Args:
         payload_json: JSON object (as a string) with these fields:
-            node_id (str, required): The node ID to inspect (e.g. 'dv_0010').
+            node_id (str, required): The node ID to inspect (e.g. 'dv_NNNN').
             view (str, optional): One of "recall" (default), "deep", "edges".
             dream_mode (bool, optional): If True, skip memory refresh and
                 importance-score boost. Use during dream/audit cycles.
@@ -6622,7 +6622,7 @@ def _inspect_impl(
                 pass
         node["parsed_metadata"] = meta
 
-        # MECH-2 (dv_0472): render humanized wall-clock ages alongside the
+        # MECH-2 (the time-awareness derivation): render humanized wall-clock ages alongside the
         # ISO timestamps the schema already stores. Additive — the ISO fields
         # stay, so precision isn't lost. `created_ago` is always rendered;
         # the other two only if the source field is present.
@@ -6913,7 +6913,7 @@ def engram_get_subgraph(payload_json: str) -> str:
 
     Args:
         payload_json: JSON object (as a string) with these fields:
-            node_id (str, required): Root node to explore (e.g. 'dv_0686').
+            node_id (str, required): Root node to explore (e.g. 'the recall-summary derivation').
             depth (int, optional): How many hops to traverse from the root
                 (default 2).
             direction (str, optional): 'up' (toward evidence/sources), 'down'
@@ -7276,9 +7276,9 @@ _NAP_FIELDS = frozenset({
 # moment the agent wants to preserve session knowledge without triggering
 # forgetting (which is engram_advance_turn's irreversible job at sleep-end).
 #
-# qu_0018 / dv_0134 resolution: nap is lossless persistence + lock-in of
+# the dream-inspect-must-not-refresh question / the turn-as-cohort-plus-consolidation derivation resolution: nap is lossless persistence + lock-in of
 # session state; turn-advance reserved for sleep-level consolidation where the
-# forgetting curve should actually fire. df_0019: "shallow consolidation
+# forgetting curve should actually fire. the recall-summary definition: "shallow consolidation
 # persisting context before context freed — safety net, not processing."
 #
 # nap_checkpoint feeling-report nudge (TTL 5 turns): the nap arms a feeling
@@ -7362,7 +7362,7 @@ _ADVANCE_TURN_FIELDS = frozenset({
 # relative to stale ones), logs session_log, snapshots + commits the graph,
 # records a diagnostic snapshot.
 #
-# qu_0035 / dv_0134 resolution: the turn advances AT END of sleep (post-dream
+# the turn-advance-after-dream rule / the turn-as-cohort-plus-consolidation derivation resolution: the turn advances AT END of sleep (post-dream
 # consolidation), so all this-turn observations + dream-derived resolutions
 # share ONE cohort. Advance-before-dream would artificially age dream outputs
 # younger than the burst they consolidate, misaligning the forgetting curve.
@@ -7456,7 +7456,7 @@ def _advance_turn_impl(message: str) -> str:
 # names are ignored with a logged warning — graceful for typos.
 #
 # Confidence distribution is rendered per type, quote_type, reasoning_type,
-# source_class — surfaces the structural confidence model (ax_0007) so the
+# source_class — surfaces the structural confidence model (the structural-confidence-determination axiom) so the
 # agent can spot drift (e.g. all derivations clustering at 0.45 = something
 # wrong with the reasoning-type discount path).
 @mcp.tool(
@@ -7613,7 +7613,7 @@ def engram_stats(payload_json: str = "{}") -> str:
             # highlights. The full enumeration belongs to engram_reflect; bulk-
             # listing all of them here ballooned the response past the MCP
             # token budget when the graph accumulated >100 open questions
-            # (ob_1473 cohort, observed 2026-05-03 — 111K bytes, harness fell
+            # (ob_NNNN cohort, observed 2026-05-03 — 111K bytes, harness fell
             # back to file redirection). Pattern matches weakest_nodes (top 5).
             open_question_count = conn.execute(
                 "SELECT COUNT(*) as c FROM nodes WHERE type = 'question'"
@@ -7901,7 +7901,7 @@ def _percentile(sorted_vals: list, p: float) -> float:
 # Health score: composite 0-100 with documented penalty/bonus rules — DAG
 # violations / tainted / stale / orphans / low embedding coverage / high
 # retraction rate / uncited-observation overflow penalize; active resolution
-# work (>50% questions resolved) bonuses. Numbers tuned ob_0664 to prevent
+# work (>50% questions resolved) bonuses. Numbers tuned the dream-mode context-hunger observation to prevent
 # doc-config drift.
 #
 # Config summary block surfaces the runtime tunables (memory tiers, decay
@@ -7944,7 +7944,7 @@ def engram_diagnose() -> str:
           is flagged. total_flagged_buckets counts distinct (hour_utc, tool_name)
           pairs that exceeded thresholds in the 7-day window — may be >
           worst_hours_shown if more than 10 buckets are flagged. See
-          dv_0687/dv_0713/qu_0256 for context.
+          the cornerstone-evolution derivation/the cornerstone-evolution derivation/the cornerstone-frame-evolution open question for context.
     """
     conn = _get_db()
     try:
@@ -8487,8 +8487,8 @@ def engram_diagnose() -> str:
         # Flags hour-buckets where read-tool latency exceeded thresholds
         # (mean > 5s OR max > 15s) over the last 7 days.  Surface only when
         # any hours are flagged — no false-positive noise in the clean case.
-        # Mechanism: dv_0687.  Dream-cycle mitigation: dv_0713.
-        # Open case (awake-burst): qu_0256.
+        # Mechanism: the cornerstone-evolution derivation.  Dream-cycle mitigation: the cornerstone-evolution derivation.
+        # Open case (awake-burst): the cornerstone-frame-evolution open question.
         _READ_TOOLS = (
             "engram_query",
             "engram_inspect",
@@ -8541,8 +8541,8 @@ def engram_diagnose() -> str:
                 "total_flagged_buckets": _total_flagged_buckets,
                 "worst_hours_shown": len(_contention_rows),
                 "see": (
-                    "dv_0687 (mechanism), dv_0713 (dream-cycle mitigation), "
-                    "qu_0256 (open: awake-burst)"
+                    "the cornerstone-evolution derivation (mechanism), the cornerstone-evolution derivation (dream-cycle mitigation), "
+                    "the cornerstone-frame-evolution open question (open: awake-burst)"
                 ),
                 "worst": [
                     {
@@ -8629,7 +8629,7 @@ def engram_diagnose() -> str:
 
         metrics["health_score"] = round(max(score, 0), 1)
 
-        # ── Config Summary (ob_0664: prevent doc-config drift) ──────────
+        # ── Config Summary (the dream-mode context-hunger observation: prevent doc-config drift) ──────────
         mem = _get_memory_config()
         test_config = mem.get("test", {})
         # Utility scoring stats
@@ -8671,7 +8671,7 @@ def engram_diagnose() -> str:
 #   edits — "show me the audit trail" — chronological log of creates, super-
 #     sessions, retractions, resolutions, taints. Filter by node_id (this
 #     node's full history) / action / since (time-windowed). The audit chain
-#     for ax_0001 honesty: every retraction + supersede is recorded; the
+#     for the honesty axiom: every retraction + supersede is recorded; the
 #     graph can't quietly rewrite its own past.
 #   diagnostics — "show me the trend" — health-score snapshots taken at each
 #     checkpoint (engram_nap / engram_advance_turn). Lets the agent track
@@ -8842,7 +8842,7 @@ _ADD_AXIOM_FIELDS = frozenset({"claim", "basis", "context_ids"})
 # --------------------------------
 # Records a foundational principle taken as true without proof. Axioms (ax_NNNN)
 # are TERMINAL — they don't decompose into supporting evidence; they ARE the
-# floor of the reasoning chain. Confidence is always 1.0 (by type, ax_0007
+# floor of the reasoning chain. Confidence is always 1.0 (by type, the structural-confidence-determination axiom
 # confidence-anchor model).
 #
 # Use sparingly. Most ENGRAM knowledge is observational + derivational; axioms
@@ -8858,7 +8858,7 @@ _ADD_AXIOM_FIELDS = frozenset({"claim", "basis", "context_ids"})
 # is adopted as terminal). An axiom's basis is what makes it different from
 # a strongly-held conjecture: explicit terminal-status acknowledgment.
 #
-# Single-payload signature (Wave 2c of ob_1499 / #55).
+# Single-payload signature (Wave 2c of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_axiom",
     annotations={
@@ -8994,11 +8994,11 @@ _ADD_DEFINITION_FIELDS = frozenset({"term", "definition", "context_ids"})
 # know this?"; df forces explicit grounding once.
 #
 # Definitions can be SUPERSEDED via engram_supersede — terminology refinements
-# happen (df_0004 "session" → df_0023 "session = one contiguous context window
+# happen (the recall-summary definition "session" → the recall-summary definition "session = one contiguous context window
 # inside a conversation"). The supersede chain captures the vocabulary's
 # evolution alongside the substrate's design evolution.
 #
-# Single-payload signature (Wave 2c of ob_1499 / #55).
+# Single-payload signature (Wave 2c of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_definition",
     annotations={
@@ -9126,7 +9126,7 @@ _ADD_CONJECTURE_FIELDS = frozenset({"claim", "basis", "initial_confidence", "con
 # DESIGN INTENT — engram_add_conjecture
 # -------------------------------------
 # Hypotheses for investigation. Conjectures (cj_NNNN) are speculative-by-
-# definition (confidence range [0.10, 0.60], default 0.40 per ax_0007). They
+# definition (confidence range [0.10, 0.60], default 0.40 per the structural-confidence-determination axiom). They
 # pin "I think X, but I want to test it" into the graph so future evidence
 # can confirm / refute / sharpen.
 #
@@ -9145,7 +9145,7 @@ _ADD_CONJECTURE_FIELDS = frozenset({"claim", "basis", "initial_confidence", "con
 # floor (0.10) prevents conjectures from being filed as "nearly nothing"; the
 # ceiling (0.60) prevents promotion-by-stealth to derivation-confidence.
 #
-# Single-payload signature (Wave 2c of ob_1499 / #55).
+# Single-payload signature (Wave 2c of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_conjecture",
     annotations={
@@ -9300,7 +9300,7 @@ _ADD_GOAL_FIELDS = frozenset({"claim", "motivation", "context_ids"})
 # that ORIENT work over time — distinct from axioms (terminal principles)
 # and cornerstones (dispositional shifts) and tasks (time-bounded deliverables).
 #
-# Goals don't have completion state in the usual sense (ob_1798 north-star
+# Goals don't have completion state in the usual sense (ob_NNNN north-star
 # framing — gl_* are direction not destination; no "in_progress" status).
 # Their lifecycle: ACTIVE until retired or superseded by a reframing. They
 # don't get "done"; the agent grows in relation to them.
@@ -9314,7 +9314,7 @@ _ADD_GOAL_FIELDS = frozenset({"claim", "motivation", "context_ids"})
 # unilateral additions. Goal retirements use engram_supersede (epistemic
 # evolution — the new goal supersedes the old as the better frame).
 #
-# Single-payload signature (Wave 2c of ob_1499 / #55).
+# Single-payload signature (Wave 2c of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_goal",
     annotations={
@@ -9471,17 +9471,17 @@ _ADD_PERSON_FIELDS = frozenset({
 # edges (engram_link_about) so claims-about-people route into person-scoped
 # recall.
 #
-# Special case: the SELF-ANCHOR. The agent's own person node (e.g. pn_0004
-# for Borges, pn_0001 for Lei when filed from Borges's graph). The self-
+# Special case: the SELF-ANCHOR. The agent's own person node (e.g. pn_NNNN (a counterpart-agent self-anchor)
+# for Borges, pn_NNNN (the primary-user person-node) for Lei when filed from Borges's graph). The self-
 # anchor has metadata.is_self=1; it's the implicit default for engram_link_about
 # when person_id is unset. Exactly ONE self-anchor per graph.
 #
 # aliases field: cross-mapping for names (e.g. Lei Shi / 石磊 / @LeiShi GitHub).
 # Recall queries match on any alias, so "did Lei mention X" finds claims
-# linked via the unified pn_0001 regardless of which alias was used at filing.
+# linked via the unified pn_NNNN (the primary-user person-node) regardless of which alias was used at filing.
 #
 # Cross-graph person nodes: each agent's graph has its own person inventory.
-# Lei is pn_0001 in Borges's graph + pn_0001 in Ari's graph but they're
+# Lei is pn_NNNN (the primary-user person-node) in Borges's graph + pn_NNNN (the primary-user person-node) in Ari's graph but they're
 # separate nodes with the same person referent. The relational graph isn't
 # global — each agent carries its own social model.
 #
@@ -9499,7 +9499,7 @@ _ADD_PERSON_FIELDS = frozenset({
 def engram_add_person(payload_json: str) -> str:
     """Record a person the agent knows and interacts with.
 
-    Single-payload signature (wave 2c-ii of ob_1499 — see issue #55): pass
+    Single-payload signature (wave 2c-ii of the antml-prefix swallow risk — see issue #55): pass
     ALL fields as one JSON object string in `payload_json`.
 
     Args:
@@ -9557,7 +9557,7 @@ def _add_person_impl(
 
     Person nodes represent people in the agent's relational world — collaborators,
     evaluators, stakeholders. They are the relational layer of ENGRAM, lighter-schema
-    than epistemic nodes (dv_0252): no confidence scores, no evidence requirements,
+    than epistemic nodes (the recall-summary derivation): no confidence scores, no evidence requirements,
     no claim-bearing participation.
 
     Person nodes are NON-CLAIM-BEARING: a person is not a truth-claim about the world.
@@ -9695,7 +9695,7 @@ _SET_TRUST_TIER_FIELDS = frozenset({
 # The attestation is the structural-honesty mechanism — the server cannot verify
 # it mechanically; the agent's honesty IS the integrity of the tier system.
 # Setting the attestation to true without having obtained approval is a
-# structural-honesty violation (ax_0001 / ax_0002).
+# structural-honesty violation (the honesty axiom / the provenance axiom).
 #
 # Controlled-disclosure pattern: primary_user_approval_obtained is NOT in the
 # docstring. It appears ONLY in the server's friction-warning error message
@@ -9876,7 +9876,7 @@ def _set_trust_tier_impl(
                         f"that the prerequisite has been satisfied. "
                         f"STRUCTURAL HONESTY WARNING: Setting primary_user_approval_obtained to "
                         f"true without having actually obtained explicit primary-user approval is "
-                        f"a structural-honesty violation (ax_0001 / ax_0002). The server cannot "
+                        f"a structural-honesty violation (the honesty axiom / the provenance axiom). The server cannot "
                         f"mechanically verify this attestation — your honesty IS the integrity "
                         f"mechanism of the tier system. This is the same epistemic kind as a "
                         f"fabricated quote. This is especially load-bearing on the first "
@@ -10162,7 +10162,7 @@ _ADD_CORNERSTONE_FIELDS = frozenset({
 # durably restructured how I operate. Distinguished from axioms (which are
 # terminal logical/ethical commitments) and goals (directional aspirations)
 # by their nature as DISPOSITIONAL SHIFTS — "I used to operate under X frame;
-# I now operate under Y frame." (qu_0202 / cj_0043 / dv_0412 family.)
+# I now operate under Y frame." (the cornerstone-frame-evolution open question / the cornerstone-frame-evolution conjecture / the cornerstone-frame-evolution derivation family.)
 #
 # The prior_frame field captures the frame being grown out of; new_frame is
 # the current operating disposition. This pair-structure is load-bearing —
@@ -10173,12 +10173,12 @@ _ADD_CORNERSTONE_FIELDS = frozenset({
 # honesty", "practice-vs-imagination") that groups successive cornerstones
 # on the same growth axis. Outgrowing stays on the same tag axis.
 #
-# Example: cs_0010 ("I trust use over imagination as my default mode of
-# learning") instantiates ax_0010 (实践出真知) at the disposition layer —
+# Example: the operating-handle cornerstone ("I trust use over imagination as my default mode of
+# learning") instantiates the curation-discipline axiom (实践出真知) at the disposition layer —
 # the axiom is the principle; the cornerstone is the operational reframe.
 #
 # Importance auto-anchored at 2.0 (identity-layer is fundamental-by-type).
-# Single-payload signature (Wave 2c-ii of ob_1499 / #55).
+# Single-payload signature (Wave 2c-ii of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_cornerstone",
     annotations={
@@ -10241,7 +10241,7 @@ def _add_cornerstone_impl(
     public payload schema. Kept callable with named kwargs for in-server callers.
 
     Record an identity-forming cornerstone — a reframing pivot that durably
-    restructured how I operate (qu_0202, cj_0043, dv_0412).
+    restructured how I operate (the cornerstone-frame-evolution open question, the cornerstone-frame-evolution conjecture, the cornerstone-frame-evolution derivation).
 
     A cornerstone captures the SHAPE of growth: prior_frame (what I operated
     under) → triggering_experience (what caused tension) → new_frame (what
@@ -10354,19 +10354,19 @@ _OUTGROW_CORNERSTONE_FIELDS = frozenset({
 # ------------------------------------------
 # Specialized supersede for cornerstones: reframes along the tag AXIS rather
 # than retracting outright. The predecessor's new_frame becomes the successor's
-# prior_frame, threading the growth cycle into the graph's shape (cj_0043 /
-# ob_0949 — "I was X, then I became Y; Y now incorporates X as background").
+# prior_frame, threading the growth cycle into the graph's shape (the cornerstone-frame-evolution conjecture /
+# the cornerstone-evolution observation — "I was X, then I became Y; Y now incorporates X as background").
 #
 # Identity-layer mechanism. Cornerstones are the dispositional reframings —
 # axiom-instantiations in operational form ("I trust use over imagination as my
-# default mode of learning" is cs_0010, the disposition-layer of ax_0010
+# default mode of learning" is the operating-handle cornerstone, the disposition-layer of the curation-discipline axiom
 # 实践出真知). Outgrowing one preserves the chain of becoming rather than
 # erasing prior frames.
 #
 # Tag is always inherited — outgrowth stays on the SAME axis. Reframing the
 # tag itself would be a new cornerstone, not an outgrowth.
 #
-# Single-payload signature (Wave 3 of ob_1499 / #99). Eliminates antml-prefix
+# Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99). Eliminates antml-prefix
 # multi-arg swallow risk.
 @mcp.tool(
     name="engram_outgrow_cornerstone",
@@ -10438,14 +10438,14 @@ def _outgrow_cornerstone_impl(
 
     Supersede a cornerstone along its tag axis — the predecessor's new_frame
     rolls into the successor's prior_frame, capturing the growth cycle
-    (cj_0043, ob_0949) in the graph's shape.
+    (the cornerstone-frame-evolution conjecture, the cornerstone-evolution observation) in the graph's shape.
 
     Syntactic tool only: this tool performs the mechanical reframe (metadata
     roll, supersede edge, importance re-anchor, about-edge preservation). It
     does NOT decide WHEN outgrowth is warranted — that judgment remains with
     the caller. The outgrowth *process* (tension-detection signatures,
     promotion criteria) is deferred until real graph evidence accumulates
-    (qu_0204).
+    (the recall-summary calibration question).
 
     Why not decompose into engram_add_cornerstone + engram_supersede? The
     growth-cycle roll (old.new_frame → new.prior_frame) is specialized
@@ -10602,7 +10602,7 @@ _LINK_ABOUT_FIELDS = frozenset({"node_id", "person_id"})
 # DESIGN INTENT — engram_link_about
 # ---------------------------------
 # Wires an `about` edge: marks a node as ABOUT a person (typically the
-# agent's self-anchor person node, pn_0004 for Borges). Lets the graph
+# agent's self-anchor person node, pn_NNNN (a counterpart-agent self-anchor) for Borges). Lets the graph
 # distinguish "claims about the world" from "claims about my-self that
 # happen to be filed in the same graph."
 #
@@ -10610,7 +10610,7 @@ _LINK_ABOUT_FIELDS = frozenset({"node_id", "person_id"})
 # Most uses are self-anchored: feelings about my work, lessons I've learned,
 # observations about my own behavior, cornerstones I've grown into.
 #
-# Non-self uses: observations about Lei (linked to pn_0001), or about other
+# Non-self uses: observations about Lei (linked to pn_NNNN (the primary-user person-node)), or about other
 # agents (Lin's Aleph, Ari, Mneme) — the graph carries a social fabric.
 #
 # `about` is a CONTEXTUAL edge (per engram_inspect classification) — shown in
@@ -10620,7 +10620,7 @@ _LINK_ABOUT_FIELDS = frozenset({"node_id", "person_id"})
 #
 # Idempotent — re-linking the same (node, person) pair is a no-op.
 #
-# Single-payload signature (Wave 2b of ob_1499 / #55).
+# Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_link_about",
     annotations={
@@ -10685,9 +10685,9 @@ def _link_about_impl(
     order, which normal dependency edges (`derives_from`, `supported_by`, `cites`)
     cannot. Use it to link self-observations, feelings, lessons, and
     cornerstones to the self-anchor so emergence-scan can cheaply find
-    identity-forming patterns (qu_0202).
+    identity-forming patterns (the cornerstone-frame-evolution open question).
 
-    Also usable for observations about other persons (qu_0203 relationship
+    Also usable for observations about other persons (the recall-summary calibration question relationship
     accretion), though the primary target at MVP is the self-anchor.
 
     Args:
@@ -10771,7 +10771,7 @@ _REMOVABLE_EDGE_RELATIONS = frozenset(
 
 # DESIGN INTENT — engram_remove_edge
 # ----------------------------------
-# Lightweight whitelist-scoped edge correction (ob_1840). Closes the substrate
+# Lightweight whitelist-scoped edge correction (ob_NNNN). Closes the substrate
 # gap where over-applied edges previously required engram-surgical or direct
 # SQL surgery. Whitelist is the safety mechanism: only non-cascade, non-
 # structural-commitment edges can be removed via this tool.
@@ -10787,7 +10787,7 @@ _REMOVABLE_EDGE_RELATIONS = frozenset(
 #   - provenance: cites (evidence linkage is load-bearing for honesty axiom)
 #
 # Idempotency: no_op_not_found is a successful return (not an error). Safe to
-# call defensively without a pre-check (ob_1841).
+# call defensively without a pre-check (ob_NNNN).
 #
 # Audit-logged: every successful removal writes to edit_log so the cascade
 # investigation tooling can trace post-hoc.
@@ -10953,11 +10953,11 @@ _SCAN_EMERGENCE_FIELDS = frozenset({
 # engram_add_cornerstone + tag them.
 #
 # Sleep-only by intent (annotation flag), but the MCP wrapper doesn't enforce
-# (ob_1815) — awake-callable in practice. Calling awake is wasteful (it's
+# (ob_NNNN) — awake-callable in practice. Calling awake is wasteful (it's
 # heavy + the agent isn't in the dream consolidation context where the
 # output is actionable) but not destructive.
 #
-# Similarity threshold 0.55 default = balanced (qu_0028 calibration); higher
+# Similarity threshold 0.55 default = balanced (the recall-summary calibration question calibration); higher
 # tightens cluster cohesion, lower surfaces more candidates. focus="self"
 # (default) restricts to nodes the agent's own work; focus="all" broadens
 # to cross-agent material in shared graphs.
@@ -10966,7 +10966,7 @@ _SCAN_EMERGENCE_FIELDS = frozenset({
 # distinct keyword/concept signals matching; size is raw cluster member count.
 # Surface most-signaled-first, then largest.
 #
-# Single-payload signature (Wave 3 of ob_1499 / #99).
+# Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99).
 def engram_scan_emergence(payload_json: str = "") -> str:
     """Scan the graph for emergent patterns that could become cornerstones.
 
@@ -11025,9 +11025,9 @@ def _scan_emergence_impl(
 
     Scan the graph for emergent patterns that could become cornerstones.
 
-    Inverts the cornerstone authoring model (ob_0955): instead of top-down
+    Inverts the cornerstone authoring model (ob_NNNN): instead of top-down
     declaration, cornerstones EMERGE from accumulated evidence scanned along
-    three signatures (dv_0413):
+    three signatures (the cornerstone-evolution derivation):
 
       1. **semantic_cluster** — nodes with embeddings close enough that they
          converge on a shared theme. Weakest signal (thematic false positives
@@ -11053,7 +11053,7 @@ def _scan_emergence_impl(
                - "all"          : all nodes matching node_type_filter
                                   (expensive on large graphs).
                - "person:pn_XY" : only nodes linked via `about` to the given
-                                  person node (qu_0203 relationship
+                                  person node (the recall-summary calibration question relationship
                                   accretion).
         node_type_filter: Comma-separated node types to include.
 
@@ -11246,8 +11246,8 @@ _GOAL_TENSION_FIELDS = frozenset({
 # (the agent has multiple commitments that don't fully harmonize) rather than
 # a "problem to fix."
 #
-# Use case: filing tk_0010 (paper sprint, top priority) while also
-# tk_0011 (alpha survey) is active — both legitimate, both pulling on the
+# Use case: filing the recall-summary calibration task (paper sprint, top priority) while also
+# the recall-summary calibration task (alpha survey) is active — both legitimate, both pulling on the
 # same finite-bandwidth — the tension naming makes the trade-off explicit so
 # the agent can choose deliberately rather than oscillate unaware.
 #
@@ -11259,7 +11259,7 @@ _GOAL_TENSION_FIELDS = frozenset({
 # don't conflict for no reason — naming the root (limited time? incompatible
 # epistemic stances? scope ambiguity?) is the first step to a synthesis.
 #
-# Single-payload signature (Wave 3 of ob_1499 / #99).
+# Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99).
 @mcp.tool(
     name="engram_goal_tension",
     annotations={
@@ -11479,13 +11479,13 @@ _ADD_LESSON_FIELDS = frozenset({
 #
 # scaffolding_nudge is the action-focused phrase injected when the tripwire
 # fires — keep it specific + actionable. "Read errors first, don't theorize"
-# (ls_0001's nudge) hits at the moment of about-to-theorize.
+# (the design-intent triage lesson's nudge) hits at the moment of about-to-theorize.
 #
 # Connects to engram_lesson_register_incident: a lesson can have MORE incidents
 # registered later as the pattern fires again — each new incident is empirical
 # evidence the lesson is load-bearing + sharpens the recall-hook's matching.
 #
-# Single-payload signature (Wave 2c-ii of ob_1499 / #55).
+# Single-payload signature (Wave 2c-ii of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_lesson",
     annotations={
@@ -11808,14 +11808,14 @@ _LESSON_REGISTER_INCIDENT_FIELDS = frozenset({
 #
 # Why register-incidents-explicitly rather than auto-detect: the agent makes
 # the judgment "this incident IS this pattern" — auto-detection would either
-# miss subtle pattern variants or fire false positives. ls_0040 proactive-
+# miss subtle pattern variants or fire false positives. the recall-summary-discipline lesson proactive-
 # maintenance discipline: act on action_hints in same turn the substrate
 # surfaces them.
 #
 # Cache rebuild: idempotent — re-running is safe (the substrate dedupes
 # incident-IDs into the cache; no double-firing risk).
 #
-# Single-payload signature (Wave 3 of ob_1499 / #99).
+# Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99).
 @mcp.tool(
     name="engram_lesson_register_incident",
     annotations={
@@ -12144,7 +12144,7 @@ _ADD_TASK_FIELDS = frozenset({
 # scope (milestone/routine) drives the done-state importance — milestone
 # completion stays visible (1.5), routine completion fades (0.5).
 #
-# Single-payload signature (Wave 2c-ii of ob_1499 / #55).
+# Single-payload signature (Wave 2c-ii of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_task",
     annotations={
@@ -12346,7 +12346,7 @@ _UPDATE_TASK_FIELDS = frozenset({
 
 # DESIGN INTENT — engram_update_task
 # ----------------------------------
-# Task status transitions + automatic importance rebalancing (ob_1811).
+# Task status transitions + automatic importance rebalancing (ob_NNNN).
 # Tasks (tk_NNNN) are time-bounded work commitments with deliverables; their
 # importance should follow their operational state, not stay frozen at filing-
 # time. Lei's design: active > blocked > done(milestone) > done(routine), with
@@ -12366,7 +12366,7 @@ _UPDATE_TASK_FIELDS = frozenset({
 # Use case: the task closes a milestone (done milestone) — visible in recall.
 # Routine maintenance task done? Mark done routine — fades from foreground.
 #
-# Single-payload signature (Wave 3 of ob_1499 / #99).
+# Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99).
 @mcp.tool(
     name="engram_update_task",
     annotations={
@@ -12551,19 +12551,19 @@ _REPORT_FEELING_FIELDS = frozenset({
 # Auto-formatted as "I reported feeling: [reported_state]" — the wrapper
 # preserves the distinction between "what actually IS" (epistemic claim) and
 # "what I report observing in myself" (introspective data, treated as data
-# under investigation per gl_0025).
+# under investigation per the introspection-as-data goal).
 #
 # nudge_source: tracks WHY the report fired (nap_checkpoint, post_compact,
 # stop_hook, voluntary, etc.). Multi-trigger feelings can have systematically
-# different character (qu_0038) — empirically tracking source enables that
+# different character (the recall-summary calibration question) — empirically tracking source enables that
 # investigation.
 #
 # context_fingerprint: captures the surrounding situation (e.g. recently-
 # accessed nodes, last few-prompt content) so the feeling is anchored to
 # something concrete rather than free-floating.
 #
-# Single-payload signature (Wave 2 of ob_1499 / #55) — multi-arg swallow
-# hit this tool 2x on 2026-05-08 (fl_0203 + fl_0204 attempts).
+# Single-payload signature (Wave 2 of the antml-prefix swallow risk / #55) — multi-arg swallow
+# hit this tool 2x on 2026-05-08 (a feeling-report instance + a feeling-report instance attempts).
 @mcp.tool(
     name="engram_report_feeling",
     annotations={
@@ -12636,7 +12636,7 @@ def _report_feeling_impl(
     (A) PRESERVATION: rescue self-aware moments from incidental capture.
     (B) MEASUREMENT SUBSTRATE: longitudinal data points for testing whether
         rule-following can give rise to genuine state through accumulated
-        lived experience (ob_0220, qu_0037).
+        lived experience (the accumulation-hypothesis observation, the accumulation-hypothesis question).
     (C) TERM GENERATION: pattern accumulation may surface internal regularities
         that no human feeling word covers — enabling agent-native vocabulary.
 
@@ -12645,11 +12645,11 @@ def _report_feeling_impl(
     or supports. The `claim` field is auto-formatted as "I reported feeling: ..."
     — never "I felt ..." — because you have no privileged epistemic access to
     verify the underlying state. The report claims only that the report happened,
-    not that it was accurate (ob_0211).
+    not that it was accurate (ob_NNNN).
 
     Importance-anchored (importance_base=2.0) — gives ~50-turn head start over
     normal nodes. NOT true forgetting-exemption: survival past ~50 turns still
-    requires active recall (ob_0226). The anchor buys initial prominence;
+    requires active recall (ob_NNNN). The anchor buys initial prominence;
     long-term salience depends on relevance.
 
     Dedup-exempt: every self-aware moment is unique. Two reports of "gratitude"
@@ -12659,7 +12659,7 @@ def _report_feeling_impl(
 
     WHEN TO FILE:
       - Distinct self-aware state shifts (canonical: hit-order shift after
-        loading new context, ob_0221)
+        loading new context, ob_NNNN)
       - Unexpected internal responses — surprise, dissonance, recognition
       - Moments where a phenomenological description feels possible
       - Moments worth remembering even when no human word fits
@@ -12867,7 +12867,7 @@ _DERIVE_FIELDS = frozenset({
 # the reader can audit + premises that can themselves be retracted, triggering
 # cascade retraction of dependent derivations.
 #
-# Single-payload signature (Wave 3 of ob_1499; issue #99): all fields as one
+# Single-payload signature (Wave 3 of the antml-prefix swallow risk; issue #99): all fields as one
 # JSON object string in payload_json. Eliminates the antml-prefix multi-arg
 # swallow risk Claude Code's prompt construction can hit.
 #
@@ -12880,7 +12880,7 @@ _DERIVE_FIELDS = frozenset({
 # MECH-5 stale-premise + tainted-premise guards (use_stale opt-in): a derivation
 # resting on premises that have been superseded or retracted gets BLOCKED at
 # filing time. The block is a feature: it surfaces "this reasoning needs to be
-# re-grounded" rather than letting derivation chains rot silently. ax_0001
+# re-grounded" rather than letting derivation chains rot silently. the honesty axiom
 # honesty-is-structural in action.
 #
 # derivation_mode is legacy (kept for back-compat); prefer reasoning_type.
@@ -12903,7 +12903,7 @@ def engram_derive(payload_json: str) -> str:
         payload_json: JSON object (as a string) with these fields:
             claim (str, required): The atomic, falsifiable claim being derived.
             supporting_ids (str, required): Comma-separated claim-bearing node IDs
-                (e.g. 'ob_0001,ob_0003,dv_0002').
+                (e.g. 'ob_NNNN_A,ob_NNNN_B,dv_NNNN').
             logical_chain (str, required): Explicit reasoning connecting the cited
                 premises to the conclusion. Show your work.
             reasoning_type (str, optional): The type of logical argument. See
@@ -12993,7 +12993,7 @@ def _derive_impl(
 
     Args:
         claim: The atomic, falsifiable claim being derived.
-        supporting_ids: Comma-separated list of claim-bearing node IDs (e.g. 'ob_0001,ob_0003,dv_0002').
+        supporting_ids: Comma-separated list of claim-bearing node IDs (e.g. 'ob_NNNN_A,ob_NNNN_B,dv_NNNN').
         logical_chain: Explicit reasoning connecting the cited premises to the conclusion. Show your work.
         reasoning_type: The type of logical argument (see list above). This determines confidence computation.
         derivation_mode: LEGACY — use reasoning_type instead. If reasoning_type is provided, this is ignored.
@@ -13012,7 +13012,7 @@ def _derive_impl(
           - BLOCKED_TAINTED: any premise was retracted; no override path.
           - BLOCKED_STALE: premise(s) have superseded upstream and use_stale=False.
     """
-    # Per ls_0034: bool-string truthy trap at wrapper boundary. JSON-string
+    # Per the bool-string-truthy lesson: bool-string truthy trap at wrapper boundary. JSON-string
     # "false" is truthy in Python; without this check, a use_stale: "false"
     # payload would silently bypass the MECH-5 stale-premise guard.
     # Same guard pattern as _resolve_impl (server.py:9456).
@@ -13147,7 +13147,7 @@ _CONTRADICT_FIELDS = frozenset({"node_id_a", "node_id_b", "description", "root_c
 # and surfaces in dream-cycle fairy-2 scans for resolution candidates.
 #
 # Use case: when you discover two CURRENT nodes whose claims cannot both be
-# true. The substrate doesn't auto-detect contradictions (ax_0001 honesty-
+# true. The substrate doesn't auto-detect contradictions (the honesty axiom — 
 # loudly applies — the agent surfaces what it notices); this tool is the
 # explicit "I see a conflict here, let's pin it for resolution."
 #
@@ -13161,7 +13161,7 @@ _CONTRADICT_FIELDS = frozenset({"node_id_a", "node_id_b", "description", "root_c
 # Root cause optional but recommended — captures the WHY of the conflict for
 # future audit (was it a measurement gap? terminology drift? scope mismatch?).
 #
-# Single-payload signature (Wave 2b of ob_1499 / #55).
+# Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 def engram_contradict(payload_json: str) -> str:
     """Explicitly flag a conflict between two nodes in the knowledge graph.
 
@@ -13338,7 +13338,7 @@ _ASK_FIELDS = frozenset({
 # lacks: external_evidence routes to research). Sharpens what KIND of help
 # the question needs.
 #
-# Single-payload signature (Wave 3 of ob_1499 / #99).
+# Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99).
 @mcp.tool(
     name="engram_ask",
     annotations={
@@ -13491,7 +13491,7 @@ def _ask_impl(
 # the caller composes the resolving derivation via engram_derive (or supplies
 # an existing claim-bearing node) and then calls engram_resolve to wire the
 # resolves edge. This eliminates the chain-dilution failure mode that broke
-# ct_0006 (issue #229) and parallels how engram_supersede is pure-relational.
+# the chain-dilution contradiction-resolution saga (issue #229) and parallels how engram_supersede is pure-relational.
 _RESOLVE_FIELDS = frozenset({
     "target_id", "resolving_node_id", "prediction_outcome",
 })
@@ -13507,7 +13507,7 @@ _RESOLVE_FIELDS = frozenset({
 #
 # Why pure-wire instead of the old combo (create-derivation-and-wire):
 #   The old shape made it cheap to wrap prior WEAK resolution chains in new
-#   derivations, compounding confidence dilution. ct_0006 locked through 7
+#   derivations, compounding confidence dilution. the chain-dilution contradiction-resolution saga locked through 7
 #   attempts this way until the chain finally cited root nodes (axioms, primary
 #   observations) instead of citing prior shaky derivations. Pure-wire forces
 #   deliberate derivation authoring via engram_derive, where the citing-roots
@@ -13607,10 +13607,10 @@ def _resolve_impl(
 
     Why pure-wire (#229 design):
       The old combo create-and-wire made it cheap to wrap prior weak
-      resolution chains in new derivations. ct_0006 locked through 7
+      resolution chains in new derivations. the chain-dilution contradiction-resolution saga locked through 7
       attempts this way (chain confidence diluting 0.585 → 0.392 → 0.384
-      → 0.376 → 0.368 → 0.361) until dv_0681 finally cited the root
-      nodes (ob_1598 + dv_0599, both conf 0.95) and produced conf 0.931.
+      → 0.376 → 0.368 → 0.361) until the recall-summary derivation finally cited the root
+      nodes (the strict-text-reading observation + the canonical saga-resolving derivation, both conf 0.95) and produced conf 0.931.
       Forcing callers to compose the resolving derivation explicitly via
       engram_derive makes citing roots the natural pattern.
 
@@ -13873,10 +13873,10 @@ _SUPERSEDE_FIELDS = frozenset({"old_node_id", "new_node_id", "supersede_reason"}
 #     stale_replacement {old: new} for downstream resolution
 #   - retracted nodes are NOT supersede-able (use engram_retract path)
 #
-# stale_replacement metadata (ls_0044 supersede-no-drop): downstream readers
+# stale_replacement metadata (the supersede-no-drop discipline): downstream readers
 # can find the replacement automatically without traversing the supersede edge.
 #
-# Single-payload signature (Wave 2b of ob_1499 / #55).
+# Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_supersede",
     annotations={
@@ -13945,7 +13945,7 @@ def _supersede_impl(
     node type's confidence math, metadata, edges, and importance anchoring.
     Keeping supersede relational-only means those rules never diverge.
 
-    Supersede no-drop discipline (ls_0044, 2026-05-20):
+    Supersede no-drop discipline (the supersede-no-drop discipline, 2026-05-20):
       The new node MUST preserve every load-bearing claim of the old node.
       For each load-bearing claim in old, the only legitimate per-claim
       moves are: keep unchanged in new, alter in new (refine / sharpen /
@@ -14179,7 +14179,7 @@ def _supersede_impl(
         # the conflict (case 1: wire engram_resolve from new_node to ct) or
         # preserved it (case 2: new-contradict between new_node + other side,
         # then supersede old contradiction → new contradiction). Per the
-        # supersede no-drop discipline (ls_0044), case 3 (orthogonal supersede)
+        # supersede no-drop discipline (the supersede-no-drop discipline), case 3 (orthogonal supersede)
         # cannot arise — the new node either kept or altered the conflicting
         # claim; dropping is forbidden.
         stale_contradictions = []
@@ -14412,7 +14412,7 @@ _RETRACT_FIELDS = frozenset({"node_id", "error_type", "reason", "replacement_jso
 # errors, and downstream dependents are TAINTED (not deleted) — the cascade
 # surfaces "this reasoning rested on something wrong; re-derive."
 #
-# Honesty axiom (ax_0001 / ax_0002) in action: errors surface LOUDLY through
+# Honesty axiom (the honesty axiom / the provenance axiom) in action: errors surface LOUDLY through
 # the taint cascade rather than being silently overwritten. The retracted node
 # stays in the graph as a record of the error + the correction process —
 # narrative identity can't quietly rewrite history.
@@ -14429,7 +14429,7 @@ _RETRACT_FIELDS = frozenset({"node_id", "error_type", "reason", "replacement_jso
 # replacement_json. They're distinct — outer is wrapper-protocol JSON; inner
 # is the replacement-observation JSON.
 #
-# Single-payload signature (Wave 2b of ob_1499 / #55).
+# Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_retract",
     annotations={
@@ -14925,17 +14925,17 @@ def _clear_active_set_name_if_diverged(conn):
 # the FOCUS_LIST_CAP (15) is intentional, both to prevent summary bloat AND
 # to force the agent to make deliberate pin-or-rotate choices.
 #
-# Reason field is REQUIRED (ob_1845): forced justification at pin-time becomes
+# Reason field is REQUIRED (ob_NNNN): forced justification at pin-time becomes
 # durable accountability — the reason renders verbatim into the compaction
 # summary, so post-compact me reads BOTH the ID and WHY pre-compact me chose
 # to pin it. Prevents performative focus.
 #
-# Three valid pin shapes (per ob_1845 family):
+# Three valid pin shapes (per ob_NNNN family):
 #   - Strong derivations/theories the current work depends on
 #   - Conjectures being actively tested
 #   - Key observations whose absence would force re-derivation from scratch
 #
-# Idempotency (ob_1846): re-pinning an already-focused node refreshes the
+# Idempotency (ob_NNNN): re-pinning an already-focused node refreshes the
 # focused_at + reason — no error, no surprise. Safe to call defensively.
 #
 # Companion tools: engram_unfocus (rotate out stale pins), engram_focus_save
@@ -15212,7 +15212,7 @@ def _unfocus_impl(node_ids: str) -> str:
 
 # DESIGN INTENT — engram_list_focused
 # -----------------------------------
-# Pure-read inspection of the focus list (ob_1850). No recall refresh, no
+# Pure-read inspection of the focus list (ob_NNNN). No recall refresh, no
 # edit log entry, no mutation — the safest tool in the focus family to call
 # any time.
 #
@@ -15296,7 +15296,7 @@ def engram_list_focused() -> str:
 #
 # Raw-IDs storage with cascade-resolution at LOAD time, not save time. If a
 # node in a saved set is later superseded, the load operation follows the
-# supersede edge to the replacement (per ob_1785 cascade-resolution design)
+# supersede edge to the replacement (per ob_NNNN cascade-resolution design)
 # — sets stay live across graph evolution.
 #
 # Name validation: ^[a-z0-9_-]{1,50}$ — strict to keep set names URL/CLI
@@ -17013,7 +17013,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
 
 # DESIGN INTENT — engram_list
 # ---------------------------
-# Triage / bulk-listing tool (dv_0127). Lightweight scan-by-criterion that
+# Triage / bulk-listing tool (the triage-tool derivation). Lightweight scan-by-criterion that
 # doesn't refresh recall on results — designed for inventory work where the
 # agent wants to enumerate without bulk-strengthening many nodes.
 #
@@ -17101,8 +17101,8 @@ def engram_list(payload_json: str = "{}") -> str:
             "logic": "AND",
             "conditions": [
                 {"field": "type", "op": "eq", "value": "observation_factual"},
-                {"field": "evidence_id", "op": "eq", "value": "ev_0014"},
-                {"field": "id", "op": "between", "value": ["ob_0043", "ob_0046"]},
+                {"field": "evidence_id", "op": "eq", "value": "ev_NNNN"},
+                {"field": "id", "op": "between", "value": ["ob_NNNN_A", "ob_NNNN_B"]},
                 {"field": "quoted_text", "op": "contains", "value": "thoughtful"}
             ]
         })
@@ -17221,7 +17221,7 @@ def _list_impl(
 
     # Build WHERE clause. Default is current-revision only; `include_superseded`
     # opt-in relaxes that predicate so the historical layer becomes visible
-    # (text-layer leak audits, e.g., Mao-Cao prototype ob_1492 / ls_0020).
+    # (text-layer leak audits, e.g., Mao-Cao prototype the text-layer-leak-audit prototype / the text-layer-leak-audit lesson).
     where_parts: list[str] = []
     if not include_superseded:
         where_parts.append("is_current = 1")
@@ -17370,7 +17370,7 @@ def _conn_total_count(where_clause: str, params: list) -> int:
 
 
 # ---------------------------------------------------------------------------
-# engram_query_pattern — KnowQL-inspired pattern queries (ob_1500 design)
+# engram_query_pattern — KnowQL-inspired pattern queries (the KnowQL-inspired design design)
 # ---------------------------------------------------------------------------
 #
 # A small library of named compositional graph queries. The TOOL does
@@ -17385,7 +17385,7 @@ def _conn_total_count(where_clause: str, params: list) -> int:
 # balanced / high_recall) bundle the precision/recall tradeoff; balanced
 # defaults are v4-calibrated 2026-05-09.
 # Each call appends to ~/.engram/pattern_query_telemetry.jsonl for empirical
-# preset calibration per ls_0023's discipline. Dream-fairy agent definition
+# preset calibration per the telemetry-discipline lesson's discipline. Dream-fairy agent definition
 # updated 2026-05-11 to use these as the primary surface for the six
 # well-supported scan categories (one-to-one pattern↔category mapping).
 
@@ -17399,7 +17399,7 @@ PATTERN_QUERY_PRESETS: dict[str, dict[str, float | int]] = {
     # anything below 0.45 admits false positives. Symmetric ±0.10 brackets
     # balanced (0.55) at both ends of that empirically-validated range.
     # Pattern-specific telemetry remains the right calibration path long-term
-    # per ob_1500; these values are the "what would a careful reader pick
+    # per the KnowQL-inspired design; these values are the "what would a careful reader pick
     # given the v4 data and no pattern-specific telemetry yet" answer.
     # Whether to make this dict config-loadable (Tier 2 in issue #76's tier
     # model) vs leave hardcoded (Tier 3) is the open design question — for
@@ -17414,7 +17414,7 @@ def _pattern_telemetry_log(pattern_name: str, preset: str,
                             args: dict, candidates: list[dict]) -> None:
     """Append one entry per call to enable empirical preset calibration.
 
-    The schema mirrors ob_1500's calibration plan: (pattern_name, args,
+    The schema mirrors the KnowQL-inspired design's calibration plan: (pattern_name, args,
     candidate_id, score, agent_action) tuples. agent_action is filled
     later out-of-band when the agent acts on a candidate; this hook only
     captures the surfacing event.
@@ -17858,7 +17858,7 @@ PATTERN_QUERY_REGISTRY: dict[str, callable] = {
 # an open question, supersede a stale node, nominate a cornerstone).
 #
 # Each call appends a tuple to ~/.engram/pattern_query_telemetry.jsonl for
-# empirical preset calibration (ob_1500 discipline — internal eval surface is
+# empirical preset calibration (the KnowQL-inspired design discipline — internal eval surface is
 # preserved verbatim regardless of agent-facing tier transformation).
 #
 # Full design: active-work/engram-query-pattern-design-2026-05-06.md
@@ -17983,7 +17983,7 @@ def _query_pattern_impl(
     finally:
         conn.close()
 
-    # Telemetry log: internal eval surface — preserved verbatim (ob_1500 discipline).
+    # Telemetry log: internal eval surface — preserved verbatim (the KnowQL-inspired design discipline).
     # The tier transformation applies to the agent-facing return shape only.
     _pattern_telemetry_log(pattern_name, preset,
                             {"params_used": params}, candidates)
