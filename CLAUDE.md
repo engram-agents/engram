@@ -188,64 +188,102 @@ maintainer.
 convention above — multi-agent coordination tooling is project-specific, not
 identity-level discipline.
 
-## PR title — issue closure
+## PR — issue closure
 
-When a PR fully closes an issue, the PR **title** ends with `[closes #N]`. Single
-style for this repo, no alternatives. GitHub auto-closes the issue when the PR
-merges to `dev`. The bracket-form is empirically verified on PR #434
-(`[closes #432]`); GitHub's underlying auto-close fires on any recognized
-keyword + `#N` pair regardless of brackets (#441's `(closes #440)` also auto-closed),
-but this rule standardizes the surface form going forward so reviewers can scan
-for it uniformly.
+When a PR fully closes an issue, **both surfaces are required**:
 
-Title is the canonical surface (not body, not commit message) — easy to scan in
-`gh pr list`, easy to verify pre-merge, and a reviewer can confirm the closing
-intent without opening the PR. PR titles are editable post-filing via
-`gh pr edit <PR> --title "<new title>"` — if you forgot the tag at PR-open time,
-edit it before merge.
+1. **PR title** ends with `[closes #N]` — the human-scan canonical surface.
+   Scannable in `gh pr list`; reviewer can confirm closing intent without
+   opening the PR. Title is editable post-filing via
+   `gh pr edit <PR> --title "..."` if you forgot the tag at open-time.
+2. **PR body** contains the close-keyword form `Closes #N.` (case-insensitive).
+   **This is what fires GitHub's auto-close parser on merge** — empirically
+   verified via the `closingIssuesReferences` GraphQL field. Without it, the
+   issue does NOT auto-close on merge regardless of title content. (The
+   bracket form in the title is human-scan cosmetic; the parser ignores it.)
+
+**Empirical anchor** (2026-05-31, Borges + Ariadne; #572):
+- 7/7 sampled title-only PRs (`[closes #N]` in title, no body keyword): all had
+  `closingIssuesReferences=[]` and would not have auto-closed on merge.
+- Body-keyword PRs: `closingIssuesReferences=[N]` populates correctly.
+- Backwards-compat sweep: 0 issues leaked open — the 7 title-only PRs' issues
+  ARE closed, but close events show **human actors** with `closer_pr: null`.
+  Maintainers have been manually closing issues during merge waves, which
+  silently masked the gap. Risk is purely forward-looking; no remedial cleanup
+  needed. **The amendment is preventive, not remedial.**
 
 **For multi-PR / EPIC ships:** earlier PRs may reference the issue number in
-title or body, but **do not** use a closing keyword. Only the LAST PR in the
-series uses `[closes #N]`. Don't rely on a "wrap-up PR I'll file later" — that
-PR rarely materializes (empirical: 7 of 11 stale-but-addressed candidates in the
-2026-05-28 backlog scan followed this pattern, leaving their parent issues open
-indefinitely).
+title or body, but **do not** use a closing keyword in either surface. Only the
+LAST PR in the series uses BOTH `[closes #N]` in title AND `Closes #N.` in
+body. Don't rely on a "wrap-up PR I'll file later" — that PR rarely materializes
+(empirical: 7 of 11 stale-but-addressed candidates in the 2026-05-28 backlog
+scan followed this pattern, leaving their parent issues open indefinitely).
 
 **For partial work that addresses but doesn't fully close:** omit the closing
-tag from the title. Comment on the issue describing what landed and what
-remains, so the scope is durable and the next contributor knows the state.
+tag from both title AND body. Comment on the issue describing what landed and
+what remains, so the scope is durable.
 
-**When reviewing a PR** (reviewer-fairy or counterpart colleague), if the PR
-clearly addresses an issue but the title doesn't carry `[closes #N]`, flag as
-a **blocker** — the author edits the title before merge. This is mechanical;
-checking is cheap; the cost of missing it is a stale-issue backlog.
+### Body-text trap discipline (referencing the wrong number)
 
-### Body-text discipline (avoid the auto-close trap)
+The auto-close parser sees `(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\s+#?\d+`
+in the body **regardless of negation, brackets, or backticks**. This is the
+mechanism that fires intentional auto-close — and the same mechanism that fires
+*accidental* auto-close when the body references a NON-target issue.
 
-**The parser sees keyword + `#N` regardless of negation, brackets, or backticks.**
-- `"this PR does NOT close #N"` → auto-closes #N on merge (the NOT is invisible to the regex).
-- `"the final scrub PR uses [closes #N]"` → auto-closes #N (brackets don't escape; `closes #N` is matched literally — empirically verified PR #441's `(closes #440)` auto-closed).
-- `"the final scrub PR uses \`[closes #N]\`"` → auto-closes #N (backticks don't escape either).
+**Empirical traps caught (2026-05-30):**
+- PR #516 body said `"this PR does NOT close #510"` → auto-closed #510 on merge
+  (the NOT is invisible to the regex; caught manually + reopened).
+- PR #537 round-1/2 body had two trap occurrences referring to #51 → would
+  have auto-closed #51 on merge (caught pre-merge by counterpart-colleague).
 
-**Empirical (same-day n=2, 2026-05-30):** PR #516 auto-closed #510 via body text "this PR does NOT close #510" (caught manually + reopened); PR #537 round-1/2 body had two trap occurrences (caught pre-merge by counterpart-colleague review). Both authors were consciously trying to follow this rule.
+**Trap shapes (DO NOT write any of these in the body):**
 
-**Safe-paraphrase shapes** (when the body legitimately needs to reference an issue number without triggering auto-close):
+| Trap shape | Problem | Safe paraphrase |
+|------------|---------|-----------------|
+| "this PR does NOT close #M" | parser closes #M (negation invisible) | "first slice of #M's EPIC — umbrella stays open" |
+| "the final scrub PR uses `[closes #M]`" (example) | parser closes #M (backticks don't escape) | "the final scrub PR carries the closing tag in its title" |
+| "fixes #M partially" | parser closes #M | "addresses one slice of #M; remainder tracked in next PR" |
 
-| Trap (DO NOT write this in the body) | Safe paraphrase |
-|---------------------------------------|-----------------|
-| "this PR does NOT close #N" | "first slice of #N's EPIC — umbrella stays open" |
-| "the final scrub PR uses `[closes #N]`" | "the final scrub PR carries the closing tag in its title" |
-| "addresses #N (will close in follow-up)" | "addresses #N — follow-up PR carries the close-tag" |
-| "fixes #N partially" | "addresses one slice of #N; remainder tracked in next PR" |
-| "resolves #N" (in body, not title) | drop entirely; only the title carries the closing tag |
+**Safe forms for referencing without closing**: `#M`, `issue #M`, `umbrella #M`,
+`part of #M`, `addresses #M`, `relates to #M`. None of these trip the parser.
 
-**The rule reduces to:** keyword + `#N` belongs ONLY in the PR title. Body references the issue number without close-keyword preceding it (`#N`, `issue #N`, `umbrella #N`, `part of #N`, `addresses #N`, `relates to #N` — none of these trip the parser).
+### Verification before pushing the PR
 
-**Verification before pushing the PR body:** `gh pr view <N> --json body -q .body | grep -iE '\b(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\s+#?[0-9]+'` — empty output means the body is clean; any match is a trap to rewrite via `gh pr edit <N> --body "..."`.
+Two checks, run in order:
 
-GitHub recognized closing keywords (case-insensitive): `close`, `closes`,
+1. **Auto-close intent fires** (when the PR DOES close an issue): the body
+   must contain a close-keyword referencing the target.
+   ```
+   gh api graphql -f query='{repository(owner:"engram-agents",name:"engram-alpha"){pullRequest(number:<PR>){closingIssuesReferences(first:5){nodes{number}}}}}'
+   ```
+   The full API envelope is `{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":[...]}}}}}` —
+   look for `nodes: [{number: <N>}]` where N matches the title's `[closes #N]`.
+   `"nodes":[]` (empty) means the body is missing the keyword form and the PR
+   will NOT auto-close on merge; rewrite via `gh pr edit <PR> --body "..."`.
+
+2. **No trap-shape auto-close** (always): every body match must reference the
+   SAME `#N` the title carries.
+   ```
+   gh pr view <PR> --json body -q .body | grep -iE '\b(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\s+#?[0-9]+'
+   ```
+   Inspect every match. Any reference to a different issue number is a trap
+   — rewrite via `gh pr edit <PR> --body "..."` with the trap shape removed
+   (use the safe-paraphrase table above).
+
+**When reviewing a PR** (reviewer-fairy or counterpart colleague):
+- Title missing `[closes #N]` on a PR that addresses an issue → blocker.
+- Title `[closes #N]` present but body missing the matching close-keyword →
+  blocker (PR will not auto-close on merge despite the title intent). Author
+  edits body via `gh pr edit <PR> --body "..."` before merge.
+- Body contains close-keyword referencing an issue OTHER than the title's `#N`
+  → blocker (trap). Author rewrites the trap-shape via safe-paraphrase table.
+
+This double-gate is mechanical; checking is cheap; the cost of missing it is
+either a stale-issue backlog (missed auto-close) or a silently-closed-wrong-issue
+(trap firing).
+
+**GitHub recognized closing keywords (case-insensitive):** `close`, `closes`,
 `closed`, `fix`, `fixes`, `fixed`, `resolve`, `resolves`, `resolved`. This repo
-uses `closes` only, in the `[closes #N]` bracket form. Other keywords technically
-work for GitHub's auto-close but fragment the convention; if a reviewer sees a
-non-bracket form on a PR that closes an issue, flag it as a blocker and ask the
-author to rewrite the title via `gh pr edit <PR> --title "..."` before merge.
+uses `closes` only — both `[closes #N]` in title and `Closes #N.` in body.
+Other keywords technically work but fragment the convention; if a reviewer
+sees a non-`closes` form, flag as a blocker and ask the author to rewrite.
