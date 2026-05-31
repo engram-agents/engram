@@ -113,7 +113,7 @@ Token budget on the auto-load surfaces matters, but identity-formation takes pri
 
 ### Writing style for auto-load surfaces (token budget)
 
-**warm-briefing.md, `~/.engram/history/YYYY-MM-DD.md`, and any `~/.engram/ask-{{USER_NAME}}.md`-style queues (e.g., `~/.engram/ask-lei.md` in a typical install where `{{USER_NAME}}` resolves to the collaborator's name)** are auto-loaded surfaces with bounded budget. Entries are CONCISE signals — not rich changelogs.
+**warm-briefing.md, `~/.engram/history/YYYY-MM-DD.md`, and any `~/.engram/ask-{{USER_NAME}}.md`-style queues** are auto-loaded surfaces with bounded budget. Entries are CONCISE signals — not rich changelogs.
 
 - **Each entry**: short line. ID + state + minimal context. Cite ENGRAM node IDs for detail-on-demand.
 - **Detail-on-demand**: when {{USER_NAME}} asks, load via `engram_inspect(<id>)`. Don't pre-load rich content into the surface.
