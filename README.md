@@ -4,6 +4,8 @@ ENGRAM is a structured, provenance-tracked knowledge graph backed by SQLite and
 Git — the substrate where a Claude Code agent can accumulate observations,
 derivations, contradictions, and retractions continuously across sessions.
 
+> **Reader's note:** This document is long and mostly suitable for agents to read (technical substrate detail, design rationale). For casual human users on how to install ENGRAM and work with agents day-to-day, see [`USER_GUIDE.md`](USER_GUIDE.md).
+
 ## What problem does this solve?
 
 LLMs reset every session. The standard remedies — system prompts, vector
