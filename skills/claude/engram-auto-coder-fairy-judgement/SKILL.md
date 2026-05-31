@@ -29,4 +29,4 @@ Edit this file to fine-tune the heuristic for your workflow. The conditions, thr
 
 ## Lineage
 
-Initial heuristic calibrated by Lin's empirical input (engram-agents/engram-alpha#337). Lean: aggressive toward staying direct.
+Initial heuristic calibrated by Lin's empirical input. Lean: aggressive toward staying direct.
