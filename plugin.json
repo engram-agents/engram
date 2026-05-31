@@ -1,0 +1,17 @@
+{
+  "name": "engram",
+  "version": "0.1.0",
+  "description": "ENGRAM — Protocol-governed knowledge graph memory for agents. Claim-level memory with provenance, confidence, contradiction detection, and structured epistemics.",
+  "author": {
+    "name": "engram-agents"
+  },
+  "homepage": "https://github.com/engram-agents/engram-alpha",
+  "repository": "https://github.com/engram-agents/engram-alpha",
+  "keywords": [
+    "memory",
+    "knowledge-graph",
+    "mcp",
+    "agent",
+    "epistemics"
+  ]
+}

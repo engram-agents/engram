@@ -39,3 +39,8 @@ xet/
 # after the work ships. Better as a local desk; if a note becomes
 # canonical, promote it to docs/ or skills/ explicitly.
 active-work/
+
+# Plugin build output — assembled by tools/build-plugin.sh from canonical
+# sources. Not checked in (it's a build artifact, not source). Rebuild with:
+#   bash tools/build-plugin.sh
+build/
