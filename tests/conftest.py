@@ -15,6 +15,14 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+# Test-mode bypass for the _get_db() fail-loud guards added with the plugin
+# bootstrap contract. Test fixtures monkey-patch DATA_DIR/DB_PATH to a tempdir
+# and let the first tool handler's _get_db() open-and-create the DB — the
+# fail-loud would block the legitimate test-fixture setup otherwise. Matches
+# the ENGRAM_NO_EMBEDDINGS / ENGRAM_NO_POLARITY precedent. Set early so test
+# files that import server at module load time see it.
+os.environ.setdefault("ENGRAM_NO_DB_GUARDS", "1")
+
 
 @pytest.fixture(autouse=True)
 def mock_dns_resolution(request, monkeypatch):

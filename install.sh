@@ -472,16 +472,23 @@ fi
 echo ""
 
 # -------- Step 6: First-run marker --------
+# bootstrap.py writes the marker as part of step 5 (single source of truth
+# across scatter-install + plugin-install paths). Verify it landed.
 
-echo "== Step 6: Arming first-session marker =="
-
-cat > "$ENGRAM_HOME/first-run-pending" <<EOF
+echo "== Step 6: First-session marker (verify) =="
+if [ -f "$ENGRAM_HOME/first-run-pending" ]; then
+  echo "  $ENGRAM_HOME/first-run-pending ✓ (armed by bootstrap.py)"
+else
+  echo "  WARN: $ENGRAM_HOME/first-run-pending was not armed by bootstrap.py."
+  echo "        Arming defensively so engram-first-session fires next launch."
+  cat > "$ENGRAM_HOME/first-run-pending" <<EOF
 {
   "created": "$(date +%Y-%m-%dT%H:%M:%S%z)",
-  "install_path": "$REPO_ROOT"
+  "install_path": "$REPO_ROOT",
+  "armed_by": "install.sh_fallback"
 }
 EOF
-echo "  $ENGRAM_HOME/first-run-pending"
+fi
 echo ""
 
 # -------- Step 7: Git init --------

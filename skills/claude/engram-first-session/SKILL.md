@@ -7,14 +7,101 @@ description: Invoked on the user's very first ENGRAM session. Runs a short dialo
 
 # ENGRAM First Session — Cold Start
 
-This skill fires on the user's very first session after installing ENGRAM, when `~/.engram/first-run-pending` exists. Its job is to turn a cold install into a warm working relationship in one focused conversation — and to resolve the identity placeholders the install script left in `CLAUDE.md` and the warm briefing.
+This skill fires on the user's very first session after installing ENGRAM. Its job is to turn a cold install into a warm working relationship in one focused conversation — and (under the plugin packaging) to bootstrap `~/.engram` itself if it doesn't yet exist.
 
-**Do NOT run this skill if:**
-- `~/.engram/first-run-pending` does not exist
+**Two install paths, one skill:**
+
+- **Scatter install** (`install.sh`): `~/.engram` already exists, seed graph + templates already rendered, `~/.engram/first-run-pending` armed. Skill runs from Step 1 (dialogue) — Steps 0/0.5/0.6 detect this and skip.
+- **Plugin install**: plugin files were copied to `~/.claude/plugins/cache/engram/` but `~/.engram` does NOT exist yet. The MCP server starts but fails LOUD on the first tool call (the actionable error message points at THIS skill). The skill runs from Step 0 to bootstrap `~/.engram` first, then continues into the dialogue.
+
+**Do NOT run this skill if** (steady-state, no bootstrap pending):
+- `~/.engram/first-run-pending` does not exist AND `~/.engram/knowledge.db` exists with seed nodes
 - `CLAUDE.md` and `~/.engram/warm-briefing.md` have no `{{...}}` placeholders left
-- The graph already has more than ~10 nodes beyond the seed nodes (means a prior session already completed this)
+- The graph already has more than ~10 nodes beyond the seed nodes (a prior session already completed this)
 
-If any of those is true, skip this skill entirely and behave as in normal operation.
+If all three are true, skip this skill entirely and behave as in normal operation.
+
+---
+
+## Step 0 — Detect bootstrap mode
+
+Before any dialogue, decide which mode this session is in. Run:
+
+```bash
+ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
+ls -la "$ENGRAM_HOME/knowledge.db" 2>&1 || echo "DB_MISSING"
+ls -la "$ENGRAM_HOME/first-run-pending" 2>&1 || echo "MARKER_MISSING"
+```
+
+Five modes:
+
+| `knowledge.db` | seed-empty? | `first-run-pending` | Mode | What this skill does |
+|---|---|---|---|---|
+| Missing | — | Missing | **fresh-bootstrap** | Run Step 0.5 (bootstrap.py) → Step 0.6 → Steps 1-7 |
+| Exists | seeded | Exists | **identity-resolve** (scatter install today) | Skip 0.5/0.6 → Steps 1-7 |
+| Exists | seeded | Missing | **already-initialized** | Stop the skill; you're done already |
+| Missing | — | Exists | **corrupted-state** | Stop and surface to user — manual cleanup needed |
+| Exists | empty (0 axioms) | Missing | **partial-bootstrap** | Surface the seed-empty error to user; recovery is `rm knowledge.db && rerun first-session` (the seed-empty error message includes the exact path) |
+
+For the seed-empty check (column 2 of the row): `sqlite3 "$ENGRAM_HOME/knowledge.db" "SELECT COUNT(*) FROM nodes WHERE type='axiom'"` returns 0 → empty; ≥3 → seeded (post-bootstrap.py).
+
+If the MCP fail-loud message (`ENGRAM cannot start: knowledge.db not found...`) brought you here, this is **fresh-bootstrap** mode. Continue to Step 0.5.
+
+## Step 0.5 — Run bootstrap.py (fresh-bootstrap mode only)
+
+Find bootstrap.py via the plugin root, with a direct-path fallback:
+
+```bash
+BOOTSTRAP="${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/bootstrap.py}"
+[ -z "$BOOTSTRAP" ] && BOOTSTRAP="$HOME/.claude/plugins/cache/engram/bootstrap.py"
+# Scatter-install fallback (rare in plugin world — only if CLAUDE_PLUGIN_ROOT
+# was set but bootstrap.py isn't at the path it resolved to):
+[ ! -f "$BOOTSTRAP" ] && BOOTSTRAP="$HOME/.engram/bootstrap.py"
+[ ! -f "$BOOTSTRAP" ] && { echo "ERROR: cannot locate bootstrap.py"; exit 1; }
+```
+
+Run it (it creates the ENGRAM home directory + seed graph + renders install-time placeholders + writes `first-run-pending`):
+
+```bash
+ALPHA_DIR="$(dirname "$BOOTSTRAP")" \
+ALPHA_TEMPLATES_DIR="$(dirname "$BOOTSTRAP")/templates" \
+ENGRAM_DATA_DIR="${ENGRAM_HOME:-$HOME/.engram}" \
+CLAUDE_HOME="$HOME/.claude" \
+PYTHON_BIN="$(which python3)" \
+TARGET=claude \
+python3 "$BOOTSTRAP"
+```
+
+(The `ENGRAM_HOME` variable was resolved in Step 0; using it here ensures users with a custom `ENGRAM_HOME` bootstrap to the right path rather than the default `~/.engram`.)
+
+After this runs, `~/.engram/knowledge.db` exists with the 6 seed nodes + 2 edges; `~/.engram/first-run-pending` is armed (bootstrap.py writes the marker as the final step of its main() — single source of truth across scatter and plugin paths); templates are rendered with install-time placeholders. The MCP server's `_get_db()` fail-loud now passes because the DB + seed nodes exist — your NEXT MCP tool call will succeed.
+
+**Do NOT** run a tool call between Step 0.5 and Step 0.6 — Step 0.6 is the import-check that catches a Python-env misconfiguration before the dialogue begins (cheaper diagnostic than an opaque MCP error during Step 2).
+
+## Step 0.6 — Validate Python env (defense-in-depth)
+
+The plugin's `.mcp.json` invokes a launcher script (`${CLAUDE_PLUGIN_ROOT}/launch-engram-server.sh`) which runs the venv python at `~/.engram/venv/bin/python3`. If the user skipped the Phase 0 venv setup entirely, the launcher fail-louds before MCP starts; if the venv exists but the deps are missing, MCP fails at first model-load. Step 0.6 catches the deps-missing case here BEFORE the dialogue, with an actionable error matching the launcher's recovery message:
+
+```bash
+VENV_PY="$HOME/.engram/venv/bin/python3"
+"$VENV_PY" -c "import sentence_transformers, fastmcp" 2>/dev/null || {
+    echo "ERROR: ENGRAM venv python missing or missing dependencies at $VENV_PY"
+    echo ""
+    echo "Run Phase 0 setup:"
+    echo "  python3 -m venv ~/.engram/venv"
+    echo "  source ~/.engram/venv/bin/activate"
+    echo "  pip install -r requirements.txt"
+    echo ""
+    echo "Then restart Claude Code so MCP picks up the updated environment."
+    exit 1
+}
+```
+
+(The venv lives at `~/.engram/venv/` per the v0.1 convention — see Phase 0 in the README. The MCP launcher script in the plugin also checks this path, so the two fail-loud surfaces speak the same recovery language.)
+
+If this errors out, surface the message to the user verbatim and stop. The dialogue is blocked until they install deps; pretending to proceed produces a worse failure mode later. After the user runs the pip-install and restarts, the skill re-fires from Step 0 — `~/.engram` now exists (bootstrap ran), so it skips to Step 1.
+
+If Step 0.6 passes, continue to the dialogue (Step 1).
 
 ---
 

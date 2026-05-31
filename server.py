@@ -982,8 +982,75 @@ def _assert_sqlite_version(conn: sqlite3.Connection):
         )
 
 
+def _db_missing_message() -> str:
+    """Actionable error message when the DB file is missing.
+
+    Surfaced via _get_db() raising on the first tool call when no DB exists at
+    DATA_DIR/knowledge.db. The plugin packaging never runs install.sh, so this
+    is the user's signal that engram-first-session needs to bootstrap.
+    """
+    engram_home_env = os.environ.get("ENGRAM_HOME", "<unset; default ~/.engram>")
+    return (
+        f"ENGRAM cannot start: knowledge.db not found at {DB_PATH}\n\n"
+        "This usually means one of:\n"
+        "  - Fresh install — run the engram-first-session skill to bootstrap\n"
+        "    (your agent will walk you through it in the next conversation).\n"
+        "  - ENGRAM_HOME is pointing at the wrong directory — check the env var\n"
+        f"    (current ENGRAM_HOME: {engram_home_env}).\n"
+        "  - You moved your install — symlink ~/.engram to your data directory.\n\n"
+        "If you intend to start fresh in a non-standard location, set ENGRAM_HOME\n"
+        "explicitly and re-run the engram-first-session skill."
+    )
+
+
+def _seed_missing_message() -> str:
+    """Actionable error message when the DB exists but has no seed nodes.
+
+    Raised when SELECT COUNT(*) FROM nodes WHERE type='axiom' returns 0 —
+    implies bootstrap.py never completed against this DB (either it crashed
+    mid-run or the user manually created an empty knowledge.db).
+    """
+    return (
+        f"ENGRAM cannot start: knowledge.db exists at {DB_PATH} but has no seed nodes.\n\n"
+        "This usually means a bootstrap was started but never completed.\n"
+        "Run the engram-first-session skill to complete the bootstrap, or\n"
+        f"delete {DB_PATH} (verify it's empty first!) and re-run first-session\n"
+        "for a clean retry."
+    )
+
+
 def _get_db() -> sqlite3.Connection:
-    """Get a database connection, creating tables if needed."""
+    """Get a database connection, creating tables if needed.
+
+    Fails LOUD if the DB file is missing or seed-empty — the plugin packaging
+    has no install.sh-precondition, so missing DB means engram-first-session
+    needs to bootstrap (which it does via bootstrap.py, called from the skill).
+    Per-call check is intentionally lazy: subsequent calls after bootstrap.py
+    runs in the same session succeed without MCP restart (no /mcp dance).
+
+    Guard-bypass env vars (set when running in a controlled environment that
+    doesn't need the guards):
+      - ENGRAM_BOOTSTRAP=1 — bootstrap.py sets this in its own process before
+        calling engram_add_axiom / engram_add_definition / engram_add_goal to
+        seed the graph; that call chain goes through _get_db(), so without the
+        bypass the fail-loud guards block the very seeding that's supposed to
+        satisfy them (chicken-and-egg).
+      - ENGRAM_NO_DB_GUARDS=1 — test-mode bypass (matches ENGRAM_NO_EMBEDDINGS
+        / ENGRAM_NO_POLARITY precedent). The test fixtures monkey-patch DATA_DIR
+        and DB_PATH to a tempdir, then call tool handlers whose first _get_db()
+        opens-and-creates the DB; the fail-loud would block the legitimate
+        test-fixture setup. conftest.py sets this once at session start.
+
+    Both are scoped to the env that sets them (bootstrap subprocess + pytest
+    session). The production MCP server never sets either, so guards stay
+    active for real user flows.
+    """
+    bootstrap_mode = (
+        os.environ.get("ENGRAM_BOOTSTRAP") == "1"
+        or os.environ.get("ENGRAM_NO_DB_GUARDS") == "1"
+    )
+    if not DB_PATH.exists() and not bootstrap_mode:
+        raise RuntimeError(_db_missing_message())
     _ensure_data_dir()
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
@@ -1421,6 +1488,20 @@ def _get_db() -> sqlite3.Connection:
                 )
     except Exception:
         pass  # Don't block startup on check failures
+
+    # Empty-graph sentinel — DB exists but bootstrap.py never seeded it.
+    # Distinct from the DB-missing case at the top: this happens if bootstrap
+    # crashed mid-run, or the user created an empty knowledge.db manually.
+    # Same fail-loud path; engram-first-session handles both. Bypass under
+    # ENGRAM_BOOTSTRAP=1 so bootstrap.py's own seeding can run (its first
+    # axiom-add lands on an empty graph by definition).
+    if not bootstrap_mode:
+        seed_count = conn.execute(
+            "SELECT COUNT(*) FROM nodes WHERE type='axiom'"
+        ).fetchone()[0]
+        if seed_count == 0:
+            conn.close()
+            raise RuntimeError(_seed_missing_message())
 
     return conn
 

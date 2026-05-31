@@ -39,7 +39,15 @@ Edges:
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+
+
+def _now_iso() -> str:
+    """ISO-8601 UTC timestamp for marker writes — matches install.sh's
+    `date +%Y-%m-%dT%H:%M:%S%z` shape close enough for downstream readers.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z")
 
 ALPHA_DIR = Path(os.environ["ALPHA_DIR"])
 TEMPLATES_DIR = Path(os.environ["ALPHA_TEMPLATES_DIR"])
@@ -218,8 +226,39 @@ def merge_hook_settings(
 
 
 def main() -> None:
-    print("  Creating seed graph...", flush=True)
-    ids = create_seed_graph()
+    # Refuse to overwrite an existing install — defense-in-depth for the
+    # plugin path (which doesn't go through install.sh's gate at install.sh:178).
+    # FORCE=1 in env bypasses (matches install.sh --force semantics).
+    db_path = ENGRAM_HOME / "knowledge.db"
+    if db_path.exists():
+        force = os.environ.get("FORCE", "0") == "1"
+        if not force:
+            raise SystemExit(
+                f"ERROR: knowledge.db already exists at {db_path}.\n"
+                "  bootstrap.py refuses to overwrite an existing install.\n"
+                "  - If this is your data — DO NOT delete it. To upgrade, use\n"
+                "    tools/deploy.sh or the engram-upgrade skill.\n"
+                "  - If this is an aborted prior bootstrap (verify the DB is\n"
+                "    truly empty first), delete the file and re-run.\n"
+                "  - To force a fresh-start that discards existing data,\n"
+                "    re-run with FORCE=1 in the environment."
+            )
+
+    # Bootstrap-mode env bypass: server.py's _get_db() fail-loud guards
+    # (DB-missing + seed-empty) block bootstrap's own engram_add_axiom calls
+    # in the chicken-and-egg path:
+    #   bootstrap.py calls server.engram_add_axiom
+    #     -> _add_axiom_impl -> _get_db()  -> DB missing -> RAISE
+    # The env var scopes the bypass to bootstrap's own subprocess; the
+    # production MCP server never sets it, so the guards stay active for
+    # real user flows. After seeding completes, unset (defense-in-depth in
+    # case main() ever runs in a long-lived parent process).
+    os.environ["ENGRAM_BOOTSTRAP"] = "1"
+    try:
+        print("  Creating seed graph...", flush=True)
+        ids = create_seed_graph()
+    finally:
+        os.environ.pop("ENGRAM_BOOTSTRAP", None)
     for placeholder, node_id in ids.items():
         print(f"    {placeholder} = {node_id}", flush=True)
 
@@ -274,6 +313,18 @@ def main() -> None:
             substitutions,
         )
         print(f"  heartbeat-queue/README.md → {ENGRAM_HOME}/heartbeat-queue/README.md", flush=True)
+
+    # Arm the first-run-pending marker — engram-first-session checks it to
+    # gate the cold-start dialogue. Previously written by install.sh:478
+    # AFTER bootstrap.py ran; consolidated here so the plugin-install path
+    # (which doesn't go through install.sh) also gets the marker. Single
+    # source of truth: bootstrap.py owns marker write.
+    marker_payload = json.dumps({
+        "created": _now_iso(),
+        "install_path": str(ALPHA_DIR),
+    }, indent=2)
+    (ENGRAM_HOME / "first-run-pending").write_text(marker_payload)
+    print(f"  first-run-pending → {ENGRAM_HOME}/first-run-pending", flush=True)
 
     # Target-specific identity doc + hook config
     if TARGET == "claude":
