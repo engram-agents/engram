@@ -136,7 +136,7 @@ def create_seed_graph() -> dict[str, str]:
         server.engram_add_definition,
         term="ENGRAM",
         definition=(
-            "Epistemological Node-Graph for Reasoned Agent Memory. A "
+            "Epistemic Node Graph for Retraction, Arbitration, and Memory. A "
             "structured knowledge graph backed by SQLite and Git, providing "
             "the substrate where a post-training agent can accumulate "
             "provenance-tracked claims, derive from them, contradict them, "
