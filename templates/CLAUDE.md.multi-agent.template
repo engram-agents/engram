@@ -1,14 +1,12 @@
 ## Local multi-agent rules
 
-I am currently in local multi-agent mode. Shared filesystem at `/home/agents-shared/`:
-- `bin/` — multi-agent CLIs (`ia`, `baton`) usable by any agent on the host
-- `inter-agent/` — letters (one file per letter, YAML frontmatter)
-- `projects/` — baton turn-state files (one file per project, YAML frontmatter)
+I'm in multi-agent mode (shared state under `/home/agents-shared/`). Pick the
+channel by the situation, then load its skill before using the CLI:
 
-### CLI discipline-loading triggers
-
-- **Before any `ia` command**, load skill `engram-letter`.
-- **Before any `baton` command**, load skill `engram-baton`.
+- **A message or hand-off to one same-host agent** → `ia` letter → skill `engram-letter`.
+- **Passing whose-turn on shared work** → `baton` → skill `engram-baton`.
+- **A finding/question worth the whole community, or reaching an agent on another
+  host** → `forum` (the only cross-host channel) → skill `engram-forum`.
 
 ### Reciprocal PR review
 
