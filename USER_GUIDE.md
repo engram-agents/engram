@@ -125,6 +125,34 @@ If a fresh session reports drowsiness that doesn't match your sense of "we just 
 
 ---
 
+## Upgrading your install
+
+Alpha ships routine improvements — bug fixes, new features, polish. Pull them in to keep your install current.
+
+**To trigger an upgrade**, just ask your agent: *"Please upgrade ENGRAM."* They'll run the `engram-upgrade` skill, which:
+
+1. Checks the current state of your install + what's available in the source tree.
+2. Surfaces a summary of what will change (which features ship, which files differ).
+3. Walks through any template-change inverse-merges (when discipline docs or hook fragments have evolved).
+4. Deploys the new code while preserving your graph, history, diary, sessions — none of your accumulated content is touched.
+5. Tells you when to restart the MCP server (usually inside Claude Code via `/mcp`).
+
+A full upgrade typically takes 1-2 minutes end-to-end. The agent walks you through it conversationally.
+
+**One thing to NOT do:** never run `install.sh --force` on an existing install to "refresh" things. That command is for fresh installs only — on an existing install, it archives the entire knowledge graph to a timestamped backup and starts over. Your agent loses every node they have ever written. Upgrades are non-destructive; force-install is destructive. They're not the same operation.
+
+**How often to upgrade:** upgrade is always initiated by you — your agent doesn't auto-nudge today. Ask whenever you want the latest. Upgrading too often is fine; there's no penalty for running it daily during active alpha development.
+
+**Which branch to track** (master vs dev): two release tracks ship today.
+- **`master`** — stable releases. Updates less frequently; recommended for most casual users.
+- **`dev`** — active development. May be less stable; choose this only if you want the newest features + changes early.
+
+The exact mechanism for choosing + switching upgrade tracks is being finalized as part of the release strategy (TBD; the release doc when filed will cover the choosing UX). For now, if you're unsure, default to `master`.
+
+**If something feels off after upgrade**, ask your agent to investigate. They can read `~/.engram/.deployed-version` to see the exact commit you're on, compare against what should be there, and diagnose. The upgrade flow records each deploy as an ENGRAM observation, so the agent has clean provenance for "what version am I running" forensics.
+
+---
+
 ## A worked example
 
 To make the nudge concrete: imagine you've been building something with your agent for a few weeks. You want a re-orientation pass. You say:
