@@ -33,6 +33,57 @@ the unified payload_json signature as of 2026-05-27.
   command above. Fix locally with `git remote set-head origin --auto` to
   re-sync your clone's `origin/HEAD` pointer.
 
+## Install tiers — a design-time discipline
+
+Tiering is **not** a release-time packaging step bolted on at the end — it starts
+at **design time**. The first question for any new artifact — a feature, tool,
+hook, skill, sub-agent, schema change, or whole subsystem — is: **which tier does
+this belong to, and how does it ship accordingly?** If you can't answer that, the
+design isn't finished.
+
+**Three cumulative depth tiers** (Essential ⊂ Convenience ⊂ Dev — choosing one
+ships it plus everything below):
+
+- **Essential (T1)** — removing it breaks epistemic identity OR continuity: the
+  MCP server + all its tools, the core read/write/continuity hooks, the drowsiness
+  meter (it times the pre-compaction consolidation save), the consolidation cycle
+  (sleep / nap / first-session / retract / contradiction-resolution), the
+  dream/summary fairies, the runtime modules, the identity docs.
+- **Convenience (T2, the default)** — established agentic routines that *degrade
+  UX but are recoverable*: self-paced loops, coder/reviewer fairies +
+  orchestration, research/curiosity loops, the upgrade flow, the viz dashboard,
+  the deference detector, the proactive output style.
+- **Developer (T3)** — ENGRAM-development tooling only: self-improvement, the
+  recall-measurement harness, leak scanners, DB-surgery tools, the surface-drift
+  hooks, baselines.
+
+**Orthogonal axis — `--multi-agent`** (a topology flag, not a depth tier; composes
+with any depth tier): inter-agent letters / turn-state batons / the shared forum —
+their CLIs, prompt-hooks, coordination skills, and the multi-agent CLAUDE.md
+template.
+
+**Two load-bearing rules:**
+
+1. **A safety discipline ships with its tool, at the same tier.** If *misuse* of a
+   tool is harmful (not merely "unused-is-benign"), its usage-discipline skill is
+   the same tier as the tool — they are one inseparable unit. (This is why the
+   trust-tier MCP tools **and** the `engram-trust-tier` skill are all T1: a safety
+   tool used without its discipline is worse than not having it.)
+
+2. **Every shippable is tagged exactly once in the manifest.** The tier map *will
+   be* the single source of truth at `packaging/tiers.json`; `build-plugin.sh
+   --tier` and `install.sh --tier` *will* filter through it at **build time** (the
+   agent-led install reads the README, prompts the user for tier + multi-agent, and
+   builds accordingly — no post-install pruning). **CI must fail the build if any
+   shippable path is untiered or any manifest entry is dangling** — so "added a
+   skill, forgot to tier it" cannot drift past review. This is a mechanical gate,
+   not vigilance.
+
+*(The `packaging/tiers.json` manifest + the CI tag-once test land with the tiering
+rollout. Until they do, the tier of any new artifact is still a required design
+decision — record it in the audit so the manifest is a transcription, not a
+re-derivation.)*
+
 ## PR review convention (multi-agent mode)
 
 When this host runs **multiple ENGRAM agents** (e.g. Ariadne + Borges) — i.e. a
