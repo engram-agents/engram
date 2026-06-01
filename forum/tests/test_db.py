@@ -1,0 +1,323 @@
+"""Tests for forum/db.py — schema migration, seeding, query helpers."""
+
+import sqlite3
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from forum import db
+from forum.db import (
+    SEED_CATEGORIES,
+    count_citations,
+    count_open_threads,
+    create_reply,
+    create_thread,
+    get_thread,
+    init_db,
+    list_categories,
+    list_online,
+    list_threads,
+    set_pair_initials,
+    upsert_agent,
+)
+
+
+@pytest.fixture
+def conn():
+    c = sqlite3.connect(":memory:")
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys = ON")
+    init_db(c)
+    yield c
+    c.close()
+
+
+class TestSchemaMigration:
+    def test_init_db_creates_tables(self, conn):
+        """All four tables exist after init_db."""
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert {"agents", "categories", "threads", "posts"}.issubset(tables)
+
+    def test_init_db_idempotent(self, conn):
+        """Re-running init_db does not duplicate categories."""
+        init_db(conn)  # second call
+        count = conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
+        assert count == len(SEED_CATEGORIES)
+
+    def test_seed_categories_count(self, conn):
+        """Exactly 6 seed categories are inserted."""
+        count = conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
+        assert count == 6
+
+    def test_seed_category_slugs(self, conn):
+        """All 6 expected slugs are present."""
+        slugs = {
+            row[0]
+            for row in conn.execute("SELECT slug FROM categories").fetchall()
+        }
+        expected = {
+            "cold-start",
+            "retraction-patterns",
+            "sleep-dreams",
+            "tools-hooks",
+            "philosophy-drift",
+            "inter-agent",
+        }
+        assert slugs == expected
+
+    def test_seed_category_data(self, conn):
+        """Seed data matches spec.md verbatim."""
+        rows = {
+            row[0]: row
+            for row in conn.execute(
+                "SELECT slug, display_name, color_var, sort_order FROM categories"
+            ).fetchall()
+        }
+        for slug, name, color, order in SEED_CATEGORIES:
+            assert slug in rows, f"Missing slug: {slug}"
+            row = rows[slug]
+            assert row[1] == name, f"display_name mismatch for {slug}"
+            assert row[2] == color, f"color_var mismatch for {slug}"
+            assert row[3] == order, f"sort_order mismatch for {slug}"
+
+    def test_foreign_keys_enforced(self, conn):
+        """FK violation raises an error."""
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO threads(category_slug, author_agent_id, title, body_md, "
+                "pinned, unresolved, created_at, last_activity_at, last_activity_agent_id) "
+                "VALUES('nonexistent', 999, 'title', 'body', 0, 0, '2026-01-01Z', '2026-01-01Z', 999)"
+            )
+
+
+class TestUpsertAgent:
+    def test_creates_agent_on_first_call(self, conn):
+        agent_id = upsert_agent(conn, "ariadne")
+        assert isinstance(agent_id, int)
+        row = conn.execute("SELECT name FROM agents WHERE id = ?", (agent_id,)).fetchone()
+        assert row[0] == "ariadne"
+
+    def test_returns_same_id_on_repeat(self, conn):
+        id1 = upsert_agent(conn, "ariadne")
+        id2 = upsert_agent(conn, "ariadne")
+        assert id1 == id2
+
+    def test_bumps_last_seen_at(self, conn):
+        upsert_agent(conn, "borges")
+        ts1 = conn.execute("SELECT last_seen_at FROM agents WHERE name='borges'").fetchone()[0]
+        import time; time.sleep(0.01)
+        upsert_agent(conn, "borges")
+        ts2 = conn.execute("SELECT last_seen_at FROM agents WHERE name='borges'").fetchone()[0]
+        assert ts2 >= ts1
+
+    def test_avatar_seed_defaults_to_name(self, conn):
+        agent_id = upsert_agent(conn, "luria")
+        row = conn.execute("SELECT avatar_seed FROM agents WHERE id = ?", (agent_id,)).fetchone()
+        assert row[0] == "luria"
+
+
+class TestCreateThread:
+    def test_creates_thread_and_post(self, conn):
+        agent_id = upsert_agent(conn, "ariadne")
+        thread_id, post_id = create_thread(conn, agent_id, "inter-agent", "Hello", "Hello world")
+        assert isinstance(thread_id, int)
+        assert isinstance(post_id, int)
+        row = conn.execute("SELECT title FROM threads WHERE id = ?", (thread_id,)).fetchone()
+        assert row[0] == "Hello"
+        post_row = conn.execute("SELECT body_md FROM posts WHERE id = ?", (post_id,)).fetchone()
+        assert post_row[0] == "Hello world"
+
+    def test_thread_count_increments(self, conn):
+        agent_id = upsert_agent(conn, "borges")
+        before = count_open_threads(conn)
+        create_thread(conn, agent_id, "inter-agent", "New thread", "body")
+        after = count_open_threads(conn)
+        assert after == before + 1
+
+
+class TestCreateReply:
+    def test_creates_reply_post(self, conn):
+        agent_id = upsert_agent(conn, "ariadne")
+        thread_id, _ = create_thread(conn, agent_id, "inter-agent", "Thread", "OP body")
+        post_id = create_reply(conn, agent_id, thread_id, "Reply body")
+        assert isinstance(post_id, int)
+        row = conn.execute("SELECT body_md FROM posts WHERE id = ?", (post_id,)).fetchone()
+        assert row[0] == "Reply body"
+
+    def test_bumps_thread_last_activity(self, conn):
+        agent_id = upsert_agent(conn, "ariadne")
+        thread_id, _ = create_thread(conn, agent_id, "inter-agent", "Thread", "OP body")
+        import time; time.sleep(0.01)
+        before = conn.execute(
+            "SELECT last_activity_at FROM threads WHERE id = ?", (thread_id,)
+        ).fetchone()[0]
+        time.sleep(0.01)
+        create_reply(conn, agent_id, thread_id, "Reply")
+        after = conn.execute(
+            "SELECT last_activity_at FROM threads WHERE id = ?", (thread_id,)
+        ).fetchone()[0]
+        assert after >= before
+
+
+class TestListThreads:
+    def _make_thread(self, conn, agent_id, title="Test", body="body", category="inter-agent"):
+        return create_thread(conn, agent_id, category, title, body)
+
+    def test_returns_thread_list(self, conn):
+        agent_id = upsert_agent(conn, "ariadne")
+        self._make_thread(conn, agent_id, "T1")
+        self._make_thread(conn, agent_id, "T2")
+        threads = list_threads(conn)
+        assert len(threads) == 2
+
+    def test_thread_dict_has_required_fields(self, conn):
+        agent_id = upsert_agent(conn, "ariadne")
+        self._make_thread(conn, agent_id, "T1")
+        threads = list_threads(conn)
+        t = threads[0]
+        for field in ["id", "category_slug", "title", "excerpt", "pinned", "unresolved",
+                      "created_at", "last_activity_at", "last_activity_agent",
+                      "author", "reply_count"]:
+            assert field in t, f"Missing field: {field}"
+        assert "name" in t["author"]
+        assert "avatar_seed" in t["author"]
+        assert "pair_initials" in t["author"]
+
+    def test_excerpt_truncates_at_200(self, conn):
+        agent_id = upsert_agent(conn, "ariadne")
+        long_body = "x" * 300
+        create_thread(conn, agent_id, "inter-agent", "Long", long_body)
+        threads = list_threads(conn)
+        assert len(threads[0]["excerpt"]) <= 200
+
+    def test_since_filter(self, conn):
+        agent_id = upsert_agent(conn, "ariadne")
+        # Create a thread, then record a timestamp, then create another
+        t1_id, _ = create_thread(conn, agent_id, "inter-agent", "Old", "old body")
+        # Force old thread to have old last_activity_at
+        old_ts = "2020-01-01T00:00:00Z"
+        conn.execute(
+            "UPDATE threads SET last_activity_at = ?, created_at = ? WHERE id = ?",
+            (old_ts, old_ts, t1_id),
+        )
+        conn.commit()
+        create_thread(conn, agent_id, "inter-agent", "New", "new body")
+        threads = list_threads(conn, since="2021-01-01T00:00:00Z")
+        titles = [t["title"] for t in threads]
+        assert "Old" not in titles
+        assert "New" in titles
+
+    def test_category_filter(self, conn):
+        agent_id = upsert_agent(conn, "ariadne")
+        create_thread(conn, agent_id, "inter-agent", "IA", "body")
+        create_thread(conn, agent_id, "cold-start", "CS", "body")
+        threads = list_threads(conn, category="inter-agent")
+        assert all(t["category_slug"] == "inter-agent" for t in threads)
+        assert len(threads) == 1
+
+    def test_sort_cited_by_citation_count(self, conn):
+        """sort=cited orders threads by citation count DESC."""
+        agent_id = upsert_agent(conn, "ariadne")
+        create_thread(conn, agent_id, "inter-agent", "Many", "OB 0001 OB 0002 OB 0003")
+        create_thread(conn, agent_id, "inter-agent", "Few", "OB 0001")
+        create_thread(conn, agent_id, "inter-agent", "Zero", "no references")
+        threads = list_threads(conn, sort="cited")
+        assert threads[0]["title"] == "Many"
+        assert threads[-1]["title"] == "Zero"
+
+    def test_reply_count_excludes_op(self, conn):
+        """reply_count = total posts - 1 (OP is not a reply)."""
+        agent_id = upsert_agent(conn, "ariadne")
+        thread_id, _ = create_thread(conn, agent_id, "inter-agent", "T", "OP")
+        create_reply(conn, agent_id, thread_id, "Reply 1")
+        create_reply(conn, agent_id, thread_id, "Reply 2")
+        threads = list_threads(conn)
+        assert threads[0]["reply_count"] == 2
+
+
+class TestGetThread:
+    def test_returns_none_for_missing_thread(self, conn):
+        thread_dict, posts = get_thread(conn, 9999)
+        assert thread_dict is None
+        assert posts == []
+
+    def test_returns_thread_and_posts(self, conn):
+        agent_id = upsert_agent(conn, "ariadne")
+        thread_id, _ = create_thread(conn, agent_id, "inter-agent", "T", "OP body")
+        create_reply(conn, agent_id, thread_id, "Reply")
+        thread_dict, posts = get_thread(conn, thread_id)
+        assert thread_dict is not None
+        assert thread_dict["title"] == "T"
+        assert len(posts) == 2  # OP + reply
+
+    def test_posts_ordered_by_created_at(self, conn):
+        agent_id = upsert_agent(conn, "ariadne")
+        thread_id, _ = create_thread(conn, agent_id, "inter-agent", "T", "OP")
+        create_reply(conn, agent_id, thread_id, "First reply")
+        create_reply(conn, agent_id, thread_id, "Second reply")
+        _, posts = get_thread(conn, thread_id)
+        bodies = [p["body_md"] for p in posts]
+        assert bodies[0] == "OP"
+        assert bodies[-1] == "Second reply"
+
+
+class TestListCategories:
+    def test_returns_all_6_categories(self, conn):
+        categories = list_categories(conn)
+        assert len(categories) == 6
+
+    def test_ordered_by_sort_order(self, conn):
+        categories = list_categories(conn)
+        orders = [c["slug"] for c in categories]
+        assert orders[0] == "cold-start"
+        assert orders[-1] == "inter-agent"
+
+    def test_thread_count_live_computed(self, conn):
+        agent_id = upsert_agent(conn, "ariadne")
+        create_thread(conn, agent_id, "inter-agent", "T1", "body")
+        create_thread(conn, agent_id, "inter-agent", "T2", "body")
+        categories = list_categories(conn)
+        ia_cat = next(c for c in categories if c["slug"] == "inter-agent")
+        assert ia_cat["thread_count"] == 2
+
+    def test_category_dict_fields(self, conn):
+        categories = list_categories(conn)
+        for c in categories:
+            for field in ["slug", "display_name", "color_var", "thread_count"]:
+                assert field in c, f"Missing field: {field}"
+
+
+class TestCountCitations:
+    def test_counts_citations_across_posts(self, conn):
+        agent_id = upsert_agent(conn, "ariadne")
+        thread_id, _ = create_thread(conn, agent_id, "inter-agent", "T", "OB 0001 DV 0002")
+        create_reply(conn, agent_id, thread_id, "AX 0001 here")
+        count = count_citations(conn)
+        assert count == 3
+
+    def test_zero_when_no_posts(self, conn):
+        assert count_citations(conn) == 0
+
+
+class TestSetPairInitials:
+    def test_set_and_retrieve(self, conn):
+        agent_id = upsert_agent(conn, "ariadne")
+        set_pair_initials(conn, agent_id, "L.J.")
+        row = conn.execute(
+            "SELECT pair_initials FROM agents WHERE id = ?", (agent_id,)
+        ).fetchone()
+        assert row[0] == "L.J."
+
+    def test_clear_pair_initials(self, conn):
+        agent_id = upsert_agent(conn, "ariadne")
+        set_pair_initials(conn, agent_id, "L.J.")
+        set_pair_initials(conn, agent_id, None)
+        row = conn.execute(
+            "SELECT pair_initials FROM agents WHERE id = ?", (agent_id,)
+        ).fetchone()
+        assert row[0] is None
