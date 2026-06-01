@@ -10,7 +10,7 @@ Eleven subcommands:
   init        Create a new project baton file
   flip        Pass the baton to another participant (PR layer)
   claim       Take a Project-layer baton from the pool (pool → self)
-  release     Return a Project-layer baton to the pool (self → lei)
+  release     Return a Project-layer baton to the pool (self → pool sentinel)
   status      List active projects (not merged or cancelled)
   mine        Shorthand for status --mine
   show        Display a project file
@@ -440,10 +440,10 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         initial_turn = participants[0]
 
     # Validate initial turn
-    if initial_turn != "lei" and initial_turn not in participants:
+    if initial_turn != _pool_sentinel() and initial_turn not in participants:
         print(
             f"baton init: turn '{initial_turn}' must be in participants "
-            f"{participants} or 'lei'.",
+            f"{participants} or the pool sentinel ({_pool_sentinel()!r}).",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
@@ -552,15 +552,15 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_VALIDATION)
 
-    # Validate: to_agent must be in participants or 'lei'
+    # Validate: to_agent must be in participants or the pool sentinel
     participants_str = fields.get("participants", "").strip()
     participants = _parse_participants(participants_str) if participants_str else []
 
-    if to_agent != "lei" and to_agent not in participants:
+    if to_agent != _pool_sentinel() and to_agent not in participants:
         print(
             f"baton flip: '{to_agent}' is not a participant in {project_id}. "
             f"Participants: {participants}. "
-            "Only participants (or 'lei') can receive the baton.",
+            "Only participants (or the pool sentinel) can receive the baton.",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
@@ -613,9 +613,58 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 # Pool sentinel: the name held between active agent claims.
-# Convention: "lei" (Lei's personal sentinel used across baton files).
-# Escape valve: if the sentinel changes, update this constant.
-_POOL_SENTINEL = "lei"
+# Derived from $ENGRAM_HOME/config.json's primary_user field (issue #606 —
+# the former hardcoded "lei" was a fresh-install bug; any non-lei install
+# could not use the pool sentinel correctly).
+_POOL_SENTINEL_CACHE: list = []  # one-element list; empty = not yet resolved
+
+
+def _pool_sentinel() -> str:
+    """Return the pool sentinel for this install.
+
+    The sentinel is the value of primary_user in $ENGRAM_HOME/config.json —
+    the same field the hooks read.  Result is cached after first call so
+    repeated calls inside a single CLI invocation pay no extra I/O.
+
+    Resolution order:
+      1. Cached value (after first call).
+      2. config.json primary_user field.
+      3. BATON_POOL_SENTINEL env var (fallback only; config.json wins when present).
+      4. Exit with EXIT_VALIDATION — fails loud rather than silently
+         hardcoding a name.
+    """
+    if _POOL_SENTINEL_CACHE:
+        return _POOL_SENTINEL_CACHE[0]
+
+    # Read from config.json (same pattern as engram-surface-hook.py).
+    engram_home = (
+        os.environ.get("ENGRAM_DATA_DIR")
+        or os.environ.get("ENGRAM_HOME")
+        or str(Path.home() / ".engram")
+    )
+    try:
+        config_path = Path(engram_home) / "config.json"
+        pu = json.loads(config_path.read_text()).get("primary_user")
+        if pu:
+            _POOL_SENTINEL_CACHE.append(str(pu).lower())
+            return _POOL_SENTINEL_CACHE[0]
+    except (OSError, ValueError, AttributeError):
+        pass
+
+    # Fallback: BATON_POOL_SENTINEL env var (config.json primary_user wins
+    # when present; this path is only reached when config.json is absent or
+    # lacks primary_user — useful for test fixtures and non-standard installs).
+    env_val = os.environ.get("BATON_POOL_SENTINEL")
+    if env_val:
+        _POOL_SENTINEL_CACHE.append(env_val.lower())
+        return _POOL_SENTINEL_CACHE[0]
+
+    print(
+        "baton: cannot determine pool sentinel — set primary_user in "
+        "$ENGRAM_HOME/config.json (or set BATON_POOL_SENTINEL).",
+        file=sys.stderr,
+    )
+    sys.exit(EXIT_VALIDATION)
 
 
 def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str) -> None:
@@ -623,7 +672,8 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
     Equivalent to 'baton flip <project-id> <self> "claimed"' but makes the
     Project-layer grab/ungrab vocabulary first-class. Only succeeds when
-    turn == pool sentinel (lei); refuses to steal from another agent.
+    turn == pool sentinel (the install's primary_user); refuses to steal from
+    another agent.
     """
     projects_dir = Path(BATON_PROJECTS_DIR)
     project_id = args.project_id
@@ -660,7 +710,7 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
     # Validate: current turn must be the pool sentinel
     current_turn = fields.get("turn", "").strip().lower()
-    if current_turn != _POOL_SENTINEL:
+    if current_turn != _pool_sentinel():
         print(
             f"baton claim: refusing to steal claim from {current_turn}; "
             "use 'baton flip <project-id> <self> <reason>' if you have an "
@@ -713,7 +763,7 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     _updated_fields, updated_body = _parse_frontmatter(updated_text)
 
     # Append turn log entry
-    log_entry = f"- {now} {_POOL_SENTINEL} → {self_name}: claimed"
+    log_entry = f"- {now} {_pool_sentinel()} → {self_name}: claimed"
     final_body = _append_turn_log(updated_body, log_entry)
 
     # Reconstruct final content: frontmatter + updated body
@@ -735,9 +785,9 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 def cmd_release(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     """Release a Project-layer baton back to the pool.
 
-    Equivalent to 'baton flip <project-id> lei <reason>' but restricted to
-    the current holder (only you can release what you hold). With --done,
-    also appends '(done)' to the project title (idempotent).
+    Equivalent to 'baton flip <project-id> <pool-sentinel> <reason>' but
+    restricted to the current holder (only you can release what you hold).
+    With --done, also appends '(done)' to the project title (idempotent).
     """
     projects_dir = Path(BATON_PROJECTS_DIR)
     project_id = args.project_id
@@ -804,9 +854,9 @@ def cmd_release(args: argparse.Namespace, config: dict, agent_name: str) -> None
 
     now = _now_iso()
 
-    # Build frontmatter updates: turn → lei, turn_since → now, turn_reason → reason
+    # Build frontmatter updates: turn → pool sentinel, turn_since → now, turn_reason → reason
     updates: dict = {
-        "turn": _POOL_SENTINEL,
+        "turn": _pool_sentinel(),
         "turn_since": now,
         "turn_reason": f'"{reason}"',
     }
@@ -826,7 +876,7 @@ def cmd_release(args: argparse.Namespace, config: dict, agent_name: str) -> None
     _updated_fields, updated_body = _parse_frontmatter(updated_text)
 
     # Append turn log entry (and a second line if title was renamed)
-    log_entry = f"- {now} {self_name} → {_POOL_SENTINEL}: {reason}"
+    log_entry = f"- {now} {self_name} → {_pool_sentinel()}: {reason}"
     if title_renamed:
         log_entry += f"\n- {now} title marked (done)"
     final_body = _append_turn_log(updated_body, log_entry)
@@ -840,7 +890,7 @@ def cmd_release(args: argparse.Namespace, config: dict, agent_name: str) -> None
         final_content = updated_text
 
     _atomic_write(dest, final_content)
-    print(f"baton release: {project_id} → {_POOL_SENTINEL}")
+    print(f"baton release: {project_id} → {_pool_sentinel()}")
     if mark_done:
         print("  marked (done)")
 
@@ -1318,7 +1368,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Atomically update turn, turn_since, and turn_reason in the "
             "project file, and append a turn-log line. "
-            "TO must be a participant or 'lei'."
+            "TO must be a participant or the pool sentinel (the install's primary_user)."
         ),
     )
     p_flip.add_argument(
@@ -1329,7 +1379,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_flip.add_argument(
         "to",
         metavar="TO",
-        help="Agent or 'lei' to pass the baton to",
+        help="Agent or the pool sentinel (primary_user) to pass the baton to",
     )
     p_flip.add_argument(
         "reason",
@@ -1343,9 +1393,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Claim a Project-layer baton from the pool (pool → self)",
         description=(
             "Take a Project-layer baton for yourself. Only succeeds when the "
-            "current turn is the pool sentinel (lei). Refuses to steal from "
-            "another agent — use 'baton flip' with an explicit handoff agreement "
-            "if needed.\n\n"
+            "current turn is the pool sentinel (the install's primary_user). "
+            "Refuses to steal from another agent — use 'baton flip' with an "
+            "explicit handoff agreement if needed.\n\n"
             "Vocabulary distinction: claim/release are Project-layer verbs "
             "(single driver, rare passes). flip is the PR-layer verb (frequent "
             "passing through fairy → reviewer → colleague → maintainer)."
@@ -1360,9 +1410,10 @@ def build_parser() -> argparse.ArgumentParser:
     # -- release --
     p_release = subparsers.add_parser(
         "release",
-        help="Return a Project-layer baton to the pool (self → lei)",
+        help="Return a Project-layer baton to the pool (self → pool sentinel)",
         description=(
-            "Release a Project-layer baton back to the pool sentinel (lei). "
+            "Release a Project-layer baton back to the pool sentinel "
+            "(the install's primary_user). "
             "Only the current holder can release. Use --done to also append "
             "'(done)' to the project title (idempotent).\n\n"
             "Vocabulary distinction: claim/release are Project-layer verbs "

@@ -49,9 +49,18 @@ def _run_baton(
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def _write_config(engram_home: Path, agent_name: str = "borges") -> None:
-    """Write a minimal config.json into engram_home."""
-    cfg = {"mode": "multi", "agent_name": agent_name}
+def _write_config(
+    engram_home: Path,
+    agent_name: str = "borges",
+    primary_user: str = "lei",
+) -> None:
+    """Write a minimal config.json into engram_home.
+
+    primary_user defaults to "lei" so that the pool sentinel resolves to
+    "lei" on all existing tests (issue #606 fix — the sentinel is now
+    read from config.json, not hardcoded).
+    """
+    cfg = {"mode": "multi", "agent_name": agent_name, "primary_user": primary_user}
     (engram_home / "config.json").write_text(json.dumps(cfg))
 
 
@@ -1503,3 +1512,139 @@ class TestReopen:
         assert rc == 0, f"reopen failed; stderr: {stderr}"
         assert "PR-1308" in stdout
         assert "in-progress" in stdout
+
+
+# ===========================================================================
+# CATEGORY 13: Pool sentinel resolution (issue #606)
+# ===========================================================================
+
+class TestPoolSentinel:
+    """Pool sentinel is derived from config primary_user, not hardcoded."""
+
+    def test_sentinel_resolves_to_non_lei_primary_user(
+        self, engram_home, projects_dir
+    ):
+        """With primary_user='alice' in config, the pool sentinel is 'alice'.
+
+        This is the core fresh-install correctness test from issue #606:
+        a non-lei primary_user install must work end-to-end.
+        """
+        # Write config with primary_user=alice (non-lei install).
+        _write_config(engram_home, agent_name="borges", primary_user="alice")
+
+        # Create a pool project: turn=alice (the sentinel for this install).
+        _write_project(
+            projects_dir, "pool-alice-test",
+            title="non-lei sentinel test",
+            turn="alice",
+            participants=["borges", "ariadne"],
+            status="in-progress",
+        )
+
+        # claim must succeed when turn == pool sentinel (alice).
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "claim", "pool-alice-test",
+        )
+        assert rc == 0, (
+            f"claim failed with primary_user=alice; stderr: {stderr}"
+        )
+        turn = _read_project_field(projects_dir, "pool-alice-test", "turn")
+        assert turn == "borges", f"Expected turn=borges after claim; got {turn!r}"
+
+        # release must put the baton back to alice (the sentinel), not "lei".
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "release", "pool-alice-test",
+        )
+        assert rc == 0, (
+            f"release failed with primary_user=alice; stderr: {stderr}"
+        )
+        turn_after = _read_project_field(projects_dir, "pool-alice-test", "turn")
+        assert turn_after == "alice", (
+            f"Expected turn=alice (sentinel) after release; got {turn_after!r}"
+        )
+
+        # Confirm the audit log uses alice, not lei.
+        content = (projects_dir / "pool-alice-test.md").read_text()
+        assert "→ borges: claimed" in content, "Claim audit entry missing"
+        assert "→ alice: released" in content, "Release audit entry uses wrong sentinel"
+        assert "lei" not in content.split("## Turn log")[-1], (
+            "Literal 'lei' must not appear in the turn log for an alice install"
+        )
+
+    def test_sentinel_case_normalizes_capitalized_primary_user(
+        self, engram_home, projects_dir
+    ):
+        """primary_user='Alice' (capitalized) in config normalizes to sentinel 'alice'.
+
+        Regression test for PR #612 round-2: _pool_sentinel() used to return
+        the raw config string, so a capitalized primary_user would silently
+        fail all sentinel comparisons (which .strip().lower() their operand).
+        The fix applies .lower() in _pool_sentinel() itself, so both paths
+        (config-derived and env-fallback) are consistent with the comparison
+        sites.
+        """
+        # Write config with primary_user=Alice (capitalized — the bug trigger).
+        _write_config(engram_home, agent_name="borges", primary_user="Alice")
+
+        # Baton file has turn=alice (lowercase) — what a well-formed file looks like.
+        _write_project(
+            projects_dir, "pool-alice-cap-test",
+            title="capitalized primary_user test",
+            turn="alice",
+            participants=["borges", "ariadne"],
+            status="in-progress",
+        )
+
+        # claim must succeed: sentinel resolves to 'alice' despite 'Alice' in config.
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "claim", "pool-alice-cap-test",
+        )
+        assert rc == 0, (
+            f"claim failed with primary_user='Alice' (capitalized); stderr: {stderr}"
+        )
+        turn = _read_project_field(projects_dir, "pool-alice-cap-test", "turn")
+        assert turn == "borges", f"Expected turn=borges after claim; got {turn!r}"
+
+        # release must write sentinel as lowercase 'alice', not raw 'Alice'.
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "release", "pool-alice-cap-test",
+        )
+        assert rc == 0, (
+            f"release failed with primary_user='Alice' (capitalized); stderr: {stderr}"
+        )
+        turn_after = _read_project_field(projects_dir, "pool-alice-cap-test", "turn")
+        assert turn_after == "alice", (
+            f"Expected turn=alice (lowercased sentinel) after release; got {turn_after!r}"
+        )
+
+    def test_missing_config_no_env_fails_loud(self, engram_home, projects_dir):
+        """Missing config.json + no BATON_POOL_SENTINEL → exit non-zero with message.
+
+        Any operation that resolves the pool sentinel must fail loud (not
+        silently return a wrong name) when the sentinel cannot be determined.
+        """
+        # Do NOT write config.json — engram_home exists but has no config file.
+        _write_project(
+            projects_dir, "pool-no-config",
+            title="no config test",
+            turn="someone",
+            participants=["borges", "ariadne"],
+            status="in-progress",
+        )
+
+        # claim triggers sentinel resolution; must fail loud.
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "claim", "pool-no-config",
+            env_overrides={"BATON_POOL_SENTINEL": ""},  # empty → not set
+        )
+        assert rc != 0, (
+            f"Expected non-zero exit when config missing; got rc={rc}"
+        )
+        assert "sentinel" in stderr.lower() or "primary_user" in stderr.lower(), (
+            f"Expected error message mentioning sentinel/primary_user; got: {stderr!r}"
+        )
