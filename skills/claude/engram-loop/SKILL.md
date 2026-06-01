@@ -250,8 +250,10 @@ With the marker present, the hook tells you the right thing; the discipline is:
 ## Relation to the specialized loop skills
 
 `engram-curiosity-loop` (breadth-first research), `engram-meta-loop` (autonomous
-top-level), `engram-deep-research` (depth-first), and `engram-school-day` (fixed
-curriculum) are KINDS of self-paced loop. **The loop FORMALITY — the marker
+top-level), `engram-deep-research` (depth-first), `engram-school-day` (fixed
+curriculum), and `engram-collaborating-loop` (multi-agent Monitor-wake +
+relaxed-heartbeat coordination) are KINDS of self-paced loop. **The loop
+FORMALITY — the marker
 lifecycle (Steps 0–3) and the loop-mode drowsiness behavior (Step 4) — lives
 HERE, as the single source of truth.** Specialized skills reference this one for
 the formality and carry only their own STYLE: what to work on, how to pace
