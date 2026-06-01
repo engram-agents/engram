@@ -1,0 +1,53 @@
+name: tests
+
+# Expensive full pytest suite — MASTER-ONLY by design (release merges).
+# Running this on every dev PR is too costly on the GitHub Actions free tier
+# (~5min wall × the py3.11/3.12 matrix per run). Dev-PR coverage is instead:
+#   - the cheap scrub gates (check-no-new-shipped-node-ids.yml) on every PR, and
+#   - a local full-suite run after each merge (maintainer-run, $0 quota).
+# Manual `workflow_dispatch` is available for an on-demand full run.
+# (Decision: Lei 2026-06-01 — CI economics for the alpha release.)
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      # Skip the optional sentence-transformers embedding code path in CI
+      # so we don't pay the ~500MB model download per run. Tests pass either way.
+      ENGRAM_NO_EMBEDDINGS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          # forum/tests/ import forum.server (Flask + bleach + markdown-it-py +
+          # beautifulsoup4 + html5lib); those deps live in forum/requirements.txt,
+          # not the main requirements. Without this the forum suite errors on
+          # import and the gate red-X's. (forum/ shipped in #615.)
+          pip install -r forum/requirements.txt
+
+      - name: Run pytest
+        # Explicit paths (pytest.ini sets no testpaths). Covers the main suite
+        # AND forum/tests/ (8 files) — the latter was silently skipped by the
+        # original `pytest tests/` since forum/ postdates this workflow.
+        # tools/ forum-CLI tests arrive with #616; add `tools/` to this path
+        # once #616 merges (omitted now — empty tools/ test set would exit-5).
+        run: pytest tests/ forum/tests/ -v --tb=short

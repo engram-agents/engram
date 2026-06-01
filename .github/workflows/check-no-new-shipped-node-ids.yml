@@ -1,0 +1,78 @@
+name: no-new-shipped-node-ids
+
+# Enforces the policy from issue #51 / DEVELOPMENT.md "Shipped files —
+# no concrete ENGRAM node IDs": PRs to dev or master must not ADD new
+# concrete ENGRAM node ID references (regex below) inside alpha-released
+# files. Existing references are grandfathered; the scrub of the existing
+# corpus happens incrementally in follow-up PRs to issue #51.
+
+on:
+  pull_request:
+    branches: [dev, master]
+
+jobs:
+  check-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history so origin/<base> is reachable.
+
+      - name: Fail on newly-added concrete ENGRAM node IDs in shipped files
+        run: |
+          BASE_REF="origin/${{ github.base_ref }}"
+          # The pattern follows engram_ids.py's documented broad shape:
+          # every TYPE_PREFIX in server.py is exactly two lowercase letters,
+          # so `[a-z]{2}_\d{4,}` catches every current type AND future types
+          # without per-add maintenance. Current TYPE_PREFIX set (server.py
+          # ~628): ev, ob, pr, dv, th, ct, qu, ax, df, cj, gl, gt, fl, tk,
+          # ls, pn, cs, ts. The broad form is restrictive enough in practice
+          # (random text rarely matches `xx_NNNN+` boundaries).
+          PATTERN='\b[a-z]{2}_[0-9]{4,}\b'
+
+          # Allowlist scope rationale:
+          #   tests/, paper_draft/, active-work/ — non-shipped surfaces
+          #   README.md — documents seed-graph IDs that ARE in every install
+          #   CHANGELOG.md — historical record; scrub planned separately
+          #   this workflow file — contains the pattern literally
+          # IN scope (intentionally NOT excluded; flag if added to):
+          #   skills/, agents/, hooks/, integrations/, output-styles/,
+          #   templates/, SKILL.md, CLAUDE.md, USER_GUIDE.md, DEVELOPMENT.md,
+          #   server.py and engram_*.py modules, tools/ (most of it).
+          EXCLUDES=(
+            ':(exclude)tests/'
+            ':(exclude)paper_draft/'
+            ':(exclude)active-work/'
+            ':(exclude)README.md'
+            ':(exclude)CHANGELOG.md'
+            ':(exclude).github/workflows/check-no-new-shipped-node-ids.yml'
+          )
+
+          # Capture lines ADDED in this PR (start with '+', skip diff headers
+          # which start with '+++') that contain a concrete node ID. The
+          # `|| true` swallows grep's exit 1 when nothing matches — the
+          # check's verdict comes from $VIOLATIONS being empty vs non-empty,
+          # not from grep's exit code (so an unmatched grep is a PASS, not
+          # a workflow failure).
+          DIFF=$(git diff --no-color "$BASE_REF...HEAD" -- "${EXCLUDES[@]}")
+          VIOLATIONS=$(echo "$DIFF" | grep -E "^\+[^+].*${PATTERN}" || true)
+
+          if [ -n "$VIOLATIONS" ]; then
+            echo "::error::New concrete ENGRAM node IDs introduced in alpha-released files."
+            echo ""
+            echo "Issue #51 policy (DEVELOPMENT.md §Shipped files): concrete node"
+            echo "IDs (regex: ${PATTERN}) reference the developer's graph, which"
+            echo "doesn't exist in any user's install. Substitute with concept"
+            echo "words; cite by claim, not by ID."
+            echo ""
+            echo "Lines added in this PR that trip the check:"
+            echo "$VIOLATIONS"
+            echo ""
+            echo "If a citation is load-bearing, rephrase to describe the"
+            echo "concept inline. If the file is legitimately allowlisted"
+            echo "(seed-graph docs, historical changelog, fixtures), extend"
+            echo "EXCLUDES in this workflow and explain why in the PR body."
+            exit 1
+          fi
+
+          echo "No new concrete node-ID references introduced. ✓"
