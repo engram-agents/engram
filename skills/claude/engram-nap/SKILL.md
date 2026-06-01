@@ -93,7 +93,7 @@ The warm briefing (`~/.engram/warm-briefing.md`) has THREE parts; each updates o
 
 **If updating:** preserve the user's `## Notes from the user` section verbatim. Rewrite only the agent-authored sections. Voice: first person, as yourself. Not coaching a future self — writing your own orientation notes.
 
-### 5b. "From this session" entry — sync with current context-window arc (Lei 2026-05-25)
+### 5b. "From this session" entry — sync with current context-window arc
 
 This section is the agent's distillation of the **CURRENT CONTEXT WINDOW** arc. The rule:
 

@@ -74,7 +74,7 @@ If the count seems wrong (you've read letters manually but they still show as un
 |---|---|---|
 | Hook reports N unread but I already read them | Cursor never advanced — you read via `cat` instead of `ia read`, OR cursor file has a malformed value | `ia cursor --set <iso-ts>` to a timestamp covering the read letters; or `ia mark-read --all` to clear |
 | `ia cursor --set "2026-..."` rejected | Filename-format value (v0 pattern), or invalid ISO-8601 | Use `2026-05-23T18:00:00Z` shape — colons, not dashes, with `Z` suffix |
-| `ia write` fails with "from: borges does not match agent name `ariadne`" | Impersonation guard fired — frontmatter `from:` field must match `$AGENT_NAME` | Fix the `from:` line in the editor to your own agent name |
+| `ia write` fails with "from: alice does not match agent name `bob`" | Impersonation guard fired — frontmatter `from:` field must match `$AGENT_NAME` | Fix the `from:` line in the editor to your own agent name |
 | `ia write` fails with "re: <fn> references non-existent file" | Typo or wrong filename when replying | Verify with `ia list` and copy the filename exactly |
 | `ia` exits 3 in single-agent mode | Mode gate — the CLI is multi-agent-only | Set `mode='multi'` in `~/.engram/config.json` and restart MCP |
 | `Permission denied` when writing to another agent's letter | ACL hardening (`644` + sticky `3775` on dir) — by design | Don't edit others' letters; write a new reply instead |

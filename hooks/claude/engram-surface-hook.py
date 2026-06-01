@@ -393,7 +393,7 @@ def format_nudge(result: dict) -> str:
         lines.append(f"  Memory: {len(not_recalled)} nodes not recalled recently")
 
     # Others — non-top non-special matched IDs with keyword prefix
-    # (Lei 2026-05-19 PM extension, keyword-only filter per #234 2026-05-20).
+    # (the maintainer extension, keyword-only filter per #234 2026-05-20).
     # Each line: "[id] `kw1` · `kw2` · ..." — nodes without keywords are dropped
     # (no-keywords nodes provide no recognition value in skim, just noise).
     # Keywords-only (no summary) gives the agent a faceted index for "which of
@@ -402,7 +402,7 @@ def format_nudge(result: dict) -> str:
     matched_meta = result.get("matched_meta") or []
     others = [m for m in matched_meta if m.get("id") not in rendered_ids]
     # Filter to nodes with at least 1 keyword; drop bare-ID entries entirely
-    # (per Lei 2026-05-20 issue #234 Findings 1+2): no-keywords nodes provide
+    # (per the maintainer issue #234 Findings 1+2): no-keywords nodes provide
     # no recognition value in skim, just noise.
     others_with_kw = [
         m for m in others
@@ -711,7 +711,7 @@ def main():
     _daemon_latency_ms = int((time.perf_counter() - _daemon_t0) * 1000)
 
     # Emit engram.surface.fire event for the structured event log.
-    # See ~/borges-desk/projects/engram-logging/DESIGN.md §4.1 + alpha #175.
+    # See alpha #175.
     # Failure-mode contract: emitter.emit NEVER raises; if init fails or
     # the import itself fails, we degrade silently to a no-op.
     try:

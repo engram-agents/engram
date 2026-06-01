@@ -23,7 +23,7 @@ Token budget cap: if "new since last prompt" exceeds 10 letters,
 group-summarize with a "+ N older from <authors>" line.
 
 Anti-patterns guarded:
-  - Mode gate is the first check — single-agent installs (Lin, Chenni)
+  - Mode gate is the first check — single-agent installs
     see exactly zero behavior change.
   - Read cursor is NEVER advanced here; only surfaced cursor advances.
   - No LLM calls, no network, no DB — file-system reads only.
@@ -32,7 +32,7 @@ Anti-patterns guarded:
 Part of the inter-agent-comms-v1 cohort (PR 3), stacked on PR 1's
 mode-gate foundation (is_multi_agent_mode, get_counterparts helpers).
 
-Design doc: borges-desk/projects/inter-agent-comms-v1/DESIGN.md
+Design doc: see project design notes.
 """
 
 import json

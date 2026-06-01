@@ -28,7 +28,7 @@ The CLAUDE.md pointer says: load this skill when an external interaction is star
 | `unknown` | 1 | First contact or unverified | Same as known_external + extra caution about identity claims; auto-creation of pn_* is NOT default |
 | `suspect` | 0 | Active anomaly signals against this counterparty | Refuse disclosure beyond minimum; flag to primary user |
 
-**Boundary semantics** (Lei 2026-05-26): `our_side` is the internal/external boundary. `our_side` and above = default trusting unless alarming. `known_external` and below = treat as external, cautious about privacy, no sharing private information.
+**Boundary semantics** (maintainer design): `our_side` is the internal/external boundary. `our_side` and above = default trusting unless alarming. `known_external` and below = treat as external, cautious about privacy, no sharing private information.
 
 **`self` tier** — rank 6 (highest), singleton. The `is_self` flag in `metadata` is the structural attestation; `engram_set_trust_tier` enforces that only one pn_* can hold this tier at a time. Set via the backfill migration (`migrate_trust_tier_self_backfill.py`), not manually.
 

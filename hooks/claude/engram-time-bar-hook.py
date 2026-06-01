@@ -2,7 +2,7 @@
 """
 engram-time-bar-hook.py (MECH-1 of the time-awareness design, the time-awareness derivation)
 
-Prepends a one-line ambient time bar to the UserPromptSubmit output so Borges
+Prepends a one-line ambient time bar to the UserPromptSubmit output so the agent
 has real-world temporal grounding on every turn without having to query it.
 Closes the Welcome-Back failure mode and the FROZEN-NOW-IN-
 COMPACTION-SUMMARY risk (the CLOCK-DRIFT-hygiene derivation) by re-rendering every turn against wall-clock.
@@ -139,6 +139,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        # Never crash the hook chain — emit a stub so Borges sees something.
+        # Never crash the hook chain — emit a stub so the agent sees something.
         print(f"[Time: (hook-error: {type(exc).__name__})]")
         sys.exit(0)

@@ -7,8 +7,8 @@ write tool calls so SQLite WAL contention doesn't bite. Read tools
 pass through unchanged.
 
 Asymmetric design: only the heartbeat session writes the marker; only
-interactive sessions check it. No deadlock risk. Discussed with Lei
-2026-05-07 — prefer warn-and-queue over sleep-and-block so the
+interactive sessions check it. No deadlock risk. Discussed with the maintainer
+— prefer warn-and-queue over sleep-and-block so the
 interactive caller isn't hung; the deferred call is logged to disk
 for later replay.
 
@@ -16,7 +16,7 @@ Auto-derive write-set: parses alpha/server.py for @mcp.tool decorators
 and classifies each tool by its `readOnlyHint` annotation. A tool is
 WRITE if its annotations dict has `readOnlyHint: True` ABSENT — i.e.
 the readOnlyHint annotation is the source of truth for read-vs-write
-classification, no separate list to maintain (per Lei 2026-05-07: a
+classification, no separate list to maintain (per the maintainer: a
 naming convention or a manual list both create drift; the existing
 annotation IS the metadata). Cached in /tmp keyed by server.py mtime;
 re-parsed on mtime change.

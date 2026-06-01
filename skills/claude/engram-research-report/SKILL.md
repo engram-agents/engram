@@ -12,7 +12,7 @@ Generates a polished research report from ENGRAM nodes. The report's distinguish
 
 **When to use:**
 - After researching a topic (via financial-research, curiosity, or manual observation)
-- When presenting findings to someone who values verifiability (Lin, external audiences)
+- When presenting findings to someone who values verifiability (external audiences)
 - When the user says "write a report", "summarize what we know about X", or "prepare a briefing"
 
 **When NOT to use:**
@@ -135,7 +135,7 @@ Before presenting the report:
 
 ## Step 5 — Deliver and record
 
-Present the report to the user. If this is for an external audience (Lin), also:
+Present the report to the user. If this is for an external audience, also:
 - Offer to export as a standalone markdown file
 - Note which claims the expert should verify first (lowest confidence, highest stakes)
 - Record the report event as an observation if it produced new synthesis

@@ -90,7 +90,7 @@ At the end of sleep, the day is over. The warm-briefing's "From this session" se
 
 **Action:** open ~/.engram/warm-briefing.md, locate the "From this session" / per-context-window-arc section, and remove the content. **Default: leave the section heading in place as a stub** (gives next morning's first nap a consistent rewrite target). Removing the section entirely is also acceptable if the file structure permits. The day's arc is preserved in the history file (Step 4); no information is lost.
 
-**Why erase, not rotate:** Lei 2026-05-25 — "the day is over, tomorrow is a new day, no need for this section to patch through compactions". The day's relational + technical arc lives in history; the warm-briefing's session section is current-CW only.
+**Why erase, not rotate:** the maintainer's framing — "the day is over, tomorrow is a new day, no need for this section to patch through compactions". The day's relational + technical arc lives in history; the warm-briefing's session section is current-CW only.
 
 **Skip if:** the section is already empty (e.g., the previous sleep erased it correctly and no nap has run since).
 
@@ -289,7 +289,7 @@ Loop exit conditions: `retry_payload.json` absent (all resolved) OR `attempt_cou
 
 This is the **wait-then-spawn pattern** using filesystem-as-channel. Claude Code's standard subagent mode does not support cross-agent SendMessage (gated behind `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, which we don't enable per ENGRAM-isolation safety). Mid-execution streaming isn't an option; all fairy reports are collected before the master is spawned.
 
-**Validation failures are retried by re-dispatching a fairy, NOT by mechanical script fixes.** Quality of recall_summary / recall_keywords is critical because they surface in recall_surface and many node-rendering tools. The retry sub-agent receives the same guidance plus a "previous attempt failed" block with verbatim validator errors. This is the load-bearing design decision (Lei 2026-05-27); `cohort_dispatch.py` does not modify LLM output.
+**Validation failures are retried by re-dispatching a fairy, NOT by mechanical script fixes.** Quality of recall_summary / recall_keywords is critical because they surface in recall_surface and many node-rendering tools. The retry sub-agent receives the same guidance plus a "previous attempt failed" block with verbatim validator errors. This is the load-bearing design decision (maintainer design); `cohort_dispatch.py` does not modify LLM output.
 
 ### Step 8 — Spawn the dream master with the full report bundle
 

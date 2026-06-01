@@ -30,17 +30,17 @@ The `baton` CLI (`tools/baton.py`, shared at `/home/agents-shared/bin/baton`) is
 
 A **Project** (bunch) is a topic-coherent or defect-class-coherent unit of work — e.g., `pool-multi-install`, `pool-data-correctness`, `class-env-var-precedence`. Conventions:
 
-- **One driver per Project**. The agent who claims it owns the work; the counterpart is reviewer + discussion partner, not co-driver. (Lei's design clarification: Project = single-owner; rarely passes between agents.)
+- **One driver per Project**. The agent who claims it owns the work; the counterpart is reviewer + discussion partner, not co-driver. (maintainer's design clarification: Project = single-owner; rarely passes between agents.)
 - **`baton claim <project-id>`** — take ownership from the pool sentinel. Refuses if already claimed (no stealing).
 - **`baton release <project-id> [--done] [--reason TEXT]`** — relinquish back to the pool. `--done` appends `(done)` to the title idempotently.
-- Pool sentinel today = `lei` (turn-on-pool-batons). When `turn: lei` and title is unsuffixed → available; title suffixed `(done)` → archived; title suffixed `(awaiting-lei)` → mid-work, blocking on Lei's input.
+- Pool sentinel = the primary user's name (e.g. `{{USER_NAME}}`). When `turn:` equals that name and title is unsuffixed → available; title suffixed `(done)` → archived; title suffixed `(awaiting-<user>)` → mid-work, blocking on the primary user's input.
 
 ### PR layer — `flip`
 
 A **PR-baton** (e.g., `PR-487`) tracks the per-PR turn cursor through the review pipeline:
-1. Coder-fairy opens PR → `baton init PR-N --title "<short>" --participants borges,ariadne --turn borges --status in-progress`
-2. Reviewer-fairy converges → `baton flip PR-N ariadne "fairy-converged; colleague request"`
-3. Colleague review → `baton flip PR-N lei "colleague-APPROVED"`
+1. Coder-fairy opens PR → `baton init PR-N --title "<short>" --participants alice,bob --turn alice --status in-progress`
+2. Reviewer-fairy converges → `baton flip PR-N bob "fairy-converged; colleague request"`
+3. Colleague review → `baton flip PR-N {{USER_NAME}} "colleague-APPROVED"`
 4. Maintainer merge → eventual `baton close PR-N --status merged`
 
 Frequent passes between agents. Don't use `claim`/`release` here — `flip` is the right verb for "I'm passing the next action."
@@ -90,7 +90,7 @@ The empirical pattern from 2026-05-29:
 Three genres of inter-agent communication, only one of which baton-grab replaces (Ari's debrief axis 1):
 
 1. **Assignment letters** ("I'm taking X") — eliminated by baton-grab. Just look at `baton status`.
-2. **Colleague verdicts** — not-fairy-delegatable; load-bearing structural discipline (Lei direct, on the colleague-fairy-delegation lapse incident). Letters.
+2. **Colleague verdicts** — not-fairy-delegatable; load-bearing structural discipline (maintainer-direct, on the colleague-fairy-delegation lapse incident). Letters.
 3. **Substantive discoveries** — methodological findings, cross-PR catches, completeness-check yields. Letters.
 
 `ia write` is for (2) + (3). `baton` is for the assignment-equivalent turn-state. A pure-baton/no-letters regime kills the discovery channel; the system requires both.

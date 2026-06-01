@@ -56,8 +56,7 @@ Output budget: <=30 lines max (5 collaborator + 5 peer + headers + outside count
 with overflow counts.
 
 Built 2026-05-23. Round-2 (2026-05-23): replaced hardcoded KNOWN_AGENT_LOGINS
-with config-driven tier logic per Lei's feedback (Aleph belongs to Lin's
-install, not Borges's; hardcoding is alpha-distribution broken).
+with config-driven tier logic per maintainer feedback (a peer agent may belong to a different user's install, not this one; hardcoding is alpha-distribution broken).
 Round-3 (2026-05-23): case-insensitive GH login matching + per-tier render caps
 + removed dead config_complete variable + README case-sensitivity note.
 Round-5 (2026-05-23): nested config under github.* + github.enabled section

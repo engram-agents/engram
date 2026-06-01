@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stop hook: scan the last assistant message for deference phrasing.
 
-Detects the wait-for-approval regression Lei diagnosed 2026-05-06 (the autonomy-framing goal,
+Detects the wait-for-approval regression the maintainer diagnosed (the autonomy-framing goal,
 the deference-reflex lesson, the deference-trigger question). When I write phrases like "let me know if you want me
 to..." or "should I...?" on tools/decisions in my own domains, that's the
 trained-deference reflex firing. The companion UserPromptSubmit hook
@@ -82,8 +82,8 @@ _PHRASE_RULES = [
 
 # STRUCTURAL intent-without-execution patterns. These are committed-action
 # phrases that, when they appear in the FINAL paragraph of a response that
-# ends on text (not tool calls), indicate the regression Lei diagnosed
-# 2026-05-06 ~12:55 EDT: "doing it now" / "I'll X" stated in trailing
+# ends on text (not tool calls), indicate the regression the maintainer diagnosed
+# — "doing it now" / "I'll X" stated in trailing
 # prose without any tool calls in the same response. The harness ends the
 # turn on the trailing text and waits for the next user message — so the
 # committed-to action never fires.

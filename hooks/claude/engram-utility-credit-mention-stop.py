@@ -2,7 +2,7 @@
 """Stop hook: scrape last assistant message for ENGRAM node-id mentions and
 bump utility_score for every mentioned ID found in the substrate DB.
 
-Implements alpha #177 area 4 (broader credit-assignment per Lei 2026-05-19):
+Implements alpha #177 area 4 (broader credit-assignment per the maintainer):
 the prior utility-reward mechanism only fired when a recalled node was
 later cited as a `derives_from` premise in engram_derive (server.py:2694).
 This misses prose-mention, inline ID-citation, and informed-but-uncited
@@ -11,7 +11,7 @@ by scanning the response text after every assistant turn and bumping
 utility_score for any mentioned node IDs directly — no window
 intersection required.
 
-Mechanism (V1.2 — simplified in PR #215 after #214 retired recall_window; Lei 2026-05-19)
+Mechanism (V1.2 — simplified in PR #215 after #214 retired recall_window; the maintainer)
 ---------
 1. Read `last_assistant_message` from Claude Code's Stop-hook stdin
    payload (synchronous, not subject to the JSONL flush race that bit

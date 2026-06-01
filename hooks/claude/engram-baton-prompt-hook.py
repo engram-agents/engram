@@ -12,7 +12,7 @@ surfaced/read cursor mechanism needed; the baton file IS the state.
 
 Anti-patterns guarded:
   - Single-agent guard: if projects directory doesn't exist, exits silently.
-    Single-agent users (Lin, Chenni) see zero behavior change.
+    Single-agent users see zero behavior change.
   - No LLM calls, no DB — file-system reads and optional gh calls only.
     Per-gh-call timeout 4s; worst case one gh call per in-court baton on a
     full cache miss (N_batons calls). The 30s-TTL status cache makes the

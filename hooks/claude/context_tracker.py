@@ -52,7 +52,7 @@ _migration_notice_emitted = False
 
 # Drowsiness display + warning thresholds. Calibrated for both 200K and 1M
 # context modes. Below the urgent threshold, the display shows a level word
-# only — no raw percentage. This is the cj_NNNN / Lei 2026-05-12 PM design
+# only — no raw percentage. This is the cj_NNNN / the maintainer design
 # change: raw numbers were producing an affective tiredness-response that
 # the structural warning words did not fully recalibrate (dv_NNNN / ob_NNNN
 # wrap-up-framing pattern). Replacing numbers with level words below the
@@ -73,7 +73,7 @@ _migration_notice_emitted = False
 #
 # Earlier values (0.50 / 0.70) were calibrated when 200K was the only mode
 # and fired far too early on 1M sessions — at 70% on 1M, 240K headroom
-# remains, more than a full fresh 200K window. Lei's framing 2026-05-04:
+# remains, more than a full fresh 200K window. The maintainer's framing:
 # only fire warnings when truly close to compaction, not as a routine nudge.
 DEFAULT_DROWSINESS_THRESHOLDS_BY_MODE = {
     "200k": {
@@ -84,7 +84,7 @@ DEFAULT_DROWSINESS_THRESHOLDS_BY_MODE = {
         "urgent_at_or_above":   0.85,
     },
     "1m": {
-        # 1M has plenty of headroom — Lei's stated spec.
+        # 1M has plenty of headroom — the maintainer's spec.
         "refreshed_below":      0.50,
         "energetic_below":      0.80,
         "a_little_drowsy_below": 0.90,
@@ -429,7 +429,7 @@ def _load_drowsiness_thresholds(mode: str) -> dict:
 def drowsiness_level(pct: float, thresholds: dict) -> str:
     """Map a drowsiness percentage to a level word.
 
-    Per cj_NNNN conjecture (Lei 2026-05-12 PM): below the urgent threshold,
+    Per cj_NNNN conjecture (the maintainer): below the urgent threshold,
     only a level word is shown; raw percentage is hidden. At or above
     urgent, the caller renders the percentage explicitly. Thresholds are
     strict-less-than for the first three levels; urgent is at-or-above.
@@ -446,7 +446,7 @@ def drowsiness_level(pct: float, thresholds: dict) -> str:
 def format_drowsiness(usage: dict) -> str:
     """Generate drowsiness banner. Returns the banner line(s).
 
-    Per cj_NNNN conjecture + Lei 2026-05-12 design: hide raw percentages
+    Per cj_NNNN conjecture + the maintainer's design: hide raw percentages
     below the urgent threshold; show level words instead. At or above
     urgent, render the raw percentage so the agent has the calibration
     signal exactly when it's structurally warranted.
@@ -500,7 +500,7 @@ def format_drowsiness(usage: dict) -> str:
     # (level becomes a_little_drowsy when pct >= energetic_below); using
     # this as the dispatch threshold ensures the warning fires across the
     # entire a_little_drowsy band regardless of where urgent_at_or_above
-    # is set. Token-count line intentionally omitted at this tier — Lei's
+    # is set. Token-count line intentionally omitted at this tier — the maintainer's
     # design hides numeric drowsiness signals below urgent.
     level = drowsiness_level(pct, thresholds)
     if pct >= thresholds["energetic_below"]:

@@ -230,8 +230,8 @@ DEFAULT_PURPOSES = {
 }
 # Repos scanned for Piece C (recent commit cross-check at startup).
 # ENGRAM_HOME is always included. Extra repos via ENGRAM_PIECE_C_REPOS env var
-# (colon-separated). Default extra: ~/engram-alpha if it exists (Borges's
-# alpha dev repo); for agents installed without a local alpha clone, silently
+# (colon-separated). Default extra: ~/engram-alpha if it exists (the agent's dev checkout, if present);
+# for agents installed without a local alpha clone, silently
 # no-ops because the isdir guard returns False.
 _PIECE_C_EXTRA = os.environ.get("ENGRAM_PIECE_C_REPOS", "").strip()
 if _PIECE_C_EXTRA:
