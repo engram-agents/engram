@@ -44,3 +44,4 @@ active-work/
 # sources. Not checked in (it's a build artifact, not source). Rebuild with:
 #   bash tools/build-plugin.sh
 build/
+/.claude/scheduled_tasks.lock

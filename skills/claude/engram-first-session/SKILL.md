@@ -63,16 +63,23 @@ BOOTSTRAP="${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/bootstrap.py}"
 Run it (it creates the ENGRAM home directory + seed graph + renders install-time placeholders + writes `first-run-pending`):
 
 ```bash
+# Use the venv python — bootstrap.py imports server.py, which imports fastmcp
+# and sentence_transformers. Those live in the venv at ~/.engram/venv/, NOT
+# in system python3. Running with system python3 fails with ModuleNotFoundError
+# on the first import even when the venv is correctly set up.
+VENV_PY="$HOME/.engram/venv/bin/python3"
+
 ALPHA_DIR="$(dirname "$BOOTSTRAP")" \
 ALPHA_TEMPLATES_DIR="$(dirname "$BOOTSTRAP")/templates" \
 ENGRAM_DATA_DIR="${ENGRAM_HOME:-$HOME/.engram}" \
 CLAUDE_HOME="$HOME/.claude" \
-PYTHON_BIN="$(which python3)" \
+PYTHON_BIN="$VENV_PY" \
 TARGET=claude \
-python3 "$BOOTSTRAP"
+ENGRAM_INSTALL_MODE=plugin \
+"$VENV_PY" "$BOOTSTRAP"
 ```
 
-(The `ENGRAM_HOME` variable was resolved in Step 0; using it here ensures users with a custom `ENGRAM_HOME` bootstrap to the right path rather than the default `~/.engram`.)
+(The `ENGRAM_HOME` variable was resolved in Step 0; using it here ensures users with a custom `ENGRAM_HOME` bootstrap to the right path rather than the default `~/.engram`. `PYTHON_BIN` is set to the venv python so bootstrap.py + any subprocesses it spawns inherit the right interpreter.)
 
 After this runs, `~/.engram/knowledge.db` exists with the 6 seed nodes + 2 edges; `~/.engram/first-run-pending` is armed (bootstrap.py writes the marker as the final step of its main() — single source of truth across scatter and plugin paths); templates are rendered with install-time placeholders. The MCP server's `_get_db()` fail-loud now passes because the DB + seed nodes exist — your NEXT MCP tool call will succeed.
 

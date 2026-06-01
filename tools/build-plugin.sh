@@ -92,6 +92,70 @@ for f in "$REPO_ROOT"/engram_*.py; do
   cp "$f" "$PLUGIN_ROOT/$(basename "$f")"
 done
 
+# ── 1b. tools/ — minimum subset that server.py imports at runtime ─────────────
+#
+# server.py:433 does `from tools.recall_summary_validator import ...`. The
+# plugin tree needs a tools/ Python package with that one module + the
+# __init__.py to make it importable. We deliberately do NOT copy the full
+# tools/ directory — most of it is dev-only (cohort dispatch, deploy.sh,
+# baton CLI, etc) and doesn't belong in the shipped plugin. If server.py
+# adds new `from tools.X` imports in the future, add them to RUNTIME_TOOLS
+# below + verify they have no dev-only transitive deps.
+#
+# Reorganize is a post-v0.1 task; this is the minimum unblock.
+
+log "Copying tools/ runtime subset → plugin tools/"
+mkdir -p "$PLUGIN_ROOT/tools"
+
+RUNTIME_TOOLS=(
+  __init__.py
+  # Imported by server.py:433 (validator constants + per-entry validation).
+  recall_summary_validator.py
+  # Referenced by skills/agents that fire during normal agent operation:
+  #   - SKILL.md uses verify_quote.py for pre-write quote checks.
+  #   - SKILL.md uses inspect_raw.py for stripped-field access during diagnosis.
+  #   - engram-sleep skill + engram-dream-master agent use bucket_findings(),
+  #     fetch_safety_row, check_snapshot_divergence from dream_master_batch.py
+  #     and _build_initial_prompt() from cohort_dispatch.py.
+  #   - cohort_dispatch.py transitively imports recall_summary_payload (which
+  #     imports recall_summary_validator — already in this list) and
+  #     recall_summary_prompts.
+  #   - write_sleep_marker.py is invoked by engram-sleep skill + dream-master.
+  verify_quote.py
+  inspect_raw.py
+  dream_master_batch.py
+  cohort_dispatch.py
+  recall_summary_payload.py
+  recall_summary_prompts.py
+  write_sleep_marker.py
+)
+
+for f in "${RUNTIME_TOOLS[@]}"; do
+  src="$REPO_ROOT/tools/$f"
+  [[ -f "$src" ]] || die "Required tools/$f not found at $src"
+  cp "$src" "$PLUGIN_ROOT/tools/$f"
+done
+
+# ── 1c. templates/ — bootstrap.py renders these into ~/.engram/ + ~/.claude/ ──
+#
+# bootstrap.py reads $ALPHA_TEMPLATES_DIR ($(dirname $BOOTSTRAP)/templates by
+# SKILL.md Step 0.5) and renders:
+#   - warm-briefing.md.template → ~/.engram/warm-briefing.md
+#   - CLAUDE.md.template        → ~/.claude/CLAUDE.md (TARGET=claude)
+#   - HEARTBEAT.md.template     → ~/.engram/HEARTBEAT.md (if present;
+#                                  heartbeat retirement tracked in #583)
+#   - heartbeat-queue/README.md.template → if present
+# Without templates/ in the plugin tree, bootstrap.py raises FileNotFoundError
+# during the substitute_template step after seeding succeeds.
+# (Empirical: Lei Chromebook trial 2026-05-31.)
+#
+# Ship all of templates/ (96K) — simpler than enumerating, and the
+# .multi-agent / .example / .service variants are inert if not rendered.
+
+log "Copying templates → plugin templates/"
+mkdir -p "$PLUGIN_ROOT/templates"
+cp -a "$REPO_ROOT/templates/." "$PLUGIN_ROOT/templates/"
+
 # ── 2. Manifests ──────────────────────────────────────────────────────────────
 
 log "Copying manifests"
@@ -131,7 +195,12 @@ done
 # Substitute {{PYTHON}} → python3 in start-engram-daemon.sh
 # (The shell script shares the template var with install.sh; we resolve it for plugin use.)
 if [[ -f "$PLUGIN_ROOT/hooks/start-engram-daemon.sh" ]]; then
-  sed -i 's/{{PYTHON}}/python3/g' "$PLUGIN_ROOT/hooks/start-engram-daemon.sh"
+  # {{PYTHON}} → venv python at the canonical ~/.engram/venv/ location.
+  # The literal $HOME expands at script-run time (not build time), so the
+  # plugin works under any user's home. Earlier substitution to bare
+  # 'python3' broke the surface daemon because fastmcp + sentence-transformers
+  # only live in the venv, not system python (Lei Chromebook trial 2026-05-31).
+  sed -i 's|{{PYTHON}}|$HOME/.engram/venv/bin/python3|g' "$PLUGIN_ROOT/hooks/start-engram-daemon.sh"
   log "  Substituted {{PYTHON}} → python3 in start-engram-daemon.sh"
 fi
 

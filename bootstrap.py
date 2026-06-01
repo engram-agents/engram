@@ -63,12 +63,19 @@ ALPHA_INTEGRATIONS_DIR = (
     Path(os.environ["ALPHA_INTEGRATIONS_DIR"]) if TARGET == "gemini" else None
 )
 
-# Import the server from the snapshot copied into $ENGRAM_HOME (install.sh
-# step 4). This makes the install self-contained — ongoing main-branch
-# changes to server.py do not affect an already-installed alpha.
-# ENGRAM_DATA_DIR is read by server.py at module import and must be set
-# before this import — install.sh handles that.
-sys.path.insert(0, str(ENGRAM_HOME))
+# Import the server from bootstrap.py's own directory. server.py is colocated
+# with bootstrap.py in both install paths:
+#   - Scatter install: install.sh step 4 copies bootstrap.py + server.py +
+#     engram_*.py modules into $ENGRAM_HOME, then runs bootstrap.py from there.
+#   - Plugin install: tools/build-plugin.sh assembles bootstrap.py + server.py
+#     + engram_*.py into the plugin tree under $CLAUDE_PLUGIN_ROOT.
+# Using __file__'s dirname keeps the import self-contained and works for
+# both install paths without depending on env-var conventions (ENGRAM_HOME
+# only happens to contain server.py in scatter mode; in plugin mode the
+# venv data dir at ~/.engram/ never gets server.py copied into it).
+# ENGRAM_HOME is still read by server.py at module import (line 145) to
+# resolve DATA_DIR — that's a separate concern from where server.py lives.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import server  # noqa: E402
 
 
@@ -244,6 +251,101 @@ def main() -> None:
                 "    re-run with FORCE=1 in the environment."
             )
 
+    # In plugin mode, symlink ~/.engram/tools -> <plugin-root>/tools so that
+    # existing skill/agent references to ~/.engram/tools/<file> (which were
+    # written for the scatter install path) keep resolving via the symlink
+    # to the plugin's bundled runtime tools. Plugin upgrades auto-propagate
+    # because the symlink target is the plugin cache dir.
+    # Scatter install behavior unchanged — install.sh copies tools directly
+    # into ~/.engram/tools/ at step 4.
+    #
+    # Plugin detection: we use bootstrap.py's OWN dir (Path(__file__)), not
+    # the CLAUDE_PLUGIN_ROOT env var. Claude Code substitutes
+    # ${CLAUDE_PLUGIN_ROOT} into plugin manifest files (.mcp.json,
+    # hooks.json, skill files) at file-read time — it is NOT a process env
+    # var available to subprocess like bootstrap.py running underneath the
+    # skill Bash. (Empirical: 2026-05-31, Lei's Chromebook trial,
+    # `echo $CLAUDE_PLUGIN_ROOT` returns empty in the user shell.) The
+    # plugin root IS where bootstrap.py lives, since build-plugin.sh copies
+    # bootstrap.py to ${PLUGIN_ROOT}/bootstrap.py.
+    bootstrap_dir = Path(__file__).resolve().parent
+    plugin_marker = bootstrap_dir / "plugin.json"
+    if plugin_marker.is_file():
+        # We're in plugin install — bootstrap.py is in the plugin tree.
+        engram_tools_link = ENGRAM_HOME / "tools"
+        plugin_tools = bootstrap_dir / "tools"
+        # Ensure ENGRAM_HOME exists before trying to place the symlink inside
+        # it. _ensure_data_dir() in server.py creates it later via the first
+        # engram_add_axiom call, but we need it earlier here.
+        ENGRAM_HOME.mkdir(parents=True, exist_ok=True)
+        if plugin_tools.is_dir():
+            try:
+                if engram_tools_link.is_symlink() or engram_tools_link.exists():
+                    if engram_tools_link.is_symlink():
+                        engram_tools_link.unlink()
+                    elif engram_tools_link.is_dir():
+                        backup = ENGRAM_HOME / "tools.scatter-backup"
+                        engram_tools_link.rename(backup)
+                        print(
+                            f"  ~/.engram/tools (existing dir) → moved to {backup}"
+                            f" before replacing with plugin-tools symlink",
+                            flush=True,
+                        )
+                engram_tools_link.symlink_to(plugin_tools)
+                print(
+                    f"  ~/.engram/tools → symlink → {plugin_tools}",
+                    flush=True,
+                )
+            except OSError as e:
+                print(
+                    f"  WARN: could not create ~/.engram/tools symlink: {e}",
+                    flush=True,
+                )
+        else:
+            print(
+                f"  WARN: plugin tools dir not found at {plugin_tools} —"
+                " skill references to ~/.engram/tools/* will not resolve",
+                flush=True,
+            )
+
+        # Same symlink shape for ~/.engram/hooks/ — many existing surfaces
+        # (README troubleshooting, learn-from-error diagnostic command,
+        # CLAUDE.md.template hook-path table, etc.) reference the scatter
+        # path. The symlink lets those references resolve through to the
+        # plugin's hook scripts without doc churn, and plugin upgrades
+        # auto-propagate (Lei Chromebook trial 2026-05-31).
+        engram_hooks_link = ENGRAM_HOME / "hooks"
+        plugin_hooks = bootstrap_dir / "hooks"
+        if plugin_hooks.is_dir():
+            try:
+                if engram_hooks_link.is_symlink() or engram_hooks_link.exists():
+                    if engram_hooks_link.is_symlink():
+                        engram_hooks_link.unlink()
+                    elif engram_hooks_link.is_dir():
+                        backup = ENGRAM_HOME / "hooks.scatter-backup"
+                        engram_hooks_link.rename(backup)
+                        print(
+                            f"  ~/.engram/hooks (existing dir) → moved to {backup}"
+                            f" before replacing with plugin-hooks symlink",
+                            flush=True,
+                        )
+                engram_hooks_link.symlink_to(plugin_hooks)
+                print(
+                    f"  ~/.engram/hooks → symlink → {plugin_hooks}",
+                    flush=True,
+                )
+            except OSError as e:
+                print(
+                    f"  WARN: could not create ~/.engram/hooks symlink: {e}",
+                    flush=True,
+                )
+        else:
+            print(
+                f"  WARN: plugin hooks dir not found at {plugin_hooks} —"
+                " skill references to ~/.engram/hooks/* will not resolve",
+                flush=True,
+            )
+
     # Bootstrap-mode env bypass: server.py's _get_db() fail-loud guards
     # (DB-missing + seed-empty) block bootstrap's own engram_add_axiom calls
     # in the chicken-and-egg path:
@@ -335,14 +437,41 @@ def main() -> None:
         )
         print(f"  CLAUDE.md → {CLAUDE_HOME}/CLAUDE.md", flush=True)
 
-        fragment = TEMPLATES_DIR.parent / "settings.hooks.json.template"
-        if fragment.exists():
-            status = merge_hook_settings(
-                fragment,
-                CLAUDE_HOME / "settings.json",
-                substitutions,
+        # settings.hooks.json.template merge is SCATTER-only. The template uses
+        # {{ENGRAM_HOOKS_DIR}} → ~/.engram/hooks/ substitution. Scatter install
+        # creates that dir + copies hook scripts there. Plugin install does NOT
+        # — plugin's own hooks/hooks.json (assembled by tools/build-plugin.sh)
+        # registers hooks at ${CLAUDE_PLUGIN_ROOT}/hooks/ instead. Merging the
+        # scatter template in plugin mode would write hook commands pointing at
+        # ~/.engram/hooks/*.py files that don't exist, leading to Claude Code
+        # hook-runner errors on every session.
+        # Detect plugin mode the same way as the ~/.engram/tools symlink branch:
+        # check whether bootstrap.py lives next to a plugin.json (plugin tree)
+        # rather than relying on CLAUDE_PLUGIN_ROOT env-var inheritance, which
+        # is unreliable for subprocesses under skill-runtime Bash (empirical:
+        # Lei's Chromebook trial, `echo $CLAUDE_PLUGIN_ROOT` returns empty).
+        # SKILL.md Step 0.5 also sets ENGRAM_INSTALL_MODE=plugin as belt-and-
+        # suspenders override.
+        _bootstrap_dir = Path(__file__).resolve().parent
+        plugin_mode = (
+            os.environ.get("ENGRAM_INSTALL_MODE") == "plugin"
+            or (_bootstrap_dir / "plugin.json").is_file()
+        )
+        if plugin_mode:
+            print(
+                "  settings.hooks.json merge: SKIPPED (plugin mode — "
+                "hooks/hooks.json handles plugin hook registration)",
+                flush=True,
             )
-            print(f"  {status}", flush=True)
+        else:
+            fragment = TEMPLATES_DIR.parent / "settings.hooks.json.template"
+            if fragment.exists():
+                status = merge_hook_settings(
+                    fragment,
+                    CLAUDE_HOME / "settings.json",
+                    substitutions,
+                )
+                print(f"  {status}", flush=True)
 
     elif TARGET == "gemini":
         gemini_template = (

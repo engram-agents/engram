@@ -756,11 +756,23 @@ def main():
     # Warn if daemon is down (semantic search degraded)
     if not used_daemon:
         user_name = get_user_name()
+        # Resolve the daemon script path relative to this hook's own location.
+        # Works for both install paths:
+        #   - Scatter: hook is at ~/.engram/hooks/engram-surface-hook.py
+        #     → daemon at ~/.engram/hooks/start-engram-daemon.sh
+        #   - Plugin: hook is at ${plugin}/hooks/engram-surface-hook.py
+        #     → daemon at ${plugin}/hooks/start-engram-daemon.sh
+        # Without this, the recovery path would point at ~/.engram/hooks/
+        # which doesn't exist in plugin installs.
+        daemon_script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "start-engram-daemon.sh",
+        )
         parts.append(
             f"[⚠️ ENGRAM CRITICAL — surface daemon offline; semantic recall "
             f"DISABLED, ranking degraded to lexical-only. Notify {user_name} "
             f"immediately — recall quality is severely impaired. "
-            f"Recovery: bash {os.path.join(ENGRAM_HOME, 'hooks', 'start-engram-daemon.sh')}]"
+            f"Recovery: bash {daemon_script}]"
         )
 
     # ENGRAM recall nudge

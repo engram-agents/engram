@@ -65,33 +65,20 @@ This alpha package installs:
 
 ## Setup expectations
 
-ENGRAM is distributed as a git repository, not a binary package. The install
-and upgrade workflow assumes you have a local clone:
+ENGRAM is distributed as a git repository, not a binary package. There are two
+install paths:
 
-```bash
-git clone https://github.com/engram-agents/engram-alpha.git
-cd engram-alpha
-./install.sh
-```
+- **Plugin install (recommended, v0.1.0-alpha+)** — Claude Code plugin packaging.
+  Cleaner separation between the plugin's mechanical surfaces (MCP server, hooks,
+  skills) and your user-data (`~/.engram/`). See [Plugin install](#plugin-install-recommended) below.
+- **Scatter install (legacy, still supported)** — `./install.sh` writes
+  directly into `~/.claude/` + `~/.engram/`. Pre-v0.1.0-alpha installs use this;
+  it remains the upgrade path for testers already on it. See
+  [Scatter install (legacy)](#scatter-install-legacy) below.
 
-**Upgrades** flow through that same clone:
-
-```bash
-cd path/to/engram-alpha
-git pull origin dev
-tools/deploy.sh
-```
-
-Once `~/.engram/` exists, `tools/deploy.sh` syncs the current source tree into
-it without touching your knowledge graph, history, diary, or sessions. See
-[Upgrading vs reinstalling](#upgrading-vs-reinstalling) for details.
-
-**Why git clone, not zip download?** GitHub's "Source code (tar.gz)" tarball on
-Releases works for a one-shot install, but you lose easy upgrades — you'd need
-to re-download, re-extract, and re-run `tools/deploy.sh` against the new path
-each time. Alpha testers are expected to handle `git pull` for the smoother
-upgrade path. If you genuinely cannot use git in your environment, the tarball
-install works; you'll just be on a fixed version until you re-download.
+Both install paths share the same `bootstrap.py` and `~/.engram/` contract — no
+fork. You can switch from scatter to plugin (or stay on scatter) without losing
+your graph.
 
 ---
 
@@ -99,35 +86,204 @@ install works; you'll just be on a fixed version until you re-download.
 
 - **Python 3.10.7+** with `pip` — 3.10.7 is the first backport of the `sys.get_int_max_str_digits` CVE fix that current `transformers` needs at import. Any 3.11.0 final or later is also fine; 3.10.0–3.10.6 and 3.11.0rc1 are specifically broken.
 - **git**
-- Python packages declared in `requirements.txt` (currently: `fastmcp`, `sentence-transformers`)
-
-```bash
-pip install -r requirements.txt
-```
-
-(`requirements-lock.txt` is also in the repo but is Linux-x86_64 CI-only — pinned to the CPU-torch wheel that only resolves on Linux. Do not use it on macOS or Windows.)
-
 - An existing Claude Code installation (the MCP client that will talk to the
-  server)
-- A writable `~/.claude/` and `~/.engram/`
+  server).
+- A writable `~/.claude/` and `~/.engram/`.
+
+Python packages declared in `requirements.txt` (currently: `fastmcp`,
+`sentence-transformers`) — install instructions below depend on the install
+path.
+
+(`requirements-lock.txt` is also in the repo but is Linux-x86_64 CI-only —
+pinned to the CPU-torch wheel that only resolves on Linux. Do not use it on
+macOS or Windows.)
 
 ---
 
-## Quick install (for humans)
+## Plugin install (recommended)
 
-From inside a clone of this repo:
+The canonical install path from v0.1.0-alpha onward.
+
+**This section is written for AGENTS, not humans.** ENGRAM installation is
+agent-driven by design: the agent (Claude Code in agent mode) reads this
+README, does the deterministic file/shell work, and relays back to the human
+ONLY the steps the human must perform (typing slash commands inside Claude
+Code, restarting Claude Code, installing software the agent cannot install).
+
+If you're a human reader who wants a manual install: you can still execute
+every command here yourself — but the expected path is asking your Claude
+Code agent to run the install, not reading this as a runbook. The `Agent:`
+and `Ask the human to:` framings below are who SHOULD do each step.
+
+### Phase 0 — One-time prereqs
+
+**Ask the human to:** install Claude Code (see [Claude Code docs](https://code.claude.com)).
+This is the one truly human-only step — Claude Code must exist before an
+agent can run inside it. After install, the human starts a Claude Code session
+and asks the agent to continue ENGRAM install from this README.
+
+**Agent:** create the venv at the canonical path and install ENGRAM's deps:
 
 ```bash
+python3 -m venv ~/.engram/venv
+source ~/.engram/venv/bin/activate
+pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+```
+
+The venv MUST live at `~/.engram/venv/` — the plugin's launcher script looks
+for the venv python at that exact path (co-located with the data dir; the
+plugin install never touches the venv).
+
+**Why the `--extra-index-url`?** `sentence-transformers` transitively pulls
+`torch`, and pip's default torch wheels are the CUDA build (~2GB of
+`nvidia-*` transitive deps). The CPU-only wheel via the
+`download.pytorch.org/whl/cpu` index is faster to download, smaller on disk,
+and the right choice for the default ENGRAM install. The polarity-dedup
+feature that would benefit from a GPU is OFF by default and recommended OFF
+until it's calibrated (see [Polarity defaults](#polarity-defaults) below).
+
+### Phase 1 — Plugin assembly + registration
+
+**Agent:** clone the repo and run the install-marketplace script:
+
+```bash
+git clone https://github.com/engram-agents/engram-alpha.git
+cd engram-alpha
+bash tools/install-local-marketplace.sh
+```
+
+That script:
+1. Runs `tools/build-plugin.sh` to assemble `build/plugin/` from canonical sources.
+2. Copies `build/plugin/` to `~/.engram/marketplace/plugins/engram/`.
+3. Writes `~/.engram/marketplace/.claude-plugin/marketplace.json` referencing the plugin.
+4. Runs `claude plugin marketplace add ~/.engram/marketplace` to register it.
+
+**Why a marketplace and not `/plugin install <path>`?** Claude Code's
+`/plugin install` slash command does not accept raw local paths — it resolves
+plugin references through registered marketplaces. The script assembles a
+local marketplace at `~/.engram/marketplace/` (user-data location; the
+engram-alpha repo itself stays a normal source repo, NOT a plugin tree).
+
+**Ask the human to:** run two slash commands inside their Claude Code session,
+then restart Claude Code:
+
+```
+/plugin install engram     # install from the local marketplace
+/plugin enable  engram     # REQUIRED — local marketplace plugins ship disabled
+```
+
+Then close and re-open Claude Code so MCP picks up the now-enabled plugin.
+
+These three steps **cannot be done by the agent**: slash commands and the
+restart happen inside Claude Code's UI, not in the agent's shell. After the
+restart, the agent (in the new session) picks up from Phase 2.
+
+> **Why the explicit enable step?** For a plugin installed from a non-Anthropic
+> marketplace (including a self-hosted/local marketplace like this one),
+> `/plugin install` does NOT auto-enable. Empirically verified during the
+> v0.1.0-alpha trial.
+
+### Phase 2 — First Claude Code session (post-restart)
+
+The human restarts Claude Code. The new agent takes over from here. The
+expected flow inside this fresh session — fully agent-driven, no human input
+beyond the [first-session dialogue](skills/claude/engram-first-session/SKILL.md) it asks for:
+
+1. MCP server starts. The launcher confirms `~/.engram/venv/bin/python3` is
+   executable. If the venv is missing, the launcher fail-louds with the exact
+   Phase 0 recovery command — the agent reads this, asks the human to confirm,
+   and re-runs Phase 0 if needed.
+2. The agent makes its first `engram_*` MCP tool call. Because `~/.engram/knowledge.db`
+   doesn't yet exist (fresh install), `_get_db()` raises with an actionable error
+   pointing at the `engram-first-session` skill.
+3. The agent invokes the `engram-first-session` skill, which:
+   - Detects fresh-bootstrap mode (no DB, no marker).
+   - Runs `bootstrap.py` to create `~/.engram/`, seed the graph (6 nodes + 2
+     edges), render `CLAUDE.md` + warm-briefing templates, and arm the
+     `first-run-pending` marker.
+   - Validates the venv has the ENGRAM deps (`sentence-transformers` +
+     `fastmcp`).
+   - Runs the first-session dialogue **with the human**: who they are, what to
+     call the agent, what brought them to ENGRAM. The human answers in the
+     conversation; the agent writes the graph nodes as they go.
+
+### Phase 3 — Steady state
+
+Subsequent sessions: SessionStart hook fires, MCP works normally, the
+`engram-first-session` skill is gated by the (now-deleted) marker and doesn't
+re-fire. No human action required.
+
+### Upgrading the plugin
+
+**Agent:** re-run the install-marketplace script (it's idempotent):
+
+```bash
+cd path/to/engram-alpha
+git pull origin dev
+bash tools/install-local-marketplace.sh
+```
+
+**Ask the human to:** in their Claude Code session, refresh the marketplace and
+pull the new plugin version:
+
+```
+/plugin marketplace update
+/plugin upgrade engram
+```
+
+(Restart Claude Code if MCP doesn't pick up the new server.py automatically.)
+
+Then in a Claude Code session:
+
+```
+/plugin marketplace update    # refresh local marketplace index
+/plugin upgrade engram        # pull the new version
+```
+
+Your `~/.engram/knowledge.db`, history, diary, and sessions are never touched
+by the upgrade — only `~/.engram/marketplace/plugins/engram/` and the
+`~/.engram/venv/` (if you re-ran `pip install`).
+
+---
+
+## Polarity defaults
+
+ENGRAM ships with a polarity-dedup feature (NLI cross-encoder that flags
+near-contradictions in your observations). It is **OFF by default and
+recommended OFF for all users** as of v0.1.0-alpha:
+
+- The NLI model is ~1.5GB and benefits from a GPU you probably don't have.
+- The feature isn't calibrated yet; early empirical data (issue #106)
+  shows a high false-positive "wolf-cry" rate on real observation streams.
+- The standard semantic-similarity dedup hints (the action-hint tiers
+  emitted by `engram_add_observation`) cover the load-bearing cases without
+  the NLI overhead.
+
+Leave `polarity.enabled = false` in `~/.engram/config.json` (the default).
+Re-evaluate when calibration data lands.
+
+---
+
+## Scatter install (legacy)
+
+The pre-v0.1.0-alpha install path. Still supported for upgrade-from-scatter
+testers (Lei's original install + anyone already on scatter). New users should
+prefer the plugin install above.
+
+```bash
+git clone https://github.com/engram-agents/engram-alpha.git
+cd engram-alpha
+pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
 ./install.sh
 ```
 
 That's it. Start a new Claude Code session; the agent will read
 `~/.engram/first-run-pending` and run the cold-start dialogue.
 
-### Upgrading vs reinstalling
+### Upgrading vs reinstalling (scatter)
 
-- **To upgrade an existing install** (pick up newer alpha code while keeping
-  your graph, history, diary, and sessions intact):
+- **To upgrade an existing scatter install** (pick up newer alpha code while
+  keeping your graph, history, diary, and sessions intact):
   ```bash
   tools/deploy.sh
   ```
@@ -139,6 +295,13 @@ That's it. Start a new Claude Code session; the agent will read
   ./install.sh --force            # Claude target
   ./install-gemini.sh --force     # Gemini target
   ```
+
+**Why git clone, not zip download?** GitHub's "Source code (tar.gz)" tarball on
+Releases works for a one-shot install, but you lose easy upgrades — you'd need
+to re-download, re-extract, and re-run `tools/deploy.sh` against the new path
+each time. Alpha testers are expected to handle `git pull` for the smoother
+upgrade path. If you genuinely cannot use git in your environment, the tarball
+install works; you'll just be on a fixed version until you re-download.
 
 ---
 

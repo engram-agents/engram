@@ -72,10 +72,23 @@ def _resolve_runtime_dir(engram_home: str) -> str:
 def _resolve_mcp_server_path(engram_home: str) -> str:
     """Resolve the MCP server.py path for process-existence check.
 
-    Mirrors the _resolve_runtime_dir priority:
-      1. $ENGRAM_HOME/server.py (default alpha-install pattern)
-      2. ~/engram-alpha/server.py (live-source dev fallback)
+    Priority order:
+      1. Hook-colocated server.py (works for BOTH install paths —
+         scatter copies bootstrap.py + server.py + hooks together into
+         ~/.engram/; plugin assembles them together at <plugin>/).
+         This is the only candidate that works in plugin install — the
+         MCP server runs from the plugin tree, not from ENGRAM_HOME.
+      2. $ENGRAM_HOME/server.py (legacy scatter-install pattern in case
+         hooks were copied separately or the colocation is unusual)
+      3. ~/engram-alpha/server.py (live-source dev fallback)
     """
+    # Hook lives at <runtime-dir>/hooks/engram-session-start-hook.py,
+    # server.py lives at <runtime-dir>/server.py.
+    hook_dir = os.path.dirname(os.path.abspath(__file__))
+    runtime_dir = os.path.dirname(hook_dir)
+    colocated = os.path.join(runtime_dir, "server.py")
+    if os.path.exists(colocated):
+        return colocated
     candidate = os.path.join(engram_home, "server.py")
     if os.path.exists(candidate):
         return candidate
