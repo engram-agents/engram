@@ -1,0 +1,465 @@
+{
+  "schema_version": 1,
+  "depth_tiers": [
+    "essential",
+    "convenience",
+    "dev"
+  ],
+  "axes": {
+    "multi_agent": "orthogonal flag \u2014 composes with any depth tier"
+  },
+  "default_tier": "convenience",
+  "mechanisms": [
+    {
+      "path": "server.py",
+      "tier": "essential"
+    },
+    {
+      "path": "bootstrap.py",
+      "tier": "essential"
+    },
+    {
+      "path": "SKILL.md",
+      "tier": "essential"
+    },
+    {
+      "path": "launch-engram-server.sh",
+      "tier": "essential"
+    },
+    {
+      "path": "settings.hooks.json.template",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_client.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_confidence.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_filter.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_idf.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_ids.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_log_emitter.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_log_indexer.py",
+      "tier": "essential"
+    },
+    {
+      "path": "viz_server.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/__init__.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/recall_summary_validator.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/verify_quote.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/inspect_raw.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/dream_master_batch.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/cohort_dispatch.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/recall_summary_payload.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/recall_summary_prompts.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/write_sleep_marker.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/deploy.sh",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/build-plugin.sh",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/install-local-marketplace.sh",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/migrate-backup.sh",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/operator-setup-viz.sh",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/heartbeat.sh",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/sleep.sh",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/sync-cron.sh",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/render_cron.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/config_schema.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/session.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/compute_task_time.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/verify_sleep.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/_common.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/_session_context.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/engram-pkg",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/migration",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/ia.py",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "tools/baton.py",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "tools/_channel.py",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "tools/inter_agent_pulse.py",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "tools/forum.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/scan-leaks.py",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/deference_baseline.py",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/antml_repair_baseline.py",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/migrate_db_trust_tier.py",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/surgical.py",
+      "tier": "dev"
+    },
+    {
+      "path": "hooks/claude/start-engram-daemon.sh",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/engram-surface-daemon.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/engram-surface-hook.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/engram-session-start-hook.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/engram-postcompact-hook.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/engram-toolcall-repair.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/engram-write-yield-hook.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/engram-user-identity-hook.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/engram-stop-hook.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/context_tracker.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/engram-deference-detector-prompt.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "hooks/claude/engram-deference-detector-stop.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "hooks/claude/engram-github-notifications-hook.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "hooks/claude/engram-end-of-day-hook.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "hooks/claude/engram-inter-agent-prompt-hook.py",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "hooks/claude/engram-baton-prompt-hook.py",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "hooks/claude/engram-forum-prompt-hook.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-first-session",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-sleep",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-nap",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-retract",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-resolve-cascade",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-contradiction-resolution",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-learn-from-error",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-trust-tier",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/internal-external-decision",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-loop",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-curiosity-loop",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-meta-loop",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-deep-research",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-school-day",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-research-report",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-fairy-orchestration",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-auto-coder-fairy-judgement",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-auto-reviewer-fairy-judgement",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-upgrade",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-loop-diagnose",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-letter",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "skills/claude/engram-baton",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "skills/claude/engram-forum",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-collaborating-loop",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "skills/claude/engram-self-improve",
+      "tier": "dev"
+    },
+    {
+      "path": "agents/claude/engram-dream-fairy.md",
+      "tier": "essential"
+    },
+    {
+      "path": "agents/claude/engram-dream-master.md",
+      "tier": "essential"
+    },
+    {
+      "path": "agents/claude/engram-summary-fairy.md",
+      "tier": "essential"
+    },
+    {
+      "path": "agents/claude/engram-batch-summary-fairy.md",
+      "tier": "essential"
+    },
+    {
+      "path": "agents/claude/engram-coder-fairy.md",
+      "tier": "convenience"
+    },
+    {
+      "path": "agents/claude/engram-pr-reviewer.md",
+      "tier": "convenience"
+    },
+    {
+      "path": "output-styles/claude/proactive-with-carveouts.md",
+      "tier": "convenience"
+    },
+    {
+      "path": "templates/CLAUDE.md.template",
+      "tier": "essential"
+    },
+    {
+      "path": "templates/warm-briefing.md.template",
+      "tier": "essential"
+    },
+    {
+      "path": "templates/config.json.example",
+      "tier": "essential"
+    },
+    {
+      "path": "templates/HEARTBEAT.md.template",
+      "tier": "convenience"
+    },
+    {
+      "path": "templates/crontab.template",
+      "tier": "convenience"
+    },
+    {
+      "path": "templates/heartbeat-queue",
+      "tier": "convenience"
+    },
+    {
+      "path": "templates/engram-surface-daemon.service.template",
+      "tier": "convenience"
+    },
+    {
+      "path": "templates/engram-viz-user.service.template",
+      "tier": "convenience"
+    },
+    {
+      "path": "templates/engram-viz.service",
+      "tier": "convenience"
+    },
+    {
+      "path": "templates/CLAUDE.md.multi-agent.template",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "templates/agents.json.example",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "integrations/gemini-cli",
+      "tier": "convenience"
+    }
+  ]
+}
