@@ -341,9 +341,10 @@ def main() -> None:
     all_letters = _scan_letters(agent_name)
 
     # ── Partition ─────────────────────────────────────────────────────────────
-    # new_letters: timestamp > surfaced_cursor (arrived since last prompt)
-    # unread_letters: surfaced_cursor >= timestamp > read_cursor (seen before, still unread)
-    # read: timestamp <= read_cursor (acknowledged — invisible)
+    # Acknowledged (ts <= read_cursor) → invisible first, regardless of surfaced cursor.
+    # Of the remaining unread letters:
+    #   new_letters:   ts > surfaced_cursor (arrived since last prompt)
+    #   unread_letters: ts <= surfaced_cursor (seen before, still unread)
     now = datetime.now(timezone.utc)
 
     new_letters = []
@@ -351,14 +352,18 @@ def main() -> None:
 
     for letter in all_letters:
         ts = letter["timestamp"]
-        if surfaced_cursor is None:
-            # First ever run: treat everything as "new"
+        # Already acknowledged (ts <= read_cursor) → invisible, regardless of the
+        # surfaced cursor. The read cursor can run AHEAD of the surfaced cursor when
+        # a letter is read via `ia read` without an intervening UserPromptSubmit fire
+        # (e.g. a Monitor task-notification wake), so the "new" bucket must also
+        # require the letter to be unread. (#627)
+        is_unread = read_cursor is None or ts > read_cursor
+        if not is_unread:
+            continue
+        if surfaced_cursor is None or ts > surfaced_cursor:
             new_letters.append(letter)
-        elif ts > surfaced_cursor:
-            new_letters.append(letter)
-        elif read_cursor is None or ts > read_cursor:
+        else:
             unread_letters.append(letter)
-        # else: ts <= read_cursor → acknowledged, invisible
 
     # ── Advance surfaced cursor ───────────────────────────────────────────────
     # Always advance, even if nothing to surface — keeps the delta window current.

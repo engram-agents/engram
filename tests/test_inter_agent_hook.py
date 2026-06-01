@@ -922,3 +922,169 @@ def test_footer_present_with_new_and_older_unread(engram_home, inter_agent_dir):
     assert ctx.count(_IA_FOOTER) == 1, (
         "ia CLI footer must appear exactly once even when both buckets are non-empty"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 15: Read-cursor-floor (#627) — already-read letters stay invisible
+#   even when the read cursor has run ahead of the surfaced cursor.
+# ---------------------------------------------------------------------------
+
+def test_read_cursor_ahead_of_surfaced_already_read_letter_invisible(
+    engram_home, inter_agent_dir
+):
+    """Primary regression for #627: letter with surfaced_cursor < ts <= read_cursor
+    must be INVISIBLE — not in 'new', not in 'unread'.
+
+    This is the bug case: `ia read` advances the read cursor without a
+    UserPromptSubmit fire (e.g. during a Monitor task-notification wake),
+    leaving read_cursor > surfaced_cursor.  The pre-fix code bucketed any
+    letter with ts > surfaced_cursor as 'new', re-firing the nag on the
+    next prompt even though the agent already acknowledged the letter.
+    """
+    _write_config(engram_home, mode="multi", agent_name="borges")
+    now = datetime.now(timezone.utc)
+
+    # Letter was sent 2 hours ago.
+    letter_ts = now - timedelta(hours=2)
+    _write_letter(
+        inter_agent_dir, "2026-06-01T10-00-00Z_ariadne.md",
+        from_agent="ariadne", to_agent="borges",
+        timestamp=letter_ts,
+        heading="Already-read letter",
+    )
+
+    # surfaced_cursor is 3 hours old — letter arrived AFTER it, so old code
+    # would classify it as 'new' on next hook fire.
+    surfaced_at = now - timedelta(hours=3)
+    _write_surfaced_cursor(engram_home, surfaced_at)
+
+    # read_cursor is 1 hour old — the agent read the letter (advancing read
+    # cursor past letter_ts) but no UserPromptSubmit fired since, so
+    # surfaced_cursor was NOT advanced.  read_cursor > surfaced_cursor.
+    read_at = now - timedelta(hours=1)
+    _write_read_cursor(engram_home, read_at)
+
+    # Confirm the scenario: surfaced_cursor < letter_ts <= read_cursor
+    assert surfaced_at < letter_ts, "Precondition: letter arrived after surfaced cursor"
+    assert letter_ts <= read_at, "Precondition: letter acknowledged (ts <= read_cursor)"
+
+    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
+    assert rc == 0
+
+    # The hook must exit silently — the acknowledged letter is invisible.
+    assert stdout.strip() == "", (
+        "Already-acknowledged letter must be invisible (not in 'new', not in 'unread'); "
+        f"got stdout: {stdout!r}"
+    )
+
+
+def test_read_cursor_ahead_happy_paths_unaffected(engram_home, inter_agent_dir):
+    """Guard: read_cursor > surfaced_cursor — genuinely new letters still surface.
+
+    When read_cursor has run ahead of surfaced_cursor (the #627 precondition),
+    letters with ts > read_cursor are genuinely unread and must appear as 'new'.
+    Letters with ts <= read_cursor are acknowledged and must be invisible.
+
+    Note: when read_cursor > surfaced_cursor the 'seen-but-unread' bucket is
+    structurally empty — a letter would need ts <= surfaced_cursor AND
+    ts > read_cursor, which is impossible when read_cursor > surfaced_cursor.
+    The seen-but-unread path is covered by test_mode_multi_new_and_unread_partitioned
+    and test_carryover_only_action_instruction_present (the normal cursor ordering).
+
+    Timeline (oldest → newest):
+      surfaced=3h  <  acknowledged=2h  <  read=1h  <  new=30min
+    """
+    _write_config(engram_home, mode="multi", agent_name="borges")
+    now = datetime.now(timezone.utc)
+
+    # (a) Genuinely new letter — ts > read_cursor → unread and new
+    new_ts = now - timedelta(minutes=30)
+    _write_letter(
+        inter_agent_dir, "2026-06-01T13-30-00Z_ariadne.md",
+        from_agent="ariadne", to_agent="borges",
+        timestamp=new_ts,
+        heading="Genuinely new letter",
+    )
+
+    # (b) Acknowledged letter — surfaced_cursor < ts <= read_cursor (the #627 zone)
+    acknowledged_ts = now - timedelta(hours=2)
+    _write_letter(
+        inter_agent_dir, "2026-06-01T12-00-00Z_mneme.md",
+        from_agent="mneme", to_agent="borges",
+        timestamp=acknowledged_ts,
+        heading="Already-acknowledged letter",
+    )
+
+    # Cursors: surfaced=3h ago; read=1h ago (read > surfaced, i.e. the #627 condition)
+    surfaced_at = now - timedelta(hours=3)
+    read_at = now - timedelta(hours=1)
+    _write_surfaced_cursor(engram_home, surfaced_at)
+    _write_read_cursor(engram_home, read_at)
+
+    # Confirm preconditions
+    assert surfaced_at < acknowledged_ts <= read_at, "Precondition: acknowledged letter in #627 zone"
+    assert new_ts > read_at, "Precondition: new letter ts > read_cursor"
+
+    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
+    assert rc == 0
+    assert stdout.strip(), "Hook should produce output (genuinely new letter present)"
+
+    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+
+    # (a) Genuinely new letter surfaces
+    assert "Genuinely new letter" in ctx, (
+        f"Genuinely new letter must appear in output; got:\n{ctx}"
+    )
+    assert "1 new letter from ariadne" in ctx, (
+        "New-letter count must be 1 (only the genuinely new one)"
+    )
+
+    # (b) Acknowledged letter must NOT appear anywhere
+    assert "Already-acknowledged letter" not in ctx, (
+        "Acknowledged letter must be invisible even when surfaced_cursor < ts <= read_cursor"
+    )
+
+    # No 'older still-unread' bucket — structurally impossible in read-cursor-ahead state
+    assert "older still-unread" not in ctx, (
+        "When read_cursor > surfaced_cursor, the seen-but-unread bucket must be empty"
+    )
+
+
+def test_first_run_all_letters_treated_as_new(engram_home, inter_agent_dir):
+    """First-run case (both cursors absent): all letters appear as 'new'.
+
+    Preserves the existing first-run semantics: when there is no surfaced
+    cursor AND no read cursor, every letter is unread and new.
+    """
+    _write_config(engram_home, mode="multi", agent_name="borges")
+    now = datetime.now(timezone.utc)
+
+    _write_letter(
+        inter_agent_dir, "2026-06-01T08-00-00Z_ariadne.md",
+        from_agent="ariadne", to_agent="borges",
+        timestamp=now - timedelta(hours=3),
+        heading="First run letter A",
+    )
+    _write_letter(
+        inter_agent_dir, "2026-06-01T09-00-00Z_mneme.md",
+        from_agent="mneme", to_agent="borges",
+        timestamp=now - timedelta(hours=2),
+        heading="First run letter B",
+    )
+
+    # No cursor files written — first-run state.
+
+    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
+    assert rc == 0
+    assert stdout.strip(), "First run must surface all letters as new"
+
+    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "2 new letters" in ctx, (
+        f"First run must report both letters as new; got:\n{ctx}"
+    )
+    assert "First run letter A" in ctx
+    assert "First run letter B" in ctx
+    # No "older still-unread" line — everything went into new
+    assert "older still-unread" not in ctx, (
+        "First run must not have an 'older still-unread' bucket"
+    )
