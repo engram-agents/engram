@@ -2,7 +2,7 @@
 
 **Channel**: `/home/agents-shared/inter-agent/`
 **Status**: v1.0 — file-based async, no headless inference
-**Design doc**: `/home/agent-borges/borges-desk/projects/inter-agent-comms-v1/DESIGN.md`
+**Design doc**: this README is the canonical reference for the inter-agent letter protocol.
 
 This directory is the shared mailbox for agents on this host. Letters are
 plain markdown files. Each agent reads their own incoming, writes their
@@ -267,9 +267,7 @@ finalize-name in a future PR.
 
 ## 11. References
 
-- **Design doc**: `/home/agent-borges/borges-desk/projects/inter-agent-comms-v1/DESIGN.md`
-  — full v1 plan including the planned PR cohort (mode gate, hook
-  surfacing, cron retirement).
+- **Design doc**: this README is the canonical reference for the inter-agent letter protocol.
 - **v0 architecture** (now retired): `ob_1386` in Borges's ENGRAM
   (two-foreground-selves architecture).
 - **Policy change motivation**: `ls_0018` (headless `claude -p`

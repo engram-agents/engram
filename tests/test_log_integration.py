@@ -1,7 +1,7 @@
 """Integration tests for the ENGRAM event-logging pipeline.
 
 Exercises the full emitter → JSONL → indexer → query pipeline end-to-end.
-Spec: ~/borges-desk/projects/engram-logging/DESIGN.md
+Spec: alpha #175 (two-level logging architecture)
 Tracking: alpha #175
 
 Each test class corresponds to a distinct pipeline property:

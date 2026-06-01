@@ -1,6 +1,6 @@
 """ENGRAM event indexer — JSONL-to-SQLite derived projection.
 
-Spec: ~/borges-desk/projects/engram-logging/DESIGN.md §6
+Spec: alpha #175 (two-level logging architecture)
 Tracking: alpha #175
 
 This module reads per-session JSONL event files from

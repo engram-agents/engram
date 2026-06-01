@@ -1,6 +1,6 @@
 """ENGRAM event emitter — append-only structured event log.
 
-Spec: ~/borges-desk/projects/engram-logging/DESIGN.md §5
+Spec: alpha #175 (two-level logging architecture)
 Tracking: alpha #175
 
 This module is the single emit-side entry point for ENGRAM's append-only

@@ -35,7 +35,7 @@ from fastmcp import FastMCP
 # normal state for server.py: it runs as a long-lived MCP process serving
 # multiple Claude sessions and has no single session_id to bind to.
 # Phase 4 will add a separate init path for server-side events.
-# See ~/borges-desk/projects/engram-logging/DESIGN.md §4.2 for the spec.
+# See alpha #175 (two-level logging architecture) for the spec.
 from engram_log_emitter import emit_if_initialized  # noqa: E402
 
 # sqlite-vec (optional): SIMD-accelerated KNN over embeddings, replaces the
@@ -5723,7 +5723,7 @@ def _search_nodes(
             the auto-surface hook for short prompts that benefit from
             prev-response-tail prepending on the embedding side WITHOUT
             polluting FTS (which stays keyword-matched against `query`).
-            See alpha #177 + ~/borges-desk/projects/auto-surface-prepending/.
+            See alpha #177.
         return_debug: if True, include a ``debug`` key in the returned dict
             with intermediate ranking signals (keyword extraction, FTS/semantic
             candidate counts, per-result scores). Default False — never bloats

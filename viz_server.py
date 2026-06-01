@@ -2884,7 +2884,7 @@ HEALTH_HTML = r"""<!DOCTYPE html>
 
 # ---------------------------------------------------------------------------
 # Stats tab — agent-stats dashboard backed by ~/.engram/logs/index.db
-# Per alpha #175 + ~/borges-desk/projects/engram-logging/PHASE4-STATS-TAB.md.
+# Per alpha #175 (two-level logging architecture).
 # Privacy: queries ONLY filter WHERE level = 1 (stats-only); L2 events are
 # in the index but never surfaced through this dashboard.
 # ---------------------------------------------------------------------------
