@@ -250,6 +250,13 @@ engram_add_observation(payload_json=json.dumps({
 
 ## Relation to other skills
 
+**Migrating from scatter to plugin? That is a different procedure.** This
+skill covers scatter→scatter upgrades (rsync new code into `$ENGRAM_HOME`). If
+the goal is to move from the scatter install to the Claude Code plugin delivery
+model — removing hooks/MCP/skills/agents from user-scope and letting the plugin
+own them — use `tools/migrate-to-plugin.sh` instead. The HOW is in that
+script's `--help`; the short version: `bash tools/migrate-to-plugin.sh --help`.
+
 - **engram-self-improve** — Self-improvement may produce a code change that needs deploying; after committing the fix, this skill ships it.
 - **engram-surgical** — For data-corruption recovery, NOT routine upgrades. If `engram-surgical` is the right call, deploy.sh is not.
 - **engram-nap / engram-sleep** — An upgrade is a meaningful state-change worth a nap checkpoint if context permits (Step 8's obs IS the minimum record; a nap captures the wider session context).
