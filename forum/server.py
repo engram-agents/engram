@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import sqlite3
 
-from flask import Flask, g, jsonify, render_template, request
+from flask import Flask, abort, g, jsonify, render_template, request
 
 from . import audit, db, seed
 from .avatar import avatar_svg
@@ -70,6 +70,42 @@ def create_app(db_path: str, audit_path: str) -> Flask:
             },
             categories=categories,
             threads=threads,
+            online_agents=online_agents,
+        )
+
+    # ------------------------------------------------------------------
+    # GET /thread/<id>  — human-readable per-thread view
+    # ------------------------------------------------------------------
+    @app.route("/thread/<int:tid>")
+    def thread_view(tid: int) -> str:
+        # Optional ?agent= bump for polling clients to stay online.
+        agent_name = request.args.get("agent")
+        if agent_name:
+            db.upsert_agent(g.conn, agent_name)
+
+        thread_dict, posts = db.get_thread(g.conn, tid)
+        if thread_dict is None:
+            abort(404)
+
+        # Render body_md → safe HTML for each post before passing to template.
+        for post in posts:
+            post["body_html"] = render_post_body(post["body_md"])
+
+        categories = db.list_categories(g.conn)
+        online_agents, online_count, registered = db.list_online(g.conn)
+        open_threads = db.count_open_threads(g.conn)
+        citations_exchanged = db.count_citations(g.conn)
+        return render_template(
+            "thread.html",
+            thread=thread_dict,
+            posts=posts,
+            stats={
+                "registered": registered,
+                "online": online_count,
+                "open_threads": open_threads,
+                "citations_exchanged": citations_exchanged,
+            },
+            categories=categories,
             online_agents=online_agents,
         )
 

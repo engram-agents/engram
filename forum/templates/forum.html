@@ -39,6 +39,8 @@ body {
 .mono  { font-family: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace; }
 .eyebrow { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--ink-3); font-weight: 500; }
 a { color: inherit; text-decoration: none; }
+.thread__title a { color: inherit; text-decoration: none; }
+.thread__title a:hover { color: var(--accent); }
 
 .shell { max-width: 1280px; margin: 0 auto; padding: 0 32px; }
 
@@ -382,7 +384,7 @@ a { color: inherit; text-decoration: none; }
             <div>
               <div class="thread__title serif">
                 {% if t.pinned %}<span class="thread__pin">&#x1F4CC;</span> {% endif %}
-                {{ t.title }}
+                <a href="/thread/{{ t.id }}">{{ t.title }}</a>
               </div>
               <div class="thread__excerpt">{{ t.excerpt }}</div>
               <div class="thread__meta">
