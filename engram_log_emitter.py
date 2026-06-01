@@ -74,7 +74,7 @@ class Emitter:
         self.sessions_dir = logs_dir / "sessions"
         self._bound_context: dict[str, Any] = {}
         self._write_lock = threading.Lock()
-        self._engram_home = Path(os.environ.get("ENGRAM_HOME") or os.environ.get("ENGRAM_DATA_DIR") or str(Path.home() / ".engram"))
+        self._engram_home = Path(os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram"))
         try:
             self.sessions_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -105,7 +105,7 @@ class Emitter:
         with _INIT_LOCK:
             if _EMITTER_INSTANCE is None:
                 if logs_dir is None:
-                    engram_home = Path(os.environ.get("ENGRAM_HOME") or os.environ.get("ENGRAM_DATA_DIR") or str(Path.home() / ".engram"))
+                    engram_home = Path(os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram"))
                     logs_dir = engram_home / "logs"
                 _EMITTER_INSTANCE = cls(
                     session_id=session_id,

@@ -23,12 +23,8 @@ HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def _resolve_engram_home() -> str:
     """Per-install data dir: knowledge.db, sockets, briefing, history."""
-    # Multi-install precedence: prefer ENGRAM_DATA_DIR (server's canonical), fall back
-    # to ENGRAM_HOME (the conventional name), then default. Resolves the multi-install
-    # split-brain where operator sets one var but not the other (#354).
     return (
-        os.environ.get("ENGRAM_DATA_DIR")
-        or os.environ.get("ENGRAM_HOME")
+        os.environ.get("ENGRAM_HOME")
         or os.path.expanduser("~/.engram")
     )
 
@@ -53,9 +49,7 @@ def _resolve_runtime_dir(engram_home: str) -> str:
 ENGRAM_HOME = _resolve_engram_home()
 PROJECT_DIR = _resolve_runtime_dir(ENGRAM_HOME)
 
-# Bridge for downstream callers: ensure both ENGRAM_HOME and ENGRAM_DATA_DIR
-# are set to the resolved value, so any sibling process inherits both.
-os.environ.setdefault("ENGRAM_DATA_DIR", ENGRAM_HOME)
+# Bridge for downstream callers: ensure ENGRAM_HOME is set so any sibling process inherits it.
 os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
 SOCKET_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.sock")
 COUNTER_PATH = os.path.join(ENGRAM_HOME, "prompt-counter.json")

@@ -111,8 +111,8 @@ def test_contention_section_fires_on_high_mean():
     )
 
     assert "see" in section, f"'see' field missing from section: {section}"
-    assert "dv_0687" in section["see"], (
-        f"expected dv_0687 in see field: {section['see']}"
+    assert "the cornerstone-evolution derivation" in section["see"], (
+        f"expected cornerstone-evolution derivation reference in see field: {section['see']}"
     )
 
 

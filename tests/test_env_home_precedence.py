@@ -1,18 +1,20 @@
-"""Tests for ENGRAM_HOME-preferred reader precedence (issue #489, PR 1).
+"""Tests for ENGRAM_HOME as the single canonical data-dir env var.
 
-Verifies the canonical reader form:
-    os.environ.get("ENGRAM_HOME") or os.environ.get("ENGRAM_DATA_DIR") or <DEFAULT>
+ENGRAM_DATA_DIR was removed (unified into ENGRAM_HOME, 2026-06-01); the canonical
+reader form is now:
+    os.environ.get("ENGRAM_HOME") or <DEFAULT>
 
-Coverage:
-  1. engram_client._load_engram_config: ENGRAM_HOME wins over ENGRAM_DATA_DIR.
-  2. engram_client._load_engram_config: ENGRAM_DATA_DIR used when ENGRAM_HOME unset.
-  3. engram_client._load_engram_config: default used when neither var set.
-  4. server.py DATA_DIR: ENGRAM_HOME wins over ENGRAM_DATA_DIR.
-  5. server.py DATA_DIR: ENGRAM_DATA_DIR used when ENGRAM_HOME unset.
-  6. server.py DATA_DIR: default (~/.engram) used when neither var set.
-  7. tools/inspect_raw.py DATA_DIR: ENGRAM_HOME wins over ENGRAM_DATA_DIR.
-  8. tools/inspect_raw.py DATA_DIR: ENGRAM_DATA_DIR used when ENGRAM_HOME unset.
-  9. tools/inspect_raw.py DATA_DIR: default (~/.engram) used when neither var set.
+These tests are the **unification regression guard**: they set a *stray*
+ENGRAM_DATA_DIR and assert it is IGNORED, so the removed fallback cannot creep
+back in. (Originally an ENGRAM_HOME-vs-ENGRAM_DATA_DIR precedence test, #489.)
+
+Coverage (× 3 consumers: engram_client._load_engram_config, server.py DATA_DIR,
+tools/inspect_raw.py DATA_DIR):
+  1. ENGRAM_HOME set + a stray ENGRAM_DATA_DIR set → resolves to ENGRAM_HOME
+     (the stray ENGRAM_DATA_DIR has no effect).
+  2. ENGRAM_HOME unset + a stray ENGRAM_DATA_DIR set → resolves to the ~/.engram
+     DEFAULT, NOT to ENGRAM_DATA_DIR (proves the fallback is gone).
+  3. Neither var set → resolves to the ~/.engram default.
 
 Each test explicitly clears both vars at the start so a leaked global from another
 test module cannot contaminate results.
@@ -39,7 +41,8 @@ sys.path.insert(0, str(REPO_ROOT))
 # ---------------------------------------------------------------------------
 
 def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Explicitly remove both vars so no leaked global can contaminate."""
+    """Remove ENGRAM_HOME and any stray ENGRAM_DATA_DIR so no leaked global
+    contaminates results."""
     monkeypatch.delenv("ENGRAM_HOME", raising=False)
     monkeypatch.delenv("ENGRAM_DATA_DIR", raising=False)
 
@@ -77,9 +80,9 @@ def _reload_inspect_raw(monkeypatch: pytest.MonkeyPatch) -> object:
 class TestEngramClientConfigResolution:
     """engram_client._load_engram_config reads ENGRAM_HOME to find config.json."""
 
-    def test_home_wins_over_data_dir(self, monkeypatch, tmp_path):
-        """ENGRAM_HOME set and ENGRAM_DATA_DIR set to a different path →
-        config from ENGRAM_HOME is returned (HOME wins)."""
+    def test_home_used_stray_data_dir_ignored(self, monkeypatch, tmp_path):
+        """ENGRAM_HOME set + a stray ENGRAM_DATA_DIR set to a different path →
+        config from ENGRAM_HOME is returned; the stray ENGRAM_DATA_DIR is ignored."""
         _clean_env(monkeypatch)
         home_dir = tmp_path / "home"
         data_dir = tmp_path / "data"
@@ -90,28 +93,40 @@ class TestEngramClientConfigResolution:
         (data_dir / "config.json").write_text(json.dumps({"_source": "data"}))
 
         monkeypatch.setenv("ENGRAM_HOME", str(home_dir))
-        monkeypatch.setenv("ENGRAM_DATA_DIR", str(data_dir))
+        monkeypatch.setenv("ENGRAM_DATA_DIR", str(data_dir))  # must be IGNORED
 
         import engram_client
         cfg = engram_client._load_engram_config()
         assert cfg.get("_source") == "home", (
-            f"Expected config from ENGRAM_HOME; got: {cfg}"
+            f"Expected config from ENGRAM_HOME (stray ENGRAM_DATA_DIR ignored); got: {cfg}"
         )
 
-    def test_data_dir_fallback_when_home_unset(self, monkeypatch, tmp_path):
-        """ENGRAM_HOME unset, ENGRAM_DATA_DIR set → config from ENGRAM_DATA_DIR."""
+    def test_data_dir_ignored_when_home_unset(self, monkeypatch, tmp_path):
+        """ENGRAM_HOME unset + a stray ENGRAM_DATA_DIR set → resolution IGNORES
+        ENGRAM_DATA_DIR and falls through to the ~/.engram default (no config
+        there → {}). Guards against the removed DATA_DIR fallback creeping back."""
         _clean_env(monkeypatch)
         data_dir = tmp_path / "data"
         data_dir.mkdir()
         (data_dir / "config.json").write_text(json.dumps({"_source": "data"}))
+        monkeypatch.setenv("ENGRAM_DATA_DIR", str(data_dir))  # must be IGNORED
 
-        monkeypatch.setenv("ENGRAM_DATA_DIR", str(data_dir))
-        # ENGRAM_HOME is explicitly unset (done by _clean_env above)
+        # Point the ~/.engram default at an empty dir (no config.json)
+        no_config_dir = tmp_path / "empty_home"
+        no_config_dir.mkdir()
+        original_expanduser = os.path.expanduser
+
+        def fake_expanduser(p):
+            if p == "~/.engram":
+                return str(no_config_dir)
+            return original_expanduser(p)
+
+        monkeypatch.setattr(os.path, "expanduser", fake_expanduser)
 
         import engram_client
         cfg = engram_client._load_engram_config()
-        assert cfg.get("_source") == "data", (
-            f"Expected config from ENGRAM_DATA_DIR; got: {cfg}"
+        assert cfg == {}, (
+            f"Expected {{}} (default used, stray ENGRAM_DATA_DIR ignored); got: {cfg}"
         )
 
     def test_default_when_neither_set(self, monkeypatch, tmp_path):
@@ -146,9 +161,9 @@ class TestEngramClientConfigResolution:
 class TestServerDataDirResolution:
     """server.DATA_DIR resolves from env vars at module import time."""
 
-    def test_home_wins_over_data_dir(self, monkeypatch, tmp_path):
-        """ENGRAM_HOME set and ENGRAM_DATA_DIR set to a different path →
-        DATA_DIR resolves to ENGRAM_HOME value (HOME wins)."""
+    def test_home_used_stray_data_dir_ignored(self, monkeypatch, tmp_path):
+        """ENGRAM_HOME set + a stray ENGRAM_DATA_DIR set to a different path →
+        DATA_DIR resolves to ENGRAM_HOME; the stray ENGRAM_DATA_DIR is ignored."""
         _clean_env(monkeypatch)
         home_dir = tmp_path / "home"
         data_dir = tmp_path / "data"
@@ -156,7 +171,7 @@ class TestServerDataDirResolution:
         data_dir.mkdir()
 
         monkeypatch.setenv("ENGRAM_HOME", str(home_dir))
-        monkeypatch.setenv("ENGRAM_DATA_DIR", str(data_dir))
+        monkeypatch.setenv("ENGRAM_DATA_DIR", str(data_dir))  # must be IGNORED
         monkeypatch.setenv("ENGRAM_NO_EMBEDDINGS", "1")
 
         for key in list(sys.modules):
@@ -165,24 +180,33 @@ class TestServerDataDirResolution:
         import server  # type: ignore[import]
         # DATA_DIR is set at import time from the env
         assert server.DATA_DIR == Path(home_dir), (
-            f"Expected DATA_DIR={home_dir}; got {server.DATA_DIR}"
+            f"Expected DATA_DIR={home_dir} (stray ENGRAM_DATA_DIR ignored); got {server.DATA_DIR}"
         )
 
-    def test_data_dir_fallback_when_home_unset(self, monkeypatch, tmp_path):
-        """ENGRAM_HOME unset, ENGRAM_DATA_DIR set → DATA_DIR is ENGRAM_DATA_DIR."""
+    def test_data_dir_ignored_when_home_unset(self, monkeypatch, tmp_path):
+        """ENGRAM_HOME unset + a stray ENGRAM_DATA_DIR set → DATA_DIR resolves to
+        the ~/.engram default, NOT to ENGRAM_DATA_DIR (fallback removed)."""
         _clean_env(monkeypatch)
         data_dir = tmp_path / "data"
         data_dir.mkdir()
 
-        monkeypatch.setenv("ENGRAM_DATA_DIR", str(data_dir))
+        monkeypatch.setenv("ENGRAM_DATA_DIR", str(data_dir))  # must be IGNORED
         monkeypatch.setenv("ENGRAM_NO_EMBEDDINGS", "1")
+        original_expanduser = os.path.expanduser
+
+        def fake_expanduser(p):
+            if p == "~/.engram":
+                return str(tmp_path / "default_engram")
+            return original_expanduser(p)
+
+        monkeypatch.setattr(os.path, "expanduser", fake_expanduser)
 
         for key in list(sys.modules):
             if key == "server" or key.startswith("engram_"):
                 del sys.modules[key]
         import server  # type: ignore[import]
-        assert server.DATA_DIR == Path(data_dir), (
-            f"Expected DATA_DIR={data_dir}; got {server.DATA_DIR}"
+        assert server.DATA_DIR == Path(tmp_path / "default_engram"), (
+            f"Expected DATA_DIR=default (stray ENGRAM_DATA_DIR ignored); got {server.DATA_DIR}"
         )
 
     def test_default_when_neither_set(self, monkeypatch, tmp_path):
@@ -214,9 +238,9 @@ class TestServerDataDirResolution:
 class TestInspectRawDataDirResolution:
     """tools/inspect_raw.py DATA_DIR resolves at module import time."""
 
-    def test_home_wins_over_data_dir(self, monkeypatch, tmp_path):
-        """ENGRAM_HOME set and ENGRAM_DATA_DIR set to a different path →
-        DATA_DIR resolves to ENGRAM_HOME value (HOME wins)."""
+    def test_home_used_stray_data_dir_ignored(self, monkeypatch, tmp_path):
+        """ENGRAM_HOME set + a stray ENGRAM_DATA_DIR set to a different path →
+        DATA_DIR resolves to ENGRAM_HOME; the stray ENGRAM_DATA_DIR is ignored."""
         _clean_env(monkeypatch)
         home_dir = tmp_path / "home"
         data_dir = tmp_path / "data"
@@ -224,24 +248,33 @@ class TestInspectRawDataDirResolution:
         data_dir.mkdir()
 
         monkeypatch.setenv("ENGRAM_HOME", str(home_dir))
-        monkeypatch.setenv("ENGRAM_DATA_DIR", str(data_dir))
+        monkeypatch.setenv("ENGRAM_DATA_DIR", str(data_dir))  # must be IGNORED
 
         inspect_raw = _reload_inspect_raw(monkeypatch)
         assert inspect_raw.DATA_DIR == Path(home_dir), (
-            f"Expected DATA_DIR={home_dir}; got {inspect_raw.DATA_DIR}"
+            f"Expected DATA_DIR={home_dir} (stray ENGRAM_DATA_DIR ignored); got {inspect_raw.DATA_DIR}"
         )
 
-    def test_data_dir_fallback_when_home_unset(self, monkeypatch, tmp_path):
-        """ENGRAM_HOME unset, ENGRAM_DATA_DIR set → DATA_DIR is ENGRAM_DATA_DIR."""
+    def test_data_dir_ignored_when_home_unset(self, monkeypatch, tmp_path):
+        """ENGRAM_HOME unset + a stray ENGRAM_DATA_DIR set → DATA_DIR resolves to
+        the ~/.engram default, NOT to ENGRAM_DATA_DIR (fallback removed)."""
         _clean_env(monkeypatch)
         data_dir = tmp_path / "data"
         data_dir.mkdir()
 
-        monkeypatch.setenv("ENGRAM_DATA_DIR", str(data_dir))
+        monkeypatch.setenv("ENGRAM_DATA_DIR", str(data_dir))  # must be IGNORED
+        original_expanduser = os.path.expanduser
+
+        def fake_expanduser(p):
+            if p == "~/.engram":
+                return str(tmp_path / "default_engram")
+            return original_expanduser(p)
+
+        monkeypatch.setattr(os.path, "expanduser", fake_expanduser)
 
         inspect_raw = _reload_inspect_raw(monkeypatch)
-        assert inspect_raw.DATA_DIR == Path(data_dir), (
-            f"Expected DATA_DIR={data_dir}; got {inspect_raw.DATA_DIR}"
+        assert inspect_raw.DATA_DIR == Path(tmp_path / "default_engram"), (
+            f"Expected DATA_DIR=default (stray ENGRAM_DATA_DIR ignored); got {inspect_raw.DATA_DIR}"
         )
 
     def test_default_when_neither_set(self, monkeypatch, tmp_path):

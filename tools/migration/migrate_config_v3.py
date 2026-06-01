@@ -70,7 +70,7 @@ DEFAULT_POLARITY = {
 
 
 def default_config_path() -> Path:
-    base = os.environ.get("ENGRAM_HOME") or os.environ.get("ENGRAM_DATA_DIR") or os.path.expanduser("~/.engram")
+    base = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
     return Path(base) / "config.json"
 
 

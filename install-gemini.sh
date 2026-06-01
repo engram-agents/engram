@@ -288,7 +288,7 @@ echo "== Step 6: Seed graph + GEMINI.md template resolution =="
 ALPHA_DIR="$ALPHA_DIR" \
 ALPHA_TEMPLATES_DIR="$ALPHA_DIR/templates" \
 ALPHA_INTEGRATIONS_DIR="$ALPHA_DIR/integrations" \
-ENGRAM_DATA_DIR="$ENGRAM_HOME" \
+ENGRAM_HOME="$ENGRAM_HOME" \
 GEMINI_EXT_DIR="$GEMINI_EXT_DIR" \
 PYTHON_BIN="$PYTHON_BIN" \
 TARGET="gemini" \

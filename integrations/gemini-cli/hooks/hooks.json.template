@@ -13,7 +13,7 @@
           {
             "type": "command",
             "name": "engram-session-start",
-            "command": "ENGRAM_HOME={{ENGRAM_HOME}} ENGRAM_DATA_DIR={{ENGRAM_HOME}} {{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-session-start-hook.py",
+            "command": "ENGRAM_HOME={{ENGRAM_HOME}} {{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-session-start-hook.py",
             "timeout": 5000,
             "description": "Record per-session marker, reset context-tracker baseline"
           }
@@ -26,21 +26,21 @@
           {
             "type": "command",
             "name": "engram-user-identity",
-            "command": "ENGRAM_HOME={{ENGRAM_HOME}} ENGRAM_DATA_DIR={{ENGRAM_HOME}} {{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-user-identity-hook.py",
+            "command": "ENGRAM_HOME={{ENGRAM_HOME}} {{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-user-identity-hook.py",
             "timeout": 3000,
             "description": "Detect user identity from prompt"
           },
           {
             "type": "command",
             "name": "engram-surface",
-            "command": "ENGRAM_HOME={{ENGRAM_HOME}} ENGRAM_DATA_DIR={{ENGRAM_HOME}} {{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-surface-hook.py",
+            "command": "ENGRAM_HOME={{ENGRAM_HOME}} {{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-surface-hook.py",
             "timeout": 10000,
             "description": "Surface ENGRAM recall and write nudges"
           },
           {
             "type": "command",
             "name": "engram-end-of-day",
-            "command": "ENGRAM_HOME={{ENGRAM_HOME}} ENGRAM_DATA_DIR={{ENGRAM_HOME}} {{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-end-of-day-hook.py",
+            "command": "ENGRAM_HOME={{ENGRAM_HOME}} {{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-end-of-day-hook.py",
             "timeout": 3000,
             "description": "Detect end-of-day phrases; surface bedtime+sleep combo nudge"
           }
@@ -53,7 +53,7 @@
           {
             "type": "command",
             "name": "engram-stop",
-            "command": "ENGRAM_HOME={{ENGRAM_HOME}} ENGRAM_DATA_DIR={{ENGRAM_HOME}} {{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-stop-hook.py",
+            "command": "ENGRAM_HOME={{ENGRAM_HOME}} {{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-stop-hook.py",
             "timeout": 5000,
             "description": "Flag missing ENGRAM writes for the turn"
           }

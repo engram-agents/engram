@@ -37,7 +37,7 @@ def _load_engram_config() -> dict:
     Returns an empty dict if the file is absent or unparseable. Callers
     use .get() with defaults so missing keys degrade gracefully.
     """
-    engram_home = os.environ.get("ENGRAM_HOME") or os.environ.get("ENGRAM_DATA_DIR") or os.path.expanduser("~/.engram")
+    engram_home = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
     config_path = Path(engram_home) / "config.json"
     if config_path.exists():
         try:
@@ -346,7 +346,7 @@ class EngramClient:
         # Override the data directory before importing server
         resolved_dir = str(Path(db_dir).expanduser()) if db_dir else None
         if resolved_dir:
-            os.environ["ENGRAM_DATA_DIR"] = resolved_dir
+            os.environ["ENGRAM_HOME"] = resolved_dir
 
         # Import fresh — needed if we're running multiple clients
         # with different db_dirs in the same process

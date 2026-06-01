@@ -35,17 +35,11 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import write_baseline
 
-# Multi-install precedence: prefer ENGRAM_DATA_DIR (server's canonical), fall back
-# to ENGRAM_HOME (the conventional name), then default. Resolves the multi-install
-# split-brain where operator sets one var but not the other (#354).
 ENGRAM_HOME = (
-    os.environ.get("ENGRAM_DATA_DIR")
-    or os.environ.get("ENGRAM_HOME")
+    os.environ.get("ENGRAM_HOME")
     or os.path.expanduser("~/.engram")
 )
-# Bridge for downstream callers: ensure both ENGRAM_HOME and ENGRAM_DATA_DIR
-# are set to the resolved value, so any sibling process inherits both (#354).
-os.environ.setdefault("ENGRAM_DATA_DIR", ENGRAM_HOME)
+# Bridge for downstream callers: ensure ENGRAM_HOME is set so any sibling process inherits it.
 os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
 SESSION_ROLE = os.environ.get("ENGRAM_SESSION_ROLE", "interactive").strip().lower()
 SESSION_PURPOSE = os.environ.get("ENGRAM_SESSION_PURPOSE", "").strip()

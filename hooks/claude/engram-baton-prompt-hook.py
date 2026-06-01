@@ -42,12 +42,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-# Multi-install precedence: prefer ENGRAM_DATA_DIR (server's canonical), fall back
-# to ENGRAM_HOME (the conventional name), then default. Resolves the multi-install
-# split-brain where operator sets one var but not the other (#354).
 ENGRAM_HOME = (
-    os.environ.get("ENGRAM_DATA_DIR")
-    or os.environ.get("ENGRAM_HOME")
+    os.environ.get("ENGRAM_HOME")
     or str(Path.home() / ".engram")
 )
 BATON_PROJECTS_DIR = os.environ.get("BATON_PROJECTS_DIR", "/home/agents-shared/projects")

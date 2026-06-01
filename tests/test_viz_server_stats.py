@@ -15,6 +15,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -170,17 +171,20 @@ class TestGetStatsDataPopulated(unittest.TestCase):
                 data TEXT NOT NULL
             );
         """)
+        # Use a recent timestamp within the 7-day stats window so Panel 1 counts fire.
+        # Hardcoded dates rot as the 7-day window slides; use now()-1day instead.
+        recent = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         # Insert 3 L1 events + 1 L2 event (Stats should ignore L2)
         conn.executemany(
             "INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
-                ("u1", "s1", 5, "2026-05-17T10:00:00Z", "engram.surface.fire", None, 1,
+                ("u1", "s1", 5, recent, "engram.surface.fire", None, 1,
                  100, 0, None, None, None, None, None, "{}"),
-                ("u2", "s1", 5, "2026-05-17T10:00:01Z", "engram.hook.fire", None, 1,
+                ("u2", "s1", 5, recent, "engram.hook.fire", None, 1,
                  None, None, "engram-stop-hook", 50, 0, None, None, "{}"),
-                ("u3", "s1", 5, "2026-05-17T10:00:02Z", "engram.tool.engram_call", None, 1,
+                ("u3", "s1", 5, recent, "engram.tool.engram_call", None, 1,
                  None, None, None, None, None, "engram_add_observation", "created", "{}"),
-                ("u4-l2", "s1", 5, "2026-05-17T10:00:03Z", "engram.surface.fire.l2", None, 2,
+                ("u4-l2", "s1", 5, recent, "engram.surface.fire.l2", None, 2,
                  None, None, None, None, None, None, None, '{"prompt_text":"secret"}'),
             ],
         )

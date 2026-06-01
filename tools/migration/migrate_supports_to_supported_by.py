@@ -27,7 +27,7 @@ Usage:
     python tools/migration/migrate_supports_to_supported_by.py [--db PATH] [--apply]
 
 Flags:
-    --db PATH   Path to knowledge.db (default: $ENGRAM_DATA_DIR/knowledge.db
+    --db PATH   Path to knowledge.db (default: $ENGRAM_HOME/knowledge.db
                 or ~/.engram/knowledge.db).
     --apply     Execute the migration. Default is dry-run (read-only preview).
 """
@@ -40,7 +40,7 @@ from pathlib import Path
 
 
 def default_db_path() -> Path:
-    base = os.environ.get("ENGRAM_HOME") or os.environ.get("ENGRAM_DATA_DIR") or os.path.expanduser("~/.engram")
+    base = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
     return Path(base) / "knowledge.db"
 
 
@@ -164,7 +164,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument(
         "--db", type=Path, default=default_db_path(),
-        help="Path to knowledge.db (default: $ENGRAM_DATA_DIR/knowledge.db or ~/.engram/knowledge.db)",
+        help="Path to knowledge.db (default: $ENGRAM_HOME/knowledge.db or ~/.engram/knowledge.db)",
     )
     parser.add_argument(
         "--apply", action="store_true",

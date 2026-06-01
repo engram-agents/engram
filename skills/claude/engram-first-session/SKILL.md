@@ -71,7 +71,7 @@ VENV_PY="$HOME/.engram/venv/bin/python3"
 
 ALPHA_DIR="$(dirname "$BOOTSTRAP")" \
 ALPHA_TEMPLATES_DIR="$(dirname "$BOOTSTRAP")/templates" \
-ENGRAM_DATA_DIR="${ENGRAM_HOME:-$HOME/.engram}" \
+ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}" \
 CLAUDE_HOME="$HOME/.claude" \
 PYTHON_BIN="$VENV_PY" \
 TARGET=claude \

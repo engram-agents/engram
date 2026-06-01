@@ -25,7 +25,7 @@ def _setup():
     """Reset test DB and reimport server module.
 
     Uses _configure_paths(TEST_DIR) — the canonical isolation pattern — instead of
-    the ENGRAM_DB_DIR env var (a no-op: server reads ENGRAM_DATA_DIR).  See
+    the ENGRAM_DB_DIR env var (a no-op: server reads ENGRAM_HOME).  See
     test_cascade_semantics.py::fresh_server() for the reference implementation.
     """
     if os.path.exists(TEST_DIR):
@@ -129,33 +129,33 @@ def test_synthetic_scheme_rejected():
 # ── Honesty axiom reminder ───────────────────────────────────────────────────
 
 def test_axiom_reminder_in_web_url_errors():
-    """All web URL validation errors should include the ax_0002 honesty reminder."""
+    """All web URL validation errors should include the provenance axiom reminder."""
     server = _setup()
     # No hostname
     r = _add_evidence(server, "https://")
-    assert "ax_0002" in r.get("error", ""), "Missing axiom reminder in no-hostname error"
+    assert "the provenance axiom" in r.get("error", ""), "Missing axiom reminder in no-hostname error"
 
     # No TLD
     r = _add_evidence(server, "https://session-transcript/abc")
-    assert "ax_0002" in r.get("error", ""), "Missing axiom reminder in no-TLD error"
+    assert "the provenance axiom" in r.get("error", ""), "Missing axiom reminder in no-TLD error"
 
     # DNS failure
     r = _add_evidence(server, "https://totally-fake-domain-xyz999.com/x")
-    assert "ax_0002" in r.get("error", ""), "Missing axiom reminder in DNS error"
+    assert "the provenance axiom" in r.get("error", ""), "Missing axiom reminder in DNS error"
 
 
 def test_axiom_reminder_in_scheme_errors():
-    """Synthetic scheme errors should include the ax_0002 honesty reminder."""
+    """Synthetic scheme errors should include the provenance axiom reminder."""
     server = _setup()
     r = _add_evidence(server, "conversation://session")
-    assert "ax_0002" in r.get("error", ""), "Missing axiom reminder in scheme error"
+    assert "the provenance axiom" in r.get("error", ""), "Missing axiom reminder in scheme error"
 
 
 def test_axiom_reminder_in_file_errors():
-    """File-based evidence errors should include the ax_0002 honesty reminder."""
+    """File-based evidence errors should include the provenance axiom reminder."""
     server = _setup()
     r = _add_evidence(server, "file:///nonexistent/path/file.txt")
-    assert "ax_0002" in r.get("error", ""), "Missing axiom reminder in file-not-found error"
+    assert "the provenance axiom" in r.get("error", ""), "Missing axiom reminder in file-not-found error"
 
 
 # ── Integration: observation auto-creates evidence ───────────────────────────

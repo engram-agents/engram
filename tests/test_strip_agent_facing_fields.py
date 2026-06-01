@@ -44,12 +44,11 @@ atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 # fresh_server() mutates these env vars process-wide; capture their pre-test
 # values and restore them at module teardown so they don't leak into later test
-# modules. Without this, ENGRAM_DATA_DIR=TEST_DIR leaks and — under the canonical
-# ENGRAM_HOME > ENGRAM_DATA_DIR precedence (#489 / PR1) — a later test that sets
+# modules. Without this, ENGRAM_HOME=TEST_DIR leaks and a later test that sets
 # neither var would resolve to the leaked TEST_DIR instead of its real default.
 # The leaker restoring its own mutation is the fix; well-behaved scoped patch.dict
 # victims need no change.
-_ORIG_ENV = {k: os.environ.get(k) for k in ("ENGRAM_DATA_DIR", "ENGRAM_NO_EMBEDDINGS")}
+_ORIG_ENV = {k: os.environ.get(k) for k in ("ENGRAM_HOME", "ENGRAM_NO_EMBEDDINGS")}
 
 
 def teardown_module(module):
@@ -67,7 +66,7 @@ def fresh_server():
         if key == "server" or key.startswith("engram_"):
             del sys.modules[key]
     os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
-    os.environ["ENGRAM_DATA_DIR"] = TEST_DIR
+    os.environ["ENGRAM_HOME"] = TEST_DIR
     import server
     server._configure_paths(TEST_DIR)
     server._ensure_data_dir()
@@ -642,7 +641,7 @@ class TestInspectRawCli:
         """Running without --field lists available stripped fields."""
         server = fresh_server()
         obs_id = _add_obs(server, "CLI list mode test.")
-        env = {**os.environ, "ENGRAM_DATA_DIR": TEST_DIR}
+        env = {**os.environ, "ENGRAM_HOME": TEST_DIR}
         result = subprocess.run(
             [sys.executable, INSPECT_RAW, obs_id],
             capture_output=True, text=True, env=env,
@@ -657,7 +656,7 @@ class TestInspectRawCli:
         """--field confidence_history returns a non-empty list."""
         server = fresh_server()
         obs_id = _add_obs(server, "CLI confidence_history field test.")
-        env = {**os.environ, "ENGRAM_DATA_DIR": TEST_DIR}
+        env = {**os.environ, "ENGRAM_HOME": TEST_DIR}
         result = subprocess.run(
             [sys.executable, INSPECT_RAW, obs_id, "--field", "confidence_history"],
             capture_output=True, text=True, env=env,
@@ -670,7 +669,7 @@ class TestInspectRawCli:
         """--field confidence_history --json produces valid JSON list."""
         server = fresh_server()
         obs_id = _add_obs(server, "CLI JSON output test.")
-        env = {**os.environ, "ENGRAM_DATA_DIR": TEST_DIR}
+        env = {**os.environ, "ENGRAM_HOME": TEST_DIR}
         result = subprocess.run(
             [sys.executable, INSPECT_RAW, obs_id, "--field", "confidence_history", "--json"],
             capture_output=True, text=True, env=env,
@@ -686,7 +685,7 @@ class TestInspectRawCli:
         """--field parsed_metadata --json returns a dict with source_class."""
         server = fresh_server()
         obs_id = _add_obs(server, "CLI parsed_metadata JSON test.")
-        env = {**os.environ, "ENGRAM_DATA_DIR": TEST_DIR}
+        env = {**os.environ, "ENGRAM_HOME": TEST_DIR}
         result = subprocess.run(
             [sys.executable, INSPECT_RAW, obs_id, "--field", "parsed_metadata", "--json"],
             capture_output=True, text=True, env=env,
@@ -701,7 +700,7 @@ class TestInspectRawCli:
     def test_unknown_node_exits_1(self):
         """Non-existent node ID should exit with code 1."""
         fresh_server()
-        env = {**os.environ, "ENGRAM_DATA_DIR": TEST_DIR}
+        env = {**os.environ, "ENGRAM_HOME": TEST_DIR}
         result = subprocess.run(
             [sys.executable, INSPECT_RAW, "ob_9999"],
             capture_output=True, text=True, env=env,

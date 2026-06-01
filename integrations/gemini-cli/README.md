@@ -21,7 +21,7 @@ The Gemini agent picks its own name during the first-session dialogue (it does *
 
 | File | Purpose |
 |------|---------|
-| `gemini-extension.json.template` | Gemini extension manifest (registers the ENGRAM MCP server, names `GEMINI.md` as the context file, sets `ENGRAM_HOME` + `ENGRAM_DATA_DIR` env on the server) |
+| `gemini-extension.json.template` | Gemini extension manifest (registers the ENGRAM MCP server, names `GEMINI.md` as the context file, sets `ENGRAM_HOME` env on the server) |
 | `hooks/hooks.json.template` | Hook event wiring — SessionStart, BeforeAgent, AfterAgent → existing alpha hook scripts, with `ENGRAM_HOME` set per command |
 | `GEMINI.md.template` | Agent-facing context (identity scaffolding + ENGRAM write discipline) — auto-loaded by Gemini CLI when the extension is active |
 | `README.md` | This file |

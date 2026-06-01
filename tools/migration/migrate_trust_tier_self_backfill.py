@@ -32,8 +32,8 @@ described in the upgrade guide after merge.
 
 ## Flags
 
-    --db PATH   Path to knowledge.db (default: $ENGRAM_DATA_DIR/knowledge.db
-                or $ENGRAM_HOME/knowledge.db or ~/.engram/knowledge.db).
+    --db PATH   Path to knowledge.db (default: $ENGRAM_HOME/knowledge.db
+                or ~/.engram/knowledge.db).
     --dry-run   Preview all planned changes; no DB writes (default mode).
     --live      Apply the migration. Takes a backup before writing.
 """
@@ -51,7 +51,6 @@ from pathlib import Path
 def default_db_path() -> Path:
     base = (
         os.environ.get("ENGRAM_HOME")
-        or os.environ.get("ENGRAM_DATA_DIR")
         or os.path.expanduser("~/.engram")
     )
     return Path(base) / "knowledge.db"
@@ -182,7 +181,7 @@ def main() -> int:
         "--db", type=Path, default=default_db_path(),
         help=(
             "Path to knowledge.db "
-            "(default: $ENGRAM_DATA_DIR/knowledge.db or ~/.engram/knowledge.db)"
+            "(default: $ENGRAM_HOME/knowledge.db or ~/.engram/knowledge.db)"
         ),
     )
     mode_group = parser.add_mutually_exclusive_group()

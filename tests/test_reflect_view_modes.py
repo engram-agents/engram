@@ -609,16 +609,26 @@ def test_whitespace_only_recall_summary_falls_back_to_claim():
 # ---------------------------------------------------------------------------
 
 def test_schema_has_summary_top_k():
-    """TOOL_SCHEMAS['engram_reflect'] contains summary_top_k parameter."""
+    """TOOL_SCHEMAS['engram_reflect'] documents summary_top_k in its payload_json description.
+
+    Post wave-3 payload_json migration (2026-05-27): engram_reflect uses a single
+    payload_json parameter. summary_top_k is documented inside the payload_json
+    description string rather than as a top-level parameter key.
+    """
     if "engram_client" in sys.modules:
         del sys.modules["engram_client"]
     import engram_client
     schema = engram_client.TOOL_SCHEMAS.get("engram_reflect")
     assert schema is not None, "engram_reflect missing from TOOL_SCHEMAS"
     params = schema.get("parameters", {})
-    assert "summary_top_k" in params, (
-        f"summary_top_k missing from engram_reflect schema parameters; "
+    assert "payload_json" in params, (
+        f"engram_reflect schema missing payload_json parameter; "
         f"got: {list(params.keys())}"
+    )
+    pj_desc = params["payload_json"].get("description", "")
+    assert "summary_top_k" in pj_desc, (
+        f"summary_top_k undocumented in engram_reflect payload_json description; "
+        f"description: {pj_desc!r}"
     )
 
 

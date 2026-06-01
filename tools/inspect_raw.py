@@ -23,11 +23,11 @@ Available stripped fields:
     git_sha            Git commit SHA when the file was read (file:// obs only)
     parsed_metadata    Full parsed metadata dict (superset of metadata string)
 
-Honors ENGRAM_DATA_DIR environment variable (same pattern as server.py).
+Honors ENGRAM_HOME environment variable (same pattern as server.py).
 Does NOT honor the #348 hardcoded-path bug — uses the env-var correctly.
 
 Examples:
-    ENGRAM_DATA_DIR=/tmp/test-engram python inspect_raw.py ob_NNNN
+    ENGRAM_HOME=/tmp/test-engram python inspect_raw.py ob_NNNN
     python inspect_raw.py dv_NNNN --field confidence_history
     python inspect_raw.py ob_NNNN --field embedding | python -c "import json,sys; v=json.load(sys.stdin); print(f'len={len(v)}, first5={v[:5]}')"
 """
@@ -39,7 +39,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-DATA_DIR = Path(os.environ.get("ENGRAM_HOME") or os.environ.get("ENGRAM_DATA_DIR") or os.path.expanduser("~/.engram"))
+DATA_DIR = Path(os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram"))
 DB_PATH = DATA_DIR / "knowledge.db"
 
 # Columns that exist as top-level fields in the nodes table.
@@ -65,7 +65,7 @@ ALL_STRIPPED_FIELDS = _TABLE_STRIPPED_COLS | _METADATA_STRIPPED_KEYS | _SYNTHETI
 def _get_row(node_id: str) -> dict | None:
     if not DB_PATH.exists():
         print(f"ERROR: DB not found at {DB_PATH}", file=sys.stderr)
-        print(f"  Set ENGRAM_DATA_DIR to point at your engram data directory.", file=sys.stderr)
+        print(f"  Set ENGRAM_HOME to point at your engram data directory.", file=sys.stderr)
         sys.exit(1)
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row

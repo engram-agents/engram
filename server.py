@@ -142,7 +142,7 @@ DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 # Configuration
 # ---------------------------------------------------------------------------
 
-DATA_DIR = Path(os.environ.get("ENGRAM_HOME") or os.environ.get("ENGRAM_DATA_DIR") or os.path.expanduser("~/.engram"))
+DATA_DIR = Path(os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram"))
 DB_PATH = DATA_DIR / "knowledge.db"
 SNAPSHOT_PATH = DATA_DIR / "graph_snapshot.md"
 CONFIG_PATH = DATA_DIR / "config.json"

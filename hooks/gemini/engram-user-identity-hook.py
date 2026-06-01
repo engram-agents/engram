@@ -27,12 +27,8 @@ import re
 import sqlite3
 import sys
 
-# Multi-install precedence: prefer ENGRAM_DATA_DIR (server's canonical), fall back
-# to ENGRAM_HOME (the conventional name), then default. Resolves the multi-install
-# split-brain where operator sets one var but not the other (#354).
 ENGRAM_HOME = (
-    os.environ.get("ENGRAM_DATA_DIR")
-    or os.environ.get("ENGRAM_HOME")
+    os.environ.get("ENGRAM_HOME")
     or os.path.expanduser("~/.engram")
 )
 DB_PATH = os.path.join(ENGRAM_HOME, "knowledge.db")

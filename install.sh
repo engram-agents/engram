@@ -456,7 +456,7 @@ echo "== Step 5: Seed graph + template resolution =="
 
 ALPHA_DIR="$ALPHA_DIR" \
 ALPHA_TEMPLATES_DIR="$ALPHA_DIR/templates" \
-ENGRAM_DATA_DIR="$ENGRAM_HOME" \
+ENGRAM_HOME="$ENGRAM_HOME" \
 CLAUDE_HOME="$CLAUDE_HOME" \
 PYTHON_BIN="$PYTHON_BIN" \
 FORCE="$FORCE" \

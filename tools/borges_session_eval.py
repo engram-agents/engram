@@ -34,12 +34,8 @@ from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-# Multi-install precedence: prefer ENGRAM_DATA_DIR (server's canonical), fall back
-# to ENGRAM_HOME (the conventional name), then default. Resolves the multi-install
-# split-brain where operator sets one var but not the other (#471, follow-up to #354).
 ENGRAM_HOME = Path(
-    os.environ.get("ENGRAM_DATA_DIR")
-    or os.environ.get("ENGRAM_HOME")
+    os.environ.get("ENGRAM_HOME")
     or str(Path.home() / ".engram")
 )
 INVOCATION_LOG = ENGRAM_HOME / "toolcall-invocations.jsonl"

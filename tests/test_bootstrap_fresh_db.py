@@ -37,12 +37,12 @@ def test_bootstrap_seeds_fresh_db_under_env_bypass():
         assert not engram_home.exists()
         claude_home.mkdir(parents=True)
 
-        # Mirror the env vars install.sh sets at install.sh:458-464.
+        # Mirror the env vars install.sh sets at install.sh:457-463.
         env = os.environ.copy()
         env.update({
             "ALPHA_DIR": str(REPO_ROOT),
             "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "templates"),
-            "ENGRAM_DATA_DIR": str(engram_home),
+            "ENGRAM_HOME": str(engram_home),
             "CLAUDE_HOME": str(claude_home),
             "PYTHON_BIN": sys.executable,
             "TARGET": "claude",
@@ -55,7 +55,7 @@ def test_bootstrap_seeds_fresh_db_under_env_bypass():
         # server.py to live alongside the install). For this E2E test we
         # need to either copy server.py into engram_home (mirroring
         # install.sh's step 4) OR run bootstrap from a place where it
-        # finds server.py. install.sh copies server.py to ENGRAM_DATA_DIR
+        # finds server.py. install.sh copies server.py to ENGRAM_HOME
         # at step 4 BEFORE step 5 runs bootstrap.py. We replicate that
         # minimal step here: copy server.py + engram_*.py runtime
         # modules into engram_home.
@@ -142,7 +142,7 @@ def test_bootstrap_refuses_overwrite_existing_db():
         env.update({
             "ALPHA_DIR": str(REPO_ROOT),
             "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "templates"),
-            "ENGRAM_DATA_DIR": str(engram_home),
+            "ENGRAM_HOME": str(engram_home),
             "CLAUDE_HOME": str(workdir / ".claude"),
             "PYTHON_BIN": sys.executable,
             "TARGET": "claude",

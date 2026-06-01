@@ -34,11 +34,8 @@ from typing import Optional
 # Environment + paths
 # ---------------------------------------------------------------------------
 
-# Multi-install precedence: prefer ENGRAM_DATA_DIR (server's canonical), fall back
-# to ENGRAM_HOME (the conventional name), then default. Mirrors ia.py + baton.py.
 ENGRAM_HOME = (
-    os.environ.get("ENGRAM_DATA_DIR")
-    or os.environ.get("ENGRAM_HOME")
+    os.environ.get("ENGRAM_HOME")
     or str(Path.home() / ".engram")
 )
 

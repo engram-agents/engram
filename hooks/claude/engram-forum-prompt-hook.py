@@ -40,8 +40,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 ENGRAM_HOME = (
-    os.environ.get("ENGRAM_DATA_DIR")
-    or os.environ.get("ENGRAM_HOME")
+    os.environ.get("ENGRAM_HOME")
     or str(Path.home() / ".engram")
 )
 

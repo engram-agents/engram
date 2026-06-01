@@ -13,7 +13,7 @@ session in the chosen CLI.
 Expected env vars:
   ALPHA_DIR              — path to the alpha/ snapshot (for seed-manifest)
   ALPHA_TEMPLATES_DIR    — path to alpha/templates/
-  ENGRAM_DATA_DIR        — target for the ENGRAM data dir; also where
+  ENGRAM_HOME            — target for the ENGRAM data dir; also where
                            server.py, engram_confidence.py, and SKILL.md
                            were copied (import path below)
   TARGET                 — 'claude' (default) | 'gemini'
@@ -51,7 +51,7 @@ def _now_iso() -> str:
 
 ALPHA_DIR = Path(os.environ["ALPHA_DIR"])
 TEMPLATES_DIR = Path(os.environ["ALPHA_TEMPLATES_DIR"])
-ENGRAM_HOME = Path(os.environ.get("ENGRAM_HOME") or os.environ["ENGRAM_DATA_DIR"])
+ENGRAM_HOME = Path(os.environ["ENGRAM_HOME"])
 TARGET = os.environ.get("TARGET", "claude").lower()
 
 if TARGET not in ("claude", "gemini"):

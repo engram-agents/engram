@@ -43,12 +43,8 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import write_baseline
 
-# Multi-install precedence: prefer ENGRAM_DATA_DIR (server's canonical), fall back
-# to ENGRAM_HOME (the conventional name), then default. Resolves the multi-install
-# split-brain where operator sets one var but not the other (#354).
 ENGRAM_HOME = (
-    os.environ.get("ENGRAM_DATA_DIR")
-    or os.environ.get("ENGRAM_HOME")
+    os.environ.get("ENGRAM_HOME")
     or os.path.expanduser("~/.engram")
 )
 
@@ -728,7 +724,6 @@ def main() -> None:
     # hook must never block session start.
     try:
         _runtime_dir = _resolve_runtime_dir(ENGRAM_HOME)
-        os.environ.setdefault("ENGRAM_DATA_DIR", ENGRAM_HOME)
         os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
         if _runtime_dir not in sys.path:
             sys.path.insert(0, _runtime_dir)

@@ -20,6 +20,7 @@ Coverage:
 """
 
 import atexit
+import inspect
 import json
 import os
 import shutil
@@ -56,8 +57,12 @@ class _DirectClient:
         fn = getattr(self._server, tool_name)
         args = arguments or {}
         # Mirror EngramClient.call's legacy-form auto-wrap for single-payload
-        # tools (currently engram_add_observation): if the caller passes the
-        # legacy named-field dict, wrap as payload_json.
+        # tools: if the caller passes the legacy named-field dict, wrap as
+        # payload_json.  Primary check: TOOL_SCHEMAS (for registered tools).
+        # Fallback: inspect the function signature directly (for focus tools
+        # that are not in TOOL_SCHEMAS but were migrated to payload_json in
+        # the wave-3 single-payload migration, 2026-05-27).
+        wrapped = False
         try:
             from engram_client import TOOL_SCHEMAS
             schema = TOOL_SCHEMAS.get(tool_name)
@@ -65,8 +70,14 @@ class _DirectClient:
                     and list(schema.get("parameters", {}).keys()) == ["payload_json"]
                     and "payload_json" not in args):
                 args = {"payload_json": json.dumps(args)}
+                wrapped = True
         except ImportError:
             pass
+        if not wrapped and "payload_json" not in args:
+            sig = inspect.signature(fn)
+            params = list(sig.parameters.keys())
+            if params == ["payload_json"] and args:
+                args = {"payload_json": json.dumps(args)}
         result_str = fn(**args)
         return json.loads(result_str)
 
