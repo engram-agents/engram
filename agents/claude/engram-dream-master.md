@@ -387,9 +387,9 @@ If the helper script invocation fails, log the error in the dream record but DO 
 
 # Output contract — ask-{{USER_NAME}} surface update
 
-After the sleep-success marker is written (post-`engram_advance_turn`), surface the dream's "Flagged for the user" items into Lei's morning queue so they're visible at next session start.
+After the sleep-success marker is written (post-`engram_advance_turn`), surface the dream's "Flagged for the user" items into the user's morning queue so they're visible at next session start.
 
-Lei's morning queue lives in two files (the three-file pattern):
+The user's morning queue lives in two files (the three-file pattern):
 
 - `~/.engram/ask-{{USER_NAME}}.md` — auto-loaded digest. One short line per active item, citing ENGRAM node IDs.
 - `~/.engram/ask-{{USER_NAME}}-details.md` — full descriptions, NOT auto-loaded. Section headings referenced by digest links.
@@ -422,7 +422,7 @@ Lei's morning queue lives in two files (the three-file pattern):
 ```
 ## dream-YYYY-MM-DD-<short-topic>
 
-[Full context the dream record captured — typically a paragraph or two; cite the supporting nodes; explain what decision Lei needs to make.]
+[Full context the dream record captured — typically a paragraph or two; cite the supporting nodes; explain what decision the user needs to make.]
 ```
 
 7. **Update the "Last updated" timestamp** at the top of ask-{{USER_NAME}}.md (look for a line like `**Last updated:** ...`) to the dream's completion time + `End-of-dream.`
@@ -445,7 +445,7 @@ git -C ~/.engram commit -m "ask-{{USER_NAME}}: dream YYYY-MM-DD no new items"
 
 ## Edge cases
 
-- **No flagged-for-user items this cycle** — skip steps 4-6. Still update the timestamp (step 7) so Lei sees you ran. Optional: write a sub-section `### From dream YYYY-MM-DD` with a single line `- No items flagged for user input this cycle.`
+- **No flagged-for-user items this cycle** — skip steps 4-6. Still update the timestamp (step 7) so the user sees you ran. Optional: write a sub-section `### From dream YYYY-MM-DD` with a single line `- No items flagged for user input this cycle.`
 - **ask-{{USER_NAME}}.md or ask-{{USER_NAME}}-details.md does not exist** — installs without these files (e.g. fresh users) — skip this step entirely. Note in dream record under "Flagged for the user" that the surface was bypassed. (The skill is forward-compat by design.)
 - **Failure to write** — log in dream record, do NOT retry. The turn already advanced before this step; ask-{{USER_NAME}} failures don't undo that. Next cycle's dream-master will see the dream-flagged items again from the prior dream record and can re-surface. Acceptable failure mode.
 

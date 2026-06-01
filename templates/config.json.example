@@ -46,7 +46,7 @@
   "cadence": {
     "_comment_cadence": "Cron + drowsiness tunables. heartbeat_minutes is a list of minute-of-hour values to fire heartbeat (e.g., [0, 30] = twice an hour). sleep_hour/minute is when the daily sleep cycle fires in user.timezone. sleep_protected_window_minutes is how wide a window around sleep that heartbeat avoids — render_cron.py computes per-slot skips from this window (no separate skip-list config). drowsiness_caution_pct/urgent_pct trigger context_tracker warnings.",
 
-    "_comment_multi_agent": "Multi-agent stagger: each agent has its own config.json with its own cadence — render_cron.py does NOT auto-stagger. To run two agents on the same host without overlapping schedules, edit heartbeat_minutes and sleep_minute per agent directly. Worked example (Lei's setup): Borges uses sleep_hour=20, sleep_minute=30, heartbeat_minutes=[0, 30]; Mneme uses sleep_hour=20, sleep_minute=15, heartbeat_minutes=[15, 45]. The 15-min offset puts the two sleep cycles sequential (Mneme 20:15 → Borges 20:30) instead of concurrent.",
+    "_comment_multi_agent": "Multi-agent stagger: each agent has its own config.json with its own cadence — render_cron.py does NOT auto-stagger. To run two agents on the same host without overlapping schedules, edit heartbeat_minutes and sleep_minute per agent directly. Worked example (a two-agent setup): Agent A uses sleep_hour=20, sleep_minute=30, heartbeat_minutes=[0, 30]; Agent B uses sleep_hour=20, sleep_minute=15, heartbeat_minutes=[15, 45]. The 15-min offset puts the two sleep cycles sequential (Agent B 20:15 → Agent A 20:30) instead of concurrent.",
 
     "heartbeat_minutes": [0, 30],
     "sleep_hour": 20,
