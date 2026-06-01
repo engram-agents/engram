@@ -8,7 +8,7 @@
 #     SKILL.md                  ENGRAM protocol reference
 #     bootstrap.py              bootstrap helper (imported by first-session)
 #     plugin.json               plugin manifest
-#     .mcp.json                 MCP server registration
+#     .mcp.json                 MCP server registration (source: packaging/mcp.json)
 #     hooks/
 #       hooks.json              plugin hook config
 #       *.py *.sh               hook scripts
@@ -160,7 +160,14 @@ cp -a "$REPO_ROOT/templates/." "$PLUGIN_ROOT/templates/"
 
 log "Copying manifests"
 cp "$REPO_ROOT/plugin.json"  "$PLUGIN_ROOT/plugin.json"
-cp "$REPO_ROOT/.mcp.json"    "$PLUGIN_ROOT/.mcp.json"
+# Source lives at packaging/mcp.json, NOT repo-root .mcp.json — a file literally
+# named `.mcp.json` at the repo root is auto-loaded by Claude Code as a
+# project-scope MCP server for every dev-mode clone, conflicting with the
+# working user-scope engram and knocking it offline on restart (#618). The repo
+# is never *recognized* as a plugin; build-plugin.sh reconstructs the format, so
+# the source path is arbitrary. It is renamed to `.mcp.json` here at the plugin
+# root, where the packaged-plugin format expects it.
+cp "$REPO_ROOT/packaging/mcp.json" "$PLUGIN_ROOT/.mcp.json"
 
 # ── 3. Hooks ──────────────────────────────────────────────────────────────────
 
