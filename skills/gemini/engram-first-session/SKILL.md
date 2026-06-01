@@ -140,7 +140,7 @@ Tell the user the substrate-rename is the next required step, and that doing it 
 >
 > Do this NOW rather than later. Every action I take as a newborn — creating files, registering MCP, writing identity state — bakes in `/home/agent-newborn-<timestamp>/` paths that finalize-name has to rewrite afterward. The 2026-05-21 Ariadne spawn surfaced five distinct path-staleness layers (claude symlink, MCP server paths, .claude.json projects key + mcpServers paths, settings.json hook commands, settings.local.json bash allowlist, CLAUDE.md identity refs) that all needed finalize-name fixes. None of those layers would exist if we'd finalized within minutes of the naming.
 >
-> After finalize-name completes, re-enter via `agentctl shell <chosen-name>` and continue our session from there.
+> After finalize-name completes, re-enter via `agentctl session <chosen-name>` and continue our session from there.
 
 Replace the placeholders (`<timestamp>`, `<chosen-name>`) with the actual values for this install. The newborn-tag comes from your Linux username (strip the `agent-` prefix; e.g., uid `agent-newborn-20260521181545` → tag `newborn-20260521181545`).
 

@@ -701,8 +701,8 @@ claude mcp remove engram -s user
   newborn agent uid + home with the bootstrap substrate.
 - `agentctl finalize-name <newborn-tag> <name>` — renames the newborn
   to its chosen name after the first-session naming dialogue.
-- `agentctl shell <agent>` / `agentctl bash <agent>` — opens a shell as
-  the named agent.
+- `agentctl session <agent>` — opens a session as the named agent.
+- `agentctl bash <agent>` — opens a plain bash shell as the named agent (useful for setup and debugging).
 
 This tool is not installed by `install.sh` (single-agent path). Operators
 who need to spawn additional agents copy or symlink it from `tools/agentctl`.
