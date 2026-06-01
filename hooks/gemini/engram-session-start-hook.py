@@ -31,6 +31,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import write_baseline
@@ -41,6 +42,12 @@ ENGRAM_HOME = (
 )
 # Bridge for downstream callers: ensure ENGRAM_HOME is set so any sibling process inherits it.
 os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
+
+# Inter-agent dir (mirrors ia.py convention)
+INTER_AGENT_DIR = os.environ.get("INTER_AGENT_DIR", "/home/agents-shared/inter-agent")
+STARRED_CAP = 10
+STARRED_STALE_DAYS = 7  # soft TTL for staleness nudge (nudge only, never auto-drop)
+
 SESSION_ROLE = os.environ.get("ENGRAM_SESSION_ROLE", "interactive").strip().lower()
 SESSION_PURPOSE = os.environ.get("ENGRAM_SESSION_PURPOSE", "").strip()
 SESSIONS_DIR = os.path.join(ENGRAM_HOME, "sessions")
@@ -291,6 +298,78 @@ def sleep_status_block() -> str:
     )
 
 
+def starred_block(engram_home: str) -> str:
+    """Render starred inter-agent letters as concise pointers.
+
+    One line per entry: ⭐ [<from>] "<title>" — ia read <filename>
+    Stars older than STARRED_STALE_DAYS get a trailing nudge: ⚠ stale Nd — unstar if resolved
+    Reads from/title from snapshot fields stored at star-time — does NOT re-open or re-parse
+    the source letter. If the source letter was deleted, still renders from the snapshot.
+    Returns empty string when the list is empty, the file is missing, or any
+    read error occurs. Never raises — hook must not block session start.
+    """
+    try:
+        starred_path = os.path.join(engram_home, "inter-agent-starred.json")
+        try:
+            raw = Path(starred_path).read_text(encoding="utf-8")
+            entries = json.loads(raw)
+            if not isinstance(entries, list):
+                return ""
+        except (OSError, json.JSONDecodeError, ValueError):
+            return ""
+
+        if not entries:
+            return ""
+
+        now = datetime.now(timezone.utc)
+        lines = []
+        skipped = 0
+        for entry in entries:
+            filename = entry.get("filename", "").strip()
+            if not filename:
+                skipped += 1
+                continue
+
+            # Read from/title from snapshot; graceful fallback for old entries lacking snapshot fields
+            from_agent = (entry.get("from") or "").strip() or "unknown"
+            title = (entry.get("title") or "").strip() or "(no title)"
+            note = entry.get("note", "").strip()
+            note_part = f" — {note}" if note else ""
+
+            # Staleness nudge: compute age from starred_at
+            stale_part = ""
+            starred_at_str = entry.get("starred_at", "")
+            if starred_at_str:
+                try:
+                    starred_dt = datetime.strptime(starred_at_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                    age_days = (now - starred_dt).days
+                    if age_days >= STARRED_STALE_DAYS:
+                        stale_part = f"  ⚠ stale {age_days}d — unstar if resolved"
+                except ValueError:
+                    pass
+
+            lines.append(f"  ⭐ [{from_agent}] \"{title}\" — ia read {filename}{note_part}{stale_part}")
+
+        if not lines:
+            return ""
+
+        total = len(lines)
+        display_lines = lines[:STARRED_CAP]
+        remaining = total - len(display_lines)
+        header = f"⭐ {total} starred letter(s) — key cross-session context, re-read if relevant:"
+        block_lines = [header] + display_lines
+        if remaining > 0:
+            block_lines.append(f"  ... +{remaining} more (ia starred to see all)")
+        if skipped > 0:
+            block_lines.append(
+                f"  (note: {skipped} starred entry/entries skipped (missing filename field))"
+            )
+        return "\n".join(block_lines)
+    except Exception:
+        # Hook discipline: never surface starred-block errors at session start.
+        return ""
+
+
 def main() -> None:
     try:
         hook_input = json.load(sys.stdin)
@@ -334,6 +413,20 @@ def main() -> None:
             "Start Reading items can be skipped; the compaction summary "
             "carries work-thread continuity.]"
         )
+
+    # ── Starred letters surface ────────────────────────────────────────────
+    # Inject starred-letter pointers at both fresh-session (startup) and
+    # post-compaction (compact/resume) so load-bearing cross-session agreements
+    # survive the experiential reset. Pointer-not-injection: one line each,
+    # NOT full content. Silent skip on any failure — hook must not block
+    # session start.
+    try:
+        _starred = starred_block(ENGRAM_HOME)
+        if _starred:
+            lines.append(_starred)
+    except Exception:
+        pass
+
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",

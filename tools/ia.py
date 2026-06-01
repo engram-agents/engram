@@ -5,13 +5,16 @@ A thin CLI wrapping the inter-agent file protocol at
 /home/agents-shared/inter-agent/. Provides validated letter creation,
 cursor-tracked reading, and quick status checks.
 
-Six subcommands:
+Nine subcommands:
   list        Show letters addressed to me (default: unread only)
   read        Display a letter; advance read cursor to its timestamp
   write       Create a new letter via $EDITOR with validated frontmatter
   mark-read   Advance read cursor without displaying a letter
   cursor      Show or set the read cursor
   status      Quick health check (agent name, mode, cursor, unread count)
+  star        Star a letter to re-surface it at continuity-reset points
+  unstar      Remove a letter from the starred list
+  starred     List all starred letters
 
 Design doc: ariadne-desk/projects/inter-agent-cli/DESIGN.md (v2, 2026-05-23)
 Protocol:   inter-agent/README.md
@@ -43,6 +46,7 @@ INTER_AGENT_DIR = os.environ.get("INTER_AGENT_DIR", "/home/agents-shared/inter-a
 
 READ_CURSOR_PATH = os.path.join(ENGRAM_HOME, "inter-agent-read-cursor.txt")
 SURFACED_CURSOR_PATH = os.path.join(ENGRAM_HOME, "inter-agent-surfaced-cursor.txt")
+STARRED_LIST_PATH = os.path.join(ENGRAM_HOME, "inter-agent-starred.json")
 
 # Exit codes per DESIGN §7
 EXIT_OK = 0
@@ -477,6 +481,53 @@ def _scan_replied_filenames(agent_name: str, inter_agent_dir: Path) -> set:
             replied.add(re_field)
 
     return replied
+
+
+# ---------------------------------------------------------------------------
+# Starred letters helpers  (per-agent star list, pointer-not-injection)
+# ---------------------------------------------------------------------------
+
+STARRED_CAP = 10  # max entries rendered in the starred surface block
+STARRED_STALE_DAYS = 7  # soft TTL for staleness nudge (nudge only, never auto-drop)
+
+
+def _read_starred(starred_path: str = STARRED_LIST_PATH) -> list:
+    """Read the starred-letters list; return [] on missing/corrupt file.
+
+    Each entry is a dict with at minimum {"filename": ..., "starred_at": ..., "note": ...}.
+    Snapshot entries (added at star-time) also carry {"from": ..., "title": ...} so the
+    list surface can render without re-parsing the source letter.
+    Tolerates any read or parse failure (missing file, invalid JSON, non-list shape).
+    """
+    try:
+        raw = Path(starred_path).read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data
+        return []
+    except (OSError, json.JSONDecodeError, ValueError):
+        return []
+
+
+def _write_starred(entries: list, starred_path: str = STARRED_LIST_PATH) -> None:
+    """Write the starred-letters list atomically (tmp + os.replace).
+
+    Uses the same atomic tmp + os.replace pattern as _write_cursor so concurrent
+    hook fires cannot read a partial starred file.
+    """
+    dest = Path(starred_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    try:
+        tmp.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+        os.replace(tmp, dest)
+    except OSError as e:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        print(f"ia: starred-list write failed: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
 
 
 # ---------------------------------------------------------------------------
@@ -1053,6 +1104,159 @@ def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: star
+# ---------------------------------------------------------------------------
+
+def cmd_star(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    inter_agent_dir = Path(INTER_AGENT_DIR)
+
+    filename = args.filename
+    # Validate the filename exists in inter-agent/ and parse it once to snapshot from+title
+    candidate = Path(filename)
+    if not candidate.is_absolute():
+        candidate = inter_agent_dir / filename
+    if not candidate.exists():
+        print(
+            f"ia star: file not found: '{filename}' "
+            f"(looked in {inter_agent_dir}). "
+            f"Use 'ia list --all' to see available letters.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    # Parse letter once (validation + snapshot)
+    try:
+        text = candidate.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        print(f"ia star: cannot read '{candidate}': {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    fields, body = _parse_frontmatter(text)
+    snapshot_from = fields.get("from", "unknown").strip() if fields else "unknown"
+    snapshot_title = _extract_title(fields, body) if fields else "(no title)"
+
+    # Use basename only in the starred list (not full path)
+    if Path(filename).is_absolute():
+        filename = Path(filename).name
+
+    entries = _read_starred()
+    note = args.note or ""
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Idempotent: update note (and refresh snapshot fields) if already starred
+    for entry in entries:
+        if entry.get("filename") == filename:
+            if note:
+                entry["note"] = note
+            # Refresh snapshot fields in case letter was edited since last star
+            entry["from"] = snapshot_from
+            entry["title"] = snapshot_title
+            print(f"ia star: '{filename}' already starred (updated note)" if note else
+                  f"ia star: '{filename}' already starred (no-op)")
+            _write_starred(entries)
+            return
+
+    entries.append({
+        "filename": filename,
+        "from": snapshot_from,
+        "title": snapshot_title,
+        "starred_at": now_str,
+        "note": note,
+    })
+    _write_starred(entries)
+    print(f"ia star: starred '{filename}'")
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: unstar
+# ---------------------------------------------------------------------------
+
+def cmd_unstar(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    filename = args.filename
+    # Normalize to basename
+    filename = Path(filename).name
+
+    entries = _read_starred()
+    new_entries = [e for e in entries if e.get("filename") != filename]
+
+    if len(new_entries) == len(entries):
+        print(f"ia unstar: '{filename}' was not starred (no-op)")
+        return
+
+    _write_starred(new_entries)
+    print(f"ia unstar: unstarred '{filename}'")
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: starred
+# ---------------------------------------------------------------------------
+
+def cmd_starred(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    inter_agent_dir = Path(INTER_AGENT_DIR)
+
+    entries = _read_starred()
+
+    if args.format == "json":
+        print(json.dumps(entries, indent=2))
+        return
+
+    # Human format: show each entry with from · title · filename · note · staleness
+    if not entries:
+        print("starred (0): no starred letters.")
+        return
+
+    now = datetime.now(timezone.utc)
+    print(f"starred ({len(entries)}):")
+    skipped = 0
+    shown = 0
+    missing_count = 0
+    for entry in entries:
+        filename = entry.get("filename", "").strip()
+        if not filename:
+            skipped += 1
+            continue
+
+        # Read from/title from snapshot; graceful fallback for old entries lacking snapshot fields
+        from_agent = (entry.get("from") or "").strip() or "unknown"
+        title = (entry.get("title") or "").strip() or "(no title)"
+        note = entry.get("note", "").strip()
+        starred_at_str = entry.get("starred_at", "")
+
+        # Check source letter existence (warn but still render from snapshot)
+        letter_path = inter_agent_dir / filename
+        if not letter_path.exists():
+            missing_count += 1
+
+        note_part = f"  note: {note}" if note else ""
+        missing_part = "  [source letter no longer present]" if not letter_path.exists() else ""
+
+        # Staleness nudge
+        stale_part = ""
+        if starred_at_str:
+            try:
+                starred_dt = datetime.strptime(starred_at_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                age_days = (now - starred_dt).days
+                if age_days >= STARRED_STALE_DAYS:
+                    stale_part = f"  ⚠ stale {age_days}d — unstar if resolved"
+            except ValueError:
+                pass
+
+        print(f"  {from_agent:<12}  \"{title}\"")
+        print(f"    {filename}{note_part}{missing_part}{stale_part}")
+        shown += 1
+
+    if missing_count > 0:
+        print(
+            f"note: {missing_count} starred letter(s) no longer exist in {inter_agent_dir}",
+            file=sys.stderr,
+        )
+    if skipped > 0:
+        print(
+            f"note: {skipped} starred entry/entries skipped (missing filename field)",
+            file=sys.stderr,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -1264,6 +1468,57 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format: human (default) or json",
     )
 
+    # -- star --
+    p_star = subparsers.add_parser(
+        "star",
+        help="Star a letter to re-surface it at session-start and post-compaction",
+        description=(
+            "Mark a letter as key cross-session context. Starred letters are "
+            "surfaced as concise pointers at session-start and post-compaction "
+            "so important agreements survive experiential resets. "
+            "Idempotent: starring an already-starred letter updates the note "
+            "or is a no-op."
+        ),
+    )
+    p_star.add_argument(
+        "filename",
+        metavar="FILENAME",
+        help="Letter filename (basename or full path in inter-agent/)",
+    )
+    p_star.add_argument(
+        "--note", metavar="TEXT", default="",
+        help="Optional note describing why this letter is starred",
+    )
+
+    # -- unstar --
+    p_unstar = subparsers.add_parser(
+        "unstar",
+        help="Remove a letter from the starred list",
+        description=(
+            "Remove a letter from the starred list. No-op if the letter is not "
+            "currently starred."
+        ),
+    )
+    p_unstar.add_argument(
+        "filename",
+        metavar="FILENAME",
+        help="Letter filename (basename or full path) to unstar",
+    )
+
+    # -- starred --
+    p_starred = subparsers.add_parser(
+        "starred",
+        help="List starred letters with from · title · filename · note",
+        description=(
+            "Show all starred letters with their sender, title, filename, and note. "
+            "Warns if a starred letter's file no longer exists."
+        ),
+    )
+    p_starred.add_argument(
+        "--format", choices=["human", "json"], default="human",
+        help="Output format: human (default) or json",
+    )
+
     return parser
 
 
@@ -1297,6 +1552,12 @@ def main() -> None:
         cmd_cursor(args, config, agent_name)
     elif args.subcommand == "status":
         cmd_status(args, config, agent_name)
+    elif args.subcommand == "star":
+        cmd_star(args, config, agent_name)
+    elif args.subcommand == "unstar":
+        cmd_unstar(args, config, agent_name)
+    elif args.subcommand == "starred":
+        cmd_starred(args, config, agent_name)
     else:
         parser.print_help()
         sys.exit(EXIT_VALIDATION)

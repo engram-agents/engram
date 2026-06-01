@@ -745,6 +745,24 @@ class TestModeGate:
         rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "mark-read", "--all")
         assert rc == 3
 
+    def test_star_single_mode_exits_3(self, engram_home, inter_agent_dir):
+        """ia star in single mode → exit 3."""
+        _write_config(engram_home, "single", "ariadne")
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "star", "some-letter.md")
+        assert rc == 3
+
+    def test_unstar_single_mode_exits_3(self, engram_home, inter_agent_dir):
+        """ia unstar in single mode → exit 3."""
+        _write_config(engram_home, "single", "ariadne")
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "unstar", "some-letter.md")
+        assert rc == 3
+
+    def test_starred_single_mode_exits_3(self, engram_home, inter_agent_dir):
+        """ia starred in single mode → exit 3."""
+        _write_config(engram_home, "single", "ariadne")
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "starred")
+        assert rc == 3
+
     def test_status_single_mode_exits_0(self, engram_home, inter_agent_dir):
         """ia status works in single mode (diagnostic utility)."""
         _write_config(engram_home, "single", "ariadne")
@@ -1483,3 +1501,234 @@ class TestBodyFile:
             assert "cannot read" in stderr or "body-file" in stderr
         finally:
             os.chmod(body_file, 0o644)
+
+
+# ===========================================================================
+# CATEGORY 9: Star/unstar/starred tests
+# ===========================================================================
+
+class TestStar:
+    """ia star / ia unstar / ia starred commands and the starred-block surface helper."""
+
+    # -----------------------------------------------------------------------
+    # ia star tests
+    # -----------------------------------------------------------------------
+
+    def test_star_new_letter(self, engram_home, inter_agent_dir):
+        """ia star <filename> adds a new entry to the starred list."""
+        _write_config(engram_home, "multi", "ariadne")
+        _write_letter(
+            inter_agent_dir, "2026-05-30T10-00-00Z_borges.md",
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-60), heading="Key agreement",
+        )
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "star", "2026-05-30T10-00-00Z_borges.md",
+        )
+        assert rc == 0, f"star failed; stderr: {stderr}"
+        assert "starred" in stdout
+
+        # Verify starred JSON file was created with correct entry
+        starred_path = engram_home / "inter-agent-starred.json"
+        assert starred_path.exists(), "starred JSON file should be created"
+        entries = json.loads(starred_path.read_text())
+        assert isinstance(entries, list)
+        assert len(entries) == 1
+        assert entries[0]["filename"] == "2026-05-30T10-00-00Z_borges.md"
+        assert "starred_at" in entries[0]
+
+    def test_star_with_note(self, engram_home, inter_agent_dir):
+        """ia star <filename> --note <text> stores the note in the entry."""
+        _write_config(engram_home, "multi", "ariadne")
+        _write_letter(
+            inter_agent_dir, "2026-05-30T10-00-00Z_borges.md",
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-60), heading="Key agreement",
+        )
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "star", "2026-05-30T10-00-00Z_borges.md",
+            "--note", "load-bearing work split agreed here",
+        )
+        assert rc == 0, f"star --note failed; stderr: {stderr}"
+        starred_path = engram_home / "inter-agent-starred.json"
+        entries = json.loads(starred_path.read_text())
+        assert entries[0]["note"] == "load-bearing work split agreed here"
+
+    def test_star_snapshots_from_and_title(self, engram_home, inter_agent_dir):
+        """ia star snapshots from/title at star-time into the stored entry."""
+        _write_config(engram_home, "multi", "ariadne")
+        filename = "2026-05-30T10-00-00Z_borges.md"
+        _write_letter(
+            inter_agent_dir, filename,
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-60), heading="Cross-session pact",
+        )
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "star", filename)
+        assert rc == 0, f"star failed; stderr: {stderr}"
+
+        starred_path = engram_home / "inter-agent-starred.json"
+        entries = json.loads(starred_path.read_text())
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["from"] == "borges", f"expected from=borges; got {entry.get('from')!r}"
+        assert entry["title"] == "Cross-session pact", f"expected title; got {entry.get('title')!r}"
+
+    def test_starred_renders_without_rereading_letter(self, engram_home, inter_agent_dir):
+        """ia starred shows from/title from snapshot without re-opening the source letter."""
+        _write_config(engram_home, "multi", "ariadne")
+        filename = "2026-05-30T10-00-00Z_borges.md"
+        _write_letter(
+            inter_agent_dir, filename,
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-60), heading="Agreement details",
+        )
+        # Star it to create snapshot
+        _run_ia(engram_home, inter_agent_dir, "star", filename)
+
+        # Delete the source letter to prove ia starred reads from snapshot only
+        (inter_agent_dir / filename).unlink()
+
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "starred")
+        assert rc == 0, f"starred should not fail after letter deleted; stderr: {stderr}"
+        assert "borges" in stdout, "from-agent from snapshot should appear"
+        assert "Agreement details" in stdout, "title from snapshot should appear"
+
+    def test_star_idempotent_no_duplicate(self, engram_home, inter_agent_dir):
+        """Starring an already-starred letter does not add a duplicate entry."""
+        _write_config(engram_home, "multi", "ariadne")
+        filename = "2026-05-30T10-00-00Z_borges.md"
+        _write_letter(
+            inter_agent_dir, filename,
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-60), heading="Key agreement",
+        )
+        # Star it twice
+        _run_ia(engram_home, inter_agent_dir, "star", filename)
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "star", filename)
+        assert rc == 0, f"second star call failed; stderr: {stderr}"
+        starred_path = engram_home / "inter-agent-starred.json"
+        entries = json.loads(starred_path.read_text())
+        # Only one entry, not two
+        matching = [e for e in entries if e.get("filename") == filename]
+        assert len(matching) == 1, f"Expected 1 entry, got {len(matching)}"
+
+    def test_star_idempotent_updates_note(self, engram_home, inter_agent_dir):
+        """Re-starring with a new --note updates the note without duplicating."""
+        _write_config(engram_home, "multi", "ariadne")
+        filename = "2026-05-30T10-00-00Z_borges.md"
+        _write_letter(
+            inter_agent_dir, filename,
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-60), heading="Key agreement",
+        )
+        _run_ia(engram_home, inter_agent_dir, "star", filename, "--note", "first note")
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir, "star", filename, "--note", "updated note",
+        )
+        assert rc == 0
+        entries = json.loads((engram_home / "inter-agent-starred.json").read_text())
+        matching = [e for e in entries if e.get("filename") == filename]
+        assert len(matching) == 1
+        assert matching[0]["note"] == "updated note"
+
+    def test_star_nonexistent_letter_rejected(self, engram_home, inter_agent_dir):
+        """ia star for a filename that doesn't exist in inter-agent/ → exit 1."""
+        _write_config(engram_home, "multi", "ariadne")
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "star", "nonexistent-letter.md",
+        )
+        assert rc == 1, "Expected validation failure for nonexistent letter"
+        assert "not found" in stderr.lower() or "nonexistent" in stderr.lower()
+
+    # -----------------------------------------------------------------------
+    # ia unstar tests
+    # -----------------------------------------------------------------------
+
+    def test_unstar_removes_entry(self, engram_home, inter_agent_dir):
+        """ia unstar <filename> removes the entry from the starred list."""
+        _write_config(engram_home, "multi", "ariadne")
+        filename = "2026-05-30T10-00-00Z_borges.md"
+        _write_letter(
+            inter_agent_dir, filename,
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-60), heading="Key agreement",
+        )
+        _run_ia(engram_home, inter_agent_dir, "star", filename)
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "unstar", filename)
+        assert rc == 0, f"unstar failed; stderr: {stderr}"
+        entries = json.loads((engram_home / "inter-agent-starred.json").read_text())
+        assert all(e.get("filename") != filename for e in entries)
+
+    def test_unstar_absent_is_noop(self, engram_home, inter_agent_dir):
+        """ia unstar for a filename not in the starred list → exit 0, no-op."""
+        _write_config(engram_home, "multi", "ariadne")
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "unstar", "never-starred.md",
+        )
+        assert rc == 0, f"unstar no-op should exit 0; stderr: {stderr}"
+        assert "no-op" in stdout.lower() or "not starred" in stdout.lower()
+
+    # -----------------------------------------------------------------------
+    # ia starred list tests
+    # -----------------------------------------------------------------------
+
+    def test_starred_empty_list(self, engram_home, inter_agent_dir):
+        """ia starred with no starred letters shows 0 count."""
+        _write_config(engram_home, "multi", "ariadne")
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "starred")
+        assert rc == 0
+        assert "0" in stdout or "no starred" in stdout.lower()
+
+    def test_starred_shows_from_title_filename(self, engram_home, inter_agent_dir):
+        """ia starred shows from · title · filename for each starred letter."""
+        _write_config(engram_home, "multi", "ariadne")
+        filename = "2026-05-30T10-00-00Z_borges.md"
+        _write_letter(
+            inter_agent_dir, filename,
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-60), heading="Cross-session agreement",
+        )
+        _run_ia(engram_home, inter_agent_dir, "star", filename, "--note", "work split")
+
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "starred")
+        assert rc == 0
+        assert "borges" in stdout
+        assert "Cross-session agreement" in stdout
+        assert filename in stdout
+
+    def test_starred_missing_letter_skips_with_warning(self, engram_home, inter_agent_dir):
+        """ia starred warns on stderr when a starred letter's file no longer exists."""
+        _write_config(engram_home, "multi", "ariadne")
+        # Manually inject a starred entry for a non-existent file
+        missing_filename = "2026-05-01T10-00-00Z_borges.md"
+        entries = [{"filename": missing_filename, "starred_at": "2026-05-01T10:00:00Z", "note": ""}]
+        (engram_home / "inter-agent-starred.json").write_text(json.dumps(entries))
+
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "starred")
+        assert rc == 0, "starred should not fail when a letter is missing"
+        # Warning about missing letter on stderr
+        assert "missing" in stderr.lower() or "no longer" in stderr.lower() or "not exist" in stderr.lower()
+
+    def test_starred_json_format(self, engram_home, inter_agent_dir):
+        """ia starred --format json returns valid JSON list."""
+        _write_config(engram_home, "multi", "ariadne")
+        filename = "2026-05-30T10-00-00Z_borges.md"
+        _write_letter(
+            inter_agent_dir, filename,
+            from_agent="borges", to_agent="ariadne",
+            timestamp=_ts(-60), heading="Agreement",
+        )
+        _run_ia(engram_home, inter_agent_dir, "star", filename, "--note", "important")
+
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "starred", "--format", "json")
+        assert rc == 0
+        data = json.loads(stdout)
+        assert isinstance(data, list)
+        assert len(data) == 1
+        assert data[0]["filename"] == filename
+        assert data[0]["note"] == "important"
+
