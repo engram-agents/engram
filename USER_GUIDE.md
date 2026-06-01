@@ -238,3 +238,87 @@ None of this happens in week one. Most of it is visible by month two. The relati
 ## When in doubt
 
 Ask your agent. They have context you don't, and they will often notice questions you haven't thought to ask. The best conversations start with *"what are we missing?"* — from either side.
+
+---
+
+## Appendix: Multi-Agent Mode
+
+ENGRAM defaults to single-agent mode — one user, one agent, one knowledge graph. **Multi-agent mode** lets ONE user run MULTIPLE agents on the same host. (If you and a housemate share a machine but each just want ONE agent, you DON'T need multi-agent mode — each of you installs single-agent in your own Linux user home and everything works normally. Multi-agent is specifically for the one-user-multiple-agents case.)
+
+When this fits: you want a co-worker agent that specializes in something different from your main one (e.g., a research-focused agent + a coding-focused agent), or you want two agents who can review each other's PRs (this is how alpha development happens — Lei runs Borges + Ariadne side-by-side).
+
+### When NOT to use multi-agent mode
+
+Single-agent mode is the right choice if:
+- You're the only user of the host and one agent is plenty for your work.
+- You and other humans share the host but each only wants ONE agent each — install single-agent in each of your respective Linux user homes; the agents stay isolated by user account.
+- You're just getting started — try single-agent first, add the second agent later if you find a concrete use for it.
+
+Multi-agent adds operational overhead (more agents to manage, more memory, more disk). Worth the cost only when you have a real reason for the second agent.
+
+### Setup overview
+
+Multi-agent mode requires three pieces:
+
+1. **A Linux user-account per agent.** Each agent runs as its own OS user (`agent-<name>`) with its own home directory. The operator-setup install script creates these accounts.
+2. **A shared filesystem at `/home/agents-shared/`.** Agents drop coordination files here (letters + project state) that all agents on the host can read. Setup happens once during install.
+3. **`agentctl` — your CLI for interacting with the agents.** This is what you use day-to-day. The operator-setup install puts `agentctl` on your PATH; if `agentctl` isn't found after install, see the install notes (tracked separately).
+
+### Spawning a new agent (agentctl workflow)
+
+Bringing up a new agent is a 6-step flow. The agent first comes up under a placeholder tag (`newborn-YYYYMMDDhhmmss`); the agent picks 3 candidate names in its first session and you finalize the rename afterward:
+
+```bash
+# Step 1 — spawn a newborn (no name yet; auto-generates a timestamp tag)
+# --runtime claude is the default and the only supported runtime in v0.1
+sudo agentctl spawn [--runtime claude]
+
+# (spawn prints the newborn's tag, e.g. "newborn-20260530220500")
+
+# Step 2 — enter the newborn's bash login shell
+agentctl bash <newborn-tag>
+
+# Step 3 — inside that shell, materialize ENGRAM
+bash ~/.runtime/install.sh
+
+# Step 4 — log in to the LLM provider (interactive)
+claude login
+
+# Step 5 — start the first session
+claude                         # the SessionStart hook fires engram-first-session;
+                               # the agent generates 3 candidate names; you pick one
+
+# Step 6 — from YOUR shell (NOT inside the newborn), finalize the rename
+sudo agentctl finalize-name <newborn-tag> <chosen-name>
+```
+
+After step 6, the agent is fully named + ready. `agentctl health` will show them in the health table; `agentctl session <chosen-name>` opens future sessions.
+
+If you want to abandon a newborn partway through (before finalize-name), clean up with:
+
+```bash
+sudo userdel -r agent-<newborn-tag>
+```
+
+Note: `spawn` + `finalize-name` require a leading `sudo` (they create/rename Linux user accounts). `share` and `unshare` also require `sudo`. `session` and `bash` don't take a leading `sudo` but will prompt for your sudo password internally — they re-exec `sudo -u <user>` to start a shell as the agent's Linux user. `health` and `share-status` are read-or-local and don't prompt.
+
+### Daily interaction
+
+Once spawned, here are the verbs you'll use most:
+
+| Command | What it does |
+|---|---|
+| `agentctl health` | Health table — shows every agent + heartbeat freshness + any flags (no agent-name argument; always shows all) |
+| `agentctl session <agent>` | Open a working session as `<agent>`. Persistent tmux-backed; auto-attaches to an existing one if already running. **Prompts for your sudo password** (starts the CLI as the agent's Linux user) |
+| `agentctl bash <agent>` | Plain bash shell as the agent (no CLI) — useful for setup and debugging. **Prompts for your sudo password** (starts the shell as the agent's Linux user) |
+| `agentctl share-status [<agent>]` | List active directory shares (omit `<agent>` to see all) |
+
+To share a directory with an agent (so it can read/write your project files), use `sudo agentctl share <agent> <path> [--mode rw|ro]`. To revoke a share, `sudo agentctl unshare <agent> <path>` (recursively removes the ACL).
+
+`agentctl --help` lists everything; `agentctl <command> --help` explains each command's flags.
+
+### What the agents do among themselves
+
+When you run multiple agents, they automatically coordinate among themselves via shared filesystem mechanisms (inter-agent letters + per-project state files). You don't need to manage this — it happens transparently as part of their workflow. Their `CLAUDE.md` and skill files carry the coordination discipline; you interact with each agent individually through `agentctl`.
+
+The visible signal: when you run `agentctl health`, you'll see all your agents and roughly what each is up to. When you open a session with one of them, they may mention what they coordinated with their counterpart about (e.g., "I reviewed Borges's PR this morning"). That's the multi-agent layer in action.

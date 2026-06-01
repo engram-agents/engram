@@ -6,17 +6,15 @@
 # Lei reviews.  After review move to /home/user/.local/bin/agentctl.
 #
 # Scope of v0:
-#   status   shell   bash   run   talk   logs
-# Added v0.1 (broker — share/unshare/shares; grant/audit/upgrade-engram still TBD):
-#   share    unshare    shares
-# Added v0.2 (cron pause/resume for graceful agent quiescence):
-#   pause    resume
+#   health   session   bash
+# Added v0.1 (broker — share/unshare/share-status):
+#   share    unshare    share-status
 # Added v0.3 (spawn flow — multi-agent newborn lifecycle, v0.1 minimum):
 #   spawn    finalize-name
 #
 # Usage:
-#   agentctl status                      # health table for all agents
-#   agentctl shell <agent> [--local] [...flags]
+#   agentctl health                      # health table for all agents
+#   agentctl session <agent> [--local] [...flags]
 #                                        # interactive session as agent;
 #                                        # default: claude-remote (tmux-backed,
 #                                        # persistent); auto-attaches to existing
@@ -26,23 +24,13 @@
 #                                        # flags pass through (--continue,
 #                                        # --resume, --print, etc.).
 #   agentctl bash <agent>                # plain bash shell as agent (no CLI)
-#   agentctl run <agent> -- "<prompt>"   # one-shot prompt
-#   agentctl talk <agent>                # opens an inter-agent message draft
-#   agentctl logs <agent> [--tail]       # tail heartbeat/session logs
-#   agentctl pause <agent>               # comment out heartbeat + sleep crons
-#                                        # (dispatchers stay up so inbox stays
-#                                        # reachable). Backup auto-written to
-#                                        # /home/agents-shared/cron-backups/.
-#                                        # Idempotent. Audited.
-#   agentctl resume <agent>              # uncomment paused heartbeat + sleep
-#                                        # crons. Idempotent. Audited.
 #   sudo agentctl share <agent> <path> [--mode rw|ro] [--ttl <duration>]
 #                                        # grant agent ACL access to spt-side path;
 #                                        # parent dirs get --x traversal, target gets
 #                                        # rwX (or rX for --mode ro), default ACL on
 #                                        # dirs so new files inherit. Audited.
 #   sudo agentctl unshare <agent> <path> # revoke share (recursive ACL removal)
-#   agentctl shares [<agent>]            # list active shares
+#   agentctl share-status [<agent>]      # list active shares
 #   sudo agentctl spawn [--runtime claude]  (v0.1: claude only)
 #                       [--alpha-source PATH] [--bootstrap-path PATH]
 #                                        # birth a newborn-tagged agent
@@ -88,7 +76,7 @@ resolve_user() {
 }
 
 # ---------- subcommands ----------
-cmd_status() {
+cmd_health() {
     printf '%-12s %-7s %-22s %-10s\n' AGENT UID LAST_SLEEP HEALTHFILE
     printf '%-12s %-7s %-22s %-10s\n' '-----' '---' '----------' '----------'
     while read -r name; do
@@ -112,16 +100,16 @@ except Exception as e:
     done < <(list_agents)
 }
 
-cmd_shell() {
+cmd_session() {
     local name="${1:-}"; shift || true
     [[ -z "$name" ]] && {
-        echo "Usage: agentctl shell <agent> [--local] [--no-share] [--cd <dir>] [...claude-remote/runtime flags]" >&2
+        echo "Usage: agentctl session <agent> [--local] [--no-share] [--cd <dir>] [...claude-remote/runtime flags]" >&2
         echo "  Default: tmux-backed claude-remote (persistent across terminal close)." >&2
         echo "  --local: bypass claude-remote; use ~/.runtime/start.sh adapter or bare claude." >&2
         echo "  --no-share: skip auto-share of cwd to agent (agent runs from its own home)." >&2
         echo "  --cd <dir>: use <dir> as the project folder instead of the caller's cwd." >&2
         echo "    Useful for resuming pre-migration sessions whose project hash matches" >&2
-        echo "    a different dir, e.g. 'agentctl shell borges --cd /home/user/kg_protocol_for_ai --resume <id>'." >&2
+        echo "    a different dir, e.g. 'agentctl session borges --cd /home/user/kg_protocol_for_ai --resume <id>'." >&2
         echo "  Flags after agent name pass through (e.g., --continue, --resume <id>, --print)." >&2
         echo "  Auto-share: cwd (or --cd target) becomes the agent's project folder. If the" >&2
         echo "    agent doesn't already have rwX on it, this re-execs 'sudo agentctl share'" >&2
@@ -160,7 +148,7 @@ cmd_shell() {
     fi
 
     # Project-dir propagation + auto-share. Lei's design (2026-05-03): the directory
-    # where you type `agentctl shell` becomes the agent's project folder by default.
+    # where you type `agentctl session` becomes the agent's project folder by default.
     # We auto-grant rwX ACL so the agent can write inside it, then pass cwd as the
     # project dir to claude-remote / fallback launchers. Claude organizes session
     # JSONL by cwd (~/.claude/projects/<encoded-cwd>/), so this also keeps
@@ -264,55 +252,13 @@ cmd_bash() {
     sudo -u "$user" -i
 }
 
-cmd_run() {
-    local name="${1:-}"; shift || true
-    [[ -z "$name" ]] && { echo "Usage: agentctl run <agent> -- \"<prompt>\"" >&2; exit 2; }
-    [[ "${1:-}" == "--" ]] && shift
-    local user; user=$(resolve_user "$name")
-    sudo -u "$user" -i bash -c '~/.runtime/start.sh -p "$@"' -- "$@"
-}
 
-cmd_talk() {
-    local name="${1:-}"
-    [[ -z "$name" ]] && { echo "Usage: agentctl talk <agent>" >&2; exit 2; }
-    local _user; _user=$(resolve_user "$name") # validates agent exists
-    local stamp; stamp=$(date -u +%Y-%m-%dT%H-%M-%SZ)
-    local out="$SHARED_ROOT/inter-agent/${stamp}_spt-to-${name}.md"
-    : >"$out"
-    cat >"$out" <<HEADER
----
-from: spt
-to: $name
-timestamp: $stamp
----
-
-HEADER
-    "${EDITOR:-vi}" "$out"
-    chgrp agents "$out" 2>/dev/null || true
-}
-
-cmd_logs() {
-    local name="${1:-}"; shift || true
-    [[ -z "$name" ]] && { echo "Usage: agentctl logs <agent> [--tail]" >&2; exit 2; }
-    local _user; _user=$(resolve_user "$name")
-    local tail=0
-    [[ "${1:-}" == "--tail" ]] && tail=1
-    local home="/home/agent-$name"
-    # Group-readable agent logs.  Heartbeat first, then session.
-    local hb="$home/.engram/logs/heartbeat.log"
-    if [[ -r "$hb" ]]; then
-        if [[ $tail -eq 1 ]]; then tail -f "$hb"; else cat "$hb"; fi
-    else
-        echo "(no heartbeat log at $hb)"
-    fi
-}
-
-# ---------- v0.2 cron pause / resume ----------
+# ---------- internal cron helpers (used by finalize-name; not user-facing) ----------
 #
 # Comments out (or restores) the heartbeat.sh + sleep.sh lines in <agent>'s
-# crontab. Dispatcher and @reboot lines are intentionally left untouched so the
-# inbox / inter-agent channel stays reachable while the agent is quiesced.
-# Idempotent: re-running pause when already paused is a no-op; same for resume.
+# crontab. Called internally by cmd_finalize_name during the rename flow to
+# quiesce the newborn before usermod and restore crons after. Not exposed as
+# user-facing commands.
 
 cmd_pause() {
     local name="${1:-}"
@@ -894,8 +840,7 @@ JSON
   ✓ surface daemon: restarted under $chosen_user
 
 Smoke test:
-  agentctl shell $chosen          # should drop you into a clean shell
-  agentctl logs $chosen --tail    # should see new heartbeat fire on next :00 or :30
+  agentctl session $chosen        # should drop you into a clean session
   sudo -u $chosen_user crontab -l | grep AGENT_NAME=
                                   # should show AGENT_NAME=$chosen, not newborn-*
 
@@ -904,7 +849,7 @@ active-work/spawn-implementation-2026-05-05.md (v0.2 retire ceremony).
 DONE
 }
 
-# ---------- v0.1 broker: share / unshare / shares ----------
+# ---------- v0.1 broker: share / unshare / share-status ----------
 #
 # Mechanism: POSIX ACLs (setfacl/getfacl). Multi-agent compatible (each agent
 # has its own ACL entry on the path), TTL-revocable, audit-logged. State lives
@@ -1117,7 +1062,7 @@ PYEOF
     echo "✓ Unshared $path from $agent"
 }
 
-cmd_shares() {
+cmd_share_status() {
     local agent="${1:-}"
     local state_dir="$SHARED_ROOT/share-state"
     if [[ ! -d "$state_dir" ]]; then
@@ -1152,22 +1097,14 @@ cmd_help() {
 }
 
 case "$SUBCMD" in
-    status)        cmd_status        "$@" ;;
-    shell)         cmd_shell         "$@" ;;
+    health)        cmd_health        "$@" ;;
+    session)       cmd_session       "$@" ;;
     bash)          cmd_bash          "$@" ;;
-    run)           cmd_run           "$@" ;;
-    talk)          cmd_talk          "$@" ;;
-    logs)          cmd_logs          "$@" ;;
-    pause)         cmd_pause         "$@" ;;
-    resume)        cmd_resume        "$@" ;;
     spawn)         cmd_spawn         "$@" ;;
     finalize-name) cmd_finalize_name "$@" ;;
     share)         cmd_share         "$@" ;;
     unshare)       cmd_unshare       "$@" ;;
-    shares)        cmd_shares        "$@" ;;
-    grant|audit|upgrade-engram)
-        echo "ERROR: '$SUBCMD' not implemented yet.  See active-work/multi-agent-uid-substrate-2026-05-02.md" >&2
-        exit 3 ;;
+    share-status)  cmd_share_status  "$@" ;;
     help|--help|-h) cmd_help ;;
     *) echo "Unknown subcommand: $SUBCMD"; cmd_help; exit 2 ;;
 esac
