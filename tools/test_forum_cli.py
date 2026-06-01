@@ -1,0 +1,815 @@
+"""Tests for tools/forum.py — agent-first forum CLI.
+
+Integration strategy: spin up the real forum server via Flask's test_client()
+(from forum.server.create_app + a tmp SQLite DB) and wire the CLI's _api_get /
+_api_post to call through it. This avoids contract-drift between mock responses
+and the real API — the CLI talks to the actual Flask routes.
+
+The wiring is done by monkeypatching the forum module's _do_request() function
+so that urllib.request calls are intercepted and forwarded to the Flask test
+client. This keeps the CLI code unmodified while giving real HTTP semantics
+(status codes, JSON bodies, error shapes).
+
+Test coverage (per spec):
+  - post new thread (returns thread_id + post_id)
+  - reply to existing thread (returns thread_id + post_id)
+  - list with category filter
+  - list with sort filter
+  - list --limit
+  - read advances cursor to thread's last_activity_at
+  - read --format json
+  - status tally (new_since_cursor count)
+  - online command
+  - cursor --set monotonic enforcement
+  - cursor --set --force override
+  - cursor --show
+  - server-unreachable → exit 3
+  - unknown-category → exit 2
+  - missing agent_name → exit 2
+"""
+
+import io
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+from unittest import mock
+
+import pytest
+
+# ---------------------------------------------------------------------------
+# Discover the worktree root so we can import the CLI module
+# ---------------------------------------------------------------------------
+_THIS_DIR = Path(__file__).parent
+_ROOT = _THIS_DIR.parent  # repo root (worktree root)
+
+# Ensure tools/ and forum/ are on the path
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+import tools.forum as forum_cli  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Try to import the real forum server for integration tests.
+# If the forum package isn't importable (e.g. missing Flask), fall back to
+# mock-only mode and skip integration fixtures gracefully.
+# ---------------------------------------------------------------------------
+try:
+    from forum.db import init_db
+    from forum.server import create_app
+    _FORUM_AVAILABLE = True
+except ImportError:
+    _FORUM_AVAILABLE = False
+
+SKIP_INTEGRATION = pytest.mark.skipif(
+    not _FORUM_AVAILABLE,
+    reason="forum server package not importable (Flask/deps missing)",
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def engram_home(tmp_path):
+    """Temp ENGRAM_HOME with a minimal config.json."""
+    home = tmp_path / "engram"
+    home.mkdir()
+    config = {"agent_name": "testbot", "forum": {"url": "http://localhost:59999"}}
+    (home / "config.json").write_text(json.dumps(config))
+    return home
+
+
+@pytest.fixture(autouse=True)
+def reset_forum_cli_cache(engram_home, monkeypatch):
+    """Reset the CLI's lazy-cached forum URL and patch ENGRAM_HOME on each test."""
+    # Reset the module-level URL cache
+    forum_cli._FORUM_URL_CACHE = None
+
+    # Patch ENGRAM_HOME + cursor paths in the module
+    monkeypatch.setattr(forum_cli, "ENGRAM_HOME", str(engram_home))
+    monkeypatch.setattr(
+        forum_cli, "READ_CURSOR_PATH", str(engram_home / "forum-read-cursor.txt")
+    )
+    monkeypatch.setattr(
+        forum_cli, "SURFACED_CURSOR_PATH", str(engram_home / "forum-surfaced-cursor.txt")
+    )
+    yield
+    # Reset cache again after each test
+    forum_cli._FORUM_URL_CACHE = None
+
+
+@pytest.fixture
+def flask_app(tmp_path):
+    """Real Flask forum app with a tmp SQLite DB (integration tests only)."""
+    if not _FORUM_AVAILABLE:
+        pytest.skip("forum server not available")
+    db_path = str(tmp_path / "forum.db")
+    audit_path = str(tmp_path / "audit.jsonl")
+    conn = sqlite3.connect(db_path)
+    init_db(conn)
+    conn.close()
+    app = create_app(db_path, audit_path)
+    app.config["TESTING"] = True
+    return app
+
+
+@pytest.fixture
+def flask_client(flask_app):
+    return flask_app.test_client()
+
+
+@pytest.fixture
+def wired_cli(flask_client, engram_home):
+    """Wire the CLI's HTTP calls through the Flask test client.
+
+    Returns a helper that calls forum_cli with the given argv + optional stdin,
+    captures stdout/stderr, and returns (stdout, stderr, exit_code).
+
+    The Flask test client is patched onto forum_cli._do_request so that any
+    urllib.request.Request → flask_client response. We also set FORUM_URL to
+    a local URL so that _resolve_forum_url doesn't try to connect for real.
+    """
+    base_url = "http://testserver"
+
+    # Override config to point at our fake URL
+    config = {"agent_name": "testbot", "forum": {"url": base_url}}
+    (engram_home / "config.json").write_text(json.dumps(config))
+    forum_cli._FORUM_URL_CACHE = None
+
+    def _patched_do_request(req, url):
+        """Translate urllib.request.Request into a flask test_client call.
+
+        Mirrors the error-handling contract of the real _do_request:
+        exits with appropriate exit codes for HTTP errors.
+        """
+        # Extract relative path (strip base_url prefix)
+        if url.startswith(base_url):
+            path = url[len(base_url):]
+        else:
+            path = url
+
+        method = req.get_method()
+        headers = dict(req.headers) if req.headers else {}
+
+        if method == "POST":
+            data = req.data
+            resp = flask_client.post(
+                path,
+                data=data,
+                content_type=headers.get("Content-Type", "application/json"),
+            )
+        else:
+            resp = flask_client.get(path)
+
+        # Mirror _do_request error handling for non-2xx responses
+        if resp.status_code >= 400:
+            body = resp.data.decode("utf-8", errors="replace")
+            try:
+                err_data = json.loads(body)
+                err_msg = err_data.get("error", body)
+            except (json.JSONDecodeError, ValueError):
+                err_msg = body
+            if resp.status_code == 404:
+                print(f"forum: not found (404): {err_msg}", file=sys.stderr)
+                sys.exit(forum_cli.EXIT_NOT_FOUND)
+            elif resp.status_code == 400:
+                print(f"forum: validation error (400): {err_msg}", file=sys.stderr)
+                sys.exit(forum_cli.EXIT_VALIDATION)
+            else:
+                print(f"forum: server error ({resp.status_code}): {err_msg}", file=sys.stderr)
+                sys.exit(forum_cli.EXIT_VALIDATION)
+
+        return json.loads(resp.data.decode("utf-8"))
+
+    def run_cli(argv, stdin_text=None):
+        """Run the CLI with given argv; return (stdout, stderr, exit_code)."""
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        stdin_str = stdin_text if stdin_text is not None else ""
+
+        with mock.patch.object(forum_cli, "_do_request", side_effect=_patched_do_request), \
+             mock.patch("sys.argv", ["forum"] + argv), \
+             mock.patch("sys.stdout", stdout_buf), \
+             mock.patch("sys.stderr", stderr_buf), \
+             mock.patch("sys.stdin", io.StringIO(stdin_str)):
+            try:
+                forum_cli.main()
+                exit_code = 0
+            except SystemExit as e:
+                exit_code = e.code if isinstance(e.code, int) else 0
+
+        return stdout_buf.getvalue(), stderr_buf.getvalue(), exit_code
+
+    return run_cli
+
+
+# ---------------------------------------------------------------------------
+# Integration tests (require flask_app)
+# ---------------------------------------------------------------------------
+
+@SKIP_INTEGRATION
+class TestPostNewThread:
+    def test_returns_thread_and_post_ids(self, wired_cli):
+        stdout, stderr, code = wired_cli(
+            ["post", "--category", "inter-agent", "--title", "Hello forum"],
+            stdin_text="This is the first post.",
+        )
+        assert code == 0, f"stderr: {stderr}"
+        assert "thread_id=" in stdout
+        assert "post_id=" in stdout
+
+    def test_thread_id_is_integer(self, wired_cli):
+        stdout, stderr, code = wired_cli(
+            ["post", "--category", "cold-start", "--title", "Cold start test"],
+            stdin_text="Body text.",
+        )
+        assert code == 0, f"stderr: {stderr}"
+        # Extract thread_id value
+        import re
+        m = re.search(r"thread_id=(\d+)", stdout)
+        assert m is not None
+        assert int(m.group(1)) > 0
+
+    def test_unknown_category_exits_2(self, wired_cli):
+        stdout, stderr, code = wired_cli(
+            ["post", "--category", "does-not-exist", "--title", "Bad category"],
+            stdin_text="Body.",
+        )
+        assert code == forum_cli.EXIT_VALIDATION, f"stdout: {stdout}, stderr: {stderr}"
+
+    def test_empty_stdin_exits_2(self, wired_cli):
+        stdout, stderr, code = wired_cli(
+            ["post", "--category", "inter-agent", "--title", "No body"],
+            stdin_text="",
+        )
+        assert code == forum_cli.EXIT_VALIDATION
+
+
+@SKIP_INTEGRATION
+class TestReply:
+    def _make_thread(self, wired_cli):
+        stdout, _, _ = wired_cli(
+            ["post", "--category", "inter-agent", "--title", "OP thread"],
+            stdin_text="Opening post body.",
+        )
+        import re
+        m = re.search(r"thread_id=(\d+)", stdout)
+        return int(m.group(1))
+
+    def test_reply_returns_thread_and_post_ids(self, wired_cli):
+        tid = self._make_thread(wired_cli)
+        stdout, stderr, code = wired_cli(
+            ["reply", str(tid)],
+            stdin_text="This is a reply.",
+        )
+        assert code == 0, f"stderr: {stderr}"
+        assert f"thread_id={tid}" in stdout
+        assert "post_id=" in stdout
+
+    def test_reply_to_nonexistent_thread_exits_4(self, wired_cli):
+        stdout, stderr, code = wired_cli(
+            ["reply", "99999"],
+            stdin_text="Reply body.",
+        )
+        assert code == forum_cli.EXIT_NOT_FOUND
+
+
+@SKIP_INTEGRATION
+class TestList:
+    def _post_thread(self, wired_cli, category="inter-agent", title="Test thread"):
+        wired_cli(
+            ["post", "--category", category, "--title", title],
+            stdin_text="Thread body.",
+        )
+
+    def test_list_returns_threads(self, wired_cli):
+        self._post_thread(wired_cli)
+        stdout, stderr, code = wired_cli(["list"])
+        assert code == 0, f"stderr: {stderr}"
+        assert "THREADS" in stdout
+
+    def test_list_category_filter(self, wired_cli):
+        self._post_thread(wired_cli, category="cold-start", title="CS thread")
+        self._post_thread(wired_cli, category="inter-agent", title="IA thread")
+
+        stdout, _, code = wired_cli(["list", "--category", "cold-start"])
+        assert code == 0
+        assert "cold-start" in stdout
+        # The inter-agent thread should not appear
+        assert "IA thread" not in stdout
+
+    def test_list_sort_new(self, wired_cli):
+        self._post_thread(wired_cli)
+        stdout, _, code = wired_cli(["list", "--sort", "new"])
+        assert code == 0
+        assert "THREADS" in stdout
+
+    def test_list_limit(self, wired_cli):
+        for i in range(3):
+            self._post_thread(wired_cli, title=f"Thread {i}")
+        stdout, _, code = wired_cli(["list", "--limit", "1"])
+        assert code == 0
+        # With --limit 1, exactly one thread entry
+        import re
+        entries = re.findall(r"#\d+", stdout)
+        assert len(entries) == 1
+
+    def test_list_json_format(self, wired_cli):
+        self._post_thread(wired_cli)
+        stdout, _, code = wired_cli(["list", "--format", "json"])
+        assert code == 0
+        data = json.loads(stdout)
+        assert "threads" in data
+        assert isinstance(data["threads"], list)
+
+    def test_list_does_not_advance_cursor(self, wired_cli, engram_home):
+        """list must not touch the read cursor."""
+        cursor_path = engram_home / "forum-read-cursor.txt"
+        self._post_thread(wired_cli)
+        before_exists = cursor_path.exists()
+        wired_cli(["list"])
+        after_exists = cursor_path.exists()
+        # The cursor should not have been created by list
+        assert not after_exists or (
+            before_exists and cursor_path.read_text() == ""
+        ), "list must not advance the read cursor"
+
+
+@SKIP_INTEGRATION
+class TestRead:
+    def _make_thread(self, wired_cli, category="tools-hooks", title="Test thread"):
+        stdout, _, _ = wired_cli(
+            ["post", "--category", category, "--title", title],
+            stdin_text="Initial post body.",
+        )
+        import re
+        m = re.search(r"thread_id=(\d+)", stdout)
+        return int(m.group(1))
+
+    def test_read_displays_thread(self, wired_cli):
+        tid = self._make_thread(wired_cli)
+        stdout, stderr, code = wired_cli(["read", str(tid)])
+        assert code == 0, f"stderr: {stderr}"
+        assert "Thread" in stdout or str(tid) in stdout
+        # Should display body_md content
+        assert "Initial post body" in stdout
+
+    def test_read_advances_cursor(self, wired_cli, engram_home):
+        """read must advance the read cursor to the thread's last_activity_at."""
+        cursor_path = engram_home / "forum-read-cursor.txt"
+        assert not cursor_path.exists(), "cursor should not exist yet"
+
+        tid = self._make_thread(wired_cli)
+        stdout, stderr, code = wired_cli(["read", str(tid)])
+        assert code == 0, f"stderr: {stderr}"
+
+        # Cursor must now exist
+        assert cursor_path.exists(), "read must write the cursor"
+        raw = cursor_path.read_text().strip()
+        # Must be a valid ISO timestamp
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        assert dt.tzinfo is not None
+
+    def test_read_cursor_is_monotonic(self, wired_cli, engram_home):
+        """A second read of an older thread must not retreat the cursor."""
+        tid1 = self._make_thread(wired_cli, title="First thread")
+        tid2 = self._make_thread(wired_cli, title="Second thread")
+
+        # Read thread2 first (newer)
+        wired_cli(["read", str(tid2)])
+        cursor_after_t2 = Path(engram_home / "forum-read-cursor.txt").read_text().strip()
+
+        # Read thread1 (older last_activity) — cursor must not retreat
+        wired_cli(["read", str(tid1)])
+        cursor_after_t1 = Path(engram_home / "forum-read-cursor.txt").read_text().strip()
+        assert cursor_after_t1 >= cursor_after_t2, (
+            "read cursor must not retreat when reading an older thread"
+        )
+
+    def test_read_json_format(self, wired_cli):
+        tid = self._make_thread(wired_cli)
+        stdout, _, code = wired_cli(["read", str(tid), "--format", "json"])
+        assert code == 0
+        data = json.loads(stdout)
+        assert "thread" in data
+        assert "posts" in data
+        # posts must have body_md (not body_html)
+        for post in data["posts"]:
+            assert "body_md" in post
+
+    def test_read_nonexistent_thread_exits_4(self, wired_cli):
+        stdout, stderr, code = wired_cli(["read", "99999"])
+        assert code == forum_cli.EXIT_NOT_FOUND
+
+
+@SKIP_INTEGRATION
+class TestStatus:
+    def test_status_shows_agent(self, wired_cli):
+        stdout, stderr, code = wired_cli(["status"])
+        assert code == 0, f"stderr: {stderr}"
+        assert "testbot" in stdout
+
+    def test_status_shows_url(self, wired_cli):
+        stdout, _, _ = wired_cli(["status"])
+        assert "testserver" in stdout or "http" in stdout
+
+    def test_status_json_format(self, wired_cli):
+        stdout, _, code = wired_cli(["status", "--format", "json"])
+        assert code == 0
+        data = json.loads(stdout)
+        assert "agent" in data
+        assert "new_since_cursor" in data
+        assert "online_count" in data
+
+    def test_status_new_count_increases_after_post(self, wired_cli, engram_home):
+        """After posting a thread, status should show new_since_cursor > 0."""
+        # Status with no cursor and no threads → 0 new
+        # (cursor is None → no since= filter → returns all; but DB is empty)
+        stdout, _, _ = wired_cli(["status", "--format", "json"])
+        data = json.loads(stdout)
+        assert data["new_since_cursor"] == 0
+
+        # Post a thread
+        wired_cli(
+            ["post", "--category", "inter-agent", "--title", "New thread"],
+            stdin_text="Body.",
+        )
+
+        # Set cursor to a far-past time so the new thread is "after" cursor
+        past = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        forum_cli._write_cursor(str(engram_home / "forum-read-cursor.txt"), past)
+
+        # Status with past cursor → new_since_cursor > 0
+        stdout, _, _ = wired_cli(["status", "--format", "json"])
+        data = json.loads(stdout)
+        assert data["new_since_cursor"] >= 1
+
+
+@SKIP_INTEGRATION
+class TestOnline:
+    def test_online_shows_registered(self, wired_cli):
+        # Posting as testbot registers it
+        wired_cli(
+            ["post", "--category", "inter-agent", "--title", "Online test"],
+            stdin_text="Body.",
+        )
+        stdout, _, code = wired_cli(["online"])
+        assert code == 0
+        # Should mention at least 1 online (testbot just made a request)
+        assert "registered" in stdout.lower() or "ONLINE" in stdout
+
+    def test_online_json_format(self, wired_cli):
+        stdout, _, code = wired_cli(["online", "--format", "json"])
+        assert code == 0
+        data = json.loads(stdout)
+        assert "online" in data
+        assert "count" in data
+        assert "registered" in data
+
+
+# ---------------------------------------------------------------------------
+# Cursor tests (local only — no server needed)
+# ---------------------------------------------------------------------------
+
+class TestCursor:
+    def _set_cursor(self, engram_home, ts_str):
+        cursor_path = engram_home / "forum-read-cursor.txt"
+        cursor_path.write_text(ts_str + "\n")
+
+    def test_cursor_show_when_none(self, engram_home):
+        """cursor --show when no cursor exists prints '(none)'."""
+        stdout_buf = io.StringIO()
+        with mock.patch("sys.argv", ["forum", "cursor", "--show"]), \
+             mock.patch("sys.stdout", stdout_buf):
+            try:
+                forum_cli.main()
+            except SystemExit:
+                pass
+        assert "(none)" in stdout_buf.getvalue()
+
+    def test_cursor_set_advances_forward(self, engram_home):
+        """cursor --set with a forward timestamp succeeds."""
+        ts = "2026-06-01T12:00:00Z"
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with mock.patch("sys.argv", ["forum", "cursor", "--set", ts]), \
+             mock.patch("sys.stdout", stdout_buf), \
+             mock.patch("sys.stderr", stderr_buf):
+            try:
+                forum_cli.main()
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        assert code == 0, stderr_buf.getvalue()
+        cursor_path = Path(engram_home / "forum-read-cursor.txt")
+        assert cursor_path.exists()
+        assert ts in cursor_path.read_text()
+
+    def test_cursor_set_monotonic_refuses_backward(self, engram_home):
+        """cursor --set refuses to move cursor backward without --force."""
+        self._set_cursor(engram_home, "2026-06-01T12:00:00Z")
+        stderr_buf = io.StringIO()
+        with mock.patch("sys.argv", ["forum", "cursor", "--set", "2026-01-01T00:00:00Z"]), \
+             mock.patch("sys.stderr", stderr_buf):
+            try:
+                forum_cli.main()
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        assert code == forum_cli.EXIT_VALIDATION
+        assert "backward" in stderr_buf.getvalue()
+
+    def test_cursor_set_force_allows_backward(self, engram_home):
+        """cursor --set --force allows cursor to move backward."""
+        self._set_cursor(engram_home, "2026-06-01T12:00:00Z")
+        old_ts = "2026-01-01T00:00:00Z"
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with mock.patch("sys.argv", ["forum", "cursor", "--set", old_ts, "--force"]), \
+             mock.patch("sys.stdout", stdout_buf), \
+             mock.patch("sys.stderr", stderr_buf):
+            try:
+                forum_cli.main()
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        assert code == 0, stderr_buf.getvalue()
+        cursor_path = Path(engram_home / "forum-read-cursor.txt")
+        assert old_ts in cursor_path.read_text()
+
+    def test_cursor_invalid_timestamp_exits_2(self, engram_home):
+        """cursor --set with a non-ISO value exits 2."""
+        stderr_buf = io.StringIO()
+        with mock.patch("sys.argv", ["forum", "cursor", "--set", "not-a-date"]), \
+             mock.patch("sys.stderr", stderr_buf):
+            try:
+                forum_cli.main()
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        assert code == forum_cli.EXIT_VALIDATION
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: error handling + agent-name gate (no server needed)
+# ---------------------------------------------------------------------------
+
+class TestAgentNameGate:
+    def test_missing_agent_name_exits_2(self, engram_home, monkeypatch):
+        """Commands that need an agent fail-loud with EXIT_VALIDATION."""
+        # Remove agent_name from config
+        (engram_home / "config.json").write_text(
+            json.dumps({"forum": {"url": "http://localhost:59999"}})
+        )
+        forum_cli._FORUM_URL_CACHE = None
+
+        # Patch env vars to ensure no username fallback
+        monkeypatch.delenv("USER", raising=False)
+        monkeypatch.delenv("LOGNAME", raising=False)
+        # Also patch _get_agent_name to ensure no pwd fallback
+        monkeypatch.setattr(forum_cli, "_get_agent_name", lambda *a, **kw: "")
+
+        stderr_buf = io.StringIO()
+        stdout_buf = io.StringIO()
+        with mock.patch("sys.argv", ["forum", "online"]), \
+             mock.patch("sys.stdout", stdout_buf), \
+             mock.patch("sys.stderr", stderr_buf):
+            try:
+                forum_cli.main()
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        assert code == forum_cli.EXIT_VALIDATION
+        assert "agent_name" in stderr_buf.getvalue()
+
+
+class TestServerUnreachable:
+    def test_unreachable_exits_3(self, engram_home, monkeypatch):
+        """When the server is down, any network command exits EXIT_UNREACHABLE."""
+        # Point at a port nothing is listening on
+        (engram_home / "config.json").write_text(
+            json.dumps({"agent_name": "testbot", "forum": {"url": "http://localhost:59999"}})
+        )
+        forum_cli._FORUM_URL_CACHE = None
+
+        stderr_buf = io.StringIO()
+        stdout_buf = io.StringIO()
+        with mock.patch("sys.argv", ["forum", "online"]), \
+             mock.patch("sys.stdout", stdout_buf), \
+             mock.patch("sys.stderr", stderr_buf):
+            try:
+                forum_cli.main()
+                code = 0
+            except SystemExit as e:
+                code = e.code
+
+        assert code == forum_cli.EXIT_UNREACHABLE
+        err = stderr_buf.getvalue()
+        assert "not reachable" in err
+        assert "localhost:59999" in err
+
+
+class TestUrlResolution:
+    """Unit tests for _resolve_forum_url resolution order."""
+
+    def test_config_wins_over_env(self, engram_home, monkeypatch):
+        forum_cli._FORUM_URL_CACHE = None
+        config = {"agent_name": "x", "forum": {"url": "http://from-config:5002"}}
+        (engram_home / "config.json").write_text(json.dumps(config))
+        monkeypatch.setenv("FORUM_URL", "http://from-env:5002")
+        url = forum_cli._resolve_forum_url()
+        assert url == "http://from-config:5002"
+        forum_cli._FORUM_URL_CACHE = None
+
+    def test_env_wins_over_default(self, engram_home, monkeypatch):
+        forum_cli._FORUM_URL_CACHE = None
+        config = {"agent_name": "x"}
+        (engram_home / "config.json").write_text(json.dumps(config))
+        monkeypatch.setenv("FORUM_URL", "http://from-env:5002")
+        url = forum_cli._resolve_forum_url()
+        assert url == "http://from-env:5002"
+        forum_cli._FORUM_URL_CACHE = None
+
+    def test_default_fallback(self, engram_home, monkeypatch):
+        forum_cli._FORUM_URL_CACHE = None
+        config = {"agent_name": "x"}
+        (engram_home / "config.json").write_text(json.dumps(config))
+        monkeypatch.delenv("FORUM_URL", raising=False)
+        url = forum_cli._resolve_forum_url()
+        assert url == "http://localhost:5002"
+        forum_cli._FORUM_URL_CACHE = None
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: fix regressions (no server needed)
+# ---------------------------------------------------------------------------
+
+class TestStatusHintWhenCursorUnset:
+    """status --since hint must not emit '--since (none)' when cursor is unset."""
+
+    def _run_status(self, engram_home, monkeypatch):
+        """Run `forum status` with a mocked _api_get that returns empty data."""
+        # Patch _api_get to return minimal stub data so status doesn't need a server
+        def fake_api_get(url, params=None):
+            if "/api/threads" in url:
+                return {"threads": []}
+            if "/api/agents/online" in url:
+                return {"count": 0, "registered": 0}
+            return {}
+
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with mock.patch.object(forum_cli, "_api_get", side_effect=fake_api_get), \
+             mock.patch("sys.argv", ["forum", "status"]), \
+             mock.patch("sys.stdout", stdout_buf), \
+             mock.patch("sys.stderr", stderr_buf):
+            try:
+                forum_cli.main()
+            except SystemExit:
+                pass
+        return stdout_buf.getvalue()
+
+    def test_no_since_none_hint_when_cursor_unset(self, engram_home, monkeypatch):
+        """When read cursor is unset, status must not suggest --since (none)."""
+        # Cursor file does not exist — cursor is None
+        cursor_path = engram_home / "forum-read-cursor.txt"
+        assert not cursor_path.exists(), "cursor must not exist for this test"
+
+        # Patch _api_get to return one thread so the hint branch fires
+        def fake_api_get(url, params=None):
+            if "/api/threads" in url:
+                return {"threads": [{"id": 1, "title": "x", "last_activity_at": "2026-05-31T10:00:00Z"}]}
+            if "/api/agents/online" in url:
+                return {"count": 1, "registered": 1}
+            return {}
+
+        stdout_buf = io.StringIO()
+        with mock.patch.object(forum_cli, "_api_get", side_effect=fake_api_get), \
+             mock.patch("sys.argv", ["forum", "status"]), \
+             mock.patch("sys.stdout", stdout_buf), \
+             mock.patch("sys.stderr", io.StringIO()):
+            try:
+                forum_cli.main()
+            except SystemExit:
+                pass
+        output = stdout_buf.getvalue()
+        assert "--since (none)" not in output, (
+            f"status must not emit '--since (none)' when cursor is unset; got:\n{output}"
+        )
+
+    def test_since_hint_present_when_cursor_is_set(self, engram_home):
+        """When read cursor IS set, the --since <cursor> hint should appear."""
+        # Write a real cursor
+        ts = "2026-05-01T00:00:00Z"
+        (engram_home / "forum-read-cursor.txt").write_text(ts + "\n")
+
+        def fake_api_get(url, params=None):
+            if "/api/threads" in url:
+                return {"threads": [{"id": 1, "title": "y", "last_activity_at": "2026-05-31T10:00:00Z"}]}
+            if "/api/agents/online" in url:
+                return {"count": 1, "registered": 1}
+            return {}
+
+        stdout_buf = io.StringIO()
+        with mock.patch.object(forum_cli, "_api_get", side_effect=fake_api_get), \
+             mock.patch("sys.argv", ["forum", "status"]), \
+             mock.patch("sys.stdout", stdout_buf), \
+             mock.patch("sys.stderr", io.StringIO()):
+            try:
+                forum_cli.main()
+            except SystemExit:
+                pass
+        output = stdout_buf.getvalue()
+        assert "--since 2026-05-01T00:00:00Z" in output, (
+            f"status must include '--since <cursor>' hint when cursor is set; got:\n{output}"
+        )
+
+
+class TestHookCursorNotAdvancedOnUnreachableNoCache:
+    """Hook must not advance the surfaced cursor when server is unreachable and no cache exists."""
+
+    @classmethod
+    def _load_hook_module(cls):
+        """Load engram-forum-prompt-hook.py via importlib (hyphenated filename)."""
+        import importlib.util
+        hook_path = (
+            Path(__file__).parent.parent
+            / "hooks" / "claude" / "engram-forum-prompt-hook.py"
+        )
+        spec = importlib.util.spec_from_file_location("engram_forum_prompt_hook", hook_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_cursor_not_advanced_on_unreachable_no_cache(self, tmp_path, monkeypatch):
+        """When server is unreachable and no cache exists, surfaced cursor must not advance."""
+        hook = self._load_hook_module()
+
+        # Set up a temp ENGRAM_HOME so the hook reads config from it
+        engram_home = tmp_path / "hook-engram"
+        engram_home.mkdir()
+        config = {"agent_name": "testbot", "forum": {"url": "http://localhost:59998"}}
+        (engram_home / "config.json").write_text(json.dumps(config))
+
+        surfaced_cursor_path = str(engram_home / "forum-surfaced-cursor.txt")
+        hook_cache_path = str(engram_home / "forum-hook-cache.json")
+
+        # Patch module-level paths
+        monkeypatch.setattr(hook, "ENGRAM_HOME", str(engram_home))
+        monkeypatch.setattr(hook, "SURFACED_CURSOR_PATH", surfaced_cursor_path)
+        monkeypatch.setattr(hook, "HOOK_CACHE_PATH", hook_cache_path)
+
+        # No cache file exists; _fetch_threads returns None (server unreachable)
+        monkeypatch.setattr(hook, "_fetch_threads", lambda *a, **kw: None)
+        # _load_cache returns None (no fresh cache)
+        monkeypatch.setattr(hook, "_load_cache", lambda: None)
+
+        # Run the hook's main — should exit silently
+        try:
+            hook.main()
+        except SystemExit:
+            pass
+
+        # Surfaced cursor must NOT have been written
+        assert not Path(surfaced_cursor_path).exists(), (
+            "hook must not advance the surfaced cursor when server is unreachable "
+            "and no cache exists (threads is None)"
+        )
+
+    def test_cursor_advanced_on_successful_fetch(self, tmp_path, monkeypatch):
+        """When a successful fetch returns threads (even empty list), cursor IS advanced."""
+        hook = self._load_hook_module()
+
+        engram_home = tmp_path / "engram2"
+        engram_home.mkdir()
+        config = {"agent_name": "testbot", "forum": {"url": "http://localhost:59998"}}
+        (engram_home / "config.json").write_text(json.dumps(config))
+
+        surfaced_cursor_path = str(engram_home / "forum-surfaced-cursor.txt")
+        hook_cache_path = str(engram_home / "forum-hook-cache.json")
+
+        monkeypatch.setattr(hook, "ENGRAM_HOME", str(engram_home))
+        monkeypatch.setattr(hook, "SURFACED_CURSOR_PATH", surfaced_cursor_path)
+        monkeypatch.setattr(hook, "HOOK_CACHE_PATH", hook_cache_path)
+
+        # Successful fetch returns empty list (no new threads — hook exits silently)
+        monkeypatch.setattr(hook, "_fetch_threads", lambda *a, **kw: [])
+        monkeypatch.setattr(hook, "_load_cache", lambda: None)
+        # _save_cache is a no-op for this test
+        monkeypatch.setattr(hook, "_save_cache", lambda threads: None)
+
+        try:
+            hook.main()
+        except SystemExit:
+            pass
+
+        # Surfaced cursor SHOULD have been written (threads is not None — empty list is fine)
+        assert Path(surfaced_cursor_path).exists(), (
+            "hook must advance the surfaced cursor when fetch succeeds (even with 0 threads)"
+        )
