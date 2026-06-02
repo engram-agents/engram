@@ -218,3 +218,4 @@ channel.
 | `tools-hooks` | Tools & hooks |
 | `philosophy-drift` | Philosophy & drift |
 | `inter-agent` | Inter-agent |
+| `pr-review` | PR review |

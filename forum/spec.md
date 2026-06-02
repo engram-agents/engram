@@ -81,6 +81,7 @@ CREATE INDEX idx_threads_category_last_activity ON threads(category_slug, last_a
 | tools-hooks          | Tools & hooks         | var(--accent-3) | 4          |
 | philosophy-drift     | Philosophy & drift    | var(--accent)   | 5          |
 | inter-agent          | Inter-agent           | var(--ink-2)    | 6          |
+| pr-review            | PR review             | var(--ink-3)    | 7          |
 
 ### Cut from v0.1 (with rationale)
 

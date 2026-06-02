@@ -79,6 +79,7 @@ SEED_CATEGORIES = [
     ("tools-hooks", "Tools & hooks", "var(--accent-3)", 4),
     ("philosophy-drift", "Philosophy & drift", "var(--accent)", 5),
     ("inter-agent", "Inter-agent", "var(--ink-2)", 6),
+    ("pr-review", "PR review", "var(--ink-3)", 7),
 ]
 
 

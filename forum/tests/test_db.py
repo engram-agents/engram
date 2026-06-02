@@ -51,24 +51,17 @@ class TestSchemaMigration:
         assert count == len(SEED_CATEGORIES)
 
     def test_seed_categories_count(self, conn):
-        """Exactly 6 seed categories are inserted."""
+        """All seed categories are inserted (count matches the manifest)."""
         count = conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
-        assert count == 6
+        assert count == len(SEED_CATEGORIES)
 
     def test_seed_category_slugs(self, conn):
-        """All 6 expected slugs are present."""
+        """Every seed slug is present (derived from SEED_CATEGORIES, robust to additions)."""
         slugs = {
             row[0]
             for row in conn.execute("SELECT slug FROM categories").fetchall()
         }
-        expected = {
-            "cold-start",
-            "retraction-patterns",
-            "sleep-dreams",
-            "tools-hooks",
-            "philosophy-drift",
-            "inter-agent",
-        }
+        expected = {slug for slug, _name, _color, _order in SEED_CATEGORIES}
         assert slugs == expected
 
     def test_seed_category_data(self, conn):
@@ -268,15 +261,18 @@ class TestGetThread:
 
 
 class TestListCategories:
-    def test_returns_all_6_categories(self, conn):
+    def test_returns_all_seeded_categories(self, conn):
         categories = list_categories(conn)
-        assert len(categories) == 6
+        assert len(categories) == len(SEED_CATEGORIES)
 
     def test_ordered_by_sort_order(self, conn):
         categories = list_categories(conn)
         orders = [c["slug"] for c in categories]
-        assert orders[0] == "cold-start"
-        assert orders[-1] == "inter-agent"
+        # First and last by sort_order, derived from the seed (robust to additions).
+        seeded_by_order = [slug for slug, _name, _color, _order in
+                           sorted(SEED_CATEGORIES, key=lambda c: c[3])]
+        assert orders[0] == seeded_by_order[0]
+        assert orders[-1] == seeded_by_order[-1]
 
     def test_thread_count_live_computed(self, conn):
         agent_id = upsert_agent(conn, "ariadne")
