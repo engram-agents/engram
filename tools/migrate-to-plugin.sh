@@ -267,6 +267,14 @@ require_jq() {
 step0_preflight() {
     section "Step 0: Pre-flight"
 
+    # jq is required up-front. Step 2's plugin build reads multi_agent/install_tier
+    # from config.json via jq to pass --multi-agent/--tier (#704); without jq the
+    # config read is skipped and the build silently falls back to single-agent —
+    # the exact regression #704 prevents. Fail loud here, before any build, rather
+    # than at Step 3 (which still calls require_jq for the --resume path that skips
+    # Step 0). require_jq is idempotent, so the double-call on the full path is safe.
+    require_jq
+
     # Guard: scatter install must exist.
     if [[ ! -f "$ENGRAM_HOME/knowledge.db" ]]; then
         err "No scatter install found — $ENGRAM_HOME/knowledge.db does not exist.
@@ -364,16 +372,36 @@ BACKUP_DIR=""
 step2_install_plugin() {
     section "Step 2: Install plugin surfaces"
 
+    # Build the plugin with THIS install's feature-set, read from config.json.
+    # Without this, build-plugin.sh defaults to single-agent (MULTI_AGENT=0) and
+    # reads only its --multi-agent/--tier flags (never config.json), so migrating
+    # a multi-agent install would SILENTLY DROP its multi-agent surfaces
+    # (baton / inter-agent letters / forum / inter-agent prompt-hook). #704.
+    # NOTE: necessary, not sufficient — other break surfaces (surface-drift hooks,
+    # RUNTIME_TOOLS, the engram_client fallback) are separate; see the audit on #704.
+    # install.sh persists both fields; install_tier is null on controlled
+    # multi-agent installs, so pass --tier ONLY when set (else build-plugin uses
+    # its manifest default_tier).
+    local build_flags=()
+    local _cfg="$ENGRAM_HOME/config.json"
+    if [[ -f "$_cfg" ]] && command -v jq &>/dev/null; then
+        local _ma _tier
+        _ma="$(jq -r '.multi_agent // false' "$_cfg")"
+        _tier="$(jq -r '.install_tier // empty' "$_cfg")"
+        [[ "$_ma" == "true" ]] && build_flags+=("--multi-agent")
+        [[ -n "$_tier" ]] && build_flags+=("--tier" "$_tier")
+    fi
+
     if [[ $DRY_RUN -eq 1 ]]; then
-        dry "Would run: bash $REPO_ROOT/tools/build-plugin.sh"
+        dry "Would run: bash $REPO_ROOT/tools/build-plugin.sh ${build_flags[*]:-}"
         dry "Would run: bash $REPO_ROOT/tools/install-local-marketplace.sh"
         dry "Would write migration state 'post-step2' to $MIGRATION_STATE_FILE"
         dry "Would pause and wait for user /plugin install + --resume invocation."
         return
     fi
 
-    info "Building plugin tree..."
-    bash "$REPO_ROOT/tools/build-plugin.sh"
+    info "Building plugin tree (flags: ${build_flags[*]:-none})..."
+    bash "$REPO_ROOT/tools/build-plugin.sh" ${build_flags[@]+"${build_flags[@]}"}
 
     info "Installing local marketplace..."
     bash "$REPO_ROOT/tools/install-local-marketplace.sh"
