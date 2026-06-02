@@ -628,6 +628,88 @@ class TestCursor:
                 code = e.code
         assert code == forum_cli.EXIT_VALIDATION
 
+    # --- regression tests for issue #663: cursor precision ---
+
+    def test_cursor_roundtrip_preserves_microseconds(self, engram_home):
+        """_write_cursor then _read_cursor round-trips microseconds exactly.
+
+        Regression for #663: the old strftime("%Y-%m-%dT%H:%M:%SZ") truncated
+        microseconds, so a sub-second timestamp was silently coarsened.
+        """
+        cursor_path = str(engram_home / "forum-read-cursor.txt")
+        ts = datetime(2026, 6, 2, 12, 0, 0, 123456, tzinfo=timezone.utc)
+        forum_cli._write_cursor(cursor_path, ts)
+        recovered = forum_cli._read_cursor(cursor_path)
+        assert recovered is not None
+        assert recovered == ts, (
+            f"round-trip must preserve microseconds; wrote {ts!r}, got {recovered!r}"
+        )
+
+    def test_cursor_str_microseconds_not_excluded_by_since_filter(self, engram_home):
+        """The fixed cursor format preserves microseconds so the since-filter works correctly.
+
+        The core bug in #663: the cursor was formatted as seconds-only
+        '2026-06-02T12:00:00Z' (strftime truncation), while DB timestamps carry
+        microseconds like '2026-06-02T12:00:00.500000Z'.  Lexicographically
+        '.' (0x2E) < 'Z' (0x5A), so '...00.500000Z' sorts BEFORE '...00Z',
+        meaning a DB `WHERE created_at > '...00Z'` silently EXCLUDES a post at
+        '...00.500000Z' even though it is temporally later.
+
+        After the fix, the cursor stores its microseconds (e.g. '...00.123456Z').
+        A post at '...00.500000Z' satisfies '...00.500000Z' > '...00.123456Z'
+        because after the common '...00.' prefix the digit comparison is correct.
+
+        This test constructs the bug directly: the cursor was advanced to a
+        datetime with non-zero microseconds (e.g. 123456 µs), which the OLD code
+        would truncate to '...00Z', losing the sub-second component.  We verify
+        that the FIXED _cursor_str keeps the microseconds so that a subsequent
+        post at 500000 µs correctly sorts AFTER the cursor.
+        """
+        # Simulate cursor advanced to a datetime with non-zero microseconds
+        # (e.g. the thread's last_activity_at was at 123456 µs into the second).
+        cursor_ts = datetime(2026, 6, 2, 12, 0, 0, 123456, tzinfo=timezone.utc)
+        cursor_str = forum_cli._cursor_str(cursor_ts)
+
+        # Fixed: microseconds are preserved in the output
+        assert cursor_str == "2026-06-02T12:00:00.123456Z", (
+            f"_cursor_str must preserve microseconds after fix; got {cursor_str!r}"
+        )
+
+        # A post at 500000 µs in the same second — must sort AFTER the cursor
+        # so the since-filter `WHERE created_at > cursor_str` includes it.
+        post_ts_str = "2026-06-02T12:00:00.500000Z"
+        assert cursor_str < post_ts_str, (
+            f"Post at {post_ts_str!r} must sort AFTER cursor {cursor_str!r} "
+            f"(since-filter includes it); '.' prefix comparison must work correctly"
+        )
+
+        # Also verify the pre-fix behavior: old seconds-only cursor string would
+        # have caused the post to be EXCLUDED (sorts before the cursor).
+        old_cursor_str = "2026-06-02T12:00:00Z"
+        post_same_second_str = "2026-06-02T12:00:00.000123Z"
+        # '.' (0x2E) < 'Z' (0x5A) → sub-second post sorts BEFORE seconds-only cursor
+        assert post_same_second_str < old_cursor_str, (
+            "Pre-fix demonstration: a sub-second post sorts BEFORE a seconds-only cursor; "
+            "this is the lexicographic ordering bug that the fix eliminates by ensuring "
+            "the cursor carries microseconds matching the DB timestamp format"
+        )
+
+    def test_cursor_backward_compat_seconds_only_string_parses(self, engram_home):
+        """A legacy seconds-only cursor file ('...T12:00:00Z') still parses correctly.
+
+        _read_cursor uses datetime.fromisoformat which handles both formats,
+        so old cursor files written before this fix remain readable.
+        """
+        cursor_path = engram_home / "forum-read-cursor.txt"
+        # Write old-format seconds-only string directly (no microseconds)
+        cursor_path.write_text("2026-05-01T10:30:00Z\n")
+        recovered = forum_cli._read_cursor(str(cursor_path))
+        assert recovered is not None
+        expected = datetime(2026, 5, 1, 10, 30, 0, 0, tzinfo=timezone.utc)
+        assert recovered == expected, (
+            f"seconds-only legacy cursor must parse correctly; got {recovered!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Unit tests: error handling + agent-name gate (no server needed)

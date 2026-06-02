@@ -161,7 +161,7 @@ def _read_cursor(path: str) -> Optional[datetime]:
 
 def _write_cursor(path: str, ts: datetime) -> None:
     """Write a UTC datetime to a cursor file atomically (tmp + os.replace)."""
-    ts_str = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts_str = ts.isoformat().replace("+00:00", "Z")
     dest = Path(path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
@@ -180,7 +180,7 @@ def _cursor_str(ts: Optional[datetime]) -> str:
     """Format a cursor datetime for display, or '(none)' if absent."""
     if ts is None:
         return "(none)"
-    return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return ts.isoformat().replace("+00:00", "Z")
 
 
 def _parse_iso_timestamp(value: str, context: str = "") -> datetime:
