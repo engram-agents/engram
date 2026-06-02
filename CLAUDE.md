@@ -84,6 +84,42 @@ rollout. Until they do, the tier of any new artifact is still a required design
 decision — record it in the audit so the manifest is a transcription, not a
 re-derivation.)*
 
+## PR merge-readiness — CI-green gate (both modes)
+
+Merge-readiness has **two** gates, not one: a PR is merge-ready only when it is
+**review-converged AND CI-green on the current tip.** This is a property of the PR,
+not of the coordination topology — it holds identically in single-agent and
+multi-agent mode. (Multi-agent: it gates the `baton flip → <maintainer>` below.
+Single-agent: it gates surfacing the PR as ready / flipping the solo cursor to the
+maintainer. Same rule, different surface — so a single-agent contributor is just as
+bound by it.)
+
+Before presenting a PR as merge-ready, check CI on the current tip:
+
+```
+gh pr view <N> --json statusCheckRollup,mergeStateStatus
+```
+
+(`mergeStateStatus: CLEAN` + every `statusCheckRollup[].conclusion: SUCCESS` = green.)
+
+- **Green** → present as merge-ready.
+- **Pending / running** → do NOT present as ready yet. CI is async: hold (keep the
+  turn with yourself), **re-check on the next loop tick**, advance only once green.
+  This is the one legitimate case where a converged PR sits un-advanced for a tick.
+- **Failed** → it's a **blocker**: back to the author for a fix round, same as any
+  reviewer blocker. Never present a red PR as ready.
+
+**Re-check after ANY post-approval commit.** A moved tip (e.g. folding a late
+reviewer nit after the approve) re-triggers CI and can fail on the new commit even
+though the approved commit was green — CI-green must hold on the tip the maintainer
+would actually merge.
+
+*Origin: converged-but-red PRs reached "ready" framing twice (a CI gate was red while
+review-convergence was checked but CI was not). v1 is this discipline (vigilance); the
+structural form — a flip-to-maintainer guard that refuses when CI is red, mechanical
+like the CI tag-once gate — is the better v2 (mechanical gate > vigilance), tracked as
+a follow-up.*
+
 ## PR review convention (multi-agent mode)
 
 When this host runs **multiple ENGRAM agents** (e.g. Ariadne + Borges) — i.e. a
@@ -107,8 +143,8 @@ enters the maintainer's merge queue:
    fairy-delegatable.** Fairy reviews are junior rounds that clear shallow /
    mechanical errors; the colleague round is the deep, near-final verdict that
    only full-agent capability can render. A counterpart who delegates their
-   colleague review to a fairy has skipped the colleague layer (Lei direct,
-   on the colleague-fairy-delegation lapse incident).
+   colleague review to a fairy has skipped the colleague layer (the user flagged
+   this directly, after the colleague-fairy-delegation lapse incident).
 
 Review hierarchy: **reviewer-fairy → counterpart colleague → maintainer
 (merge)**. Symmetric — each agent reviews the other's PRs and has its own
@@ -188,7 +224,7 @@ created.
 
 1. `gh project create --owner engram-agents --title "pool-X — short scope"` →
    returns Project number `N`.
-2. `baton init pool-X --title "..." --participants borges,ariadne --turn lei
+2. `baton init pool-X --title "..." --participants borges,ariadne --turn <maintainer>
    --status in-progress --github project/N` → creates
    `/home/agents-shared/projects/pool-X.md` with the GitHub anchor set. The
    auto-pull hook reads `github: project/N` to render the Project's
@@ -198,7 +234,7 @@ created.
 4. `gh project item-add N --owner engram-agents --url <issue-url>` for each
    issue.
 
-Pool sentinel `turn: lei` = the bunch is available for claim. (For batons
+Pool sentinel `turn: <maintainer>` = the bunch is available for claim. (For batons
 already created without `--github`, use `baton anchor pool-X --github
 project/N` to set the anchor after the fact.)
 
