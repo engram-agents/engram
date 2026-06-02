@@ -56,13 +56,23 @@ def _resolve_runtime_dir(engram_home: str) -> str:
     Priority:
       1. $ENGRAM_RUNTIME_DIR if set explicitly.
       2. $ENGRAM_HOME if it bundles a server snapshot (alpha-install pattern).
-      3. ~/engram-alpha (live-source fallback for dev installs).
+      3. Plugin root: hook lives at <plugin_root>/hooks/hook.py (flat layout —
+         tools/build-plugin.sh copies hooks into <plugin_root>/hooks/ without
+         a platform subdir), so the plugin root is two dirname() levels up
+         from __file__. engram_client.py lives at <plugin_root>/. This
+         resolves clean plugin installs where ENGRAM_HOME is data-only.
+      4. ~/engram-alpha (live-source fallback for dev installs).
     """
     explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
     if explicit:
         return explicit
     if os.path.exists(os.path.join(engram_home, "engram_client.py")):
         return engram_home
+    plugin_root = os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))
+    )
+    if os.path.exists(os.path.join(plugin_root, "engram_client.py")):
+        return plugin_root
     return os.path.expanduser("~/engram-alpha")
 
 
