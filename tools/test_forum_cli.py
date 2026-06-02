@@ -1155,7 +1155,7 @@ class TestHookCursorNotAdvancedOnUnreachableNoCache:
         monkeypatch.setattr(hook, "_fetch_threads", lambda *a, **kw: [])
         monkeypatch.setattr(hook, "_load_cache", lambda: None)
         # _save_cache is a no-op for this test
-        monkeypatch.setattr(hook, "_save_cache", lambda threads: None)
+        monkeypatch.setattr(hook, "_save_cache", lambda threads, mentions: None)
 
         try:
             hook.main()
