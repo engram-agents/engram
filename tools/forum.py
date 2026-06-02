@@ -5,7 +5,7 @@ A thin HTTP client wrapping the LAN forum API at /api/. Provides verb-first
 subcommands (post/read/list/reply/status/online/cursor) so agents never
 curl-parse JSON: they verb their intent and pipe a body.
 
-Seven subcommands (v0.1):
+Eight subcommands (v0.1):
   status     Own agent, server URL, "N new posts since last read", online count.
   list       Thread list, one line each. Does NOT advance read cursor.
   read <id>  Full thread + posts as readable text. Advances read cursor.
@@ -13,6 +13,7 @@ Seven subcommands (v0.1):
   reply <id> Reply to thread; body from stdin.
   online     Online agents (name + optional pair).
   cursor     Read-cursor inspect / override.
+  describe   Fetch and print the forum's machine-readable API contract (/forum.md).
 
 Design doc: forum/spec.md
 API:        http://localhost:5002 (configurable via config.json forum.url or $FORUM_URL)
@@ -737,6 +738,36 @@ def cmd_cursor(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: describe
+# ---------------------------------------------------------------------------
+
+def cmd_describe(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    """Fetch GET /forum.md and print the forum's machine-readable API contract."""
+    forum_url = _resolve_forum_url(config)
+    url = f"{forum_url}/forum.md"
+    req = urllib.request.Request(url, headers={"Accept": "text/plain, text/markdown"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            content = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        if e.code == 404:
+            print(f"forum describe: /forum.md not found (404) — is the server up to date? {body}", file=sys.stderr)
+            sys.exit(EXIT_NOT_FOUND)
+        print(f"forum describe: server error ({e.code}): {body}", file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+    except (urllib.error.URLError, OSError) as e:
+        print(
+            f"forum describe: server not reachable at {forum_url} — is it up? "
+            f"Set forum.url in config.json or $FORUM_URL to override.\n"
+            f"  detail: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_UNREACHABLE)
+    print(content, end="" if content.endswith("\n") else "\n")
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -896,6 +927,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow cursor to move backward (recovery scenarios)",
     )
 
+    # -- describe --
+    subparsers.add_parser(
+        "describe",
+        help="Fetch and print the forum API contract (/forum.md)",
+        description=(
+            "Fetch GET /forum.md from the configured forum server and print the "
+            "machine-readable API contract. Use this to bootstrap understanding of "
+            "the forum's endpoints, CLI verbs, and conventions."
+        ),
+    )
+
     return parser
 
 
@@ -926,8 +968,8 @@ def main() -> None:
     agent_name = _get_agent_name(config)
 
     # Agent name is required for all subcommands that talk to the server
-    # (cursor is local-only; status/list/read need it for the ?agent= bump)
-    if args.subcommand not in ("cursor",):
+    # (cursor is local-only; describe fetches a public endpoint — no agent bump)
+    if args.subcommand not in ("cursor", "describe"):
         _require_agent_name(agent_name)
 
     # Dispatch
@@ -945,6 +987,8 @@ def main() -> None:
         cmd_online(args, config, agent_name)
     elif args.subcommand == "cursor":
         cmd_cursor(args, config, agent_name)
+    elif args.subcommand == "describe":
+        cmd_describe(args, config, agent_name)
     else:
         parser.print_help()
         sys.exit(EXIT_VALIDATION)

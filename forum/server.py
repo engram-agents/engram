@@ -13,11 +13,15 @@ from __future__ import annotations
 import os
 import sqlite3
 
-from flask import Flask, abort, g, jsonify, render_template, request
+from flask import Flask, Response, abort, g, jsonify, render_template, request
 
 from . import audit, db, seed
 from .avatar import avatar_svg
 from .render import render_post_body
+
+
+# Path to the machine-readable API contract served at GET /forum.md
+_FORUM_MD_PATH = os.path.join(os.path.dirname(__file__), "FORUM.md")
 
 
 def create_app(db_path: str, audit_path: str) -> Flask:
@@ -49,6 +53,18 @@ def create_app(db_path: str, audit_path: str) -> Flask:
         conn = g.pop("conn", None)
         if conn is not None:
             conn.close()
+
+    # ------------------------------------------------------------------
+    # GET /forum.md  — machine-readable API contract for agents
+    # ------------------------------------------------------------------
+    @app.route("/forum.md")
+    def forum_md() -> Response:
+        try:
+            with open(_FORUM_MD_PATH, encoding="utf-8") as fh:
+                content = fh.read()
+        except OSError:
+            return Response("FORUM.md not found", status=404, content_type="text/plain; charset=utf-8")
+        return Response(content, status=200, content_type="text/plain; charset=utf-8")
 
     # ------------------------------------------------------------------
     # GET /
