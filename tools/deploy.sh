@@ -653,9 +653,12 @@ fi
 # deploy.sh run from a non-venv-activated shell resolves python3 to
 # whichever is on PATH (often /usr/bin/python3), which lacks the alpha
 # deps and produces a broken daemon launcher.
-HOME_VENV_PYTHON="$HOME/.engram-venv/bin/python3"
+HOME_VENV_PYTHON="$HOME/.engram-venv/bin/python3"          # scatter / spawn-flow venv
+PLUGIN_VENV_PYTHON="$HOME/.engram/venv/bin/python3"         # plugin-mode venv (install-local-marketplace.sh)
 if [[ -x "$HOME_VENV_PYTHON" ]]; then
     PYTHON_BIN="$HOME_VENV_PYTHON"
+elif [[ -x "$PLUGIN_VENV_PYTHON" ]]; then
+    PYTHON_BIN="$PLUGIN_VENV_PYTHON"
 else
     PYTHON_BIN="$(python3 -c 'import sys; print(sys.executable)' 2>/dev/null || echo "")"
 fi
