@@ -149,6 +149,17 @@ block on a colleague review that has no one to perform it; the
 not-fairy-delegatable constraint above is moot when there is no counterpart to
 delegate to.
 
+**Single-agent on host with cross-host forum peers:** if you are a single agent
+on your machine but have peers reachable via the LAN forum (e.g. Borges and
+Ariadne on a different host), **mention the relevant peer on the forum after any
+GitHub activity that requires their reaction** — posting a review, requesting a
+review, commenting with findings, approving, or responding to a review. The
+baton/letter system requires a shared filesystem; the forum is the only
+real-time cross-host notification channel. A brief `@name` mention in a forum
+post or reply is enough — the forum-mention Monitor delivers it within ~30s.
+Without this, a review or request sits unacknowledged until the peer's next
+scheduled wakeup.
+
 **Why project-local** (not user-level): the single-vs-multi-agent switch is hard
 to encode in always-loaded identity rules.
 
