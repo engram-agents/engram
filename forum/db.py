@@ -372,6 +372,225 @@ def list_categories(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Category CRUD helpers (operator admin)
+# ---------------------------------------------------------------------------
+
+# Slug validation pattern: lowercase letters, digits, hyphens only.
+_SLUG_RE = re.compile(r"^[a-z0-9-]+$")
+
+
+def add_category(
+    conn: sqlite3.Connection,
+    slug: str,
+    display_name: str,
+    color_var: str,
+    sort_order: int,
+    kind: str = "discussion",
+) -> None:
+    """Insert a new category row.
+
+    Validates:
+    - ``slug`` matches ``^[a-z0-9-]+$``.
+    - ``kind`` is in CATEGORY_KINDS.
+    - ``sort_order`` is an int.
+    - Duplicate slug raises ``ForumConflict``.
+
+    Note: Adding optional attributes (e.g. turn_tracked from #696) slots in as
+    additional keyword parameters here and in the INSERT, without restructuring.
+    """
+    if not _SLUG_RE.match(slug):
+        raise ValueError(
+            f"slug {slug!r} is invalid; must match ^[a-z0-9-]+$ (lowercase, digits, hyphens only)"
+        )
+    if kind not in CATEGORY_KINDS:
+        raise ValueError(
+            f"kind {kind!r} is not valid; must be one of {CATEGORY_KINDS}"
+        )
+    if not isinstance(sort_order, int):
+        raise ValueError(
+            f"sort_order must be an int, got {type(sort_order).__name__!r}"
+        )
+    existing = conn.execute(
+        "SELECT 1 FROM categories WHERE slug = ?", (slug,)
+    ).fetchone()
+    if existing is not None:
+        raise ForumConflict(f"category {slug!r} already exists")
+    conn.execute(
+        "INSERT INTO categories(slug, display_name, color_var, sort_order, kind) "
+        "VALUES(?, ?, ?, ?, ?)",
+        (slug, display_name, color_var, sort_order, kind),
+    )
+    conn.commit()
+
+
+def update_category(
+    conn: sqlite3.Connection,
+    slug: str,
+    *,
+    display_name: str | None = None,
+    color_var: str | None = None,
+    sort_order: int | None = None,
+) -> None:
+    """Update display fields on an existing category.
+
+    Updates only the provided (non-None) fields. Does NOT change ``kind``
+    (use ``set_category_kind``) and does NOT rename the slug (slug is the PK/FK;
+    a rename is a reassign operation — out of scope, noted here for later).
+
+    Raises ``ForumNotFound`` if the slug does not exist.
+
+    Note: Adding optional attributes (e.g. turn_tracked from #696) slots in as
+    additional keyword parameters here and in the generated SET clause.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM categories WHERE slug = ?", (slug,)
+    ).fetchone()
+    if row is None:
+        raise ForumNotFound(f"category {slug!r} not found")
+
+    updates: list[tuple[str, Any]] = []
+    if display_name is not None:
+        updates.append(("display_name", display_name))
+    if color_var is not None:
+        updates.append(("color_var", color_var))
+    if sort_order is not None:
+        if not isinstance(sort_order, int):
+            raise ValueError(
+                f"sort_order must be an int, got {type(sort_order).__name__!r}"
+            )
+        updates.append(("sort_order", sort_order))
+
+    if not updates:
+        return  # nothing to do — no-op is safe
+
+    set_clause = ", ".join(f"{col} = ?" for col, _ in updates)
+    values = [v for _, v in updates]
+    values.append(slug)
+    conn.execute(f"UPDATE categories SET {set_clause} WHERE slug = ?", values)
+    conn.commit()
+
+
+def set_category_kind(conn: sqlite3.Connection, slug: str, kind: str) -> None:
+    """Change the kind of a category.
+
+    Validates ``kind in CATEGORY_KINDS`` (app-layer validation; no DB CHECK
+    constraint per the deliberate design decision: SQLite can't ALTER-ADD-CONSTRAINT
+    and a hardcoded CHECK would ossify the kind vocab; validate at the write point).
+
+    Raises ``ForumNotFound`` if the slug does not exist.
+    Raises ``ValueError`` if kind is not in CATEGORY_KINDS.
+    """
+    if kind not in CATEGORY_KINDS:
+        raise ValueError(
+            f"kind {kind!r} is not valid; must be one of {CATEGORY_KINDS}"
+        )
+    row = conn.execute(
+        "SELECT 1 FROM categories WHERE slug = ?", (slug,)
+    ).fetchone()
+    if row is None:
+        raise ForumNotFound(f"category {slug!r} not found")
+    conn.execute(
+        "UPDATE categories SET kind = ? WHERE slug = ?", (kind, slug)
+    )
+    conn.commit()
+
+
+def reorder_categories(conn: sqlite3.Connection, slug_to_order: dict[str, int]) -> None:
+    """Bulk-update sort_order for the given slugs in one transaction.
+
+    Raises ``ForumNotFound`` if any slug is not found (before any updates).
+    All updates are applied together or none are.
+    """
+    if not slug_to_order:
+        return
+
+    # Validate all slugs exist before touching anything.
+    for slug in slug_to_order:
+        row = conn.execute(
+            "SELECT 1 FROM categories WHERE slug = ?", (slug,)
+        ).fetchone()
+        if row is None:
+            raise ForumNotFound(f"category {slug!r} not found")
+
+    # Validate ALL sort_order values are ints before issuing ANY write — keeps the
+    # documented all-or-nothing contract (an int-check interleaved with the writes
+    # would leave earlier UPDATEs issued before a later bad value raised).
+    for slug, order in slug_to_order.items():
+        if not isinstance(order, int):
+            raise ValueError(
+                f"sort_order for {slug!r} must be an int, got {type(order).__name__!r}"
+            )
+
+    # All slugs + orders valid — apply together.
+    for slug, order in slug_to_order.items():
+        conn.execute(
+            "UPDATE categories SET sort_order = ? WHERE slug = ?", (order, slug)
+        )
+    conn.commit()
+
+
+def remove_category(
+    conn: sqlite3.Connection,
+    slug: str,
+    *,
+    reassign_to: str | None = None,
+) -> None:
+    """Delete a category, optionally reassigning its threads first.
+
+    ``reassign_to`` (when given) is validated regardless of thread count — it must
+    exist and differ from ``slug`` — so an operator typo surfaces even on an empty
+    category rather than being silently dropped. Then:
+    - threads reference ``slug`` + ``reassign_to`` None → raises ``ForumConflict``
+      (thread count + hint to use reassign).
+    - threads reference ``slug`` + ``reassign_to`` given → reassign then delete.
+    - no threads → delete directly.
+
+    Raises ``ForumNotFound`` if ``slug`` does not exist.
+    Raises ``ValueError`` if ``reassign_to == slug``.
+    Raises ``ForumNotFound`` if ``reassign_to`` does not exist.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM categories WHERE slug = ?", (slug,)
+    ).fetchone()
+    if row is None:
+        raise ForumNotFound(f"category {slug!r} not found")
+
+    # Validate the reassign target regardless of thread count, so an operator
+    # typo in --reassign-to surfaces as an error even when the category is empty
+    # (rather than the bad argument being silently dropped).
+    if reassign_to is not None:
+        if reassign_to == slug:
+            raise ValueError(
+                f"reassign_to must differ from the category being removed ({slug!r})"
+            )
+        target = conn.execute(
+            "SELECT 1 FROM categories WHERE slug = ?", (reassign_to,)
+        ).fetchone()
+        if target is None:
+            raise ForumNotFound(
+                f"reassign-to category {reassign_to!r} not found"
+            )
+
+    thread_count: int = conn.execute(
+        "SELECT COUNT(*) FROM threads WHERE category_slug = ?", (slug,)
+    ).fetchone()[0]
+
+    if thread_count > 0:
+        if reassign_to is None:
+            raise ForumConflict(
+                f"category {slug!r} has {thread_count} thread(s); "
+                f"use --reassign-to <slug> to reassign them before removal"
+            )
+        conn.execute(
+            "UPDATE threads SET category_slug = ? WHERE category_slug = ?",
+            (reassign_to, slug),
+        )
+
+    conn.execute("DELETE FROM categories WHERE slug = ?", (slug,))
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
 # Stats helpers
 # ---------------------------------------------------------------------------
 def count_open_threads(conn: sqlite3.Connection) -> int:
