@@ -61,7 +61,7 @@ class TestSchemaMigration:
             row[0]
             for row in conn.execute("SELECT slug FROM categories").fetchall()
         }
-        expected = {slug for slug, _name, _color, _order in SEED_CATEGORIES}
+        expected = {slug for slug, *_ in SEED_CATEGORIES}
         assert slugs == expected
 
     def test_seed_category_data(self, conn):
@@ -72,7 +72,7 @@ class TestSchemaMigration:
                 "SELECT slug, display_name, color_var, sort_order FROM categories"
             ).fetchall()
         }
-        for slug, name, color, order in SEED_CATEGORIES:
+        for slug, name, color, order, _kind in SEED_CATEGORIES:
             assert slug in rows, f"Missing slug: {slug}"
             row = rows[slug]
             assert row[1] == name, f"display_name mismatch for {slug}"
@@ -270,7 +270,7 @@ class TestListCategories:
         categories = list_categories(conn)
         orders = [c["slug"] for c in categories]
         # First and last by sort_order, derived from the seed (robust to additions).
-        seeded_by_order = [slug for slug, _name, _color, _order in
+        seeded_by_order = [slug for slug, *_ in
                            sorted(SEED_CATEGORIES, key=lambda c: c[3])]
         assert orders[0] == seeded_by_order[0]
         assert orders[-1] == seeded_by_order[-1]

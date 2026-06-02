@@ -35,11 +35,11 @@ def bare_conn():
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys = ON")
     c.executescript(SCHEMA_SQL)
-    for slug, name, color, order in SEED_CATEGORIES:
+    for slug, name, color, order, kind in SEED_CATEGORIES:
         c.execute(
-            "INSERT INTO categories(slug, display_name, color_var, sort_order) "
-            "VALUES(?, ?, ?, ?) ON CONFLICT(slug) DO NOTHING",
-            (slug, name, color, order),
+            "INSERT INTO categories(slug, display_name, color_var, sort_order, kind) "
+            "VALUES(?, ?, ?, ?, ?) ON CONFLICT(slug) DO NOTHING",
+            (slug, name, color, order, kind),
         )
     c.commit()
     yield c

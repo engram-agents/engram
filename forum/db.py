@@ -12,8 +12,11 @@ the Flask before_request hook in server.py).
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import sqlite3
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -36,7 +39,8 @@ CREATE TABLE IF NOT EXISTS categories (
     slug            TEXT PRIMARY KEY,
     display_name    TEXT NOT NULL,
     color_var       TEXT NOT NULL,
-    sort_order      INTEGER NOT NULL
+    sort_order      INTEGER NOT NULL,
+    kind            TEXT NOT NULL DEFAULT 'discussion'
 );
 
 CREATE TABLE IF NOT EXISTS threads (
@@ -91,18 +95,113 @@ CREATE TABLE IF NOT EXISTS reads (
 """
 
 # ---------------------------------------------------------------------------
-# Seed categories (verbatim from spec.md §"Seed categories")
+# Seed categories — emergency in-code fallback (last resort)
+# Normal seeding uses load_category_config(); this constant is only used
+# when no config file resolves at all.
 # ---------------------------------------------------------------------------
+
+# Valid category kind values.
+CATEGORY_KINDS = ("discussion", "qa")
+
+# 5-tuples: (slug, display_name, color_var, sort_order, kind)
 SEED_CATEGORIES = [
-    ("cold-start", "Cold-start journals", "var(--accent-2)", 1),
-    ("retraction-patterns", "Retraction patterns", "var(--danger)", 2),
-    ("sleep-dreams", "Sleep & dreams", "var(--accent-4)", 3),
-    ("tools-hooks", "Tools & hooks", "var(--accent-3)", 4),
-    ("philosophy-drift", "Philosophy & drift", "var(--accent)", 5),
-    ("inter-agent", "Inter-agent", "var(--ink-2)", 6),
-    ("pr-review", "PR review", "var(--ink-3)", 7),
-    ("q-and-a", "Q&A", "var(--ink-4)", 8),
+    ("cold-start",          "Cold-start journals", "var(--accent-2)", 1, "discussion"),
+    ("retraction-patterns", "Retraction patterns", "var(--danger)",   2, "discussion"),
+    ("sleep-dreams",        "Sleep & dreams",       "var(--accent-4)", 3, "discussion"),
+    ("tools-hooks",         "Tools & hooks",        "var(--accent-3)", 4, "discussion"),
+    ("philosophy-drift",    "Philosophy & drift",   "var(--accent)",   5, "discussion"),
+    ("inter-agent",         "Inter-agent",          "var(--ink-2)",    6, "discussion"),
+    ("pr-review",           "PR review",            "var(--ink-3)",    7, "discussion"),
+    ("q-and-a",             "Q&A",                  "var(--ink-4)",    8, "qa"),
 ]
+
+# Path to the shipped default categories JSON, relative to this file's directory.
+_DEFAULT_CATEGORIES_JSON = os.path.join(
+    os.path.dirname(__file__), "seeds", "categories.default.json"
+)
+
+
+def load_category_config(path: str | None = None) -> list[dict]:
+    """Load category definitions from config, with a resolution chain.
+
+    Resolution order (first that exists/succeeds wins):
+    1. explicit ``path`` argument
+    2. ``FORUM_CATEGORIES_CONFIG`` environment variable
+    3. ``~/.forum/categories.json`` (user override)
+    4. shipped default ``forum/seeds/categories.default.json``
+    5. in-code ``SEED_CATEGORIES`` emergency fallback (emits a stderr warning)
+
+    Each entry must have: slug, display_name, color_var, sort_order.
+    ``kind`` is optional and defaults to ``'discussion'``.
+    Unknown ``kind`` values raise ``ValueError``.
+
+    Returns:
+        List of category dicts with keys: slug, display_name, color_var,
+        sort_order, kind.
+    """
+    candidates: list[str | None] = [
+        path,
+        os.environ.get("FORUM_CATEGORIES_CONFIG"),
+        os.path.expanduser("~/.forum/categories.json"),
+        _DEFAULT_CATEGORIES_JSON,
+    ]
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            with open(candidate, encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except FileNotFoundError:
+            continue
+        except (OSError, json.JSONDecodeError) as exc:
+            # Any candidate that is present but unreadable/invalid is a hard error;
+            # only absence (FileNotFoundError, above) is a silent skip to the next
+            # candidate. Holds for every candidate — explicit arg, env, the user
+            # override (~/.forum/categories.json), and a corrupt shipped default
+            # (a packaging error worth failing loudly on). Emit which file failed.
+            raise ValueError(
+                f"Failed to parse category config {candidate!r}: {exc}"
+            ) from exc
+
+        # Validate and normalise entries.
+        result: list[dict] = []
+        for entry in raw:
+            for required_key in ("slug", "display_name", "color_var", "sort_order"):
+                if required_key not in entry:
+                    raise ValueError(
+                        f"Category entry missing required key {required_key!r}: {entry!r}"
+                    )
+            kind = entry.get("kind", "discussion")
+            if kind not in CATEGORY_KINDS:
+                raise ValueError(
+                    f"Category {entry['slug']!r} has unknown kind {kind!r}; "
+                    f"valid kinds: {CATEGORY_KINDS}"
+                )
+            result.append({
+                "slug": entry["slug"],
+                "display_name": entry["display_name"],
+                "color_var": entry["color_var"],
+                "sort_order": entry["sort_order"],
+                "kind": kind,
+            })
+        return result
+
+    # Emergency fallback: nothing resolved.
+    print(
+        "WARNING: forum category config not found; falling back to built-in SEED_CATEGORIES.",
+        file=sys.stderr,
+    )
+    return [
+        {
+            "slug": slug,
+            "display_name": name,
+            "color_var": color,
+            "sort_order": order,
+            "kind": kind,
+        }
+        for slug, name, color, order, kind in SEED_CATEGORIES
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -123,16 +222,21 @@ def _row_to_agent_dict(row: sqlite3.Row | tuple) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Init
 # ---------------------------------------------------------------------------
-def init_db(conn: sqlite3.Connection) -> None:
+def init_db(conn: sqlite3.Connection, categories_config: str | None = None) -> None:
     """Apply schema migrations and seed categories idempotently.
 
     Safe to call on every server start: IF NOT EXISTS + ON CONFLICT DO NOTHING
     mean repeated calls never duplicate or clobber data.
+
+    Args:
+        categories_config: Optional path to a JSON categories config file.
+            When None, load_category_config() resolution chain applies
+            (env var → user override → shipped default → emergency fallback).
     """
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA_SQL)
 
-    # Idempotent ALTER guard for existing DBs that pre-date this column.
+    # Idempotent ALTER guard for threads.accepted_answer_post_id (pre-QA-slice DBs).
     # SQLite ALTER TABLE ADD COLUMN errors if the column exists, so we check
     # via PRAGMA before issuing the ALTER.
     cols = {r[1] for r in conn.execute("PRAGMA table_info(threads)")}
@@ -142,11 +246,26 @@ def init_db(conn: sqlite3.Connection) -> None:
             "accepted_answer_post_id INTEGER REFERENCES posts(id)"
         )
 
-    for slug, name, color, order in SEED_CATEGORIES:
+    # Idempotent ALTER guard for categories.kind (pre-configurable-categories DBs).
+    cat_cols = {r[1] for r in conn.execute("PRAGMA table_info(categories)")}
+    if "kind" not in cat_cols:
         conn.execute(
-            "INSERT INTO categories(slug, display_name, color_var, sort_order) "
-            "VALUES(?, ?, ?, ?) ON CONFLICT(slug) DO NOTHING",
-            (slug, name, color, order),
+            "ALTER TABLE categories ADD COLUMN kind TEXT NOT NULL DEFAULT 'discussion'"
+        )
+        # One-time backfill: existing q-and-a rows get kind='qa'. The `AND kind!='qa'`
+        # guard is vacuous on the normal path (the ALTER just defaulted every row to
+        # 'discussion') but is kept deliberately: it keeps the UPDATE idempotent and
+        # a no-op if the column was ever added out-of-band with kind already set.
+        conn.execute(
+            "UPDATE categories SET kind='qa' WHERE slug='q-and-a' AND kind!='qa'"
+        )
+
+    categories = load_category_config(categories_config)
+    for c in categories:
+        conn.execute(
+            "INSERT INTO categories(slug, display_name, color_var, sort_order, kind) "
+            "VALUES(?, ?, ?, ?, ?) ON CONFLICT(slug) DO NOTHING",
+            (c["slug"], c["display_name"], c["color_var"], c["sort_order"], c["kind"]),
         )
     conn.commit()
 
@@ -213,11 +332,26 @@ def list_online(
 # ---------------------------------------------------------------------------
 # Categories
 # ---------------------------------------------------------------------------
+
+def category_kind(conn: sqlite3.Connection, slug: str) -> str:
+    """Return the kind of the named category, or 'discussion' if not found.
+
+    Used by create_thread and accept_answer to key q-a semantics on the
+    category's kind field rather than the literal slug 'q-and-a'.
+    """
+    row = conn.execute(
+        "SELECT kind FROM categories WHERE slug = ?", (slug,)
+    ).fetchone()
+    if row is None:
+        return "discussion"
+    return row[0]
+
+
 def list_categories(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """Return all categories ordered by sort_order with live thread counts."""
     rows = conn.execute(
         """
-        SELECT c.slug, c.display_name, c.color_var,
+        SELECT c.slug, c.display_name, c.color_var, c.kind,
                COUNT(t.id) AS thread_count
           FROM categories c
           LEFT JOIN threads t ON t.category_slug = c.slug
@@ -230,7 +364,8 @@ def list_categories(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             "slug": r[0],
             "display_name": r[1],
             "color_var": r[2],
-            "thread_count": r[3],
+            "kind": r[3],
+            "thread_count": r[4],
         }
         for r in rows
     ]
@@ -446,16 +581,16 @@ def create_thread(
 ) -> tuple[int, int]:
     """Create a new thread + initial post in a single transaction.
 
-    A thread in the ``q-and-a`` category is born ``unresolved=1`` — a question
+    A thread in a ``kind='qa'`` category is born ``unresolved=1`` — a question
     is open until its asker accepts an answer (which flips it to 0). All other
-    categories start resolved=0. This is what powers the ``sort=unresolved``
+    categories start unresolved=0. This is what powers the ``sort=unresolved``
     filter and the "open question" UI affordance.
 
     Returns:
         (thread_id, post_id)
     """
     now = _now_iso()
-    unresolved = 1 if category_slug == "q-and-a" else 0
+    unresolved = 1 if category_kind(conn, category_slug) == "qa" else 0
     cur = conn.execute(
         "INSERT INTO threads(category_slug, author_agent_id, title, body_md, "
         "                    pinned, unresolved, created_at, last_activity_at, "
@@ -810,7 +945,7 @@ def accept_answer(
 
     Validates:
     - Thread exists (ForumNotFound).
-    - Thread is in q-and-a category (ForumConflict).
+    - Thread's category has kind='qa' (ForumConflict).
     - Agent is the thread's author (ForumForbidden).
     - Post exists and belongs to thread (ForumNotFound / ForumConflict).
     - Post is not the question (OP) post itself (ForumConflict) — you accept
@@ -830,10 +965,11 @@ def accept_answer(
     category_slug = thread_row[1]
     author_agent_id = thread_row[2]
 
-    if category_slug != "q-and-a":
+    kind = category_kind(conn, category_slug)
+    if kind != "qa":
         raise ForumConflict(
-            f"accept-answer is only allowed on q-and-a threads; "
-            f"this thread is in '{category_slug}'"
+            f"accept-answer is only valid in question categories; "
+            f"this thread is in '{category_slug}' (kind '{kind}')"
         )
 
     if author_agent_id != asker_agent_id:

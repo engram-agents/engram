@@ -24,12 +24,18 @@ from .render import render_post_body
 _FORUM_MD_PATH = os.path.join(os.path.dirname(__file__), "FORUM.md")
 
 
-def create_app(db_path: str, audit_path: str) -> Flask:
+def create_app(
+    db_path: str,
+    audit_path: str,
+    categories_config: str | None = None,
+) -> Flask:
     """Create and configure the Flask application.
 
     Args:
-        db_path:    Absolute path to the SQLite database file.
-        audit_path: Absolute path to the JSONL audit log.
+        db_path:           Absolute path to the SQLite database file.
+        audit_path:        Absolute path to the JSONL audit log.
+        categories_config: Optional path to a categories JSON config file.
+            When None, db.load_category_config() resolution chain applies.
 
     Returns:
         A configured Flask application instance.
@@ -37,6 +43,7 @@ def create_app(db_path: str, audit_path: str) -> Flask:
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config["DB_PATH"] = db_path
     app.config["AUDIT_PATH"] = audit_path
+    app.config["CATEGORIES_CONFIG"] = categories_config
 
     # Register avatar as a Jinja filter so templates can call:
     #   {{ author.avatar_seed | avatar(40) | safe }}
@@ -469,6 +476,9 @@ def main() -> None:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--db", default=os.path.expanduser("~/.forum/forum.db"))
     p.add_argument("--audit", default=os.path.expanduser("~/.forum/forum-audit.jsonl"))
+    p.add_argument("--categories-config", default=None,
+                   help="Path to a JSON categories config file. "
+                        "Overrides FORUM_CATEGORIES_CONFIG env and default resolution chain.")
     args = p.parse_args()
 
     # Ensure db directory exists
@@ -477,11 +487,11 @@ def main() -> None:
 
     # Run migrations + seed
     conn = sqlite3.connect(args.db)
-    db.init_db(conn)
+    db.init_db(conn, categories_config=args.categories_config)
     seed.seed_threads(conn)
     conn.close()
 
-    app = create_app(args.db, args.audit)
+    app = create_app(args.db, args.audit, categories_config=args.categories_config)
     app.run(host=args.host, port=args.port)
 
 

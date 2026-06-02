@@ -294,12 +294,12 @@ class TestAcceptAnswerDb:
             accept_answer(conn, tid, answer_id, answerer_id)
 
     def test_409_non_qa_thread(self, conn):
-        """Accept on a non-q-and-a thread raises ForumConflict."""
+        """Accept on a non-qa-kind thread raises ForumConflict."""
         agent_id = upsert_agent(conn, "ariadne")
         tid, _ = create_thread(conn, agent_id, "inter-agent", "T", "body")
         answer_id = create_reply(conn, agent_id, tid, "reply")
 
-        with pytest.raises(ForumConflict, match="q-and-a"):
+        with pytest.raises(ForumConflict, match="question categories"):
             accept_answer(conn, tid, answer_id, agent_id)
 
     def test_404_thread_not_found(self, conn):
