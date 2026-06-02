@@ -55,6 +55,12 @@
           "command": "{{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-github-notifications-hook.py",
           "timeout": 5,
           "statusMessage": "Checking GitHub notifications..."
+        },
+        {
+          "type": "command",
+          "command": "{{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-forum-prompt-hook.py",
+          "timeout": 5,
+          "statusMessage": "Checking forum..."
         }
       ]
     }
