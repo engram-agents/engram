@@ -1,33 +1,33 @@
 """Tag-once gate: every path in the build-plugin.sh shippable universe must appear
-exactly once in packaging/tiers.json, with no dangling manifest entries.
+in packaging/tiers.json (either as a tiered mechanism or in the explicit excluded list),
+with no dangling manifest entries.
 
 Enumeration unit choices (load-bearing design decision)
 =======================================================
 build-plugin.sh uses DIFFERENT copy granularities for different surfaces:
 
   * Top-level files (server.py, bootstrap.py, SKILL.md, launch-engram-server.sh,
-    engram_*.py, RUNTIME_TOOLS): copied per-file → manifest unit = per-file.
+    engram_*.py): copied per-file → manifest unit = per-file.
 
-  * skills/claude: ``cp -r skills/claude/.`` = whole dir contents; each skill is
-    a named sub-directory. Manifest unit = per-skill-dir, e.g.
-    ``skills/claude/engram-sleep``.
+  * tools/*: manifest-driven per-item copy — each tools/ entry in the manifest
+    is a file or sub-directory with its own tier tag.
 
-  * hooks/claude: ``find hooks/claude -maxdepth 1 -name '*.py' -o -name '*.sh'``
-    = per-file, minus HOOKS_EXCLUDE. Manifest unit = per-hook-file, e.g.
-    ``hooks/claude/engram-surface-hook.py``.
+  * skills/claude: per-skill-dir granularity (one entry per named sub-directory).
+    Manifest unit = per-skill-dir, e.g. ``skills/claude/engram-sleep``.
 
-  * agents/claude: ``find agents/claude -maxdepth 1 -name '*.md' ! -name README.md``
-    = per-file. Manifest unit = per-agent-file, e.g.
-    ``agents/claude/engram-dream-fairy.md``.
+  * hooks/claude: per-file granularity, filtered entirely through the manifest
+    (HOOKS_EXCLUDE array deleted; manifest tier tags are the sole authority).
+    Manifest unit = per-hook-file, e.g. ``hooks/claude/engram-surface-hook.py``.
 
-  * output-styles/claude: ``cp -r output-styles/claude/.`` = whole dir contents;
-    each item is a flat file. Manifest unit = per-file, e.g.
-    ``output-styles/claude/proactive-with-carveouts.md``.
+  * agents/claude: per-file granularity (*.md excluding README.md).
+    Manifest unit = per-agent-file, e.g. ``agents/claude/engram-dream-fairy.md``.
 
-  * templates: ``cp -a templates/.`` = whole dir contents; items may be files OR
-    sub-directories (e.g. heartbeat-queue/). Manifest unit = per-top-level-item
-    inside templates/, e.g. ``templates/CLAUDE.md.template`` and
-    ``templates/heartbeat-queue``.
+  * output-styles/claude: per-file granularity.
+    Manifest unit = per-file, e.g. ``output-styles/claude/proactive-with-carveouts.md``.
+
+  * templates: per-top-level-item (files AND sub-directories).
+    Manifest unit = per-top-level-item inside templates/, e.g.
+    ``templates/CLAUDE.md.template`` and ``templates/heartbeat-queue``.
 
 The test enumerates each surface at the SAME granularity the manifest uses, so
 the cross-check is 1:1 with no false mismatches.
@@ -41,13 +41,29 @@ and operator tools also have manifest entries. Those extra entries are valid
 (the dangling-entry check only fires if a manifest path does NOT exist anywhere
 in the repo, not if it falls outside the plugin-copy scope). This gives the
 manifest broader coverage while keeping the CI gate mechanical and offline.
+
+Completeness gate (filesystem → manifest)
+=========================================
+``test_every_shippable_path_is_tagged`` enumerates candidate files from the
+FILESYSTEM (the actual repo dirs that build-plugin.sh draws from), then asserts
+that every candidate file appears in the manifest EITHER as a tiered mechanism
+OR in the manifest's ``excluded`` list.  A candidate that is neither tiered
+nor excluded FAILS the test — this is the "forgot-to-tag" catch.
+
+The complementary ``test_no_dangling_manifest_entries`` runs in the other
+direction (manifest → filesystem) and catches mechanisms that were removed or
+renamed without updating the manifest.
+
+The ``excluded`` list in packaging/tiers.json is the explicit accounting of
+candidate-dir files that are intentionally NOT shipped, each carrying a short
+``reason``.  It replaces the deleted HOOKS_EXCLUDE concept by moving the
+"do not ship" intent INTO the manifest where it is auditable.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 
 import pytest
 
@@ -57,145 +73,12 @@ BUILD_PLUGIN_SH = os.path.join(REPO_ROOT, "tools", "build-plugin.sh")
 
 VALID_TIERS = {"essential", "convenience", "dev"}
 
+TIER_RANKS = {"essential": 0, "convenience": 1, "dev": 2}
+
 
 # ---------------------------------------------------------------------------
-# helpers — enumerate the build-plugin.sh shippable universe
+# helpers
 # ---------------------------------------------------------------------------
-
-
-def _parse_hooks_exclude() -> set[str]:
-    """Parse the HOOKS_EXCLUDE array from tools/build-plugin.sh.
-
-    Returns a set of bare filenames (no path prefix) that build-plugin.sh
-    explicitly skips when copying hooks/claude/.
-
-    Uses a multiline-aware end-of-array anchor (``^\\)``) so inline comments
-    containing parentheses (e.g. ``# persona-specific (multi-agent...)``) do
-    not prematurely close the match.
-    """
-    with open(BUILD_PLUGIN_SH, encoding="utf-8") as f:
-        text = f.read()
-
-    m = re.search(
-        r"HOOKS_EXCLUDE=\((.*?)^\)",
-        text,
-        re.DOTALL | re.MULTILINE,
-    )
-    if not m:
-        raise AssertionError(
-            "Could not locate HOOKS_EXCLUDE=( ... ) array in tools/build-plugin.sh. "
-            "Did the variable name or syntax change? Update _parse_hooks_exclude()."
-        )
-
-    block = m.group(1)
-    excludes: set[str] = set()
-    for line in block.splitlines():
-        # Strip inline comments before splitting on whitespace
-        line = line.split("#")[0].strip()
-        if not line:
-            continue
-        token = line.strip('"').strip("'")
-        if token:
-            excludes.add(token)
-    return excludes
-
-
-def _parse_runtime_tools() -> list[str]:
-    """Parse the RUNTIME_TOOLS array from tools/build-plugin.sh.
-
-    Returns a list of bare filenames (no path prefix) in the tools/ subset
-    that build-plugin.sh copies to plugin/tools/.
-    """
-    with open(BUILD_PLUGIN_SH, encoding="utf-8") as f:
-        text = f.read()
-
-    m = re.search(
-        r"RUNTIME_TOOLS=\((.*?)^\)",
-        text,
-        re.DOTALL | re.MULTILINE,
-    )
-    if not m:
-        raise AssertionError(
-            "Could not locate RUNTIME_TOOLS=( ... ) array in tools/build-plugin.sh. "
-            "Did the variable name or syntax change? Update _parse_runtime_tools()."
-        )
-
-    block = m.group(1)
-    tools: list[str] = []
-    for line in block.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        token = line.split()[0].strip('"').strip("'")
-        if token:
-            tools.append(token)
-    return tools
-
-
-def _enumerate_shippable_plugin_paths() -> set[str]:
-    """Enumerate every path that build-plugin.sh copies into the plugin tree.
-
-    Returns paths relative to the repo root, using the same granularity as
-    packaging/tiers.json (described in the module docstring above).
-    """
-    shippable: set[str] = set()
-
-    # 1. Explicitly copied top-level files
-    for p in ("server.py", "bootstrap.py", "SKILL.md", "launch-engram-server.sh"):
-        shippable.add(p)
-
-    # 2. engram_*.py modules (globbed from repo root)
-    for fname in os.listdir(REPO_ROOT):
-        if fname.startswith("engram_") and fname.endswith(".py"):
-            fpath = os.path.join(REPO_ROOT, fname)
-            if os.path.isfile(fpath):
-                shippable.add(fname)
-
-    # 3. RUNTIME_TOOLS subset of tools/
-    for tool_basename in _parse_runtime_tools():
-        shippable.add(f"tools/{tool_basename}")
-
-    # 4. hooks/claude/* minus HOOKS_EXCLUDE (per-file granularity)
-    hooks_dir = os.path.join(REPO_ROOT, "hooks", "claude")
-    excludes = _parse_hooks_exclude()
-    for fname in os.listdir(hooks_dir):
-        fpath = os.path.join(hooks_dir, fname)
-        if not os.path.isfile(fpath):
-            continue
-        if not (fname.endswith(".py") or fname.endswith(".sh")):
-            continue
-        if fname in excludes:
-            continue
-        shippable.add(f"hooks/claude/{fname}")
-
-    # 5. skills/claude/* (per-skill-dir granularity)
-    skills_dir = os.path.join(REPO_ROOT, "skills", "claude")
-    for dname in os.listdir(skills_dir):
-        dpath = os.path.join(skills_dir, dname)
-        if os.path.isdir(dpath):
-            shippable.add(f"skills/claude/{dname}")
-
-    # 6. agents/claude/*.md excluding README.md (per-file granularity)
-    agents_dir = os.path.join(REPO_ROOT, "agents", "claude")
-    for fname in os.listdir(agents_dir):
-        if fname.endswith(".md") and fname != "README.md":
-            fpath = os.path.join(agents_dir, fname)
-            if os.path.isfile(fpath):
-                shippable.add(f"agents/claude/{fname}")
-
-    # 7. output-styles/claude/* (per-file granularity)
-    styles_dir = os.path.join(REPO_ROOT, "output-styles", "claude")
-    for fname in os.listdir(styles_dir):
-        fpath = os.path.join(styles_dir, fname)
-        if os.path.isfile(fpath):
-            shippable.add(f"output-styles/claude/{fname}")
-
-    # 8. templates/* (per-top-level-item granularity — files AND sub-dirs)
-    templates_dir = os.path.join(REPO_ROOT, "templates")
-    for item in os.listdir(templates_dir):
-        shippable.add(f"templates/{item}")
-
-    return shippable
 
 
 def _load_manifest() -> dict:
@@ -207,25 +90,144 @@ def _manifest_path_set(manifest: dict) -> set[str]:
     return {entry["path"] for entry in manifest["mechanisms"]}
 
 
+def _excluded_path_set(manifest: dict) -> set[str]:
+    """Return the set of paths in manifest['excluded'] (intentionally-not-shipped)."""
+    return {entry["path"] for entry in manifest.get("excluded", [])}
+
+
+def _shipping_set_for_tier(
+    manifest: dict,
+    tier: str = "convenience",
+    multi_agent: bool = False,
+) -> set[str]:
+    """Return the set of manifest paths that ship at (tier, multi_agent).
+
+    ships(m) := rank(m.tier) <= rank(chosen_tier)
+                AND (m.multi_agent != true OR multi_agent_chosen)
+    """
+    chosen_rank = TIER_RANKS[tier]
+    result: set[str] = set()
+    for entry in manifest["mechanisms"]:
+        entry_rank = TIER_RANKS.get(entry.get("tier", "dev"), 2)
+        if entry_rank > chosen_rank:
+            continue
+        if entry.get("multi_agent") is True and not multi_agent:
+            continue
+        result.add(entry["path"])
+    return result
+
+
+def _enumerate_candidate_paths() -> set[str]:
+    """Enumerate every file that is a candidate for shipping.
+
+    Returns paths relative to the repo root, using the same granularity as
+    packaging/tiers.json (described in the module docstring above).
+
+    These are the paths that build-plugin.sh draws from.  Every one of them
+    must be either tiered (in mechanisms[]) or explicitly excluded (in
+    excluded[]) — no silent omissions.
+    """
+    candidates: set[str] = set()
+
+    # hooks/claude: per .py / .sh file
+    hooks_dir = os.path.join(REPO_ROOT, "hooks", "claude")
+    if os.path.isdir(hooks_dir):
+        for fname in os.listdir(hooks_dir):
+            if fname.endswith(".py") or fname.endswith(".sh"):
+                candidates.add(f"hooks/claude/{fname}")
+
+    # skills/claude: per subdirectory
+    skills_dir = os.path.join(REPO_ROOT, "skills", "claude")
+    if os.path.isdir(skills_dir):
+        for dname in os.listdir(skills_dir):
+            if os.path.isdir(os.path.join(skills_dir, dname)):
+                candidates.add(f"skills/claude/{dname}")
+
+    # agents/claude: per .md file (excluding README.md)
+    agents_dir = os.path.join(REPO_ROOT, "agents", "claude")
+    if os.path.isdir(agents_dir):
+        for fname in os.listdir(agents_dir):
+            if fname.endswith(".md") and fname != "README.md":
+                candidates.add(f"agents/claude/{fname}")
+
+    # output-styles/claude: per file
+    styles_dir = os.path.join(REPO_ROOT, "output-styles", "claude")
+    if os.path.isdir(styles_dir):
+        for fname in os.listdir(styles_dir):
+            full = os.path.join(styles_dir, fname)
+            if os.path.isfile(full):
+                candidates.add(f"output-styles/claude/{fname}")
+
+    # tools/*: per top-level item (files and directories), excluding __pycache__
+    # build-plugin.sh copies only manifest-listed entries, never __pycache__
+    tools_dir = os.path.join(REPO_ROOT, "tools")
+    if os.path.isdir(tools_dir):
+        for fname in os.listdir(tools_dir):
+            if fname == "__pycache__" or fname.endswith(".pyc"):
+                continue
+            candidates.add(f"tools/{fname}")
+
+    # Top-level named files
+    for fname in [
+        "server.py",
+        "bootstrap.py",
+        "SKILL.md",
+        "launch-engram-server.sh",
+        "settings.hooks.json.template",
+        "viz_server.py",
+    ]:
+        if os.path.exists(os.path.join(REPO_ROOT, fname)):
+            candidates.add(fname)
+
+    # engram_*.py runtime modules
+    for fname in os.listdir(REPO_ROOT):
+        if fname.startswith("engram_") and fname.endswith(".py"):
+            candidates.add(fname)
+
+    # templates: per top-level item (files and directories)
+    templates_dir = os.path.join(REPO_ROOT, "templates")
+    if os.path.isdir(templates_dir):
+        for fname in os.listdir(templates_dir):
+            candidates.add(f"templates/{fname}")
+
+    return candidates
+
+
 # ---------------------------------------------------------------------------
 # tests
 # ---------------------------------------------------------------------------
 
 
 def test_every_shippable_path_is_tagged():
-    """Every path that build-plugin.sh ships must appear in packaging/tiers.json.
+    """Every candidate file from the build-plugin.sh source dirs must be
+    accounted for in packaging/tiers.json.
 
-    Fails naming the specific path(s) that are shippable but untagged.
-    This is the primary drift-prevention gate: adding a new skill/hook/agent
-    without tiering it is caught here before CI merges.
+    Fails naming any candidate path that is neither:
+      - listed as a tiered mechanism in mechanisms[], nor
+      - explicitly listed in excluded[] as intentionally not shipped.
+
+    This is the primary completeness gate: adding a new skill, hook, or agent
+    without tiering it (or explicitly excluding it) is caught here before CI
+    merges.  The test enumerates from the FILESYSTEM — not from the manifest —
+    so it cannot be defeated by simply omitting an entry.
     """
-    shippable = _enumerate_shippable_plugin_paths()
-    manifest_paths = _manifest_path_set(_load_manifest())
+    manifest = _load_manifest()
+    tiered_paths = _manifest_path_set(manifest)
+    excluded_paths = _excluded_path_set(manifest)
+    accounted_for = tiered_paths | excluded_paths
 
-    missing = shippable - manifest_paths
-    assert not missing, (
-        f"Shippable path(s) not tagged in packaging/tiers.json — add them with a tier:\n"
-        + "\n".join(f"  {p}" for p in sorted(missing))
+    candidates = _enumerate_candidate_paths()
+
+    unaccounted: list[str] = []
+    for p in sorted(candidates):
+        if p not in accounted_for:
+            unaccounted.append(p)
+
+    assert not unaccounted, (
+        "packaging/tiers.json is missing an accounting for these candidate paths "
+        "(add each as a tiered mechanism in mechanisms[] or as an intentionally-excluded "
+        "entry in excluded[]):\n"
+        + "\n".join(f"  {p}" for p in unaccounted)
     )
 
 

@@ -7,11 +7,20 @@
 # engram-first-session cold-start dialogue.
 #
 # Usage:
-#   ./install.sh            # install
-#   ./install.sh --force    # archive existing install and start fresh
-#                           #   (knowledge graph + history are moved to a
-#                           #   timestamped backup dir; NOT preserved)
+#   ./install.sh                        # install (default tier: convenience)
+#   ./install.sh --tier essential       # minimal install (core only)
+#   ./install.sh --tier dev             # full install (all tiers)
+#   ./install.sh --multi-agent          # include multi-agent surfaces (baton/letter/forum)
+#   ./install.sh --force                # archive existing install and start fresh
+#                                       #   (knowledge graph + history are moved to a
+#                                       #   timestamped backup dir; NOT preserved)
 #   ./install.sh --help
+#
+# TIER FILTERING: packaging/tiers.json is the single source of truth.
+# The predicate is:
+#   ships(m) := rank(m.tier) <= rank(chosen_tier)
+#               AND (m.multi_agent != true OR --multi-agent given)
+# where rank(essential)=0, rank(convenience)=1, rank(dev)=2.
 #
 # To UPGRADE an existing install while preserving the knowledge graph,
 # history, diary, and sessions, use:  tools/deploy.sh
@@ -28,12 +37,21 @@ CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
 
 FORCE=0
 WITH_CRON=0
-for arg in "$@"; do
-  case "$arg" in
-    --force) FORCE=1 ;;
-    --with-cron) WITH_CRON=1 ;;
+TIER_ARG=""
+MULTI_AGENT=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force) FORCE=1; shift ;;
+    --with-cron) WITH_CRON=1; shift ;;
+    --tier)
+      [[ $# -ge 2 ]] || { echo "ERROR: --tier requires an argument (essential|convenience|dev)"; exit 1; }
+      TIER_ARG="$2"
+      shift 2
+      ;;
+    --multi-agent) MULTI_AGENT=1; shift ;;
     --help|-h)
-      echo "Usage: ./install.sh [--force] [--with-cron]"
+      echo "Usage: ./install.sh [--tier <essential|convenience|dev>] [--multi-agent] [--force] [--with-cron]"
       echo ""
       echo "Environment overrides:"
       echo "  ENGRAM_HOME   target for ENGRAM data (default: \$HOME/.engram)"
@@ -41,6 +59,10 @@ for arg in "$@"; do
       echo "  AGENT_NAME    cron identity for the installed agent (default: derived from username)"
       echo "  COUNTERPART_NAME   peer agent name for inter-agent dispatcher (optional)"
       echo ""
+      echo "  --tier <tier>: depth tier to install — essential, convenience (default), or dev."
+      echo "          Cumulative: dev includes convenience includes essential."
+      echo "  --multi-agent: include multi-agent-gated mechanisms (baton, letter, forum"
+      echo "          coordination hooks, inter-agent tools). Off by default."
       echo "  --force: archive existing installation and start fresh."
       echo "           Moves \$ENGRAM_HOME (graph, history, diary, sessions, logs)"
       echo "           to a timestamped backup directory. The new install starts"
@@ -57,7 +79,7 @@ for arg in "$@"; do
       echo "               AGENT_NAME=<name> \$ENGRAM_HOME/tools/sync-cron.sh --apply"
       exit 0
       ;;
-    *) echo "Unknown arg: $arg (use --help)"; exit 1 ;;
+    *) echo "Unknown arg: $1 (use --help)"; exit 1 ;;
   esac
 done
 
@@ -65,6 +87,78 @@ echo "== ENGRAM Alpha Install =="
 echo "  Repo:    $REPO_ROOT"
 echo "  ENGRAM:  $ENGRAM_HOME"
 echo "  Claude:  $CLAUDE_HOME"
+echo ""
+
+# ── Manifest-based tier filtering ─────────────────────────────────────────────
+#
+# packaging/tiers.json is the single source of truth for what ships at each tier.
+# The predicate:
+#   ships(m) := rank(m.tier) <= rank(chosen_tier)
+#               AND (m.multi_agent != true OR multi_agent_chosen)
+# where rank(essential)=0, rank(convenience)=1, rank(dev)=2.
+
+MANIFEST="$REPO_ROOT/packaging/tiers.json"
+if [[ ! -f "$MANIFEST" ]]; then
+  echo "ERROR: packaging/tiers.json not found at $MANIFEST — is PR-1 merged?"
+  exit 1
+fi
+command -v jq >/dev/null 2>&1 || { echo "ERROR: jq is required but not found on PATH"; exit 1; }
+
+MANIFEST_DEFAULT_TIER="$(jq -r '.default_tier' "$MANIFEST")"
+CHOSEN_TIER="${TIER_ARG:-$MANIFEST_DEFAULT_TIER}"
+
+# Validate tier
+if ! jq -e --arg t "$CHOSEN_TIER" '.depth_tiers | map(. == $t) | any' "$MANIFEST" >/dev/null 2>&1; then
+  VALID="$(jq -r '.depth_tiers[]' "$MANIFEST" | tr '\n' '|' | sed 's/|$//')"
+  echo "ERROR: Invalid tier '$CHOSEN_TIER'. Valid tiers: $VALID"
+  exit 1
+fi
+
+_tier_rank() {
+  case "$1" in
+    essential)   echo 0 ;;
+    convenience) echo 1 ;;
+    dev)         echo 2 ;;
+    *)           echo "ERROR: Unknown tier: $1" >&2; exit 1 ;;
+  esac
+}
+CHOSEN_RANK=$(_tier_rank "$CHOSEN_TIER")
+
+# Build shipping set: newline-delimited paths that satisfy the predicate
+_SHIPPED_PATHS="$(jq -r \
+  --argjson chosen_rank "$CHOSEN_RANK" \
+  --argjson multi_agent "$MULTI_AGENT" \
+  '
+  def tier_rank:
+    if . == "essential"   then 0
+    elif . == "convenience" then 1
+    elif . == "dev"         then 2
+    else error("unknown tier: " + .)
+    end;
+
+  .mechanisms[]
+  | select(
+      (.tier | tier_rank) <= $chosen_rank
+      and (
+        (has("multi_agent") | not)
+        or (.multi_agent != true)
+        or ($multi_agent == 1)
+      )
+    )
+  | .path
+  ' "$MANIFEST")"
+
+# Populate associative array for O(1) membership test
+declare -A _SHIP_SET
+while IFS= read -r _p; do
+  [[ -n "$_p" ]] && _SHIP_SET["$_p"]=1
+done <<< "$_SHIPPED_PATHS"
+
+# ships <manifest-path> → returns 0 if path is in the shipping set, 1 otherwise
+ships() { [[ "${_SHIP_SET[$1]+_}" ]]; }
+
+echo "  Tier:    $CHOSEN_TIER (rank=$CHOSEN_RANK)"
+echo "  Multi-agent: $( [[ $MULTI_AGENT -eq 1 ]] && echo yes || echo no )"
 echo ""
 
 # -------- Step 1: Preflight checks --------
@@ -258,27 +352,41 @@ echo ""
 
 echo "== Step 4: Copying files =="
 
+# Skills — manifest-filtered (replaces wholesale cp -r of skills/claude/)
+# engram-letter is still gated additionally by multi-agent infra check in
+# Step 9 for the scatter install path (symlink/binary requirement), but the
+# tier filter means it only ships here when --multi-agent was given.
 if [ -d "$ALPHA_DIR/skills/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/skills/claude" 2>/dev/null | grep -v '^\.gitkeep$' || true)" ]; then
-  # Copy all skills except multi-agent-gated ones (engram-letter requires
-  # /home/agents-shared/inter-agent/ to be present; handled in Step 9 gate).
+  _skills_copied=0
   for d in "$ALPHA_DIR/skills/claude/"*/; do
-    skill_name=$(basename "$d")
-    if [ "$skill_name" = "engram-letter" ]; then
-      continue  # handled inside multi-agent gate in Step 9
+    skill_name="$(basename "$d")"
+    manifest_key="skills/claude/$skill_name"
+    if ships "$manifest_key"; then
+      cp -r "$d" "$CLAUDE_HOME/skills/"
+      _skills_copied=$((_skills_copied + 1))
+    else
+      echo "  (tier-filtered) $manifest_key"
     fi
-    cp -r "$d" "$CLAUDE_HOME/skills/"
   done
-  echo "  skills → $CLAUDE_HOME/skills/ (from skills/claude/, multi-agent-gated skills deferred)"
+  echo "  skills → $CLAUDE_HOME/skills/ ($_skills_copied skills, tier=$CHOSEN_TIER multi-agent=$( [[ $MULTI_AGENT -eq 1 ]] && echo yes || echo no ))"
 fi
 
-# Sub-agents. Used by sleep-routine (engram-dream-fairy) and PR workflow
-# (engram-pr-reviewer). `cp -rL` follows symlinks at the source — the
-# alpha repo keeps `.claude/agents/*.md` symlinked to `agents/claude/*.md`
-# so the alpha-dev working copies and the shipped copies are guaranteed
-# byte-identical.
+# Sub-agents — manifest-filtered. Used by sleep-routine (engram-dream-fairy) and
+# PR workflow (engram-pr-reviewer). `cp -rL` follows symlinks at the source.
 if [ -d "$ALPHA_DIR/agents/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/agents/claude" 2>/dev/null | grep -v '^\.gitkeep$' || true)" ]; then
-  cp -rL "$ALPHA_DIR/agents/claude/"* "$CLAUDE_HOME/agents/"
-  echo "  agents → $CLAUDE_HOME/agents/ (from agents/claude/)"
+  _agents_copied=0
+  while IFS= read -r src; do
+    fname="$(basename "$src")"
+    manifest_key="agents/claude/$fname"
+    if ships "$manifest_key"; then
+      # -L follows symlinks (alpha keeps .claude/agents/*.md symlinked to agents/claude/*.md)
+      cp -L "$src" "$CLAUDE_HOME/agents/$fname"
+      _agents_copied=$((_agents_copied + 1))
+    else
+      echo "  (tier-filtered) $manifest_key"
+    fi
+  done < <(find "$ALPHA_DIR/agents/claude" -maxdepth 1 -name "*.md" ! -name "README.md" | sort)
+  echo "  agents → $CLAUDE_HOME/agents/ ($_agents_copied agents, tier=$CHOSEN_TIER)"
 fi
 
 # Invariant: .claude/agents/ should contain only symlinks pointing into
@@ -298,13 +406,36 @@ while IFS= read -r f; do
     fi
 done < <(find "$ALPHA_DIR/.claude/agents" -type f -name '*.md')
 
+# Output styles — manifest-filtered
 if [ -d "$ALPHA_DIR/output-styles/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/output-styles/claude" 2>/dev/null | grep -v '^\.gitkeep$' || true)" ]; then
-  cp -r "$ALPHA_DIR/output-styles/claude/"* "$CLAUDE_HOME/output-styles/"
-  echo "  output-styles → $CLAUDE_HOME/output-styles/ (from output-styles/claude/)"
+  _styles_copied=0
+  for src in "$ALPHA_DIR/output-styles/claude/"*; do
+    [ -f "$src" ] || continue
+    fname="$(basename "$src")"
+    manifest_key="output-styles/claude/$fname"
+    if ships "$manifest_key"; then
+      cp "$src" "$CLAUDE_HOME/output-styles/$fname"
+      _styles_copied=$((_styles_copied + 1))
+    else
+      echo "  (tier-filtered) $manifest_key"
+    fi
+  done
+  echo "  output-styles → $CLAUDE_HOME/output-styles/ ($_styles_copied files, tier=$CHOSEN_TIER)"
 fi
 
+# Hooks — manifest-filtered (replaces wholesale cp -r of hooks/claude/)
 if [ -d "$ALPHA_DIR/hooks/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/hooks/claude" 2>/dev/null | grep -v '^\.gitkeep$' || true)" ]; then
-  cp -r "$ALPHA_DIR/hooks/claude/"* "$ENGRAM_HOME/hooks/"
+  _hooks_copied=0
+  while IFS= read -r src; do
+    fname="$(basename "$src")"
+    manifest_key="hooks/claude/$fname"
+    if ships "$manifest_key"; then
+      cp "$src" "$ENGRAM_HOME/hooks/$fname"
+      _hooks_copied=$((_hooks_copied + 1))
+    else
+      echo "  (tier-filtered) $manifest_key"
+    fi
+  done < <(find "$ALPHA_DIR/hooks/claude" -maxdepth 1 \( -name "*.py" -o -name "*.sh" \) | sort)
   chmod +x "$ENGRAM_HOME/hooks/"*.py 2>/dev/null || true
   chmod +x "$ENGRAM_HOME/hooks/"*.sh 2>/dev/null || true
   # Bake the resolved interpreter path into the daemon-launch script so it
@@ -315,7 +446,7 @@ if [ -d "$ALPHA_DIR/hooks/claude" ] && [ -n "$(ls -A "$ALPHA_DIR/hooks/claude" 2
     sed -i.bak "s|{{PYTHON}}|$PYTHON_BIN|g" "$ENGRAM_HOME/hooks/start-engram-daemon.sh"
     rm -f "$ENGRAM_HOME/hooks/start-engram-daemon.sh.bak"
   fi
-  echo "  hooks → $ENGRAM_HOME/hooks/ (from hooks/claude/)"
+  echo "  hooks → $ENGRAM_HOME/hooks/ ($_hooks_copied hooks, tier=$CHOSEN_TIER multi-agent=$( [[ $MULTI_AGENT -eq 1 ]] && echo yes || echo no ))"
 fi
 
 # Optional: install surface daemon as systemd user service for auto-restart
@@ -348,17 +479,32 @@ if command -v systemctl &>/dev/null && \
   fi
 fi
 
-# Tools: heartbeat, sleep, dispatcher launchers, telegram bot, channel
-# helpers, sync-cron + render_cron, migrate_config_v2. Copied per-install
-# (not symlinked) so each agent's tools operate on their own $ENGRAM_HOME
-# by env-var contract. Cron registration happens in Step 8 below only
-# when --with-cron is passed (opt-in default; heartbeat mode is not yet
-# stable enough to ship into a fresh tester's environment by default).
+# Tools — manifest-filtered. The tools/ copy is per-item from the manifest
+# (each tools/ entry is a file or sub-directory with its own tier tag).
+# Copied per-install (not symlinked) so each agent's tools operate on their
+# own $ENGRAM_HOME by env-var contract. Cron registration happens in Step 8.
 if [ -d "$ALPHA_DIR/tools" ] && [ -n "$(ls -A "$ALPHA_DIR/tools" 2>/dev/null || true)" ]; then
-  cp -r "$ALPHA_DIR/tools/"* "$ENGRAM_HOME/tools/"
+  _tools_copied=0
+  # Iterate over all manifest entries under tools/ that pass the predicate
+  while IFS= read -r manifest_key; do
+    [[ "$manifest_key" == tools/* ]] || continue
+    src="$ALPHA_DIR/$manifest_key"
+    dest="$ENGRAM_HOME/$manifest_key"
+    if [[ ! -e "$src" ]]; then
+      echo "  WARN: manifest entry $manifest_key not found at $src — skipping"
+      continue
+    fi
+    mkdir -p "$(dirname "$dest")"
+    if [[ -d "$src" ]]; then
+      cp -r "$src/." "$dest/"
+    else
+      cp "$src" "$dest"
+    fi
+    _tools_copied=$((_tools_copied + 1))
+  done <<< "$_SHIPPED_PATHS"
   chmod +x "$ENGRAM_HOME/tools/"*.sh 2>/dev/null || true
   chmod +x "$ENGRAM_HOME/tools/"*.py 2>/dev/null || true
-  echo "  tools → $ENGRAM_HOME/tools/"
+  echo "  tools → $ENGRAM_HOME/tools/ ($_tools_copied items, tier=$CHOSEN_TIER multi-agent=$( [[ $MULTI_AGENT -eq 1 ]] && echo yes || echo no ))"
 fi
 
 # Register the ENGRAM MCP server via the Claude Code CLI. This writes into
@@ -426,6 +572,31 @@ deployed_at=$INSTALL_TS
 deployed_from=$ALPHA_DIR
 EOF
 echo "  .deployed-version → $ENGRAM_HOME/.deployed-version (baseline for future deploy.sh runs)"
+
+# Record the install tier + multi-agent flag into config.json so that future
+# deploy.sh / engram-upgrade runs can re-apply the same filter (no silent
+# tier-creep on upgrade). Written as a merge into config.json if it already
+# exists (bootstrap.py may have created it); created if absent.
+CONFIG_JSON="$ENGRAM_HOME/config.json"
+if command -v jq >/dev/null 2>&1; then
+  _MA_JSON="$( [[ $MULTI_AGENT -eq 1 ]] && echo true || echo false )"
+  if [ -f "$CONFIG_JSON" ]; then
+    # Merge into existing config: add/overwrite install_tier and multi_agent fields
+    _tmp="$(mktemp)"
+    jq --arg tier "$CHOSEN_TIER" --argjson ma "$_MA_JSON" \
+       '. + {install_tier: $tier, multi_agent: $ma}' \
+       "$CONFIG_JSON" > "$_tmp" && mv "$_tmp" "$CONFIG_JSON"
+    echo "  config.json updated: install_tier=$CHOSEN_TIER, multi_agent=$_MA_JSON"
+  else
+    # Bootstrap hasn't run yet — create a minimal config with tier fields;
+    # bootstrap.py will merge additional keys when it runs in Step 5.
+    jq -n --arg tier "$CHOSEN_TIER" --argjson ma "$_MA_JSON" \
+       '{install_tier: $tier, multi_agent: $ma}' > "$CONFIG_JSON"
+    echo "  config.json created: install_tier=$CHOSEN_TIER, multi_agent=$_MA_JSON"
+  fi
+else
+  echo "  WARN: jq not available — skipping config.json tier recording"
+fi
 
 # Crontab template: staged into $ENGRAM_HOME so tools/sync-cron.sh can
 # read it post-install without reaching back into the alpha source tree.
@@ -572,19 +743,22 @@ else
   echo ""
 fi
 
-# -------- Step 9: ia CLI + engram-letter skill (multi-agent only) --------
+# -------- Step 9: ia CLI (multi-agent only) --------
 #
 # Multi-agent install gate: ia CLI is multi-agent-only (its mode-gate exits 3
-# on single-agent hosts). engram-letter skill presupposes ia and the inter-
-# agent inbox — installing it on single-agent hosts creates a dead skill.
-# Gate signal: presence of /home/agents-shared/inter-agent/ (the structural
-# marker that host operator has set up multi-agent infrastructure per #299).
+# on single-agent hosts). The tier filter (--multi-agent flag) already gates
+# whether engram-letter skill, baton, and inter-agent hooks ship in Step 4.
+# This step handles the ia binary placement in the shared/local bin path,
+# which the manifest-filtered copy above cannot do (it's a binary install,
+# not a plain file copy into $ENGRAM_HOME/tools/).
+#
+# Gate: --multi-agent flag was given AND /home/agents-shared/inter-agent/ exists.
 # Stronger than config.json mode check because config.json may not exist yet
 # at fresh-install time.
 
-echo "== Step 9: ia CLI + engram-letter skill (multi-agent) =="
+echo "== Step 9: ia CLI (multi-agent) =="
 
-if [ -d "/home/agents-shared/inter-agent" ]; then
+if [ "$MULTI_AGENT" -eq 1 ] && [ -d "/home/agents-shared/inter-agent" ]; then
   IA_SRC="$ALPHA_DIR/tools/ia.py"
   if [ -f "$IA_SRC" ]; then
     SHARED_BIN="/home/agents-shared/bin"
@@ -602,12 +776,11 @@ if [ -d "/home/agents-shared/inter-agent" ]; then
   else
     echo "  WARN: tools/ia.py not found — skipping ia install"
   fi
-  if [ -d "$ALPHA_DIR/skills/claude/engram-letter" ]; then
-    cp -r "$ALPHA_DIR/skills/claude/engram-letter" "$CLAUDE_HOME/skills/"
-    echo "  engram-letter skill → $CLAUDE_HOME/skills/engram-letter/ (multi-agent)"
-  fi
+  echo "  (engram-letter skill, baton, inter-agent hooks: already handled in Step 4 via --multi-agent filter)"
+elif [ "$MULTI_AGENT" -eq 0 ] && [ -d "/home/agents-shared/inter-agent" ]; then
+  echo "  ia CLI: skipped (multi-agent infra present but --multi-agent not given; re-run with --multi-agent to enable)"
 else
-  echo "  ia CLI + engram-letter skill: skipped (single-agent install; multi-agent infrastructure at /home/agents-shared/inter-agent/ not present)"
+  echo "  ia CLI: skipped (single-agent install; pass --multi-agent to enable multi-agent surfaces)"
 fi
 echo ""
 

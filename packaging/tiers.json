@@ -6,7 +6,7 @@
     "dev"
   ],
   "axes": {
-    "multi_agent": "orthogonal flag \u2014 composes with any depth tier"
+    "multi_agent": "orthogonal flag — composes with any depth tier"
   },
   "default_tier": "convenience",
   "mechanisms": [
@@ -112,6 +112,10 @@
     },
     {
       "path": "tools/migrate-backup.sh",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/migrate-to-plugin.sh",
       "tier": "convenience"
     },
     {
@@ -278,6 +282,10 @@
     },
     {
       "path": "hooks/claude/engram-forum-prompt-hook.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "hooks/claude/engram-time-bar-hook.py",
       "tier": "convenience"
     },
     {
@@ -460,6 +468,44 @@
     {
       "path": "integrations/gemini-cli",
       "tier": "convenience"
+    }
+  ],
+  "excluded": [
+    {
+      "path": "hooks/claude/context_tracker_hook.py",
+      "reason": "superseded by hooks/claude/context_tracker.py (Issue #140 session-isolation rewrite); context_tracker_hook.py is the old hook wrapper, now replaced by the multi-session-safe hook embedded in engram-session-start-hook.py"
+    },
+    {
+      "path": "hooks/claude/engram-utility-credit-mention-stop.py",
+      "reason": "dead hook — not wired in hooks.json or settings.hooks.json.template; the utility credit-assign mechanism (prose-mention bump) was never integrated into the live hook config"
+    },
+    {
+      "path": "tools/_telegram_api.py",
+      "reason": "Telegram-specific transport helper; persona-specific integration (Borges/Lei channel), not part of generic ENGRAM install"
+    },
+    {
+      "path": "tools/telegram_bot.py",
+      "reason": "Telegram bot CLI; persona-specific integration (Borges/Lei channel), not part of generic ENGRAM install"
+    },
+    {
+      "path": "tools/agent-bootstrap",
+      "reason": "operator-level host administration script for multi-agent Linux host setup (uid/group/home perms); not part of ENGRAM plugin — lives at /usr/local/sbin/agent-bootstrap on production hosts, installed separately by Lei"
+    },
+    {
+      "path": "tools/agentctl",
+      "reason": "Lei's day-to-day admin CLI for co-located AI agents; operator tool that lives at /home/user/.local/bin/agentctl, not part of ENGRAM plugin"
+    },
+    {
+      "path": "tools/borges_session_eval.py",
+      "reason": "Borges-persona-specific session quality evaluator; references Borges-specific ENGRAM observation IDs and rubric scaffolding, not generic ENGRAM tooling"
+    },
+    {
+      "path": "tools/test_forum_cli.py",
+      "reason": "test file for tools/forum.py — CI tooling only, never ships"
+    },
+    {
+      "path": "tools/test_migrate_to_plugin.sh",
+      "reason": "test file for tools/migrate-to-plugin.sh — CI tooling only, never ships"
     }
   ]
 }
