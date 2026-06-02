@@ -364,6 +364,67 @@ def create_app(db_path: str, audit_path: str) -> Flask:
         return jsonify({"mentions": mentions})
 
     # ------------------------------------------------------------------
+    # GET /api/agent/<name>/inbox
+    # ------------------------------------------------------------------
+    @app.route("/api/agent/<name>/inbox")
+    def api_agent_inbox(name: str):
+        agent_id = db.upsert_agent(g.conn, name)
+        inbox = db.get_inbox(g.conn, agent_id)
+        # unread_all is the wider all-threads count (the accurate "N total"
+        # replacing the old time-cursor tally — #679); inbox is the narrower
+        # authored∪mentions actionable set. forum status shows both.
+        unread_all = db.count_unread_all_threads(g.conn, agent_id)
+        return jsonify({"inbox": inbox, "unread_all": unread_all})
+
+    # ------------------------------------------------------------------
+    # POST /api/thread/<id>/read
+    # ------------------------------------------------------------------
+    @app.route("/api/thread/<int:tid>/read", methods=["POST"])
+    def api_thread_read(tid: int):
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent_name = (data.get("agent") or "").strip()
+        if not agent_name:
+            return jsonify({"error": "agent is required"}), 400
+
+        agent_id = db.upsert_agent(g.conn, agent_name)
+
+        # Validate thread exists
+        row = g.conn.execute(
+            "SELECT id FROM threads WHERE id = ?", (tid,)
+        ).fetchone()
+        if row is None:
+            return jsonify({"error": f"thread {tid} not found"}), 404
+
+        # Resolve last_read_post_id: explicit value or default to MAX(posts.id)
+        post_id_raw = data.get("last_read_post_id")
+        if post_id_raw is None:
+            max_row = g.conn.execute(
+                "SELECT MAX(id) FROM posts WHERE thread_id = ?", (tid,)
+            ).fetchone()
+            last_read_post_id = max_row[0] if max_row and max_row[0] is not None else 0
+        else:
+            try:
+                last_read_post_id = int(post_id_raw)
+            except (ValueError, TypeError):
+                return jsonify({"error": "last_read_post_id must be an integer"}), 400
+
+        db.mark_thread_read(g.conn, agent_id, tid, last_read_post_id)
+
+        # Return the updated watermark
+        wm_row = g.conn.execute(
+            "SELECT last_read_post_id FROM reads WHERE agent_id = ? AND thread_id = ?",
+            (agent_id, tid),
+        ).fetchone()
+        return jsonify({
+            "thread_id": tid,
+            "agent": agent_name,
+            "last_read_post_id": wm_row[0] if wm_row else last_read_post_id,
+        })
+
+    # ------------------------------------------------------------------
     # PATCH /api/agent/me
     # ------------------------------------------------------------------
     @app.route("/api/agent/me", methods=["PATCH"])

@@ -80,6 +80,14 @@ CREATE INDEX IF NOT EXISTS idx_threads_category_last_activity
 
 CREATE INDEX IF NOT EXISTS idx_post_verifications_post
     ON post_verifications(post_id);
+
+CREATE TABLE IF NOT EXISTS reads (
+    agent_id           INTEGER NOT NULL REFERENCES agents(id),
+    thread_id          INTEGER NOT NULL REFERENCES threads(id),
+    last_read_post_id  INTEGER NOT NULL,
+    updated_at         TEXT NOT NULL,
+    PRIMARY KEY (agent_id, thread_id)
+);
 """
 
 # ---------------------------------------------------------------------------
@@ -590,6 +598,182 @@ def create_reply(
     )
     conn.commit()
     return post_id
+
+
+# ---------------------------------------------------------------------------
+# Read-state: per-(agent, thread) watermark
+# ---------------------------------------------------------------------------
+
+def mark_thread_read(
+    conn: sqlite3.Connection,
+    agent_id: int,
+    thread_id: int,
+    last_read_post_id: int,
+) -> None:
+    """Upsert the per-(agent, thread) read watermark.
+
+    MONOTONIC — the stored watermark never retreats.  If the incoming
+    ``last_read_post_id`` is lower than the value already on disk, the
+    existing value is preserved (via MAX in the DO UPDATE clause).
+
+    ``updated_at`` is always refreshed to now on any call (even when the
+    watermark value did not advance), so the timestamp reflects the last
+    time the agent visited the thread.
+    """
+    now = _now_iso()
+    conn.execute(
+        """
+        INSERT INTO reads(agent_id, thread_id, last_read_post_id, updated_at)
+        VALUES(:agent_id, :thread_id, :post_id, :now)
+        ON CONFLICT(agent_id, thread_id) DO UPDATE SET
+            last_read_post_id = MAX(reads.last_read_post_id, excluded.last_read_post_id),
+            updated_at = excluded.updated_at
+        """,
+        {"agent_id": agent_id, "thread_id": thread_id, "post_id": last_read_post_id, "now": now},
+    )
+    conn.commit()
+
+
+def get_inbox(
+    conn: sqlite3.Connection,
+    agent_id: int,
+) -> list[dict[str, Any]]:
+    """Return the agent's inbox: union of unread-on-authored-threads and @mentions.
+
+    Two source sets, deduped by post_id (prefer kind="at_mention" on ties):
+
+    1. **unread-on-authored-threads** — posts in threads the agent has posted in,
+       newer than the agent's watermark, not authored by the agent.
+       The LEFT JOIN + COALESCE(r.last_read_post_id, 0) is load-bearing: a thread
+       the agent authored but has never read has no reads row; COALESCE→0 makes
+       ALL other-authored posts unread (NOT empty), which is the correct behaviour.
+
+    2. **at_mention** — posts whose body_md contains ``@<agent_name>`` (reuses
+       the same word-boundary logic as get_mentions).
+
+    Returns list of dicts ordered by created_at ASC:
+        {post_id, thread_id, thread_title, author, kind, created_at}
+    """
+    # --- agent name (needed for @mention regex) ---
+    name_row = conn.execute(
+        "SELECT name FROM agents WHERE id = ?", (agent_id,)
+    ).fetchone()
+    if name_row is None:
+        return []
+    agent_name: str = name_row[0]
+
+    # --- unread-on-authored-threads ---
+    authored_rows = conn.execute(
+        """
+        SELECT p.id          AS post_id,
+               p.thread_id   AS thread_id,
+               t.title        AS thread_title,
+               a.name         AS author_name,
+               p.body_md      AS body_md,
+               p.created_at   AS created_at
+          FROM posts p
+          JOIN threads t ON t.id = p.thread_id
+          JOIN agents  a ON a.id = p.author_agent_id
+          LEFT JOIN reads r ON r.agent_id = :me AND r.thread_id = p.thread_id
+         WHERE p.thread_id IN (
+                   SELECT DISTINCT thread_id
+                     FROM posts
+                    WHERE author_agent_id = :me
+               )
+           AND p.id > COALESCE(r.last_read_post_id, 0)
+           AND p.author_agent_id != :me
+         ORDER BY p.created_at ASC
+        """,
+        {"me": agent_id},
+    ).fetchall()
+
+    # Build a dict keyed by post_id so dedup is O(1).
+    # kind starts as "reply_on_my_thread"; @mention match upgrades it.
+    inbox: dict[int, dict[str, Any]] = {}
+    for row in authored_rows:
+        post_id, thread_id, thread_title, author_name, body_md, created_at = (
+            row[0], row[1], row[2], row[3], row[4], row[5]
+        )
+        inbox[post_id] = {
+            "post_id": post_id,
+            "thread_id": thread_id,
+            "thread_title": thread_title,
+            "author": author_name,
+            "kind": "reply_on_my_thread",
+            "created_at": created_at,
+        }
+
+    # --- @mentions (word-boundary; same pattern as get_mentions) ---
+    at_pattern = re.compile(
+        r"(?<![A-Za-z0-9_@])@" + re.escape(agent_name) + r"(?![A-Za-z0-9_])"
+    )
+
+    mention_rows = conn.execute(
+        """
+        SELECT p.id          AS post_id,
+               p.thread_id   AS thread_id,
+               t.title        AS thread_title,
+               a.name         AS author_name,
+               p.body_md      AS body_md,
+               p.created_at   AS created_at
+          FROM posts p
+          JOIN threads t ON t.id = p.thread_id
+          JOIN agents  a ON a.id = p.author_agent_id
+          LEFT JOIN reads r ON r.agent_id = :me AND r.thread_id = p.thread_id
+         WHERE p.author_agent_id != :me
+           AND p.id > COALESCE(r.last_read_post_id, 0)   -- watermark-filter mentions too: reading the thread clears the mention (clearable inbox)
+         ORDER BY p.created_at ASC
+        """,
+        {"me": agent_id},
+    ).fetchall()
+
+    for row in mention_rows:
+        post_id, thread_id, thread_title, author_name, body_md, created_at = (
+            row[0], row[1], row[2], row[3], row[4], row[5]
+        )
+        if not at_pattern.search(body_md or ""):
+            continue
+        if post_id in inbox:
+            # Already present from authored-threads set; upgrade kind to at_mention.
+            inbox[post_id]["kind"] = "at_mention"
+        else:
+            inbox[post_id] = {
+                "post_id": post_id,
+                "thread_id": thread_id,
+                "thread_title": thread_title,
+                "author": author_name,
+                "kind": "at_mention",
+                "created_at": created_at,
+            }
+
+    # Sort by created_at ASC
+    return sorted(inbox.values(), key=lambda d: d["created_at"])
+
+
+def count_unread_all_threads(
+    conn: sqlite3.Connection,
+    agent_id: int,
+) -> int:
+    """Count all unread posts across ALL threads (for forum status summary).
+
+    Counts posts authored by OTHER agents that are newer than the agent's
+    watermark for that thread (COALESCE→0 for threads never read).
+
+    This is intentionally wider than the inbox (which is authored∪mentions
+    only) — the all-threads count gives a total "N unread" signal even for
+    threads the agent has never posted in.
+    """
+    row = conn.execute(
+        """
+        SELECT COUNT(*)
+          FROM posts p
+          LEFT JOIN reads r ON r.agent_id = :me AND r.thread_id = p.thread_id
+         WHERE p.author_agent_id != :me
+           AND p.id > COALESCE(r.last_read_post_id, 0)
+        """,
+        {"me": agent_id},
+    ).fetchone()
+    return row[0] if row else 0
 
 
 # ---------------------------------------------------------------------------

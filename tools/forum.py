@@ -40,6 +40,7 @@ ENGRAM_HOME = (
     or str(Path.home() / ".engram")
 )
 
+# forum-read-cursor.txt is deprecated/vestigial — read-state is pure-server now (v2).
 READ_CURSOR_PATH = os.path.join(ENGRAM_HOME, "forum-read-cursor.txt")
 SURFACED_CURSOR_PATH = os.path.join(ENGRAM_HOME, "forum-surfaced-cursor.txt")
 
@@ -385,10 +386,27 @@ def _format_mention_line(mentions: list) -> Optional[str]:
     return f"\U0001f514 {total} {noun} waiting on you: {summary}"
 
 
+def _fetch_inbox(forum_url: str, agent_name: str) -> Optional[dict]:
+    """Fetch the server-side inbox response for ``agent_name`` (v2 read-state).
+
+    Returns the full response dict ``{"inbox": [...], "unread_all": N}`` on
+    success, or ``None`` if the endpoint is unreachable / returns an unexpected
+    error.  Failures are silently swallowed so that a missing or old server
+    never breaks ``forum status``. (``unread_all`` is the wider all-threads
+    count; ``inbox`` is the narrower authored∪mentions actionable set.)
+    """
+    import urllib.parse as _up
+
+    url = f"{forum_url}/api/agent/{_up.quote(agent_name, safe='')}/inbox"
+    data = _api_get(url, swallow_errors=True)
+    if data is None:
+        return None
+    return data
+
+
+
 def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     forum_url = _resolve_forum_url(config)
-    read_cursor = _read_cursor(READ_CURSOR_PATH)
-    cursor_str = _cursor_str(read_cursor)
 
     # GET /api/agents/online?agent=<self>  (also bumps last_seen)
     online_data = _api_get(
@@ -396,75 +414,59 @@ def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         params={"agent": agent_name} if agent_name else None,
     )
 
-    # GET /api/threads?since=<cursor>  — count new threads since read cursor
-    threads_params: dict = {}
-    if read_cursor is not None:
-        threads_params["since"] = cursor_str
-    if agent_name:
-        threads_params["agent"] = agent_name
-    threads_data = _api_get(f"{forum_url}/api/threads", params=threads_params or None)
-
-    new_count = len(threads_data.get("threads", []))
     online_count = online_data.get("count", 0)
     registered = online_data.get("registered", 0)
 
-    # GET /api/agent/<name>/mentions?since=<cursor>  — advisory; failures silently omitted.
-    # v1 choice: the mention `since` reuses the global read cursor, so the bell
-    # shows mentions since your last read/ack — consistent with the new-post
-    # counter above. Consequence: `status --ack` advances the cursor and thus
-    # clears the bell for mentions you never opened. Acceptable for an advisory
-    # nudge in v1; if it proves to drop mentions users meant to address, revisit
-    # with per-mention read-state.
-    mentions: Optional[list] = None
+    # v2 read-state: fetch server-side inbox (authored∪mentions) and all-threads
+    # unread count.  Falls back gracefully if the server does not yet support v2.
+    inbox_resp: Optional[dict] = None
     if agent_name:
-        since_for_mentions = cursor_str if read_cursor is not None else None
-        mentions = _fetch_mentions(forum_url, agent_name, since_for_mentions)
+        inbox_resp = _fetch_inbox(forum_url, agent_name)
+
+    inbox_items = inbox_resp.get("inbox", []) if inbox_resp is not None else []
+    # all-threads unread total (#679 accurate count); falls back to the inbox
+    # size if the server is pre-v2 and omits the field.
+    unread_all = inbox_resp.get("unread_all", len(inbox_items)) if inbox_resp is not None else 0
+    # Partition inbox into authored-thread replies and @mentions
+    authored_unread = [
+        item for item in inbox_items
+        if item.get("kind") == "reply_on_my_thread"
+    ]
+    mention_items = [
+        item for item in inbox_items
+        if item.get("kind") == "at_mention"
+    ]
 
     if args.format == "json":
         output = {
             "agent": agent_name or "(unknown)",
             "forum_url": forum_url,
-            "read_cursor": cursor_str,
-            "new_since_cursor": new_count,
             "online_count": online_count,
             "registered": registered,
-            "mentions": mentions or [],
+            "unread_total": unread_all,
+            "unread_on_my_threads": len(authored_unread),
+            "mention_count": len(mention_items),
+            "inbox": inbox_items,
         }
         print(json.dumps(output, indent=2))
-        # Advance cursor on --ack
-        if args.ack and threads_data.get("threads"):
-            _advance_cursor_to_latest(threads_data["threads"])
         return
 
     # Human / agent-readable
     print(f"agent:        {agent_name or '(unknown)'}")
     print(f"forum url:    {forum_url}")
-    print(f"read cursor:  {cursor_str}")
-    print(f"new posts:    {new_count} since last read")
+    print(f"unread:       {unread_all} total")
+    print(f"  on threads you're in: {len(authored_unread)}")
+    print(f"  @mentions:            {len(mention_items)}")
     print(f"online:       {online_count} of {registered} registered")
 
-    # Mention summary line — only when mentions were successfully fetched and non-empty
-    if mentions is not None:
-        mention_line = _format_mention_line(mentions)
+    # Mention summary line — only when mention items were found
+    if mention_items:
+        mention_line = _format_mention_line(mention_items)
         if mention_line:
             print(mention_line)
 
-    if new_count > 0:
-        if read_cursor is not None:
-            print(
-                f"\n  run `forum list` to see threads"
-                f"  or `forum list --since {cursor_str}` for new only"
-            )
-        else:
-            print(
-                f"\n  run `forum list` to see threads"
-                f"  or `forum read <id>` to start your read cursor"
-            )
-
-    # Advance cursor on --ack
-    if args.ack and threads_data.get("threads"):
-        _advance_cursor_to_latest(threads_data["threads"])
-        print(f"  (read cursor advanced to now)")
+    if unread_all > 0:
+        print("\n  run `forum list` to see threads  or `forum read <id>` to read")
 
 
 def _advance_cursor_to_latest(threads: list) -> None:
@@ -569,18 +571,15 @@ def cmd_read(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     else:
         _render_thread_human(thread, posts)
 
-    # Advance read cursor to thread's last_activity_at (monotonic)
-    last_act = thread.get("last_activity_at")
-    if last_act:
-        try:
-            new_ts = datetime.fromisoformat(last_act.replace("Z", "+00:00"))
-            if new_ts.tzinfo is None:
-                new_ts = new_ts.replace(tzinfo=timezone.utc)
-            current = _read_cursor(READ_CURSOR_PATH)
-            if current is None or new_ts > current:
-                _write_cursor(READ_CURSOR_PATH, new_ts)
-        except ValueError:
-            pass
+    # v2 read-state: post the watermark server-side (max post id in this thread).
+    # forum-read-cursor.txt is deprecated/vestigial — read-state is pure-server now.
+    if agent_name and posts:
+        max_post_id = max(p.get("id", 0) for p in posts if isinstance(p.get("id"), int))
+        if max_post_id > 0:
+            _api_post(
+                f"{forum_url}/api/thread/{args.thread_id}/read",
+                {"agent": agent_name, "last_read_post_id": max_post_id},
+            )
 
 
 def _render_thread_human(thread: dict, posts: list) -> None:
