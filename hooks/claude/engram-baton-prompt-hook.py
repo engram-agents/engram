@@ -486,7 +486,8 @@ def main() -> None:
     n = len(my_batons)
     baton_word = "baton" if n == 1 else "batons"
     lines = [
-        f"\U0001f3be {n} {baton_word} in your court:"
+        f"\U0001f3be {n} {baton_word} in your court — YOUR MOVE on each "
+        f"(a baton here = ACTION PENDING from you, NOT 'parked', NOT 'waiting on them'):"
     ]
 
     for b in my_batons:
@@ -540,6 +541,19 @@ def main() -> None:
             lines.append(f"  - {pid} ({since_str}){reason_part}{live_clause}")
         else:
             lines.append(f"  - {pid}{reason_part}{live_clause}")
+
+    # Explicit decision prompt — a baton in your court is a PENDING ACTION, not a
+    # status line. Force classification rather than glazing past "in your court"
+    # as "parked." (Origin: a baton sat un-flipped 37m, misread as "waiting on
+    # peer" when the peer had no signal — the holder must flip for them to know.)
+    lines.append("  ↳ For EACH above, decide which state it's in — then ACT, don't defer:")
+    lines.append("     • still working on it → keep it (no flip needed)")
+    lines.append("     • done, waiting on a peer → FLIP IT NOW to them: baton flip <id> <peer>")
+    lines.append("     • colleague-approved + CI green → FLIP IT NOW to the maintainer")
+    lines.append(
+        "     A baton left in your court un-flipped is a DROPPED baton: the peer/maintainer "
+        "gets NO signal until you flip. \"In your court\" means YOUR move — it is never \"parked.\""
+    )
 
     # ── Persist updated cache ─────────────────────────────────────────────────
     if gh_ok and cache:
