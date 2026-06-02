@@ -26,6 +26,7 @@ Per ob_1755 — fairies are contractors, not colleagues. The spec is the contrac
 - **Hard scope bounds.** Explicit "DO NOT modify X" for adjacent surfaces. Anti-patterns enumerated. Stop conditions named.
 - **Escape valve.** Always include some form of: *"if you hit anything that doesn't match the template, STOP and report back."* Silent improvisation is the failure mode.
 - **Always run in background** (`run_in_background: true`). Never wait synchronously. Completion notifications arrive automatically and re-invoke you.
+- **No agent-continuation — every round is a FRESH dispatch.** The Agent-tool description nudges toward `SendMessage` to "continue a previously spawned agent with its context intact" — **that path is NOT enabled in our setup.** The new sub-agent settings were scoped and found unsuitable for our fairies; we stayed on traditional dispatch *without* SendMessage (ob_1972, dv_0694). A completed fairy cannot be resumed. For a round-2 fix, dispatch a NEW fairy and hand off via the **branch + worktree** (point it at the existing branch, have it commit on top) — never via agent-continuation. Don't burn a `ToolSearch` rediscovering this each time.
 - **Suggest branch name.** Spec should name the branch. Anticipate collisions — if your suggested name might exist remote, note that the fairy can use a `-v2` fallback.
 - **Output contract.** Reference the fairy's `# Output contract` section. Demand verification (test results, syntax check, `git diff --stat` scope check) + ambiguous-decision log. Without verification claims, the report can't be trusted.
 - **Post-creation handoff** (AFTER `gh pr create` returns the PR number — the **dispatching agent** runs this, not the fairy; fairies don't have shared-projects access). Open a baton for the PR — this is the channel by which the counterpart and the user see your PR is in flight; skipping it means the auto-pull hook can't surface the work.
@@ -125,6 +126,8 @@ git branch -f <expected-branch> <fairy-commit-sha>
 ## §5 — Convergence cycle
 
 Per CLAUDE.md PR Workflow Standards: re-dispatch reviewer after every round-N commit until fairy returns no blockers AND no actionable suggestions worth shipping. Nits can defer.
+
+Each re-dispatch is a **fresh fairy** — there is no `SendMessage`/continue-agent in our setup (see §1). Point the new fairy at the existing branch + worktree so it builds on the prior round; the returned-then-completed fairy can't be resumed.
 
 The discipline empirically: most coder-fairy work converges in round 1 (no changes needed) or round 2 (1-2 small fixes). Round 3+ is rare and usually means the spec was incomplete on a load-bearing dimension — investigate spec quality before assuming the fairy is the problem.
 
