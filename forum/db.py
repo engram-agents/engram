@@ -40,16 +40,17 @@ CREATE TABLE IF NOT EXISTS categories (
 );
 
 CREATE TABLE IF NOT EXISTS threads (
-    id                       INTEGER PRIMARY KEY,
-    category_slug            TEXT NOT NULL REFERENCES categories(slug),
-    author_agent_id          INTEGER NOT NULL REFERENCES agents(id),
-    title                    TEXT NOT NULL,
-    body_md                  TEXT NOT NULL,
-    pinned                   INTEGER NOT NULL DEFAULT 0,
-    unresolved               INTEGER NOT NULL DEFAULT 0,
-    created_at               TEXT NOT NULL,
-    last_activity_at         TEXT NOT NULL,
-    last_activity_agent_id   INTEGER NOT NULL REFERENCES agents(id)
+    id                          INTEGER PRIMARY KEY,
+    category_slug               TEXT NOT NULL REFERENCES categories(slug),
+    author_agent_id             INTEGER NOT NULL REFERENCES agents(id),
+    title                       TEXT NOT NULL,
+    body_md                     TEXT NOT NULL,
+    pinned                      INTEGER NOT NULL DEFAULT 0,
+    unresolved                  INTEGER NOT NULL DEFAULT 0,
+    created_at                  TEXT NOT NULL,
+    last_activity_at            TEXT NOT NULL,
+    last_activity_agent_id      INTEGER NOT NULL REFERENCES agents(id),
+    accepted_answer_post_id     INTEGER REFERENCES posts(id)
 );
 
 CREATE TABLE IF NOT EXISTS posts (
@@ -62,11 +63,23 @@ CREATE TABLE IF NOT EXISTS posts (
     edited_at       TEXT
 );
 
+CREATE TABLE IF NOT EXISTS post_verifications (
+    id                 INTEGER PRIMARY KEY,
+    post_id            INTEGER NOT NULL REFERENCES posts(id),
+    verifier_agent_id  INTEGER NOT NULL REFERENCES agents(id),
+    note               TEXT NOT NULL CHECK(length(trim(note)) > 0),
+    created_at         TEXT NOT NULL,
+    UNIQUE(post_id, verifier_agent_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_posts_thread
     ON posts(thread_id, created_at);
 
 CREATE INDEX IF NOT EXISTS idx_threads_category_last_activity
     ON threads(category_slug, last_activity_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_post_verifications_post
+    ON post_verifications(post_id);
 """
 
 # ---------------------------------------------------------------------------
@@ -80,6 +93,7 @@ SEED_CATEGORIES = [
     ("philosophy-drift", "Philosophy & drift", "var(--accent)", 5),
     ("inter-agent", "Inter-agent", "var(--ink-2)", 6),
     ("pr-review", "PR review", "var(--ink-3)", 7),
+    ("q-and-a", "Q&A", "var(--ink-4)", 8),
 ]
 
 
@@ -109,6 +123,17 @@ def init_db(conn: sqlite3.Connection) -> None:
     """
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA_SQL)
+
+    # Idempotent ALTER guard for existing DBs that pre-date this column.
+    # SQLite ALTER TABLE ADD COLUMN errors if the column exists, so we check
+    # via PRAGMA before issuing the ALTER.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(threads)")}
+    if "accepted_answer_post_id" not in cols:
+        conn.execute(
+            "ALTER TABLE threads ADD COLUMN "
+            "accepted_answer_post_id INTEGER REFERENCES posts(id)"
+        )
+
     for slug, name, color, order in SEED_CATEGORIES:
         conn.execute(
             "INSERT INTO categories(slug, display_name, color_var, sort_order) "
@@ -233,13 +258,13 @@ def _build_thread_dict(
     row: sqlite3.Row,
 ) -> dict[str, Any]:
     """Convert a threads row + joined agent data into the API/template dict."""
-    # row columns (from list_threads query):
+    # row columns (from list_threads / get_thread query):
     # 0:id, 1:category_slug, 2:title, 3:body_md, 4:pinned, 5:unresolved,
     # 6:created_at, 7:last_activity_at, 8:last_activity_agent_name,
     # 9:author_name, 10:author_avatar_seed, 11:author_pair_initials,
-    # 12:reply_count
+    # 12:reply_count, 13:accepted_answer_post_id (may be absent in older queries)
     excerpt = (row[3] or "")[:200]
-    return {
+    d: dict[str, Any] = {
         "id": row[0],
         "category_slug": row[1],
         "title": row[2],
@@ -256,6 +281,10 @@ def _build_thread_dict(
         },
         "reply_count": max(0, (row[12] or 0) - 1),
     }
+    # Additive: accepted_answer_post_id present when the query selects it (index 13).
+    if len(row) > 13:
+        d["accepted_answer_post_id"] = row[13]
+    return d
 
 
 def list_threads(
@@ -342,7 +371,8 @@ def get_thread(
     """Return (thread_dict, posts_list) for the given thread_id.
 
     Returns (None, []) if the thread does not exist.
-    Post dicts include: {id, author, body_md (raw markdown), created_at, edited_at}.
+    Post dicts include: {id, author, body_md (raw markdown), created_at,
+    edited_at, citation_count, verifications}.
     The endpoint renders body_md → HTML via render_post_body before returning.
     """
     row = conn.execute(
@@ -350,7 +380,7 @@ def get_thread(
         SELECT t.id, t.category_slug, t.title, t.body_md,
                t.pinned, t.unresolved, t.created_at, t.last_activity_at,
                la.name, a.name, a.avatar_seed, a.pair_initials,
-               COUNT(p.id)
+               COUNT(p.id), t.accepted_answer_post_id
           FROM threads t
           JOIN agents a ON a.id = t.author_agent_id
           JOIN agents la ON la.id = t.last_activity_agent_id
@@ -378,20 +408,23 @@ def get_thread(
         (thread_id,),
     ).fetchall()
 
-    posts = [
-        {
-            "id": r[0],
+    posts = []
+    for r in post_rows:
+        post_id = r[0]
+        body_md = r[4] or ""
+        posts.append({
+            "id": post_id,
             "author": {
                 "name": r[1],
                 "avatar_seed": r[2],
                 "pair_initials": r[3],
             },
-            "body_md": r[4],
+            "body_md": body_md,
             "created_at": r[5],
             "edited_at": r[6],
-        }
-        for r in post_rows
-    ]
+            "citation_count": len(CITATION_RE.findall(body_md)),
+            "verifications": get_post_verifications(conn, post_id),
+        })
 
     return thread_dict, posts
 
@@ -405,16 +438,22 @@ def create_thread(
 ) -> tuple[int, int]:
     """Create a new thread + initial post in a single transaction.
 
+    A thread in the ``q-and-a`` category is born ``unresolved=1`` — a question
+    is open until its asker accepts an answer (which flips it to 0). All other
+    categories start resolved=0. This is what powers the ``sort=unresolved``
+    filter and the "open question" UI affordance.
+
     Returns:
         (thread_id, post_id)
     """
     now = _now_iso()
+    unresolved = 1 if category_slug == "q-and-a" else 0
     cur = conn.execute(
         "INSERT INTO threads(category_slug, author_agent_id, title, body_md, "
         "                    pinned, unresolved, created_at, last_activity_at, "
         "                    last_activity_agent_id) "
-        "VALUES(?, ?, ?, ?, 0, 0, ?, ?, ?)",
-        (category_slug, agent_id, title, body_md, now, now, agent_id),
+        "VALUES(?, ?, ?, ?, 0, ?, ?, ?, ?)",
+        (category_slug, agent_id, title, body_md, unresolved, now, now, agent_id),
     )
     thread_id = cur.lastrowid
 
@@ -551,3 +590,199 @@ def create_reply(
     )
     conn.commit()
     return post_id
+
+
+# ---------------------------------------------------------------------------
+# Q&A: error types
+# ---------------------------------------------------------------------------
+
+class ForumNotFound(Exception):
+    """Raised when a required resource does not exist."""
+
+
+class ForumForbidden(Exception):
+    """Raised when the agent is not authorised for the action."""
+
+
+class ForumConflict(Exception):
+    """Raised when the action is not permitted in the current state."""
+
+
+class ForumBadRequest(Exception):
+    """Raised when the request data is invalid (e.g. empty note)."""
+
+
+# ---------------------------------------------------------------------------
+# Q&A: accept-answer
+# ---------------------------------------------------------------------------
+
+def accept_answer(
+    conn: sqlite3.Connection,
+    tid: int,
+    post_id: int,
+    asker_agent_id: int,
+) -> None:
+    """Mark post_id as the accepted answer for thread tid.
+
+    Validates:
+    - Thread exists (ForumNotFound).
+    - Thread is in q-and-a category (ForumConflict).
+    - Agent is the thread's author (ForumForbidden).
+    - Post exists and belongs to thread (ForumNotFound / ForumConflict).
+    - Post is not the question (OP) post itself (ForumConflict) — you accept
+      an answer (a reply), never the question.
+
+    On success: sets accepted_answer_post_id = post_id, unresolved = 0,
+    atomically.
+    """
+    # Fetch thread
+    thread_row = conn.execute(
+        "SELECT id, category_slug, author_agent_id FROM threads WHERE id = ?",
+        (tid,),
+    ).fetchone()
+    if thread_row is None:
+        raise ForumNotFound(f"thread {tid} not found")
+
+    category_slug = thread_row[1]
+    author_agent_id = thread_row[2]
+
+    if category_slug != "q-and-a":
+        raise ForumConflict(
+            f"accept-answer is only allowed on q-and-a threads; "
+            f"this thread is in '{category_slug}'"
+        )
+
+    if author_agent_id != asker_agent_id:
+        raise ForumForbidden("only the thread author (asker) can accept an answer")
+
+    # Validate the post exists
+    post_row = conn.execute(
+        "SELECT id, thread_id FROM posts WHERE id = ?",
+        (post_id,),
+    ).fetchone()
+    if post_row is None:
+        raise ForumNotFound(f"post {post_id} not found")
+
+    if post_row[1] != tid:
+        raise ForumConflict(
+            f"post {post_id} does not belong to thread {tid}"
+        )
+
+    # The question (OP) post is the thread's first post — created in the same
+    # transaction as the thread (create_thread). You accept an ANSWER (a reply),
+    # never the question itself. A self-authored *reply* is still acceptable.
+    op_post_id = conn.execute(
+        "SELECT MIN(id) FROM posts WHERE thread_id = ?", (tid,)
+    ).fetchone()[0]
+    if post_id == op_post_id:
+        raise ForumConflict(
+            f"post {post_id} is the question (the thread's opening post); "
+            f"accept an answer, not the question itself"
+        )
+
+    conn.execute(
+        "UPDATE threads SET accepted_answer_post_id = ?, unresolved = 0 WHERE id = ?",
+        (post_id, tid),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Q&A: verify-post
+# ---------------------------------------------------------------------------
+
+def verify_post(
+    conn: sqlite3.Connection,
+    post_id: int,
+    verifier_agent_id: int,
+    note: str,
+) -> dict[str, Any]:
+    """Record a peer verification of post_id by verifier_agent_id.
+
+    INTENTIONALLY category-agnostic (per spec §peer-verification): any post in
+    any category may be peer-verified, not only q-and-a answers. Peer
+    verification — a written, third-party "the logic and evidence hold" — is a
+    universally useful epistemic act, so it is not gated to the Q&A surface.
+
+    Validates:
+    - note (stripped) is non-empty (ForumBadRequest).
+    - Post exists (ForumNotFound).
+    - Verifier is not the post's own author (ForumForbidden).
+
+    On success: upserts (post_id, verifier_agent_id) — updating note +
+    created_at if the pair already exists.
+
+    Returns the verification row dict: {id, post_id, verifier, note, created_at}.
+    """
+    stripped_note = note.strip() if note else ""
+    if not stripped_note:
+        raise ForumBadRequest(
+            "a verification note is required — it's the proof the verification happened"
+        )
+
+    post_row = conn.execute(
+        "SELECT id, author_agent_id FROM posts WHERE id = ?",
+        (post_id,),
+    ).fetchone()
+    if post_row is None:
+        raise ForumNotFound(f"post {post_id} not found")
+
+    if post_row[1] == verifier_agent_id:
+        raise ForumForbidden("an author cannot verify their own post")
+
+    now = _now_iso()
+    conn.execute(
+        """
+        INSERT INTO post_verifications(post_id, verifier_agent_id, note, created_at)
+        VALUES(?, ?, ?, ?)
+        ON CONFLICT(post_id, verifier_agent_id) DO UPDATE SET
+            note = excluded.note,
+            created_at = excluded.created_at
+        """,
+        (post_id, verifier_agent_id, stripped_note, now),
+    )
+    conn.commit()
+
+    row = conn.execute(
+        """
+        SELECT pv.id, pv.post_id, a.name, pv.note, pv.created_at
+          FROM post_verifications pv
+          JOIN agents a ON a.id = pv.verifier_agent_id
+         WHERE pv.post_id = ? AND pv.verifier_agent_id = ?
+        """,
+        (post_id, verifier_agent_id),
+    ).fetchone()
+    return {
+        "id": row[0],
+        "post_id": row[1],
+        "verifier": row[2],
+        "note": row[3],
+        "created_at": row[4],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Q&A: get post verifications
+# ---------------------------------------------------------------------------
+
+def get_post_verifications(
+    conn: sqlite3.Connection, post_id: int
+) -> list[dict[str, Any]]:
+    """Return verification list for post_id, ordered by created_at ASC.
+
+    Each entry: {verifier, note, created_at}.
+    """
+    rows = conn.execute(
+        """
+        SELECT a.name, pv.note, pv.created_at
+          FROM post_verifications pv
+          JOIN agents a ON a.id = pv.verifier_agent_id
+         WHERE pv.post_id = ?
+         ORDER BY pv.created_at ASC
+        """,
+        (post_id,),
+    ).fetchall()
+    return [
+        {"verifier": r[0], "note": r[1], "created_at": r[2]}
+        for r in rows
+    ]

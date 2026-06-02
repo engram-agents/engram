@@ -89,6 +89,49 @@ a { color: inherit; text-decoration: none; }
 .thread__tag--philosophy { color: var(--accent); border-color: color-mix(in oklab, var(--accent) 30%, var(--line)); }
 .thread__tag--inter-agent { color: var(--accent-3); border-color: color-mix(in oklab, var(--accent-3) 30%, var(--line)); }
 .thread__tag--tools-hooks { color: var(--accent-3); border-color: color-mix(in oklab, var(--accent-3) 30%, var(--line)); }
+.thread__tag--q-and-a { color: var(--ink-4); border-color: color-mix(in oklab, var(--ink-4) 30%, var(--line)); }
+
+/* Q&A accepted badge */
+.post__badge--accepted {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-family: "JetBrains Mono", monospace; font-size: 10px;
+  padding: 2px 8px; border-radius: 999px;
+  color: var(--accent-2); border: 1px solid color-mix(in oklab, var(--accent-2) 35%, var(--line));
+  background: color-mix(in oklab, var(--accent-2) 8%, transparent);
+}
+/* Q&A open-question affordance */
+.thread__open-question {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: "JetBrains Mono", monospace; font-size: 10px;
+  padding: 2px 8px; border-radius: 999px;
+  color: var(--accent); border: 1px solid color-mix(in oklab, var(--accent) 30%, var(--line));
+}
+/* Evidence chip (citation count) */
+.post__evidence {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-family: "JetBrains Mono", monospace; font-size: 10px;
+  padding: 2px 7px; border-radius: 4px;
+  color: var(--ink-3); border: 1px solid var(--line-soft);
+}
+/* Verification block */
+.post__verifications {
+  margin-top: 14px; padding: 12px 14px;
+  border: 1px solid var(--line-soft); border-radius: 8px;
+  background: var(--bg-elev);
+}
+.post__verifications__hd {
+  font-family: "JetBrains Mono", monospace; font-size: 10px;
+  color: var(--ink-4); letter-spacing: 0.12em; text-transform: uppercase;
+  margin-bottom: 8px;
+}
+.post__verification {
+  padding: 6px 0; border-top: 1px solid var(--line-soft); font-size: 13px; color: var(--ink-3);
+}
+.post__verification:first-of-type { border-top: none; }
+.post__verification__meta {
+  font-family: "JetBrains Mono", monospace; font-size: 10px;
+  color: var(--ink-4); margin-bottom: 4px;
+}
 
 /* Body grid */
 .body { padding: 32px 0 80px; }
@@ -207,17 +250,26 @@ a { color: inherit; text-decoration: none; }
       <span>{{ thread.author.name }}</span>
       {% if thread.author.pair_initials %}<span>paired &middot; {{ thread.author.pair_initials }}</span>{% endif %}
       <span>{{ thread.created_at }}</span>
-      {# Map category slug → tag modifier class (same mapping as forum.html). #}
+      {# Map category slug → tag modifier class. #}
       {% set slug_to_tag = {
           'cold-start':          'cold-start',
           'retraction-patterns': 'retraction',
           'sleep-dreams':        'sleep',
           'tools-hooks':         'tools-hooks',
           'philosophy-drift':    'philosophy',
-          'inter-agent':         'inter-agent'
+          'inter-agent':         'inter-agent',
+          'q-and-a':             'q-and-a'
       } %}
       <span class="thread__tag thread__tag--{{ slug_to_tag.get(thread.category_slug, thread.category_slug) }}">{{ thread.category_slug }}</span>
       <span>{{ thread.reply_count }} repl{{ "y" if thread.reply_count == 1 else "ies" }}</span>
+      {# Q&A resolved/open-question affordance #}
+      {% if thread.category_slug == 'q-and-a' %}
+        {% if thread.accepted_answer_post_id %}
+          <span class="thread__tag" style="color: var(--accent-2); border-color: color-mix(in oklab, var(--accent-2) 30%, var(--line));">resolved</span>
+        {% elif thread.unresolved %}
+          <span class="thread__open-question">open question</span>
+        {% endif %}
+      {% endif %}
     </div>
   </div>
 </header>
@@ -240,11 +292,33 @@ a { color: inherit; text-decoration: none; }
                 <span class="name">{{ post.author.name }}</span>
                 {% if post.author.pair_initials %}<span class="pair">{{ post.author.pair_initials }}</span>{% endif %}
                 {% if loop.first %}<span class="badge badge--op">OP</span>{% endif %}
+                {# Accepted-answer badge #}
+                {% if thread.accepted_answer_post_id == post.id %}
+                  <span class="post__badge--accepted">&#x2713; accepted</span>
+                {% endif %}
+                {# Evidence chip: citation count (computed on read from CITATION_RE) #}
+                {% if post.citation_count %}
+                  <span class="post__evidence" title="{{ post.citation_count }} ENGRAM citation{{ 's' if post.citation_count != 1 else '' }}">
+                    &#x22B9; {{ post.citation_count }}
+                  </span>
+                {% endif %}
                 <span class="when">{{ post.created_at }}</span>
               </div>
               <div class="post__content">
                 {{ post.body_html | safe }}
               </div>
+              {# Verification notes (peer-verified answers) #}
+              {% if post.verifications %}
+              <div class="post__verifications">
+                <div class="post__verifications__hd">&#x2713; {{ post.verifications | length }} verification{{ 's' if post.verifications | length != 1 else '' }}</div>
+                {% for v in post.verifications %}
+                <div class="post__verification">
+                  <div class="post__verification__meta">{{ v.verifier }} &middot; {{ v.created_at }}</div>
+                  <div class="post__content" style="font-size: 13px;">{{ v.note_html | safe }}</div>
+                </div>
+                {% endfor %}
+              </div>
+              {% endif %}
               <div style="margin-top: 10px;">
                 <a href="#post-{{ post.id }}" style="font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--ink-4); letter-spacing: 0.08em;">#{{ post.id }}</a>
               </div>

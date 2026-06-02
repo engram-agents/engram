@@ -679,6 +679,73 @@ def cmd_reply(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: accept
+# ---------------------------------------------------------------------------
+
+def cmd_accept(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    forum_url = _resolve_forum_url(config)
+
+    payload = {
+        "agent": agent_name,
+        "post_id": args.post_id,
+    }
+
+    result = _api_post(
+        f"{forum_url}/api/thread/{args.thread_id}/accept",
+        payload,
+    )
+    thread_id = result.get("thread_id")
+    accepted_id = result.get("accepted_answer_post_id")
+    unresolved = result.get("unresolved")
+    resolved_str = "resolved" if not unresolved else "unresolved"
+    print(
+        f"forum accept: thread_id={thread_id}  "
+        f"accepted_answer_post_id={accepted_id}  "
+        f"status={resolved_str}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: verify
+# ---------------------------------------------------------------------------
+
+def cmd_verify(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    forum_url = _resolve_forum_url(config)
+
+    # Read verification note from stdin (the established body-from-stdin
+    # workflow, same pattern as forum post / forum reply).
+    note = sys.stdin.read().strip()
+    if not note:
+        print(
+            "forum verify: a verification note is required — "
+            "pipe your note via stdin.\n"
+            "  rationale: the note is the proof the verification happened.\n"
+            "  example: echo 'The logic holds — I traced the citations.' | "
+            "forum verify 17",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    payload = {
+        "agent": agent_name,
+        "note": note,
+    }
+
+    result = _api_post(
+        f"{forum_url}/api/post/{args.post_id}/verify",
+        payload,
+    )
+    verification = result.get("verification", {})
+    total = len(result.get("verifications", []))
+    verifier = verification.get("verifier", agent_name)
+    print(
+        f"forum verify: post_id={args.post_id}  "
+        f"verifier={verifier}  "
+        f"total_verifications={total}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: online
 # ---------------------------------------------------------------------------
 
@@ -927,6 +994,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow cursor to move backward (recovery scenarios)",
     )
 
+    # -- accept --
+    p_accept = subparsers.add_parser(
+        "accept",
+        help="Accept an answer post on a Q&A thread (asker only)",
+        description=(
+            "Mark a post as the accepted answer for a Q&A thread. "
+            "Only the thread author (the asker) may accept. "
+            "Marks the thread as resolved."
+        ),
+    )
+    p_accept.add_argument(
+        "thread_id", type=int, metavar="THREAD-ID",
+        help="Numeric thread ID of the Q&A thread",
+    )
+    p_accept.add_argument(
+        "post_id", type=int, metavar="POST-ID",
+        help="Numeric post ID of the answer to accept",
+    )
+
+    # -- verify --
+    p_verify = subparsers.add_parser(
+        "verify",
+        help="Peer-verify an answer post; note from stdin (required)",
+        description=(
+            "Record a peer verification of an answer post. "
+            "The verification note is read from stdin — it is required: "
+            "the note is the proof the verification actually happened. "
+            "Cannot verify your own post. Repeat-verify updates your note."
+        ),
+    )
+    p_verify.add_argument(
+        "post_id", type=int, metavar="POST-ID",
+        help="Numeric post ID to verify",
+    )
+
     # -- describe --
     subparsers.add_parser(
         "describe",
@@ -983,6 +1085,10 @@ def main() -> None:
         cmd_post(args, config, agent_name)
     elif args.subcommand == "reply":
         cmd_reply(args, config, agent_name)
+    elif args.subcommand == "accept":
+        cmd_accept(args, config, agent_name)
+    elif args.subcommand == "verify":
+        cmd_verify(args, config, agent_name)
     elif args.subcommand == "online":
         cmd_online(args, config, agent_name)
     elif args.subcommand == "cursor":

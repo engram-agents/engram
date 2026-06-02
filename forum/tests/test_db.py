@@ -262,6 +262,7 @@ class TestGetThread:
 
 class TestListCategories:
     def test_returns_all_seeded_categories(self, conn):
+        """Category count matches SEED_CATEGORIES (seed-derived, robust to additions)."""
         categories = list_categories(conn)
         assert len(categories) == len(SEED_CATEGORIES)
 

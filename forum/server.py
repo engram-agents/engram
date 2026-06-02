@@ -104,8 +104,12 @@ def create_app(db_path: str, audit_path: str) -> Flask:
             abort(404)
 
         # Render body_md → safe HTML for each post before passing to template.
+        # Also sanitize verification notes through the same render pipeline
+        # (notes are agent-supplied — security-critical).
         for post in posts:
             post["body_html"] = render_post_body(post["body_md"])
+            for v in post.get("verifications", []):
+                v["note_html"] = render_post_body(v["note"])
 
         categories = db.list_categories(g.conn)
         online_agents, online_count, registered = db.list_online(g.conn)
@@ -158,10 +162,98 @@ def create_app(db_path: str, audit_path: str) -> Flask:
             return jsonify({"error": "thread not found"}), 404
 
         # Render body_md → safe HTML for posts before returning to client.
+        # Also sanitize each verification note through the same render pipeline
+        # (notes are agent-supplied — security-critical, same threat surface as
+        # post bodies).
         for post in posts:
             post["body_html"] = render_post_body(post["body_md"])
+            for v in post.get("verifications", []):
+                v["note_html"] = render_post_body(v["note"])
 
         return jsonify({"thread": thread_dict, "posts": posts})
+
+    # ------------------------------------------------------------------
+    # POST /api/thread/<id>/accept
+    # ------------------------------------------------------------------
+    @app.route("/api/thread/<int:tid>/accept", methods=["POST"])
+    def api_accept_answer(tid: int):
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent_name = (data.get("agent") or "").strip()
+        if not agent_name:
+            return jsonify({"error": "agent is required"}), 400
+
+        post_id = data.get("post_id")
+        if post_id is None:
+            return jsonify({"error": "post_id is required"}), 400
+        try:
+            post_id = int(post_id)
+        except (ValueError, TypeError):
+            return jsonify({"error": "post_id must be an integer"}), 400
+
+        agent_id = db.upsert_agent(g.conn, agent_name)
+
+        try:
+            db.accept_answer(g.conn, tid, post_id, agent_id)
+        except db.ForumNotFound as e:
+            return jsonify({"error": str(e)}), 404
+        except db.ForumForbidden as e:
+            return jsonify({"error": str(e)}), 403
+        except db.ForumConflict as e:
+            return jsonify({"error": str(e)}), 409
+
+        # Return the updated thread summary
+        row = g.conn.execute(
+            "SELECT id, category_slug, unresolved, accepted_answer_post_id "
+            "FROM threads WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        return jsonify({
+            "thread_id": row[0],
+            "category_slug": row[1],
+            "unresolved": bool(row[2]),
+            "accepted_answer_post_id": row[3],
+        })
+
+    # ------------------------------------------------------------------
+    # POST /api/post/<id>/verify
+    # ------------------------------------------------------------------
+    @app.route("/api/post/<int:pid>/verify", methods=["POST"])
+    def api_verify_post(pid: int):
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent_name = (data.get("agent") or "").strip()
+        if not agent_name:
+            return jsonify({"error": "agent is required"}), 400
+
+        note = data.get("note") or ""
+
+        agent_id = db.upsert_agent(g.conn, agent_name)
+
+        try:
+            verification = db.verify_post(g.conn, pid, agent_id, note)
+        except db.ForumBadRequest as e:
+            return jsonify({"error": str(e)}), 400
+        except db.ForumNotFound as e:
+            return jsonify({"error": str(e)}), 404
+        except db.ForumForbidden as e:
+            return jsonify({"error": str(e)}), 403
+
+        # Sanitize the returned note through the render pipeline
+        verification["note_html"] = render_post_body(verification["note"])
+
+        verifications = db.get_post_verifications(g.conn, pid)
+        for v in verifications:
+            v["note_html"] = render_post_body(v["note"])
+
+        return jsonify({
+            "verification": verification,
+            "verifications": verifications,
+        })
 
     # ------------------------------------------------------------------
     # POST /api/post
