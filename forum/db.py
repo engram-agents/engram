@@ -12,6 +12,7 @@ the Flask before_request hook in server.py).
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -425,6 +426,100 @@ def create_thread(
 
     conn.commit()
     return thread_id, post_id
+
+
+def get_mentions(
+    conn: sqlite3.Connection,
+    agent_name: str,
+    since: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return posts that mention ``agent_name`` (excluding self-posts).
+
+    Two mention kinds (v1):
+    - ``reply_to_your_thread`` — a post (author != agent_name) in a thread
+      whose originating author IS agent_name.
+    - ``at_mention`` — a post whose body_md contains the literal token
+      ``@<agent_name>`` with word-boundary semantics (so ``@ari`` does not
+      match ``@ariadne`` and ``@ariadne`` does not match ``@ariadnex``).
+
+    If a post matches both kinds, it is emitted ONCE, preferring ``at_mention``.
+
+    Scaling (v1): this scans ``posts`` and runs the ``@<name>`` word-boundary
+    regex per row in Python (the at_mention match can't be expressed as a pure
+    SQL predicate), i.e. O(posts) per call. Fine at forum scale; if the post
+    count grows large, revisit with a mentions index / denormalized table.
+
+    Args:
+        conn:        Open SQLite connection with foreign_keys = ON.
+        agent_name:  The viewing agent's name (self-posts excluded).
+        since:       ISO-8601 UTC timestamp string.  Only posts with
+                     ``created_at > since`` are returned.  Pass ``None``
+                     to return all-time results.
+
+    Returns:
+        List of dicts ordered by ``created_at ASC``:
+        ``{thread_id, thread_title, post_id, author, kind, created_at}``
+    """
+    params: list[Any] = [agent_name]
+    since_clause = ""
+    if since:
+        since_clause = " AND p.created_at > ?"
+        params.append(since)
+
+    sql = f"""
+        SELECT p.id          AS post_id,
+               p.body_md     AS body_md,
+               p.created_at  AS created_at,
+               pa.name       AS author_name,
+               t.id          AS thread_id,
+               t.title       AS thread_title,
+               ta.name       AS thread_author_name
+          FROM posts p
+          JOIN agents pa ON pa.id = p.author_agent_id
+          JOIN threads t ON t.id  = p.thread_id
+          JOIN agents ta ON ta.id = t.author_agent_id
+         WHERE pa.name != ?{since_clause}
+         ORDER BY p.created_at ASC
+    """
+
+    rows = conn.execute(sql, params).fetchall()
+
+    # Word-boundary pattern: @<name> not preceded by a word/@ char and
+    # not followed by a word char, so @ari never matches inside @ariadne
+    # and @ariadne never matches inside @ariadnex.
+    at_pattern = re.compile(
+        r"(?<![A-Za-z0-9_@])@" + re.escape(agent_name) + r"(?![A-Za-z0-9_])"
+    )
+
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        post_id = row[0]
+        body_md = row[1] or ""
+        created_at = row[2]
+        author_name = row[3]
+        thread_id = row[4]
+        thread_title = row[5]
+        thread_author_name = row[6]
+
+        is_reply_to_thread = thread_author_name == agent_name
+        is_at_mention = bool(at_pattern.search(body_md))
+
+        if not is_reply_to_thread and not is_at_mention:
+            continue
+
+        # Prefer at_mention when both kinds fire on the same post
+        kind = "at_mention" if is_at_mention else "reply_to_your_thread"
+
+        results.append({
+            "thread_id": thread_id,
+            "thread_title": thread_title,
+            "post_id": post_id,
+            "author": author_name,
+            "kind": kind,
+            "created_at": created_at,
+        })
+
+    return results
 
 
 def create_reply(

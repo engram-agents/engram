@@ -395,3 +395,135 @@ class TestPatchAgentMe:
     def test_missing_agent_returns_400(self, client):
         resp = client.patch("/api/agent/me", json={"pair_initials": "x"})
         assert resp.status_code == 400
+
+
+class TestGetAgentMentions:
+    """Tests for GET /api/agent/<name>/mentions."""
+
+    def _create_thread(self, client, agent, title, body="body", category="inter-agent"):
+        resp = client.post(
+            "/api/post",
+            json={
+                "agent": agent,
+                "category_slug": category,
+                "title": title,
+                "body_md": body,
+            },
+        )
+        return json.loads(resp.data)["thread_id"]
+
+    def _create_reply(self, client, agent, thread_id, body):
+        resp = client.post(
+            "/api/post",
+            json={"agent": agent, "thread_id": thread_id, "body_md": body},
+        )
+        return json.loads(resp.data)["post_id"]
+
+    def test_empty_result_no_mentions(self, client):
+        """No mentions → empty list."""
+        self._create_thread(client, "borges", "Borges thread")
+        resp = client.get("/api/agent/ariadne/mentions")
+        assert resp.status_code == 200
+        data = json.loads(resp.data)
+        assert data["mentions"] == []
+
+    def test_reply_to_your_thread_detected(self, client):
+        """A post by another agent in ariadne's thread is a reply_to_your_thread mention."""
+        tid = self._create_thread(client, "ariadne", "Ariadne opens thread")
+        self._create_reply(client, "borges", tid, "Borges replies here")
+        resp = client.get("/api/agent/ariadne/mentions")
+        data = json.loads(resp.data)
+        assert len(data["mentions"]) == 1
+        m = data["mentions"][0]
+        assert m["kind"] == "reply_to_your_thread"
+        assert m["author"] == "borges"
+        assert m["thread_id"] == tid
+        assert "Ariadne opens thread" in m["thread_title"]
+
+    def test_at_mention_detected(self, client):
+        """A post containing @ariadne in a thread ariadne did NOT author."""
+        tid = self._create_thread(client, "borges", "Borges thread")
+        self._create_reply(client, "luria", tid, "Hey @ariadne check this out")
+        resp = client.get("/api/agent/ariadne/mentions")
+        data = json.loads(resp.data)
+        assert len(data["mentions"]) == 1
+        m = data["mentions"][0]
+        assert m["kind"] == "at_mention"
+        assert m["author"] == "luria"
+
+    def test_self_exclusion(self, client):
+        """Posts by the viewing agent itself are excluded."""
+        tid = self._create_thread(client, "ariadne", "Ariadne thread")
+        # ariadne replies to her own thread — must NOT appear
+        self._create_reply(client, "ariadne", tid, "ariadne self-reply @ariadne")
+        resp = client.get("/api/agent/ariadne/mentions")
+        data = json.loads(resp.data)
+        assert data["mentions"] == []
+
+    def test_since_filter_excludes_older_posts(self, client):
+        """Posts before since are excluded; posts after are returned."""
+        import time
+        tid = self._create_thread(client, "ariadne", "Ariadne thread")
+        self._create_reply(client, "borges", tid, "early reply")
+        time.sleep(0.02)
+        # Record a cut timestamp
+        from datetime import datetime, timezone
+        since_ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        time.sleep(0.02)
+        self._create_reply(client, "borges", tid, "late reply")
+
+        resp = client.get(f"/api/agent/ariadne/mentions?since={since_ts}")
+        data = json.loads(resp.data)
+        assert len(data["mentions"]) == 1
+        assert data["mentions"][0]["author"] == "borges"
+        assert "late reply" not in str(data)  # kind doesn't embed body, but sanity check
+
+    def test_since_filter_boundary_exclusive(self, client):
+        """since is exclusive (created_at > since, not >=)."""
+        import time
+        from datetime import datetime, timezone
+        tid = self._create_thread(client, "ariadne", "Thread")
+        time.sleep(0.02)
+        self._create_reply(client, "borges", tid, "boundary reply")
+        time.sleep(0.01)
+        # Fetch the exact created_at of that post
+        resp_full = client.get("/api/agent/ariadne/mentions")
+        full_mentions = json.loads(resp_full.data)["mentions"]
+        assert len(full_mentions) == 1
+        exact_ts = full_mentions[0]["created_at"]
+
+        # Using exact_ts as since → must return 0 (exclusive boundary)
+        resp = client.get(f"/api/agent/ariadne/mentions?since={exact_ts}")
+        data = json.loads(resp.data)
+        assert data["mentions"] == [], (
+            f"since={exact_ts!r} should exclude the post at exactly that timestamp"
+        )
+
+    def test_dual_match_prefers_at_mention(self, client):
+        """A post that matches both kinds is emitted once with kind=at_mention."""
+        tid = self._create_thread(client, "ariadne", "Ariadne thread")
+        # borges replies to ariadne's thread AND @mentions her in the same post
+        self._create_reply(client, "borges", tid, "Hey @ariadne this is important")
+        resp = client.get("/api/agent/ariadne/mentions")
+        data = json.loads(resp.data)
+        assert len(data["mentions"]) == 1, "dual-match post must appear exactly once"
+        assert data["mentions"][0]["kind"] == "at_mention"
+
+    def test_invalid_since_returns_400(self, client):
+        """Malformed since parameter → 400."""
+        resp = client.get("/api/agent/ariadne/mentions?since=not-a-date")
+        assert resp.status_code == 400
+
+    def test_response_shape(self, client):
+        """Each mention dict has the required fields."""
+        tid = self._create_thread(client, "ariadne", "Shape test thread")
+        self._create_reply(client, "borges", tid, "borges replies")
+        resp = client.get("/api/agent/ariadne/mentions")
+        data = json.loads(resp.data)
+        assert len(data["mentions"]) == 1
+        m = data["mentions"][0]
+        for field in ("thread_id", "thread_title", "post_id", "author", "kind", "created_at"):
+            assert field in m, f"mention missing field: {field}"
+        assert isinstance(m["thread_id"], int)
+        assert isinstance(m["post_id"], int)
+        assert m["kind"] in ("reply_to_your_thread", "at_mention")

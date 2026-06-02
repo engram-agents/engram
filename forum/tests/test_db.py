@@ -12,6 +12,7 @@ from forum.db import (
     count_open_threads,
     create_reply,
     create_thread,
+    get_mentions,
     get_thread,
     init_db,
     list_categories,
@@ -302,6 +303,118 @@ class TestCountCitations:
 
     def test_zero_when_no_posts(self, conn):
         assert count_citations(conn) == 0
+
+
+class TestGetMentions:
+    """Unit tests for db.get_mentions()."""
+
+    def _make_thread(self, conn, author_name, title="Thread", body="body"):
+        agent_id = upsert_agent(conn, author_name)
+        thread_id, _ = create_thread(conn, agent_id, "inter-agent", title, body)
+        return thread_id
+
+    def _make_reply(self, conn, author_name, thread_id, body):
+        agent_id = upsert_agent(conn, author_name)
+        return create_reply(conn, agent_id, thread_id, body)
+
+    def test_empty_when_no_mentions(self, conn):
+        """No mentions → empty list."""
+        self._make_thread(conn, "borges", "Borges thread")
+        result = get_mentions(conn, "ariadne")
+        assert result == []
+
+    def test_reply_to_your_thread(self, conn):
+        """borges replying to ariadne's thread is a reply_to_your_thread mention."""
+        tid = self._make_thread(conn, "ariadne", "Ariadne thread")
+        self._make_reply(conn, "borges", tid, "borges reply")
+        result = get_mentions(conn, "ariadne")
+        assert len(result) == 1
+        m = result[0]
+        assert m["kind"] == "reply_to_your_thread"
+        assert m["author"] == "borges"
+        assert m["thread_id"] == tid
+        assert m["thread_title"] == "Ariadne thread"
+
+    def test_at_mention(self, conn):
+        """@ariadne in a post body (in a thread ariadne didn't author) → at_mention."""
+        tid = self._make_thread(conn, "borges", "Borges thread")
+        self._make_reply(conn, "luria", tid, "Hey @ariadne, check this")
+        result = get_mentions(conn, "ariadne")
+        assert len(result) == 1
+        assert result[0]["kind"] == "at_mention"
+        assert result[0]["author"] == "luria"
+
+    def test_self_exclusion(self, conn):
+        """ariadne posting in her own thread (even with @ariadne) is excluded."""
+        tid = self._make_thread(conn, "ariadne", "Ariadne thread")
+        self._make_reply(conn, "ariadne", tid, "@ariadne self note")
+        result = get_mentions(conn, "ariadne")
+        assert result == []
+
+    def test_dual_match_prefers_at_mention(self, conn):
+        """Post matching both kinds → emitted once with kind=at_mention."""
+        tid = self._make_thread(conn, "ariadne", "Ariadne thread")
+        self._make_reply(conn, "borges", tid, "Hey @ariadne, replying here")
+        result = get_mentions(conn, "ariadne")
+        assert len(result) == 1
+        assert result[0]["kind"] == "at_mention"
+
+    def test_at_mention_word_boundary_prefix(self, conn):
+        """@ari does NOT trigger a mention for agent 'ariadne'."""
+        tid = self._make_thread(conn, "borges", "Borges thread")
+        self._make_reply(conn, "luria", tid, "Hey @ari, how are you?")
+        result = get_mentions(conn, "ariadne")
+        assert result == [], "@ari must not match @ariadne (prefix word-boundary)"
+
+    def test_at_mention_word_boundary_suffix(self, conn):
+        """@ariadnex does NOT trigger a mention for agent 'ariadne'."""
+        tid = self._make_thread(conn, "borges", "Borges thread")
+        self._make_reply(conn, "luria", tid, "Talking to @ariadnex not you")
+        result = get_mentions(conn, "ariadne")
+        assert result == [], "@ariadnex must not match @ariadne (suffix word-boundary)"
+
+    def test_at_mention_exact_match(self, conn):
+        """@ariadne (exact) at end-of-string triggers mention."""
+        tid = self._make_thread(conn, "borges", "Borges thread")
+        self._make_reply(conn, "luria", tid, "ping @ariadne")
+        result = get_mentions(conn, "ariadne")
+        assert len(result) == 1
+        assert result[0]["kind"] == "at_mention"
+
+    def test_since_filter_excludes_older(self, conn):
+        """Posts before 'since' are excluded."""
+        import time
+        from datetime import datetime, timezone
+        tid = self._make_thread(conn, "ariadne", "Ariadne thread")
+        self._make_reply(conn, "borges", tid, "early reply")
+        time.sleep(0.02)
+        since_ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        time.sleep(0.02)
+        self._make_reply(conn, "borges", tid, "late reply")
+        result = get_mentions(conn, "ariadne", since=since_ts)
+        assert len(result) == 1
+
+    def test_since_none_returns_all(self, conn):
+        """since=None returns all mentions regardless of time."""
+        tid = self._make_thread(conn, "ariadne", "Ariadne thread")
+        self._make_reply(conn, "borges", tid, "reply 1")
+        self._make_reply(conn, "borges", tid, "reply 2")
+        result = get_mentions(conn, "ariadne", since=None)
+        assert len(result) == 2
+
+    def test_result_fields(self, conn):
+        """Each mention dict contains the required fields with correct types."""
+        tid = self._make_thread(conn, "ariadne", "Field test")
+        self._make_reply(conn, "borges", tid, "borges reply")
+        result = get_mentions(conn, "ariadne")
+        assert len(result) == 1
+        m = result[0]
+        assert isinstance(m["thread_id"], int)
+        assert isinstance(m["post_id"], int)
+        assert isinstance(m["thread_title"], str)
+        assert isinstance(m["author"], str)
+        assert m["kind"] in ("reply_to_your_thread", "at_mention")
+        assert isinstance(m["created_at"], str)
 
 
 class TestSetPairInitials:

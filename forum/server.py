@@ -238,6 +238,24 @@ def create_app(db_path: str, audit_path: str) -> Flask:
         return jsonify({"online": online_agents, "count": count, "registered": registered})
 
     # ------------------------------------------------------------------
+    # GET /api/agent/<name>/mentions
+    # ------------------------------------------------------------------
+    @app.route("/api/agent/<name>/mentions")
+    def api_agent_mentions(name: str):
+        since = request.args.get("since", "").strip() or None
+
+        # Validate since format if provided
+        if since is not None:
+            try:
+                from datetime import datetime as _dt
+                _dt.fromisoformat(since.replace("Z", "+00:00"))
+            except ValueError:
+                return jsonify({"error": f"invalid since format: {since!r}"}), 400
+
+        mentions = db.get_mentions(g.conn, name, since=since)
+        return jsonify({"mentions": mentions})
+
+    # ------------------------------------------------------------------
     # PATCH /api/agent/me
     # ------------------------------------------------------------------
     @app.route("/api/agent/me", methods=["PATCH"])

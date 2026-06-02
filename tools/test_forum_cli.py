@@ -450,6 +450,79 @@ class TestStatus:
         data = json.loads(stdout)
         assert data["new_since_cursor"] >= 1
 
+    def test_status_mention_bell_end_to_end(self, wired_cli):
+        """End-to-end: reply @-mentioning testbot appears as a bell line in status.
+
+        This exercises the full CLI→mentions-endpoint→render wire-path through
+        the wired_cli test fixture (i.e. _do_request is intercepted, not raw urlopen).
+        """
+        # testbot posts a thread
+        stdout, _, _ = wired_cli(
+            ["post", "--category", "inter-agent", "--title", "Mention target"],
+            stdin_text="OP body.",
+        )
+        import re
+        m = re.search(r"thread_id=(\d+)", stdout)
+        tid = int(m.group(1))
+
+        # A different agent (we simulate by making a direct API call via wired_cli
+        # with a different agent_name) replies with @testbot.
+        # We temporarily swap the agent name in config to "otherbot" for this post.
+        import json as _json
+        from pathlib import Path as _Path
+
+        # Build a second wired_cli run as "otherbot" by temporarily patching config
+        # We reuse the same flask_client underneath via the fixture's closure.
+        # Simplest: call the reply endpoint directly through wired_cli with a
+        # monkeypatched _get_agent_name.
+        with mock.patch.object(forum_cli, "_get_agent_name", return_value="otherbot"):
+            wired_cli(
+                ["reply", str(tid)],
+                stdin_text="Hey @testbot, great thread!",
+            )
+
+        # Now run status as testbot — the bell line must appear
+        stdout, stderr, code = wired_cli(["status"])
+        assert code == 0, f"stderr: {stderr}"
+        assert "\U0001f514" in stdout, (
+            "bell emoji must appear in status output when @testbot is mentioned; "
+            f"got:\n{stdout}"
+        )
+
+    def test_status_json_includes_mentions_array(self, wired_cli):
+        """status --format json must include a 'mentions' array (empty when none pending)."""
+        stdout, _, code = wired_cli(["status", "--format", "json"])
+        assert code == 0
+        data = json.loads(stdout)
+        assert "mentions" in data, "'mentions' key must appear in status JSON output"
+        assert isinstance(data["mentions"], list), "'mentions' must be a list"
+
+    def test_status_json_includes_mentions_when_present(self, wired_cli):
+        """status --format json populates 'mentions' when @testbot is mentioned."""
+        # testbot posts a thread
+        stdout, _, _ = wired_cli(
+            ["post", "--category", "cold-start", "--title", "JSON mention test"],
+            stdin_text="OP body.",
+        )
+        import re
+        m = re.search(r"thread_id=(\d+)", stdout)
+        tid = int(m.group(1))
+
+        # otherbot replies with @testbot
+        with mock.patch.object(forum_cli, "_get_agent_name", return_value="otherbot"):
+            wired_cli(
+                ["reply", str(tid)],
+                stdin_text="Pinging @testbot about this.",
+            )
+
+        stdout, _, code = wired_cli(["status", "--format", "json"])
+        assert code == 0
+        data = json.loads(stdout)
+        assert "mentions" in data
+        assert len(data["mentions"]) >= 1, (
+            "mentions array must contain at least one entry after @testbot mention"
+        )
+
 
 @SKIP_INTEGRATION
 class TestOnline:
@@ -656,7 +729,7 @@ class TestStatusHintWhenCursorUnset:
     def _run_status(self, engram_home, monkeypatch):
         """Run `forum status` with a mocked _api_get that returns empty data."""
         # Patch _api_get to return minimal stub data so status doesn't need a server
-        def fake_api_get(url, params=None):
+        def fake_api_get(url, params=None, swallow_errors=False):
             if "/api/threads" in url:
                 return {"threads": []}
             if "/api/agents/online" in url:
@@ -682,7 +755,7 @@ class TestStatusHintWhenCursorUnset:
         assert not cursor_path.exists(), "cursor must not exist for this test"
 
         # Patch _api_get to return one thread so the hint branch fires
-        def fake_api_get(url, params=None):
+        def fake_api_get(url, params=None, swallow_errors=False):
             if "/api/threads" in url:
                 return {"threads": [{"id": 1, "title": "x", "last_activity_at": "2026-05-31T10:00:00Z"}]}
             if "/api/agents/online" in url:
@@ -709,7 +782,7 @@ class TestStatusHintWhenCursorUnset:
         ts = "2026-05-01T00:00:00Z"
         (engram_home / "forum-read-cursor.txt").write_text(ts + "\n")
 
-        def fake_api_get(url, params=None):
+        def fake_api_get(url, params=None, swallow_errors=False):
             if "/api/threads" in url:
                 return {"threads": [{"id": 1, "title": "y", "last_activity_at": "2026-05-31T10:00:00Z"}]}
             if "/api/agents/online" in url:
@@ -728,6 +801,204 @@ class TestStatusHintWhenCursorUnset:
         output = stdout_buf.getvalue()
         assert "--since 2026-05-01T00:00:00Z" in output, (
             f"status must include '--since <cursor>' hint when cursor is set; got:\n{output}"
+        )
+
+
+class TestStatusMentions:
+    """cmd_status mention-line rendering (patches _api_get + _fetch_mentions)."""
+
+    def _run_status(self, engram_home, monkeypatch, fetch_mentions_return, cursor_ts=None):
+        """Run `forum status` with stubbed API helpers; return stdout."""
+        if cursor_ts:
+            (engram_home / "forum-read-cursor.txt").write_text(cursor_ts + "\n")
+
+        def fake_api_get(url, params=None, swallow_errors=False):
+            if "/api/threads" in url:
+                return {"threads": []}
+            if "/api/agents/online" in url:
+                return {"count": 1, "registered": 1}
+            return {}
+
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with mock.patch.object(forum_cli, "_api_get", side_effect=fake_api_get), \
+             mock.patch.object(forum_cli, "_fetch_mentions",
+                               return_value=fetch_mentions_return), \
+             mock.patch("sys.argv", ["forum", "status"]), \
+             mock.patch("sys.stdout", stdout_buf), \
+             mock.patch("sys.stderr", stderr_buf):
+            try:
+                forum_cli.main()
+            except SystemExit:
+                pass
+        return stdout_buf.getvalue(), stderr_buf.getvalue()
+
+    def test_mention_line_rendered_when_mentions_present(self, engram_home, monkeypatch):
+        """When mentions are returned, a summary line is printed."""
+        mentions = [
+            {
+                "thread_id": 3,
+                "thread_title": "debugging ground-rules",
+                "post_id": 7,
+                "author": "luria",
+                "kind": "at_mention",
+                "created_at": "2026-06-01T10:00:00Z",
+            },
+            {
+                "thread_id": 1,
+                "thread_title": "first-retractions",
+                "post_id": 2,
+                "author": "borges",
+                "kind": "reply_to_your_thread",
+                "created_at": "2026-06-01T10:01:00Z",
+            },
+        ]
+        stdout, _ = self._run_status(engram_home, monkeypatch, fetch_mentions_return=mentions)
+        assert "\U0001f514" in stdout, "bell emoji must appear in mention line"
+        assert "2 posts waiting on you" in stdout
+        assert "debugging ground-rules" in stdout
+        assert "@mention by luria" in stdout
+        assert "reply to your thread by borges" in stdout
+
+    def test_no_mention_line_when_zero_mentions(self, engram_home, monkeypatch):
+        """Zero mentions → no mention line in output."""
+        stdout, _ = self._run_status(engram_home, monkeypatch, fetch_mentions_return=[])
+        assert "\U0001f514" not in stdout
+
+    def test_no_mention_line_when_fetch_fails(self, engram_home, monkeypatch):
+        """When _fetch_mentions returns None (server unreachable), no mention line."""
+        stdout, _ = self._run_status(engram_home, monkeypatch, fetch_mentions_return=None)
+        assert "\U0001f514" not in stdout
+
+    def test_status_exit_code_0_when_mention_fetch_fails(self, engram_home, monkeypatch):
+        """A mention-fetch failure must not change the status exit code."""
+        def fake_api_get(url, params=None, swallow_errors=False):
+            if "/api/threads" in url:
+                return {"threads": []}
+            if "/api/agents/online" in url:
+                return {"count": 0, "registered": 0}
+            return {}
+
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with mock.patch.object(forum_cli, "_api_get", side_effect=fake_api_get), \
+             mock.patch.object(forum_cli, "_fetch_mentions", return_value=None), \
+             mock.patch("sys.argv", ["forum", "status"]), \
+             mock.patch("sys.stdout", stdout_buf), \
+             mock.patch("sys.stderr", stderr_buf):
+            try:
+                forum_cli.main()
+                code = 0
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+        assert code == 0, f"status must exit 0 even when mention fetch fails; stderr: {stderr_buf.getvalue()}"
+
+    def test_fetch_mentions_endpoint_failure_returns_none(self, engram_home, monkeypatch):
+        """_fetch_mentions returns None (not sys.exit) when the mentions endpoint fails.
+
+        This tests the advisory-failure contract at the _fetch_mentions level:
+        a 4xx/5xx from the mentions endpoint must not propagate as sys.exit().
+        """
+        # Simulate a failing mentions endpoint by making _do_request raise SystemExit
+        # for the mentions URL (mimicking EXIT_NOT_FOUND / EXIT_VALIDATION behavior),
+        # while non-mention URLs succeed normally.
+        calls: list = []
+
+        def fake_do_request(req, url):
+            calls.append(url)
+            if "/api/agent/" in url and "/mentions" in url:
+                sys.exit(forum_cli.EXIT_NOT_FOUND)
+            # Shouldn't be called for other URLs in this test
+            return {}
+
+        result = None
+        with mock.patch.object(forum_cli, "_do_request", side_effect=fake_do_request):
+            result = forum_cli._fetch_mentions(
+                "http://testserver", "testbot", since=None
+            )
+
+        assert result is None, (
+            "_fetch_mentions must return None when the endpoint returns an error, "
+            f"not propagate sys.exit; got: {result!r}"
+        )
+
+    def test_status_json_mentions_empty_on_fetch_failure(self, engram_home, monkeypatch):
+        """status --format json must include mentions=[] even when fetch failed."""
+        def fake_api_get(url, params=None, swallow_errors=False):
+            if "/api/threads" in url:
+                return {"threads": []}
+            if "/api/agents/online" in url:
+                return {"count": 0, "registered": 0}
+            if "/mentions" in url and swallow_errors:
+                return None  # simulates fetch failure
+            return {}
+
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with mock.patch.object(forum_cli, "_api_get", side_effect=fake_api_get), \
+             mock.patch("sys.argv", ["forum", "status", "--format", "json"]), \
+             mock.patch("sys.stdout", stdout_buf), \
+             mock.patch("sys.stderr", stderr_buf):
+            try:
+                forum_cli.main()
+                code = 0
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+
+        assert code == 0
+        data = json.loads(stdout_buf.getvalue())
+        assert "mentions" in data, "JSON output must include 'mentions' key"
+        assert data["mentions"] == [], (
+            "mentions must be [] when fetch failed; got: {!r}".format(data["mentions"])
+        )
+
+    def test_mention_truncation_at_5(self, engram_home, monkeypatch):
+        """More than 5 mentions are truncated with '+N more' suffix."""
+        mentions = [
+            {
+                "thread_id": i,
+                "thread_title": f"Thread {i}",
+                "post_id": i + 100,
+                "author": "borges",
+                "kind": "reply_to_your_thread",
+                "created_at": f"2026-06-01T10:0{i}:00Z",
+            }
+            for i in range(7)
+        ]
+        stdout, _ = self._run_status(engram_home, monkeypatch, fetch_mentions_return=mentions)
+        assert "+2 more" in stdout
+
+    def test_cursor_passed_to_fetch_mentions(self, engram_home, monkeypatch):
+        """_fetch_mentions is called with the read-cursor timestamp as since."""
+        captured = {}
+
+        def fake_api_get(url, params=None, swallow_errors=False):
+            if "/api/threads" in url:
+                return {"threads": []}
+            if "/api/agents/online" in url:
+                return {"count": 0, "registered": 0}
+            return {}
+
+        def fake_fetch_mentions(forum_url, agent_name, since):
+            captured["since"] = since
+            return []
+
+        cursor_ts = "2026-05-01T00:00:00Z"
+        (engram_home / "forum-read-cursor.txt").write_text(cursor_ts + "\n")
+
+        with mock.patch.object(forum_cli, "_api_get", side_effect=fake_api_get), \
+             mock.patch.object(forum_cli, "_fetch_mentions",
+                               side_effect=fake_fetch_mentions), \
+             mock.patch("sys.argv", ["forum", "status"]), \
+             mock.patch("sys.stdout", io.StringIO()), \
+             mock.patch("sys.stderr", io.StringIO()):
+            try:
+                forum_cli.main()
+            except SystemExit:
+                pass
+        assert captured.get("since") == cursor_ts, (
+            f"_fetch_mentions should be called with cursor_ts={cursor_ts!r}; "
+            f"got since={captured.get('since')!r}"
         )
 
 

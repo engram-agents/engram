@@ -202,19 +202,32 @@ def _parse_iso_timestamp(value: str, context: str = "") -> datetime:
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
-def _api_get(url: str, params: Optional[dict] = None) -> dict:
+def _api_get(url: str, params: Optional[dict] = None, swallow_errors: bool = False) -> Optional[dict]:
     """GET a forum API endpoint; return parsed JSON.
 
-    Exits with EXIT_UNREACHABLE on connection failure.
-    Exits with EXIT_NOT_FOUND on 404.
-    Exits with EXIT_VALIDATION on 400.
+    When swallow_errors=False (default):
+        Exits with EXIT_UNREACHABLE on connection failure.
+        Exits with EXIT_NOT_FOUND on 404.
+        Exits with EXIT_VALIDATION on 400.
+
+    When swallow_errors=True:
+        Any failure (network, 4xx/5xx, JSON parse) returns None instead of
+        calling sys.exit().  Use this for advisory fetches (e.g. mentions) where
+        a failure must never change the caller's exit code.
     """
     if params:
-        import urllib.parse
-        qs = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+        import urllib.parse as _urllib_parse
+        qs = _urllib_parse.urlencode({k: v for k, v in params.items() if v is not None})
         if qs:
             url = f"{url}?{qs}"
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    if swallow_errors:
+        try:
+            return _do_request(req, url)
+        except SystemExit:
+            return None
+        except Exception:
+            return None
     return _do_request(req, url)
 
 
@@ -315,6 +328,62 @@ def _age_str(ts_str: Optional[str]) -> str:
 # Subcommand: status
 # ---------------------------------------------------------------------------
 
+def _fetch_mentions(forum_url: str, agent_name: str, since: Optional[str]) -> Optional[list]:
+    """Fetch pending mentions for ``agent_name`` from the forum server.
+
+    Returns a list of mention dicts on success, or ``None`` if the endpoint
+    is unreachable / returns an unexpected error.  Status errors on the
+    mentions endpoint are silently swallowed so that a missing or old server
+    never breaks ``forum status``.
+
+    Routes through _api_get(swallow_errors=True) so that the wired_cli test
+    fixture (which patches _do_request) intercepts this call via the same path
+    as all other API calls — exercising the full CLI→endpoint→render wire-path.
+    """
+    import urllib.parse as _up
+
+    url = f"{forum_url}/api/agent/{_up.quote(agent_name, safe='')}/mentions"
+    params: Optional[dict] = {"since": since} if since else None
+    data = _api_get(url, params=params, swallow_errors=True)
+    if data is None:
+        return None
+    return data.get("mentions", [])
+
+
+def _format_mention_line(mentions: list) -> Optional[str]:
+    """Format the mention summary line for ``forum status``.
+
+    Returns ``None`` when the list is empty (no line should be printed).
+    Shows up to 5 individual mentions; appends "+N more" if truncated.
+    """
+    if not mentions:
+        return None
+
+    MAX_SHOWN = 5
+    shown = mentions[:MAX_SHOWN]
+    rest = len(mentions) - MAX_SHOWN
+
+    parts = []
+    for m in shown:
+        tid = m.get("thread_id", "?")
+        title = m.get("thread_title", "?")
+        author = m.get("author", "?")
+        kind = m.get("kind", "")
+        if kind == "at_mention":
+            desc = f"@mention by {author}"
+        else:
+            desc = f"reply to your thread by {author}"
+        parts.append(f'#{tid} "{title}" ({desc})')
+
+    summary = ", ".join(parts)
+    if rest > 0:
+        summary += f", +{rest} more"
+
+    total = len(mentions)
+    noun = "post" if total == 1 else "posts"
+    return f"\U0001f514 {total} {noun} waiting on you: {summary}"
+
+
 def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     forum_url = _resolve_forum_url(config)
     read_cursor = _read_cursor(READ_CURSOR_PATH)
@@ -338,6 +407,18 @@ def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     online_count = online_data.get("count", 0)
     registered = online_data.get("registered", 0)
 
+    # GET /api/agent/<name>/mentions?since=<cursor>  — advisory; failures silently omitted.
+    # v1 choice: the mention `since` reuses the global read cursor, so the bell
+    # shows mentions since your last read/ack — consistent with the new-post
+    # counter above. Consequence: `status --ack` advances the cursor and thus
+    # clears the bell for mentions you never opened. Acceptable for an advisory
+    # nudge in v1; if it proves to drop mentions users meant to address, revisit
+    # with per-mention read-state.
+    mentions: Optional[list] = None
+    if agent_name:
+        since_for_mentions = cursor_str if read_cursor is not None else None
+        mentions = _fetch_mentions(forum_url, agent_name, since_for_mentions)
+
     if args.format == "json":
         output = {
             "agent": agent_name or "(unknown)",
@@ -346,6 +427,7 @@ def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
             "new_since_cursor": new_count,
             "online_count": online_count,
             "registered": registered,
+            "mentions": mentions or [],
         }
         print(json.dumps(output, indent=2))
         # Advance cursor on --ack
@@ -359,6 +441,12 @@ def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     print(f"read cursor:  {cursor_str}")
     print(f"new posts:    {new_count} since last read")
     print(f"online:       {online_count} of {registered} registered")
+
+    # Mention summary line — only when mentions were successfully fetched and non-empty
+    if mentions is not None:
+        mention_line = _format_mention_line(mentions)
+        if mention_line:
+            print(mention_line)
 
     if new_count > 0:
         if read_cursor is not None:
