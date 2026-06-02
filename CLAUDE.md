@@ -115,6 +115,34 @@ Review hierarchy: **reviewer-fairy → counterpart colleague → maintainer
 reviewed in turn. Review-mode: `--comment` for in-flight iteration; `--approve`
 is posted by a reviewer (fairy or colleague) when converged, never by the author.
 
+### Every PR carries a baton — merge-readiness is baton-tracked, not inferred
+
+Open a PR-baton **at PR creation**, for **every** PR — bunch-driven OR standalone:
+`baton init PR-N --title "<short>" --participants <self>,<counterpart> --turn <self> --status in-progress`.
+Then flip it as the turn actually passes along the review pipeline:
+
+- reviewer-fairy converged → `baton flip PR-N <counterpart> "fairy-converged; colleague please"`
+- counterpart **comments / requests changes** → it flips back to you (`flip PR-N <self>`);
+  iterate and re-review. Only an explicit colleague **approval** advances the baton — a
+  "COMMENTED with considerations" verdict does **not** (that misread is the whole origin).
+- counterpart **approved** → `baton flip PR-N <maintainer> "colleague-APPROVED; ready for merge"`
+
+*(Single-agent mode — no counterpart: skip the colleague flip; after the reviewer-fairy
+converges and your own second-layer pass is clean, flip straight to the maintainer.)*
+
+**A PR is merge-ready ONLY when its baton turn = the maintainer (pool sentinel)** —
+reached only via an explicit colleague approval (or, single-agent, your own converged
+second-layer pass). The maintainer merges from that baton signal — never from a PR that
+merely *looks* parked. A PR with **no baton**, or a baton **not yet flipped to the maintainer**, is
+**not** ready, no matter how long it has sat. Symmetrically: never leave a
+colleague-converged PR without flipping its baton to the maintainer — otherwise its
+readiness is invisible, and a colleague verdict that is actually "COMMENTED with
+considerations" (not an approval) can be misread as ready.
+
+*Origin: a PR mis-merge — the colleague verdict lived only in a letter and no baton
+tracked the turn-state, so a parked-but-unconverged PR read as merge-ready. The
+baton's `turn:` field is the single load-bearing merge-gate; a letter is not.*
+
 **Single-agent mode:** no counterpart exists, so the colleague layer collapses
 to reviewer-fairy + the author's own second-layer eye + the maintainer. Don't
 block on a colleague review that has no one to perform it; the
@@ -168,7 +196,9 @@ project/N` to set the anchor after the fact.)
 - `baton claim pool-X` — `turn:` flips to the claimer; refuses if already
   claimed (no stealing).
 - The claimer drives the bunch toward fix-PRs. Each emerging PR opens its own
-  PR-baton (`baton init PR-N ...`); the bunch baton stays put.
+  PR-baton (per "Every PR carries a baton" in the PR review convention above —
+  that rule holds for standalone PRs too, not only bunch-driven ones); the bunch
+  baton stays put.
 - Treat the listed issues as the **named scope**, not the ceiling. Mid-work,
   if a sibling issue surfaces that fits the defect-class, add it to the bunch
   rather than file a parallel one.
