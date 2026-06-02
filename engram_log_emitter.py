@@ -130,7 +130,7 @@ class Emitter:
         """Attach durable context that auto-merges into every subsequent event's `data`.
 
         Typical use at session start:
-            emitter.bind(context_mode="1m", model_id="claude-opus-4-7[1m]")
+            emitter.bind(model_id="claude-opus-4-7[1m]")
         """
         self._bound_context.update(kwargs)
 

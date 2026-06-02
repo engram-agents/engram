@@ -88,12 +88,12 @@ class TestEmit(EmitterTestBase):
         self.assertTrue(l2.exists())
 
     def test_bind_context_merges_into_data(self):
-        self.emitter.bind(context_mode="1m", model_id="claude-opus-4-7[1m]")
+        self.emitter.bind(model_id="claude-opus-4-7[1m]", session_role="interactive")
         self.emitter.emit("engram.surface.fire", 1, {"specific": "thing"})
         line = (self.logs_dir / "sessions" / "sess_X.l1.jsonl").read_text().strip()
         evt = json.loads(line)
-        self.assertEqual(evt["data"]["context_mode"], "1m")
         self.assertEqual(evt["data"]["model_id"], "claude-opus-4-7[1m]")
+        self.assertEqual(evt["data"]["session_role"], "interactive")
         self.assertEqual(evt["data"]["specific"], "thing")
 
     def test_emit_returns_uuid_usable_as_parent(self):

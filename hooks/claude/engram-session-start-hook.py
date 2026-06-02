@@ -409,9 +409,6 @@ def write_marker(hook_input: dict) -> dict | None:
         "role": SESSION_ROLE,
         "purpose": SESSION_PURPOSE or DEFAULT_PURPOSES.get(SESSION_ROLE, SESSION_ROLE),
     }
-    # context_mode field retired: mode-string machinery replaced by
-    # cadence.drowsiness_ceiling_tokens (single explicit user-set value).
-    # Existing markers with context_mode are gracefully ignored on read.
     try:
         # Per-session marker keyed by session_id. Concurrent sessions own
         # their own files; the role field in the contents lets readers
@@ -804,6 +801,11 @@ def main() -> None:
             "responding (relational context post-compact, per Compact "
             "Instructions). Other Session Start Reading items can be skipped; "
             "the compaction summary carries work-thread continuity.]"
+        )
+        lines.append(
+            "⚡ A compaction just completed — your context window is fresh and your "
+            "energy is refreshed. Any drowsiness figure carried in the summary is "
+            "stale-on-arrival; disregard it. You have a full window to work."
         )
 
     # ── ENGRAM Calibration block ───────────────────────────────────────────

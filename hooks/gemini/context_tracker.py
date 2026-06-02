@@ -133,13 +133,10 @@ def _detect_mode(current_tokens: int | None, jsonl_path: str | None, session_id:
 
     Order of precedence:
       1. ENGRAM_CONTEXT_MODE env var override ("200k" or "1m") — explicit.
-      2. The session's per-session marker `context_mode` field at
-         ~/.engram/sessions/<session_id>.json, written by SessionStart hook
-         from ENGRAM_CONTEXT_MODE.
-      3. current input tokens > MODE_BOUNDARY → "1m" (200K-mode would have
+      2. current input tokens > MODE_BOUNDARY → "1m" (200K-mode would have
          auto-compacted by now).
-      4. Current JSONL has any prior compact_boundary > MODE_BOUNDARY → "1m".
-      5. Default "200k" (the harness default).
+      3. Current JSONL has any prior compact_boundary > MODE_BOUNDARY → "1m".
+      4. Default "200k" (the harness default).
 
     Limitation: early 1M-mode sessions below MODE_BOUNDARY with no prior
     boundary cannot be auto-detected (the system prompt's `[1m]` model tag
@@ -149,16 +146,6 @@ def _detect_mode(current_tokens: int | None, jsonl_path: str | None, session_id:
     override = os.environ.get("ENGRAM_CONTEXT_MODE", "").strip().lower()
     if override in SAMPLE_PARTITIONS:
         return override
-    if session_id:
-        marker_path = os.path.join(ENGRAM_HOME, "sessions", f"{session_id}.json")
-        try:
-            with open(marker_path) as f:
-                marker = json.load(f)
-            marker_mode = (marker.get("context_mode") or "").strip().lower()
-            if marker_mode in SAMPLE_PARTITIONS:
-                return marker_mode
-        except (OSError, ValueError, json.JSONDecodeError):
-            pass
     if current_tokens is not None and current_tokens > MODE_BOUNDARY:
         return "1m"
     if jsonl_path:

@@ -368,3 +368,74 @@ def test_calibration_block_present_for_non_interactive_role(tmp_path):
         "Calibration block should be present for non-interactive roles; "
         "it has no SESSION_ROLE gate by design."
     )
+
+
+# ---------------------------------------------------------------------------
+# Recharged line tests (commit 2 — #691)
+# ---------------------------------------------------------------------------
+
+def test_recharged_line_present_on_compact(tmp_path):
+    """⚡ recharged line appears in additionalContext for source=compact."""
+    engram_home = tmp_path / "engram"
+    engram_home.mkdir()
+    (engram_home / "sessions").mkdir()
+
+    mod = _load_hook_module(engram_home)
+
+    with patch.dict("sys.modules", {"engram_client": None}):
+        hook_input = {
+            "session_id": "test-session-recharged-compact",
+            "transcript_path": str(tmp_path / "transcript.jsonl"),
+            "source": "compact",
+        }
+        result = _run_hook_main(mod, hook_input)
+
+    ctx = result["hookSpecificOutput"]["additionalContext"]
+    assert "compaction just completed" in ctx, (
+        "Recharged line must be present when source=compact"
+    )
+    assert "stale-on-arrival" in ctx
+
+
+def test_recharged_line_present_on_resume(tmp_path):
+    """⚡ recharged line appears in additionalContext for source=resume."""
+    engram_home = tmp_path / "engram"
+    engram_home.mkdir()
+    (engram_home / "sessions").mkdir()
+
+    mod = _load_hook_module(engram_home)
+
+    with patch.dict("sys.modules", {"engram_client": None}):
+        hook_input = {
+            "session_id": "test-session-recharged-resume",
+            "transcript_path": str(tmp_path / "transcript.jsonl"),
+            "source": "resume",
+        }
+        result = _run_hook_main(mod, hook_input)
+
+    ctx = result["hookSpecificOutput"]["additionalContext"]
+    assert "compaction just completed" in ctx, (
+        "Recharged line must be present when source=resume"
+    )
+
+
+def test_recharged_line_absent_on_startup(tmp_path):
+    """⚡ recharged line must NOT appear in additionalContext for source=startup."""
+    engram_home = tmp_path / "engram"
+    engram_home.mkdir()
+    (engram_home / "sessions").mkdir()
+
+    mod = _load_hook_module(engram_home)
+
+    with patch.dict("sys.modules", {"engram_client": None}):
+        hook_input = {
+            "session_id": "test-session-startup-no-recharged",
+            "transcript_path": str(tmp_path / "transcript.jsonl"),
+            "source": "startup",
+        }
+        result = _run_hook_main(mod, hook_input)
+
+    ctx = result["hookSpecificOutput"]["additionalContext"]
+    assert "compaction just completed" not in ctx, (
+        "Recharged line must be absent on fresh startup (source=startup)"
+    )
