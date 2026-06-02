@@ -1495,13 +1495,26 @@ def _get_db() -> sqlite3.Connection:
     # Same fail-loud path; engram-first-session handles both. Bypass under
     # ENGRAM_BOOTSTRAP=1 so bootstrap.py's own seeding can run (its first
     # axiom-add lands on an empty graph by definition).
+    #
+    # Knowledge-pack exception: engram-package DBs legitimately have no seed
+    # axioms — they are curated observation/derivation sets, not agent brains.
+    # config.json sets is_knowledge_pack=true at pack-init time (engram-pkg
+    # init writes it before the first _get_db() call), so this guard fires
+    # only on personal-install DBs where the empty state means bootstrap crash.
     if not bootstrap_mode:
-        seed_count = conn.execute(
-            "SELECT COUNT(*) FROM nodes WHERE type='axiom'"
-        ).fetchone()[0]
-        if seed_count == 0:
-            conn.close()
-            raise RuntimeError(_seed_missing_message())
+        is_knowledge_pack = False
+        try:
+            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            is_knowledge_pack = bool(cfg.get("is_knowledge_pack", False))
+        except Exception:
+            pass
+        if not is_knowledge_pack:
+            seed_count = conn.execute(
+                "SELECT COUNT(*) FROM nodes WHERE type='axiom'"
+            ).fetchone()[0]
+            if seed_count == 0:
+                conn.close()
+                raise RuntimeError(_seed_missing_message())
 
     return conn
 

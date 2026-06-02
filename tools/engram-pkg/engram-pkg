@@ -128,7 +128,36 @@ def _check_stale_build(pkg_path, auto_build=False):
     )
 
 
+def _ensure_pkg_config(pkg_path: Path) -> None:
+    """Write or update config.json to include is_knowledge_pack=true.
+
+    Runs before every EngramClient construction so the _get_db() seed-node
+    guard sees the flag and skips the axiom-count check. Knowledge-pack DBs
+    legitimately have no seed axioms; the flag distinguishes them from a
+    crashed personal-install bootstrap (#695).
+
+    Handles three cases:
+      - No config.json: writes a minimal one (schema_version + flag).
+      - Existing config without flag: adds flag in-place.
+      - Existing config with flag already set: no-op.
+    """
+    config_path = pkg_path / "config.json"
+    if config_path.exists():
+        try:
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            if not cfg.get("is_knowledge_pack"):
+                cfg["is_knowledge_pack"] = True
+                config_path.write_text(json.dumps(cfg, indent=2))
+        except Exception:
+            pass
+    else:
+        config_path.write_text(json.dumps(
+            {"schema_version": 2, "is_knowledge_pack": True}, indent=2
+        ))
+
+
 def get_client(pkg_path):
+    _ensure_pkg_config(Path(pkg_path))
     sys.path.insert(0, str(REPO_ROOT))
     from engram_client import EngramClient  # noqa: E402
     return EngramClient(db_dir=str(pkg_path), server_module_path=str(REPO_ROOT))
@@ -309,6 +338,17 @@ def cmd_init(args):
     readme_path = pkg_path / "README.md"
     readme_path.write_text(_README_TEMPLATE.format(pkg_name=pkg_name))
     files_written.append(("README.md", readme_path))
+
+    # Write config.json with is_knowledge_pack=true before the schema bootstrap
+    # so _get_db() skips the seed-node guard. Knowledge-pack DBs legitimately
+    # have no seed axioms (they're curated obs/dv sets, not agent brains).
+    # Placing this before get_client() ensures _ensure_data_dir() sees the
+    # flag and doesn't overwrite it with the default agent config.
+    config_path = pkg_path / "config.json"
+    config_path.write_text(json.dumps(
+        {"schema_version": 2, "is_knowledge_pack": True}, indent=2
+    ))
+    files_written.append(("config.json", config_path))
 
     # Bootstrap the schema by triggering the EngramClient once. This creates
     # knowledge.db with the full ENGRAM schema (otherwise build.sh against an
