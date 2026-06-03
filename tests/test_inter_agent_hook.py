@@ -62,12 +62,12 @@ def _write_config(engram_home: Path, mode: str, agent_name: str = "borges") -> N
 
 
 def _write_surfaced_cursor(engram_home: Path, ts: datetime) -> None:
-    ts_str = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts_str = ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     (engram_home / "inter-agent-surfaced-cursor.txt").write_text(ts_str + "\n")
 
 
 def _write_read_cursor(engram_home: Path, ts: datetime) -> None:
-    ts_str = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts_str = ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     (engram_home / "inter-agent-read-cursor.txt").write_text(ts_str + "\n")
 
 
@@ -1087,4 +1087,77 @@ def test_first_run_all_letters_treated_as_new(engram_home, inter_agent_dir):
     # No "older still-unread" line — everything went into new
     assert "older still-unread" not in ctx, (
         "First run must not have an 'older still-unread' bucket"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 16: Same-second cursor precision regression (#751)
+#     Cursor written at T:00.000000Z must NOT exclude a letter at T:00.000500Z.
+# ---------------------------------------------------------------------------
+
+def test_same_second_cursor_write_uses_microseconds(engram_home, inter_agent_dir):
+    """_write_cursor must emit fixed-width 6-digit microseconds (#751 regression).
+
+    The bug: _write_cursor wrote '...T12:00:00Z' (seconds-only).  Lexicographically
+    'T12:00:00Z' > 'T12:00:00.500000Z' ('Z'=0x5A > '.'=0x2E), so any post/letter
+    with a microsecond-precise timestamp in the same second was silently excluded
+    by a `created_at > since` (or Python datetime >) comparison.
+
+    The fix: _write_cursor now emits '...T12:00:00.000000Z'.  This test verifies
+    the written cursor format, and then confirms that a letter with a microsecond-
+    precise timestamp in the SAME second is correctly classified as 'new'
+    (letter_ts.microsecond > 0 means letter_ts > cursor_ts in Python datetime
+    comparison, since both parse to the same UTC second base but different micros).
+
+    The letter's frontmatter timestamp is written with microseconds directly to
+    simulate a real letter authored by a tool that preserves sub-second precision.
+    """
+    _write_config(engram_home, mode="multi", agent_name="borges")
+
+    # Write cursor at the start of a second with zero microseconds
+    cursor_ts = datetime(2026, 1, 1, 12, 0, 0, 0, tzinfo=timezone.utc)
+    _write_surfaced_cursor(engram_home, cursor_ts)
+
+    # Verify the written cursor format uses microseconds (the fix)
+    raw_cursor = (engram_home / "inter-agent-surfaced-cursor.txt").read_text().strip()
+    assert "." in raw_cursor, (
+        f"Cursor file must use microseconds format after fix; got: {raw_cursor!r} — "
+        "pre-fix format 'T12:00:00Z' would lexically sort AFTER any same-second "
+        "microsecond-precise timestamp"
+    )
+    assert raw_cursor == "2026-01-01T12:00:00.000000Z", (
+        f"Cursor must use fixed-width 6-digit microseconds; got: {raw_cursor!r}"
+    )
+
+    # Write a letter whose timestamp is 500ms later in the same second.
+    # We write the frontmatter directly (not via _write_letter's seconds-only helper)
+    # to simulate a tool that emits microsecond-precise timestamps.
+    letter_ts = datetime(2026, 1, 1, 12, 0, 0, 500000, tzinfo=timezone.utc)
+    letter_ts_str = letter_ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    letter_content = (
+        "---\n"
+        "from: ariadne\n"
+        "to: borges\n"
+        f"timestamp: {letter_ts_str}\n"
+        "---\n"
+        "\n"
+        "# Same-second letter\n"
+        "\n"
+        "A letter with a sub-second timestamp.\n"
+    )
+    (inter_agent_dir / "2026-01-01T12-00-00.500000Z_ariadne.md").write_text(letter_content)
+
+    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
+    assert rc == 0, f"Hook must not crash; stderr: {stderr}"
+    assert stdout.strip(), (
+        "Same-second letter must surface as new — letter_ts 12:00:00.500000Z "
+        "must be > cursor 12:00:00.000000Z (Python datetime comparison works correctly "
+        "once cursor is parsed from the fixed-width microseconds format)"
+    )
+    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "Same-second letter" in ctx, (
+        f"Same-second letter title must appear in hook output; got:\n{ctx}"
+    )
+    assert "1 new letter from ariadne" in ctx, (
+        "Letter must be classified as 'new' (letter_ts > cursor_ts after the fix)"
     )

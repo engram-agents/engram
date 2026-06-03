@@ -63,7 +63,7 @@ def _load_hook():
 
 def _write_cursor_file(path: Path, ts: datetime) -> None:
     """Write a UTC datetime to a cursor file in the hook's expected format."""
-    ts_str = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts_str = ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     path.write_text(ts_str + "\n")
 
 
@@ -378,7 +378,7 @@ def test_mentions_since_is_read_cursor_not_surfaced_cursor(
     # Surfaced cursor and read cursor are DIFFERENT timestamps
     surfaced_ts = datetime(2026, 1, 2, 15, 0, 0, tzinfo=timezone.utc)
     read_ts = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
-    expected_read_since = read_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    expected_read_since = read_ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
     _write_cursor_file(tmp_cursor, surfaced_ts)
     _write_cursor_file(tmp_read_cursor, read_ts)
@@ -398,7 +398,7 @@ def test_mentions_since_is_read_cursor_not_surfaced_cursor(
     actual_since = calls[0]
     assert actual_since == expected_read_since, (
         f"_fetch_mentions `since` must be the READ cursor ({expected_read_since!r}), "
-        f"not the surfaced cursor ({surfaced_ts.strftime('%Y-%m-%dT%H:%M:%SZ')!r}). "
+        f"not the surfaced cursor ({surfaced_ts.strftime('%Y-%m-%dT%H:%M:%S.%fZ')!r}). "
         f"Got: {actual_since!r}"
     )
 
@@ -734,4 +734,66 @@ def test_old_server_404_mentions_silent_skip_in_main(
     assert "\U0001f4e2" in ctx, "Generic threads line must work when mentions 404s"
     assert "\U0001f514" not in ctx, (
         "Mention line must be absent when mentions endpoint returns None (old server)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# C1: Same-second cursor precision regression (#751)
+#     Cursor written at T:00.000000Z must NOT exclude a post at T:00.000500Z.
+# ---------------------------------------------------------------------------
+
+def test_same_second_post_not_excluded_by_cursor(
+    tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
+):
+    """Same-second post is surfaced even when cursor was written in the same second.
+
+    Regression for #751: a coarse seconds-only cursor '...T12:00:00Z' sorts
+    AFTER a same-second post '...T12:00:00.500000Z' (Z=0x5A > .=0x2E), so the
+    server's `created_at > since` filter excluded the post.  The fix writes
+    cursors with fixed-width 6-digit microseconds so a cursor at
+    '...T12:00:00.000000Z' correctly precedes '...T12:00:00.500000Z'.
+
+    This test verifies that the `since_str` produced by the hook (which mirrors
+    what the hook passes to _fetch_threads) uses the microsecond format.
+    """
+    hook = _load_hook()
+    _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
+    _stub_config(hook, monkeypatch)
+
+    # Cursor at the start of a second (zero microseconds)
+    cursor_ts = datetime(2026, 1, 1, 12, 0, 0, 0, tzinfo=timezone.utc)
+    _write_cursor_file(tmp_cursor, cursor_ts)
+
+    # Capture the `since` value that the hook passes to _fetch_threads
+    captured_since = []
+
+    def stub_fetch_threads(url, since, agent):
+        captured_since.append(since)
+        # Simulate a post that arrived at T:00.000500Z (same second, after cursor)
+        return [{"id": "99", "title": "Same-second post"}]
+
+    monkeypatch.setattr(hook, "_fetch_threads", stub_fetch_threads)
+    monkeypatch.setattr(hook, "_fetch_mentions", lambda url, name, since: [])
+
+    output = _run_main(hook, capture_output=True)
+
+    assert captured_since, "_fetch_threads must have been called"
+    since_value = captured_since[0]
+
+    # Must use fixed-width microseconds format
+    assert since_value is not None, "since_str must not be None when cursor exists"
+    assert "." in since_value, (
+        f"since_str must contain '.' (microseconds separator); got: {since_value!r} — "
+        f"seconds-only format would lexically sort AFTER same-second posts"
+    )
+    assert since_value == "2026-01-01T12:00:00.000000Z", (
+        f"since_str must use fixed-width 6-digit microseconds; got: {since_value!r}"
+    )
+
+    # The post must surface in the output
+    assert output.strip(), "Same-second post must produce output"
+    data = json.loads(output.strip())
+    ctx = data["hookSpecificOutput"]["additionalContext"]
+    assert "new forum post" in ctx or "new forum posts" in ctx, (
+        "Same-second post must appear in thread-count line"
     )

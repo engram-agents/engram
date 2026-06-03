@@ -145,7 +145,7 @@ def _read_cursor(path: str) -> Optional[datetime]:
 
 def _write_cursor(path: str, ts: datetime) -> None:
     """Write a UTC datetime to a cursor file atomically."""
-    ts_str = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts_str = ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     dest = Path(path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
@@ -318,12 +318,12 @@ def main() -> None:
 
     # ── Read cursors ──────────────────────────────────────────────────────────
     surfaced_cursor = _read_cursor(SURFACED_CURSOR_PATH)
-    since_str = surfaced_cursor.strftime("%Y-%m-%dT%H:%M:%SZ") if surfaced_cursor else None
+    since_str = surfaced_cursor.strftime("%Y-%m-%dT%H:%M:%S.%fZ") if surfaced_cursor else None
 
     # Read cursor drives mention `since` — mentions persist until agent acts.
     # This hook NEVER writes the read cursor (that's the CLI's job).
     read_cursor = _read_cursor(READ_CURSOR_PATH)
-    read_cursor_str = read_cursor.strftime("%Y-%m-%dT%H:%M:%SZ") if read_cursor else None
+    read_cursor_str = read_cursor.strftime("%Y-%m-%dT%H:%M:%S.%fZ") if read_cursor else None
 
     # ── Fetch threads + mentions (with cache + stale-cache fallback) ──────────
     threads: Optional[list] = None

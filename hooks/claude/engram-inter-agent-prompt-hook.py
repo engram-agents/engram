@@ -152,7 +152,7 @@ def _write_cursor(path: str, ts: datetime) -> None:
     Uses an atomic tmp + os.replace pattern so a concurrent hook fire cannot
     read an empty or partial file between O_TRUNC and the write completing.
     """
-    ts_str = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts_str = ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     dest = Path(path)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
     try:
