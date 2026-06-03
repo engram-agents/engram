@@ -14154,28 +14154,35 @@ def _resolve_impl(
         # outcome IS the status, no confidence projection.
         if target["type"] == "prediction":
             resolution_status = prediction_outcome
+            best_resolver_id = resolving_node_id  # latest-wired for categorical outcomes
         elif target["type"] == "conjecture":
             resolution_status = prediction_outcome
+            best_resolver_id = resolving_node_id  # latest-wired for categorical outcomes
         else:
-            max_conf_row = conn.execute(
-                """SELECT MAX(n.confidence) AS max_conf FROM edges e
+            # Fetch the argmax-confidence current resolver (ORDER BY desc, LIMIT 1) so
+            # that resolved_by always points at the strongest resolver, not the latest-wired
+            # one. Same query that drove MAX(confidence) before, now returning the id too.
+            best_row = conn.execute(
+                """SELECT n.id, n.confidence FROM edges e
                    JOIN nodes n ON e.source_id = n.id
                    WHERE e.target_id = ? AND e.relation = 'resolves'
-                   AND n.is_current = 1 AND n.status != 'retracted'""",
+                   AND n.is_current = 1 AND n.status != 'retracted'
+                   ORDER BY n.confidence DESC LIMIT 1""",
                 (target_id,),
             ).fetchone()
-            max_conf = max_conf_row["max_conf"] if max_conf_row and max_conf_row["max_conf"] is not None else confidence
+            max_conf = best_row["confidence"] if best_row and best_row["confidence"] is not None else confidence
+            best_resolver_id = best_row["id"] if best_row else resolving_node_id
             if max_conf >= threshold:
                 resolution_status = "resolved"
             else:
                 resolution_status = "partially_resolved"
 
         conn.execute(
-            "UPDATE nodes SET status = ? WHERE id = ?",
-            (resolution_status, target_id),
+            "UPDATE nodes SET status = ?, resolved_by = ? WHERE id = ?",
+            (resolution_status, best_resolver_id, target_id),
         )
         _log_edit(conn, "resolved", target_id, target["type"],
-                  {"resolved_by": resolving_node_id, "resolution_status": resolution_status})
+                  {"resolved_by": best_resolver_id, "resolution_status": resolution_status})
 
         _utility_reward(conn, [target_id, resolving_node_id], action="resolve")
         conn.commit()

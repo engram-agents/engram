@@ -106,6 +106,82 @@ def test_resolve_flips_target_status_to_resolved():
     assert q_inspect["node"]["status"] == "resolved", q_inspect["node"]
 
 
+def test_resolve_writes_resolved_by_column():
+    """engram_resolve must backfill the resolved_by column (issue #758).
+
+    Previously only the status column was updated; resolved_by was always NULL.
+    """
+    import sqlite3
+    server = fresh_server()
+    q_id, _, dv_id = _seed_strong_resolution(server)
+    json.loads(server.engram_resolve(payload_json=json.dumps({
+        "target_id": q_id,
+        "resolving_node_id": dv_id,
+    })))
+    conn = sqlite3.connect(str(server.DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT resolved_by FROM nodes WHERE id = ?", (q_id,)
+        ).fetchone()
+        assert row is not None, f"Node {q_id} not found in DB"
+        assert row["resolved_by"] == dv_id, (
+            f"resolved_by column not written: expected {dv_id!r}, got {row['resolved_by']!r}"
+        )
+    finally:
+        conn.close()
+
+
+def test_resolved_by_points_at_strongest_not_latest():
+    """resolved_by must track the argmax-confidence resolver, not the latest-wired one.
+
+    Wire the strong resolver first, then a weak one below threshold. resolved_by
+    must remain pointed at the strong resolver — latest-wired semantics would
+    leave it pointing at the weak one, which didn't determine the status.
+    """
+    import sqlite3
+    server = fresh_server()
+    q_id, _, strong_dv_id = _seed_strong_resolution(server)
+
+    json.loads(server.engram_resolve(payload_json=json.dumps({
+        "target_id": q_id,
+        "resolving_node_id": strong_dv_id,
+    })))
+
+    weak_ob = json.loads(server.engram_add_observation(payload_json=json.dumps({
+        "url": "https://example.com/weak",
+        "title": "Weak",
+        "quoted_text": "Weak speculation about Y.",
+        "interpretation": "Weakly attributed.",
+        "claim": "Y is weakly supported.",
+        "quote_type": "attributed_analysis",
+    })))
+    weak_dv = json.loads(server.engram_derive(payload_json=json.dumps({
+        "claim": "Weak argument for Y.",
+        "supporting_ids": weak_ob["observation_id"],
+        "logical_chain": "Loose analogy.",
+        "reasoning_type": "inductive_statistical",
+    })))
+    json.loads(server.engram_resolve(payload_json=json.dumps({
+        "target_id": q_id,
+        "resolving_node_id": weak_dv["derivation_id"],
+    })))
+
+    conn = sqlite3.connect(str(server.DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT resolved_by FROM nodes WHERE id = ?", (q_id,)
+        ).fetchone()
+        assert row is not None
+        assert row["resolved_by"] == strong_dv_id, (
+            f"resolved_by should point at strongest resolver {strong_dv_id!r}, "
+            f"not the latest-wired weak one. Got {row['resolved_by']!r}"
+        )
+    finally:
+        conn.close()
+
+
 # ── 2. Schema enforcement ──────────────────────────────────────────────────
 
 
