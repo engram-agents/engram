@@ -8,7 +8,14 @@ Closes the Welcome-Back failure mode and the FROZEN-NOW-IN-
 COMPACTION-SUMMARY risk (the CLOCK-DRIFT-hygiene derivation) by re-rendering every turn against wall-clock.
 
 Output (one line, prepended to the injected context):
-  [Time: <UTC_iso_zulu> (<weekday>) | <tz_label> <local_iso> | session started <hms> ago | last user msg <hms> ago]
+  [Time: <weekday> <local_date> <local_12h> <tz_abbr> (<utc_hhmmZ>) | session started <hms> ago | last user msg <hms> ago]
+
+User-local time is PROMINENT — weekday, date, 12-hour clock, and tz abbr are all
+derived from the user's timezone (not UTC), so the agent reads the human's actual
+time-of-day directly. UTC is a small parenthetical, kept only for correlating
+UTC-stamped surfaces (forum / inter-agent letters / git). If the local tz can't
+be resolved, the bar falls back to a clearly-labelled UTC. (Origin: an agent read
+the leading UTC field as the local time and confabulated 'it's 2am'; #721.)
 
 Signal sources:
   - UTC now: datetime.now(timezone.utc)
@@ -78,6 +85,35 @@ def _get_lei_tz():
     return user.get("timezone") or DEFAULT_TZ
 
 
+def _format_time_field(now_utc: datetime, tz_name: str) -> str:
+    """Render the time field with USER-LOCAL prominent and UTC parenthetical.
+
+    weekday / date / 12-hour clock / tz abbr are all derived from the user's
+    timezone (so the agent reads the human's real time-of-day, including the
+    correct local date — which can differ from the UTC date near midnight).
+    UTC is reduced to a small ``(HH:MMZ)`` tail. If the timezone can't be
+    resolved (no zoneinfo module, bad tz name), fall back to a clearly-labelled
+    UTC so the failure is visible rather than silently mis-rendered as local.
+    """
+    if ZoneInfo is not None:
+        try:
+            local = now_utc.astimezone(ZoneInfo(tz_name))
+            weekday = local.strftime("%a")
+            local_date = local.strftime("%Y-%m-%d")
+            # 12-hour clock, strip the leading zero ("07:34 PM" -> "7:34 PM").
+            # Safe: %I produces "01".."12" (never "00"), so there is at most one
+            # leading zero and lstrip("0") never eats a meaningful digit
+            # ("10"/"11"/"12" start with 1; "12:00 AM/PM" survive intact).
+            local_12h = local.strftime("%I:%M %p").lstrip("0")
+            tz_abbr = local.strftime("%Z") or tz_name
+            utc_short = now_utc.strftime("%H:%MZ")
+            return f"{weekday} {local_date} {local_12h} {tz_abbr} ({utc_short})"
+        except Exception:
+            pass
+    # Local tz unavailable — show UTC prominently and SAY so (don't pretend it's local).
+    return f"{now_utc.strftime('%a')} {now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')} UTC (local tz unavailable)"
+
+
 def _read_session_id_from_stdin():
     """Pull session_id off this hook's stdin payload. Returns None on any error."""
     try:
@@ -95,8 +131,7 @@ def _read_session_id_from_stdin():
 
 def main():
     now_utc = datetime.now(timezone.utc)
-    utc_iso = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-    weekday = now_utc.strftime("%a")
+    utc_iso = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")  # retained: stamps last-user-msg.json below
 
     # Per-session marker keyed by session_id (issue #140 retired the global
     # active-session.json). Falls through to unknown when stdin is empty.
@@ -113,22 +148,9 @@ def main():
     except Exception:
         pass
 
-    tz_name = _get_lei_tz()
-    local_iso = ""
-    tz_label = tz_name
-    if ZoneInfo is not None:
-        try:
-            local = now_utc.astimezone(ZoneInfo(tz_name))
-            local_iso = local.strftime("%Y-%m-%d %H:%M")
-            tz_abbr = local.strftime("%Z")
-            if tz_abbr:
-                tz_label = tz_abbr
-        except Exception:
-            local_iso = "tz-error"
-
+    time_field = _format_time_field(now_utc, _get_lei_tz())
     bar = (
-        f"[Time: {utc_iso} ({weekday}) | "
-        f"{tz_label} {local_iso} | "
+        f"[Time: {time_field} | "
         f"session started {session_ago} ago | "
         f"last user msg {last_msg_ago} ago]"
     )
