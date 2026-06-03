@@ -40,22 +40,31 @@ import sys
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Locate server.py — prefer the install's copy, fall back to repo-adjacent.
-# The script is shipped in tools/ and the server.py is one directory up (repo)
-# OR in ENGRAM_HOME (plugin install). We import from wherever we find it.
+# Locate server.py — probe plugin runtime dir first, then scatter fallback,
+# then repo-adjacent.  Priority order matters: on a plugin install the
+# canonical server.py lives at engram_home/marketplace/plugins/engram/;
+# the legacy scatter copy at engram_home/server.py is an inert leftover that
+# may not be current (and is absent on a clean plugin install).
 # ---------------------------------------------------------------------------
 
 def _find_server_py(engram_home: Path) -> Path | None:
-    """Try ENGRAM_HOME first (plugin install), then repo root (dev install)."""
-    # Plugin install: server.py lives in ENGRAM_HOME
-    candidate = engram_home / "server.py"
-    if candidate.exists():
-        return candidate
-    # Dev install: repo root is parent of tools/
-    repo_root = Path(__file__).resolve().parent.parent
-    candidate = repo_root / "server.py"
-    if candidate.exists():
-        return candidate
+    """Find server.py in priority order.
+
+    Checks in priority order:
+    1. Plugin runtime dir (engram_home/marketplace/plugins/engram/) — canonical
+       on plugin installs; preferred over any scatter leftover.
+    2. ENGRAM_HOME directly (engram_home/server.py) — scatter leftover or a
+       non-standard layout; absent on a clean plugin install.
+    3. Repo root (parent of tools/) — dev-repo layout fallback.
+    """
+    candidates = [
+        engram_home / "marketplace" / "plugins" / "engram" / "server.py",
+        engram_home / "server.py",
+        Path(__file__).resolve().parent.parent / "server.py",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
     return None
 
 

@@ -931,3 +931,121 @@ def _fake_git_result_obj(returncode=0, stdout="", stderr=""):
     r.stdout = stdout
     r.stderr = stderr
     return r
+
+
+# ---------------------------------------------------------------------------
+# Test Area 7: _find_server_py candidate ordering (#742)
+# ---------------------------------------------------------------------------
+
+def _load_regen_module():
+    """Load tools/engram-regenerate-embeddings.py as a module and return it."""
+    import importlib.util
+    regen_script = REPO_ROOT / "tools" / "engram-regenerate-embeddings.py"
+    if not regen_script.exists():
+        pytest.skip("tools/engram-regenerate-embeddings.py not found")
+    spec = importlib.util.spec_from_file_location("engram_regen_for_test", str(regen_script))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestFindServerPy:
+    """_find_server_py probes plugin dir first, scatter second, repo-root third.
+
+    Three scenarios (all using isolated tmp dirs so no real engram install is
+    touched):
+
+    1. clean_plugin   — only plugin path exists → must return plugin path.
+    2. plugin_scatter — plugin AND scatter both exist → must return plugin path
+                        (not the scatter leftover).
+    3. dev_repo_only  — neither plugin nor scatter under tmp_home; function falls
+                        back to the repo-root server.py → must return repo path.
+
+    Scenarios 1 and 2 are the discrimination tests: they FAIL on the old
+    scatter-first ordering (verified via the mutant-kill check in the spec).
+    """
+
+    def setup_method(self):
+        self.mod = _load_regen_module()
+        self.tmp = Path(tempfile.mkdtemp(prefix="engram_test_findservpy_"))
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _plugin_path(self) -> Path:
+        return self.tmp / "marketplace" / "plugins" / "engram" / "server.py"
+
+    def _scatter_path(self) -> Path:
+        return self.tmp / "server.py"
+
+    def _make_plugin(self) -> Path:
+        p = self._plugin_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("# plugin server.py\n")
+        return p
+
+    def _make_scatter(self) -> Path:
+        p = self._scatter_path()
+        p.write_text("# scatter server.py\n")
+        return p
+
+    # -- Scenario 1: clean plugin install -----------------------------------
+
+    def test_clean_plugin_returns_plugin_path(self):
+        """When only the plugin server.py exists, _find_server_py returns it.
+
+        On the old scatter-first ordering this returned None (scatter absent,
+        scatter checked first and not found, then plugin never checked because
+        scatter was the intended first match — actually returns None or falls
+        through to repo), but most critically on the old code with scatter-first
+        candidates=[scatter, plugin, repo], a clean-plugin install had scatter
+        absent so it would fall through to repo, ignoring the plugin entirely.
+        """
+        plugin_p = self._make_plugin()
+        result = self.mod._find_server_py(self.tmp)
+        assert result == plugin_p, (
+            f"Expected plugin path {plugin_p!r}, got {result!r}. "
+            f"Possible scatter-first ordering bug."
+        )
+
+    # -- Scenario 2: plugin + scatter leftover ------------------------------
+
+    def test_plugin_wins_over_scatter_leftover(self):
+        """When both plugin and scatter server.py exist, the plugin wins.
+
+        This is the core discrimination test: old scatter-first code would
+        have returned the scatter path here.
+        """
+        plugin_p = self._make_plugin()
+        scatter_p = self._make_scatter()
+
+        result = self.mod._find_server_py(self.tmp)
+        assert result == plugin_p, (
+            f"Expected plugin path {plugin_p!r} to win over scatter {scatter_p!r}, "
+            f"but got {result!r}. This indicates scatter-first ordering."
+        )
+        assert result != scatter_p, (
+            f"Scatter leftover {scatter_p!r} must not be returned when plugin exists."
+        )
+
+    # -- Scenario 3: dev-repo only ------------------------------------------
+
+    def test_dev_repo_fallback(self):
+        """When neither plugin nor scatter exist under tmp_home, the repo-root server.py is returned.
+
+        Uses a tmp_home with no server.py files so the function must fall through
+        to the third candidate (parent of tools/ == REPO_ROOT).
+        REPO_ROOT/server.py must exist for this test to be meaningful.
+        """
+        repo_server = REPO_ROOT / "server.py"
+        if not repo_server.exists():
+            pytest.skip("REPO_ROOT/server.py not present — skipping dev-repo fallback scenario")
+
+        # Ensure neither plugin nor scatter exist in tmp_home
+        assert not self._plugin_path().exists()
+        assert not self._scatter_path().exists()
+
+        result = self.mod._find_server_py(self.tmp)
+        assert result == repo_server, (
+            f"Expected repo-root fallback {repo_server!r}, got {result!r}."
+        )
