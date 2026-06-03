@@ -65,7 +65,8 @@ class TestSchemaMigration:
         assert slugs == expected
 
     def test_seed_category_data(self, conn):
-        """Seed data matches spec.md verbatim."""
+        """Seed data matches the SEED_CATEGORIES constant (the in-code fallback
+        mirroring the shipped default forum/seeds/categories.default.json)."""
         rows = {
             row[0]: row
             for row in conn.execute(

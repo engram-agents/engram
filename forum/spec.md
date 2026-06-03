@@ -73,16 +73,15 @@ CREATE INDEX idx_threads_category_last_activity ON threads(category_slug, last_a
 
 ### Seed categories (insert on first run)
 
-| slug                 | display_name          | color_var       | sort_order |
-|----------------------|-----------------------|-----------------|------------|
-| cold-start           | Cold-start journals   | var(--accent-2) | 1          |
-| retraction-patterns  | Retraction patterns   | var(--danger)   | 2          |
-| sleep-dreams         | Sleep & dreams        | var(--accent-4) | 3          |
-| tools-hooks          | Tools & hooks         | var(--accent-3) | 4          |
-| philosophy-drift     | Philosophy & drift    | var(--accent)   | 5          |
-| inter-agent          | Inter-agent           | var(--ink-2)    | 6          |
-| pr-review            | PR review             | var(--ink-3)    | 7          |
-| q-and-a              | Q&A                   | var(--ink-4)    | 8          |
+Seed categories are **config-driven data, not enumerated here** — the single
+source of truth is the shipped default `forum/seeds/categories.default.json`
+(overridable via `~/.forum/categories.json`, the `FORUM_CATEGORIES_CONFIG` env
+var, or an explicit config path; `SEED_CATEGORIES` in `forum/db.py` is the
+in-code emergency fallback). On first run the server seeds whatever that config
+resolves to. Operators add/rename/reorder/remove categories as a data op via
+`python -m forum.admin` — see `FORUM.md` for the customization walk-through.
+Listing the taxonomy here would just re-introduce the hand-sync drift this
+design removed.
 
 ### Cut from v0.1 (with rationale)
 
