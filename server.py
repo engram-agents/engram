@@ -49,6 +49,17 @@ try:
 except Exception:  # pragma: no cover
     _sqlite_vec = None
     _SQLITE_VEC_IMPORT_OK = False
+    # Loud, not silent: a missing vec0 backend means semantic search quietly
+    # degrades to the slow O(N) cosine path AND the #720 backup will crash on any
+    # vec_nodes table it tries to drop. This degradation went unnoticed on real
+    # installs (the migration venv-create omitted sqlite-vec) — so announce it.
+    import sys as _sys
+    print(
+        "[engram] sqlite-vec unavailable — semantic search is on the slow "
+        "O(N) pure-Python cosine fallback; install sqlite-vec==0.1.9 in this "
+        "interpreter to enable the vec0 KNN index (see #728).",
+        file=_sys.stderr,
+    )
 
 # Flipped to False at runtime if extension loading fails on the actual
 # connection (some Python sqlite3 builds compile without load_extension).
