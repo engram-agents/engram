@@ -725,6 +725,10 @@ def _init_git():
     versioning layer had to be disabled. With ENGRAM_DISABLE_GIT=1, _git_available
     stays False and engram_nap / engram_advance_turn silently skip committing
     while still saving the session log and graph state to disk.
+
+    Also ensures a canonical .gitignore that excludes binary files, transient
+    SQLite files, and other junk that must never be tracked. Idempotent —
+    safe to call on an already-initialized repo.
     """
     global _git_available, GIT_TIMEOUT
     if os.environ.get("ENGRAM_DISABLE_GIT"):
@@ -732,6 +736,10 @@ def _init_git():
         print("[engram] ENGRAM_DISABLE_GIT set — version control disabled by user opt-out.", file=sys.stderr)
         return
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # Write .gitignore before git init so it's respected from the first commit.
+    # Patterns verified 2026-06-02 against real files that slipped through before
+    # this fix (*.db tracked, *.bak tracked, *.log tracked, etc.).
+    _ensure_engram_gitignore(DATA_DIR)
     git_dir = DATA_DIR / ".git"
     if git_dir.exists():
         _git_available = True
@@ -750,6 +758,57 @@ def _init_git():
             print(f"[engram] git init failed, version control disabled: {r.stderr}", file=sys.stderr)
     finally:
         GIT_TIMEOUT = saved_timeout
+
+
+def _ensure_engram_gitignore(data_dir: "Path") -> None:
+    """Write (or refresh) DATA_DIR/.gitignore with the canonical ENGRAM patterns.
+
+    Idempotent: if the file already contains ALL required patterns it is left
+    unchanged. If it is absent or missing patterns, the canonical content is
+    written (replacing any prior content — the canonical set is the authoritative
+    truth, not a patch-on-top).
+
+    Patterns rationale (each earned by a real file that slipped through):
+      *.db / *.db-shm / *.db-wal / *.db-journal — SQLite binary + WAL files; binary,
+          never diff-able, must never be tracked (restoring from .sql is the intent).
+      *?mode=* — URI-junk files from botched sqlite opens (e.g. knowledge.db?mode=ro).
+      *.bak / *.bak.* / config.json.bak* — timestamped backups; large, binary, churn.
+      *.backfill-snapshot-* — temporary backfill snapshots.
+      *.log — log files; noise, never part of the backup.
+      marketplace/ venv/ __pycache__/ *.pyc — runtime / build artifacts.
+
+    NOT excluded: knowledge.sql (the text dump), graph_snapshot.md, session_log.md,
+    config.json, warm-briefing.md, diary/*, history/*, *.json identity files — these
+    ARE the backup.
+    """
+    _GITIGNORE_PATTERNS = [
+        "*.db",
+        "*.db-shm",
+        "*.db-wal",
+        "*.db-journal",
+        "*?mode=*",
+        "*.bak",
+        "*.bak.*",
+        "config.json.bak*",
+        "*.backfill-snapshot-*",
+        "*.log",
+        "marketplace/",
+        "venv/",
+        "__pycache__/",
+        "*.pyc",
+    ]
+    gitignore_path = data_dir / ".gitignore"
+    canonical = "\n".join(_GITIGNORE_PATTERNS) + "\n"
+    try:
+        if gitignore_path.exists():
+            existing = gitignore_path.read_text(encoding="utf-8")
+            # Check if ALL required patterns are present (exact-line match)
+            existing_lines = {l.strip() for l in existing.splitlines()}
+            if all(p in existing_lines for p in _GITIGNORE_PATTERNS):
+                return  # Already complete — leave it alone
+        gitignore_path.write_text(canonical, encoding="utf-8")
+    except OSError:
+        pass  # Best-effort — if we can't write it, git init still proceeds
 
 # ---------------------------------------------------------------------------
 # Database initialization
@@ -4272,21 +4331,39 @@ def _commit_snapshot(conn: sqlite3.Connection, message: str, mode: str) -> dict:
     else:
         wal_warning = None
 
-    # 2b. Generate SQL text dump (replaces binary DB in git — the SQL-dump-replaces-binary derivation)
-    #     The SQL dump is text-diffable and round-trips perfectly via
-    #     `sqlite3 new.db < knowledge.sql`. This makes git storage growth
-    #     linear in actual data changes, not quadratic in cumulative file sizes.
+    # 2b. Generate embedding-stripped SQL text dump (the SQL-dump-replaces-binary derivation).
+    #     Embeddings (~384-float blobs, ~37 MB) are regenerable from claim text and must
+    #     NOT be included — they churn on every nap and defeat delta compression, growing
+    #     .git to GBs (verified 2026-06-02: 79.7 MB → 42.6 MB stripped, lossless rebuild).
+    #     Method: engram_backup.dump_stripped (pure-Python, no sqlite3 CLI).
+    #
+    #     Restore path: `sqlite3 ~/.engram/knowledge.db < knowledge.sql`
+    #     After restore: run `python tools/engram-regenerate-embeddings.py` to rebuild
+    #     semantic search (embedding column is NULL in the dump, NULL in the restored DB).
     sql_dump_path = DATA_DIR / "knowledge.sql"
+    _dump_stats = None
+    _dump_error = None
     try:
-        import subprocess as _sp
-        dump_result = _sp.run(
-            ["sqlite3", str(DB_PATH), ".dump"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if dump_result.returncode == 0:
-            sql_dump_path.write_text(dump_result.stdout, encoding="utf-8")
-    except Exception:
-        pass  # Best-effort — snapshot.md still provides human-readable backup
+        import engram_backup  # local import: server.py's dir is on sys.path; dodges import-order
+        _dump_stats = engram_backup.dump_stripped(str(DB_PATH), str(sql_dump_path))
+    except Exception as e:
+        # LOUD, not silent: the class-5 failure this PR exists to prevent is a
+        # backup that fails without anyone noticing. Record + log; do NOT `pass`,
+        # do NOT abort the rest of the snapshot commit.
+        import sys as _sys
+        print(f"[engram backup] CRITICAL: knowledge.sql dump FAILED: {e}", file=_sys.stderr)
+        _dump_error = str(e)
+
+    # Collect dump fields once so every subsequent return path carries them.
+    # The agent-visible response must surface sql_dump_error on ALL exit paths,
+    # not only the success path — otherwise a backup failure is visible on stderr
+    # but invisible to the agent reading the nap/sleep response (the class-5
+    # silent-failure mode this PR eliminates).
+    _dump_fields: dict = {}
+    if _dump_stats is not None:
+        _dump_fields["sql_dump"] = _dump_stats
+    if _dump_error is not None:
+        _dump_fields["sql_dump_error"] = _dump_error
 
     # 3. Stage explicit files only (never `git add .` — would pull in backups,
     #    daemon sockets, etc.)
@@ -4302,13 +4379,14 @@ def _commit_snapshot(conn: sqlite3.Connection, message: str, mode: str) -> dict:
                 files_to_stage.append(f"diary/{f.name}")
 
     if not files_to_stage:
-        return {"git_committed": False, "reason": "no tracked files exist"}
+        return {"git_committed": False, "reason": "no tracked files exist", **_dump_fields}
 
     add_result = _git("add", "--", *files_to_stage)
     if add_result.returncode != 0:
         return {
             "git_committed": False,
             "reason": f"git add failed: {add_result.stderr.strip()}",
+            **_dump_fields,
         }
 
     # 4. Check if there's actually anything to commit (skip empty commits)
@@ -4321,6 +4399,7 @@ def _commit_snapshot(conn: sqlite3.Connection, message: str, mode: str) -> dict:
             "git_committed": False,
             "reason": "no changes since last commit",
             "head_sha": head_sha,
+            **_dump_fields,
         }
 
     # 5. Commit
@@ -4332,6 +4411,7 @@ def _commit_snapshot(conn: sqlite3.Connection, message: str, mode: str) -> dict:
         return {
             "git_committed": False,
             "reason": f"git commit failed: {commit_result.stderr.strip()}",
+            **_dump_fields,
         }
 
     # 6. Capture the new commit SHA
@@ -4343,6 +4423,7 @@ def _commit_snapshot(conn: sqlite3.Connection, message: str, mode: str) -> dict:
         "commit_sha": sha,
         "files_committed": files_to_stage,
         "commit_message": commit_msg,
+        **_dump_fields,
     }
     if wal_warning:
         result["wal_warning"] = wal_warning

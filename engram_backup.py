@@ -1,0 +1,257 @@
+"""Pure-Python ENGRAM backup dump + index rebuild — zero sqlite3-CLI dependency.
+
+This is the single reusable backup mechanism shared by every #720 call site
+(server `_commit_snapshot`, `tools/engram-fix-git-backup.sh`,
+`tools/engram-regenerate-embeddings.py`). It deliberately uses only the
+stdlib `sqlite3` module — never the `sqlite3` command-line binary — because
+that binary is NOT guaranteed installed (verified absent on real installs),
+and shelling out to it under `except: pass` silently skips the backup on
+those hosts (the class-5 failure mode #720 itself was meant to prevent).
+
+The dump excludes ALL regenerable/derived data so git diffs stay small and
+grow linearly instead of churning a fresh multi-MB blob every nap:
+
+  - embedding values  — nulled (regenerable from claim text via the embed model)
+  - nodes_fts*         — the FTS5 index + its shadow tables + the fts5vocab
+                         table (rebuildable from the restored rows)
+  - vec_nodes          — the sqlite-vec KNN index, if the extension is loaded
+                         (install-conditional: absent when sqlite-vec didn't load)
+
+Restore contract (all three regenerable layers rebuilt, none shipped):
+  1. sqlite3 new.db < knowledge.sql          # base rows; embedding NULL; no FTS/vec
+  2. backfill embeddings (needs the embed model — lives in the regen tool)
+  3. rebuild_fts_index(db)                    # FTS5 'rebuild' from restored rows
+  4. vec backfill (server _backfill_vec_nodes at first _get_db, if ext loads)
+
+Verified round-trip (2026-06-03, Ariadne): base-table parity exact, embeddings
+NULL+regenerable, FTS search returns byte-identical hit counts post-rebuild,
+no sqlite3 CLI anywhere. The fts5vocab table must be dropped BEFORE its parent
+nodes_fts or `iterdump` itself raises `no such fts5 table: main.nodes_fts`.
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import tempfile
+
+
+# Tables whose contents are derived/regenerable and must never reach the dump.
+# nodes_fts* matches the FTS5 virtual table, its shadow tables
+# (nodes_fts_data/idx/docsize/config) and the fts5vocab table (nodes_fts_vocab).
+_DERIVED_TABLE_PREFIXES = ("nodes_fts",)
+_DERIVED_TABLE_NAMES = ("vec_nodes",)
+
+
+def _derived_drop_plan(conn: sqlite3.Connection) -> tuple[list[str], list[str], list[str]]:
+    """Return (fts_triggers, vocab_tables, base_virtual_tables) to drop, in safe order.
+
+    Order matters: fts5vocab tables depend on their parent FTS table, so they
+    must be dropped first or `iterdump()` chokes trying to read the orphan.
+    """
+    triggers = [
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND sql LIKE '%nodes_fts%'"
+        ).fetchall()
+    ]
+    vocab = [
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE sql LIKE '%fts5vocab%'"
+        ).fetchall()
+    ]
+    # Parent virtual tables (nodes_fts + vec_nodes); dropping nodes_fts also
+    # removes its shadow tables. Exclude the vocab tables already handled above.
+    base = [
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND "
+            "(name='nodes_fts' OR name='vec_nodes')"
+        ).fetchall()
+    ]
+    return triggers, vocab, base
+
+
+def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
+    """Write a regenerable-stripped SQL text dump of ``src_db_path`` to ``out_sql_path``.
+
+    Pure-Python: takes a consistent hot backup via the sqlite3 module's
+    ``Connection.backup`` (never locks the live DB hard, WAL-safe), strips the
+    derived data on the COPY only (the source DB is never modified), then writes
+    a restorable ``iterdump`` to ``out_sql_path``.
+
+    Returns a stats dict: ``{statements, bytes, fts_excluded, vec_excluded}``.
+    Raises on failure — callers MUST surface errors, never ``except: pass`` them
+    (silent skip is the failure mode this module exists to eliminate).
+    """
+    src = sqlite3.connect(src_db_path)
+    fd, snap = tempfile.mkstemp(
+        suffix=".snap.db", dir=os.path.dirname(os.path.abspath(src_db_path)), prefix=".engram-bk-"
+    )
+    os.close(fd)
+    try:
+        bk = sqlite3.connect(snap)
+        try:
+            src.backup(bk)  # consistent hot backup, pure-Python, no CLI
+        finally:
+            src.close()
+
+        triggers, vocab, base = _derived_drop_plan(bk)
+        fts_excluded = any(t == "nodes_fts" for t in base) or bool(vocab)
+        vec_excluded = any(t == "vec_nodes" for t in base)
+
+        # Strip on the snapshot only — live DB untouched.
+        bk.execute("UPDATE nodes SET embedding=NULL")
+        for tn in triggers:
+            bk.execute(f"DROP TRIGGER IF EXISTS {tn}")
+        for vn in vocab:  # vocab depends on parent FTS table → drop first
+            bk.execute(f"DROP TABLE IF EXISTS {vn}")
+        for tn in base:   # nodes_fts (+shadow) / vec_nodes
+            bk.execute(f"DROP TABLE IF EXISTS {tn}")
+        bk.commit()
+
+        statements = 0
+        with open(out_sql_path, "w", encoding="utf-8") as f:
+            for line in bk.iterdump():
+                f.write(line + "\n")
+                statements += 1
+        bk.close()
+    finally:
+        try:
+            os.unlink(snap)
+        except OSError:
+            pass
+
+    return {
+        "statements": statements,
+        "bytes": os.path.getsize(out_sql_path),
+        "fts_excluded": fts_excluded,
+        "vec_excluded": vec_excluded,
+    }
+
+
+def rebuild_fts_index(db_path: str) -> bool:
+    """Rebuild the FTS5 index from the current rows of ``nodes`` (post-restore).
+
+    Idempotent. Returns True if the rebuild ran, False if there is no
+    ``nodes_fts`` table to rebuild (e.g. the server hasn't recreated it yet —
+    it does so lazily at first ``_get_db``; call this AFTER that, or after the
+    schema-init that creates the virtual table). FTS5 'rebuild' repopulates the
+    index from the external content (the ``nodes`` table) — the restored rows.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        has_fts = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='nodes_fts'"
+        ).fetchone()
+        if not has_fts:
+            return False
+        conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def verify_roundtrip(src_db_path: str) -> dict:
+    """Self-check: dump ``src_db_path``, restore to a temp DB, and confirm the
+    base rows survive and the FTS index rebuilds to identical hit counts.
+
+    Returns a report dict; raises AssertionError on any divergence. Used by the
+    test suite and the cleanup script's lossless-verify step (replacing the
+    sqlite3-CLI verify). Does not modify the source DB.
+    """
+    import re
+
+    src = sqlite3.connect(src_db_path)
+    base_tables = [
+        r[0]
+        for r in src.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'nodes_fts%' AND name!='vec_nodes'"
+        ).fetchall()
+    ]
+    orig_counts = {t: src.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in base_tables}
+    has_fts = src.execute("SELECT sql FROM sqlite_master WHERE name='nodes_fts'").fetchone()
+    fts_sql = has_fts[0] if has_fts else None
+    fts_hits_orig = (
+        src.execute("SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'migration'").fetchone()[0]
+        if fts_sql
+        else None
+    )
+    src.close()
+
+    dump_path = tempfile.mktemp(suffix=".sql")
+    recon_path = tempfile.mktemp(suffix=".db")
+    try:
+        stats = dump_stripped(src_db_path, dump_path)
+        # belt-and-suspenders: no derived-table statement should remain
+        guard = re.compile(r"\b(nodes_fts\w*|vec_nodes)\b")
+        leaked = [ln for ln in open(dump_path) if guard.search(ln)]
+        assert not leaked, f"derived-table statements leaked into dump: {leaked[:2]}"
+
+        rc = sqlite3.connect(recon_path)
+        rc.executescript(open(dump_path).read())
+        for t in base_tables:
+            got = rc.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+            assert got == orig_counts[t], f"{t}: {got} != {orig_counts[t]}"
+        null_emb = rc.execute("SELECT count(*) FROM nodes WHERE embedding IS NULL").fetchone()[0]
+        total = rc.execute("SELECT count(*) FROM nodes").fetchone()[0]
+        assert null_emb == total, f"embeddings not fully stripped: {null_emb}/{total}"
+
+        fts_ok = None
+        if fts_sql:
+            rc.execute(fts_sql)
+            rc.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
+            hits = rc.execute(
+                "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'migration'"
+            ).fetchone()[0]
+            assert hits == fts_hits_orig, f"FTS hits diverged: {hits} != {fts_hits_orig}"
+            fts_ok = hits
+        rc.close()
+        return {
+            **stats,
+            "base_tables": len(base_tables),
+            "nodes": orig_counts.get("nodes"),
+            "fts_hits": fts_ok,
+            "ok": True,
+        }
+    finally:
+        for p in (dump_path, recon_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def _main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    p = argparse.ArgumentParser(prog="engram_backup", description=__doc__)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    d = sub.add_parser("dump", help="Write a regenerable-stripped SQL dump.")
+    d.add_argument("src_db")
+    d.add_argument("out_sql")
+    r = sub.add_parser("rebuild-fts", help="Rebuild the FTS index from current rows.")
+    r.add_argument("db")
+    v = sub.add_parser("verify", help="Self-check the dump→restore→FTS-rebuild round-trip.")
+    v.add_argument("src_db")
+    args = p.parse_args(argv)
+
+    if args.cmd == "dump":
+        stats = dump_stripped(args.src_db, args.out_sql)
+        print(f"dump: {stats['statements']} stmts, {stats['bytes']/1024/1024:.2f} MB "
+              f"(fts_excluded={stats['fts_excluded']} vec_excluded={stats['vec_excluded']})")
+    elif args.cmd == "rebuild-fts":
+        ran = rebuild_fts_index(args.db)
+        print("FTS rebuilt" if ran else "no nodes_fts table to rebuild")
+    elif args.cmd == "verify":
+        rep = verify_roundtrip(args.src_db)
+        print(f"round-trip OK: nodes={rep['nodes']} fts_hits={rep['fts_hits']} "
+              f"dump={rep['bytes']/1024/1024:.2f}MB stmts={rep['statements']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

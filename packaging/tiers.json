@@ -31,6 +31,10 @@
       "tier": "essential"
     },
     {
+      "path": "engram_backup.py",
+      "tier": "essential"
+    },
+    {
       "path": "engram_client.py",
       "tier": "essential"
     },
@@ -108,6 +112,14 @@
     },
     {
       "path": "tools/install-local-marketplace.sh",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/engram-regenerate-embeddings.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/engram-fix-git-backup.sh",
       "tier": "convenience"
     },
     {

@@ -913,3 +913,82 @@ The agent cannot set `nudge_source` directly. This is a deliberate constraint �
 ---
 
 **Open question tracked outside this draft:** the tripwire matching-quality empirical-validation question.
+
+---
+
+## §9 Git Backup and Restore
+
+### §9.1 What is tracked
+
+`~/.engram/.git` is a local git repository that captures the graph state at
+every nap/sleep checkpoint via `_commit_snapshot`. Files committed:
+
+| File | Description |
+|------|-------------|
+| `knowledge.sql` | Embedding-stripped SQL text dump — the primary restore artifact |
+| `graph_snapshot.md` | Human-readable diff target |
+| `session_log.md` | Chronological session audit trail |
+| `config.json` | Trust pool / confidence / embedding configuration |
+| `warm-briefing.md` | Identity continuity artifact |
+| `diary/*` | Private reflections |
+| `.gitignore` | Canonical binary-exclusion patterns |
+
+**Binary files are never tracked.** `knowledge.db`, `*.db-wal`, `*.db-shm`,
+`*.bak`, and log files are gitignored. The `.gitignore` is written automatically
+by `_init_git` at server startup.
+
+### §9.2 Why embeddings are stripped from the dump
+
+Each node carries a ~384-float embedding vector (~37 MB total on a mature graph).
+These vectors churn on every nap (new/modified nodes) and inflate `knowledge.sql`
+to ~79 MB per commit — storing near-full blobs with no delta compression, causing
+`.git` to balloon to GBs.
+
+Embeddings are **regenerable** from claim text. Stripping them from the dump
+reduces it to a few MB of actual claim/edge/metadata text, restoring linear
+storage growth. After a git restore, run the regenerate script (§9.3).
+
+### §9.3 Restore procedure
+
+If `knowledge.db` is lost or corrupted, restore from the git-tracked SQL dump:
+
+**Step 1: Restore the DB from the text dump**
+```bash
+# From a clean state (or after deleting the corrupt DB):
+sqlite3 ~/.engram/knowledge.db < ~/.engram/knowledge.sql
+```
+
+**Step 2: Regenerate embeddings (restores semantic search)**
+```bash
+python tools/engram-regenerate-embeddings.py
+# Or, if running from a plugin install:
+python ~/.engram/tools/engram-regenerate-embeddings.py
+```
+
+The script is idempotent — it only touches nodes with `embedding IS NULL`.
+Progress is logged to stderr. Typical runtime: 1–5 minutes depending on
+graph size and whether the model is cached.
+
+**Step 3: Restart the MCP server**
+```bash
+pkill -f 'python.*server.py'
+# Claude Code will restart it automatically on the next tool call.
+```
+
+### §9.4 One-time cleanup for bloated existing installs
+
+If `~/.engram/.git` has grown to GBs (binary files tracked, embeddings in dump):
+
+```bash
+bash tools/engram-fix-git-backup.sh          # preview first:
+bash tools/engram-fix-git-backup.sh --dry-run
+```
+
+The script:
+1. Creates an out-of-tree safety snapshot (`~/.engram-db-safety-<ts>.db`)
+2. Writes the canonical `.gitignore`
+3. Generates an embedding-stripped `knowledge.sql` and verifies lossless rebuild
+4. Drops the old git history, runs a fresh `git init`, creates a clean root commit
+5. Prints the `git push --force` command for the operator to run manually
+
+`ENGRAM data (knowledge.db) is never deleted or mutated by this script.`
