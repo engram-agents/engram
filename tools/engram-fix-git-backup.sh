@@ -15,7 +15,8 @@
 #
 # Env vars:
 #   ENGRAM_HOME   ENGRAM data directory (default: ~/.engram)
-#   PYTHON_BIN    Python interpreter (default: python3)
+#   PYTHON_BIN    Python interpreter (default: $ENGRAM_HOME/venv/bin/python if
+#                 present, else python3 with a warning about sqlite_vec)
 #
 # Steps:
 #   0. Refuse unless knowledge.db exists (safety gate)
@@ -39,7 +40,16 @@ set -euo pipefail
 # Configuration
 # ---------------------------------------------------------------------------
 ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+# Resolve python: honour explicit $PYTHON_BIN override; else prefer the ENGRAM
+# venv (which has sqlite_vec); else fall back to system python3 with a warning.
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+    if [[ -x "$ENGRAM_HOME/venv/bin/python" ]]; then
+        PYTHON_BIN="$ENGRAM_HOME/venv/bin/python"
+    else
+        PYTHON_BIN="python3"
+        echo "[engram-fix-git-backup] WARNING: venv python not found at $ENGRAM_HOME/venv/bin/python; falling back to system python3 — the SQL dump may fail on vec0 tables if sqlite_vec is missing." >&2
+    fi
+fi
 DRY_RUN=0
 
 # Resolve the engram_backup.py module (same dir as this script's repo root)
@@ -48,7 +58,7 @@ if [[ ! -f "$ENGRAM_BACKUP" ]]; then
     echo "[engram-fix-git-backup] ERROR: engram_backup.py not found at $ENGRAM_BACKUP" >&2
     exit 1
 fi
-PY="${PYTHON_BIN:-python3}"
+PY="$PYTHON_BIN"
 
 # ---------------------------------------------------------------------------
 # Argument parsing

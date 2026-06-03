@@ -59,6 +59,28 @@ def _find_server_py(engram_home: Path) -> Path | None:
     return None
 
 
+def _find_engram_backup_dir(engram_home: Path, server_py: Path) -> Path | None:
+    """Find the directory that contains a current engram_backup.py.
+
+    Checks in priority order:
+    1. Plugin runtime dir (engram_home/marketplace/plugins/engram/) — canonical
+       on plugin installs; preferred even when a stale scatter server.py was
+       found by _find_server_py.
+    2. Same dir as the located server.py — correct for dev-repo layout and for
+       any install where server.py and engram_backup.py co-deploy together.
+    3. Repo root (parent of tools/) — fallback for dev runs without ENGRAM_HOME.
+    """
+    candidates = [
+        engram_home / "marketplace" / "plugins" / "engram",
+        server_py.parent,
+        Path(__file__).resolve().parent.parent,
+    ]
+    for d in candidates:
+        if (d / "engram_backup.py").exists():
+            return d
+    return None
+
+
 def _import_server(engram_home: Path):
     """Import server.py and configure it to use engram_home."""
     server_py = _find_server_py(engram_home)
@@ -71,6 +93,14 @@ def _import_server(engram_home: Path):
         sys.exit(1)
     if str(server_py.parent) not in sys.path:
         sys.path.insert(0, str(server_py.parent))
+    # Ensure engram_backup.py is importable: find its directory and prepend it
+    # to sys.path.  The plugin layout keeps engram_backup.py in the plugin
+    # runtime dir (engram_home/marketplace/plugins/engram/), which may differ
+    # from server_py.parent when _find_server_py resolves a stale scatter copy
+    # of server.py from engram_home directly.
+    backup_dir = _find_engram_backup_dir(engram_home, server_py)
+    if backup_dir is not None and str(backup_dir) not in sys.path:
+        sys.path.insert(0, str(backup_dir))
     import importlib
     if "server" in sys.modules:
         del sys.modules["server"]
@@ -149,7 +179,7 @@ def backfill_embeddings(engram_home: Path) -> None:
 
         if null_count == 0:
             print("[regen] No nodes with NULL embedding — nothing to do.", file=sys.stderr)
-            import engram_backup  # available after _import_server put server.py's dir on sys.path
+            import engram_backup  # available after _import_server inserted the backup module dir on sys.path
             if engram_backup.rebuild_fts_index(str(db_path)):
                 print("[regen] FTS index rebuilt from current rows.", file=sys.stderr)
             else:
@@ -242,7 +272,7 @@ def backfill_embeddings(engram_home: Path) -> None:
             file=sys.stderr,
         )
 
-        import engram_backup  # available after _import_server put server.py's dir on sys.path
+        import engram_backup  # available after _import_server inserted the backup module dir on sys.path
         if engram_backup.rebuild_fts_index(str(db_path)):
             print("[regen] FTS index rebuilt from restored rows.", file=sys.stderr)
         else:
