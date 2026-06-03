@@ -1,6 +1,6 @@
 """Tests for the git-backup embedding-stripping fix (#717).
 
-Coverage (four test areas):
+Coverage (six test areas):
 
   1. _commit_snapshot embedding-stripped dump
      - The SQL dump written to knowledge.sql must NOT contain the embedding column.
@@ -20,6 +20,17 @@ Coverage (four test areas):
      - When the dump fails, ALL early-return paths (no tracked files, git add
        failed, git commit failed, no changes since last commit) carry
        sql_dump_error so the agent-visible response surfaces the failure.
+
+  5. _commit_snapshot push uses HEAD, not "master" (#737)
+     - The push call targets HEAD so any default branch name is correct.
+     - The remote_push result-key shape is unchanged.
+
+  6. _commit_snapshot skips gitignored paths (#731)
+     - A gitignored diary file is dropped and the commit still lands.
+     - skipped_ignored surfaces when files are dropped; absent when nothing dropped.
+     - check-ignore error (rc>1) keeps all files (best-effort).
+     - When ALL stageable files are gitignored, reason is 'all stageable files are
+       gitignored' (distinct from 'no tracked files exist').
 """
 
 from __future__ import annotations
@@ -456,17 +467,27 @@ class TestCommitSnapshotDumpFieldsOnEarlyReturn:
         import sqlite3 as _sqlite3
         return _sqlite3.connect(str(self.db_path))
 
-    def test_no_tracked_files_path_carries_dump_error(self):
-        """'no tracked files exist' return dict includes sql_dump_error on dump failure."""
+    def test_no_changes_since_last_commit_path_carries_dump_error(self):
+        """'no changes since last commit' return dict includes sql_dump_error on dump failure.
+
+        setup_method creates config.json via _ensure_data_dir(), and _snapshot_patch writes
+        graph_snapshot.md — so files_to_stage is non-empty.  The mocked _git returns:
+          - check-ignore: rc=0, stdout="" → ignored_set={}, no files dropped
+          - git add: rc=0 (success)
+          - git status: rc=0, stdout="" (empty porcelain → no changes since last commit)
+          - rev-parse HEAD: rc=0, stdout="" (no HEAD in this repo, but best-effort)
+        This exercises the 'no changes since last commit' early-return path.
+        """
         conn = self._conn()
         with self._snapshot_patch(), self._failing_dump_patch():
             with mock.patch.object(self.server, "_git", return_value=self._fake_git_result(0, "", "")):
                 result = self.server._commit_snapshot(conn, "test", "nap")
         conn.close()
-        # DATA_DIR has no tracked files (besides the snapshot just written) → hits
-        # "no tracked files exist" path; sql_dump_error must appear.
+        assert result.get("reason") == "no changes since last commit", (
+            f"Expected 'no changes since last commit' reason; got: {result}"
+        )
         assert "sql_dump_error" in result, (
-            f"Expected sql_dump_error in 'no tracked files' return; got: {result}"
+            f"Expected sql_dump_error in 'no changes since last commit' return; got: {result}"
         )
         assert "synthetic dump failure" in result["sql_dump_error"]
 
@@ -479,6 +500,7 @@ class TestCommitSnapshotDumpFieldsOnEarlyReturn:
             with mock.patch.object(
                 self.server, "_git",
                 side_effect=[
+                    self._fake_git_result(1),              # check-ignore → rc=1 (none ignored)
                     self._fake_git_result(1, stderr="git add error"),  # git add → fail
                 ],
             ):
@@ -497,8 +519,9 @@ class TestCommitSnapshotDumpFieldsOnEarlyReturn:
             with mock.patch.object(
                 self.server, "_git",
                 side_effect=[
-                    self._fake_git_result(0),            # git add → ok
-                    self._fake_git_result(0, stdout=""),  # git status --porcelain → empty (no changes)
+                    self._fake_git_result(1),              # check-ignore → rc=1 (none ignored)
+                    self._fake_git_result(0),              # git add → ok
+                    self._fake_git_result(0, stdout=""),   # git status --porcelain → empty (no changes)
                     self._fake_git_result(0, stdout="abc123"),  # rev-parse HEAD
                 ],
             ):
@@ -517,7 +540,8 @@ class TestCommitSnapshotDumpFieldsOnEarlyReturn:
             with mock.patch.object(
                 self.server, "_git",
                 side_effect=[
-                    self._fake_git_result(0),                            # git add → ok
+                    self._fake_git_result(1),              # check-ignore → rc=1 (none ignored)
+                    self._fake_git_result(0),              # git add → ok
                     self._fake_git_result(0, stdout="M graph_snapshot.md"),  # git status → has changes
                     self._fake_git_result(1, stderr="commit error"),          # git commit → fail
                 ],
@@ -528,3 +552,382 @@ class TestCommitSnapshotDumpFieldsOnEarlyReturn:
             f"Expected sql_dump_error in 'git commit failed' return; got: {result}"
         )
         assert "synthetic dump failure" in result["sql_dump_error"]
+
+
+# ---------------------------------------------------------------------------
+# Test Area 5: _commit_snapshot push uses HEAD, not "master" (#737)
+# ---------------------------------------------------------------------------
+
+class TestCommitSnapshotPushUsesHEAD:
+    """_commit_snapshot auto-push targets HEAD, not hardcoded 'master'.
+
+    Fix for #737: repos whose default branch is 'main' or 'dev' silently
+    failed to push because the push targeted the wrong branch name.
+    """
+
+    def setup_method(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="engram_test_push_head_"))
+        for key in list(sys.modules):
+            if key == "server" or key.startswith("engram_"):
+                del sys.modules[key]
+        os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
+        os.environ["ENGRAM_NO_DB_GUARDS"] = "1"
+        import server
+        server._configure_paths(self.tmp)
+        server._ensure_data_dir()
+        server._git_available = True
+        self.server = server
+        self.db_path = self.tmp / "knowledge.db"
+        _make_fixture_db(self.db_path, num_nodes=2, with_embeddings=False)
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _fake_git_result(self, returncode=0, stdout="", stderr=""):
+        r = mock.Mock()
+        r.returncode = returncode
+        r.stdout = stdout
+        r.stderr = stderr
+        return r
+
+    def _snapshot_patch(self):
+        return mock.patch.object(self.server, "_generate_snapshot", return_value="# test snapshot\n")
+
+    def _conn(self):
+        import sqlite3 as _sqlite3
+        return _sqlite3.connect(str(self.db_path))
+
+    def test_push_uses_head_not_master(self):
+        """The push call uses 'HEAD' as the refspec, not the literal string 'master'."""
+        (self.tmp / "graph_snapshot.md").write_text("x")
+        conn = self._conn()
+        git_calls = []
+
+        def recording_git(*args):
+            git_calls.append(args)
+            if args[0] == "check-ignore":
+                return self._fake_git_result(1)            # none ignored
+            if args[0] == "add":
+                return self._fake_git_result(0)
+            if args[0] == "status":
+                return self._fake_git_result(0, stdout="M graph_snapshot.md")
+            if args[0] == "commit":
+                return self._fake_git_result(0)
+            if args[0] == "rev-parse":
+                return self._fake_git_result(0, stdout="abc123def456")
+            if args[0] == "push":
+                return self._fake_git_result(0)
+            return self._fake_git_result(0)
+
+        with self._snapshot_patch():
+            with mock.patch("engram_backup.dump_stripped", return_value={}):
+                with mock.patch.object(self.server, "_git", side_effect=recording_git):
+                    result = self.server._commit_snapshot(conn, "test", "nap")
+        conn.close()
+
+        push_calls = [c for c in git_calls if c[0] == "push"]
+        assert push_calls, "No push call was made"
+        assert len(push_calls) == 1, f"Expected exactly one push call; got: {push_calls}"
+        push_args = push_calls[0]
+        assert push_args == ("push", "origin", "HEAD"), (
+            f"Push must use 'HEAD' as refspec, not 'master' or any other literal. "
+            f"Got: {push_args}"
+        )
+        assert result.get("git_committed") is True
+        assert "master" not in str(push_calls), (
+            "Literal 'master' found in push call — the #737 fix did not land"
+        )
+
+    def test_push_result_key_shape_unchanged(self):
+        """The 'remote_push' key still surfaces 'success' or 'failed: ...' (#737 must not break callers)."""
+        (self.tmp / "graph_snapshot.md").write_text("x")
+        conn = self._conn()
+
+        def fake_git(*args):
+            r = mock.Mock()
+            r.stderr = ""
+            r.returncode = 1 if args[0] == "check-ignore" else 0
+            if args[0] == "rev-parse":
+                r.stdout = "abc123"
+            elif args[0] == "status":
+                r.stdout = "M graph_snapshot.md"  # non-empty → has changes → commit proceeds
+            else:
+                r.stdout = ""
+            return r
+
+        with self._snapshot_patch():
+            with mock.patch("engram_backup.dump_stripped", return_value={}):
+                with mock.patch.object(self.server, "_git", side_effect=fake_git):
+                    result = self.server._commit_snapshot(conn, "test", "nap")
+        conn.close()
+        assert "remote_push" in result, f"'remote_push' key missing from result: {result}"
+        assert result["remote_push"] == "success", (
+            f"Expected remote_push='success' but got: {result['remote_push']}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test Area 6: _commit_snapshot skips gitignored paths (#731)
+# ---------------------------------------------------------------------------
+
+class TestCommitSnapshotSkipsGitignored:
+    """_commit_snapshot filters gitignored paths before staging.
+
+    Fix for #731: a stray ignored file (e.g. diary/diary.db matching *.db)
+    caused git add to fail with rc!=0, aborting the entire backup.
+    Now: check-ignore filters ignored paths before staging; result carries
+    'skipped_ignored' when any paths were dropped.
+    """
+
+    def setup_method(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="engram_test_gitignore_skip_"))
+        for key in list(sys.modules):
+            if key == "server" or key.startswith("engram_"):
+                del sys.modules[key]
+        os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
+        os.environ["ENGRAM_NO_DB_GUARDS"] = "1"
+        import server
+        server._configure_paths(self.tmp)
+        server._ensure_data_dir()
+        self.server = server
+        self.db_path = self.tmp / "knowledge.db"
+        _make_fixture_db(self.db_path, num_nodes=2, with_embeddings=False)
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _snapshot_patch(self):
+        return mock.patch.object(self.server, "_generate_snapshot", return_value="# test snapshot\n")
+
+    def _conn(self):
+        import sqlite3 as _sqlite3
+        return _sqlite3.connect(str(self.db_path))
+
+    def test_ignored_path_skipped_commit_proceeds(self):
+        """With a real git repo, a gitignored diary file is skipped and the commit still lands.
+
+        Uses a real tmp git repo so git check-ignore runs for real.
+        """
+        import subprocess
+
+        git_home = Path(tempfile.mkdtemp(prefix="engram_gitrepo_"))
+        try:
+            # Init a git repo in git_home
+            subprocess.run(["git", "init", str(git_home)], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", str(git_home), "config", "user.email", "test@test.com"],
+                check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(git_home), "config", "user.name", "Test"],
+                check=True, capture_output=True,
+            )
+
+            # Point server at git_home so _git runs from there
+            for key in list(sys.modules):
+                if key == "server" or key.startswith("engram_"):
+                    del sys.modules[key]
+            import server as srv
+            srv._configure_paths(git_home)
+            srv._ensure_data_dir()
+            srv._git_available = True
+
+            # Write .gitignore that ignores *.db (broad rule, like production)
+            # and negates the normal diary.md so it's not ignored
+            (git_home / ".gitignore").write_text("*.db\n")
+
+            # Write tracked files
+            (git_home / "graph_snapshot.md").write_text("snapshot content\n")
+
+            # Write a diary dir with one normal file + one .db file that will be ignored
+            diary_dir = git_home / "diary"
+            diary_dir.mkdir(exist_ok=True)
+            (diary_dir / "diary.md").write_text("diary entry\n")
+            (diary_dir / "diary.db").write_text("binary-like ignored file\n")
+
+            db_path = git_home / "knowledge.db"
+            _make_fixture_db(db_path, num_nodes=2, with_embeddings=False)
+
+            conn = __import__("sqlite3").connect(str(db_path))
+
+            with mock.patch.object(srv, "_generate_snapshot", return_value="# test snapshot\n"):
+                with mock.patch("engram_backup.dump_stripped", return_value={}):
+                    result = srv._commit_snapshot(conn, "test", "nap")
+            conn.close()
+
+            # The commit must have proceeded (not aborted by the ignored .db file)
+            assert result.get("git_committed") is True, (
+                f"Commit was aborted — expected it to proceed past the ignored file. "
+                f"Result: {result}"
+            )
+            # skipped_ignored must list the dropped .db path
+            assert "skipped_ignored" in result, (
+                f"Expected 'skipped_ignored' key in result; got: {result}"
+            )
+            skipped = result["skipped_ignored"]
+            assert any("diary.db" in p for p in skipped), (
+                f"Expected diary.db in skipped_ignored; got: {skipped}"
+            )
+            # diary.md must have been committed
+            files_committed = result.get("files_committed", [])
+            assert any("diary.md" in p for p in files_committed), (
+                f"Expected diary.md in files_committed; got: {files_committed}"
+            )
+        finally:
+            shutil.rmtree(git_home, ignore_errors=True)
+
+    def test_ignored_path_skipped_mock_based(self):
+        """Mock-based: when check-ignore reports a file ignored, it is dropped and skipped_ignored surfaces."""
+        (self.tmp / "graph_snapshot.md").write_text("x")
+        diary_dir = self.tmp / "diary"
+        diary_dir.mkdir(exist_ok=True)
+        (diary_dir / "diary.md").write_text("entry\n")
+        (diary_dir / "diary.db").write_text("ignored\n")
+
+        git_calls = []
+
+        def recording_git(*args):
+            git_calls.append(args)
+            if args[0] == "check-ignore":
+                # Simulate diary.db being ignored
+                return _fake_git_result_obj(0, stdout="diary/diary.db\n")
+            if args[0] == "add":
+                return _fake_git_result_obj(0)
+            if args[0] == "status":
+                return _fake_git_result_obj(0, stdout="M graph_snapshot.md")
+            if args[0] == "commit":
+                return _fake_git_result_obj(0)
+            if args[0] == "rev-parse":
+                return _fake_git_result_obj(0, stdout="deadbeef")
+            if args[0] == "push":
+                return _fake_git_result_obj(0)
+            return _fake_git_result_obj(0)
+
+        conn = self._conn()
+        with self._snapshot_patch():
+            with mock.patch("engram_backup.dump_stripped", return_value={}):
+                with mock.patch.object(self.server, "_git", side_effect=recording_git):
+                    result = self.server._commit_snapshot(conn, "test", "nap")
+        conn.close()
+
+        assert result.get("git_committed") is True, f"Commit should have proceeded: {result}"
+        assert "skipped_ignored" in result, f"Expected skipped_ignored key: {result}"
+        assert "diary/diary.db" in result["skipped_ignored"], (
+            f"Expected diary/diary.db in skipped_ignored: {result['skipped_ignored']}"
+        )
+        # git add must NOT have been called with the ignored path
+        add_calls = [c for c in git_calls if c[0] == "add"]
+        assert add_calls, "No git add call was made"
+        for add_call in add_calls:
+            assert "diary/diary.db" not in add_call, (
+                f"diary/diary.db must not appear in git add args: {add_call}"
+            )
+
+    def test_no_ignored_files_no_skipped_key(self):
+        """When no files are ignored (check-ignore rc=1), skipped_ignored key is absent."""
+        (self.tmp / "graph_snapshot.md").write_text("x")
+
+        def fake_git(*args):
+            r = mock.Mock()
+            r.stderr = ""
+            if args[0] == "check-ignore":
+                r.returncode = 1    # none ignored
+                r.stdout = ""
+            elif args[0] == "rev-parse":
+                r.returncode = 0
+                r.stdout = "abc123"
+            else:
+                r.returncode = 0
+                r.stdout = "M graph_snapshot.md" if args[0] == "status" else ""
+            return r
+
+        conn = self._conn()
+        with self._snapshot_patch():
+            with mock.patch("engram_backup.dump_stripped", return_value={}):
+                with mock.patch.object(self.server, "_git", side_effect=fake_git):
+                    result = self.server._commit_snapshot(conn, "test", "nap")
+        conn.close()
+        assert "skipped_ignored" not in result, (
+            f"skipped_ignored should not appear when nothing was dropped: {result}"
+        )
+
+    def test_check_ignore_error_keeps_all_files(self):
+        """When check-ignore returns rc>1 (error), all files are kept (best-effort)."""
+        (self.tmp / "graph_snapshot.md").write_text("x")
+
+        def fake_git(*args):
+            r = mock.Mock()
+            r.stderr = ""
+            if args[0] == "check-ignore":
+                r.returncode = 128   # git error
+                r.stdout = ""
+            elif args[0] == "rev-parse":
+                r.returncode = 0
+                r.stdout = "abc123"
+            else:
+                r.returncode = 0
+                r.stdout = "M graph_snapshot.md" if args[0] == "status" else ""
+            return r
+
+        conn = self._conn()
+        with self._snapshot_patch():
+            with mock.patch("engram_backup.dump_stripped", return_value={}):
+                with mock.patch.object(self.server, "_git", side_effect=fake_git):
+                    result = self.server._commit_snapshot(conn, "test", "nap")
+        conn.close()
+        # With rc>1 (error), all files are kept → commit proceeds
+        assert result.get("git_committed") is True, (
+            f"Commit should proceed when check-ignore errors (best-effort): {result}"
+        )
+        assert "skipped_ignored" not in result
+
+    def test_all_gitignored_returns_distinct_reason(self):
+        """When check-ignore drops ALL staged files, reason is 'all stageable files are gitignored'.
+
+        Distinguishes the case where files exist on disk but every one is gitignored from
+        the case where no files existed at all (which returns 'no tracked files exist').
+        The skipped_ignored list is populated in the result.
+        """
+        (self.tmp / "graph_snapshot.md").write_text("x")
+
+        def fake_git(*args):
+            r = mock.Mock()
+            r.stderr = ""
+            if args[0] == "check-ignore":
+                # Report ALL files as ignored (rc=0, stdout = all the paths we gave it)
+                paths = [a for a in args if a not in ("check-ignore", "--")]
+                r.returncode = 0
+                r.stdout = "\n".join(paths) + "\n"
+            else:
+                r.returncode = 0
+                r.stdout = ""
+            return r
+
+        conn = self._conn()
+        with self._snapshot_patch():
+            with mock.patch("engram_backup.dump_stripped", return_value={}):
+                with mock.patch.object(self.server, "_git", side_effect=fake_git):
+                    result = self.server._commit_snapshot(conn, "test", "nap")
+        conn.close()
+
+        assert result.get("git_committed") is False, (
+            f"Commit should not proceed when all files are gitignored: {result}"
+        )
+        assert result.get("reason") == "all stageable files are gitignored", (
+            f"Expected reason 'all stageable files are gitignored'; got: {result.get('reason')!r}"
+        )
+        assert "skipped_ignored" in result, (
+            f"skipped_ignored must be present when all files were filtered: {result}"
+        )
+        assert len(result["skipped_ignored"]) > 0, (
+            f"skipped_ignored must be non-empty: {result}"
+        )
+
+
+def _fake_git_result_obj(returncode=0, stdout="", stderr=""):
+    """Standalone helper (used by TestCommitSnapshotSkipsGitignored mock tests)."""
+    r = mock.Mock()
+    r.returncode = returncode
+    r.stdout = stdout
+    r.stderr = stderr
+    return r

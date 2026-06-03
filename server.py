@@ -4392,6 +4392,26 @@ def _commit_snapshot(conn: sqlite3.Connection, message: str, mode: str) -> dict:
     if not files_to_stage:
         return {"git_committed": False, "reason": "no tracked files exist", **_dump_fields}
 
+    # Filter out gitignored paths before staging (#731).
+    # `git check-ignore -- <paths>` stdout lists the ignored ones.
+    # Returncode: 0 = at least one ignored (stdout lists them), 1 = none ignored, >1 = error.
+    # On error, keep all files (best-effort — don't let the guard itself break the backup).
+    skipped_ignored: list[str] = []
+    ci_result = _git("check-ignore", "--", *files_to_stage)
+    if ci_result.returncode == 0:
+        # At least one path is ignored; subtract the listed ones.
+        ignored_set = {p.strip() for p in ci_result.stdout.splitlines() if p.strip()}
+        skipped_ignored = [p for p in files_to_stage if p in ignored_set]
+        files_to_stage = [p for p in files_to_stage if p not in ignored_set]
+    # returncode == 1 → none ignored, keep all; returncode > 1 → git error, keep all (best-effort)
+
+    if skipped_ignored:
+        _dump_fields["skipped_ignored"] = skipped_ignored
+
+    if not files_to_stage:
+        # All candidate files were filtered out by check-ignore, not absent from disk.
+        return {"git_committed": False, "reason": "all stageable files are gitignored", **_dump_fields}
+
     add_result = _git("add", "--", *files_to_stage)
     if add_result.returncode != 0:
         return {
@@ -4440,7 +4460,8 @@ def _commit_snapshot(conn: sqlite3.Connection, message: str, mode: str) -> dict:
         result["wal_warning"] = wal_warning
 
     # 7. Auto-push to remote (best-effort, never blocks checkpoint)
-    push_result = _git("push", "origin", "master")
+    # Use HEAD so the push targets the current branch, not hardcoded "master" (#737).
+    push_result = _git("push", "origin", "HEAD")
     if push_result.returncode == 0:
         result["remote_push"] = "success"
     else:
