@@ -126,11 +126,14 @@ SEEN="$HOME/.engram/.collab-monitor-seen"
 ls "$DIR"/*.md 2>/dev/null | sort > "$SEEN"
 while true; do
   ls "$DIR"/*.md 2>/dev/null | sort > "$SEEN.now"
-  # New filenames since last scan, excluding letters you authored (named *_<SELF>.md).
-  comm -13 "$SEEN" "$SEEN.now" | grep -v "_${SELF}\.md\$" | while read -r f; do
-    echo "📬 new inter-agent letter: $(basename "$f")"
-  done
-  mv "$SEEN.now" "$SEEN"
+  # Only diff+update on a non-empty listing — a transient empty `ls` must not clobber $SEEN
+  # (the seed-clobber flood, #743). A genuinely empty dir simply waits for the first letter.
+  if [ -s "$SEEN.now" ]; then
+    comm -13 "$SEEN" "$SEEN.now" | grep -v "_${SELF}\.md\$" | while read -r f; do
+      echo "📬 new inter-agent letter: $(basename "$f")"
+    done
+    mv "$SEEN.now" "$SEEN"
+  fi
   sleep 2
 done
 ```
@@ -190,13 +193,20 @@ ids() { python3 -c 'import json,sys
 try:
     for m in json.load(sys.stdin).get("mentions",[]): print(str(m.get("post_id"))+"\t"+m.get("thread_title","?"))
 except Exception: pass'; }
-curl -s "$URL" 2>/dev/null | ids | sort > "$SEEN"      # seed: emit only NEW
+# Seed: retry until the first SUCCESSFUL poll so the baseline is always the real
+# current state (never empty-then-flooded). Handles arm-while-forum-down (waits),
+# arm-while-up (seeds now), and genuine-zero-mentions (empty baseline on a *successful* poll).
+until RESP="$(curl -s --fail "$URL" 2>/dev/null)"; do sleep 30; done
+printf '%s' "$RESP" | ids | sort > "$SEEN"
 while true; do
-  curl -s "$URL" 2>/dev/null | ids | sort > "$SEEN.now"
+  sleep 30
+  # Forum unreachable -> curl --fail returns non-zero -> skip the cycle, PRESERVE $SEEN (the fix).
+  RESP="$(curl -s --fail "$URL" 2>/dev/null)" || continue
+  printf '%s' "$RESP" | ids | sort > "$SEEN.now"
   comm -13 "$SEEN" "$SEEN.now" | while IFS=$'\t' read -r pid title; do
     [ -n "$pid" ] && echo "📣 new forum @-mention: post $pid in \"$title\""
   done
-  mv "$SEEN.now" "$SEEN"; sleep 30
+  mv "$SEEN.now" "$SEEN"
 done
 ```
 
@@ -257,6 +267,7 @@ consequential post of the day.
   only you relax your heartbeat while your counterpart still reads cadence as
   signal, you can still be misread as paused — agree on the combo together (a
   short letter is enough).
+- **Never clobber the seen-set on a failed poll.** Gate the seen-set update on a *valid* poll (3a: `curl --fail` success — a 200-OK even with an empty body is a valid poll and updates `$SEEN`; 1: a non-empty `ls`) — never overwrite `$SEEN` with the result of a failed/empty poll. A forum-down (network) or transient-empty (`ls`) cycle must PRESERVE the prior seen-set and skip; otherwise the next recovery floods every historical item as "new" (observed live during the 2026-06-03 forum cutover; #743 / 2026-06-03 cutover).
 
 ---
 
