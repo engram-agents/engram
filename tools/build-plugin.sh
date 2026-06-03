@@ -267,8 +267,101 @@ COPIED_PATHS+=("packaging/mcp.json")
 log "Copying hooks → plugin hooks/ (manifest-filtered)"
 mkdir -p "$PLUGIN_ROOT/hooks"
 
-# Copy the plugin hook config (already written with ${CLAUDE_PLUGIN_ROOT} paths)
-cp "$REPO_ROOT/hooks/hooks.json" "$PLUGIN_ROOT/hooks/hooks.json"
+# Filter hooks.json to include ONLY entries whose hook file ships at this
+# tier/multi-agent config.  The source hooks/hooks.json references every hook
+# across all tiers; shipping it wholesale would register hooks whose files are
+# absent, producing a UserPromptSubmit FileNotFoundError on every prompt for
+# non-MA / lower-tier installs (#713 root cause).
+#
+# Algorithm:
+#   1. Read hooks/hooks.json.
+#   2. For each hook entry whose command references a hooks/<file>, drop the
+#      entry if <file> is NOT in the shipping set.
+#   3. After dropping entries, prune event-arrays / group-arrays that became
+#      empty, so the output JSON stays valid and minimal.
+#   4. Write the filtered result to $PLUGIN_ROOT/hooks/hooks.json.
+#
+# Uses python3 (already a hard build-time dependency; the nested JSON structure
+# is awkward to manipulate correctly with jq alone).
+#
+# The shipped hook basenames are derived directly from SHIPPED_PATHS (computed
+# above) by filtering for hooks/claude/* entries.  The filter runs BEFORE the
+# hook-file copy loop so the built hooks.json is in place before hook scripts
+# are written alongside it.
+
+log "Filtering hooks.json for tier=$CHOSEN_TIER multi-agent=$( [[ $MULTI_AGENT -eq 1 ]] && echo yes || echo no )"
+python3 - "$REPO_ROOT" "$PLUGIN_ROOT" "$SHIPPED_PATHS" <<'PYEOF'
+import json
+import os
+import re
+import sys
+
+repo_root   = sys.argv[1]
+plugin_root = sys.argv[2]
+shipped_paths_raw = sys.argv[3] if len(sys.argv) > 3 else ""
+
+# Build set of shipped hook basenames from the shipped paths list.
+shipped_hook_names: set[str] = set()
+for line in shipped_paths_raw.splitlines():
+    line = line.strip()
+    if line.startswith("hooks/claude/"):
+        shipped_hook_names.add(os.path.basename(line))
+
+HOOK_REF_RE = re.compile(r'\bhooks/([A-Za-z0-9_\-]+\.(?:py|sh))\b')
+
+src_path = os.path.join(repo_root, "hooks", "hooks.json")
+with open(src_path, encoding="utf-8") as f:
+    data = json.load(f)
+
+def hook_ships(entry: dict) -> bool:
+    """Return True iff this hook entry should be kept at the current build config.
+
+    An entry is dropped if its command references a hooks/<file> that is NOT in
+    the shipped set.  Entries with no hooks/<file> reference are always kept.
+    """
+    cmd = entry.get("command", "")
+    m = HOOK_REF_RE.search(cmd)
+    if m is None:
+        return True  # no hook-file reference → keep unconditionally
+    return m.group(1) in shipped_hook_names
+
+filtered_hooks: dict = {}
+for event_name, groups in data.get("hooks", {}).items():
+    filtered_groups = []
+    for group in groups:
+        raw_entries = group.get("hooks", [])
+        kept_entries = [e for e in raw_entries if hook_ships(e)]
+        if not kept_entries:
+            # All entries in this group were dropped → prune the group.
+            continue
+        filtered_group = {k: v for k, v in group.items() if k != "hooks"}
+        filtered_group["hooks"] = kept_entries
+        filtered_groups.append(filtered_group)
+    if not filtered_groups:
+        # All groups for this event were pruned → omit the event key.
+        continue
+    filtered_hooks[event_name] = filtered_groups
+
+out = {"hooks": filtered_hooks}
+dest_path = os.path.join(plugin_root, "hooks", "hooks.json")
+with open(dest_path, "w", encoding="utf-8") as f:
+    json.dump(out, f, indent=2)
+    f.write("\n")
+
+dropped = sum(
+    1 for groups in data.get("hooks", {}).values()
+    for group in groups
+    for entry in group.get("hooks", [])
+    if not hook_ships(entry)
+)
+kept = sum(
+    len(group.get("hooks", []))
+    for groups in filtered_hooks.values()
+    for group in groups
+)
+print(f"[build-plugin] hooks.json filtered: {kept} entries kept, {dropped} dropped (tier/MA excluded)")
+PYEOF
+
 COPIED_PATHS+=("hooks/hooks.json")
 
 # Copy hook scripts filtered through the manifest predicate.
@@ -360,6 +453,65 @@ for src in "$STYLES_DIR"/*; do
     log "  (tier-filtered) $manifest_key"
   fi
 done
+
+# ── 6b. hooks.json ↔ shipped-files consistency gate (all-or-nothing) ─────────
+#
+# After filtering hooks.json (step 3) and copying hook scripts (also step 3):
+# every file referenced in the BUILT hooks/hooks.json MUST exist on disk.
+# No skipping — the filter step already removed entries for non-shipped hooks,
+# so any reference that remains in hooks.json IS expected to be present.
+# If any referenced file is missing, the build fails (exit≠0).
+#
+# This is the all-or-nothing version of the round-1 gate.  Round-1 skipped
+# references to tier-excluded hooks, which produced a FALSE PASS: a default
+# (non-MA) build had engram-inter-agent-prompt-hook.py still in hooks.json
+# (because hooks.json was copied wholesale) but absent from the hooks/ dir,
+# and the gate silently passed it as "intentionally excluded".  The filtering
+# step in section 3 corrects the root cause; this gate enforces the invariant
+# that the correction actually worked. (#713 round-2)
+
+log "Checking hooks.json ↔ shipped-files consistency (all-or-nothing)"
+python3 - "$PLUGIN_ROOT" <<'PYEOF'
+import json
+import os
+import re
+import sys
+
+plugin_root = sys.argv[1]
+
+hooks_json_path = os.path.join(plugin_root, "hooks", "hooks.json")
+
+with open(hooks_json_path, encoding="utf-8") as f:
+    data = json.load(f)
+
+# Extract every path of the form hooks/<file> from command strings.
+HOOK_REF_RE = re.compile(r'\bhooks/([A-Za-z0-9_\-]+\.(?:py|sh))\b')
+
+referenced: list[str] = []
+hooks_root = data.get("hooks", {})
+for event_name, groups in hooks_root.items():
+    for group in groups:
+        for entry in group.get("hooks", []):
+            cmd = entry.get("command", "")
+            for m in HOOK_REF_RE.finditer(cmd):
+                referenced.append(m.group(1))
+
+missing: list[str] = []
+for fname in set(referenced):
+    fpath = os.path.join(plugin_root, "hooks", fname)
+    if not os.path.exists(fpath):
+        missing.append(fname)
+
+if missing:
+    print("[build-plugin] ERROR: built hooks.json references hook file(s) that are MISSING from the plugin:")
+    for f in sorted(missing):
+        print(f"[build-plugin]   MISSING: hooks/{f}")
+    print("[build-plugin] The hooks.json filter step should have dropped these entries.")
+    print("[build-plugin] Check the filtering logic in build-plugin.sh step 3.")
+    sys.exit(1)
+
+print(f"[build-plugin] hooks.json ↔ shipped-files: OK ({len(set(referenced))} referenced, all present)")
+PYEOF
 
 # ── 7. Build manifest — record tier choice + shipped paths ────────────────────
 

@@ -23,6 +23,12 @@
         "hooks": [
           {
             "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-time-bar-hook.py\"",
+            "timeout": 3,
+            "statusMessage": "Stamping ambient time..."
+          },
+          {
+            "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-user-identity-hook.py\"",
             "timeout": 3,
             "statusMessage": "Detecting user identity..."
@@ -50,6 +56,12 @@
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-inter-agent-prompt-hook.py\"",
             "timeout": 5,
             "statusMessage": "Checking for inter-agent letters..."
+          },
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-baton-prompt-hook.py\"",
+            "timeout": 5,
+            "statusMessage": "Checking baton turn-state..."
           },
           {
             "type": "command",

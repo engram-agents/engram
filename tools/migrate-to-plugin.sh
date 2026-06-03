@@ -394,7 +394,8 @@ step2_install_plugin() {
 
     if [[ $DRY_RUN -eq 1 ]]; then
         dry "Would run: bash $REPO_ROOT/tools/build-plugin.sh ${build_flags[*]:-}"
-        dry "Would run: bash $REPO_ROOT/tools/install-local-marketplace.sh"
+        dry "Would run: bash $REPO_ROOT/tools/install-local-marketplace.sh --skip-build"
+        dry "Would create venv + pip install -r requirements.txt (if $ENGRAM_HOME/venv absent or fastmcp not importable)"
         dry "Would write migration state 'post-step2' to $MIGRATION_STATE_FILE"
         dry "Would pause and wait for user /plugin install + --resume invocation."
         return
@@ -403,8 +404,42 @@ step2_install_plugin() {
     info "Building plugin tree (flags: ${build_flags[*]:-none})..."
     bash "$REPO_ROOT/tools/build-plugin.sh" ${build_flags[@]+"${build_flags[@]}"}
 
-    info "Installing local marketplace..."
-    bash "$REPO_ROOT/tools/install-local-marketplace.sh"
+    info "Installing local marketplace (--skip-build: reusing the build above)..."
+    # Pass --skip-build so install-local-marketplace.sh does NOT re-invoke
+    # build-plugin.sh without flags — that flagless rebuild would clobber the
+    # tier/multi-agent-correct build we just ran above. (#713)
+    bash "$REPO_ROOT/tools/install-local-marketplace.sh" --skip-build
+
+    # Ensure the plugin venv exists and has dependencies installed. (#713)
+    # The plugin launcher (launch-engram-server.sh) hard-requires
+    # $ENGRAM_HOME/venv/bin/python3 and exits if absent. Scatter installs running
+    # on system python have no such venv, so migration must create it.
+    #
+    # Python3 selection: prefer the python3 on PATH (same interpreter the scatter
+    # install used at runtime), which by definition has the venv module available
+    # on any modern distro. If for any reason it lacks venv, the command will fail
+    # loud via set -euo pipefail — do not try to paper over it silently.
+    _venv_dir="$ENGRAM_HOME/venv"
+    _venv_python="$_venv_dir/bin/python3"
+    _venv_pip="$_venv_dir/bin/pip"
+
+    _venv_needs_create=0
+    if [[ ! -f "$_venv_python" ]]; then
+        _venv_needs_create=1
+    elif ! "$_venv_python" -c "import fastmcp" &>/dev/null 2>&1; then
+        _venv_needs_create=1
+    fi
+
+    if [[ $_venv_needs_create -eq 1 ]]; then
+        info "Creating plugin venv at $_venv_dir ..."
+        info "NOTE: this is a one-time HEAVY install (sentence-transformers pulls"
+        info "      torch, ~minutes depending on bandwidth). Please be patient."
+        python3 -m venv "$_venv_dir"
+        "$_venv_pip" install --quiet -r "$REPO_ROOT/requirements.txt"
+        info "Venv created and dependencies installed."
+    else
+        info "Plugin venv already present with fastmcp importable — skipping venv create."
+    fi
 
     write_migration_state "post-step2"
 

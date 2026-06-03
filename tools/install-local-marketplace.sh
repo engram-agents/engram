@@ -21,12 +21,17 @@
 # (the user separately runs `/plugin install engram` from inside Claude Code).
 #
 # USAGE:
-#   bash tools/install-local-marketplace.sh [--help] [--skip-add]
+#   bash tools/install-local-marketplace.sh [--help] [--skip-add] [--skip-build]
 #
 # OPTIONS:
 #   --help        Show this help and exit.
 #   --skip-add    Assemble the marketplace tree but skip the
 #                 `claude plugin marketplace add` step.
+#   --skip-build  Skip the internal build-plugin.sh invocation entirely.
+#                 Use this when the caller has already built build/plugin/ with
+#                 the correct flags (e.g., migrate-to-plugin.sh Step 2) and you
+#                 do not want this script to clobber that build with a flagless
+#                 rebuild.  build/plugin/plugin.json must already exist.
 #
 # PRECONDITIONS:
 #   - Repo cloned + this script run from the repo root.
@@ -53,7 +58,7 @@ die() { printf '[install-local-marketplace] ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-Usage: bash tools/install-local-marketplace.sh [--help] [--skip-add]
+Usage: bash tools/install-local-marketplace.sh [--help] [--skip-add] [--skip-build]
 
 Assembles a local Claude Code marketplace at $ENGRAM_HOME/marketplace/ from
 build/plugin/ and (by default) registers it via `claude plugin marketplace add`.
@@ -61,6 +66,9 @@ build/plugin/ and (by default) registers it via `claude plugin marketplace add`.
 Options:
   --help        Show this help and exit.
   --skip-add    Assemble but skip the `claude plugin marketplace add` step.
+  --skip-build  Skip the internal build-plugin.sh invocation. Use when the
+                caller has already built build/plugin/ with the correct flags.
+                build/plugin/plugin.json must already exist.
 
 After running:
   $ENGRAM_HOME/marketplace/.claude-plugin/marketplace.json
@@ -82,10 +90,12 @@ EOF
 }
 
 SKIP_ADD=0
+SKIP_BUILD=0
 for arg in "$@"; do
   case "$arg" in
     --help|-h) usage ;;
     --skip-add) SKIP_ADD=1 ;;
+    --skip-build) SKIP_BUILD=1 ;;
     *) die "Unknown argument: $arg. Run with --help for usage." ;;
   esac
 done
@@ -99,11 +109,32 @@ ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
 MARKETPLACE_ROOT="$ENGRAM_HOME/marketplace"
 PLUGIN_SRC="$REPO_ROOT/build/plugin"
 
-# Always rebuild — cached build/plugin/ would be stale if the user edited
-# build-plugin.sh, the source tree, etc. between marketplace assemblies.
-# build-plugin.sh is idempotent + fast, so no downside to always invoking it.
-log "Building plugin tree (idempotent)"
-bash "$REPO_ROOT/tools/build-plugin.sh"
+# Build the plugin tree unless --skip-build was passed.
+#
+# When called standalone (no --skip-build), read $ENGRAM_HOME/config.json for
+# {multi_agent, install_tier} and pass the matching flags to build-plugin.sh.
+# This mirrors the build_flags pattern in migrate-to-plugin.sh (step2_install_plugin)
+# and makes this script self-sufficient: any caller gets a config-correct build
+# rather than a silent single-agent/convenience default.
+#
+# When called with --skip-build (e.g., from migrate-to-plugin.sh after it has
+# already run build-plugin.sh with the correct flags), the existing build/plugin/
+# tree is used directly — no second flagless rebuild that would clobber the first.
+if [[ $SKIP_BUILD -eq 1 ]]; then
+  log "Skipping build-plugin.sh invocation (--skip-build)"
+else
+  # Assemble build flags from config.json (same pattern as migrate-to-plugin.sh).
+  build_flags=()
+  _cfg="$ENGRAM_HOME/config.json"
+  if [[ -f "$_cfg" ]] && command -v jq &>/dev/null; then
+    _ma="$(jq -r '.multi_agent // false' "$_cfg")"
+    _tier="$(jq -r '.install_tier // empty' "$_cfg")"
+    [[ "$_ma" == "true" ]] && build_flags+=("--multi-agent")
+    [[ -n "$_tier" ]] && build_flags+=("--tier" "$_tier")
+  fi
+  log "Building plugin tree (flags: ${build_flags[*]:-none})"
+  bash "$REPO_ROOT/tools/build-plugin.sh" ${build_flags[@]+"${build_flags[@]}"}
+fi
 
 if [[ ! -f "$PLUGIN_SRC/plugin.json" ]]; then
   die "build/plugin/plugin.json missing — build-plugin.sh did not assemble correctly"
