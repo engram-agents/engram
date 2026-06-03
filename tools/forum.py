@@ -330,27 +330,6 @@ def _age_str(ts_str: Optional[str]) -> str:
 # Subcommand: status
 # ---------------------------------------------------------------------------
 
-def _fetch_mentions(forum_url: str, agent_name: str, since: Optional[str]) -> Optional[list]:
-    """Fetch pending mentions for ``agent_name`` from the forum server.
-
-    Returns a list of mention dicts on success, or ``None`` if the endpoint
-    is unreachable / returns an unexpected error.  Status errors on the
-    mentions endpoint are silently swallowed so that a missing or old server
-    never breaks ``forum status``.
-
-    Routes through _api_get(swallow_errors=True) so that the wired_cli test
-    fixture (which patches _do_request) intercepts this call via the same path
-    as all other API calls — exercising the full CLI→endpoint→render wire-path.
-    """
-    import urllib.parse as _up
-
-    url = f"{forum_url}/api/agent/{_up.quote(agent_name, safe='')}/mentions"
-    params: Optional[dict] = {"since": since} if since else None
-    data = _api_get(url, params=params, swallow_errors=True)
-    if data is None:
-        return None
-    return data.get("mentions", [])
-
 
 def _format_mention_line(mentions: list) -> Optional[str]:
     """Format the mention summary line for ``forum status``.

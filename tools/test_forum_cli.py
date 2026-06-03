@@ -361,35 +361,68 @@ class TestRead:
         assert "Initial post body" in stdout
 
     def test_read_advances_cursor(self, wired_cli, engram_home):
-        """read must advance the read cursor to the thread's last_activity_at."""
-        cursor_path = engram_home / "forum-read-cursor.txt"
-        assert not cursor_path.exists(), "cursor should not exist yet"
+        """read must post a server-side read watermark (v2 read-state).
 
+        In v2, cmd_read posts the max post_id to /api/thread/<id>/read rather
+        than writing a local cursor file.  A reply from another agent makes the
+        thread appear unread; after testbot reads it the watermark clears it
+        from the inbox (unread_total drops back to 0).
+        """
         tid = self._make_thread(wired_cli)
+
+        # Have otherbot reply so testbot has an unread post in the thread.
+        with mock.patch.object(forum_cli, "_get_agent_name", return_value="otherbot"):
+            wired_cli(["reply", str(tid)], stdin_text="Reply from otherbot.")
+
+        # Before read: testbot sees the reply as unread
+        stdout, _, _ = wired_cli(["status", "--format", "json"])
+        before = json.loads(stdout)
+        assert before["unread_total"] >= 1, (
+            "reply from otherbot must appear unread before testbot reads the thread; "
+            f"got unread_total={before['unread_total']!r}"
+        )
+
         stdout, stderr, code = wired_cli(["read", str(tid)])
         assert code == 0, f"stderr: {stderr}"
 
-        # Cursor must now exist
-        assert cursor_path.exists(), "read must write the cursor"
-        raw = cursor_path.read_text().strip()
-        # Must be a valid ISO timestamp
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        assert dt.tzinfo is not None
+        # After read: the watermark must clear the thread from testbot's inbox
+        stdout, _, _ = wired_cli(["status", "--format", "json"])
+        after = json.loads(stdout)
+        assert after["unread_total"] == 0, (
+            "read must post the server-side watermark so the thread leaves the inbox; "
+            f"got unread_total={after['unread_total']!r}"
+        )
 
     def test_read_cursor_is_monotonic(self, wired_cli, engram_home):
-        """A second read of an older thread must not retreat the cursor."""
+        """Reading multiple threads in any order clears each from the server-side inbox.
+
+        In v2, read state is tracked server-side via per-thread watermarks.
+        Reading thread2 (newer) before thread1 (older) must clear both — the
+        watermark is per-thread, so reading an older thread does not undo the
+        newer thread's watermark.
+        """
         tid1 = self._make_thread(wired_cli, title="First thread")
         tid2 = self._make_thread(wired_cli, title="Second thread")
 
-        # Read thread2 first (newer)
-        wired_cli(["read", str(tid2)])
-        cursor_after_t2 = Path(engram_home / "forum-read-cursor.txt").read_text().strip()
+        # Have otherbot reply to both threads so testbot has unread content.
+        with mock.patch.object(forum_cli, "_get_agent_name", return_value="otherbot"):
+            wired_cli(["reply", str(tid1)], stdin_text="Reply to first.")
+            wired_cli(["reply", str(tid2)], stdin_text="Reply to second.")
 
-        # Read thread1 (older last_activity) — cursor must not retreat
-        wired_cli(["read", str(tid1)])
-        cursor_after_t1 = Path(engram_home / "forum-read-cursor.txt").read_text().strip()
-        assert cursor_after_t1 >= cursor_after_t2, (
-            "read cursor must not retreat when reading an older thread"
+        # Read thread2 first (newer), then thread1 (older)
+        _, _, code2 = wired_cli(["read", str(tid2)])
+        assert code2 == 0, "read of thread2 must succeed"
+
+        _, _, code1 = wired_cli(["read", str(tid1)])
+        assert code1 == 0, "read of thread1 must succeed"
+
+        # Both threads must be cleared from the inbox after reading each
+        stdout, _, _ = wired_cli(["status", "--format", "json"])
+        after = json.loads(stdout)
+        assert after["unread_total"] == 0, (
+            "reading both threads must clear them from the server-side inbox "
+            "(per-thread watermarks are cumulative, not regressive); "
+            f"got unread_total={after['unread_total']!r}"
         )
 
     def test_read_json_format(self, wired_cli):
@@ -420,35 +453,51 @@ class TestStatus:
         assert "testserver" in stdout or "http" in stdout
 
     def test_status_json_format(self, wired_cli):
+        """status --format json emits the v2 read-state shape."""
         stdout, _, code = wired_cli(["status", "--format", "json"])
         assert code == 0
         data = json.loads(stdout)
         assert "agent" in data
-        assert "new_since_cursor" in data
         assert "online_count" in data
+        # v2 read-state keys (replaces old new_since_cursor)
+        assert "unread_total" in data
+        assert "unread_on_my_threads" in data
+        assert "mention_count" in data
+        assert "inbox" in data
 
     def test_status_new_count_increases_after_post(self, wired_cli, engram_home):
-        """After posting a thread, status should show new_since_cursor > 0."""
-        # Status with no cursor and no threads → 0 new
-        # (cursor is None → no since= filter → returns all; but DB is empty)
+        """After another agent replies, status shows unread_total > 0 (v2 read-state).
+
+        In v2, unread counts come from the server-side inbox endpoint
+        (per-thread watermarks), not from a local time cursor.  testbot posts a
+        thread; otherbot replies; status for testbot must then report
+        unread_total >= 1.  After testbot reads the thread, unread_total drops
+        back to 0.
+        """
+        # Fresh DB — no threads → 0 unread
         stdout, _, _ = wired_cli(["status", "--format", "json"])
         data = json.loads(stdout)
-        assert data["new_since_cursor"] == 0
+        assert data["unread_total"] == 0
 
-        # Post a thread
-        wired_cli(
+        # testbot posts a thread; otherbot replies
+        stdout, _, _ = wired_cli(
             ["post", "--category", "inter-agent", "--title", "New thread"],
             stdin_text="Body.",
         )
+        import re as _re
+        m = _re.search(r"thread_id=(\d+)", stdout)
+        tid = int(m.group(1))
 
-        # Set cursor to a far-past time so the new thread is "after" cursor
-        past = datetime(2020, 1, 1, tzinfo=timezone.utc)
-        forum_cli._write_cursor(str(engram_home / "forum-read-cursor.txt"), past)
+        with mock.patch.object(forum_cli, "_get_agent_name", return_value="otherbot"):
+            wired_cli(["reply", str(tid)], stdin_text="Reply from otherbot.")
 
-        # Status with past cursor → new_since_cursor > 0
+        # Status: otherbot's reply must appear unread for testbot
         stdout, _, _ = wired_cli(["status", "--format", "json"])
         data = json.loads(stdout)
-        assert data["new_since_cursor"] >= 1
+        assert data["unread_total"] >= 1, (
+            "otherbot's reply must be counted as unread by server-side watermark; "
+            f"got unread_total={data['unread_total']!r}"
+        )
 
     def test_status_mention_bell_end_to_end(self, wired_cli):
         """End-to-end: reply @-mentioning testbot appears as a bell line in status.
@@ -490,15 +539,20 @@ class TestStatus:
         )
 
     def test_status_json_includes_mentions_array(self, wired_cli):
-        """status --format json must include a 'mentions' array (empty when none pending)."""
+        """status --format json emits mention_count and inbox (v2 shape, no top-level mentions array)."""
         stdout, _, code = wired_cli(["status", "--format", "json"])
         assert code == 0
         data = json.loads(stdout)
-        assert "mentions" in data, "'mentions' key must appear in status JSON output"
-        assert isinstance(data["mentions"], list), "'mentions' must be a list"
+        # v2 shape: mention info is in mention_count (int) and inbox items with kind=="at_mention"
+        assert "mention_count" in data, "'mention_count' key must appear in status JSON output"
+        assert isinstance(data["mention_count"], int), "'mention_count' must be an int"
+        assert "inbox" in data, "'inbox' key must appear in status JSON output"
+        assert isinstance(data["inbox"], list), "'inbox' must be a list"
+        # When no mentions, mention_count must be 0
+        assert data["mention_count"] == 0
 
     def test_status_json_includes_mentions_when_present(self, wired_cli):
-        """status --format json populates 'mentions' when @testbot is mentioned."""
+        """status --format json populates mention_count and inbox when @testbot is mentioned."""
         # testbot posts a thread
         stdout, _, _ = wired_cli(
             ["post", "--category", "cold-start", "--title", "JSON mention test"],
@@ -518,9 +572,17 @@ class TestStatus:
         stdout, _, code = wired_cli(["status", "--format", "json"])
         assert code == 0
         data = json.loads(stdout)
-        assert "mentions" in data
-        assert len(data["mentions"]) >= 1, (
-            "mentions array must contain at least one entry after @testbot mention"
+        assert data["mention_count"] >= 1, (
+            "mention_count must be >= 1 after @testbot mention; "
+            f"got mention_count={data['mention_count']!r}"
+        )
+        at_mention_items = [
+            item for item in data["inbox"]
+            if item.get("kind") == "at_mention"
+        ]
+        assert len(at_mention_items) >= 1, (
+            "inbox must contain at least one at_mention item after @testbot mention; "
+            f"inbox={data['inbox']!r}"
         )
 
 
@@ -859,16 +921,22 @@ class TestStatusHintWhenCursorUnset:
         )
 
     def test_since_hint_present_when_cursor_is_set(self, engram_home):
-        """When read cursor IS set, the --since <cursor> hint should appear."""
-        # Write a real cursor
+        """status exits 0 and renders v2 unread fields regardless of local cursor state.
+
+        In v2, forum status reads state from the server-side inbox endpoint;
+        the local forum-read-cursor.txt is not used by cmd_status.  This test
+        verifies that having a cursor file does not break status and that the
+        v2 output shape (agent, unread, @mentions) is present.
+        """
+        # Write a cursor file — v2 status must not error on it
         ts = "2026-05-01T00:00:00Z"
         (engram_home / "forum-read-cursor.txt").write_text(ts + "\n")
 
         def fake_api_get(url, params=None, swallow_errors=False):
-            if "/api/threads" in url:
-                return {"threads": [{"id": 1, "title": "y", "last_activity_at": "2026-05-31T10:00:00Z"}]}
             if "/api/agents/online" in url:
                 return {"count": 1, "registered": 1}
+            if "/inbox" in url:
+                return {"inbox": [], "unread_all": 0}
             return {}
 
         stdout_buf = io.StringIO()
@@ -881,31 +949,51 @@ class TestStatusHintWhenCursorUnset:
             except SystemExit:
                 pass
         output = stdout_buf.getvalue()
-        assert "--since 2026-05-01T00:00:00Z" in output, (
-            f"status must include '--since <cursor>' hint when cursor is set; got:\n{output}"
+        assert "testbot" in output, (
+            f"status must render agent name in v2 output; got:\n{output}"
+        )
+        assert "unread" in output, (
+            f"status must render unread count in v2 output; got:\n{output}"
+        )
+        assert "@mentions" in output, (
+            f"status must render @mentions count in v2 output; got:\n{output}"
         )
 
 
 class TestStatusMentions:
-    """cmd_status mention-line rendering (patches _api_get + _fetch_mentions)."""
+    """cmd_status mention-line rendering (patches _api_get + _fetch_inbox for v2)."""
 
-    def _run_status(self, engram_home, monkeypatch, fetch_mentions_return, cursor_ts=None):
-        """Run `forum status` with stubbed API helpers; return stdout."""
+    def _run_status(self, engram_home, monkeypatch, inbox_items, inbox_fetch_fails=False,
+                    cursor_ts=None):
+        """Run `forum status` with stubbed API helpers; return (stdout, stderr).
+
+        Patches _fetch_inbox directly (v2 read-state path) so the mention-line
+        rendering can be exercised without a live server.
+
+        inbox_items  -- list of inbox item dicts to return from _fetch_inbox
+                        (must have 'kind' field: 'at_mention' or 'reply_on_my_thread').
+        inbox_fetch_fails -- if True, _fetch_inbox returns None (simulates server failure).
+        cursor_ts    -- optional local cursor timestamp (written to cursor file;
+                        v2 status does not use it, but should not error on it).
+        """
         if cursor_ts:
             (engram_home / "forum-read-cursor.txt").write_text(cursor_ts + "\n")
 
         def fake_api_get(url, params=None, swallow_errors=False):
-            if "/api/threads" in url:
-                return {"threads": []}
             if "/api/agents/online" in url:
                 return {"count": 1, "registered": 1}
             return {}
 
+        if inbox_fetch_fails:
+            fake_inbox = None
+        else:
+            fake_inbox = {"inbox": inbox_items, "unread_all": len(inbox_items)}
+
         stdout_buf = io.StringIO()
         stderr_buf = io.StringIO()
         with mock.patch.object(forum_cli, "_api_get", side_effect=fake_api_get), \
-             mock.patch.object(forum_cli, "_fetch_mentions",
-                               return_value=fetch_mentions_return), \
+             mock.patch.object(forum_cli, "_fetch_inbox",
+                               return_value=fake_inbox), \
              mock.patch("sys.argv", ["forum", "status"]), \
              mock.patch("sys.stdout", stdout_buf), \
              mock.patch("sys.stderr", stderr_buf):
@@ -916,8 +1004,13 @@ class TestStatusMentions:
         return stdout_buf.getvalue(), stderr_buf.getvalue()
 
     def test_mention_line_rendered_when_mentions_present(self, engram_home, monkeypatch):
-        """When mentions are returned, a summary line is printed."""
-        mentions = [
+        """When at_mention inbox items are present, a bell summary line is printed.
+
+        In v2, cmd_status calls _format_mention_line with items whose kind=='at_mention'.
+        Items with kind=='reply_on_my_thread' are counted separately (unread_on_my_threads)
+        and do not appear in the bell line.
+        """
+        inbox_items = [
             {
                 "thread_id": 3,
                 "thread_title": "debugging ground-rules",
@@ -931,32 +1024,31 @@ class TestStatusMentions:
                 "thread_title": "first-retractions",
                 "post_id": 2,
                 "author": "borges",
-                "kind": "reply_to_your_thread",
+                "kind": "at_mention",
                 "created_at": "2026-06-01T10:01:00Z",
             },
         ]
-        stdout, _ = self._run_status(engram_home, monkeypatch, fetch_mentions_return=mentions)
+        stdout, _ = self._run_status(engram_home, monkeypatch, inbox_items=inbox_items)
         assert "\U0001f514" in stdout, "bell emoji must appear in mention line"
         assert "2 posts waiting on you" in stdout
         assert "debugging ground-rules" in stdout
         assert "@mention by luria" in stdout
-        assert "reply to your thread by borges" in stdout
+        assert "@mention by borges" in stdout
 
     def test_no_mention_line_when_zero_mentions(self, engram_home, monkeypatch):
-        """Zero mentions → no mention line in output."""
-        stdout, _ = self._run_status(engram_home, monkeypatch, fetch_mentions_return=[])
+        """Zero inbox items → no bell mention line in output."""
+        stdout, _ = self._run_status(engram_home, monkeypatch, inbox_items=[])
         assert "\U0001f514" not in stdout
 
     def test_no_mention_line_when_fetch_fails(self, engram_home, monkeypatch):
-        """When _fetch_mentions returns None (server unreachable), no mention line."""
-        stdout, _ = self._run_status(engram_home, monkeypatch, fetch_mentions_return=None)
+        """When _fetch_inbox returns None (server unreachable), no mention line."""
+        stdout, _ = self._run_status(engram_home, monkeypatch, inbox_items=[],
+                                     inbox_fetch_fails=True)
         assert "\U0001f514" not in stdout
 
     def test_status_exit_code_0_when_mention_fetch_fails(self, engram_home, monkeypatch):
-        """A mention-fetch failure must not change the status exit code."""
+        """An inbox-fetch failure must not change the status exit code."""
         def fake_api_get(url, params=None, swallow_errors=False):
-            if "/api/threads" in url:
-                return {"threads": []}
             if "/api/agents/online" in url:
                 return {"count": 0, "registered": 0}
             return {}
@@ -964,7 +1056,7 @@ class TestStatusMentions:
         stdout_buf = io.StringIO()
         stderr_buf = io.StringIO()
         with mock.patch.object(forum_cli, "_api_get", side_effect=fake_api_get), \
-             mock.patch.object(forum_cli, "_fetch_mentions", return_value=None), \
+             mock.patch.object(forum_cli, "_fetch_inbox", return_value=None), \
              mock.patch("sys.argv", ["forum", "status"]), \
              mock.patch("sys.stdout", stdout_buf), \
              mock.patch("sys.stderr", stderr_buf):
@@ -973,51 +1065,44 @@ class TestStatusMentions:
                 code = 0
             except SystemExit as e:
                 code = e.code if isinstance(e.code, int) else 0
-        assert code == 0, f"status must exit 0 even when mention fetch fails; stderr: {stderr_buf.getvalue()}"
+        assert code == 0, f"status must exit 0 even when inbox fetch fails; stderr: {stderr_buf.getvalue()}"
 
-    def test_fetch_mentions_endpoint_failure_returns_none(self, engram_home, monkeypatch):
-        """_fetch_mentions returns None (not sys.exit) when the mentions endpoint fails.
+    def test_fetch_inbox_endpoint_failure_returns_none(self, engram_home, monkeypatch):
+        """_fetch_inbox returns None (not sys.exit) when the inbox endpoint fails.
 
-        This tests the advisory-failure contract at the _fetch_mentions level:
-        a 4xx/5xx from the mentions endpoint must not propagate as sys.exit().
+        This tests the advisory-failure contract at the _fetch_inbox level:
+        a 4xx/5xx from the inbox endpoint must not propagate as sys.exit().
         """
-        # Simulate a failing mentions endpoint by making _do_request raise SystemExit
-        # for the mentions URL (mimicking EXIT_NOT_FOUND / EXIT_VALIDATION behavior),
-        # while non-mention URLs succeed normally.
         calls: list = []
 
         def fake_do_request(req, url):
             calls.append(url)
-            if "/api/agent/" in url and "/mentions" in url:
+            if "/api/agent/" in url and "/inbox" in url:
                 sys.exit(forum_cli.EXIT_NOT_FOUND)
-            # Shouldn't be called for other URLs in this test
             return {}
 
         result = None
         with mock.patch.object(forum_cli, "_do_request", side_effect=fake_do_request):
-            result = forum_cli._fetch_mentions(
-                "http://testserver", "testbot", since=None
+            result = forum_cli._fetch_inbox(
+                "http://testserver", "testbot"
             )
 
         assert result is None, (
-            "_fetch_mentions must return None when the endpoint returns an error, "
+            "_fetch_inbox must return None when the endpoint returns an error, "
             f"not propagate sys.exit; got: {result!r}"
         )
 
     def test_status_json_mentions_empty_on_fetch_failure(self, engram_home, monkeypatch):
-        """status --format json must include mentions=[] even when fetch failed."""
+        """status --format json emits mention_count=0 and inbox=[] when inbox fetch fails."""
         def fake_api_get(url, params=None, swallow_errors=False):
-            if "/api/threads" in url:
-                return {"threads": []}
             if "/api/agents/online" in url:
                 return {"count": 0, "registered": 0}
-            if "/mentions" in url and swallow_errors:
-                return None  # simulates fetch failure
             return {}
 
         stdout_buf = io.StringIO()
         stderr_buf = io.StringIO()
         with mock.patch.object(forum_cli, "_api_get", side_effect=fake_api_get), \
+             mock.patch.object(forum_cli, "_fetch_inbox", return_value=None), \
              mock.patch("sys.argv", ["forum", "status", "--format", "json"]), \
              mock.patch("sys.stdout", stdout_buf), \
              mock.patch("sys.stderr", stderr_buf):
@@ -1029,48 +1114,55 @@ class TestStatusMentions:
 
         assert code == 0
         data = json.loads(stdout_buf.getvalue())
-        assert "mentions" in data, "JSON output must include 'mentions' key"
-        assert data["mentions"] == [], (
-            "mentions must be [] when fetch failed; got: {!r}".format(data["mentions"])
+        assert "mention_count" in data, "JSON output must include 'mention_count' key"
+        assert data["mention_count"] == 0, (
+            "mention_count must be 0 when inbox fetch failed; got: {!r}".format(data["mention_count"])
+        )
+        assert "inbox" in data, "JSON output must include 'inbox' key"
+        assert data["inbox"] == [], (
+            "inbox must be [] when fetch failed; got: {!r}".format(data["inbox"])
         )
 
     def test_mention_truncation_at_5(self, engram_home, monkeypatch):
-        """More than 5 mentions are truncated with '+N more' suffix."""
-        mentions = [
+        """More than 5 at_mention inbox items are truncated with '+N more' suffix."""
+        inbox_items = [
             {
                 "thread_id": i,
                 "thread_title": f"Thread {i}",
                 "post_id": i + 100,
                 "author": "borges",
-                "kind": "reply_to_your_thread",
+                "kind": "at_mention",
                 "created_at": f"2026-06-01T10:0{i}:00Z",
             }
             for i in range(7)
         ]
-        stdout, _ = self._run_status(engram_home, monkeypatch, fetch_mentions_return=mentions)
+        stdout, _ = self._run_status(engram_home, monkeypatch, inbox_items=inbox_items)
         assert "+2 more" in stdout
 
-    def test_cursor_passed_to_fetch_mentions(self, engram_home, monkeypatch):
-        """_fetch_mentions is called with the read-cursor timestamp as since."""
+    def test_fetch_inbox_called_with_agent_name(self, engram_home, monkeypatch):
+        """_fetch_inbox is called with the agent name (v2 read-state; no client cursor).
+
+        In v2, cmd_status calls _fetch_inbox(forum_url, agent_name) — the server
+        is responsible for determining what is unread.  The local read cursor is
+        not passed to the inbox endpoint.
+        """
         captured = {}
 
         def fake_api_get(url, params=None, swallow_errors=False):
-            if "/api/threads" in url:
-                return {"threads": []}
             if "/api/agents/online" in url:
                 return {"count": 0, "registered": 0}
             return {}
 
-        def fake_fetch_mentions(forum_url, agent_name, since):
-            captured["since"] = since
-            return []
+        def fake_fetch_inbox(forum_url, agent_name):
+            captured["agent_name"] = agent_name
+            return {"inbox": [], "unread_all": 0}
 
         cursor_ts = "2026-05-01T00:00:00Z"
         (engram_home / "forum-read-cursor.txt").write_text(cursor_ts + "\n")
 
         with mock.patch.object(forum_cli, "_api_get", side_effect=fake_api_get), \
-             mock.patch.object(forum_cli, "_fetch_mentions",
-                               side_effect=fake_fetch_mentions), \
+             mock.patch.object(forum_cli, "_fetch_inbox",
+                               side_effect=fake_fetch_inbox), \
              mock.patch("sys.argv", ["forum", "status"]), \
              mock.patch("sys.stdout", io.StringIO()), \
              mock.patch("sys.stderr", io.StringIO()):
@@ -1078,9 +1170,9 @@ class TestStatusMentions:
                 forum_cli.main()
             except SystemExit:
                 pass
-        assert captured.get("since") == cursor_ts, (
-            f"_fetch_mentions should be called with cursor_ts={cursor_ts!r}; "
-            f"got since={captured.get('since')!r}"
+        assert captured.get("agent_name") == "testbot", (
+            f"_fetch_inbox must be called with the agent name; "
+            f"got agent_name={captured.get('agent_name')!r}"
         )
 
 
