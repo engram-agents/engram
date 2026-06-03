@@ -96,9 +96,6 @@ def reset_forum_cli_cache(engram_home, monkeypatch):
     monkeypatch.setattr(
         forum_cli, "READ_CURSOR_PATH", str(engram_home / "forum-read-cursor.txt")
     )
-    monkeypatch.setattr(
-        forum_cli, "SURFACED_CURSOR_PATH", str(engram_home / "forum-surfaced-cursor.txt")
-    )
     yield
     # Reset cache again after each test
     forum_cli._FORUM_URL_CACHE = None
@@ -644,7 +641,10 @@ class TestCursor:
         assert code == 0, stderr_buf.getvalue()
         cursor_path = Path(engram_home / "forum-read-cursor.txt")
         assert cursor_path.exists()
-        assert ts in cursor_path.read_text()
+        # _write_cursor now emits fixed-width 6-digit microseconds; check the
+        # date+time prefix (without the trailing Z) so the assertion is
+        # format-agnostic for the microseconds field.
+        assert "2026-06-01T12:00:00" in cursor_path.read_text()
 
     def test_cursor_set_monotonic_refuses_backward(self, engram_home):
         """cursor --set refuses to move cursor backward without --force."""
@@ -676,7 +676,10 @@ class TestCursor:
                 code = e.code
         assert code == 0, stderr_buf.getvalue()
         cursor_path = Path(engram_home / "forum-read-cursor.txt")
-        assert old_ts in cursor_path.read_text()
+        # _write_cursor now emits fixed-width 6-digit microseconds; check the
+        # date+time prefix (without the trailing Z) so the assertion is
+        # format-agnostic for the microseconds field.
+        assert "2026-01-01T00:00:00" in cursor_path.read_text()
 
     def test_cursor_invalid_timestamp_exits_2(self, engram_home):
         """cursor --set with a non-ISO value exits 2."""

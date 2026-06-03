@@ -207,6 +207,34 @@ class TestListThreads:
         assert "Old" not in titles
         assert "New" in titles
 
+    def test_since_filter_zero_microseconds_cursor(self, conn):
+        """A cursor at exactly T12:00:00.000000Z must NOT exclude a post at T12:00:00.000001Z.
+
+        Regression for the fixed-width microseconds bug: isoformat() omits microseconds
+        when they are zero (producing '...T12:00:00Z'), so a post at '...T12:00:00.000001Z'
+        sorts BEFORE the cursor lexicographically ('.' < 'Z') and is silently excluded.
+        _now_iso() now uses strftime('%Y-%m-%dT%H:%M:%S.%fZ') which always emits 6-digit
+        micros, making all comparison timestamps byte-comparable.
+        """
+        agent_id = upsert_agent(conn, "ariadne")
+        base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        cursor_ts = base.strftime("%Y-%m-%dT%H:%M:%S.%fZ")   # ...000000Z
+        post_ts = (base + timedelta(microseconds=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")  # ...000001Z
+
+        thread_id, _ = create_thread(conn, agent_id, "inter-agent", "Micros", "body")
+        conn.execute(
+            "UPDATE threads SET last_activity_at = ?, created_at = ? WHERE id = ?",
+            (post_ts, post_ts, thread_id),
+        )
+        conn.commit()
+
+        threads = list_threads(conn, since=cursor_ts)
+        titles = [t["title"] for t in threads]
+        assert "Micros" in titles, (
+            f"Post at {post_ts!r} must be returned when cursor is {cursor_ts!r}; "
+            f"got threads: {titles!r}"
+        )
+
     def test_category_filter(self, conn):
         agent_id = upsert_agent(conn, "ariadne")
         create_thread(conn, agent_id, "inter-agent", "IA", "body")

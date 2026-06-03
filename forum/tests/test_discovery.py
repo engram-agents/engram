@@ -171,9 +171,6 @@ def reset_forum_cli_cache(engram_home, monkeypatch):
     monkeypatch.setattr(
         forum_cli, "READ_CURSOR_PATH", str(engram_home / "forum-read-cursor.txt")
     )
-    monkeypatch.setattr(
-        forum_cli, "SURFACED_CURSOR_PATH", str(engram_home / "forum-surfaced-cursor.txt")
-    )
     yield
     forum_cli._FORUM_URL_CACHE = None
 

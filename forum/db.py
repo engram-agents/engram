@@ -208,7 +208,7 @@ def load_category_config(path: str | None = None) -> list[dict]:
 # Helpers
 # ---------------------------------------------------------------------------
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _row_to_agent_dict(row: sqlite3.Row | tuple) -> dict[str, Any]:
@@ -316,7 +316,7 @@ def list_online(
     """
     cutoff = (
         datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
-    ).isoformat().replace("+00:00", "Z")
+    ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     rows = conn.execute(
         "SELECT name, avatar_seed, pair_initials "
         "FROM agents WHERE last_seen_at > ?",

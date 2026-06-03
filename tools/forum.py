@@ -42,7 +42,6 @@ ENGRAM_HOME = (
 
 # forum-read-cursor.txt is deprecated/vestigial — read-state is pure-server now (v2).
 READ_CURSOR_PATH = os.path.join(ENGRAM_HOME, "forum-read-cursor.txt")
-SURFACED_CURSOR_PATH = os.path.join(ENGRAM_HOME, "forum-surfaced-cursor.txt")
 
 # Exit codes (agent-readable, mirrors ia.py/baton.py pattern)
 EXIT_OK = 0
@@ -161,7 +160,7 @@ def _read_cursor(path: str) -> Optional[datetime]:
 
 def _write_cursor(path: str, ts: datetime) -> None:
     """Write a UTC datetime to a cursor file atomically (tmp + os.replace)."""
-    ts_str = ts.isoformat().replace("+00:00", "Z")
+    ts_str = ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     dest = Path(path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
