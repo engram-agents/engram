@@ -103,6 +103,20 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
 
         # Strip on the snapshot only — live DB untouched.
         bk.execute("UPDATE nodes SET embedding=NULL")
+
+        # Load sqlite-vec into the snapshot connection so the vec0 virtual table
+        # (vec_nodes) can be dropped — dropping a vec0 vtable requires its module.
+        # Best-effort: if the extension is unavailable the DB won't have a vec_nodes
+        # table to drop anyway. Do NOT swallow a drop failure into a silent no-op —
+        # loud failure is the whole point of this module (#720).
+        try:
+            import sqlite_vec
+            bk.enable_load_extension(True)
+            sqlite_vec.load(bk)
+            bk.enable_load_extension(False)
+        except Exception:
+            pass  # extension unavailable; if vec_nodes exists the drop below will raise (acceptable: pathological install)
+
         for tn in triggers:
             bk.execute(f"DROP TRIGGER IF EXISTS {tn}")
         for vn in vocab:  # vocab depends on parent FTS table → drop first
@@ -169,7 +183,8 @@ def verify_roundtrip(src_db_path: str) -> dict:
         r[0]
         for r in src.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name NOT LIKE 'nodes_fts%' AND name!='vec_nodes'"
+            "AND name NOT LIKE 'nodes_fts%' AND name NOT LIKE 'vec_nodes%' "
+            "AND name NOT LIKE 'sqlite_%'"
         ).fetchall()
     ]
     orig_counts = {t: src.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in base_tables}
@@ -186,8 +201,17 @@ def verify_roundtrip(src_db_path: str) -> dict:
     recon_path = tempfile.mktemp(suffix=".db")
     try:
         stats = dump_stripped(src_db_path, dump_path)
-        # belt-and-suspenders: no derived-table statement should remain
-        guard = re.compile(r"\b(nodes_fts\w*|vec_nodes)\b")
+        # belt-and-suspenders: no derived-TABLE STATEMENT should remain.
+        # Anchored at the statement keyword + table target so that node content
+        # which *mentions* "vec_nodes" or "nodes_fts" in its text does NOT match
+        # (e.g. INSERT INTO "nodes" VALUES(... 'vec_nodes virtual table ...')).
+        # Only lines whose statement target IS the derived table will match.
+        guard = re.compile(
+            r'^\s*(CREATE\s+(VIRTUAL\s+)?TABLE\s+(IF\s+NOT\s+EXISTS\s+)?["\']?(vec_nodes|nodes_fts)'
+            r'|INSERT\s+INTO\s+["\']?(vec_nodes|nodes_fts)'
+            r'|CREATE\s+TRIGGER\s+["\']?(vec_nodes|nodes_fts))',
+            re.IGNORECASE,
+        )
         leaked = [ln for ln in open(dump_path) if guard.search(ln)]
         assert not leaked, f"derived-table statements leaked into dump: {leaked[:2]}"
 
@@ -207,7 +231,17 @@ def verify_roundtrip(src_db_path: str) -> dict:
             hits = rc.execute(
                 "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'migration'"
             ).fetchone()[0]
-            assert hits == fts_hits_orig, f"FTS hits diverged: {hits} != {fts_hits_orig}"
+            # Skip the hit-count assertion when the original probe returned 0 —
+            # a 0==0 check is vacuous (no 'migration' term in this graph), but we
+            # still ran the rebuild above so a rebuild error is still caught.
+            # When the term IS present, the assertion is live and catches real regressions.
+            # (Resolves the #723 FTS-probe-vacuity nit flagged by Ariadne.)
+            if fts_hits_orig:
+                # The live FTS index may be stale (drifted from its rows); the rebuilt index is
+                # fresh and authoritative. Row-parity above already guarantees no data loss, so
+                # the rebuild must have >= the (possibly under-indexed) original's hit count.
+                # Exact-equality would false-fail on any graph whose live FTS index is stale.
+                assert hits >= fts_hits_orig, f"FTS hits regressed after rebuild: {hits} < {fts_hits_orig}"
             fts_ok = hits
         rc.close()
         return {
