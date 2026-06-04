@@ -27,10 +27,6 @@
       "tier": "essential"
     },
     {
-      "path": "settings.hooks.json.template",
-      "tier": "essential"
-    },
-    {
       "path": "engram_backup.py",
       "tier": "essential"
     },
@@ -485,7 +481,7 @@
     },
     {
       "path": "hooks/claude/engram-utility-credit-mention-stop.py",
-      "reason": "dead hook — not wired in hooks.json or settings.hooks.json.template; the utility credit-assign mechanism (prose-mention bump) was never integrated into the live hook config"
+      "reason": "dead hook — not wired in hooks.json; the utility credit-assign mechanism (prose-mention bump) was never integrated into the live hook config"
     },
     {
       "path": "tools/_telegram_api.py",

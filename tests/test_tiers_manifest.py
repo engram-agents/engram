@@ -173,7 +173,6 @@ def _enumerate_candidate_paths() -> set[str]:
         "bootstrap.py",
         "SKILL.md",
         "launch-engram-server.sh",
-        "settings.hooks.json.template",
         "viz_server.py",
     ]:
         if os.path.exists(os.path.join(REPO_ROOT, fname)):

@@ -197,41 +197,6 @@ def substitute_template(
     dst.write_text(text)
 
 
-def merge_hook_settings(
-    fragment_path: Path, target: Path, substitutions: dict[str, str]
-) -> str:
-    """Merge ENGRAM hook registrations into ~/.claude/settings.json.
-
-    If the target has no existing `hooks` key, we write ours directly.
-    If `hooks` already exists, we refuse to clobber and write the rendered
-    fragment to a sibling file for manual merge. Returns a status string.
-    """
-    text = fragment_path.read_text()
-    for placeholder, value in substitutions.items():
-        text = text.replace(placeholder, value)
-    hooks_block = json.loads(text)
-
-    if target.exists():
-        existing = json.loads(target.read_text())
-    else:
-        existing = {}
-
-    if "hooks" in existing and existing["hooks"]:
-        # Don't clobber user customizations. Drop the rendered fragment
-        # alongside and let the user merge.
-        side = target.with_suffix(".engram-hooks.json")
-        side.write_text(json.dumps(hooks_block, indent=2))
-        return (
-            f"WARN: {target} already has a 'hooks' key; ENGRAM fragment "
-            f"written to {side} for manual merge."
-        )
-
-    existing["hooks"] = hooks_block
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(existing, indent=2))
-    return f"settings.json ← hooks merged ({target})"
-
-
 def main() -> None:
     # Refuse to overwrite an existing install — defense-in-depth for the
     # plugin path (which doesn't go through install.sh's gate at install.sh:178).
@@ -436,42 +401,6 @@ def main() -> None:
             substitutions,
         )
         print(f"  CLAUDE.md → {CLAUDE_HOME}/CLAUDE.md", flush=True)
-
-        # settings.hooks.json.template merge is SCATTER-only. The template uses
-        # {{ENGRAM_HOOKS_DIR}} → ~/.engram/hooks/ substitution. Scatter install
-        # creates that dir + copies hook scripts there. Plugin install does NOT
-        # — plugin's own hooks/hooks.json (assembled by tools/build-plugin.sh)
-        # registers hooks at ${CLAUDE_PLUGIN_ROOT}/hooks/ instead. Merging the
-        # scatter template in plugin mode would write hook commands pointing at
-        # ~/.engram/hooks/*.py files that don't exist, leading to Claude Code
-        # hook-runner errors on every session.
-        # Detect plugin mode the same way as the ~/.engram/tools symlink branch:
-        # check whether bootstrap.py lives next to a plugin.json (plugin tree)
-        # rather than relying on CLAUDE_PLUGIN_ROOT env-var inheritance, which
-        # is unreliable for subprocesses under skill-runtime Bash (empirical:
-        # Lei's Chromebook trial, `echo $CLAUDE_PLUGIN_ROOT` returns empty).
-        # SKILL.md Step 0.5 also sets ENGRAM_INSTALL_MODE=plugin as belt-and-
-        # suspenders override.
-        _bootstrap_dir = Path(__file__).resolve().parent
-        plugin_mode = (
-            os.environ.get("ENGRAM_INSTALL_MODE") == "plugin"
-            or (_bootstrap_dir / "plugin.json").is_file()
-        )
-        if plugin_mode:
-            print(
-                "  settings.hooks.json merge: SKIPPED (plugin mode — "
-                "hooks/hooks.json handles plugin hook registration)",
-                flush=True,
-            )
-        else:
-            fragment = TEMPLATES_DIR.parent / "settings.hooks.json.template"
-            if fragment.exists():
-                status = merge_hook_settings(
-                    fragment,
-                    CLAUDE_HOME / "settings.json",
-                    substitutions,
-                )
-                print(f"  {status}", flush=True)
 
     elif TARGET == "gemini":
         gemini_template = (
