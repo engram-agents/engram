@@ -103,6 +103,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/engine",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/install-local-marketplace.sh",
       "tier": "convenience"
     },
@@ -510,6 +514,10 @@
     {
       "path": "tools/test_migrate_to_plugin.sh",
       "reason": "test file for tools/migrate-to-plugin.sh — CI tooling only, never ships"
+    },
+    {
+      "path": "tools/build-plugin-legacy.sh",
+      "reason": "legacy build script preserved verbatim as golden equivalence test fixture (golden tests compare its output against the engine CLI); deleted after engine soak period (tracked in #791)"
     }
   ]
 }
