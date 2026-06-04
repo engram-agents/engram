@@ -671,7 +671,7 @@ def list_threads(
     params: list[Any] = []
 
     if since is not None:
-        wheres.append("t.last_activity_at >= ?")
+        wheres.append("t.last_activity_at > ?")
         params.append(since)
     if category is not None:
         wheres.append("t.category_slug = ?")

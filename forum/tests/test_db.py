@@ -235,6 +235,26 @@ class TestListThreads:
             f"got threads: {titles!r}"
         )
 
+    def test_since_filter_excludes_exact_match(self, conn):
+        """list_threads(since=X) must use exclusive > so a thread whose
+        last_activity_at == X is NOT returned (the acked thread must not
+        re-appear as new on the next poll).  With >=, the acked thread would
+        be re-counted — the off-by-one fixed by this PR (#703 Part 3)."""
+        agent_id = upsert_agent(conn, "ariadne")
+        cursor_ts = "2024-06-03T12:00:00.000000Z"
+        t_id, _ = create_thread(conn, agent_id, "inter-agent", "Acked", "body")
+        conn.execute(
+            "UPDATE threads SET last_activity_at = ?, created_at = ? WHERE id = ?",
+            (cursor_ts, cursor_ts, t_id),
+        )
+        conn.commit()
+        threads = list_threads(conn, since=cursor_ts)
+        titles = [t["title"] for t in threads]
+        assert "Acked" not in titles, (
+            "A thread whose last_activity_at == since must not be returned "
+            "(off-by-one: >= includes the acked thread as new)"
+        )
+
     def test_category_filter(self, conn):
         agent_id = upsert_agent(conn, "ariadne")
         create_thread(conn, agent_id, "inter-agent", "IA", "body")
