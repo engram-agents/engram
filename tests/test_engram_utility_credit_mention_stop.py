@@ -12,6 +12,18 @@ those functions.
 
 All tests are self-contained: they build minimal in-memory or tmp_path
 sqlite schemas. Production knowledge.db is NEVER touched.
+
+ENGRAM_HOME isolation (#792)
+----------------------------
+The hook module freezes ENGRAM_HOME-derived paths (KNOWLEDGE_DB, LOG_PATH,
+and sys.path insertion) at import time. Without env isolation, every test run
+that exercises main() appended to the real ~/.engram/utility-credit-mention.log.
+
+Fix: the `isolated_engram_home` autouse fixture sets ENGRAM_HOME to a per-test
+tmp_path and re-executes the hook module via its saved spec so ALL module-frozen
+paths re-derive from the tmp directory. Teardown restores the original env and
+re-executes again, leaving the module in its pre-test state for any non-pytest
+code sharing the process.
 """
 
 from __future__ import annotations
@@ -33,15 +45,65 @@ sys.path.insert(0, str(REPO_ROOT))
 # Load the hook module from its hooks/claude/ path (not normally importable).
 HOOK_PATH = REPO_ROOT / "hooks" / "claude" / "engram-utility-credit-mention-stop.py"
 
+# The real ENGRAM_HOME — used only to verify the real log is NOT written.
+_REAL_ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+
 
 def _load_hook():
     spec = importlib.util.spec_from_file_location("engram_utility_credit_mention_stop", HOOK_PATH)
     module = importlib.util.module_from_spec(spec)
+    sys.modules["engram_utility_credit_mention_stop"] = module
     spec.loader.exec_module(module)
-    return module
+    return module, spec
 
 
-hook = _load_hook()
+hook, _HOOK_SPEC = _load_hook()
+
+
+def _reload_hook() -> None:
+    """Re-execute the hook module in place using the saved file spec.
+
+    importlib.reload() fails for modules loaded via spec_from_file_location
+    with a non-importable path (Python's _find_spec can't locate the module
+    by name in sys.path). Re-executing via the saved spec achieves the same
+    effect: all module-level globals (ENGRAM_HOME, KNOWLEDGE_DB, LOG_PATH,
+    and the sys.path insertion) are re-evaluated from the current environment.
+    The existing module object is mutated in place so callers holding a
+    reference to `hook` see the updated values immediately.
+    """
+    _HOOK_SPEC.loader.exec_module(hook)
+
+
+# --------------------------------------------------------------------------- #
+# ENGRAM_HOME isolation fixture (#792)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(autouse=True)
+def isolated_engram_home(tmp_path):
+    """Isolate the full ENGRAM_HOME surface for every test.
+
+    Sets ENGRAM_HOME to tmp_path and reloads the hook module so that all
+    module-frozen paths (ENGRAM_HOME, KNOWLEDGE_DB, LOG_PATH, and the
+    sys.path insertion) re-derive from the tmp directory rather than the
+    real ~/.engram. Restores the original env and re-reloads at teardown.
+
+    This fixture is autouse=True (function scope) so every test in this file
+    runs in a hermetic sandbox with no production-path leakage.
+    """
+    # --- setup ---
+    orig_env_value = os.environ.get("ENGRAM_HOME")
+    os.environ["ENGRAM_HOME"] = str(tmp_path)
+    _reload_hook()
+
+    yield
+
+    # --- teardown: restore original state ---
+    if orig_env_value is None:
+        os.environ.pop("ENGRAM_HOME", None)
+    else:
+        os.environ["ENGRAM_HOME"] = orig_env_value
+    _reload_hook()
 
 
 # --------------------------------------------------------------------------- #
@@ -67,6 +129,83 @@ def tmp_db(tmp_path) -> str:
     conn.commit()
     conn.close()
     return str(db_path)
+
+
+# --------------------------------------------------------------------------- #
+# Hermeticity proof — module paths must not point at the real ~/.engram (#792)
+# --------------------------------------------------------------------------- #
+
+
+def test_module_paths_hermetic():
+    """After the isolated_engram_home fixture, NONE of the module-frozen paths
+    should point under the real ENGRAM_HOME (~/.engram).
+
+    Checks: hook.ENGRAM_HOME, hook.KNOWLEDGE_DB, hook.LOG_PATH.
+    Also verifies that the fixture's tmp_path is the new ENGRAM_HOME.
+    """
+    real_home = _REAL_ENGRAM_HOME
+    for attr in ("ENGRAM_HOME", "KNOWLEDGE_DB", "LOG_PATH"):
+        val = getattr(hook, attr)
+        assert not str(val).startswith(real_home), (
+            f"hook.{attr}={val!r} still points under real ENGRAM_HOME={real_home!r} "
+            f"after isolated_engram_home fixture. The reload-based isolation failed."
+        )
+    # The new ENGRAM_HOME must be the tmp_path injected by the fixture.
+    assert hook.ENGRAM_HOME == os.environ["ENGRAM_HOME"], (
+        f"hook.ENGRAM_HOME={hook.ENGRAM_HOME!r} does not match "
+        f"os.environ['ENGRAM_HOME']={os.environ['ENGRAM_HOME']!r}"
+    )
+
+
+def test_hermeticity_real_log_not_polluted(monkeypatch, tmp_path):
+    """Meta-test: running main() does NOT write to the real ENGRAM_HOME log.
+
+    Records the real log's size (or absence) before calling main(), then
+    calls main() with a synthetic Stop-hook payload that will trigger the log
+    write path (mentioned_count > 0), then asserts the real log is byte-identical.
+
+    After the isolated_engram_home fixture, hook.LOG_PATH and the _log()
+    default argument both point to tmp_path, so any log write goes there
+    rather than to the real ~/.engram/utility-credit-mention.log.
+    """
+    real_log = Path(_REAL_ENGRAM_HOME) / "utility-credit-mention.log"
+    before_size = real_log.stat().st_size if real_log.exists() else -1
+
+    # Build a tmp knowledge.db with ob_0001 so main() finds something to bump.
+    db_path = tmp_path / "knowledge.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE nodes (id TEXT PRIMARY KEY, utility_score REAL)")
+    conn.execute("INSERT INTO nodes (id, utility_score) VALUES (?, ?)", ("ob_0001", 0.0))
+    conn.commit()
+    conn.close()
+
+    # Wrap credit_mentions to route the bump to our tmp db
+    # (hook.KNOWLEDGE_DB now points to isolated_engram_home's tmp, not this test's
+    # tmp_path; the wrapper ensures the right DB gets the write).
+    _real_credit_mentions = hook.credit_mentions
+
+    def _credit_mentions_with_tmp_db(last_message: str, **kwargs):
+        kwargs.setdefault("db_path", str(db_path))
+        return _real_credit_mentions(last_message, **kwargs)
+
+    monkeypatch.setattr(hook, "credit_mentions", _credit_mentions_with_tmp_db)
+
+    payload = json.dumps({
+        "stop_hook_active": False,
+        "last_assistant_message": "Firing the full pipeline, mentioning ob_0001.",
+        "session_id": "hermetic-proof-session",
+        "transcript_path": "",
+    })
+    monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
+
+    hook.main()
+
+    after_size = real_log.stat().st_size if real_log.exists() else -1
+    assert before_size == after_size, (
+        f"Real ENGRAM_HOME log changed: before={before_size} bytes, after={after_size} bytes. "
+        f"The isolation fixture did not fully contain log writes. "
+        f"Real log path: {real_log}"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -457,14 +596,14 @@ def test_main_full_pipeline_bumps_utility_via_stdin(monkeypatch, tmp_path):
       3. credit_mentions() finds ob_0001, bumps its utility_score.
       4. Q_new = Q_old + 0.10 * (1 - Q_old) = 0.0 + 0.10 * 1.0 = 0.10.
 
-    ENGRAM_HOME is pointed at tmp_path throughout; production knowledge.db is
-    never touched.
+    ENGRAM_HOME is pointed at an isolated tmp_path throughout (via the
+    isolated_engram_home autouse fixture); the real log is never touched.
 
     Note on db_path threading: credit_mentions() has `db_path=KNOWLEDGE_DB` as
-    a default argument frozen at import time, so monkeypatching hook.KNOWLEDGE_DB
-    does not affect calls made without an explicit db_path argument.  We wrap
-    credit_mentions to inject the tmp db_path so the real bump logic runs while
-    pointing at the synthetic DB.
+    a default argument frozen at import time. After the autouse fixture's reload,
+    KNOWLEDGE_DB points to the fixture's tmp_path, not this test's tmp_path.
+    We wrap credit_mentions to inject this test's tmp db_path so the real bump
+    logic runs while pointing at the synthetic DB.
     """
     # Build a minimal knowledge.db with a single node at utility_score=0.0.
     db_path = tmp_path / "knowledge.db"
@@ -475,9 +614,14 @@ def test_main_full_pipeline_bumps_utility_via_stdin(monkeypatch, tmp_path):
     conn.close()
 
     # Redirect LOG_PATH to tmp_path so main()'s _log() writes there.
+    # After the autouse fixture's reload, LOG_PATH already points to a tmp dir;
+    # this monkeypatch redirects it specifically to this test's tmp_path for
+    # clarity, but the real ~/.engram log is not written either way.
     monkeypatch.setattr(hook, "LOG_PATH", str(tmp_path / "utility-credit-mention.log"))
 
-    # Wrap credit_mentions to inject the tmp db_path, leaving all other logic intact.
+    # Wrap credit_mentions to inject this test's tmp db_path, leaving all other
+    # logic intact. (The default db_path after reload points to the fixture's
+    # tmp_path, not this test's tmp_path — they differ.)
     _real_credit_mentions = hook.credit_mentions
 
     def _credit_mentions_with_tmp_db(last_message: str, **kwargs):
