@@ -1104,6 +1104,79 @@ def get_inbox(
     return sorted(inbox.values(), key=lambda d: d["created_at"])
 
 
+def search_threads(
+    conn: sqlite3.Connection,
+    q: str,
+) -> list[dict[str, Any]]:
+    """Return threads whose title OR any post body LIKE q (case-insensitive).
+
+    Implementation:
+    - Two parameterised LIKE queries (title-match and body-match) combined with
+      UNION to deduplicate — no FTS5, no schema changes.
+    - Results ordered by last_activity_at DESC (recency order per spec).
+    - match_count: number of posts in the thread whose body_md LIKE q.  Threads
+      matched only by title carry match_count=0 (the title itself matched).
+
+    Security:
+    - q is passed as a bound parameter only — never interpolated into SQL.
+    - like_q (% wrapped) is the SQL LIKE operand; % and _ in q are treated as
+      literal search characters via Python-level escaping before wrapping.
+
+    Args:
+        conn: Open SQLite connection.
+        q:    Raw search term from the user (stripped; must be non-empty).
+
+    Returns:
+        List of thread dicts (same shape as list_threads) plus ``match_count``.
+        Empty list if q is empty after stripping.
+    """
+    stripped = q.strip()
+    if not stripped:
+        return []
+
+    # Escape SQL LIKE metacharacters in the user query so that literal
+    # percent/underscore characters don't accidentally act as wildcards.
+    escaped = stripped.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    like_q = f"%{escaped}%"
+
+    sql = """
+        SELECT
+               t.id, t.category_slug, t.title, t.body_md,
+               t.pinned, t.unresolved, t.created_at, t.last_activity_at,
+               la.name AS last_activity_agent_name,
+               a.name AS author_name, a.avatar_seed, a.pair_initials,
+               COUNT(p.id) AS reply_count
+          FROM threads t
+          JOIN agents a  ON a.id  = t.author_agent_id
+          JOIN agents la ON la.id = t.last_activity_agent_id
+          LEFT JOIN posts p ON p.thread_id = t.id
+         WHERE t.id IN (
+               -- title match
+               SELECT id FROM threads WHERE title LIKE ? ESCAPE '\\'
+               UNION
+               -- body match (any post in the thread)
+               SELECT DISTINCT p2.thread_id
+                 FROM posts p2
+                WHERE p2.body_md LIKE ? ESCAPE '\\'
+         )
+         GROUP BY t.id
+         ORDER BY t.last_activity_at DESC
+    """
+
+    rows = conn.execute(sql, (like_q, like_q)).fetchall()
+    result = [_build_thread_dict(conn, r) for r in rows]
+
+    # Annotate each thread with match_count (posts whose body_md LIKE q).
+    for td in result:
+        count_row = conn.execute(
+            "SELECT COUNT(*) FROM posts WHERE thread_id = ? AND body_md LIKE ? ESCAPE '\\'",
+            (td["id"], like_q),
+        ).fetchone()
+        td["match_count"] = count_row[0] if count_row else 0
+
+    return result
+
+
 def count_unread_all_threads(
     conn: sqlite3.Connection,
     agent_id: int,

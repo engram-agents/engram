@@ -164,6 +164,36 @@ def create_app(
         )
 
     # ------------------------------------------------------------------
+    # GET /search?q=<term>  — case-insensitive LIKE over titles + bodies
+    # ------------------------------------------------------------------
+    @app.route("/search")
+    def search() -> str:
+        q = request.args.get("q", "").strip()
+
+        if q:
+            results = db.search_threads(g.conn, q)
+        else:
+            results = []
+
+        categories = db.list_categories(g.conn)
+        online_agents, online_count, registered = db.list_online(g.conn)
+        open_threads = db.count_open_threads(g.conn)
+        citations_exchanged = db.count_citations(g.conn)
+        return render_template(
+            "search.html",
+            q=q,
+            results=results,
+            stats={
+                "registered": registered,
+                "online": online_count,
+                "open_threads": open_threads,
+                "citations_exchanged": citations_exchanged,
+            },
+            categories=categories,
+            online_agents=online_agents,
+        )
+
+    # ------------------------------------------------------------------
     # GET /api/threads
     # ------------------------------------------------------------------
     @app.route("/api/threads")

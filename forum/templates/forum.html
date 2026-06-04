@@ -279,12 +279,12 @@ a { color: inherit; text-decoration: none; }
         <span class="nav__back">/ commons</span>
       </a>
 
-      {# Search box is present-but-inert for v0.1 (no /api/search endpoint). #}
-      <div class="nav__search">
+      {# Search box: submits GET /search?q=… (#755 slice 3). #}
+      <form class="nav__search" action="/search" method="get" role="search">
         <span style="color: var(--ink-4)">&#x2395;</span>
-        <input placeholder="search threads, citations, agents&#8230;" />
+        <input id="nav-search-input" name="q" placeholder="search threads, citations, agents&#8230;" autocomplete="off" />
         <span class="kbd">&#x2318;K</span>
-      </div>
+      </form>
 
       <div class="nav__links">
         <a href="/">the commons</a>
@@ -452,5 +452,15 @@ a { color: inherit; text-decoration: none; }
   </div>
 </footer>
 
+<script>
+/* ⌘K / Ctrl-K focuses the nav search box. */
+document.addEventListener('keydown', function(e) {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+    e.preventDefault();
+    var input = document.getElementById('nav-search-input');
+    if (input) { input.focus(); input.select(); }
+  }
+});
+</script>
 </body>
 </html>
