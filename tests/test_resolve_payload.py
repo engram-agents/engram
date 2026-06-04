@@ -579,3 +579,134 @@ def test_prediction_partial_resolution_does_not_include_discipline_hint():
     assert "discipline_hint" not in r2, (
         f"discipline_hint must NOT be present on a prediction resolution; got {r2}"
     )
+
+
+def test_retract_last_resolver_clears_resolved_by():
+    """Retracting the last resolver must reopen the target and clear resolved_by to NULL."""
+    server = fresh_server()
+    q_id, _, dv_id = _seed_strong_resolution(server)
+
+    # Resolve the question.
+    r = json.loads(server.engram_resolve(payload_json=json.dumps({
+        "target_id": q_id,
+        "resolving_node_id": dv_id,
+    })))
+    assert r.get("status") == "resolution_created", r
+
+    # Verify resolved_by is populated.
+    import sqlite3
+    db_path = os.path.join(TEST_DIR, "knowledge.db")
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT status, resolved_by FROM nodes WHERE id = ?", (q_id,)).fetchone()
+    assert row["status"] in ("resolved", "partially_resolved"), row["status"]
+    assert row["resolved_by"] == dv_id, f"resolved_by should be {dv_id!r}, got {row['resolved_by']!r}"
+    conn.close()
+
+    # Retract the resolver.
+    ret = json.loads(server.engram_retract(payload_json=json.dumps({
+        "node_id": dv_id,
+        "error_type": "other",
+        "reason": "Retracting for test.",
+    })))
+    assert ret.get("status") in ("retracted", "retraction_recorded"), ret
+
+    # The target should be reopened and resolved_by cleared.
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT status, resolved_by FROM nodes WHERE id = ?", (q_id,)).fetchone()
+    assert row["status"] == "open", f"target should be reopened, got {row['status']!r}"
+    assert row["resolved_by"] is None, f"resolved_by must be NULL after last resolver retracted, got {row['resolved_by']!r}"
+    conn.close()
+
+
+def test_retract_one_of_two_resolvers_updates_resolved_by():
+    """Retracting one of two resolvers must update resolved_by to the remaining stronger one."""
+    server = fresh_server()
+
+    # Seed an observation and a question.
+    ob = json.loads(server.engram_add_observation(payload_json=json.dumps({
+        "url": "https://example.com/multi-resolver",
+        "title": "Multi-resolver test",
+        "quoted_text": "Evidence for multi-resolver scenario.",
+        "interpretation": "This supports both resolvers.",
+        "claim": "Multi-resolver evidence.",
+        "quote_type": "official_statement",
+    })))
+    ob_id = ob["observation_id"]
+
+    q = json.loads(server.engram_ask(payload_json=json.dumps({
+        "question": "Is multi-resolver correctly handled?",
+    })))
+    q_id = q["question_id"]
+
+    # Create a strong resolver (inductive_generalization → higher computed confidence).
+    dv_strong = json.loads(server.engram_derive(payload_json=json.dumps({
+        "claim": "Multi-resolver correctly handled — strong evidence.",
+        "supporting_ids": ob_id,
+        "logical_chain": "Strong evidence confirms it.",
+        "reasoning_type": "inductive_generalization",
+    })))
+    assert "derivation_id" in dv_strong, dv_strong
+    dv_strong_id = dv_strong["derivation_id"]
+
+    # Create a weaker resolver (inductive_analogy → lower computed confidence).
+    dv_weak = json.loads(server.engram_derive(payload_json=json.dumps({
+        "claim": "Multi-resolver correctly handled — weak evidence.",
+        "supporting_ids": ob_id,
+        "logical_chain": "Weak evidence suggests it.",
+        "reasoning_type": "inductive_analogy",
+    })))
+    assert "derivation_id" in dv_weak, dv_weak
+    dv_weak_id = dv_weak["derivation_id"]
+
+    # Wire weak FIRST so resolved_by = dv_weak_id, then wire strong SECOND
+    # so resolved_by = dv_strong_id before retraction.  After retracting strong,
+    # the else-branch must update resolved_by back to dv_weak_id.  If wired in
+    # the opposite order, resolved_by is already dv_weak_id before retraction
+    # and the else-branch is a no-op — the test passes even without the fix.
+    r1 = json.loads(server.engram_resolve(payload_json=json.dumps({
+        "target_id": q_id,
+        "resolving_node_id": dv_weak_id,
+    })))
+    assert r1.get("status") == "resolution_created", r1
+
+    r2 = json.loads(server.engram_resolve(payload_json=json.dumps({
+        "target_id": q_id,
+        "resolving_node_id": dv_strong_id,
+    })))
+    assert r2.get("status") in ("resolution_created", "no_op"), r2
+
+    # Verify resolved_by is dv_strong_id before retraction (pre-condition).
+    import sqlite3
+    db_path = os.path.join(TEST_DIR, "knowledge.db")
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT resolved_by FROM nodes WHERE id = ?", (q_id,)).fetchone()
+    assert row["resolved_by"] == dv_strong_id, (
+        f"pre-retraction: resolved_by must be the most-recently-wired resolver "
+        f"{dv_strong_id!r}, got {row['resolved_by']!r}"
+    )
+    conn.close()
+
+    # Retract the strong resolver.
+    ret = json.loads(server.engram_retract(payload_json=json.dumps({
+        "node_id": dv_strong_id,
+        "error_type": "other",
+        "reason": "Retracting strong resolver for test.",
+    })))
+    assert ret.get("status") in ("retracted", "retraction_recorded"), ret
+
+    # Target should downgrade to partially_resolved (weak resolver's confidence ~0.45
+    # is below the 0.7 threshold), and resolved_by must point at the remaining weak resolver.
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT status, resolved_by FROM nodes WHERE id = ?", (q_id,)).fetchone()
+    assert row["status"] == "partially_resolved", (
+        f"target must downgrade to partially_resolved when strongest resolver is retracted "
+        f"and only a below-threshold resolver remains; got {row['status']!r}"
+    )
+    assert row["resolved_by"] == dv_weak_id, (
+        f"resolved_by must be updated to remaining resolver {dv_weak_id!r}, got {row['resolved_by']!r}"
+    )
+    conn.close()

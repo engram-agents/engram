@@ -15318,24 +15318,29 @@ def _retract_impl(
         # Retracting the resolution should revert the target to 'open' so it
         # can be re-resolved with proper provenance.
         reopened_targets = []
+        retract_config = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
+        retract_threshold = retract_config.get("resolution_confidence_threshold", DEFAULT_RESOLUTION_THRESHOLD)
         resolution_edges = conn.execute(
             "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'resolves'",
             (node_id,),
         ).fetchall()
         for re in resolution_edges:
             tid = re["target_id"]
-            # Check if there's another non-retracted resolution for this target
+            # Check if there's another non-retracted resolution for this target.
+            # Also fetch confidence to find the strongest remaining resolver for
+            # the resolved_by column update (issue #762).
             other_resolutions = conn.execute(
-                """SELECT e.source_id FROM edges e
+                """SELECT e.source_id, n.confidence FROM edges e
                    JOIN nodes n ON e.source_id = n.id
                    WHERE e.target_id = ? AND e.relation = 'resolves'
-                   AND n.id != ? AND n.status != 'retracted' AND n.is_current = 1""",
+                   AND n.id != ? AND n.status != 'retracted' AND n.is_current = 1
+                   ORDER BY n.confidence DESC""",
                 (tid, node_id),
             ).fetchall()
             if not other_resolutions:
-                # No other valid resolution — reopen the target
+                # No other valid resolution — reopen the target and clear resolved_by.
                 conn.execute(
-                    "UPDATE nodes SET status = 'open' WHERE id = ?",
+                    "UPDATE nodes SET status = 'open', resolved_by = NULL WHERE id = ?",
                     (tid,),
                 )
                 target_node = conn.execute(
@@ -15346,6 +15351,28 @@ def _retract_impl(
                     "type": target_node["type"] if target_node else "unknown",
                     "claim": target_node["claim"] if target_node else "",
                 })
+            else:
+                # Other resolvers remain — update resolved_by to the strongest one
+                # and recompute status vs threshold (issue #762 coherence fix).
+                # Predictions/conjectures use categorical outcome as status, so their
+                # status is not recomputed — only the resolved_by pointer is updated.
+                strongest = other_resolutions[0]
+                target_type_row = conn.execute(
+                    "SELECT type FROM nodes WHERE id = ?", (tid,)
+                ).fetchone()
+                target_type = target_type_row["type"] if target_type_row else ""
+                if target_type in ("prediction", "conjecture"):
+                    conn.execute(
+                        "UPDATE nodes SET resolved_by = ? WHERE id = ?",
+                        (strongest["source_id"], tid),
+                    )
+                else:
+                    max_remaining = strongest["confidence"] if strongest["confidence"] is not None else 0.0
+                    new_status = "resolved" if max_remaining >= retract_threshold else "partially_resolved"
+                    conn.execute(
+                        "UPDATE nodes SET resolved_by = ?, status = ? WHERE id = ?",
+                        (strongest["source_id"], new_status, tid),
+                    )
 
         # Audit trail: log each edge removal before the DELETE so the
         # deletions are visible via engram_history mode=edits.
