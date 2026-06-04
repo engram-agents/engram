@@ -174,6 +174,19 @@ FEELING_NUDGE_SOURCES = {"post_compact", "nap_checkpoint", "dream_review"}
 # When True, _ensure_data_dir() will refuse to create ~/.engram.
 _SANDBOX_ACTIVE = False
 
+# ---------------------------------------------------------------------------
+# WAL/shm self-guard state (#786)
+# ---------------------------------------------------------------------------
+
+# Timestamp of last walguard check (epoch float); 0.0 = never checked.
+_walguard_last_check: float = 0.0
+# Throttle interval: run the inode check at most once every 30 seconds.
+_WALGUARD_CHECK_INTERVAL: float = 30.0
+# Set to True after the first _get_db() call (startup marker-clearing path runs once).
+_walguard_startup_done: bool = False
+# Set to True after the first skipped-guard log line is emitted (once-per-process).
+_walguard_disabled_logged: bool = False
+
 
 def _configure_paths(data_dir: str | Path) -> None:
     """Reconfigure ALL module-level path globals from a single data_dir.
@@ -190,6 +203,7 @@ def _configure_paths(data_dir: str | Path) -> None:
     """
     global DATA_DIR, DB_PATH, SNAPSHOT_PATH, CONFIG_PATH, LOG_PATH
     global FEELING_NUDGE_MARKER, ERROR_INCIDENTS_PATH
+    global _walguard_last_check, _walguard_startup_done, _walguard_disabled_logged
     DATA_DIR = Path(data_dir)
     DB_PATH = DATA_DIR / "knowledge.db"
     SNAPSHOT_PATH = DATA_DIR / "graph_snapshot.md"
@@ -197,6 +211,10 @@ def _configure_paths(data_dir: str | Path) -> None:
     LOG_PATH = DATA_DIR / "session_log.md"
     FEELING_NUDGE_MARKER = DATA_DIR / "feeling-nudge-active.json"
     ERROR_INCIDENTS_PATH = str(DATA_DIR / "error_incidents.json")
+    # Reset walguard state when paths change (e.g. test isolation)
+    _walguard_last_check = 0.0
+    _walguard_startup_done = False
+    _walguard_disabled_logged = False
 
 # Utility Q-update learning rate per USE action. Three tiers per Lei
 # 2026-05-19 design call. Numbers preserve the existing α scale.
@@ -1089,6 +1107,207 @@ def _seed_missing_message() -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# WAL/shm self-guard helpers (#786)
+# ---------------------------------------------------------------------------
+
+
+def _walguard_startup_clear(conn: sqlite3.Connection) -> None:
+    """First-init check: clear a stale degraded marker if the DB is now healthy.
+
+    Called once per server lifetime (guarded by _walguard_startup_done flag).
+    If a degraded marker exists AND detect_shm_displacement() returns None AND
+    PRAGMA integrity_check returns 'ok', the marker is removed and a log line
+    is emitted.  If integrity_check fails, the marker is left in place and a
+    loud error is logged.
+
+    Never raises — any internal failure is logged and swallowed.
+    """
+    import sys
+    try:
+        import engram_walguard as _wg
+        marker = _wg.read_degraded_marker(DATA_DIR)
+        if marker is None:
+            return  # no stale marker; nothing to do
+        detection = _wg.detect_shm_displacement(str(DB_PATH))
+        if detection is not None:
+            # Still displaced — leave the marker and log loudly
+            print(
+                f"[walguard] CRITICAL: stale degraded marker present AND shm still displaced "
+                f"(reason={detection.get('reason')}); leaving marker in place. "
+                f"Do not run a hard checkpoint — request a clean MCP restart. (#786)",
+                file=sys.stderr,
+            )
+            return
+        # Displacement gone — verify integrity before clearing
+        try:
+            rows = conn.execute("PRAGMA integrity_check").fetchall()
+            ic_ok = len(rows) == 1 and rows[0][0] == "ok"
+        except Exception as ie:
+            print(
+                f"[walguard] integrity_check raised during startup clear: {ie}; "
+                f"leaving degraded marker in place. (#786)",
+                file=sys.stderr,
+            )
+            return
+        if ic_ok:
+            _wg.clear_degraded_marker(DATA_DIR)
+            print(
+                "[walguard] degraded marker cleared after healthy restart. (#786)",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[walguard] CRITICAL: integrity_check FAILED during startup; "
+                f"leaving degraded marker in place. Check DB health before resuming. (#786)",
+                file=sys.stderr,
+            )
+    except Exception as e:
+        print(f"[walguard] startup clear error (non-fatal): {e!r} (#786)", file=sys.stderr)
+
+
+def _run_walguard_check(conn: sqlite3.Connection) -> None:
+    """Throttled WAL-guard check called from every tool dispatch via _get_db().
+
+    No-ops unless ≥30 s have elapsed since the last check (keeps per-call cost
+    near zero — two stat() calls plus a listdir that is amortised over the
+    interval).  On detection: logs loudly, writes the degraded marker, attempts
+    an emergency dump (checkpoint skipped — checkpointing under a split-brain
+    WAL-index is the corruption vector, #786), and updates the marker's dump
+    fields.
+
+    Storm-gate (#786): displacement is a persistent condition.  To avoid firing
+    a full SQL dump + git commit on every 30-second throttle window for the
+    entire duration of the incident:
+      - If a marker already exists with dump_committed=True and the same reason,
+        skip the dump entirely UNLESS the last dump is >3600 s stale (hourly
+        refresh keeps later writes captured without triggering a storm).
+      - The original detected_at timestamp is always preserved for forensics.
+
+    MUST NOT raise — any internal failure is logged and swallowed.  A broken
+    guard must never take down tool dispatch.
+    """
+    global _walguard_last_check
+    try:
+        now = time.monotonic()
+        if now - _walguard_last_check < _WALGUARD_CHECK_INTERVAL:
+            return
+        _walguard_last_check = now
+
+        import engram_walguard as _wg
+        detection = _wg.detect_shm_displacement(str(DB_PATH))
+        if detection is None:
+            return  # healthy
+
+        import sys
+
+        # ── Storm-gate: check for an existing committed marker (#786) ─────────
+        # If we already committed a dump for this same displacement reason,
+        # skip the expensive dump/commit unless the last dump is >1 hour old
+        # (hourly refresh — keeps later writes captured without firing 720
+        # commits over a 6-hour incident window).
+        existing_marker = _wg.read_degraded_marker(DATA_DIR)
+        original_detected_at: Optional[str] = None
+
+        if existing_marker is not None and existing_marker.get("dump_committed") is True:
+            if existing_marker.get("reason") == detection.get("reason"):
+                # Same displacement reason — check hourly-refresh eligibility.
+                original_detected_at = existing_marker.get("detected_at")
+                last_dump_iso = existing_marker.get("last_emergency_dump")
+                needs_refresh = True
+                if last_dump_iso is not None:
+                    try:
+                        from datetime import datetime as _dt, timezone as _tz
+                        last_dump_ts = _dt.fromisoformat(last_dump_iso).timestamp()
+                        needs_refresh = (time.time() - last_dump_ts) > 3600.0
+                    except Exception:
+                        pass  # unparseable timestamp → conservative: refresh
+
+                if not needs_refresh:
+                    # Dump is fresh; no storm action — return silently.
+                    return
+
+                # Dump is stale (>1 h): proceed with a refresh dump but log it.
+                print(
+                    f"[walguard] displacement still present (reason={detection.get('reason')}); "
+                    f"last dump >1 h ago — refreshing emergency dump. (#786)",
+                    file=sys.stderr,
+                )
+            else:
+                # Reason changed (unusual but possible) — treat as a new event.
+                original_detected_at = None
+
+        if original_detected_at is None:
+            # First detection: log loudly.
+            print(
+                f"[walguard] CRITICAL: WAL-index displacement detected "
+                f"(reason={detection.get('reason')}, fd={detection.get('fd')}). "
+                f"Writing degraded marker and attempting emergency dump. (#786)",
+                file=sys.stderr,
+            )
+
+        # Write initial/refreshed marker (dump_committed=False until dump completes).
+        # Pass detected_at to preserve the original timestamp on re-dumps.
+        try:
+            _wg.write_degraded_marker(
+                DATA_DIR, detection, dump_info=None,
+                detected_at=original_detected_at,
+            )
+        except Exception as me:
+            print(f"[walguard] marker write failed: {me!r} (#786)", file=sys.stderr)
+
+        # Emergency dump: skip_checkpoint=True to avoid the corruption vector
+        dump_info: dict = {}
+        try:
+            dump_info = _commit_snapshot(
+                conn,
+                message="WAL-index displacement detected — securing dump (#786)",
+                mode="emergency",
+                skip_checkpoint=True,
+            )
+        except Exception as de:
+            print(f"[walguard] emergency dump raised: {de!r} (#786)", file=sys.stderr)
+            dump_info = {"git_committed": False, "error": str(de)}
+
+        # Update marker with dump result; preserve original detected_at.
+        try:
+            _wg.write_degraded_marker(
+                DATA_DIR, detection, dump_info=dump_info,
+                detected_at=original_detected_at,
+            )
+        except Exception as me2:
+            print(f"[walguard] marker update after dump failed: {me2!r} (#786)", file=sys.stderr)
+
+    except Exception as e:
+        import sys
+        print(f"[walguard] _run_walguard_check error (non-fatal): {e!r} (#786)", file=sys.stderr)
+
+
+def _walguard_degraded_banner() -> str:
+    """Return the degraded-state warning string if the marker is present, else ''.
+
+    Reads DATA_DIR unconditionally — NOT gated by ENGRAM_NO_DB_GUARDS.  Test
+    code that writes a degraded marker into its isolated DATA_DIR will trigger
+    this function and see the warning in any tool that calls it.  Tests that
+    exercise banner-affected tools with a marker present should assert on the
+    '_walguard_warning' key in the parsed JSON response dict.
+    """
+    try:
+        import engram_walguard as _wg
+        marker = _wg.read_degraded_marker(DATA_DIR)
+        if marker is None:
+            return ""
+        ts = marker.get("detected_at", "unknown")
+        sha = marker.get("dump_sha") or "FAILED"
+        return (
+            f"⚠️ SUBSTRATE DEGRADED: WAL-index displaced at {ts}; "
+            f"emergency dump {sha}; "
+            f"do not hard-kill the session — request a clean MCP restart. (#786)"
+        )
+    except Exception:
+        return ""
+
+
 def _get_db() -> sqlite3.Connection:
     """Get a database connection, creating tables if needed.
 
@@ -1596,6 +1815,33 @@ def _get_db() -> sqlite3.Connection:
             if seed_count == 0:
                 conn.close()
                 raise RuntimeError(_seed_missing_message())
+
+    # ── WAL-guard checks (#786) ─────────────────────────────────────────────
+    # Skipped in test/bootstrap mode (ENGRAM_NO_DB_GUARDS=1 / ENGRAM_BOOTSTRAP=1)
+    # to prevent false positives from the test framework's temp-dir lifecycle
+    # (multiple tests reuse the same path, causing lingering fds to appear deleted).
+    # Production MCP servers never set these flags.
+    if not bootstrap_mode:
+        global _walguard_startup_done
+        if not _walguard_startup_done:
+            _walguard_startup_done = True
+            _walguard_startup_clear(conn)
+
+        # Throttled (≥30 s interval): detect shm displacement, emergency-dump
+        # if detected, write degraded marker.  Must not raise.
+        _run_walguard_check(conn)
+    else:
+        # Emit one stderr line on the FIRST skipped check so that a production
+        # server accidentally started with ENGRAM_NO_DB_GUARDS=1 is visible
+        # rather than silently unguarded.
+        global _walguard_disabled_logged
+        if not _walguard_disabled_logged:
+            _walguard_disabled_logged = True
+            import sys as _sys
+            print(
+                "[walguard] disabled by ENGRAM_NO_DB_GUARDS / bootstrap mode (#786)",
+                file=_sys.stderr,
+            )
 
     return conn
 
@@ -4303,7 +4549,12 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
     return "\n".join(lines)
 
 
-def _commit_snapshot(conn: sqlite3.Connection, message: str, mode: str) -> dict:
+def _commit_snapshot(
+    conn: sqlite3.Connection,
+    message: str,
+    mode: str,
+    skip_checkpoint: bool = False,
+) -> dict:
     """Generate the markdown snapshot, write it, and commit ~/.engram/.git.
 
     This is the durable version-controlled record of the graph state. It is the
@@ -4327,9 +4578,32 @@ def _commit_snapshot(conn: sqlite3.Connection, message: str, mode: str) -> dict:
     produces tiny git diffs (linear storage growth vs quadratic for binary).
     Restore: `sqlite3 ~/.engram/knowledge.db < knowledge.sql`
 
-    SQLite WAL is checkpointed (TRUNCATE) before generating the SQL dump.
+    SQLite WAL is checkpointed (TRUNCATE) before generating the SQL dump,
+    unless skip_checkpoint=True or a degraded marker is present — checkpointing
+    under a displaced WAL-index is the corruption vector (#786); the SQL dump
+    reads through the coherent connection and is safe without a prior checkpoint.
+
+    Args:
+        conn: Live database connection.
+        message: Commit message body.
+        mode: Commit mode tag (e.g. "nap", "sleep", "emergency").
+        skip_checkpoint: When True, omit the PRAGMA wal_checkpoint(TRUNCATE)
+            step.  Forced True when a degraded marker is present (regardless of
+            caller), to prevent checkpointing under a split-brain WAL-index.
     """
     global _git_available
+
+    # ── Degraded-marker override (#786) ────────────────────────────────────
+    # If a degraded marker is present, force skip_checkpoint=True regardless of
+    # caller.  Checkpointing under a displaced WAL-index is the corruption vector
+    # (#786); the SQL dump reads through the coherent connection and is safe.
+    if not skip_checkpoint:
+        try:
+            import engram_walguard as _wg
+            if _wg.read_degraded_marker(DATA_DIR) is not None:
+                skip_checkpoint = True
+        except Exception:
+            pass  # failure to read marker → conservative: proceed with caller's value
 
     # Lazy init in case startup didn't initialize git (e.g. older deployments)
     if not _git_available:
@@ -4344,14 +4618,17 @@ def _commit_snapshot(conn: sqlite3.Connection, message: str, mode: str) -> dict:
     except Exception as e:
         return {"git_committed": False, "reason": f"snapshot write failed: {e}"}
 
-    # 2. Flush WAL into the main db file so the committed db is consistent
-    try:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    except Exception as e:
-        # Non-fatal — continue, but record it
-        wal_warning = f"wal_checkpoint failed: {e}"
-    else:
-        wal_warning = None
+    # 2. Flush WAL into the main db file so the committed db is consistent.
+    # Skipped when skip_checkpoint=True: checkpointing under a displaced WAL-index
+    # is the corruption vector (#786); the SQL dump reads through the coherent
+    # connection and is safe.
+    wal_warning = None
+    if not skip_checkpoint:
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception as e:
+            # Non-fatal — continue, but record it
+            wal_warning = f"wal_checkpoint failed: {e}"
 
     # 2b. Generate embedding-stripped SQL text dump (the SQL-dump-replaces-binary derivation).
     #     Embeddings (~384-float blobs, ~37 MB) are regenerable from claim text and must
@@ -6432,7 +6709,11 @@ def engram_surface(payload_json: str) -> str:
         })
     if "query" not in params:
         return json.dumps({"error": "payload_json must include required field 'query'"})
-    return _surface_impl(**params)
+    result_dict = json.loads(_surface_impl(**params))
+    banner = _walguard_degraded_banner()
+    if banner:
+        result_dict["_walguard_warning"] = banner
+    return json.dumps(result_dict)
 
 
 def _surface_impl(
@@ -7568,7 +7849,11 @@ def engram_nap(payload_json: str) -> str:
         })
     if "message" not in params:
         return json.dumps({"error": "payload_json must include required field 'message'"})
-    return _nap_impl(**params)
+    result_dict = json.loads(_nap_impl(**params))
+    banner = _walguard_degraded_banner()
+    if banner:
+        result_dict["_walguard_warning"] = banner
+    return json.dumps(result_dict)
 
 
 def _nap_impl(message: str) -> str:
@@ -7654,7 +7939,11 @@ def engram_advance_turn(payload_json: str) -> str:
         })
     if "message" not in params:
         return json.dumps({"error": "payload_json must include required field 'message'"})
-    return _advance_turn_impl(**params)
+    result_dict = json.loads(_advance_turn_impl(**params))
+    banner = _walguard_degraded_banner()
+    if banner:
+        result_dict["_walguard_warning"] = banner
+    return json.dumps(result_dict)
 
 
 def _advance_turn_impl(message: str) -> str:
@@ -7944,6 +8233,9 @@ def engram_stats(payload_json: str = "{}") -> str:
                 conn, created_at_filter, filter_args
             )
 
+        banner = _walguard_degraded_banner()
+        if banner:
+            result["_walguard_warning"] = banner
         return json.dumps(result)
     finally:
         conn.close()
@@ -8882,6 +9174,9 @@ def engram_diagnose() -> str:
             },
         }
 
+        banner = _walguard_degraded_banner()
+        if banner:
+            metrics["_walguard_warning"] = banner
         return json.dumps(metrics)
     finally:
         conn.close()
