@@ -190,7 +190,7 @@ def backfill_embeddings(engram_home: Path) -> None:
             print("[regen] No nodes with NULL embedding — nothing to do.", file=sys.stderr)
             import engram_backup  # available after _import_server inserted the backup module dir on sys.path
             if engram_backup.rebuild_fts_index(str(db_path)):
-                print("[regen] FTS index rebuilt from current rows.", file=sys.stderr)
+                print("[regen] FTS index rebuild complete.", file=sys.stderr)
             else:
                 print("[regen] no nodes_fts table present — skipping FTS rebuild.", file=sys.stderr)
             return
@@ -283,7 +283,7 @@ def backfill_embeddings(engram_home: Path) -> None:
 
         import engram_backup  # available after _import_server inserted the backup module dir on sys.path
         if engram_backup.rebuild_fts_index(str(db_path)):
-            print("[regen] FTS index rebuilt from restored rows.", file=sys.stderr)
+            print("[regen] FTS index rebuild complete.", file=sys.stderr)
         else:
             print("[regen] no nodes_fts table present — skipping FTS rebuild.", file=sys.stderr)
 

@@ -164,14 +164,53 @@ def test_verify_roundtrip_self_check(engram_db):
     assert rep["fts_hits"] == 2
 
 
-def test_rebuild_fts_noop_without_table(tmp_path):
-    """rebuild_fts_index returns False (not crash) when there's no FTS table."""
+def test_rebuild_fts_returns_false_when_no_nodes_table(tmp_path):
+    """rebuild_fts_index returns False when there's no nodes table (non-ENGRAM DB).
+
+    The new self-contained rebuild (#781) creates the FTS table if nodes exists
+    but FTS doesn't, so the old 'no FTS → False' contract is gone.  The new
+    contract is: False only when nodes itself is absent.
+    """
     p = str(tmp_path / "plain.db")
     conn = sqlite3.connect(p)
-    conn.execute("CREATE TABLE nodes(id TEXT, claim TEXT)")
+    conn.execute("CREATE TABLE other_table(id TEXT, claim TEXT)")
     conn.commit()
     conn.close()
     assert engram_backup.rebuild_fts_index(p) is False
+
+
+def test_rebuild_fts_creates_fts_table_when_absent(tmp_path):
+    """rebuild_fts_index returns True and creates nodes_fts when nodes exists but FTS doesn't.
+
+    This is the #781 self-contained restore-path: the dump strips nodes_fts,
+    and rebuild_fts_index must create it, populate it, and exclude retractions.
+    """
+    p = str(tmp_path / "plain.db")
+    conn = sqlite3.connect(p)
+    conn.executescript(
+        """
+        CREATE TABLE nodes (
+            id TEXT PRIMARY KEY,
+            claim TEXT,
+            quoted_text TEXT,
+            interpretation TEXT
+        );
+        CREATE TABLE edges (src TEXT, dst TEXT, relation TEXT);
+        """
+    )
+    conn.execute("INSERT INTO nodes VALUES ('ob_1', 'plugin migration', 'src', 'interp')")
+    conn.commit()
+    conn.close()
+    assert engram_backup.rebuild_fts_index(p) is True
+    # FTS must now exist and be queryable.
+    conn = sqlite3.connect(p)
+    has_fts = conn.execute("SELECT 1 FROM sqlite_master WHERE name='nodes_fts'").fetchone()
+    assert has_fts is not None
+    hits = conn.execute(
+        "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'migration'"
+    ).fetchone()[0]
+    conn.close()
+    assert hits == 1
 
 
 def test_verify_roundtrip_no_false_positive_on_content_mentioning_derived_tables(tmp_path):

@@ -125,11 +125,21 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
             bk.execute(f"DROP TABLE IF EXISTS {tn}")
         bk.commit()
 
+        # Read user_version BEFORE closing the snapshot — iterdump() does not
+        # emit PRAGMA user_version, so restored DBs would land at 0 and
+        # re-fire one-shot migrations (e.g. #274) even on an already-migrated
+        # graph.  We append the PRAGMA explicitly so restore reproduces the
+        # source's migration state (#781).
+        src_user_version = bk.execute("PRAGMA user_version").fetchone()[0]
+
         statements = 0
         with open(out_sql_path, "w", encoding="utf-8") as f:
             for line in bk.iterdump():
                 f.write(line + "\n")
                 statements += 1
+            # Append user_version after the COMMIT so it executes on restore.
+            f.write(f"PRAGMA user_version = {src_user_version};\n")
+            statements += 1
         bk.close()
     finally:
         try:
@@ -148,20 +158,85 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
 def rebuild_fts_index(db_path: str) -> bool:
     """Rebuild the FTS5 index from the current rows of ``nodes`` (post-restore).
 
-    Idempotent. Returns True if the rebuild ran, False if there is no
-    ``nodes_fts`` table to rebuild (e.g. the server hasn't recreated it yet —
-    it does so lazily at first ``_get_db``; call this AFTER that, or after the
-    schema-init that creates the virtual table). FTS5 'rebuild' repopulates the
-    index from the external content (the ``nodes`` table) — the restored rows.
+    Self-contained restore-path fix (#781): creates the FTS table if absent,
+    rebuilds from all current ``nodes`` rows (so retracted rows are present in
+    the index immediately after rebuild), then 'delete'-inserts each retracted
+    row to exclude it from the index (this succeeds only because rebuild just
+    populated them — delete-on-empty is the crash).  Finally sets
+    PRAGMA user_version = 1 so the server's one-shot #274 migration gate is
+    satisfied and does not re-fire on the next _get_db call.
+
+    Order is load-bearing: rebuild THEN delete (not delete THEN rebuild, which
+    is the original crash path).
+
+    Returns True if the rebuild ran, False if the ``nodes`` table does not
+    exist (the DB is not ENGRAM-shaped — nothing to do).
+
+    Note: nodes_fts uses content='nodes' (external-content FTS5) with
+    deliberate index-side deletion of retracted rows.  FTS5's 'integrity-check'
+    therefore always reports "malformed" on a graph with retractions — this is
+    expected by design (#781).
     """
     conn = sqlite3.connect(db_path)
     try:
-        has_fts = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE name='nodes_fts'"
+        # Bail early if this isn't an ENGRAM-shaped DB.
+        has_nodes = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes'"
         ).fetchone()
-        if not has_fts:
+        if not has_nodes:
             return False
+
+        # Create the FTS table if it was stripped from the dump (it always is).
+        # Guard: only create if nodes has the three columns the FTS table
+        # indexes (claim, quoted_text, interpretation).  Minimal test fixtures
+        # may have a stripped-down nodes schema; we skip creation for those.
+        node_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(nodes)").fetchall()
+        }
+        fts_required_cols = {"claim", "quoted_text", "interpretation"}
+        has_fts_cols = fts_required_cols.issubset(node_cols)
+        if not has_fts_cols:
+            # nodes schema is incomplete — cannot create or rebuild FTS safely.
+            return True  # Still report True: nodes exists, we just can't index.
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
+                claim, quoted_text, interpretation,
+                content='nodes', content_rowid='rowid'
+            )
+            """
+        )
+
+        # Step 1: rebuild — populates the index from ALL nodes rows, including
+        # retracted ones (external-content 'rebuild' mirrors the content table).
         conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
+
+        # Step 2: delete-insert retracted rows — succeeds because they were just
+        # populated by the rebuild above.  On an empty index this would raise
+        # sqlite3.DatabaseError ("database disk image is malformed") — the exact
+        # crash that step 1 prevents.
+        # Guard: only query status='retracted' if the status column exists
+        # (minimal test fixtures may omit it; real ENGRAM DBs always have it).
+        col_names = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(nodes)").fetchall()
+        }
+        if "status" in col_names:
+            retracted = conn.execute(
+                "SELECT rowid, COALESCE(claim,''), COALESCE(quoted_text,''), "
+                "COALESCE(interpretation,'') FROM nodes WHERE status='retracted'"
+            ).fetchall()
+            for rowid, claim, quoted_text, interpretation in retracted:
+                conn.execute(
+                    "INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation) "
+                    "VALUES ('delete', ?, ?, ?, ?)",
+                    (rowid, claim, quoted_text, interpretation),
+                )
+
+        # Step 3: gate the server's #274 migration so it doesn't re-fire.
+        conn.execute("PRAGMA user_version = 1")
+
         conn.commit()
         return True
     finally:

@@ -1431,6 +1431,11 @@ def _get_db() -> sqlite3.Connection:
     # The trigger above handles all retractions going forward; this migration
     # is only needed to clean up the pre-trigger state on upgrade.
     # Superseded nodes are deliberately left in the index (Lei's design call).
+    #
+    # Note: nodes_fts uses content='nodes' (external-content FTS5) with
+    # deliberate index-side deletion of retracted rows.  As a result, FTS5's
+    # 'integrity-check' command always reports "malformed" on a graph that has
+    # retractions — this is expected by design, not a sign of corruption (#781).
     current_user_version = conn.execute("PRAGMA user_version").fetchone()[0]
     if current_user_version < 1:
         try:
@@ -1446,12 +1451,18 @@ def _get_db() -> sqlite3.Connection:
                 """
             )
             # Bump version INSIDE the try block so that if the INSERT fails
-            # (OperationalError caught below), the gate stays at 0 and the
-            # migration can retry on the next startup rather than being
+            # (DatabaseError / OperationalError caught below), the gate stays at
+            # 0 and the migration can retry on the next startup rather than being
             # permanently skipped.
             conn.execute("PRAGMA user_version = 1")
-        except sqlite3.OperationalError:
-            pass  # nodes_fts not yet created — leave version at 0 for retry
+        except sqlite3.DatabaseError:
+            # Covers both sqlite3.OperationalError (nodes_fts not yet created —
+            # leave version at 0 for retry) and sqlite3.DatabaseError proper
+            # (FTS5 phantom-malformed raised when 'delete'-inserting against an
+            # empty index on a restore-from-dump path — #781).
+            # OperationalError is a subclass of DatabaseError so the single
+            # except handles both cases with unchanged retry-gate semantics.
+            pass
 
     # ── Diagnostic suite tables (append-only logs) ──────────────────────────
     # edit_history: chronological audit trail of every graph mutation.
