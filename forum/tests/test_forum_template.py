@@ -316,3 +316,35 @@ class TestAvatarFilterIsConsumed:
 
     def test_avatar_svg_differs_by_seed(self):
         assert avatar_svg("Cipher", 32) != avatar_svg("Mnemo", 32)
+
+
+class TestRemovedElementsAbsent:
+    """Regression guard for #755 slice 1 — dead elements stay removed.
+
+    Each string below was a dead interactable removed by the slice-1 cleanup
+    (EDITING functions or no-backing-data views, per #755's rule). A future
+    re-introduction should fail loudly here, not be rediscovered by a human
+    clicking a button that does nothing.
+    """
+
+    def test_new_thread_button_absent(self, app):
+        assert "+ new thread" not in render_forum(app)
+
+    def test_bookmarked_view_absent(self, app):
+        assert "Bookmarked" not in render_forum(app)
+
+    def test_active_retractions_view_absent(self, app):
+        assert "Active retractions" not in render_forum(app)
+
+    def test_unresolved_sort_button_absent(self, app):
+        # The sort segment keeps Hot/New/Most cited (slice 2 wires them);
+        # 'Unresolved' duplicated the Open-questions view and was removed.
+        assert ">Unresolved<" not in render_forum(app)
+
+    def test_post_foot_css_absent(self, app):
+        assert "post__foot" not in render_forum(app)
+
+    def test_open_questions_view_kept(self, app):
+        # Deliberately KEPT (slice 2 implements it) — guard against
+        # over-removal as much as re-introduction.
+        assert "Open questions" in render_forum(app)
