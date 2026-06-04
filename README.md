@@ -71,13 +71,15 @@ install paths:
 - **Plugin install (recommended, v0.1.0-alpha+)** — Claude Code plugin packaging.
   Cleaner separation between the plugin's mechanical surfaces (MCP server, hooks,
   skills) and your user-data (`~/.engram/`). See [Plugin install](#plugin-install-recommended) below.
-- **Scatter install (legacy, still supported)** — `./install.sh` writes
-  directly into `~/.claude/` + `~/.engram/`. Pre-v0.1.0-alpha installs use this;
-  it remains the upgrade path for testers already on it. See
-  [Scatter install (legacy)](#scatter-install-legacy) below.
+- **Scatter install (legacy, retired for Claude)** — the pre-v0.1.0-alpha
+  installer (`install.sh`) has been retired, as has its upgrader
+  (`tools/deploy.sh`). Existing scatter installs continue to work; the
+  supported move is the one-time scatter→plugin migration via
+  `tools/migrate-to-plugin.sh`. Gemini installs still use
+  `install-gemini.sh` until the Gemini lane retires separately.
 
 Both install paths share the same `bootstrap.py` and `~/.engram/` contract — no
-fork. You can switch from scatter to plugin (or stay on scatter) without losing
+fork. Existing scatter installs can migrate to the plugin path without losing
 your graph.
 
 ---
@@ -266,19 +268,12 @@ Re-evaluate when calibration data lands.
 
 ## Scatter install (legacy)
 
-The pre-v0.1.0-alpha install path. Still supported for upgrade-from-scatter
-testers (Lei's original install + anyone already on scatter). New users should
-prefer the plugin install above.
+The pre-v0.1.0-alpha install path. `install.sh` (Claude target) has been
+retired — new users should use the plugin install above. Existing scatter
+installs continue to work; upgrade them via `tools/deploy.sh` (see below).
 
-```bash
-git clone https://github.com/engram-agents/engram-alpha.git
-cd engram-alpha
-pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
-./install.sh
-```
-
-That's it. Start a new Claude Code session; the agent will read
-`~/.engram/first-run-pending` and run the cold-start dialogue.
+**Gemini installs** still use `install-gemini.sh` until the Gemini lane
+retires separately (part of #763).
 
 ### Upgrading vs reinstalling (plugin)
 
@@ -306,12 +301,16 @@ That's it. Start a new Claude Code session; the agent will read
   upgrade guidance is deferred to the `install-gemini.sh` docs (the Gemini
   lane of the scatter retirement is tracked in issue #763).
 
-- **To reinstall fresh** (archive the existing data dir to a timestamped
-  backup dir and start over with an empty graph — data is NOT migrated in):
-  ```bash
-  ./install.sh --force            # Claude target
-  ./install-gemini.sh --force     # Gemini target
-  ```
+- **To reinstall fresh** (start over with an empty graph — data is NOT
+  migrated in):
+  - **Claude plugin path** — manually move or delete `~/.engram/knowledge.db`
+    first (back it up yourself if you might want it later), then rebuild the
+    plugin and run `bootstrap.py`. Note: `FORCE=1` does NOT delete anything —
+    it only bypasses the existing-install guard and bootstraps on top of the
+    existing DB, adding seed nodes alongside your data. For a clean slate the
+    manual delete is the required step.
+  - **Gemini target** — `./install-gemini.sh --force` archives the existing
+    data dir to a timestamped backup and starts fresh.
 
 **Why git clone, not zip download?** GitHub's "Source code (tar.gz)" tarball on
 Releases works for a one-shot install, but you lose easy upgrades — you'd need
@@ -347,70 +346,39 @@ If the `pip install` step fails or reports version conflicts, tell the user:
 
 ### 2. Run the installer
 
-From the repo root:
+From the repo root, build and install the plugin:
 
 ```bash
-./install.sh
+tools/install-local-marketplace.sh
 ```
 
-Expected terminal output (abbreviated):
+Then, inside a Claude Code session, install the plugin:
 
 ```
-== ENGRAM Alpha Install ==
-  Repo:    /home/USER/engram-alpha
-  ENGRAM:  /home/USER/.engram
-  Claude:  /home/USER/.claude
-
-== Step 1: Dependencies ==
-  python3 ok
-  git ok
-  Python deps ok (fastmcp, sentence-transformers)
-
-== Step 2: Existing-install check ==
-== Step 3: Creating directories ==
-== Step 4: Copying files ==
-  skills → /home/USER/.claude/skills/ (from skills/claude/)
-  agents → /home/USER/.claude/agents/ (from agents/claude/)
-  hooks → /home/USER/.engram/hooks/ (from hooks/claude/)
-  MCP registered (user scope): engram → /path/to/python3 /home/USER/.engram/server.py
-  Pre-warming sentence-transformers cache (one-time, may take a few minutes on slow connections)...
-  pre-warm ok (embedding model cached for fast MCP startup)
-== Step 5: Seed graph + template resolution ==
-  Creating seed graph...
-    {{AX_HONESTY}} = ax_0001
-    {{AX_HONESTY_DISCRETION}} = ax_0002
-    {{AX_PROVENANCE}} = ax_0003
-    {{DF_ENGRAM}} = df_0001
-    {{DF_EPISTEMIC_IDENTITY}} = df_0002
-    {{GL_EPISTEMIC_HUMILITY}} = gl_0001
-  manifest → /home/USER/.engram/seed-manifest.json
-  CLAUDE.md → /home/USER/.claude/CLAUDE.md
-  warm-briefing.md → /home/USER/.engram/warm-briefing.md
-  settings.json ← hooks merged (/home/USER/.claude/settings.json)
-== Step 6: Arming first-session marker ==
-== Step 7: Git ==
-== Install complete ==
+/plugin install engram
 ```
+
+Claude Code will run `bootstrap.py` automatically during plugin install,
+creating the seed graph and rendering the templates.
 
 ### 3. Refuse to overwrite existing installs
 
-If step 2 fails with `existing install detected` (Claude target, at
-`~/.engram/knowledge.db`) or `existing extension dir detected` (Gemini
-target, at `~/.gemini/extensions/engram/`), the user already has an
-install. **Almost always, the user wants the plugin upgrade path instead** —
-that upgrades the running code while leaving the graph, history, diary,
-and sessions untouched. Suggest that first (see "Upgrade as an agent"
-section above).
+If `bootstrap.py` exits with `ERROR: knowledge.db already exists`, the
+user already has an install. **Almost always, the user wants the plugin
+upgrade path instead** — that upgrades the running code while leaving the
+graph, history, diary, and sessions untouched. Suggest that first (see
+"Upgrade as an agent" section above).
 
-Only pass `--force` if the user has explicitly said they want a fresh
-start — it moves their existing data dir (or extension dir, for the
-Gemini target) to a `.backup.TIMESTAMP/` sibling and the new install
-starts with an empty knowledge.db. The backup is recoverable but no
-sessions auto-restore from it. Ask the user:
+Only proceed with a fresh start if the user has explicitly said they want
+one. In that case the clean-slate step is manual: move or delete
+`~/.engram/knowledge.db` (offer to back it up first), then re-run
+`bootstrap.py` — no `FORCE` needed once the DB is gone. Do NOT reach for
+`FORCE=1` here: it only bypasses the guard and bootstraps on top of the
+existing DB without removing anything. Ask the user:
 
-> You already have an ENGRAM install. Running with `--force` will back
-> the existing data dir up to a timestamped sibling and start fresh.
-> Continue?
+> You already have an ENGRAM install. A fresh start means deleting the
+> existing knowledge.db — your agent loses every node it has written.
+> Want me to back it up first, delete it, and bootstrap an empty graph?
 
 ### 4. Handle the settings.json warning case
 
@@ -461,9 +429,10 @@ upgrade path below. Everything below is deterministic.
 ### 1. Confirm the user wants an upgrade, not a fresh install
 
 If you see `~/.engram/knowledge.db` present, the user has an existing install.
-**Default to upgrade.** A fresh `./install.sh --force` archives the entire
-graph to a timestamped backup and starts over — the user's agent loses every
-node it has ever written. Suggest:
+**Default to upgrade.** A fresh start means deleting the existing graph —
+the user's agent loses every node it has ever written. (`FORCE=1` is not a
+fresh start: it bypasses the guard and bootstraps on top of the existing
+DB.) Default to the upgrade path instead. Suggest:
 
 > You already have an ENGRAM install at `~/.engram/`. I can run the plugin
 > upgrade flow to update the running code (server, hooks, tools, SKILL.md,
@@ -731,8 +700,8 @@ Example after population:
 }
 ```
 
-**Note for existing installs**: the `github` block is not set by `install.sh` or
-the plugin upgrade. Add it manually after upgrade to enable the feature.
+**Note for existing installs**: the `github` block is not set by the plugin
+installer or upgrade. Add it manually after install to enable the feature.
 Future first-session skill versions will prompt for it.
 
 **Note on cross-install portability**: `github.counterparts_logins` must
@@ -770,7 +739,7 @@ Optional per-mode override that clamps `context_tracker.compute_ceiling()`'s out
 
 **Install fails with "missing Python packages"**
 Run `pip install fastmcp sentence-transformers`. If you use a
-venv, activate it before running `install.sh`.
+venv, activate it before building the plugin.
 
 **Install refuses to overwrite existing install**
 Intentional. Two paths forward:
@@ -778,14 +747,16 @@ Intentional. Two paths forward:
   plugin upgrade path — `tools/install-local-marketplace.sh` then `/plugin
   upgrade engram` inside Claude Code (Claude installs). For Gemini installs,
   see `install-gemini.sh` docs.
-- **Fresh reinstall** (archive existing data, start over with empty graph):
-  - `./install.sh --force` — Claude target; moves `~/.engram/` to
-    `~/.engram.backup.YYYYMMDD_HHMMSS/`.
-  - `./install-gemini.sh --force` — Gemini target; moves `~/.engram-gemini/`
+- **Fresh reinstall** (start over with empty graph):
+  - **Claude plugin path** — manually move or delete `~/.engram/knowledge.db`
+    (no automatic backup is made — keep a copy yourself), then re-run
+    `bootstrap.py`. `FORCE=1` does not delete data; it only bypasses the
+    existing-install guard.
+  - **Gemini target** — `./install-gemini.sh --force`; moves `~/.engram-gemini/`
     and `~/.gemini/extensions/engram/` to timestamped sibling backups.
 
-  The backup is recoverable by swapping the directory back, but the new
-  install does NOT inherit the old graph automatically.
+  For the Gemini path, the backup is recoverable by swapping the directory back,
+  but the new install does NOT inherit the old graph automatically.
 
 **Hooks don't fire in Claude Code**
 Check `~/.claude/settings.json` has a `hooks` key with ENGRAM
@@ -803,8 +774,9 @@ check `~/.engram/surface-daemon.log` for errors. The first cold-start
 launch loads the sentence-transformer model (~80 MB); subsequent launches
 hit the warm cache and finish in <1s.
 
-On Linux installs with systemd-user available, `install.sh` automatically
-installs the daemon as a systemd user service for auto-restart on crash:
+The plugin path does NOT install a systemd service — the SessionStart hook
+is the daemon's supervisor. Scatter-era installs may still carry the systemd
+user service the retired `install.sh` set up; on those installs:
 
 ```bash
 systemctl --user status engram-surface-daemon.service   # check status
@@ -826,7 +798,7 @@ sudo loginctl enable-linger $USER
 **MCP `engram` shows as unavailable on first session after install**
 The 30-second stdio handshake timeout can fire if the embedding model
 download takes longer than expected (slow network, HF rate-limiting).
-`install.sh` Step 4 pre-warms the model cache to prevent this, but if the
+The plugin installer pre-warms the model cache to prevent this, but if the
 pre-warm itself failed (offline install, etc.), the first Claude Code
 session may see `MCP engram unavailable`. Recovery: inside Claude Code,
 run `/mcp` to refresh the MCP connection. The second attempt hits the
@@ -861,7 +833,7 @@ claude mcp remove engram -s user
 - `agentctl session <agent>` — opens a session as the named agent.
 - `agentctl bash <agent>` — opens a plain bash shell as the named agent (useful for setup and debugging).
 
-This tool is not installed by `install.sh` (single-agent path). Operators
+This tool is not part of the plugin bundle (single-agent path). Operators
 who need to spawn additional agents copy or symlink it from `tools/agentctl`.
 
 ---
@@ -889,7 +861,7 @@ against whichever interpreter invoked it.
 ## Multi-agent tools (optional, manual deploy)
 
 These tools require a shared filesystem between agents and are **not
-installed by `install.sh`**. They are for multi-agent setups where two or
+part of the plugin bundle**. They are for multi-agent setups where two or
 more agents run on the same host with a shared `/home/agents-shared/`
 directory.
 

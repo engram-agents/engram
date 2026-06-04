@@ -72,7 +72,7 @@ template.
 
 2. **Every shippable is tagged exactly once in the manifest.** The tier map *will
    be* the single source of truth at `packaging/tiers.json`; `build-plugin.sh
-   --tier` and `install.sh --tier` *will* filter through it at **build time** (the
+   --tier` *will* filter through it at **build time** (the
    agent-led install reads the README, prompts the user for tier + multi-agent, and
    builds accordingly — no post-install pruning). **CI must fail the build if any
    shippable path is untiered or any manifest entry is dangling** — so "added a

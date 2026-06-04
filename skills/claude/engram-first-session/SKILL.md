@@ -9,10 +9,10 @@ description: Invoked on the user's very first ENGRAM session. Runs a short dialo
 
 This skill fires on the user's very first session after installing ENGRAM. Its job is to turn a cold install into a warm working relationship in one focused conversation — and (under the plugin packaging) to bootstrap `~/.engram` itself if it doesn't yet exist.
 
-**Two install paths, one skill:**
+**Two install states, one skill:**
 
-- **Scatter install** (`install.sh`): `~/.engram` already exists, seed graph + templates already rendered, `~/.engram/first-run-pending` armed. Skill runs from Step 1 (dialogue) — Steps 0/0.5/0.6 detect this and skip.
-- **Plugin install**: plugin files were copied to `~/.claude/plugins/cache/engram/` but `~/.engram` does NOT exist yet. The MCP server starts but fails LOUD on the first tool call (the actionable error message points at THIS skill). The skill runs from Step 0 to bootstrap `~/.engram` first, then continues into the dialogue.
+- **Pre-bootstrapped** (rare — e.g. a prior scatter install or a manual bootstrap): `~/.engram` already exists, seed graph + templates already rendered, `~/.engram/first-run-pending` armed. Skill runs from Step 1 (dialogue) — Steps 0/0.5/0.6 detect this and skip.
+- **Plugin install** (normal path): plugin files were copied to `~/.claude/plugins/cache/engram/` but `~/.engram` does NOT exist yet. The MCP server starts but fails LOUD on the first tool call (the actionable error message points at THIS skill). The skill runs from Step 0 to bootstrap `~/.engram` first, then continues into the dialogue.
 
 **Do NOT run this skill if** (steady-state, no bootstrap pending):
 - `~/.engram/first-run-pending` does not exist AND `~/.engram/knowledge.db` exists with seed nodes
@@ -257,7 +257,7 @@ Do this step LAST, only after the dialogue is genuinely complete. If the session
    - `{{SELF_NODE_ID}}` → the person node ID captured in Step 3 (e.g., `pn_NNNN`). To verify idempotency: if the placeholder is already resolved (no literal `{{SELF_NODE_ID}}` remains in the file), skip without error.
    - Any other `{{...}}` markers present — consult the user if ambiguous, do not guess.
 4. Write the resolved files back. Enumerate each one explicitly: `~/.claude/CLAUDE.md`, `~/.engram/warm-briefing.md`, `~/.engram/HEARTBEAT.md` (if it was present in step 5.1), `~/.engram/heartbeat-queue/README.md` (if present), `~/.claude/output-styles/proactive-with-carveouts.md` (if present — this file ships with the Proactive-with-Carveouts output style; older installs without it can skip), `~/.claude/skills/internal-external-decision/SKILL.md` (if present — same provenance), `~/.claude/skills/engram-upgrade/SKILL.md` (if present — references ask-{{USER_NAME}}.md in checkpoint + anti-pattern sections). Silent drop of any required file would leave it firing forever with raw `{{AGENT_NAME}}`/`{{USER_NAME}}`/`{{COUNTERPART_NAME}}` placeholders in the prose AND in the `to-heartbeat/to-{{COUNTERPART_NAME}}-drafts/` directory path — which would point at a literal-braces directory that never exists.
-5. **Bootstrap the ask-{{USER_NAME}}.md auto-load surface.** Run `touch "$HOME/.engram/ask-<USER_NAME>.md"` substituting the resolved user name — e.g. for USER_NAME=alice, run `touch ~/.engram/ask-alice.md`. This ensures session-start reads don't silently no-op on a fresh install before the agent has written anything. Previously bootstrapped at install.sh time as a hardcoded `ask-<user>.md` — moved here so the filename matches whatever the user's name is.
+5. **Bootstrap the ask-{{USER_NAME}}.md auto-load surface.** Run `touch "$HOME/.engram/ask-<USER_NAME>.md"` substituting the resolved user name — e.g. for USER_NAME=alice, run `touch ~/.engram/ask-alice.md`. This ensures session-start reads don't silently no-op on a fresh install before the agent has written anything. The filename matches whatever the user's name is (resolved during this dialogue, not hard-coded at install time).
 6. Delete `~/.engram/first-run-pending`.
 7. Call `engram_advance_turn(payload_json=json.dumps({"message": "First session with <USER_NAME>: named <AGENT_NAME>. Founding motivation: <one-line quote or summary>."}))` — this is a real session checkpoint (advances turn counter), not a nap. The naming event is worth a turn.
 

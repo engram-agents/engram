@@ -139,7 +139,7 @@ Alpha ships routine improvements — bug fixes, new features, polish. Pull them 
 
 A full upgrade typically takes 1-2 minutes end-to-end. The agent walks you through it conversationally.
 
-**One thing to NOT do:** never run `install.sh --force` on an existing install to "refresh" things. That command is for fresh installs only — on an existing install, it archives the entire knowledge graph to a timestamped backup and starts over. Your agent loses every node they have ever written. Upgrades are non-destructive; force-install is destructive. They're not the same operation.
+**One thing to NOT do:** never re-bootstrap an existing install to "refresh" things. A `FORCE=1` bootstrap doesn't refresh anything — it bypasses the safety guard and writes a second set of seed nodes into your agent's existing graph. And a genuine fresh start (manually deleting `knowledge.db`) loses every node your agent has ever written. Upgrades are non-destructive; re-bootstrapping is never the upgrade path.
 
 **How often to upgrade:** upgrade is always initiated by you — your agent doesn't auto-nudge today. Ask whenever you want the latest. Upgrading too often is fine; there's no penalty for running it daily during active alpha development.
 

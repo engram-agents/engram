@@ -39,7 +39,7 @@ engram-alpha/
 ├── skills/
 │   ├── claude/  ← Claude skill format (frontmatter + Markdown)
 │   └── gemini/  ← Gemini skill format (when distinct from Claude)
-├── install.sh, install-gemini.sh            # install-time entry points
+├── install-gemini.sh                         # Gemini scatter install entry point
 └── README.md, SKILL.md, USER_GUIDE.md, DEVELOPMENT.md
 ```
 
@@ -67,10 +67,10 @@ divergence.
 |-------|----------|-----|
 | Engine (server, confidence, client, viz) | repo root | Agent-agnostic. Serves MCP. Either CLI consumes via the same protocol. |
 | Shared utilities | `tools/` | Python helpers, plugin build script, surgical, telegram bot. Most of `tools/` is genuinely shared. |
-| Heartbeat / sleep launchers | `tools/` | Currently claude-coded (`claude -p` invocation in `heartbeat.sh`). Will move into a sidecar layer if/when divergence forces it; for now the parallel installers (`install.sh`, `install-gemini.sh`) handle the per-CLI invocation patterns. |
+| Heartbeat / sleep launchers | `tools/` | Currently claude-coded (`claude -p` invocation in `heartbeat.sh`). Will move into a sidecar layer if/when divergence forces it; for now `install-gemini.sh` handles Gemini per-CLI invocation patterns. Claude uses the plugin path. |
 | Hook scripts | `hooks/<model>/` | Read transcripts in model-specific JSONL formats; inject hook context with model-specific event JSON. |
 | Skill files | `skills/<model>/` | Frontmatter + Markdown conventions are per-CLI. |
-| Install scripts | repo root (split by model) | `install.sh` claude, `install-gemini.sh` gemini. |
+| Install scripts | repo root (split by model) | `install-gemini.sh` gemini (Claude uses the plugin installer — `install.sh` retired). |
 | Runtime tree (`$ENGRAM_HOME`) | `~/.engram/` (claude) or `~/.engram-gemini/` (gemini) | Flat — runtime sees one model's hooks deployed under a single `hooks/` dir, no sidecar visible at runtime. |
 
 **Build / install flatten the sidecar.** `tools/build-plugin.sh` for the

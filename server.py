@@ -1056,8 +1056,8 @@ def _db_missing_message() -> str:
     """Actionable error message when the DB file is missing.
 
     Surfaced via _get_db() raising on the first tool call when no DB exists at
-    DATA_DIR/knowledge.db. The plugin packaging never runs install.sh, so this
-    is the user's signal that engram-first-session needs to bootstrap.
+    DATA_DIR/knowledge.db. The plugin packaging has no installer-script step,
+    so this is the user's signal that engram-first-session needs to bootstrap.
     """
     engram_home_env = os.environ.get("ENGRAM_HOME", "<unset; default ~/.engram>")
     return (
@@ -1093,7 +1093,7 @@ def _get_db() -> sqlite3.Connection:
     """Get a database connection, creating tables if needed.
 
     Fails LOUD if the DB file is missing or seed-empty — the plugin packaging
-    has no install.sh-precondition, so missing DB means engram-first-session
+    has no installer-script precondition, so missing DB means engram-first-session
     needs to bootstrap (which it does via bootstrap.py, called from the skill).
     Per-call check is intentionally lazy: subsequent calls after bootstrap.py
     runs in the same session succeed without MCP restart (no /mcp dance).

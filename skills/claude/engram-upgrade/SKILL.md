@@ -192,7 +192,7 @@ engram_add_observation(payload_json=json.dumps({
 - **Running the upgrade slash-commands yourself.** `/plugin …` and `/mcp` are user actions; the agent's job is the rebuild (Step 3) and the gates.
 - **Skipping Step 6 because the template diff "looked fine."** The CLAUDE.md inverse-merge is the one place a plugin upgrade still needs judgment. If deferring, write it to the ask-user queue immediately.
 - **Building without checking the feature-set flags.** A wrong-flag build *succeeds* and silently drops surfaces (#704/#707 class). The Step 3 checkpoint exists for this.
-- **`install.sh --force` to "refresh" anything.** That archives the entire knowledge graph. It is never the upgrade path.
+- **Re-bootstrapping (`FORCE=1`) to "refresh" anything.** `FORCE=1` only bypasses the existing-install guard — bootstrap then writes seed nodes INTO the existing graph (it deletes nothing). Never the upgrade path; a true fresh start is a manual `knowledge.db` delete.
 - **Killing the MCP subprocess to "restart" it.** User-restart only.
 - **Reaching for the retired scatter path** (`tools/deploy.sh` rsync into `~/.engram/`) on a plugin install — it does not serve the plugin layout and will not update the running plugin.
 

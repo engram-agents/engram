@@ -1,7 +1,8 @@
 # agents/claude/ — canonical source for shipped Claude sub-agents
 
-This directory is the **source of truth** for sub-agent definitions that
-`install.sh` deploys to a fresh install's `~/.claude/agents/`. The alpha
+This directory is the **source of truth** for sub-agent definitions shipped
+in the plugin bundle (assembled by `tools/build-plugin.sh` per
+`packaging/tiers.json`). The alpha
 repo's own `.claude/agents/` directory contains relative symlinks
 (`../../agents/claude/<file>.md`) pointing back here, so the alpha-dev
 working copy and the shipped copy can never drift — there's only one

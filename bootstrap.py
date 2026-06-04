@@ -2,7 +2,7 @@
 """
 ENGRAM alpha bootstrap.
 
-Invoked by install.sh (TARGET=claude, default) or install-gemini.sh
+Invoked by the plugin installer (TARGET=claude, default) or install-gemini.sh
 (TARGET=gemini). Creates the seed graph (6 nodes + 2 edges) and renders
 target-specific templates with the install-time placeholders.
 
@@ -44,8 +44,8 @@ from pathlib import Path
 
 
 def _now_iso() -> str:
-    """ISO-8601 UTC timestamp for marker writes — matches install.sh's
-    `date +%Y-%m-%dT%H:%M:%S%z` shape close enough for downstream readers.
+    """ISO-8601 UTC timestamp for marker writes — same
+    `date +%Y-%m-%dT%H:%M:%S%z` shape used by downstream readers.
     """
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z")
 
@@ -64,15 +64,12 @@ ALPHA_INTEGRATIONS_DIR = (
 )
 
 # Import the server from bootstrap.py's own directory. server.py is colocated
-# with bootstrap.py in both install paths:
-#   - Scatter install: install.sh step 4 copies bootstrap.py + server.py +
-#     engram_*.py modules into $ENGRAM_HOME, then runs bootstrap.py from there.
+# with bootstrap.py in the plugin install path:
 #   - Plugin install: tools/build-plugin.sh assembles bootstrap.py + server.py
 #     + engram_*.py into the plugin tree under $CLAUDE_PLUGIN_ROOT.
-# Using __file__'s dirname keeps the import self-contained and works for
-# both install paths without depending on env-var conventions (ENGRAM_HOME
-# only happens to contain server.py in scatter mode; in plugin mode the
-# venv data dir at ~/.engram/ never gets server.py copied into it).
+# Using __file__'s dirname keeps the import self-contained without depending
+# on env-var conventions (in plugin mode the venv data dir at ~/.engram/ never
+# gets server.py copied into it).
 # ENGRAM_HOME is still read by server.py at module import (line 145) to
 # resolve DATA_DIR — that's a separate concern from where server.py lives.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -199,8 +196,11 @@ def substitute_template(
 
 def main() -> None:
     # Refuse to overwrite an existing install — defense-in-depth for the
-    # plugin path (which doesn't go through install.sh's gate at install.sh:178).
-    # FORCE=1 in env bypasses (matches install.sh --force semantics).
+    # plugin path.
+    # FORCE=1 in env bypasses the guard ONLY — it does not delete anything;
+    # bootstrap then runs on top of the existing DB (seed nodes added
+    # alongside existing data). A clean slate requires manually deleting
+    # knowledge.db first.
     db_path = ENGRAM_HOME / "knowledge.db"
     if db_path.exists():
         force = os.environ.get("FORCE", "0") == "1"
@@ -212,8 +212,9 @@ def main() -> None:
                 "    the engram-upgrade skill.\n"
                 "  - If this is an aborted prior bootstrap (verify the DB is\n"
                 "    truly empty first), delete the file and re-run.\n"
-                "  - To force a fresh-start that discards existing data,\n"
-                "    re-run with FORCE=1 in the environment."
+                "  - FORCE=1 in the environment bypasses this guard WITHOUT\n"
+                "    deleting anything (bootstrap runs on top of the existing\n"
+                "    DB). For a true fresh start, delete the file first."
             )
 
     # In plugin mode, symlink ~/.engram/tools -> <plugin-root>/tools so that
@@ -221,8 +222,8 @@ def main() -> None:
     # written for the scatter install path) keep resolving via the symlink
     # to the plugin's bundled runtime tools. Plugin upgrades auto-propagate
     # because the symlink target is the plugin cache dir.
-    # Scatter install behavior unchanged — install.sh copies tools directly
-    # into ~/.engram/tools/ at step 4.
+    # Non-plugin path: tools/ is expected to already be in $ENGRAM_HOME
+    # (e.g. via deploy.sh or a manual copy).
     #
     # Plugin detection: we use bootstrap.py's OWN dir (Path(__file__)), not
     # the CLAUDE_PLUGIN_ROOT env var. Claude Code substitutes
@@ -382,10 +383,8 @@ def main() -> None:
         print(f"  heartbeat-queue/README.md → {ENGRAM_HOME}/heartbeat-queue/README.md", flush=True)
 
     # Arm the first-run-pending marker — engram-first-session checks it to
-    # gate the cold-start dialogue. Previously written by install.sh:478
-    # AFTER bootstrap.py ran; consolidated here so the plugin-install path
-    # (which doesn't go through install.sh) also gets the marker. Single
-    # source of truth: bootstrap.py owns marker write.
+    # gate the cold-start dialogue. bootstrap.py is the single source of
+    # truth for the marker write (both plugin and any other install path).
     marker_payload = json.dumps({
         "created": _now_iso(),
         "install_path": str(ALPHA_DIR),

@@ -128,8 +128,8 @@ def test_bootstrap_refuses_overwrite_existing_db():
     """bootstrap.py with an existing knowledge.db raises SystemExit unless FORCE=1.
 
     Origin: PR #577 added the refuse-overwrite gate as defense-in-depth for
-    the plugin path (install.sh has the same gate at install.sh:178). This
-    test guards the gate itself.
+    the plugin path (the retired scatter installer carried the same gate).
+    This test guards the gate itself.
     """
     workdir = Path(tempfile.mkdtemp(prefix="engram_bootstrap_refuse_"))
     try:
@@ -160,6 +160,78 @@ def test_bootstrap_refuses_overwrite_existing_db():
         assert result.returncode != 0
         # The actionable message points the user at recovery paths.
         assert "refuses to overwrite" in result.stderr or "refuses to overwrite" in result.stdout
+
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_bootstrap_force_preserves_existing_data():
+    """FORCE=1 bypasses the guard WITHOUT deleting the existing DB.
+
+    Pins the actual FORCE=1 semantics so docs can't drift: bootstrap with
+    FORCE=1 runs on top of the existing knowledge.db — pre-existing tables
+    and rows survive, seed nodes are added alongside. FORCE=1 is neither
+    an archive (the retired install.sh --force archived the data dir) nor
+    a discard; a true clean slate requires manually deleting knowledge.db.
+    Origin: PR-C review of the scatter-retirement EPIC — two successive doc
+    sweeps mislabeled FORCE=1 ("archives" → "discards") because neither was
+    pinned by a behavioral test.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="engram_bootstrap_force_"))
+    try:
+        engram_home = workdir / ".engram"
+        engram_home.mkdir(parents=True)
+        # Plant a REAL sqlite DB with a sentinel table + row, so we can
+        # assert survival after the FORCE=1 bootstrap.
+        db_path = engram_home / "knowledge.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE sentinel_pre_force (note TEXT)")
+        conn.execute(
+            "INSERT INTO sentinel_pre_force VALUES ('planted-before-force')"
+        )
+        conn.commit()
+        conn.close()
+
+        env = os.environ.copy()
+        env.update({
+            "ALPHA_DIR": str(REPO_ROOT),
+            "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "templates"),
+            "ENGRAM_HOME": str(engram_home),
+            "CLAUDE_HOME": str(workdir / ".claude"),
+            "PYTHON_BIN": sys.executable,
+            "TARGET": "claude",
+            "FORCE": "1",
+        })
+
+        result = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "bootstrap.py")],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, (
+            f"FORCE=1 bootstrap failed:\nstdout={result.stdout}\n"
+            f"stderr={result.stderr}"
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            # The pre-existing data SURVIVED — FORCE=1 deleted nothing.
+            row = conn.execute("SELECT note FROM sentinel_pre_force").fetchone()
+            assert row == ("planted-before-force",), (
+                "pre-existing data should survive FORCE=1 bootstrap"
+            )
+            # Seed nodes were added ALONGSIDE the surviving data.
+            axiom_count = conn.execute(
+                "SELECT COUNT(*) FROM nodes WHERE type='axiom'"
+            ).fetchone()[0]
+            assert axiom_count >= 3, (
+                f"expected seed axioms added alongside existing data, "
+                f"got {axiom_count}"
+            )
+        finally:
+            conn.close()
 
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
