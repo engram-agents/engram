@@ -28,6 +28,20 @@ import types
 
 import pytest
 
+# ---------------------------------------------------------------------------
+# Guard: skip all tests on hosts without the sqlite3 CLI.
+# cmd_scope_export calls cmd_init, which runs scripts/dump.sh — that script
+# shells out to the sqlite3 binary (engram-pkg:196-199).  Without the binary,
+# every test that calls _scope_export() fails with a SystemExit from
+# engram-pkg:366.  Interim skip until the pure-Python template port lands
+# (part of #799).
+# ---------------------------------------------------------------------------
+requires_sqlite3_cli = pytest.mark.skipif(
+    shutil.which("sqlite3") is None,
+    reason="engram-pkg templates shell out to the sqlite3 CLI (#799); interim skip until the pure-Python port",
+)
+pytestmark = requires_sqlite3_cli
+
 # Ensure repo root is on path so we can import server + the CLI module.
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
