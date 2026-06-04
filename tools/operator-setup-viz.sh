@@ -3,8 +3,8 @@
 # systemd user service (systemctl --user), owned by and running as the human
 # operator.
 #
-# This replaces the legacy system-level engram-viz.service (which ran as
-# agent-borges and could not write peer agents' configs). The --user service
+# This replaces the legacy system-level engram-viz.service (which ran as a
+# system account and could not write per-operator configs). The --user service
 # runs under the operator's own UID so config writes work without extra
 # privilege delegation.
 #

@@ -173,3 +173,25 @@ def select_shippables(
             continue
         result.append(entry)
     return result
+
+
+def get_identity_coupled_paths(manifest: dict[str, Any]) -> set[str]:
+    """Return the set of paths that have identity_coupled=true.
+
+    Used by the tag-once gate test and build validation.
+
+    Parameters
+    ----------
+    manifest:
+        Parsed tiers.json dict (from load_manifest).
+
+    Returns
+    -------
+    set[str]
+        Paths with identity_coupled=true.
+    """
+    return {
+        entry["path"]
+        for entry in manifest["mechanisms"]
+        if entry.get("identity_coupled") is True
+    }

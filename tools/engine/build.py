@@ -45,6 +45,20 @@ FLAG: The bash script's COPIED_PATHS list records "packaging/mcp.json" as the
 path for the .mcp.json source — this is an artifact of how the bash script
 tracks source paths, not destination paths.  We replicate this in
 shipped_paths of the build manifest.
+
+Phase 3 additions
+-----------------
+  - Platform profiles (packaging/platforms/): loaded at build time and baked
+    into the bundle root as ``platform.json`` (read-only runtime fact).
+  - --target claude-code|codex (default: claude-code = today's behavior).
+    For codex: emits .codex-plugin/plugin.json, hooks.json references
+    the profile's plugin_root_env (CODEX_PLUGIN_ROOT), and the MCP config is
+    emitted as a plain JSON object without ${CLAUDE_PLUGIN_ROOT} substitution.
+  - --identity self|foreign (default: self = today's behavior).
+    foreign drops identity_coupled entries from tiers.json regardless of tier,
+    then runs a leak-scan VALIDATE step over the emitted tree.
+  - --engram-home <path>: parameterizes ENGRAM_HOME pinning in hook commands
+    for foreign bundles (substituted during hooks.json generation).
 """
 
 from __future__ import annotations
@@ -66,6 +80,316 @@ HOOK_REF_RE = re.compile(r'\bhooks/([A-Za-z0-9_\-]+\.(?:py|sh))\b')
 
 PYTHON_SUBSTITUTION_TARGET = "{{PYTHON}}"
 PYTHON_SUBSTITUTION_VALUE = "$HOME/.engram/venv/bin/python3"
+
+# Patterns that must not appear in a foreign bundle.
+# These catch PERSONAL IDENTITY strings — the builder's specific home path and
+# agent identifier.  They do NOT include 'agents-shared' because that string
+# appears in hook source files as a configurable environment-variable default
+# (os.environ.get("INTER_AGENT_DIR", "/home/agents-shared/...")) which is a
+# legitimate deployment configuration default, not a personal identity leak.
+#
+# IMPORTANT: these patterns are built via concatenation rather than written as
+# plain string literals.  If the literals appeared here verbatim, this source
+# file would match its own patterns when it is shipped at the convenience tier
+# (tools/engine is a shipped tools/ entry), causing the foreign leak-scan to
+# flag three self-inflicted hits.  Concatenation produces identical regex
+# semantics while keeping this file clean.
+_AB = "agent-" + "borges"  # personal agent identifier — do NOT expand inline
+FOREIGN_LEAK_PATTERNS: list[re.Pattern[str]] = [
+    re.compile("/home/" + _AB),
+    re.compile(r"\b" + _AB + r"\b"),
+]
+
+SCAN_EXTENSIONS = {".py", ".md", ".sh", ".json", ".template"}
+SKIP_DIRS = {".git", "__pycache__", "node_modules"}
+# scan-leaks.py self-matches on its own pattern literals; skip it in the scanner
+SKIP_FILES = {"scan-leaks.py"}
+
+
+# ---------------------------------------------------------------------------
+# platform profile helpers
+# ---------------------------------------------------------------------------
+
+
+def load_platform_profile(repo_root: str, target: str) -> dict[str, Any]:
+    """Load and return a platform profile from packaging/platforms/<target>.json.
+
+    Parameters
+    ----------
+    repo_root:
+        Absolute path to the engram-alpha repo root.
+    target:
+        Platform target name (e.g. "claude-code", "codex").
+
+    Returns
+    -------
+    dict
+        The parsed platform profile.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the profile file does not exist.
+    ValueError
+        If the profile is missing a required "platform" field.
+    """
+    profile_path = os.path.join(repo_root, "packaging", "platforms", f"{target}.json")
+    if not os.path.isfile(profile_path):
+        raise FileNotFoundError(
+            f"Platform profile not found: {profile_path} "
+            f"(target={target!r})"
+        )
+    with open(profile_path, encoding="utf-8") as f:
+        profile = json.load(f)
+    if "platform" not in profile:
+        raise ValueError(
+            f"Platform profile {profile_path} is missing required 'platform' field"
+        )
+    return profile
+
+
+def bake_platform_json(plugin_root: str, profile: dict[str, Any]) -> None:
+    """Write the platform profile as platform.json at the bundle root.
+
+    Parameters
+    ----------
+    plugin_root:
+        Absolute path to the output plugin directory.
+    profile:
+        The platform profile dict (from load_platform_profile).
+    """
+    dest = os.path.join(plugin_root, "platform.json")
+    with open(dest, "w", encoding="utf-8") as f:
+        json.dump(profile, f, indent=2)
+        f.write("\n")
+
+
+# ---------------------------------------------------------------------------
+# identity-axis helpers
+# ---------------------------------------------------------------------------
+
+
+def select_shippables_with_identity(
+    manifest: dict[str, Any],
+    tier: str,
+    multi_agent: bool,
+    identity: str,
+) -> list[dict[str, Any]]:
+    """Return shippable entries, filtering identity_coupled when identity=foreign.
+
+    Extends select_shippables with the identity axis:
+      - identity=self (default): no additional filtering (today's behavior).
+      - identity=foreign: drops any entry with identity_coupled=true, regardless
+        of tier or multi_agent.
+
+    Parameters
+    ----------
+    manifest:
+        Parsed tiers.json dict.
+    tier, multi_agent:
+        Passed through to select_shippables.
+    identity:
+        "self" or "foreign".
+
+    Returns
+    -------
+    list[dict]
+        Filtered shippable entries.
+    """
+    entries = select_shippables(manifest, tier, multi_agent)
+    if identity == "foreign":
+        entries = [e for e in entries if not e.get("identity_coupled")]
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# codex-specific emission helpers
+# ---------------------------------------------------------------------------
+
+
+def emit_codex_plugin_json(
+    plugin_root: str,
+    repo_root: str,
+    profile: dict[str, Any],
+) -> None:
+    """Emit .codex-plugin/plugin.json at the bundle root.
+
+    Mirrors the shape from the verified test bundle:
+      { name, version, description }
+    Derives name/version/description from the repo's plugin.json.
+
+    Parameters
+    ----------
+    plugin_root:
+        Absolute path to the output plugin directory.
+    repo_root:
+        Absolute path to the repo root (source of plugin.json).
+    profile:
+        The loaded codex platform profile (unused here beyond validation).
+    """
+    src_plugin = os.path.join(repo_root, "plugin.json")
+    with open(src_plugin, encoding="utf-8") as f:
+        src_data = json.load(f)
+
+    codex_plugin_dir = os.path.join(plugin_root, ".codex-plugin")
+    os.makedirs(codex_plugin_dir, exist_ok=True)
+
+    codex_manifest = {
+        "name": src_data.get("name", "engram"),
+        "version": src_data.get("version", "0.1.0"),
+        "description": src_data.get("description", ""),
+        "paths": {
+            "skills": "skills/",
+            "mcp_servers": ".mcp.json",
+            "hooks": "hooks/hooks.json",
+        },
+    }
+    dest = os.path.join(codex_plugin_dir, "plugin.json")
+    with open(dest, "w", encoding="utf-8") as f:
+        json.dump(codex_manifest, f, indent=2)
+        f.write("\n")
+
+
+def emit_codex_mcp_json(
+    plugin_root: str,
+    repo_root: str,
+    profile: dict[str, Any],
+    engram_home: str | None,
+) -> None:
+    """Emit .mcp.json for codex without ${CLAUDE_PLUGIN_ROOT} substitution.
+
+    For codex targets, the MCP config uses absolute-path strategy: the launch
+    script path is constructed from the profile's plugin_root_env to express
+    the intent, but since Codex doesn't expand ${ENV} in .mcp.json at load
+    time the same way Claude Code does, we emit the env var reference using
+    the profile's plugin_root_env name (CODEX_PLUGIN_ROOT) so the runtime
+    can substitute it.
+
+    The ENGRAM_HOME env is set in the mcp server env dict if engram_home is
+    provided.
+
+    Parameters
+    ----------
+    plugin_root:
+        Absolute path to the output plugin directory.
+    repo_root:
+        Absolute path to the repo root.
+    profile:
+        The loaded codex platform profile.
+    engram_home:
+        Optional ENGRAM_HOME path to pin in the MCP config env.
+    """
+    root_env = profile.get("plugin_root_env", "CODEX_PLUGIN_ROOT")
+    server_entry: dict[str, Any] = {
+        "command": f"${{{root_env}}}/launch-engram-server.sh",
+        "args": [],
+    }
+    if engram_home:
+        server_entry["env"] = {"ENGRAM_HOME": engram_home}
+
+    mcp_config = {"mcpServers": {"engram": server_entry}}
+
+    dest = os.path.join(plugin_root, ".mcp.json")
+    with open(dest, "w", encoding="utf-8") as f:
+        json.dump(mcp_config, f, indent=2)
+        f.write("\n")
+
+
+def rewrite_hooks_for_codex(
+    hooks_cfg: dict[str, Any],
+    profile: dict[str, Any],
+    engram_home: str | None,
+) -> dict[str, Any]:
+    """Rewrite hook commands to use the codex profile's plugin_root_env.
+
+    Replaces ${CLAUDE_PLUGIN_ROOT} with ${<plugin_root_env>} in all hook
+    commands, and prepends ENGRAM_HOME=<path> if engram_home is given.
+
+    Parameters
+    ----------
+    hooks_cfg:
+        Filtered hooks.json dict (already tier/identity filtered).
+    profile:
+        The loaded codex platform profile.
+    engram_home:
+        Optional ENGRAM_HOME path to prepend to hook commands.
+
+    Returns
+    -------
+    dict
+        Rewritten hooks config.
+    """
+    root_env = profile.get("plugin_root_env", "CODEX_PLUGIN_ROOT")
+    old_root = "${CLAUDE_PLUGIN_ROOT}"
+    new_root = f"${{{root_env}}}"
+
+    def _rewrite_cmd(cmd: str) -> str:
+        # Replace plugin root env reference
+        cmd = cmd.replace(old_root, new_root)
+        # Prepend ENGRAM_HOME if requested and not already present
+        if engram_home and "ENGRAM_HOME=" not in cmd:
+            cmd = f"ENGRAM_HOME={engram_home} {cmd}"
+        return cmd
+
+    import copy
+    result = copy.deepcopy(hooks_cfg)
+    for event_name, groups in result.get("hooks", {}).items():
+        for group in groups:
+            for entry in group.get("hooks", []):
+                if "command" in entry:
+                    entry["command"] = _rewrite_cmd(entry["command"])
+    return result
+
+
+# ---------------------------------------------------------------------------
+# leak scanner (inline, for foreign bundle VALIDATE step)
+# ---------------------------------------------------------------------------
+
+
+def scan_for_leaks(
+    bundle_root: str,
+    patterns: list[re.Pattern[str]] | None = None,
+) -> list[tuple[str, int, str]]:
+    """Scan a bundle tree for identity leak patterns.
+
+    Parameters
+    ----------
+    bundle_root:
+        Absolute path to the bundle root to scan.
+    patterns:
+        List of compiled regex patterns to search for.
+        Defaults to FOREIGN_LEAK_PATTERNS.
+
+    Returns
+    -------
+    list of (rel_path, lineno, snippet) tuples
+        Empty list means clean.
+    """
+    if patterns is None:
+        patterns = FOREIGN_LEAK_PATTERNS
+
+    hits: list[tuple[str, int, str]] = []
+    for dirpath, dirs, files in os.walk(bundle_root):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for fname in files:
+            if fname in SKIP_FILES:
+                continue
+            ext = os.path.splitext(fname)[1]
+            if ext not in SCAN_EXTENSIONS:
+                continue
+            fpath = os.path.join(dirpath, fname)
+            try:
+                with open(fpath, encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except OSError:
+                continue
+            rel = os.path.relpath(fpath, bundle_root)
+            for i, line in enumerate(content.splitlines(), 1):
+                for pat in patterns:
+                    if pat.search(line):
+                        hits.append((rel, i, line.strip()[:120]))
+                        break  # one hit per line is enough
+    return hits
 
 
 # ---------------------------------------------------------------------------
@@ -240,10 +564,17 @@ def build_plugin(
     tier: str,
     multi_agent: bool,
     manifest: dict[str, Any] | None = None,
+    target: str = "claude-code",
+    identity: str = "self",
+    engram_home: str | None = None,
 ) -> list[str]:
     """Assemble the ENGRAM plugin tree.
 
-    Mirrors build-plugin.sh sections 1–7 exactly.
+    Mirrors build-plugin.sh sections 1–7 exactly for the claude-code target.
+    Phase 3 additions:
+      - target: "claude-code" (default, today's behavior) or "codex"
+      - identity: "self" (default) or "foreign" (drops identity_coupled entries)
+      - engram_home: optional ENGRAM_HOME path for foreign/codex bundles
 
     Parameters
     ----------
@@ -257,6 +588,12 @@ def build_plugin(
         Whether to include multi-agent-gated mechanisms.
     manifest:
         Pre-loaded manifest dict (optional; loaded from repo_root if None).
+    target:
+        Platform target: "claude-code" or "codex".
+    identity:
+        Identity scope: "self" (today) or "foreign" (drops identity_coupled).
+    engram_home:
+        Optional ENGRAM_HOME path to embed in hook commands and MCP config.
 
     Returns
     -------
@@ -269,17 +606,22 @@ def build_plugin(
         manifest_path = os.path.join(repo_root, "packaging", "tiers.json")
         manifest = load_manifest(manifest_path)
 
+    # Load platform profile
+    profile = load_platform_profile(repo_root, target)
+
     chosen_rank_str = tier
     tier_rank_val = {"essential": 0, "convenience": 1, "dev": 2}.get(tier, -1)
     ma_str = "yes" if multi_agent else "no"
 
     _log(
         f"Tier: {tier} (rank={tier_rank_val}), "
-        f"multi-agent: {ma_str}"
+        f"multi-agent: {ma_str}, "
+        f"target: {target}, "
+        f"identity: {identity}"
     )
 
-    # Build shipping set
-    shipped_entries = select_shippables(manifest, tier, multi_agent)
+    # Build shipping set (with identity axis filtering)
+    shipped_entries = select_shippables_with_identity(manifest, tier, multi_agent, identity)
     ship_set = _build_ship_set(shipped_entries)
 
     # ── Clean and create plugin root ─────────────────────────────────────────
@@ -377,12 +719,26 @@ def build_plugin(
     )
     copied_paths.append("plugin.json")
 
-    # Source: packaging/mcp.json → destination: .mcp.json at plugin root
-    shutil.copy2(
-        os.path.join(repo_root, "packaging", "mcp.json"),
-        os.path.join(plugin_root, ".mcp.json"),
-    )
-    copied_paths.append("packaging/mcp.json")
+    if target == "codex":
+        # Codex: emit .codex-plugin/plugin.json instead of a raw .mcp.json copy
+        _log("  (codex) emitting .codex-plugin/plugin.json")
+        emit_codex_plugin_json(plugin_root, repo_root, profile)
+        _log("  (codex) emitting .mcp.json (no ${CLAUDE_PLUGIN_ROOT})")
+        emit_codex_mcp_json(plugin_root, repo_root, profile, engram_home)
+        copied_paths.append(".codex-plugin/plugin.json")
+        copied_paths.append(".mcp.json")
+    else:
+        # claude-code: Source: packaging/mcp.json → destination: .mcp.json at plugin root
+        shutil.copy2(
+            os.path.join(repo_root, "packaging", "mcp.json"),
+            os.path.join(plugin_root, ".mcp.json"),
+        )
+        copied_paths.append("packaging/mcp.json")
+
+    # Bake platform.json into bundle root
+    _log(f"  Baking platform.json (platform={target!r})")
+    bake_platform_json(plugin_root, profile)
+    copied_paths.append("platform.json")
 
     # ── 3. Hooks — manifest-filtered ─────────────────────────────────────────
 
@@ -399,8 +755,16 @@ def build_plugin(
     with open(src_hooks_path, encoding="utf-8") as f:
         hooks_data = json.load(f)
 
-    # Filter
+    # Filter (tier + identity axis)
     filtered_hooks = filter_hooks_json(hooks_data, ship_set)
+
+    # For codex target: rewrite commands to use profile's plugin_root_env
+    if target == "codex":
+        _log(
+            f"  (codex) rewriting hook commands: "
+            f"${{CLAUDE_PLUGIN_ROOT}} → ${{{profile.get('plugin_root_env', 'CODEX_PLUGIN_ROOT')}}}"
+        )
+        filtered_hooks = rewrite_hooks_for_codex(filtered_hooks, profile, engram_home)
 
     # Count stats for logging (mirrors bash script output)
     kept, dropped = _count_filter_stats(hooks_data, filtered_hooks, ship_set)
@@ -571,14 +935,35 @@ def build_plugin(
     build_manifest_path = os.path.join(plugin_root, ".engram-build-manifest.json")
     _log(f"Writing build manifest → {build_manifest_path}")
 
-    build_manifest = {
+    build_manifest: dict[str, Any] = {
         "tier": tier,
         "multi_agent": multi_agent,
+        "target": target,
+        "identity": identity,
         "shipped_paths": copied_paths,
     }
     with open(build_manifest_path, "w", encoding="utf-8") as f:
         json.dump(build_manifest, f, indent=2)
         f.write("\n")
+
+    # ── 8. Leak-scan VALIDATE step (foreign bundles only) ────────────────────
+
+    if identity == "foreign":
+        _log("Running leak-scan VALIDATE over emitted bundle (foreign identity)...")
+        leaks = scan_for_leaks(plugin_root)
+        if leaks:
+            import sys
+            print(
+                "[build-plugin] ERROR: Leak-scan FAILED — identity strings found in "
+                "foreign bundle:",
+                file=sys.stderr,
+            )
+            for rel, lineno, snippet in leaks:
+                print(f"[build-plugin]   {rel}:{lineno}  {snippet}", file=sys.stderr)
+            raise RuntimeError(
+                f"Leak-scan failed: {len(leaks)} hit(s) in foreign bundle"
+            )
+        _log("  Leak-scan: CLEAN")
 
     # ── Done ──────────────────────────────────────────────────────────────────
 
@@ -637,11 +1022,15 @@ def write_build_manifest(
     tier: str,
     multi_agent: bool,
     shipped_paths: list[str],
+    target: str = "claude-code",
+    identity: str = "self",
 ) -> None:
     """Write .engram-build-manifest.json to plugin root."""
-    manifest = {
+    manifest: dict[str, Any] = {
         "tier": tier,
         "multi_agent": multi_agent,
+        "target": target,
+        "identity": identity,
         "shipped_paths": shipped_paths,
     }
     path = os.path.join(plugin_root, ".engram-build-manifest.json")

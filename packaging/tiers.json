@@ -288,25 +288,30 @@
     },
     {
       "path": "hooks/claude/engram-github-notifications-hook.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "identity_coupled": true
     },
     {
       "path": "hooks/claude/engram-end-of-day-hook.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "identity_coupled": true
     },
     {
       "path": "hooks/claude/engram-inter-agent-prompt-hook.py",
       "tier": "convenience",
-      "multi_agent": true
+      "multi_agent": true,
+      "identity_coupled": true
     },
     {
       "path": "hooks/claude/engram-baton-prompt-hook.py",
       "tier": "convenience",
-      "multi_agent": true
+      "multi_agent": true,
+      "identity_coupled": true
     },
     {
       "path": "hooks/claude/engram-forum-prompt-hook.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "identity_coupled": true
     },
     {
       "path": "hooks/claude/engram-time-bar-hook.py",
@@ -534,10 +539,6 @@
     {
       "path": "tools/test_migrate_to_plugin.sh",
       "reason": "test file for tools/migrate-to-plugin.sh — CI tooling only, never ships"
-    },
-    {
-      "path": "tools/build-plugin-legacy.sh",
-      "reason": "legacy build script preserved verbatim as golden equivalence test fixture (golden tests compare its output against the engine CLI); deleted after engine soak period (tracked in #791)"
     }
   ]
 }

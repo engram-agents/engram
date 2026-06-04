@@ -10,8 +10,8 @@
 #   --output <DIR>                        override output directory
 #   --help / -h                           show help and exit
 #
-# The legacy script is preserved verbatim at tools/build-plugin-legacy.sh
-# as a test fixture (golden equivalence tests use it).
+# The engine is now the sole implementation; the legacy bash script and
+# golden equivalence tests were retired when the engine graduated.
 #
 # Run from the repo root (engram-alpha/).
 

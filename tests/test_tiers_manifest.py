@@ -310,3 +310,47 @@ def test_manifest_has_required_top_level_fields():
     assert not missing, (
         f"packaging/tiers.json is missing required top-level fields: {sorted(missing)}"
     )
+
+
+def test_identity_coupled_flag_is_bool_when_present():
+    """mechanisms[].identity_coupled, when present, must be a JSON boolean.
+
+    Tag-once gate extension for the identity axis (#778/#791).
+    """
+    manifest = _load_manifest()
+    bad: list[str] = []
+    for entry in manifest["mechanisms"]:
+        if "identity_coupled" in entry:
+            if not isinstance(entry["identity_coupled"], bool):
+                bad.append(entry["path"])
+
+    assert not bad, (
+        "packaging/tiers.json entries with non-boolean identity_coupled field:\n"
+        + "\n".join(f"  {p}" for p in sorted(bad))
+    )
+
+
+def test_identity_coupled_hooks_are_known():
+    """The 5 identity-coupled hooks from spec #778 must all be tagged identity_coupled=true.
+
+    Ensures the tag-once gate covers the load-bearing set.
+    """
+    manifest = _load_manifest()
+    ic_paths = {
+        entry["path"]
+        for entry in manifest["mechanisms"]
+        if entry.get("identity_coupled") is True
+    }
+
+    expected = {
+        "hooks/claude/engram-baton-prompt-hook.py",
+        "hooks/claude/engram-inter-agent-prompt-hook.py",
+        "hooks/claude/engram-forum-prompt-hook.py",
+        "hooks/claude/engram-github-notifications-hook.py",
+        "hooks/claude/engram-end-of-day-hook.py",
+    }
+    missing = expected - ic_paths
+    assert not missing, (
+        "Expected identity_coupled=true on these hooks per spec #778, but it is missing:\n"
+        + "\n".join(f"  {p}" for p in sorted(missing))
+    )

@@ -2,12 +2,15 @@
 
 Usage:
     python3 -m tools.engine.cli build [--tier T] [--multi-agent] [--output DIR]
+                                      [--target <claude-code|codex>]
+                                      [--identity <self|foreign>]
+                                      [--engram-home PATH]
     python3 -m tools.engine.cli plan <flow>
     python3 -m tools.engine.cli run <flow> [--ack-changeset] [--allow-branch]
     python3 -m tools.engine.cli doctor
 
 Subcommands:
-    build   — assemble the ENGRAM Claude Code plugin tree (Phase 1)
+    build   — assemble the ENGRAM plugin tree (Phase 1–3)
     plan    — print the step DAG + current check() state for a flow
     run     — execute a flow until DONE / PAUSED / FAILED
     doctor  — run verify() on every step and print a health table
@@ -21,6 +24,9 @@ Flag-compatible with tools/build-plugin.sh (build subcommand):
     --tier <essential|convenience|dev>   depth tier (default: manifest's default_tier)
     --multi-agent                         include multi-agent-gated mechanisms
     --output <DIR>                        output directory (default: build/plugin)
+    --target <claude-code|codex>          platform target (default: claude-code)
+    --identity <self|foreign>             identity scope (default: self)
+    --engram-home <PATH>                  ENGRAM_HOME path for foreign/codex bundles
     --help / -h                           show help and exit
 
 Must be run from the repo root (the directory containing server.py).
@@ -73,6 +79,25 @@ def build_command(args: list[str]) -> int:
         metavar="DIR",
         help="Output directory (default: build/plugin)",
     )
+    parser.add_argument(
+        "--target",
+        default="claude-code",
+        metavar="TARGET",
+        help="Platform target: claude-code (default) or codex",
+    )
+    parser.add_argument(
+        "--identity",
+        default="self",
+        metavar="IDENTITY",
+        help="Identity scope: self (default) or foreign",
+    )
+    parser.add_argument(
+        "--engram-home",
+        dest="engram_home",
+        default=None,
+        metavar="PATH",
+        help="ENGRAM_HOME path to embed in hook commands and MCP config",
+    )
     parser.add_argument("--help", "-h", action="store_true")
 
     parsed, unknown = parser.parse_known_args(args)
@@ -89,17 +114,24 @@ def build_command(args: list[str]) -> int:
         print(
             "Usage: python3 -m tools.engine.cli build "
             "[--tier <essential|convenience|dev>] [--multi-agent] [--output DIR]\n"
+            "       [--target <claude-code|codex>] [--identity <self|foreign>]\n"
+            "       [--engram-home PATH]\n"
             "\n"
-            "Assembles the ENGRAM Claude Code plugin tree.\n"
+            "Assembles the ENGRAM plugin tree.\n"
             "\n"
             "Options:\n"
-            "  --tier <tier>    Depth tier to build: essential, convenience, or dev.\n"
-            "                   Default: the manifest's default_tier (convenience).\n"
-            "                   Cumulative: dev includes convenience includes essential.\n"
-            "  --multi-agent    Include multi-agent-gated mechanisms (baton, letter, forum\n"
-            "                   coordination hooks, inter-agent tools). Off by default.\n"
-            "  --output <DIR>   Output directory. Default: build/plugin\n"
-            "  --help           Show this help message and exit.\n"
+            "  --tier <tier>       Depth tier to build: essential, convenience, or dev.\n"
+            "                      Default: the manifest's default_tier (convenience).\n"
+            "                      Cumulative: dev includes convenience includes essential.\n"
+            "  --multi-agent       Include multi-agent-gated mechanisms (baton, letter, forum\n"
+            "                      coordination hooks, inter-agent tools). Off by default.\n"
+            "  --output <DIR>      Output directory. Default: build/plugin\n"
+            "  --target <TARGET>   Platform target: claude-code (default) or codex.\n"
+            "  --identity <scope>  Identity scope: self (default) or foreign.\n"
+            "                      foreign drops identity_coupled entries and runs a\n"
+            "                      leak-scan over the emitted bundle.\n"
+            "  --engram-home PATH  ENGRAM_HOME path to embed in hook commands and MCP config.\n"
+            "  --help              Show this help message and exit.\n"
             "\n"
             "Tier filtering uses packaging/tiers.json as the single source of truth.\n"
             "The build manifest is written to <output>/.engram-build-manifest.json.\n"
@@ -109,6 +141,26 @@ def build_command(args: list[str]) -> int:
             "Re-running is safe: the output tree is cleaned and rebuilt each time."
         )
         return 0
+
+    # Validate --target
+    valid_targets = {"claude-code", "codex"}
+    if parsed.target not in valid_targets:
+        print(
+            f"[build-plugin] ERROR: Unknown --target {parsed.target!r}. "
+            f"Valid targets: {', '.join(sorted(valid_targets))}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Validate --identity
+    valid_identities = {"self", "foreign"}
+    if parsed.identity not in valid_identities:
+        print(
+            f"[build-plugin] ERROR: Unknown --identity {parsed.identity!r}. "
+            f"Valid values: {', '.join(sorted(valid_identities))}",
+            file=sys.stderr,
+        )
+        return 1
 
     # Repo root guard: must be run from a directory containing server.py
     repo_root = os.getcwd()
@@ -151,6 +203,9 @@ def build_command(args: list[str]) -> int:
             tier=tier,
             multi_agent=multi_agent,
             manifest=manifest,
+            target=parsed.target,
+            identity=parsed.identity,
+            engram_home=parsed.engram_home,
         )
     except RuntimeError as e:
         # build_plugin already printed the error message

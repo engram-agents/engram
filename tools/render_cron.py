@@ -47,6 +47,7 @@ assertions (S4 from the 2026-05-05 PR review).
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -214,7 +215,7 @@ def _self_check() -> int:
         "sleep_hour": 20, "sleep_minute": 30,
         "sleep_protected_window_minutes": 60,
     }
-    out = render_heartbeat_lines(cadence, "/home/agent-borges/.engram")
+    out = render_heartbeat_lines(cadence, os.path.expanduser("~/.engram"))
     lines = out.split("\n")
     assert "0 0-19,22-23 * * *" in lines[0], f"line 0 expected '0 0-19,22-23', got: {lines[0]!r}"
     assert "30 0-19,21-23 * * *" in lines[1], f"line 1 expected '30 0-19,21-23', got: {lines[1]!r}"
