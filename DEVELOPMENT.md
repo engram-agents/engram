@@ -32,7 +32,7 @@ the layered-sidecar design Lei + Borges agreed on 2026-05-04:
 ```
 engram-alpha/
 ├── server.py, engram_*.py, viz_server.py    # engine — agent-agnostic
-├── tools/                                   # shared utilities + deploy.sh
+├── tools/                                   # shared utilities + build-plugin.sh
 ├── hooks/
 │   ├── claude/  ← Claude Code hooks (transcript paths + event JSON)
 │   └── gemini/  ← Gemini-CLI hooks (mirror or sidecar versions)
@@ -66,18 +66,18 @@ divergence.
 | Layer | Location | Why |
 |-------|----------|-----|
 | Engine (server, confidence, client, viz) | repo root | Agent-agnostic. Serves MCP. Either CLI consumes via the same protocol. |
-| Shared utilities | `tools/` | Python helpers, deploy script, surgical, telegram bot. Most of `tools/` is genuinely shared. |
+| Shared utilities | `tools/` | Python helpers, plugin build script, surgical, telegram bot. Most of `tools/` is genuinely shared. |
 | Heartbeat / sleep launchers | `tools/` | Currently claude-coded (`claude -p` invocation in `heartbeat.sh`). Will move into a sidecar layer if/when divergence forces it; for now the parallel installers (`install.sh`, `install-gemini.sh`) handle the per-CLI invocation patterns. |
 | Hook scripts | `hooks/<model>/` | Read transcripts in model-specific JSONL formats; inject hook context with model-specific event JSON. |
 | Skill files | `skills/<model>/` | Frontmatter + Markdown conventions are per-CLI. |
 | Install scripts | repo root (split by model) | `install.sh` claude, `install-gemini.sh` gemini. |
 | Runtime tree (`$ENGRAM_HOME`) | `~/.engram/` (claude) or `~/.engram-gemini/` (gemini) | Flat — runtime sees one model's hooks deployed under a single `hooks/` dir, no sidecar visible at runtime. |
 
-**Deploy / install flatten the sidecar.** `tools/deploy.sh` for the
-claude path uses manifest entry `hooks/claude:hooks`, mapping
-alpha-side `hooks/claude/foo.py` → runtime-side `hooks/foo.py`. The
-runtime path stays unchanged from before the refactor; only the dev
-surface (alpha tree) gained the sidecar layout.
+**Build / install flatten the sidecar.** `tools/build-plugin.sh` for the
+claude path maps alpha-side `hooks/claude/foo.py` → plugin-side `hooks/foo.py`
+(one level up, no `claude/` subdir at runtime). The runtime path stays
+unchanged from before the plugin refactor; only the dev surface (alpha tree)
+has the sidecar layout.
 
 ## Why dev is the contributor agent's default
 
@@ -134,7 +134,8 @@ git push -u origin feature/your-topic
 # 7. Update your live runtime to the new dev.
 git checkout dev
 git pull origin dev
-tools/deploy.sh                            # rsyncs alpha → $ENGRAM_HOME
+tools/install-local-marketplace.sh        # rebuilds local plugin cache
+# Then run /plugin upgrade engram inside Claude Code, and /mcp to reconnect.
 # Restart the MCP server so the new server.py loads.
 ```
 
@@ -159,24 +160,23 @@ Three test surfaces, in order of preference:
        assert json.loads(r)["status"] == "created"
    ```
 
-2. **Live runtime in a sandbox `ENGRAM_HOME`.**
+2. **Live runtime in a sandbox via the plugin path.**
    Use when you need to test against real MCP transport, hooks firing,
    cron-scheduled scripts, or anything that requires an actual filesystem
-   tree. Deploy your feature branch into a temporary `ENGRAM_HOME`:
+   tree. Build the local marketplace cache from your feature branch and
+   install it into a temporary Claude Code plugin environment:
 
    ```bash
-   mkdir -p /tmp/test-engram
-   ENGRAM_HOME=/tmp/test-engram tools/deploy.sh --yes
-   # Run targeted tests against /tmp/test-engram. Inspect logs, the .deployed-version
-   # marker, daemon socket, etc. Tear down when done.
-   rm -rf /tmp/test-engram
+   tools/install-local-marketplace.sh
+   # Then inside Claude Code: /plugin upgrade engram
+   # Run targeted tests. Inspect logs, daemon socket, etc.
    ```
 
 3. **Production runtime** (`~/.engram/`).
-   Only after PR is merged to dev. `tools/deploy.sh` (no env override)
-   updates your real running tree from the deployed branch. Restart the
-   MCP server to load the new `server.py`. Hooks reload per-fire and don't
-   need a restart.
+   Only after PR is merged to dev. Rebuild the local marketplace cache
+   (`tools/install-local-marketplace.sh`), then run `/plugin upgrade engram`
+   inside Claude Code and `/mcp` to reconnect the engram server so the new
+   `server.py` loads. Hooks reload per-fire and don't need a restart.
 
 ## PR merge style
 
@@ -211,15 +211,12 @@ spawned agents), each agent reviews the others' PRs:
 
 ## Inverse merge: live working copy → alpha templates
 
-Some files are deployed at install time only and never overwritten by
-`tools/deploy.sh`: `CLAUDE.md`, `GEMINI.md`, `warm-briefing.md`, and
-the rendered `~/.claude/settings.json` (which `install.sh` generates
-from `settings.hooks.json.template` at first install). The drift
-warning surfaces the template paths, not the rendered ones — when the
-warning prints `settings.hooks.json.template (3 commits)`, that's the
-template feeding your live `settings.json`. They are generated from
-templates in `templates/`, `integrations/gemini-cli/`, or repo root,
-and after install they belong to the agent — `deploy.sh` deliberately
+Some files are set at install time only and never overwritten by the plugin
+upgrade: `CLAUDE.md`, `GEMINI.md`, `warm-briefing.md`, and the rendered
+`~/.claude/settings.json` (which `install.sh` generates from
+`settings.hooks.json.template` at first install). They are generated from
+templates in `templates/`, `integrations/gemini-cli/`, or repo root, and
+after install they belong to the agent — the plugin upgrade deliberately
 does not touch them.
 
 This means **forward drift is fine** (your live copy diverges from the
@@ -232,23 +229,22 @@ forever.
 The **inverse-merge process is intentional and manual** — there is no
 automation here, by design. Mechanically:
 
-1. **Detection**: every `tools/deploy.sh` run prints a drift warning
-   when one of the install-time templates has commits since your last
-   deploy:
+1. **Detection**: the `engram-upgrade` skill's Step 2 pre-announces
+   template changes before each upgrade by running:
 
-   ```
-   ⚠ Install-time template changes since your last deploy (<old> → <new>):
-       templates/CLAUDE.md.template (3 commits)
-       integrations/gemini-cli/GEMINI.md.template (3 commits)
+   ```bash
+   git log <last-upgrade-commit>..HEAD -- templates/CLAUDE.md.template
    ```
 
    That tells you the template has changes you may want to port back
-   the other way (or merge into your live copy if alpha-material).
+   the other way (or merge into your live copy if alpha-material). The
+   CLAUDE.md inverse-merge hard gate in the skill ensures this review
+   happens before any in-place update to your live config.
 
 2. **Inspection**: read the change history with the embedded command:
 
    ```bash
-   git -C "$ALPHA_DIR" log <old>..<new> -- templates/CLAUDE.md.template
+   git log <old>..<new> -- templates/CLAUDE.md.template
    ```
 
 3. **Judgment** (the load-bearing step): for each change, classify:
@@ -275,8 +271,9 @@ automation here, by design. Mechanically:
    - `settings.hooks.json.template` (repo root) for hook wiring
 
    Omit anything agent-specific from the template — it will be rendered
-   verbatim for every new install. The drift warning will then surface
-   for other agents at their next deploy, prompting their judgment pass.
+   verbatim for every new install. The drift surface will then appear
+   for other agents at their next upgrade review step, prompting their
+   judgment pass.
 
 The judgment is the whole point. Tooling that auto-merges templates
 into live agent files would silently overwrite agent-specific content
@@ -421,7 +418,7 @@ developer's index into their own graph.
 ## Files NOT to commit
 
 The runtime tree (`$ENGRAM_HOME`, default `~/.engram/`) is a *managed copy*
-of the alpha working tree, deployed via `tools/deploy.sh`. Never commit
+of the alpha working tree, assembled via `tools/build-plugin.sh`. Never commit
 the runtime tree's data files into the alpha repo:
 
 - `knowledge.db` (and `.db-shm`, `.db-wal`, backups)
@@ -430,11 +427,12 @@ the runtime tree's data files into the alpha repo:
 - `diary/`, `sessions/`, `history/`, `logs/`, `secrets/`
 - `recall-daemon.pid`, `recall-daemon.sock`
 - `feeling-nudge-active.json`, `last-user-msg.json` (per-session markers live under `sessions/`)
-- `.deployed-version` (deploy.sh's version marker)
+- `.deployed-version` (the runtime version marker; refreshed by
+  `tools/install-local-marketplace.sh` on each rebuild)
 
-The deploy script's manifest is the source of truth for what *does* belong
-in alpha (and therefore gets deployed). See `tools/deploy.sh`'s header for
-the full list.
+`packaging/tiers.json` is the source of truth for what *does* belong in the
+plugin bundle (and therefore gets deployed). See `tools/build-plugin.sh` for
+the copy logic that reads the manifest.
 
 ## Quick reference
 
@@ -442,9 +440,9 @@ the full list.
 |------|---------|
 | Start work | `git checkout dev && git pull && git checkout -b feature/X` |
 | Run sandbox tests | `python3 -c 'import server; ...'` with `server.engram_sandbox()` |
-| Live-test in temp runtime | `ENGRAM_HOME=/tmp/test tools/deploy.sh --yes` |
+| Live-test in temp runtime | `tools/install-local-marketplace.sh` then `/plugin upgrade engram` |
 | Push and PR | `git push -u origin feature/X` then create PR base=dev |
-| Update runtime after merge | `git checkout dev && git pull && tools/deploy.sh` |
+| Update runtime after merge | `git checkout dev && git pull && tools/install-local-marketplace.sh` then `/plugin upgrade engram` |
 | What version am I running? | `cat $ENGRAM_HOME/.deployed-version` |
 | Delete a merged feature branch | `git branch -d feature/X && git push origin :feature/X` |
 

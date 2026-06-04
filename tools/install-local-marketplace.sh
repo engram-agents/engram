@@ -191,10 +191,11 @@ log "Marketplace assembled at $MARKETPLACE_ROOT"
 
 # ── Version marker ─────────────────────────────────────────────────────────────
 # Refresh ~/.engram/.deployed-version so the plugin path maintains the same
-# forensics anchor deploy.sh kept for scatter (which commit is my running code
-# from?). Without this the marker goes stale after every plugin upgrade — the
-# engram-upgrade skill's change-set review (deployed..target) and post-upgrade
-# verification both anchor on it. Same format as deploy.sh's writer.
+# forensics anchor the retired scatter upgrader (deploy.sh) kept (which commit
+# is my running code from?). Without this the marker goes stale after every
+# plugin upgrade — the engram-upgrade skill's change-set review
+# (deployed..target) and post-upgrade verification both anchor on it. Same
+# format the scatter-era writer used.
 ALPHA_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 ALPHA_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
 if [[ -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then

@@ -36,8 +36,8 @@ Scope boundary
 ==============
 The CI test only checks paths that build-plugin.sh ships (the plugin install
 path). The manifest intentionally covers MORE than this — scatter-install paths
-(tools/deploy.sh, tools/baton.py, viz_server.py, etc.), the Gemini integration,
-and operator tools also have manifest entries. Those extra entries are valid
+(tools/baton.py, viz_server.py, etc.), the Gemini integration, and operator
+tools also have manifest entries. Those extra entries are valid
 (the dangling-entry check only fires if a manifest path does NOT exist anywhere
 in the repo, not if it falls outside the plugin-copy scope). This gives the
 manifest broader coverage while keeping the CI gate mechanical and offline.

@@ -280,15 +280,32 @@ pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requiremen
 That's it. Start a new Claude Code session; the agent will read
 `~/.engram/first-run-pending` and run the cold-start dialogue.
 
-### Upgrading vs reinstalling (scatter)
+### Upgrading vs reinstalling (plugin)
 
-- **To upgrade an existing scatter install** (pick up newer alpha code while
+- **To upgrade an existing plugin install** (pick up newer alpha code while
   keeping your graph, history, diary, and sessions intact):
-  ```bash
-  tools/deploy.sh
-  ```
-  Works for both Claude (`~/.engram/`) and Gemini (`~/.engram-gemini/`)
-  installs — `tools/deploy.sh` auto-detects the target from `$ENGRAM_HOME`.
+  1. Rebuild the local marketplace cache:
+     ```bash
+     tools/install-local-marketplace.sh
+     ```
+  2. Upgrade the plugin inside Claude Code:
+     ```
+     /plugin upgrade engram
+     ```
+  3. Reconnect the MCP server: run `/mcp` inside Claude Code and reconnect
+     the engram server (or restart Claude Code entirely).
+  4. Load the `engram-upgrade` skill for the agent-led checklist — it
+     walks through template-change review, config sanity checks, and the
+     post-upgrade verification steps.
+
+  The graph, history, diary, and sessions are NEVER touched by upgrades.
+  `~/.claude/CLAUDE.md` is user-owned and is not overwritten automatically
+  (the upgrade skill's Step 2 surfaces template changes for your review).
+
+  **Gemini installs:** the plugin path covers Claude Code only. Gemini
+  upgrade guidance is deferred to the `install-gemini.sh` docs (the Gemini
+  lane of the scatter retirement is tracked in issue #763).
+
 - **To reinstall fresh** (archive the existing data dir to a timestamped
   backup dir and start over with an empty graph — data is NOT migrated in):
   ```bash
@@ -298,10 +315,10 @@ That's it. Start a new Claude Code session; the agent will read
 
 **Why git clone, not zip download?** GitHub's "Source code (tar.gz)" tarball on
 Releases works for a one-shot install, but you lose easy upgrades — you'd need
-to re-download, re-extract, and re-run `tools/deploy.sh` against the new path
-each time. Alpha testers are expected to handle `git pull` for the smoother
-upgrade path. If you genuinely cannot use git in your environment, the tarball
-install works; you'll just be on a fixed version until you re-download.
+to re-download, re-extract, and rebuild the plugin from the new path each time.
+Alpha testers are expected to handle `git pull` for the smoother upgrade path.
+If you genuinely cannot use git in your environment, the tarball install works;
+you'll just be on a fixed version until you re-download.
 
 ---
 
@@ -380,9 +397,10 @@ Expected terminal output (abbreviated):
 If step 2 fails with `existing install detected` (Claude target, at
 `~/.engram/knowledge.db`) or `existing extension dir detected` (Gemini
 target, at `~/.gemini/extensions/engram/`), the user already has an
-install. **Almost always, the user wants `tools/deploy.sh` instead** —
+install. **Almost always, the user wants the plugin upgrade path instead** —
 that upgrades the running code while leaving the graph, history, diary,
-and sessions untouched. Suggest that first.
+and sessions untouched. Suggest that first (see "Upgrade as an agent"
+section above).
 
 Only pass `--force` if the user has explicitly said they want a fresh
 start — it moves their existing data dir (or extension dir, for the
@@ -436,9 +454,9 @@ resolve. The grep should report that only those three remain.
 
 ## Upgrade as an agent (on behalf of a user)
 
-If the user already has an ENGRAM install and wants newer alpha code without
-losing their graph, history, diary, or sessions, run `tools/deploy.sh`.
-Everything below is deterministic.
+If the user already has a plugin ENGRAM install and wants newer alpha code
+without losing their graph, history, diary, or sessions, follow the plugin
+upgrade path below. Everything below is deterministic.
 
 ### 1. Confirm the user wants an upgrade, not a fresh install
 
@@ -447,56 +465,43 @@ If you see `~/.engram/knowledge.db` present, the user has an existing install.
 graph to a timestamped backup and starts over — the user's agent loses every
 node it has ever written. Suggest:
 
-> You already have an ENGRAM install at `~/.engram/`. I can run
-> `tools/deploy.sh` to update the running code (server, hooks, tools, SKILL.md)
-> while keeping your graph, history, diary, and sessions intact. Want me to
-> proceed?
+> You already have an ENGRAM install at `~/.engram/`. I can run the plugin
+> upgrade flow to update the running code (server, hooks, tools, SKILL.md,
+> skills, agents) while keeping your graph, history, diary, and sessions
+> intact. Want me to proceed?
 
-### 2. Dry-run first
+### 2. Rebuild the local marketplace cache
 
-```bash
-tools/deploy.sh --dry-run
-```
-
-Read the planned changes back to the user before applying. The output shows
-every file that would change with rsync's compact change-flag notation
-(`>fcst......` = regular file with checksum/size/time differing).
-
-### 3. Apply
+From the alpha repo root:
 
 ```bash
-tools/deploy.sh --yes
+tools/install-local-marketplace.sh
 ```
 
-Expected terminal output (abbreviated):
+This packages the current alpha tree into the local plugin cache that Claude
+Code's `/plugin` command reads from.
+
+### 3. Upgrade the plugin inside Claude Code
+
+Run inside a Claude Code session:
 
 ```
-=== ENGRAM deploy ===
-  source:  /home/USER/engram-alpha (BRANCH @ COMMIT)
-  target:  /home/USER/.engram
-  delete:  no (use --delete to remove stale files)
-  mode:    live (will apply)
-
-  CHANGED:   hooks/claude → hooks
-  CHANGED:   server.py
-  CHANGED:   engram_client.py
-  CHANGED:   tools
-  CHANGED:   SKILL.md
-
-  ✓ Substituted {{PYTHON}} → /path/to/python3 in hooks/start-engram-daemon.sh
-
-✓ Deployed alpha @ COMMIT → /home/USER/.engram
-  Version marker: /home/USER/.engram/.deployed-version
+/plugin upgrade engram
 ```
 
-### 4. What deploy.sh DOES and DOES NOT change
+This replaces the installed plugin with the freshly built cache from step 2.
 
-**Updated (managed copy of alpha):**
+### 4. What the plugin upgrade DOES and DOES NOT change
 
-- `~/.engram/server.py`, `engram_client.py`, `engram_confidence.py`, `engram_filter.py`, `viz_server.py`
-- `~/.engram/hooks/*` (including the just-substituted `{{PYTHON}}` in `start-engram-daemon.sh`)
-- `~/.engram/tools/*`
-- `~/.engram/SKILL.md` (the protocol doc)
+**Updated (new plugin bundle):**
+
+- `server.py`, `bootstrap.py`, and the `engram_*.py` runtime modules
+  (matching `build-plugin.sh`'s copy rules)
+- `hooks/*` (including `start-engram-daemon.sh` with `{{PYTHON}}` substituted)
+- `tools/*`
+- `SKILL.md` (the protocol doc)
+- `skills/claude/*` and `agents/claude/*` — the plugin upgrade path handles
+  these, unlike the retired scatter path which could not reach them.
 
 **Preserved (user's data + state):**
 
@@ -508,45 +513,32 @@ Expected terminal output (abbreviated):
 **Not touched (install-time-only; require manual inverse-merge):**
 
 - `~/.claude/CLAUDE.md` — rendered from template once at install-time. If the
-  template changed since the user's last deploy, the deploy command prints a
-  `⚠ Install-time template changes since your last deploy` notice and lists
-  the template paths. Inverse-merging template changes into the live config
-  is judgment work — both directions can drift.
+  template changed since the user's last upgrade, the `engram-upgrade` skill's
+  Step 2 (`git log -- templates/CLAUDE.md.template`) surfaces those changes for
+  review. Inverse-merging template changes into the live config is judgment
+  work — both directions can drift.
 - `~/.claude/settings.json` — similar; the hooks fragment is install-time-only.
-- `~/.claude/skills/*` and `~/.claude/agents/*` — fresh-install
-  source-of-truth. **There is no automated update path** — `install.sh`
-  hard-exits at Step 2 when `knowledge.db` is present, and
-  `tools/deploy.sh`'s manifest is scoped to `$ENGRAM_HOME` (skills and
-  agents live outside it). If you need to update them on an existing
-  install, the safe path is a targeted manual copy:
-  `cp -r /home/USER/engram-alpha/skills/claude/* ~/.claude/skills/` and
-  `cp -r /home/USER/engram-alpha/agents/claude/* ~/.claude/agents/`. Do
-  NOT re-run `install.sh --force` to "refresh" — that archives the
-  user's entire knowledge graph.
 
-### 5. Restart the MCP server
+### 5. Reconnect the MCP server
 
-`tools/deploy.sh` writes the new `server.py` but the running MCP server is
-still the old version. Tell the user:
+After the plugin upgrade, the running MCP server is still the old version.
+Tell the user:
 
-> Deploy complete. Please restart the engram MCP server so Claude Code
+> Upgrade complete. Please reconnect the engram MCP server so Claude Code
 > picks up the new code. Inside Claude Code, run `/mcp` to open the MCP
 > management surface and reconnect the engram server, or restart Claude
-> Code entirely. Hooks (`context_tracker.py`, etc.) reload per-fire
-> automatically — no restart needed for those.
+> Code entirely. Hooks reload per-fire automatically — no restart needed
+> for those.
 
-Do NOT attempt to kill the MCP subprocess yourself. The stdio-MCP redeploy
+Do NOT attempt to kill the MCP subprocess yourself. The stdio-MCP reconnect
 contract is user-restart only — killing the subprocess from an agent breaks
 the harness's transport state.
 
-### 6. Verify the version marker
+### 6. Run the engram-upgrade skill checklist
 
-```bash
-cat ~/.engram/.deployed-version
-```
-
-The marker records the alpha commit SHA + timestamp. If the user reports a
-behavior change later, this is the forensics anchor.
+Load the `engram-upgrade` skill. It walks through template-change review,
+config sanity checks, and post-upgrade verification. This is the agent-led
+gate that catches drift the mechanical upgrade step cannot detect.
 
 ---
 
@@ -697,8 +689,8 @@ the page to see new nodes.
 ## `~/.engram/config.json` reference
 
 The config file is created at install time and updated by the first-session
-dialogue and by hook machinery. It is preserved across upgrades (`tools/deploy.sh`
-never overwrites it). All fields are optional unless noted.
+dialogue and by hook machinery. It is preserved across upgrades (the plugin
+upgrade never overwrites it). All fields are optional unless noted.
 
 ### Identity fields (set by first-session skill)
 
@@ -740,7 +732,7 @@ Example after population:
 ```
 
 **Note for existing installs**: the `github` block is not set by `install.sh` or
-`tools/deploy.sh`. Add it manually after upgrade to enable the feature.
+the plugin upgrade. Add it manually after upgrade to enable the feature.
 Future first-session skill versions will prompt for it.
 
 **Note on cross-install portability**: `github.counterparts_logins` must
@@ -782,8 +774,10 @@ venv, activate it before running `install.sh`.
 
 **Install refuses to overwrite existing install**
 Intentional. Two paths forward:
-- **Upgrade** (keep your graph, history, sessions; update code only):
-  `tools/deploy.sh` — works for both Claude and Gemini installs.
+- **Upgrade** (keep your graph, history, sessions; update code only): use the
+  plugin upgrade path — `tools/install-local-marketplace.sh` then `/plugin
+  upgrade engram` inside Claude Code (Claude installs). For Gemini installs,
+  see `install-gemini.sh` docs.
 - **Fresh reinstall** (archive existing data, start over with empty graph):
   - `./install.sh --force` — Claude target; moves `~/.engram/` to
     `~/.engram.backup.YYYYMMDD_HHMMSS/`.
@@ -949,8 +943,9 @@ the full protocol and deployment instructions.
   existing data dir is moved to a timestamped backup before reinstall. The
   fresh install starts with an empty graph; old data is preserved in the
   backup but not migrated. To upgrade an existing install while preserving
-  the graph, use `tools/deploy.sh` instead — it deploys code into the
-  running tree without touching data files.
+  the graph, use the plugin upgrade path (`tools/install-local-marketplace.sh`
+  + `/plugin upgrade engram`) instead — it updates the running plugin without
+  touching data files.
 - **Agency.** The hooks are advisory; the agent is never blocked from
   writing to the graph. The only mechanical guards are on the server side
   (provenance, DAG invariant, claim-bearing types for derivations).

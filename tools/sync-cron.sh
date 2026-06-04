@@ -79,7 +79,7 @@ fi
 
 # Resolve paths. Prefer caller-provided. Fallback: $ENGRAM_HOME/config.json
 # for config (the agent's live config), and the alpha source tree for the
-# template (since deploy.sh doesn't ship templates/ to runtime).
+# template (templates/ are not shipped to the runtime dir).
 if [[ -z "$CONFIG_PATH" ]]; then
     CONFIG_PATH="$ENGRAM_HOME/config.json"
 fi

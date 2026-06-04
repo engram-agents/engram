@@ -61,7 +61,7 @@ docker run --rm -it -v "$(pwd):/alpha:ro" --entrypoint /bin/bash engram-install-
 ## When to run
 
 - **Before tagging a V1 release** — every install.sh change should pass the harness on a clean target.
-- **After modifying any of**: install.sh, bootstrap.py, deploy.sh, the templates/ directory, hooks/claude/, skills/claude/.
+- **After modifying any of**: install.sh, bootstrap.py, the templates/ directory, hooks/claude/, skills/claude/.
 - **After a Python-deps change** — fastmcp or sentence-transformers version bumps can break preflight.
 
 ## Future extensions

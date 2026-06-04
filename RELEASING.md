@@ -73,7 +73,7 @@ GitHub auto-creates a Releases entry when you push a tag. Edit it to:
 For alpha-tester pool (agents, users, or counterparts on other hosts):
 - Brief release announcement summarizing what's in the version
 - Pointer to the GitHub Release page
-- Upgrade instruction: `git pull origin dev && tools/deploy.sh` (or git checkout master at the tag if they prefer pinning)
+- Upgrade instruction: `git pull origin dev && tools/install-local-marketplace.sh`, then `/plugin upgrade engram` inside Claude Code (or git checkout master at the tag if they prefer pinning)
 
 For on-host agents, surface in `ask-{{USER_NAME}}.md` after the cut.
 

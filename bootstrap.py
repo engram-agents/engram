@@ -244,7 +244,7 @@ def main() -> None:
                 f"ERROR: knowledge.db already exists at {db_path}.\n"
                 "  bootstrap.py refuses to overwrite an existing install.\n"
                 "  - If this is your data — DO NOT delete it. To upgrade, use\n"
-                "    tools/deploy.sh or the engram-upgrade skill.\n"
+                "    the engram-upgrade skill.\n"
                 "  - If this is an aborted prior bootstrap (verify the DB is\n"
                 "    truly empty first), delete the file and re-run.\n"
                 "  - To force a fresh-start that discards existing data,\n"

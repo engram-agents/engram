@@ -103,10 +103,6 @@
       "tier": "essential"
     },
     {
-      "path": "tools/deploy.sh",
-      "tier": "convenience"
-    },
-    {
       "path": "tools/build-plugin.sh",
       "tier": "convenience"
     },
