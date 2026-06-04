@@ -64,9 +64,40 @@ ENGRAM_HOME = (
     or str(Path.home() / ".engram")
 )
 
-# Make engram_ids importable at module scope (avoids duplicate sys.path inserts
-# on repeated calls to credit_mentions in test harnesses).
-sys.path.insert(0, ENGRAM_HOME)
+
+def _resolve_runtime_dir(engram_home: str) -> str:
+    """Locate the directory that contains engram_ids.py and engram_log_emitter.py.
+
+    Probe order mirrors engram-surface-hook.py's resolver; the sentinel file
+    differs (engram_ids.py here vs engram_client.py there) because each hook
+    probes for the module it actually imports.
+      1. $ENGRAM_RUNTIME_DIR if set explicitly.
+      2. $ENGRAM_HOME if it bundles runtime modules (scatter / snapshot install).
+      3. Plugin root: hook lives at <plugin_root>/hooks/hook.py, so the plugin
+         root is two dirname() levels up from __file__. Runtime modules live at
+         <plugin_root>/. Resolves clean plugin installs where ENGRAM_HOME is
+         data-only (issue #782 class: stale scatter copy at ENGRAM_HOME must
+         not shadow the plugin's live copy).
+      4. ~/engram-alpha live-source fallback for dev installs.
+    """
+    explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
+    if explicit:
+        return explicit
+    if os.path.exists(os.path.join(engram_home, "engram_ids.py")):
+        return engram_home
+    plugin_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if os.path.exists(os.path.join(plugin_root, "engram_ids.py")):
+        return plugin_root
+    return os.path.expanduser("~/engram-alpha")
+
+
+_RUNTIME_DIR = _resolve_runtime_dir(ENGRAM_HOME)
+
+# Ensure runtime modules are importable. Uses the plugin-aware resolution
+# above instead of the retired scatter-layout sys.path.insert(0, ENGRAM_HOME).
+if _RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _RUNTIME_DIR)
+
 KNOWLEDGE_DB = os.path.join(ENGRAM_HOME, "knowledge.db")
 LOG_PATH = os.path.join(ENGRAM_HOME, "utility-credit-mention.log")
 

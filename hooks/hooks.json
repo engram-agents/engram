@@ -122,6 +122,12 @@
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-deference-detector-stop.py\"",
             "timeout": 5,
             "statusMessage": "Detecting deference patterns..."
+          },
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-utility-credit-mention-stop.py\"",
+            "timeout": 5,
+            "statusMessage": "Crediting mentioned nodes..."
           }
         ]
       }

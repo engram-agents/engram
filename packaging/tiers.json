@@ -293,6 +293,10 @@
       "tier": "convenience"
     },
     {
+      "path": "hooks/claude/engram-utility-credit-mention-stop.py",
+      "tier": "convenience"
+    },
+    {
       "path": "skills/claude/engram-first-session",
       "tier": "essential"
     },
@@ -478,10 +482,6 @@
     {
       "path": "hooks/claude/context_tracker_hook.py",
       "reason": "superseded by hooks/claude/context_tracker.py (Issue #140 session-isolation rewrite); context_tracker_hook.py is the old hook wrapper, now replaced by the multi-session-safe hook embedded in engram-session-start-hook.py"
-    },
-    {
-      "path": "hooks/claude/engram-utility-credit-mention-stop.py",
-      "reason": "dead hook — not wired in hooks.json; the utility credit-assign mechanism (prose-mention bump) was never integrated into the live hook config"
     },
     {
       "path": "tools/_telegram_api.py",

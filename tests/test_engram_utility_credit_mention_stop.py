@@ -439,3 +439,71 @@ def test_is_real_user_message_empty_list_is_not_boundary():
 def test_is_real_user_message_empty_string_is_not_boundary():
     """Empty string content is not a real user message either."""
     assert hook._is_real_user_message("") is False
+
+
+# --------------------------------------------------------------------------- #
+# Activation smoke test — first-ever production activation (issue #783)
+# --------------------------------------------------------------------------- #
+
+
+def test_main_full_pipeline_bumps_utility_via_stdin(monkeypatch, tmp_path):
+    """Smoke test for the full main() path: synthetic Stop-hook stdin payload
+    mentioning ob_0001; assert utility_score increased by Q-update formula.
+
+    This hook was never activated before issue #783.  This test exercises the
+    complete execution path that will run in production:
+      1. main() reads stdin JSON (Stop-hook payload shape).
+      2. collect_turn_text() is called (no transcript → falls back to stdin msg).
+      3. credit_mentions() finds ob_0001, bumps its utility_score.
+      4. Q_new = Q_old + 0.10 * (1 - Q_old) = 0.0 + 0.10 * 1.0 = 0.10.
+
+    ENGRAM_HOME is pointed at tmp_path throughout; production knowledge.db is
+    never touched.
+
+    Note on db_path threading: credit_mentions() has `db_path=KNOWLEDGE_DB` as
+    a default argument frozen at import time, so monkeypatching hook.KNOWLEDGE_DB
+    does not affect calls made without an explicit db_path argument.  We wrap
+    credit_mentions to inject the tmp db_path so the real bump logic runs while
+    pointing at the synthetic DB.
+    """
+    # Build a minimal knowledge.db with a single node at utility_score=0.0.
+    db_path = tmp_path / "knowledge.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE nodes (id TEXT PRIMARY KEY, utility_score REAL)")
+    conn.execute("INSERT INTO nodes (id, utility_score) VALUES (?, ?)", ("ob_0001", 0.0))
+    conn.commit()
+    conn.close()
+
+    # Redirect LOG_PATH to tmp_path so main()'s _log() writes there.
+    monkeypatch.setattr(hook, "LOG_PATH", str(tmp_path / "utility-credit-mention.log"))
+
+    # Wrap credit_mentions to inject the tmp db_path, leaving all other logic intact.
+    _real_credit_mentions = hook.credit_mentions
+
+    def _credit_mentions_with_tmp_db(last_message: str, **kwargs):
+        # .setdefault() supplies the tmp default only when db_path is absent,
+        # so a test that passes an explicit db_path has it forwarded unchanged.
+        kwargs.setdefault("db_path", str(db_path))
+        return _real_credit_mentions(last_message, **kwargs)
+
+    monkeypatch.setattr(hook, "credit_mentions", _credit_mentions_with_tmp_db)
+
+    # Construct a minimal Stop-hook stdin payload that mentions ob_0001.
+    payload = json.dumps({
+        "stop_hook_active": False,
+        "last_assistant_message": "I built this derivation using ob_0001 as the key premise.",
+        "session_id": "smoke-test-session",
+        "transcript_path": "",
+    })
+    monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
+
+    hook.main()
+
+    # Assert utility_score was bumped: Q_new = 0.0 + 0.10*(1-0.0) = 0.10
+    conn = sqlite3.connect(str(db_path))
+    val = conn.execute("SELECT utility_score FROM nodes WHERE id = 'ob_0001'").fetchone()[0]
+    conn.close()
+    assert val == pytest.approx(0.10, abs=1e-9), (
+        f"Activation smoke test failed: utility_score={val!r}, expected 0.10. "
+        "The full main() pipeline did not bump the utility score for the mentioned node."
+    )
