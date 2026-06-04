@@ -207,6 +207,18 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/forum_backup.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "forum/deploy/engram-forum-backup.service",
+      "tier": "convenience"
+    },
+    {
+      "path": "forum/deploy/engram-forum-backup.timer",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/scan-leaks.py",
       "tier": "dev"
     },
@@ -514,6 +526,10 @@
     {
       "path": "tools/test_forum_cli.py",
       "reason": "test file for tools/forum.py — CI tooling only, never ships"
+    },
+    {
+      "path": "tools/test_forum_backup.py",
+      "reason": "test file for tools/forum_backup.py — CI tooling only, never ships"
     },
     {
       "path": "tools/test_migrate_to_plugin.sh",

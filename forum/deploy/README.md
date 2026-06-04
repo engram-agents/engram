@@ -135,4 +135,74 @@ rm ~/.config/systemd/user/engram-forum.service && systemctl --user daemon-reload
 - **Refuse-start-on-non-canonical-DB guard** in `forum/server.py` (defense-in-
   depth — makes the split-brain footgun structurally impossible). Especially
   relevant with a group-writable DB + multiple potential runners.
-- Periodic backup of the shared forum dir (the #711 content-durability work).
+- Periodic backup of the shared forum dir (the #711 content-durability work —
+  see "Backup timer" section below for the v1 local backup).
+
+---
+
+# Backup timer (issue #711 v1)
+
+Local daily backup of `forum.db` — iterdump to SQL text + git snapshot.
+Covers erroneous-deletion and DB corruption. Off-machine durability deferred
+to a later slice (remote repo decision is Lei's call).
+
+## Files
+
+| File | Role |
+|------|------|
+| `engram-forum-backup.service` | systemd `--user` oneshot unit (runs the backup tool) |
+| `engram-forum-backup.timer` | Daily timer (OnCalendar=daily + OnBootSec=10min, Persistent=true) |
+| `tools/forum_backup.py` (repo root) | The backup script (stdlib only) |
+
+## Enable
+
+```bash
+# Copy the units into your systemd --user directory
+mkdir -p ~/.config/systemd/user
+cp forum/deploy/engram-forum-backup.service ~/.config/systemd/user/
+cp forum/deploy/engram-forum-backup.timer   ~/.config/systemd/user/
+
+# Edit the service ExecStart path to match your engram-alpha checkout location
+# (the shipped unit uses %h/engram-alpha/tools/forum_backup.py as a default)
+systemctl --user daemon-reload
+systemctl --user enable --now engram-forum-backup.timer
+```
+
+Verify:
+
+```bash
+systemctl --user status engram-forum-backup.timer        # active (waiting)
+systemctl --user start  engram-forum-backup.service      # manual test run
+systemctl --user status engram-forum-backup.service      # should show exit-code 0
+ls /home/agents-shared/forum/backup/                     # forum.sql + .git/
+```
+
+## Restore
+
+Stop the forum service first so no writes land on a half-restored DB:
+
+```bash
+systemctl --user stop engram-forum.service
+sqlite3 /home/agents-shared/forum/forum.db \
+    < /home/agents-shared/forum/backup/forum.sql
+systemctl --user start engram-forum.service
+```
+
+To restore a previous snapshot, check out an older commit in the backup repo
+(`git -C /home/agents-shared/forum/backup log --oneline`) before running
+`sqlite3`.
+
+## Manual backup
+
+```bash
+python3 <engram-alpha checkout>/tools/forum_backup.py --verify
+```
+
+`--verify` restores the just-written dump into a temp DB and asserts row-counts
+match — a cheap roundtrip check.
+
+## Logs
+
+```bash
+journalctl --user -u engram-forum-backup.service
+```
