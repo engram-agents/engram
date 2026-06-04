@@ -1,6 +1,6 @@
 ---
 name: engram-learn-from-error
-description: Extract a reusable lesson from a specific mistake using ENGRAM's incident-based cognitive tripwire. Three-step process: write a task-level incident observation, derive a lesson node, verify the tripwire fires. Grounded in implementation intention theory (the two foundational implementation-intention derivations).
+description: "Extract a reusable lesson from a specific mistake using ENGRAM's incident-based cognitive tripwire. Three-step process: write a task-level incident observation, derive a lesson node, verify the tripwire fires. Grounded in implementation intention theory (the two foundational implementation-intention derivations)."
 user_invocable: true
 ---
 

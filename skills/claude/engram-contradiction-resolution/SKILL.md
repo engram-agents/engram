@@ -1,3 +1,8 @@
+---
+name: engram-contradiction-resolution
+description: "Drive an ENGRAM contradiction (ct_XXXX) to a clean substrate state - the tool-call sequence for investigating, resolving, and verifying a contradiction node. Load when a contradiction needs resolution."
+---
+
 # ENGRAM — Contradiction resolution
 
 How to drive a contradiction (ct_XXXX) to a clean substrate state. Focused on the **ENGRAM operation sequence**, not the philosophical logic of the resolution itself — the latter is yours to author; this skill describes which tools to call in what order.

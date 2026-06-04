@@ -1,6 +1,6 @@
 ---
 name: engram-meta-loop
-description: Top-level autonomous session — freely choose between research, build, consolidation, experimentation, aspiration, and dialogue-prep based on what would move goals forward most. Three structural constraints prevent drift and bloat: mandatory consolidation (every 5 iterations), step-back reflection (every 10), hard stop (at 50). Produces a session briefing for the user.
+description: "Top-level autonomous session — freely choose between research, build, consolidation, experimentation, aspiration, and dialogue-prep based on what would move goals forward most. Three structural constraints prevent drift and bloat: mandatory consolidation (every 5 iterations), step-back reflection (every 10), hard stop (at 50). Produces a session briefing for the user."
 user_invocable: true
 ---
 

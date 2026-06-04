@@ -1,6 +1,6 @@
 ---
 name: engram-self-improve
-description: Self-driven improvement of ENGRAM infrastructure. Triggered by experiencing a gap during normal use — friction, missing features, near-misses, or invariant violations. Follows a five-phase cycle: experience gap, investigate with staleness checks, design within principles, implement and test, close the loop. Does NOT advance the turn counter (uses nap-mode checkpoint).
+description: "Self-driven improvement of ENGRAM infrastructure. Triggered by experiencing a gap during normal use — friction, missing features, near-misses, or invariant violations. Follows a five-phase cycle: experience gap, investigate with staleness checks, design within principles, implement and test, close the loop. Does NOT advance the turn counter (uses nap-mode checkpoint)."
 ---
 
 > **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). As you get familiar with this skill, consider cleaning them up: replace each citation with a generalized concept-word, or remove if it isn't load-bearing. The skill is yours now.

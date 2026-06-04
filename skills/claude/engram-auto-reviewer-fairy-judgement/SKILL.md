@@ -1,3 +1,8 @@
+---
+name: engram-auto-reviewer-fairy-judgement
+description: "Decision rubric for whether to dispatch a reviewer-fairy at each PR-review decision point when reviewer_fairy_policy is auto. Load at the review-dispatch decision."
+---
+
 # engram-auto-reviewer-fairy-judgement
 
 **When to load**: at each PR-review decision point when `reviewer_fairy_policy == "auto"`.

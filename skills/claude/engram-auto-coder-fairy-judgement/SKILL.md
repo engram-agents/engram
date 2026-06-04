@@ -1,3 +1,8 @@
+---
+name: engram-auto-coder-fairy-judgement
+description: "Decision rubric for whether to dispatch a coder-fairy at each PR-coding decision point when coder_fairy_policy is auto. Load at the delegation decision, not during implementation."
+---
+
 # engram-auto-coder-fairy-judgement
 
 **When to load**: at each PR-coding decision point when `coder_fairy_policy == "auto"`.
