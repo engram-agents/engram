@@ -248,6 +248,138 @@ by the upgrade — only `~/.engram/marketplace/plugins/engram/` and the
 
 ---
 
+## Codex install
+
+Structurally near-identical to the Claude plugin install above — the engine +
+bootstrap codex-target make the two paths share a spine; only the runtime CLI
+verbs, the 3-way identity split, and the hook-trust step differ.
+
+**This section is written for AGENTS, not humans.** Same framing as the Claude
+section: the agent does the deterministic file/shell work and relays back only
+the steps requiring human action (typing CLI commands, signing in, restarting
+Codex).
+
+### Phase 0 — One-time prereqs
+
+**IDENTICAL to Claude Phase 0:**
+
+**Agent:** create the venv and install ENGRAM's deps (same commands, same venv
+path — the ENGRAM MCP server is `server.py` running under the same Python
+regardless of runtime):
+
+```bash
+python3 -m venv ~/.engram/venv
+source ~/.engram/venv/bin/activate
+pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+```
+
+**CODEX-DELTA — Codex CLI install:**
+
+**Ask the human to:** install the Codex CLI if not already present (requires
+Node.js; consult [Codex CLI docs](https://github.com/openai/codex) for the
+current minimum Node version):
+
+```bash
+npm install -g @openai/codex   # codex-cli ≥ 0.136.0 required — older versions
+                                # lack plugin/hook support
+```
+
+Then sign in:
+
+```bash
+codex login
+```
+
+### Phase 1 — Plugin assembly + registration
+
+**CODEX-DELTA — build with codex target:**
+
+**Agent:** clone the repo (or reuse an existing clone) and build the codex
+bundle:
+
+```bash
+git clone https://github.com/engram-agents/engram-alpha.git
+cd engram-alpha
+python3 -m tools.engine.cli build --target codex
+```
+
+The engine emits a codex-flavoured bundle: `.codex-plugin/plugin.json`,
+`CODEX_PLUGIN_ROOT`-based hook paths, and strict-JSON envelopes instead of
+Claude's `antml`-prefix format.
+
+**Ask the human to:** register and add the plugin. ⚠ _These two commands'
+exact invocation form is empirically pinned during first spawn 2026-06-04 —
+exact marketplace-add/plugin-add syntax to be confirmed from the spawn
+runbook before treating them as final:_
+
+```bash
+codex plugin marketplace add ~/.engram/marketplace   # register local marketplace
+codex plugin add engram                              # install from it
+```
+
+### Phase 1.5 — Identity surfaces (CODEX-DELTA, no Claude equivalent)
+
+Where the Claude path renders **one** file (`~/.claude/CLAUDE.md`), the
+codex path renders **three** via `bootstrap.py TARGET=codex`:
+
+| File | Purpose |
+|------|---------|
+| `~/.codex/config.toml` `instructions=` | Compaction-surviving identity core |
+| `~/.codex/AGENTS.md` | Project conventions (agent-facing) |
+| `~/.engram/codex-compact-prompt.md` | Compaction-summary instructions |
+
+**Why three files?** Codex drops `AGENTS.md` from its compaction context, so
+identity that must survive a compaction cycle lives in `instructions=` — the
+structural reason for the 3-way split.
+
+**Agent:** run bootstrap with the codex target (uses the same venv python):
+
+```bash
+VENV_PY="$HOME/.engram/venv/bin/python3"
+ALPHA_DIR="$(pwd)" \
+ALPHA_TEMPLATES_DIR="$(pwd)/templates" \
+ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}" \
+CODEX_HOME="$HOME/.codex" \
+PYTHON_BIN="$VENV_PY" \
+TARGET=codex \
+ENGRAM_INSTALL_MODE=plugin \
+"$VENV_PY" bootstrap.py
+```
+
+The `engram-first-session` skill (now platform-aware) resolves
+`{{AGENT_NAME}}` / `{{USER_NAME}}` in these files during the first-session
+dialogue, as it does for the Claude path.
+
+### Phase 1.6 — Hook trust (CODEX-DELTA)
+
+**Ask the human to:** on first `codex` launch, Codex presents an interactive
+`/hooks` review — the human must review and trust the ENGRAM hook definitions
+before hooks run. ⚠ _Exact UX verified during first spawn 2026-06-04._
+
+(The `--dangerously-bypass-hook-trust` flag exists for headless/CI use but is
+NOT appropriate for a real agent install — the trust-review step is the
+human's safety gate.)
+
+### Phase 2 — First session
+
+**IDENTICAL to Claude Phase 2.**
+
+The agent invokes `engram-first-session` (gated by `first-run-pending`),
+which is platform-aware as of this PR. Same dialogue, same graph seed, same
+naming conversation. The skill detects the Codex runtime and resolves
+placeholders into the three identity files from Phase 1.5 rather than into
+`CLAUDE.md`.
+
+### Phase 3 — Steady state
+
+**IDENTICAL to Claude Phase 3.**
+
+Subsequent sessions: SessionStart hook fires, MCP works normally, the
+`engram-first-session` skill is gated by the (now-deleted) marker and doesn't
+re-fire. No human action required.
+
+---
+
 ## Polarity defaults
 
 ENGRAM ships with a polarity-dedup feature (NLI cross-encoder that flags

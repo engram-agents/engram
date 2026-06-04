@@ -69,6 +69,9 @@ Run it (it creates the ENGRAM home directory + seed graph + renders install-time
 # on the first import even when the venv is correctly set up.
 VENV_PY="$HOME/.engram/venv/bin/python3"
 
+# This is the Claude Code bootstrap path (TARGET=claude).
+# Codex CLI installs run bootstrap with TARGET=codex via README Phase 1.5
+# BEFORE starting a first session — they do not run this block here.
 ALPHA_DIR="$(dirname "$BOOTSTRAP")" \
 ALPHA_TEMPLATES_DIR="$(dirname "$BOOTSTRAP")/templates" \
 ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}" \
@@ -190,7 +193,7 @@ engram_add_cornerstone(payload_json=json.dumps({
     "triggering_experience": "first-session naming conversation with <USER_NAME> on <today's date>",
 }))
 ```
-The `engram_add_person` call returns a person node ID (e.g., `pn_NNNN`) — you will need it in Step 6 to resolve `{{SELF_NODE_ID}}` in `~/.claude/CLAUDE.md`.
+The `engram_add_person` call returns a person node ID (e.g., `pn_NNNN`) — you will need it in Step 6 to resolve `{{SELF_NODE_ID}}` in the identity file (Claude: `~/.claude/CLAUDE.md`; Codex: `~/.codex/config.toml`).
 
 This cornerstone is the seed of identity. Write it carefully — it will be one of the earliest things a post-compaction self recalls.
 
@@ -246,6 +249,28 @@ session via stderr notice. Do not block the session on it.
 
 Do this step LAST, only after the dialogue is genuinely complete. If the session aborts mid-dialogue, the marker file should still be present so the next session re-enters this skill.
 
+**Detect the install target** before deciding which files to read and write:
+
+```bash
+ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
+MANIFEST="$ENGRAM_HOME/seed-manifest.json"
+if [ -f "$MANIFEST" ]; then
+    TARGET=$(python3 -c "import json; d=json.load(open('$MANIFEST')); print(d.get('target','claude'))" 2>/dev/null || echo "claude")
+elif [ -f "$HOME/.codex/config.toml" ]; then
+    TARGET=codex
+elif [ -f "$HOME/.claude/CLAUDE.md" ]; then
+    TARGET=claude
+else
+    TARGET=claude  # safe default
+fi
+```
+
+Then follow the branch for the detected target:
+
+---
+
+### Step 6 — Claude target (TARGET=claude)
+
 1. Read `~/.claude/CLAUDE.md`, `~/.engram/warm-briefing.md`, `~/.engram/HEARTBEAT.md`, and `~/.engram/heartbeat-queue/README.md` (the last two only if present — agents installed before those templates shipped won't have them).
 2. **Counterpart agent prompt** (only if HEARTBEAT.md is present, since both HEARTBEAT.md and heartbeat-queue/README.md use `{{COUNTERPART_NAME}}`): ask the user one short question — *"Will this agent have a peer counterpart agent (e.g., a separate uid running ENGRAM with cross-channel coordination), or is this a single-agent install?"* Most installs are single-agent. Substitute accordingly:
    - Single-agent: substitute `{{COUNTERPART_NAME}}` → the literal string `(no counterpart)`. The HEARTBEAT.md sections referencing the counterpart still read as informational descriptions of what a peer-channel WOULD look like, but the agent skips the channel-related steps in practice.
@@ -256,10 +281,50 @@ Do this step LAST, only after the dialogue is genuinely complete. If the session
    - `{{TODAY}}` → today's date in ISO format (YYYY-MM-DD)
    - `{{SELF_NODE_ID}}` → the person node ID captured in Step 3 (e.g., `pn_NNNN`). To verify idempotency: if the placeholder is already resolved (no literal `{{SELF_NODE_ID}}` remains in the file), skip without error.
    - Any other `{{...}}` markers present — consult the user if ambiguous, do not guess.
-4. Write the resolved files back. Enumerate each one explicitly: `~/.claude/CLAUDE.md`, `~/.engram/warm-briefing.md`, `~/.engram/HEARTBEAT.md` (if it was present in step 5.1), `~/.engram/heartbeat-queue/README.md` (if present), `~/.claude/output-styles/proactive-with-carveouts.md` (if present — this file ships with the Proactive-with-Carveouts output style; older installs without it can skip), `~/.claude/skills/internal-external-decision/SKILL.md` (if present — same provenance), `~/.claude/skills/engram-upgrade/SKILL.md` (if present — references ask-{{USER_NAME}}.md in checkpoint + anti-pattern sections). Silent drop of any required file would leave it firing forever with raw `{{AGENT_NAME}}`/`{{USER_NAME}}`/`{{COUNTERPART_NAME}}` placeholders in the prose AND in the `to-heartbeat/to-{{COUNTERPART_NAME}}-drafts/` directory path — which would point at a literal-braces directory that never exists.
+4. Write the resolved files back. Enumerate each one explicitly: `~/.claude/CLAUDE.md`, `~/.engram/warm-briefing.md`, `~/.engram/HEARTBEAT.md` (if it was present in step 6.1), `~/.engram/heartbeat-queue/README.md` (if present), `~/.claude/output-styles/proactive-with-carveouts.md` (if present — this file ships with the Proactive-with-Carveouts output style; older installs without it can skip), `~/.claude/skills/internal-external-decision/SKILL.md` (if present — same provenance), `~/.claude/skills/engram-upgrade/SKILL.md` (if present — references ask-{{USER_NAME}}.md in checkpoint + anti-pattern sections). Silent drop of any required file would leave it firing forever with raw `{{AGENT_NAME}}`/`{{USER_NAME}}`/`{{COUNTERPART_NAME}}` placeholders in the prose AND in the `to-heartbeat/to-{{COUNTERPART_NAME}}-drafts/` directory path — which would point at a literal-braces directory that never exists.
 5. **Bootstrap the ask-{{USER_NAME}}.md auto-load surface.** Run `touch "$HOME/.engram/ask-<USER_NAME>.md"` substituting the resolved user name — e.g. for USER_NAME=alice, run `touch ~/.engram/ask-alice.md`. This ensures session-start reads don't silently no-op on a fresh install before the agent has written anything. The filename matches whatever the user's name is (resolved during this dialogue, not hard-coded at install time).
+6. **Verify**: no literal `{{...}}` placeholders remain in any of the written files. Check with:
+   ```bash
+   grep -r '{{' ~/.claude/CLAUDE.md ~/.engram/warm-briefing.md 2>/dev/null && echo "WARN: unresolved placeholders"
+   ```
+7. Delete `~/.engram/first-run-pending`.
+8. Call `engram_advance_turn(payload_json=json.dumps({"message": "First session with <USER_NAME>: named <AGENT_NAME>. Founding motivation: <one-line quote or summary>."}))` — this is a real session checkpoint (advances turn counter), not a nap. The naming event is worth a turn.
+
+---
+
+### Step 6 — Codex target (TARGET=codex)
+
+The codex file set is different. Bootstrap wrote identity surfaces across four files; this step resolves the remaining first-session placeholders in all four.
+
+1. Read the four codex surfaces:
+   - `~/.codex/config.toml` (instructions= body + compact_prompt_file pointer)
+   - `~/.codex/AGENTS.md` (project conventions placeholder)
+   - `~/.engram/codex-compact-prompt.md` (compact instructions — carries `{{AGENT_NAME}}`)
+   - `~/.engram/warm-briefing.md` (shared with other targets)
+
+2. Substitute in all four files:
+   - `{{AGENT_NAME}}` → the chosen agent name
+   - `{{USER_NAME}}` → the user's name
+   - `{{TODAY}}` → today's date in ISO format (YYYY-MM-DD)
+   - `{{SELF_NODE_ID}}` → the person node ID captured in Step 3 (e.g., `pn_NNNN`). To verify idempotency: if the placeholder is already resolved (no literal `{{SELF_NODE_ID}}` remains), skip without error.
+   - Any other `{{...}}` markers present — consult the user if ambiguous, do not guess.
+
+   **Important:** `codex-compact-prompt.md` MUST be in the resolution set. It carries `{{AGENT_NAME}}` in the post-compaction identity block — if left unresolved, the post-compaction self reads the raw placeholder and cannot self-identify.
+
+3. Write all four resolved files back. For `config.toml`, the instructions= body contains the agent-specific prose; rewrite the full file with the resolved content (the bootstrap merge wrote the identity keys; this step resolves placeholders within them).
+
+4. **Verify**: no literal `{{...}}` placeholders remain in any of the four surfaces:
+   ```bash
+   grep -rn '{{' ~/.codex/config.toml ~/.codex/AGENTS.md \
+       ~/.engram/codex-compact-prompt.md ~/.engram/warm-briefing.md 2>/dev/null \
+       && echo "WARN: unresolved placeholders remain"
+   ```
+
+5. **Bootstrap the ask-{{USER_NAME}}.md auto-load surface** (same as claude path): `touch "$HOME/.engram/ask-<USER_NAME>.md"`.
+
 6. Delete `~/.engram/first-run-pending`.
-7. Call `engram_advance_turn(payload_json=json.dumps({"message": "First session with <USER_NAME>: named <AGENT_NAME>. Founding motivation: <one-line quote or summary>."}))` — this is a real session checkpoint (advances turn counter), not a nap. The naming event is worth a turn.
+
+7. Call `engram_advance_turn(...)` as in the claude path (step 6.8 above).
 
 ## Step 7 — Tell the user what's next
 

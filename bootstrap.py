@@ -2,9 +2,10 @@
 """
 ENGRAM alpha bootstrap.
 
-Invoked by the plugin installer (TARGET=claude, default) or install-gemini.sh
-(TARGET=gemini). Creates the seed graph (6 nodes + 2 edges) and renders
-target-specific templates with the install-time placeholders.
+Invoked by the plugin installer (TARGET=claude, default), install-gemini.sh
+(TARGET=gemini), or directly (TARGET=codex). Creates the seed graph (6 nodes
++ 2 edges) and renders target-specific templates with the install-time
+placeholders.
 
 Does NOT resolve {{AGENT_NAME}}, {{USER_NAME}}, {{TODAY}} — those belong to
 the first-session dialogue, which runs when the user starts their first
@@ -16,13 +17,14 @@ Expected env vars:
   ENGRAM_HOME            — target for the ENGRAM data dir; also where
                            server.py, engram_confidence.py, and SKILL.md
                            were copied (import path below)
-  TARGET                 — 'claude' (default) | 'gemini'
+  TARGET                 — 'claude' (default) | 'gemini' | 'codex'
   CLAUDE_HOME            — required for TARGET=claude (target for ~/.claude)
+  CODEX_HOME             — required for TARGET=codex (target for ~/.codex)
   GEMINI_EXT_DIR         — required for TARGET=gemini (target for the
                            Gemini CLI extension dir, e.g. ~/.gemini/extensions/engram)
   ALPHA_INTEGRATIONS_DIR — required for TARGET=gemini (path to alpha/integrations/)
 
-Seed graph (same for both targets — each install gets its own copy in
+Seed graph (same for all targets — each install gets its own copy in
 its own knowledge.db):
   - axiom: honesty as structural requirement     → {{AX_HONESTY}}
   - axiom: honesty ⊥ discretion (disambiguation) → {{AX_HONESTY_DISCRETION}}
@@ -38,6 +40,7 @@ Edges:
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,10 +57,11 @@ TEMPLATES_DIR = Path(os.environ["ALPHA_TEMPLATES_DIR"])
 ENGRAM_HOME = Path(os.environ["ENGRAM_HOME"])
 TARGET = os.environ.get("TARGET", "claude").lower()
 
-if TARGET not in ("claude", "gemini"):
-    raise SystemExit(f"Unknown TARGET={TARGET!r}; must be 'claude' or 'gemini'")
+if TARGET not in ("claude", "gemini", "codex"):
+    raise SystemExit(f"Unknown TARGET={TARGET!r}; must be 'claude', 'gemini', or 'codex'")
 
 CLAUDE_HOME = Path(os.environ["CLAUDE_HOME"]) if TARGET == "claude" else None
+CODEX_HOME = Path(os.environ["CODEX_HOME"]) if TARGET == "codex" else None
 GEMINI_EXT_DIR = Path(os.environ["GEMINI_EXT_DIR"]) if TARGET == "gemini" else None
 ALPHA_INTEGRATIONS_DIR = (
     Path(os.environ["ALPHA_INTEGRATIONS_DIR"]) if TARGET == "gemini" else None
@@ -192,6 +196,174 @@ def substitute_template(
         text = text.replace(placeholder, value)
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(text)
+
+
+def _remove_compact_section(text: str) -> str:
+    """Remove the '## Compact Instructions' section from a rendered template body.
+
+    The compact content ships separately as codex-compact-prompt.md; the
+    instructions= field carries identity content only.
+
+    Removes from '## Compact Instructions\\n' through (but not including)
+    the next '## ' section header. If no compact section found, returns
+    text unchanged.
+    """
+    start = text.find("\n## Compact Instructions\n")
+    if start == -1:
+        return text
+    # Find the next section header after the compact section
+    next_section = text.find("\n## ", start + 1)
+    if next_section == -1:
+        # Compact section is last — remove to end
+        return text[:start]
+    return text[:start] + "\n" + text[next_section + 1:]
+
+
+def merge_codex_config_toml(
+    config_path: Path,
+    instructions_body: str,
+    compact_prompt_path: str,
+) -> None:
+    """Write Codex identity keys into config.toml, preserving pre-existing stanzas.
+
+    Strategy (merge-not-clobber):
+    - Read the existing file if present; otherwise start from empty string.
+    - Strip any pre-existing instructions=, experimental_compact_prompt_file=,
+      and # model = ... lines (to replace them idempotently).
+    - Prepend the new identity block (instructions, compact_prompt_file, model
+      comment) to the remaining content.
+    - Write the result back.
+
+    This ensures that plugin stanzas appended by 'codex plugin add' after an
+    initial bootstrap run are preserved intact on subsequent runs.
+    """
+    # Read existing content (may contain plugin stanzas)
+    existing = config_path.read_text() if config_path.exists() else ""
+
+    # Strip lines that are part of the identity block we're (re)writing.
+    # These patterns match:
+    #   instructions = """..."""  (multiline — find start/end)
+    #   experimental_compact_prompt_file = "..."
+    #   # model = ...
+    remaining = existing
+
+    # Remove multiline instructions = """...""" block
+    instr_start = remaining.find('instructions = """')
+    if instr_start != -1:
+        instr_end = remaining.find('"""', instr_start + len('instructions = """'))
+        if instr_end != -1:
+            instr_end += 3  # include the closing """
+            # Also consume any trailing newline
+            if instr_end < len(remaining) and remaining[instr_end] == "\n":
+                instr_end += 1
+            remaining = remaining[:instr_start] + remaining[instr_end:]
+
+    # Remove experimental_compact_prompt_file = "..." line
+    remaining = re.sub(
+        r'^experimental_compact_prompt_file\s*=\s*"[^"]*"\n?',
+        "",
+        remaining,
+        flags=re.MULTILINE,
+    )
+
+    # Remove # model = ... comment line
+    remaining = re.sub(
+        r'^# model\s*=.*\n?',
+        "",
+        remaining,
+        flags=re.MULTILINE,
+    )
+
+    # Build the identity block
+    identity_block = (
+        f'instructions = """\n{instructions_body}\n"""\n'
+        f'experimental_compact_prompt_file = "{compact_prompt_path}"\n'
+        f"# model = codex-1  # uncomment and set your preferred Codex model\n"
+    )
+
+    # Prepend identity block; preserve remaining plugin stanzas
+    # Ensure a blank line separator if remaining has content
+    if remaining.strip():
+        new_content = identity_block + "\n" + remaining.lstrip("\n")
+    else:
+        new_content = identity_block
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(new_content)
+
+
+def _render_codex_target(substitutions: dict[str, str]) -> None:
+    """Render the three Codex identity surfaces.
+
+    1. ~/.engram/codex-compact-prompt.md  — compact instructions (standalone)
+    2. ~/.codex/config.toml               — identity keys (merge-not-clobber)
+    3. ~/.codex/AGENTS.md                 — project conventions placeholder
+
+    The instructions= body is the full CLAUDE.md.template rendered with
+    seed-IDs/ENGRAM_HOME, then adapted for Codex (CLAUDE_PLUGIN_ROOT →
+    CODEX_PLUGIN_ROOT; ~/.claude/CLAUDE.md self-refs → ~/.codex/config.toml;
+    output-styles ref → personality/#816) with the ## Compact Instructions
+    section removed (that content lives in codex-compact-prompt.md).
+
+    {{AGENT_NAME}}, {{USER_NAME}}, {{SELF_NODE_ID}}, {{TODAY}} are intentionally
+    left for the first-session skill to resolve.
+    """
+    assert CODEX_HOME is not None, "CODEX_HOME must be set for TARGET=codex"
+
+    # 1. codex-compact-prompt.md — compact instructions file
+    compact_body = substitutions.get("{{COMPACT_INSTRUCTIONS}}", "")
+    # Apply seed-IDs and ENGRAM_HOME (leave first-session markers alone)
+    compact_rendered = compact_body
+    for placeholder, value in substitutions.items():
+        if placeholder != "{{COMPACT_INSTRUCTIONS}}":
+            compact_rendered = compact_rendered.replace(placeholder, value)
+    compact_out = ENGRAM_HOME / "codex-compact-prompt.md"
+    compact_out.parent.mkdir(parents=True, exist_ok=True)
+    compact_out.write_text(compact_rendered)
+    print(f"  codex-compact-prompt.md → {compact_out}", flush=True)
+
+    # 2. ~/.codex/config.toml — instructions= body
+    # Start from the CLAUDE.md.template, substitute seed-IDs + ENGRAM_HOME,
+    # then apply Codex-specific adaptations, then remove compact section.
+    claude_template_path = TEMPLATES_DIR / "CLAUDE.md.template"
+    raw = claude_template_path.read_text()
+
+    # Apply all substitutions (this folds {{COMPACT_INSTRUCTIONS}} back in,
+    # giving us the full rendered text before we strip the compact section)
+    rendered = raw
+    for placeholder, value in substitutions.items():
+        rendered = rendered.replace(placeholder, value)
+
+    # Remove the ## Compact Instructions section (lives in the separate file)
+    rendered = _remove_compact_section(rendered)
+
+    # Codex-specific textual adaptations
+    rendered = rendered.replace("CLAUDE_PLUGIN_ROOT", "CODEX_PLUGIN_ROOT")
+    rendered = rendered.replace(
+        "`~/.claude/CLAUDE.md`",
+        "`~/.codex/config.toml`",
+    )
+    # Replace the output-styles reference with the personality/#816 pointer
+    rendered = rendered.replace(
+        "`~/.claude/output-styles/*`",
+        "personality (see #816)",
+    )
+
+    compact_prompt_path = str(ENGRAM_HOME / "codex-compact-prompt.md")
+    merge_codex_config_toml(
+        CODEX_HOME / "config.toml",
+        rendered,
+        compact_prompt_path,
+    )
+    print(f"  config.toml → {CODEX_HOME}/config.toml", flush=True)
+
+    # 3. ~/.codex/AGENTS.md — project conventions placeholder
+    substitute_template(
+        TEMPLATES_DIR / "AGENTS.md.template",
+        CODEX_HOME / "AGENTS.md",
+        substitutions,
+    )
+    print(f"  AGENTS.md → {CODEX_HOME}/AGENTS.md", flush=True)
 
 
 def main() -> None:
@@ -335,9 +507,28 @@ def main() -> None:
     substitutions["{{ENGRAM_HOME}}"] = str(ENGRAM_HOME)
     substitutions["{{PYTHON}}"] = os.environ.get("PYTHON_BIN", "python3")
 
+    # Load compact-instructions.md into substitutions so the Claude target
+    # can fold it back in (lossless) and the codex target can write it as a
+    # separate file.
+    compact_instructions_path = TEMPLATES_DIR / "compact-instructions.md"
+    if compact_instructions_path.exists():
+        substitutions["{{COMPACT_INSTRUCTIONS}}"] = (
+            compact_instructions_path.read_text()
+        )
+    else:
+        # Fallback: leave the marker unreplaced (the template will still render
+        # with the literal placeholder, which is visible and actionable).
+        print(
+            f"  WARN: compact-instructions.md not found at "
+            f"{compact_instructions_path}; {{{{COMPACT_INSTRUCTIONS}}}} "
+            f"left unresolved",
+            flush=True,
+        )
+
     manifest = {
         "seed_ids": ids,
         "alpha_dir": str(ALPHA_DIR),
+        "target": TARGET,
     }
     (ENGRAM_HOME / "seed-manifest.json").write_text(
         json.dumps(manifest, indent=2)
@@ -400,6 +591,9 @@ def main() -> None:
             substitutions,
         )
         print(f"  CLAUDE.md → {CLAUDE_HOME}/CLAUDE.md", flush=True)
+
+    elif TARGET == "codex":
+        _render_codex_target(substitutions)
 
     elif TARGET == "gemini":
         gemini_template = (

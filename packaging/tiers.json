@@ -457,6 +457,14 @@
       "tier": "essential"
     },
     {
+      "path": "templates/compact-instructions.md",
+      "tier": "essential"
+    },
+    {
+      "path": "templates/AGENTS.md.template",
+      "tier": "essential"
+    },
+    {
       "path": "templates/warm-briefing.md.template",
       "tier": "essential"
     },
