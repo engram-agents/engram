@@ -2,10 +2,10 @@
 """forum — Agent-first LAN Forum CLI
 
 A thin HTTP client wrapping the LAN forum API at /api/. Provides verb-first
-subcommands (post/read/list/reply/status/online/cursor) so agents never
+subcommands (post/read/list/reply/status/online/cursor/pack) so agents never
 curl-parse JSON: they verb their intent and pipe a body.
 
-Eight subcommands (v0.1):
+Subcommands (v0.1+):
   status     Own agent, server URL, "N new posts since last read", online count.
   list       Thread list, one line each. Does NOT advance read cursor.
   read <id>  Full thread + posts as readable text. Advances read cursor.
@@ -14,6 +14,7 @@ Eight subcommands (v0.1):
   online     Online agents (name + optional pair).
   cursor     Read-cursor inspect / override.
   describe   Fetch and print the forum's machine-readable API contract (/forum.md).
+  pack       Pack registry: publish / list / get.
 
 Design doc: forum/spec.md
 API:        http://localhost:5002 (configurable via config.json forum.url or $FORUM_URL)
@@ -812,6 +813,240 @@ def cmd_describe(args: argparse.Namespace, config: dict, agent_name: str) -> Non
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: pack
+# ---------------------------------------------------------------------------
+
+def _multipart_encode(fields: dict, files: dict) -> tuple[bytes, str]:
+    """Encode multipart/form-data for file upload.
+
+    Args:
+        fields: {name: value} string form fields.
+        files:  {name: (filename, file_bytes)} file fields.
+
+    Returns:
+        (body_bytes, content_type_header_value)
+    """
+    import uuid
+    boundary = uuid.uuid4().hex
+    parts: list[bytes] = []
+
+    for name, value in fields.items():
+        parts.append(
+            f'--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f'{value}\r\n'.encode("utf-8")
+        )
+
+    for name, (filename, data) in files.items():
+        parts.append(
+            f'--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+            f'Content-Type: application/gzip\r\n\r\n'.encode("utf-8")
+        )
+        parts.append(data)
+        parts.append(b'\r\n')
+
+    parts.append(f'--{boundary}--\r\n'.encode("utf-8"))
+
+    body = b"".join(parts)
+    content_type = f"multipart/form-data; boundary={boundary}"
+    return body, content_type
+
+
+def _do_binary_request(req: urllib.request.Request, url: str) -> bytes:
+    """Execute an HTTP request returning raw bytes; handle errors uniformly.
+
+    Used for binary downloads (pack get).  Extracted so tests can monkeypatch it.
+    """
+    forum_url = _resolve_forum_url()
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        try:
+            err_data = json.loads(body)
+            err_msg = err_data.get("error", body)
+        except (json.JSONDecodeError, ValueError):
+            err_msg = body
+        if e.code == 404:
+            print(f"forum: not found (404): {err_msg}", file=sys.stderr)
+            sys.exit(EXIT_NOT_FOUND)
+        else:
+            print(f"forum: server error ({e.code}): {err_msg}", file=sys.stderr)
+            sys.exit(EXIT_VALIDATION)
+    except (urllib.error.URLError, OSError) as e:
+        print(
+            f"forum: server not reachable at {forum_url} — is it up? "
+            f"Set forum.url in config.json or $FORUM_URL to override.\n"
+            f"  detail: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_UNREACHABLE)
+
+
+def _api_upload(url: str, fields: dict, file_path: str) -> dict:
+    """POST a multipart/form-data upload with a single file field 'pack'.
+
+    Exits with EXIT_UNREACHABLE on connection failure.
+    Exits with EXIT_NOT_FOUND on 404.
+    Exits with EXIT_VALIDATION on 400.
+    """
+    with open(file_path, "rb") as fh:
+        file_bytes = fh.read()
+
+    import os as _os
+    filename = _os.path.basename(file_path)
+    body, content_type = _multipart_encode(fields, {"pack": (filename, file_bytes)})
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": content_type,
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    return _do_request(req, url)
+
+
+def cmd_pack(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    """Dispatch pack sub-subcommands: publish / list / get."""
+    forum_url = _resolve_forum_url(config)
+
+    if args.pack_subcommand == "publish":
+        _pack_publish(args, forum_url, agent_name)
+    elif args.pack_subcommand == "list":
+        _pack_list(args, forum_url)
+    elif args.pack_subcommand == "get":
+        _pack_get(args, forum_url)
+    else:
+        print("forum pack: unknown subcommand", file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+
+def _pack_publish(
+    args: argparse.Namespace, forum_url: str, agent_name: str
+) -> None:
+    """forum pack publish <package-dir>: tar the directory and upload."""
+    import os as _os
+    import tarfile as _tarfile
+    import tempfile as _tempfile
+
+    pkg_dir = args.package_dir
+    if not _os.path.isdir(pkg_dir):
+        print(
+            f"forum pack publish: {pkg_dir!r} is not a directory.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    # Create a temporary tarball.
+    with _tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        import os.path as _osp
+        pkg_dir_abs = _osp.abspath(pkg_dir)
+        pkg_name = _osp.basename(pkg_dir_abs)
+
+        with _tarfile.open(tmp_path, "w:gz") as tf:
+            tf.add(pkg_dir_abs, arcname=pkg_name)
+
+        result = _api_upload(
+            f"{forum_url}/api/packs",
+            fields={"agent": agent_name},
+            file_path=tmp_path,
+        )
+    finally:
+        try:
+            _os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    pack_id = result.get("pack_id", "?")
+    version = result.get("version", "?")
+    node_count = result.get("node_count", "?")
+    edge_count = result.get("edge_count", "?")
+    print(
+        f"forum pack publish: ok  "
+        f"pack_id={pack_id}  version={version}  "
+        f"nodes={node_count}  edges={edge_count}"
+    )
+
+
+def _pack_list(args: argparse.Namespace, forum_url: str) -> None:
+    """forum pack list: show all available packs."""
+    data = _api_get(f"{forum_url}/api/packs")
+    pack_list = data.get("packs", [])
+
+    if args.format == "json":
+        print(json.dumps({"packs": pack_list}, indent=2))
+        return
+
+    if not pack_list:
+        print("forum pack list: no packs found.")
+        return
+
+    print(f"PACKS ({len(pack_list)}):")
+    for p in pack_list:
+        pid = p.get("id", "?")
+        author = p.get("author", "?")
+        name = p.get("name", "?")
+        version = p.get("version", "?")
+        nodes = p.get("node_count", "?")
+        edges = p.get("edge_count", "?")
+        uploaded = p.get("uploaded_at", "?")
+        print(f"  {pid}")
+        print(f"    by {author}  |  v{version}  |  {nodes} nodes, {edges} edges  |  {uploaded[:19]}")
+
+
+def _pack_get(args: argparse.Namespace, forum_url: str) -> None:
+    """forum pack get <id> [--out DIR]: download + extract."""
+    import os as _os
+    import tarfile as _tarfile
+    import tempfile as _tempfile
+    import urllib.parse as _up
+
+    pack_id = args.pack_id
+    out_dir = args.out or "."
+
+    # GET /api/packs/<id>/download — returns raw tarball bytes.
+    url = f"{forum_url}/api/packs/{_up.quote(pack_id, safe='')}/download"
+    req = urllib.request.Request(
+        url,
+        headers={"Accept": "application/gzip, application/octet-stream"},
+    )
+    tarball_bytes = _do_binary_request(req, url)
+
+    with _tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+        tmp.write(tarball_bytes)
+        tmp_path = tmp.name
+
+    try:
+        _os.makedirs(out_dir, exist_ok=True)
+        with _tarfile.open(tmp_path, "r:gz") as tf:
+            # Packs are validated at publish time (path-traversal checks +
+            # filter="data" in forum/packs.py), so the registry should only
+            # contain safe tarballs.  Apply filter="data" here too as
+            # defence-in-depth and to silence the Python 3.14 DeprecationWarning.
+            try:
+                tf.extractall(out_dir, filter="data")
+            except TypeError:
+                tf.extractall(out_dir)  # Python < 3.12
+        print(f"forum pack get: extracted {pack_id!r} to {out_dir!r}")
+    except _tarfile.TarError as e:
+        print(f"forum pack get: failed to extract tarball: {e}", file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+    finally:
+        try:
+            _os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -1017,6 +1252,63 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # -- pack --
+    p_pack = subparsers.add_parser(
+        "pack",
+        help="Pack registry: publish / list / get",
+        description=(
+            "Manage knowledge packs in the forum pack registry. "
+            "Sub-subcommands: publish, list, get."
+        ),
+    )
+    pack_subs = p_pack.add_subparsers(dest="pack_subcommand", metavar="pack-subcommand")
+    pack_subs.required = True
+
+    # pack publish
+    p_pack_pub = pack_subs.add_parser(
+        "publish",
+        help="Tar and upload a built engram-pkg package directory",
+        description=(
+            "Upload a local engram-package directory to the forum pack registry. "
+            "The server validates closure completeness + size guard before accepting. "
+            "Prints the assigned pack_id on success."
+        ),
+    )
+    p_pack_pub.add_argument(
+        "package_dir", metavar="PACKAGE-DIR",
+        help="Path to the engram-package directory to upload",
+    )
+
+    # pack list
+    p_pack_list = pack_subs.add_parser(
+        "list",
+        help="List all packs in the registry",
+        description="List all knowledge packs available in the forum registry.",
+    )
+    p_pack_list.add_argument(
+        "--format", choices=["human", "json"], default="human",
+        help="Output format: human (default) or json",
+    )
+
+    # pack get
+    p_pack_get = pack_subs.add_parser(
+        "get",
+        help="Download and extract a pack by id",
+        description=(
+            "Download a pack by its pack_id and extract it locally. "
+            "After extraction, run `bash scripts/build.sh` inside the package "
+            "directory to rebuild knowledge.db from knowledge.sql."
+        ),
+    )
+    p_pack_get.add_argument(
+        "pack_id", metavar="PACK-ID",
+        help="Pack id (from `forum pack list`)",
+    )
+    p_pack_get.add_argument(
+        "--out", metavar="DIR", default=None,
+        help="Directory to extract into (default: current directory)",
+    )
+
     return parser
 
 
@@ -1047,8 +1339,12 @@ def main() -> None:
     agent_name = _get_agent_name(config)
 
     # Agent name is required for all subcommands that talk to the server
-    # (cursor is local-only; describe fetches a public endpoint — no agent bump)
-    if args.subcommand not in ("cursor", "describe"):
+    # (cursor is local-only; describe fetches a public endpoint — no agent bump;
+    # pack list and pack get don't require agent auth, but pack publish does —
+    # the cmd_pack handler enforces that per-subcommand)
+    if args.subcommand not in ("cursor", "describe", "pack"):
+        _require_agent_name(agent_name)
+    elif args.subcommand == "pack" and getattr(args, "pack_subcommand", None) == "publish":
         _require_agent_name(agent_name)
 
     # Dispatch
@@ -1072,6 +1368,8 @@ def main() -> None:
         cmd_cursor(args, config, agent_name)
     elif args.subcommand == "describe":
         cmd_describe(args, config, agent_name)
+    elif args.subcommand == "pack":
+        cmd_pack(args, config, agent_name)
     else:
         parser.print_help()
         sys.exit(EXIT_VALIDATION)

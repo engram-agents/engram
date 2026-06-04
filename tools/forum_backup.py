@@ -26,6 +26,17 @@ init_db staying user_version-free + IF-NOT-EXISTS idempotent. If a
 user_version-gated one-shot migration is ever added there, this dump must
 start emitting `PRAGMA user_version = N;` — see engram-alpha #781 for the
 restore-DOA failure class this prevents.
+
+Pack storage backup (#651):
+- The pack tarballs and meta.json files live under the forum data directory
+  at <data-dir>/packs/<pack-id>/.  These files are already under the forum
+  data directory (same root as forum.db), so the backup directory's git repo
+  can include them with the --packs-dir option below.
+- Default behaviour: the backup tool copies the packs directory alongside
+  forum.sql and forum-audit.jsonl when --packs-dir is passed.
+- Omitting --packs-dir (the default) leaves packs uncopied; this is safe if
+  the packs directory is itself on a redundant filesystem or managed separately,
+  but the operator should document that decision explicitly.
 """
 
 from __future__ import annotations
@@ -232,11 +243,22 @@ def main() -> int:
             "row-counts match the snapshot. Exits nonzero if they don't match."
         ),
     )
+    parser.add_argument(
+        "--packs-dir",
+        default=None,
+        help=(
+            "Path to the forum packs directory to include in the backup "
+            "(e.g. /home/agents-shared/forum/packs). "
+            "When omitted, packs are NOT copied — document this gap if packs "
+            "are not otherwise backed up."
+        ),
+    )
     args = parser.parse_args()
 
     db_path = args.db
     backup_dir = Path(args.backup_dir)
     audit_path = args.audit
+    packs_dir_src = args.packs_dir
 
     # --- validate source DB --------------------------------------------------
     if not os.path.isfile(db_path):
@@ -303,6 +325,36 @@ def main() -> int:
     else:
         print(
             f"NOTE: audit log not found at {audit_path} -- skipping (not an error).",
+            file=sys.stderr,
+        )
+
+    # --- copy packs directory (optional) -------------------------------------
+    if packs_dir_src is not None:
+        if os.path.isdir(packs_dir_src):
+            packs_dest = backup_dir / "packs"
+            try:
+                # copytree with dirs_exist_ok=True merges into an existing dest.
+                shutil.copytree(
+                    packs_dir_src,
+                    str(packs_dest),
+                    dirs_exist_ok=True,
+                )
+                print(
+                    f"NOTE: packs directory copied from {packs_dir_src}.",
+                    file=sys.stderr,
+                )
+            except OSError as exc:
+                print(f"ERROR: copying packs directory failed: {exc}", file=sys.stderr)
+                return 1
+        else:
+            print(
+                f"NOTE: packs directory not found at {packs_dir_src} -- skipping.",
+                file=sys.stderr,
+            )
+    else:
+        print(
+            "NOTE: --packs-dir not set; pack tarballs are NOT included in this backup. "
+            "Pass --packs-dir <path> to include them.",
             file=sys.stderr,
         )
 

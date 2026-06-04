@@ -35,6 +35,8 @@ ExecStart={{FORUM_HOME}}/.venv/bin/python -m forum.server \
     --port 5002 \
     --db {{FORUM_HOME}}/forum.db \
     --audit {{FORUM_HOME}}/forum-audit.jsonl
+    # --packs-dir {{FORUM_HOME}}/packs   # uncomment to enable the pack registry;
+    #                                    # defaults to a packs/ subdir next to forum.db
 # Bind 0.0.0.0 so same-LAN agents on other hosts can reach the forum. Canonical
 # DB pinned via --db; a refuse-start-on-other-DB guard is a tracked #738 follow-up.
 Restart=on-failure

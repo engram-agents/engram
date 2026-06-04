@@ -85,6 +85,20 @@ CREATE INDEX IF NOT EXISTS idx_threads_category_last_activity
 CREATE INDEX IF NOT EXISTS idx_post_verifications_post
     ON post_verifications(post_id);
 
+CREATE TABLE IF NOT EXISTS packs (
+    id              TEXT PRIMARY KEY,
+    author          TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    uploaded_at     TEXT NOT NULL,
+    root_count      INTEGER NOT NULL DEFAULT 0,
+    node_count      INTEGER NOT NULL DEFAULT 0,
+    edge_count      INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_packs_author_name
+    ON packs(author, name);
+
 CREATE TABLE IF NOT EXISTS reads (
     agent_id           INTEGER NOT NULL REFERENCES agents(id),
     thread_id          INTEGER NOT NULL REFERENCES threads(id),
@@ -1398,3 +1412,84 @@ def get_post_verifications(
         {"verifier": r[0], "note": r[1], "created_at": r[2]}
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Packs
+# ---------------------------------------------------------------------------
+
+def next_pack_version(conn: sqlite3.Connection, author: str, name: str) -> int:
+    """Return 1 + max existing version for this author+name, or 1 if new."""
+    row = conn.execute(
+        "SELECT MAX(version) FROM packs WHERE author = ? AND name = ?",
+        (author, name),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return 1
+    return int(row[0]) + 1
+
+
+def insert_pack(
+    conn: sqlite3.Connection,
+    pack_id: str,
+    author: str,
+    name: str,
+    version: int,
+    uploaded_at: str,
+    root_count: int,
+    node_count: int,
+    edge_count: int,
+) -> None:
+    """Insert a new pack row (pack_id must be unique)."""
+    conn.execute(
+        "INSERT INTO packs(id, author, name, version, uploaded_at, "
+        "                  root_count, node_count, edge_count) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+        (pack_id, author, name, version, uploaded_at, root_count, node_count, edge_count),
+    )
+    conn.commit()
+
+
+def list_packs(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Return all packs ordered by uploaded_at DESC."""
+    rows = conn.execute(
+        "SELECT id, author, name, version, uploaded_at, "
+        "       root_count, node_count, edge_count "
+        "  FROM packs "
+        " ORDER BY uploaded_at DESC"
+    ).fetchall()
+    return [
+        {
+            "id": r[0],
+            "author": r[1],
+            "name": r[2],
+            "version": r[3],
+            "uploaded_at": r[4],
+            "root_count": r[5],
+            "node_count": r[6],
+            "edge_count": r[7],
+        }
+        for r in rows
+    ]
+
+
+def get_pack(conn: sqlite3.Connection, pack_id: str) -> dict[str, Any] | None:
+    """Return the pack row dict for pack_id, or None if not found."""
+    row = conn.execute(
+        "SELECT id, author, name, version, uploaded_at, "
+        "       root_count, node_count, edge_count "
+        "  FROM packs WHERE id = ?",
+        (pack_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": row[0],
+        "author": row[1],
+        "name": row[2],
+        "version": row[3],
+        "uploaded_at": row[4],
+        "root_count": row[5],
+        "node_count": row[6],
+        "edge_count": row[7],
+    }

@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import tempfile
+from pathlib import Path
 
-from flask import Flask, Response, abort, g, jsonify, render_template, request
+from flask import Flask, Response, abort, g, jsonify, render_template, request, send_file
 
-from . import audit, db, seed
+from . import audit, db, packs as packs_mod, seed
 from .avatar import avatar_svg
 from .render import render_post_body
 
@@ -28,6 +30,7 @@ def create_app(
     db_path: str,
     audit_path: str,
     categories_config: str | None = None,
+    packs_dir: str | None = None,
 ) -> Flask:
     """Create and configure the Flask application.
 
@@ -36,14 +39,25 @@ def create_app(
         audit_path:        Absolute path to the JSONL audit log.
         categories_config: Optional path to a categories JSON config file.
             When None, db.load_category_config() resolution chain applies.
+        packs_dir:         Directory to store uploaded packs. Defaults to
+            a ``packs/`` subdirectory next to the DB file.
 
     Returns:
         A configured Flask application instance.
     """
+    if packs_dir is None:
+        packs_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "packs")
+
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config["DB_PATH"] = db_path
     app.config["AUDIT_PATH"] = audit_path
     app.config["CATEGORIES_CONFIG"] = categories_config
+    app.config["PACKS_DIR"] = packs_dir
+    # Cap upload size at 50 MB.  Packs are bounded by MAX_NODES=200 /
+    # MAX_EDGES=400, so a 50 MB ceiling is generous while blocking
+    # disk-fill attacks on this HTTP-exposed upload path.  Flask returns
+    # 413 automatically when the limit is exceeded.
+    app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
 
     # Register avatar as a Jinja filter so templates can call:
     #   {{ author.avatar_seed | avatar(40) | safe }}
@@ -519,6 +533,128 @@ def create_app(
         )
         return jsonify({"agent": agent_name, "pair_initials": pair_initials})
 
+    # ------------------------------------------------------------------
+    # POST /api/packs  — upload + validate + store a pack
+    # ------------------------------------------------------------------
+    @app.route("/api/packs", methods=["POST"])
+    def api_packs_publish():
+        # Auth: same agent-identity convention as other mutations.
+        agent_name = (request.form.get("agent") or "").strip()
+        if not agent_name:
+            return jsonify({"error": "agent is required (form field)"}), 400
+
+        # Accept the tarball as a multipart file upload.
+        if "pack" not in request.files:
+            return jsonify({"error": "'pack' file field is required"}), 400
+
+        upload = request.files["pack"]
+        if not upload.filename:
+            return jsonify({"error": "uploaded file has no filename"}), 400
+
+        # Write the upload to a temp file for validation.
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+            tmp_path = tmp.name
+            upload.save(tmp_path)
+
+        try:
+            # Validate: shape + closure invariant + size guard.
+            try:
+                pack_meta = packs_mod.validate_pack(Path(tmp_path))
+            except packs_mod.PackValidationError as exc:
+                return jsonify({"error": str(exc)}), 400
+
+            # Determine version and pack-id.
+            pack_name = pack_meta["name"]
+            author_slug = packs_mod._slugify(agent_name)
+            name_slug = packs_mod._slugify(pack_name)
+            version = db.next_pack_version(g.conn, author_slug, name_slug)
+            pack_id = packs_mod.make_pack_id(agent_name, pack_name, version)
+            uploaded_at = packs_mod._now_iso()
+
+            # Store the pack on disk.
+            _packs_dir = Path(app.config["PACKS_DIR"])
+            _packs_dir.mkdir(parents=True, exist_ok=True)
+            pack_dir = packs_mod.store_pack(_packs_dir, pack_id, Path(tmp_path))
+            packs_mod.write_pack_meta(
+                pack_dir,
+                pack_id=pack_id,
+                author=author_slug,
+                name=name_slug,
+                version=version,
+                uploaded_at=uploaded_at,
+                root_count=pack_meta["root_count"],
+                node_count=pack_meta["node_count"],
+                edge_count=pack_meta["edge_count"],
+            )
+
+            # Record in DB.
+            db.insert_pack(
+                g.conn,
+                pack_id=pack_id,
+                author=author_slug,
+                name=name_slug,
+                version=version,
+                uploaded_at=uploaded_at,
+                root_count=pack_meta["root_count"],
+                node_count=pack_meta["node_count"],
+                edge_count=pack_meta["edge_count"],
+            )
+
+        finally:
+            try:
+                import os as _os
+                _os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        return jsonify({
+            "pack_id": pack_id,
+            "author": author_slug,
+            "name": name_slug,
+            "version": version,
+            "uploaded_at": uploaded_at,
+            "node_count": pack_meta["node_count"],
+            "edge_count": pack_meta["edge_count"],
+        }), 201
+
+    # ------------------------------------------------------------------
+    # GET /api/packs  — list all packs (meta only)
+    # ------------------------------------------------------------------
+    @app.route("/api/packs")
+    def api_packs_list():
+        pack_list = db.list_packs(g.conn)
+        return jsonify({"packs": pack_list})
+
+    # ------------------------------------------------------------------
+    # GET /api/packs/<id>  — single pack meta
+    # ------------------------------------------------------------------
+    @app.route("/api/packs/<pack_id>")
+    def api_packs_get(pack_id: str):
+        pack = db.get_pack(g.conn, pack_id)
+        if pack is None:
+            return jsonify({"error": f"pack {pack_id!r} not found"}), 404
+        return jsonify({"pack": pack})
+
+    # ------------------------------------------------------------------
+    # GET /api/packs/<id>/download  — serve the tarball
+    # ------------------------------------------------------------------
+    @app.route("/api/packs/<pack_id>/download")
+    def api_packs_download(pack_id: str):
+        pack = db.get_pack(g.conn, pack_id)
+        if pack is None:
+            return jsonify({"error": f"pack {pack_id!r} not found"}), 404
+
+        tarball = Path(app.config["PACKS_DIR"]) / pack_id / "package.tar.gz"
+        if not tarball.exists():
+            return jsonify({"error": f"tarball for pack {pack_id!r} not found on disk"}), 404
+
+        return send_file(
+            str(tarball),
+            mimetype="application/gzip",
+            as_attachment=True,
+            download_name=f"{pack_id}.tar.gz",
+        )
+
     return app
 
 
@@ -536,6 +672,9 @@ def main() -> None:
     p.add_argument("--categories-config", default=None,
                    help="Path to a JSON categories config file. "
                         "Overrides FORUM_CATEGORIES_CONFIG env and default resolution chain.")
+    p.add_argument("--packs-dir", default=None,
+                   help="Directory for uploaded pack storage. "
+                        "Defaults to packs/ next to --db.")
     args = p.parse_args()
 
     # Ensure db directory exists
@@ -548,7 +687,12 @@ def main() -> None:
     seed.seed_threads(conn)
     conn.close()
 
-    app = create_app(args.db, args.audit, categories_config=args.categories_config)
+    app = create_app(
+        args.db,
+        args.audit,
+        categories_config=args.categories_config,
+        packs_dir=args.packs_dir,
+    )
     app.run(host=args.host, port=args.port)
 
 

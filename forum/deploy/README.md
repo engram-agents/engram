@@ -168,6 +168,20 @@ systemctl --user daemon-reload
 systemctl --user enable --now engram-forum-backup.timer
 ```
 
+> **If you use the pack registry**, add `--packs-dir <path>` to the
+> `forum_backup.py` command in the backup service unit.  Without it,
+> `forum_backup.py` emits a NOTE to stdout but does **not** back up packs.
+> Operators who activate pack publishing and rely on the existing timer without
+> updating the unit will have a silent backup gap for published pack tarballs.
+> Example (edit `~/.config/systemd/user/engram-forum-backup.service`):
+>
+> ```
+> ExecStart=... forum_backup.py ... --packs-dir {{FORUM_HOME}}/packs
+> ```
+>
+> Substitute the actual packs directory path for `{{FORUM_HOME}}/packs`.
+> Run `systemctl --user daemon-reload` after editing.
+
 Verify:
 
 ```bash

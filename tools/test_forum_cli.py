@@ -1261,3 +1261,253 @@ class TestHookCursorNotAdvancedOnUnreachableNoCache:
         assert Path(surfaced_cursor_path).exists(), (
             "hook must advance the surfaced cursor when fetch succeeds (even with 0 threads)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Pack CLI tests
+# ---------------------------------------------------------------------------
+
+import io as _io_module
+import tarfile as _tarfile_module
+
+# Minimal knowledge.sql — empty graph, trivially closure-complete.
+_PACK_MINIMAL_SQL = """\
+CREATE TABLE IF NOT EXISTS nodes (
+    id TEXT PRIMARY KEY,
+    type TEXT,
+    claim TEXT,
+    confidence REAL,
+    evidence_id TEXT,
+    source_class TEXT,
+    quote_type TEXT,
+    status TEXT,
+    created_at TEXT,
+    updated_at TEXT,
+    reasoning_type TEXT,
+    logical_chain TEXT,
+    tags TEXT,
+    author TEXT
+);
+CREATE TABLE IF NOT EXISTS edges (
+    id INTEGER PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    created_at TEXT
+);
+"""
+
+
+def _make_test_pack_dir(tmp_path, sql_content=None):
+    """Create a minimal engram-package directory in tmp_path/pkg.
+
+    Returns the path to the package directory.
+    """
+    pkg = tmp_path / "test-pack"
+    pkg.mkdir()
+    (pkg / "knowledge.sql").write_text(
+        sql_content if sql_content is not None else _PACK_MINIMAL_SQL,
+        encoding="utf-8",
+    )
+    scripts = pkg / "scripts"
+    scripts.mkdir()
+    (scripts / "build.sh").write_text("#!/bin/bash\n# stub\n")
+    (scripts / "dump.sh").write_text("#!/bin/bash\n# stub\n")
+    (pkg / "README.md").write_text("# Test Pack\n")
+    return pkg
+
+
+@pytest.fixture
+def flask_app_with_packs(tmp_path):
+    """Real Flask forum app with a temp DB and packs_dir (pack integration tests)."""
+    if not _FORUM_AVAILABLE:
+        pytest.skip("forum server not available")
+    db_path = str(tmp_path / "forum.db")
+    audit_path = str(tmp_path / "audit.jsonl")
+    packs_dir = str(tmp_path / "packs")
+    conn = sqlite3.connect(db_path)
+    init_db(conn)
+    conn.close()
+    app = create_app(db_path, audit_path, packs_dir=packs_dir)
+    app.config["TESTING"] = True
+    return app
+
+
+@pytest.fixture
+def wired_cli_packs(flask_app_with_packs, engram_home):
+    """wired_cli variant that supports multipart uploads for pack tests.
+
+    Extends the standard _patched_do_request to also handle multipart POST
+    (used by forum pack publish).  The multipart body is passed as-is to the
+    Flask test client which handles it natively.
+    """
+    flask_client_packs = flask_app_with_packs.test_client()
+    base_url = "http://testserver"
+
+    config = {"agent_name": "testbot", "forum": {"url": base_url}}
+    (engram_home / "config.json").write_text(json.dumps(config))
+    forum_cli._FORUM_URL_CACHE = None
+
+    def _patched_do_request(req, url):
+        if url.startswith(base_url):
+            path = url[len(base_url):]
+        else:
+            path = url
+
+        method = req.get_method()
+        # urllib.request lowercases the 't' in Content-Type → "Content-type".
+        # Use case-insensitive lookup to avoid falling back to application/json.
+        headers_raw = dict(req.headers) if req.headers else {}
+        headers_lower = {k.lower(): v for k, v in headers_raw.items()}
+        content_type = headers_lower.get("content-type", "application/json")
+
+        if method == "POST":
+            data = req.data
+            resp = flask_client_packs.post(
+                path,
+                data=data,
+                content_type=content_type,
+            )
+        else:
+            resp = flask_client_packs.get(path)
+
+        if resp.status_code >= 400:
+            body = resp.data.decode("utf-8", errors="replace")
+            try:
+                err_data = json.loads(body)
+                err_msg = err_data.get("error", body)
+            except (json.JSONDecodeError, ValueError):
+                err_msg = body
+            if resp.status_code == 404:
+                print(f"forum: not found (404): {err_msg}", file=sys.stderr)
+                sys.exit(forum_cli.EXIT_NOT_FOUND)
+            elif resp.status_code == 400:
+                print(f"forum: validation error (400): {err_msg}", file=sys.stderr)
+                sys.exit(forum_cli.EXIT_VALIDATION)
+            else:
+                print(f"forum: server error ({resp.status_code}): {err_msg}", file=sys.stderr)
+                sys.exit(forum_cli.EXIT_VALIDATION)
+
+        return json.loads(resp.data.decode("utf-8"))
+
+    def _patched_do_binary_request(req, url):
+        """Handle binary downloads (pack get) via the test client."""
+        if url.startswith(base_url):
+            path = url[len(base_url):]
+        else:
+            path = url
+
+        resp = flask_client_packs.get(path)
+
+        if resp.status_code >= 400:
+            body = resp.data.decode("utf-8", errors="replace")
+            try:
+                err_data = json.loads(body)
+                err_msg = err_data.get("error", body)
+            except (json.JSONDecodeError, ValueError):
+                err_msg = body
+            if resp.status_code == 404:
+                print(f"forum: not found (404): {err_msg}", file=sys.stderr)
+                sys.exit(forum_cli.EXIT_NOT_FOUND)
+            else:
+                print(f"forum: server error ({resp.status_code}): {err_msg}", file=sys.stderr)
+                sys.exit(forum_cli.EXIT_VALIDATION)
+
+        return resp.data
+
+    def run_cli(argv, stdin_text=None):
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        stdin_str = stdin_text if stdin_text is not None else ""
+
+        with mock.patch.object(forum_cli, "_do_request", side_effect=_patched_do_request), \
+             mock.patch.object(forum_cli, "_do_binary_request",
+                               side_effect=_patched_do_binary_request), \
+             mock.patch("sys.argv", ["forum"] + argv), \
+             mock.patch("sys.stdout", stdout_buf), \
+             mock.patch("sys.stderr", stderr_buf), \
+             mock.patch("sys.stdin", io.StringIO(stdin_str)):
+            try:
+                forum_cli.main()
+                exit_code = 0
+            except SystemExit as e:
+                exit_code = e.code if isinstance(e.code, int) else 0
+
+        return stdout_buf.getvalue(), stderr_buf.getvalue(), exit_code
+
+    return run_cli
+
+
+@SKIP_INTEGRATION
+class TestPackCLIPublish:
+    def test_pack_publish_exits_0(self, wired_cli_packs, tmp_path):
+        pkg_dir = _make_test_pack_dir(tmp_path)
+        stdout, stderr, code = wired_cli_packs(["pack", "publish", str(pkg_dir)])
+        assert code == 0, f"stderr: {stderr}"
+
+    def test_pack_publish_prints_pack_id(self, wired_cli_packs, tmp_path):
+        pkg_dir = _make_test_pack_dir(tmp_path)
+        stdout, stderr, code = wired_cli_packs(["pack", "publish", str(pkg_dir)])
+        assert code == 0, f"stderr: {stderr}"
+        assert "pack_id=" in stdout
+
+    def test_pack_publish_missing_dir_exits_2(self, wired_cli_packs, tmp_path):
+        stdout, stderr, code = wired_cli_packs(
+            ["pack", "publish", str(tmp_path / "does-not-exist")]
+        )
+        assert code == forum_cli.EXIT_VALIDATION
+
+
+@SKIP_INTEGRATION
+class TestPackCLIList:
+    def test_pack_list_exits_0(self, wired_cli_packs):
+        stdout, stderr, code = wired_cli_packs(["pack", "list"])
+        assert code == 0, f"stderr: {stderr}"
+
+    def test_pack_list_empty_initially(self, wired_cli_packs):
+        stdout, stderr, code = wired_cli_packs(["pack", "list"])
+        assert code == 0
+        assert "no packs" in stdout.lower()
+
+    def test_pack_list_shows_pack_after_publish(self, wired_cli_packs, tmp_path):
+        pkg_dir = _make_test_pack_dir(tmp_path)
+        wired_cli_packs(["pack", "publish", str(pkg_dir)])
+        stdout, stderr, code = wired_cli_packs(["pack", "list"])
+        assert code == 0, f"stderr: {stderr}"
+        assert "PACKS" in stdout
+
+    def test_pack_list_json_format(self, wired_cli_packs):
+        stdout, stderr, code = wired_cli_packs(["pack", "list", "--format", "json"])
+        assert code == 0
+        data = json.loads(stdout)
+        assert "packs" in data
+
+
+@SKIP_INTEGRATION
+class TestPackCLIGet:
+    def test_pack_get_after_publish(self, wired_cli_packs, tmp_path):
+        # Publish first.
+        pkg_dir = _make_test_pack_dir(tmp_path)
+        pub_stdout, _, pub_code = wired_cli_packs(["pack", "publish", str(pkg_dir)])
+        assert pub_code == 0, f"publish failed: {pub_stdout}"
+
+        # Extract pack_id from output.
+        import re
+        m = re.search(r"pack_id=(\S+)", pub_stdout)
+        assert m is not None, f"pack_id not in output: {pub_stdout}"
+        pack_id = m.group(1)
+
+        # Download and extract the pack.
+        out_dir = str(tmp_path / "extracted")
+        stdout, stderr, code = wired_cli_packs(
+            ["pack", "get", pack_id, "--out", out_dir]
+        )
+        assert code == 0, f"stderr: {stderr}"
+        assert "extracted" in stdout
+
+    def test_pack_get_unknown_exits_4(self, wired_cli_packs, tmp_path):
+        out_dir = str(tmp_path / "out")
+        stdout, stderr, code = wired_cli_packs(
+            ["pack", "get", "does-not-exist-v99", "--out", out_dir]
+        )
+        assert code == forum_cli.EXIT_NOT_FOUND
