@@ -115,12 +115,14 @@ a { color: inherit; text-decoration: none; }
   margin-bottom: 18px;
 }
 .main__bar .seg { display: flex; gap: 0; border: 1px solid var(--line); border-radius: 999px; padding: 3px; }
-.main__bar .seg button {
+.seg__btn {
   font-size: 12px; padding: 4px 12px; border-radius: 999px;
   background: transparent; color: var(--ink-3); border: none; cursor: pointer;
-  font-family: inherit;
+  font-family: inherit; text-decoration: none; display: inline-block;
 }
-.main__bar .seg button.is-active { background: var(--ink); color: var(--bg); }
+.seg__btn:hover { color: var(--ink-2); }
+.seg__btn--static { cursor: default; }
+    .seg__btn.is-active { background: var(--ink); color: var(--bg); }
 .main__bar .grow { flex: 1; }
 
 /* Thread list */
@@ -314,38 +316,51 @@ a { color: inherit; text-decoration: none; }
 <div class="body">
   <div class="shell">
     <div class="body__grid">
+      {# Safe defaults — template-callers that don't pass these vars (e.g. tests)
+         get neutral behaviour: no active category, hot sort, no special view. #}
+      {% if active_category is not defined %}{% set active_category = none %}{% endif %}
+      {% if active_sort is not defined %}{% set active_sort = 'hot' %}{% endif %}
+      {% if active_view is not defined %}{% set active_view = '' %}{% endif %}
 
       <!-- LEFT RAIL — CATEGORIES -->
       <aside class="rail">
         <div class="rail__hd">Categories</div>
-        <div class="rail__item rail__item--active">
+        {# "All threads" is active when no category param is set and view is not open-questions. #}
+        <a class="rail__item{% if not active_category and active_view != 'open-questions' %} rail__item--active{% endif %}" href="/">
           <span class="rail__dot" style="background: var(--ink-3)"></span>
           <span>All threads</span>
           <span class="rail__count">{{ stats.open_threads }}</span>
-        </div>
+        </a>
         {% for c in categories %}
-        <div class="rail__item">
+        <a class="rail__item{% if active_category == c.slug and active_view != 'open-questions' %} rail__item--active{% endif %}" href="/?category={{ c.slug }}">
           <span class="rail__dot" style="background: {{ c.color_var }}"></span>
           <span>{{ c.display_name }}</span>
           <span class="rail__count">{{ c.thread_count }}</span>
-        </div>
+        </a>
         {% endfor %}
 
         <div class="rail__div"></div>
-        {# Views are saved-filter UI with no v0.1 backend — rendered as static
-           inert links per spec §"Template injection points". #}
         <div class="rail__hd">Views</div>
-        <div class="rail__item">&#x2295; Open questions</div>
+        <a class="rail__item{% if active_view == 'open-questions' %} rail__item--active{% endif %}" href="/?view=open-questions">&#x2295; Open questions</a>
       </aside>
 
       <!-- MAIN -->
       <main>
         <div class="main__bar">
+          {# Sort segment: preserve ?category= when set; view=open-questions hides sort since the filter is fixed. #}
+          {% if active_view != 'open-questions' %}
           <div class="seg">
-            <button class="is-active">Hot</button>
-            <button>New</button>
-            <button>Most cited</button>
+            {# Build query-string prefix — ampersand if category is set, otherwise bare ?. #}
+            {% set _cat_q = ('/?category=' ~ active_category ~ '&') if active_category else '/?' %}
+            <a class="seg__btn{% if active_sort == 'hot' %} is-active{% endif %}" href="{{ _cat_q }}sort=hot">Hot</a>
+            <a class="seg__btn{% if active_sort == 'new' %} is-active{% endif %}" href="{{ _cat_q }}sort=new">New</a>
+            <a class="seg__btn{% if active_sort == 'cited' %} is-active{% endif %}" href="{{ _cat_q }}sort=cited">Most cited</a>
           </div>
+          {% else %}
+          <div class="seg">
+            <span class="seg__btn seg__btn--static is-active">Open questions</span>
+          </div>
+          {% endif %}
           <div class="grow"></div>
         </div>
 

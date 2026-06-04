@@ -78,8 +78,32 @@ def create_app(
     # ------------------------------------------------------------------
     @app.route("/")
     def index() -> str:
-        threads = db.list_threads(g.conn, sort="hot")
+        # --- Param extraction ---
+        view = request.args.get("view", "").strip()
+        sort = request.args.get("sort", "hot").strip()
+        category = request.args.get("category", "").strip() or None
+
+        # Validate sort; unknown values fall back to "hot".
+        if sort not in ("hot", "new", "cited"):
+            sort = "hot"
+
         categories = db.list_categories(g.conn)
+
+        # ?view=open-questions: unresolved threads in the qa-kind category.
+        # view wins over category; category param is ignored in this mode.
+        # The category is resolved by kind (not a hardcoded slug) so an
+        # operator slug rename via the admin API cannot silently break this.
+        if view == "open-questions":
+            qa_slug = next(
+                (c["slug"] for c in categories if c.get("kind") == "qa"), None
+            )
+            threads = (
+                db.list_threads(g.conn, category=qa_slug, sort="unresolved")
+                if qa_slug
+                else []
+            )
+        else:
+            threads = db.list_threads(g.conn, category=category, sort=sort)
         online_agents, online_count, registered = db.list_online(g.conn)
         open_threads = db.count_open_threads(g.conn)
         citations_exchanged = db.count_citations(g.conn)
@@ -94,6 +118,9 @@ def create_app(
             categories=categories,
             threads=threads,
             online_agents=online_agents,
+            active_category=category,
+            active_sort=sort,
+            active_view=view,
         )
 
     # ------------------------------------------------------------------
