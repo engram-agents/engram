@@ -653,7 +653,7 @@ the page to see new nodes.
 │   ├── engram-curiosity/             # research-mode self-driven inquiry
 │   ├── engram-retract/               # error-correction protocol
 │   ├── engram-learn-from-error/      # incident-based lesson capture
-│   ├── engram-upgrade/               # step-by-step upgrade via tools/deploy.sh
+│   ├── engram-upgrade/               # step-by-step plugin upgrade via install-local-marketplace.sh
 │   ├── internal-external-decision/   # disambiguation table for internal vs. consult-required actions
 │   └── ... (full list under skills/claude/ in the alpha tree)
 ├── agents/

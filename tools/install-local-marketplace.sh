@@ -126,7 +126,13 @@ else
   # Assemble build flags from config.json (same pattern as migrate-to-plugin.sh).
   build_flags=()
   _cfg="$ENGRAM_HOME/config.json"
-  if [[ -f "$_cfg" ]] && command -v jq &>/dev/null; then
+  if [[ -f "$_cfg" ]]; then
+    # Hard-require jq when a config exists: without it the build silently
+    # proceeds flagless and drops configured surfaces (multi-agent / dev tier)
+    # — the #704 class. Same contract as migrate-to-plugin.sh's require_jq.
+    if ! command -v jq &>/dev/null; then
+      die "jq is required to read $_cfg for build flags (multi_agent/install_tier). Without jq the build would silently drop your configured surfaces (#704 class). Install jq and retry."
+    fi
     _ma="$(jq -r '.multi_agent // false' "$_cfg")"
     _tier="$(jq -r '.install_tier // empty' "$_cfg")"
     [[ "$_ma" == "true" ]] && build_flags+=("--multi-agent")
@@ -182,6 +188,28 @@ if ! python3 -c "import json; json.load(open('$MARKETPLACE_ROOT/.claude-plugin/m
 fi
 
 log "Marketplace assembled at $MARKETPLACE_ROOT"
+
+# ── Version marker ─────────────────────────────────────────────────────────────
+# Refresh ~/.engram/.deployed-version so the plugin path maintains the same
+# forensics anchor deploy.sh kept for scatter (which commit is my running code
+# from?). Without this the marker goes stale after every plugin upgrade — the
+# engram-upgrade skill's change-set review (deployed..target) and post-upgrade
+# verification both anchor on it. Same format as deploy.sh's writer.
+ALPHA_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+ALPHA_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+if [[ -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+  ALPHA_DIRTY="dirty"
+else
+  ALPHA_DIRTY="clean"
+fi
+cat > "$ENGRAM_HOME/.deployed-version" <<MARKER
+alpha_sha=$ALPHA_SHA
+alpha_branch=$ALPHA_BRANCH
+alpha_dirty=$ALPHA_DIRTY
+deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+deployed_from=$REPO_ROOT
+MARKER
+log "Version marker refreshed: $ENGRAM_HOME/.deployed-version (alpha_sha=$ALPHA_SHA)"
 
 if [[ $SKIP_ADD -eq 1 ]]; then
   log "Skipping 'claude plugin marketplace add' (--skip-add)"
