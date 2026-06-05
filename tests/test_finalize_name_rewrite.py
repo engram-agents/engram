@@ -431,6 +431,120 @@ class TestBinaryFilesSkipped:
 
 
 # ---------------------------------------------------------------------------
+# Test: invalid-UTF-8-but-no-NUL file is skipped (strict UTF-8 guard)
+# ---------------------------------------------------------------------------
+
+class TestInvalidUtf8Skipped:
+    def test_invalid_utf8_no_nul_skipped(self, tmp_path, extracted_script):
+        """A file with the old tag AND invalid UTF-8 bytes but NO NUL is skipped.
+
+        Without the strict-UTF-8 guard the rewriter reads it with errors="replace",
+        substitutes U+FFFD for the bad bytes, and writes back — silently corrupting
+        the file.  With the guard it skips the file: bytes unchanged, no backup,
+        exit 0, no exception.
+        """
+        home = tmp_path / OLD_TAG
+        home.mkdir()
+        # Construct bytes that: contain OLD_TAG (so the rewriter would attempt to
+        # process it), include \xff\xfe (invalid UTF-8 — not a valid 2-byte seq
+        # and no NUL so the binary-NUL sniff does NOT catch it).
+        content = (
+            b"agent config for " + OLD_TAG.encode("ascii")
+            + b" path=/home/" + OLD_TAG.encode("ascii")
+            + b" \xff\xfe extra data"
+        )
+        bad_file = home / "config.cfg"
+        bad_file.write_bytes(content)
+
+        result = _run_script(extracted_script, home, OLD_TAG, NEW_NAME)
+
+        # Script must exit 0 — decode failure is a skip, not a fatal error
+        assert result.returncode == 0, (
+            f"Expected exit 0 on invalid-UTF-8 skip, got {result.returncode}. "
+            f"stderr: {result.stderr!r}"
+        )
+        # File bytes must be untouched (no rewrite attempted)
+        assert bad_file.read_bytes() == content, (
+            "Invalid-UTF-8 file must be left byte-for-byte intact"
+        )
+        # No .bak-prefinalize (skip happens before backup)
+        bak = Path(str(bad_file) + ".bak-prefinalize")
+        assert not bak.exists(), (
+            ".bak-prefinalize must NOT be created for invalid-UTF-8 skipped file"
+        )
+        # The skip must be reported in the summary output
+        assert "skipped (invalid UTF-8)" in result.stdout, (
+            f"Expected invalid-UTF-8 skip count in stdout, got: {result.stdout!r}"
+        )
+        assert "skipped (invalid UTF-8): 1 file(s)" in result.stdout, (
+            f"Expected 'skipped (invalid UTF-8): 1 file(s)' in stdout utf8-skip summary, got: {result.stdout!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test: write_text encoding pin survives LC_ALL=C
+# ---------------------------------------------------------------------------
+
+class TestLcAllCLocale:
+    """Regression guard for the locale-default write_text and stdout-glyph bugs
+    (round-3 + round-4 fixes).
+
+    Under LC_ALL=C with PEP 538 locale coercion disabled (PYTHONCOERCECLOCALE=0
+    + PYTHONUTF8=0), Python's default codec is ASCII.  Two failure modes exist:
+
+    1. write_text(new_text) raises UnicodeEncodeError for any valid-UTF-8 file
+       whose content contains non-ASCII characters.  Fixed by pinning
+       encoding="utf-8" on write_text.
+
+    2. print(f"  ✓ ...") raises UnicodeEncodeError because stdout is ASCII-only.
+       Fixed by sys.stdout.reconfigure(errors="replace") at script startup.
+
+    Without PYTHONCOERCECLOCALE=0 + PYTHONUTF8=0 the test is non-discriminating:
+    PEP 538 silently rewrites LC_ALL=C to C.UTF-8 at interpreter startup, so
+    both bugs are masked even with the fixes reverted.  The env vars must be
+    present to make the test a real regression guard.
+    """
+
+    def test_non_ascii_utf8_rewrites_under_lc_all_c(self, tmp_path, extracted_script):
+        """A valid-UTF-8 file with non-ASCII bytes rewrites correctly under LC_ALL=C.
+
+        PYTHONCOERCECLOCALE=0 + PYTHONUTF8=0 disable PEP 538 coercion so the
+        ASCII-codec premise actually holds, making this a real regression guard
+        rather than a vacuous pass.
+        """
+        home = tmp_path / OLD_TAG
+        home.mkdir()
+        # File with non-ASCII UTF-8 content (é = U+00E9 = 0xC3 0xA9) AND the old tag.
+        content = f"# config for {OLD_TAG}\n# path: /home/{OLD_TAG}\n# note: café\n"
+        cfg = home / "config.toml"
+        cfg.write_text(content, encoding="utf-8")
+
+        env = {
+            **os.environ,
+            "LC_ALL": "C",
+            "LANG": "C",
+            "LANGUAGE": "C",
+            "PYTHONCOERCECLOCALE": "0",
+            "PYTHONUTF8": "0",
+        }
+        result = subprocess.run(
+            [sys.executable, str(extracted_script), str(home), OLD_TAG, NEW_NAME],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 0, (
+            f"Expected exit 0 under LC_ALL=C, got {result.returncode}. "
+            f"stderr: {result.stderr!r}"
+        )
+        rewritten = cfg.read_text(encoding="utf-8")
+        assert OLD_TAG not in rewritten, "OLD_TAG must be replaced"
+        assert NEW_NAME in rewritten, "NEW_NAME must appear after rewrite"
+        assert "café" in rewritten, "Non-ASCII bytes must survive rewrite byte-correctly"
+
+
+# ---------------------------------------------------------------------------
 # Test: pruned directories are not descended
 # ---------------------------------------------------------------------------
 

@@ -622,6 +622,12 @@ import shutil
 import sys
 from pathlib import Path
 
+# Reconfigure stdout to replace unencodable characters instead of raising.
+# Covers the ✓ glyph in progress lines (and any future glyphs) when stdout
+# is bound to an ASCII codec (e.g. LC_ALL=C with PEP 538 coercion disabled).
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
+
 # ---------------------------------------------------------------------------
 # Skip-list constants  (empirically derived — do NOT loosen without a new sweep)
 # ---------------------------------------------------------------------------
@@ -776,6 +782,7 @@ def rewrite_tree(home, old_prefix, new_prefix):
     total = 0
     touched = 0
     skipped_record = 0
+    skipped_utf8 = 0
 
     for dirpath, dirs, files in os.walk(home_path):
         # Prune directories in-place so os.walk doesn't descend into them.
@@ -791,9 +798,15 @@ def rewrite_tree(home, old_prefix, new_prefix):
                 # binary skips are not counted in skipped_record (different category)
                 continue
 
-            # Read as text; skip if unreadable (permissions, dangling symlink, etc.)
+            # Read as strict UTF-8; skip on decode error (invalid-UTF-8 file
+            # with no NUL bytes would pass _is_binary but silently corrupt on
+            # rewrite via U+FFFD substitution — skip it instead).
+            # Also skip on OSError (permissions, dangling symlink, etc.)
             try:
-                text = p.read_text(errors="replace")
+                text = p.read_text(encoding="utf-8", errors="strict")
+            except UnicodeDecodeError:
+                skipped_utf8 += 1
+                continue
             except OSError:
                 continue
 
@@ -827,12 +840,12 @@ def rewrite_tree(home, old_prefix, new_prefix):
                 if not _try_toml_validate(new_text, p):
                     sys.exit(1)
 
-            p.write_text(new_text)
+            p.write_text(new_text, encoding="utf-8")
             total += count
             touched += 1
             print(f"  ✓ {p.name}: {count} occurrences rewritten")
 
-    return {"touched": touched, "total": total, "skipped_record": skipped_record}
+    return {"touched": touched, "total": total, "skipped_record": skipped_record, "skipped_utf8": skipped_utf8}
 
 
 if __name__ == "__main__":
@@ -855,6 +868,10 @@ if __name__ == "__main__":
     if result["skipped_record"] > 0:
         print(
             f"  skipped (record/log/dump): {result['skipped_record']} file(s) — factual record, left intact"
+        )
+    if result["skipped_utf8"] > 0:
+        print(
+            f"  skipped (invalid UTF-8): {result['skipped_utf8']} file(s) — not valid UTF-8, left intact"
         )
 # === END finalize_name_rewrite ===
 PYTHON
