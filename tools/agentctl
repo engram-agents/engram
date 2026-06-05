@@ -596,12 +596,18 @@ cmd_finalize_name() {
     #     every prompt.
     #   - .claude/settings.local.json → additional settings.
     #   - .claude/CLAUDE.md → agent identity file path refs.
-    # History files (history.jsonl, file-history/, session JSONLs)
-    # are INTENTIONALLY left untouched — they're factual record of
-    # what cwd was at the time.
-    # Fix: text-substitute the old prefix across all active-config
-    # files; validate JSON files post-rewrite.
-    echo "Step 2c: rewriting stale newborn paths in active-config files..."
+    #   - .codex/config.toml → ENOENT on codex startup (issue #825).
+    #   - .engram/seed-manifest.json, .codex/rules/default.rules, etc.
+    # History/record files (.jsonl, .log, .sql, graph_snapshot.md,
+    # *-complete.json) are INTENTIONALLY left untouched — they are a
+    # factual record of the newborn phase and must stay intact.
+    # Binary files (knowledge.db, .pyc, images) are skipped — rewriting
+    # binary content corrupts it.
+    # Fix: exhaustively walk $chosen_home and text-substitute old_prefix
+    # → new_prefix in every file that is NOT a record/binary, using an
+    # empirically-derived skip-set (inline below — agentctl is a single
+    # vendored file; the rewrite logic lives here, not in a sibling module).
+    echo "Step 2c: rewriting stale newborn paths in all config/runtime files (exhaustive walk)..."
     # Substitute the user-name part (not just /home/<name>) so both
     # absolute-path form (/home/agent-newborn-XXX) AND encoded-cwd form
     # (-home-agent-newborn-XXX, inside .claude/projects/ encodings + bash
@@ -609,71 +615,271 @@ cmd_finalize_name() {
     local old_path="$newborn_user"
     local new_path="$chosen_user"
     if sudo -u "$chosen_user" python3 - "$chosen_home" "$old_path" "$new_path" <<'PYTHON'
-import json, shutil, sys
+# === BEGIN finalize_name_rewrite (single source; tests/test_finalize_name_rewrite.py extracts between these sentinels) ===
+import json
+import os
+import shutil
+import sys
 from pathlib import Path
-home, old_prefix, new_prefix = sys.argv[1], sys.argv[2], sys.argv[3]
-active_files = [
-    f"{home}/.claude.json",
-    f"{home}/.claude/settings.json",
-    f"{home}/.claude/settings.local.json",
-    f"{home}/.claude/CLAUDE.md",
-    # ~/.engram/ files that engram-first-session renders with the
-    # (then-current newborn) AGENT_NAME baked in. Caught by Ari via
-    # engram-alpha#260 — her own debugging trail surfaced what my
-    # initial sweep missed (the symmetric agent-side substrate).
-    f"{home}/.engram/HEARTBEAT.md",
-    f"{home}/.engram/heartbeat-queue/README.md",
-    f"{home}/.engram/warm-briefing.md",
-    # Hook scripts with install-time absolute-path substitutions.
-    # install.sh:315 substitutes {{PYTHON}} → $PYTHON_BIN here;
-    # rename invalidates the absolute venv path. Without this:
-    # surface daemon fails to start, recall falls back to FTS-only.
-    f"{home}/.engram/hooks/start-engram-daemon.sh",
-    # Per-user systemd surface daemon service file.
-    # install.sh:336-338 substitutes {{PYTHON}}, {{ENGRAM_HOOKS_DIR}},
-    # and {{ENGRAM_HOME}} into the template; rename strands all three.
-    # (PR #469's cross-install detect-and-skip is orthogonal — it
-    # prevents one install clobbering another's service file; #260
-    # is about rewriting THIS install's service file post-rename.)
-    f"{home}/.config/systemd/user/engram-surface-daemon.service",
-]
-total = 0
-touched = 0
-for path_str in active_files:
-    p = Path(path_str)
-    if not p.is_file():
-        continue
-    text = p.read_text()
-    count = text.count(old_prefix)
-    if count == 0:
-        continue
-    shutil.copy(p, str(p) + ".bak-prefinalize")
-    new_text = text.replace(old_prefix, new_prefix)
-    if p.suffix == ".json":
-        try:
-            json.loads(new_text)
-        except json.JSONDecodeError as e:
-            print(f"  ERROR: rewrite would invalidate JSON in {p}: {e}", file=sys.stderr)
-            print(f"         backup at {p}.bak-prefinalize untouched", file=sys.stderr)
-            sys.exit(1)
-    p.write_text(new_text)
-    total += count
-    touched += 1
-    print(f"  ✓ {p.name}: {count} occurrences rewritten")
-if total == 0:
-    print("  (no stale references found)")
-else:
-    print(f"  total: {total} occurrences across {touched} file(s)")
+
+# ---------------------------------------------------------------------------
+# Skip-list constants  (empirically derived — do NOT loosen without a new sweep)
+# ---------------------------------------------------------------------------
+
+# Directory components: stop os.walk from descending into these.
+# Rationale: binaries, bytecache, VCS, package caches, historical transcripts,
+# periodic backup snapshots — descending is expensive and produces no rewrites
+# we actually want.
+_PRUNE_DIRS = frozenset({
+    "venv",
+    "__pycache__",
+    ".git",
+    "node_modules",
+    "file-history",
+    "sessions",
+    "cron-backups",
+})
+
+# File extensions to skip entirely.
+# .pyc       — compiled bytecode (binary, variable-length fields)
+# .jsonl     — session/history transcripts (factual record of the newborn phase)
+# .log       — log files (factual record)
+# .sql       — e.g. knowledge.sql; the ENGRAM graph DUMP.  It regenerates from
+#              knowledge.db on the next nap/checkpoint, AND may contain node
+#              text that legitimately references the newborn home as accurate
+#              history — must not be rewritten.
+# .bak       — existing backups (don't rewrite our own safety copies)
+_SKIP_EXTENSIONS = frozenset({
+    ".pyc",
+    ".jsonl",
+    ".log",
+    ".sql",
+    ".bak",
+})
+
+# Exact filenames to skip (base name only, no directory component).
+# graph_snapshot.md      — regenerable summary snapshot
+# history.jsonl          — handled by extension, but listed explicitly for clarity
+# knowledge.db           — SQLite binary
+# knowledge.db-wal       — WAL journal (binary)
+# knowledge.db-shm       — shared-memory file (binary)
+_SKIP_NAMES = frozenset({
+    "graph_snapshot.md",
+    "history.jsonl",
+    "knowledge.db",
+    "knowledge.db-wal",
+    "knowledge.db-shm",
+})
+
+# Suffix patterns for endswith checks.
+# *-complete.json — e.g. finalize-name-complete.json: the rename AUDIT record.
+#   Rewriting agent-newborn-<ts>→<chosen> inside it would make it falsely read
+#   "from=<chosen> to=<chosen>", corrupting the record of what the rename did.
+# *.bak-prefinalize — our own pre-write backup copies (never rewrite the safety
+#   copy). Note: Path.suffix on "foo.bak-prefinalize" is ".bak-prefinalize",
+#   not ".bak" — so these are caught by this endswith check, not the _SKIP_EXTENSIONS
+#   ".bak" entry (which catches plain ".bak" files only).
+_SKIP_SUFFIXES = (
+    "-complete.json",
+    ".bak-prefinalize",
+)
+
+_BINARY_PROBE_BYTES = 8192  # how many bytes to read for NUL-byte detection
+
+
+def _is_binary(path):
+    """Return True if the file appears to be binary (NUL byte in first 8KB)."""
+    try:
+        with path.open("rb") as fh:
+            chunk = fh.read(_BINARY_PROBE_BYTES)
+        return b"\x00" in chunk
+    except OSError:
+        return True  # unreadable → treat as binary, skip safely
+
+
+def _should_skip(path):
+    """Return (skip, reason) for a candidate file.
+
+    Reasons are human-readable labels for the skip-count report.
+    'record'  — a factual record/log/dump/audit file (must stay intact)
+    'binary'  — binary file (rewriting would corrupt it)
+    '(rewrite)' — not skipped; caller should rewrite
+    """
+    name = path.name
+    suffix = path.suffix.lower()
+
+    # Exact-name check first (fastest)
+    if name in _SKIP_NAMES:
+        return True, "record"
+
+    # Suffix-pattern check
+    for pat in _SKIP_SUFFIXES:
+        if name.endswith(pat):
+            return True, "record"
+
+    # Extension check
+    if suffix in _SKIP_EXTENSIONS:
+        return True, "record"
+
+    # Binary probe (belt-and-suspenders; catches knowledge.db, .pyc stragglers,
+    # images, etc. even if they somehow aren't under a pruned dir)
+    if _is_binary(path):
+        return True, "binary"
+
+    return False, "(rewrite)"
+
+
+def _try_toml_validate(text, path):
+    """Attempt TOML validation; return True if valid or tomllib unavailable."""
+    try:
+        import tomllib  # stdlib Python 3.11+
+    except ImportError:
+        return True  # graceful skip — no third-party dep added
+    try:
+        tomllib.loads(text)
+        return True
+    except tomllib.TOMLDecodeError as e:
+        print(
+            f"  ERROR: rewrite would invalidate TOML in {path}: {e}",
+            file=sys.stderr,
+        )
+        print(
+            f"         pre-write copy at {path}.bak-prefinalize left intact",
+            file=sys.stderr,
+        )
+        return False
+
+
+def rewrite_tree(home, old_prefix, new_prefix):
+    """Walk *home* and rewrite every text config file that contains *old_prefix*.
+
+    Parameters
+    ----------
+    home        Absolute path of the agent's home directory (string or Path).
+    old_prefix  The old newborn username token, e.g. ``agent-newborn-20260604123456``.
+                Matches BOTH ``/home/agent-newborn-<ts>`` (absolute-path form) and
+                ``-home-agent-newborn-<ts>`` (encoded-cwd form in
+                ``.claude/projects/``), because the substring covers both.
+    new_prefix  The chosen username token, e.g. ``agent-ada``.
+
+    Returns
+    -------
+    dict with keys ``touched`` (int), ``total`` (int), ``skipped_record`` (int).
+
+    Raises
+    ------
+    SystemExit(1)  if a JSON or TOML file fails to validate after rewrite
+                   (the ``.bak-prefinalize`` pre-write copy is left intact;
+                   the file itself is NOT overwritten on validation failure).
+    """
+    home_path = Path(home)
+    total = 0
+    touched = 0
+    skipped_record = 0
+
+    for dirpath, dirs, files in os.walk(home_path):
+        # Prune directories in-place so os.walk doesn't descend into them.
+        dirs[:] = [d for d in dirs if d not in _PRUNE_DIRS]
+
+        for fname in files:
+            p = Path(dirpath) / fname
+
+            skip, reason = _should_skip(p)
+            if skip:
+                if reason == "record":
+                    skipped_record += 1
+                # binary skips are not counted in skipped_record (different category)
+                continue
+
+            # Read as text; skip if unreadable (permissions, dangling symlink, etc.)
+            try:
+                text = p.read_text(errors="replace")
+            except OSError:
+                continue
+
+            count = text.count(old_prefix)
+            if count == 0:
+                continue
+
+            # Backup before any write (pre-write copy; original stays in .bak-prefinalize)
+            bak = Path(str(p) + ".bak-prefinalize")
+            shutil.copy2(p, bak)
+
+            new_text = text.replace(old_prefix, new_prefix)
+
+            # Validate JSON files post-rewrite (before overwriting)
+            if p.suffix.lower() == ".json":
+                try:
+                    json.loads(new_text)
+                except json.JSONDecodeError as e:
+                    print(
+                        f"  ERROR: rewrite would invalidate JSON in {p}: {e}",
+                        file=sys.stderr,
+                    )
+                    print(
+                        f"         pre-write copy at {bak} left intact",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+
+            # Validate TOML files post-rewrite (best-effort; py3.11+ stdlib)
+            if p.suffix.lower() == ".toml":
+                if not _try_toml_validate(new_text, p):
+                    sys.exit(1)
+
+            p.write_text(new_text)
+            total += count
+            touched += 1
+            print(f"  ✓ {p.name}: {count} occurrences rewritten")
+
+    return {"touched": touched, "total": total, "skipped_record": skipped_record}
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 4:
+        print(
+            "Usage: agentctl-heredoc <home> <old_prefix> <new_prefix>",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    _home, _old, _new = sys.argv[1], sys.argv[2], sys.argv[3]
+    result = rewrite_tree(_home, _old, _new)
+
+    if result["total"] == 0:
+        print("  (no stale references found)")
+    else:
+        print(
+            f"  total: {result['total']} occurrences across {result['touched']} file(s)"
+        )
+    if result["skipped_record"] > 0:
+        print(
+            f"  skipped (record/log/dump): {result['skipped_record']} file(s) — factual record, left intact"
+        )
+# === END finalize_name_rewrite ===
 PYTHON
     then
         :
     else
-        echo "  WARN: active-config rewrite failed; hooks/MCP/--continue may not work." >&2
-        echo "        Fix manually: replace all '$old_path' strings with '$new_path' in:" >&2
-        echo "          $chosen_home/.claude.json" >&2
-        echo "          $chosen_home/.claude/settings.json" >&2
-        echo "          $chosen_home/.claude/settings.local.json" >&2
-        echo "          $chosen_home/.claude/CLAUDE.md" >&2
+        echo "" >&2
+        echo "  ╔══════════════════════════════════════════════════════════════╗" >&2
+        echo "  ║  ERROR: Step 2c path-rewrite FAILED                         ║" >&2
+        echo "  ╚══════════════════════════════════════════════════════════════╝" >&2
+        echo "" >&2
+        echo "  The agent's config still references the old newborn path." >&2
+        echo "  codex/MCP/hooks will NOT work until this is fixed manually." >&2
+        echo "" >&2
+        echo "  Fix: replace all '$old_path' strings with '$new_path' in:" >&2
+        echo "    $chosen_home/.claude.json" >&2
+        echo "    $chosen_home/.claude/settings.json" >&2
+        echo "    $chosen_home/.claude/settings.local.json" >&2
+        echo "    $chosen_home/.claude/CLAUDE.md" >&2
+        echo "    $chosen_home/.codex/config.toml" >&2
+        echo "    (and any other config/runtime file under $chosen_home)" >&2
+        echo "" >&2
+        echo "  The rename (Step 2 usermod) already completed — the new" >&2
+        echo "  username '$chosen_user' is active but the config is stale." >&2
+        exit 1
     fi
 
     # Claude Code symlink repair. Claude Code's native installer creates
