@@ -11,21 +11,30 @@ Design notes
 - Live-write safety: uses the sqlite3 Connection.backup() API to snapshot the
   live DB into a temp file first. This guarantees the dump sees a consistent
   state even if the forum server is mid-write. Do NOT use iterdump() directly
-  on the live DB — iterdump() iterates rows without a lock, so a concurrent
+  on the live DB -- iterdump() iterates rows without a lock, so a concurrent
   write can produce a torn/inconsistent dump.
 - Idempotent commits: git status --porcelain is checked before committing; if
   nothing changed since the last backup, the run exits 0 without creating an
   empty commit.
-- No derived tables: forum.db has no FTS, vec, or embedding tables — the dump
-  is complete as-is; no stripping logic is needed.
-- Forum server is NOT stopped during backup — the sqlite3.backup() API handles
+- Derived-data stripping: as of forum hybrid-search (issue #807), forum.db
+  carries derived/regenerable data -- posts_fts* shadow tables, vec_posts and
+  vec_threads vec0 virtual tables, and embedding BLOB columns on posts/threads.
+  The dump strips all of these so git diffs stay small and grow linearly.
+  Default (strip) keeps the dump textually clean; --keep-derived restores old
+  behaviour for debugging. Regen path after restore: tools/forum_regen_derived.py.
+- The snapshot temp DB is mutated before iterdump (NULL embedding columns, drop
+  derived tables/triggers). This is safe by construction -- the snapshot is a
+  throwaway copy created by the sqlite3 backup API, never the live DB.
+- Forum server is NOT stopped during backup -- the sqlite3.backup() API handles
   live-consistency at the C library level.
 
 Restore-safety tripwire: this dump's correctness depends on forum/db.py's
-init_db staying user_version-free + IF-NOT-EXISTS idempotent. If a
-user_version-gated one-shot migration is ever added there, this dump must
-start emitting `PRAGMA user_version = N;` — see engram-alpha #781 for the
-restore-DOA failure class this prevents.
+init_db staying user_version-free + IF-NOT-EXISTS idempotent. Verified at
+slice-3 implementation time (2026-06-04): forum/db.py has NO PRAGMA user_version
+at any point -- neither in SCHEMA_SQL nor in init_db's ALTER guards. The
+user_version-free premise holds. If a user_version-gated one-shot migration is
+ever added there, this dump must start emitting `PRAGMA user_version = N;` -- see
+engram-alpha #781 for the restore-DOA failure class this prevents.
 
 Pack storage backup (#651):
 - The pack tarballs and meta.json files live under the forum data directory
@@ -43,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -61,6 +71,26 @@ DEFAULT_AUDIT = "/home/agents-shared/forum/forum-audit.jsonl"
 
 # .gitignore content written once when we init the backup git repo
 GITIGNORE_CONTENT = "*.db\n*.tmp\n"
+
+# ---------------------------------------------------------------------------
+# Derived-data exclusion constants
+# ---------------------------------------------------------------------------
+# Tables/prefixes that are derived (regenerable) and must never reach the dump.
+# posts_fts matches the FTS5 virtual table + all its shadow tables
+#   (posts_fts_data, posts_fts_idx, posts_fts_docsize, posts_fts_config,
+#    posts_fts_content if present).
+# vec_posts* and vec_threads* match the sqlite-vec vec0 tables + any shadow.
+_DERIVED_PREFIXES = ("posts_fts", "vec_posts", "vec_threads")
+
+# SQLite-internal tables that may appear in sqlite_master but carry no
+# user-data and are never in the stripped dump.  Excluded from row-count
+# parity checks so that snapshot (which may have these tables due to
+# AUTOINCREMENT or FTS shadow-table bookkeeping) compares cleanly against
+# the restored DB (which never sees them in a stripped dump).
+# sqlite_sequence: AUTOINCREMENT sequence tracker -- vec0 shadow tables use
+#   AUTOINCREMENT, so creating/dropping them leaves sqlite_sequence present
+#   (but empty) in the snapshot; the stripped dump filters it out (B1 fix).
+_SQLITE_INTERNAL_TABLES = frozenset({"sqlite_sequence", "sqlite_stat1", "sqlite_stat4"})
 
 
 # ---------------------------------------------------------------------------
@@ -89,13 +119,197 @@ def _snapshot_db(db_path: str, tmp_snap: str) -> None:
         src.close()
 
 
-def _dump_to_sql(snap_path: str) -> str:
-    """Return the full iterdump() output of *snap_path* as a string."""
-    conn = sqlite3.connect(snap_path)
+def _load_vec_best_effort(conn: sqlite3.Connection) -> bool:
+    """Load the sqlite-vec extension on *conn* if available.  Returns True on success.
+
+    Best-effort: swallows all exceptions so callers that merely want to avoid
+    "no such module: vec0" errors on SELECT/COUNT can call this unconditionally.
+    Required before any operation that touches vec0 virtual tables on a
+    potentially-vec-bearing connection (test helpers, _verify_dump, etc.).
+    """
     try:
+        import sqlite_vec  # type: ignore
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        return True
+    except Exception:
+        return False
+
+
+def _strip_derived_from_snapshot(conn: sqlite3.Connection) -> dict[str, int]:
+    """Strip derived data from *conn* (a SNAPSHOT -- safe to mutate).
+
+    The snapshot is a throwaway copy created by the sqlite3 backup API; mutating
+    it never touches the live DB.  Steps:
+      1. NULL the embedding columns on posts + threads (if they exist).
+      2. Drop FTS triggers (posts_fts_insert, posts_fts_delete, posts_fts_update).
+      3. Load sqlite-vec (best-effort) so vec0 tables can be dropped.
+      4. Drop derived virtual tables: vec_posts, vec_threads, posts_fts.
+         Dropping posts_fts also removes all its shadow tables automatically.
+
+    Returns a stats dict: {embeddings_nulled, triggers_dropped, tables_dropped}.
+
+    Note on vec0 drops: dropping a vec0 virtual table requires the sqlite-vec
+    extension loaded on that connection. We load it best-effort; if unavailable
+    and the tables don't exist (i.e. sqlite-vec was never loaded on the source
+    DB either), this is a no-op. If the tables DO exist but the extension is
+    unavailable, the DROP raises -- loud failure is intentional (#720 pattern).
+    """
+    stats: dict[str, int] = {
+        "embeddings_nulled": 0,
+        "triggers_dropped": 0,
+        "tables_dropped": 0,
+    }
+
+    # --- 1. NULL embedding columns (if present) ---
+    post_cols = {r[1] for r in conn.execute("PRAGMA table_info(posts)").fetchall()}
+    if "embedding" in post_cols:
+        # Count only rows whose embedding was non-NULL before the UPDATE.
+        stats["embeddings_nulled"] += conn.execute(
+            "SELECT COUNT(*) FROM posts WHERE embedding IS NOT NULL"
+        ).fetchone()[0]
+        conn.execute("UPDATE posts SET embedding = NULL")
+
+    thread_cols = {r[1] for r in conn.execute("PRAGMA table_info(threads)").fetchall()}
+    if "embedding" in thread_cols:
+        stats["embeddings_nulled"] += conn.execute(
+            "SELECT COUNT(*) FROM threads WHERE embedding IS NOT NULL"
+        ).fetchone()[0]
+        conn.execute("UPDATE threads SET embedding = NULL")
+
+    conn.commit()
+
+    # --- 2. Drop FTS triggers ---
+    # Two-branch OR is belt-and-suspenders by design:
+    #   name LIKE 'posts_fts_%' — prefix match covers all standard triggers
+    #     (posts_fts_insert, posts_fts_delete, posts_fts_update) and any future
+    #     variants that follow the naming convention.
+    #   sql LIKE '%posts_fts%' — fallback that catches hypothetical renamed
+    #     triggers (e.g. custom names) whose body still references posts_fts.
+    # Both branches are kept so a rename doesn't silently leave a dangling trigger.
+    triggers = [
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND (name LIKE 'posts_fts_%' OR sql LIKE '%posts_fts%')"
+        ).fetchall()
+    ]
+    for tn in triggers:
+        conn.execute(f"DROP TRIGGER IF EXISTS [{tn}]")
+        stats["triggers_dropped"] += 1
+
+    # --- 3. Load sqlite-vec so we can drop vec0 tables (best-effort) ---
+    # Absence of the extension is fine when the source DB never had vec tables
+    # (no sqlite-vec loaded on source). If the tables DO exist and the extension
+    # cannot be loaded, DROP TABLE will raise -- loud failure is intentional.
+    _load_vec_best_effort(conn)
+
+    # --- 4. Drop derived virtual tables ---
+    # vec tables first (vec0, no shadow-table cascade needed), then posts_fts
+    # (parent FTS5 table -- SQLite automatically drops its shadow tables).
+    derived_tables = [
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND (name LIKE 'vec_posts%' OR name LIKE 'vec_threads%' "
+            "     OR name LIKE 'posts_fts%')"
+        ).fetchall()
+    ]
+    vec_tables = [t for t in derived_tables if t.startswith("vec_")]
+    fts_tables = [t for t in derived_tables if t.startswith("posts_fts")]
+    for tn in vec_tables + fts_tables:
+        conn.execute(f"DROP TABLE IF EXISTS [{tn}]")
+        stats["tables_dropped"] += 1
+
+    conn.commit()
+    return stats
+
+
+def _is_internal_table_stmt(stmt: str) -> bool:
+    """Return True if *stmt* is a SQLite-internal-table statement.
+
+    Matches only statements whose target IS an internal table — anchored at
+    the statement keyword + quoted table name so post/thread content that
+    merely *mentions* an internal table name cannot trigger a false positive.
+
+    iterdump() emits each statement as a single item (possibly with embedded
+    newlines for CREATE TABLE DDL), but INSERT/DELETE statements are always
+    single-line.  The start-anchor is therefore robust for the INSERT/DELETE
+    cases that carry the silent-data-loss risk.
+    """
+    s = stmt.lstrip()
+    return any(
+        s.startswith(f'DELETE FROM "{t}"') or s.startswith(f'INSERT INTO "{t}" ')
+        for t in _SQLITE_INTERNAL_TABLES
+    )
+
+
+def _dump_to_sql(snap_path: str, keep_derived: bool = False) -> str:
+    """Return the iterdump() output of *snap_path* as a string.
+
+    When keep_derived=False (default): strips embedding columns and derived
+    tables/triggers from the snapshot before dumping.  The snapshot is a
+    throwaway copy; mutation is safe by construction.
+
+    After stripping, filters any remaining sqlite-internal-table statements
+    from the dump.  Background: vec0 shadow tables use AUTOINCREMENT, so
+    creating them creates sqlite_sequence in the source DB.  Stripping drops
+    the vec tables but leaves sqlite_sequence present-but-empty in the
+    snapshot.  iterdump() then emits a bare DELETE FROM "sqlite_sequence";
+    with no matching CREATE TABLE ... AUTOINCREMENT in the dump -- restoring
+    this into a fresh DB dies with "no such table: sqlite_sequence".
+
+    Filter rule: drop all sqlite-internal-table statements UNLESS the
+    stripped snapshot's sqlite_master contains a table with AUTOINCREMENT
+    (ground truth -- queried directly, not inferred from dump text).  Today
+    no forum base table uses AUTOINCREMENT, so this filter is always
+    lossless.  If a future base table adds AUTOINCREMENT, sqlite_sequence
+    will be kept because SQLite recreates it automatically on first INSERT
+    into any AUTOINCREMENT table, making the sequence rows needed for correct
+    behaviour.
+
+    Statement-level filtering: uses _is_internal_table_stmt() which anchors
+    the match at the statement keyword + quoted table name.  A post/thread
+    whose body_md merely *mentions* an internal table name (e.g.
+    "sqlite_sequence") is an INSERT INTO "posts" statement -- its start does
+    NOT match the anchor -- so it is kept verbatim.
+
+    When keep_derived=True: dumps everything unchanged (old behaviour, for
+    debugging via --keep-derived).
+    """
+    conn = sqlite3.connect(snap_path)
+    # Load vec best-effort so _row_counts (called by callers) doesn't raise on
+    # vec-bearing DBs.  _strip_derived_from_snapshot also loads it internally,
+    # but this covers the keep_derived=True path too.
+    _load_vec_best_effort(conn)
+    try:
+        if not keep_derived:
+            _strip_derived_from_snapshot(conn)
+        # Query ground truth BEFORE closing: does the stripped snapshot contain
+        # any AUTOINCREMENT base table?  If yes, sqlite_sequence statements in
+        # the dump are valid (SQLite creates sqlite_sequence automatically when
+        # a table with AUTOINCREMENT is created, so the sequence rows are
+        # meaningful).  If no, all internal-table statements are noise and must
+        # be filtered.  Querying sqlite_master here (not scanning dump text)
+        # avoids false positives from post/thread content that mentions
+        # AUTOINCREMENT.
+        # Note: if a future forum base table adds AUTOINCREMENT, this query
+        # will return a row and sqlite_sequence filtering is skipped -- correct
+        # behaviour, because the sequence rows are then load-bearing.
+        has_autoincrement = bool(
+            conn.execute(
+                "SELECT 1 FROM sqlite_master"
+                " WHERE type='table' AND instr(upper(sql),'AUTOINCREMENT')"
+            ).fetchone()
+        ) if not keep_derived else False
         lines = list(conn.iterdump())
     finally:
         conn.close()
+
+    if not keep_derived and not has_autoincrement:
+        lines = [ln for ln in lines if not _is_internal_table_stmt(ln)]
+
     return "\n".join(lines) + "\n"
 
 
@@ -159,47 +373,181 @@ def _row_counts(conn: sqlite3.Connection) -> dict[str, int]:
     }
 
 
-def _verify_dump(sql_path: Path, snap_path: str) -> bool:
-    """Restore *sql_path* into a temp DB and assert row-counts match the snapshot.
+# ---------------------------------------------------------------------------
+# Anchored no-derived-statements guard regex
+# ---------------------------------------------------------------------------
+# Anchored at the statement keyword + table target so that post/thread content
+# which *mentions* "posts_fts" or "vec_posts" in its text does NOT match.
+# (e.g. INSERT INTO "posts" VALUES(... 'posts_fts virtual table ...')).
+# Only lines whose statement target IS the derived table will match.
+_NO_DERIVED_RE = re.compile(
+    r'^\s*(CREATE\s+(VIRTUAL\s+)?TABLE\s+(IF\s+NOT\s+EXISTS\s+)?["\']?'
+    r'(posts_fts|vec_posts|vec_threads)'
+    r'|INSERT\s+INTO\s+["\']?(posts_fts|vec_posts|vec_threads)'
+    r'|CREATE\s+TRIGGER\s+["\']?(posts_fts|vec_posts|vec_threads)'
+    r'|CREATE\s+TRIGGER\s+\S*\s+.*posts_fts)',
+    re.IGNORECASE,
+)
 
-    Returns True on match; False (with a clear stderr message) if the dump is
-    corrupt or row-counts don't match. The caller decides process exit — keeps
-    this function programmatically callable without raising SystemExit.
+
+def _verify_dump(sql_path: Path, snap_path: str, keep_derived: bool = False) -> bool:
+    """Restore *sql_path* into a temp DB and verify correctness.
+
+    When keep_derived=False (default, strip mode):
+      - Verifies base-table row parity between the pre-strip snapshot baseline
+        and the restored DB (base tables only: excludes posts_fts* / vec_posts*
+        / vec_threads*).  The baseline is captured from the snapshot BEFORE
+        stripping so that strip-induced base-row loss is detectable.
+      - Asserts NO derived-table statements leaked into the dump (anchored
+        regex guard on posts_fts, vec_posts, vec_threads).
+      - Asserts all-NULL embedding columns in the restored posts + threads (when
+        the column exists), confirming embeddings were stripped.
+
+    When keep_derived=True (--keep-derived mode): falls back to comparing all
+    table row counts including derived tables (old full-equality behaviour).
+
+    Returns True on success; False (with a clear stderr message) on failure.
+    The caller decides process exit -- keeps this function programmatically
+    callable without raising SystemExit.
     """
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         verify_db = f.name
     try:
-        # Restore dump into temp DB. A corrupt/truncated dump surfaces as a
-        # sqlite3 error here — report cleanly instead of raising a traceback.
+        # --- Capture parity baseline from snapshot BEFORE stripping (S2) ---
+        # Loading sqlite-vec first so _row_counts doesn't raise on vec tables.
+        snap_conn = sqlite3.connect(snap_path)
+        _load_vec_best_effort(snap_conn)
+        if not keep_derived:
+            try:
+                snap_base_counts_pre_strip = {
+                    name: cnt
+                    for name, cnt in _row_counts(snap_conn).items()
+                    if not any(name.startswith(p) for p in _DERIVED_PREFIXES)
+                    and name not in _SQLITE_INTERNAL_TABLES
+                }
+            except sqlite3.OperationalError as exc:
+                # Extension unavailable AND vec tables present: cannot count safely.
+                # Fail with an actionable message instead of a raw exception.
+                print(
+                    f"ERROR: --verify failed: cannot read snapshot row counts "
+                    f"(sqlite-vec unavailable but vec0 tables exist): {exc}\n"
+                    f"  Install sqlite-vec on a host where it is available.",
+                    file=sys.stderr,
+                )
+                snap_conn.close()
+                return False
+        else:
+            try:
+                snap_counts_pre_strip = {
+                    name: cnt
+                    for name, cnt in _row_counts(snap_conn).items()
+                    if name not in _SQLITE_INTERNAL_TABLES
+                }
+            except sqlite3.OperationalError as exc:
+                print(
+                    f"ERROR: --verify failed: cannot read snapshot row counts "
+                    f"(sqlite-vec unavailable but vec0 tables exist): {exc}",
+                    file=sys.stderr,
+                )
+                snap_conn.close()
+                return False
+        snap_conn.close()
+
+        # Restore dump into temp DB.
         sql_content = sql_path.read_text(encoding="utf-8")
         conn = sqlite3.connect(verify_db)
+        # Load vec best-effort on the restore connection too (needed for --keep-derived
+        # full-count path when the dump retains vec0 DDL).
+        _load_vec_best_effort(conn)
         try:
-            conn.executescript(sql_content)
-            restored_counts = _row_counts(conn)
-        except sqlite3.Error as exc:
-            print(f"ERROR: --verify failed: dump does not restore: {exc}", file=sys.stderr)
-            return False
+            try:
+                conn.executescript(sql_content)
+            except sqlite3.Error as exc:
+                print(f"ERROR: --verify failed: dump does not restore: {exc}", file=sys.stderr)
+                return False
+
+            if not keep_derived:
+                # --- No-derived-statements guard ---
+                leaked = [ln for ln in sql_content.splitlines() if _NO_DERIVED_RE.search(ln)]
+                if leaked:
+                    print(
+                        f"ERROR: --verify failed: derived-table statements leaked into dump:\n"
+                        + "\n".join(f"  {ln}" for ln in leaked[:3]),
+                        file=sys.stderr,
+                    )
+                    return False
+
+                # --- Base-table parity vs pre-strip snapshot baseline ---
+                restored_base_counts = {
+                    name: cnt
+                    for name, cnt in _row_counts(conn).items()
+                    if not any(name.startswith(p) for p in _DERIVED_PREFIXES)
+                    and name not in _SQLITE_INTERNAL_TABLES
+                }
+
+                if restored_base_counts != snap_base_counts_pre_strip:
+                    print(
+                        f"ERROR: --verify failed: base-table row-count mismatch\n"
+                        f"  snapshot pre-strip (base): {snap_base_counts_pre_strip}\n"
+                        f"  restored (base): {restored_base_counts}",
+                        file=sys.stderr,
+                    )
+                    return False
+
+                # --- Embeddings-NULL check ---
+                post_cols = {r[1] for r in conn.execute("PRAGMA table_info(posts)").fetchall()}
+                if "embedding" in post_cols:
+                    non_null = conn.execute(
+                        "SELECT COUNT(*) FROM posts WHERE embedding IS NOT NULL"
+                    ).fetchone()[0]
+                    if non_null > 0:
+                        print(
+                            f"ERROR: --verify failed: {non_null} posts still have non-NULL "
+                            f"embedding in restored DB (stripping failed).",
+                            file=sys.stderr,
+                        )
+                        return False
+
+                thread_cols = {r[1] for r in conn.execute("PRAGMA table_info(threads)").fetchall()}
+                if "embedding" in thread_cols:
+                    non_null = conn.execute(
+                        "SELECT COUNT(*) FROM threads WHERE embedding IS NOT NULL"
+                    ).fetchone()[0]
+                    if non_null > 0:
+                        print(
+                            f"ERROR: --verify failed: {non_null} threads still have non-NULL "
+                            f"embedding in restored DB (stripping failed).",
+                            file=sys.stderr,
+                        )
+                        return False
+
+                print(
+                    f"verify OK: base rows match {restored_base_counts}; "
+                    f"no derived statements; embeddings NULL.",
+                    file=sys.stderr,
+                )
+            else:
+                # keep_derived mode: full row-count comparison including derived tables.
+                restored_counts = {
+                    name: cnt
+                    for name, cnt in _row_counts(conn).items()
+                    if name not in _SQLITE_INTERNAL_TABLES
+                }
+
+                if restored_counts != snap_counts_pre_strip:
+                    print(
+                        f"ERROR: --verify failed: row-count mismatch\n"
+                        f"  snapshot: {snap_counts_pre_strip}\n"
+                        f"  restored: {restored_counts}",
+                        file=sys.stderr,
+                    )
+                    return False
+
+                print(f"verify OK: row counts match {restored_counts}", file=sys.stderr)
+
+            return True
         finally:
             conn.close()
-
-        # Compare with snapshot row counts
-        snap_conn = sqlite3.connect(snap_path)
-        try:
-            snap_counts = _row_counts(snap_conn)
-        finally:
-            snap_conn.close()
-
-        if restored_counts != snap_counts:
-            print(
-                f"ERROR: --verify failed: row-count mismatch\n"
-                f"  snapshot: {snap_counts}\n"
-                f"  restored: {restored_counts}",
-                file=sys.stderr,
-            )
-            return False
-
-        print(f"verify OK: row counts match {restored_counts}", file=sys.stderr)
-        return True
     finally:
         try:
             os.unlink(verify_db)
@@ -240,7 +588,8 @@ def main() -> int:
         action="store_true",
         help=(
             "After writing forum.sql, restore it into a temp DB and verify "
-            "row-counts match the snapshot. Exits nonzero if they don't match."
+            "correctness (base-table row parity, no derived statements, "
+            "embeddings NULL). Exits nonzero if verification fails."
         ),
     )
     parser.add_argument(
@@ -249,8 +598,18 @@ def main() -> int:
         help=(
             "Path to the forum packs directory to include in the backup "
             "(e.g. /home/agents-shared/forum/packs). "
-            "When omitted, packs are NOT copied — document this gap if packs "
+            "When omitted, packs are NOT copied -- document this gap if packs "
             "are not otherwise backed up."
+        ),
+    )
+    parser.add_argument(
+        "--keep-derived",
+        action="store_true",
+        default=False,
+        help=(
+            "Dump everything including derived tables (posts_fts*, vec_posts, "
+            "vec_threads) and embedding BLOBs -- restores old behaviour for "
+            "debugging. Default: strip derived data (correct for production)."
         ),
     )
     args = parser.parse_args()
@@ -287,7 +646,7 @@ def main() -> int:
 
         # --- dump the snapshot to SQL ----------------------------------------
         try:
-            sql_content = _dump_to_sql(snap_path)
+            sql_content = _dump_to_sql(snap_path, keep_derived=args.keep_derived)
         except sqlite3.Error as exc:
             print(f"ERROR: iterdump failed: {exc}", file=sys.stderr)
             return 1
@@ -303,8 +662,8 @@ def main() -> int:
         # --- optional verify pass --------------------------------------------
         if args.verify:
             # Intentional order: verify BEFORE the finally-cleanup removes
-            # snap_path — the row-count comparison needs the snapshot on disk.
-            if not _verify_dump(sql_dest, snap_path):
+            # snap_path -- base-table comparison needs the snapshot on disk.
+            if not _verify_dump(sql_dest, snap_path, keep_derived=args.keep_derived):
                 return 1
 
     finally:
