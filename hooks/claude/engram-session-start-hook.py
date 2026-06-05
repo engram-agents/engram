@@ -76,6 +76,56 @@ def _resolve_runtime_dir(engram_home: str) -> str:
     return os.path.expanduser("~/engram-alpha")
 
 
+def _runtime_platform() -> str | None:
+    """Return the baked plugin platform name when available.
+
+    Plugin builds write platform.json at the runtime root. Source-tree/dev
+    execution generally has no platform.json, so return None there. The
+    probe is advisory; malformed or unreadable files are treated as unknown.
+    """
+    try:
+        hook_dir = os.path.dirname(os.path.abspath(__file__))
+        runtime_dir = os.path.dirname(hook_dir)
+        platform_path = os.path.join(runtime_dir, "platform.json")
+        with open(platform_path, encoding="utf-8") as f:
+            data = json.load(f)
+        platform = data.get("platform")
+        return platform if isinstance(platform, str) else None
+    except Exception:
+        return None
+
+
+def _startup_mcp_health_probe_allowed() -> bool:
+    """Whether SessionStart can run a reliable process-level MCP probe.
+
+    Claude plugin installs run hooks and the MCP server from the same plugin
+    runtime, so the historical pgrep-by-server.py-path check remains useful.
+
+    Codex is different: hooks can execute from a plugin cache while MCP starts
+    from the marketplace plugin path, and Codex may lazily start MCP only on
+    first tool use. At SessionStart that makes "no matching process" ambiguous
+    rather than evidence of failure. Match the #344 surface-daemon precedent:
+    do not emit startup false alarms; let use-time MCP failure surface if it
+    actually occurs.
+    """
+    platform = _runtime_platform()
+    if platform == "codex":
+        return False
+
+    # A baked non-Codex platform profile is stronger evidence than ambient
+    # environment variables. Preserve Claude's same-runtime pgrep warning even
+    # if a user shell happens to export CODEX_PLUGIN_ROOT.
+    if platform is not None:
+        return True
+
+    # When the Codex plugin-root variable is present but platform.json is absent
+    # (older/dev bundles), the hook/runtime relationship is still ambiguous.
+    if os.environ.get("CODEX_PLUGIN_ROOT"):
+        return False
+
+    return True
+
+
 def _resolve_mcp_server_path(engram_home: str) -> str:
     """Resolve the MCP server.py path for process-existence check.
 
@@ -106,13 +156,18 @@ def _check_mcp_health(engram_home: str) -> tuple[bool, str | None]:
     """Check whether the ENGRAM MCP server process is running.
 
     Uses pgrep -f to search for the resolved server.py path in process
-    command lines. Hard timeout of 1s. Any unexpected exception is treated
+    command lines only when the current platform has a reliable hook/server
+    path relationship. Hard timeout of 1s. Any unexpected exception is treated
     as ok=True (advisory probe — never block session start).
 
     Returns:
-        (ok, reason): ok=True if process found or probe itself errors;
-                      ok=False with a reason string otherwise.
+        (ok, reason): ok=True if process found, the platform defers startup
+                      probing, or the probe itself errors; ok=False with a
+                      reason string otherwise.
     """
+    if not _startup_mcp_health_probe_allowed():
+        return True, None
+
     try:
         server_path = _resolve_mcp_server_path(engram_home)
         result = subprocess.run(
@@ -852,15 +907,18 @@ def main() -> None:
         pass
 
     # ── Substrate health probe ─────────────────────────────────────────────
-    # Check MCP server. Warn in additionalContext when offline so the agent
-    # surfaces the degradation to the user immediately (instead of discovering
-    # via mid-task tool failure). Probe is advisory: any unexpected exception
-    # is treated as ok=True — never block session start.
+    # Check MCP server only on platforms where the process-level probe is
+    # reliable. Warn in additionalContext when offline so the agent surfaces
+    # the degradation to the user immediately (instead of discovering via
+    # mid-task tool failure). Probe is advisory: any unexpected exception is
+    # treated as ok=True — never block session start.
     # Silent default: no extra line when probe passes. Closes #198.
-    # Note: surface-daemon health warning is intentionally NOT done here.
-    # A false alarm on startup (daemon not yet running) fires every session
-    # and trains the agent to ignore the warning. The warning fires at actual
-    # use-time from engram-surface-hook.py instead (closes #344).
+    #
+    # Codex is intentionally deferred here: hooks may run from a plugin cache
+    # while MCP runs from the marketplace plugin path, and MCP may lazy-start on
+    # first tool use. A false alarm on startup fires every session and trains
+    # the agent to ignore the warning. Match the surface-daemon use-time
+    # warning precedent (closes #344) for the Codex MCP path (closes #827).
     mcp_ok, mcp_reason = _check_mcp_health(ENGRAM_HOME)
 
     if not mcp_ok:
