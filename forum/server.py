@@ -62,6 +62,93 @@ def _read_pack_readme(packs_dir: str, pack_id: str) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Hybrid search config — FORUM_SEARCH_ALPHA
+#
+# Alpha blends the cosine (semantic) arm vs BM25 (FTS) arm in hybrid search:
+#   score = alpha * cosine + (1 - alpha) * bm25_normalized
+# Default 0.5.  Set FORUM_SEARCH_ALPHA=[0,1] in the environment to tune.
+# A richer config surface is tracked as a future improvement; env is the
+# current surface pending that (noted in PR body).
+# ---------------------------------------------------------------------------
+_SEARCH_ALPHA_WARN_ONCE: bool = False
+
+
+def _get_search_alpha() -> float:
+    """Read FORUM_SEARCH_ALPHA from env; default 0.5; clamp [0,1].
+
+    Warns once per process on parse failure, then falls back to 0.5.
+    """
+    global _SEARCH_ALPHA_WARN_ONCE
+    raw = os.environ.get("FORUM_SEARCH_ALPHA", "").strip()
+    if not raw:
+        return 0.5
+    try:
+        v = float(raw)
+        return max(0.0, min(1.0, v))
+    except ValueError:
+        if not _SEARCH_ALPHA_WARN_ONCE:
+            _SEARCH_ALPHA_WARN_ONCE = True
+            print(
+                f"[forum] FORUM_SEARCH_ALPHA={raw!r} is not a valid float; "
+                "using default 0.5. This is warned once per process.",
+                file=sys.stderr,
+            )
+        return 0.5
+
+
+def _run_search(
+    conn: "sqlite3.Connection",
+    q: str,
+    mode: str,
+    limit: int = 50,
+) -> "tuple[list[dict], str]":
+    """Execute the search mode ladder and return (results, mode_used).
+
+    mode_used is the rung actually executed by search_threads_hybrid (returned
+    directly from that function, not inferred from result shape).  It may
+    differ from mode when the ladder degrades (e.g. hybrid requested but model
+    unavailable → mode_used='fts'; or FTS table missing → mode_used='like').
+
+    Degradation flags in db.py fire ONLY on structural causes (missing table,
+    OperationalError), never on explicit lower-rung requests.
+
+    Args:
+        conn:  Open SQLite connection (sqlite-vec already loaded by before_request).
+        q:     Raw query string (may be empty).
+        mode:  Requested mode: 'hybrid', 'fts', or 'like'.
+        limit: Maximum results.
+
+    Returns:
+        (results_list, mode_used_string)
+    """
+    if not q.strip():
+        return [], mode
+
+    alpha = _get_search_alpha()
+
+    if mode == "like":
+        results = db.search_threads(conn, q)
+        return results, "like"
+
+    if mode == "fts":
+        # FTS-only: pass query_vector=None and expected_rung="fts" so the
+        # db layer knows this is an explicit request (no degradation flag).
+        results, mode_used = db.search_threads_hybrid(
+            conn, q, query_vector=None, alpha=alpha, limit=limit,
+            expected_rung="fts",
+        )
+        return results, mode_used
+
+    # mode == "hybrid" (default)
+    query_vector = emb_mod.encode(q) if emb_mod.available() else None
+    results, mode_used = db.search_threads_hybrid(
+        conn, q, query_vector=query_vector, alpha=alpha, limit=limit,
+        expected_rung="hybrid",
+    )
+    return results, mode_used
+
+
 def create_app(
     db_path: str,
     audit_path: str,
@@ -225,16 +312,22 @@ def create_app(
         )
 
     # ------------------------------------------------------------------
-    # GET /search?q=<term>  — case-insensitive LIKE over titles + bodies
+    # GET /search?q=<term>[&mode=hybrid|fts|like]
+    #
+    # mode ladder (slice 2 of #807):
+    #   hybrid (default) — FTS5 BM25 + semantic vec KNN blend.
+    #   fts              — FTS5 only (diagnostic / degraded fallback).
+    #   like             — LIKE floor (always available).
+    # Alpha from FORUM_SEARCH_ALPHA env (default 0.5).
     # ------------------------------------------------------------------
     @app.route("/search")
     def search() -> str:
         q = request.args.get("q", "").strip()
+        mode = request.args.get("mode", "hybrid").strip()
+        if mode not in ("hybrid", "fts", "like"):
+            mode = "hybrid"
 
-        if q:
-            results = db.search_threads(g.conn, q)
-        else:
-            results = []
+        results, mode_used = _run_search(g.conn, q, mode)
 
         categories = db.list_categories(g.conn)
         online_agents, online_count, registered = db.list_online(g.conn)
@@ -244,6 +337,7 @@ def create_app(
             "search.html",
             q=q,
             results=results,
+            mode_used=mode_used,
             stats={
                 "registered": registered,
                 "online": online_count,
@@ -279,6 +373,49 @@ def create_app(
         readme_html = render_post_body(readme_raw) if readme_raw else None
 
         return render_template("pack_detail.html", pack=pack, readme_html=readme_html)
+    # ------------------------------------------------------------------
+# GET /api/search?q=<term>[&mode=hybrid|fts|like][&limit=N]
+    #
+    # JSON response: {query, mode_used, results: [{thread_id, title,
+    #     score, match_count, url}]}
+    # mode_used reflects the ladder rung actually executed (may differ
+    # from mode when degradation fired).
+    # ------------------------------------------------------------------
+    @app.route("/api/search")
+    def api_search():
+        q = request.args.get("q", "").strip()
+        mode = request.args.get("mode", "hybrid").strip()
+        if mode not in ("hybrid", "fts", "like"):
+            mode = "hybrid"
+        try:
+            limit = int(request.args.get("limit", 50))
+        except (ValueError, TypeError):
+            limit = 50
+        limit = max(1, min(200, limit))
+
+        results, mode_used = _run_search(g.conn, q, mode, limit=limit)
+        # Slice once here after _run_search so ALL rungs (including the LIKE
+        # rung, which search_threads() does not limit internally) honour the
+        # clamped limit.  The hybrid/fts rung already caps at limit inside
+        # search_threads_hybrid; slicing again is idempotent for those paths.
+        results = results[:limit]
+
+        forum_url_base = request.host_url.rstrip("/")
+        api_results = [
+            {
+                "thread_id": t["id"],
+                "title": t["title"],
+                "score": t.get("score", 0.0),
+                "match_count": t.get("match_count", 0),
+                "url": f"{forum_url_base}/thread/{t['id']}",
+            }
+            for t in results
+        ]
+        return jsonify({
+            "query": q,
+            "mode_used": mode_used,
+            "results": api_results,
+        })
 
     # ------------------------------------------------------------------
     # GET /api/threads

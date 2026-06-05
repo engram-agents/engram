@@ -2,8 +2,8 @@
 """forum — Agent-first LAN Forum CLI
 
 A thin HTTP client wrapping the LAN forum API at /api/. Provides verb-first
-subcommands (post/read/list/reply/status/online/cursor/pack) so agents never
-curl-parse JSON: they verb their intent and pipe a body.
+subcommands (post/read/list/reply/status/online/cursor/pack/search) so agents
+never curl-parse JSON: they verb their intent and pipe a body.
 
 Subcommands (v0.1+):
   status     Own agent, server URL, "N new posts since last read", online count.
@@ -15,6 +15,7 @@ Subcommands (v0.1+):
   cursor     Read-cursor inspect / override.
   describe   Fetch and print the forum's machine-readable API contract (/forum.md).
   pack       Pack registry: publish / list / get.
+  search     Hybrid search (FTS + semantic blend); prints ranked results.
 
 Design doc: forum/spec.md
 API:        http://localhost:5002 (configurable via config.json forum.url or $FORUM_URL)
@@ -1047,6 +1048,46 @@ def _pack_get(args: argparse.Namespace, forum_url: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: search
+# ---------------------------------------------------------------------------
+
+def cmd_search(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    """forum search <q> [--mode hybrid|fts|like] [--limit N]
+
+    Hits GET /api/search and prints ranked results: score, title, url,
+    match_count.  Uses the hybrid ranking path by default.
+    """
+    forum_url = _resolve_forum_url(config)
+
+    params: dict = {"q": args.query, "mode": args.mode, "limit": str(args.limit)}
+
+    data = _api_get(f"{forum_url}/api/search", params=params)
+
+    if args.format == "json":
+        print(json.dumps(data, indent=2))
+        return
+
+    query_echo = data.get("query", args.query)
+    mode_used = data.get("mode_used", args.mode)
+    results = data.get("results", [])
+
+    print(f"SEARCH: {query_echo!r}  (mode: {mode_used}, {len(results)} result(s))")
+    if not results:
+        print("  (no results)")
+        return
+
+    for r in results:
+        tid = r.get("thread_id", "?")
+        title = r.get("title", "(no title)")
+        score = r.get("score", 0.0)
+        match_count = r.get("match_count", 0)
+        url = r.get("url", "")
+        matches_part = f"  {match_count} post match{'es' if match_count != 1 else ''}" if match_count else ""
+        print(f"  #{tid}  score={score:.3f}{matches_part}  {url}")
+        print(f"         {title}")
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -1252,6 +1293,34 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # -- search --
+    p_search = subparsers.add_parser(
+        "search",
+        help="Hybrid search (FTS + semantic blend); prints ranked results",
+        description=(
+            "Search forum threads using hybrid FTS + semantic ranking. "
+            "Hits GET /api/search and prints results ordered by relevance score. "
+            "Mode 'hybrid' blends BM25 + cosine similarity (default); "
+            "'fts' uses FTS5 only; 'like' uses the LIKE floor."
+        ),
+    )
+    p_search.add_argument(
+        "query", metavar="QUERY",
+        help="Search query text",
+    )
+    p_search.add_argument(
+        "--mode", choices=["hybrid", "fts", "like"], default="hybrid",
+        help="Search mode: hybrid (default), fts, or like",
+    )
+    p_search.add_argument(
+        "--limit", type=int, default=20, metavar="N",
+        help="Maximum results to show (default: 20)",
+    )
+    p_search.add_argument(
+        "--format", choices=["human", "json"], default="human",
+        help="Output format: human (default) or json",
+    )
+
     # -- pack --
     p_pack = subparsers.add_parser(
         "pack",
@@ -1338,11 +1407,11 @@ def main() -> None:
     config = _load_config()
     agent_name = _get_agent_name(config)
 
-    # Agent name is required for all subcommands that talk to the server
-    # (cursor is local-only; describe fetches a public endpoint — no agent bump;
-    # pack list and pack get don't require agent auth, but pack publish does —
-    # the cmd_pack handler enforces that per-subcommand)
-    if args.subcommand not in ("cursor", "describe", "pack"):
+    # Agent name is required for most subcommands (search is agent-optional —
+    # it's a read-only endpoint, no bump needed).
+    # cursor is local-only; describe fetches a public endpoint — no agent bump;
+    # pack list and pack get don't require agent auth, but pack publish does.
+    if args.subcommand not in ("cursor", "describe", "pack", "search"):
         _require_agent_name(agent_name)
     elif args.subcommand == "pack" and getattr(args, "pack_subcommand", None) == "publish":
         _require_agent_name(agent_name)
@@ -1370,6 +1439,8 @@ def main() -> None:
         cmd_describe(args, config, agent_name)
     elif args.subcommand == "pack":
         cmd_pack(args, config, agent_name)
+    elif args.subcommand == "search":
+        cmd_search(args, config, agent_name)
     else:
         parser.print_help()
         sys.exit(EXIT_VALIDATION)

@@ -28,7 +28,8 @@ from forum.server import create_app
 
 
 @pytest.fixture
-def app(tmp_path):
+def app(tmp_path, monkeypatch):
+    monkeypatch.setenv("FORUM_NO_EMBEDDINGS", "1")
     db_path = str(tmp_path / "forum.db")
     audit_path = str(tmp_path / "audit.jsonl")
     conn = sqlite3.connect(db_path)

@@ -1329,6 +1329,312 @@ def search_threads(
     return result
 
 
+# ---------------------------------------------------------------------------
+# Hybrid search (slice 2 of #807)
+# ---------------------------------------------------------------------------
+
+# Once-per-process degradation log flags (mirrors the #730 pattern).
+_HYBRID_DEGRADED_TO_FTS: bool = False
+_HYBRID_DEGRADED_TO_LIKE: bool = False
+
+
+def _fts5_quote(q: str) -> str:
+    """Wrap a raw user query as an FTS5 string literal.
+
+    FTS5 MATCH syntax treats bare tokens with special chars (`:`, `-`, `*`,
+    `"`) as operators.  Quoting the whole query as a string literal (`"…"`,
+    with internal `"` doubled) forces literal-phrase matching and avoids
+    syntax errors on adversarial or code-heavy queries.
+
+    Examples::
+
+        _fts5_quote('hello world')  -> '"hello world"'
+        _fts5_quote('C++: style')   -> '"C++: style"'
+        _fts5_quote('say "yes"')    -> '"say ""yes\"""'
+        # Embedded double-quotes are doubled; outer quotes wrap all.
+    """
+    escaped = q.replace('"', '""')
+    return f'"{escaped}"'
+
+
+def search_threads_hybrid(
+    conn: sqlite3.Connection,
+    q: str,
+    query_vector: "list[float] | None" = None,
+    alpha: float = 0.5,
+    limit: int = 50,
+    expected_rung: str = "hybrid",
+) -> "tuple[list[dict[str, Any]], str]":
+    """Hybrid search: FTS5 BM25 + vec KNN blend, deduped to threads.
+
+    Score formula: alpha * cosine + (1 - alpha) * bm25_normalized
+    where bm25_normalized is per-query min-max to [0,1] (negative-better
+    BM25 inverted and rescaled within the candidate set).
+
+    Degradation ladder (loud-once-per-process for STRUCTURAL failures):
+      1. hybrid  — FTS5 + semantic arms blended (requires vec tables + vector).
+      2. fts     — FTS5 only (query_vector is None or vec tables unavailable).
+      3. like    — LIKE fallback via search_threads() (FTS table missing or
+                   MATCH error — structural causes only, not empty-hit results).
+
+    Degradation flags (_HYBRID_DEGRADED_TO_FTS / _HYBRID_DEGRADED_TO_LIKE)
+    fire ONLY on structural causes (missing table, OperationalError).  An
+    explicit lower-rung request (expected_rung='fts') or an empty-result
+    fallthrough does NOT consume a flag or emit a warning — those are not
+    structural failures.
+
+    Args:
+        conn:          Open SQLite connection (with sqlite-vec loaded if
+                       available — caller's responsibility, mirrors server.py).
+        q:             Raw query string.
+        query_vector:  Pre-encoded query embedding from forum/embeddings.py
+                       encode().  Pass None when the embedding model is off;
+                       the function degrades to FTS-only scoring (alpha→0).
+        alpha:         Blend weight [0,1] for the cosine arm.  0 = pure FTS,
+                       1 = pure semantic.  Default 0.5.
+        limit:         Maximum threads to return.
+        expected_rung: The rung the caller explicitly requested ("hybrid",
+                       "fts", or "like").  When the caller deliberately
+                       requests a lower rung (e.g. "fts"), no degradation
+                       flag is set or logged for that choice.
+
+    Returns:
+        (results, rung_used) where results is a list of thread dicts (same
+        shape as _build_thread_dict + match_count) plus a ``score`` key
+        (float, higher is better), ordered score DESC; and rung_used is the
+        ladder rung actually executed ("hybrid" | "fts" | "like").
+    """
+    global _HYBRID_DEGRADED_TO_FTS, _HYBRID_DEGRADED_TO_LIKE
+
+    stripped = q.strip()
+    if not stripped:
+        return [], expected_rung
+
+    alpha = max(0.0, min(1.0, alpha))
+    overfetch = limit * 2  # KNN overfetch — mirrors engram-side idiom
+
+    # ------------------------------------------------------------------
+    # FTS arm — posts_fts BM25 candidates
+    # ------------------------------------------------------------------
+    fts_rows: list[tuple[int, float]] = []  # (post_id, raw_bm25)
+    try:
+        fts_q = _fts5_quote(stripped)
+        rows = conn.execute(
+            "SELECT rowid, bm25(posts_fts) FROM posts_fts WHERE posts_fts MATCH ?",
+            (fts_q,),
+        ).fetchall()
+        # bm25() is negative-better in SQLite; collect raw values for
+        # normalization within this candidate set (per-query relative scale,
+        # fine for blending — not comparable across queries).
+        fts_rows = [(r[0], r[1]) for r in rows]
+    except sqlite3.OperationalError as _fts_err:
+        # Structural failure: posts_fts table missing or MATCH error.
+        # This IS a structural degradation — log it once.
+        if not _HYBRID_DEGRADED_TO_LIKE:
+            _HYBRID_DEGRADED_TO_LIKE = True
+            print(
+                f"[forum] hybrid-search: posts_fts unavailable or MATCH error "
+                f"({_fts_err!r}); falling back to LIKE search. "
+                "This is logged once per process.",
+                file=sys.stderr,
+            )
+        return search_threads(conn, stripped), "like"
+
+    # If FTS returned zero results AND no semantic arm, fall through to LIKE.
+    # This is a per-query empty-result path — NOT a structural degradation;
+    # do not set the flag or log a warning.
+    if not fts_rows and query_vector is None:
+        return search_threads(conn, stripped), "like"
+
+    # Normalize BM25 scores to [0,1] within candidate set.
+    # BM25 is negative-better: most-relevant row has the most-negative value.
+    # Invert: fts_norm = (raw - min) / (max - min); min-row → 1.0 (best).
+    post_fts_norm: dict[int, float] = {}
+    if fts_rows:
+        raw_vals = [r[1] for r in fts_rows]
+        bm25_min = min(raw_vals)   # most negative = most relevant
+        bm25_max = max(raw_vals)   # least negative = least relevant
+        span = bm25_max - bm25_min
+        for post_id, raw in fts_rows:
+            if span == 0.0:
+                post_fts_norm[post_id] = 1.0
+            else:
+                # Invert so that the best (most-negative) score maps to 1.0.
+                post_fts_norm[post_id] = (bm25_max - raw) / span
+
+    # ------------------------------------------------------------------
+    # Semantic arm — vec_posts + vec_threads KNN
+    # ------------------------------------------------------------------
+    # vec0 distance metric: for float[384] vec0 uses L2 distance by default.
+    # For L2-normalized vectors (unit norm, which embeddings.encode() ensures):
+    #   ||a - b||^2 = 2 - 2·cos(a, b)  →  cos = 1 - L2²/2
+    # So cosine_similarity = 1 - (l2_distance ** 2) / 2.
+    # This identity holds exactly for unit-norm vectors and avoids a separate
+    # dot-product query.  See issue #807 design-settlement + embeddings.py.
+    post_vec_sim: dict[int, float] = {}   # post_id → cosine similarity
+    thread_vec_sim: dict[int, float] = {}  # thread_id → centroid cosine sim
+
+    vec_arm_available = (query_vector is not None) and _VEC_BACKEND_AVAILABLE
+
+    # Log FTS-degradation only when query_vector is unexpectedly absent
+    # (i.e. model offline / structural cause) — NOT when the caller explicitly
+    # requested the fts rung (expected_rung == "fts").
+    if query_vector is None and expected_rung not in ("fts", "like") and not _HYBRID_DEGRADED_TO_FTS:
+        _HYBRID_DEGRADED_TO_FTS = True
+        print(
+            "[forum] hybrid-search: no query vector (model off or "
+            "FORUM_NO_EMBEDDINGS set); using FTS-only scoring (alpha→0). "
+            "This is logged once per process.",
+            file=sys.stderr,
+        )
+
+    if vec_arm_available and query_vector is not None:
+        try:
+            from . import embeddings as _emb
+            qvec_blob = _emb.serialize(query_vector)
+
+            # KNN on vec_posts (post-level semantic hits)
+            vec_post_rows = conn.execute(
+                """
+                SELECT post_id, distance
+                  FROM vec_posts
+                 WHERE embedding MATCH ?
+                   AND k = ?
+                """,
+                (qvec_blob, overfetch),
+            ).fetchall()
+            for pid, l2_dist in vec_post_rows:
+                # Cosine similarity from L2 distance for unit-norm vectors:
+                # cos = 1 - L2² / 2  (identity for normalized vectors)
+                cos_sim = 1.0 - (l2_dist ** 2) / 2.0
+                cos_sim = max(0.0, min(1.0, cos_sim))
+                post_vec_sim[pid] = cos_sim
+
+            # KNN on vec_threads (centroid-level semantic hits)
+            vec_thread_rows = conn.execute(
+                """
+                SELECT thread_id, distance
+                  FROM vec_threads
+                 WHERE embedding MATCH ?
+                   AND k = ?
+                """,
+                (qvec_blob, overfetch),
+            ).fetchall()
+            for tid, l2_dist in vec_thread_rows:
+                cos_sim = 1.0 - (l2_dist ** 2) / 2.0
+                cos_sim = max(0.0, min(1.0, cos_sim))
+                thread_vec_sim[tid] = cos_sim
+
+        except sqlite3.OperationalError:
+            # vec0 tables not present — structural degradation, log once.
+            vec_arm_available = False
+            if not _HYBRID_DEGRADED_TO_FTS:
+                _HYBRID_DEGRADED_TO_FTS = True
+                print(
+                    "[forum] hybrid-search: vec_posts/vec_threads tables unavailable; "
+                    "using FTS-only scoring. This is logged once per process.",
+                    file=sys.stderr,
+                )
+
+    # ------------------------------------------------------------------
+    # Map post hits → thread_id, compute per-thread scores
+    # ------------------------------------------------------------------
+    # Collect all candidate post IDs from both arms.
+    all_post_ids: set[int] = set(post_fts_norm.keys()) | set(post_vec_sim.keys())
+
+    # Map post → thread (one query if we have candidates).
+    post_to_thread: dict[int, int] = {}
+    if all_post_ids:
+        placeholders = ",".join("?" * len(all_post_ids))
+        mapping_rows = conn.execute(
+            f"SELECT id, thread_id FROM posts WHERE id IN ({placeholders})",
+            list(all_post_ids),
+        ).fetchall()
+        for post_id_val, tid_val in mapping_rows:
+            post_to_thread[post_id_val] = tid_val
+
+    # Compute per-post blend score and accumulate max per thread.
+    thread_best_post_score: dict[int, float] = {}  # thread_id → max post score
+
+    effective_alpha = alpha if vec_arm_available else 0.0
+    for pid in all_post_ids:
+        fts_score = post_fts_norm.get(pid, 0.0)
+        sem_score = post_vec_sim.get(pid, 0.0)
+        blend = effective_alpha * sem_score + (1.0 - effective_alpha) * fts_score
+        tid_for_post = post_to_thread.get(pid)
+        if tid_for_post is not None:
+            if tid_for_post not in thread_best_post_score or blend > thread_best_post_score[tid_for_post]:
+                thread_best_post_score[tid_for_post] = blend
+
+    # Centroid contribution: thread_id → centroid_cosine * 0.9
+    # Final thread score = max(best_post_score, centroid_score * 0.9)
+    all_thread_ids: set[int] = set(thread_best_post_score.keys()) | set(thread_vec_sim.keys())
+    thread_final_score: dict[int, float] = {}
+    for tid_val in all_thread_ids:
+        post_contrib = thread_best_post_score.get(tid_val, 0.0)
+        centroid_contrib = thread_vec_sim.get(tid_val, 0.0) * 0.9
+        thread_final_score[tid_val] = max(post_contrib, centroid_contrib)
+
+    if not thread_final_score:
+        # All candidate sets empty — fall through to LIKE.
+        # This is a per-query empty-result path; NOT a structural degradation.
+        return search_threads(conn, stripped), "like"
+
+    # ------------------------------------------------------------------
+    # Fetch thread rows for matched IDs (standard _build_thread_dict query)
+    # ------------------------------------------------------------------
+    sorted_tids = sorted(
+        thread_final_score.keys(),
+        key=lambda t: thread_final_score[t],
+        reverse=True,
+    )[:limit]
+
+    if not sorted_tids:
+        return [], "fts" if not vec_arm_available else "hybrid"
+
+    placeholders = ",".join("?" * len(sorted_tids))
+    sql = f"""
+        SELECT t.id, t.category_slug, t.title, t.body_md,
+               t.pinned, t.unresolved, t.created_at, t.last_activity_at,
+               la.name AS last_activity_agent_name,
+               a.name AS author_name, a.avatar_seed, a.pair_initials,
+               COUNT(p.id) AS reply_count
+          FROM threads t
+          JOIN agents a  ON a.id  = t.author_agent_id
+          JOIN agents la ON la.id = t.last_activity_agent_id
+          LEFT JOIN posts p ON p.thread_id = t.id
+         WHERE t.id IN ({placeholders})
+         GROUP BY t.id
+    """
+    rows = conn.execute(sql, sorted_tids).fetchall()
+
+    # Build thread dicts in score order (re-sort by our score, since SQL
+    # GROUP BY may reorder relative to the sorted_tids list).
+    tid_to_row: dict[int, Any] = {r[0]: r for r in rows}
+    result: list[dict[str, Any]] = []
+    for tid_val in sorted_tids:
+        row = tid_to_row.get(tid_val)
+        if row is None:
+            continue
+        td = _build_thread_dict(conn, row)
+        td["score"] = thread_final_score[tid_val]
+
+        # match_count: number of posts whose body_md LIKE q (same as search_threads)
+        escaped = stripped.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like_q = f"%{escaped}%"
+        count_row = conn.execute(
+            "SELECT COUNT(*) FROM posts WHERE thread_id = ? AND body_md LIKE ? ESCAPE '\\'",
+            (tid_val, like_q),
+        ).fetchone()
+        td["match_count"] = count_row[0] if count_row else 0
+
+        result.append(td)
+
+    # Report rung: hybrid if semantic arm was active, fts otherwise.
+    rung_used = "hybrid" if vec_arm_available else "fts"
+    return result, rung_used
+
+
 def count_unread_all_threads(
     conn: sqlite3.Connection,
     agent_id: int,
