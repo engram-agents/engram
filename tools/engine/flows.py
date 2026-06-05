@@ -11,6 +11,9 @@ Upgrade flow
 Mechanizes the ENGRAM plugin upgrade skill (skills/claude/engram-upgrade/).
 Steps map 1-to-1 with the skill's numbered sections:
 
+  substrate-health        [operator] gate: marker absent → healthy, step skipped;
+                          marker present → refuse upgrade; never opens knowledge.db
+                          (hazard constraint per #786 §1; part of #786)
   source-tree-located     Step 0a: .deployed-version exists + points to readable dir
   tree-at-commit          Step 0b: source tree is on dev and clean (or at expected SHA)
   changeset-reviewed      Step 1:  agent-judgment step — emits changeset summary;
@@ -19,6 +22,7 @@ Steps map 1-to-1 with the skill's numbered sections:
                                    (unless ctx.allow_branch — guard per #794)
   flags-match-config      Step 3:  tier + multi_agent in built manifest match config.json
   plugin-marketplace-update  Step 4: [operator] /plugin marketplace update
+                                     (requires substrate-health + flags-match-config)
   plugin-upgrade          Step 5:  [operator] /plugin upgrade engram
   mcp-reconnect           Step 6:  [operator, conditional] /mcp reconnect — only when
                                    server.py or engram_*.py changed in deployed..target range
@@ -60,6 +64,88 @@ from .steps import Step
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+# Substrate-degraded marker filename — mirrors engram_walguard._MARKER_FILENAME
+# (engram_walguard.py:139).  The engine does NOT import engram_walguard to avoid
+# pulling in ENGRAM runtime dependencies; this one-line join is the full resolution.
+_SUBSTRATE_MARKER_FILENAME = ".substrate-degraded.json"
+
+
+def _substrate_marker_path(engram_home: str) -> str:
+    """Return the path to the degraded-substrate marker file.
+
+    Resolution mirrors engram_walguard._marker_path (line 143):
+    Path(data_dir) / _MARKER_FILENAME, where data_dir == engram_home.
+    The engine resolves engram_home from ctx["engram_home"], the same source
+    used by _load_engram_config below.
+    """
+    return os.path.join(engram_home, _SUBSTRATE_MARKER_FILENAME)
+
+
+def _read_substrate_marker(engram_home: str) -> "dict | None":
+    """Read the degraded-substrate marker if present; return None when absent.
+
+    HAZARD CONSTRAINT: never opens knowledge.db — marker file read only
+    (os.path.exists + open).  An external DB connection on a poisoned live WAL
+    creates the split-brain it checks for (see issue #786 §1).
+
+    Tolerates malformed JSON: treats any read/parse failure as degraded
+    (presence = degraded; content is best-effort detail only).
+    """
+    path = _substrate_marker_path(engram_home)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        # Marker present but unreadable → still degraded; return sentinel
+        return {"reason": "(marker present but unreadable)", "dump_sha": None, "detected_at": None}
+
+
+def _substrate_health_instruction(marker: "dict | None", engram_home: str = "") -> str:
+    """Build the operator instruction string for the substrate-health step.
+
+    Called unconditionally at construction time; when the marker is absent,
+    ``marker`` is None and the reason/dump_sha fields fall back to "(unknown)".
+    Renders the marker's reason/detected_at/dump_sha fields and points at the
+    documented restore path.  Tolerates missing fields.
+
+    ``engram_home`` is used to render the exact rm path in the instruction.
+    Falls back to the ``~/.engram`` literal when not provided.
+    """
+    reason = "(unknown)" if not marker else (marker.get("reason") or "(unknown)")
+    ts = "" if not marker else (marker.get("detected_at") or "")
+    dump_sha = "" if not marker else (marker.get("dump_sha") or "(none)")
+
+    # Render the rm path from the resolved engram_home so the instruction names
+    # the correct file even under --ctx-file with a custom engram_home.
+    # Note: the instruction is built at construction time using the env/default
+    # resolution; the check/verify lambdas always use ctx["engram_home"] and
+    # will correctly reflect a different runtime engram_home if --ctx-file
+    # changes it.  This is the "cheapest fix" per the colleague suggestion.
+    marker_path = _substrate_marker_path(engram_home) if engram_home else "~/.engram/.substrate-degraded.json"
+
+    ts_line = f"\n  Detected at:  {ts}" if ts else ""
+    return (
+        "SUBSTRATE DEGRADED — upgrade refused.\n"
+        "\n"
+        f"  Reason:    {reason}{ts_line}\n"
+        f"  Dump SHA:  {dump_sha}\n"
+        "\n"
+        f"The degraded-state marker ({marker_path}) is present.\n"
+        "This means the WAL/shm guard detected split-brain WAL-index displacement\n"
+        "and performed an emergency dump.  Upgrading on a poisoned substrate risks\n"
+        "permanent data loss.\n"
+        "\n"
+        "Required actions before upgrading:\n"
+        "  1. Restore from the last emergency dump (see #781/#790 restore procedure).\n"
+        "  2. Verify the restored DB is clean (engram_stats returns your real node count).\n"
+        f"  3. Remove the marker: rm {marker_path}\n"
+        "  4. Re-run the upgrade flow.\n"
+        "\n"
+        "Do NOT upgrade until the marker is cleared — this step blocks on every run."
+    )
 
 
 def _read_deployed_version(engram_home: str) -> dict[str, str]:
@@ -138,12 +224,70 @@ def _load_engram_config(ctx: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _make_substrate_health_step(engram_home: str) -> Step:
+    """Build the substrate-health Step, reading the marker at construction time.
+
+    upgrade_flow() creates a fresh step list on every call, so reading the
+    marker here (at flow-construction time) captures the current marker state
+    and embeds it into the instruction string.  The check/verify lambdas
+    re-read the marker path on each invocation so they reflect the live
+    filesystem state if the flow is re-run after the marker is removed.
+
+    HAZARD CONSTRAINT: no DB connection — marker file read only.
+    """
+    # Read marker now to embed content into the static instruction string.
+    # The lambdas re-check the path on every call (idempotent/resumable contract).
+    marker = _read_substrate_marker(engram_home)
+    instruction = _substrate_health_instruction(marker, engram_home)
+
+    return Step(
+        id="substrate-health",
+        requires=[],
+        kind="operator",
+        check=lambda ctx: not os.path.exists(
+            _substrate_marker_path(ctx["engram_home"])
+        ),
+        apply=None,
+        verify=lambda ctx: not os.path.exists(
+            _substrate_marker_path(ctx["engram_home"])
+        ),
+        instruction=instruction,
+    )
+
+
 def upgrade_flow() -> list[Step]:
     """Return the step list for the ENGRAM plugin upgrade flow.
 
     The returned list is a fresh copy each call; callers may mutate it.
+
+    Ctx contract additions (substrate-health):
+      No new ctx keys required.  The step reads ctx["engram_home"] (already
+      required) to locate the degraded-substrate marker.
     """
+    # Resolve engram_home the same way the CLI does (_build_ctx_from_env), so
+    # that the substrate-health instruction embeds the live marker content.
+    # We cannot use ctx here (not yet constructed), so fall back to the env var
+    # or the default ~/.engram — the same resolution _build_ctx_from_env uses.
+    # Tests override this by passing a fake engram_home in ctx; the check/verify
+    # lambdas inside the step always use ctx["engram_home"], so fake dirs work.
+    _default_engram_home = os.environ.get(
+        "ENGRAM_HOME", os.path.expanduser("~/.engram")
+    )
+
     return [
+        # ── Step substrate-health [operator] ─────────────────────────────
+        # Root prerequisite gating all live-install-mutating steps.
+        # Reads the degraded-substrate marker written by engram_walguard (the
+        # ONE detector; merged #796).  This step NEVER opens knowledge.db —
+        # marker read + os.path.exists only (hazard constraint: #786 §1).
+        #
+        # DAG: no requires (parallel root alongside source-tree-located).
+        # plugin-marketplace-update requires this step, gating all
+        # live-install-mutating steps (marketplace-update → plugin-upgrade →
+        # mcp-reconnect) transitively.  Pure-compute preflight steps (0a–3)
+        # are not gated and may run safely on any substrate state.
+        _make_substrate_health_step(_default_engram_home),
+
         # ── Step 0a: source-tree-located ─────────────────────────────────
         Step(
             id="source-tree-located",
@@ -221,7 +365,7 @@ def upgrade_flow() -> list[Step]:
         # ── Step 4: plugin-marketplace-update [operator] ─────────────────
         Step(
             id="plugin-marketplace-update",
-            requires=["flags-match-config"],
+            requires=["flags-match-config", "substrate-health"],
             kind="operator",
             check=lambda ctx: bool(ctx.get("_plugin_marketplace_updated")),
             apply=None,

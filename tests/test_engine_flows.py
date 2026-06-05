@@ -4,10 +4,10 @@ All tests use a FULLY FAKE ctx built with tmp dirs — they NEVER touch
 /home/agent-borges/.engram or the real repo state.
 
 Coverage:
-  1. upgrade_flow() returns the expected 10 steps in the right order
+  1. upgrade_flow() returns the expected 12 steps in the right order
   2. plan_flow() reports check() state correctly
   3. Full run with fake ctx → PAUSED at first operator step
-     (plugin-marketplace-update is step index 5, first operator step)
+     (plugin-marketplace-update when substrate is healthy)
   4. Fake the operator action → resume → PAUSED at next operator step
   5. Walk through all operator steps → Done
   6. #794 branch guard: build step refuses non-dev without allow_branch
@@ -16,6 +16,12 @@ Coverage:
   9. mcp-reconnect is automatically satisfied when no server files changed
  10. template-gate marks done and does not touch ~/.claude/CLAUDE.md
  11. #707-class: marketplace-rebuilt fails loud when install_tier unset
+ 12. substrate-health: marker present → check/verify False; absent → True
+ 13. substrate-health: malformed marker → still degraded; instruction renders
+ 14. substrate-health: flow pauses at substrate-health when marker present
+ 15. substrate-health: downstream steps not reached when marker present
+ 16. Doctor: marker present → substrate-health unsatisfied; absent → satisfied
+ 17. Drift guard: flows._SUBSTRATE_MARKER_FILENAME == engram_walguard._MARKER_FILENAME
 """
 
 from __future__ import annotations
@@ -38,6 +44,10 @@ from tools.engine.steps import run_flow, run_doctor, Done, Paused, Failed
 # ---------------------------------------------------------------------------
 
 EXPECTED_STEP_IDS = [
+    # substrate-health has no requires (parallel root with source-tree-located);
+    # topological order puts it first because it's listed first in upgrade_flow()
+    # and Kahn's algorithm respects insertion order for zero-in-degree nodes.
+    "substrate-health",
     "source-tree-located",
     "tree-at-commit",
     "changeset-reviewed",
@@ -53,6 +63,7 @@ EXPECTED_STEP_IDS = [
 
 # Operator steps in order
 OPERATOR_STEPS = [
+    "substrate-health",
     "plugin-marketplace-update",
     "plugin-upgrade",
     "mcp-reconnect",
@@ -778,3 +789,234 @@ class TestUnsetInstallTierLoudFailure:
                 f"marketplace-rebuilt should not fail with valid install_tier; "
                 f"got: {result.reason}"
             )
+
+
+# ---------------------------------------------------------------------------
+# 12–16. substrate-health step (#786)
+# ---------------------------------------------------------------------------
+
+
+def _write_marker(engram_home: str, *, malformed: bool = False, **extra: object) -> str:
+    """Write a fake degraded-substrate marker to engram_home.
+
+    Returns the marker path.
+    """
+    path = os.path.join(engram_home, ".substrate-degraded.json")
+    if malformed:
+        with open(path, "w") as f:
+            f.write("{ this is not valid json }")
+    else:
+        payload = {
+            "reason": "shm_deleted",
+            "detected_at": "2026-06-04T14:00:00+00:00",
+            "dump_sha": "abc1234def5678",
+            **extra,
+        }
+        with open(path, "w") as f:
+            json.dump(payload, f)
+    return path
+
+
+class TestSubstrateHealthStep:
+    """substrate-health step behaviour — marker present/absent/malformed."""
+
+    # ── 12. check() and verify() reflect marker presence ──────────────────
+
+    def test_marker_absent_check_true(self, tmp_path):
+        """When no marker exists, check() returns True (step skipped)."""
+        _, _, ctx = _make_fake_env(str(tmp_path))
+        # No marker written — engram_home is a fresh dir.
+        steps = upgrade_flow()
+        step_by_id = {s.id: s for s in steps}
+        sh = step_by_id["substrate-health"]
+        assert sh.check(ctx) is True
+
+    def test_marker_absent_verify_true(self, tmp_path):
+        """When no marker exists, verify() returns True (doctor: satisfied)."""
+        _, _, ctx = _make_fake_env(str(tmp_path))
+        steps = upgrade_flow()
+        step_by_id = {s.id: s for s in steps}
+        sh = step_by_id["substrate-health"]
+        assert sh.verify(ctx) is True
+
+    def test_marker_present_check_false(self, tmp_path):
+        """When marker is present, check() returns False (step not satisfied)."""
+        _, _, ctx = _make_fake_env(str(tmp_path))
+        _write_marker(ctx["engram_home"])
+        steps = upgrade_flow()
+        step_by_id = {s.id: s for s in steps}
+        sh = step_by_id["substrate-health"]
+        assert sh.check(ctx) is False
+
+    def test_marker_present_verify_false(self, tmp_path):
+        """When marker is present, verify() returns False (doctor: unsatisfied)."""
+        _, _, ctx = _make_fake_env(str(tmp_path))
+        _write_marker(ctx["engram_home"])
+        steps = upgrade_flow()
+        step_by_id = {s.id: s for s in steps}
+        sh = step_by_id["substrate-health"]
+        assert sh.verify(ctx) is False
+
+    # ── 13. malformed marker ───────────────────────────────────────────────
+
+    def test_malformed_marker_check_false(self, tmp_path):
+        """Malformed marker → still treated as degraded; check() returns False."""
+        _, _, ctx = _make_fake_env(str(tmp_path))
+        _write_marker(ctx["engram_home"], malformed=True)
+        steps = upgrade_flow()
+        step_by_id = {s.id: s for s in steps}
+        sh = step_by_id["substrate-health"]
+        assert sh.check(ctx) is False
+
+    def test_malformed_marker_instruction_renders(self, tmp_path):
+        """Malformed marker — instruction renders without raising; includes fallback text."""
+        from tools.engine.flows import _read_substrate_marker, _substrate_health_instruction
+        engram_home = str(tmp_path / "engram_home_malformed")
+        os.makedirs(engram_home, exist_ok=True)
+        _write_marker(engram_home, malformed=True)
+
+        marker = _read_substrate_marker(engram_home)
+        # Malformed: _read_substrate_marker returns a sentinel dict, not None
+        assert marker is not None, "Malformed marker should return sentinel, not None"
+        instruction = _substrate_health_instruction(marker)
+        # Must not raise and must include the degraded header
+        assert "SUBSTRATE DEGRADED" in instruction
+        # Should mention the fallback reason
+        assert "unreadable" in instruction or "unknown" in instruction
+
+    # ── 14. flow pauses at substrate-health when marker present ───────────
+
+    def test_flow_pauses_at_substrate_health(self, tmp_path):
+        """With marker present, run_flow pauses at substrate-health."""
+        _, _, ctx = _make_fake_env(str(tmp_path))
+        _write_marker(ctx["engram_home"])
+        ctx["ack_changeset"] = True
+        ctx["_template_gate_done"] = True
+
+        steps = upgrade_flow()
+        result = run_flow(steps, ctx)
+
+        assert isinstance(result, Paused), f"Expected Paused, got {result}"
+        assert result.step_id == "substrate-health"
+
+    def test_flow_instruction_contains_marker_fields(self, tmp_path, monkeypatch):
+        """The Paused instruction includes the marker's reason and dump_sha.
+
+        Exercises the production env-resolution path: ENGRAM_HOME is set to
+        the test's tmp_path so upgrade_flow() picks up the marker at
+        construction time via _default_engram_home.
+        """
+        marker_home = str(tmp_path)
+        _write_marker(
+            marker_home,
+            reason="shm_deleted",
+            dump_sha="deadbeef12345678",
+            detected_at="2026-06-04T14:00:00+00:00",
+        )
+
+        # Point the env-resolution path at the test's tmp_path so that
+        # upgrade_flow()'s _default_engram_home reads our marker.
+        monkeypatch.setenv("ENGRAM_HOME", marker_home)
+        steps = upgrade_flow()
+
+        step_by_id = {s.id: s for s in steps}
+        sh = step_by_id["substrate-health"]
+        assert "shm_deleted" in sh.instruction
+        assert "deadbeef12345678" in sh.instruction
+
+    # ── 15. downstream steps not reached when marker present ──────────────
+
+    def test_downstream_steps_not_attempted_with_marker(self, tmp_path):
+        """When substrate-health blocks, plugin-marketplace-update is not reached."""
+        _, _, ctx = _make_fake_env(str(tmp_path))
+        _write_marker(ctx["engram_home"])
+        ctx["ack_changeset"] = True
+        ctx["_template_gate_done"] = True
+
+        steps = upgrade_flow()
+        result = run_flow(steps, ctx)
+
+        # Must pause at substrate-health, NOT at any downstream step
+        assert isinstance(result, Paused)
+        assert result.step_id == "substrate-health"
+        # Plugin steps must not have been attempted
+        assert not ctx.get("_plugin_marketplace_updated")
+        assert not ctx.get("_plugin_upgrade_done")
+
+    def test_after_marker_removed_flow_proceeds(self, tmp_path):
+        """After removing the marker, substrate-health is satisfied and flow continues."""
+        _, _, ctx = _make_fake_env(str(tmp_path))
+        marker_path = _write_marker(ctx["engram_home"])
+        ctx["ack_changeset"] = True
+        ctx["_template_gate_done"] = True
+
+        steps = upgrade_flow()
+        # First run: blocked at substrate-health
+        r1 = run_flow(steps, ctx)
+        assert isinstance(r1, Paused)
+        assert r1.step_id == "substrate-health"
+
+        # Simulate operator clearing the marker
+        os.remove(marker_path)
+
+        # Second run: substrate-health now satisfied; proceeds to plugin-marketplace-update
+        r2 = run_flow(steps, ctx)
+        assert isinstance(r2, Paused)
+        assert r2.step_id == "plugin-marketplace-update"
+
+    # ── 16. Doctor mode: substrate-health row ─────────────────────────────
+
+    def test_doctor_marker_absent_satisfied(self, tmp_path):
+        """Doctor: substrate-health satisfied when marker absent."""
+        _, _, ctx = _make_fake_env(str(tmp_path))
+        # Fully pre-satisfy everything else so we can isolate substrate-health
+        ctx.update({
+            "ack_changeset": True,
+            "_plugin_marketplace_updated": True,
+            "_plugin_upgrade_done": True,
+            "_mcp_reconnected": True,
+            "_template_gate_done": True,
+            "_stats_verified": True,
+            "_record_filed": True,
+        })
+
+        steps = upgrade_flow()
+        results = run_doctor(steps, ctx)
+        by_id = {r.step_id: r for r in results}
+
+        assert "substrate-health" in by_id
+        assert by_id["substrate-health"].satisfied is True
+
+    def test_doctor_marker_present_unsatisfied(self, tmp_path):
+        """Doctor: substrate-health unsatisfied when marker present."""
+        _, _, ctx = _make_fake_env(str(tmp_path))
+        _write_marker(ctx["engram_home"])
+        ctx.update({
+            "ack_changeset": True,
+            "_plugin_marketplace_updated": True,
+            "_plugin_upgrade_done": True,
+            "_mcp_reconnected": True,
+            "_template_gate_done": True,
+            "_stats_verified": True,
+            "_record_filed": True,
+        })
+
+        steps = upgrade_flow()
+        results = run_doctor(steps, ctx)
+        by_id = {r.step_id: r for r in results}
+
+        assert "substrate-health" in by_id
+        assert by_id["substrate-health"].satisfied is False
+
+    # ── drift guard ───────────────────────────────────────────────────────────
+
+    def test_marker_filename_matches_walguard(self):
+        """flows._SUBSTRATE_MARKER_FILENAME must equal engram_walguard._MARKER_FILENAME.
+
+        If the names drift, the substrate-health gate silently always-passes
+        because it looks for a file that walguard never creates.
+        Mechanical gate > vigilance.
+        """
+        from engram_walguard import _MARKER_FILENAME
+        from tools.engine import flows
+        assert flows._SUBSTRATE_MARKER_FILENAME == _MARKER_FILENAME
