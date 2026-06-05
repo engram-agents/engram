@@ -3,7 +3,7 @@
 Validation pipeline (run server-side before accepting a pack upload):
   1. Package shape: knowledge.sql + scripts/ + README present.
   2. Closure invariant: rebuild knowledge.sql into a temp DB; run
-     _assert_closure_completeness from engram-pkg (imported, not copied).
+     _find_dangling_edges from engram-pkg (imported, not copied).
   3. Size guard: node_count <= MAX_NODES, edge_count <= MAX_EDGES (mirrors
      engram-pkg defaults).
 
@@ -32,7 +32,6 @@ import shutil
 import sqlite3
 import tarfile
 import tempfile
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -42,39 +41,6 @@ from typing import Any
 # ---------------------------------------------------------------------------
 MAX_NODES = 200
 MAX_EDGES = 400
-
-
-# ---------------------------------------------------------------------------
-# Thread-safety: serialise the sys.exit patch window.
-#
-# _validate_closure_completeness temporarily replaces sys.exit globally so
-# that _assert_closure_completeness (which calls sys.exit on violation) can
-# be caught and converted to PackValidationError.  Flask runs threaded by
-# default; two concurrent uploads racing through the patch window can
-# interleave like this:
-#
-#   Thread A: original_exit_A = sys.exit      # sys.exit is real exit
-#   Thread B: original_exit_B = sys.exit      # sys.exit is real exit
-#   Thread A: sys.exit = _patched_A
-#   Thread B: sys.exit = _patched_B           # overwrites A's patch
-#   Thread A: finally → sys.exit = original_exit_A  # restores real exit
-#   Thread B: finally → sys.exit = original_exit_B  # also restores (fine here)
-#
-#   BUT if Thread B's finally runs first and restores real exit, then Thread A's
-#   finally restores real exit — harmless.  The dangerous case is if Thread A
-#   grabs original_exit_A = _patched_B (another thread's stub) and restores
-#   that, leaving sys.exit pointing to the _CaptureExit-raising stub forever.
-#
-# Serialising with this lock makes the patch window atomic: each thread sees
-# the real sys.exit when it captures, and restores the real sys.exit in its
-# finally.  Validation is I/O-bound anyway (DB rebuild), so the lock
-# contention on a LAN-only registry is negligible.
-#
-# Long-term fix: refactor engram-pkg's _assert_closure_completeness to raise a
-# typed exception instead of calling sys.exit, eliminating the patch entirely.
-# That refactor is tracked in issue #651's thread (engram-pkg exception-refactor).
-# ---------------------------------------------------------------------------
-_CLOSURE_CHECK_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -183,8 +149,8 @@ def _validate_package_shape(extract_dir: Path) -> None:
 def _validate_closure_completeness(extract_dir: Path) -> tuple[int, int]:
     """Rebuild knowledge.sql into a temp DB and run the closure invariant check.
 
-    Reuses engram-pkg's _assert_closure_completeness so the invariant has one
-    home and cannot drift.
+    Calls engram-pkg's pure checker _find_dangling_edges directly so the
+    invariant has one home and cannot drift.
 
     Returns (node_count, edge_count) on success.
     Raises PackValidationError if the invariant is violated.
@@ -203,7 +169,7 @@ def _validate_closure_completeness(extract_dir: Path) -> tuple[int, int]:
             conn.executescript(sql_content)
             conn.row_factory = sqlite3.Row
 
-            # Load all nodes and edges into the shape _assert_closure_completeness expects.
+            # Load all nodes and edges into the shape _find_dangling_edges expects.
             try:
                 node_rows = conn.execute("SELECT * FROM nodes").fetchall()
                 edge_rows = conn.execute("SELECT * FROM edges").fetchall()
@@ -224,34 +190,19 @@ def _validate_closure_completeness(extract_dir: Path) -> tuple[int, int]:
         except OSError:
             pass
 
-    # Run the closure-completeness invariant from engram-pkg.
-    # _assert_closure_completeness raises SystemExit on violation; we catch
-    # that and convert it to PackValidationError so the server can return 400.
-    #
-    # The patch window is serialised with _CLOSURE_CHECK_LOCK (module-level).
-    # Without the lock, concurrent Flask threads can interleave the
-    # capture/restore and leave sys.exit permanently pointing to a stub after
-    # both threads exit.  See _CLOSURE_CHECK_LOCK's comment for the full race.
-    import sys as _sys
-
-    class _CaptureExit(Exception):
-        def __init__(self, msg):
-            self.msg = msg
-
-    def _patched_exit(msg=""):
-        raise _CaptureExit(str(msg))
-
-    with _CLOSURE_CHECK_LOCK:
-        original_exit = _sys.exit
-        _sys.exit = _patched_exit
-        try:
-            cli._assert_closure_completeness(nodes, edges)
-        except _CaptureExit as exc:
-            raise PackValidationError(
-                f"Closure-completeness invariant violated: {exc.msg}"
-            )
-        finally:
-            _sys.exit = original_exit
+    # Run the closure-completeness invariant via engram-pkg's pure checker.
+    dangling = cli._find_dangling_edges(nodes, edges)
+    if dangling:
+        examples = "; ".join(
+            f"{s} →[{r}]→ {t}" for s, t, r in dangling[:5]
+        )
+        raise PackValidationError(
+            f"Closure-completeness invariant violated: "
+            f"ERROR: scope-export: closure-completeness invariant violated — "
+            f"{len(dangling)} edge(s) have an endpoint outside the pack. "
+            f"Examples: {examples}. "
+            f"This is a bug in the closure logic; please report it."
+        )
 
     return len(nodes), len(edges)
 

@@ -659,6 +659,25 @@ def _compute_provenance_closure(
     return visited, unique_edges
 
 
+def _find_dangling_edges(
+    nodes: dict, edges: list[dict]
+) -> list[tuple[str, str, str]]:
+    """Return a list of (src, tgt, relation) for edges with an endpoint outside nodes.
+
+    Pure checker — no I/O, no sys.exit, no side effects.  Returns an empty list
+    when the closure is complete.  The wrapper _assert_closure_completeness
+    calls this and exits on violation; callers that need to handle violations
+    programmatically (e.g. server-side validation) call this directly.
+    """
+    node_set = set(nodes.keys())
+    dangling = []
+    for e in edges:
+        src, tgt = e["source_id"], e["target_id"]
+        if src not in node_set or tgt not in node_set:
+            dangling.append((src, tgt, e["relation"]))
+    return dangling
+
+
 def _assert_closure_completeness(nodes: dict, edges: list[dict]) -> None:
     """Assert the closure-completeness invariant (spec §3a).
 
@@ -667,13 +686,12 @@ def _assert_closure_completeness(nodes: dict, edges: list[dict]) -> None:
 
     This is a hard guard — not advisory.  A dangling edge is silent-wrong
     on the consume side (see §3a rationale).
+
+    Thin wrapper around _find_dangling_edges for the CLI exit path; callers
+    that need to handle violations programmatically should call
+    _find_dangling_edges directly.
     """
-    node_set = set(nodes.keys())
-    dangling = []
-    for e in edges:
-        src, tgt = e["source_id"], e["target_id"]
-        if src not in node_set or tgt not in node_set:
-            dangling.append((src, tgt, e["relation"]))
+    dangling = _find_dangling_edges(nodes, edges)
     if dangling:
         examples = "; ".join(f"{s} →[{r}]→ {t}" for s, t, r in dangling[:5])
         sys.exit(

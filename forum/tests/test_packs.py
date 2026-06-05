@@ -532,3 +532,51 @@ class TestPacksSymlinkRejection:
         assert (
             "link" in body["error"].lower() or "sym" in body["error"].lower()
         ), f"Unexpected error: {body['error']}"
+
+
+# ---------------------------------------------------------------------------
+# Concurrent validation — pure checker must not interfere across threads
+# ---------------------------------------------------------------------------
+
+class TestConcurrentValidation:
+    """With the pure _find_dangling_edges checker there is no shared mutable
+    state (no sys.exit patch window), so concurrent validations are trivially
+    thread-safe.  This test asserts both outcomes are correct when a valid pack
+    and a closure-violating pack are validated simultaneously.
+    """
+
+    def test_concurrent_good_and_bad_pack_both_correct(self, app):
+        """Two threads validating simultaneously: one 201, one 400."""
+        import threading
+
+        good_tarball = _make_pack_tarball()
+        bad_tarball = _make_pack_tarball(knowledge_sql=_CLOSURE_VIOLATION_SQL)
+
+        results = {}
+
+        def upload_good():
+            with app.test_client() as c:
+                results["good"] = _upload_pack(c, good_tarball)
+
+        def upload_bad():
+            with app.test_client() as c:
+                results["bad"] = _upload_pack(c, bad_tarball)
+
+        t1 = threading.Thread(target=upload_good)
+        t2 = threading.Thread(target=upload_bad)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        assert results.get("good") is not None, "good thread did not complete"
+        assert results.get("bad") is not None, "bad thread did not complete"
+
+        assert results["good"].status_code == 201, (
+            f"Expected 201 for valid pack, got {results['good'].status_code}: "
+            f"{results['good'].data.decode()}"
+        )
+        assert results["bad"].status_code == 400, (
+            f"Expected 400 for closure-violating pack, got {results['bad'].status_code}: "
+            f"{results['bad'].data.decode()}"
+        )
