@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
 
@@ -25,6 +26,40 @@ from .render import render_post_body
 
 # Path to the machine-readable API contract served at GET /forum.md
 _FORUM_MD_PATH = os.path.join(os.path.dirname(__file__), "FORUM.md")
+
+# README candidate names (case variants) to probe inside a pack tarball.
+_README_NAMES = ("README.md", "readme.md", "README")
+
+
+def _read_pack_readme(packs_dir: str, pack_id: str) -> str | None:
+    """Extract and return the README text from a stored pack tarball.
+
+    Returns the README content as a string, or None if the tarball does not
+    exist or contains no README entry.  Reads only the README member — does
+    not extract other files.
+    """
+    tarball = Path(packs_dir) / pack_id / "package.tar.gz"
+    if not tarball.exists():
+        return None
+    try:
+        with tarfile.open(str(tarball), "r:gz") as tf:
+            members = tf.getnames()
+            # README may be at the top level or inside a single top-level dir.
+            for name in members:
+                basename = Path(name).name
+                if basename in _README_NAMES:
+                    member = tf.getmember(name)
+                    # Belt-and-suspenders: upload-time validation in packs.py
+                    # already rejects symlinks and hardlinks, but guard here
+                    # too so _read_pack_readme is self-contained.
+                    if member.issym() or member.islnk():
+                        continue
+                    f = tf.extractfile(member)
+                    if f is not None:
+                        return f.read().decode("utf-8", errors="replace")
+    except (tarfile.TarError, OSError, KeyError):
+        return None
+    return None
 
 
 def create_app(
@@ -218,6 +253,32 @@ def create_app(
             categories=categories,
             online_agents=online_agents,
         )
+
+    # ------------------------------------------------------------------
+    # GET /packs  — HTML pack index (browse all published packs)
+    # ------------------------------------------------------------------
+    @app.route("/packs")
+    def packs_index() -> str:
+        pack_list = db.list_packs(g.conn)
+        return render_template("packs.html", packs=pack_list)
+
+    # ------------------------------------------------------------------
+    # GET /packs/<pack_id>  — HTML pack detail with rendered README
+    # ------------------------------------------------------------------
+    @app.route("/packs/<pack_id>")
+    def pack_detail(pack_id: str) -> str:
+        pack = db.get_pack(g.conn, pack_id)
+        if pack is None:
+            abort(404)
+
+        # Read README from the stored tarball and render it through the same
+        # sanitization pipeline as post bodies (render_post_body handles both
+        # markdown and plain text safely — if the README isn't markdown, it
+        # just renders as a paragraph, which is acceptable).
+        readme_raw = _read_pack_readme(app.config["PACKS_DIR"], pack_id)
+        readme_html = render_post_body(readme_raw) if readme_raw else None
+
+        return render_template("pack_detail.html", pack=pack, readme_html=readme_html)
 
     # ------------------------------------------------------------------
     # GET /api/threads

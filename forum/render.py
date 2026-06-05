@@ -8,6 +8,8 @@ forum/fairy-spec-backend.md §3):
   3. Citation-chip transform as a TEXT-NODE-SCOPED BeautifulSoup walk — never a
      raw-HTML-string regex (that path was explicitly rejected in round-1 review
      because it injects into attribute values and breaks <code>-block semantics).
+  4. Pack-reference transform — same post-sanitization text-node-scoped approach:
+     ``pack:<id>`` tokens become links to ``/packs/<id>`` (added in #651 slice b).
 
 ``ENGRAM_TYPE_PREFIXES`` is the single source of truth for the forum.  It drives:
 - The citation regex used in the chip transform here.
@@ -62,6 +64,23 @@ CITATION_RE = re.compile(
 )
 
 # ---------------------------------------------------------------------------
+# Pack reference regex — matches pack:<id> tokens in post bodies.
+#
+# Pack IDs are slugs shaped <author>-<name>-v<N> (see make_pack_id in
+# packs.py).  The slug character set is [a-z0-9-] (lowercase alphanumeric +
+# hyphens).  We require a version suffix (-v<digits>) to avoid matching
+# partial or malformed tokens.
+#
+# Security note: the pack-id must be validated against this pattern before
+# becoming an href — so a token like ``pack:../../etc/passwd`` or
+# ``pack:UPPER CASE`` produces no link at all (no link is safer than a
+# potentially-harmful one).  A reference to a not-yet-published or deleted
+# pack will link to a 404 — that is intentional (cheap, and any broken link
+# discovered by the community is a signal, not a corruption).
+# ---------------------------------------------------------------------------
+PACK_ID_RE = re.compile(r"pack:([a-z0-9][a-z0-9-]*-v\d+)")  # safe slug form only
+
+# ---------------------------------------------------------------------------
 # Bleach allowlist
 # ---------------------------------------------------------------------------
 _ALLOWED_TAGS = [
@@ -70,7 +89,7 @@ _ALLOWED_TAGS = [
 ]
 
 _ALLOWED_ATTRIBUTES: dict[str, list[str]] = {
-    "a": ["href"],
+    "a": ["href", "class"],  # "class" required: _apply_pack_refs emits class="pack-ref" post-bleach
     "span": ["class"],
 }
 
@@ -130,6 +149,50 @@ def _apply_citation_chips(sanitized_html: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Pack reference transform — text-node-scoped BeautifulSoup walk
+# ---------------------------------------------------------------------------
+def _apply_pack_refs(sanitized_html: str) -> str:
+    """Replace pack:<id> tokens with links to /packs/<id>.
+
+    Mirrors the citation-chip approach exactly:
+    - Operates on NavigableString text nodes only.
+    - Skips text inside <code>, <pre>, and <a> subtrees (same SKIP_TAGS as
+      _apply_citation_chips) — pack tokens inside code blocks stay verbatim.
+    - Validates the captured id against PACK_ID_RE before building the href,
+      so malformed tokens (path traversal attempts, uppercase, spaces) produce
+      no link.
+
+    Security: PACK_ID_RE only allows [a-z0-9-]+-v<digits> forms.  The id
+    captured from the regex is therefore safe to embed in a relative href
+    without further escaping (it cannot contain quotes, angle brackets, or
+    slashes).
+    """
+    soup = BeautifulSoup(sanitized_html, "html5lib")
+    SKIP_TAGS = {"code", "pre", "a"}
+
+    for text_node in list(soup.find_all(string=True)):
+        if any(
+            parent.name in SKIP_TAGS
+            for parent in text_node.parents
+            if parent.name is not None
+        ):
+            continue
+
+        new_html = PACK_ID_RE.sub(
+            lambda m: f'<a href="/packs/{m.group(1)}" class="pack-ref">pack:{m.group(1)}</a>',
+            str(text_node),
+        )
+        if new_html != str(text_node):
+            replacement = BeautifulSoup(new_html, "html.parser")
+            text_node.replace_with(*list(replacement.contents))
+
+    body = soup.find("body")
+    if body is not None:
+        return "".join(str(c) for c in body.contents)
+    return str(soup)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 def render_post_body(body_md: str) -> str:
@@ -141,15 +204,16 @@ def render_post_body(body_md: str) -> str:
          <embed>, on*=, javascript: URLs, data: URLs, etc.).
       3. Citation-chip transform (post-sanitization plain-text → styled span)
          as a text-node-scoped BeautifulSoup walk.
+      4. Pack-reference transform (post-sanitization, same text-node-scoped
+         approach): pack:<id> → <a href="/packs/<id>">.
 
     Returns sanitized HTML string ready for direct template rendering
     (no further escaping needed downstream).
 
     The pipeline invariant (per fairy-spec-backend.md §3):
     Bleach is the LAST operation that decides which tags/attrs may exist.
-    The citation-chip transform runs strictly on text content of the already-
-    sanitized tree and may emit only the single allowlisted <span class=
-    "citation citation--XX">...</span> around matched text.
+    The citation-chip and pack-reference transforms run strictly on text
+    content of the already-sanitized tree and may only emit allowlisted tags.
     """
     # Step 1: Markdown → HTML (inline HTML disabled)
     raw_html = _md.render(body_md)
@@ -166,5 +230,8 @@ def render_post_body(body_md: str) -> str:
 
     # Step 3: Citation chip transform (text-node-scoped, post-sanitization)
     result = _apply_citation_chips(clean_html)
+
+    # Step 4: Pack reference transform (text-node-scoped, post-citation-chips)
+    result = _apply_pack_refs(result)
 
     return result
