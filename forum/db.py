@@ -5,9 +5,19 @@ Implements:
 - Seed category upsert (INSERT ... ON CONFLICT DO NOTHING).
 - Query helpers matching the GET / template-data contract.
 
-All queries use parameterised ? placeholders — no string interpolation.
+All queries use parameterised ? placeholders -- no string interpolation.
 Foreign key enforcement: PRAGMA foreign_keys = ON (set by init_db and by
 the Flask before_request hook in server.py).
+
+Embedding storage (slice 1 of issue #807):
+- posts.embedding BLOB + threads.embedding BLOB: L2-normalized 384-dim vectors
+  (serialized as little-endian float32; see forum/embeddings.py for details).
+- posts_fts: FTS5 external-content table over posts(body_md).
+- vec_posts, vec_threads: vec0 virtual tables (created only when sqlite-vec
+  loads; their absence never breaks the forum -- the embedding layer degrades
+  loudly, not silently).
+- db.py stays pure-SQL+math: no model dependency here. The embeddings module
+  (forum/embeddings.py) handles all encode() calls; db.py handles the writes.
 """
 
 from __future__ import annotations
@@ -21,6 +31,41 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .render import CITATION_RE
+
+# ---------------------------------------------------------------------------
+# sqlite-vec (optional) -- mirrors server.py:46-66
+# ---------------------------------------------------------------------------
+
+try:
+    import sqlite_vec as _sqlite_vec  # type: ignore
+    _SQLITE_VEC_IMPORT_OK = True
+except Exception:
+    _sqlite_vec = None  # type: ignore
+    _SQLITE_VEC_IMPORT_OK = False
+
+# Flipped to False at runtime if extension loading fails on the actual
+# connection (some Python sqlite3 builds compile without load_extension).
+_VEC_BACKEND_AVAILABLE = _SQLITE_VEC_IMPORT_OK
+
+
+def _load_vec_extension(conn: sqlite3.Connection) -> bool:
+    """Load the sqlite-vec extension on a connection. Returns True on success.
+
+    Must be called per-connection -- extensions are not shared across SQLite
+    connections. Mirrors the pattern from server.py:1043-1060.
+    """
+    global _VEC_BACKEND_AVAILABLE
+    if not _VEC_BACKEND_AVAILABLE or _sqlite_vec is None:
+        return False
+    try:
+        conn.enable_load_extension(True)
+        _sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        return True
+    except Exception:
+        _VEC_BACKEND_AVAILABLE = False
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -273,6 +318,99 @@ def init_db(conn: sqlite3.Connection, categories_config: str | None = None) -> N
         conn.execute(
             "UPDATE categories SET kind='qa' WHERE slug='q-and-a' AND kind!='qa'"
         )
+
+    # ----------------------------------------------------------------
+    # Embedding columns (slice 1 of #807)
+    # SQLite ALTER TABLE has no IF NOT EXISTS, so guard with PRAGMA.
+    # ----------------------------------------------------------------
+    post_cols = {r[1] for r in conn.execute("PRAGMA table_info(posts)")}
+    if "embedding" not in post_cols:
+        conn.execute("ALTER TABLE posts ADD COLUMN embedding BLOB")
+
+    thread_cols = {r[1] for r in conn.execute("PRAGMA table_info(threads)")}
+    if "embedding" not in thread_cols:
+        conn.execute("ALTER TABLE threads ADD COLUMN embedding BLOB")
+
+    # ----------------------------------------------------------------
+    # FTS5 external-content table over posts(body_md) + triggers.
+    #
+    # External-content keeps FTS rows in sync with the canonical posts
+    # table via INSERT/DELETE/UPDATE triggers. The table is created with
+    # IF NOT EXISTS so init_db is idempotent.
+    #
+    # Bare 'rebuild' in the backfill script is safe here: forum posts have
+    # no retraction-exclusion semantics (unlike engram nodes_fts in #727),
+    # so a full rebuild simply re-indexes all rows. The backfill documents
+    # this distinction explicitly.
+    # ----------------------------------------------------------------
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS posts_fts
+        USING fts5(body_md, content='posts', content_rowid='id')
+        """
+    )
+
+    # AFTER INSERT trigger: new post body_md enters FTS.
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS posts_fts_insert
+        AFTER INSERT ON posts BEGIN
+            INSERT INTO posts_fts(rowid, body_md)
+            VALUES (new.id, new.body_md);
+        END
+        """
+    )
+
+    # AFTER DELETE trigger: defensive -- posts are append-only today
+    # (no DELETE on posts in db.py or admin.py), but cheap insurance if
+    # that ever changes.
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS posts_fts_delete
+        AFTER DELETE ON posts BEGIN
+            INSERT INTO posts_fts(posts_fts, rowid, body_md)
+            VALUES ('delete', old.id, old.body_md);
+        END
+        """
+    )
+
+    # AFTER UPDATE trigger: defensive -- posts are append-only today,
+    # but cheap insurance if the body_md column is ever updated.
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS posts_fts_update
+        AFTER UPDATE OF body_md ON posts BEGIN
+            INSERT INTO posts_fts(posts_fts, rowid, body_md)
+            VALUES ('delete', old.id, old.body_md);
+            INSERT INTO posts_fts(rowid, body_md)
+            VALUES (new.id, new.body_md);
+        END
+        """
+    )
+
+    # ----------------------------------------------------------------
+    # vec0 virtual tables (created only when sqlite-vec is available).
+    # Their absence must never break the forum -- all writes succeed
+    # whether or not the vec tables exist.
+    # Mirrors the conditional-creation pattern from server.py:1580-1592.
+    # ----------------------------------------------------------------
+    vec_loaded = _load_vec_extension(conn)
+    if vec_loaded:
+        try:
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS vec_posts
+                USING vec0(post_id INTEGER PRIMARY KEY, embedding float[384])
+                """
+            )
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS vec_threads
+                USING vec0(thread_id INTEGER PRIMARY KEY, embedding float[384])
+                """
+            )
+        except sqlite3.OperationalError:
+            pass  # vec0 creation failed -- fall back to embedding column only
 
     categories = load_category_config(categories_config)
     for c in categories:
@@ -1493,3 +1631,129 @@ def get_pack(conn: sqlite3.Connection, pack_id: str) -> dict[str, Any] | None:
         "node_count": row[6],
         "edge_count": row[7],
     }
+
+
+# ---------------------------------------------------------------------------
+# Embedding write helpers (slice 1 of #807)
+#
+# db.py stays pure-SQL+math: no model dependency here. The embeddings module
+# (forum/embeddings.py) handles encode() calls; these helpers handle the writes.
+# Failure semantics: callers (server.py) wrap these in try/except so an
+# embedding failure never fails the post write.
+# ---------------------------------------------------------------------------
+
+def set_post_embedding(
+    conn: sqlite3.Connection,
+    post_id: int,
+    vector: list[float],
+) -> None:
+    """Write a post's embedding to posts.embedding and mirror into vec_posts.
+
+    vec0 has no UPSERT on virtual tables, so we delete-then-insert to handle
+    re-embedding. Mirrors the pattern from server.py:2494-2504.
+
+    Args:
+        conn:     Open SQLite connection (sqlite-vec already loaded if available).
+        post_id:  The post's integer primary key.
+        vector:   Normalized 384-dim float list (serialize with embeddings.serialize).
+    """
+    from . import embeddings as _emb
+    blob = _emb.serialize(vector)
+    conn.execute(
+        "UPDATE posts SET embedding = ? WHERE id = ?",
+        (blob, post_id),
+    )
+    # Mirror into vec0 KNN index when available.
+    if _VEC_BACKEND_AVAILABLE and _sqlite_vec is not None and len(vector) == 384:
+        try:
+            conn.execute("DELETE FROM vec_posts WHERE post_id = ?", (post_id,))
+            conn.execute(
+                "INSERT INTO vec_posts(post_id, embedding) VALUES (?, ?)",
+                (post_id, blob),
+            )
+        except sqlite3.Error:
+            # Any DB error (missing table, type mismatch, etc.) is non-fatal:
+            # the canonical store is posts.embedding; backfill repairs the index.
+            pass
+
+
+def update_thread_centroid(
+    conn: sqlite3.Connection,
+    thread_id: int,
+    post_vector: list[float],
+) -> None:
+    """Incrementally update a thread's embedding centroid after a new post.
+
+    Formula: new = normalize((old * n + post_vec) / (n + 1))
+    where n = number of already-embedded posts in the thread (NOT including
+    the new post, which has already been written to posts.embedding by the
+    time this is called).
+
+    n is computed by query -- never from a denormalized counter -- so the
+    centroid is drift-proof under failed embeds.
+
+    Posts are append-only in this codebase (verified: no UPDATE/DELETE on
+    posts in forum/db.py or admin.py).
+
+    APPROXIMATION NOTE: the incremental update is a fast, order-dependent
+    approximation of the post-vector mean. It is exact only when a thread's
+    post vectors are collinear. In the general case, threads.embedding stores
+    only the normalized centroid, discarding the running-sum magnitude; the
+    formula treats ‖S_n‖ = n, which is true only if all prior post vectors
+    are collinear. Reordering the same set of posts yields a different centroid.
+
+    renormalized_mean() (used by the backfill tool) is the canonical
+    order-invariant recompute. Running backfill WILL shift incrementally-built
+    centroids on any multi-topic thread. This is expected and acceptable:
+    the centroid is a recall signal (scored as centroid·0.9 in slice-2 hybrid
+    search), not a reproducibility-critical value.
+
+    Args:
+        conn:        Open SQLite connection (sqlite-vec already loaded if available).
+        thread_id:   The thread's integer primary key.
+        post_vector: Normalized 384-dim float list for the new post.
+    """
+    from . import embeddings as _emb
+
+    # Count already-embedded posts (the new post was just written, so it IS
+    # counted here -- which is correct: n+1 total, n = current count after
+    # the write includes the new post embedding).
+    # IMPORTANT: we query AFTER set_post_embedding has already stored the new
+    # post's embedding, so the count naturally includes it. The incremental
+    # formula needs the count BEFORE the new post, so we subtract 1.
+    total_embedded = conn.execute(
+        "SELECT COUNT(*) FROM posts WHERE thread_id = ? AND embedding IS NOT NULL",
+        (thread_id,),
+    ).fetchone()[0]
+    n_before = total_embedded - 1  # exclude the post we just wrote
+
+    # Fetch the current thread centroid (may be NULL for first post).
+    row = conn.execute(
+        "SELECT embedding FROM threads WHERE id = ?", (thread_id,)
+    ).fetchone()
+
+    if row is None or row[0] is None or n_before <= 0:
+        # <= 0 (not == 0): defensive against n_before going negative when the new
+        # post's own embedding write failed, leaving total_embedded one less than
+        # expected (would produce n_before = -1 without this guard).
+        # First embedded post: centroid IS the post vector (already normalized).
+        new_centroid = list(post_vector)
+    else:
+        old_centroid = _emb.deserialize(row[0])
+        new_centroid = _emb.incremental_centroid(old_centroid, n_before, post_vector)
+
+    blob = _emb.serialize(new_centroid)
+    conn.execute(
+        "UPDATE threads SET embedding = ? WHERE id = ?",
+        (blob, thread_id),
+    )
+    # Mirror into vec0 KNN index when available.
+    if _VEC_BACKEND_AVAILABLE and _sqlite_vec is not None and len(new_centroid) == 384:
+        try:
+            conn.execute("DELETE FROM vec_threads WHERE thread_id = ?", (thread_id,))
+            conn.execute(
+                "INSERT INTO vec_threads(thread_id, embedding) VALUES (?, ?)",
+                (thread_id, blob),
+            )
+        except sqlite3.OperationalError:
+            pass  # vec_threads missing -- embedding column is the canonical store

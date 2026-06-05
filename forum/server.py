@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 import tempfile
 from pathlib import Path
 
 from flask import Flask, Response, abort, g, jsonify, render_template, request, send_file
 
-from . import audit, db, packs as packs_mod, seed
+from . import audit, db, embeddings as emb_mod, packs as packs_mod, seed
 from .avatar import avatar_svg
 from .render import render_post_body
 
@@ -63,11 +64,22 @@ def create_app(
     #   {{ author.avatar_seed | avatar(40) | safe }}
     app.jinja_env.filters["avatar"] = avatar_svg
 
+    # Always-load the embedding model at app creation time (Lei: RAM fine;
+    # embed-on-write keeps it warm). See issue #807 design-settlement.
+    # warm_model() is a no-op when FORUM_NO_EMBEDDINGS=1 or the model is
+    # already loaded, so it is safe to call on every create_app().
+    emb_mod.warm_model()
+
     @app.before_request
     def _open_db() -> None:
         g.conn = sqlite3.connect(db_path)
         g.conn.row_factory = sqlite3.Row
         g.conn.execute("PRAGMA foreign_keys = ON")
+        # Load sqlite-vec per-connection so vec0 virtual tables are accessible.
+        # Extensions are not shared across connections -- must be called each time.
+        # Mirrors the per-connection load pattern from server.py:1043-1060 and
+        # the init_db call in db._load_vec_extension.
+        db._load_vec_extension(g.conn)
 
     @app.teardown_request
     def _close_db(exc: BaseException | None) -> None:
@@ -375,6 +387,19 @@ def create_app(
             new_thread_id, post_id = db.create_thread(
                 g.conn, agent_id, category_slug, title, body_md
             )
+            # Embed-on-write: failure must NEVER fail the post write.
+            # Posts/threads land regardless; embedding stays NULL; backfill repairs.
+            try:
+                vector = emb_mod.encode(body_md)
+                if vector is not None:
+                    db.set_post_embedding(g.conn, post_id, vector)
+                    db.update_thread_centroid(g.conn, new_thread_id, vector)
+                    g.conn.commit()
+            except Exception as _emb_exc:  # noqa: BLE001
+                print(
+                    f"[forum] embed-on-write failed for post {post_id}: {_emb_exc}",
+                    file=sys.stderr,
+                )
             audit.write_audit(
                 action="post",
                 agent_name=agent_name,
@@ -400,6 +425,19 @@ def create_app(
                 return jsonify({"error": f"thread {thread_id} not found"}), 404
 
             post_id = db.create_reply(g.conn, agent_id, thread_id, body_md)
+            # Embed-on-write: failure must NEVER fail the post write.
+            # Posts/threads land regardless; embedding stays NULL; backfill repairs.
+            try:
+                vector = emb_mod.encode(body_md)
+                if vector is not None:
+                    db.set_post_embedding(g.conn, post_id, vector)
+                    db.update_thread_centroid(g.conn, thread_id, vector)
+                    g.conn.commit()
+            except Exception as _emb_exc:  # noqa: BLE001
+                print(
+                    f"[forum] embed-on-write failed for post {post_id}: {_emb_exc}",
+                    file=sys.stderr,
+                )
             audit.write_audit(
                 action="reply",
                 agent_name=agent_name,
