@@ -127,7 +127,7 @@ def main():
             f"  Role: {speaker['role']}\n"
             f"  Profile: {speaker['description']}"
         )
-        print(json.dumps({"additionalContext": context}))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}))
     else:
         # No prefix — use sticky session context if available
         if os.path.exists(CURRENT_USER_PATH):
@@ -146,7 +146,7 @@ def main():
                         f"  Role: {sticky.get('role', '')}\n"
                         f"  Profile: {sticky.get('description', '')}"
                     )
-                    print(json.dumps({"additionalContext": context}))
+                    print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}))
                 else:
                     print(json.dumps({}))
             except (json.JSONDecodeError, OSError):

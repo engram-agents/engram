@@ -154,7 +154,7 @@ def main():
         f"session started {session_ago} ago | "
         f"last user msg {last_msg_ago} ago]"
     )
-    print(bar)
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": bar}}))
 
 
 if __name__ == "__main__":
@@ -162,5 +162,5 @@ if __name__ == "__main__":
         main()
     except Exception as exc:
         # Never crash the hook chain — emit a stub so the agent sees something.
-        print(f"[Time: (hook-error: {type(exc).__name__})]")
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": f"[Time: (hook-error: {type(exc).__name__})]"}}))
         sys.exit(0)

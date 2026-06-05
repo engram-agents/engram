@@ -39,7 +39,7 @@ def main() -> None:
         "or design choice worth recording? If so, write to ENGRAM now "
         "(observation, derivation, question, or conjecture). If not, carry on.]"
     )
-    print(output)
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": output}}))
 
     _duration_ms = int((time.perf_counter() - _t0) * 1000)
 
