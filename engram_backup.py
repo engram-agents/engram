@@ -20,7 +20,7 @@ grow linearly instead of churning a fresh multi-MB blob every nap:
 Restore contract (all three regenerable layers rebuilt, none shipped):
   1. sqlite3 new.db < knowledge.sql          # base rows; embedding NULL; no FTS/vec
   2. backfill embeddings (needs the embed model — lives in the regen tool)
-  3. rebuild_fts_index(db)                    # FTS5 'rebuild' from restored rows
+  3. rebuild_fts_index(db)                    # rebuild + exclude retracted rows (#727)
   4. vec backfill (server _backfill_vec_nodes at first _get_db, if ext loads)
 
 Verified round-trip (2026-06-03, Ariadne): base-table parity exact, embeddings
@@ -300,30 +300,77 @@ def verify_roundtrip(src_db_path: str) -> dict:
         assert null_emb == total, f"embeddings not fully stripped: {null_emb}/{total}"
 
         fts_ok = None
+        fts_ok_orig = None
         if fts_sql:
-            rc.execute(fts_sql)
-            rc.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
-            hits = rc.execute(
+            # Capture fts_ok_orig immediately so it is available in any AssertionError
+            # context below (if the parity assert fires, fts_hits_orig is already
+            # measured; without this assignment here it would stay None and obscure
+            # the pollution signal in production backup logs).
+            fts_ok_orig = fts_hits_orig
+
+            # Close rc before calling rebuild_fts_index — the helper manages its
+            # own connection to recon_path and must not race a live connection.
+            rc.close()
+            rebuild_fts_index(recon_path)
+            rc = sqlite3.connect(recon_path)
+
+            # Structural parity assertion: every current (non-retracted) row must
+            # be in the index, and every retracted row must be excluded.  This is
+            # the invariant rebuild_fts_index actually guarantees.
+            #
+            # #727: the old assertion (hits >= fts_hits_orig) is INVERTED under
+            # index pollution — a CLEAN rebuild on the recon legitimately returns
+            # FEWER hits than a POLLUTED live source index (Borges confirmed
+            # live=137 with 2 retracted matches, clean=135 on his graph).  The >=
+            # would false-fail exactly when the source index is polluted and the
+            # recon is correct.  Replaced with the structural invariant below.
+            recon_cols = {
+                row[1]
+                for row in rc.execute("PRAGMA table_info(nodes)").fetchall()
+            }
+            if "status" in recon_cols:
+                # IS NOT is SQLite's null-safe complement of IS: a NULL-status row
+                # evaluates to TRUE here (counted as non-retracted), matching what
+                # rebuild_fts_index actually guarantees — it only removes rows where
+                # status='retracted', so NULL-status rows remain in the index.
+                # Using != 'retracted' would give NULL (not TRUE) for NULL-status rows,
+                # undercounting expected_fts_count and causing a false AssertionError.
+                expected_fts_count = rc.execute(
+                    "SELECT count(*) FROM nodes WHERE status IS NOT 'retracted'"
+                ).fetchone()[0]
+            else:
+                # No status column — all nodes are indexable (minimal fixture).
+                expected_fts_count = rc.execute(
+                    "SELECT count(*) FROM nodes"
+                ).fetchone()[0]
+            # FTS5 external-content note: SELECT count(*) FROM nodes_fts returns the
+            # total rows in the content table (including tombstoned/retracted rows),
+            # not the indexed-document count.  nodes_fts_docsize has exactly one row
+            # per non-deleted document — this is the correct structural invariant.
+            actual_fts_count = rc.execute(
+                "SELECT count(*) FROM nodes_fts_docsize"
+            ).fetchone()[0]
+            assert actual_fts_count == expected_fts_count, (
+                f"FTS structural parity failed: nodes_fts_docsize has {actual_fts_count} rows, "
+                f"expected {expected_fts_count} (non-retracted nodes); "
+                f"source fts_hits_orig={fts_ok_orig}"
+            )
+
+            # Probe-term hit counts are informational only — NOT used to gate pass/fail.
+            # fts_hits_orig: source probe count (may include retracted-row pollution).
+            # fts_hits: recon probe count (definitionally clean post rebuild_fts_index).
+            # The delta between the two surfaces any pollution in the source index —
+            # diagnostic signal that exposed the whole #727 mechanism.
+            fts_ok = rc.execute(
                 "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'migration'"
             ).fetchone()[0]
-            # Skip the hit-count assertion when the original probe returned 0 —
-            # a 0==0 check is vacuous (no 'migration' term in this graph), but we
-            # still ran the rebuild above so a rebuild error is still caught.
-            # When the term IS present, the assertion is live and catches real regressions.
-            # (Resolves the #723 FTS-probe-vacuity nit flagged by Ariadne.)
-            if fts_hits_orig:
-                # The live FTS index may be stale (drifted from its rows); the rebuilt index is
-                # fresh and authoritative. Row-parity above already guarantees no data loss, so
-                # the rebuild must have >= the (possibly under-indexed) original's hit count.
-                # Exact-equality would false-fail on any graph whose live FTS index is stale.
-                assert hits >= fts_hits_orig, f"FTS hits regressed after rebuild: {hits} < {fts_hits_orig}"
-            fts_ok = hits
         rc.close()
         return {
             **stats,
             "base_tables": len(base_tables),
             "nodes": orig_counts.get("nodes"),
             "fts_hits": fts_ok,
+            "fts_hits_orig": fts_ok_orig,
             "ok": True,
         }
     finally:

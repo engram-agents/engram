@@ -482,10 +482,15 @@ def test_dump_stripped_with_real_vec_nodes(tmp_path):
 def test_verify_roundtrip_stale_fts_index_does_not_raise(tmp_path):
     """Regression test for the stale-FTS-index false-fail (issue #724 continuation).
 
-    Reproduces the live-graph failure: original DB has 135 'migration' hits but
-    a fresh rebuild produces 137 — the live FTS index was stale (2 docs not yet
-    indexed). verify_roundtrip must NOT raise when rebuilt >= original; the `>=`
-    comparison handles the stale-original case.
+    Reproduces the live-graph failure: original DB has a stale FTS index that
+    under-counts docs.  verify_roundtrip must NOT raise on this fixture.
+
+    #727: the old `>=` hit-count assertion handled this case (rebuilt >= stale
+    original).  The new structural-parity assertion is unconditional and also
+    handles it — the recon parity check compares nodes_fts row count against
+    the non-retracted nodes count, independent of the stale source FTS state.
+    The probe-hit assertions in this test still hold numerically (rebuilt=3 >=
+    stale=1) and are preserved as diagnostic checks.
 
     Construction: build a DB, populate rows through the trigger (so the FTS
     index is consistent), then insert extra rows BYPASSING the FTS trigger so
@@ -552,52 +557,266 @@ def test_verify_roundtrip_stale_fts_index_does_not_raise(tmp_path):
     assert node_rows_with_migration == 3, f"expected 3 node rows with 'migration', got {node_rows_with_migration}"
     # Stale gap confirmed: live FTS (1) < rows (3).
 
-    # verify_roundtrip must NOT raise.  The rebuilt index will return 3 hits
-    # (>= the stale original's 1), satisfying the >= assertion.
+    # verify_roundtrip must NOT raise.  The rebuilt index will return 3 hits.
+    # #727: pass is now determined by structural parity, not by hit count comparison.
     rep = engram_backup.verify_roundtrip(db_path)
     assert rep["ok"] is True
     assert rep["nodes"] == 3
-    # fts_hits is the rebuilt count — must be >= the stale original count.
+    # Informational probe checks: rebuilt clean count >= stale source count.
     assert rep["fts_hits"] >= live_hits_stale
 
 
 def test_verify_roundtrip_fresh_index_exact_match_still_passes(engram_db):
-    """Confirm that an already-consistent (non-stale) FTS index still passes.
+    """Confirm that an already-consistent (non-stale, non-polluted) FTS index still passes.
 
     The engram_db fixture inserts all 4 rows through the trigger so both the
     live FTS count (2 'migration' hits) and the rebuilt count (2 hits) are
-    identical.  The >= assertion holds trivially (2 >= 2), so this test checks
-    that tightening == to >= did NOT break the common case.
+    identical.  #727: pass is now determined by structural parity (nodes_fts row
+    count == non-retracted node count); probe-hit count is informational.
     """
     rep = engram_backup.verify_roundtrip(engram_db)
     assert rep["ok"] is True
     assert rep["nodes"] == 4
-    # The fixture has ob_1 and ob_3 matching 'migration' — rebuilt must report >= 2.
+    # The fixture has ob_1 and ob_3 matching 'migration' — recon probe returns 2.
     assert rep["fts_hits"] is not None
-    assert rep["fts_hits"] >= 2
+    assert rep["fts_hits"] == 2
 
 
-def test_verify_roundtrip_fts_regression_still_trips(tmp_path):
-    """Confirm that a genuine FTS regression (rebuilt < original) still raises.
+def test_verify_roundtrip_null_status_node_passes(tmp_path):
+    """#811 BLOCKER regression: verify_roundtrip must pass when a node has explicit NULL status.
 
-    We cannot construct a genuine regression via the full verify_roundtrip path
-    because dump_stripped + rebuild_fts_index always produces a correct index.
-    Instead we test the comparison logic directly: assert that (hits < fts_hits_orig)
-    raises AssertionError, mirroring what verify_roundtrip would do.
+    SQL three-valued logic: `status != 'retracted'` evaluates to NULL (not TRUE)
+    for a NULL-status row, so the row is NOT counted — but rebuild_fts_index only
+    removes rows with status='retracted', so the NULL-status row IS in the rebuilt
+    index.  Result: parity mismatch (expected < actual), raising AssertionError on
+    a healthy roundtrip.
 
-    This is the unit-test approach described in the spec: if constructing a true
-    regression via the full path is impractical, test the comparison logic directly.
+    Fix: the parity predicate uses `status IS NOT 'retracted'` (SQLite null-safe),
+    which correctly counts NULL-status rows as non-retracted.
+
+    Fixture: one active node + one node with explicit NULL status (not relying on
+    DEFAULT — INSERT supplies NULL directly).  verify_roundtrip must PASS and
+    report rep["nodes"] == 2.
     """
-    # Simulate the assertion logic in verify_roundtrip for the regression case.
-    hits = 1           # rebuilt index (lower — a genuine regression)
-    fts_hits_orig = 3  # original live count
+    db_path = str(tmp_path / "knowledge.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE nodes (
+            id          TEXT PRIMARY KEY,
+            claim       TEXT,
+            quoted_text TEXT,
+            interpretation TEXT,
+            status      TEXT,
+            embedding   TEXT
+        );
+        CREATE TABLE edges (src TEXT, dst TEXT, relation TEXT);
+        CREATE VIRTUAL TABLE nodes_fts USING fts5(
+            claim, quoted_text, interpretation,
+            content='nodes', content_rowid='rowid'
+        );
+        CREATE TRIGGER nodes_fts_insert AFTER INSERT ON nodes BEGIN
+            INSERT INTO nodes_fts(rowid, claim, quoted_text, interpretation)
+            VALUES (new.rowid, new.claim, new.quoted_text, new.interpretation);
+        END;
+        CREATE VIRTUAL TABLE nodes_fts_vocab USING fts5vocab('nodes_fts', 'row');
+        """
+    )
+    # Active node — status explicitly 'active'.
+    conn.execute(
+        "INSERT INTO nodes VALUES ('ob_active', 'migration completed', 'forum post', 'active node', 'active', NULL)"
+    )
+    # NULL-status node — explicit NULL, not relying on DEFAULT.
+    conn.execute(
+        "INSERT INTO nodes(id, claim, quoted_text, interpretation, status, embedding) "
+        "VALUES ('ob_null', 'second claim present', 'src doc', 'null status node', NULL, NULL)"
+    )
+    conn.commit()
+    conn.close()
 
-    # The assertion in verify_roundtrip is: assert hits >= fts_hits_orig
-    # A regression means hits < fts_hits_orig, which must raise.
-    raised = False
-    try:
-        assert hits >= fts_hits_orig, f"FTS hits regressed after rebuild: {hits} < {fts_hits_orig}"
-    except AssertionError:
-        raised = True
+    # Must NOT raise — both nodes are non-retracted and must be counted by parity.
+    rep = engram_backup.verify_roundtrip(db_path)
+    assert rep["ok"] is True
+    assert rep["nodes"] == 2
 
-    assert raised, "Expected AssertionError for regression case (rebuilt < original) but none was raised"
+
+def test_verify_roundtrip_passes_with_polluted_source_and_retraction(tmp_path):
+    """#727 regression: verify_roundtrip must pass when the SOURCE index is polluted
+    by a bare rebuild (includes retracted rows) while the RECON index is clean.
+
+    This is the exact failure mode #727 documents: Borges observed live=137 FTS
+    hits (with 2 retracted matches) vs. clean=135 hits post-rebuild.  The old
+    `hits >= fts_hits_orig` assertion would FALSE-FAIL here (135 >= 137 is false)
+    even though the recon index is CORRECT and the source index is POLLUTED.
+
+    Construction:
+    - One node containing the probe term 'migration' (non-retracted).
+    - One node containing 'migration' that is RETRACTED — correctly absent from
+      a healthy index, but present in a bare-rebuild-polluted index.
+    - Pollute the source FTS by running a bare INSERT INTO nodes_fts VALUES('rebuild')
+      after the retraction trigger has excluded the retracted row — the bare rebuild
+      re-adds it, so fts_hits_orig = 2.
+    - verify_roundtrip must pass: the recon structural parity holds (1 non-retracted
+      node → 1 FTS row), and fts_hits_clean = 1 < fts_hits_orig = 2.
+
+    The old `>=` assertion would have raised here (1 >= 2 is false).
+    """
+    db_path = str(tmp_path / "knowledge.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE nodes (
+            id          TEXT PRIMARY KEY,
+            claim       TEXT,
+            quoted_text TEXT,
+            interpretation TEXT,
+            status      TEXT,
+            embedding   TEXT
+        );
+        CREATE TABLE edges (src TEXT, dst TEXT, relation TEXT);
+        CREATE VIRTUAL TABLE nodes_fts USING fts5(
+            claim, quoted_text, interpretation,
+            content='nodes', content_rowid='rowid'
+        );
+        CREATE TRIGGER nodes_fts_insert AFTER INSERT ON nodes BEGIN
+            INSERT INTO nodes_fts(rowid, claim, quoted_text, interpretation)
+            VALUES (new.rowid, new.claim, new.quoted_text, new.interpretation);
+        END;
+        CREATE TRIGGER nodes_fts_delete AFTER DELETE ON nodes BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation)
+            VALUES('delete', old.rowid, old.claim, old.quoted_text, old.interpretation);
+        END;
+        CREATE VIRTUAL TABLE nodes_fts_vocab USING fts5vocab('nodes_fts', 'row');
+        """
+    )
+    # Non-retracted node — probe term present.
+    conn.execute(
+        "INSERT INTO nodes VALUES ('ob_live', 'plugin migration succeeded', 'forum post', 'migration complete', 'active', NULL)"
+    )
+    # Retracted node — probe term present.  The retract trigger will exclude it
+    # from the live FTS index via 'delete'-insert.
+    conn.execute(
+        "INSERT INTO nodes VALUES ('ob_retracted', 'migration plan deprecated', 'old doc', 'retracted migration ref', 'retracted', NULL)"
+    )
+    # Simulate the retract trigger exclusion: 'delete'-insert the retracted row
+    # so the healthy live index correctly has 1 hit (ob_live only).
+    retracted_row = conn.execute(
+        "SELECT rowid, claim, quoted_text, interpretation FROM nodes WHERE id='ob_retracted'"
+    ).fetchone()
+    conn.execute(
+        "INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation) "
+        "VALUES ('delete', ?, ?, ?, ?)",
+        retracted_row,
+    )
+    conn.commit()
+
+    # Confirm healthy live index has 1 hit.
+    clean_hits = conn.execute(
+        "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'migration'"
+    ).fetchone()[0]
+    assert clean_hits == 1, f"expected 1 clean hit, got {clean_hits}"
+
+    # NOW pollute: bare rebuild re-adds the retracted row to the index.
+    conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
+    conn.commit()
+
+    polluted_hits = conn.execute(
+        "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'migration'"
+    ).fetchone()[0]
+    assert polluted_hits == 2, f"expected 2 polluted hits, got {polluted_hits}"
+    conn.close()
+
+    # verify_roundtrip must pass.
+    # The recon structural parity: 1 non-retracted node → 1 FTS row (correct).
+    # The old `>=` would have raised: recon_hits(1) >= fts_hits_orig(2) → False.
+    rep = engram_backup.verify_roundtrip(db_path)
+    assert rep["ok"] is True
+    assert rep["nodes"] == 2  # total nodes (retracted + active)
+    # fts_hits is the clean recon probe count (1 — retracted row excluded).
+    assert rep["fts_hits"] == 1
+    # fts_hits_orig is the polluted source probe count (2 — retracted row included).
+    assert rep["fts_hits_orig"] == 2
+
+
+def test_verify_roundtrip_retracted_term_absent_from_recon_fts(tmp_path):
+    """#727: after verify_roundtrip, the recon FTS must NOT contain terms that
+    appear ONLY in retracted nodes.
+
+    A MATCH on a term that is exclusive to a retracted node must return 0 hits
+    on the recon FTS — confirming rebuild_fts_index correctly excluded the
+    retracted row from the index (not just from the row count).
+
+    This tests the post-roundtrip recon DB directly by running verify_roundtrip
+    and then probing the cleaned-up recon index before it is deleted.  Since
+    verify_roundtrip deletes the recon temp file on exit, we run a manual
+    dump→restore→rebuild sequence to inspect the recon index ourselves.
+    """
+    db_path = str(tmp_path / "knowledge.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE nodes (
+            id          TEXT PRIMARY KEY,
+            claim       TEXT,
+            quoted_text TEXT,
+            interpretation TEXT,
+            status      TEXT,
+            embedding   TEXT
+        );
+        CREATE TABLE edges (src TEXT, dst TEXT, relation TEXT);
+        CREATE VIRTUAL TABLE nodes_fts USING fts5(
+            claim, quoted_text, interpretation,
+            content='nodes', content_rowid='rowid'
+        );
+        CREATE TRIGGER nodes_fts_insert AFTER INSERT ON nodes BEGIN
+            INSERT INTO nodes_fts(rowid, claim, quoted_text, interpretation)
+            VALUES (new.rowid, new.claim, new.quoted_text, new.interpretation);
+        END;
+        """
+    )
+    # Non-retracted node — uses 'xyzzy_active' as a distinctive term.
+    conn.execute(
+        "INSERT INTO nodes VALUES ('ob_active', 'xyzzy_active term present', 'src', 'active node', 'active', NULL)"
+    )
+    # Retracted node — uses 'xyzzy_retracted' as a distinctive term.
+    # Simulate retract trigger exclusion via 'delete'-insert.
+    conn.execute(
+        "INSERT INTO nodes VALUES ('ob_ret', 'xyzzy_retracted term exclusive', 'src', 'retracted ref', 'retracted', NULL)"
+    )
+    ret_row = conn.execute(
+        "SELECT rowid, claim, quoted_text, interpretation FROM nodes WHERE id='ob_ret'"
+    ).fetchone()
+    conn.execute(
+        "INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation) "
+        "VALUES ('delete', ?, ?, ?, ?)",
+        ret_row,
+    )
+    conn.commit()
+    conn.close()
+
+    # Perform manual dump → restore → rebuild_fts_index and inspect.
+    dump_sql = str(tmp_path / "dump.sql")
+    recon_db = str(tmp_path / "recon.db")
+    engram_backup.dump_stripped(db_path, dump_sql)
+    rc = sqlite3.connect(recon_db)
+    rc.executescript(open(dump_sql).read())
+    rc.close()
+    engram_backup.rebuild_fts_index(recon_db)
+
+    rc = sqlite3.connect(recon_db)
+    # Term from the retracted node must NOT appear in the recon index.
+    retracted_hits = rc.execute(
+        "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'xyzzy_retracted'"
+    ).fetchone()[0]
+    # Term from the active node MUST appear.
+    active_hits = rc.execute(
+        "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'xyzzy_active'"
+    ).fetchone()[0]
+    rc.close()
+
+    assert retracted_hits == 0, (
+        f"retracted-node term 'xyzzy_retracted' should be absent from recon FTS, got {retracted_hits} hits"
+    )
+    assert active_hits == 1, (
+        f"active-node term 'xyzzy_active' should be present in recon FTS, got {active_hits} hits"
+    )
