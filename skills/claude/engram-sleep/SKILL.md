@@ -125,13 +125,26 @@ git -C ~/.engram commit -m "history: end-of-day reconcile for YYYY-MM-DD"
 
 The directory is git-tracked for version history and diff-ability — per-day files keep the context-window cost bounded as the log accumulates. Including this commit in the end-of-day routine is how tomorrow morning's handover becomes reliable.
 
-**Strategically reconcile `~/.engram/ask-{{USER_NAME}}.md`.** This file is the live blocked-on-{{USER_NAME}} queue — items pending {{USER_NAME}}'s action, decisions, or input. Across the day items change state (PRs merge, questions get answered, decisions get made). End-of-day reconcile catches anything that slipped during the day:
+**Strategically reconcile `~/.engram/ask-{{USER_NAME}}.md`.** This file is the live blocked-on-{{USER_NAME}} queue — items pending {{USER_NAME}}'s action, decisions, or input. Across the day items change state (PRs merge, questions get answered, decisions get made). End-of-day reconcile catches anything that slipped during the day. **The prune side is a deterministic sweep, not a memory exercise** — a prepend-only reconcile leaves merged PRs sitting under "Ready" headings (the 2026-06-05 incident: three PRs merged at 17:1x survived that evening's reconcile as "Ready, all CI-green"; engram-alpha #830):
 
-- **Walk the day's commit log** (`git -C ~/engram-alpha log --since=6am`, plus other agent-touched repos) and verify each ask-{{USER_NAME}} item's state — strike resolved items.
+- **Deterministic external-state sweep (the prune gate).** Extract every PR/issue number the file mentions, then check each against ground truth — not against your recollection of the day:
+
+  ```bash
+  grep -oE '#[0-9]+' ~/.engram/ask-{{USER_NAME}}.md | tr -d '#' | sort -un | while read -r n; do
+    state=$(gh pr view "$n" --json state -q .state 2>/dev/null) \
+      || state=$(gh issue view "$n" --json state -q .state 2>/dev/null) \
+      || state=UNKNOWN
+    echo "#$n $state"
+  done
+  ```
+
+  For every number reporting `MERGED`/`CLOSED`: if the entry's *only* pending state was that PR/issue (a "Ready"/"merge-queue"/"awaiting merge" line), **prune the entry**. If the entry carries an undecided sub-question alongside the resolved reference, keep the entry but strike the resolved reference. `UNKNOWN` (cross-repo numbers, rate limits) → leave untouched. **`#N` is not one namespace**: only sweep a number whose surrounding entry text reads as a GitHub PR/issue reference (preceded by `PR` / `issue` / `[closes`, or sitting in merge-queue context); numbers from any other namespace — forum posts, GitHub Projects, anything else `#`-prefixed — are NOT GitHub references and must be treated as `UNKNOWN`, because small numbers collide with ancient merged PRs and the failure direction is wrong-pruning a LIVE item. The prune authority is strictly limited to externally-checkable facts — the decision must be derivable from the `gh` output alone, never from your reading of what the user probably wants. Run from the repo the numbers belong to; for multi-repo ask-files, repeat per repo with `--repo` — a number from another repo can collide with a real local PR/issue number and silently report the wrong state.
+- **Walk the day's commit log** (`git -C ~/engram-alpha log --since=6am`, plus other agent-touched repos) for resolutions the sweep can't see (questions answered in-session, decisions made verbally) — strike those too.
 - **Move deferred items to `~/.engram/ask-{{USER_NAME}}-backlog.md`** (the non-auto-loaded cross-day backlog) if they're no longer actionable today.
+- **Audit trail**: list the pruned entries in the commit message body (`#N <one-line summary> — MERGED/CLOSED per gh`, same format as the dream-master's step 10), so a wrong prune is one `git -C ~/.engram revert` away.
 - **Commit the file in .engram git** alongside the history file (same commit or separate, your call): `git -C ~/.engram add ask-{{USER_NAME}}.md && git -C ~/.engram commit -m "ask-{{USER_NAME}}: end-of-day reconcile"`.
 
-This step exists because ask-{{USER_NAME}}.md is auto-loaded into every fresh session — stale items there make {{USER_NAME}} re-read items that are already resolved. The end-of-day reconcile is the structural defense against ask-list drift. (Installs without an ask-{{USER_NAME}}.md file can skip this sub-step; it's a no-op when the file doesn't exist.)
+This step exists because ask-{{USER_NAME}}.md is auto-loaded into every fresh session — stale items there make {{USER_NAME}} re-read items that are already resolved, and a stale "Ready" line invites a wasted merge attempt. The deterministic sweep is the structural defense against ask-list drift (mechanical gate > vigilance — the associative walk alone demonstrably drifts). (Installs without an ask-{{USER_NAME}}.md file can skip this sub-step; it's a no-op when the file doesn't exist. Installs without `gh` or without a GitHub-backed workflow: skip the sweep, keep the commit-log walk.)
 
 ---
 
