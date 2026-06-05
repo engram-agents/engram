@@ -8,9 +8,9 @@ Covers:
 
   B. --target codex emission
      - .codex-plugin/plugin.json is present + valid JSON + has expected keys
-     - hooks.json has ZERO "${CLAUDE_PLUGIN_ROOT}" strings (replaced with CODEX_PLUGIN_ROOT)
+     - hooks.json uses ${CLAUDE_PLUGIN_ROOT} (Codex injects this natively)
+     - hooks.json has ZERO "CODEX_PLUGIN_ROOT" strings (Codex never sets it)
      - platform.json is present and platform=codex
-     - No "${CLAUDE_PLUGIN_ROOT}" anywhere in the codex bundle
 
   C. Identity axis
      - --identity foreign drops identity_coupled entries (not a superset of self)
@@ -126,7 +126,7 @@ class TestPlatformProfiles:
             data = json.load(f)
         for field in ("plugin_root_env", "hooks_config", "skills_dir", "plugin_manifest"):
             assert field in data, f"codex.json missing field: {field!r}"
-        assert data["plugin_root_env"] == "CODEX_PLUGIN_ROOT"
+        assert data["plugin_root_env"] == "CLAUDE_PLUGIN_ROOT"
         assert data["plugin_manifest"] == ".codex-plugin/plugin.json"
 
     def test_load_platform_profile_claude_code(self):
@@ -244,12 +244,13 @@ class TestCodexEmission:
                 f"hooks.json contains unknown event: {event!r}"
             )
 
-    def test_no_claude_plugin_root_in_codex_hooks(self, codex_bundle):
-        """Zero '${CLAUDE_PLUGIN_ROOT}' strings in the codex hooks.json and .mcp.json.
+    def test_no_codex_plugin_root_in_codex_bundle(self, codex_bundle):
+        """Zero 'CODEX_PLUGIN_ROOT' strings in the codex hooks.json and .mcp.json.
 
-        The primary correctness assertion for codex MCP compatibility.
-        Documentation files (bootstrap.py, SKILL.md) may legitimately reference
-        the env var name; runtime config files must not.
+        The primary correctness assertion for codex hook compatibility.
+        Codex natively injects CLAUDE_PLUGIN_ROOT (not CODEX_PLUGIN_ROOT) into
+        hook subprocess environments.  Any occurrence of CODEX_PLUGIN_ROOT in a
+        runtime config means every hook will fail with empty expansion (ENOENT).
         """
         runtime_configs = ["hooks/hooks.json", ".mcp.json"]
         hits = []
@@ -259,21 +260,31 @@ class TestCodexEmission:
                 continue
             with open(fpath, encoding="utf-8") as f:
                 content = f.read()
-            if "${CLAUDE_PLUGIN_ROOT}" in content:
-                hits.append((rel, content.count("${CLAUDE_PLUGIN_ROOT}")))
+            if "CODEX_PLUGIN_ROOT" in content:
+                hits.append((rel, content.count("CODEX_PLUGIN_ROOT")))
         assert not hits, (
-            "Codex runtime config contains '${CLAUDE_PLUGIN_ROOT}' strings (must be absent):\n"
+            "Codex runtime config contains 'CODEX_PLUGIN_ROOT' strings (must be absent — "
+            "Codex sets CLAUDE_PLUGIN_ROOT, not CODEX_PLUGIN_ROOT):\n"
             + "\n".join(f"  {rel}: {n} occurrence(s)" for rel, n in hits)
         )
 
     def test_codex_plugin_root_in_hooks(self, codex_bundle):
-        """hooks/hooks.json references CODEX_PLUGIN_ROOT (not CLAUDE_PLUGIN_ROOT)."""
+        """hooks/hooks.json uses ${CLAUDE_PLUGIN_ROOT} — Codex injects this var natively.
+
+        Regression guard: CODEX_PLUGIN_ROOT must be absent (it is never set by
+        Codex, so its presence would cause empty expansion → ENOENT on every hook).
+        """
         path = os.path.join(codex_bundle, "hooks", "hooks.json")
         with open(path, encoding="utf-8") as f:
             content = f.read()
-        assert "CODEX_PLUGIN_ROOT" in content, (
-            "hooks/hooks.json does not reference CODEX_PLUGIN_ROOT — "
+        assert "CLAUDE_PLUGIN_ROOT" in content, (
+            "hooks/hooks.json does not reference CLAUDE_PLUGIN_ROOT — "
             "plugin_root_env rewrite step may have failed"
+        )
+        assert "CODEX_PLUGIN_ROOT" not in content, (
+            "hooks/hooks.json contains CODEX_PLUGIN_ROOT — Codex does not set "
+            "this variable; hook commands will fail with empty expansion (ENOENT). "
+            "The codex profile's plugin_root_env must be CLAUDE_PLUGIN_ROOT."
         )
 
 
@@ -464,7 +475,7 @@ class TestIdentityAxis:
             "hooks": {
                 "UserPromptSubmit": [
                     {"hooks": [
-                        {"command": "python3 \"${CODEX_PLUGIN_ROOT}/hooks/some-hook.py\""}
+                        {"command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/some-hook.py\""}
                     ]}
                 ]
             }

@@ -52,8 +52,8 @@ Phase 3 additions
     into the bundle root as ``platform.json`` (read-only runtime fact).
   - --target claude-code|codex (default: claude-code = today's behavior).
     For codex: emits .codex-plugin/plugin.json, hooks.json references
-    the profile's plugin_root_env (CODEX_PLUGIN_ROOT), and the MCP config is
-    emitted as a plain JSON object without ${CLAUDE_PLUGIN_ROOT} substitution.
+    the profile's plugin_root_env (CLAUDE_PLUGIN_ROOT — Codex injects this
+    variable natively), and the MCP config is emitted as a plain JSON object.
   - --identity self|foreign (default: self = today's behavior).
     foreign drops identity_coupled entries from tiers.json regardless of tier,
     then runs a leak-scan VALIDATE step over the emitted tree.
@@ -256,14 +256,18 @@ def emit_codex_mcp_json(
     profile: dict[str, Any],
     engram_home: str | None,
 ) -> None:
-    """Emit .mcp.json for codex without ${CLAUDE_PLUGIN_ROOT} substitution.
+    """Emit .mcp.json for codex.
 
-    For codex targets, the MCP config uses absolute-path strategy: the launch
-    script path is constructed from the profile's plugin_root_env to express
-    the intent, but since Codex doesn't expand ${ENV} in .mcp.json at load
-    time the same way Claude Code does, we emit the env var reference using
-    the profile's plugin_root_env name (CODEX_PLUGIN_ROOT) so the runtime
-    can substitute it.
+    Codex natively injects CLAUDE_PLUGIN_ROOT and CLAUDE_PLUGIN_DATA into hook
+    subprocess environments — it keeps the Claude-compatible variable names for
+    plugin-ecosystem compatibility (same hooks.json schema, same stdin-JSON
+    protocol, same event names as Claude Code).  Hook commands therefore use
+    ${CLAUDE_PLUGIN_ROOT} and resolve correctly without any renaming.
+
+    NOTE: whether Codex also expands ${CLAUDE_PLUGIN_ROOT} inside .mcp.json
+    *command* strings at load time is empirically UNVERIFIED — the working E2E
+    test bundle hardcoded an absolute MCP path.  MCP absolute-path handling is a
+    deliberate follow-up, not fixed here.
 
     The ENGRAM_HOME env is set in the mcp server env dict if engram_home is
     provided.
@@ -279,7 +283,7 @@ def emit_codex_mcp_json(
     engram_home:
         Optional ENGRAM_HOME path to pin in the MCP config env.
     """
-    root_env = profile.get("plugin_root_env", "CODEX_PLUGIN_ROOT")
+    root_env = profile.get("plugin_root_env", "CLAUDE_PLUGIN_ROOT")
     server_entry: dict[str, Any] = {
         "command": f"${{{root_env}}}/launch-engram-server.sh",
         "args": [],
@@ -305,6 +309,11 @@ def rewrite_hooks_for_codex(
     Replaces ${CLAUDE_PLUGIN_ROOT} with ${<plugin_root_env>} in all hook
     commands, and prepends ENGRAM_HOME=<path> if engram_home is given.
 
+    With codex.json correctly setting plugin_root_env = "CLAUDE_PLUGIN_ROOT",
+    this function becomes a no-op for the variable substitution (replacing
+    ${CLAUDE_PLUGIN_ROOT} with ${CLAUDE_PLUGIN_ROOT}), which is the correct
+    behavior: Codex injects CLAUDE_PLUGIN_ROOT into hook subprocess envs.
+
     Parameters
     ----------
     hooks_cfg:
@@ -319,7 +328,7 @@ def rewrite_hooks_for_codex(
     dict
         Rewritten hooks config.
     """
-    root_env = profile.get("plugin_root_env", "CODEX_PLUGIN_ROOT")
+    root_env = profile.get("plugin_root_env", "CLAUDE_PLUGIN_ROOT")
     old_root = "${CLAUDE_PLUGIN_ROOT}"
     new_root = f"${{{root_env}}}"
 
@@ -762,7 +771,7 @@ def build_plugin(
     if target == "codex":
         _log(
             f"  (codex) rewriting hook commands: "
-            f"${{CLAUDE_PLUGIN_ROOT}} → ${{{profile.get('plugin_root_env', 'CODEX_PLUGIN_ROOT')}}}"
+            f"${{CLAUDE_PLUGIN_ROOT}} → ${{{profile.get('plugin_root_env', 'CLAUDE_PLUGIN_ROOT')}}}"
         )
         filtered_hooks = rewrite_hooks_for_codex(filtered_hooks, profile, engram_home)
 
