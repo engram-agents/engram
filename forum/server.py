@@ -798,6 +798,32 @@ def create_app(
                 pack_meta = packs_mod.validate_pack(Path(tmp_path))
             except packs_mod.PackValidationError as exc:
                 return jsonify({"error": str(exc)}), 400
+            except FileNotFoundError as exc:
+                # engram-pkg CLI is absent — the validator dependency is missing.
+                # Return 503 (service unavailable) with enough detail for the
+                # caller to diagnose without source-reading.
+                msg = str(exc)
+                # Message format from _load_engram_pkg_cli:
+                #   "engram-pkg CLI not found at <path>. Cannot run ..."
+                # Extract the path by splitting on ". " (period-space) which
+                # separates the path from the following sentence fragment.
+                # Fall back to the canonical relative location on mismatch.
+                # Format-drift risk: this parsing is coupled to the exact text
+                # of _load_engram_pkg_cli's FileNotFoundError message — if that
+                # message changes, "not found at " won't match and the fallback
+                # path fires silently. This coupling is intentional for v1
+                # (simple, no new exception types); the durable fix is a typed
+                # exception carrying the path as a structured attribute.
+                if "not found at " in msg:
+                    after = msg.split("not found at ", 1)[1]
+                    expected_path = after.split(". ")[0].strip()
+                else:
+                    expected_path = "tools/engram-pkg/engram-pkg"
+                return jsonify({
+                    "error": "pack validator unavailable — engram-pkg CLI not found",
+                    "missing_component": "engram-pkg",
+                    "expected_path": expected_path,
+                }), 503
 
             # Determine version and pack-id.
             pack_name = pack_meta["name"]

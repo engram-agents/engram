@@ -580,3 +580,137 @@ class TestConcurrentValidation:
             f"Expected 400 for closure-violating pack, got {results['bad'].status_code}: "
             f"{results['bad'].data.decode()}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Size-guard env-override tests
+# ---------------------------------------------------------------------------
+
+class TestSizeGuardEnvOverride:
+    """FORUM_PACK_MAX_NODES / FORUM_PACK_MAX_EDGES override the hard-coded
+    defaults, letting operators raise limits without a code change.
+    """
+
+    def _make_sql_with_nodes(self, n: int) -> str:
+        """Build knowledge.sql with n isolated nodes (no edges)."""
+        lines = [_MINIMAL_SQL]
+        for i in range(n):
+            nid = f"ob_{i:04d}"
+            lines.append(
+                f"INSERT INTO nodes VALUES ('{nid}', 'observation', 'claim {i}', 0.85, "
+                f"NULL, NULL, NULL, 'active', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', "
+                f"NULL, NULL, NULL, 'test-agent');"
+            )
+        return "\n".join(lines)
+
+    def test_env_override_raises_node_limit(self, client, monkeypatch):
+        """With FORUM_PACK_MAX_NODES raised to 300, a 250-node pack is accepted."""
+        monkeypatch.setenv("FORUM_PACK_MAX_NODES", "300")
+        sql = self._make_sql_with_nodes(250)
+        tarball = _make_pack_tarball(knowledge_sql=sql)
+        resp = _upload_pack(client, tarball)
+        assert resp.status_code == 201, (
+            f"Expected 201 with raised limit, got {resp.status_code}: {resp.data.decode()}"
+        )
+        body = resp.get_json()
+        assert body["node_count"] == 250, (
+            f"Override took effect (status 201) but node_count mismatch: {body}"
+        )
+
+    def test_default_limit_still_rejects_over_200(self, client, monkeypatch):
+        """Without override, a 201-node pack is still rejected (default 200)."""
+        monkeypatch.delenv("FORUM_PACK_MAX_NODES", raising=False)
+        monkeypatch.delenv("FORUM_PACK_MAX_EDGES", raising=False)
+        sql = self._make_sql_with_nodes(201)
+        tarball = _make_pack_tarball(knowledge_sql=sql)
+        resp = _upload_pack(client, tarball)
+        assert resp.status_code == 400, resp.data.decode()
+
+    def test_invalid_env_value_falls_back_to_default(self, client, monkeypatch):
+        """A non-integer FORUM_PACK_MAX_NODES silently falls back to 200."""
+        monkeypatch.setenv("FORUM_PACK_MAX_NODES", "not-a-number")
+        # 201 nodes should still be rejected (default 200 in effect)
+        sql = self._make_sql_with_nodes(201)
+        tarball = _make_pack_tarball(knowledge_sql=sql)
+        resp = _upload_pack(client, tarball)
+        assert resp.status_code == 400, (
+            f"Expected 400 with invalid env (default fallback), got {resp.status_code}: "
+            f"{resp.data.decode()}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Missing validator → 503 with detail
+# ---------------------------------------------------------------------------
+
+class TestMissingValidatorReturns503:
+    """When the engram-pkg CLI is absent, publish returns 503 with a JSON
+    body naming the missing component and the expected path.
+    """
+
+    def test_missing_cli_returns_503(self, client, monkeypatch, tmp_path):
+        """Monkeypatch cli_path to a nonexistent location → 503."""
+        import forum.packs as _packs
+
+        nonexistent = tmp_path / "no-such-dir" / "engram-pkg"
+
+        original_load = _packs._load_engram_pkg_cli
+
+        def _patched_load():
+            raise FileNotFoundError(
+                f"engram-pkg CLI not found at {nonexistent}. "
+                "Cannot run closure validation."
+            )
+
+        monkeypatch.setattr(_packs, "_load_engram_pkg_cli", _patched_load)
+        # Also reset the cached module so the patch actually fires.
+        monkeypatch.setattr(_packs, "_CLI_MODULE", None)
+
+        tarball = _make_pack_tarball()
+        resp = _upload_pack(client, tarball)
+        assert resp.status_code == 503, (
+            f"Expected 503, got {resp.status_code}: {resp.data.decode()}"
+        )
+
+    def test_missing_cli_503_body_names_component(self, client, monkeypatch, tmp_path):
+        """503 body must name the missing component ('engram-pkg')."""
+        import forum.packs as _packs
+
+        nonexistent = tmp_path / "no-such-dir" / "engram-pkg"
+
+        def _patched_load():
+            raise FileNotFoundError(
+                f"engram-pkg CLI not found at {nonexistent}. "
+                "Cannot run closure validation."
+            )
+
+        monkeypatch.setattr(_packs, "_load_engram_pkg_cli", _patched_load)
+        monkeypatch.setattr(_packs, "_CLI_MODULE", None)
+
+        tarball = _make_pack_tarball()
+        resp = _upload_pack(client, tarball)
+        body = json.loads(resp.data)
+        assert "engram-pkg" in body.get("missing_component", ""), (
+            f"Expected 'engram-pkg' in missing_component, got: {body}"
+        )
+
+    def test_missing_cli_503_body_names_expected_path(self, client, monkeypatch, tmp_path):
+        """503 body must include the expected_path field with the CLI path."""
+        import forum.packs as _packs
+
+        nonexistent = tmp_path / "no-such-dir" / "engram-pkg"
+
+        def _patched_load():
+            raise FileNotFoundError(
+                f"engram-pkg CLI not found at {nonexistent}. "
+                "Cannot run closure validation."
+            )
+
+        monkeypatch.setattr(_packs, "_load_engram_pkg_cli", _patched_load)
+        monkeypatch.setattr(_packs, "_CLI_MODULE", None)
+
+        tarball = _make_pack_tarball()
+        resp = _upload_pack(client, tarball)
+        body = json.loads(resp.data)
+        assert "expected_path" in body, f"Missing 'expected_path' key in body: {body}"
+        assert body["expected_path"], "expected_path must be non-empty"

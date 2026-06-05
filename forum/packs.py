@@ -38,9 +38,29 @@ from typing import Any
 
 # ---------------------------------------------------------------------------
 # Size-guard thresholds — mirror engram-pkg defaults.
+#
+# Operator-overridable via environment variables (read lazily in
+# _validate_size_guard so tests can monkeypatch os.environ without a module
+# reload):
+#   FORUM_PACK_MAX_NODES  — int; default 200
+#   FORUM_PACK_MAX_EDGES  — int; default 400
+# Invalid / missing values fall back silently to the defaults.
 # ---------------------------------------------------------------------------
 MAX_NODES = 200
 MAX_EDGES = 400
+
+
+def _get_size_limits() -> tuple[int, int]:
+    """Return (max_nodes, max_edges) from env vars, falling back to defaults."""
+    try:
+        max_nodes = int(os.environ["FORUM_PACK_MAX_NODES"])
+    except (KeyError, ValueError):
+        max_nodes = MAX_NODES
+    try:
+        max_edges = int(os.environ["FORUM_PACK_MAX_EDGES"])
+    except (KeyError, ValueError):
+        max_edges = MAX_EDGES
+    return max_nodes, max_edges
 
 
 # ---------------------------------------------------------------------------
@@ -210,16 +230,21 @@ def _validate_closure_completeness(extract_dir: Path) -> tuple[int, int]:
 def _validate_size_guard(node_count: int, edge_count: int) -> None:
     """Enforce the same size limits as engram-pkg scope-export.
 
+    Limits are read lazily from env vars (FORUM_PACK_MAX_NODES /
+    FORUM_PACK_MAX_EDGES) so operator overrides take effect without a
+    server restart, and tests can monkeypatch os.environ directly.
+
     Raises PackValidationError if either limit is exceeded.
     """
-    if node_count > MAX_NODES:
+    max_nodes, max_edges = _get_size_limits()
+    if node_count > max_nodes:
         raise PackValidationError(
-            f"Pack exceeds node size guard ({node_count} > {MAX_NODES} max). "
+            f"Pack exceeds node size guard ({node_count} > {max_nodes} max). "
             f"Re-export with a narrower root set."
         )
-    if edge_count > MAX_EDGES:
+    if edge_count > max_edges:
         raise PackValidationError(
-            f"Pack exceeds edge size guard ({edge_count} > {MAX_EDGES} max). "
+            f"Pack exceeds edge size guard ({edge_count} > {max_edges} max). "
             f"Re-export with a narrower root set."
         )
 
