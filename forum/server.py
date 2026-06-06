@@ -154,6 +154,7 @@ def create_app(
     audit_path: str,
     categories_config: str | None = None,
     packs_dir: str | None = None,
+    dep_results: dict | None = None,
 ) -> Flask:
     """Create and configure the Flask application.
 
@@ -164,6 +165,11 @@ def create_app(
             When None, db.load_category_config() resolution chain applies.
         packs_dir:         Directory to store uploaded packs. Defaults to
             a ``packs/`` subdirectory next to the DB file.
+        dep_results:       Optional dict from probe_deps() / _run_boot_verify().
+            When provided, exposed via the ``"deps"`` key in GET /health.
+            When None (e.g. test fixtures that call create_app() directly),
+            /health omits the ``"deps"`` key — the endpoint is still additive-
+            compatible with any existing health payload shape.
 
     Returns:
         A configured Flask application instance.
@@ -181,6 +187,8 @@ def create_app(
     # disk-fill attacks on this HTTP-exposed upload path.  Flask returns
     # 413 automatically when the limit is exceeded.
     app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
+    # Store dep probe results for /health (None when called from tests without probing).
+    app.config["DEP_RESULTS"] = dep_results or {}
 
     # Register avatar as a Jinja filter so templates can call:
     #   {{ author.avatar_seed | avatar(40) | safe }}
@@ -208,6 +216,34 @@ def create_app(
         conn = g.pop("conn", None)
         if conn is not None:
             conn.close()
+
+    # ------------------------------------------------------------------
+    # GET /health  — liveness + dependency status
+    #
+    # Always returns 200 (the server is alive to answer this).
+    # The "deps" object is additive: present when dep_results were injected
+    # by main(); absent when create_app() is called directly (e.g. tests).
+    # Existing integrations that read /health need no changes.
+    #
+    # Response shape:
+    #   {"status": "ok"|"degraded", "deps": {"<dep>": "ok"|"degraded"|"missing"}}
+    # ------------------------------------------------------------------
+    @app.route("/health")
+    def health() -> Response:
+        dr = app.config.get("DEP_RESULTS") or {}
+        # Strip private diagnostic keys (prefixed with _).
+        deps_public = {k: v for k, v in dr.items() if not k.startswith("_")}
+        # Status is "degraded" if any dep is not "ok" (missing counts too, though
+        # a server that passed boot-verify will only have "degraded" soft deps here).
+        overall = "ok"
+        for v in deps_public.values():
+            if v != "ok":
+                overall = "degraded"
+                break
+        payload: dict = {"status": overall}
+        if deps_public:
+            payload["deps"] = deps_public
+        return jsonify(payload)
 
     # ------------------------------------------------------------------
     # GET /forum.md  — machine-readable API contract for agents
@@ -921,6 +957,152 @@ def create_app(
 
 
 # ---------------------------------------------------------------------------
+# Boot-verify probe (Part of #868 slice B — A9 fix)
+#
+# Converts deploy-time latent dependency gaps into start-time loud failures.
+# Run BEFORE binding the port; do NOT call at module import time — tests import
+# this module without intending to fire probes.
+# ---------------------------------------------------------------------------
+
+def probe_deps(db_path: str, audit_path: str) -> dict:
+    """Run all dependency probes and return a status dict.
+
+    Returns a dict with keys:
+        "db"         -> "ok" | "missing"
+        "audit_log"  -> "ok" | "missing"
+        "engram_pkg" -> "ok" | "missing"
+        "embeddings" -> "ok" | "degraded"
+
+    Hard deps (missing → caller should exit 2): db, audit_log, engram_pkg.
+    Soft deps (missing → DEGRADED banner, server still starts): embeddings.
+
+    Internal ``_<dep>_error`` / ``_<dep>_path`` keys carry diagnostic detail
+    for error messages; callers should treat any key starting with ``_`` as
+    private to this function.
+    """
+    results: dict = {}
+
+    # ------------------------------------------------------------------
+    # Hard dep 1: DB parent dir writable + PRAGMA user_version accessible.
+    # Mirrors the actual write path: sqlite3.connect(db_path) in main().
+    # ------------------------------------------------------------------
+    db_abs = os.path.abspath(db_path)
+    db_parent = os.path.dirname(db_abs)
+    try:
+        if not os.path.isdir(db_parent) or not os.access(db_parent, os.W_OK):
+            raise OSError(f"directory {db_parent!r} missing or not writable")
+        _probe_conn = sqlite3.connect(db_abs)
+        _probe_conn.execute("PRAGMA user_version")
+        _probe_conn.close()
+        results["db"] = "ok"
+    except Exception as _exc:  # noqa: BLE001
+        results["db"] = "missing"
+        results["_db_error"] = str(_exc)
+
+    # ------------------------------------------------------------------
+    # Hard dep 2: audit-log path writable (open-append probe).
+    # Mirrors audit.write_audit(path=audit_path) which opens for append.
+    # ------------------------------------------------------------------
+    audit_abs = os.path.abspath(audit_path)
+    audit_parent = os.path.dirname(audit_abs)
+    try:
+        os.makedirs(audit_parent, exist_ok=True)
+        with open(audit_abs, "a", encoding="utf-8"):
+            pass
+        results["audit_log"] = "ok"
+    except Exception as _exc:  # noqa: BLE001
+        results["audit_log"] = "missing"
+        results["_audit_log_error"] = str(_exc)
+
+    # ------------------------------------------------------------------
+    # Hard dep 3: engram-pkg CLI file existence.
+    # Mirrors packs._load_engram_pkg_cli(): same path resolution, same
+    # consumption pattern (file-existence check before importlib load).
+    # The pack-validation endpoints raise FileNotFoundError when the file
+    # is absent, producing a 503 on every upload; we fail start instead.
+    # ------------------------------------------------------------------
+    here = Path(__file__).resolve()
+    repo_root = here.parent.parent  # forum/ -> repo root
+    cli_path = repo_root / "tools" / "engram-pkg" / "engram-pkg"
+    if cli_path.exists():
+        results["engram_pkg"] = "ok"
+    else:
+        results["engram_pkg"] = "missing"
+        results["_engram_pkg_path"] = str(cli_path)
+
+    # ------------------------------------------------------------------
+    # Soft dep: embeddings backend (sentence-transformers + sqlite-vec).
+    # Absent → FTS-only mode — a designed degradation (emb_mod already
+    # announces it at import time; we surface it structurally here).
+    # ------------------------------------------------------------------
+    if emb_mod.available():
+        results["embeddings"] = "ok"
+    else:
+        results["embeddings"] = "degraded"
+
+    return results
+
+
+def _run_boot_verify(db_path: str, audit_path: str, verify_only: bool = False) -> dict:
+    """Run boot-verify probes; exit 2 on hard-dep failure.
+
+    One stderr line per hard-dep failure; DEGRADED banner for soft deps.
+    If ``verify_only`` is True, print a full report then exit 0 (all ok)
+    or 2 (any hard dep missing) — never binds the port.
+    Returns the probe results dict (only reached when all hard deps pass,
+    or when running in verify_only mode, which exits before returning).
+    """
+    results = probe_deps(db_path, audit_path)
+    hard_deps = ("db", "audit_log", "engram_pkg")
+    any_hard_fail = any(results.get(k) == "missing" for k in hard_deps)
+
+    if verify_only:
+        for dep in ("db", "audit_log", "engram_pkg", "embeddings"):
+            status = results.get(dep, "unknown")
+            print(f"[forum verify] {dep}: {status}", file=sys.stderr)
+        if any_hard_fail:
+            print(
+                "[forum verify] FAILED — hard dep(s) missing; server would not start.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        print("[forum verify] OK — all hard deps present.", file=sys.stderr)
+        if results.get("embeddings") == "degraded":
+            print(
+                "[forum] DEGRADED: embeddings backend unavailable — "
+                "running in FTS-only mode (semantic search disabled).",
+                file=sys.stderr,
+            )
+        sys.exit(0)
+
+    # Normal startup path: fail loud on any hard-dep missing.
+    if results.get("db") == "missing":
+        err = results.get("_db_error", "unknown error")
+        print(f"[forum] FATAL: DB dependency check failed: {err}", file=sys.stderr)
+    if results.get("audit_log") == "missing":
+        err = results.get("_audit_log_error", "unknown error")
+        print(f"[forum] FATAL: audit-log dependency check failed: {err}", file=sys.stderr)
+    if results.get("engram_pkg") == "missing":
+        path = results.get("_engram_pkg_path", "tools/engram-pkg/engram-pkg")
+        print(
+            f"[forum] FATAL: engram-pkg CLI not found at {path} — "
+            "pack validation will fail; aborting start.",
+            file=sys.stderr,
+        )
+    if any_hard_fail:
+        sys.exit(2)
+
+    if results.get("embeddings") == "degraded":
+        print(
+            "[forum] DEGRADED: embeddings backend unavailable — "
+            "running in FTS-only mode (semantic search disabled).",
+            file=sys.stderr,
+        )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -937,7 +1119,16 @@ def main() -> None:
     p.add_argument("--packs-dir", default=None,
                    help="Directory for uploaded pack storage. "
                         "Defaults to packs/ next to --db.")
+    p.add_argument("--verify-only", action="store_true",
+                   help="Run boot-verify probes, print report, exit 0/2 without binding the port.")
     args = p.parse_args()
+
+    # ------------------------------------------------------------------
+    # Boot-verify: run BEFORE binding the port.
+    # Exits 2 on hard-dep failure; DEGRADED banner for soft deps.
+    # With --verify-only, prints a full report and exits without starting.
+    # ------------------------------------------------------------------
+    dep_results = _run_boot_verify(args.db, args.audit, verify_only=args.verify_only)
 
     # Ensure db directory exists
     db_dir = os.path.dirname(os.path.abspath(args.db))
@@ -954,6 +1145,7 @@ def main() -> None:
         args.audit,
         categories_config=args.categories_config,
         packs_dir=args.packs_dir,
+        dep_results=dep_results,
     )
     app.run(host=args.host, port=args.port)
 
