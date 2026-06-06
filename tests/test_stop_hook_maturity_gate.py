@@ -122,13 +122,24 @@ def _write_config(engram_home: Path, threshold: int) -> None:
 
 
 def _append_tool_use(transcript: Path) -> None:
-    """Append a minimal tool_use JSONL entry (compact JSON, matching real format)."""
+    """Append an assistant JSONL entry with non-engram tool_use and long prose.
+
+    Prose-gate update (issue #845 step 1.5): the new emit predicate requires
+    BOTH (A) assistant prose > threshold AND (B) no engram write. This helper
+    satisfies both conditions: prose > 400 chars (A) and tool name is
+    "engram_query" — a read tool, not in the write set (B). Uses compact JSON
+    to match the real Claude Code transcript format.
+    """
+    # Prose length must exceed the default threshold (400 chars). 401 chars of
+    # 'x' is the minimal value that satisfies condition A.
+    long_prose = "x" * 401
     entry = json.dumps(
         {
             "type": "assistant",
             "message": {
                 "content": [
-                    {"type": "tool_use", "id": "tu_test", "name": "engram_query", "input": {}}
+                    {"type": "text", "text": long_prose},
+                    {"type": "tool_use", "id": "tu_test", "name": "engram_query", "input": {}},
                 ]
             },
         },

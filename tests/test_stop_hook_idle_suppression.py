@@ -71,19 +71,28 @@ def _nudge_emitted(stdout: str) -> bool:
 
 
 def _append_tool_use(transcript: Path) -> None:
-    """Append a minimal tool_use JSONL entry to the transcript.
+    """Append an assistant JSONL entry with a non-engram tool_use and long prose.
+
+    Prose-gate update (issue #845 step 1.5): the new emit predicate requires
+    BOTH (A) assistant prose > threshold AND (B) no engram write. This helper
+    satisfies both conditions: prose > 400 chars (condition A) and tool name
+    is "engram_query" — a read tool, not in the write set (condition B). The
+    hook correctly emits on this delta.
 
     Uses separators=(',', ':') to produce compact JSON without spaces after
-    colons, matching the real Claude Code transcript format. The hook's marker
-    _TOOL_USE_MARKER searches for '"type":"tool_use"' (no space), which is what
-    real transcripts contain — verified against live ~/.claude/projects/*.jsonl.
+    colons, matching the real Claude Code transcript format — verified against
+    live ~/.claude/projects/*.jsonl.
     """
+    # Prose length must exceed the default threshold (400 chars). 401 chars of
+    # 'x' is the minimal value that satisfies condition A.
+    long_prose = "x" * 401
     entry = json.dumps(
         {
             "type": "assistant",
             "message": {
                 "content": [
-                    {"type": "tool_use", "id": "tu_test", "name": "engram_query", "input": {}}
+                    {"type": "text", "text": long_prose},
+                    {"type": "tool_use", "id": "tu_test", "name": "engram_query", "input": {}},
                 ]
             },
         },
@@ -141,11 +150,17 @@ def test_first_fire_emits_nudge_and_creates_state_file(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Test 2: second fire, delta contains tool_use → nudge emitted
+# Test 2: second fire, delta contains long prose (prose-gate driven emit)
 # ---------------------------------------------------------------------------
 
-def test_second_fire_with_tool_use_delta_emits_nudge(tmp_path):
-    """After tool activity between fires, the nudge must still emit."""
+def test_second_fire_with_long_prose_delta_emits_nudge(tmp_path):
+    """After a long-prose turn between fires, the nudge must emit.
+
+    This tests the prose-gate predicate (#845 step 1.5): prose > threshold
+    AND no engram write → EMIT. The _append_tool_use helper produces a delta
+    with long prose (>400 chars) and a non-engram tool, satisfying both
+    conditions A and B of the gate.
+    """
     engram_home = tmp_path / "engram"
     engram_home.mkdir()
     transcript = tmp_path / "transcript.jsonl"
@@ -154,15 +169,16 @@ def test_second_fire_with_tool_use_delta_emits_nudge(tmp_path):
     # Fire 1: establishes state (empty transcript)
     _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
-    # Simulate tool activity: append a tool_use record to the transcript
+    # Simulate long-prose turn: append a record with >400 chars prose and a
+    # non-engram tool (both conditions of the prose gate are satisfied).
     _append_tool_use(transcript)
 
-    # Fire 2: delta has tool_use → must emit
+    # Fire 2: delta has long prose + no engram write → prose gate emits
     stdout, rc = _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
     assert rc == 0
     assert _nudge_emitted(stdout), (
-        f"Delta with tool_use must emit nudge; stdout={stdout!r}"
+        f"Long-prose delta (prose gate) must emit nudge; stdout={stdout!r}"
     )
 
 
