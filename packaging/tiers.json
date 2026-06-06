@@ -257,6 +257,14 @@
       "tier": "dev"
     },
     {
+      "path": "tools/run_touched_tests.py",
+      "tier": "dev"
+    },
+    {
+      "path": "packaging/test-map.json",
+      "tier": "dev"
+    },
+    {
       "path": "hooks/claude/start-engram-daemon.sh",
       "tier": "essential"
     },
