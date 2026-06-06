@@ -874,6 +874,15 @@ Intentional. Two paths forward:
     `bootstrap.py`. `FORCE=1` does not delete data; it only bypasses the
     existing-install guard.
 
+**`/plugin install engram` reports "Plugin not found" (reinstall on existing machine)**
+The plugin is already in Claude Code's cache from a previous install. Recovery:
+- **In-session**: `/plugin enable engram@engram-local`
+- **CLI**: `claude plugin enable engram@engram-local`
+
+The `install-local-marketplace.sh` step was correct — this is a cache-state issue,
+not a missing plugin. The install command fails when the plugin is already registered
+(even as disabled); the enable command is the correct recovery path.
+
 **Hooks don't fire in Claude Code**
 Check `~/.claude/settings.json` has a `hooks` key with ENGRAM
 entries. If it doesn't, look for
@@ -927,6 +936,11 @@ already ran — look at `~/.claude/CLAUDE.md` and
 written in.
 
 **Uninstall**
+
+> **Warning: irreversible.** `~/.engram/` is your entire knowledge graph — back it up
+> first (`~/.engram/knowledge.db` is the graph). `~/.claude/CLAUDE.md` may contain
+> your customizations beyond the ENGRAM template — review before deleting.
+
 ```bash
 rm -rf ~/.engram
 rm ~/.claude/CLAUDE.md
