@@ -22,6 +22,83 @@ import time
 
 IDLE_TIMEOUT = 28800  # 8 hours without queries -> exit
 
+# ---------------------------------------------------------------------------
+# Indexer ownership (issue #861)
+#
+# The JSONL→index.db ingestion pass (engram_log_indexer.Indexer) had no
+# owning process: hooks wrote JSONL, server.py wrote tool events directly
+# into index.db, viz_server read index.db read-only, but nobody ran the
+# indexer. Hook/surface stats died silently on 2026-05-17 when the last
+# manual run aged out of the 7-day stat window.
+#
+# Fix: this daemon — long-lived, per-agent, essential-tier — owns a periodic
+# incremental pass. viz_server stays read-only. server.py continues writing
+# its own events directly.
+#
+# The pass runs in a dedicated daemon thread so the accept loop (primary
+# recall-serving path) is never blocked or delayed by an indexer run.
+# ---------------------------------------------------------------------------
+
+def _parse_indexer_interval() -> int:
+    """Return the indexer tick interval in seconds.
+
+    Reads ENGRAM_INDEXER_INTERVAL_S from the environment; falls back to 60
+    on any bad value (non-integer, negative, zero).
+    """
+    raw = os.environ.get("ENGRAM_INDEXER_INTERVAL_S", "")
+    if raw:
+        try:
+            val = int(raw)
+            if val > 0:
+                return val
+        except (ValueError, TypeError):
+            pass
+    return 60
+
+
+def run_indexer_tick(last_run_ts: float, interval_s: int) -> float:
+    """Run one incremental indexer pass if the interval has elapsed.
+
+    Returns the updated last_run_ts (either the original value if the
+    interval has not elapsed, or `now` — the monotonic timestamp captured at
+    the gate check — after a successful or failed pass).
+
+    Failure contract: any exception from Indexer.run_once() is caught,
+    logged to stderr (one line), and suppressed — the daemon must never
+    be killed or delayed by an indexer failure.
+    """
+    now = time.monotonic()
+    if now - last_run_ts < interval_s:
+        return last_run_ts
+
+    try:
+        from engram_log_indexer import Indexer
+        result = Indexer.run_once()
+        if result.get("rows_inserted", 0) > 0:
+            print(
+                f"[engram-daemon] indexer tick: {result['files_processed']} file(s), "
+                f"{result['rows_inserted']} row(s) inserted",
+                file=sys.stderr,
+            )
+    except Exception as exc:
+        print(f"[engram-daemon] indexer tick failed (suppressed): {exc}", file=sys.stderr)
+
+    return now
+
+
+def _indexer_loop(interval_s: int, shutdown_event: threading.Event) -> None:
+    """Daemon-thread target: fire run_indexer_tick every interval_s seconds.
+
+    Runs as a daemon thread so it does not prevent the process from exiting.
+    The thread wakes once per second to check shutdown, but only fires the
+    indexer pass when the interval has elapsed — minimising unnecessary wakeups
+    while still responding to shutdown within ~1s.
+    """
+    last_run_ts: float = float("-inf")  # force an immediate pass on first tick
+    while not shutdown_event.is_set():
+        last_run_ts = run_indexer_tick(last_run_ts, interval_s)
+        shutdown_event.wait(timeout=1.0)
+
 
 def _resolve_engram_home() -> str:
     """Per-install data dir: knowledge.db, sockets, briefing, history."""
@@ -176,6 +253,15 @@ def main():
     # Start idle watchdog
     watchdog = threading.Thread(target=idle_watchdog, daemon=True)
     watchdog.start()
+
+    # Start periodic JSONL→index.db indexer (issue #861: daemon owns this pass)
+    _indexer_interval = _parse_indexer_interval()
+    indexer_thread = threading.Thread(
+        target=_indexer_loop,
+        args=(_indexer_interval, _shutdown),
+        daemon=True,
+    )
+    indexer_thread.start()
 
     # Create Unix socket server
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
