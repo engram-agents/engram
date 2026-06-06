@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Convention map for non-imported surfaces — hooks, shells, skills, templates, packaging. Layer 2 of tools/run_touched_tests.py selection. All test_globs verified to exist at seeding time (2026-06-06). Aspirational or non-existent test targets must use full_suite_fallback=true rather than invented paths.",
+  "description": "Convention map for non-imported surfaces \u2014 hooks, shells, skills, templates, packaging. Layer 2 of tools/run_touched_tests.py selection. All test_globs verified to exist at seeding time (2026-06-06). Aspirational or non-existent test targets must use full_suite_fallback=true rather than invented paths.",
   "mappings": [
     {
       "path_prefix_or_glob": "hooks/claude/context_tracker.py",
@@ -237,7 +237,7 @@
       "test_globs": [
         "tests/test_run_touched_tests.py"
       ],
-      "note": "The runner itself is a fail-open trigger — changes to it always trigger full suite in production. This entry is for the completeness gate only."
+      "note": "The runner itself is a fail-open trigger \u2014 changes to it always trigger full suite in production. This entry is for the completeness gate only."
     },
     {
       "path_prefix_or_glob": "tools/scan-leaks.py",
@@ -354,6 +354,20 @@
         "tests/test_tiers_manifest.py"
       ],
       "note": "Agent document changes trigger tiers manifest check only"
+    },
+    {
+      "path_prefix_or_glob": "tools/release_gates.py",
+      "test_globs": [
+        "tests/test_release_gates.py"
+      ],
+      "note": "scorecard tool; tests import via from tools.release_gates (L1-inert stem per the tools-package quirk) \u2014 explicit map entry"
+    },
+    {
+      "path_prefix_or_glob": "packaging/release-gates.json",
+      "test_globs": [
+        "tests/test_release_gates.py"
+      ],
+      "note": "scorecard config; consumed by release_gates tests"
     }
   ],
   "unmapped": [

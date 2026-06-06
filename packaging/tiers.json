@@ -265,6 +265,14 @@
       "tier": "dev"
     },
     {
+      "path": "tools/release_gates.py",
+      "tier": "dev"
+    },
+    {
+      "path": "packaging/release-gates.json",
+      "tier": "dev"
+    },
+    {
       "path": "hooks/claude/start-engram-daemon.sh",
       "tier": "essential"
     },
