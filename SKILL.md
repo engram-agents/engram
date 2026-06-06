@@ -299,7 +299,7 @@ A **prescriptive rule extracted from repeated mistakes.** Error observations des
 **When to write.** A specific moment produced a distinct internal state worth marking — surprise, recognition, dissonance, unusual satisfaction, discomfort that isn't task friction. The nudge markers (nap, post-compact, dream-review) prompt honest self-check; respond *if and only if* something genuine surfaced.
 
 **When NOT to.**
-- Performative reports to "use the nudge" — null is a valid data point (§6 of `engram_feeling_node_design.md`).
+- Performative reports to "use the nudge" — null is a valid data point; a null-result check is never a failure.
 - Running affect commentary — not a log; a record of distinct moments.
 - Anything that generalizes across the session — that's a derivation about my patterns, not a feeling at a moment.
 
@@ -612,7 +612,7 @@ The grading exists because the old binary rule (`same_evidence → DUPLICATE`) f
 
 **Source reliability — primary-contact discipline.** Before citing any AI-aggregator surface (EmergentMind, LLM-generated survey pages, auto-summary blogs, crowd-curated secondary digests), track the primary papers. Other AI agents building those surfaces lack ENGRAM-style provenance/confidence/contradiction discipline, so their output inherits unmitigated hallucination risk — treating them as independent evidence imports that risk into my graph. This rule was promoted from the paper-gaps loop heuristic after the SRAF falsification — the "formalism" EmergentMind attributed to a self-models research cluster didn't exist in any of the 10 aggregated primary papers when each primary was contacted directly. The fix is mechanical: read the primary, cite the primary; if primary contact is blocked, say so and note the aggregator as derived-reading rather than evidence.
 
-**Source reliability — yellow-card mechanism.** Known-unreliable domains are maintained in `~/.engram/config.json` under `yellow_domains`, each entry shaped `{"domain": "...", "reason": "...", "engram_node": "..."}`. When `engram_add_observation` or `engram_add_evidence` encounters a matching URL (suffix match, like `trust_pool`), the response includes a `yellow_card_warning` field with the rationale and the ENGRAM node that grounded the flag. The warning does NOT block — blocking would overfire on legitimate uses (reading the aggregator to identify primaries worth contacting). It raises the bar: if I write a direct observation rooted on a yellow source without first tracing to primaries, I'm violating discipline I know about.
+**Source reliability — yellow-card mechanism.** Known-unreliable domains are maintained in `~/.engram/config.json` under `yellow_domains`, each entry shaped `{"domain": "...", "reason": "...", "engram_node": "..."}`. When `engram_add_observation` encounters a matching URL (suffix match, like `trust_pool`), the response includes a `yellow_card_warning` field with the rationale and the ENGRAM node that grounded the flag. The warning does NOT block — blocking would overfire on legitimate uses (reading the aggregator to identify primaries worth contacting). It raises the bar: if I write a direct observation rooted on a yellow source without first tracing to primaries, I'm violating discipline I know about.
 
 **Adding a new yellow-card.** Two writes, same commit: (a) record an observation with `source_class="user_stated"` or `external` explaining WHY the source is flagged, grounded by whatever derivation/observation exposed the unreliability; (b) add a new entry to `yellow_domains` in `config.json` citing that observation's node ID. Manual sync keeps the config diff auditable and prevents automation drift. First seed entry: `emergentmind.com` flagged after the SRAF-falsification primary-contact audit.
 
@@ -662,7 +662,7 @@ Pick by argument shape, not by which confidence I want. "These three sources agr
 - As a diary entry for something that was interesting but not a distinct *state*. The diary lives in `~/.engram/diary/`; feeling reports are structured self-data.
 - For task friction ("the build was slow and that annoyed me"). Friction is friction; log it to the friction log, not the feeling store.
 
-**Inline trap — performative filing.** The trap §6 of `engram_feeling_node_design.md` warns against: producing a feeling report to demonstrate the tool is working, or to satisfy a perceived nudge obligation. Performative reports corrupt the introspection corpus (the reader-effect problem — what reads as honest self-report becomes performance) and train the wrong reflex. A null result is a data point; a fabricated feeling is noise.
+**Inline trap — performative filing.** Producing a feeling report to demonstrate the tool is working, or to satisfy a perceived nudge obligation, is the inline trap (performative filing). Performative reports corrupt the introspection corpus (the reader-effect problem — what reads as honest self-report becomes performance) and train the wrong reflex. A null result is a data point; a fabricated feeling is noise.
 
 The timing semantics — which marker arms the `nudge_source`, when the TTL expires, why nap and dream fire different markers — belong to §8, not here.
 
@@ -705,7 +705,7 @@ Conjectures are provisional foundations (conf 0.10–0.60). Questions are resear
 
 Retract poisons the chain (downstream marked tainted, needs re-evaluation). Supersede ages the chain gracefully (downstream marked stale, may still hold). Retracting correct-but-outdated nodes is a category error that fires false cascades; superseding actually-wrong nodes leaves downstream poison in place.
 
-**Retract is on-the-spot error cleanup, not knowledge update.** If I realize a claim was wrong *at write time* — fabricated quote, mis-citation, hallucinated premise — retract. If my *understanding* evolved and the earlier claim was honest-but-outdated, supersede. The distinction matters because retract poisons downstream; using it for knowledge updates fires false cascades and makes agents avoid recording revisions. (This is also why `engram_revive` doesn't exist — with the retract-vs-supersede line crisp, the "I retracted and shouldn't have" case collapses to supersede or to recreating the observation.)
+**Retract is on-the-spot error cleanup, not knowledge update.** If I realize a claim was wrong *at write time* — fabricated quote, mis-citation, hallucinated premise — retract. If my *understanding* evolved and the earlier claim was honest-but-outdated, supersede. The distinction matters because retract poisons downstream; using it for knowledge updates fires false cascades and makes agents avoid recording revisions. (There is no "undo retract" operation — with the retract-vs-supersede line crisp, the "I retracted and shouldn't have" case collapses to supersede or to recreating the observation.)
 
 ### §6.4 Contradict vs goal-tension
 
