@@ -426,3 +426,60 @@ class TestFilterHooksJson:
         assert filtered == {"hooks": {}}, (
             "When all events are pruned, result must be {'hooks': {}}"
         )
+
+
+# ---------------------------------------------------------------------------
+# compute_build_version edge tests
+# ---------------------------------------------------------------------------
+
+
+class TestComputeBuildVersion:
+    """Edge tests for tools.engine.build.compute_build_version."""
+
+    def setup_method(self):
+        from tools.engine.build import compute_build_version
+        self.compute_build_version = compute_build_version
+
+    def test_pure_numeric_sha7_with_leading_zero_yields_valid_semver(
+        self, monkeypatch, tmp_path
+    ):
+        """A pure-numeric sha7 with a leading zero (e.g. '0149257') must produce
+        a valid semver prerelease identifier.
+
+        Semver §9 forbids leading zeroes in numeric identifiers; the fix prefixes
+        with 'g' to make the identifier alphanumeric (no leading-zero restriction).
+        """
+        import subprocess as _subprocess
+
+        # Monkeypatch subprocess.check_output to return the problematic SHA
+        def _fake_check_output(cmd, **kwargs):
+            if cmd[:2] == ["git", "rev-parse"]:
+                return "0149257\n"
+            return _subprocess.check_output(cmd, **kwargs)
+
+        monkeypatch.setattr(_subprocess, "check_output", _fake_check_output)
+
+        version_str = self.compute_build_version(str(tmp_path))
+
+        # The sha component must be "g0149257", not "0149257".
+        # After the timestamp-first reorder, sha is the SECOND prerelease
+        # identifier: "0.1.0-dev.<stamp>.g0149257"
+        assert version_str.endswith(".g0149257"), (
+            f"Expected 'g' prefix on numeric sha7 as second identifier; got: {version_str!r}"
+        )
+
+        # The prerelease sha identifier (now second) must be alphanumeric (no
+        # leading-zero restriction under semver §9 for non-numeric identifiers).
+        # We validate via the semver prerelease identifier rule directly: each
+        # dot-separated identifier that is NOT purely numeric is unrestricted;
+        # an alphanumeric identifier starting with 'g' satisfies this.
+        # Note: the regex requires a letter-first identifier — that is always
+        # true here because the guard prefixes 'g' by construction.
+        import re
+        parts = version_str.split("-dev.")
+        assert len(parts) == 2, f"Unexpected version format: {version_str!r}"
+        sha_part = parts[1].split(".")[1]  # second identifier (timestamp is first)
+        assert re.match(r"^[a-zA-Z][a-zA-Z0-9]*$", sha_part), (
+            f"Prerelease sha identifier is not an alphanumeric non-numeric identifier: "
+            f"{sha_part!r} (full version: {version_str!r})"
+        )

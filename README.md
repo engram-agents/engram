@@ -240,6 +240,10 @@ Then in a Claude Code session:
 /plugin upgrade engram        # pull the new version
 ```
 
+Each rebuild stamps a unique version (`0.1.0-dev.<YYYYMMDDHHMMss>.<sha7>`) into the
+emitted `plugin.json`, so `/plugin upgrade` always sees a newer version and never
+reports "already at latest".
+
 Your `~/.engram/knowledge.db`, history, diary, and sessions are never touched
 by the upgrade — only `~/.engram/marketplace/plugins/engram/` and the
 `~/.engram/venv/` (if you re-ran `pip install`).

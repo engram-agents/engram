@@ -67,6 +67,8 @@ import json
 import os
 import re
 import shutil
+import subprocess
+from datetime import datetime, timezone
 from typing import Any
 
 from .manifest import select_shippables, load_manifest, resolve_tier
@@ -104,6 +106,78 @@ SCAN_EXTENSIONS = {".py", ".md", ".sh", ".json", ".template", ".service"}
 SKIP_DIRS = {".git", "__pycache__", "node_modules"}
 # scan-leaks.py self-matches on its own pattern literals; skip it in the scanner
 SKIP_FILES = {"scan-leaks.py"}
+
+
+# ---------------------------------------------------------------------------
+# build-time version stamping
+# ---------------------------------------------------------------------------
+
+
+def compute_build_version(repo_root: str) -> str:
+    """Compute a unique per-rebuild plugin version string.
+
+    Format: ``0.1.0-dev.<YYYYMMDDHHMMss>.<sha7>``
+
+    The prerelease form (``-dev.``) is used rather than semver build metadata
+    (``+``) because the Claude Code plugin manager's comparison semantics for
+    build metadata are not exposed in this repo.  The prerelease form orders
+    correctly under semver and is universally accepted by JSON schema validators.
+
+    The timestamp leads the prerelease identifier chain (rather than the sha)
+    because semver prerelease identifiers compare left-to-right.  With the sha
+    first, a rebuild at a lexically-lower sha could compare as a downgrade under
+    precedence-based comparators even though the timestamp is strictly later.
+    Timestamp-first is strictly monotonic under precedence comparators AND still
+    unique under difference comparators — robust under unknown plugin-manager
+    semantics.
+
+    Within a single build invocation this function should be called ONCE and the
+    result threaded through to every place that emits a version string — callers
+    must not call it multiple times, as the timestamp component moves between calls.
+
+    The sha7 reflects committed HEAD, not working-tree state; uncommitted changes
+    do not alter the sha component — the timestamp provides per-rebuild uniqueness.
+
+    Parameters
+    ----------
+    repo_root:
+        Absolute path to the engram-alpha repo root.  Used for ``git rev-parse``.
+
+    Returns
+    -------
+    str
+        Version string, e.g. ``"0.1.0-dev.20260606153042.1a4c9b4"``.
+        Falls back to ``"0.1.0-dev.<stamp>.unknown"`` if git is unavailable.
+    """
+    # Short SHA of HEAD at the source tree
+    try:
+        sha7 = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo_root,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip() or "unknown"
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        sha7 = "unknown"
+
+    # Semver §9: numeric identifiers MUST NOT include leading zeroes.
+    # A pure-numeric sha7 (e.g. "0149257") would violate this; prefix with "g"
+    # (git-describe convention) to make it alphanumeric, which has no such
+    # restriction.
+    if sha7.isdigit():
+        sha7 = "g" + sha7
+
+    # UTC timestamp — second-level granularity so consecutive dirty-tree
+    # rebuilds at the same SHA produce distinct version strings
+    stamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d%H%M%S")
+
+    # Timestamp leads the prerelease chain: semver identifiers compare
+    # left-to-right, so timestamp-first is strictly monotonic under
+    # precedence-based comparators regardless of sha lexical ordering.
+    # The sha remains as the second identifier for per-commit uniqueness.
+    # (The 14-digit timestamp begins with '2', so no leading-zero issue there;
+    # the isdigit guard above still applies to sha7, now the second identifier.)
+    return f"0.1.0-dev.{stamp}.{sha7}"
 
 
 # ---------------------------------------------------------------------------
@@ -211,12 +285,14 @@ def emit_codex_plugin_json(
     plugin_root: str,
     repo_root: str,
     profile: dict[str, Any],
+    build_version: str | None = None,
 ) -> None:
     """Emit .codex-plugin/plugin.json at the bundle root.
 
     Mirrors the shape from the verified test bundle:
       { name, version, description }
-    Derives name/version/description from the repo's plugin.json.
+    Derives name/description from the repo's plugin.json; uses build_version
+    for the version field (stamped at build time) when provided.
 
     Parameters
     ----------
@@ -226,6 +302,10 @@ def emit_codex_plugin_json(
         Absolute path to the repo root (source of plugin.json).
     profile:
         The loaded codex platform profile (unused here beyond validation).
+    build_version:
+        Pre-computed build version string (from compute_build_version).
+        When provided, this overrides the version in the source plugin.json.
+        When None, falls back to the source plugin.json version.
     """
     src_plugin = os.path.join(repo_root, "plugin.json")
     with open(src_plugin, encoding="utf-8") as f:
@@ -234,9 +314,11 @@ def emit_codex_plugin_json(
     codex_plugin_dir = os.path.join(plugin_root, ".codex-plugin")
     os.makedirs(codex_plugin_dir, exist_ok=True)
 
+    version = build_version if build_version is not None else src_data.get("version", "0.1.0")
+
     codex_manifest = {
         "name": src_data.get("name", "engram"),
-        "version": src_data.get("version", "0.1.0"),
+        "version": version,
         "description": src_data.get("description", ""),
         "paths": {
             "skills": "skills/",
@@ -790,6 +872,10 @@ def build_plugin(
         manifest_path = os.path.join(repo_root, "packaging", "tiers.json")
         manifest = load_manifest(manifest_path)
 
+    # Compute build version once — threaded through to all version-bearing outputs
+    # so all emitted files carry the same stamp within a single build invocation.
+    build_version = compute_build_version(repo_root)
+
     # Load platform profile
     profile = load_platform_profile(repo_root, target)
 
@@ -896,17 +982,20 @@ def build_plugin(
 
     # ── 2. Manifests ─────────────────────────────────────────────────────────
 
-    _log("Copying manifests")
-    shutil.copy2(
-        os.path.join(repo_root, "plugin.json"),
-        os.path.join(plugin_root, "plugin.json"),
-    )
+    _log(f"Writing plugin.json (version={build_version!r})")
+    src_plugin_path = os.path.join(repo_root, "plugin.json")
+    with open(src_plugin_path, encoding="utf-8") as f:
+        plugin_data = json.load(f)
+    plugin_data["version"] = build_version
+    with open(os.path.join(plugin_root, "plugin.json"), "w", encoding="utf-8") as f:
+        json.dump(plugin_data, f, indent=2)
+        f.write("\n")
     copied_paths.append("plugin.json")
 
     if target == "codex":
         # Codex: emit .codex-plugin/plugin.json instead of a raw .mcp.json copy
         _log("  (codex) emitting .codex-plugin/plugin.json")
-        emit_codex_plugin_json(plugin_root, repo_root, profile)
+        emit_codex_plugin_json(plugin_root, repo_root, profile, build_version=build_version)
         _log("  (codex) emitting .mcp.json (no ${CLAUDE_PLUGIN_ROOT})")
         emit_codex_mcp_json(plugin_root, repo_root, profile, engram_home)
         copied_paths.append(".codex-plugin/plugin.json")
@@ -1188,27 +1277,6 @@ def build_plugin(
     _log(f"  python3 -c \"import json; json.load(open('{plugin_root}/.engram-build-manifest.json'))\" && echo OK")
 
     return copied_paths
-
-
-# ---------------------------------------------------------------------------
-# plugin manifest emission helpers (testable individually)
-# ---------------------------------------------------------------------------
-
-
-def emit_plugin_json(repo_root: str, plugin_root: str) -> None:
-    """Copy plugin.json from repo root to plugin root."""
-    shutil.copy2(
-        os.path.join(repo_root, "plugin.json"),
-        os.path.join(plugin_root, "plugin.json"),
-    )
-
-
-def emit_mcp_json(repo_root: str, plugin_root: str) -> None:
-    """Copy packaging/mcp.json → plugin_root/.mcp.json."""
-    shutil.copy2(
-        os.path.join(repo_root, "packaging", "mcp.json"),
-        os.path.join(plugin_root, ".mcp.json"),
-    )
 
 
 def write_build_manifest(
