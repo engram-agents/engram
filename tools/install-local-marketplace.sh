@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# install-local-marketplace.sh — assembles a local Claude Code marketplace
-# from build/plugin/ and registers it with Claude Code.
+# install-local-marketplace.sh — assembles a local ENGRAM plugin marketplace
+# from build/plugin/ and optionally registers it with the host CLI.
 #
 # OUTPUT: $ENGRAM_HOME/marketplace/ (default ~/.engram/marketplace/)
 #   .claude-plugin/
@@ -17,11 +17,11 @@
 #       agents/
 #       ...
 #
-# Then runs `claude plugin marketplace add $ENGRAM_HOME/marketplace`
-# (the user separately runs `/plugin install engram` from inside Claude Code).
+# Then runs `claude plugin marketplace add $ENGRAM_HOME/marketplace` for Claude
+# Code targets. Codex targets are installed with `codex plugin add engram@engram-local`.
 #
 # USAGE:
-#   bash tools/install-local-marketplace.sh [--help] [--skip-add] [--skip-build]
+#   bash tools/install-local-marketplace.sh [--help] [--skip-add] [--skip-build] [--target <claude-code|codex>]
 #
 # OPTIONS:
 #   --help        Show this help and exit.
@@ -32,6 +32,7 @@
 #                 the correct flags (e.g., migrate-to-plugin.sh Step 2) and you
 #                 do not want this script to clobber that build with a flagless
 #                 rebuild.  build/plugin/plugin.json must already exist.
+#   --target T    Build target: claude-code (default) or codex.
 #
 # PRECONDITIONS:
 #   - Repo cloned + this script run from the repo root.
@@ -58,10 +59,11 @@ die() { printf '[install-local-marketplace] ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-Usage: bash tools/install-local-marketplace.sh [--help] [--skip-add] [--skip-build]
+Usage: bash tools/install-local-marketplace.sh [--help] [--skip-add] [--skip-build] [--target <claude-code|codex>]
 
-Assembles a local Claude Code marketplace at $ENGRAM_HOME/marketplace/ from
-build/plugin/ and (by default) registers it via `claude plugin marketplace add`.
+Assembles a local ENGRAM marketplace at $ENGRAM_HOME/marketplace/ from
+build/plugin/. With --target claude-code it registers via `claude plugin marketplace add`;
+with --target codex it installs via `codex plugin add engram@engram-local`.
 
 Options:
   --help        Show this help and exit.
@@ -69,6 +71,8 @@ Options:
   --skip-build  Skip the internal build-plugin.sh invocation. Use when the
                 caller has already built build/plugin/ with the correct flags.
                 build/plugin/plugin.json must already exist.
+  --target T    Build target to pass through when not using --skip-build:
+                claude-code (default) or codex.
 
 After running:
   $ENGRAM_HOME/marketplace/.claude-plugin/marketplace.json
@@ -77,28 +81,43 @@ After running:
 Then in a Claude Code session:
   /plugin install engram
 
+Or for Codex:
+  bash tools/install-local-marketplace.sh --target codex
+
 To upgrade later:
   cd path/to/engram-alpha
   git pull origin dev
-  bash tools/build-plugin.sh
-  bash tools/install-local-marketplace.sh    # re-assembles, idempotent
+  bash tools/install-local-marketplace.sh    # builds + re-assembles, idempotent
   # then in Claude Code:
   /plugin marketplace update
   /plugin upgrade engram
+  # or in Codex:
+  bash tools/install-local-marketplace.sh --target codex
 EOF
   exit 0
 }
 
 SKIP_ADD=0
 SKIP_BUILD=0
-for arg in "$@"; do
-  case "$arg" in
+TARGET="claude-code"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
     --help|-h) usage ;;
-    --skip-add) SKIP_ADD=1 ;;
-    --skip-build) SKIP_BUILD=1 ;;
-    *) die "Unknown argument: $arg. Run with --help for usage." ;;
+    --skip-add) SKIP_ADD=1; shift ;;
+    --skip-build) SKIP_BUILD=1; shift ;;
+    --target)
+      [[ $# -ge 2 ]] || die "--target requires a value: claude-code or codex"
+      TARGET="$2"
+      shift 2
+      ;;
+    --target=*) TARGET="${1#--target=}"; shift ;;
+    *) die "Unknown argument: $1. Run with --help for usage." ;;
   esac
 done
+case "$TARGET" in
+  claude-code|codex) ;;
+  *) die "Invalid --target: $TARGET (expected claude-code or codex)" ;;
+esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ ! -f "$REPO_ROOT/server.py" ]]; then
@@ -107,7 +126,7 @@ fi
 
 ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
 MARKETPLACE_ROOT="$ENGRAM_HOME/marketplace"
-PLUGIN_SRC="$REPO_ROOT/build/plugin"
+PLUGIN_SRC="${ENGRAM_BUILD_DIR:-$REPO_ROOT/build/plugin}"
 
 # Build the plugin tree unless --skip-build was passed.
 #
@@ -138,12 +157,23 @@ else
     [[ "$_ma" == "true" ]] && build_flags+=("--multi-agent")
     [[ -n "$_tier" ]] && build_flags+=("--tier" "$_tier")
   fi
-  log "Building plugin tree (flags: ${build_flags[*]:-none})"
+  build_flags+=("--target" "$TARGET")
+  log "Building plugin tree (target: $TARGET, flags: ${build_flags[*]:-none})"
   bash "$REPO_ROOT/tools/build-plugin.sh" ${build_flags[@]+"${build_flags[@]}"}
 fi
 
 if [[ ! -f "$PLUGIN_SRC/plugin.json" ]]; then
-  die "build/plugin/plugin.json missing — build-plugin.sh did not assemble correctly"
+  die "$PLUGIN_SRC/plugin.json missing — build-plugin.sh did not assemble correctly"
+fi
+
+if [[ $SKIP_BUILD -eq 1 ]]; then
+  if [[ ! -f "$PLUGIN_SRC/platform.json" ]]; then
+    die "--skip-build cannot verify target: $PLUGIN_SRC/platform.json missing. Rebuild with tools/install-local-marketplace.sh --target $TARGET or pass a build tree with platform.json."
+  fi
+  BUILT_TARGET="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('platform',''))" "$PLUGIN_SRC/platform.json")"
+  if [[ "$BUILT_TARGET" != "$TARGET" ]]; then
+    die "--skip-build target mismatch: $PLUGIN_SRC/platform.json is '$BUILT_TARGET' but --target is '$TARGET'. Rebuild with tools/install-local-marketplace.sh --target $TARGET or pass the matching --target."
+  fi
 fi
 
 log "Cleaning $MARKETPLACE_ROOT"
@@ -151,7 +181,7 @@ rm -rf "$MARKETPLACE_ROOT"
 mkdir -p "$MARKETPLACE_ROOT/.claude-plugin"
 mkdir -p "$MARKETPLACE_ROOT/plugins/engram"
 
-log "Copying build/plugin/ -> $MARKETPLACE_ROOT/plugins/engram/"
+log "Copying $PLUGIN_SRC/ -> $MARKETPLACE_ROOT/plugins/engram/"
 cp -a "$PLUGIN_SRC/." "$MARKETPLACE_ROOT/plugins/engram/"
 
 PLUGIN_VERSION="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('version','0.1.0'))" "$PLUGIN_SRC/plugin.json")"
@@ -213,41 +243,68 @@ MARKER
 log "Version marker refreshed: $ENGRAM_HOME/.deployed-version (alpha_sha=$ALPHA_SHA)"
 
 if [[ $SKIP_ADD -eq 1 ]]; then
-  log "Skipping 'claude plugin marketplace add' (--skip-add)"
-  log "To register manually: claude plugin marketplace add $MARKETPLACE_ROOT"
-  log "Then in a Claude Code session: /plugin install engram"
+  log "Skipping host CLI marketplace registration (--skip-add)"
+  if [[ "$TARGET" == "codex" ]]; then
+    log "To install in Codex: codex plugin add engram@engram-local"
+  else
+    log "To register manually: claude plugin marketplace add $MARKETPLACE_ROOT"
+    log "Then in a Claude Code session: /plugin install engram"
+  fi
   exit 0
 fi
 
-if ! command -v claude >/dev/null 2>&1; then
-  log "WARN: 'claude' not on PATH - cannot register the marketplace automatically"
-  log "      Run manually: claude plugin marketplace add $MARKETPLACE_ROOT"
-  log "      Then in a Claude Code session: /plugin install engram"
-  exit 0
+if [[ "$TARGET" == "codex" ]]; then
+  if ! command -v codex >/dev/null 2>&1; then
+    log "WARN: 'codex' not on PATH - cannot install the plugin automatically"
+    log "      Run manually in Codex: codex plugin add engram@engram-local"
+    exit 0
+  fi
+  log "Installing/updating plugin with Codex"
+  codex plugin add engram@engram-local
+else
+  if ! command -v claude >/dev/null 2>&1; then
+    log "WARN: 'claude' not on PATH - cannot register the marketplace automatically"
+    log "      Run manually: claude plugin marketplace add $MARKETPLACE_ROOT"
+    log "      Then in a Claude Code session: /plugin install engram"
+    exit 0
+  fi
+
+  log "Registering marketplace with Claude Code"
+  claude plugin marketplace add "$MARKETPLACE_ROOT"
 fi
 
-log "Registering marketplace with Claude Code"
-claude plugin marketplace add "$MARKETPLACE_ROOT"
-
 log ""
 log "═══════════════════════════════════════════════════════════════════"
-log " Marketplace registered. Next steps (in a Claude Code session):"
-log "═══════════════════════════════════════════════════════════════════"
-log ""
-log "  1. /plugin install engram      # install from the local marketplace"
-log "  2. /plugin enable  engram      # ENABLE — local marketplace plugins"
-log "                                 #   ship DISABLED by default; this"
-log "                                 #   step is REQUIRED to activate."
-log "  3. Restart Claude Code so MCP picks up the now-enabled plugin."
-log ""
-log " (Empirically verified: 2026-05-31 Chromebook trial. The /plugin"
-log "  install step alone leaves the plugin in disabled state — the"
-log "  user must explicitly /plugin enable engram.)"
-log ""
-log " To upgrade later:"
-log "   cd path/to/engram-alpha"
-log "   git pull origin dev"
-log "   bash tools/install-local-marketplace.sh"
-log "   # then in Claude Code:"
-log "   /plugin marketplace update"
-log "   /plugin upgrade engram"
+if [[ "$TARGET" == "codex" ]]; then
+  log " Codex marketplace installed/updated. Next steps:"
+  log "═══════════════════════════════════════════════════════════════════"
+  log ""
+  log "  Restart or resume Codex so hooks/MCP reload the upgraded plugin cache."
+  log "  If hook trust changed, approve the refreshed hook definitions when prompted."
+  log ""
+  log " To upgrade later in Codex:"
+  log "   cd path/to/engram-alpha"
+  log "   git pull origin dev"
+  log "   bash tools/install-local-marketplace.sh --target codex"
+else
+  log " Marketplace registered. Next steps (in a Claude Code session):"
+  log "═══════════════════════════════════════════════════════════════════"
+  log ""
+  log "  1. /plugin install engram      # install from the local marketplace"
+  log "  2. /plugin enable  engram      # ENABLE — local marketplace plugins"
+  log "                                 #   ship DISABLED by default; this"
+  log "                                 #   step is REQUIRED to activate."
+  log "  3. Restart Claude Code so MCP picks up the now-enabled plugin."
+  log ""
+  log " (Empirically verified: 2026-05-31 Chromebook trial. The /plugin"
+  log "  install step alone leaves the plugin in disabled state — the"
+  log "  user must explicitly /plugin enable engram.)"
+  log ""
+  log " To upgrade later:"
+  log "   cd path/to/engram-alpha"
+  log "   git pull origin dev"
+  log "   bash tools/install-local-marketplace.sh"
+  log "   # then in Claude Code:"
+  log "   /plugin marketplace update"
+  log "   /plugin upgrade engram"
+fi

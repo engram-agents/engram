@@ -1,15 +1,15 @@
 ---
 name: engram-upgrade
-description: Use when upgrading an existing plugin-mode ENGRAM install to newer alpha code while preserving the graph, history, diary, and sessions. Walks through the source-tree pre-flight + change-set review + `install-local-marketplace.sh` rebuild + the user-run `/plugin marketplace update` + `/plugin upgrade engram` + MCP reconnect + the CLAUDE.md.template inverse-merge gate + verification + ENGRAM record. Each step is a verified checkpoint, not a context-impression. (Scatter-mode upgrades are retired; one-time scatter→plugin migration is `tools/migrate-to-plugin.sh`, not this skill.)
+description: Use when upgrading an existing plugin-mode ENGRAM install to newer alpha code while preserving the graph, history, diary, and sessions. Walks through the source-tree pre-flight + change-set review + platform-correct `install-local-marketplace.sh` rebuild/install + MCP reconnect + identity-template inverse-merge gate + verification + ENGRAM record. Each step is a verified checkpoint, not a context-impression. (Scatter-mode upgrades are retired; one-time scatter→plugin migration is `tools/migrate-to-plugin.sh`, not this skill.)
 ---
 
 # ENGRAM Upgrade (Plugin) — Step-by-Step
 
 Upgrading a plugin-mode ENGRAM install is mechanically simple but keeps one well-known failure mode: **trusting context-impression that a step is done** instead of verifying its completion checkpoint. This skill codifies each step + its verification so nothing is silently skipped.
 
-**The architecture that makes plugin upgrades simple:** your *data* (`~/.engram/knowledge.db`, history, diary, sessions) and your *identity surfaces* (`~/.claude/CLAUDE.md`, warm-briefing) are **never touched** by a plugin upgrade. The *code* (server, hooks, tools, skills, agents) lives in the plugin tree (`~/.engram/marketplace/plugins/engram/`), and the whole tree is replaced atomically by `/plugin upgrade`. That's why the scatter-era manual steps are gone: **hooks, skills, agents, and tools upgrade with the plugin automatically** (the `~/.engram/tools` and `~/.engram/hooks` symlinks point into the plugin tree, so references keep resolving).
+**The architecture that makes plugin upgrades simple:** your *data* (`~/.engram/knowledge.db`, history, diary, sessions) and your *identity surfaces* (`~/.claude/CLAUDE.md`, warm-briefing) are **never touched** by a plugin upgrade. The *code* (server, hooks, tools, skills, agents) lives in the plugin tree (`~/.engram/marketplace/plugins/engram/`) and the host plugin cache. Claude Code replaces the cache via `/plugin upgrade`; Codex refreshes it via `codex plugin add engram@engram-local`. That's why the scatter-era manual steps are gone: **hooks, skills, agents, and tools upgrade with the plugin automatically**. Helper paths are host-dependent: use the installed plugin tree/cache (e.g. `~/.codex/plugins/cache/.../tools/verify_quote.py` on Codex) rather than assuming legacy `~/.engram/tools` symlinks exist.
 
-**The one residual hard gate:** `~/.claude/CLAUDE.md` is user-scope identity — rendered from `templates/CLAUDE.md.template` at install time and *not* plugin-owned. If the template changed upstream, the live file needs an inverse-merge (Step 6). That's the load-bearing judgment step of this skill.
+**The one residual hard gate:** the host identity surface is user-scope identity and is *not* plugin-owned. On Claude this is usually `~/.claude/CLAUDE.md` rendered from `templates/CLAUDE.md.template`; on Codex it may be `~/.codex/config.toml` instructions plus project `AGENTS.md` from `templates/AGENTS.md.template`. If the relevant upstream template changed, the live surface needs an inverse-merge (Step 6). That's the load-bearing judgment step of this skill.
 
 **When to use:**
 - The install is plugin-mode (`~/.engram/marketplace/plugins/engram/plugin.json` exists) and the user wants newer alpha code without losing data
@@ -33,7 +33,7 @@ Both must exist. If `knowledge.db` exists but the plugin marker does NOT, this i
 
 Surface to the user:
 
-> You're on the plugin install with an existing graph at `~/.engram/`. I can rebuild the local marketplace from newer alpha code; you'll then run `/plugin marketplace update` + `/plugin upgrade engram` to pull it in. Your graph, history, diary, and sessions are untouched. Want me to proceed?
+> You're on the plugin install with an existing graph at `~/.engram/`. I can rebuild the local marketplace from newer alpha code and refresh the host plugin cache (Claude: via slash-command steps; Codex: via `codex plugin add`). Your graph, history, diary, and sessions are untouched. Want me to proceed?
 
 Wait for an affirmative before continuing — the upgrade changes the running server + hooks behavior.
 
@@ -95,39 +95,50 @@ git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/dev" -- templates/CLAUDE.m
 
 ## Step 3 — Rebuild + re-assemble the local marketplace (agent-run)
 
+First identify the host target. In Codex sessions, use `codex`; otherwise default to `claude-code`.
+
 ```bash
 SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)
 cd "$SOURCE_DIR"
-bash tools/install-local-marketplace.sh
+TARGET=claude-code   # or: TARGET=codex in Codex sessions
+bash tools/install-local-marketplace.sh --target "$TARGET"
 ```
 
-This single script is the whole agent-side upgrade: it **reads your `config.json`** (`multi_agent`, `install_tier`) and **builds the plugin with those flags** (via `tools/build-plugin.sh`), then re-assembles `~/.engram/marketplace/` from the fresh `build/plugin/`. Idempotent — safe to re-run.
+This single script is the whole agent-side upgrade: it **reads your `config.json`** (`multi_agent`, `install_tier`) and **builds the plugin with those flags** plus the explicit host target (via `tools/build-plugin.sh`), then re-assembles `~/.engram/marketplace/` from the fresh `build/plugin/`. For Codex, it also runs `codex plugin add engram@engram-local` when `codex` is on PATH. Idempotent — safe to re-run.
 
 **Watch the build log for the feature-set lines** — this is where a silent mis-build would happen:
 - The tier/multi-agent line must match your install (e.g. `Tier: dev …, multi-agent: yes`). A multi-agent install that builds single-agent **silently drops** baton/letters/forum surfaces (#704 class).
 - If your `install_tier` is null/unset, the build falls back to the manifest default (`convenience`) — a dev-tier install would silently lose its dev tools (#707). Set `install_tier` in `~/.engram/config.json` before building if it's unset.
 
-**Checkpoint**: script exited 0 + marketplace re-assembled + the logged tier/multi-agent flags match `~/.engram/config.json` + the `Version marker refreshed` line shows the new `alpha_sha` (the script maintains `~/.engram/.deployed-version` so Steps 2 and 7 stay anchored).
+**Checkpoint**: script exited 0 + marketplace re-assembled + the logged target/tier/multi-agent flags match the host and `~/.engram/config.json` + `platform.json` in the marketplace has the intended target + the `Version marker refreshed` line shows the new `alpha_sha` (the script maintains `~/.engram/.deployed-version` so Steps 2 and 7 stay anchored).
 
 ---
 
-## Step 4 — Pull the new plugin version (USER action)
+## Step 4 — Pull the new plugin version (host-specific)
 
-The agent cannot run slash-commands. Tell the user:
+**Claude Code:** the agent cannot run slash-commands. Tell the user:
 
 > Marketplace rebuilt at the new commit. In this Claude Code session please run:
 > `/plugin marketplace update` (refresh the local marketplace index)
 > `/plugin upgrade engram` (pull the new plugin version)
 
-**Checkpoint**: user confirms both commands ran (or explicitly defers — if deferred, the new code is NOT live; track it so it doesn't fall off).
+**Codex:** `tools/install-local-marketplace.sh --target codex` runs `codex plugin add engram@engram-local` itself when `codex` is on PATH. Verify the cache actually changed:
+
+```bash
+sha1sum ~/.engram/marketplace/plugins/engram/hooks/engram-stop-hook.py
+sha1sum ~/.codex/plugins/cache/engram-local/engram/0.1.0/hooks/engram-stop-hook.py
+cat ~/.codex/plugins/cache/engram-local/engram/0.1.0/platform.json
+```
+
+**Checkpoint**: Claude user confirms both slash commands ran, OR Codex cache/platform/hash verification shows the installed cache matches the marketplace. If deferred, the new code is NOT live; track it so it doesn't fall off.
 
 ---
 
 ## Step 5 — Reconnect MCP (USER action)
 
-The plugin tree now has the new `server.py`, but the running MCP server is still the old process. Tell the user:
+The plugin tree/cache now has the new `server.py`, but the running MCP server may still be an old process. Tell the user:
 
-> Please reconnect the engram MCP server: run `/mcp` and reconnect engram, or restart Claude Code. Hooks reload per-fire automatically — no restart needed for those.
+> Please reconnect the engram MCP server: Claude — run `/mcp` and reconnect engram, or restart Claude Code. Codex — restart/resume the Codex session if MCP or hooks are still using stale plugin state; approve refreshed hook definitions if prompted.
 
 **Do NOT** kill the MCP subprocess yourself — the stdio-MCP contract is user-restart only; killing it from an agent breaks the harness transport.
 
@@ -137,20 +148,23 @@ The plugin tree now has the new `server.py`, but the running MCP server is still
 
 ## Step 6 — CLAUDE.md template inverse-merge (HARD GATE, the residual)
 
-If Step 2 found `templates/CLAUDE.md.template` changed in the range, **do not skip this**. `~/.claude/CLAUDE.md` is user-scope identity — the plugin upgrade did not touch it, so template-side additions (new disciplines, corrected rules) have NOT reached the running agent.
+If Step 2 found the host identity template changed in the range, **do not skip this**. On Claude, check `templates/CLAUDE.md.template` against `~/.claude/CLAUDE.md`. On Codex, check `templates/AGENTS.md.template` and any local first-person instructions in `~/.codex/config.toml`/project `AGENTS.md`. The plugin upgrade did not touch these user-scope identity surfaces, so template-side additions may NOT have reached the running agent.
 
 **The "I'll come back to it" failure mode is real** (2026-05-16: a template discipline-change was deferred post-deploy, never merged, and misfired for days before diagnosis). Resolve it now or track it explicitly — never silent-defer.
 
 ```bash
 SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)
+# Claude:
 diff "$SOURCE_DIR"/templates/CLAUDE.md.template ~/.claude/CLAUDE.md
+# Codex (adapt live path to the install):
+diff "$SOURCE_DIR"/templates/AGENTS.md.template /path/to/live/AGENTS.md
 ```
 
 - Inverse-merge template-side additions that are identity- or discipline-forming into the live file; **preserve agent-local customizations** (the template is the floor, not the ceiling).
 - Mechanical change → just copy. Judgment-laden (new discipline, conflicts with local content) → surface the diff to the user and decide together.
 - Verify with grep-presence + a re-diff whose remaining hunks are each either (i) a local customization you're keeping or (ii) a template addition you deliberately declined.
 
-**What you do NOT need anymore (scatter-era steps, now plugin-owned):** no `settings.json` hook merge (the plugin's `hooks.json` registers hooks), no manual `cp` of skills/agents (they ship inside the plugin tree and updated in Step 4).
+**What you do NOT need anymore (scatter-era steps, now plugin-owned):** no manual hook merge (the plugin's `hooks.json` registers hooks), no manual `cp` of skills/agents (they ship inside the plugin tree/cache and updated in Step 4).
 
 **Checkpoint**: template changes inverse-merged + verified, OR explicitly deferred with the user's agreement AND tracked in the ask-user queue.
 
@@ -162,7 +176,7 @@ diff "$SOURCE_DIR"/templates/CLAUDE.md.template ~/.claude/CLAUDE.md
 cat ~/.engram/.deployed-version          # marker SHA = the commit you built (forensics anchor)
 ```
 
-Then through the **plugin MCP** (after Step 5's reconnect): call `engram_stats` and confirm it returns your real node count — this proves the new server is running against your untouched graph. If `engram_stats` errors or the node count is implausible, stop and investigate before declaring the upgrade done.
+Then through the **plugin MCP** (after Step 5's reconnect): call `engram_stats` and confirm it returns your real node count — this proves the new server is running against your untouched graph. On Codex, also verify installed-cache files match the marketplace if hooks are the upgrade target. If `engram_stats` errors or the node count is implausible, stop and investigate before declaring the upgrade done.
 
 **Checkpoint**: marker SHA matches the intended commit + `engram_stats` returns the expected graph through the new server.
 
@@ -172,25 +186,28 @@ Then through the **plugin MCP** (after Step 5's reconnect): call `engram_stats` 
 
 ```python
 engram_add_observation(payload_json=json.dumps({
-    "claim": "ENGRAM plugin upgrade <YYYY-MM-DD HH:MM TZ>: marketplace rebuilt at <commit SHA> (<branch>), /plugin upgrade run, MCP reconnected: <done|deferred>. CLAUDE.md template gate: <merged paths | 'no template changes' | 'deferred+tracked'>. engram_stats verified: <N> nodes.",
-    "url": "file:///home/<user>/.engram/.deployed-version",
+    "claim": "ENGRAM plugin upgrade <YYYY-MM-DD HH:MM TZ>: <host target> marketplace/cache rebuilt at <commit SHA> (<branch>), host plugin refresh: <done|deferred>. MCP reconnected: <done|deferred>. Identity-template gate: <merged paths | 'no template changes' | 'deferred+tracked'>. engram_stats verified: <N> nodes.",
+    "interpretation": "Why the quoted evidence proves the upgrade state.",
+    "url": "file:///path/to/committed-or-transcript-evidence",
     "title": "ENGRAM plugin upgrade <YYYY-MM-DD> — <commit SHA>",
-    "quoted_text": "<paste the contents of .deployed-version>",
+    "quoted_text": "<exact verified quote from committed evidence or session transcript>",
     "quote_type": "hard_data",
     "source_class": "introspective",
     "source_date": "<YYYY-MM-DD>",
 }))
 ```
 
-**Checkpoint**: obs filed; its SHA matches Step 7's marker.
+Do **not** cite `file://~/.engram/.deployed-version` directly unless it is committed/tracked evidence. ENGRAM's provenance guard may reject untracked files; use a verified transcript/log quote instead.
+
+**Checkpoint**: obs filed; its SHA/target/cache claim matches Step 7's verified evidence.
 
 ---
 
 ## Anti-patterns
 
 - **Context-impression that a step is done.** Every step has a checkpoint command — verify explicitly, not from "I think I did that." This is the failure mode the skill exists to close.
-- **Running the upgrade slash-commands yourself.** `/plugin …` and `/mcp` are user actions; the agent's job is the rebuild (Step 3) and the gates.
-- **Skipping Step 6 because the template diff "looked fine."** The CLAUDE.md inverse-merge is the one place a plugin upgrade still needs judgment. If deferring, write it to the ask-user queue immediately.
+- **Running Claude slash-commands yourself.** `/plugin …` and `/mcp` are Claude user actions. Codex is different: `codex plugin add engram@engram-local` is an ordinary CLI command and can be run by the agent.
+- **Skipping Step 6 because the template diff "looked fine."** The identity-surface inverse-merge is the one place a plugin upgrade still needs judgment. If deferring, write it to the ask-user queue immediately.
 - **Building without checking the feature-set flags.** A wrong-flag build *succeeds* and silently drops surfaces (#704/#707 class). The Step 3 checkpoint exists for this.
 - **Re-bootstrapping (`FORCE=1`) to "refresh" anything.** `FORCE=1` only bypasses the existing-install guard — bootstrap then writes seed nodes INTO the existing graph (it deletes nothing). Never the upgrade path; a true fresh start is a manual `knowledge.db` delete.
 - **Killing the MCP subprocess to "restart" it.** User-restart only.
