@@ -519,10 +519,6 @@
       "tier": "convenience"
     },
     {
-      "path": "templates/engram-viz.service",
-      "tier": "convenience"
-    },
-    {
       "path": "templates/CLAUDE.md.multi-agent.template",
       "tier": "convenience",
       "multi_agent": true

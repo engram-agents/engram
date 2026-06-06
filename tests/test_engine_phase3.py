@@ -679,6 +679,42 @@ class TestIdentityAxis:
             "tools/ surface"
         )
 
+    def test_planted_leak_in_service_file_detected(self, tmp_path):
+        """A .service file containing an identity literal is caught by scan_for_leaks.
+
+        Regression test for the SCAN_EXTENSIONS gap closed in PR #896 / issue #814:
+        build.py originally lacked '.service' in SCAN_EXTENSIONS, so a systemd
+        service template with a hardcoded builder identity (e.g. User=agent-borges)
+        was invisible to the foreign-bundle leak-scan.  Adding '.service' closed
+        that class.  This test pins the fix: a planted .service leak must be detected.
+        """
+        from tools.engine.build import scan_for_leaks, FOREIGN_LEAK_PATTERNS
+
+        bundle_dir = str(tmp_path / "service_planted")
+        os.makedirs(bundle_dir)
+
+        # Plant the leak in a .service file using the same sentinel as the
+        # other planted-leak tests.  Concatenation keeps this source file
+        # itself clean (same discipline as FOREIGN_LEAK_PATTERNS above).
+        leak_content = (
+            "[Service]\n"
+            "User=" + "agent-borges" + "\n"
+            "WorkingDirectory=/home/" + "agent-borges" + "/.engram\n"
+            "ExecStart=/home/" + "agent-borges" + "/.engram/venv/bin/python3 viz_server.py\n"
+        )
+        with open(os.path.join(bundle_dir, "engram-viz.service"), "w") as f:
+            f.write(leak_content)
+
+        leaks = scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS)
+        assert leaks, (
+            "scan_for_leaks did not detect the planted identity leak in "
+            "engram-viz.service — '.service' may be missing from SCAN_EXTENSIONS"
+        )
+        hit_files = {rel for rel, _lineno, _snippet in leaks}
+        assert any("engram-viz.service" in f for f in hit_files), (
+            f"Leak hit not in engram-viz.service; hit_files={hit_files}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # D. claude-code output property gates

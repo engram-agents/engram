@@ -38,7 +38,7 @@ LEAK_PATTERNS = [
     (re.compile(r"/home/user/"), "hardcoded user home"),
 ]
 
-SCAN_EXTENSIONS = {".py", ".md", ".sh", ".json", ".template"}
+SCAN_EXTENSIONS = {".py", ".md", ".sh", ".json", ".template", ".service"}
 SKIP_FILES = {"LICENSE", "scan-leaks.py"}  # scanner self-matches on its own regex literals
 SKIP_DIRS = {".git", "__pycache__", "node_modules"}
 

@@ -100,7 +100,7 @@ FOREIGN_LEAK_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\b" + _AB + r"\b"),
 ]
 
-SCAN_EXTENSIONS = {".py", ".md", ".sh", ".json", ".template"}
+SCAN_EXTENSIONS = {".py", ".md", ".sh", ".json", ".template", ".service"}
 SKIP_DIRS = {".git", "__pycache__", "node_modules"}
 # scan-leaks.py self-matches on its own pattern literals; skip it in the scanner
 SKIP_FILES = {"scan-leaks.py"}
