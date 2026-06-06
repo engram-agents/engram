@@ -298,8 +298,6 @@ maintainer.
 
 ### Known gaps (tracked separately)
 
-- `baton reopen` verb missing — a `status: merged` baton with open work can't
-  return to `in-progress` without manual frontmatter edit.
 - Baton CLI doesn't auto-sync the Issues-list section with Project items —
   drift possible; rely on the Project's item-list as ground truth, the baton's
   Issues section as the human-readable summary.

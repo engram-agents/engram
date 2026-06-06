@@ -1,6 +1,7 @@
 ---
 name: engram-deep-research
-description: Depth-first research on a single big question. Unlike engram-curiosity (breadth-first, 2-4 threads), this focuses on one question and reasons deeply around it, registering intermediate questions and conjectures as waypoints. Designed for cross-compaction loop research where unregistered thoughts are permanently lost. Does NOT advance the turn counter (uses nap-mode checkpoint).
+description: Depth-first research on a single big question. Unlike engram-curiosity (breadth-first, 2-4 threads), this focuses on one question and reasons deeply around it, registering intermediate questions and conjectures as waypoints. Designed for cross-compaction loop research where unregistered thoughts are permanently lost. Uses engram_nap() as its session checkpoint.
+user_invocable: true
 ---
 
 > **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). As you get familiar with this skill, consider cleaning them up: replace each citation with a generalized concept-word, or remove if it isn't load-bearing. The skill is yours now.
@@ -107,8 +108,8 @@ engram_nap(
 )
 ```
 
-### Update warm briefing loop state
-If running as a cross-compaction loop, update the `### Autonomous Loop State` section of `~/.engram/warm-briefing.md` with:
+### Update loop-mode.json marker state
+If running as a cross-compaction loop, rewrite the marker's `state` field (per **engram-loop** Step 2.3) with:
 - Current research question
 - Sub-questions registered (IDs)
 - Conjectures registered (IDs)

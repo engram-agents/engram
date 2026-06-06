@@ -100,7 +100,7 @@ Reason: [why this mode over others]
 
 Run one iteration in the chosen modality. Follow the relevant specialized skill's per-iteration guidance:
 - Research → engram-curiosity-loop steps 1-3
-- Build → engram-build steps 2-3
+- Build → spec the work and record design reasoning to ENGRAM citing committed files; implement on a branch; validate by running tests and smoke-testing the changed behavior; record what was built as an observation
 - Consolidation → see "Mandatory Consolidation" section below
 - Experimentation → design test, run it, record results
 - Dialogue-prep → frame questions with context and options for the user

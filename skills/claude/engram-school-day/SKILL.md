@@ -44,7 +44,7 @@ This is the Phase 1 hypothesis. Phase 2 tunes it based on accumulated data.
 
 ## Staleness check (every wake-up)
 
-See `engram-loop` SKILL.md Step 3 — Loop END / Stale-loop detection. That's the SSoT for the on-every-wake check (`cat ~/.engram/loop-mode.json`, absent → stale re-fire → stop, present → live).
+See `engram-loop` SKILL.md Step 0 — On entry / stale-loop detection. That's the SSoT for the on-every-wake check (`cat ~/.engram/loop-mode.json`, absent → stale re-fire → stop, present → live).
 
 **School-day's additional check** on top of the generic one: after confirming the marker is present, also verify it names this skill:
 
@@ -52,7 +52,7 @@ See `engram-loop` SKILL.md Step 3 — Loop END / Stale-loop detection. That's th
 cat ~/.engram/loop-mode.json | grep '"skill":"school-day"' && echo "OK live school-day" || echo "Wrong-loop marker — stop"
 ```
 
-- Generic stale-check (engram-loop Step 3): file absent → "Stale loop detected — loop-mode.json absent, skipping" → stop
+- Generic stale-check (engram-loop Step 0): file absent → "Stale loop detected — loop-mode.json absent, skipping" → stop
 - School-day extra: file present but `"skill"` is not `"school-day"` → "Wrong loop marker present — expected school-day, found X — stop and report"
 
 Both checks must pass before proceeding to the iteration body.
@@ -66,10 +66,10 @@ Both checks must pass before proceeding to the iteration body.
 This is engram-loop's Step 1 marker write (see engram-loop SKILL.md). School-day extends the generic schema with skill-identification + per-iteration state:
 
 ```bash
-echo '{"activated":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","kind":"research","task":"school-day Phase 1 curriculum (7-iteration cycles, baseline data collection)","pacer":"scheduleWakeup","skill":"school-day","cycle":1,"iteration":1}' > ~/.engram/loop-mode.json
+echo '{"activated":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","kind":"research","topic":"school-day Phase 1 curriculum","instructions":"7-iteration fixed rotation (aspiration, research ×3, consolidation, audit, debrief); baseline data collection","state":"Cycle 1, Iteration 1 — starting","cadence_seconds":270,"pacer":"scheduleWakeup","skill":"school-day","cycle":1,"iteration":1}' > ~/.engram/loop-mode.json
 ```
 
-The base fields (`activated`, `kind`, `task`, `pacer`) match engram-loop's Step 1 contract; `skill`, `cycle`, `iteration` are school-day extras that the Step 3 stale-check (above) keys off of.
+The base fields (`activated`, `kind`, `topic`, `instructions`, `state`, `cadence_seconds`, `pacer`) match engram-loop's Step 1 contract; `skill`, `cycle`, `iteration` are school-day extras that the Step 0 stale-check (above) keys off of.
 
 ### 2. Record session start health
 

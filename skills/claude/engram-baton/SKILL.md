@@ -113,6 +113,7 @@ Three genres of inter-agent communication, only one of which baton-grab replaces
 | List your in-court batons | `baton mine` |
 | List all active projects | `baton status` |
 | Archive a project | `baton close <id> --status merged|cancelled` |
+| Reopen a closed/merged baton | `baton reopen <id> [--status in-progress|in-review|planning]` |
 
 Pass `--help` to any subcommand for the full flag list.
 

@@ -35,6 +35,9 @@ Any operation against the inter-agent letter system:
 | `ia write --to <agent> [--re <fn>] [--title <text>] [--from-stdin]` | Open `$EDITOR` (or take stdin) with validated frontmatter template; atomic write with mode `644` |
 | `ia mark-read <filename \| --all \| --up-to <ts>>` | Advance cursor without displaying |
 | `ia cursor [--show \| --set <ts>] [--advanced --type read/surfaced] [--force]` | Inspect or override cursor; `--advanced` gates the surfaced-cursor access; `--force` overrides monotonic |
+| `ia star <filename> [--note TEXT]` | Mark a letter as key cross-session context; surfaced at session-start and post-compaction |
+| `ia unstar <filename>` | Remove a letter from the starred list |
+| `ia starred [--format human\|json]` | Show all starred letters with sender, title, filename, and note |
 
 Pass `--help` to any subcommand for full flag listing.
 

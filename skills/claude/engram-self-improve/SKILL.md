@@ -17,7 +17,7 @@ A self-improvement session starts from **lived experience**, not from a decision
 
 **When NOT to use:**
 - Speculative improvements without experienced friction (that's feature design, not self-improvement)
-- Code reading for understanding (use engram-code-survey)
+- Code reading for understanding (read the relevant code directly, or dispatch a read-only survey sub-agent)
 - Fixing a bug the user reported (that's a bug fix, not self-improvement)
 - When context budget is high (self-improvement touches multiple phases and burns context)
 
@@ -212,12 +212,12 @@ engram_nap(payload_json=json.dumps({"message": "<summary: gap addressed, change 
 
 ## Why self-improvement uses nap-mode checkpoints
 
-Same rationale as code surveys and curiosity sessions: self-improvement produces changes that haven't been consolidated yet. Advancing the turn would start decaying the new observations before they've been connected to the broader graph. The proper sequence: improve → consolidate in a sleep cycle → turn advance.
+Same rationale as deep-reading and curiosity sessions: self-improvement produces changes that haven't been consolidated yet. Advancing the turn would start decaying the new observations before they've been connected to the broader graph. The proper sequence: improve → consolidate in a sleep cycle → turn advance.
 
 ## Relation to other skills
 
-- **engram-code-survey** — Produces the knowledge that feeds Phase 2. Survey reads; self-improve writes. The survey's invariant catalog and theory derivations are the pre-checks for Phase 3.
-- **engram-build** — General feature building. Self-improve is specifically for gap-driven changes to ENGRAM's own infrastructure, with principle compliance checks that don't apply to general feature work.
+- **Code reading (Phase 2 input)** — Produces the knowledge that feeds Phase 2. Read the relevant source files directly, or dispatch a read-only survey sub-agent to catalog invariants and derive theories that become the pre-checks for Phase 3. Self-improve writes; the survey phase reads.
+- **General feature building** — Self-improve is specifically for gap-driven changes to ENGRAM's own infrastructure, with principle compliance checks (Phase 3) that don't apply to general feature work. General feature work follows the same implementation pattern (spec, branch, implement, validate, record) without the self-improvement principle compliance layer.
 - **engram-sleep** — Consolidation. Handles the stale/tainted nodes that self-improvement's supersede-on-discovery creates. Self-improve creates the mess; sleep cleans it up.
 - **engram-curiosity** — Outward-facing research. Self-improve is inward-facing — improving the system's own infrastructure based on experienced friction.
 

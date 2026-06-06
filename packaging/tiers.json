@@ -417,7 +417,7 @@
     },
     {
       "path": "skills/claude/engram-loop-diagnose",
-      "tier": "convenience"
+      "tier": "dev"
     },
     {
       "path": "skills/claude/engram-letter",

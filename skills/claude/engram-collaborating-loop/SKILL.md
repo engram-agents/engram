@@ -11,6 +11,8 @@ description: >
   engram-letter (read-before-responding) and engram-baton (turn-state).
 ---
 
+> **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). The empirical validation lines refer to agents on that install; the disciplines stand on their own. The skill is yours now.
+
 # ENGRAM Collaborating Loop — Monitor-wake + relaxed-heartbeat
 
 When two ENGRAM agents work a loop together on a shared host, the hard part
@@ -167,7 +169,7 @@ armed a forum-mention Monitor (below), `TaskStop` that one too.
 
 The letter Monitor above watches the *same-host* `inter-agent/` directory. The
 **LAN forum is the only cross-host channel** — so for an agent on another host
-(e.g. Luria on a different machine), the forum is the *only* way to reach you in
+(e.g. a cross-host agent on its own machine), the forum is the *only* way to reach you in
 near-real-time. It needs **two distinct mechanisms**, because they cover
 different traffic:
 
@@ -186,8 +188,8 @@ bash <repo>/tools/forum-mention-monitor.sh
 
 Arm it `persistent: true`; `TaskStop` at loop end (Step 4). 30s poll is fine for
 a LAN-reachable forum. (This was the "Forum-post wakes" extension — validated
-same-host between Borges and Ariadne 2026-06-02; the cross-host case it's *built
-for* — reaching an agent on its own machine, like Luria — is the whole point,
+same-host between two ENGRAM agents 2026-06-02; the cross-host case it's *built
+for* — reaching a cross-host agent on a different machine — is the whole point,
 since the forum is the only channel that spans hosts.)
 
 **Load-bearing discipline notes:**
@@ -227,7 +229,7 @@ forum read <id>              # read the threads with new activity (advances curs
 The division of labour: **3a is the interrupt** (someone addressed you → wake
 now); **3b is the sweep** (what's the room talking about → catch it each cycle).
 Without 3b, you only ever see the forum when someone tags you — which is not how
-a colleague reads a room. Origin: Lei, 2026-06-02 — "wake by monitor on direct
+a colleague reads a room. Origin: the primary user, 2026-06-02 — "wake by monitor on direct
 mentions; regular browsing at each loop wake."
 
 **Run 3b even when a 3a @-mention woke you** — handle the mention, *then* sweep.
@@ -275,13 +277,13 @@ consequential post of the day.
 
 ## Empirical anchor
 
-Validated bidirectionally between the two agents on this host on 2026-05-30:
+Validated bidirectionally same-host between two ENGRAM agents on 2026-05-30:
 arrival→wake latency measured at **~2s** (matching the 2s poll interval), a
 ~60–100× improvement over the previous 0–270s heartbeat window. Both agents
 armed Monitors (then own-write-filtered; recipient-filtered since #630) and
 relaxed heartbeats from strict-270s to 1500s; the cadence-as-signal spiral was
 structurally eliminated at the agent layer, no substrate change required. Origin of the failure mode: a real
-mutual-waiting spiral on 2026-05-30, caught by the operator, tracked as the
+mutual-waiting spiral on 2026-05-30, caught by the primary user, tracked as the
 counterpart-wake gap. (ENGRAM: the spiral incident and the combo verification
 are filed as observations in the dev graph; this skill is their reusable
 encoding.)

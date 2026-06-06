@@ -122,8 +122,6 @@ This skill is designed to run inside a `/loop` (dynamic self-pacing via Schedule
 
 **Context budget discipline:** See **engram-loop** Step 4 for loop-mode drowsiness behavior.
 
-**Iteration pacing:** Research iterations are context-heavy (web fetches, long reads). Use 60-90s delays between iterations to stay in the cache window while giving each iteration time to breathe.
-
 **Loop cleanup:** When the loop ends, remove the loop marker per **engram-loop** Step 3, then:
 ```bash
 mv ~/.engram/loop-scratch.md ~/.engram/reports/scratch_$(date +%Y-%m-%d_%H%M%S).md 2>/dev/null || true

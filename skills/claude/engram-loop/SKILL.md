@@ -17,7 +17,7 @@ A "loop" is any self-paced sequence of work bursts the agent paces itself
 through (via `ScheduleWakeup`), rather than turn-by-turn with the user. The
 load-bearing convention is a single marker file: **`~/.engram/loop-mode.json`**.
 
-Its presence is the ONLY thing the drowsiness hook (`context_tracker.py`)
+Its presence is the ONLY thing the drowsiness module (invoked via the surface hook)
 checks to switch from the normal nap-nudge to the loop-aware banner
 ("nap once to stage the window, then keep working and ride auto-compaction —
 don't slow down for a manual compaction"). No marker → the hook serves the

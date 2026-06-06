@@ -1,6 +1,6 @@
 ---
 name: engram-research-report
-description: Generate a professional research report from ENGRAM knowledge with full provenance citations. Every claim traces to its source — the visible proof that this isn't vanilla LLM output.
+description: "Generate a professional research report from ENGRAM knowledge with full provenance citations. Every claim traces to its source — the visible proof that this isn't vanilla LLM output. Invoke when the user says 'write a report', 'summarize what we know about X', or 'prepare a briefing'."
 user_invocable: true
 ---
 
@@ -29,8 +29,8 @@ Parse the user's request for:
 - **Existing nodes**: Query ENGRAM for relevant observations, derivations, and evidence
 
 ```
-engram_query("<topic keywords>", top_k=20)
-engram_surface("<topic>")
+engram_query(payload_json=json.dumps({"query": "<topic keywords>", "top_k": 20}))
+engram_surface(payload_json=json.dumps({"query": "<topic>"}))
 ```
 
 Collect all relevant node IDs. For each derivation, also inspect its premises to build the full provenance chain.

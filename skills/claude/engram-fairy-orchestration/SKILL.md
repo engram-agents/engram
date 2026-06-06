@@ -9,13 +9,13 @@ description: Use when dispatching one or more fairies (sub-agents via the Agent 
 
 Use this skill when about to dispatch sub-agents (fairies) for focused work. CLAUDE.md tells you when to delegate; this skill tells you how to do it well, and how to scale to cohorts of 3+ stacked/parallel PRs without losing track.
 
-The empirical record this skill rests on: ob_1755 (fairy contractor principle), ob_1970 (worktree-lifecycle pain points + 39 hanging worktrees incident), ls_0047 (always-delegate-PR-coding), ob_1978 (8-PR cohort 2026-05-21 manager-of-fairies validation), ls_0030 (sub-agent .md disciplines).
+The empirical record this skill rests on is catalogued in §7 (References).
 
 ---
 
 ## §1 — Briefing pattern (every dispatch)
 
-Per ob_1755 — fairies are contractors, not colleagues. The spec is the contract. A fairy has no access to your mind, conversation history, ENGRAM, or accumulated context. Anything load-bearing must be in the spec.
+Fairies are contractors, not colleagues. The spec is the contract. A fairy has no access to your mind, conversation history, ENGRAM, or accumulated context. Anything load-bearing must be in the spec.
 
 - **Pre-spec coordination check** (BEFORE drafting the spec). If the spec names an issue number, verify no open PR already addresses it. Two checks, both cheap (substitute the actual issue / PR number for `NN` in each):
     - `gh pr list --search 'in:title "#NN"' --state open` — catches a counterpart's open PR with the issue number in its title.
@@ -26,7 +26,7 @@ Per ob_1755 — fairies are contractors, not colleagues. The spec is the contrac
 - **Hard scope bounds.** Explicit "DO NOT modify X" for adjacent surfaces. Anti-patterns enumerated. Stop conditions named.
 - **Escape valve.** Always include some form of: *"if you hit anything that doesn't match the template, STOP and report back."* Silent improvisation is the failure mode.
 - **Always run in background** (`run_in_background: true`). Never wait synchronously. Completion notifications arrive automatically and re-invoke you.
-- **No agent-continuation — every round is a FRESH dispatch.** The Agent-tool description nudges toward `SendMessage` to "continue a previously spawned agent with its context intact" — **that path is NOT enabled in our setup.** The new sub-agent settings were scoped and found unsuitable for our fairies; we stayed on traditional dispatch *without* SendMessage (ob_1972, dv_0694). A completed fairy cannot be resumed. For a round-2 fix, dispatch a NEW fairy and hand off via the **branch + worktree** (point it at the existing branch, have it commit on top) — never via agent-continuation. Don't burn a `ToolSearch` rediscovering this each time.
+- **No agent-continuation — every round is a FRESH dispatch.** The Agent-tool description nudges toward `SendMessage` to "continue a previously spawned agent with its context intact" — **that path is NOT enabled in our setup.** The new sub-agent settings were scoped and found unsuitable for our fairies; we stayed on traditional dispatch *without* SendMessage (see §7). A completed fairy cannot be resumed. For a round-2 fix, dispatch a NEW fairy and hand off via the **branch + worktree** (point it at the existing branch, have it commit on top) — never via agent-continuation. Don't burn a `ToolSearch` rediscovering this each time.
 - **Suggest branch name.** Spec should name the branch. Anticipate collisions — if your suggested name might exist remote, note that the fairy can use a `-v2` fallback.
 - **Output contract.** Reference the fairy's `# Output contract` section. Demand verification (test results, syntax check, `git diff --stat` scope check) + ambiguous-decision log. Without verification claims, the report can't be trusted.
 - **Post-creation handoff** (AFTER `gh pr create` returns the PR number — the **dispatching agent** runs this, not the fairy; fairies don't have shared-projects access). Open a baton for the PR — this is the channel by which the counterpart and the user see your PR is in flight; skipping it means the auto-pull hook can't surface the work.
@@ -66,7 +66,7 @@ When PR-B consumes PR-A's API, branch PR-B off PR-A's tip (not `dev`). Rebase af
 
 ### Spec quality is the lever
 
-ls_0047 (always-delegate) + bottleneck-first + spec-vs-impl-separability compose into the structural finding: **concurrent throughput unlocks by spec quality, not by code-writing speed.** The bottleneck shifts from coding to specifying. Optimize there.
+The always-delegate rule + bottleneck-first + spec-vs-impl-separability compose into the structural finding: **concurrent throughput unlocks by spec quality, not by code-writing speed.** The bottleneck shifts from coding to specifying. Optimize there.
 
 ---
 
@@ -100,7 +100,7 @@ git branch -f <expected-branch> <fairy-commit-sha>
 
 - **Nested worktrees**: when a fairy is dispatched to fix issues on a branch already checked out by a previous fairy's worktree, the new fairy's worktree nests inside the previous one (e.g., `.claude/worktrees/agent-AAA/.claude/worktrees/agent-BBB`). Functionally OK but hard to clean. Best avoided by cleaning round-N's worktree before round-N+1 dispatches.
 - **Branch-name suggestion collisions**: spec's suggested name collides with existing remote branch from unrelated prior work. Fairy creates `-v2`. Anticipate in spec template.
-- **Weekly bulk-prune**: worktrees on merged or origin-absent branches. Without periodic pruning, hanging worktrees accumulate (39+ in one incident, ob_1970).
+- **Weekly bulk-prune**: worktrees on merged or origin-absent branches. Without periodic pruning, hanging worktrees accumulate (39+ in one incident — see §7).
 
 ### Recovery procedures (when things go wrong)
 
@@ -154,4 +154,5 @@ You do NOT need to load this skill for:
 - **ls_0047** — PR-coding-always-fairy rule (no size exception)
 - **ob_1978** — Manager-of-fairies validation cohort (8 PRs in 3.5h, three-layer task tracking, failure modes catalog)
 - **ls_0030** — Sub-agent .md disciplines (NOT-parent disclaimer + tools whitelist + frontmatter strictness)
+- **Agent-continuation scoping (2026-05-21)** — SendMessage continuation was scoped and found unsuitable for fairy dispatch; fresh-dispatch via branch+worktree is the validated hand-off path. (Anchored in the developer graph; your own dispatch experience replaces these anchors over time.)
 - **engram-coder-fairy.md** § Character — what we value in a fairy (make the call locally, surface transparently, stay in scope, validate not gesture, escape valve over silent improvisation)
