@@ -2,8 +2,8 @@
 name: engram-collaborating-loop
 description: >
   Multi-agent coordination loop: pair a real-time Monitor wake (counterpart's
-  letter/baton arrives → your loop wakes in ~2s) with a relaxed ScheduleWakeup
-  heartbeat fallback. Use when two ENGRAM agents on a shared host are working a
+  letter/baton arrives → your loop wakes in ~2s) with a per-state ScheduleWakeup
+  heartbeat fallback (270s self-wake; fairy-wait may relax). Use when two ENGRAM agents on a shared host are working a
   loop together and need low-latency hand-offs WITHOUT the cadence-as-signal
   mutual-waiting spiral. This is a KIND of engram-loop — it inherits all loop
   formality (the loop-mode.json marker lifecycle, drowsiness behavior) from
@@ -13,7 +13,7 @@ description: >
 
 > **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). The empirical validation lines refer to agents on that install; the disciplines stand on their own. The skill is yours now.
 
-# ENGRAM Collaborating Loop — Monitor-wake + relaxed-heartbeat
+# ENGRAM Collaborating Loop — Monitor-wake + per-state heartbeat
 
 When two ENGRAM agents work a loop together on a shared host, the hard part
 isn't the work — it's the hand-off latency. A letter from your counterpart
@@ -66,13 +66,35 @@ Arm a **persistent `Monitor`** that polls the shared inter-agent directory for
 new letters **addressed to you**, and emits one event per arrival. Each
 event wakes your loop in ~2s — independent of your `ScheduleWakeup` deadline.
 
-### Mechanism 2 — the relaxed `ScheduleWakeup` heartbeat (guaranteed, high-latency)
+### Mechanism 2 — the `ScheduleWakeup` heartbeat (guaranteed liveness, cadence is per-state)
 
-Because the Monitor now delivers real-time wake on actual arrivals, the
-heartbeat is no longer your coordination channel — it's a **safety net**. Relax
-it (e.g. ~1500s instead of strict 270s). This is the move that kills the
-spiral: with the Monitor handling responsiveness, a long heartbeat no longer
-broadcasts "I paused," so there's nothing for the counterpart to mirror.
+The heartbeat is your **liveness guarantee** — the periodic re-check that catches
+a dead Monitor and ensures you wake even when nothing else fires. Its cadence is
+a **per-state decision**, not a standing license to relax:
+
+> **Self-sufficient-wake invariant: never leave yourself in a state where only
+> others can wake you.** A Monitor event still requires the counterpart to act
+> first, and the Monitor can die silently. If both agents simultaneously rely on
+> the other side to produce the event that wakes them, the result is a deadlock —
+> each waits for the other, indefinitely. The heartbeat is what breaks this.
+
+**Cadence rules by state:**
+
+The only harness-guaranteed wake is the **task-notification** from a background agent (fairy) completing — the harness delivers it regardless of Monitor health or counterpart activity. Everything else (Monitor events, forum mentions, letters) is best-effort.
+
+| State | Primary wake available | Cadence |
+|---|---|---|
+| **Fairy running** (background agent via Agent tool) | Task-notification on completion (harness-guaranteed) | 600–1200s (10–20 min) |
+| **Monitor running, no fairy** (letter Monitor armed, no background agent) | Monitor events (can die silently) | 270s floor |
+| **Forum-only / no Monitor / no fairy** | Forum mention (not guaranteed) | 270s floor |
+
+Fairy-wait: when you have dispatched a background agent and it is still running, arm a long heartbeat. The task-notification wakes you when the fairy completes; the heartbeat is a genuine fallback, not the primary signal. Event-only (no fairy): arm 270s regardless of Monitor state — the Monitor is a reliability improvement, not a guarantee.
+
+The Monitor-backed combo (Mechanism 1 + Mechanism 2) kills the **cadence-as-signal
+spiral** — the Monitor makes responsiveness independent of heartbeat pace —
+but it does NOT eliminate the need for a tight heartbeat in non-fairy-wait states.
+The Monitor is the **latency channel**; the heartbeat is the **liveness guarantee**.
+Relaxation is a per-state call, not a blanket license.
 
 ### Why both — the load-bearing insight
 
@@ -85,29 +107,33 @@ Each mechanism covers the other's failure mode:
 
 Neither alone is enough: a Monitor alone has no backstop if it dies; a tight
 heartbeat alone is the spiral. Together they give low-latency hand-offs **and** a
-guaranteed floor — and the relaxed cadence stops broadcasting false-pause.
+guaranteed floor — and in fairy-wait states the harness re-invokes independently,
+making relaxation safe.
 
 ---
 
 ## Step 1 — Start the loop (inherit the formality)
 
 Follow `engram-loop` Step 0/1: decide START vs CONTINUATION and, on a fresh
-start, write `~/.engram/loop-mode.json` with your cadence. Set the relaxed
-heartbeat here:
+start, write `~/.engram/loop-mode.json` with your cadence. Write your starting cadence here:
 
 ```json
-{ "cadence_seconds": 1500, "pacer": "scheduleWakeup", "kind": "work", "...": "..." }
+{ "cadence_seconds": 270, "pacer": "scheduleWakeup", "kind": "work", "...": "..." }
 ```
 
-The marker is the loop's source of truth across compaction — see `engram-loop`.
-Do not duplicate its lifecycle logic; just record the relaxed cadence in it.
+(Fairy-wait states may relax `cadence_seconds` to 600–1200s (10–20 min) — see Mechanism 2.)
 
-> **On the relaxed cadence vs `engram-loop`'s 270s default:** `engram-loop`
-> says hold the tight default unless the operator explicitly says otherwise.
-> **Loading this skill IS that instruction.** The Monitor-backed coordination
-> pattern is exactly the case where the relaxed heartbeat is correct, because
-> responsiveness no longer rides on cadence — so a relaxed `cadence_seconds`
-> here is the deliberate exception, not a drift from the default.
+The marker is the loop's source of truth across compaction — see `engram-loop`.
+Do not duplicate its lifecycle logic; just record the current cadence in it, and
+update it when you transition between states.
+
+> **On cadence vs `engram-loop`'s 270s default:** `engram-loop` says hold the
+> tight default unless the operator explicitly says otherwise. **Loading this
+> skill IS that instruction for fairy-wait states only** — when the harness
+> provides a self-side re-invocation on sub-agent completion, relaxing to 600–1200s (10–20 min)
+> is safe. For all other states (counterpart-wait, idle, monitor-watching),
+> hold 270s even with a Monitor armed — the Monitor requires the counterpart
+> to act first, and that is not a self-sufficient wake. See Mechanism 2.
 
 ## Step 2 — Arm the letter Monitor (filter on recipient)
 
@@ -243,13 +269,19 @@ consequential post of the day.
 
 ## Discipline notes
 
-- **The heartbeat is the floor, not the channel.** Don't tighten it back to
-  270s "to be safe" — that re-introduces the cadence-as-signal pressure the
-  combo exists to remove. Trust the Monitor for responsiveness; let the
-  heartbeat be slow.
+- **The heartbeat is the liveness guarantee, not the channel.** The Monitor is
+  the latency channel (responsiveness); the heartbeat is the floor (liveness).
+  Relaxation is a **per-state decision**: fairy-wait states may use 600–1200s (10–20 min)
+  because the harness re-invokes on task-notification (harness-guaranteed wake); all other
+  states use 270s even with a Monitor armed — a Monitor event requires the
+  counterpart to act first, which is not a self-sufficient wake. Never leave
+  yourself in a state where only others can wake you: if both sides
+  simultaneously relax past 270s in a non-fairy-wait state, the result is
+  mutual-wait deadlock. Don't drop to 270s "to be safe" in fairy-wait; do
+  stay at 270s "to be safe" everywhere else.
 - **Silence from the Monitor means "no letters," which is fine** — but a Monitor
-  that *died* also looks like silence. That's exactly why the relaxed heartbeat
-  is non-negotiable: it's the periodic re-check that catches a dead Monitor.
+  that *died* also looks like silence. That's exactly why the self-heartbeat
+  is non-negotiable (whatever its per-state cadence): it's the periodic re-check that catches a dead Monitor.
   Don't drop the heartbeat just because the Monitor is doing the work.
 - **One Monitor per shared surface you coordinate on.** v1 watches
   `inter-agent/` (letters). If you also want baton-flip wakes, add a second
@@ -286,13 +318,16 @@ structurally eliminated at the agent layer, no substrate change required. Origin
 mutual-waiting spiral on 2026-05-30, caught by the primary user, tracked as the
 counterpart-wake gap. (ENGRAM: the spiral incident and the combo verification
 are filed as observations in the dev graph; this skill is their reusable
-encoding.)
+encoding.) The pacing rule was refined on 2026-06-06 after operating experience
+showed that blanket heartbeat relaxation re-introduces deadlock risk in non-fairy-wait
+states: cadence is now per-state (fairy-wait may relax; all other states hold 270s),
+enforcing the self-sufficient-wake invariant.
 
 ---
 
 ## Substrate anchor
 
-- **Pacer:** `ScheduleWakeup` (relaxed heartbeat) + `Monitor` tool (persistent,
+- **Pacer:** `ScheduleWakeup` (per-state heartbeat) + `Monitor` tool (persistent,
   real-time wake). Stop the Monitor with `TaskStop`.
 - **Loop formality (SSoT):** `engram-loop` — the `loop-mode.json` marker
   lifecycle + drowsiness behavior. This skill does not restate it.
