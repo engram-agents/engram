@@ -395,7 +395,7 @@ step2_install_plugin() {
     if [[ $DRY_RUN -eq 1 ]]; then
         dry "Would run: bash $REPO_ROOT/tools/build-plugin.sh ${build_flags[*]:-}"
         dry "Would run: bash $REPO_ROOT/tools/install-local-marketplace.sh --skip-build"
-        dry "Would create venv + pip install -r requirements.txt (if $ENGRAM_HOME/venv absent or fastmcp not importable)"
+        dry "Would create venv + pip install -r requirements.txt (if $ENGRAM_HOME/venv absent or fastmcp not importable); upgrade deps in-place if sqlite_vec absent"
         dry "Would write migration state 'post-step2' to $MIGRATION_STATE_FILE"
         dry "Would pause and wait for user /plugin install + --resume invocation."
         return
@@ -439,6 +439,16 @@ step2_install_plugin() {
         info "Venv created and dependencies installed."
     else
         info "Plugin venv already present with fastmcp importable — skipping venv create."
+        # Secondary upgrade check: venvs created before sqlite_vec was added to
+        # requirements.txt (#729 / PR #730) are missing sqlite_vec, causing
+        # semantic search to fall back to Python-cosine and backup dumps to crash
+        # on DBs with vec_nodes tables. If sqlite_vec is absent, upgrade in-place
+        # (pip install -r) without destroying existing venv state.
+        if ! "$_venv_python" -c "import sqlite_vec" &>/dev/null 2>&1; then
+            info "Existing venv is missing sqlite_vec — upgrading dependencies in-place..."
+            "$_venv_pip" install --quiet -r "$REPO_ROOT/requirements.txt"
+            info "Venv dependencies upgraded (sqlite_vec now present)."
+        fi
     fi
 
     write_migration_state "post-step2"

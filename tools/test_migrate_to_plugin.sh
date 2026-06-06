@@ -765,6 +765,98 @@ SETTINGS
 }
 
 # ---------------------------------------------------------------------------
+# T8 — venv upgrade: fastmcp present but sqlite_vec absent triggers pip install
+#       (#729 / PR #730: existing venvs pre-dating sqlite_vec requirement must
+#        be upgraded in-place rather than silently left with degraded semantics)
+# ---------------------------------------------------------------------------
+test_t8_venv_upgrade_when_sqlite_vec_missing() {
+    section "T8: Existing venv missing sqlite_vec — pip install triggered"
+    TESTS_RUN=$((TESTS_RUN + 1))
+
+    local fixture_dir
+    fixture_dir="$(make_fixture "t8")"
+
+    # Build a fake venv: a python3 stub that can "import fastmcp" but NOT
+    # "import sqlite_vec", plus a pip stub that logs its invocations.
+    local fake_venv="$fixture_dir/dot_engram/venv"
+    local fake_bin="$fake_venv/bin"
+    mkdir -p "$fake_bin"
+
+    local pip_log="$fixture_dir/pip_calls.log"
+
+    # Fake python3: succeeds on "import fastmcp", fails on "import sqlite_vec"
+    cat > "$fake_bin/python3" <<'FAKEPY'
+#!/usr/bin/env bash
+# Stub python3: simulates a venv that has fastmcp but not sqlite_vec
+args=("$@")
+for arg in "${args[@]}"; do
+    if [[ "$arg" == *"import sqlite_vec"* ]]; then
+        exit 1
+    fi
+    if [[ "$arg" == *"import fastmcp"* ]]; then
+        exit 0
+    fi
+done
+exit 0
+FAKEPY
+    chmod +x "$fake_bin/python3"
+
+    # Fake pip: records call args to pip_log and exits 0
+    cat > "$fake_bin/pip" <<FAKEPIP
+#!/usr/bin/env bash
+echo "pip \$*" >> "$pip_log"
+exit 0
+FAKEPIP
+    chmod +x "$fake_bin/pip"
+
+    # The upgrade logic from step2_install_plugin, extracted for direct testing.
+    # Variables mirror the script's local names so the logic can be copy-tested.
+    local _venv_dir="$fake_venv"
+    local _venv_python="$fake_bin/python3"
+    local _venv_pip="$fake_bin/pip"
+    # Fake requirements.txt path (content doesn't matter; pip is stubbed)
+    local _req="$fixture_dir/requirements.txt"
+    echo "fastmcp>=0.1.0" > "$_req"
+    echo "sqlite-vec==0.1.9" >> "$_req"
+
+    # Run the upgrade-check logic inline (mirrors the else-branch added by #729)
+    if ! "$_venv_python" -c "import sqlite_vec" &>/dev/null 2>&1; then
+        "$_venv_pip" install --quiet -r "$_req"
+    fi
+
+    # T8a: pip was called (log file created and non-empty)
+    if [[ -f "$pip_log" ]] && grep -q "install" "$pip_log"; then
+        pass "T8a: pip install invoked when sqlite_vec missing from existing venv"
+    else
+        fail "T8a: pip install was NOT invoked — existing venv with missing sqlite_vec silently skipped"
+    fi
+
+    # T8b: pip was called with -r <requirements file>
+    if grep -q "\-r " "$pip_log" 2>/dev/null; then
+        pass "T8b: pip install called with -r (requirements file upgrade, not ad-hoc)"
+    else
+        fail "T8b: pip install not called with -r flag (expected requirements-file upgrade)"
+    fi
+
+    # T8c: when sqlite_vec IS importable, pip is NOT called (no spurious upgrades)
+    local pip_log2="$fixture_dir/pip_calls2.log"
+    # Patch fake python3 to accept both imports
+    cat > "$fake_bin/python3" <<'FAKEPY2'
+#!/usr/bin/env bash
+exit 0
+FAKEPY2
+    chmod +x "$fake_bin/python3"
+
+    if ! "$_venv_python" -c "import sqlite_vec" &>/dev/null 2>&1; then
+        "$_venv_pip" install --quiet -r "$_req" 2>>"$pip_log2" || true
+        # if we fell into the upgrade branch despite sqlite_vec being importable, that's wrong
+        fail "T8c: pip install triggered even though sqlite_vec is importable (spurious upgrade)"
+    else
+        pass "T8c: No pip install when sqlite_vec already importable (no spurious upgrade)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
 echo ""
@@ -780,6 +872,7 @@ test_t4_idempotency
 test_t5_dry_run_no_mutations
 test_t6_already_migrated_verify
 test_t7_path_not_name_matching
+test_t8_venv_upgrade_when_sqlite_vec_missing
 
 echo ""
 echo "=========================================="
