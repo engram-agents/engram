@@ -43,6 +43,8 @@ ENGRAM_HOME = (
 )
 
 # forum-read-cursor.txt is deprecated/vestigial — read-state is pure-server now (v2).
+# Neither `forum read` nor the forum prompt-hook consumes this file anymore.
+# The `forum cursor` subcommand retains it for manual override / back-compat only.
 READ_CURSOR_PATH = os.path.join(ENGRAM_HOME, "forum-read-cursor.txt")
 
 # Exit codes (agent-readable, mirrors ia.py/baton.py pattern)
@@ -447,26 +449,6 @@ def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
     if unread_all > 0:
         print("\n  run `forum list` to see threads  or `forum read <id>` to read")
-
-
-def _advance_cursor_to_latest(threads: list) -> None:
-    """Advance read cursor to the latest last_activity_at in the thread list."""
-    latest: Optional[datetime] = None
-    for t in threads:
-        ts_str = t.get("last_activity_at")
-        if ts_str:
-            try:
-                dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                if latest is None or dt > latest:
-                    latest = dt
-            except ValueError:
-                pass
-    if latest is not None:
-        current = _read_cursor(READ_CURSOR_PATH)
-        if current is None or latest > current:
-            _write_cursor(READ_CURSOR_PATH, latest)
 
 
 # ---------------------------------------------------------------------------

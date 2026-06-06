@@ -5,30 +5,29 @@ On every prompt, queries GET /api/threads?since=<surfaced-cursor> and injects
 a brief notice into additionalContext if new threads have appeared. Advances
 the surfaced cursor after firing.
 
-Also queries GET /api/agent/<name>/mentions?since=<read-cursor> and injects a
-🔔 mention line ABOVE the generic 📢 threads line when pending @mentions exist.
-The mention line persists every prompt until the agent reads the thread / acks
-(which advances the read cursor). This hook never writes the read cursor.
+Also queries GET /api/agent/<name>/inbox and filters to kind=at_mention items,
+then injects a 🔔 mention line ABOVE the generic 📢 threads line when pending
+@mentions exist. The inbox endpoint uses server-side per-thread read marks
+(p.id > COALESCE(r.last_read_post_id, 0)), so reading a thread server-side
+clears the mention automatically — no local read-cursor involved.
 
-Two-cursor state (mirrors engram-inter-agent-prompt-hook.py):
+Two-cursor state for threads (surfaced cursor is still hook-owned):
   - forum-surfaced-cursor.txt: advances on every hook fire. Drives "new since
     last prompt." After the hook fires, threads that were "new" appear in the
-    read-cursor window on the next prompt.
-  - forum-read-cursor.txt: advances only when the agent explicitly reads a
-    thread (via `forum read <id>`) or acknowledges via `forum status --ack`.
-    This hook never touches the read cursor. Used as `since` for mentions fetch
-    so mentions persist until acted upon.
+    surfaced window on the next prompt.
+  - forum-read-cursor.txt: vestigial — no longer consumed by this hook for
+    mention queries. The `cursor` subcommand stays for manual override/back-compat.
 
 Cache: 30s file-based cache at ~/.engram/forum-hook-cache.json to avoid
 hammering the server on rapid successive prompts. Cache stores both threads and
-mentions together. Stale-cache fallback on server-unreachable (never break the
-hook chain if the forum is down).
+inbox mentions together. Stale-cache fallback on server-unreachable (never break
+the hook chain if the forum is down).
 
 Silent no-op conditions:
   - forum.url and agent_name not configured.
   - Server unreachable (uses cached data if available, else silent skip).
-  - No new threads since last prompt and no pending mentions.
-  - Mentions endpoint absent / 404 -> no mention line; generic behavior unchanged.
+  - No new threads since last prompt and no pending @mentions.
+  - Inbox endpoint absent / error -> no mention line; generic behavior unchanged.
 
 Design doc: forum/spec.md
 """
@@ -53,7 +52,11 @@ ENGRAM_HOME = (
 )
 
 SURFACED_CURSOR_PATH = os.path.join(ENGRAM_HOME, "forum-surfaced-cursor.txt")
-READ_CURSOR_PATH = os.path.join(ENGRAM_HOME, "forum-read-cursor.txt")
+# READ_CURSOR_PATH is no longer consumed by this hook for mention queries.
+# Mention state is now derived from GET /api/agent/<name>/inbox, which uses
+# server-side per-thread read marks — no local cursor needed.
+# The `forum cursor` subcommand in tools/forum.py retains READ_CURSOR_PATH
+# for manual override / back-compat only.
 HOOK_CACHE_PATH = os.path.join(ENGRAM_HOME, "forum-hook-cache.json")
 
 CACHE_TTL_SECONDS = 30
@@ -228,20 +231,24 @@ def _fetch_threads(forum_url: str, since: Optional[str], agent_name: str) -> Opt
         return None
 
 
-def _fetch_mentions(forum_url: str, agent_name: str, since: Optional[str]) -> Optional[list]:
-    """GET /api/agent/<name>/mentions?since=<read-cursor>.
+def _fetch_inbox(forum_url: str, agent_name: str) -> Optional[list]:
+    """GET /api/agent/<name>/inbox — returns at_mention items only.
 
-    Returns mention list on success, None on any error (advisory; never breaks
-    the hook chain). Swallows ALL errors including 404 (old server without the
-    mentions endpoint) — same bare-except discipline as _fetch_threads.
-    Timeout: 5 seconds.
+    The inbox endpoint uses server-side per-thread read marks so "reading the
+    thread clears the mention" — no local cursor needed.
+
+    Returns a list of inbox items filtered to kind=at_mention on success,
+    None on any error (advisory; never breaks the hook chain). Swallows ALL
+    errors including 404 (old server without the inbox endpoint) — same
+    bare-except discipline as _fetch_threads. Timeout: 5 seconds.
     URL-quotes the agent name for safety.
+
+    Response shape: {"inbox": [...], "unread_all": N}
+    Item shape: {post_id, thread_id, thread_title, author, kind, created_at}
     """
     import urllib.parse
     quoted_name = urllib.parse.quote(agent_name, safe="")
-    url = f"{forum_url}/api/agent/{quoted_name}/mentions"
-    if since:
-        url = f"{url}?since={urllib.parse.quote(since, safe=':')}"
+    url = f"{forum_url}/api/agent/{quoted_name}/inbox"
 
     try:
         req = urllib.request.Request(
@@ -251,7 +258,10 @@ def _fetch_mentions(forum_url: str, agent_name: str, since: Optional[str]) -> Op
         with urllib.request.urlopen(req, timeout=5) as resp:
             body = resp.read().decode("utf-8")
             data = json.loads(body)
-            return data.get("mentions", [])
+            inbox = data.get("inbox", [])
+            # Filter to at_mention only — reply_on_my_thread items are out of scope
+            # for the banner (they are a different notification class).
+            return [item for item in inbox if item.get("kind") == "at_mention"]
     except Exception:
         return None
 
@@ -316,43 +326,16 @@ def main() -> None:
     agent_name = _get_agent_name(config)
     forum_url = _get_forum_url(config)
 
-    # ── Read cursors ──────────────────────────────────────────────────────────
+    # ── Read surfaced cursor ──────────────────────────────────────────────────
     surfaced_cursor = _read_cursor(SURFACED_CURSOR_PATH)
     since_str = surfaced_cursor.strftime("%Y-%m-%dT%H:%M:%S.%fZ") if surfaced_cursor else None
 
-    # Read cursor drives mention `since` — mentions persist until agent acts.
-    # This hook NEVER writes the read cursor (that's the CLI's job).
-    #
-    # Pass the cursor string VERBATIM to the server — do NOT parse-then-reformat.
-    # The forum CLI writes forum-read-cursor.txt at SECOND precision
-    # (e.g. "2026-06-05T16:52:54Z"), while mention created_at values carry
-    # MICROSECONDS (e.g. "…54.153797Z"). A parse→re-serialize round-trip turns
-    # "…54Z" into "…54.000000Z", which string-compares BEFORE "…54.153797Z"
-    # ('0' < '1'), so a mention that IS the thread's last activity never clears
-    # and surfaces every prompt forever. The raw file form compares correctly
-    # ('.' < 'Z'): "…54Z" > "…54.153797Z" in lexicographic order, so the server's
-    # `created_at > since` filter correctly excludes the already-seen mention.
-    # Any format normalisation here re-introduces #847. (issue #847)
-    #
-    # KNOWN LIMITATION (accepted trade, colleague round 2026-06-05): a NEW
-    # mention created within the same second AS the cursor but AFTER the read
-    # (e.g. cursor "…54Z", mention "…54.80Z") also compares below the cursor
-    # and is silently skipped by this hook — degraded-not-lost (the per-wake
-    # forum browse / status sweep still surfaces it). The loud-stuck failure
-    # this PR fixes was strictly worse. The class-level fix is single-precision
-    # timestamps at all forum write paths — tracked as #847's follow-up layer.
-    read_cursor = _read_cursor(READ_CURSOR_PATH)          # validity gate only
-    read_cursor_str = None
-    if read_cursor is not None:
-        try:
-            # Re-read verbatim — the TOCTOU window between the validity parse and
-            # this read is benign: the CLI always writes valid ISO, and a newer
-            # cursor is stricter (excludes more), never looser.
-            read_cursor_str = Path(READ_CURSOR_PATH).read_text().strip() or None
-        except OSError:
-            read_cursor_str = None
+    # Mention state no longer uses a local read cursor. The inbox endpoint
+    # (GET /api/agent/<name>/inbox) uses server-side per-thread read marks, so
+    # "reading a thread clears the mention" is handled by the server. No local
+    # cursor read needed here.
 
-    # ── Fetch threads + mentions (with cache + stale-cache fallback) ──────────
+    # ── Fetch threads + inbox mentions (with cache + stale-cache fallback) ────
     threads: Optional[list] = None
     mentions: Optional[list] = None
 
@@ -371,9 +354,10 @@ def main() -> None:
         # Live fetch with since=current surfaced cursor.
         threads = _fetch_threads(forum_url, since_str, agent_name)
         if threads is not None:
-            # Also fetch mentions (advisory; failure → None, not a blocker).
+            # Also fetch inbox mentions (advisory; failure → None, not a blocker).
+            # Filtered to kind=at_mention inside _fetch_inbox.
             if agent_name:
-                mentions = _fetch_mentions(forum_url, agent_name, read_cursor_str)
+                mentions = _fetch_inbox(forum_url, agent_name)
             else:
                 mentions = None
             _save_cache(threads, mentions if mentions is not None else [])

@@ -1,29 +1,34 @@
 """Tests for hooks/claude/engram-forum-prompt-hook.py.
 
-Covers two sets of scenarios:
+Covers three sets of scenarios:
 
 A) Surfaced-cursor advance semantics (original tests):
    1. Cache hit  -> cursor UNCHANGED.
    2. Live fetch success -> cursor ADVANCED to ~now.
    3. Unreachable, no cache -> cursor UNCHANGED.
 
-B) Mention-line injection (new, spec §6):
-   1. Mention line present when endpoint returns >=1 mention.
-   2. Mention line ABSENT when endpoint returns None (old server / unreachable),
+B) Mention-line injection (inbox endpoint, post-#907):
+   1. Mention line present when _fetch_inbox returns >=1 at_mention item.
+   2. Mention line ABSENT when _fetch_inbox returns None (old server / unreachable),
       generic-thread line unaffected.
-   3. Mentions fetch is called with the READ cursor as `since`, NOT the surfaced
-      cursor (the load-bearing §2 assertion).
-   4. Persistence: same mention surfaces on consecutive prompts when read cursor
-      has NOT advanced.
+   3. (#907 contract) Mention in inbox appears in banner; when the server marks
+      the thread read (simulated: inbox no longer returns it), the banner clears.
+      Banner is a pure function of server read-state — no local cursor involved.
+   4. Persistence: same mention surfaces on consecutive prompts when inbox
+      still returns it (server has not yet marked the thread read).
    5. Cache stores both threads + mentions; fresh-cache hit reads both without
       a second server call; OLD cache file (no `mentions` key) -> no KeyError.
    6. Both-lines ordering: mention line ABOVE generic threads line.
-   7. Empty agent_name -> no mentions fetch; generic thread line still works.
-   8. 404 mentions endpoint (old server) -> no mention line; generic unchanged.
+   7. Empty agent_name -> no inbox fetch; generic thread line still works.
+   8. 404 inbox endpoint (old server) -> no mention line; generic unchanged.
+   9. kind=reply_on_my_thread items from the inbox are NOT surfaced in the banner.
+
+C) Surfaced-cursor precision regression (#751):
+   1. Same-second post not excluded by cursor.
 
 Each test loads the hook as a module via importlib, monkeypatches
-SURFACED_CURSOR_PATH, READ_CURSOR_PATH, and HOOK_CACHE_PATH to tmp paths,
-and stubs _load_config / _fetch_threads / _fetch_mentions as needed.
+SURFACED_CURSOR_PATH and HOOK_CACHE_PATH to tmp paths, and stubs
+_load_config / _fetch_threads / _fetch_inbox as needed.
 main() is called directly (catching SystemExit); then cursors / output
 are inspected.
 """
@@ -80,15 +85,25 @@ def _write_fresh_cache(cache_path: Path, threads: list, mentions: list = None) -
     cache_path.write_text(json.dumps(payload))
 
 
-def _make_mention(tid: str = "42", title: str = "Test Thread",
-                  author: str = "luria", kind: str = "at_mention") -> dict:
-    """Build a minimal mention dict matching the API schema."""
+def _make_inbox_item(tid: str = "42", title: str = "Test Thread",
+                     author: str = "luria", kind: str = "at_mention") -> dict:
+    """Build a minimal inbox item dict matching the API schema.
+
+    The inbox endpoint returns items with post_id/thread_id/thread_title/author/
+    kind/created_at; kind is 'at_mention' or 'reply_on_my_thread'.
+    """
     return {
         "thread_id": tid,
         "thread_title": title,
         "author": author,
         "kind": kind,
+        "post_id": 1,
+        "created_at": "2026-01-01T12:00:00Z",
     }
+
+
+# Back-compat alias used in tests that pre-date the inbox migration.
+_make_mention = _make_inbox_item
 
 
 def _run_main(hook, capture_output: bool = False):
@@ -131,11 +146,13 @@ def tmp_cache(tmp_path: Path) -> Path:
 
 
 def _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor=None):
-    """Point the hook module at tmp paths."""
+    """Point the hook module at tmp paths.
+
+    tmp_read_cursor is accepted for backward compat but is a no-op —
+    the hook no longer reads READ_CURSOR_PATH for mention queries.
+    """
     monkeypatch.setattr(hook, "SURFACED_CURSOR_PATH", str(tmp_cursor))
     monkeypatch.setattr(hook, "HOOK_CACHE_PATH", str(tmp_cache))
-    if tmp_read_cursor is not None:
-        monkeypatch.setattr(hook, "READ_CURSOR_PATH", str(tmp_read_cursor))
 
 
 def _stub_config(hook, monkeypatch, agent_name: str = "testbot"):
@@ -299,19 +316,18 @@ def test_unreachable_no_cache_cursor_unchanged(tmp_cursor, tmp_cache, monkeypatc
 def test_mention_line_present_when_mentions_returned(
     tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
 ):
-    """🔔 mention line appears in output when the mentions endpoint returns >=1."""
+    """🔔 mention line appears in output when _fetch_inbox returns >=1 at_mention item."""
     hook = _load_hook()
     _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
     _stub_config(hook, monkeypatch)
 
     _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
-    _write_cursor_file(tmp_read_cursor, datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc))
 
-    mention = _make_mention(tid="99", title="Review my PR", author="luria")
+    mention = _make_inbox_item(tid="99", title="Review my PR", author="luria")
 
     monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
-    monkeypatch.setattr(hook, "_fetch_mentions",
-                        lambda url, name, since: [mention])
+    monkeypatch.setattr(hook, "_fetch_inbox",
+                        lambda url, name: [mention])
 
     output = _run_main(hook, capture_output=True)
 
@@ -332,7 +348,7 @@ def test_mention_line_present_when_mentions_returned(
 def test_mention_line_absent_on_none_generic_unaffected(
     tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
 ):
-    """When _fetch_mentions returns None, no mention line; threads line unchanged."""
+    """When _fetch_inbox returns None, no mention line; threads line unchanged."""
     hook = _load_hook()
     _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
     _stub_config(hook, monkeypatch)
@@ -341,7 +357,7 @@ def test_mention_line_absent_on_none_generic_unaffected(
 
     monkeypatch.setattr(hook, "_fetch_threads",
                         lambda url, since, agent: [{"id": "1", "title": "hello"}])
-    monkeypatch.setattr(hook, "_fetch_mentions", lambda url, name, since: None)
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name: None)
 
     output = _run_main(hook, capture_output=True)
 
@@ -353,54 +369,75 @@ def test_mention_line_absent_on_none_generic_unaffected(
     assert "\U0001f4e2" in ctx, "Generic threads line (📢) must appear"
     # Mention line must NOT be present
     assert "\U0001f514" not in ctx, (
-        "Mention line (🔔) must NOT appear when _fetch_mentions returns None"
+        "Mention line (🔔) must NOT appear when _fetch_inbox returns None"
     )
 
 
 # ---------------------------------------------------------------------------
-# B3: READ cursor is the `since` for mentions (load-bearing §2 assertion)
+# B3: #907 contract — banner is a pure function of server read-state
+#     A mention present in the inbox appears in the banner; after the server
+#     marks the thread read (simulated: inbox no longer returns the item),
+#     the banner clears. No local cursor is involved.
 # ---------------------------------------------------------------------------
 
-def test_mentions_since_is_read_cursor_not_surfaced_cursor(
+def test_907_banner_clears_when_inbox_no_longer_returns_mention(
     tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
 ):
-    """_fetch_mentions must be called with the READ cursor as `since`, not surfaced.
+    """#907 regression contract: banner is driven entirely by the server inbox.
 
-    This is the core §2 invariant: mentions persist every prompt until the
-    agent acts on them (reads/acks), which advances the read cursor. The
-    surfaced cursor advances on every hook fire and would clear the mention
-    line after one prompt — wrong behavior.
+    Prompt 1: inbox returns a mention → 🔔 banner appears.
+    Prompt 2: server marks the thread read (simulated: inbox returns []) → 🔔 clears.
+
+    This is the core invariant fixed by #907: the banner must be a pure function
+    of the server's read-state, not a local cursor that can drift out of sync.
     """
     hook = _load_hook()
     _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
     _stub_config(hook, monkeypatch)
 
-    # Surfaced cursor and read cursor are DIFFERENT timestamps
-    surfaced_ts = datetime(2026, 1, 2, 15, 0, 0, tzinfo=timezone.utc)
-    read_ts = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
-    expected_read_since = read_ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
 
-    _write_cursor_file(tmp_cursor, surfaced_ts)
-    _write_cursor_file(tmp_read_cursor, read_ts)
+    mention = _make_inbox_item(tid="55", title="Please review", author="ariadne")
+    inbox_items = [mention]
 
-    calls = []
-
-    def stub_fetch_mentions(url, name, since):
-        calls.append(since)
-        return []
+    def fetch_inbox_dynamic(url, name):
+        return list(inbox_items)
 
     monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
-    monkeypatch.setattr(hook, "_fetch_mentions", stub_fetch_mentions)
+    monkeypatch.setattr(hook, "_fetch_inbox", fetch_inbox_dynamic)
 
-    _run_main(hook)
+    # Prompt 1: mention present in inbox → banner appears
+    output1 = _run_main(hook, capture_output=True)
+    assert output1.strip(), "Prompt 1: expected non-empty output"
+    data1 = json.loads(output1.strip())
+    ctx1 = data1["hookSpecificOutput"]["additionalContext"]
+    assert "\U0001f514" in ctx1, "Prompt 1: mention line must appear when inbox returns it"
 
-    assert calls, "_fetch_mentions must have been called"
-    actual_since = calls[0]
-    assert actual_since == expected_read_since, (
-        f"_fetch_mentions `since` must be the READ cursor ({expected_read_since!r}), "
-        f"not the surfaced cursor ({surfaced_ts.strftime('%Y-%m-%dT%H:%M:%S.%fZ')!r}). "
-        f"Got: {actual_since!r}"
-    )
+    # Expire the cache so prompt 2 does a live fetch
+    if tmp_cache.exists():
+        cache_data = json.loads(tmp_cache.read_text())
+        cache_data["fetched_at"] = time.time() - 60
+        tmp_cache.write_text(json.dumps(cache_data))
+
+    # Server marks the thread read — inbox now returns []
+    inbox_items.clear()
+
+    # Reload hook for a clean module state
+    hook2 = _load_hook()
+    _patch_hook_paths(hook2, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
+    _stub_config(hook2, monkeypatch)
+    monkeypatch.setattr(hook2, "_fetch_threads", lambda url, since, agent: [])
+    monkeypatch.setattr(hook2, "_fetch_inbox", fetch_inbox_dynamic)
+
+    # Prompt 2: inbox is empty → banner must clear (exit 0, no output)
+    output2 = _run_main(hook2, capture_output=True)
+    if output2.strip():
+        data2 = json.loads(output2.strip())
+        ctx2 = data2["hookSpecificOutput"]["additionalContext"]
+        assert "\U0001f514" not in ctx2, (
+            "Prompt 2: banner must clear when inbox returns [] "
+            "(server has marked the thread read — #907 contract)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -408,42 +445,41 @@ def test_mentions_since_is_read_cursor_not_surfaced_cursor(
 #     read cursor has NOT advanced
 # ---------------------------------------------------------------------------
 
-def test_mentions_persist_when_read_cursor_unchanged(
+def test_mentions_persist_when_inbox_still_returns_item(
     tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
 ):
-    """Mention line appears on both prompt-1 and prompt-2 when read cursor is static.
+    """Mention line appears on both prompt-1 and prompt-2 when inbox still returns it.
 
-    The "stays in your court" property: a mention is a standing obligation
-    until the agent reads the thread (which advances the read cursor).
+    The "stays in your court" property: a mention persists until the server
+    marks the thread read (i.e., until the agent runs `forum read <id>`).
+    The hook sees the same mention from the inbox on consecutive prompts.
     """
     hook = _load_hook()
     _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
     _stub_config(hook, monkeypatch)
 
-    read_ts = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
-    _write_cursor_file(tmp_read_cursor, read_ts)
     _write_cursor_file(tmp_cursor, datetime(2026, 1, 2, 0, 0, 0, tzinfo=timezone.utc))
 
-    mention = _make_mention(tid="7", title="Luria needs you", author="luria")
+    mention = _make_inbox_item(tid="7", title="Luria needs you", author="luria")
 
     monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
 
-    def fetch_mentions(url, name, since):
-        # returns the same mention regardless of since — simulates a server
-        # where the mention hasn't been read yet
+    def fetch_inbox(url, name):
+        # Returns the same mention regardless — simulates a server where the
+        # thread has not been marked read yet.
         return [mention]
 
-    monkeypatch.setattr(hook, "_fetch_mentions", fetch_mentions)
+    monkeypatch.setattr(hook, "_fetch_inbox", fetch_inbox)
 
     # Prompt 1
     output1 = _run_main(hook, capture_output=True)
     # Expire the cache so prompt 2 does a live fetch again
     if tmp_cache.exists():
-        data = json.loads(tmp_cache.read_text())
-        data["fetched_at"] = time.time() - 60  # force expired
-        tmp_cache.write_text(json.dumps(data))
+        cache_data = json.loads(tmp_cache.read_text())
+        cache_data["fetched_at"] = time.time() - 60  # force expired
+        tmp_cache.write_text(json.dumps(cache_data))
 
-    # Advance surfaced cursor (hook does this on live fetch) but NOT read cursor
+    # Advance surfaced cursor (hook does this on live fetch)
     _write_cursor_file(tmp_cursor, datetime(2026, 1, 2, 1, 0, 0, tzinfo=timezone.utc))
 
     # Prompt 2
@@ -454,7 +490,7 @@ def test_mentions_persist_when_read_cursor_unchanged(
         data = json.loads(output.strip())
         ctx = data["hookSpecificOutput"]["additionalContext"]
         assert "\U0001f514" in ctx, (
-            f"Prompt {prompt_n}: mention line must persist when read cursor unchanged"
+            f"Prompt {prompt_n}: mention line must persist while inbox still returns it"
         )
 
 
@@ -466,32 +502,31 @@ def test_mentions_persist_when_read_cursor_unchanged(
 def test_cache_stores_and_reads_both_threads_and_mentions(
     tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
 ):
-    """A fresh-cache prompt reads both threads+mentions without calling _fetch_mentions."""
+    """A fresh-cache prompt reads both threads+mentions without calling _fetch_inbox."""
     hook = _load_hook()
     _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
     _stub_config(hook, monkeypatch)
 
     _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
-    _write_cursor_file(tmp_read_cursor, datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc))
 
-    mention = _make_mention(tid="55", title="Cached mention", author="luria")
+    mention = _make_inbox_item(tid="55", title="Cached mention", author="luria")
     # Write a cache file that already contains mentions
     _write_fresh_cache(tmp_cache, threads=[], mentions=[mention])
 
-    fetch_mentions_calls = []
+    fetch_inbox_calls = []
 
-    def stub_fetch_mentions(url, name, since):
-        fetch_mentions_calls.append((url, name, since))
+    def stub_fetch_inbox(url, name):
+        fetch_inbox_calls.append((url, name))
         return []
 
     monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
-    monkeypatch.setattr(hook, "_fetch_mentions", stub_fetch_mentions)
+    monkeypatch.setattr(hook, "_fetch_inbox", stub_fetch_inbox)
 
     output = _run_main(hook, capture_output=True)
 
-    # _fetch_mentions must NOT have been called (cache was fresh)
-    assert fetch_mentions_calls == [], (
-        "_fetch_mentions must not be called on a fresh-cache hit"
+    # _fetch_inbox must NOT have been called (cache was fresh)
+    assert fetch_inbox_calls == [], (
+        "_fetch_inbox must not be called on a fresh-cache hit"
     )
     # But the mention line from cache must still appear
     assert output.strip(), "Expected output from cached mention"
@@ -555,9 +590,8 @@ def test_stale_cache_fallback_renders_mentions(
     _stub_config(hook, monkeypatch)
 
     _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
-    _write_cursor_file(tmp_read_cursor, datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc))
 
-    mention = _make_mention(tid="77", title="Stale but present", author="luria")
+    mention = _make_inbox_item(tid="77", title="Stale but present", author="luria")
 
     # Write an EXPIRED cache (fetched_at far in the past) that contains a mention.
     # _load_cache() will return None (expired), forcing the live-fetch path.
@@ -598,14 +632,13 @@ def test_both_lines_ordering_mention_above_generic(
     _stub_config(hook, monkeypatch)
 
     _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
-    _write_cursor_file(tmp_read_cursor, datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc))
 
-    mention = _make_mention(tid="10", title="Needs review", author="luria")
+    mention = _make_inbox_item(tid="10", title="Needs review", author="luria")
 
     monkeypatch.setattr(hook, "_fetch_threads",
                         lambda url, since, agent: [{"id": "2", "title": "new thread"}])
-    monkeypatch.setattr(hook, "_fetch_mentions",
-                        lambda url, name, since: [mention])
+    monkeypatch.setattr(hook, "_fetch_inbox",
+                        lambda url, name: [mention])
 
     output = _run_main(hook, capture_output=True)
     assert output.strip(), "Expected non-empty output"
@@ -632,7 +665,7 @@ def test_both_lines_ordering_mention_above_generic(
 def test_empty_agent_name_no_mentions_fetch_generic_works(
     tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
 ):
-    """When agent_name is empty, _fetch_mentions is never called; threads work."""
+    """When agent_name is empty, _fetch_inbox is never called; threads work."""
     hook = _load_hook()
     _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
 
@@ -645,20 +678,20 @@ def test_empty_agent_name_no_mentions_fetch_generic_works(
 
     _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
 
-    fetch_mentions_calls = []
+    fetch_inbox_calls = []
 
-    def stub_fetch_mentions(url, name, since):
-        fetch_mentions_calls.append(name)
-        return [_make_mention()]
+    def stub_fetch_inbox(url, name):
+        fetch_inbox_calls.append(name)
+        return [_make_inbox_item()]
 
     monkeypatch.setattr(hook, "_fetch_threads",
                         lambda url, since, agent: [{"id": "3", "title": "thread"}])
-    monkeypatch.setattr(hook, "_fetch_mentions", stub_fetch_mentions)
+    monkeypatch.setattr(hook, "_fetch_inbox", stub_fetch_inbox)
 
     output = _run_main(hook, capture_output=True)
 
-    assert fetch_mentions_calls == [], (
-        "_fetch_mentions must NOT be called when agent_name is empty"
+    assert fetch_inbox_calls == [], (
+        "_fetch_inbox must NOT be called when agent_name is empty"
     )
     # Threads line must still be present
     assert output.strip(), "Expected threads output even with empty agent_name"
@@ -669,25 +702,22 @@ def test_empty_agent_name_no_mentions_fetch_generic_works(
 
 
 # ---------------------------------------------------------------------------
-# B8: 404 mentions endpoint (old server) -> silent skip; generic unchanged
-#     (This is the "safe to merge before every install has #662's server" test)
+# B8: 404 inbox endpoint (old server) -> silent skip; generic unchanged
+#     (This is the "safe to merge before every install has the inbox endpoint" test)
 #
 #     Two layers:
-#     (a) _fetch_mentions itself swallows a 404 HTTPError -> returns None.
-#     (b) main() receiving None from _fetch_mentions -> no mention line,
+#     (a) _fetch_inbox itself swallows a 404 HTTPError -> returns None.
+#     (b) main() receiving None from _fetch_inbox -> no mention line,
 #         generic thread line still works.
 # ---------------------------------------------------------------------------
 
-def test_fetch_mentions_swallows_404(monkeypatch):
-    """_fetch_mentions must return None (not raise) when the server returns 404.
+def test_fetch_inbox_swallows_404(monkeypatch):
+    """_fetch_inbox must return None (not raise) when the server returns 404.
 
     This is the low-level contract: any HTTP error including 404 is swallowed
-    so that a missing /api/agent/<name>/mentions endpoint on an old server is
+    so that a missing /api/agent/<name>/inbox endpoint on an old server is
     indistinguishable from "no mentions" from the caller's perspective.
     """
-    import urllib.error
-    import urllib.request
-
     hook = _load_hook()
 
     # Patch urlopen to raise HTTPError 404
@@ -698,43 +728,123 @@ def test_fetch_mentions_swallows_404(monkeypatch):
 
     monkeypatch.setattr(hook.urllib.request, "urlopen", fake_urlopen)
 
-    result = hook._fetch_mentions("http://localhost:5002", "testbot", None)
+    result = hook._fetch_inbox("http://localhost:5002", "testbot")
     assert result is None, (
-        "_fetch_mentions must return None on HTTPError 404 (old server)"
+        "_fetch_inbox must return None on HTTPError 404 (old server)"
     )
 
 
-def test_old_server_404_mentions_silent_skip_in_main(
+def test_old_server_404_inbox_silent_skip_in_main(
     tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
 ):
-    """A 404 from the mentions endpoint results in no mention line; generic unchanged.
+    """A 404 from the inbox endpoint results in no mention line; generic unchanged.
 
-    Validates the PR's safety property: a hook hitting an old server
-    (without #662's /api/agent/<name>/mentions endpoint) silently skips the
-    mention line — it does NOT break the hook chain or suppress the threads line.
-    Uses _fetch_mentions returning None (as it would after swallowing a 404).
+    Validates the safety property: a hook hitting an old server (without the
+    /api/agent/<name>/inbox endpoint) silently skips the mention line — it does
+    NOT break the hook chain or suppress the threads line.
+    Uses _fetch_inbox returning None (as it would after swallowing a 404).
     """
     hook = _load_hook()
     _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
     _stub_config(hook, monkeypatch)
 
     _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
-    _write_cursor_file(tmp_read_cursor, datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc))
 
     monkeypatch.setattr(hook, "_fetch_threads",
                         lambda url, since, agent: [{"id": "5", "title": "new thread"}])
-    # Simulate what _fetch_mentions returns after swallowing a 404
-    monkeypatch.setattr(hook, "_fetch_mentions", lambda url, name, since: None)
+    # Simulate what _fetch_inbox returns after swallowing a 404
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name: None)
 
     output = _run_main(hook, capture_output=True)
 
-    assert output.strip(), "Expected threads output even when mentions endpoint is 404"
+    assert output.strip(), "Expected threads output even when inbox endpoint is 404"
     data = json.loads(output.strip())
     ctx = data["hookSpecificOutput"]["additionalContext"]
-    assert "\U0001f4e2" in ctx, "Generic threads line must work when mentions 404s"
+    assert "\U0001f4e2" in ctx, "Generic threads line must work when inbox 404s"
     assert "\U0001f514" not in ctx, (
-        "Mention line must be absent when mentions endpoint returns None (old server)"
+        "Mention line must be absent when inbox endpoint returns None (old server)"
     )
+
+
+# ---------------------------------------------------------------------------
+# B9: kind=reply_on_my_thread items NOT surfaced in the banner
+#     Two layers:
+#     (a) _fetch_inbox itself filters to at_mention only before returning.
+#     (b) When inbox contains ONLY reply_on_my_thread items, the banner is
+#         absent — _fetch_inbox returns [] and no 🔔 line is emitted.
+# ---------------------------------------------------------------------------
+
+def test_fetch_inbox_filters_reply_on_my_thread(monkeypatch):
+    """_fetch_inbox must return only at_mention items, not reply_on_my_thread.
+
+    This tests the filtering layer inside _fetch_inbox: when the server inbox
+    response contains both kinds, only at_mention items reach the caller.
+    """
+    hook = _load_hook()
+
+    # Build a fake server response with both kinds
+    inbox_response = {
+        "inbox": [
+            {"thread_id": "10", "thread_title": "Mention", "author": "a",
+             "kind": "at_mention", "post_id": 1, "created_at": "2026-01-01T12:00:00Z"},
+            {"thread_id": "11", "thread_title": "Reply", "author": "b",
+             "kind": "reply_on_my_thread", "post_id": 2, "created_at": "2026-01-01T12:00:01Z"},
+        ],
+        "unread_all": 2,
+    }
+
+    class FakeResponse:
+        def read(self):
+            return json.dumps(inbox_response).encode("utf-8")
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+
+    def fake_urlopen(req, timeout=None):
+        return FakeResponse()
+
+    monkeypatch.setattr(hook.urllib.request, "urlopen", fake_urlopen)
+
+    result = hook._fetch_inbox("http://localhost:5002", "testbot")
+    assert result is not None, "_fetch_inbox must succeed"
+    assert len(result) == 1, (
+        f"_fetch_inbox must return only at_mention items; got {result!r}"
+    )
+    assert result[0]["kind"] == "at_mention", (
+        "Only at_mention items must be returned by _fetch_inbox"
+    )
+    assert result[0]["thread_id"] == "10"
+
+
+def test_reply_on_my_thread_only_inbox_no_banner(
+    tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
+):
+    """When inbox contains only reply_on_my_thread items, the 🔔 banner is absent.
+
+    _fetch_inbox filters to at_mention; when the inbox has no at_mention items,
+    _fetch_inbox returns [] and the hook emits no mention banner.
+    """
+    hook = _load_hook()
+    _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
+    _stub_config(hook, monkeypatch)
+
+    _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
+
+    # _fetch_inbox returns [] because all inbox items are reply_on_my_thread
+    # (the real _fetch_inbox filters; this simulates that filtered result)
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name: [])
+
+    output = _run_main(hook, capture_output=True)
+
+    # No at_mention items → no banner, no output (exit 0)
+    if output.strip():
+        data = json.loads(output.strip())
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        assert "\U0001f514" not in ctx, (
+            "reply_on_my_thread items must NOT appear in the 🔔 mention banner"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -773,7 +883,7 @@ def test_same_second_post_not_excluded_by_cursor(
         return [{"id": "99", "title": "Same-second post"}]
 
     monkeypatch.setattr(hook, "_fetch_threads", stub_fetch_threads)
-    monkeypatch.setattr(hook, "_fetch_mentions", lambda url, name, since: [])
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name: [])
 
     output = _run_main(hook, capture_output=True)
 
@@ -799,292 +909,3 @@ def test_same_second_post_not_excluded_by_cursor(
     )
 
 
-# ===========================================================================
-# Part D — Mention cursor precision regression (#847)
-# ===========================================================================
-#
-# Root cause: the forum CLI writes forum-read-cursor.txt at SECOND precision
-# (e.g. "2026-06-05T16:52:54Z").  Mention created_at values carry MICROSECONDS
-# (e.g. "…54.153797Z").  The old hook line:
-#
-#   read_cursor_str = read_cursor.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-#
-# turned "…54Z" into "…54.000000Z".  String-compare on the server:
-#   "…54.153797Z" > "…54.000000Z"  →  mention ranks ABOVE the cursor →
-#   never clears, surfaces every prompt forever.
-#
-# The raw file form compares correctly: '.' (0x2E) < 'Z' (0x5A), so
-# "…54Z" (no dot) sorts AFTER "…54.153797Z" (has dot), meaning the server
-# correctly excludes the already-seen mention.
-#
-# Fix: pass the cursor string verbatim from the file; _read_cursor() serves as
-# the validity gate only.
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# D1 — The incident pin (regression discriminator)
-#      Cursor file contains "2026-06-05T16:52:54Z" (second precision, no dot).
-#      The `since` param reaching the mentions fetch MUST be byte-identical
-#      to that raw string — NOT "2026-06-05T16:52:54.000000Z".
-#
-#      This test MUST fail against the pre-fix code (line 326 re-serialises via
-#      strftime which adds ".000000") and MUST pass with the verbatim-pass fix.
-# ---------------------------------------------------------------------------
-
-def test_mention_since_cursor_passed_verbatim_second_precision(
-    tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
-):
-    """Cursor file at second precision must reach _fetch_mentions byte-identical.
-
-    The forum CLI writes forum-read-cursor.txt at second precision, e.g.
-    "2026-06-05T16:52:54Z" (no microseconds, no dot). The hook's old
-    parse→re-serialize round-trip turned this into "2026-06-05T16:52:54.000000Z",
-    which compares BEFORE a mention at "…54.153797Z" on the server — so the
-    mention never cleared. The fix reads the file verbatim. This test is the
-    regression discriminator: it is RED against the pre-fix strftime line and
-    GREEN after the verbatim-pass fix. Any re-introduction of format
-    normalisation in this code path will make it red again. (issue #847)
-    """
-    hook = _load_hook()
-    _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
-    _stub_config(hook, monkeypatch)
-
-    # Write cursor at SECOND precision — exactly as the forum CLI does
-    RAW_CURSOR = "2026-06-05T16:52:54Z"
-    tmp_read_cursor.write_text(RAW_CURSOR + "\n")
-
-    # Give the surfaced cursor a different, valid value so the hook runs
-    _write_cursor_file(tmp_cursor, datetime(2026, 6, 5, 16, 52, 54, 0, tzinfo=timezone.utc))
-
-    captured_since = []
-
-    def stub_fetch_mentions(url, name, since):
-        captured_since.append(since)
-        return []
-
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
-    monkeypatch.setattr(hook, "_fetch_mentions", stub_fetch_mentions)
-
-    _run_main(hook)
-
-    assert captured_since, "_fetch_mentions must have been called"
-    actual = captured_since[0]
-    assert actual == RAW_CURSOR, (
-        f"since= must be the raw file string {RAW_CURSOR!r} byte-identical; "
-        f"got {actual!r}. If this is '2026-06-05T16:52:54.000000Z', the "
-        f"parse→re-serialize round-trip has been re-introduced and #847 is back."
-    )
-
-
-# ---------------------------------------------------------------------------
-# D2 — End-to-end shape: a mention at "…54.153797Z" does NOT surface when
-#      the cursor file contains "…54Z" (second precision).
-#
-#      The server's `created_at > since` string comparison is simulated in the
-#      stub: the mention's created_at "…54.153797Z" is NOT strictly greater than
-#      the raw cursor "…54Z" ('.', 0x2E < 'Z', 0x5A), so the stub returns [].
-#      With the verbatim fix the hook passes "…54Z" and the stub correctly
-#      filters the mention out. With the old normalised "…54.000000Z" the stub
-#      would return the mention (since "…54.153797Z" > "…54.000000Z").
-# ---------------------------------------------------------------------------
-
-def test_mention_at_same_second_does_not_surface_with_verbatim_cursor(
-    tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
-):
-    """A mention whose created_at matches the cursor second must not resurface.
-
-    Simulates the server-side string comparison `created_at > since`:
-    - mention created_at: "2026-06-05T16:52:54.153797Z"
-    - cursor file (second precision): "2026-06-05T16:52:54Z"
-
-    Raw comparison: "2026-06-05T16:52:54.153797Z" > "2026-06-05T16:52:54Z"
-    is FALSE because '.' (0x2E) < 'Z' (0x5A) — the already-seen mention
-    is correctly excluded when the cursor is passed verbatim.
-
-    With the old normalised cursor "…54.000000Z", the same mention would have
-    been included (since "…54.153797Z" > "…54.000000Z") and surfaced forever.
-
-    Note: this test simulates the server-side filter in the stub because the
-    test harness does not host a real forum server. The stub faithfully
-    replicates the `created_at > since` string comparison the real server uses,
-    which is the exact comparison documented in the issue #847 live-endpoint
-    proof.
-    """
-    hook = _load_hook()
-    _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
-    _stub_config(hook, monkeypatch)
-
-    RAW_CURSOR = "2026-06-05T16:52:54Z"
-    MENTION_CREATED_AT = "2026-06-05T16:52:54.153797Z"
-    tmp_read_cursor.write_text(RAW_CURSOR + "\n")
-    _write_cursor_file(tmp_cursor, datetime(2026, 6, 5, 16, 52, 55, 0, tzinfo=timezone.utc))
-
-    mention = {
-        "thread_id": "100",
-        "thread_title": "The incident thread",
-        "author": "borges",
-        "kind": "at_mention",
-        "created_at": MENTION_CREATED_AT,
-    }
-
-    def stub_fetch_mentions_with_filter(url, name, since):
-        # Replicate the server's `created_at > since` string comparison.
-        # '.' (0x2E) < 'Z' (0x5A), so "…54.153797Z" is NOT > "…54Z" →
-        # mention is excluded when `since` is the raw verbatim cursor.
-        # If `since` were the normalised "…54.000000Z" the mention WOULD
-        # pass (since "…54.153797Z" > "…54.000000Z").
-        return [m for m in [mention] if m["created_at"] > since]
-
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
-    monkeypatch.setattr(hook, "_fetch_mentions", stub_fetch_mentions_with_filter)
-
-    output = _run_main(hook, capture_output=True)
-
-    # When the fix is correct, no mention surfaces (the filter returns []).
-    # The hook also has no threads, so output is empty (sys.exit(0)).
-    # An output with a 🔔 line means the mention leaked through — #847 is back.
-    if output.strip():
-        data = json.loads(output.strip())
-        ctx = data["hookSpecificOutput"]["additionalContext"]
-        assert "\U0001f514" not in ctx, (
-            f"Mention at {MENTION_CREATED_AT!r} must NOT surface when cursor is "
-            f"{RAW_CURSOR!r} (verbatim); if it does, the round-trip normalisation "
-            f"re-introduced #847. since= was probably '2026-06-05T16:52:54.000000Z' "
-            f"(re-serialised) rather than the raw '2026-06-05T16:52:54Z'."
-        )
-
-
-# ---------------------------------------------------------------------------
-# D3 — Cursor file absent -> no `since` param (existing behaviour preserved)
-# ---------------------------------------------------------------------------
-
-def test_mention_since_absent_when_cursor_file_missing(
-    tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
-):
-    """When forum-read-cursor.txt is absent, `since` is None (no param sent).
-
-    Ensures the validity-gate contract is unchanged: a missing cursor file
-    means no since= constraint, so the mentions fetch returns all unread mentions.
-    """
-    hook = _load_hook()
-    _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
-    _stub_config(hook, monkeypatch)
-
-    # Surfaced cursor present; read cursor file deliberately absent
-    _write_cursor_file(tmp_cursor, datetime(2026, 6, 5, 16, 0, 0, 0, tzinfo=timezone.utc))
-    assert not tmp_read_cursor.exists(), "Read cursor file must not exist for this test"
-
-    captured_since = []
-
-    def stub_fetch_mentions(url, name, since):
-        captured_since.append(since)
-        return []
-
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
-    monkeypatch.setattr(hook, "_fetch_mentions", stub_fetch_mentions)
-
-    _run_main(hook)
-
-    assert captured_since, "_fetch_mentions must have been called"
-    assert captured_since[0] is None, (
-        f"since= must be None when cursor file is absent; got {captured_since[0]!r}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# D4 — Cursor file with invalid ISO -> treated as absent; no `since` param
-#      (validity gate retained — _read_cursor returns None for invalid content)
-# ---------------------------------------------------------------------------
-
-def test_mention_since_absent_when_cursor_file_invalid(
-    tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
-):
-    """Invalid cursor file is treated as absent: `since` is None, validity gate retained.
-
-    The _read_cursor() validity check must still reject malformed content.
-    A broken cursor file must not propagate garbage to the server.
-    """
-    hook = _load_hook()
-    _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
-    _stub_config(hook, monkeypatch)
-
-    _write_cursor_file(tmp_cursor, datetime(2026, 6, 5, 16, 0, 0, 0, tzinfo=timezone.utc))
-    # Write an invalid timestamp to the read cursor file
-    tmp_read_cursor.write_text("not-a-valid-iso-timestamp\n")
-
-    captured_since = []
-
-    def stub_fetch_mentions(url, name, since):
-        captured_since.append(since)
-        return []
-
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
-    monkeypatch.setattr(hook, "_fetch_mentions", stub_fetch_mentions)
-
-    _run_main(hook)
-
-    assert captured_since, "_fetch_mentions must have been called"
-    assert captured_since[0] is None, (
-        f"since= must be None when cursor file is invalid; got {captured_since[0]!r}. "
-        f"The validity gate (_read_cursor returning None) must still prevent garbage "
-        f"from reaching the server."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Known-limitation pin (#847 follow-up layer, accepted trade — colleague round)
-# ---------------------------------------------------------------------------
-
-
-def test_known_limitation_newer_same_second_mention_also_skipped(
-    tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
-):
-    """KNOWN-LIMITATION PIN (accepted trade, colleague round 2026-06-05): a NEW
-    mention created in the SAME second as the cursor but AFTER the read
-    (cursor "…54Z", mention "…54.800000Z") ALSO compares below the verbatim
-    cursor ('.' < 'Z') and is skipped by the hook — degraded-not-lost: the
-    per-wake forum browse/status sweep still surfaces it. The loud-stuck
-    failure #847 fixed was strictly worse than this silent one-second window.
-
-    This pins the accepted behavior so any change to it is deliberate. It
-    should flip exactly when the substrate-side single-precision timestamp
-    normalization (#847's follow-up layer) lands — at that point this test
-    goes red: delete it and close the follow-up.
-    """
-    hook = _load_hook()
-    _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
-    _stub_config(hook, monkeypatch)
-
-    RAW_CURSOR = "2026-06-05T16:52:54Z"
-    NEWER_SAME_SECOND = "2026-06-05T16:52:54.800000Z"  # AFTER the read, same second
-    tmp_read_cursor.write_text(RAW_CURSOR + "\n")
-    _write_cursor_file(tmp_cursor, datetime(2026, 6, 5, 16, 52, 55, 0, tzinfo=timezone.utc))
-
-    mention = {
-        "thread_id": "101",
-        "thread_title": "Arrived just after the read",
-        "author": "ariadne",
-        "kind": "at_mention",
-        "created_at": NEWER_SAME_SECOND,
-    }
-
-    def stub_fetch_mentions_with_filter(url, name, since):
-        # Same server-side string comparison as the incident tests.
-        return [m for m in [mention] if m["created_at"] > since]
-
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
-    monkeypatch.setattr(hook, "_fetch_mentions", stub_fetch_mentions_with_filter)
-
-    output = _run_main(hook, capture_output=True)
-
-    # ACCEPTED-LIMITATION assertion: the genuinely-new same-second mention is
-    # currently skipped (filter excludes it under the verbatim cursor).
-    if output.strip():
-        data = json.loads(output.strip())
-        ctx = data["hookSpecificOutput"]["additionalContext"]
-        assert "\U0001f514" not in ctx, (
-            "The newer-same-second mention surfaced — the accepted limitation "
-            "has been lifted (substrate precision normalization landed?). "
-            "Deliberate change required: delete this pin and close #847's "
-            "follow-up layer."
-        )
