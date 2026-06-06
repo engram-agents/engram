@@ -350,6 +350,181 @@ def rewrite_hooks_for_codex(
     return result
 
 
+
+
+# ---------------------------------------------------------------------------
+# Codex custom-agent transform helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_agent_frontmatter(src_path: str) -> tuple[dict[str, Any], str]:
+    """Parse the small YAML-frontmatter subset used by agents/claude/*.md.
+
+    The build engine intentionally stays stdlib-only, so this is not a general
+    YAML parser. It handles the scalar and one-line list shapes present in the
+    shipped fairy specs: ``key: value``, ``tools: *``, and
+    ``tools: [Read, Write]``.
+    """
+    with open(src_path, encoding="utf-8") as f:
+        text = f.read()
+    if not text.startswith("---\n"):
+        raise ValueError(f"Agent spec missing YAML frontmatter: {src_path}")
+
+    try:
+        _blank, frontmatter, body = text.split("---\n", 2)
+    except ValueError as exc:
+        raise ValueError(f"Agent spec has unterminated frontmatter: {src_path}") from exc
+
+    data: dict[str, Any] = {}
+    for raw_line in frontmatter.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            raise ValueError(f"Unsupported frontmatter line in {src_path}: {raw_line!r}")
+        key, value = line.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if value.startswith("[") and value.endswith("]"):
+            inner = value[1:-1].strip()
+            data[key] = [item.strip() for item in inner.split(",") if item.strip()]
+        elif value.lower() in {"true", "false"}:
+            data[key] = value.lower() == "true"
+        else:
+            data[key] = value
+    return data, body.lstrip("\n")
+
+
+def _agent_tools_to_list(raw_tools: Any) -> list[str] | str:
+    if raw_tools == "*":
+        return "*"
+    if isinstance(raw_tools, list):
+        return [str(t).strip() for t in raw_tools if str(t).strip()]
+    if isinstance(raw_tools, str):
+        return [t.strip() for t in raw_tools.split(",") if t.strip()]
+    return []
+
+
+def _codex_model_config(profile: dict[str, Any], claude_tier: str | None) -> dict[str, str]:
+    """Map Claude-style model tiers (opus/sonnet/haiku) through codex.json."""
+    tiers = profile.get("agent_model_tiers", {})
+    default_tier = profile.get("default_agent_model_tier", "sonnet")
+    tier = claude_tier or default_tier
+    cfg = tiers.get(tier) or tiers.get(default_tier) or {}
+    return {k: str(v) for k, v in cfg.items() if v is not None}
+
+
+def _toml_scalar(value: Any) -> str:
+    """Return a TOML-safe scalar using JSON string escaping for strings."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _toml_array(values: list[str]) -> str:
+    """Return a TOML-safe string array."""
+    return "[" + ", ".join(_toml_scalar(value) for value in values) + "]"
+
+
+def _engram_mcp_tool_names(tools: list[str] | str) -> list[str]:
+    """Extract raw ENGRAM MCP tool names from Claude-style tool identifiers.
+
+    Claude agent specs name MCP tools as ``mcp__engram__engram_query``.
+    Codex MCP policy allowlists use the server-local tool name
+    (``engram_query``) under the installed plugin MCP policy table.
+    """
+    if tools == "*":
+        return []
+    prefix = "mcp__engram__"
+    return [
+        tool[len(prefix) :]
+        for tool in tools
+        if isinstance(tool, str) and tool.startswith(prefix)
+    ]
+
+
+def _emit_codex_agent_toml(
+    src_path: str,
+    dest_path: str,
+    manifest_key: str,
+    profile: dict[str, Any],
+) -> None:
+    """Transform a Claude Markdown fairy spec into Codex custom-agent TOML."""
+    meta, body = _parse_agent_frontmatter(src_path)
+
+    name = meta.get("name")
+    description = meta.get("description")
+    if not name or not description:
+        raise ValueError(f"Agent spec {src_path} missing required name/description")
+
+    tools = _agent_tools_to_list(meta.get("tools", []))
+    model_cfg = _codex_model_config(profile, meta.get("model"))
+
+    notes: list[str] = [
+        "# Codex transform metadata",
+        f"- Source Claude spec: `{manifest_key}`.",
+    ]
+    if "isolation" in meta:
+        notes.append(
+            f"- Claude isolation: `{meta['isolation']}`. Preserve this operationally; "
+            "keep the task scoped and isolated from unrelated work."
+        )
+    if meta.get("default_background") is True:
+        notes.append(
+            "- Claude default_background: true. You may work without chatty progress "
+            "updates; return a concise structured handoff when done."
+        )
+    if tools == "*":
+        notes.append("- Claude tools whitelist: `*` (full tool access in the source spec).")
+    elif tools:
+        notes.append("- Claude tools whitelist: " + ", ".join(f"`{tool}`" for tool in tools) + ".")
+    notes.append(
+        "- Codex custom-agent TOML cannot express every Claude frontmatter field; "
+        "the non-equivalent fields above are preserved here as instructions."
+    )
+
+    developer_instructions = "\n".join(notes) + "\n\n" + body
+
+    lines: list[str] = [
+        f"name = {_toml_scalar(name)}",
+        f"description = {_toml_scalar(description)}",
+        f"developer_instructions = {_toml_scalar(developer_instructions)}",
+    ]
+    for key in ("model", "model_reasoning_effort"):
+        if key in model_cfg:
+            lines.append(f"{key} = {_toml_scalar(model_cfg[key])}")
+
+    # Codex custom-agent config inherits optional config fields when omitted.
+    # For fairies whose Claude whitelist has no ENGRAM MCP entry, explicitly
+    # clear MCP servers so a parent session's ENGRAM write tools do not leak in.
+    # For fairies with explicit ENGRAM MCP entries, preserve the whitelist as
+    # a Codex MCP allowlist instead of inheriting the whole server.  This keeps
+    # read-only dream/summary fairies read-only while still allowing the
+    # dream-master's ``tools: *`` spec to inherit full read/write access.
+    engram_tools = _engram_mcp_tool_names(tools)
+    if tools != "*" and not engram_tools:
+        lines.append("mcp_servers = {}")
+    elif engram_tools:
+        # ENGRAM is provided by the installed plugin, not by a top-level
+        # user-defined MCP server.  In Codex config, plugin-bundled MCP tool
+        # policy lives under [plugins."<plugin>@<marketplace>".mcp_servers.*].
+        # Emitting a partial [mcp_servers.engram] table with only enabled_tools
+        # is malformed because top-level MCP server tables require a transport
+        # (command or url).
+        plugin_policy_id = profile.get("plugin_mcp_policy_id", "engram@engram-local")
+        lines.extend(
+            [
+                "",
+                f"[plugins.{_toml_scalar(plugin_policy_id)}.mcp_servers.engram]",
+                f"enabled_tools = {_toml_array(engram_tools)}",
+            ]
+        )
+
+    with open(dest_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+        f.write("\n")
+
+
 # ---------------------------------------------------------------------------
 # leak scanner (inline, for foreign bundle VALIDATE step)
 # ---------------------------------------------------------------------------
@@ -871,9 +1046,19 @@ def build_plugin(
         fname = os.path.basename(src)
         manifest_key = f"agents/claude/{fname}"
         if _ships(ship_set, manifest_key):
-            shutil.copy2(src, os.path.join(plugin_root, "agents", fname))
+            if target == "codex":
+                dest_name = os.path.splitext(fname)[0] + ".toml"
+                _emit_codex_agent_toml(
+                    src,
+                    os.path.join(plugin_root, "agents", dest_name),
+                    manifest_key,
+                    profile,
+                )
+                _log(f"  {manifest_key} -> agents/{dest_name}")
+            else:
+                shutil.copy2(src, os.path.join(plugin_root, "agents", fname))
+                _log(f"  {manifest_key}")
             copied_paths.append(manifest_key)
-            _log(f"  {manifest_key}")
         else:
             _log(f"  (tier-filtered) {manifest_key}")
 

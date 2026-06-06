@@ -18,6 +18,7 @@ import json
 import os
 import sqlite3
 import sys
+import types
 import unittest
 from pathlib import Path
 
@@ -771,10 +772,22 @@ class TestStandaloneMiniNudgeFooter(unittest.TestCase):
         orig_daemon = self.hook.query_daemon
         orig_fts = self.hook.query_fts_fallback
         orig_pack = self.hook._query_attached_packs
+        orig_tripwire = self.hook.check_incident_tripwire
+        orig_patterns = self.hook.check_error_patterns
+        orig_write = self.hook.check_write_reminder
+        orig_repair = self.hook.check_repair_marker
+        orig_feeling = self.hook.check_feeling_nudge_marker
+        orig_warm = self.hook.check_warm_briefing
 
         self.hook.query_daemon = lambda *a, **kw: own_graph_result
         self.hook.query_fts_fallback = lambda *a, **kw: own_graph_result
         self.hook._query_attached_packs = lambda *a, **kw: pack_results
+        self.hook.check_incident_tripwire = lambda *a, **kw: ""
+        self.hook.check_error_patterns = lambda *a, **kw: ""
+        self.hook.check_write_reminder = lambda *a, **kw: ""
+        self.hook.check_repair_marker = lambda *a, **kw: ""
+        self.hook.check_feeling_nudge_marker = lambda *a, **kw: ""
+        self.hook.check_warm_briefing = lambda *a, **kw: ""
 
         hook_input = json.dumps({
             "prompt": "epistemology knowledge",
@@ -785,6 +798,11 @@ class TestStandaloneMiniNudgeFooter(unittest.TestCase):
         captured_output = io.StringIO()
         orig_stdout = sys.stdout
         orig_stdin = sys.stdin
+        orig_context_tracker = sys.modules.get("context_tracker")
+        sys.modules["context_tracker"] = types.SimpleNamespace(
+            estimate_usage=lambda *a, **kw: None,
+            format_drowsiness=lambda *a, **kw: "",
+        )
         try:
             sys.stdin = io.StringIO(hook_input)
             sys.stdout = captured_output
@@ -798,6 +816,16 @@ class TestStandaloneMiniNudgeFooter(unittest.TestCase):
             self.hook.query_daemon = orig_daemon
             self.hook.query_fts_fallback = orig_fts
             self.hook._query_attached_packs = orig_pack
+            self.hook.check_incident_tripwire = orig_tripwire
+            self.hook.check_error_patterns = orig_patterns
+            self.hook.check_write_reminder = orig_write
+            self.hook.check_repair_marker = orig_repair
+            self.hook.check_feeling_nudge_marker = orig_feeling
+            self.hook.check_warm_briefing = orig_warm
+            if orig_context_tracker is None:
+                sys.modules.pop("context_tracker", None)
+            else:
+                sys.modules["context_tracker"] = orig_context_tracker
 
         raw = captured_output.getvalue().strip()
         if not raw:

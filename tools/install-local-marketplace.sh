@@ -261,6 +261,77 @@ if [[ "$TARGET" == "codex" ]]; then
   fi
   log "Installing/updating plugin with Codex"
   codex plugin add engram@engram-local
+
+  CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+
+  # Codex 0.137.0 does not expand ${CLAUDE_PLUGIN_ROOT} in plugin .mcp.json
+  # command strings at MCP startup.  Patch the installed cache entry to the
+  # absolute cache path so the next session can spawn ENGRAM reliably.
+  CODEX_PLUGIN_CACHE_DIR=""
+  if [[ -d "$CODEX_HOME/plugins/cache/engram-local/engram" ]]; then
+    CODEX_PLUGIN_CACHE_DIR="$(python3 - "$CODEX_HOME/plugins/cache/engram-local/engram" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+
+def version_key(name: str) -> tuple[int, ...]:
+    parts = re.split(r"[^0-9]+", name)
+    return tuple(int(part) for part in parts if part)
+
+candidates = [
+    os.path.join(root, name)
+    for name in os.listdir(root)
+    if os.path.isdir(os.path.join(root, name))
+]
+if candidates:
+    candidates.sort(key=lambda path: (version_key(os.path.basename(path)), os.path.basename(path)))
+    print(candidates[-1])
+PY
+)"
+  fi
+  if [[ -n "$CODEX_PLUGIN_CACHE_DIR" && -f "$CODEX_PLUGIN_CACHE_DIR/.mcp.json" ]]; then
+    log "Patching Codex plugin MCP command -> $CODEX_PLUGIN_CACHE_DIR/launch-engram-server.sh"
+    python3 - "$CODEX_PLUGIN_CACHE_DIR/.mcp.json" "$CODEX_PLUGIN_CACHE_DIR/launch-engram-server.sh" <<'PY'
+import json
+import sys
+path, command = sys.argv[1:3]
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+data.setdefault("mcpServers", {}).setdefault("engram", {})["command"] = command
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+  else
+    log "WARN: could not locate installed Codex plugin cache .mcp.json for absolute command patch"
+  fi
+
+  CODEX_AGENTS_DIR="$CODEX_HOME/agents"
+  if compgen -G "$MARKETPLACE_ROOT/plugins/engram/agents/*.toml" > /dev/null; then
+    log "Installing Codex custom-agent TOML files -> $CODEX_AGENTS_DIR"
+    mkdir -p "$CODEX_AGENTS_DIR"
+    cp -a "$MARKETPLACE_ROOT/plugins/engram/agents/"*.toml "$CODEX_AGENTS_DIR/"
+
+    # Codex custom agents are config layers.  Plugin MCP tool allow/deny policy
+    # must target the plugin-provided server namespace, not top-level
+    # [mcp_servers.*] transport tables.  Rewrite older built TOMLs defensively.
+    python3 - "$CODEX_AGENTS_DIR" <<'PY'
+import pathlib
+import sys
+agents_dir = pathlib.Path(sys.argv[1])
+for path in agents_dir.glob("engram-*.toml"):
+    text = path.read_text(encoding="utf-8")
+    text = text.replace(
+        "[mcp_servers.engram]",
+        "[plugins.\"engram@engram-local\".mcp_servers.engram]",
+    )
+    path.write_text(text, encoding="utf-8")
+PY
+  else
+    log "WARN: no Codex custom-agent TOML files found in $MARKETPLACE_ROOT/plugins/engram/agents"
+  fi
 else
   if ! command -v claude >/dev/null 2>&1; then
     log "WARN: 'claude' not on PATH - cannot register the marketplace automatically"

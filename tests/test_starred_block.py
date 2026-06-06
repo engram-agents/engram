@@ -43,7 +43,10 @@ def _load_hook_module(hook_path: Path, module_name: str, engram_home: Path, inte
     os.environ["INTER_AGENT_DIR"] = str(inter_agent_dir)
     os.environ["ENGRAM_SESSION_ROLE"] = "interactive"
 
-    # Stub context_tracker so module-level import doesn't fail
+    # Stub context_tracker so module-level import doesn't fail. Restore the
+    # caller's sys.modules entry after import so this test helper doesn't leak a
+    # MagicMock into later tests that import context_tracker at runtime.
+    original_context_tracker = sys.modules.get("context_tracker")
     stub_ct = MagicMock()
     stub_ct.write_baseline = MagicMock(return_value=None)
     stub_ct.find_active_jsonl = MagicMock(return_value=None)
@@ -56,7 +59,13 @@ def _load_hook_module(hook_path: Path, module_name: str, engram_home: Path, inte
 
     spec = importlib.util.spec_from_file_location(module_name, hook_path)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if original_context_tracker is None:
+            sys.modules.pop("context_tracker", None)
+        else:
+            sys.modules["context_tracker"] = original_context_tracker
     return module
 
 

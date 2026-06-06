@@ -32,6 +32,7 @@ import os
 import re
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -286,6 +287,106 @@ class TestCodexEmission:
             "this variable; hook commands will fail with empty expansion (ENOENT). "
             "The codex profile's plugin_root_env must be CLAUDE_PLUGIN_ROOT."
         )
+
+
+class TestCodexAgentEmission:
+    """Codex target transforms Claude fairy Markdown specs into Codex TOML agents."""
+
+    @pytest.fixture(scope="class")
+    def codex_convenience_bundle(self, tmp_path_factory) -> str:
+        """Build a codex convenience bundle and return its root path."""
+        bundle_dir = str(tmp_path_factory.mktemp("codex_agents"))
+        result = _run_build(
+            ["--target", "codex", "--tier", "convenience"],
+            output_dir=bundle_dir,
+        )
+        assert result.returncode == 0, (
+            f"codex convenience build failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        return bundle_dir
+
+    def _read_agent(self, bundle: str, name: str) -> dict:
+        path = os.path.join(bundle, "agents", f"{name}.toml")
+        assert os.path.isfile(path), f"Codex agent TOML not found: {path}"
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+
+    def test_codex_agents_are_toml_not_claude_markdown(self, codex_convenience_bundle):
+        """Codex bundles emit .toml custom-agent files and no Claude .md copies."""
+        agents_dir = os.path.join(codex_convenience_bundle, "agents")
+        names = sorted(os.listdir(agents_dir))
+        assert "engram-coder-fairy.toml" in names
+        assert "engram-pr-reviewer.toml" in names
+        assert not [name for name in names if name.endswith(".md")], names
+
+    def test_codex_agent_toml_has_required_fields(self, codex_convenience_bundle):
+        """Generated TOML parses and contains Codex custom-agent required fields."""
+        agent = self._read_agent(codex_convenience_bundle, "engram-coder-fairy")
+        for field in ("name", "description", "developer_instructions"):
+            assert field in agent, f"generated agent missing {field!r}"
+        assert agent["name"] == "engram-coder-fairy"
+        assert agent["developer_instructions"].startswith("# Codex transform metadata")
+
+    def test_codex_agent_preserves_not_parent_instruction(self, codex_convenience_bundle):
+        """The identity-boundary warning from the Claude spec survives transform."""
+        agent = self._read_agent(codex_convenience_bundle, "engram-pr-reviewer")
+        assert "# You are NOT the parent agent" in agent["developer_instructions"]
+        assert 'Not "I am [the parent\'s name]."' in agent["developer_instructions"]
+
+    def test_codex_agent_model_tier_mapping_comes_from_profile(self, codex_convenience_bundle):
+        """Claude model tiers map through codex.json profile into Codex model fields."""
+        coder = self._read_agent(codex_convenience_bundle, "engram-coder-fairy")
+        master = self._read_agent(codex_convenience_bundle, "engram-dream-master")
+        assert coder["model"] == "gpt-5.4"
+        assert coder["model_reasoning_effort"] == "high"
+        assert master["model"] == "gpt-5.5"
+        assert master["model_reasoning_effort"] == "high"
+
+    def test_codex_agent_no_claude_frontmatter_leaks(self, codex_convenience_bundle):
+        """Generated TOML must not retain raw Claude YAML frontmatter syntax."""
+        path = os.path.join(codex_convenience_bundle, "agents", "engram-coder-fairy.toml")
+        content = Path(path).read_text(encoding="utf-8")
+        assert not content.startswith("---")
+        assert not re.search(r"^tools:", content, re.MULTILINE)
+        assert not re.search(r"^default_background:", content, re.MULTILINE)
+        assert not re.search(r"^isolation:", content, re.MULTILINE)
+
+    def test_codex_agent_blocks_inherited_mcp_when_claude_spec_has_no_mcp(self, codex_convenience_bundle):
+        """Non-MCP fairies explicitly clear inherited MCP servers in Codex config."""
+        coder = self._read_agent(codex_convenience_bundle, "engram-coder-fairy")
+        reviewer = self._read_agent(codex_convenience_bundle, "engram-pr-reviewer")
+        assert coder.get("mcp_servers") == {}
+        assert reviewer.get("mcp_servers") == {}
+
+    def test_codex_agent_allowlists_declared_mcp_tools(self, codex_convenience_bundle):
+        """MCP-using dream/summary fairies preserve Claude tool whitelists."""
+        dream = self._read_agent(codex_convenience_bundle, "engram-dream-fairy")
+        summary = self._read_agent(codex_convenience_bundle, "engram-summary-fairy")
+        dream_tools = dream["plugins"]["engram@engram-local"]["mcp_servers"]["engram"]["enabled_tools"]
+        assert set(dream_tools) == {
+            "engram_query",
+            "engram_query_pattern",
+            "engram_inspect",
+            "engram_list",
+            "engram_get_subgraph",
+            "engram_history",
+            "engram_surface",
+            "engram_diagnose",
+            "engram_stats",
+            "engram_focus_sets",
+            "engram_list_focused",
+        }
+        summary_tools = summary["plugins"]["engram@engram-local"]["mcp_servers"]["engram"]["enabled_tools"]
+        assert set(summary_tools) == {
+            "engram_inspect",
+            "engram_list",
+            "engram_query",
+        }
+
+    def test_codex_agent_full_tool_spec_inherits_full_mcp(self, codex_convenience_bundle):
+        """Dream master has tools:* and inherits full ENGRAM read/write MCP."""
+        master = self._read_agent(codex_convenience_bundle, "engram-dream-master")
+        assert "mcp_servers" not in master
 
 
 class TestCodexEmissionWithEngramHome:
