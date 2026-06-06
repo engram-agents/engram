@@ -33,9 +33,38 @@ exception in the check path — missing file, corrupt state, I/O error — cause
 the nudge to emit. Suppression must never become the default under uncertainty.
 The advisory-probe pattern in engram-session-start-hook.py `_check_mcp_health`
 is the in-repo precedent for this discipline.
+
+Maturity-gate suppression (issue #845)
+---------------------------------------
+The write-nudge is scaffolding for young graphs: it trains healthy write habits
+before they are internalized. For an established agent with a mature graph the
+nudge is noise — the discipline fires from identity, not from an external
+tripwire. Empirical anchor: the hook was silently mute from creation until #824
+(agents built healthy write habits without it); the nudge is a bootstrapping aid,
+not a permanent fixture.
+
+Fix — maturity gate: before the idle delta-scan, count current nodes in
+knowledge.db. If the count meets or exceeds the threshold (default 300,
+configurable via config.json cadence.write_nudge_node_threshold), suppress
+silently without touching the idle-suppression state file (the gate is
+stateless; crossing back under threshold — e.g. restore from backup — leaves
+the idle machinery undisturbed).
+
+Fail direction (opposite of #840): on any DB error — missing file, missing
+table, query failure — return False (NOT muted → emit). Rationale: a missing or
+unreadable DB most likely means a newborn install, exactly who the nudge is for.
+The maturity gate fails toward nudging (young-agent assumption); the #840 idle
+gate fails toward emitting (uncertainty assumption). Both fail directions resolve
+to emission, by different reasoning.
+
+Config: cadence.write_nudge_node_threshold in ~/.engram/config.json.
+  - Absent or unreadable → use default (300).
+  - Set to 0 or negative → gate disabled; nudge always emits regardless of
+    graph size. This lets an agent deliberately opt back into nudges.
 """
 import json
 import os
+import sqlite3
 import sys
 import time
 
@@ -54,6 +83,79 @@ _NUDGE_STATE_FILE = os.path.join(ENGRAM_HOME, ".write-nudge-last-fire.json")
 # which is correct (over-nudging beats under-nudging). False negatives for
 # suppression are fine — we never suppress when uncertain.
 _TOOL_USE_MARKER = b'"type":"tool_use"'
+
+# Default threshold for the maturity gate: suppress nudge when the graph has
+# at least this many current nodes. Overridable via config.json.
+_DEFAULT_NODE_THRESHOLD = 300
+
+
+def _read_node_threshold() -> int:
+    """Read cadence.write_nudge_node_threshold from config.json.
+
+    Returns the configured value, or _DEFAULT_NODE_THRESHOLD if absent or
+    unreadable. A value of 0 or negative in config means the gate is disabled
+    (caller interprets <= 0 as always-emit).
+    """
+    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+        cadence = config.get("cadence", {})
+        val = cadence.get("write_nudge_node_threshold")
+        if val is None:
+            return _DEFAULT_NODE_THRESHOLD
+        return int(val)
+    except Exception:  # noqa: BLE001
+        # Config missing, unreadable, or malformed — use the default.
+        return _DEFAULT_NODE_THRESHOLD
+
+
+def _maturity_muted() -> bool:
+    """Return True iff the agent's graph is mature enough to suppress the nudge.
+
+    Reads the current-node count from knowledge.db and compares against the
+    configured threshold. The query counts only is_current=1 rows — retracted
+    and superseded nodes (is_current=0) do not count toward maturity.
+
+    Fail direction: on ANY failure — DB missing, table missing, query error —
+    return False (NOT muted → emit). A missing or unreadable DB most likely
+    indicates a newborn install, exactly who the nudge is for. The maturity gate
+    fails toward nudging (young-agent assumption); the #840 idle gate fails
+    toward emitting (uncertainty assumption). Both fail directions resolve to
+    emission, by different reasoning.
+
+    Gate-disabled path: if the configured threshold is <= 0, return False
+    immediately (gate disabled; the caller always emits regardless of graph
+    size). An agent can opt back into nudges by setting the threshold to 0 or
+    negative in config.json.
+    """
+    try:
+        threshold = _read_node_threshold()
+        if threshold <= 0:
+            # Gate explicitly disabled via config — never mute.
+            return False
+
+        db_path = os.path.join(ENGRAM_HOME, "knowledge.db")
+        # Open read-only via WAL-safe URI path. Under WAL mode a mode=ro
+        # connection reads the pre-transaction snapshot and does not raise
+        # SQLITE_BUSY during concurrent writes. Any exception that does occur
+        # (missing file, missing table, I/O error) lands on the except branch
+        # below and fails toward nudging.
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT count(*) FROM nodes WHERE is_current = 1"
+            ).fetchone()
+            current_count = row[0]
+        finally:
+            conn.close()
+
+        return current_count >= threshold
+
+    except Exception:  # noqa: BLE001
+        # Any failure — missing DB, missing table, query error — fails toward
+        # nudging (young-agent assumption). Do NOT mute.
+        return False
 
 
 def _should_suppress(transcript_path: str) -> bool:
@@ -148,6 +250,15 @@ def main() -> None:
                 transcript_path = tp
     except Exception:
         pass
+
+    # Maturity-gate check (issue #845): cheaper than the delta-scan and checked
+    # first. A mature graph means the write-discipline fires from identity, not
+    # from this tripwire — suppress silently. Do NOT touch the state file on
+    # this path; the gate is stateless so crossing back under threshold (e.g.
+    # restore from backup) leaves the idle machinery undisturbed.
+    if _maturity_muted():
+        # Empty stdout is the canonical no-op per #824/#832 contract.
+        return
 
     # Idle-suppression check (issue #840). Wrap entirely in try/except so any
     # failure here cannot prevent the nudge from emitting.
