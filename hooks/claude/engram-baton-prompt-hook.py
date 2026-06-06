@@ -67,6 +67,10 @@ _FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):\s*(.*)$", re.MULTILINE)
 # PR-ID fallback pattern: "PR-NNN"
 _PR_ID_RE = re.compile(r"^PR-(\d+)$")
 
+# Fallback path for the baton CLI when shutil.which("baton") returns None.
+# Defined at module level so tests can patch it.
+_BATON_FALLBACK = "/home/agents-shared/bin/baton"
+
 
 # ---------------------------------------------------------------------------
 # Config helpers  (mirrors engram-inter-agent-prompt-hook.py exactly)
@@ -448,6 +452,100 @@ def _scan_my_batons(agent_name: str) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Auto-archive pass
+# ---------------------------------------------------------------------------
+
+def _auto_archive_merged_pr_batons(cache: dict) -> None:
+    """Scan ALL open PR-batons and close any whose live GitHub status is MERGED.
+
+    This pass is independent of the in-court rendering loop — it runs over
+    every baton file regardless of which agent holds the turn.  Merged PRs
+    always have turn==<maintainer> (the merge-ready signal), so they are
+    never in any agent's court and would never be reached by the rendering
+    loop scan.
+
+    Instrumentation: every outcome (success, failure, skip) is written to
+    stderr (the hook log channel).  Stdout is reserved for prompt context.
+
+    Cost discipline: reuses the existing 30s-TTL cache passed in from main();
+    adds zero gh calls for cache-fresh anchors.
+    """
+    # Resolve the baton binary once; reuse the result for the guard check.
+    _baton_which = shutil.which("baton")
+    baton_bin = _baton_which or _BATON_FALLBACK
+    if not _baton_which and not Path(_BATON_FALLBACK).exists():
+        print(
+            "baton auto-archive: baton CLI not found; skipping",
+            file=sys.stderr,
+        )
+        return
+
+    projects_dir = Path(BATON_PROJECTS_DIR)
+    if not projects_dir.is_dir():
+        return
+
+    for md_file in projects_dir.glob("*.md"):
+        try:
+            text = md_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        fields, _body = _parse_frontmatter(text)
+        if not fields:
+            continue
+
+        # Skip already-closed batons (idempotency gate)
+        status = fields.get("status", "").strip().lower()
+        if status in CLOSED_STATUSES:
+            continue
+
+        # Only PR-batons (project_id matches ^PR-\d+$)
+        project_id = fields.get("project", "").strip()
+        if not project_id:
+            project_id = md_file.stem
+        if not _PR_ID_RE.match(project_id):
+            continue
+
+        # Resolve GitHub anchor — fallback to PR-NNN pattern
+        github_field = fields.get("github", "").strip()
+        anchor = _resolve_anchor(project_id, github_field)
+        if not anchor:
+            continue
+
+        # Fetch live status via the existing cache mechanism (30s TTL)
+        live_status = _get_live_status(anchor, cache)
+        if not (live_status == "MERGED" or live_status.startswith("MERGED")):
+            continue
+
+        # Live status is MERGED — close the baton
+        pid = project_id
+        try:
+            result = subprocess.run(
+                [baton_bin, "close", pid, "--status", "merged"],
+                capture_output=True,
+                text=True,
+                timeout=_GH_TIMEOUT,
+            )
+            if result.returncode != 0:
+                stderr_snippet = (result.stderr or "")[:200]
+                print(
+                    f"baton auto-archive: close {pid} failed (rc={result.returncode}): "
+                    f"{stderr_snippet}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"baton auto-archive: closed {pid} (PR merged)",
+                    file=sys.stderr,
+                )
+        except Exception as e:
+            print(
+                f"baton auto-archive: close {pid} raised: {e!r}",
+                file=sys.stderr,
+            )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -464,17 +562,10 @@ def main() -> None:
     agent_name = _get_agent_name(config)
     # Even if agent_name is empty, scanning returns nothing (no turn match).
 
-    # ── Scan for my batons ────────────────────────────────────────────────────
-    my_batons = _scan_my_batons(agent_name)
-
-    # ── Exit silently if nothing to surface ───────────────────────────────────
-    if not my_batons:
-        sys.exit(0)
-
     # ── Detect gh availability once (don't retry per baton) ──────────────────
     gh_ok = _gh_available()
 
-    # ── Load cache (once for all batons) ─────────────────────────────────────
+    # ── Load cache (once for all batons and the auto-archive pass) ───────────
     cache: dict = {}
     if gh_ok:
         try:
@@ -482,95 +573,91 @@ def main() -> None:
         except Exception:
             cache = {}
 
-    # ── Build injection block ─────────────────────────────────────────────────
-    n = len(my_batons)
-    baton_word = "baton" if n == 1 else "batons"
-    lines = [
-        f"\U0001f3be {n} {baton_word} in your court — YOUR MOVE on each "
-        f"(a baton here = ACTION PENDING from you, NOT 'parked', NOT 'waiting on them'):"
-    ]
+    # ── Scan for my batons ────────────────────────────────────────────────────
+    my_batons = _scan_my_batons(agent_name)
 
-    for b in my_batons:
-        pid = b["project_id"]
-        turn_since = b["turn_since"]
-        turn_reason = b["turn_reason"]
-        github_anchor = b["github_anchor"]
+    # ── Build injection block (only when there are in-court batons) ───────────
+    if my_batons:
+        n = len(my_batons)
+        baton_word = "baton" if n == 1 else "batons"
+        lines = [
+            f"\U0001f3be {n} {baton_word} in your court — YOUR MOVE on each "
+            f"(a baton here = ACTION PENDING from you, NOT 'parked', NOT 'waiting on them'):"
+        ]
 
-        # Format: since HH:MMZ, Xh ago
-        if turn_since:
-            since_short = turn_since.strftime("%H:%MZ")
-            age = _format_age(turn_since)
-            age_part = f", {age}" if age else ""
-            since_str = f"since {since_short}{age_part}"
-        else:
-            since_str = ""
+        for b in my_batons:
+            pid = b["project_id"]
+            turn_since = b["turn_since"]
+            turn_reason = b["turn_reason"]
+            github_anchor = b["github_anchor"]
 
-        reason_part = f" — {turn_reason}" if turn_reason else ""
+            # Format: since HH:MMZ, Xh ago
+            if turn_since:
+                since_short = turn_since.strftime("%H:%MZ")
+                age = _format_age(turn_since)
+                age_part = f", {age}" if age else ""
+                since_str = f"since {since_short}{age_part}"
+            else:
+                since_str = ""
 
-        # Live GitHub status clause (best-effort; never blocks or raises)
-        live_clause = ""
-        live_status = ""
-        if gh_ok and github_anchor:
-            try:
-                live_status = _get_live_status(github_anchor, cache)
-                if live_status:
-                    live_clause = f" [{live_status}]"
-            except Exception:
-                pass
+            reason_part = f" — {turn_reason}" if turn_reason else ""
 
-        # Auto-archive: if a PR-baton's underlying PR is now MERGED, close the
-        # baton via `baton close <pid> --status merged`.  Conditions:
-        #   1. live_status == "MERGED"
-        #   2. project_id matches ^PR-\d+$ (PR-batons only; not project/N)
-        #   3. baton's own status is not already "merged" (idempotency gate)
-        # Silently ignores any failure — degrade-to-silent same as gh calls.
-        # Does NOT change the rendered output for this prompt; the [MERGED]
-        # clause still appears.  Next prompt scan will exclude the closed baton.
-        if live_status == "MERGED" and _PR_ID_RE.match(b["project_id"]) and b["status"] != "merged":
-            try:
-                subprocess.run(
-                    ["baton", "close", b["project_id"], "--status", "merged"],
-                    capture_output=True,
-                    text=True,
-                    timeout=_GH_TIMEOUT,
-                )
-            except Exception:
-                pass
+            # Live GitHub status clause (best-effort; never blocks or raises)
+            live_clause = ""
+            if gh_ok and github_anchor:
+                try:
+                    live_status = _get_live_status(github_anchor, cache)
+                    if live_status:
+                        live_clause = f" [{live_status}]"
+                except Exception:
+                    pass
 
-        if since_str:
-            lines.append(f"  - {pid} ({since_str}){reason_part}{live_clause}")
-        else:
-            lines.append(f"  - {pid}{reason_part}{live_clause}")
+            if since_str:
+                lines.append(f"  - {pid} ({since_str}){reason_part}{live_clause}")
+            else:
+                lines.append(f"  - {pid}{reason_part}{live_clause}")
 
-    # Explicit decision prompt — a baton in your court is a PENDING ACTION, not a
-    # status line. Force classification rather than glazing past "in your court"
-    # as "parked." (Origin: a baton sat un-flipped 37m, misread as "waiting on
-    # peer" when the peer had no signal — the holder must flip for them to know.)
-    lines.append("  ↳ For EACH above, decide which state it's in — then ACT, don't defer:")
-    lines.append("     • still working on it → keep it (no flip needed)")
-    lines.append("     • done, waiting on a peer → FLIP IT NOW to them: baton flip <id> <peer>")
-    lines.append("     • colleague-approved + CI green → FLIP IT NOW to the maintainer")
-    lines.append(
-        "     A baton left in your court un-flipped is a DROPPED baton: the peer/maintainer "
-        "gets NO signal until you flip. \"In your court\" means YOUR move — it is never \"parked.\""
-    )
+        # Explicit decision prompt — a baton in your court is a PENDING ACTION, not a
+        # status line. Force classification rather than glazing past "in your court"
+        # as "parked." (Origin: a baton sat un-flipped 37m, misread as "waiting on
+        # peer" when the peer had no signal — the holder must flip for them to know.)
+        lines.append("  ↳ For EACH above, decide which state it's in — then ACT, don't defer:")
+        lines.append("     • still working on it → keep it (no flip needed)")
+        lines.append("     • done, waiting on a peer → FLIP IT NOW to them: baton flip <id> <peer>")
+        lines.append("     • colleague-approved + CI green → FLIP IT NOW to the maintainer")
+        lines.append(
+            "     A baton left in your court un-flipped is a DROPPED baton: the peer/maintainer "
+            "gets NO signal until you flip. \"In your court\" means YOUR move — it is never \"parked.\""
+        )
 
-    # ── Persist updated cache ─────────────────────────────────────────────────
+        context = "\n".join(lines)
+
+        response = {
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": context,
+            }
+        }
+
+        print(json.dumps(response))
+
+    # ── Auto-archive pass: runs even when my_batons is empty ─────────────────
+    # Merged PR-batons always have turn==<maintainer>, so they are never in any
+    # agent's in-court list.  This second scan covers ALL open PR-batons
+    # regardless of turn, closing any whose live GitHub status is MERGED.
+    # Guard: skip when gh is unavailable (no live status reachable anyway).
+    if gh_ok:
+        _auto_archive_merged_pr_batons(cache)
+
+    # ── Persist cache after auto-archive pass ────────────────────────────────
+    # Single save here, after both the in-court rendering pass and the
+    # auto-archive pass have completed.  Covers archive-pass cache additions
+    # on both the in-court and zero-in-court paths.
     if gh_ok and cache:
         try:
             _save_cache(cache)
         except Exception:
             pass
-
-    context = "\n".join(lines)
-
-    response = {
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": context,
-        }
-    }
-    print(json.dumps(response))
 
 
 if __name__ == "__main__":

@@ -418,7 +418,13 @@ class TestAutoArchiveOnMerged:
     # ------------------------------------------------------------------
 
     def test_auto_archive_pr_baton_when_merged(self, engram_home, projects_dir):
-        """baton close is called when a PR-baton's live status returns MERGED."""
+        """baton close is called when a PR-baton's live status returns MERGED.
+
+        After the reachability fix, auto-archive runs as a second scan pass
+        in _auto_archive_merged_pr_batons(), regardless of which agent holds
+        the turn.  The baton here has turn==borges (in-court) but the test
+        verifies the second-pass code path, not the old rendering-loop path.
+        """
         _write_config(engram_home, "borges")
         _write_project(
             projects_dir, "PR-1100",
@@ -429,23 +435,27 @@ class TestAutoArchiveOnMerged:
 
         mod = _load_hook_module(engram_home, projects_dir)
 
+        def _which(name):
+            """Return a fake binary path for known tools, None otherwise."""
+            return name  # "baton" → "baton", "gh" → "gh"
+
         with patch.dict(os.environ, {
             "ENGRAM_HOME": str(engram_home),
             "BATON_PROJECTS_DIR": str(projects_dir),
         }):
-            with patch.object(mod, "_fetch_pr_status", return_value="MERGED"):
-                with patch.object(mod, "subprocess") as mock_subproc:
-                    # subprocess.run is called for baton close; ensure it
-                    # doesn't raise so the hook completes.
-                    mock_subproc.run.return_value = type(
-                        "CompletedProcess", (), {"returncode": 0}
-                    )()
-                    mod.main()
+            with patch.object(mod.shutil, "which", side_effect=_which):
+                with patch.object(mod, "_fetch_pr_status", return_value="MERGED"):
+                    with patch.object(mod, "subprocess") as mock_subproc:
+                        # subprocess.run is called for baton close; ensure it
+                        # doesn't raise so the hook completes.
+                        mock_subproc.run.return_value = type(
+                            "CompletedProcess", (), {"returncode": 0}
+                        )()
+                        mod.main()
 
-        # Verify baton close was called exactly once with the expected args
-        # (assert_called_once_with also catches accidental double-fire regressions
-        # — _fetch_pr_status is patched so no subprocess.run for gh is invoked;
-        # the only subprocess.run in this code path is the baton close call.)
+        # Verify baton close was called exactly once with the expected args.
+        # _fetch_pr_status is patched so no subprocess.run for gh is invoked;
+        # the only subprocess.run in this code path is the baton close call.
         mock_subproc.run.assert_called_once_with(
             ["baton", "close", "PR-1100", "--status", "merged"],
             capture_output=True,
@@ -471,6 +481,9 @@ class TestAutoArchiveOnMerged:
 
         baton_close_calls = []
 
+        def _which(name):
+            return name  # "baton" → "baton", "gh" → "gh"
+
         def _fake_run(args, **kwargs):
             if args[:2] == ["baton", "close"]:
                 baton_close_calls.append(args)
@@ -480,10 +493,11 @@ class TestAutoArchiveOnMerged:
             "ENGRAM_HOME": str(engram_home),
             "BATON_PROJECTS_DIR": str(projects_dir),
         }):
-            with patch.object(mod, "_fetch_pr_status", return_value="OPEN"):
-                with patch.object(mod, "subprocess") as mock_subproc:
-                    mock_subproc.run.side_effect = _fake_run
-                    mod.main()
+            with patch.object(mod.shutil, "which", side_effect=_which):
+                with patch.object(mod, "_fetch_pr_status", return_value="OPEN"):
+                    with patch.object(mod, "subprocess") as mock_subproc:
+                        mock_subproc.run.side_effect = _fake_run
+                        mod.main()
 
         assert baton_close_calls == [], (
             "baton close must not be called when live status is OPEN"
@@ -508,6 +522,9 @@ class TestAutoArchiveOnMerged:
 
         baton_close_calls = []
 
+        def _which(name):
+            return name  # "baton" → "baton", "gh" → "gh"
+
         def _fake_run(args, **kwargs):
             if args[:2] == ["baton", "close"]:
                 baton_close_calls.append(args)
@@ -517,12 +534,13 @@ class TestAutoArchiveOnMerged:
             "ENGRAM_HOME": str(engram_home),
             "BATON_PROJECTS_DIR": str(projects_dir),
         }):
-            # Even if we somehow get MERGED back (no anchor resolves for pool-42,
-            # so _fetch_pr_status won't actually be called), ensure the guard holds.
-            with patch.object(mod, "_fetch_pr_status", return_value="MERGED"):
-                with patch.object(mod, "subprocess") as mock_subproc:
-                    mock_subproc.run.side_effect = _fake_run
-                    mod.main()
+            with patch.object(mod.shutil, "which", side_effect=_which):
+                # Even if we somehow get MERGED back (no anchor resolves for pool-42,
+                # so _fetch_pr_status won't actually be called), ensure the guard holds.
+                with patch.object(mod, "_fetch_pr_status", return_value="MERGED"):
+                    with patch.object(mod, "subprocess") as mock_subproc:
+                        mock_subproc.run.side_effect = _fake_run
+                        mod.main()
 
         assert baton_close_calls == [], (
             "baton close must not be called for non-PR-N project IDs"
@@ -535,7 +553,13 @@ class TestAutoArchiveOnMerged:
     def test_archive_subprocess_failure_does_not_crash_hook(
         self, engram_home, projects_dir
     ):
-        """If baton close subprocess raises, hook completes normally."""
+        """If baton close subprocess raises, hook completes normally.
+
+        After the reachability fix, the baton close call is in
+        _auto_archive_merged_pr_batons().  When subprocess.run raises, the
+        exception is caught, a stderr line is emitted, and the hook exits
+        cleanly — the JSON output must still appear on stdout.
+        """
         _write_config(engram_home, "borges")
         _write_project(
             projects_dir, "PR-1300",
@@ -546,30 +570,41 @@ class TestAutoArchiveOnMerged:
 
         mod = _load_hook_module(engram_home, projects_dir)
 
+        def _which(name):
+            return name  # "baton" → "baton", "gh" → "gh"
+
         def _exploding_run(args, **kwargs):
-            if args[:2] == ["baton", "close"]:
+            if args and args[0] == "baton" and len(args) > 1 and args[1] == "close":
                 raise OSError("baton not found")
             return type("CompletedProcess", (), {"returncode": 0})()
 
-        captured_output = []
+        stdout_output = []
 
-        def _fake_print(data):
-            captured_output.append(data)
+        def _fake_print(*args, **kwargs):
+            # Only capture stdout prints (no file= kwarg, or file=sys.stdout).
+            # stderr prints (file=sys.stderr) are not captured here.
+            file = kwargs.get("file", None)
+            if file is None or file is sys.stdout:
+                stdout_output.append(args[0] if args else "")
 
         with patch.dict(os.environ, {
             "ENGRAM_HOME": str(engram_home),
             "BATON_PROJECTS_DIR": str(projects_dir),
         }):
-            with patch.object(mod, "_fetch_pr_status", return_value="MERGED"):
-                with patch.object(mod, "subprocess") as mock_subproc:
-                    mock_subproc.run.side_effect = _exploding_run
-                    with patch("builtins.print", side_effect=_fake_print):
-                        # Should not raise despite OSError in baton close
-                        mod.main()
+            with patch.object(mod.shutil, "which", side_effect=_which):
+                with patch.object(mod, "_fetch_pr_status", return_value="MERGED"):
+                    with patch.object(mod, "subprocess") as mock_subproc:
+                        mock_subproc.run.side_effect = _exploding_run
+                        with patch("builtins.print", side_effect=_fake_print):
+                            # Should not raise despite OSError in baton close
+                            mod.main()
 
-        # Hook must have produced a JSON output (not crashed silently)
-        assert len(captured_output) == 1
-        response = json.loads(captured_output[0])
+        # Hook must have produced exactly one JSON output on stdout
+        assert len(stdout_output) == 1, (
+            f"Expected 1 stdout print (JSON response), got {len(stdout_output)}: "
+            f"{stdout_output}"
+        )
+        response = json.loads(stdout_output[0])
         assert "hookSpecificOutput" in response
         ctx = response["hookSpecificOutput"]["additionalContext"]
         assert "PR-1300" in ctx
@@ -610,4 +645,374 @@ class TestAutoArchiveOnMerged:
         assert batons == [], (
             "Merged baton must be excluded by _scan_my_batons — "
             "auto-archive code path never reached for already-closed batons"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests 18–24: Second-pass auto-archive — spec cases (a)–(g)
+#
+# These tests exercise the new _auto_archive_merged_pr_batons() function,
+# which runs as a second scan pass over ALL open PR-batons regardless of
+# whose turn it is.  This is the reachability fix for issue #874.
+# ---------------------------------------------------------------------------
+
+class TestAutoArchiveSecondPass:
+    """Second-pass auto-archive: scans ALL open PR-batons regardless of turn."""
+
+    # ------------------------------------------------------------------
+    # Helper: mock shutil.which to return the binary name for known tools
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _which(name: str):
+        """Fake shutil.which: returns the name itself for known tools."""
+        if name in ("baton", "gh"):
+            return name
+        return None
+
+    # ------------------------------------------------------------------
+    # (a) Merged PR-baton at turn==someoneelse → baton close invoked
+    #
+    # The critical reachability case: baton has turn=maintainer (not borges),
+    # so it never appears in _scan_my_batons("borges").  The second pass must
+    # find and archive it.
+    # ------------------------------------------------------------------
+
+    def test_a_merged_pr_baton_turn_other_agent_invokes_baton_close(
+        self, engram_home, projects_dir
+    ):
+        """baton close is called for a merged PR-baton held by another agent."""
+        _write_config(engram_home, "borges")
+        # Baton is at turn=maintainer — NOT in borges's court
+        _write_project(
+            projects_dir, "PR-2100",
+            turn="maintainer",
+            status="in-progress",
+            turn_reason="colleague-approved; ready for merge",
+        )
+
+        mod = _load_hook_module(engram_home, projects_dir)
+
+        with patch.dict(os.environ, {
+            "ENGRAM_HOME": str(engram_home),
+            "BATON_PROJECTS_DIR": str(projects_dir),
+        }):
+            with patch.object(mod.shutil, "which", side_effect=self._which):
+                with patch.object(mod, "_fetch_pr_status", return_value="MERGED"):
+                    with patch.object(mod, "subprocess") as mock_subproc:
+                        mock_subproc.run.return_value = type(
+                            "CompletedProcess", (), {"returncode": 0}
+                        )()
+                        mod.main()
+
+        mock_subproc.run.assert_called_once_with(
+            ["baton", "close", "PR-2100", "--status", "merged"],
+            capture_output=True,
+            text=True,
+            timeout=mod._GH_TIMEOUT,
+        )
+
+    # ------------------------------------------------------------------
+    # (b) Merged PR-baton already status=merged → NOT invoked (idempotency)
+    # ------------------------------------------------------------------
+
+    def test_b_already_closed_baton_not_archived_again(
+        self, engram_home, projects_dir
+    ):
+        """baton close is NOT called for a baton already in CLOSED_STATUSES."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-2200",
+            turn="maintainer",
+            status="merged",          # already closed
+            turn_reason="done",
+        )
+
+        mod = _load_hook_module(engram_home, projects_dir)
+
+        baton_close_calls = []
+
+        def _fake_run(args, **kwargs):
+            if args and args[0] == "baton" and len(args) > 1 and args[1] == "close":
+                baton_close_calls.append(args)
+            return type("CompletedProcess", (), {"returncode": 0})()
+
+        with patch.dict(os.environ, {
+            "ENGRAM_HOME": str(engram_home),
+            "BATON_PROJECTS_DIR": str(projects_dir),
+        }):
+            with patch.object(mod.shutil, "which", side_effect=self._which):
+                with patch.object(mod, "_fetch_pr_status", return_value="MERGED"):
+                    with patch.object(mod, "subprocess") as mock_subproc:
+                        mock_subproc.run.side_effect = _fake_run
+                        mod.main()
+
+        assert baton_close_calls == [], (
+            "baton close must not be called for an already-merged baton"
+        )
+
+    # ------------------------------------------------------------------
+    # (c) Non-PR project baton (e.g. pool-x) → never considered
+    # ------------------------------------------------------------------
+
+    def test_c_non_pr_project_baton_never_archived(
+        self, engram_home, projects_dir
+    ):
+        """Pool/project batons (non-PR-NNN ids) are never auto-archived."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "pool-coordination",
+            turn="maintainer",
+            status="in-progress",
+            turn_reason="pool work ongoing",
+        )
+
+        mod = _load_hook_module(engram_home, projects_dir)
+
+        baton_close_calls = []
+
+        def _fake_run(args, **kwargs):
+            if args and args[0] == "baton" and len(args) > 1 and args[1] == "close":
+                baton_close_calls.append(args)
+            return type("CompletedProcess", (), {"returncode": 0})()
+
+        with patch.dict(os.environ, {
+            "ENGRAM_HOME": str(engram_home),
+            "BATON_PROJECTS_DIR": str(projects_dir),
+        }):
+            with patch.object(mod.shutil, "which", side_effect=self._which):
+                # Even if fetch returns MERGED, pool-coordination is not PR-NNN
+                with patch.object(mod, "_fetch_pr_status", return_value="MERGED"):
+                    with patch.object(mod, "subprocess") as mock_subproc:
+                        mock_subproc.run.side_effect = _fake_run
+                        mod.main()
+
+        assert baton_close_calls == [], (
+            "baton close must not be called for non-PR-NNN project IDs"
+        )
+
+    # ------------------------------------------------------------------
+    # (d) gh unavailable (gh_ok=False) → auto-archive pass skipped entirely
+    # ------------------------------------------------------------------
+
+    def test_d_gh_unavailable_skips_auto_archive(
+        self, engram_home, projects_dir
+    ):
+        """When gh is unavailable, _auto_archive_merged_pr_batons is not called."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-2400",
+            turn="maintainer",
+            status="in-progress",
+            turn_reason="awaiting merge",
+        )
+
+        mod = _load_hook_module(engram_home, projects_dir)
+
+        baton_close_calls = []
+
+        def _fake_run(args, **kwargs):
+            if args and args[0] == "baton" and len(args) > 1 and args[1] == "close":
+                baton_close_calls.append(args)
+            return type("CompletedProcess", (), {"returncode": 0})()
+
+        def _which_no_gh(name):
+            # gh is absent; baton is present but should never be reached
+            if name == "gh":
+                return None
+            return name
+
+        with patch.dict(os.environ, {
+            "ENGRAM_HOME": str(engram_home),
+            "BATON_PROJECTS_DIR": str(projects_dir),
+        }):
+            with patch.object(mod.shutil, "which", side_effect=_which_no_gh):
+                with patch.object(mod, "_fetch_pr_status", return_value="MERGED"):
+                    with patch.object(mod, "subprocess") as mock_subproc:
+                        mock_subproc.run.side_effect = _fake_run
+                        mod.main()
+
+        assert baton_close_calls == [], (
+            "baton close must not be called when gh is unavailable"
+        )
+
+    # ------------------------------------------------------------------
+    # (e) baton close returns nonzero → stderr contains auto-archive + pid;
+    #     hook stdout is unaffected (no output when no in-court batons)
+    # ------------------------------------------------------------------
+
+    def test_e_nonzero_returncode_emits_stderr_and_leaves_stdout_clean(
+        self, engram_home, projects_dir
+    ):
+        """Non-zero baton close returncode → stderr log; stdout empty."""
+        _write_config(engram_home, "borges")
+        # Baton at turn=maintainer — no in-court baton for borges
+        _write_project(
+            projects_dir, "PR-2500",
+            turn="maintainer",
+            status="in-progress",
+            turn_reason="ready for merge",
+        )
+
+        mod = _load_hook_module(engram_home, projects_dir)
+
+        stderr_lines = []
+        stdout_lines = []
+
+        def _fake_print(*args, **kwargs):
+            file = kwargs.get("file", None)
+            text = args[0] if args else ""
+            if file is sys.stderr:
+                stderr_lines.append(str(text))
+            else:
+                stdout_lines.append(str(text))
+
+        def _failing_run(cmd_args, **kwargs):
+            cp = type(
+                "CompletedProcess", (),
+                {
+                    "returncode": 1,
+                    "stderr": "baton: no such file",
+                    "stdout": "",
+                },
+            )()
+            return cp
+
+        with patch.dict(os.environ, {
+            "ENGRAM_HOME": str(engram_home),
+            "BATON_PROJECTS_DIR": str(projects_dir),
+        }):
+            with patch.object(mod.shutil, "which", side_effect=self._which):
+                with patch.object(mod, "_fetch_pr_status", return_value="MERGED"):
+                    with patch.object(mod, "subprocess") as mock_subproc:
+                        mock_subproc.run.side_effect = _failing_run
+                        with patch("builtins.print", side_effect=_fake_print):
+                            mod.main()
+
+        # stdout must be empty (no in-court batons)
+        assert stdout_lines == [], (
+            f"stdout must be empty when no batons in court; got: {stdout_lines}"
+        )
+        # stderr must contain auto-archive and the pid
+        assert any("auto-archive" in line for line in stderr_lines), (
+            f"stderr must mention 'auto-archive'; got: {stderr_lines}"
+        )
+        assert any("PR-2500" in line for line in stderr_lines), (
+            f"stderr must mention the pid 'PR-2500'; got: {stderr_lines}"
+        )
+
+    # ------------------------------------------------------------------
+    # (f) baton binary missing → stderr skip line, no exception
+    # ------------------------------------------------------------------
+
+    def test_f_baton_binary_missing_emits_skip_line_no_exception(
+        self, engram_home, projects_dir, tmp_path
+    ):
+        """When baton binary is absent, a skip line is written to stderr.
+
+        Calls the real _auto_archive_merged_pr_batons() with shutil.which
+        mocked to return None and _BATON_FALLBACK patched to a nonexistent
+        path, so the production binary-check guard is exercised directly.
+        """
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-2600",
+            turn="maintainer",
+            status="in-progress",
+            turn_reason="ready for merge",
+        )
+
+        mod = _load_hook_module(engram_home, projects_dir)
+
+        stderr_lines = []
+
+        def _fake_print(*args, **kwargs):
+            file = kwargs.get("file", None)
+            text = args[0] if args else ""
+            if file is sys.stderr:
+                stderr_lines.append(str(text))
+
+        # Use a nonexistent path so Path(_BATON_FALLBACK).exists() is False
+        fake_fallback = str(tmp_path / "bin" / "baton")
+
+        cache: dict = {}
+
+        with patch.dict(os.environ, {
+            "ENGRAM_HOME": str(engram_home),
+            "BATON_PROJECTS_DIR": str(projects_dir),
+        }):
+            # shutil.which returns None for all names (baton not on PATH)
+            with patch.object(mod.shutil, "which", return_value=None):
+                # Patch the module-level _BATON_FALLBACK to the nonexistent path
+                with patch.object(mod, "_BATON_FALLBACK", fake_fallback):
+                    with patch("builtins.print", side_effect=_fake_print):
+                        # Must not raise
+                        mod._auto_archive_merged_pr_batons(cache)
+
+        assert any("baton CLI not found" in line for line in stderr_lines), (
+            f"Expected 'baton CLI not found; skipping' in stderr; got: {stderr_lines}"
+        )
+
+    # ------------------------------------------------------------------
+    # (g) Zero in-court batons + one merged PR-baton at turn=maintainer →
+    #     auto-archive still runs; hook prints nothing to stdout
+    #
+    # This is the key early-exit restructure: the old code did
+    # `if not my_batons: sys.exit(0)` BEFORE the auto-archive pass, so
+    # the idle agent never archived anything.  After the fix, the pass
+    # runs even when my_batons is empty.
+    # ------------------------------------------------------------------
+
+    def test_g_zero_in_court_batons_auto_archive_still_runs(
+        self, engram_home, projects_dir
+    ):
+        """Auto-archive runs even with zero in-court batons; stdout stays empty."""
+        _write_config(engram_home, "borges")
+        # Only baton: turn=maintainer → NOT in borges's court
+        _write_project(
+            projects_dir, "PR-2700",
+            turn="maintainer",
+            status="in-progress",
+            turn_reason="colleague-approved",
+        )
+
+        mod = _load_hook_module(engram_home, projects_dir)
+
+        baton_close_calls = []
+        stdout_lines = []
+
+        def _fake_run(cmd_args, **kwargs):
+            if cmd_args and cmd_args[0] == "baton" and len(cmd_args) > 1 and cmd_args[1] == "close":
+                baton_close_calls.append(cmd_args)
+            return type(
+                "CompletedProcess", (),
+                {"returncode": 0, "stderr": "", "stdout": ""},
+            )()
+
+        def _fake_print(*args, **kwargs):
+            file = kwargs.get("file", None)
+            if file is None or file is sys.stdout:
+                stdout_lines.append(args[0] if args else "")
+
+        with patch.dict(os.environ, {
+            "ENGRAM_HOME": str(engram_home),
+            "BATON_PROJECTS_DIR": str(projects_dir),
+        }):
+            with patch.object(mod.shutil, "which", side_effect=self._which):
+                with patch.object(mod, "_fetch_pr_status", return_value="MERGED"):
+                    with patch.object(mod, "subprocess") as mock_subproc:
+                        mock_subproc.run.side_effect = _fake_run
+                        with patch("builtins.print", side_effect=_fake_print):
+                            mod.main()
+
+        # Auto-archive must have fired (the merged PR-baton was archived)
+        assert len(baton_close_calls) == 1, (
+            f"Expected 1 baton close call (for PR-2700); got: {baton_close_calls}"
+        )
+        assert baton_close_calls[0][2] == "PR-2700", (
+            f"Expected baton close for PR-2700; got: {baton_close_calls[0]}"
+        )
+        # stdout must be empty — no in-court batons to surface
+        assert stdout_lines == [], (
+            f"stdout must be empty when no batons in court; got: {stdout_lines}"
         )
