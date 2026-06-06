@@ -183,6 +183,16 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/collab-letter-monitor.sh",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "tools/forum-mention-monitor.sh",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
       "path": "tools/ia.py",
       "tier": "convenience",
       "multi_agent": true
@@ -208,6 +218,14 @@
     },
     {
       "path": "tools/forum_backup.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/forum_backfill_embeddings.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/forum_regen_derived.py",
       "tier": "convenience"
     },
     {
