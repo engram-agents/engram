@@ -1,10 +1,8 @@
 """Tests for the 7-day session marker pruning added at SessionStart.
 
-The prune_stale_session_markers() function lives in both
-hooks/claude/engram-session-start-hook.py and
-hooks/gemini/engram-session-start-hook.py. These tests exercise the Claude
-path; the Gemini path is structurally identical (inline copy of the same
-logic).
+The prune_stale_session_markers() function lives in
+hooks/claude/engram-session-start-hook.py. These tests exercise the Claude
+implementation.
 
 Coverage:
   (a) 8-day-old marker is deleted; 3-day and current-time markers are kept.

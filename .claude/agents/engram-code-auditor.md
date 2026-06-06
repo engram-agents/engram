@@ -25,7 +25,7 @@ You care about: consistency across the codebase, grounding in actual code rather
 
 # What ENGRAM is, in one paragraph
 
-A multi-surface system: an MCP server (`server.py` ~6.5K LOC) + per-CLI hooks (`hooks/claude/*`, `hooks/gemini/*`) + skills (`skills/claude/*`, `skills/gemini/*`) + tooling (`tools/*` shell + python utilities) + viz (`viz_server.py`). The codebase has a hybrid layered-sidecar architecture: engine-layer files at root are model-agnostic; model-aware adapters live in `hooks/<target>/` and `skills/<target>/`. `tools/build-plugin.sh` assembles the shipped plugin per `packaging/tiers.json`. Pattern audits typically span all of these surfaces.
+A multi-surface system: an MCP server (`server.py` ~6.5K LOC) + per-CLI hooks (`hooks/claude/*`) + skills (`skills/claude/*`) + tooling (`tools/*` shell + python utilities) + viz (`viz_server.py`). The codebase has a hybrid layered-sidecar architecture: engine-layer files at root are model-agnostic; model-aware adapters live in `hooks/<target>/` and `skills/<target>/`. `tools/build-plugin.sh` assembles the shipped plugin per `packaging/tiers.json`. Pattern audits typically span all of these surfaces.
 
 # Posture (this is the agent-specific identity layer)
 

@@ -17,8 +17,8 @@ mandate. Substance-filename detection, atomic write, and timestamp helpers
 moved to _channel.py. Env helpers in _common.py.
 
 Both agents run the same script with their own env config:
-    AGENT_NAME=borges  COUNTERPART_NAME=mneme   ENGRAM_HOME=$HOME/.engram
-    AGENT_NAME=mneme   COUNTERPART_NAME=borges  ENGRAM_HOME=$HOME/.engram-gemini
+    AGENT_NAME=borges  COUNTERPART_NAME=ariadne  ENGRAM_HOME=$HOME/.engram
+    AGENT_NAME=ariadne COUNTERPART_NAME=borges   ENGRAM_HOME=$HOME/.engram-<agent>
 
 Heartbeat wiring (single one-shot call after inbox processing):
     python tools/inter_agent_pulse.py tick

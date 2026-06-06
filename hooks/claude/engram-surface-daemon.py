@@ -37,7 +37,7 @@ def _resolve_runtime_dir(engram_home: str) -> str:
     Priority:
       1. $ENGRAM_RUNTIME_DIR if set explicitly.
       2. $ENGRAM_HOME if it bundles a snapshot (alpha-install pattern —
-         install-gemini.sh copies server.py + engram_client.py into the
+         scatter install copies server.py + engram_client.py into the
          data dir).
       3. Plugin root: hook lives at <plugin_root>/hooks/hook.py (flat layout —
          tools/build-plugin.sh copies hooks into <plugin_root>/hooks/ without

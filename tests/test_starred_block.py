@@ -1,4 +1,4 @@
-"""Tests for the starred_block() surface helper wired into both hooks.
+"""Tests for the starred_block() surface helper wired into the Claude hooks.
 
 Verifies:
   1. starred_block() returns "" when no starred JSON file exists.
@@ -10,7 +10,7 @@ Verifies:
   6. starred_block() caps at 10 entries and appends "+N more" tail.
   7. starred_block() returns "" on corrupt starred JSON (graceful).
 
-Tests cover both the session-start hook and the postcompact hook implementations
+Tests cover the Claude session-start hook and postcompact hook implementations
 (both contain the same starred_block function with the same contract).
 """
 
@@ -27,8 +27,6 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SESSION_START_HOOK_PATH = _REPO_ROOT / "hooks" / "claude" / "engram-session-start-hook.py"
 _POSTCOMPACT_HOOK_PATH = _REPO_ROOT / "hooks" / "claude" / "engram-postcompact-hook.py"
-_GEMINI_SESSION_START_HOOK_PATH = _REPO_ROOT / "hooks" / "gemini" / "engram-session-start-hook.py"
-_GEMINI_POSTCOMPACT_HOOK_PATH = _REPO_ROOT / "hooks" / "gemini" / "engram-postcompact-hook.py"
 
 
 # ---------------------------------------------------------------------------
@@ -73,20 +71,6 @@ def _load_postcompact_module(engram_home: Path, inter_agent_dir: Path):
     """Load the Claude postcompact hook."""
     return _load_hook_module(
         _POSTCOMPACT_HOOK_PATH, "engram_postcompact_hook", engram_home, inter_agent_dir
-    )
-
-
-def _load_gemini_session_start_module(engram_home: Path, inter_agent_dir: Path):
-    """Load the Gemini session-start hook."""
-    return _load_hook_module(
-        _GEMINI_SESSION_START_HOOK_PATH, "engram_gemini_session_start_hook", engram_home, inter_agent_dir
-    )
-
-
-def _load_gemini_postcompact_module(engram_home: Path, inter_agent_dir: Path):
-    """Load the Gemini postcompact hook."""
-    return _load_hook_module(
-        _GEMINI_POSTCOMPACT_HOOK_PATH, "engram_gemini_postcompact_hook", engram_home, inter_agent_dir
     )
 
 
@@ -142,16 +126,12 @@ def inter_agent_dir(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 def _get_starred_block_fns(engram_home, inter_agent_dir):
-    """Return the starred_block functions from all four hook implementations."""
+    """Return the starred_block functions from the Claude hook implementations."""
     ss_mod = _load_session_start_module(engram_home, inter_agent_dir)
     pc_mod = _load_postcompact_module(engram_home, inter_agent_dir)
-    g_ss_mod = _load_gemini_session_start_module(engram_home, inter_agent_dir)
-    g_pc_mod = _load_gemini_postcompact_module(engram_home, inter_agent_dir)
     return [
         ("claude-session-start", ss_mod.starred_block),
         ("claude-postcompact", pc_mod.starred_block),
-        ("gemini-session-start", g_ss_mod.starred_block),
-        ("gemini-postcompact", g_pc_mod.starred_block),
     ]
 
 

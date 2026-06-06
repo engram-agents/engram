@@ -523,10 +523,6 @@
       "path": "templates/agents.json.example",
       "tier": "convenience",
       "multi_agent": true
-    },
-    {
-      "path": "integrations/gemini-cli",
-      "tier": "convenience"
     }
   ],
   "excluded": [

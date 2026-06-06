@@ -23,7 +23,7 @@
 #   tools/sync-cron.sh [--diff] [--dry-run] [--apply]
 #                      [--config PATH] [--template PATH]
 #                      [--agent-name NAME] [--counterpart-name NAME]
-#                      [--engram-home PATH] [--agent-cli claude|gemini]
+#                      [--engram-home PATH] [--agent-cli claude]
 #
 # Flags:
 #   --diff      Print a unified diff of (current crontab) vs (new crontab)

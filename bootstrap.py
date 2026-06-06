@@ -2,10 +2,9 @@
 """
 ENGRAM alpha bootstrap.
 
-Invoked by the plugin installer (TARGET=claude, default), install-gemini.sh
-(TARGET=gemini), or directly (TARGET=codex). Creates the seed graph (6 nodes
-+ 2 edges) and renders target-specific templates with the install-time
-placeholders.
+Invoked by the plugin installer (TARGET=claude, default) or directly
+(TARGET=codex). Creates the seed graph (6 nodes + 2 edges) and renders
+target-specific templates with the install-time placeholders.
 
 Does NOT resolve {{AGENT_NAME}}, {{USER_NAME}}, {{TODAY}} — those belong to
 the first-session dialogue, which runs when the user starts their first
@@ -17,12 +16,9 @@ Expected env vars:
   ENGRAM_HOME            — target for the ENGRAM data dir; also where
                            server.py, engram_confidence.py, and SKILL.md
                            were copied (import path below)
-  TARGET                 — 'claude' (default) | 'gemini' | 'codex'
+  TARGET                 — 'claude' (default) | 'codex'
   CLAUDE_HOME            — required for TARGET=claude (target for ~/.claude)
   CODEX_HOME             — required for TARGET=codex (target for ~/.codex)
-  GEMINI_EXT_DIR         — required for TARGET=gemini (target for the
-                           Gemini CLI extension dir, e.g. ~/.gemini/extensions/engram)
-  ALPHA_INTEGRATIONS_DIR — required for TARGET=gemini (path to alpha/integrations/)
 
 Seed graph (same for all targets — each install gets its own copy in
 its own knowledge.db):
@@ -57,15 +53,11 @@ TEMPLATES_DIR = Path(os.environ["ALPHA_TEMPLATES_DIR"])
 ENGRAM_HOME = Path(os.environ["ENGRAM_HOME"])
 TARGET = os.environ.get("TARGET", "claude").lower()
 
-if TARGET not in ("claude", "gemini", "codex"):
-    raise SystemExit(f"Unknown TARGET={TARGET!r}; must be 'claude', 'gemini', or 'codex'")
+if TARGET not in ("claude", "codex"):
+    raise SystemExit(f"Unknown TARGET={TARGET!r}; must be 'claude' or 'codex'")
 
 CLAUDE_HOME = Path(os.environ["CLAUDE_HOME"]) if TARGET == "claude" else None
 CODEX_HOME = Path(os.environ["CODEX_HOME"]) if TARGET == "codex" else None
-GEMINI_EXT_DIR = Path(os.environ["GEMINI_EXT_DIR"]) if TARGET == "gemini" else None
-ALPHA_INTEGRATIONS_DIR = (
-    Path(os.environ["ALPHA_INTEGRATIONS_DIR"]) if TARGET == "gemini" else None
-)
 
 # Import the server from bootstrap.py's own directory. server.py is colocated
 # with bootstrap.py in the plugin install path:
@@ -545,7 +537,7 @@ def main() -> None:
 
     # HEARTBEAT.md — per-agent heartbeat checklist. Ships with
     # {{AGENT_NAME}} / {{USER_NAME}} / {{COUNTERPART_NAME}} placeholders that
-    # first-session resolves alongside CLAUDE.md / GEMINI.md / warm-briefing.
+    # first-session resolves alongside CLAUDE.md / AGENTS.md / warm-briefing.
     # Single-agent installs leave {{COUNTERPART_NAME}} resolved to a no-op
     # marker (handled by the first-session skill's counterpart prompt).
     heartbeat_template = TEMPLATES_DIR / "HEARTBEAT.md.template"
@@ -594,20 +586,6 @@ def main() -> None:
 
     elif TARGET == "codex":
         _render_codex_target(substitutions)
-
-    elif TARGET == "gemini":
-        gemini_template = (
-            ALPHA_INTEGRATIONS_DIR / "gemini-cli" / "GEMINI.md.template"
-        )
-        substitute_template(
-            gemini_template,
-            GEMINI_EXT_DIR / "GEMINI.md",
-            substitutions,
-        )
-        print(f"  GEMINI.md → {GEMINI_EXT_DIR}/GEMINI.md", flush=True)
-        # gemini-extension.json + hooks/hooks.json are rendered by
-        # install-gemini.sh via shell sed (they need only PYTHON / ENGRAM_HOME
-        # / ENGRAM_HOOKS_DIR — none of the seed-graph IDs).
 
 
 if __name__ == "__main__":

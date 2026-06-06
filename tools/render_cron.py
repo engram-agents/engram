@@ -149,7 +149,7 @@ def main() -> int:
     parser.add_argument("--counterpart-name", default="")
     parser.add_argument("--engram-home", required=True)
     parser.add_argument("--agent-cli", default="claude",
-                        choices=["claude", "gemini"])
+                        choices=["claude"])
     parser.add_argument("--path", default=DEFAULT_PATH)
     args = parser.parse_args()
 

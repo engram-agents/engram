@@ -75,8 +75,7 @@ install paths:
   installer (`install.sh`) has been retired, as has its upgrader
   (`tools/deploy.sh`). Existing scatter installs continue to work; the
   supported move is the one-time scatter→plugin migration via
-  `tools/migrate-to-plugin.sh`. Gemini installs still use
-  `install-gemini.sh` until the Gemini lane retires separately.
+  `tools/migrate-to-plugin.sh`.
 
 Both install paths share the same `bootstrap.py` and `~/.engram/` contract — no
 fork. Existing scatter installs can migrate to the plugin path without losing
@@ -404,9 +403,6 @@ The pre-v0.1.0-alpha install path. `install.sh` (Claude target) has been
 retired — new users should use the plugin install above. Existing scatter
 installs continue to work; upgrade them via `tools/deploy.sh` (see below).
 
-**Gemini installs** still use `install-gemini.sh` until the Gemini lane
-retires separately (part of #763).
-
 ### Upgrading vs reinstalling (plugin)
 
 - **To upgrade an existing plugin install** (pick up newer alpha code while
@@ -429,10 +425,6 @@ retires separately (part of #763).
   `~/.claude/CLAUDE.md` is user-owned and is not overwritten automatically
   (the upgrade skill's Step 2 surfaces template changes for your review).
 
-  **Gemini installs:** the plugin path covers Claude Code only. Gemini
-  upgrade guidance is deferred to the `install-gemini.sh` docs (the Gemini
-  lane of the scatter retirement is tracked in issue #763).
-
 - **To reinstall fresh** (start over with an empty graph — data is NOT
   migrated in):
   - **Claude plugin path** — manually move or delete `~/.engram/knowledge.db`
@@ -441,8 +433,6 @@ retires separately (part of #763).
     it only bypasses the existing-install guard and bootstraps on top of the
     existing DB, adding seed nodes alongside your data. For a clean slate the
     manual delete is the required step.
-  - **Gemini target** — `./install-gemini.sh --force` archives the existing
-    data dir to a timestamped backup and starts fresh.
 
 **Why git clone, not zip download?** GitHub's "Source code (tar.gz)" tarball on
 Releases works for a one-shot install, but you lose easy upgrades — you'd need
@@ -877,18 +867,12 @@ venv, activate it before building the plugin.
 Intentional. Two paths forward:
 - **Upgrade** (keep your graph, history, sessions; update code only): use the
   plugin upgrade path — `tools/install-local-marketplace.sh` then `/plugin
-  upgrade engram` inside Claude Code (Claude installs). For Gemini installs,
-  see `install-gemini.sh` docs.
+  upgrade engram` inside Claude Code.
 - **Fresh reinstall** (start over with empty graph):
   - **Claude plugin path** — manually move or delete `~/.engram/knowledge.db`
     (no automatic backup is made — keep a copy yourself), then re-run
     `bootstrap.py`. `FORCE=1` does not delete data; it only bypasses the
     existing-install guard.
-  - **Gemini target** — `./install-gemini.sh --force`; moves `~/.engram-gemini/`
-    and `~/.gemini/extensions/engram/` to timestamped sibling backups.
-
-  For the Gemini path, the backup is recoverable by swapping the directory back,
-  but the new install does NOT inherit the old graph automatically.
 
 **Hooks don't fire in Claude Code**
 Check `~/.claude/settings.json` has a `hooks` key with ENGRAM

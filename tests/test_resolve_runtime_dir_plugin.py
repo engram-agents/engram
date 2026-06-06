@@ -23,6 +23,9 @@ Two scenarios validated:
 Each test imports _resolve_runtime_dir directly from the source file after
 overriding the relevant filesystem state with a temporary directory, so no
 live ENGRAM install is touched.
+
+Tests cover the three Claude hook files only; the Gemini lane was removed
+2026-06-06 (upstream discontinued; last state at tag archive/gemini-last-state).
 """
 
 from __future__ import annotations
@@ -114,13 +117,11 @@ _HOOK_FILES = [
     _REPO_ROOT / "hooks" / "claude" / "engram-surface-hook.py",
     _REPO_ROOT / "hooks" / "claude" / "engram-session-start-hook.py",
     _REPO_ROOT / "hooks" / "claude" / "engram-surface-daemon.py",
-    _REPO_ROOT / "hooks" / "gemini" / "engram-surface-hook.py",
-    _REPO_ROOT / "hooks" / "gemini" / "engram-surface-daemon.py",
 ]
 
 
 class TestResolveRuntimeDirPluginProbe(unittest.TestCase):
-    """Plugin-root probe fires correctly for all five hook files."""
+    """Plugin-root probe fires correctly for all three Claude hook files."""
 
     def _run_plugin_layout_test(self, hook_path: Path) -> None:
         """Assert plugin-root probe resolves to plugin root.
@@ -254,16 +255,6 @@ class TestResolveRuntimeDirPluginProbe(unittest.TestCase):
             _REPO_ROOT / "hooks" / "claude" / "engram-surface-daemon.py"
         )
 
-    def test_plugin_layout_gemini_surface_hook(self):
-        self._run_plugin_layout_test(
-            _REPO_ROOT / "hooks" / "gemini" / "engram-surface-hook.py"
-        )
-
-    def test_plugin_layout_gemini_surface_daemon(self):
-        self._run_plugin_layout_test(
-            _REPO_ROOT / "hooks" / "gemini" / "engram-surface-daemon.py"
-        )
-
     # -- Scatter no-regression tests (one per hook file) --
 
     def test_scatter_no_regression_claude_surface_hook(self):
@@ -281,15 +272,6 @@ class TestResolveRuntimeDirPluginProbe(unittest.TestCase):
             _REPO_ROOT / "hooks" / "claude" / "engram-surface-daemon.py"
         )
 
-    def test_scatter_no_regression_gemini_surface_hook(self):
-        self._run_scatter_layout_test(
-            _REPO_ROOT / "hooks" / "gemini" / "engram-surface-hook.py"
-        )
-
-    def test_scatter_no_regression_gemini_surface_daemon(self):
-        self._run_scatter_layout_test(
-            _REPO_ROOT / "hooks" / "gemini" / "engram-surface-daemon.py"
-        )
 
 
 if __name__ == "__main__":

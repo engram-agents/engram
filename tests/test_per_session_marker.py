@@ -14,9 +14,8 @@ Note: _detect_mode tests were removed in the drowsiness-ceiling-tokens-respec
 PR — _detect_mode itself was retired when the mode-detection machinery was
 replaced by the single cadence.drowsiness_ceiling_tokens config field.
 
-The Gemini twin (hooks/gemini/context_tracker.py) carries identical logic;
-covering the Claude path here is enough to catch regressions to the design
-shared by both.
+Covering the Claude path here is sufficient to catch regressions to
+the design.
 """
 
 import importlib.util

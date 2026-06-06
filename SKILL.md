@@ -868,7 +868,7 @@ Note: nap is no longer the canonical pre-sleep step (the legacy nap-bundles-into
    - Rotate warm-briefing "From this session" comprehensively (full day arc; per-burst rotations already done by naps)
    - Reconcile today's history file + commit
 2. **Phase B** (consolidation + turn-advance):
-   - Dispatch dream-fairies in parallel (claude track: via dream master orchestration; gemini track: inline)
+   - Dispatch dream-fairies in parallel via dream master orchestration
    - `engram_reflect()` returns the dream agenda (tainted, stale, open conjectures, contradictions, goal tensions, feeling nudges) and arms the `dream_review` marker
    - Work the agenda: resolve / supersede / promote / refute (NO new awake-state synthesis here; that was Phase A's job)
    - Handle the dream-review feeling nudge honestly
