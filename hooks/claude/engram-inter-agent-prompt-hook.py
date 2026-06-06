@@ -265,6 +265,24 @@ def _format_senders(letters: list[dict]) -> str:
 # Letter scanning
 # ---------------------------------------------------------------------------
 
+def _is_recipient(to_field: str, agent_name: str) -> bool:
+    """Return True iff agent_name is a whole-name match in the to: field.
+
+    Membership test: split on commas, strip whitespace, exact match — NOT
+    substring. "mira" does not match "miranda"; "ariadne" does not match a
+    to: field of "aria, borges".
+
+    Both to_field and agent_name are compared case-insensitively.
+    """
+    if not agent_name or not to_field:
+        return False
+    agent_lower = agent_name.strip().lower()
+    for name in to_field.split(","):
+        if name.strip().lower() == agent_lower:
+            return True
+    return False
+
+
 def _scan_letters(agent_name: str) -> list[dict]:
     """Scan INTER_AGENT_DIR for letters addressed to agent_name.
 
@@ -287,9 +305,10 @@ def _scan_letters(agent_name: str) -> list[dict]:
             # No frontmatter — skip (malformed or README)
             continue
 
-        # Must have a valid 'to' field matching our agent name
-        to_field = fields.get("to", "").strip().lower()
-        if not agent_name or to_field != agent_name.lower():
+        # Must have a valid 'to' field that names our agent (membership test —
+        # exact whole-name match in the comma-split list, not substring).
+        to_field = fields.get("to", "").strip()
+        if not _is_recipient(to_field, agent_name):
             continue
 
         # Must have a parseable timestamp

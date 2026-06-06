@@ -1732,3 +1732,246 @@ class TestStar:
         assert data[0]["filename"] == filename
         assert data[0]["note"] == "important"
 
+
+# ===========================================================================
+# CATEGORY 10: Multi-recipient tests (part of #631)
+# ===========================================================================
+
+class TestMultiRecipient:
+    """Multi-recipient letters: --to a,b writes ONE file; membership test semantics."""
+
+    # -----------------------------------------------------------------------
+    # Write: one file, frontmatter carries both names
+    # -----------------------------------------------------------------------
+
+    def test_write_multi_recipient_creates_one_file(self, engram_home, inter_agent_dir):
+        """ia write --to ariadne,borges creates exactly ONE .md file."""
+        _write_config(engram_home, "multi", "ariadne")
+        now = datetime.now(timezone.utc)
+        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        letter = (
+            "---\n"
+            "from: ariadne\n"
+            "to: ariadne, borges\n"
+            f"timestamp: {ts_str}\n"
+            "---\n\n"
+            "Hello both.\n"
+        )
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "write", "--to", "ariadne,borges", "--from-stdin",
+            stdin_text=letter,
+        )
+        assert rc == 0, f"write --to ariadne,borges failed; stderr: {stderr}"
+        md_files = list(inter_agent_dir.glob("*.md"))
+        assert len(md_files) == 1, f"Expected exactly one .md file; got {[f.name for f in md_files]}"
+
+    def test_write_multi_recipient_frontmatter_has_both_names(self, engram_home, inter_agent_dir):
+        """Written multi-recipient letter has 'to: ariadne, borges' in frontmatter."""
+        _write_config(engram_home, "multi", "ariadne")
+        now = datetime.now(timezone.utc)
+        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        letter = (
+            "---\n"
+            "from: ariadne\n"
+            "to: ariadne, borges\n"
+            f"timestamp: {ts_str}\n"
+            "---\n\n"
+            "Hello both.\n"
+        )
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "write", "--to", "ariadne,borges", "--from-stdin",
+            stdin_text=letter,
+        )
+        assert rc == 0, f"stderr: {stderr}"
+        md_files = list(inter_agent_dir.glob("*.md"))
+        content = md_files[0].read_text()
+        from tools.ia import _parse_frontmatter
+        fields, _ = _parse_frontmatter(content)
+        to_val = fields.get("to", "")
+        assert "ariadne" in to_val, f"'ariadne' missing from to: field; got {to_val!r}"
+        assert "borges" in to_val, f"'borges' missing from to: field; got {to_val!r}"
+
+    def test_write_multi_recipient_whitespace_normalized(self, engram_home, inter_agent_dir):
+        """--to 'ariadne , borges' (spaces around comma) normalizes to 'ariadne, borges'."""
+        _write_config(engram_home, "multi", "ariadne")
+        now = datetime.now(timezone.utc)
+        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Build letter with normalized to: (what the CLI will produce after stripping)
+        letter = (
+            "---\n"
+            "from: ariadne\n"
+            "to: ariadne, borges\n"
+            f"timestamp: {ts_str}\n"
+            "---\n\n"
+            "Body.\n"
+        )
+        # Pass with extra spaces around comma
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "write", "--to", "ariadne , borges", "--from-stdin",
+            stdin_text=letter,
+        )
+        assert rc == 0, f"stderr: {stderr}"
+        # Pin the normalization: to: field must be exactly "ariadne, borges"
+        md_files = list(inter_agent_dir.glob("*.md"))
+        assert len(md_files) == 1, f"Expected exactly one .md file; got {[f.name for f in md_files]}"
+        content = md_files[0].read_text()
+        from tools.ia import _parse_frontmatter
+        fields, _ = _parse_frontmatter(content)
+        to_val = fields.get("to", "")
+        assert to_val == "ariadne, borges", (
+            f"Whitespace normalization failed: expected 'ariadne, borges', got {to_val!r}"
+        )
+
+    # -----------------------------------------------------------------------
+    # ia list: recipient A sees it, recipient B sees it, non-recipient C does not
+    # -----------------------------------------------------------------------
+
+    def test_list_recipient_a_sees_multi_recipient_letter(self, engram_home, inter_agent_dir):
+        """ia list as recipient ariadne sees a letter with to: ariadne, borges."""
+        _write_config(engram_home, "multi", "ariadne")
+        _write_letter(
+            inter_agent_dir, "2026-06-05T10-00-00Z_mira.md",
+            from_agent="mira", to_agent="ariadne, borges",
+            timestamp=_ts(-30), heading="Shared update",
+        )
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list", "--all")
+        assert rc == 0, f"stderr: {stderr}"
+        assert "Shared update" in stdout, f"Expected 'Shared update' in stdout; got:\n{stdout}"
+
+    def test_list_recipient_b_sees_multi_recipient_letter(self, engram_home, inter_agent_dir):
+        """ia list as recipient borges sees a letter with to: ariadne, borges."""
+        _write_config(engram_home, "multi", "borges")
+        _write_letter(
+            inter_agent_dir, "2026-06-05T10-00-00Z_mira.md",
+            from_agent="mira", to_agent="ariadne, borges",
+            timestamp=_ts(-30), heading="Shared update",
+        )
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list", "--all")
+        assert rc == 0, f"stderr: {stderr}"
+        assert "Shared update" in stdout, f"Expected 'Shared update' in stdout as borges; got:\n{stdout}"
+
+    def test_list_non_recipient_does_not_see_multi_recipient_letter(self, engram_home, inter_agent_dir):
+        """ia list as non-recipient mira does NOT see to: ariadne, borges."""
+        _write_config(engram_home, "multi", "mira")
+        _write_letter(
+            inter_agent_dir, "2026-06-05T10-00-00Z_sender.md",
+            from_agent="sender", to_agent="ariadne, borges",
+            timestamp=_ts(-30), heading="Shared update",
+        )
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list", "--all")
+        assert rc == 0, f"stderr: {stderr}"
+        assert "Shared update" not in stdout, \
+            f"Non-recipient mira should not see the letter; got:\n{stdout}"
+
+    # -----------------------------------------------------------------------
+    # Exact-name membership: substring non-match cases
+    # -----------------------------------------------------------------------
+
+    def test_membership_no_substring_match_short_name(self, engram_home, inter_agent_dir):
+        """to: mira does NOT match agent name 'mir' (not a whole-name match)."""
+        from tools.ia import _is_recipient
+        assert not _is_recipient("mira", "mir"), \
+            "'mir' should not match 'mira' (substring non-match)"
+
+    def test_membership_no_substring_match_prefix(self, engram_home, inter_agent_dir):
+        """to: ariadne, borges does NOT match agent name 'aria' (prefix non-match)."""
+        from tools.ia import _is_recipient
+        assert not _is_recipient("ariadne, borges", "aria"), \
+            "'aria' should not match 'ariadne, borges'"
+
+    def test_membership_exact_match_single(self, engram_home, inter_agent_dir):
+        """to: ariadne matches agent name 'ariadne' exactly."""
+        from tools.ia import _is_recipient
+        assert _is_recipient("ariadne", "ariadne")
+
+    def test_membership_exact_match_multi(self, engram_home, inter_agent_dir):
+        """to: ariadne, borges matches both 'ariadne' and 'borges' exactly."""
+        from tools.ia import _is_recipient
+        assert _is_recipient("ariadne, borges", "ariadne")
+        assert _is_recipient("ariadne, borges", "borges")
+
+    def test_membership_case_insensitive(self, engram_home, inter_agent_dir):
+        """Membership test is case-insensitive."""
+        from tools.ia import _is_recipient
+        assert _is_recipient("Ariadne, BORGES", "ariadne")
+        assert _is_recipient("Ariadne, BORGES", "borges")
+
+    def test_membership_no_match_empty_agent_name(self, engram_home, inter_agent_dir):
+        """Empty agent_name never matches."""
+        from tools.ia import _is_recipient
+        assert not _is_recipient("ariadne, borges", "")
+
+    def test_membership_no_match_empty_to_field(self, engram_home, inter_agent_dir):
+        """Empty to_field never matches."""
+        from tools.ia import _is_recipient
+        assert not _is_recipient("", "ariadne")
+
+    # -----------------------------------------------------------------------
+    # Empty-after-stripping guard: --to "," and "--to ' , '" must error loudly
+    # -----------------------------------------------------------------------
+
+    def test_write_empty_after_stripping_comma_only(self, engram_home, inter_agent_dir):
+        """--to ',' (comma only) is empty after stripping; exits with error, no file written."""
+        _write_config(engram_home, "multi", "ariadne")
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "write", "--to", ",", "--from-stdin",
+            stdin_text="---\nfrom: ariadne\nto: ,\ntimestamp: 2026-06-05T10:00:00Z\n---\n\nBody.\n",
+        )
+        assert rc != 0, "Expected non-zero exit for --to ',' (empty after stripping)"
+        assert "empty after stripping" in stderr or "empty" in stderr, (
+            f"Expected error message about empty recipient; got stderr: {stderr!r}"
+        )
+        assert list(inter_agent_dir.glob("*.md")) == [], (
+            "No letter file should be written when --to is empty after stripping"
+        )
+
+    def test_write_empty_after_stripping_spaces_around_comma(self, engram_home, inter_agent_dir):
+        """--to ' , ' (spaces around comma only) is empty after stripping; errors loudly."""
+        _write_config(engram_home, "multi", "ariadne")
+        rc, stdout, stderr = _run_ia(
+            engram_home, inter_agent_dir,
+            "write", "--to", " , ", "--from-stdin",
+            stdin_text="---\nfrom: ariadne\nto: ,\ntimestamp: 2026-06-05T10:00:00Z\n---\n\nBody.\n",
+        )
+        assert rc != 0, "Expected non-zero exit for --to ' , ' (empty after stripping)"
+        assert "empty after stripping" in stderr or "empty" in stderr, (
+            f"Expected error message about empty recipient; got stderr: {stderr!r}"
+        )
+        assert list(inter_agent_dir.glob("*.md")) == [], (
+            "No letter file should be written when --to is empty after stripping"
+        )
+
+    # -----------------------------------------------------------------------
+    # Single-recipient regression: existing behavior unchanged
+    # -----------------------------------------------------------------------
+
+    def test_single_recipient_letter_still_works(self, engram_home, inter_agent_dir):
+        """Single-recipient letter (to: borges) still visible to borges via ia list."""
+        _write_config(engram_home, "multi", "borges")
+        _write_letter(
+            inter_agent_dir, "2026-06-05T11-00-00Z_ariadne.md",
+            from_agent="ariadne", to_agent="borges",
+            timestamp=_ts(-20), heading="Single recipient test",
+        )
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list", "--all")
+        assert rc == 0, f"stderr: {stderr}"
+        assert "Single recipient test" in stdout, \
+            f"Single-recipient letter not visible; got:\n{stdout}"
+
+    def test_single_recipient_not_visible_to_other_agent(self, engram_home, inter_agent_dir):
+        """Single-recipient letter (to: borges) NOT visible to ariadne."""
+        _write_config(engram_home, "multi", "ariadne")
+        _write_letter(
+            inter_agent_dir, "2026-06-05T11-00-00Z_mira.md",
+            from_agent="mira", to_agent="borges",
+            timestamp=_ts(-20), heading="Only for borges",
+        )
+        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list", "--all")
+        assert rc == 0, f"stderr: {stderr}"
+        assert "Only for borges" not in stdout, \
+            f"Letter addressed to borges should not be visible to ariadne; got:\n{stdout}"
+

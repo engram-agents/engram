@@ -1161,3 +1161,119 @@ def test_same_second_cursor_write_uses_microseconds(engram_home, inter_agent_dir
     assert "1 new letter from ariadne" in ctx, (
         "Letter must be classified as 'new' (letter_ts > cursor_ts after the fix)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 17: Multi-recipient membership in the hook (part of #631)
+# ---------------------------------------------------------------------------
+
+def test_hook_multi_recipient_surfaces_for_named_agent(engram_home, inter_agent_dir):
+    """Hook surfaces a letter with to: ariadne, borges when agent is borges."""
+    _write_config(engram_home, mode="multi", agent_name="borges")
+    now = datetime.now(timezone.utc)
+    _write_letter(
+        inter_agent_dir, "2026-06-05T10-00-00Z_mira.md",
+        from_agent="mira", to_agent="ariadne, borges",
+        timestamp=now - timedelta(minutes=5),
+        heading="Shared update for both",
+    )
+    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
+    assert rc == 0
+    assert stdout.strip(), "Hook must surface the multi-recipient letter for borges"
+    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "Shared update for both" in ctx, (
+        f"Multi-recipient letter must surface for borges; got:\n{ctx}"
+    )
+
+
+def test_hook_multi_recipient_does_not_surface_for_non_recipient(engram_home, inter_agent_dir):
+    """Hook does NOT surface a letter with to: ariadne, borges when agent is mira."""
+    _write_config(engram_home, mode="multi", agent_name="mira")
+    now = datetime.now(timezone.utc)
+    _write_letter(
+        inter_agent_dir, "2026-06-05T10-00-00Z_sender.md",
+        from_agent="sender", to_agent="ariadne, borges",
+        timestamp=now - timedelta(minutes=5),
+        heading="Shared update for ariadne and borges",
+    )
+    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
+    assert rc == 0
+    assert stdout.strip() == "", (
+        "Multi-recipient letter to 'ariadne, borges' must not surface for 'mira'; "
+        f"got stdout: {stdout!r}"
+    )
+
+
+def test_hook_multi_recipient_no_substring_match(engram_home, inter_agent_dir):
+    """Hook does not match 'mir' when the to: field contains 'mira' (substring non-match)."""
+    _write_config(engram_home, mode="multi", agent_name="mir")
+    now = datetime.now(timezone.utc)
+    _write_letter(
+        inter_agent_dir, "2026-06-05T11-00-00Z_sender.md",
+        from_agent="sender", to_agent="mira",
+        timestamp=now - timedelta(minutes=5),
+        heading="Letter to mira only",
+    )
+    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
+    assert rc == 0
+    assert stdout.strip() == "", (
+        "Agent 'mir' must not see a letter addressed to 'mira' (no substring match); "
+        f"got stdout: {stdout!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Parity: hook._is_recipient and tools/ia._is_recipient must agree
+# ---------------------------------------------------------------------------
+
+def test_is_recipient_hook_and_ia_parity():
+    """hook._is_recipient and tools/ia._is_recipient must agree on the same input pairs.
+
+    Both implementations share the same algorithm (split on comma, strip,
+    case-insensitive exact match). This test pins them against drift: if one
+    copy is updated and the other is not, the test goes red.
+
+    Mechanical gate > vigilance — analogous to test_marker_filename_matches_walguard.
+    """
+    import importlib.util
+    import sys
+
+    # Load hook module (not importable by normal name — use spec_from_file_location)
+    hook_spec = importlib.util.spec_from_file_location(
+        "engram_inter_agent_hook",
+        Path(__file__).parent.parent / "hooks" / "claude" / "engram-inter-agent-prompt-hook.py",
+    )
+    hook_module = importlib.util.module_from_spec(hook_spec)
+    hook_spec.loader.exec_module(hook_module)
+    hook_is_recipient = hook_module._is_recipient
+
+    # Load tools/ia._is_recipient via importlib to avoid relying on sys.path order
+    ia_spec = importlib.util.spec_from_file_location(
+        "ia",
+        Path(__file__).parent.parent / "tools" / "ia.py",
+    )
+    ia_module = importlib.util.module_from_spec(ia_spec)
+    ia_spec.loader.exec_module(ia_module)
+    ia_is_recipient = ia_module._is_recipient
+
+    # ~8 input pairs covering the documented contract
+    cases = [
+        # (to_field, agent_name, description)
+        ("ariadne", "ariadne", "single recipient — match"),
+        ("ariadne", "borges", "single recipient — mismatch"),
+        ("ariadne, borges", "ariadne", "multi-recipient — first name match"),
+        ("ariadne, borges", "borges", "multi-recipient — second name match"),
+        ("mira", "mir", "substring non-match: 'mir' vs 'mira'"),
+        ("Ariadne, BORGES", "ariadne", "case-insensitive match"),
+        ("ariadne, borges", "", "empty agent_name — no match"),
+        ("", "ariadne", "empty to_field — no match"),
+    ]
+
+    for to_field, agent_name, description in cases:
+        hook_result = hook_is_recipient(to_field, agent_name)
+        ia_result = ia_is_recipient(to_field, agent_name)
+        assert hook_result == ia_result, (
+            f"Parity failure on case {description!r}: "
+            f"hook._is_recipient({to_field!r}, {agent_name!r}) = {hook_result}, "
+            f"ia._is_recipient({to_field!r}, {agent_name!r}) = {ia_result}"
+        )

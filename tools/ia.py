@@ -395,6 +395,30 @@ def _validate_frontmatter(
 # Letter scanning
 # ---------------------------------------------------------------------------
 
+def _is_recipient(to_field: str, agent_name: str) -> bool:
+    """Return True iff agent_name is a whole-name match in the to: field.
+
+    Membership test: split on commas, strip whitespace, exact match — NOT
+    substring. "mira" does not match "miranda"; "ariadne" does not match a
+    to: field of "aria, borges".
+
+    Both to_field and agent_name are compared case-insensitively.
+
+    Examples:
+      _is_recipient("ariadne", "ariadne")          -> True
+      _is_recipient("ariadne, borges", "borges")   -> True
+      _is_recipient("ariadne, borges", "aria")     -> False
+      _is_recipient("mira", "mir")                 -> False
+    """
+    if not agent_name or not to_field:
+        return False
+    agent_lower = agent_name.strip().lower()
+    for name in to_field.split(","):
+        if name.strip().lower() == agent_lower:
+            return True
+    return False
+
+
 def _scan_letters(agent_name: str, inter_agent_dir: Path) -> tuple:
     """Scan inter_agent_dir for letters addressed to agent_name.
 
@@ -419,8 +443,8 @@ def _scan_letters(agent_name: str, inter_agent_dir: Path) -> tuple:
             skipped += 1
             continue
 
-        to_field = fields.get("to", "").strip().lower()
-        if not agent_name or to_field != agent_name.lower():
+        to_field = fields.get("to", "").strip()
+        if not _is_recipient(to_field, agent_name):
             continue
 
         ts = _parse_letter_timestamp(fields.get("timestamp", ""))
@@ -746,6 +770,16 @@ def cmd_write(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     if not args.to:
         print(
             "ia write: --to is required (or use --reply FILENAME to auto-fill from source).",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    # Normalize --to: trim whitespace around commas; canonical form is "name1, name2".
+    # Applies to both single-recipient ("borges") and multi-recipient ("ariadne, borges").
+    args.to = ", ".join(n.strip() for n in args.to.split(",") if n.strip())
+    if not args.to:
+        print(
+            "ia write: --to value is empty after stripping; specify at least one recipient.",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
@@ -1347,9 +1381,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_write.add_argument(
-        "--to", required=False, default=None, metavar="AGENT",
+        "--to", required=False, default=None, metavar="AGENT[,AGENT,...]",
         help=(
-            "Recipient's canonical agent name. "
+            "Recipient(s) — one name or a comma-separated list (e.g. 'ariadne,borges'). "
+            "Whitespace around commas is tolerated. ONE file is written regardless of "
+            "recipient count; the to: frontmatter line carries all names. "
             "Required unless --reply is used (which auto-fills --to from the source letter)."
         ),
     )
