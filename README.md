@@ -72,10 +72,9 @@ install paths:
   Cleaner separation between the plugin's mechanical surfaces (MCP server, hooks,
   skills) and your user-data (`~/.engram/`). See [Plugin install](#plugin-install-recommended) below.
 - **Scatter install (legacy, retired for Claude)** — the pre-v0.1.0-alpha
-  installer (`install.sh`) has been retired, as has its upgrader
-  (`tools/deploy.sh`). Existing scatter installs continue to work; the
-  supported move is the one-time scatter→plugin migration via
-  `tools/migrate-to-plugin.sh`.
+  installer (`install.sh`) and its upgrader have both been retired. Existing
+  scatter installs continue to work; the supported move is the one-time
+  scatter→plugin migration via `tools/migrate-to-plugin.sh`.
 
 Both install paths share the same `bootstrap.py` and `~/.engram/` contract — no
 fork. Existing scatter installs can migrate to the plugin path without losing
@@ -401,7 +400,10 @@ Re-evaluate when calibration data lands.
 
 The pre-v0.1.0-alpha install path. `install.sh` (Claude target) has been
 retired — new users should use the plugin install above. Existing scatter
-installs continue to work; upgrade them via `tools/deploy.sh` (see below).
+installs continue to work; the supported upgrade path is the one-time
+scatter→plugin migration via `tools/migrate-to-plugin.sh` (see
+[Plugin install](#plugin-install-recommended) above for the upgrade flow once
+on the plugin path).
 
 ### Upgrading vs reinstalling (plugin)
 
