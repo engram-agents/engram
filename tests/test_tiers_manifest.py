@@ -58,6 +58,32 @@ The ``excluded`` list in packaging/tiers.json is the explicit accounting of
 candidate-dir files that are intentionally NOT shipped, each carrying a short
 ``reason``.  It replaces the deleted HOOKS_EXCLUDE concept by moving the
 "do not ship" intent INTO the manifest where it is auditable.
+
+Candidate-universe policy
+=========================
+The universe is the set of source directories that ``build-plugin.sh`` draws
+from (see ``_enumerate_candidate_paths`` above for the exact surface list).
+The following subtrees are deliberately OUTSIDE the universe and are not
+enumerated by this test:
+
+  * ``forum/`` — a separately-deployed second target (issue #868); its
+    files ship via a distinct build path, not through ``build-plugin.sh``.
+  * ``tests/`` — test fixtures, never shipped.
+  * ``docs/`` — documentation, never shipped.
+  * ``.github/`` — CI configuration, never shipped.
+  * Dev-only local agents (e.g. per-developer working files) that do not
+    belong to the shared plugin bundle.
+
+Removed integration lanes are DELETED from the repo, not excluded via
+the ``excluded`` list — removed lanes are deleted from the tree rather
+than excluded; the Gemini lane removal decision (issue #865, PR #873) is
+the canonical precedent.  An ``excluded`` entry is correct only for
+a file that EXISTS in the repo's candidate dirs but is intentionally
+withheld from the plugin bundle.
+
+Untiered drift WITHIN the universe fails ``test_every_shippable_path_is_tagged``.
+Manifest entries pointing at deleted or renamed files fail
+``test_no_dangling_manifest_entries``.
 """
 
 from __future__ import annotations
