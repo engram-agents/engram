@@ -322,8 +322,35 @@ def main() -> None:
 
     # Read cursor drives mention `since` — mentions persist until agent acts.
     # This hook NEVER writes the read cursor (that's the CLI's job).
-    read_cursor = _read_cursor(READ_CURSOR_PATH)
-    read_cursor_str = read_cursor.strftime("%Y-%m-%dT%H:%M:%S.%fZ") if read_cursor else None
+    #
+    # Pass the cursor string VERBATIM to the server — do NOT parse-then-reformat.
+    # The forum CLI writes forum-read-cursor.txt at SECOND precision
+    # (e.g. "2026-06-05T16:52:54Z"), while mention created_at values carry
+    # MICROSECONDS (e.g. "…54.153797Z"). A parse→re-serialize round-trip turns
+    # "…54Z" into "…54.000000Z", which string-compares BEFORE "…54.153797Z"
+    # ('0' < '1'), so a mention that IS the thread's last activity never clears
+    # and surfaces every prompt forever. The raw file form compares correctly
+    # ('.' < 'Z'): "…54Z" > "…54.153797Z" in lexicographic order, so the server's
+    # `created_at > since` filter correctly excludes the already-seen mention.
+    # Any format normalisation here re-introduces #847. (issue #847)
+    #
+    # KNOWN LIMITATION (accepted trade, colleague round 2026-06-05): a NEW
+    # mention created within the same second AS the cursor but AFTER the read
+    # (e.g. cursor "…54Z", mention "…54.80Z") also compares below the cursor
+    # and is silently skipped by this hook — degraded-not-lost (the per-wake
+    # forum browse / status sweep still surfaces it). The loud-stuck failure
+    # this PR fixes was strictly worse. The class-level fix is single-precision
+    # timestamps at all forum write paths — tracked as #847's follow-up layer.
+    read_cursor = _read_cursor(READ_CURSOR_PATH)          # validity gate only
+    read_cursor_str = None
+    if read_cursor is not None:
+        try:
+            # Re-read verbatim — the TOCTOU window between the validity parse and
+            # this read is benign: the CLI always writes valid ISO, and a newer
+            # cursor is stricter (excludes more), never looser.
+            read_cursor_str = Path(READ_CURSOR_PATH).read_text().strip() or None
+        except OSError:
+            read_cursor_str = None
 
     # ── Fetch threads + mentions (with cache + stale-cache fallback) ──────────
     threads: Optional[list] = None

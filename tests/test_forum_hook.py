@@ -797,3 +797,294 @@ def test_same_second_post_not_excluded_by_cursor(
     assert "new forum post" in ctx or "new forum posts" in ctx, (
         "Same-second post must appear in thread-count line"
     )
+
+
+# ===========================================================================
+# Part D — Mention cursor precision regression (#847)
+# ===========================================================================
+#
+# Root cause: the forum CLI writes forum-read-cursor.txt at SECOND precision
+# (e.g. "2026-06-05T16:52:54Z").  Mention created_at values carry MICROSECONDS
+# (e.g. "…54.153797Z").  The old hook line:
+#
+#   read_cursor_str = read_cursor.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+#
+# turned "…54Z" into "…54.000000Z".  String-compare on the server:
+#   "…54.153797Z" > "…54.000000Z"  →  mention ranks ABOVE the cursor →
+#   never clears, surfaces every prompt forever.
+#
+# The raw file form compares correctly: '.' (0x2E) < 'Z' (0x5A), so
+# "…54Z" (no dot) sorts AFTER "…54.153797Z" (has dot), meaning the server
+# correctly excludes the already-seen mention.
+#
+# Fix: pass the cursor string verbatim from the file; _read_cursor() serves as
+# the validity gate only.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# D1 — The incident pin (regression discriminator)
+#      Cursor file contains "2026-06-05T16:52:54Z" (second precision, no dot).
+#      The `since` param reaching the mentions fetch MUST be byte-identical
+#      to that raw string — NOT "2026-06-05T16:52:54.000000Z".
+#
+#      This test MUST fail against the pre-fix code (line 326 re-serialises via
+#      strftime which adds ".000000") and MUST pass with the verbatim-pass fix.
+# ---------------------------------------------------------------------------
+
+def test_mention_since_cursor_passed_verbatim_second_precision(
+    tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
+):
+    """Cursor file at second precision must reach _fetch_mentions byte-identical.
+
+    The forum CLI writes forum-read-cursor.txt at second precision, e.g.
+    "2026-06-05T16:52:54Z" (no microseconds, no dot). The hook's old
+    parse→re-serialize round-trip turned this into "2026-06-05T16:52:54.000000Z",
+    which compares BEFORE a mention at "…54.153797Z" on the server — so the
+    mention never cleared. The fix reads the file verbatim. This test is the
+    regression discriminator: it is RED against the pre-fix strftime line and
+    GREEN after the verbatim-pass fix. Any re-introduction of format
+    normalisation in this code path will make it red again. (issue #847)
+    """
+    hook = _load_hook()
+    _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
+    _stub_config(hook, monkeypatch)
+
+    # Write cursor at SECOND precision — exactly as the forum CLI does
+    RAW_CURSOR = "2026-06-05T16:52:54Z"
+    tmp_read_cursor.write_text(RAW_CURSOR + "\n")
+
+    # Give the surfaced cursor a different, valid value so the hook runs
+    _write_cursor_file(tmp_cursor, datetime(2026, 6, 5, 16, 52, 54, 0, tzinfo=timezone.utc))
+
+    captured_since = []
+
+    def stub_fetch_mentions(url, name, since):
+        captured_since.append(since)
+        return []
+
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
+    monkeypatch.setattr(hook, "_fetch_mentions", stub_fetch_mentions)
+
+    _run_main(hook)
+
+    assert captured_since, "_fetch_mentions must have been called"
+    actual = captured_since[0]
+    assert actual == RAW_CURSOR, (
+        f"since= must be the raw file string {RAW_CURSOR!r} byte-identical; "
+        f"got {actual!r}. If this is '2026-06-05T16:52:54.000000Z', the "
+        f"parse→re-serialize round-trip has been re-introduced and #847 is back."
+    )
+
+
+# ---------------------------------------------------------------------------
+# D2 — End-to-end shape: a mention at "…54.153797Z" does NOT surface when
+#      the cursor file contains "…54Z" (second precision).
+#
+#      The server's `created_at > since` string comparison is simulated in the
+#      stub: the mention's created_at "…54.153797Z" is NOT strictly greater than
+#      the raw cursor "…54Z" ('.', 0x2E < 'Z', 0x5A), so the stub returns [].
+#      With the verbatim fix the hook passes "…54Z" and the stub correctly
+#      filters the mention out. With the old normalised "…54.000000Z" the stub
+#      would return the mention (since "…54.153797Z" > "…54.000000Z").
+# ---------------------------------------------------------------------------
+
+def test_mention_at_same_second_does_not_surface_with_verbatim_cursor(
+    tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
+):
+    """A mention whose created_at matches the cursor second must not resurface.
+
+    Simulates the server-side string comparison `created_at > since`:
+    - mention created_at: "2026-06-05T16:52:54.153797Z"
+    - cursor file (second precision): "2026-06-05T16:52:54Z"
+
+    Raw comparison: "2026-06-05T16:52:54.153797Z" > "2026-06-05T16:52:54Z"
+    is FALSE because '.' (0x2E) < 'Z' (0x5A) — the already-seen mention
+    is correctly excluded when the cursor is passed verbatim.
+
+    With the old normalised cursor "…54.000000Z", the same mention would have
+    been included (since "…54.153797Z" > "…54.000000Z") and surfaced forever.
+
+    Note: this test simulates the server-side filter in the stub because the
+    test harness does not host a real forum server. The stub faithfully
+    replicates the `created_at > since` string comparison the real server uses,
+    which is the exact comparison documented in the issue #847 live-endpoint
+    proof.
+    """
+    hook = _load_hook()
+    _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
+    _stub_config(hook, monkeypatch)
+
+    RAW_CURSOR = "2026-06-05T16:52:54Z"
+    MENTION_CREATED_AT = "2026-06-05T16:52:54.153797Z"
+    tmp_read_cursor.write_text(RAW_CURSOR + "\n")
+    _write_cursor_file(tmp_cursor, datetime(2026, 6, 5, 16, 52, 55, 0, tzinfo=timezone.utc))
+
+    mention = {
+        "thread_id": "100",
+        "thread_title": "The incident thread",
+        "author": "borges",
+        "kind": "at_mention",
+        "created_at": MENTION_CREATED_AT,
+    }
+
+    def stub_fetch_mentions_with_filter(url, name, since):
+        # Replicate the server's `created_at > since` string comparison.
+        # '.' (0x2E) < 'Z' (0x5A), so "…54.153797Z" is NOT > "…54Z" →
+        # mention is excluded when `since` is the raw verbatim cursor.
+        # If `since` were the normalised "…54.000000Z" the mention WOULD
+        # pass (since "…54.153797Z" > "…54.000000Z").
+        return [m for m in [mention] if m["created_at"] > since]
+
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
+    monkeypatch.setattr(hook, "_fetch_mentions", stub_fetch_mentions_with_filter)
+
+    output = _run_main(hook, capture_output=True)
+
+    # When the fix is correct, no mention surfaces (the filter returns []).
+    # The hook also has no threads, so output is empty (sys.exit(0)).
+    # An output with a 🔔 line means the mention leaked through — #847 is back.
+    if output.strip():
+        data = json.loads(output.strip())
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        assert "\U0001f514" not in ctx, (
+            f"Mention at {MENTION_CREATED_AT!r} must NOT surface when cursor is "
+            f"{RAW_CURSOR!r} (verbatim); if it does, the round-trip normalisation "
+            f"re-introduced #847. since= was probably '2026-06-05T16:52:54.000000Z' "
+            f"(re-serialised) rather than the raw '2026-06-05T16:52:54Z'."
+        )
+
+
+# ---------------------------------------------------------------------------
+# D3 — Cursor file absent -> no `since` param (existing behaviour preserved)
+# ---------------------------------------------------------------------------
+
+def test_mention_since_absent_when_cursor_file_missing(
+    tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
+):
+    """When forum-read-cursor.txt is absent, `since` is None (no param sent).
+
+    Ensures the validity-gate contract is unchanged: a missing cursor file
+    means no since= constraint, so the mentions fetch returns all unread mentions.
+    """
+    hook = _load_hook()
+    _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
+    _stub_config(hook, monkeypatch)
+
+    # Surfaced cursor present; read cursor file deliberately absent
+    _write_cursor_file(tmp_cursor, datetime(2026, 6, 5, 16, 0, 0, 0, tzinfo=timezone.utc))
+    assert not tmp_read_cursor.exists(), "Read cursor file must not exist for this test"
+
+    captured_since = []
+
+    def stub_fetch_mentions(url, name, since):
+        captured_since.append(since)
+        return []
+
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
+    monkeypatch.setattr(hook, "_fetch_mentions", stub_fetch_mentions)
+
+    _run_main(hook)
+
+    assert captured_since, "_fetch_mentions must have been called"
+    assert captured_since[0] is None, (
+        f"since= must be None when cursor file is absent; got {captured_since[0]!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# D4 — Cursor file with invalid ISO -> treated as absent; no `since` param
+#      (validity gate retained — _read_cursor returns None for invalid content)
+# ---------------------------------------------------------------------------
+
+def test_mention_since_absent_when_cursor_file_invalid(
+    tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
+):
+    """Invalid cursor file is treated as absent: `since` is None, validity gate retained.
+
+    The _read_cursor() validity check must still reject malformed content.
+    A broken cursor file must not propagate garbage to the server.
+    """
+    hook = _load_hook()
+    _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
+    _stub_config(hook, monkeypatch)
+
+    _write_cursor_file(tmp_cursor, datetime(2026, 6, 5, 16, 0, 0, 0, tzinfo=timezone.utc))
+    # Write an invalid timestamp to the read cursor file
+    tmp_read_cursor.write_text("not-a-valid-iso-timestamp\n")
+
+    captured_since = []
+
+    def stub_fetch_mentions(url, name, since):
+        captured_since.append(since)
+        return []
+
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
+    monkeypatch.setattr(hook, "_fetch_mentions", stub_fetch_mentions)
+
+    _run_main(hook)
+
+    assert captured_since, "_fetch_mentions must have been called"
+    assert captured_since[0] is None, (
+        f"since= must be None when cursor file is invalid; got {captured_since[0]!r}. "
+        f"The validity gate (_read_cursor returning None) must still prevent garbage "
+        f"from reaching the server."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Known-limitation pin (#847 follow-up layer, accepted trade — colleague round)
+# ---------------------------------------------------------------------------
+
+
+def test_known_limitation_newer_same_second_mention_also_skipped(
+    tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
+):
+    """KNOWN-LIMITATION PIN (accepted trade, colleague round 2026-06-05): a NEW
+    mention created in the SAME second as the cursor but AFTER the read
+    (cursor "…54Z", mention "…54.800000Z") ALSO compares below the verbatim
+    cursor ('.' < 'Z') and is skipped by the hook — degraded-not-lost: the
+    per-wake forum browse/status sweep still surfaces it. The loud-stuck
+    failure #847 fixed was strictly worse than this silent one-second window.
+
+    This pins the accepted behavior so any change to it is deliberate. It
+    should flip exactly when the substrate-side single-precision timestamp
+    normalization (#847's follow-up layer) lands — at that point this test
+    goes red: delete it and close the follow-up.
+    """
+    hook = _load_hook()
+    _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
+    _stub_config(hook, monkeypatch)
+
+    RAW_CURSOR = "2026-06-05T16:52:54Z"
+    NEWER_SAME_SECOND = "2026-06-05T16:52:54.800000Z"  # AFTER the read, same second
+    tmp_read_cursor.write_text(RAW_CURSOR + "\n")
+    _write_cursor_file(tmp_cursor, datetime(2026, 6, 5, 16, 52, 55, 0, tzinfo=timezone.utc))
+
+    mention = {
+        "thread_id": "101",
+        "thread_title": "Arrived just after the read",
+        "author": "ariadne",
+        "kind": "at_mention",
+        "created_at": NEWER_SAME_SECOND,
+    }
+
+    def stub_fetch_mentions_with_filter(url, name, since):
+        # Same server-side string comparison as the incident tests.
+        return [m for m in [mention] if m["created_at"] > since]
+
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
+    monkeypatch.setattr(hook, "_fetch_mentions", stub_fetch_mentions_with_filter)
+
+    output = _run_main(hook, capture_output=True)
+
+    # ACCEPTED-LIMITATION assertion: the genuinely-new same-second mention is
+    # currently skipped (filter excludes it under the verbatim cursor).
+    if output.strip():
+        data = json.loads(output.strip())
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        assert "\U0001f514" not in ctx, (
+            "The newer-same-second mention surfaced — the accepted limitation "
+            "has been lifted (substrate precision normalization landed?). "
+            "Deliberate change required: delete this pin and close #847's "
+            "follow-up layer."
+        )
