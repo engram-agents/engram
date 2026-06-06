@@ -14,15 +14,27 @@
 #
 # Usage:
 #   agentctl health                      # health table for all agents
-#   agentctl session <agent> [--local] [...flags]
-#                                        # interactive session as agent;
-#                                        # default: claude-remote (tmux-backed,
-#                                        # persistent); auto-attaches to existing
-#                                        # session if running and no flags given.
-#                                        # --local opts out of tmux for direct
-#                                        # adapter/claude invocation. ALL extra
-#                                        # flags pass through (--continue,
-#                                        # --resume, --print, etc.).
+#   agentctl session <agent> [--platform <claude|codex>] [--no-share] [--cd <dir>] [...]
+#                                        # interactive session as agent; executes
+#                                        # the platform binary (claude or codex)
+#                                        # directly. Platform auto-detected from
+#                                        # baked profile or binary heuristic.
+#                                        # --local is deprecated (no-op with notice).
+#                                        # tmux and other multiplexers are the
+#                                        # operator's own affair.
+#                                        # Single-dash flag grammar (alias namespace):
+#                                        #   -xyz  is a BUNDLE of single-char aliases,
+#                                        #         expanded in char order: -x -y -z.
+#                                        #   Any unrecognized char → loud error, exit 6.
+#                                        #   No single-dash arg ever passes through raw.
+#                                        #   Bare - (stdin) passes as a non-flag arg.
+#                                        # Recognized aliases:
+#                                        #   -c  claude:--continue  codex:subcommand transform
+#                                        #   -d  claude:--dangerously-skip-permissions
+#                                        #       codex:--dangerously-bypass-approvals-and-sandbox
+#                                        #   -r  claude:--remote-control <agent>
+#                                        #       codex: error (remote control unavailable)
+#                                        # Double-dash flags and non-flag args pass through verbatim.
 #   agentctl bash <agent>                # plain bash shell as agent (no CLI)
 #   sudo agentctl share <agent> <path> [--mode rw|ro] [--ttl <duration>]
 #                                        # grant agent ACL access to spt-side path;
@@ -100,34 +112,306 @@ except Exception as e:
     done < <(list_agents)
 }
 
+# ---------- session helpers ----------
+
+# _session_platform: detect which platform binary to use for this agent.
+# Deterministic ladder, first hit wins:
+#   1. Explicit override (non-empty $1)
+#   2. Baked profile at ~/.engram/marketplace/plugins/engram/platform.json
+#   3. Binary heuristic: codex present + claude absent → codex
+#   4. Default: claude
+# No sudo inside this function — caller passes $user for the sudo cmds.
+_session_platform() {
+    local override="$1"
+    local user="$2"
+
+    # 1. Explicit override
+    if [[ -n "$override" ]]; then
+        case "$override" in
+            claude|codex) echo "$override"; return 0 ;;
+            *) echo "ERROR: --platform must be claude or codex (got '$override')" >&2; return 2 ;;
+        esac
+    fi
+
+    # 2. Baked profile (no jq dependency — grep+cut only)
+    local raw
+    raw=$(sudo -u "$user" -i bash -c \
+        'cat ~/.engram/marketplace/plugins/engram/platform.json' 2>/dev/null) || true
+    if [[ -n "$raw" ]] && echo "$raw" | grep -q '"platform"'; then
+        local val
+        val=$(echo "$raw" \
+            | grep -o '"platform"[[:space:]]*:[[:space:]]*"[^"]*"' \
+            | head -1 \
+            | sed 's/.*:[[:space:]]*"\([^"]*\)".*/\1/')
+        if [[ "$val" == "codex" ]]; then
+            echo "codex"; return 0
+        elif [[ -n "$val" ]]; then
+            echo "claude"; return 0
+        fi
+    fi
+
+    # 3. Binary heuristic: codex present AND claude absent → codex
+    local has_codex=0 has_claude=0
+    sudo -u "$user" -i bash -c 'command -v codex' >/dev/null 2>&1 && has_codex=1
+    sudo -u "$user" -i bash -c 'command -v claude' >/dev/null 2>&1 && has_claude=1
+    if [[ $has_codex -eq 1 && $has_claude -eq 0 ]]; then
+        echo "codex"; return 0
+    fi
+
+    # 4. Default
+    echo "claude"
+}
+
+# _expand_session_args: pure function (no sudo, no filesystem).
+# Expands short aliases to their full equivalents for the given platform.
+# Signature: _expand_session_args <platform> <agent_name> <args...>
+# Outputs one word per line (callers use `mapfile` to collect).
+# Returns exit 4 on unknown platform (this is the unit-test seam for
+# platform validation; cmd_session also validates via _session_platform).
+# Returns exit 5 if any arg is empty or contains a newline — the one-word-
+# per-line protocol cannot carry either (empty args are silently stripped by
+# command substitution; newline-args would split into multiple words on the
+# read side). Rejection is loud and early.
+# Returns exit 3 if codex -r is requested (remote control unavailable).
+#   Precedence: exit 3 takes priority over exit 6 when a bundle contains both
+#   an unrecognized char and -r on codex (codex -r is the more specific error).
+# Returns exit 6 if any single-dash arg contains an unrecognized alias char.
+#   Error names the offending char and the original arg on stderr.
+#
+# Flag namespace:
+#   Single-dash args (-xyz): the agentctl alias namespace — BUNDLE of single-
+#   char alias flags, expanded in char order.  Any constituent char that is not
+#   a recognized alias (c/d/r) causes loud failure (exit 6).  NO single-dash
+#   arg ever passes through raw, including chars that look like platform flags
+#   (e.g. -n, -e).  Bare - (the stdin convention) is treated as a non-flag arg
+#   and passes through verbatim.
+#   Double-dash args (--anything): platform pass-through verbatim.
+#   Non-flag args: pass through verbatim.
+#
+# Emission discipline: ALL words are emitted with `printf '%s\n'`, NEVER with
+# `echo`. bash's echo consumes flags like -n/-e/-E as its own options and emits
+# nothing or a bare newline — silent data corruption for args that happen to
+# look like echo flags. printf '%s\n' is flag-agnostic; the format string is
+# always literal. This is the same class of silent-corruption hazard as the
+# -d/--debug collision that motivated the alias layer in the first place.
+#
+# Expansion rules (single-char aliases):
+#   -c  claude → append --continue                         (deduped)
+#       codex  → base command becomes "codex resume --latest" (deduped)
+#   -d  claude → --dangerously-skip-permissions            (deduped)
+#       codex  → --dangerously-bypass-approvals-and-sandbox (deduped)
+#   -r  claude → --remote-control <agent_name>  (two words, deduped)
+#       codex  → error to stderr, return 3
+# Bundles are split first, then each char is expanded by the rules above.
+# Dedup across a bundle works identically to dedup across separate flags.
+#
+# NOTE: aliases MUST be expanded here and never passed through raw.
+# claude itself parses -d as --debug (silent behavior change); that is the
+# reason these aliases live in agentctl rather than the caller.
+_expand_session_args() {
+    local platform="$1"
+    local agent_name="$2"
+    shift 2
+
+    # Validate platform — unknown values are a caller error.
+    case "$platform" in
+        claude|codex) ;;
+        *) printf '%s\n' "ERROR: unknown platform '$platform' (expected claude or codex)" >&2; return 4 ;;
+    esac
+
+    # Reject empty args and newline-containing args before any expansion.
+    # The one-word-per-line protocol cannot carry them: command substitution
+    # strips trailing newlines (--resume "" becomes --resume silently), and a
+    # newline in an arg would split into multiple words on the mapfile side.
+    for arg in "$@"; do
+        if [[ -z "$arg" ]]; then
+            printf '%s\n' "session args may not be empty or contain newlines (got: <empty>)" >&2
+            return 5
+        fi
+        if [[ "$arg" == *$'\n'* ]]; then
+            # Represent the arg with \n visible for diagnostics.
+            local repr; repr="${arg//$'\n'/\\n}"
+            printf '%s\n' "session args may not be empty or contain newlines (got: $repr)" >&2
+            return 5
+        fi
+    done
+
+    local base_cmd="$platform"
+    local use_resume=0   # codex -c subcommand transform flag
+    local extra_args=()
+    local has_error=0     # set to 1 on codex -r (exit 3)
+    local has_bad_alias=0 # set to 1 on unrecognized single-char alias (exit 6)
+
+    # First pass: collect flags, detect -c (anywhere, including inside bundles)
+    # for codex subcommand transform.  We scan args once to determine if -c is
+    # present before emitting the base command words.  Bundle expansion applies
+    # here too: -rc, -cr, etc. all count as containing -c.
+    local saw_c=0
+    for arg in "$@"; do
+        # Bare - is not a bundle; skip.
+        [[ "$arg" == "-" ]] && continue
+        # Single-dash bundle: scan each char.
+        if [[ "$arg" =~ ^-[^-].* ]]; then
+            local chars="${arg#-}"
+            local i=0
+            while [[ $i -lt ${#chars} ]]; do
+                local ch="${chars:$i:1}"
+                [[ "$ch" == "c" ]] && saw_c=1
+                (( i++ )) || true
+            done
+        elif [[ "$arg" == "-c" ]]; then
+            # Legacy single-char form — already matched by the bundle branch above,
+            # but explicit for clarity (single char is a bundle of length 1).
+            saw_c=1
+        fi
+    done
+
+    if [[ "$platform" == "codex" && $saw_c -eq 1 ]]; then
+        use_resume=1
+    fi
+
+    # Second pass: expand aliases.
+    # Single-dash args are treated as BUNDLES: -xyz splits into -x -y -z, each
+    # expanded in char order.  Any char not in the recognized alias set (c/d/r)
+    # causes loud failure (exit 6) naming the char and the original arg.
+    # Bare - passes through as a non-flag arg.
+    # Double-dash and non-flag args pass through verbatim.
+    local skip_c_done=0   # dedupe -c for claude (emit --continue only once)
+    local seen_d=0         # dedupe -d across both platforms (emit flag once)
+    local seen_r=0         # dedupe -r on claude (emit --remote-control <agent> only once)
+
+    _expand_one_alias() {
+        # Expand a single alias char for the current platform/agent.
+        # Modifies outer-scope variables: extra_args, has_error, has_bad_alias,
+        # skip_c_done, seen_d, seen_r.  Takes: char, original_arg.
+        local ch="$1" orig_arg="$2"
+        case "$ch" in
+            c)
+                if [[ "$platform" == "claude" ]]; then
+                    if [[ $skip_c_done -eq 0 ]]; then
+                        extra_args+=("--continue")
+                        skip_c_done=1
+                    fi
+                elif [[ "$platform" == "codex" ]]; then
+                    : # absorbed into subcommand transform; no per-occurrence output
+                fi
+                ;;
+            d)
+                if [[ $seen_d -eq 0 ]]; then
+                    if [[ "$platform" == "claude" ]]; then
+                        extra_args+=("--dangerously-skip-permissions")
+                    else
+                        extra_args+=("--dangerously-bypass-approvals-and-sandbox")
+                    fi
+                    seen_d=1
+                fi
+                ;;
+            r)
+                if [[ "$platform" == "claude" ]]; then
+                    if [[ $seen_r -eq 0 ]]; then
+                        extra_args+=("--remote-control")
+                        extra_args+=("$agent_name")
+                        seen_r=1
+                    fi
+                else
+                    printf '%s\n' "remote control is not available for codex agents (drop -r)" >&2
+                    has_error=1
+                fi
+                ;;
+            *)
+                printf '%s\n' "ERROR: unrecognized alias '-$ch' in arg '$orig_arg' (recognized: c d r)" >&2
+                has_bad_alias=1
+                ;;
+        esac
+    }
+
+    for arg in "$@"; do
+        if [[ "$arg" == "-" ]]; then
+            # Bare - is the stdin convention: pass through as a non-flag arg.
+            extra_args+=("$arg")
+        elif [[ "$arg" =~ ^-[^-] ]]; then
+            # Single-dash bundle: split into chars and expand each in order.
+            local chars="${arg#-}"
+            local i=0
+            while [[ $i -lt ${#chars} ]]; do
+                local ch="${chars:$i:1}"
+                _expand_one_alias "$ch" "$arg"
+                (( i++ )) || true
+            done
+        else
+            # Double-dash flag or non-flag arg: pass through verbatim.
+            extra_args+=("$arg")
+        fi
+    done
+
+    # Exit code precedence: codex -r (exit 3) > unrecognized alias (exit 6).
+    if [[ $has_error -eq 1 ]]; then
+        return 3
+    fi
+    if [[ $has_bad_alias -eq 1 ]]; then
+        return 6
+    fi
+
+    # Emit base command words, then expanded args.
+    # printf '%s\n' is used throughout (not echo) — see emission discipline above.
+    if [[ "$platform" == "codex" && $use_resume -eq 1 ]]; then
+        printf '%s\n' "codex"
+        printf '%s\n' "resume"
+        printf '%s\n' "--latest"
+    else
+        printf '%s\n' "$base_cmd"
+    fi
+    for a in "${extra_args[@]}"; do
+        printf '%s\n' "$a"
+    done
+}
+
 cmd_session() {
     local name="${1:-}"; shift || true
     [[ -z "$name" ]] && {
-        echo "Usage: agentctl session <agent> [--local] [--no-share] [--cd <dir>] [...claude-remote/runtime flags]" >&2
-        echo "  Default: tmux-backed claude-remote (persistent across terminal close)." >&2
-        echo "  --local: bypass claude-remote; use ~/.runtime/start.sh adapter or bare claude." >&2
-        echo "  --no-share: skip auto-share of cwd to agent (agent runs from its own home)." >&2
-        echo "  --cd <dir>: use <dir> as the project folder instead of the caller's cwd." >&2
-        echo "    Useful for resuming pre-migration sessions whose project hash matches" >&2
-        echo "    a different dir, e.g. 'agentctl session borges --cd /home/user/kg_protocol_for_ai --resume <id>'." >&2
-        echo "  Flags after agent name pass through (e.g., --continue, --resume <id>, --print)." >&2
-        echo "  Auto-share: cwd (or --cd target) becomes the agent's project folder. If the" >&2
-        echo "    agent doesn't already have rwX on it, this re-execs 'sudo agentctl share'" >&2
-        echo "    once (will prompt for sudo). Refused for system paths, spt home root, and" >&2
-        echo "    dotfile dirs. Agent's own home is propagated without sharing." >&2
-        echo "  Auto-attach: if a claude-remote session is already running for the agent and" >&2
-        echo "    no flags are given, attaches to it instead of refusing." >&2
+        echo "Usage: agentctl session <agent> [--platform <claude|codex>] [--no-share] [--cd <dir>] [...]" >&2
+        echo >&2
+        echo "  Executes the platform binary (claude or codex) directly as the agent." >&2
+        echo "  Platform auto-detected from baked profile, then binary heuristic." >&2
+        echo "  tmux and other multiplexers are the operator's own affair." >&2
+        echo >&2
+        echo "  --platform <claude|codex>  override auto-detected platform" >&2
+        echo "  --no-share                 skip auto-share of cwd (agent runs from its own home)" >&2
+        echo "  --cd <dir>                 use <dir> as project folder instead of caller's cwd" >&2
+        echo "  --local                    (deprecated — no-op; sessions are always direct now)" >&2
+        echo >&2
+        echo "  Flag grammar:" >&2
+        echo "    Single-dash: agentctl alias namespace.  -xyz is a bundle: -x -y -z" >&2
+        echo "      expanded in char order.  Any unrecognized char → loud error, exit 6." >&2
+        echo "      NO single-dash arg ever passes through (including -n, -e, etc.)." >&2
+        echo "      Bare - (stdin) is a non-flag arg and passes through verbatim." >&2
+        echo "    Double-dash: platform pass-through verbatim." >&2
+        echo "    Non-flag args: pass through verbatim." >&2
+        echo >&2
+        echo "  Recognized single-char aliases:" >&2
+        echo "    -c   claude: --continue" >&2
+        echo "         codex:  subcommand becomes 'codex resume --latest'" >&2
+        echo "    -d   claude: --dangerously-skip-permissions" >&2
+        echo "         codex:  --dangerously-bypass-approvals-and-sandbox" >&2
+        echo "    -r   claude: --remote-control <agent>" >&2
+        echo "         codex:  error — remote control is not available for codex agents" >&2
         exit 2
     }
     local user; user=$(resolve_user "$name")
-    local local_mode=0
+    local platform_override=""
     local no_share=0
     local cd_override=""
     local extra=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --local)    local_mode=1; shift ;;
-            --no-share) no_share=1;   shift ;;
+            --platform)
+                [[ -z "${2:-}" ]] && { echo "ERROR: --platform requires an argument (claude|codex)" >&2; exit 2; }
+                platform_override="$2"; shift 2 ;;
+            --platform=*) platform_override="${1#--platform=}"; shift ;;
+            --local)
+                echo "(--local is deprecated: sessions are always direct now)" >&2
+                shift ;;
+            --no-share) no_share=1; shift ;;
             --cd)
                 [[ -z "${2:-}" ]] && { echo "ERROR: --cd requires a directory argument" >&2; exit 2; }
                 cd_override="$2"; shift 2 ;;
@@ -136,23 +420,20 @@ cmd_session() {
         esac
     done
 
-    # Auto-attach: if there's an existing claude-remote tmux session for this agent
-    # and the user passed no flags, attach to it. Otherwise pass flags through to
-    # claude-remote, which handles --continue, --resume, --attach, --stop, etc.
-    # (Only relevant for the tmux-backed default path, not --local.)
-    if [[ $local_mode -eq 0 && ${#extra[@]} -eq 0 ]] \
-       && sudo -u "$user" -i bash -c 'tmux has-session -t claude-remote' >/dev/null 2>&1; then
-        echo "Reattaching to existing $user claude-remote session..."
-        sudo -u "$user" -i claude-remote --attach
-        return
+    # Validate --platform early if provided (before any heavy lifting).
+    if [[ -n "$platform_override" ]]; then
+        case "$platform_override" in
+            claude|codex) ;;
+            *) echo "ERROR: --platform must be claude or codex (got '$platform_override')" >&2; exit 2 ;;
+        esac
     fi
 
     # Project-dir propagation + auto-share. Lei's design (2026-05-03): the directory
     # where you type `agentctl session` becomes the agent's project folder by default.
     # We auto-grant rwX ACL so the agent can write inside it, then pass cwd as the
-    # project dir to claude-remote / fallback launchers. Claude organizes session
-    # JSONL by cwd (~/.claude/projects/<encoded-cwd>/), so this also keeps
-    # --continue/--resume scoped to the right project.
+    # project dir to launchers. Claude organizes session JSONL by cwd
+    # (~/.claude/projects/<encoded-cwd>/), so this also keeps --continue/--resume
+    # scoped to the right project.
     #
     # Refused for: system paths, /home/user root, dotfile dirs (secrets), other
     # agents' homes. The agent's own home gets cwd propagation but no share
@@ -169,7 +450,7 @@ cmd_session() {
     fi
     local cwd_arg=()
     if [[ $no_share -eq 1 ]]; then
-        echo "(--no-share: agent runs from \$HOME; claude --continue/--resume may not see expected sessions)" >&2
+        echo "(--no-share: agent runs from \$HOME; --continue/--resume may not see expected sessions)" >&2
     else
         case "$orig_cwd" in
             "/home/$user"|"/home/$user"/* )
@@ -197,51 +478,62 @@ cmd_session() {
                     if sudo "$self" share "$name" "$orig_cwd" --mode rw; then
                         cwd_arg=("$orig_cwd")
                     else
-                        echo "Auto-share failed; running from \$HOME — claude --continue/--resume may not see expected sessions." >&2
+                        echo "Auto-share failed; running from \$HOME — --continue/--resume may not see expected sessions." >&2
                     fi
                 fi
                 ;;
         esac
     fi
 
-    if [[ $local_mode -eq 1 ]]; then
-        # Direct (non-tmux) session. Useful for debugging when tmux is in the way.
-        # cwd is preserved via bash -c "cd ... && exec" when set.
-        if sudo -u "$user" -i bash -c 'test -x "$HOME/.runtime/start.sh"' 2>/dev/null; then
-            if [[ ${#cwd_arg[@]} -gt 0 ]]; then
-                sudo -u "$user" -i bash -c "cd $(printf '%q' "${cwd_arg[0]}") && exec ~/.runtime/start.sh \"\$@\"" -- "${extra[@]}"
-            else
-                sudo -u "$user" -i bash -c '~/.runtime/start.sh "$@"' -- "${extra[@]}"
-            fi
-        else
-            if [[ ${#cwd_arg[@]} -gt 0 ]]; then
-                sudo -u "$user" -i bash -c "cd $(printf '%q' "${cwd_arg[0]}") && exec claude \"\$@\"" -- "${extra[@]}"
-            else
-                sudo -u "$user" -i claude "${extra[@]}"
-            fi
-        fi
-        return
-    fi
+    # Detect platform and expand aliases.
+    local platform
+    platform=$(_session_platform "$platform_override" "$user") || {
+        echo "ERROR: platform detection failed" >&2; exit 2
+    }
 
-    # Default: claude-remote (tmux-backed, persists across terminal close).
-    # tmux server is uid-scoped, so per-agent isolation is automatic — agent-borges's
-    # "claude-remote" tmux session is separate from agent-mneme's, no name collision.
-    # Pass cwd as positional arg so claude-remote opens its tmux pane in that dir.
-    if sudo -u "$user" -i bash -c 'command -v claude-remote' >/dev/null 2>&1; then
-        sudo -u "$user" -i claude-remote "${cwd_arg[@]}" "${extra[@]}"
-    elif sudo -u "$user" -i bash -c 'test -x "$HOME/.runtime/start.sh"' 2>/dev/null; then
-        echo "(claude-remote not in $user's PATH — using ~/.runtime/start.sh adapter; for tmux-backed sessions, deploy claude-remote to ~/.local/bin/)" >&2
+    # Capture expansion via command substitution so the exit code propagates.
+    # NOTE: process-substitution (`mapfile < <(cmd)`) always exits 0 — the
+    # sub-shell's exit code is discarded, so error paths (e.g. codex -r) would
+    # print their message but continue into a bare session.  Command substitution
+    # (`var=$(cmd)`) DOES propagate the exit code; split into two steps to
+    # preserve the one-word-per-line contract.
+    local expanded_raw
+    expanded_raw=$(_expand_session_args "$platform" "$name" "${extra[@]}") || {
+        # _expand_session_args already printed the error to stderr.
+        exit 2
+    }
+    local expanded=()
+    [[ -n "$expanded_raw" ]] && mapfile -t expanded <<< "$expanded_raw"
+    [[ ${#expanded[@]} -eq 0 ]] && { echo "ERROR: empty expansion from _expand_session_args" >&2; exit 2; }
+
+    # expanded[0] is the binary (or "codex" for the resume subcommand transform);
+    # expanded[1..] are the args (including subcommand words for codex resume).
+    # Tail args = everything after the binary word.
+    local binary="${expanded[0]:-$platform}"
+    local tail_args=("${expanded[@]:1}")
+
+    # Launch: try direct binary exec first, then ~/.runtime/start.sh fallback.
+    if sudo -u "$user" -i bash -c "command -v \"$binary\"" >/dev/null 2>&1; then
         if [[ ${#cwd_arg[@]} -gt 0 ]]; then
-            sudo -u "$user" -i bash -c "cd $(printf '%q' "${cwd_arg[0]}") && exec ~/.runtime/start.sh \"\$@\"" -- "${extra[@]}"
+            sudo -u "$user" -i bash -c \
+                "cd $(printf '%q' "${cwd_arg[0]}") && exec \"$binary\" \"\$@\"" \
+                -- "${tail_args[@]}"
         else
-            sudo -u "$user" -i bash -c '~/.runtime/start.sh "$@"' -- "${extra[@]}"
+            sudo -u "$user" -i "$binary" "${tail_args[@]}"
+        fi
+    elif sudo -u "$user" -i bash -c 'test -x "$HOME/.runtime/start.sh"' 2>/dev/null; then
+        # Fallback: ~/.runtime/start.sh adapter. Pass tail args only (not the
+        # base binary word — the adapter knows what to launch).
+        if [[ ${#cwd_arg[@]} -gt 0 ]]; then
+            sudo -u "$user" -i bash -c \
+                "cd $(printf '%q' "${cwd_arg[0]}") && exec ~/.runtime/start.sh \"\$@\"" \
+                -- "${tail_args[@]}"
+        else
+            sudo -u "$user" -i bash -c '~/.runtime/start.sh "$@"' -- "${tail_args[@]}"
         fi
     else
-        if [[ ${#cwd_arg[@]} -gt 0 ]]; then
-            sudo -u "$user" -i bash -c "cd $(printf '%q' "${cwd_arg[0]}") && exec claude \"\$@\"" -- "${extra[@]}"
-        else
-            sudo -u "$user" -i claude "${extra[@]}"
-        fi
+        echo "ERROR: no $binary on PATH for $user and no ~/.runtime/start.sh adapter" >&2
+        exit 1
     fi
 }
 
@@ -903,10 +1195,9 @@ PYTHON
     # ~/.local/bin/claude as an ABSOLUTE symlink to
     # ~/.local/share/claude/versions/X.Y.Z. After usermod -d -m moves
     # the home, the symlink TARGET still points at the old home path,
-    # leaving it dangling. Bash can't exec it → claude-remote's tmux
-    # session dies immediately → `tmux attach` reports "no sessions"
-    # (confusing because it looks like claude's own no-prior-sessions
-    # message but is actually a tmux-side artifact).
+    # leaving it dangling. Bash can't exec it → `agentctl session` fails
+    # immediately with "exec: no such file or directory" when the session
+    # command tries to exec the claude binary directly.
     # Fix: re-create the symlink with a RELATIVE target so it survives
     # any future home renames. Skip if no symlink exists (newborn that
     # never installed claude) OR if it already resolves (no rename
@@ -1319,6 +1610,17 @@ cmd_help() {
     sed -n '3,33p' "$0"
 }
 
+# ---------- internal verb: __expand-session-args ----------
+# Not listed in user-facing help (same pattern as internal cron helpers above).
+# Usage: agentctl __expand-session-args <platform> <agent_name> [args...]
+# Calls _expand_session_args and exits with its status. Used directly by the
+# test suite to exercise alias expansion without needing real agents or sudo.
+cmd__expand_session_args() {
+    local platform="${1:-}"; shift || true
+    local agent_name="${1:-}"; shift || true
+    _expand_session_args "$platform" "$agent_name" "$@"
+}
+
 case "$SUBCMD" in
     health)        cmd_health        "$@" ;;
     session)       cmd_session       "$@" ;;
@@ -1329,5 +1631,6 @@ case "$SUBCMD" in
     unshare)       cmd_unshare       "$@" ;;
     share-status)  cmd_share_status  "$@" ;;
     help|--help|-h) cmd_help ;;
+    __expand-session-args) cmd__expand_session_args "$@" ;;
     *) echo "Unknown subcommand: $SUBCMD"; cmd_help; exit 2 ;;
 esac
