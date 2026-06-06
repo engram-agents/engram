@@ -13,6 +13,7 @@ Exit codes:
 
 import json
 import os
+import re
 import socket
 import sqlite3
 import sys
@@ -95,6 +96,13 @@ DEFAULT_IDF_GATE_MIN_IDF = 4.0
 DEFAULT_IDF_GATE_SHORT_PROMPT_FLOOR_CHARS = 40
 DEFAULT_IDF_GATE_ENABLED = True  # feature flag for safe rollout
 
+# Attached-pack surfacing quota — max results pulled across all packs combined.
+_PACK_SURFACE_QUOTA = 3
+
+# Mechanical latency bound — surfacing rides a hook timeout, so cap the number
+# of pack DBs we open regardless of how many packs are configured.
+_MAX_PACKS_TO_QUERY = 10
+
 
 def _get_auto_surface_config() -> dict:
     """Read auto_surface tunables from $ENGRAM_HOME/config.json.
@@ -135,6 +143,124 @@ def _get_auto_surface_config() -> dict:
         }
     except (OSError, ValueError, json.JSONDecodeError, TypeError):
         return defaults
+
+
+def _get_attached_packs() -> list[dict]:
+    """Read attached_packs from $ENGRAM_HOME/config.json.
+
+    Returns a list of enabled pack dicts, each with 'id' and 'path' keys.
+    Any error (missing file, malformed JSON, missing section) → [] (fail-open).
+    Only entries with enabled=True and non-empty id+path are returned.
+    """
+    try:
+        config_path = os.path.join(ENGRAM_HOME, "config.json")
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        packs = config.get("attached_packs", [])
+        if not isinstance(packs, list):
+            return []
+        result = []
+        for entry in packs:
+            if not isinstance(entry, dict):
+                continue
+            if not entry.get("enabled"):
+                continue
+            pack_id = entry.get("id", "")
+            pack_path = entry.get("path", "")
+            if not pack_id or not pack_path:
+                continue
+            result.append({"id": str(pack_id), "path": str(pack_path)})
+        return result
+    except Exception:
+        return []
+
+
+def _query_attached_packs(prompt: str, quota: int = _PACK_SURFACE_QUOTA) -> list[dict]:
+    """Query attached external packs for FTS matches.
+
+    For each enabled attached pack (config order): opens knowledge.db read-only,
+    runs an FTS query, collects up to `quota` results TOTAL across all packs
+    (config-order priority, then bm25 rank). Each result dict has pack_id tagged.
+
+    Invariants:
+    - Pack DBs opened mode=ro only — read-only is a hard constraint, not an
+      optimization.
+    - Missing DB, unreadable DB, or any per-pack error → skip that pack
+      silently (fail-open).
+    - Any exception → return [] (never break own-graph surfacing).
+    """
+    try:
+        packs = _get_attached_packs()
+        if not packs:
+            return []
+
+        # Build FTS MATCH expression: tokenize to alphanumeric words ≥3 chars,
+        # take up to 8, quote-wrap each to prevent FTS5 syntax errors.
+        words = re.findall(r'[a-zA-Z0-9]{3,}', prompt)[:8]
+        if not words:
+            return []
+        match_expr = " OR ".join(f'"{w}"' for w in words)
+
+        results: list[dict] = []
+        for pack in packs[:_MAX_PACKS_TO_QUERY]:
+            if len(results) >= quota:
+                break
+            remaining = quota - len(results)
+            pack_id = pack["id"]
+            db_path = os.path.join(pack["path"], "knowledge.db")
+            try:
+                # immutable=1: engram-pkg-built packs are WAL-mode; a plain mode=ro
+                # connection creates a .db-shm sidecar (a write INTO the pack dir,
+                # grazing the read-only invariant). immutable=1 declares the file
+                # static — no locking, no -shm/-wal sidecars — which is correct for
+                # attached pack archives. Trade-off: if a pack is concurrently
+                # re-authored in place, immutable reads may be stale; attached packs
+                # are static downloads, and re-authoring an attached pack in place is
+                # out of contract.
+                conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+                conn.row_factory = sqlite3.Row
+                try:
+                    rows = conn.execute(
+                        """
+                        SELECT n.id, n.type, n.claim, n.confidence,
+                               n.recall_summary, n.recall_keywords
+                        FROM nodes_fts f
+                        JOIN nodes n ON n.rowid = f.rowid
+                        WHERE f.nodes_fts MATCH ? AND n.is_current = 1
+                        ORDER BY rank
+                        LIMIT ?
+                        """,
+                        (match_expr, remaining),
+                    ).fetchall()
+                    for row in rows:
+                        kw = row["recall_keywords"]
+                        if kw is not None:
+                            try:
+                                kw = json.loads(kw)
+                            except (json.JSONDecodeError, TypeError):
+                                kw = None
+                        results.append({
+                            "id": row["id"],
+                            "type": row["type"],
+                            "claim": row["claim"] or "",
+                            "confidence": row["confidence"],
+                            "recall_summary": row["recall_summary"],
+                            "recall_keywords": kw,
+                            "pack_id": pack_id,
+                        })
+                except Exception:
+                    # FTS5 OperationalError on weird tokens, missing table, etc.
+                    # — skip this pack silently.
+                    pass
+                finally:
+                    conn.close()
+            except Exception:
+                # DB missing, unreadable, or connection error — skip silently.
+                pass
+
+        return results
+    except Exception:
+        return []
 
 
 def _read_prev_assistant_tail(transcript_path: str | None, tail_chars: int) -> str:
@@ -335,7 +461,7 @@ def render_one_node_line(entry: dict, *, conf_prefix: bool, type_tag: bool) -> s
     return f"- [{nid}] {prefix}{kw_prefix}{body}"
 
 
-def format_nudge(result: dict) -> str:
+def format_nudge(result: dict, pack_results: list[dict] | None = None) -> str:
     """Format engram_surface result into a compact nudge string.
 
     Layout (2026-05-19 redesign):
@@ -344,9 +470,14 @@ def format_nudge(result: dict) -> str:
       3. Specials section (rendered with full content, BEFORE top_claims)
       4. Top claims section (with keyword+summary format)
       5. Warnings / Memory / IDs / footer
+      6. Attached-library section (when pack_results is non-empty)
 
     Types: line dropped — Noteworthy already conveys the type breakdown for
     specials, and when no specials are present the Types line is stats-noise.
+
+    pack_results: list of node dicts from _query_attached_packs(), each tagged
+    with 'pack_id'. Omitted or empty → section not rendered (zero-packs invariant:
+    byte-identical output to prior behavior when no packs are configured).
     """
     total = result.get("match_count", 0)
     if total == 0:
@@ -426,6 +557,20 @@ def format_nudge(result: dict) -> str:
         matched_ids = result.get("matched_ids", [])
         if matched_ids:
             lines.append(f"  IDs: {', '.join(matched_ids[:15])}")
+
+    # Attached-library section — appended AFTER all own-graph content.
+    # Only rendered when pack results exist; zero packs → section omitted
+    # entirely, preserving byte-identical output to current behavior.
+    if pack_results:
+        lines.append("  From attached libraries (read-only — cite, never import):")
+        for pr in pack_results:
+            pack_id = pr.get("pack_id", "?")
+            node_id = pr.get("id", "?")
+            namespaced_entry = dict(pr)
+            namespaced_entry["id"] = f"{pack_id}:{node_id}"
+            line = render_one_node_line(namespaced_entry, conf_prefix=True, type_tag=True)
+            lines.append(f"    {line}")
+        lines.append("    (pack nodes: deep-read via engram-pkg --pkg <path> inspect <id> — engram_inspect reads own-graph only)")
 
     lines.append("  Use engram_inspect(node_id) for details, engram_get_subgraph for full chains.")
     return "\n".join(lines)
@@ -779,11 +924,50 @@ def main():
             f"Recovery: bash {daemon_script}]"
         )
 
+    # Attached-pack surfacing — queried AFTER own-graph result, guarded
+    # fail-open so any pack error never breaks the hook.
+    pack_results: list[dict] = []
+    try:
+        pack_results = _query_attached_packs(prompt)
+    except Exception:
+        pack_results = []
+
     # ENGRAM recall nudge
     if result is not None:
-        nudge = format_nudge(result)
+        nudge = format_nudge(result, pack_results=pack_results)
         if nudge:
             parts.append(nudge)
+        elif pack_results:
+            # Own-graph returned 0 matches (match_count=0) but we have pack hits
+            # — surface them as a standalone mini-nudge.
+            pack_lines = ["[ENGRAM Recall: 0 own-graph nodes match; attached libraries:"]
+            pack_lines.append("  From attached libraries (read-only — cite, never import):")
+            for pr in pack_results:
+                pack_id = pr.get("pack_id", "?")
+                node_id = pr.get("id", "?")
+                namespaced_entry = dict(pr)
+                namespaced_entry["id"] = f"{pack_id}:{node_id}"
+                line = render_one_node_line(namespaced_entry, conf_prefix=True, type_tag=True)
+                pack_lines.append(f"    {line}")
+            pack_lines.append(
+                "  Deep-read pack nodes: engram-pkg --pkg <pack-path> inspect <node-id> (pack-scoped recall lands in a later slice).]"
+            )
+            parts.append("\n".join(pack_lines))
+    elif pack_results:
+        # Own-graph query failed entirely (result is None) but we have pack hits.
+        pack_lines = ["[ENGRAM Recall: own-graph unavailable; attached libraries:"]
+        pack_lines.append("  From attached libraries (read-only — cite, never import):")
+        for pr in pack_results:
+            pack_id = pr.get("pack_id", "?")
+            node_id = pr.get("id", "?")
+            namespaced_entry = dict(pr)
+            namespaced_entry["id"] = f"{pack_id}:{node_id}"
+            line = render_one_node_line(namespaced_entry, conf_prefix=True, type_tag=True)
+            pack_lines.append(f"    {line}")
+        pack_lines.append(
+            "  Deep-read pack nodes: engram-pkg --pkg <pack-path> inspect <node-id> (pack-scoped recall lands in a later slice).]"
+        )
+        parts.append("\n".join(pack_lines))
 
     # Write reminder (from Stop hook)
     write_reminder = check_write_reminder()
