@@ -149,16 +149,16 @@ class TestFairyPolicyDefaultConfig:
     def _get_default_config(self, tmp: Path) -> dict:
         """Write default config to tmp dir and return it."""
         import server as _server  # noqa: E402 (repo root is in sys.path)
-        orig_data_dir = _server.DATA_DIR
-        orig_config_path = _server.CONFIG_PATH
+        orig_data_dir = _server.core.DATA_DIR
+        orig_config_path = _server.core.CONFIG_PATH
         try:
-            _server.DATA_DIR = tmp
-            _server.CONFIG_PATH = tmp / "config.json"
+            _server.core.DATA_DIR = tmp
+            _server.core.CONFIG_PATH = tmp / "config.json"
             _server._ensure_data_dir()
             return json.loads((tmp / "config.json").read_text())
         finally:
-            _server.DATA_DIR = orig_data_dir
-            _server.CONFIG_PATH = orig_config_path
+            _server.core.DATA_DIR = orig_data_dir
+            _server.core.CONFIG_PATH = orig_config_path
 
     def test_default_config_has_coder_fairy_policy(self, tmp_path):
         config = self._get_default_config(tmp_path)

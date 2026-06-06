@@ -37,6 +37,7 @@ def fresh_server():
     os.environ.pop("ENGRAM_NO_EMBEDDINGS", None)
     os.environ["ENGRAM_NO_POLARITY"] = "1"
     import server
+    import engram_core
     server._configure_paths(TEST_DIR)
     server._ensure_data_dir()
     return server
@@ -60,7 +61,7 @@ def _stub_semantic_with(server, similarity, target_id, target_claim):
     class _StubEmb:
         def is_available(self_): return True
     server._embedder = _StubEmb()
-    server._get_embedding_config = lambda: {"enabled": True}
+    server.core._get_embedding_config = lambda: {"enabled": True}
 
 
 def _seed_first_obs(server, url="https://example.com/source-A"):
@@ -183,7 +184,7 @@ def test_thresholds_loaded_from_config_override():
     first_id = _seed_first_obs(server)
     # Write an override that bumps CORROBORATE to 0.90 — sim 0.70 should
     # now fall into RELATED (was CORROBORATE under defaults).
-    cfg_path = server.CONFIG_PATH
+    cfg_path = server.core.CONFIG_PATH
     cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
     cfg["thresholds"] = {
         "dedup_top_k": 15,

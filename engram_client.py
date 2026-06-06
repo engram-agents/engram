@@ -349,9 +349,14 @@ class EngramClient:
             os.environ["ENGRAM_HOME"] = resolved_dir
 
         # Import fresh — needed if we're running multiple clients
-        # with different db_dirs in the same process
-        if "server" in sys.modules:
-            del sys.modules["server"]
+        # with different db_dirs in the same process. Purge server AND
+        # engram_core as a PAIR (#872 wave 1): the path globals live on
+        # engram_core, and a fresh server importing the CACHED core would
+        # share path state with every prior client — client #2's
+        # _configure_paths would silently redirect client #1's live paths.
+        # Each client gets its own version-coherent server+core module pair.
+        for _mod in ("server", "engram_core"):
+            sys.modules.pop(_mod, None)
         import server as _server
 
         # Redirect ALL module-level paths via the centralized function.
@@ -613,7 +618,10 @@ class EngramClient:
     def reset(self):
         """Delete all data and start fresh."""
         import shutil
-        data_dir = self._server.DATA_DIR
+        # Mutable path globals live on engram_core (no server-side binding —
+        # #872 wave 1); read through the server's own core reference so this
+        # follows whatever core instance the imported server is bound to.
+        data_dir = self._server.core.DATA_DIR
         if data_dir.exists():
             shutil.rmtree(data_dir)
         self._server._ensure_data_dir()

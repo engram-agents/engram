@@ -40,14 +40,20 @@ def fresh_server(*, polarity_enabled: bool, nli_score: float | None = None):
         os.environ["ENGRAM_NO_POLARITY"] = "1"
     os.environ.pop("ENGRAM_NO_EMBEDDINGS", None)
     import server
+    import engram_core
     server._configure_paths(TEST_DIR)
     server._ensure_data_dir()
 
-    # Stub the embedder gate so semantic-search branch fires
+    # Stub the embedder gate so semantic-search branch fires. _embedder has
+    # consumers in BOTH namespaces post-#872-wave-1 (_semantic_search reads
+    # the server-module alias; core-resident _compute_and_store_embedding
+    # reads engram_core._embedder) — stub both or the core-side readers
+    # silently bypass the stub (review-caught on PR #894 round 1).
     class _StubEmb:
         def is_available(self_): return True
     server._embedder = _StubEmb()
-    server._get_embedding_config = lambda: {"enabled": True}
+    engram_core._embedder = server._embedder
+    engram_core._get_embedding_config = lambda: {"enabled": True}
 
     # Patch polarity.enabled into config.json (read-modify-write) per the
     # fixture flag. The production default is `enabled=False` as of
@@ -58,7 +64,7 @@ def fresh_server(*, polarity_enabled: bool, nli_score: float | None = None):
     # survive — keeps the fixture faithful to the real opt-in surface
     # users edit.
     if polarity_enabled:
-        config_path = server.CONFIG_PATH
+        config_path = engram_core.CONFIG_PATH
         config_path.parent.mkdir(parents=True, exist_ok=True)
         existing = {}
         if config_path.exists():
@@ -253,7 +259,7 @@ def test_polarity_disabled_via_config():
     """config.polarity.enabled=False disables the check."""
     server = fresh_server(polarity_enabled=True, nli_score=0.95)
     # Write polarity-disabled config
-    cfg_path = server.CONFIG_PATH
+    cfg_path = server.core.CONFIG_PATH
     cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
     cfg["polarity"] = {
         "enabled": False,
@@ -296,7 +302,7 @@ def test_polarity_skipped_when_sim_below_min_check():
     # above DEDUP_MIN_SIMILARITY (0.40) for the match to surface in the
     # results at all. Use min_similarity_for_check=0.45 via config so we
     # can test the gate without needing two semantic-search hits.
-    cfg_path = server.CONFIG_PATH
+    cfg_path = server.core.CONFIG_PATH
     cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
     cfg.setdefault("polarity", {})
     cfg["polarity"]["enabled"] = True
@@ -315,7 +321,7 @@ def test_polarity_skipped_when_sim_below_min_check():
 def test_polarity_threshold_configurable():
     """Setting config.polarity.threshold changes the firing point."""
     server = fresh_server(polarity_enabled=True, nli_score=0.50)
-    cfg_path = server.CONFIG_PATH
+    cfg_path = server.core.CONFIG_PATH
     cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
     cfg["polarity"] = {
         "enabled": True,

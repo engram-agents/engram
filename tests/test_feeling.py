@@ -60,10 +60,10 @@ def fresh_client():
     server = client._server
     # Force the feeling-nudge marker path into the isolated test dir so
     # tests never touch the real ~/.engram/feeling-nudge-active.json.
-    server.FEELING_NUDGE_MARKER = server.DATA_DIR / "feeling-nudge-active.json"
+    server.core.FEELING_NUDGE_MARKER = server.core.DATA_DIR / "feeling-nudge-active.json"
     # Best-effort: ensure no stale marker at the start of every test.
     try:
-        server.FEELING_NUDGE_MARKER.unlink()
+        server.core.FEELING_NUDGE_MARKER.unlink()
     except FileNotFoundError:
         pass
     return client, server
@@ -313,7 +313,7 @@ def test_feeling_dedup_exempt():
 
 def _get_metadata_from_db(server, node_id):
     """Read node metadata from DB directly (parsed_metadata stripped from MCP returns per #358)."""
-    conn = sqlite3.connect(str(server.DB_PATH))
+    conn = sqlite3.connect(str(server.core.DB_PATH))
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (node_id,)).fetchone()
@@ -391,7 +391,7 @@ def test_feeling_ctx_turn_persisted():
 def test_feeling_voluntary_when_no_marker():
     """Without a marker file, nudge_source defaults to 'voluntary'."""
     client, server = fresh_client()
-    assert not server.FEELING_NUDGE_MARKER.exists()
+    assert not server.core.FEELING_NUDGE_MARKER.exists()
     r = client.call("engram_report_feeling", {
         "reported_state": "Test.",
         "trigger": "Test.",
@@ -403,15 +403,15 @@ def test_feeling_marker_read_and_cleared():
     """A valid marker should set nudge_source and be consumed (cleared)."""
     client, server = fresh_client()
     # Arm a valid post_compact marker at the current turn.
-    server.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    server.core.DATA_DIR.mkdir(parents=True, exist_ok=True)
     marker = {
         "source": "post_compact",
         "fired_at": server._now(),
         "fired_at_turn": server._get_current_turn(),
         "ttl_turns": server.FEELING_NUDGE_TTL_TURNS,
     }
-    server.FEELING_NUDGE_MARKER.write_text(json.dumps(marker), encoding="utf-8")
-    assert server.FEELING_NUDGE_MARKER.exists()
+    server.core.FEELING_NUDGE_MARKER.write_text(json.dumps(marker), encoding="utf-8")
+    assert server.core.FEELING_NUDGE_MARKER.exists()
 
     r = client.call("engram_report_feeling", {
         "reported_state": "Test.",
@@ -419,7 +419,7 @@ def test_feeling_marker_read_and_cleared():
     })
     assert r.get("nudge_source") == "post_compact"
     # Read-and-clear — marker must be gone after the report.
-    assert not server.FEELING_NUDGE_MARKER.exists()
+    assert not server.core.FEELING_NUDGE_MARKER.exists()
 
     # A second report with no marker falls back to voluntary.
     r2 = client.call("engram_report_feeling", {
@@ -432,14 +432,14 @@ def test_feeling_marker_read_and_cleared():
 def test_feeling_marker_nap_checkpoint():
     """nap_checkpoint markers tag the report accordingly."""
     client, server = fresh_client()
-    server.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    server.core.DATA_DIR.mkdir(parents=True, exist_ok=True)
     marker = {
         "source": "nap_checkpoint",
         "fired_at": server._now(),
         "fired_at_turn": server._get_current_turn(),
         "ttl_turns": server.FEELING_NUDGE_TTL_TURNS,
     }
-    server.FEELING_NUDGE_MARKER.write_text(json.dumps(marker), encoding="utf-8")
+    server.core.FEELING_NUDGE_MARKER.write_text(json.dumps(marker), encoding="utf-8")
 
     r = client.call("engram_report_feeling", {
         "reported_state": "Test.",
@@ -451,7 +451,7 @@ def test_feeling_marker_nap_checkpoint():
 def test_feeling_marker_expired_ignored():
     """A marker whose fired_at_turn is more than TTL turns old is treated as absent."""
     client, server = fresh_client()
-    server.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    server.core.DATA_DIR.mkdir(parents=True, exist_ok=True)
     current = server._get_current_turn()
     # TTL + 1 turns in the past — guaranteed expired.
     stale_turn = current - (server.FEELING_NUDGE_TTL_TURNS + 1)
@@ -461,7 +461,7 @@ def test_feeling_marker_expired_ignored():
         "fired_at_turn": stale_turn,
         "ttl_turns": server.FEELING_NUDGE_TTL_TURNS,
     }
-    server.FEELING_NUDGE_MARKER.write_text(json.dumps(marker), encoding="utf-8")
+    server.core.FEELING_NUDGE_MARKER.write_text(json.dumps(marker), encoding="utf-8")
 
     r = client.call("engram_report_feeling", {
         "reported_state": "Test.",
@@ -470,14 +470,14 @@ def test_feeling_marker_expired_ignored():
     assert r.get("nudge_source") == "voluntary", \
         f"Expired marker should not tag report, got {r.get('nudge_source')}"
     # Expired marker should also have been cleaned up.
-    assert not server.FEELING_NUDGE_MARKER.exists()
+    assert not server.core.FEELING_NUDGE_MARKER.exists()
 
 
 def test_feeling_marker_corrupt_swallowed():
     """A corrupt marker file must not raise, must fall back to voluntary."""
     client, server = fresh_client()
-    server.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    server.FEELING_NUDGE_MARKER.write_text("{not valid json", encoding="utf-8")
+    server.core.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    server.core.FEELING_NUDGE_MARKER.write_text("{not valid json", encoding="utf-8")
 
     r = client.call("engram_report_feeling", {
         "reported_state": "Test.",
@@ -485,27 +485,27 @@ def test_feeling_marker_corrupt_swallowed():
     })
     assert r.get("nudge_source") == "voluntary"
     # Corrupt marker removed.
-    assert not server.FEELING_NUDGE_MARKER.exists()
+    assert not server.core.FEELING_NUDGE_MARKER.exists()
 
 
 def test_feeling_marker_unknown_source_rejected():
     """A marker with source not in FEELING_NUDGE_SOURCES must be ignored."""
     client, server = fresh_client()
-    server.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    server.core.DATA_DIR.mkdir(parents=True, exist_ok=True)
     marker = {
         "source": "not_a_real_source",
         "fired_at": server._now(),
         "fired_at_turn": server._get_current_turn(),
         "ttl_turns": server.FEELING_NUDGE_TTL_TURNS,
     }
-    server.FEELING_NUDGE_MARKER.write_text(json.dumps(marker), encoding="utf-8")
+    server.core.FEELING_NUDGE_MARKER.write_text(json.dumps(marker), encoding="utf-8")
 
     r = client.call("engram_report_feeling", {
         "reported_state": "Test.",
         "trigger": "Test.",
     })
     assert r.get("nudge_source") == "voluntary"
-    assert not server.FEELING_NUDGE_MARKER.exists()
+    assert not server.core.FEELING_NUDGE_MARKER.exists()
 
 
 # ── Context IDs / cites edges ──────────────────────────────────────────
@@ -568,11 +568,11 @@ def test_feeling_reflect_nudge_text_present():
 def test_feeling_reflect_arms_dream_review_marker():
     """Calling engram_reflect should arm a dream_review nudge marker."""
     client, server = fresh_client()
-    assert not server.FEELING_NUDGE_MARKER.exists()
+    assert not server.core.FEELING_NUDGE_MARKER.exists()
     client.call("engram_reflect", {})
-    assert server.FEELING_NUDGE_MARKER.exists(), \
+    assert server.core.FEELING_NUDGE_MARKER.exists(), \
         "engram_reflect should have armed the dream_review marker"
-    marker = json.loads(server.FEELING_NUDGE_MARKER.read_text())
+    marker = json.loads(server.core.FEELING_NUDGE_MARKER.read_text())
     assert marker.get("source") == "dream_review"
 
 
@@ -614,15 +614,15 @@ def test_checkpoint_nap_arms_marker():
     the nap_checkpoint feeling-report nudge.
     """
     client, server = fresh_client()
-    assert not server.FEELING_NUDGE_MARKER.exists()
+    assert not server.core.FEELING_NUDGE_MARKER.exists()
     r = client.call("engram_nap", {
         "message": "Test nap checkpoint",
     })
     # Return should include the nudge text.
     assert "feeling_report_nudge" in r, f"Expected feeling_report_nudge in nap return, got keys: {list(r.keys())}"
     # Marker file should now exist with source=nap_checkpoint.
-    assert server.FEELING_NUDGE_MARKER.exists()
-    marker = json.loads(server.FEELING_NUDGE_MARKER.read_text())
+    assert server.core.FEELING_NUDGE_MARKER.exists()
+    marker = json.loads(server.core.FEELING_NUDGE_MARKER.read_text())
     assert marker.get("source") == "nap_checkpoint"
 
 

@@ -87,7 +87,7 @@ def test_payload_json_status_transitions_rebalance_importance():
 
 def _get_metadata_from_db(server, node_id):
     """Read node metadata directly from the DB (bypasses MCP-level stripping)."""
-    conn = sqlite3.connect(str(server.DB_PATH))
+    conn = sqlite3.connect(str(server.core.DB_PATH))
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (node_id,)).fetchone()

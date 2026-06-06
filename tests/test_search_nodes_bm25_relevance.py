@@ -192,7 +192,7 @@ def test_fts_sim_merge_floor_drops_low_similarity(monkeypatch):
     class _StubEmbedder:
         def is_available(self): return True
     monkeypatch.setattr(server, "_embedder", _StubEmbedder())
-    monkeypatch.setattr(server, "_get_embedding_config", lambda: {"enabled": True})
+    monkeypatch.setattr(server.core, "_get_embedding_config", lambda: {"enabled": True})
 
     # Stub _semantic_search to assert the FTS hit is found AND assigned
     # a sub-floor similarity → the merge loop should drop it.
@@ -230,7 +230,7 @@ def test_fts_sim_merge_bump_promotes_above_floor(monkeypatch):
     class _StubEmbedder:
         def is_available(self): return True
     monkeypatch.setattr(server, "_embedder", _StubEmbedder())
-    monkeypatch.setattr(server, "_get_embedding_config", lambda: {"enabled": True})
+    monkeypatch.setattr(server.core, "_get_embedding_config", lambda: {"enabled": True})
 
     captured_sim = 0.50
     def _stub_sem(conn, q, top_k=10, min_similarity=0.0, **kw):

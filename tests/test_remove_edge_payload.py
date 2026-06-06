@@ -295,7 +295,7 @@ def _seed_lesson_with_two_incidents(server, error_incidents_tmp_path):
     error_incidents.json is freshly rebuilt to reflect both incidents on disk.
     """
     # Redirect the cache file to a test path so we don't pollute ~/.engram/.
-    server.ERROR_INCIDENTS_PATH = str(error_incidents_tmp_path)
+    server.core.ERROR_INCIDENTS_PATH = str(error_incidents_tmp_path)
 
     inc_a = json.loads(server.engram_add_observation(payload_json=json.dumps({
         "quoted_text": "Skipped reading stderr.",

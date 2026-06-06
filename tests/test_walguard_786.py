@@ -325,7 +325,7 @@ class TestSkipCheckpoint:
         server._configure_paths(self.tmp)
         server._ensure_data_dir()
         # Bypass real git: _git_available=True, mock _git to return plausible results
-        server._git_available = True
+        server.core._git_available = True
         self.server = server
 
     def teardown_method(self):
@@ -416,7 +416,7 @@ class TestSkipCheckpoint:
                 return self._make_fake_git_result(returncode=0)
             return self._make_fake_git_result(returncode=0)
 
-        with mock.patch.object(self.server, "_git", side_effect=_mock_git):
+        with mock.patch.object(self.server.core, "_git", side_effect=_mock_git):
             result = self.server._commit_snapshot(conn, "test snapshot", "test")
         conn.close()
 
@@ -457,7 +457,7 @@ class TestSkipCheckpoint:
                 return self._make_fake_git_result(returncode=0)
             return self._make_fake_git_result(returncode=0)
 
-        with mock.patch.object(self.server, "_git", side_effect=_mock_git):
+        with mock.patch.object(self.server.core, "_git", side_effect=_mock_git):
             result = self.server._commit_snapshot(
                 conn, "emergency test", "emergency", skip_checkpoint=True
             )
@@ -629,7 +629,7 @@ class TestGuardNeverRaises:
         conn.commit()
 
         # Force the throttle timer to zero so the check runs
-        self.server._walguard_last_check = 0.0
+        self.server.core._walguard_last_check = 0.0
 
         with mock.patch(
             "engram_walguard.detect_shm_displacement",
@@ -651,7 +651,7 @@ class TestGuardNeverRaises:
 
         # Set last_check to now — throttle should fire
         import time
-        self.server._walguard_last_check = time.monotonic()
+        self.server.core._walguard_last_check = time.monotonic()
 
         call_count = {"n": 0}
 
@@ -702,7 +702,7 @@ class TestBannerPlacement:
         import server
         server._configure_paths(self.tmp)
         server._ensure_data_dir()
-        server._git_available = True
+        server.core._git_available = True
         self.server = server
 
     def teardown_method(self):
@@ -824,7 +824,7 @@ class TestBannerPlacement:
         self._make_minimal_db()
         self._write_degraded_marker()
 
-        with mock.patch.object(self.server, "_git", side_effect=self._mock_git):
+        with mock.patch.object(self.server.core, "_git", side_effect=self._mock_git):
             raw = self.server.engram_nap('{"message": "banner test nap"}')
         parsed = _json.loads(raw)  # must not raise JSONDecodeError
         assert "_walguard_warning" in parsed, (
@@ -840,7 +840,7 @@ class TestBannerPlacement:
         self._make_minimal_db()
         self._write_degraded_marker()
 
-        with mock.patch.object(self.server, "_git", side_effect=self._mock_git):
+        with mock.patch.object(self.server.core, "_git", side_effect=self._mock_git):
             raw = self.server.engram_advance_turn('{"message": "banner test advance"}')
         parsed = _json.loads(raw)  # must not raise JSONDecodeError
         assert "_walguard_warning" in parsed, (
@@ -926,7 +926,7 @@ class TestStormGate:
 
     def _force_throttle_expired(self):
         """Reset the throttle so the next _run_walguard_check actually runs."""
-        self.server._walguard_last_check = 0.0
+        self.server.core._walguard_last_check = 0.0
 
     def test_no_redump_when_committed_marker_is_fresh(self):
         """Two calls with a fresh committed marker → zero additional dumps/commits.
@@ -964,7 +964,7 @@ class TestStormGate:
                 "engram_walguard.detect_shm_displacement",
                 return_value={"reason": "shm_deleted", "fd": 5},
             ), mock.patch.object(
-                self.server, "_commit_snapshot", side_effect=counting_commit_snapshot
+                self.server.core, "_commit_snapshot", side_effect=counting_commit_snapshot
             ):
                 # First call
                 self._force_throttle_expired()
@@ -1045,7 +1045,7 @@ class TestStormGate:
                 "engram_walguard.detect_shm_displacement",
                 return_value={"reason": "shm_deleted", "fd": 7},
             ), mock.patch.object(
-                self.server, "_commit_snapshot", side_effect=counting_commit_snapshot
+                self.server.core, "_commit_snapshot", side_effect=counting_commit_snapshot
             ):
                 # First call: stale marker → should fire one refresh dump
                 self._force_throttle_expired()
@@ -1105,7 +1105,7 @@ class TestDisabledGuardObservability:
         import io
 
         # Ensure the once-flag is clear (setup calls _configure_paths which resets it)
-        assert self.server._walguard_disabled_logged is False, (
+        assert self.server.core._walguard_disabled_logged is False, (
             "Flag should be False after _configure_paths"
         )
 

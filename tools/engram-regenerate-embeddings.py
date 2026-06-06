@@ -111,8 +111,12 @@ def _import_server(engram_home: Path):
     if backup_dir is not None and str(backup_dir) not in sys.path:
         sys.path.insert(0, str(backup_dir))
     import importlib
-    if "server" in sys.modules:
-        del sys.modules["server"]
+    # Purge server AND engram_core as a pair (#872 wave 1): the resolved
+    # server tree must load its own matching core — a cached engram_core
+    # from another tree/version would carry foreign path state and a
+    # version-incoherent module pair.
+    for _mod in ("server", "engram_core"):
+        sys.modules.pop(_mod, None)
     import server
     server._configure_paths(engram_home)
     return server

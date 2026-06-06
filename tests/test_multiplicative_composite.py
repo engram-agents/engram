@@ -497,12 +497,12 @@ def test_min_queryable_importance_respects_tier2_threshold_when_positive():
 
     # Force a positive tier2_threshold by stubbing the helper for this test.
     # We bypass _get_tier_threshold and verify the SQL filter uses our value.
-    original = server._get_tier_threshold
-    server._get_tier_threshold = lambda c, tier: 0.8 if tier == 2 else 0.0
+    original = server.core._get_tier_threshold
+    server.core._get_tier_threshold = lambda c, tier: 0.8 if tier == 2 else 0.0
     try:
         result = server._get_min_queryable_importance(conn)
     finally:
-        server._get_tier_threshold = original
+        server.core._get_tier_threshold = original
 
     # With threshold=0.8, only ob_0003/0004/0005 qualify (imp >= 0.8).
     # Min among those = 1.0.

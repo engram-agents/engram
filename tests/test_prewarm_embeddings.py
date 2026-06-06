@@ -44,6 +44,7 @@ def _import_server_no_embeddings():
             del sys.modules[key]
     os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
     import server
+    import engram_core
     return server
 
 
@@ -89,7 +90,7 @@ class TestPrewarmRunsOnDaemonThread:
 
         with mock.patch.object(server._embedder, "is_available", return_value=True), \
              mock.patch("threading.Thread", side_effect=lambda **kw: _FakeThread(**kw)), \
-             mock.patch("server._get_embedding_config", return_value={"model": MODEL}):
+             mock.patch("engram_core._get_embedding_config", return_value={"model": MODEL}):
 
             # Reproduce the if-is_available block from __main__ directly,
             # since _prewarm_embeddings is now module-level and importable.

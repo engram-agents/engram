@@ -368,7 +368,7 @@ class TestRegenerateEmbeddings:
              mock.patch.object(srv._embedder, "_model", "fake_model", create=True), \
              mock.patch.object(srv._embedder, "embed_batch", side_effect=_fake_embed_batch), \
              mock.patch.object(srv._embedder, "embed", side_effect=_fake_embed), \
-             mock.patch("server._embedding_text_for_node", side_effect=_fake_embedding_text):
+             mock.patch("engram_core._embedding_text_for_node", side_effect=_fake_embedding_text):
             # Patch _find_server_py to return our server.py
             with mock.patch.object(regen_mod, "_find_server_py", return_value=REPO_ROOT / "server.py"), \
                  mock.patch.object(regen_mod, "_import_server", return_value=srv):
@@ -438,7 +438,7 @@ class TestCommitSnapshotDumpFieldsOnEarlyReturn:
         import server
         server._configure_paths(self.tmp)
         server._ensure_data_dir()
-        server._git_available = True  # bypass git init; we'll mock _git calls
+        server.core._git_available = True  # bypass git init; we'll mock _git calls
         self.server = server
         self.db_path = self.tmp / "knowledge.db"
         _make_fixture_db(self.db_path, num_nodes=2, with_embeddings=False)
@@ -454,7 +454,7 @@ class TestCommitSnapshotDumpFieldsOnEarlyReturn:
 
     def _snapshot_patch(self):
         """Context manager: patch _generate_snapshot to avoid real schema dependency."""
-        return mock.patch.object(self.server, "_generate_snapshot", return_value="# test snapshot\n")
+        return mock.patch.object(self.server.core, "_generate_snapshot", return_value="# test snapshot\n")
 
     def _fake_git_result(self, returncode=0, stdout="", stderr=""):
         r = mock.Mock()
@@ -480,7 +480,7 @@ class TestCommitSnapshotDumpFieldsOnEarlyReturn:
         """
         conn = self._conn()
         with self._snapshot_patch(), self._failing_dump_patch():
-            with mock.patch.object(self.server, "_git", return_value=self._fake_git_result(0, "", "")):
+            with mock.patch.object(self.server.core, "_git", return_value=self._fake_git_result(0, "", "")):
                 result = self.server._commit_snapshot(conn, "test", "nap")
         conn.close()
         assert result.get("reason") == "no changes since last commit", (
@@ -498,7 +498,7 @@ class TestCommitSnapshotDumpFieldsOnEarlyReturn:
         conn = self._conn()
         with self._snapshot_patch(), self._failing_dump_patch():
             with mock.patch.object(
-                self.server, "_git",
+                self.server.core, "_git",
                 side_effect=[
                     self._fake_git_result(1),              # check-ignore → rc=1 (none ignored)
                     self._fake_git_result(1, stderr="git add error"),  # git add → fail
@@ -517,7 +517,7 @@ class TestCommitSnapshotDumpFieldsOnEarlyReturn:
         conn = self._conn()
         with self._snapshot_patch(), self._failing_dump_patch():
             with mock.patch.object(
-                self.server, "_git",
+                self.server.core, "_git",
                 side_effect=[
                     self._fake_git_result(1),              # check-ignore → rc=1 (none ignored)
                     self._fake_git_result(0),              # git add → ok
@@ -538,7 +538,7 @@ class TestCommitSnapshotDumpFieldsOnEarlyReturn:
         conn = self._conn()
         with self._snapshot_patch(), self._failing_dump_patch():
             with mock.patch.object(
-                self.server, "_git",
+                self.server.core, "_git",
                 side_effect=[
                     self._fake_git_result(1),              # check-ignore → rc=1 (none ignored)
                     self._fake_git_result(0),              # git add → ok
@@ -575,7 +575,7 @@ class TestCommitSnapshotPushUsesHEAD:
         import server
         server._configure_paths(self.tmp)
         server._ensure_data_dir()
-        server._git_available = True
+        server.core._git_available = True
         self.server = server
         self.db_path = self.tmp / "knowledge.db"
         _make_fixture_db(self.db_path, num_nodes=2, with_embeddings=False)
@@ -591,7 +591,7 @@ class TestCommitSnapshotPushUsesHEAD:
         return r
 
     def _snapshot_patch(self):
-        return mock.patch.object(self.server, "_generate_snapshot", return_value="# test snapshot\n")
+        return mock.patch.object(self.server.core, "_generate_snapshot", return_value="# test snapshot\n")
 
     def _conn(self):
         import sqlite3 as _sqlite3
@@ -621,7 +621,7 @@ class TestCommitSnapshotPushUsesHEAD:
 
         with self._snapshot_patch():
             with mock.patch("engram_backup.dump_stripped", return_value={}):
-                with mock.patch.object(self.server, "_git", side_effect=recording_git):
+                with mock.patch.object(self.server.core, "_git", side_effect=recording_git):
                     result = self.server._commit_snapshot(conn, "test", "nap")
         conn.close()
 
@@ -657,7 +657,7 @@ class TestCommitSnapshotPushUsesHEAD:
 
         with self._snapshot_patch():
             with mock.patch("engram_backup.dump_stripped", return_value={}):
-                with mock.patch.object(self.server, "_git", side_effect=fake_git):
+                with mock.patch.object(self.server.core, "_git", side_effect=fake_git):
                     result = self.server._commit_snapshot(conn, "test", "nap")
         conn.close()
         assert "remote_push" in result, f"'remote_push' key missing from result: {result}"
@@ -689,6 +689,7 @@ class TestCommitSnapshotSkipsGitignored:
         import server
         server._configure_paths(self.tmp)
         server._ensure_data_dir()
+        server.core._git_available = True  # bypass git init; we'll mock _git calls
         self.server = server
         self.db_path = self.tmp / "knowledge.db"
         _make_fixture_db(self.db_path, num_nodes=2, with_embeddings=False)
@@ -697,7 +698,7 @@ class TestCommitSnapshotSkipsGitignored:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _snapshot_patch(self):
-        return mock.patch.object(self.server, "_generate_snapshot", return_value="# test snapshot\n")
+        return mock.patch.object(self.server.core, "_generate_snapshot", return_value="# test snapshot\n")
 
     def _conn(self):
         import sqlite3 as _sqlite3
@@ -730,7 +731,7 @@ class TestCommitSnapshotSkipsGitignored:
             import server as srv
             srv._configure_paths(git_home)
             srv._ensure_data_dir()
-            srv._git_available = True
+            srv.core._git_available = True
 
             # Write .gitignore that ignores *.db (broad rule, like production)
             # and negates the normal diary.md so it's not ignored
@@ -750,7 +751,7 @@ class TestCommitSnapshotSkipsGitignored:
 
             conn = __import__("sqlite3").connect(str(db_path))
 
-            with mock.patch.object(srv, "_generate_snapshot", return_value="# test snapshot\n"):
+            with mock.patch.object(srv.core, "_generate_snapshot", return_value="# test snapshot\n"):
                 with mock.patch("engram_backup.dump_stripped", return_value={}):
                     result = srv._commit_snapshot(conn, "test", "nap")
             conn.close()
@@ -806,7 +807,7 @@ class TestCommitSnapshotSkipsGitignored:
         conn = self._conn()
         with self._snapshot_patch():
             with mock.patch("engram_backup.dump_stripped", return_value={}):
-                with mock.patch.object(self.server, "_git", side_effect=recording_git):
+                with mock.patch.object(self.server.core, "_git", side_effect=recording_git):
                     result = self.server._commit_snapshot(conn, "test", "nap")
         conn.close()
 
@@ -844,7 +845,7 @@ class TestCommitSnapshotSkipsGitignored:
         conn = self._conn()
         with self._snapshot_patch():
             with mock.patch("engram_backup.dump_stripped", return_value={}):
-                with mock.patch.object(self.server, "_git", side_effect=fake_git):
+                with mock.patch.object(self.server.core, "_git", side_effect=fake_git):
                     result = self.server._commit_snapshot(conn, "test", "nap")
         conn.close()
         assert "skipped_ignored" not in result, (
@@ -872,7 +873,7 @@ class TestCommitSnapshotSkipsGitignored:
         conn = self._conn()
         with self._snapshot_patch():
             with mock.patch("engram_backup.dump_stripped", return_value={}):
-                with mock.patch.object(self.server, "_git", side_effect=fake_git):
+                with mock.patch.object(self.server.core, "_git", side_effect=fake_git):
                     result = self.server._commit_snapshot(conn, "test", "nap")
         conn.close()
         # With rc>1 (error), all files are kept → commit proceeds
@@ -906,7 +907,7 @@ class TestCommitSnapshotSkipsGitignored:
         conn = self._conn()
         with self._snapshot_patch():
             with mock.patch("engram_backup.dump_stripped", return_value={}):
-                with mock.patch.object(self.server, "_git", side_effect=fake_git):
+                with mock.patch.object(self.server.core, "_git", side_effect=fake_git):
                     result = self.server._commit_snapshot(conn, "test", "nap")
         conn.close()
 

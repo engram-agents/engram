@@ -88,7 +88,7 @@ def _add_obs(server, claim="Test claim", url="https://example.com/src"):
 
 
 def _db_path(server):
-    return str(server.DB_PATH)
+    return str(server.core.DB_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +334,7 @@ class TestSimilarExistingStripping:
         class _FakeEmb:
             def is_available(self_): return True
         server._embedder = _FakeEmb()
-        server._get_embedding_config = lambda: {"enabled": True}
+        server.core._get_embedding_config = lambda: {"enabled": True}
 
     def test_match_type_absent_from_similar_existing(self):
         server = fresh_server()
@@ -421,7 +421,7 @@ class TestSimilarExistingLessonsStripping:
         class _FakeEmb:
             def is_available(self_): return True
         server._embedder = _FakeEmb()
-        server._get_embedding_config = lambda: {"enabled": True}
+        server.core._get_embedding_config = lambda: {"enabled": True}
 
     def _create_lesson(self, server, claim, incident_id):
         r = json.loads(server.engram_add_lesson(payload_json=json.dumps({

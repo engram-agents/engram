@@ -227,7 +227,7 @@ def test_batch_with_source_class():
 def _get_confidence_history_from_db(client, node_id):
     """Read confidence_history from DB (stripped from MCP returns per #358)."""
     import server as _server
-    conn = sqlite3.connect(str(_server.DB_PATH))
+    conn = sqlite3.connect(str(_server.core.DB_PATH))
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute(

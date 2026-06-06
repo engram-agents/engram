@@ -118,7 +118,7 @@ def test_resolve_writes_resolved_by_column():
         "target_id": q_id,
         "resolving_node_id": dv_id,
     })))
-    conn = sqlite3.connect(str(server.DB_PATH))
+    conn = sqlite3.connect(str(server.core.DB_PATH))
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute(
@@ -167,7 +167,7 @@ def test_resolved_by_points_at_strongest_not_latest():
         "resolving_node_id": weak_dv["derivation_id"],
     })))
 
-    conn = sqlite3.connect(str(server.DB_PATH))
+    conn = sqlite3.connect(str(server.core.DB_PATH))
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute(

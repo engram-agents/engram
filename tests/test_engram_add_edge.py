@@ -369,7 +369,7 @@ def _seed_lesson_and_dangling_incident(server, error_incidents_tmp_path):
     incident not yet linked. Returns (lesson_id, linked_incident_id,
     dangling_incident_id). error_incidents.json rebuilt to reflect linked-only
     state on disk."""
-    server.ERROR_INCIDENTS_PATH = str(error_incidents_tmp_path)
+    server.core.ERROR_INCIDENTS_PATH = str(error_incidents_tmp_path)
 
     linked = json.loads(server.engram_add_observation(payload_json=json.dumps({
         "quoted_text": "Skipped reading stderr.",

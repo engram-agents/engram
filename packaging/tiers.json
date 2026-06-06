@@ -31,6 +31,10 @@
       "tier": "essential"
     },
     {
+      "path": "engram_core.py",
+      "tier": "essential"
+    },
+    {
       "path": "engram_walguard.py",
       "tier": "essential"
     },
@@ -196,6 +200,10 @@
       "path": "tools/ia.py",
       "tier": "convenience",
       "multi_agent": true
+    },
+    {
+      "path": "tools/dump_mcp_schema.py",
+      "tier": "dev"
     },
     {
       "path": "tools/baton.py",

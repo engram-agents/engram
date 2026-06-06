@@ -54,7 +54,7 @@ def test_goal_creation():
 def _get_metadata_from_db(goal_id):
     """Read node metadata from DB directly (parsed_metadata stripped from MCP returns per #358)."""
     import server as _server
-    conn = sqlite3.connect(str(_server.DB_PATH))
+    conn = sqlite3.connect(str(_server.core.DB_PATH))
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (goal_id,)).fetchone()

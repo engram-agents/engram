@@ -159,7 +159,7 @@ class TestEngramClientConfigResolution:
 # ---------------------------------------------------------------------------
 
 class TestServerDataDirResolution:
-    """server.DATA_DIR resolves from env vars at module import time."""
+    """server.core.DATA_DIR resolves from env vars at module import time."""
 
     def test_home_used_stray_data_dir_ignored(self, monkeypatch, tmp_path):
         """ENGRAM_HOME set + a stray ENGRAM_DATA_DIR set to a different path →
@@ -179,8 +179,8 @@ class TestServerDataDirResolution:
                 del sys.modules[key]
         import server  # type: ignore[import]
         # DATA_DIR is set at import time from the env
-        assert server.DATA_DIR == Path(home_dir), (
-            f"Expected DATA_DIR={home_dir} (stray ENGRAM_DATA_DIR ignored); got {server.DATA_DIR}"
+        assert server.core.DATA_DIR == Path(home_dir), (
+            f"Expected DATA_DIR={home_dir} (stray ENGRAM_DATA_DIR ignored); got {server.core.DATA_DIR}"
         )
 
     def test_data_dir_ignored_when_home_unset(self, monkeypatch, tmp_path):
@@ -205,8 +205,8 @@ class TestServerDataDirResolution:
             if key == "server" or key.startswith("engram_"):
                 del sys.modules[key]
         import server  # type: ignore[import]
-        assert server.DATA_DIR == Path(tmp_path / "default_engram"), (
-            f"Expected DATA_DIR=default (stray ENGRAM_DATA_DIR ignored); got {server.DATA_DIR}"
+        assert server.core.DATA_DIR == Path(tmp_path / "default_engram"), (
+            f"Expected DATA_DIR=default (stray ENGRAM_DATA_DIR ignored); got {server.core.DATA_DIR}"
         )
 
     def test_default_when_neither_set(self, monkeypatch, tmp_path):
@@ -226,8 +226,8 @@ class TestServerDataDirResolution:
             if key == "server" or key.startswith("engram_"):
                 del sys.modules[key]
         import server  # type: ignore[import]
-        assert server.DATA_DIR == Path(tmp_path / "default_engram"), (
-            f"Expected DATA_DIR to use expanduser default; got {server.DATA_DIR}"
+        assert server.core.DATA_DIR == Path(tmp_path / "default_engram"), (
+            f"Expected DATA_DIR to use expanduser default; got {server.core.DATA_DIR}"
         )
 
 

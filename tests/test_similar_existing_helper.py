@@ -90,6 +90,10 @@ def test_helper_fts_applies_importance_floor_for_lessons():
     conn.commit()
 
     # Monkey-patch tier-2 threshold to 0.5 — above the seeded lesson's 0.1
+    # Target: server._get_tier_threshold (the module-level name _similar_existing_matches
+    # resolves from server.py's namespace), NOT server.core._get_tier_threshold.
+    # _similar_existing_matches lives in server.py and calls _get_tier_threshold by
+    # unqualified name — which Python resolves from the server module's __dict__.
     original_get_tier = server._get_tier_threshold
     server._get_tier_threshold = (
         lambda c, t: 0.5 if t == 2 else original_get_tier(c, t)

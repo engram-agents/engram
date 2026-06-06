@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import server
 
-
+import engram_core
 class TestSanitizeParamsStripsPrivateKeys(unittest.TestCase):
     """_sanitize_params must remove all _PAYLOAD_PRIVATE_KEYS and keep others."""
 
@@ -71,8 +71,8 @@ class TestLogEngramToolEventFireAndForget(unittest.TestCase):
         """If index.db is missing, the function returns None silently."""
         with tempfile.TemporaryDirectory(prefix="engram_test_nodb_") as tmpdir:
             # Point DATA_DIR at a dir where logs/index.db does NOT exist
-            original_data_dir = server.DATA_DIR
-            server.DATA_DIR = Path(tmpdir)
+            original_data_dir = engram_core.DATA_DIR
+            engram_core.DATA_DIR = Path(tmpdir)
             try:
                 result = server._log_engram_tool_event(
                     tool_name="engram_add_observation",
@@ -83,7 +83,7 @@ class TestLogEngramToolEventFireAndForget(unittest.TestCase):
                 # Fire-and-forget: must return None, no exception
                 self.assertIsNone(result)
             finally:
-                server.DATA_DIR = original_data_dir
+                engram_core.DATA_DIR = original_data_dir
 
     def test_no_exception_when_sqlite_connect_raises(self):
         """If sqlite3.connect fails (e.g. permission denied), no exception propagates."""
@@ -95,8 +95,8 @@ class TestLogEngramToolEventFireAndForget(unittest.TestCase):
             logs_dir.mkdir()
             (logs_dir / "index.db").touch()
 
-            original_data_dir = server.DATA_DIR
-            server.DATA_DIR = Path(tmpdir)
+            original_data_dir = engram_core.DATA_DIR
+            engram_core.DATA_DIR = Path(tmpdir)
             try:
                 with patch.object(
                     _sqlite3, "connect", side_effect=OSError("permission denied")
@@ -109,7 +109,7 @@ class TestLogEngramToolEventFireAndForget(unittest.TestCase):
                     )
                     self.assertIsNone(result)
             finally:
-                server.DATA_DIR = original_data_dir
+                engram_core.DATA_DIR = original_data_dir
 
 
 class TestExtractResultStatusHandlesNonDictReturns(unittest.TestCase):

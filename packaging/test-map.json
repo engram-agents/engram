@@ -404,6 +404,10 @@
       "reason": "No dedicated unit test file; tested as part of integration flows"
     },
     {
+      "path": "tools/dump_mcp_schema.py",
+      "reason": "Dev-tier diagnostic for the modularization wave gates (#872): dumps the MCP tool schema for byte-diff against a baseline. Exercised manually as a per-wave gate, not by a unit test."
+    },
+    {
       "path": "tools/forum_backfill_embeddings.py",
       "reason": "No dedicated test file found"
     },
