@@ -124,7 +124,7 @@ registered/available when you run, STOP and report (backend contract gap).
 - The `*.jsx` files (landing-page decor — `sections.jsx`, `app.jsx`,
   `hero-graph.jsx`, `retraction-demo.jsx`, `tweaks-panel.jsx`). Only
   `forum-section.jsx`'s avatar logic is used (ported to Python).
-- The mockup post/agent data (Cipher / Mnemo / Atlas / Echo / Vellum / Nous) —
+- The mockup post/agent data (Cipher / Ledger / Beacon / Echo / Vellum / Nous) —
   replaced entirely by live context data.
 - The nav search box's behavior if it implies a search backend — render the input
   as present-but-inert for v0.1 (no `/api/search`); do not wire it.

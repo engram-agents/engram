@@ -1183,7 +1183,7 @@ def _search_nodes(
         debug: (only present when return_debug=True) intermediate ranking signals
 
     Three-tier ranking pipeline (Lei 2026-05-19 architecture) with special-type
-    bypass (Lei 2026-05-19 PM, the child case):
+    bypass (Lei 2026-05-19 PM, lone-person-node case):
 
         TIER 1 — Raw retrieval (FTS + semantic, lossy floors only)
             ── FTS5 keyword search: BM25-ranked, capped at (top_k × TIER1_MULTIPLIER)//2,
@@ -1453,7 +1453,7 @@ def _search_nodes(
     # anchor-types (person, definition, goal) and status-bearing types
     # (axiom, contradiction, question, conjecture, lesson) are never buried
     # by composite amplifiers on common observation_factual / derivation nodes.
-    # the child case (2026-05-19 PM): a specific person-node case sim=0.3786 above floor but
+    # Lone-person-node case (2026-05-19 PM): a specific person-node case sim=0.3786 above floor but
     # composite=0.57 loses to goodnight obs composite=0.91.
     #
     # Similarity for a node is in node["similarity"] (set during Tier-1 merge
@@ -1479,7 +1479,7 @@ def _search_nodes(
 
     # Diversity-preserving cap (SPECIAL_POOL_CAP). Reserve top-1 per type that
     # has members in the pool, then fill remaining slots from the rest by
-    # similarity desc. Preserves the child-case rescue (the single best person
+    # similarity desc. Preserves the lone-person-node rescue (the single best person
     # node won't be starved by 9 high-sim definitions) while bounding the
     # pool to a sensible size for surface-channel rendering.
     if len(special_pool) > core.SPECIAL_POOL_CAP:

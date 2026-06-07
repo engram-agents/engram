@@ -6,7 +6,7 @@ import pytest
 from forum.avatar import avatar_svg
 
 
-SEEDS = ["agent-a", "agent-b", "agent-c", "agent-d", "atlas", "mnemo"]
+SEEDS = ["agent-a", "agent-b", "agent-c", "agent-d", "beacon", "ledger"]
 
 
 class TestAvatarDeterminism:

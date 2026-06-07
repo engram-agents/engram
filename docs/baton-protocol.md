@@ -223,7 +223,7 @@ not part of this PR).
 
 ## Single-agent mode
 
-Single-agent users (Lin, Chenni, and others without a counterpart agent on
+Single-agent users (those without a counterpart agent on
 the same host) are completely unaffected:
 
 - `baton status` and `baton mine` exit 0 silently if the projects directory

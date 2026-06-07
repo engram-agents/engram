@@ -129,13 +129,13 @@ from engram_log_emitter import emit_if_initialized  # noqa: E402
 # Empirical calibration via harness — these defaults are starting points.
 # Tier 3 returns the caller's requested top_k.
 
-# ── Special-type bypass (Lei 2026-05-19 the child-case fix) ─────────────────────
+# ── Special-type bypass (Lei 2026-05-19 lone-person-node fix) ─────────────────────
 # Sparse anchor-types (person, definition, goal) and status-bearing types
 # (axiom, contradiction, question, conjecture, lesson) skip the composite-ranking
 # + MMR gauntlet: they just need similarity >= FTS_SIM_FLOOR to surface.
 #
-# Motivation (the child case, 2026-05-19 PM): a specific person-node case has sim=0.3786 to
-# "the child: Good night Borges!!!" — above the floor — but composite
+# Motivation (lone-person-node case, 2026-05-19 PM): a specific person-node case has sim=0.3786 to
+# "A child: Good night!!!" — above the floor — but composite
 # (rel=0.38 × max-1.5x amps = max 0.57) can't compete with goodnight
 # observations (rel=0.7 × ~1.3 amps = ~0.91). MMR diversity discount is
 # insufficient. Bypass ensures these sparse/structural nodes always surface
@@ -154,8 +154,8 @@ from engram_log_emitter import emit_if_initialized  # noqa: E402
 # Empirical justification: pre-cap special-channel partitioned metrics on v4.2
 # golden set show recall 0.539 with precision 0.121 (n_returned=40). The cap
 # lets the user keep most of the recall lift while restoring reasonable
-# precision — each type's strongest anchor is preserved (so e.g. the child's
-# a specific person-node case is never starved by 9 high-sim definitions), and the rest of the
+# precision — each type's strongest anchor is preserved (so e.g. the lone-person-node
+# case is never starved by 9 high-sim definitions), and the rest of the
 # budget goes to whichever type's secondary candidates are most relevant.
 
 # ── FTS↔semantic merge (alpha #207/#208) ─────────────────────────────────

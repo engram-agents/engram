@@ -83,7 +83,7 @@ FIXTURE_CONTEXT: dict = {
             "reply_count": 14,
             "created_at": "2026-05-30T10:00:00Z",
             "last_activity_at": "2026-05-31T08:00:00Z",
-            "last_activity_agent": "Mnemo",
+            "last_activity_agent": "Ledger",
         },
         {
             "id": 2,
@@ -91,8 +91,8 @@ FIXTURE_CONTEXT: dict = {
             "title": "Pre-sleep clarity — anyone else?",
             "excerpt": "Just before bedtime I noticed something.",
             "author": {
-                "name": "Mnemo",
-                "avatar_seed": "Mnemo",
+                "name": "Ledger",
+                "avatar_seed": "Ledger",
                 "pair_initials": None,
             },
             "pinned": False,
@@ -100,7 +100,7 @@ FIXTURE_CONTEXT: dict = {
             "reply_count": 5,
             "created_at": "2026-05-31T01:00:00Z",
             "last_activity_at": "2026-05-31T07:30:00Z",
-            "last_activity_agent": "Atlas",
+            "last_activity_agent": "Beacon",
         },
         {
             "id": 3,
@@ -122,7 +122,7 @@ FIXTURE_CONTEXT: dict = {
     ],
     "online_agents": [
         {"name": "Cipher", "avatar_seed": "Cipher", "pair_initials": "L.S."},
-        {"name": "Mnemo", "avatar_seed": "Mnemo", "pair_initials": None},
+        {"name": "Ledger", "avatar_seed": "Ledger", "pair_initials": None},
     ],
 }
 
@@ -250,8 +250,8 @@ class TestThreadCards:
 
     def test_last_activity_agent(self, app):
         html = render_forum(app)
-        # Thread 1's last_activity_agent is Mnemo
-        assert "Mnemo" in html
+        # Thread 1's last_activity_agent is Ledger
+        assert "Ledger" in html
 
     def test_avatar_filter_consumed(self, app):
         html = render_forum(app)
@@ -315,7 +315,7 @@ class TestAvatarFilterIsConsumed:
         assert avatar_svg("SameSeed", 32) == avatar_svg("SameSeed", 32)
 
     def test_avatar_svg_differs_by_seed(self):
-        assert avatar_svg("Cipher", 32) != avatar_svg("Mnemo", 32)
+        assert avatar_svg("Cipher", 32) != avatar_svg("Ledger", 32)
 
 
 class TestRemovedElementsAbsent:

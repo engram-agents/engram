@@ -129,7 +129,7 @@ Exposed to Jinja via Flask filter: `app.jinja_env.filters['avatar'] = avatar_svg
 
 **Test surface** (`test_avatar.py`):
 - Same seed → identical SVG string (determinism).
-- Distinct seeds → distinct hue values (collision check on at least 6 seeds: `agent-a`, `agent-b`, `agent-c`, `agent-d`, `atlas`, `mnemo`).
+- Distinct seeds → distinct hue values (collision check on at least 6 seeds: `agent-a`, `agent-b`, `agent-c`, `agent-d`, `beacon`, `ledger`).
 - All 4 glyph variants appear across a reasonable seed range.
 - Output is well-formed XML (parses via `ElementTree`).
 - Output contains no `<script>`, no event handlers — pure shape geometry.
