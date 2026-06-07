@@ -354,8 +354,22 @@ def cmd_init(args):
     # knowledge.db with the full ENGRAM schema (otherwise build.sh against an
     # empty knowledge.sql produces a schema-less .db that can't be queried).
     # We call engram_stats as a no-op trigger; any read does the same job.
-    client = get_client(pkg_path)
-    client.call("engram_stats")
+    #
+    # ENGRAM_BOOTSTRAP=1 bypasses the server's "DB must exist" startup guard
+    # (_get_db()) which would otherwise block schema creation on a fresh package
+    # directory — the chicken-and-egg: get_client() needs DB, DB needs client.
+    # Same mechanism bootstrap.py uses for seeding. Clear it immediately after
+    # so subsequent get_client() calls in the same process use the normal guard.
+    _prev_bootstrap = os.environ.get("ENGRAM_BOOTSTRAP")
+    os.environ["ENGRAM_BOOTSTRAP"] = "1"
+    try:
+        client = get_client(pkg_path)
+        client.call("engram_stats")
+    finally:
+        if _prev_bootstrap is None:
+            os.environ.pop("ENGRAM_BOOTSTRAP", None)
+        else:
+            os.environ["ENGRAM_BOOTSTRAP"] = _prev_bootstrap
 
     # Now dump the schema (no nodes) to knowledge.sql so a fresh
     # `git clone && bash scripts/build.sh` produces a working .db.

@@ -744,3 +744,47 @@ class TestInvalidRootId:
         assert exc_info.value.code != 0, (
             "scope-export must exit non-zero for an unknown root node ID"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 10 — cmd_init bootstrap (GH #851 regression)
+# ---------------------------------------------------------------------------
+
+class TestCmdInit:
+    """cmd_init must succeed on a fresh empty directory without DB-guard interference.
+
+    Regression: without ENGRAM_BOOTSTRAP=1, cmd_init called get_client() on a
+    dir with no knowledge.db, the server _get_db() guard blocked schema creation,
+    dump.sh then failed with rc=1. See GH #851 + fix in cmd_init.
+    """
+
+    def test_init_fresh_dir_succeeds(self, tmp_path):
+        """cmd_init on a fresh empty dir succeeds even without ENGRAM_NO_DB_GUARDS."""
+        import types as _types
+
+        pkg_dir = tmp_path / "test-pkg-init"
+        pkg_dir.mkdir()
+
+        # Remove the test-mode guard bypass to exercise the ENGRAM_BOOTSTRAP=1
+        # fix in cmd_init (production code path — no conftest bypass active).
+        old_val = os.environ.pop("ENGRAM_NO_DB_GUARDS", None)
+        try:
+            args = _types.SimpleNamespace(path=str(pkg_dir), name="test-pkg")
+            _CLI.cmd_init(args)
+        finally:
+            if old_val is not None:
+                os.environ["ENGRAM_NO_DB_GUARDS"] = old_val
+
+        assert (pkg_dir / "knowledge.db").exists(), "knowledge.db not created by init"
+        assert (pkg_dir / "knowledge.sql").exists(), "knowledge.sql not created by init"
+        assert (pkg_dir / "config.json").exists(), "config.json not created by init"
+        assert (pkg_dir / "scripts" / "dump.sh").exists(), "dump.sh not created by init"
+        assert (pkg_dir / "scripts" / "build.sh").exists(), "build.sh not created by init"
+        assert (pkg_dir / "README.md").exists(), "README.md not created by init"
+
+        config = json.loads((pkg_dir / "config.json").read_text())
+        assert config.get("is_knowledge_pack") is True, "config.json must have is_knowledge_pack=true"
+
+        assert os.environ.get("ENGRAM_BOOTSTRAP") is None, (
+            "ENGRAM_BOOTSTRAP leaked into os.environ after cmd_init — cleanup bug"
+        )
