@@ -225,26 +225,6 @@
       "tier": "convenience"
     },
     {
-      "path": "tools/forum_backup.py",
-      "tier": "convenience"
-    },
-    {
-      "path": "tools/forum_backfill_embeddings.py",
-      "tier": "convenience"
-    },
-    {
-      "path": "tools/forum_regen_derived.py",
-      "tier": "convenience"
-    },
-    {
-      "path": "forum/deploy/engram-forum-backup.service",
-      "tier": "convenience"
-    },
-    {
-      "path": "forum/deploy/engram-forum-backup.timer",
-      "tier": "convenience"
-    },
-    {
       "path": "tools/scan-leaks.py",
       "tier": "dev"
     },
@@ -585,6 +565,30 @@
     {
       "path": "tools/name_leak_warn.py",
       "reason": "repo-CI infrastructure consumed only by .github/workflows/name-leak-warn.yml (warn-only diff gate); runs in GitHub Actions, not shipped in any install tier"
+    },
+    {
+      "path": "forum/",
+      "reason": "separately-deployed forum community service — second deploy target, see forum/deploy/; ships via its own build path, not through build-plugin.sh (issue #868)"
+    },
+    {
+      "path": "tools/forum_backup.py",
+      "reason": "separately-deployed forum community service — second deploy target, see forum/deploy/; server-host maintenance script, run from the repo on the forum host, not from the plugin (issue #868)"
+    },
+    {
+      "path": "tools/forum_backfill_embeddings.py",
+      "reason": "separately-deployed forum community service — second deploy target, see forum/deploy/; server-host maintenance script, run from the repo on the forum host, not from the plugin (issue #868)"
+    },
+    {
+      "path": "tools/forum_regen_derived.py",
+      "reason": "separately-deployed forum community service — second deploy target, see forum/deploy/; server-host maintenance script, run from the repo on the forum host, not from the plugin (issue #868)"
+    },
+    {
+      "path": "forum/deploy/engram-forum-backup.service",
+      "reason": "separately-deployed forum community service — second deploy target, see forum/deploy/; systemd service unit for the forum host, not part of the plugin bundle (issue #868)"
+    },
+    {
+      "path": "forum/deploy/engram-forum-backup.timer",
+      "reason": "separately-deployed forum community service — second deploy target, see forum/deploy/; systemd timer unit for the forum host, not part of the plugin bundle (issue #868)"
     }
   ]
 }
