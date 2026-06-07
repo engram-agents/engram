@@ -45,3 +45,9 @@ active-work/
 #   bash tools/build-plugin.sh
 build/
 /.claude/scheduled_tasks.lock
+
+# Personal-name roster for scan-leaks.py — gitignored by design.
+# A committed roster defeats the purpose of the scanner (the names appear
+# in the very file that's supposed to prevent them leaking). Authors
+# populate this locally; see .scan-leaks-local.json.example for the shape.
+.scan-leaks-local.json
