@@ -98,6 +98,35 @@ If you're done for the day, say so. Your agent will handle the rest.
 
 ---
 
+## Auto sleep: the midnight schedule
+
+Running sleep manually works, but it has a cost: sleep runs in your current session, spending tokens from whatever usage window you're in. For **Pro-tier Claude users**, this matters — each account has a rolling 5-hour usage window. A long working session that runs late, followed immediately by a manual sleep, can consume most of your remaining budget or run out mid-sleep.
+
+**Auto sleep solves this.** ENGRAM can schedule the sleep to fire automatically at a fixed time each night — default **3 AM local time**. By 3 AM, the 5-hour window that opened around 10 PM has expired and a fresh one has started. Sleep gets a full, uncontested budget with no competition from your work session.
+
+**The window math:**
+
+- Wrap up work by **10 PM** → your usage window opens
+- **3 AM** — auto sleep fires; a fresh window opened at 1 AM; sleep runs clean
+- **8 AM** — consolidation is done; another fresh window opens for the workday
+
+For most people: say goodnight, and your agent handles consolidation quietly in the background. You wake up to a fully organized ENGRAM.
+
+**Important:** Phase B of the sleep routine (the dream consolidation) spawns sub-agents that start completely fresh — they don't carry your session's context at all, so they aren't affected by window size regardless of when you sleep. The main benefit of the midnight window is for Phase A — the review and note-filing your agent does before the sub-agents take over — which runs in whatever context is current.
+
+**To enable auto sleep**, open the viz-server settings tab at `http://localhost:5001` → Settings → "Auto-sleep", check **Enable auto-sleep**, and optionally adjust the time. Or edit `~/.engram/config.json` directly:
+
+```json
+"cadence": {
+  "auto_sleep_enabled": true,
+  "auto_sleep_time": "03:00"
+}
+```
+
+Takes effect at the next session start (MCP server restart via `/mcp`). The setting is off by default — opt in when you're ready.
+
+---
+
 ## Compaction and drowsiness (read this once)
 
 This is infrastructure your agent works *around*, and understanding it shifts how you'll read certain moments. Worth ten minutes once.
@@ -150,6 +179,31 @@ A full upgrade typically takes 1-2 minutes end-to-end. The agent walks you throu
 The exact mechanism for choosing + switching upgrade tracks is being finalized as part of the release strategy (TBD; the release doc when filed will cover the choosing UX). For now, if you're unsure, default to `master`.
 
 **If something feels off after upgrade**, ask your agent to investigate. They can read `~/.engram/.deployed-version` to see the exact commit you're on, compare against what should be there, and diagnose. The upgrade flow records each deploy as an ENGRAM observation, so the agent has clean provenance for "what version am I running" forensics.
+
+---
+
+## Configuring your install
+
+`~/.engram/config.json` is the source of truth for your agent's runtime behavior. Most settings have sensible defaults and can be left alone — but a handful are worth knowing when you want to tune things.
+
+**Two ways to edit:**
+
+- **Viz-server config tab** (easiest): open `http://localhost:5001` in a browser and click Settings. Changes to most settings take effect on the next hook prompt — no restart needed. Embedding settings require an MCP server restart (via `/mcp` inside Claude Code).
+- **Direct file edit**: open `~/.engram/config.json` in any editor. Same timing applies.
+
+**Settings you're most likely to care about:**
+
+| Setting | What it does |
+|---|---|
+| `cadence.drowsiness_ceiling_tokens` | The context-window token ceiling the drowsiness meter measures fill against. Set this to ~5–10% below your session's reported auto-compaction limit (run `/context` to check). Without it, the meter falls back to a conservative 152K floor that fires frequent warnings on 1M sessions. |
+| `cadence.drowsiness_caution_pct` / `drowsiness_urgent_pct` | Percentage thresholds (of the ceiling) at which the caution and urgent drowsiness nudges fire. |
+| `cadence.auto_sleep_enabled` | Enable the nightly auto-sleep cron. Off by default. See [Auto sleep: the midnight schedule](#auto-sleep-the-midnight-schedule). |
+| `cadence.auto_sleep_time` | Local-time 24-hour clock when the nightly sleep fires. Default `"03:00"`. Format: `HH:MM`. |
+| `coder_fairy_policy` / `reviewer_fairy_policy` | Controls when your agent spawns sub-agents for PR work (`"auto"`, `"always"`, or `"explicit"`). See [Fairy delegation](#fairy-delegation--what-your-agent-does-for-pr-work). |
+
+**What you don't need to touch:** identity fields (`agent_name`, `mode`, `counterparts`) are managed by `agentctl` and shown read-only in the UI. Embedding settings are also read-only in the UI — switching models would invalidate existing embeddings.
+
+If you're unsure what a setting does, hover for the tooltip in the viz config tab, or ask your agent directly: *"What does X do in my config?"*
 
 ---
 
