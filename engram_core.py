@@ -3359,3 +3359,374 @@ def _rebuild_incidents_cache() -> dict:
     finally:
         conn.close()
 
+
+# ---------------------------------------------------------------------------
+# #872 wave-5 rolling promotions — _create_derivation (shared by B + E)
+# ---------------------------------------------------------------------------
+# Canonical copies live here; server.py originals deleted in the same commit
+# (PROMOTION-FIDELITY RULE). Verbatim move from server.py — no simplification.
+# E family (_resolve_impl) moves in wave 6 and will call core._create_derivation
+# directly from engram_resolve.py.
+
+# Excerpt length for warning surfacing (claim + retraction_reason).
+# Long enough to carry gist, short enough to keep responses compact.
+_WARNING_EXCERPT_LEN = 140
+
+# Structural expectations per reasoning type — used for validation warnings.
+REASONING_STRUCTURE = {
+    "deductive_modus_ponens": {"min_premises": 2, "max_premises": 2, "multi_source": False},
+    "deductive_modus_tollens": {"min_premises": 2, "max_premises": 2, "multi_source": False},
+    "deductive_hypothetical_syllogism": {"min_premises": 2, "max_premises": None, "multi_source": False},
+    "deductive_disjunctive": {"min_premises": 2, "max_premises": None, "multi_source": False},
+    "deductive_reductio": {"min_premises": 1, "max_premises": None, "multi_source": False},
+    "inductive_generalization": {"min_premises": 2, "max_premises": None, "multi_source": True},
+    "inductive_enumeration": {"min_premises": 2, "max_premises": None, "multi_source": False},
+    "inductive_statistical": {"min_premises": 1, "max_premises": 2, "multi_source": False},
+    "inductive_analogy": {"min_premises": 2, "max_premises": None, "multi_source": False},
+    "inductive_causal": {"min_premises": 2, "max_premises": None, "multi_source": False},
+    "abductive_best_explanation": {"min_premises": 2, "max_premises": None, "multi_source": False},
+    "abductive_elimination": {"min_premises": 2, "max_premises": None, "multi_source": False},
+    "authority_expert": {"min_premises": 1, "max_premises": None, "multi_source": False},
+    "authority_consensus": {"min_premises": 2, "max_premises": None, "multi_source": True},
+}
+
+
+def _validate_premises(
+    supporting_ids: list,
+    conn: sqlite3.Connection,
+    use_stale: bool = False,
+) -> tuple[Optional[dict], list]:
+    """MECH-5 taint/stale blocking guard for engram_derive.
+
+    Classifies each supporting premise and blocks derivations built on
+    compromised foundations — the Mao-Cao compounding pattern that
+    the diagnosed-pattern derivation diagnosed.
+
+    Rules:
+      - Any premise with metadata.tainted_by → hard block (BLOCKED_TAINTED).
+        No override. Taint means an upstream was retracted (proven wrong).
+      - Any premise with metadata.stale_by AND use_stale=False →
+        soft block (BLOCKED_STALE). Agent opts in with use_stale=True
+        when the upstream update is judged irrelevant to current logic.
+      - Mixed taint + stale → treated as tainted (taint dominates).
+
+    Returns:
+        (block_response, stale_ids)
+        - block_response: None if premises are clean (or stale-opt-in
+          covers them). Otherwise a dict ready for json.dumps with a
+          structured block error.
+        - stale_ids: list of premise IDs that are stale (for the caller
+          to stamp metadata.built_on_stale when use_stale=True lets us
+          proceed).
+    """
+    tainted_premises = []
+    stale_premises = []
+    stale_ids: list = []
+    for sid in supporting_ids:
+        row = conn.execute(
+            "SELECT metadata, status, is_current, superseded_by FROM nodes WHERE id = ?",
+            (sid,),
+        ).fetchone()
+        if not row:
+            continue
+        meta = {}
+        if row["metadata"]:
+            try:
+                meta = json.loads(row["metadata"])
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+        tainted_by = list(meta.get("tainted_by") or [])
+        stale_by = list(meta.get("stale_by") or [])
+
+        # The premise itself may be the retracted or superseded node (not
+        # just downstream of one) — the cascade markers only hit dependents.
+        # Treat a directly-retracted premise as tainted; a directly-
+        # superseded premise as stale with the replacement pulled from
+        # the superseded_by column.
+        if row["status"] == "retracted" and sid not in tainted_by:
+            tainted_by.insert(0, sid)
+        is_superseded_here = (
+            row["is_current"] == 0
+            and row["superseded_by"] is not None
+            and row["status"] != "retracted"
+        )
+        if is_superseded_here and sid not in stale_by:
+            stale_by.insert(0, sid)
+
+        if tainted_by:
+            retraction_info = []
+            for rid in tainted_by:
+                rrow = conn.execute(
+                    "SELECT metadata FROM nodes WHERE id = ?", (rid,)
+                ).fetchone()
+                r_reason = None
+                if rrow and rrow["metadata"]:
+                    try:
+                        rmeta = json.loads(rrow["metadata"])
+                        r_reason = rmeta.get("retraction_reason")
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                retraction_info.append({
+                    "retracted_by": rid,
+                    "retraction_reason_excerpt": (r_reason or "")[:_WARNING_EXCERPT_LEN],
+                })
+            tainted_premises.append({
+                "id": sid,
+                "retracted_by": retraction_info,
+            })
+        elif stale_by:
+            replacement_info = []
+            for old_id in stale_by:
+                drow = conn.execute(
+                    "SELECT superseded_by FROM nodes WHERE id = ?", (old_id,)
+                ).fetchone()
+                replacement_info.append({
+                    "superseded_id": old_id,
+                    "replaced_by_id": drow["superseded_by"] if drow else None,
+                })
+            stale_premises.append({
+                "id": sid,
+                "stale_because": replacement_info,
+            })
+            stale_ids.append(sid)
+
+    # Taint dominates — block even if use_stale=True.
+    if tainted_premises:
+        return ({
+            "status": "blocked_tainted",
+            "error": "BLOCKED_TAINTED: cannot derive from retracted or tainted premises.",
+            "tainted_premises": tainted_premises,
+            "guidance": (
+                "Resolve taint before deriving: (1) drop the tainted premise, "
+                "(2) re-derive on a replacement if the retracted upstream was "
+                "superseded with a correction, (3) file a question with "
+                "engram_ask if the conclusion's validity under the correction "
+                "is non-obvious."
+            ),
+        }, stale_ids)
+
+    if stale_premises and not use_stale:
+        return ({
+            "status": "blocked_stale",
+            "error": "BLOCKED_STALE: premise(s) have superseded upstream.",
+            "stale_premises": stale_premises,
+            "guidance": (
+                "Either retry with use_stale=True (writes a "
+                "metadata.built_on_stale audit marker — use when the upstream "
+                "update does not affect your logic), OR cite the replacement "
+                "premise(s) directly via their IDs."
+            ),
+        }, stale_ids)
+
+    return (None, stale_ids)
+
+
+def _trace_evidence_roots(conn: sqlite3.Connection, node_id: str, max_depth: int = 10) -> set:
+    """Trace a node back to its evidence root(s) through citation edges."""
+    visited = set()
+    queue = [node_id]
+    roots = set()
+
+    while queue and max_depth > 0:
+        max_depth -= 1
+        current = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+
+        node = conn.execute("SELECT type FROM nodes WHERE id = ?", (current,)).fetchone()
+        if not node:
+            continue
+        if node["type"] == "evidence":
+            roots.add(current)
+            continue
+
+        # Follow citation edges backward
+        edges = conn.execute(
+            "SELECT target_id FROM edges WHERE source_id = ? AND relation IN ('cites', 'derives_from', 'supported_by')",
+            (current,),
+        ).fetchall()
+        for e in edges:
+            queue.append(e["target_id"])
+
+    return roots
+
+
+def _validate_reasoning_structure(
+    conn: sqlite3.Connection,
+    reasoning_type: str,
+    premise_ids: list[str],
+) -> list[str]:
+    """Validate structural requirements for a reasoning type.
+
+    Returns a list of warning strings. Empty list = all checks passed.
+    Warnings don't block creation but are returned to the agent so it can
+    reconsider its classification.
+    """
+    warnings = []
+    spec = REASONING_STRUCTURE.get(reasoning_type)
+    if not spec:
+        return warnings
+
+    n = len(premise_ids)
+
+    # Check premise count
+    if n < spec["min_premises"]:
+        warnings.append(
+            f"Reasoning type '{reasoning_type}' typically requires at least "
+            f"{spec['min_premises']} premise(s), but {n} provided. "
+            f"Consider whether this is the right reasoning type."
+        )
+    if spec["max_premises"] is not None and n > spec["max_premises"]:
+        warnings.append(
+            f"Reasoning type '{reasoning_type}' typically has at most "
+            f"{spec['max_premises']} premise(s), but {n} provided. "
+            f"Consider whether a different reasoning type fits better."
+        )
+
+    # Check multi-source requirement (for corroboration/generalization/consensus)
+    if spec.get("multi_source") and n >= 2:
+        evidence_roots = {}
+        for pid in premise_ids:
+            roots = _trace_evidence_roots(conn, pid)
+            evidence_roots[pid] = roots
+
+        all_roots = set()
+        for roots in evidence_roots.values():
+            all_roots.update(roots)
+
+        if len(all_roots) <= 1 and len(premise_ids) >= 2:
+            warnings.append(
+                f"Reasoning type '{reasoning_type}' requires independent sources, "
+                f"but all premises trace back to the same evidence node. "
+                f"Multiple observations from the same source are not independent — "
+                f"consider 'deductive_hypothetical_syllogism' or 'inductive_causal' instead."
+            )
+
+    return warnings
+
+
+def _create_derivation(
+    conn: sqlite3.Connection,
+    *,
+    claim: str,
+    supporting_ids: list,
+    logical_chain: str,
+    reasoning_type: str,
+    context_ids: Optional[list] = None,
+    use_stale: bool = False,
+    extra_meta: Optional[dict] = None,
+    history_reason: Optional[str] = None,
+) -> tuple:
+    """Shared derivation-creation core for engram_derive and engram_resolve.
+
+    Runs the MECH-5 premise guard, computes confidence, INSERTs the
+    derivation row, wires derives_from + cites edges, stamps the node,
+    and issues utility rewards. Does NOT commit — caller owns the
+    transaction boundary so resolve can append a resolves edge and
+    update the target atomically.
+
+    Claim-bearing-type validation and node-existence checks are the
+    caller's responsibility so each tool can produce its own error
+    messages.
+
+    Args:
+        conn: open DB connection (caller commits)
+        claim, logical_chain: the derivation's text
+        supporting_ids: pre-validated claim-bearing premise IDs
+        reasoning_type: required — caller resolves legacy derivation_mode
+            → reasoning_type default before calling
+        context_ids: optional 'cites' targets; missing IDs are silently
+            filtered (legacy engram_derive behavior)
+        use_stale: MECH-5 opt-in for stale premises
+        extra_meta: merged into derivation metadata after reasoning
+            fields — use for resolve-specific keys (resolves,
+            resolution_status)
+        history_reason: optional confidence_history reason string;
+            defaults to a generic "Derived (reasoning_type, ...)" line
+
+    Returns:
+        (block, success) — exactly one is non-None.
+          block: MECH-5 guard response ready for json.dumps when a
+            premise was tainted or stale without opt-in
+          success: dict with node_id, confidence, reasoning_type,
+            reasoning_class, stale_ids, structure_warnings,
+            bumped_count, context_nodes
+    """
+    block, stale_ids = _validate_premises(supporting_ids, conn, use_stale=use_stale)
+    if block is not None:
+        return (block, None)
+
+    structure_warnings = _validate_reasoning_structure(conn, reasoning_type, supporting_ids)
+
+    confidence = _compute_confidence(
+        conn, "derivation", supporting_ids=supporting_ids,
+        reasoning_type=reasoning_type,
+    )
+    node_id = _next_id(conn, "derivation")
+    now = _now()
+
+    rclass = REASONING_CLASS.get(reasoning_type, "unknown")
+    discount = REASONING_DISCOUNT.get(reasoning_type, 0.95)
+
+    derive_meta = {"reasoning_type": reasoning_type, "reasoning_class": rclass}
+    if use_stale and stale_ids:
+        derive_meta["built_on_stale"] = stale_ids
+    if extra_meta:
+        derive_meta.update(extra_meta)
+
+    reason_line = history_reason or (
+        f"Derived ({reasoning_type}, discount={discount}) from {len(supporting_ids)} premises"
+    )
+
+    conn.execute(
+        """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
+           confidence, confidence_history, metadata)
+           VALUES (?, 'derivation', ?, ?, ?, ?, ?, ?)""",
+        (
+            node_id,
+            claim,
+            now,
+            logical_chain,
+            confidence,
+            json.dumps([{"timestamp": now, "value": confidence, "reason": reason_line}]),
+            json.dumps(derive_meta),
+        ),
+    )
+
+    for sid in supporting_ids:
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'derives_from', ?)",
+            (node_id, sid, now),
+        )
+
+    ctx_used: list = []
+    if context_ids:
+        for cid in context_ids:
+            exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
+            if exists:
+                try:
+                    conn.execute(
+                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
+                        (node_id, cid, now),
+                    )
+                    ctx_used.append(cid)
+                except sqlite3.IntegrityError:
+                    pass
+
+    _stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
+
+    bumped_count = 0
+    if supporting_ids:
+        bumped_count = _utility_reward(conn, supporting_ids, action="derive")
+
+    return (None, {
+        "node_id": node_id,
+        "confidence": confidence,
+        "reasoning_type": reasoning_type,
+        "reasoning_class": rclass,
+        "stale_ids": stale_ids,
+        "structure_warnings": structure_warnings,
+        "bumped_count": bumped_count,
+        "context_nodes": ctx_used,
+    })

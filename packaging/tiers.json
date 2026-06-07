@@ -59,6 +59,14 @@
       "tier": "essential"
     },
     {
+      "path": "engram_derive.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_tasks.py",
+      "tier": "essential"
+    },
+    {
       "path": "engram_walguard.py",
       "tier": "essential"
     },
