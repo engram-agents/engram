@@ -86,10 +86,10 @@ class TestGetUserName(unittest.TestCase):
             json.dump(data, f)
 
     def test_user_name_renders_from_primary_user(self):
-        """config.json = {"primary_user": "Lei"} → get_user_name() returns "Lei"."""
-        self._write_config({"primary_user": "Lei"})
+        """config.json = {"primary_user": "Alex"} → get_user_name() returns "Alex"."""
+        self._write_config({"primary_user": "Alex"})
         result = self.hook.get_user_name()
-        self.assertEqual(result, "Lei")
+        self.assertEqual(result, "Alex")
 
     def test_fallback_when_primary_user_unset(self):
         """config.json with no primary_user key → get_user_name() returns "the human"."""
@@ -130,7 +130,7 @@ class TestCriticalWarningIntegration(unittest.TestCase):
         # Write a config.json with primary_user set so the full template fires.
         config_path = os.path.join(self.tmp, "config.json")
         with open(config_path, "w", encoding="utf-8") as f:
-            json.dump({"primary_user": "Lei"}, f)
+            json.dump({"primary_user": "Alex"}, f)
         # Load the hook and redirect ENGRAM_HOME to our temp dir.
         self.hook = _load_hook_module()
         self.hook.ENGRAM_HOME = self.tmp
@@ -145,7 +145,7 @@ class TestCriticalWarningIntegration(unittest.TestCase):
         """CRITICAL warning fires and templates user_name when daemon returns None.
 
         query_daemon is mocked to return None (simulates daemon offline).
-        The output must contain the CRITICAL warning header and "Notify Lei".
+        The output must contain the CRITICAL warning header and "Notify Alex".
         """
         raw_output = _run_main_capture(self.hook, _make_hook_input())
         self.assertTrue(
@@ -165,9 +165,9 @@ class TestCriticalWarningIntegration(unittest.TestCase):
             "CRITICAL warning text must appear in additionalContext when daemon is offline",
         )
         self.assertIn(
-            "Notify Lei",
+            "Notify Alex",
             additional_context,
-            "CRITICAL warning must include 'Notify Lei' when primary_user is 'Lei'",
+            "CRITICAL warning must include 'Notify Alex' when primary_user is 'Alex'",
         )
 
 

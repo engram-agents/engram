@@ -63,7 +63,7 @@ def _write_sleep_marker(engram_home: Path, hours_ago: float) -> None:
 
 @pytest.mark.parametrize("phrase", [
     "good night",
-    "Good Night Lei",
+    "Good Night Alex",
     "let's call it a day",
     "Time to call it a night",
     "let's call it",
@@ -152,7 +152,7 @@ def test_documented_false_positives_still_fire(
 
 @pytest.mark.parametrize("prompt,expected_phrase", [
     ("good night", "good night"),
-    ("Good Night Lei", "Good Night"),
+    ("Good Night Alex", "Good Night"),
     # Re-alternation note: "let's call it" appears earlier in the pattern
     # list than "call it a day"; re.search returns the leftmost-pattern
     # match at the leftmost-position, so "let's call it" wins here.

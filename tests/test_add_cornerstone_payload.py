@@ -55,7 +55,7 @@ def test_payload_json_with_optional_fields():
         "title": "Bold internally, careful externally",
         "new_frame": "Internal-bold / external-careful filter.",
         "prior_frame": "Wait-for-approval reflex.",
-        "triggering_experience": "Lei flagged the regression 2026-05-06.",
+        "triggering_experience": "Regression caught in review, 2026-05-06.",
     }
     r = json.loads(server.engram_add_cornerstone(payload_json=json.dumps(payload)))
     assert "error" not in r, r

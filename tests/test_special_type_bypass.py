@@ -1,4 +1,4 @@
-"""Tests for the special-type bypass in _search_nodes (Lei 2026-05-19 PM, the child case).
+"""Tests for the special-type bypass in _search_nodes (2026-05-19 PM, person-node diversity case).
 
 Covers:
   1. test_special_types_bypass_composite_when_sim_above_floor
@@ -141,8 +141,8 @@ def test_special_types_bypass_composite_when_sim_above_floor():
         _add_obs(srv, f"{keyword} greetings farewell observation node {i:03d}")
 
     # Add a person node with the same keyword but low utility (freshly added,
-    # utility=0 by default) — simulates pn_0005 in the the child case.
-    person_id = _add_person(srv, f"the child {keyword} person test", role="test collaborator")
+    # utility=0 by default) — simulates the low-utility person-node bypass case.
+    person_id = _add_person(srv, f"Sample {keyword} person test", role="test collaborator")
 
     conn = fresh_conn(srv)
     try:
@@ -379,7 +379,7 @@ def test_special_pool_cap_preserves_top_per_type():
     """Diversity preservation: top-1 of each present type survives the cap.
 
     Even when one type dominates (9 persons vs 1 goal), the cap must keep
-    at least 1 of each type — guarantees the the child case (pn_0005 alone)
+    at least 1 of each type — guarantees the lone-person-node case
     isn't starved by 9 high-sim definitions.
     """
     srv = fresh_server()
@@ -408,7 +408,7 @@ def test_special_pool_cap_preserves_top_per_type():
     )
     assert "goal" in types_in_result, (
         f"goal type starved by 12 high-sim persons; only got {types_in_result}. "
-        f"This is exactly the the child-case regression the diversity cap is meant to prevent."
+        f"This is exactly the lone-person-node regression the diversity cap is meant to prevent."
     )
     assert len(special_results) == srv.SPECIAL_POOL_CAP, (
         f"Expected {srv.SPECIAL_POOL_CAP} special results, got {len(special_results)}"

@@ -1,6 +1,6 @@
 """Tests for the drowsiness-display-levels change (cj_0054 / 2026-05-12).
 
-Per Lei's design directive: hide raw drowsiness percentages below the urgent
+Per design directive (cj_0054): hide raw drowsiness percentages below the urgent
 threshold; show level words only ("refreshed" / "energetic" / "a little
 drowsy"). At or above urgent, render the raw percentage. Thresholds are
 configurable per context-window mode (200K vs 1M defaults differ; 200K

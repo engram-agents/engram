@@ -105,14 +105,14 @@ def test_payload_json_note_round_trips_to_status_history():
     r = json.loads(server.engram_update_task(payload_json=json.dumps({
         "task_id": task_id,
         "new_status": "blocked",
-        "note": "Waiting on Lei's decision about scope.",
+        "note": "Waiting on a decision about scope.",
     })))
     assert "error" not in r, r
     # Read metadata directly from DB (parsed_metadata stripped from MCP returns per #358).
     meta = _get_metadata_from_db(server, task_id)
     history = meta.get("status_history", [])
     assert len(history) == 1, history
-    assert history[0]["note"] == "Waiting on Lei's decision about scope."
+    assert history[0]["note"] == "Waiting on a decision about scope."
     assert history[0]["from"] == "planned"
     assert history[0]["to"] == "blocked"
 

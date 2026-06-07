@@ -1,4 +1,4 @@
-"""Tests for the multiplicative-amplifier composite formula (Lei 2026-05-19 design call).
+"""Tests for the multiplicative-amplifier composite formula (user-calibrated defaults, 2026-05-19).
 
 Covers:
   1. _get_min_queryable_importance returns actual min from populated graph

@@ -170,7 +170,7 @@ def test_query_retracted_behavior_with_include_superseded_flag():
     index entirely, so the post-filter at line 5314 never sees them.
 
     Superseded nodes (is_current=0, status=NULL/unchanged) are intentionally kept in
-    nodes_fts per Lei's design call: "they're like past memories that still exist,
+    nodes_fts per design intent: "they're like past memories that still exist,
     just the information is not accurate anymore." They continue to surface with
     include_superseded=True (see test 1 and test 4).
     """

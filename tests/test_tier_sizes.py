@@ -1,4 +1,4 @@
-"""Tests for the three-tier size restructure (Lei 2026-05-19 architecture discussion).
+"""Tests for the three-tier size restructure (architecture discussion, 2026-05-19).
 
 Covers:
   1. test_tier_size_constants_have_expected_values
@@ -79,7 +79,7 @@ def _add_obs(srv, claim: str) -> str:
 
 
 def test_tier_size_constants_have_expected_values():
-    """TIER1_MULTIPLIER == 30, TIER2_MULTIPLIER == 4 (Lei 2026-05-19 defaults)."""
+    """TIER1_MULTIPLIER == 30, TIER2_MULTIPLIER == 4 (user-calibrated defaults, 2026-05-19)."""
     srv = fresh_server()
     assert srv.TIER1_MULTIPLIER == 30, (
         f"Expected TIER1_MULTIPLIER=30, got {srv.TIER1_MULTIPLIER}"

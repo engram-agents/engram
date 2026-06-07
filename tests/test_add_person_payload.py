@@ -38,13 +38,13 @@ def fresh_server():
 def test_payload_json_creates_person():
     server = fresh_server()
     payload = {
-        "name": "Lei",
+        "name": "Alex",
         "role": "primary collaborator",
     }
     r = json.loads(server.engram_add_person(payload_json=json.dumps(payload)))
     assert "error" not in r, r
     assert "person_id" in r and r["person_id"].startswith("pn_"), r
-    assert r["name"] == "Lei"
+    assert r["name"] == "Alex"
     assert r["role"] == "primary collaborator"
 
 
@@ -64,7 +64,7 @@ def test_payload_json_with_optional_fields():
 def test_payload_json_is_self_flag():
     """is_self bool is honored; second self-anchor attempt is rejected."""
     server = fresh_server()
-    p1 = {"name": "Borges", "role": "self", "is_self": True}
+    p1 = {"name": "TestSelf", "role": "self", "is_self": True}
     r1 = json.loads(server.engram_add_person(payload_json=json.dumps(p1)))
     assert "error" not in r1, r1
     p2 = {"name": "OtherSelf", "role": "self", "is_self": True}

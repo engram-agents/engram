@@ -169,7 +169,7 @@ def test_malformed_config_returns_empty(tmp_path):
 
 def test_non_dict_config_shapes_return_empty(tmp_path):
     """Valid-JSON-but-non-dict shapes must return "" without raising — the hook
-    must never break session start. (Borges #335 review: config.get()/
+    must never break session start. (#335 review: config.get()/
     cadence.get() raise AttributeError on these, which the prior
     JSONDecodeError-only guard did not catch.)"""
     engram_home = _make_engram_home(tmp_path)

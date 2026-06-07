@@ -1,6 +1,6 @@
 """Tests for the prose-gate refinement in hooks/claude/engram-stop-hook.py.
 
-Issue #845, step 1.5 (Lei's spec 2026-06-05): replace #844's emit-on-any-tool_use
+Issue #845, step 1.5 (spec 2026-06-05): replace #844's emit-on-any-tool_use
 predicate with:
 
   EMIT iff:

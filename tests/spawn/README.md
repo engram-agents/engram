@@ -5,7 +5,7 @@ Validates V1 §3.3 (Phase 5 spawn-flow real-world validation): runs
 verifies the newborn agent is correctly created, install.sh runs cleanly
 under the newborn uid, and `agentctl finalize-name` completes the rename.
 
-The container provides root → no host-sudo dependency. Lei's machine
+The container provides root → no host-sudo dependency. The host machine
 doesn't need to spin up an actual third agent uid for this validation.
 
 ## Usage

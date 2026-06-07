@@ -5,7 +5,7 @@ block bootstrap.py's own seeding (bootstrap calls engram_add_axiom, which
 goes through _get_db(), which would raise on a missing DB without the
 ENGRAM_BOOTSTRAP=1 env bypass).
 
-Origin: Borges's colleague-review of PR #577 caught this as a blocker on
+Origin: colleague-review of PR #577 caught this as a blocker on
 the initial commit (smoke-test only rendered error messages, didn't run
 the bootstrap end-to-end). This test is the regression guard.
 """

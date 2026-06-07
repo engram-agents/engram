@@ -56,7 +56,7 @@ class TestResolveLogsIndex(unittest.TestCase):
 
 class TestResolveAgentConfig(unittest.TestCase):
     """Verify viz_server reads tier sizes from agent's config.json, not
-    hardcoded defaults. Regression coverage for the bug Lei flagged
+    hardcoded defaults. Regression coverage for the bug flagged
     2026-05-17: viz showed many nodes as tier 3 because TIER2_MAX=1000 was
     hardcoded in JS while production config had tier2_max_nodes=4000."""
 

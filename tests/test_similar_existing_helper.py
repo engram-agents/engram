@@ -7,7 +7,7 @@ engram_add_lesson. Two divergences existed before the extraction:
   - Lesson FTS WHERE did NOT filter by importance (only the semantic
     path did, via the importance_threshold arg to _semantic_search)
 
-Per Lei 2026-05-14 audit Q2 ("that's a drift, let's unify it, filter both
+Per 2026-05-14 audit Q2 ("that's a drift, let's unify it, filter both
 in FTS"), the helper applies the tier-2 importance floor uniformly to FTS
 for both type filters.
 

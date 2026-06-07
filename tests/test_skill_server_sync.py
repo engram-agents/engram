@@ -11,7 +11,7 @@ Prior incidents this test exists to prevent:
 - ob_0966 (foundation-tier SKILL.md staleness — tool count 13 vs 24 vs actual ~30)
 - ob_0967 (four-surface foundation rot — each surface drifts independently)
 - 2026-05-11: engram_query_pattern shipped in PR #29 (2026-05-07) but SKILL.md
-  had ZERO mention for 4 days until Lei caught it; same incident motivated
+  had ZERO mention for 4 days until caught; same incident motivated
   this test.
 - 2026-06-06: engram_add_evidence appeared in §5 prose (internal helper, not
   an MCP tool); the §4-only test was green throughout, surfaced by PR #892's

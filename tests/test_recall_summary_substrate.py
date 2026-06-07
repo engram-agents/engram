@@ -657,7 +657,7 @@ def test_format_nudge_person_special_no_confidence_rendered():
 
     person = _special_entry(
         node_id="pn_0005",
-        claim="the child, daughter of Lin and Lei.",
+        claim="A person node used for confidence-rendering test.",
         ntype="person",
         confidence=None,  # persons have no confidence field
     )

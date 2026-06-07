@@ -644,7 +644,7 @@ def test_verify_roundtrip_passes_with_polluted_source_and_retraction(tmp_path):
     """#727 regression: verify_roundtrip must pass when the SOURCE index is polluted
     by a bare rebuild (includes retracted rows) while the RECON index is clean.
 
-    This is the exact failure mode #727 documents: Borges observed live=137 FTS
+    This is the exact failure mode #727 documents: live=137 FTS
     hits (with 2 retracted matches) vs. clean=135 hits post-rebuild.  The old
     `hits >= fts_hits_orig` assertion would FALSE-FAIL here (135 >= 137 is false)
     even though the recon index is CORRECT and the source index is POLLUTED.

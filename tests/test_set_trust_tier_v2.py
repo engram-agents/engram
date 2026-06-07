@@ -193,7 +193,7 @@ def test_set_tier_primary_user_succeeds_with_approval_and_justification():
     """tier='primary_user' with approval flag + valid justification obs is accepted."""
     server = fresh_server()
     pn_id = _mk_person(server, "PrimaryUser")
-    claim = "Lei approved PrimaryUser as primary_user tier."
+    claim = "Primary user approval granted for PrimaryUser."
     ob_id = _mk_obs(server, claim)
 
     r = json.loads(server.engram_set_trust_tier(payload_json=json.dumps({
@@ -223,8 +223,8 @@ def test_set_tier_primary_user_multiple_allowed():
     server = fresh_server()
     pn_a = _mk_person(server, "PrimaryUserA")
     pn_b = _mk_person(server, "PrimaryUserB")
-    ob_a = _mk_obs(server, "Lei approved PrimaryUserA as primary_user tier.")
-    ob_b = _mk_obs(server, "Lei approved PrimaryUserB as primary_user tier.")
+    ob_a = _mk_obs(server, "Primary user approval granted for PrimaryUserA.")
+    ob_b = _mk_obs(server, "Primary user approval granted for PrimaryUserB.")
 
     r_a = json.loads(server.engram_set_trust_tier(payload_json=json.dumps({
         "target_pn": pn_a,

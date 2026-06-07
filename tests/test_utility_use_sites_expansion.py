@@ -1,4 +1,4 @@
-"""Tests for the expanded USE-action utility wiring (Lei 2026-05-19 tier table).
+"""Tests for the expanded USE-action utility wiring (tier table, 2026-05-19).
 
 Covers all new call sites added in the use-sites-expansion PR:
 
@@ -100,7 +100,7 @@ def _make_derive(server, premise_ids):
 def test_engram_supersede_bumps_new_node_only():
     """engram_supersede bumps new_node_id only; old_node_id is NOT bumped.
 
-    Spec: retired nodes shouldn't bump (Lei 2026-05-19 design call).
+    Spec: retired nodes shouldn't bump (design decision, 2026-05-19).
     """
     server = fresh_server()
     ax_old, ax_new = _seed_axioms(server, n=2)
@@ -628,7 +628,7 @@ def test_engram_outgrow_cornerstone_does_not_bump():
 
 
 def test_engram_add_task_bumps_goal_id_and_implements_ids_as_citation():
-    """engram_add_task with goal_id + implements_ids → each bumped α=0.10 (Lei 2026-05-19 Q2 greenlight).
+    """engram_add_task with goal_id + implements_ids → each bumped α=0.10 (Q2 greenlight, 2026-05-19).
 
     Folded into the multiplicative-composite PR as the Q2 follow-up; previously
     skipped because the spec said engram_add_task uses context_ids — it actually

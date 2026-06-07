@@ -13,7 +13,7 @@ Background:
     retracted nodes from the index.
 
     Superseded nodes are deliberately NOT removed from the index — they are past
-    memories, still recallable via include_superseded=True (Lei's design call).
+    memories, still recallable via include_superseded=True (design-time decision).
 
 Coverage:
     1. test_retract_removes_from_fts — trigger path: retract fires trigger,
@@ -161,7 +161,7 @@ def test_retract_does_not_remove_non_retracted_supersession():
     with a replacement C. Retracts B. Verifies A (superseded) is still in FTS
     and B (retracted) is not.
 
-    Lei's design call: superseded nodes are past memories — "the information is
+    Design intent: superseded nodes are past memories — "the information is
     not accurate anymore" but they still exist and are recallable with
     include_superseded=True. Only retracted (wrong-from-start) nodes are removed.
     """
@@ -419,7 +419,7 @@ def test_supersede_then_retract_still_removes_from_fts():
     # After supersede: A must still be in FTS (superseded nodes are kept).
     assert rowid_a in _fts_match_rowids(token_a), (
         f"Token '{token_a}' must still match rowid {rowid_a} after supersede. "
-        "Superseded nodes remain in FTS (Lei's design call)."
+        "Superseded nodes remain in FTS (design-time decision)."
     )
 
     # Step 2: Retract A — now is_current=0 AND status transitions to 'retracted'.

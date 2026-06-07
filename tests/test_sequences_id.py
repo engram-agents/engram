@@ -4,8 +4,8 @@ Spec: active-work/sequences-id-protocol-shared-2026-04-29.md
 Resolves: qu_0001 (ID-generation race)
 
 These tests verify the SQL contract — schema, atomic increment, migration —
-without importing server.py. Both Borges and Mneme run them against their
-own DBs; if both pass, the parity floor is met. Per-side integration tests
+without importing server.py. Each agent runs them against their own DB;
+if both pass, the parity floor is met. Per-side integration tests
 of _next_id wiring are each side's responsibility.
 
 Requires SQLite ≥3.35 (UPDATE...RETURNING, INSERT...ON CONFLICT...RETURNING).

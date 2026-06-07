@@ -162,12 +162,12 @@ class TestSmoke:
         _write_letter(
             inter_agent_dir, "2026-05-23T10-00-00Z_borges.md",
             from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-30), heading="Hello from Borges",
+            timestamp=_ts(-30), heading="Hello from borges",
         )
         rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list")
         assert rc == 0
         assert "borges" in stdout
-        assert "Hello from Borges" in stdout
+        assert "Hello from borges" in stdout
 
     def test_cursor_show_exits_0(self, engram_home, inter_agent_dir):
         """ia cursor --show exits 0 (no cursor file → shows '(none)')."""
@@ -202,7 +202,7 @@ class TestSmoke:
             "to: borges\n"
             f"timestamp: {ts_str}\n"
             "---\n\n"
-            "Hello Borges, this is a test letter.\n"
+            "Hello borges, this is a test letter.\n"
         )
         rc, stdout, stderr = _run_ia(
             engram_home, inter_agent_dir,
@@ -935,7 +935,7 @@ class TestIntegration:
         _write_letter(
             inter_agent_dir, "2026-05-23T10-00-00Z_borges.md",
             from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-30), heading="From Borges",
+            timestamp=_ts(-30), heading="From borges",
         )
         _write_letter(
             inter_agent_dir, "2026-05-23T11-00-00Z_mneme.md",
@@ -946,7 +946,7 @@ class TestIntegration:
             engram_home, inter_agent_dir, "list", "--from", "borges",
         )
         assert rc == 0
-        assert "From Borges" in stdout
+        assert "From borges" in stdout
         assert "From Mneme" not in stdout
 
     def test_read_latest_no_unread_message_on_stdout(self, engram_home, inter_agent_dir):
@@ -1345,7 +1345,7 @@ class TestBodyFile:
         """ia write --body-file exits 0 and creates a letter."""
         _write_config(engram_home, "multi", "ariadne")
         body_file = tmp_path / "body.md"
-        body_file.write_text("Hello Borges, this is the body.\n", encoding="utf-8")
+        body_file.write_text("Hello borges, this is the body.\n", encoding="utf-8")
         rc, stdout, stderr = _run_ia(
             engram_home, inter_agent_dir,
             "write", "--to", "borges", "--body-file", str(body_file),

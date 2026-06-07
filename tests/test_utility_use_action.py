@@ -1,4 +1,4 @@
-"""Tests for the USE-action utility scoring model (Lei 2026-05-19 design call).
+"""Tests for the USE-action utility scoring model (user-calibrated defaults, 2026-05-19).
 
 Replaces the old registration-then-confirmation two-step (recall_window.json +
 _recall_window_check) with direct action-keyed USE bumps. Every node USE

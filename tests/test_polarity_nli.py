@@ -189,7 +189,7 @@ def test_polarity_alert_overlays_all_cross_source_tiers(similarity, expected_tie
 
 
 def test_polarity_alert_fires_on_same_source():
-    """Per Lei 2026-05-10: 'same source still worth marking contradiction'.
+    """Per design intent (2026-05-10): 'same source still worth marking contradiction'.
     Polarity overlay applies to BOTH same-source (DUPLICATE/POSSIBLE_DUPLICATE/
     DISTINCT_FROM_SAME_SOURCE) and cross-source tier branches.
 
@@ -237,7 +237,7 @@ def test_polarity_alert_fires_on_same_source():
         f"Expected a same-source tier label, got: {hint}"
     )
     assert hint.startswith("POLARITY_ALERT"), (
-        f"POLARITY_ALERT should overlay same-source per Lei's call: {hint}"
+        f"POLARITY_ALERT should overlay same-source per design intent: {hint}"
     )
 
 
@@ -493,7 +493,7 @@ def test_batched_polarity_filters_below_min_sim():
 
 
 def test_polarity_defaults():
-    """Defaults: enabled=False (per Lei 2026-05-15 — opt-in for fresh installs),
+    """Defaults: enabled=False (opt-in for fresh installs, 2026-05-15),
     model=ModernCE-large-nli, threshold=0.46."""
     if "ENGRAM_NO_POLARITY" in os.environ:
         del os.environ["ENGRAM_NO_POLARITY"]
