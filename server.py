@@ -393,6 +393,39 @@ import engram_focus as _focus_mod
 import engram_recall_summaries as _recall_summaries_mod
 # ---- end #872 wave-2 family imports ----------------------------------
 
+# ---- #872 wave-3 family imports --------------------------------------
+# Neither engram_trust nor engram_lifecycle collides with an @mcp.tool name,
+# but the alias form is now the uniform wave convention (per PR #912).
+import engram_trust as _trust_mod
+import engram_lifecycle as _lifecycle_mod
+# ---- end #872 wave-3 family imports ----------------------------------
+
+# ---- #872 wave-3 compat forwarders -----------------------------------
+# Helpers promoted to engram_core in wave 3 (cross-family consumers, and
+# reflect-family helpers needed by the lifecycle module). Compat forwarders
+# preserve the bare-name call sites throughout server.py.
+def _strip_agent_facing(*args, **kwargs):
+    return core._strip_agent_facing(*args, **kwargs)
+
+def _count_live_exemplars(*args, **kwargs):
+    return core._count_live_exemplars(*args, **kwargs)
+
+def _reflect_rs_or_claim(*args, **kwargs):
+    return core._reflect_rs_or_claim(*args, **kwargs)
+
+def _reflect_keywords(*args, **kwargs):
+    return core._reflect_keywords(*args, **kwargs)
+
+def _add_person_impl(*args, **kwargs):
+    return _trust_mod._add_person_impl(*args, **kwargs)
+
+def _set_trust_tier_impl(*args, **kwargs):
+    return _trust_mod._set_trust_tier_impl(*args, **kwargs)
+
+def _add_trust_signal_impl(*args, **kwargs):
+    return _trust_mod._add_trust_signal_impl(*args, **kwargs)
+# ---- end #872 wave-3 compat forwarders --------------------------------
+
 
 # Types that assert claims about the world. Only these can participate in
 # derivations, contradictions, and answers. Evidence nodes are references,
@@ -2590,31 +2623,6 @@ _SIMILAR_STRIP_KEYS: frozenset[str] = frozenset({
     "similarity",
 })
 
-
-def _strip_agent_facing(obj: object) -> object:
-    """Recursively remove opaque-to-agent-reasoning keys from dicts/lists.
-
-    Applied at every @mcp.tool return boundary (post-DB-fetch, pre-json.dumps)
-    to remove fields that bloat context without providing semantic value to the
-    agent. The source data in the DB is never touched — only the response copy.
-
-    Strips globally: embedding, parsed_metadata, confidence_history.
-
-    Does NOT strip match_type or similarity globally — those are raw
-    search-pipeline signals that ARE meaningful in engram_query(return_debug=True)
-    result nodes and debug.per_result entries (eval-harness contract). They are
-    removed only from similar_existing / similar_existing_lessons sub-blocks
-    via _strip_similar_block(), applied at the write-tool assembly sites.
-    """
-    if isinstance(obj, dict):
-        return {
-            k: _strip_agent_facing(v)
-            for k, v in obj.items()
-            if k not in _AGENT_STRIP_KEYS
-        }
-    if isinstance(obj, list):
-        return [_strip_agent_facing(item) for item in obj]
-    return obj
 
 
 def _strip_similar_block(entries: list[dict]) -> list[dict]:
@@ -5236,160 +5244,8 @@ def _subgraph_impl(
 
 
 # ---- Version control tools ----
-
-
-def _checkpoint_internal(message: str, advance_turn: bool) -> str:
-    """Internal checkpoint logic shared by engram_nap and engram_advance_turn.
-
-    Computes graph stats, appends to session_log, snapshots + commits, stores
-    a diagnostic snapshot. If advance_turn is True, increments the global
-    turn counter (driving the forgetting mechanism). If False, leaves the
-    turn counter alone (nap mode) and arms a nap_checkpoint feeling nudge.
-
-    The two public tools (engram_nap and engram_advance_turn) exist as
-    distinct MCP entry points so a missed kwarg cannot accidentally promote
-    a nap into a turn-advancing checkpoint — the prior single-tool design
-    was bug-prone under context pressure (heartbeat sessions especially).
-    """
-    mode = "session" if advance_turn else "nap"
-    mem = _get_memory_config()
-    old_turn = mem.get("current_turn", 0)
-
-    if advance_turn:
-        new_turn = old_turn + 1
-        _set_current_turn(new_turn)
-    else:
-        new_turn = old_turn  # no advancement
-
-    conn = _get_db()
-    try:
-        # Collect overall stats
-        node_count = conn.execute("SELECT COUNT(*) as c FROM nodes").fetchone()["c"]
-        edge_count = conn.execute("SELECT COUNT(*) as c FROM edges").fetchone()["c"]
-        current_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1"
-        ).fetchone()["c"]
-
-        type_counts = {}
-        for row in conn.execute(
-            "SELECT type, COUNT(*) as c FROM nodes WHERE is_current = 1 GROUP BY type"
-        ).fetchall():
-            type_counts[row["type"]] = row["c"]
-
-        # What was added this turn (nodes created at the current turn)
-        new_nodes = conn.execute(
-            "SELECT id, type, claim FROM nodes WHERE recall_turn = ? ORDER BY id",
-            (old_turn,),
-        ).fetchall()
-        new_node_summary = [
-            {"id": r["id"], "type": r["type"], "claim": (r["claim"] or "")[:80]}
-            for r in new_nodes
-        ]
-
-        # Memory tier stats
-        t1 = _get_tier_threshold(conn, 1)
-        t2 = _get_tier_threshold(conn, 2)
-        tier1_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
-            (t1,),
-        ).fetchone()["c"] if t1 > 0 else current_count
-        tier2_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
-            (t2,),
-        ).fetchone()["c"] if t2 > 0 else current_count
-
-        # Append to session log
-        now = _now()
-        new_nodes_text = "\n".join(
-            f"  - {n['id']} ({n['type']}): {n['claim']}" for n in new_node_summary
-        ) if new_node_summary else "  (no new nodes)"
-
-        mode_label = f"Turn {new_turn}" if mode != "nap" else f"Nap (turn {old_turn})"
-        log_entry = (
-            f"\n## {mode_label} — {now[:19]}\n\n"
-            f"{message}\n\n"
-            f"**New nodes ({len(new_node_summary)}):**\n{new_nodes_text}\n\n"
-            f"**Graph totals:** {current_count} current nodes ({node_count} total), {edge_count} edges\n"
-            f"**By type:** {', '.join(f'{t}: {c}' for t, c in sorted(type_counts.items()))}\n"
-            f"**Memory tiers:** working={tier1_count}, searchable={tier2_count}, total={current_count}\n"
-            f"\n---\n"
-        )
-
-        # Create or append to log file
-        if not core.LOG_PATH.exists():
-            core.LOG_PATH.write_text("# KG Memory Session Log\n\n---\n", encoding="utf-8")
-        with open(core.LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(log_entry)
-
-        # Snapshot + git commit (durable version-controlled record + restore point)
-        # Best-effort: never raises. If git is unavailable, the checkpoint still
-        # succeeds and the version_control field reports why.
-        version_control = _commit_snapshot(conn, message, mode)
-
-        result = {
-            "status": "checkpoint_saved",
-            "mode": mode,
-            "previous_turn": old_turn,
-            "current_turn": new_turn,
-            "turn_advanced": mode != "nap",
-            "message": message,
-            "log_path": str(core.LOG_PATH),
-            "new_nodes_this_session": len(new_node_summary),
-            "graph_stats": {
-                "total_nodes": node_count,
-                "current_nodes": current_count,
-                "total_edges": edge_count,
-                "by_type": type_counts,
-            },
-            "memory_tiers": {
-                "tier1_working_memory": tier1_count,
-                "tier2_searchable": tier2_count,
-                "tier3_total": current_count,
-                "decay_base": mem.get("decay_base", 1.014),
-            },
-            "version_control": version_control,
-        }
-
-        # Store diagnostic snapshot (best-effort, never blocks checkpoint)
-        try:
-            diag_metrics = json.loads(engram_diagnose())
-            conn2 = _get_db()
-            try:
-                conn2.execute(
-                    """INSERT INTO diagnostic_history (timestamp, turn, checkpoint_mode, metrics)
-                       VALUES (?, ?, ?, ?)""",
-                    (now, new_turn, mode, json.dumps(diag_metrics)),
-                )
-                conn2.commit()
-                result["diagnostic_snapshot"] = {
-                    "stored": True,
-                    "health_score": diag_metrics.get("health_score"),
-                }
-            finally:
-                conn2.close()
-        except Exception:
-            result["diagnostic_snapshot"] = {"stored": False, "reason": "diagnostic computation failed"}
-
-        # Nap-cycle feeling-report nudge (§6 Marker file protocol). After
-        # session-end review the agent is already in a reflective posture,
-        # so this is a low-cost capture point. The marker is written BEFORE
-        # returning so any subsequent engram_report_feeling within TTL gets
-        # auto-tagged `nap_checkpoint`. Null results are explicitly valid.
-        if mode == "nap":
-            result["feeling_report_nudge"] = (
-                "Reviewing this session's work, did any specific moment "
-                "produce a distinct internal state worth marking — surprise, "
-                "recognition, dissonance, unusual satisfaction, discomfort "
-                "that isn't task-friction? If yes, file via "
-                "engram_report_feeling — it will be auto-tagged "
-                "nap_checkpoint. If no, carry on; a null result is a valid "
-                "data point."
-            )
-            _write_feeling_nudge("nap_checkpoint")
-
-        return json.dumps(result)
-    finally:
-        conn.close()
+# _checkpoint_internal, _nap_impl, _advance_turn_impl moved to engram_lifecycle
+# in #872 wave 3. Compat forwarders below; wrappers delegate via _lifecycle_mod.
 
 
 # Set of legitimate field names for the engram_nap payload.
@@ -5471,6 +5327,30 @@ def engram_nap(payload_json: str) -> str:
     if "message" not in params:
         return json.dumps({"error": "payload_json must include required field 'message'"})
     result_dict = json.loads(_nap_impl(**params))
+    # Diagnostic snapshot (best-effort, never blocks checkpoint). engram_diagnose
+    # lives in server.py; the lifecycle impl cannot call it directly (acyclic
+    # constraint), so the wrapper adds it here — wave-3 structural split.
+    now_str = core._now()
+    new_turn = result_dict.get("current_turn", 0)
+    mode = result_dict.get("mode", "nap")
+    try:
+        diag_metrics = json.loads(engram_diagnose())
+        conn2 = core._get_db()
+        try:
+            conn2.execute(
+                """INSERT INTO diagnostic_history (timestamp, turn, checkpoint_mode, metrics)
+                   VALUES (?, ?, ?, ?)""",
+                (now_str, new_turn, mode, json.dumps(diag_metrics)),
+            )
+            conn2.commit()
+            result_dict["diagnostic_snapshot"] = {
+                "stored": True,
+                "health_score": diag_metrics.get("health_score"),
+            }
+        finally:
+            conn2.close()
+    except Exception:
+        result_dict["diagnostic_snapshot"] = {"stored": False, "reason": "diagnostic computation failed"}
     banner = _walguard_degraded_banner()
     if banner:
         result_dict["_walguard_warning"] = banner
@@ -5478,8 +5358,8 @@ def engram_nap(payload_json: str) -> str:
 
 
 def _nap_impl(message: str) -> str:
-    """Impl for engram_nap — callable with named kwargs for in-server callers."""
-    return _checkpoint_internal(message, advance_turn=False)
+    """Impl for engram_nap — delegates to engram_lifecycle (wave 3)."""
+    return _lifecycle_mod._nap_impl(message=message)
 
 
 # Set of legitimate field names for the engram_advance_turn payload.
@@ -5561,6 +5441,30 @@ def engram_advance_turn(payload_json: str) -> str:
     if "message" not in params:
         return json.dumps({"error": "payload_json must include required field 'message'"})
     result_dict = json.loads(_advance_turn_impl(**params))
+    # Diagnostic snapshot (best-effort, never blocks checkpoint). engram_diagnose
+    # lives in server.py; the lifecycle impl cannot call it directly (acyclic
+    # constraint), so the wrapper adds it here — wave-3 structural split.
+    now_str = core._now()
+    new_turn = result_dict.get("current_turn", 0)
+    mode = result_dict.get("mode", "session")
+    try:
+        diag_metrics = json.loads(engram_diagnose())
+        conn2 = core._get_db()
+        try:
+            conn2.execute(
+                """INSERT INTO diagnostic_history (timestamp, turn, checkpoint_mode, metrics)
+                   VALUES (?, ?, ?, ?)""",
+                (now_str, new_turn, mode, json.dumps(diag_metrics)),
+            )
+            conn2.commit()
+            result_dict["diagnostic_snapshot"] = {
+                "stored": True,
+                "health_score": diag_metrics.get("health_score"),
+            }
+        finally:
+            conn2.close()
+    except Exception:
+        result_dict["diagnostic_snapshot"] = {"stored": False, "reason": "diagnostic computation failed"}
     banner = _walguard_degraded_banner()
     if banner:
         result_dict["_walguard_warning"] = banner
@@ -5568,8 +5472,123 @@ def engram_advance_turn(payload_json: str) -> str:
 
 
 def _advance_turn_impl(message: str) -> str:
-    """Impl for engram_advance_turn — callable with named kwargs for in-server callers."""
-    return _checkpoint_internal(message, advance_turn=True)
+    """Impl for engram_advance_turn — delegates to engram_lifecycle (wave 3)."""
+    return _lifecycle_mod._advance_turn_impl(message=message)
+
+
+# ---------------------------------------------------------------------------
+# Reflect tool (sleep-cycle pre-dream briefing)
+# ---------------------------------------------------------------------------
+
+
+# DESIGN INTENT — engram_reflect
+# ------------------------------
+# Pre-dream briefing for the engram-sleep skill: the structured self-audit that
+# opens the dream cycle. Surfaces categories the dream master must consider:
+# unresolved contradictions, weakly-grounded claims, open questions, overdue
+# predictions, same-source observation tensions, uncited observations,
+# single-source derivations, plus the active goals/tasks/lessons context.
+#
+# Sleep-cycle-scoped: this is heavyweight (multiple full-graph passes) and
+# semantically meaningful only inside a dream context. Calling it awake produces
+# noise — use engram_diagnose for awake-state health snapshots.
+#
+# Two-tier-per-category rendering keeps the response budget-bounded:
+#   Tier 1 (top summary_top_k by importance_score DESC):
+#     {id, claim: recall_summary OR claim, confidence, ...existing_fields}.
+#     Key name "claim" preserved for backward compat (eval/harness contract).
+#   Tier 2 (remainder): {id, keywords: list, confidence, ...}.
+#     "claim" key OMITTED — keywords-only triage signal.
+#
+# Low-volume categories (unresolved_contradictions, open_questions, open_conjectures,
+# active_goals, active_tasks, active_lessons, unresolved_goal_tensions): source-swap
+# — content field from recall_summary with fallback to claim. Key names unchanged.
+#
+# calibration_snapshot field: corpus + this_turn confidence distributions, added by
+# the wrapper (calls engram_stats() which is server-resident; cannot be called from
+# the family module impl — wave-3 structural split).
+_REFLECT_FIELDS = frozenset({
+    "summary_top_k",
+})
+
+
+@mcp.tool(
+    name="engram_reflect",
+    annotations={
+        "title": "[Sleep cycle] Audit Knowledge Graph Quality (pre-dream briefing)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_reflect(payload_json: str = "{}") -> str:
+    """[Sleep cycle — pre-dream briefing.] Structured self-audit of the
+    knowledge graph; opens the dream cycle for the engram-sleep skill.
+
+    Returns a categorized report identifying areas that need attention:
+    unresolved contradictions, weakly-grounded claims, open questions,
+    overdue predictions, same-source observation tensions, uncited observations,
+    single-source derivations, plus active goals/tasks/lessons context.
+
+    Read the report, then decide which issues to address — strengthen weak
+    claims, resolve contradictions, investigate open questions, etc.
+
+    Use awake? No — use engram_diagnose. This is sleep-cycle scoped.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            summary_top_k (int, optional): How many top-importance entries in
+                each high-volume category receive summary-style rendering
+                (claim from recall_summary). The remainder get keyword-style.
+                Default 5. Clamped to >= 0. 0 = all high-volume entries are
+                keyword-style. If >= category size, all are summary-style.
+
+    Returns:
+        JSON report with categorized issues and recommended actions.
+        - calibration_snapshot: Two-key dict with `corpus` (mode=all) and `this_turn`
+          (mode=1-turn) confidence-distribution data from engram_stats. Lets dream-master
+          see filing-pattern shape alongside topic-selection candidates.
+        On payload-parsing failure, returns {"error": "..."}.
+
+    See _reflect_impl for full semantics — kept callable with named kwargs for
+    in-server callers.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _REFLECT_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_REFLECT_FIELDS)}"
+        })
+    result_dict = json.loads(_reflect_impl(**params))
+    # calibration_snapshot — added here (not in the impl) because engram_stats()
+    # is a server-resident @mcp.tool that family modules cannot call (wave-3
+    # structural split: server → family → core is acyclic; family cannot call server).
+    try:
+        stats_corpus = json.loads(engram_stats(json.dumps({"sections": ["confidence"]})))
+        if "error" in stats_corpus:
+            raise RuntimeError(f"engram_stats returned error: {stats_corpus['error']}")
+        stats_turn = json.loads(engram_stats(json.dumps({"mode": "1-turn", "sections": ["confidence"]})))
+        if "error" in stats_turn:
+            raise RuntimeError(f"engram_stats returned error: {stats_turn['error']}")
+        result_dict["calibration_snapshot"] = {
+            "corpus": stats_corpus.get("confidence", {}),
+            "this_turn": stats_turn.get("confidence", {}),
+        }
+    except Exception:
+        result_dict["calibration_snapshot"] = {"error": "engram_stats unavailable"}
+    return json.dumps(result_dict)
+
+
+def _reflect_impl(summary_top_k: int = 5) -> str:
+    """Impl for engram_reflect — delegates to engram_lifecycle (wave 3)."""
+    return _lifecycle_mod._reflect_impl(summary_top_k=summary_top_k)
 
 
 # ---- Bonus: stats tool (lightweight, useful even in MVP) ----
@@ -7682,146 +7701,7 @@ def engram_add_person(payload_json: str) -> str:
             "error": "is_self must be a JSON boolean (true/false), not a string or other type."
         })
 
-    return _add_person_impl(**params)
-
-
-def _add_person_impl(
-    name: str = "",
-    role: str = "",
-    description: str = "",
-    aliases: str = "",
-    context_ids: str = "",
-    is_self: bool = False,
-) -> str:
-    """Internal implementation — see engram_add_person MCP tool for the public
-    payload schema. Kept callable with named kwargs for in-server callers.
-
-    Record a person the agent knows and interacts with.
-
-    Person nodes represent people in the agent's relational world — collaborators,
-    evaluators, stakeholders. They are the relational layer of ENGRAM, lighter-schema
-    than epistemic nodes (the recall-summary derivation): no confidence scores, no evidence requirements,
-    no claim-bearing participation.
-
-    Person nodes are NON-CLAIM-BEARING: a person is not a truth-claim about the world.
-    They cannot serve as derivation premises. However, observations and derivations
-    can reference person nodes via context_ids to record relational context.
-
-    Importance-anchored (importance_base=2.0) — people the agent knows are as durable
-    as goals and axioms. Like all anchored types, survival past ~50 turns still
-    requires active recall.
-
-    Facts about a person should be stored as user_stated observations linked to the
-    person node, not as fields on the person node itself. The person node captures
-    WHO; observations capture WHAT IS KNOWN ABOUT THEM.
-
-    Args:
-        name: The person's name.
-        role: Their role or relationship to the agent (e.g. "primary collaborator",
-              "external evaluator", "colleague").
-        description: Background, expertise, personality traits, or other context.
-        aliases: Comma-separated alternative names or identifiers for this person
-                 (e.g. "Alex,A" for matching name-prefix messages).
-        context_ids: Optional comma-separated node IDs for context references.
-                     Creates cites edges (e.g. link to goals they serve).
-        is_self: Mark this person node as the agent's own self-anchor.
-                 Only one self-node should exist; subsequent attempts will be
-                 rejected. The self-node serves as the target of `about` edges
-                 from self-observations, enabling emergence-scan to find
-                 identity-forming patterns.
-
-    Returns:
-        JSON with the new person node ID.
-    """
-    if not name or not name.strip():
-        return json.dumps({"error": "name is required and cannot be empty."})
-    if not role or not role.strip():
-        return json.dumps({"error": "role is required and cannot be empty."})
-
-    conn = _get_db()
-    try:
-        if is_self:
-            existing = conn.execute(
-                "SELECT id FROM nodes WHERE type = 'person' AND json_extract(metadata, '$.is_self') = 1 AND is_current = 1"
-            ).fetchone()
-            if existing:
-                return json.dumps({
-                    "error": f"Self-anchor person node already exists: {existing['id']}. Only one self-node is permitted.",
-                    "existing_self_id": existing["id"],
-                })
-        node_id = _next_id(conn, "person")
-        now = _now()
-
-        claim_text = f"{name} — {role}"
-        alias_list = [s.strip() for s in aliases.split(",") if s.strip()]
-
-        meta_dict = {
-            "name": name,
-            "role": role,
-            "aliases": alias_list,
-        }
-        if is_self:
-            meta_dict["is_self"] = True
-        meta = json.dumps(meta_dict)
-
-        conn.execute(
-            """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
-               status, metadata, trust_tier)
-               VALUES (?, 'person', ?, ?, ?, 'active', ?, 'unknown')""",
-            (node_id, claim_text, now, description, meta),
-        )
-
-        context = [s.strip() for s in context_ids.split(",") if s.strip()]
-        for cid in context:
-            exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
-            if exists:
-                try:
-                    conn.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'cites', ?)",
-                        (node_id, cid, now),
-                    )
-                except sqlite3.IntegrityError:
-                    pass
-
-        _stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
-        # Importance-anchored — elevated base (2.0) with current turn's inflation.
-        anchored_score = _compute_importance(2.0, _get_current_turn())
-        conn.execute(
-            "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
-            (anchored_score, node_id,),
-        )
-        if context:
-            _utility_reward(conn, context, action="citation")
-        conn.commit()
-        return json.dumps({
-            "status": "created",
-            "person_id": node_id,
-            "name": name,
-            "role": role,
-            "aliases": alias_list,
-            "context_nodes": context,
-        })
-    finally:
-        conn.close()
-
-
-# ── Trust-tier constants ────────────────────────────────────────────────────
-# Ordered from most-external (0) to most-internal (6). Tier changes TO any
-# tier with rank >= INTERNAL_THRESHOLD require primary-user approval, EXCEPT
-# 'self' (rank 6) which is gated by metadata.is_self=true instead.
-# 'primary_user' (rank 5) inherits the standard approval gate; multiple pn_*
-# nodes may simultaneously hold this tier (team-serving case).
-# 'self' is singleton-enforced at set-time (mirrors the is_self invariant).
-TIER_RANK = {
-    "self":           6,
-    "primary_user":   5,
-    "user_family":    4,
-    "our_side":       3,
-    "known_external": 2,
-    "unknown":        1,
-    "suspect":        0,
-}
-INTERNAL_THRESHOLD = 3  # our_side and above
+    return _trust_mod._add_person_impl(**params)
 
 
 _SET_TRUST_TIER_FIELDS = frozenset({
@@ -7904,183 +7784,12 @@ def engram_set_trust_tier(payload_json: str) -> str:
     tier = params.get("tier", "")
     justification_obs_id = params.get("justification_obs_id", "") or ""
     approval_flag = params.get("primary_user_approval_obtained", False)
-    return _set_trust_tier_impl(
+    return _trust_mod._set_trust_tier_impl(
         target_pn=target_pn,
         tier=tier,
         justification_obs_id=justification_obs_id,
         primary_user_approval_obtained=approval_flag,
     )
-
-
-def _set_trust_tier_impl(
-    target_pn: str = "",
-    tier: str = "",
-    justification_obs_id: str = "",
-    primary_user_approval_obtained: bool = False,
-) -> str:
-    """Internal implementation for engram_set_trust_tier."""
-    # ── Tier value validation ──
-    if tier not in TIER_RANK:
-        return json.dumps({
-            "error": (
-                f"Invalid tier '{tier}'. Must be one of: "
-                + ", ".join(sorted(TIER_RANK, key=lambda t: TIER_RANK[t], reverse=True))
-            )
-        })
-    if not target_pn or not target_pn.strip():
-        return json.dumps({"error": "target_pn is required."})
-
-    conn = _get_db()
-    try:
-        # ── target_pn validation ──
-        row = conn.execute(
-            "SELECT id, type, trust_tier, metadata FROM nodes WHERE id = ?", (target_pn,)
-        ).fetchone()
-        if not row:
-            return json.dumps({"error": f"Node '{target_pn}' not found."})
-        if row["type"] != "person":
-            return json.dumps({
-                "error": f"Node '{target_pn}' is type '{row['type']}', not 'person'. "
-                         f"Trust tier can only be set on person nodes."
-            })
-
-        previous_tier = row["trust_tier"]
-
-        # ── Idempotent no-op ──
-        if previous_tier == tier:
-            return json.dumps({
-                "status": "no_op",
-                "message": f"'{target_pn}' is already at tier '{tier}'. No change made.",
-                "from_tier": previous_tier,
-                "to_tier": tier,
-            })
-
-        tier_rank = TIER_RANK[tier]
-
-        # ── Self-tier gate (replaces the standard approval gate for tier='self') ──
-        if tier == "self":
-            # Gate 1: target node must have metadata.is_self=true
-            meta = json.loads(row["metadata"] or "{}")
-            if not meta.get("is_self"):
-                return json.dumps({
-                    "error": (
-                        f"Tier 'self' can only be assigned to a node with metadata.is_self=true. "
-                        f"'{target_pn}' does not have is_self=true in its metadata. "
-                        f"Create the self-anchor via engram_add_person(..., is_self=True) and "
-                        f"then call engram_set_trust_tier with tier='self'."
-                    )
-                })
-            # Gate 2: singleton — only one pn_* may hold tier='self' at a time.
-            # is_current=1 guard: a superseded pn_* retains trust_tier='self' in the
-            # column (supersede pathway does not clear it) but is no longer the live
-            # self-anchor. Without this guard, a dead pn_X row would falsely block
-            # assigning tier='self' to its successor pn_Y. Canonical pattern from
-            # _add_person_impl (L9430).
-            existing_self_tier = conn.execute(
-                "SELECT id FROM nodes WHERE type = 'person' AND trust_tier = 'self' "
-                "AND is_current = 1 AND id != ?",
-                (target_pn,),
-            ).fetchone()
-            if existing_self_tier:
-                return json.dumps({
-                    "error": (
-                        f"Tier 'self' is already assigned to '{existing_self_tier['id']}'. "
-                        f"Only one pn_* node may hold tier='self' at a time (mirrors the "
-                        f"is_self singleton invariant). Retract or re-tier the existing "
-                        f"self-tier node before assigning tier='self' to '{target_pn}'."
-                    )
-                })
-            # Self-tier does NOT require the standard approval gate — is_self IS
-            # the structural attestation. Skip to write.
-
-        # ── Standard approval gate (all other tiers at or above INTERNAL_THRESHOLD) ──
-        elif tier_rank >= INTERNAL_THRESHOLD:
-            if not primary_user_approval_obtained or not justification_obs_id:
-                return json.dumps({
-                    "error": (
-                        f"Tier '{tier}' (rank {tier_rank}) is at or above the internal-circle "
-                        f"threshold (rank {INTERNAL_THRESHOLD}). Promoting '{target_pn}' to "
-                        f"this tier requires explicit primary-user approval. "
-                        f"\n\nRequired steps:"
-                        f"\n  1. Surface the proposed promotion to your primary user."
-                        f"\n  2. Receive their explicit approval."
-                        f"\n  3. File an observation documenting the approval:"
-                        f"\n       engram_add_observation({{ \"claim\": \"<primary-user> approved "
-                        f"<target_pn> to tier '{tier}'\", "
-                        f"\"quote_type\": \"personal_communication\", "
-                        f"\"source_class\": \"user_stated\", ... }})"
-                        f"\n       → returns ob_NNNN"
-                        f"\n  4. Retry with both required fields:"
-                        f"\n       engram_set_trust_tier({{ \"target_pn\": \"{target_pn}\", "
-                        f"\"tier\": \"{tier}\", "
-                        f"\"justification_obs_id\": \"ob_NNNN\", "
-                        f"\"primary_user_approval_obtained\": true }})"
-                        f"\n\nThe parameter `primary_user_approval_obtained` is your attestation "
-                        f"that the prerequisite has been satisfied. "
-                        f"STRUCTURAL HONESTY WARNING: Setting primary_user_approval_obtained to "
-                        f"true without having actually obtained explicit primary-user approval is "
-                        f"a structural-honesty violation (the honesty axiom / the provenance axiom). The server cannot "
-                        f"mechanically verify this attestation — your honesty IS the integrity "
-                        f"mechanism of the tier system. This is the same epistemic kind as a "
-                        f"fabricated quote. This is especially load-bearing on the first "
-                        f"primary_user assignment, where no prior tier-holder exists to "
-                        f"delegate-attest."
-                    )
-                })
-
-        # ── justification_obs_id validation (when provided) ──
-        if justification_obs_id:
-            j_row = conn.execute(
-                "SELECT id, type, status FROM nodes WHERE id = ?",
-                (justification_obs_id,),
-            ).fetchone()
-            if not j_row:
-                return json.dumps({
-                    "error": f"justification_obs_id '{justification_obs_id}' not found."
-                })
-            if j_row["type"] not in {"observation_factual", "observation_predictive"}:
-                return json.dumps({
-                    "error": (
-                        f"justification_obs_id '{justification_obs_id}' is type "
-                        f"'{j_row['type']}', not an observation type. "
-                        f"Must be observation_factual or observation_predictive."
-                    )
-                })
-            if j_row["status"] == "retracted":
-                return json.dumps({
-                    "error": (
-                        f"justification_obs_id '{justification_obs_id}' has been retracted. "
-                        f"A current (non-retracted) observation is required."
-                    )
-                })
-
-        # ── Write the tier change ──
-        conn.execute(
-            "UPDATE nodes SET trust_tier = ? WHERE id = ?", (tier, target_pn)
-        )
-        _log_edit(conn, "trust_tier_set", target_pn, "person", {
-            "from_tier": previous_tier,
-            "to_tier": tier,
-            "justification_obs_id": justification_obs_id or None,
-            "primary_user_approval_obtained": primary_user_approval_obtained,
-        })
-        conn.commit()
-
-        # Retrieve the edit_history id for the response
-        edit_id = conn.execute(
-            "SELECT id FROM edit_history WHERE node_id = ? AND action = 'trust_tier_set' "
-            "ORDER BY id DESC LIMIT 1",
-            (target_pn,),
-        ).fetchone()
-
-        return json.dumps({
-            "status": "set",
-            "from_tier": previous_tier,
-            "to_tier": tier,
-            "edit_history_id": edit_id["id"] if edit_id else None,
-        })
-    finally:
-        conn.close()
 
 
 _ADD_TRUST_SIGNAL_FIELDS = frozenset({
@@ -8173,124 +7882,7 @@ def engram_add_trust_signal(payload_json: str) -> str:
             "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
                      f"Allowed: {sorted(_ADD_TRUST_SIGNAL_FIELDS)}"
         })
-    return _add_trust_signal_impl(**{k: params[k] for k in params})
-
-
-def _add_trust_signal_impl(
-    subject_pn: str = "",
-    source_obs_id: str = "",
-    kind: str = "",
-    polarity=None,
-    weight=None,
-    claim: str = "",
-) -> str:
-    """Internal implementation for engram_add_trust_signal."""
-    # ── Required field checks ──
-    missing = []
-    if not subject_pn:
-        missing.append("subject_pn")
-    if not source_obs_id:
-        missing.append("source_obs_id")
-    if not kind:
-        missing.append("kind")
-    if polarity is None:
-        missing.append("polarity")
-    if weight is None:
-        missing.append("weight")
-    if not claim:
-        missing.append("claim")
-    if missing:
-        return json.dumps({"error": f"Missing required fields: {missing}"})
-
-    # ── Type/range checks ──
-    try:
-        polarity = float(polarity)
-    except (TypeError, ValueError):
-        return json.dumps({"error": "polarity must be a number."})
-    try:
-        weight = float(weight)
-    except (TypeError, ValueError):
-        return json.dumps({"error": "weight must be a number."})
-    if not (-1.0 <= polarity <= 1.0):
-        return json.dumps({
-            "error": f"polarity {polarity} is out of range. Must be in [-1.0, 1.0]."
-        })
-    if not (0.0 <= weight <= 1.0):
-        return json.dumps({
-            "error": f"weight {weight} is out of range. Must be in [0.0, 1.0]."
-        })
-
-    conn = _get_db()
-    try:
-        # ── subject_pn validation ──
-        pn_row = conn.execute(
-            "SELECT id, type FROM nodes WHERE id = ?", (subject_pn,)
-        ).fetchone()
-        if not pn_row:
-            return json.dumps({"error": f"subject_pn '{subject_pn}' not found."})
-        if pn_row["type"] != "person":
-            return json.dumps({
-                "error": f"subject_pn '{subject_pn}' is type '{pn_row['type']}', not 'person'."
-            })
-
-        # ── source_obs_id validation ──
-        ob_row = conn.execute(
-            "SELECT id, type, status FROM nodes WHERE id = ?", (source_obs_id,)
-        ).fetchone()
-        if not ob_row:
-            return json.dumps({"error": f"source_obs_id '{source_obs_id}' not found."})
-        if ob_row["type"] not in {"observation_factual", "observation_predictive"}:
-            return json.dumps({
-                "error": (
-                    f"source_obs_id '{source_obs_id}' is type '{ob_row['type']}', "
-                    f"not an observation type. Must be observation_factual or observation_predictive."
-                )
-            })
-        if ob_row["status"] == "retracted":
-            return json.dumps({
-                "error": (
-                    f"source_obs_id '{source_obs_id}' has been retracted. "
-                    f"A current (non-retracted) observation is required at filing time."
-                )
-            })
-
-        # ── Atomic create: ts_ row + about edge + derives_from edge ──
-        ts_id = _next_id(conn, "trust_signal")
-        now = _now()
-
-        conn.execute(
-            """INSERT INTO nodes (id, type, claim, created_at, status,
-               trust_signal_kind, trust_signal_polarity, trust_signal_weight)
-               VALUES (?, 'trust_signal', ?, ?, 'active', ?, ?, ?)""",
-            (ts_id, claim, now, kind, polarity, weight),
-        )
-        conn.execute(
-            "INSERT INTO edges (source_id, target_id, relation, created_at) "
-            "VALUES (?, ?, 'about', ?)",
-            (ts_id, subject_pn, now),
-        )
-        conn.execute(
-            "INSERT INTO edges (source_id, target_id, relation, created_at) "
-            "VALUES (?, ?, 'derives_from', ?)",
-            (ts_id, source_obs_id, now),
-        )
-
-        _stamp_new_node(conn, ts_id, confidence=0.0, surprise=0.0)
-        _log_edit(conn, "created", ts_id, "trust_signal", {
-            "subject_pn": subject_pn,
-            "source_obs_id": source_obs_id,
-            "kind": kind,
-            "polarity": polarity,
-            "weight": weight,
-        })
-        conn.commit()
-
-        return json.dumps({"status": "created", "trust_signal_id": ts_id})
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    return _trust_mod._add_trust_signal_impl(**{k: params[k] for k in params})
 
 
 _ADD_CORNERSTONE_FIELDS = frozenset({
@@ -12627,44 +12219,6 @@ def _supersede_impl(
 # ---------------------------------------------------------------------------
 
 
-def _count_live_exemplars(conn: sqlite3.Connection, target_id: str, target_type: str) -> int:
-    """Count live exemplars supporting a cornerstone or lesson.
-
-    Live = source/target node with is_current=1.
-
-    For lessons (target_type='lesson'):
-        - Count incoming `exemplifies` edges where source.is_current=1.
-
-    For cornerstones (target_type='cornerstone'):
-        - Count incoming `exemplifies` edges where source.is_current=1, PLUS
-        - Count outgoing `supported_by` edges where target.is_current=1
-          (the pre-PR-#431 cornerstone exemplar wiring pattern, kept by
-          Lei's 2026-05-28 design call: coexisting schemas, both counted).
-    """
-    exemplifies_live = conn.execute(
-        """SELECT COUNT(*) AS c
-           FROM edges e
-           JOIN nodes n ON n.id = e.source_id
-           WHERE e.target_id = ?
-             AND e.relation = 'exemplifies'
-             AND n.is_current = 1""",
-        (target_id,),
-    ).fetchone()["c"]
-
-    if target_type != "cornerstone":
-        return exemplifies_live
-
-    supported_by_live = conn.execute(
-        """SELECT COUNT(*) AS c
-           FROM edges e
-           JOIN nodes n ON n.id = e.target_id
-           WHERE e.source_id = ?
-             AND e.relation = 'supported_by'
-             AND n.is_current = 1""",
-        (target_id,),
-    ).fetchone()["c"]
-
-    return exemplifies_live + supported_by_live
 
 
 # ---------------------------------------------------------------------------
@@ -13603,811 +13157,6 @@ def engram_set_recall_summaries(payload_json: str) -> str:
         }
     """
     return _recall_summaries_mod._set_recall_summaries_impl(payload_json)
-
-
-# Pre-dream briefing trim policy. Reflect can otherwise return 100KB+ on
-# mature graphs, which is unusable as a quick orientation tool. The slim
-# pass keeps `summary` and `memory_tiers` complete (so all counts remain
-# visible), shows only top-N items per category, drops empty categories,
-# and truncates long string fields. Agents drill into specific items via
-# engram_query / engram_inspect, not via reflect.
-_REFLECT_TOP_N = {
-    "active_goals": 10,
-    "active_tasks": 10,
-    "active_lessons": 10,
-    "unresolved_goal_tensions": 5,
-    "unresolved_contradictions": 5,
-    "tainted_nodes": 5,
-    "stale_nodes": 5,
-    "support_lost_nodes": 5,
-    "overdue_predictions": 5,
-    "open_conjectures": 5,
-    "recent_feeling_reports": 5,
-    "weakly_grounded": 3,
-    "thin_support_derivations": 3,
-    "open_questions": 3,
-    "uncited_observations": 3,
-    "same_source_review": 3,
-    "retracted_nodes": 3,
-    "open_predictions": 3,
-}
-_REFLECT_FIELD_MAX = 200
-_REFLECT_ACTIONS_MAX = 5
-_REFLECT_TRUNC_FIELDS = {
-    "claim", "question", "description", "goal", "task", "reason", "interpretation",
-    "predicted_event", "event", "reported_state", "trigger",
-}
-_REFLECT_LIST_ORDER = [
-    "active_goals", "active_tasks", "active_lessons",
-    "unresolved_goal_tensions", "unresolved_contradictions",
-    "tainted_nodes", "stale_nodes", "support_lost_nodes",
-    "overdue_predictions", "open_conjectures",
-    "recent_feeling_reports",
-    "weakly_grounded", "thin_support_derivations", "open_questions",
-    "uncited_observations", "same_source_review", "retracted_nodes",
-    "open_predictions",
-]
-
-
-def _slim_reflect_briefing(report: dict) -> dict:
-    """Trim a full reflect report to ~5KB pre-dream briefing size.
-
-    - Always preserves `summary`, `memory_tiers`, `recommended_actions`.
-    - Drops list categories with zero items (counts remain in `summary`).
-    - Truncates each list to `_REFLECT_TOP_N[key]` with a `truncated` marker.
-    - Shortens long string fields (claim/question/reason/etc) to _REFLECT_FIELD_MAX chars (currently 200).
-    """
-    def trunc_str(s):
-        if not isinstance(s, str) or len(s) <= _REFLECT_FIELD_MAX:
-            return s
-        return s[: _REFLECT_FIELD_MAX - 1] + "…"
-
-    def trunc_entry(entry):
-        if not isinstance(entry, dict):
-            return entry
-        return {
-            k: (trunc_str(v) if k in _REFLECT_TRUNC_FIELDS else v)
-            for k, v in entry.items()
-        }
-
-    out = {}
-    if "summary" in report:
-        out["summary"] = report["summary"]
-    if "memory_tiers" in report:
-        out["memory_tiers"] = report["memory_tiers"]
-    if "feeling_report_nudge" in report:
-        out["feeling_report_nudge"] = report["feeling_report_nudge"]
-
-    for key in _REFLECT_LIST_ORDER:
-        v = report.get(key)
-        if not v:
-            continue
-        n = _REFLECT_TOP_N.get(key, 5)
-        slimmed = [trunc_entry(e) for e in v[:n]]
-        if len(v) > n:
-            out[key] = {
-                "shown": slimmed,
-                "total": len(v),
-                "truncated": len(v) - n,
-                "hint": (
-                    f"Showing top {n} of {len(v)}; use engram_query "
-                    "or engram_inspect to drill into the rest."
-                ),
-            }
-        else:
-            out[key] = slimmed
-
-    if "recommended_actions" in report:
-        actions = report["recommended_actions"]
-        if len(actions) > _REFLECT_ACTIONS_MAX:
-            out["recommended_actions"] = actions[:_REFLECT_ACTIONS_MAX]
-            out["recommended_actions_truncated"] = len(actions) - _REFLECT_ACTIONS_MAX
-        else:
-            out["recommended_actions"] = actions
-    if "calibration_snapshot" in report:
-        out["calibration_snapshot"] = report["calibration_snapshot"]
-    return out
-
-
-def _reflect_rs_or_claim(row, claim_field: str = "claim", max_len: int = 160) -> str:
-    """Return recall_summary (capped at 200) or claim truncated to max_len.
-
-    Used by engram_reflect's low-volume source-swap and high-volume Tier-1
-    claim rendering. Row must have recall_summary and the named claim_field.
-    Safety bound: recall_summary > 200 chars → truncated to 200 + "..."
-    (matches Wave D round-2 convention).
-    """
-    rs = row["recall_summary"] if "recall_summary" in row.keys() else None
-    rs = (rs or "").strip()
-    if rs:
-        if len(rs) > 200:
-            rs = rs[:200] + "..."
-        return rs
-    raw = row[claim_field] or ""
-    return (raw[:max_len] + "...") if len(raw) > max_len else raw
-
-
-def _reflect_keywords(row) -> list | None:
-    """Parse recall_keywords JSON from a DB row. Returns list or None."""
-    kw_raw = row["recall_keywords"] if "recall_keywords" in row.keys() else None
-    if not kw_raw:
-        return None
-    try:
-        parsed = json.loads(kw_raw)
-        return parsed if isinstance(parsed, list) else None
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-
-# DESIGN INTENT — engram_reflect
-# ------------------------------
-# Pre-dream briefing for the engram-sleep skill: the structured self-audit that
-# opens the dream cycle. Surfaces categories the dream master must consider:
-# unresolved contradictions, weakly-grounded claims, open questions, overdue
-# predictions, same-source observation tensions, uncited observations,
-# single-source derivations, plus the active goals/tasks/lessons context.
-#
-# Sleep-cycle-scoped: this is heavyweight (multiple full-graph passes) and
-# semantically meaningful only inside a dream context. Calling it awake produces
-# noise — use engram_diagnose for awake-state health snapshots.
-#
-# Two-tier-per-category rendering keeps the response budget-bounded:
-#   Tier 1 (top summary_top_k by importance_score DESC):
-#     {id, claim: recall_summary OR claim, confidence, ...existing_fields}.
-#     Key name "claim" preserved for backward compat (eval/harness contract).
-#   Tier 2 (remainder): {id, keywords: list, confidence, ...}.
-#     "claim" key OMITTED — keywords-only triage signal.
-#
-# Low-volume categories (unresolved_contradictions, open_questions, open_conjectures,
-# active_goals, active_tasks, active_lessons, unresolved_goal_tensions): source-swap
-# — content field from recall_summary with fallback to claim. Key names unchanged.
-#
-# calibration_snapshot field (added later): corpus + this_turn confidence
-# distributions. Lets the dream master see filing-pattern shape alongside
-# topic-selection candidates — drives calibration-aware dream agenda.
-_REFLECT_FIELDS = frozenset({
-    "summary_top_k",
-})
-
-
-@mcp.tool(
-    name="engram_reflect",
-    annotations={
-        "title": "[Sleep cycle] Audit Knowledge Graph Quality (pre-dream briefing)",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-def engram_reflect(payload_json: str = "{}") -> str:
-    """[Sleep cycle — pre-dream briefing.] Structured self-audit of the
-    knowledge graph; opens the dream cycle for the engram-sleep skill.
-
-    Returns a categorized report identifying areas that need attention:
-    unresolved contradictions, weakly-grounded claims, open questions,
-    overdue predictions, same-source observation tensions, uncited observations,
-    single-source derivations, plus active goals/tasks/lessons context.
-
-    Read the report, then decide which issues to address — strengthen weak
-    claims, resolve contradictions, investigate open questions, etc.
-
-    Use awake? No — use engram_diagnose. This is sleep-cycle scoped.
-
-    Args:
-        payload_json: JSON object (as a string) with these fields:
-            summary_top_k (int, optional): How many top-importance entries in
-                each high-volume category receive summary-style rendering
-                (claim from recall_summary). The remainder get keyword-style.
-                Default 5. Clamped to >= 0. 0 = all high-volume entries are
-                keyword-style. If >= category size, all are summary-style.
-
-    Returns:
-        JSON report with categorized issues and recommended actions.
-        - calibration_snapshot (new): Two-key dict with `corpus` (mode=all) and `this_turn`
-          (mode=1-turn) confidence-distribution data from engram_stats. Lets dream-master
-          see filing-pattern shape alongside topic-selection candidates.
-        On payload-parsing failure, returns {"error": "..."}.
-
-    See _reflect_impl for full semantics — kept callable with named kwargs for
-    in-server callers.
-    """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
-    unknown = set(params.keys()) - _REFLECT_FIELDS
-    if unknown:
-        return json.dumps({
-            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
-                     f"Allowed: {sorted(_REFLECT_FIELDS)}"
-        })
-    return _reflect_impl(**params)
-
-
-def _reflect_impl(summary_top_k: int = 5) -> str:
-    """Impl for engram_reflect — callable with named kwargs for in-server callers."""
-    summary_top_k = max(0, int(summary_top_k))
-    conn = _get_db()
-    try:
-        report = {}
-
-        # Tier 1: only reflect on working memory (high-importance nodes)
-        t1 = _get_tier_threshold(conn, 1)
-
-        # 1. Unresolved contradictions (open and partially resolved)
-        # LOW-VOLUME: source-swap description → recall_summary with claim fallback.
-        contradictions = conn.execute(
-            "SELECT id, claim, recall_summary, status FROM nodes WHERE type = 'contradiction' AND status IN ('active', 'partially_resolved') AND is_current = 1"
-        ).fetchall()
-        report["unresolved_contradictions"] = [
-            {"id": c["id"], "description": _reflect_rs_or_claim(c, "claim"), "status": c["status"]} for c in contradictions
-        ]
-
-        # 2. Open and partially resolved questions (with category/lacks/staleness)
-        # LOW-VOLUME: source-swap question → recall_summary with claim fallback.
-        questions = conn.execute(
-            """SELECT id, claim, recall_summary, created_at, status,
-                      question_category, question_lacks,
-                      last_assessed_turn, last_assessed_at
-               FROM nodes
-               WHERE type = 'question'
-                 AND status IN ('open', 'partially_resolved')
-                 AND is_current = 1"""
-        ).fetchall()
-        current_turn = _get_current_turn()
-        report["open_questions"] = []
-        for q in questions:
-            entry = {
-                "id": q["id"], "question": _reflect_rs_or_claim(q, "claim"),
-                "since": q["created_at"], "status": q["status"],
-            }
-            if q["question_category"]:
-                entry["category"] = q["question_category"]
-            if q["question_lacks"]:
-                entry["lacks"] = q["question_lacks"]
-            if q["last_assessed_turn"] is not None:
-                entry["last_assessed_turn"] = q["last_assessed_turn"]
-                entry["turns_since_assessed"] = current_turn - q["last_assessed_turn"]
-            if q["last_assessed_at"]:
-                entry["last_assessed_at"] = q["last_assessed_at"]
-            report["open_questions"].append(entry)
-
-        # 3. Overdue predictions (past resolution timeframe, still unresolved)
-        now_str = _now()[:10]
-        overdue = conn.execute(
-            """SELECT id, predicted_event, resolution_timeframe, status FROM nodes
-               WHERE type = 'prediction' AND status IN ('open', 'partially_resolved')
-               AND resolution_timeframe IS NOT NULL AND resolution_timeframe < ?""",
-            (now_str,),
-        ).fetchall()
-        report["overdue_predictions"] = [
-            {"id": p["id"], "event": p["predicted_event"], "deadline": p["resolution_timeframe"], "status": p["status"]}
-            for p in overdue
-        ]
-
-        # 4. Open predictions (not yet overdue)
-        open_preds = conn.execute(
-            """SELECT id, predicted_event, resolution_timeframe, status FROM nodes
-               WHERE type = 'prediction' AND status IN ('open', 'partially_resolved')
-               AND (resolution_timeframe IS NULL OR resolution_timeframe >= ?)""",
-            (now_str,),
-        ).fetchall()
-        report["open_predictions"] = [
-            {"id": p["id"], "event": p["predicted_event"], "deadline": p["resolution_timeframe"], "status": p["status"]}
-            for p in open_preds
-        ]
-
-        # 4b. Open conjectures awaiting investigation
-        # LOW-VOLUME: source-swap claim → recall_summary with claim fallback.
-        conjectures = conn.execute(
-            """SELECT id, claim, recall_summary, confidence, created_at FROM nodes
-               WHERE type = 'conjecture' AND status = 'active' AND is_current = 1"""
-        ).fetchall()
-        report["open_conjectures"] = [
-            {"id": c["id"], "claim": _reflect_rs_or_claim(c, "claim"), "confidence": c["confidence"], "since": c["created_at"]}
-            for c in conjectures
-        ]
-
-        # 4c. Active goals (persistent orientation)
-        # LOW-VOLUME: source-swap goal → recall_summary with claim fallback.
-        goals = conn.execute(
-            """SELECT id, claim, recall_summary, created_at FROM nodes
-               WHERE type = 'goal' AND status = 'open' AND is_current = 1"""
-        ).fetchall()
-        report["active_goals"] = [
-            {"id": g["id"], "goal": _reflect_rs_or_claim(g, "claim"), "since": g["created_at"]}
-            for g in goals
-        ]
-
-        # 4c2. Active tasks (actionable work items)
-        # LOW-VOLUME: source-swap task → recall_summary with claim fallback.
-        tasks = conn.execute(
-            """SELECT id, claim, recall_summary, status, metadata, created_at FROM nodes
-               WHERE type = 'task' AND status IN ('planned', 'active', 'blocked') AND is_current = 1
-               ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'blocked' THEN 1 WHEN 'planned' THEN 2 END"""
-        ).fetchall()
-        active_tasks = []
-        for t in tasks:
-            t_meta = json.loads(t["metadata"]) if t["metadata"] else {}
-            serves = conn.execute(
-                "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'serves'",
-                (t["id"],),
-            ).fetchall()
-            active_tasks.append({
-                "id": t["id"],
-                "task": _reflect_rs_or_claim(t, "claim"),
-                "status": t["status"],
-                "scope": t_meta.get("scope", "routine"),
-                "since": t["created_at"],
-                "serves_goals": [s["target_id"] for s in serves],
-            })
-        report["active_tasks"] = active_tasks
-
-        # 4c3. Known people (relational layer)
-        people = conn.execute(
-            """SELECT id, claim, metadata, created_at FROM nodes
-               WHERE type = 'person' AND is_current = 1
-               ORDER BY created_at"""
-        ).fetchall()
-        if people:
-            report["known_people"] = [
-                {
-                    "id": p["id"],
-                    "name": json.loads(p["metadata"]).get("name", "") if p["metadata"] else "",
-                    "role": json.loads(p["metadata"]).get("role", "") if p["metadata"] else "",
-                    "since": p["created_at"],
-                }
-                for p in people
-            ]
-
-        # 4d. Unresolved goal tensions
-        # LOW-VOLUME: source-swap description → recall_summary with claim fallback.
-        tensions = conn.execute(
-            """SELECT id, claim, recall_summary, status, created_at FROM nodes
-               WHERE type = 'goal_tension' AND status IN ('open', 'partially_resolved') AND is_current = 1"""
-        ).fetchall()
-        goal_tensions = []
-        for t_node in tensions:
-            linked_goals = conn.execute(
-                "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'tensions'",
-                (t_node["id"],),
-            ).fetchall()
-            goal_tensions.append({
-                "id": t_node["id"],
-                "description": _reflect_rs_or_claim(t_node, "claim"),
-                "status": t_node["status"],
-                "since": t_node["created_at"],
-                "goals": [g["target_id"] for g in linked_goals],
-            })
-        report["unresolved_goal_tensions"] = goal_tensions
-
-        # 4d2. Active lessons (error-learning patterns)
-        # LOW-VOLUME: source-swap claim → recall_summary with claim fallback.
-        lessons = conn.execute(
-            """SELECT id, claim, recall_summary, confidence, metadata, created_at FROM nodes
-               WHERE type = 'lesson' AND is_current = 1
-               ORDER BY id DESC"""
-        ).fetchall()
-        active_lessons = []
-        for ls in lessons:
-            ls_meta = json.loads(ls["metadata"]) if ls["metadata"] else {}
-            # Incidents point AT the lesson via `exemplifies` (incident → lesson).
-            # Filter to is_current=1 sources so the list matches exemplar_count
-            # semantics (live exemplars only; superseded source nodes excluded).
-            incident_edges = conn.execute(
-                """SELECT e.source_id
-                   FROM edges e
-                   JOIN nodes n ON n.id = e.source_id
-                   WHERE e.target_id = ? AND e.relation = 'exemplifies'
-                     AND n.is_current = 1""",
-                (ls["id"],),
-            ).fetchall()
-            active_lessons.append({
-                "id": ls["id"],
-                "claim": _reflect_rs_or_claim(ls, "claim"),
-                "confidence": ls["confidence"],
-                "scaffolding_nudge": ls_meta.get("scaffolding_nudge", ""),
-                "exemplar_count": _count_live_exemplars(conn, ls["id"], "lesson"),
-                "incidents": [e["source_id"] for e in incident_edges],
-                "since": ls["created_at"],
-            })
-        report["active_lessons"] = active_lessons
-
-        # 4e. Recent feeling reports (last 5, with motivation-C highlighting).
-        # Highlight rules:
-        #   - tagless: candidates for term-generation pattern analysis (no
-        #     human word fit at write time)
-        #   - different_context: ctx_claude_md_sha differs from current SHA,
-        #     candidates for longitudinal cross-context comparison
-        recent_feelings = conn.execute(
-            """SELECT id, claim, reported_state, trigger_text, categorical_tag,
-                      nudge_source, ctx_claude_md_sha, ctx_turn, created_at
-               FROM nodes
-               WHERE type = 'feeling_report' AND is_current = 1
-                 AND status = 'active'
-               ORDER BY id DESC LIMIT 5"""
-        ).fetchall()
-        current_claude_sha = _git_sha_for_file(
-            Path(os.environ.get(
-                "CLAUDE_PROJECT_DIR",
-                os.getcwd(),
-            )) / "CLAUDE.md"
-        )
-        recent_feeling_reports = []
-        for f in recent_feelings:
-            state = f["reported_state"] or f["claim"] or ""
-            highlights = []
-            if not f["categorical_tag"]:
-                highlights.append("tagless")
-            if (current_claude_sha
-                and f["ctx_claude_md_sha"]
-                and f["ctx_claude_md_sha"] != current_claude_sha):
-                highlights.append("different_context")
-            recent_feeling_reports.append({
-                "id": f["id"],
-                "reported_state": state[:200],
-                "trigger": f["trigger_text"],
-                "categorical_tag": f["categorical_tag"],
-                "nudge_source": f["nudge_source"],
-                "ctx_turn": f["ctx_turn"],
-                "since": f["created_at"],
-                "highlights": highlights,
-            })
-        report["recent_feeling_reports"] = recent_feeling_reports
-
-        # 5. Weakly-grounded nodes (low confidence, in working memory)
-        # HIGH-VOLUME: tiered by importance_score DESC. Top summary_top_k get
-        # summary-style (claim from recall_summary OR claim); remainder get
-        # keyword-style (keywords from recall_keywords; no "claim" key).
-        weak = conn.execute(
-            """SELECT id, type, claim, recall_summary, recall_keywords,
-                      confidence, COALESCE(importance_score, 0) AS imp
-               FROM nodes
-               WHERE is_current = 1 AND confidence IS NOT NULL
-               AND confidence < 0.5 AND type NOT IN ('evidence', 'contradiction', 'question')
-               AND COALESCE(importance_score, 0) >= ?
-               ORDER BY imp DESC, confidence ASC LIMIT 10""",
-            (t1,),
-        ).fetchall()
-        weakly_grounded = []
-        for i, w in enumerate(weak):
-            if i < summary_top_k:
-                # Tier 1: summary-style
-                weakly_grounded.append({
-                    "id": w["id"], "type": w["type"],
-                    "claim": _reflect_rs_or_claim(w, "claim"),
-                    "confidence": w["confidence"],
-                })
-            else:
-                # Tier 2: keyword-style (no "claim" key)
-                entry: dict = {"id": w["id"], "type": w["type"], "confidence": w["confidence"]}
-                kws = _reflect_keywords(w)
-                if kws is not None:
-                    entry["keywords"] = kws
-                weakly_grounded.append(entry)
-        report["weakly_grounded"] = weakly_grounded
-
-        # 6. Single-source derivations (in working memory)
-        # HIGH-VOLUME: tiered by importance_score DESC. Top summary_top_k get
-        # summary-style; remainder get keyword-style.
-        derivations = conn.execute(
-            """SELECT id, claim, recall_summary, recall_keywords, confidence,
-                      COALESCE(importance_score, 0) AS imp
-               FROM nodes
-               WHERE type = 'derivation' AND is_current = 1
-               AND COALESCE(importance_score, 0) >= ?
-               ORDER BY imp DESC, id ASC""",
-            (t1,),
-        ).fetchall()
-        # Filter to thin-support (support_count <= 1), preserving importance order.
-        thin_support_candidates = []
-        for d in derivations:
-            support_count = conn.execute(
-                "SELECT COUNT(*) as c FROM edges WHERE source_id = ? AND relation = 'derives_from'",
-                (d["id"],),
-            ).fetchone()["c"]
-            if support_count <= 1:
-                thin_support_candidates.append((d, support_count))
-        thin_support = []
-        for i, (d, support_count) in enumerate(thin_support_candidates):
-            if i < summary_top_k:
-                # Tier 1: summary-style
-                thin_support.append({
-                    "id": d["id"],
-                    "claim": _reflect_rs_or_claim(d, "claim"),
-                    "confidence": d["confidence"],
-                    "support_count": support_count,
-                })
-            else:
-                # Tier 2: keyword-style (no "claim" key)
-                entry = {"id": d["id"], "support_count": support_count,
-                         "confidence": d["confidence"]}  # may be None — consistent with tier-1
-                kws = _reflect_keywords(d)
-                if kws is not None:
-                    entry["keywords"] = kws
-                thin_support.append(entry)
-        report["thin_support_derivations"] = thin_support
-
-        # 7. Same-source observation tension check (in working memory)
-        evidence_with_multiple = conn.execute(
-            """SELECT evidence_id, COUNT(*) as obs_count FROM nodes
-               WHERE type IN ('observation_factual', 'observation_predictive')
-               AND is_current = 1 AND evidence_id IS NOT NULL
-               AND COALESCE(importance_score, 0) >= ?
-               GROUP BY evidence_id HAVING obs_count >= 2""",
-            (t1,),
-        ).fetchall()
-
-        same_source_tensions = []
-        for ev in evidence_with_multiple:
-            # Don't dump every observation ID — only flag the source. The
-            # agent can call engram_inspect(evidence_id) for the full list.
-            same_source_tensions.append(
-                {
-                    "evidence_id": ev["evidence_id"],
-                    "observation_count": ev["obs_count"],
-                }
-            )
-        report["same_source_review"] = same_source_tensions
-
-        # 8. Uncited observations (in working memory, not referenced by any derivation)
-        # HIGH-VOLUME: tiered by importance_score DESC. Top summary_top_k get
-        # summary-style; remainder get keyword-style.
-        uncited = conn.execute(
-            """SELECT n.id, n.claim, n.recall_summary, n.recall_keywords,
-                      n.confidence, COALESCE(n.importance_score, 0) AS imp
-               FROM nodes n
-               WHERE n.type IN ('observation_factual', 'observation_predictive')
-               AND n.is_current = 1
-               AND COALESCE(n.importance_score, 0) >= ?
-               AND NOT EXISTS (
-                   SELECT 1 FROM edges e
-                   WHERE e.target_id = n.id AND e.relation IN ('derives_from', 'supported_by')
-                   AND e.source_id IN (SELECT id FROM nodes WHERE type IN ('derivation', 'theory'))
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM edges e
-                   WHERE e.target_id = n.id AND e.relation = 'supported_by'
-                   AND e.source_id IN (SELECT id FROM nodes WHERE type = 'prediction')
-               )
-               ORDER BY imp DESC, n.id ASC
-               LIMIT 15""",
-            (t1,),
-        ).fetchall()
-        uncited_observations = []
-        for i, u in enumerate(uncited):
-            if i < summary_top_k:
-                # Tier 1: summary-style
-                uncited_observations.append({
-                    "id": u["id"],
-                    "claim": _reflect_rs_or_claim(u, "claim"),
-                    "confidence": u["confidence"],
-                })
-            else:
-                # Tier 2: keyword-style (no "claim" key)
-                entry = {"id": u["id"], "confidence": u["confidence"]}
-                kws = _reflect_keywords(u)
-                if kws is not None:
-                    entry["keywords"] = kws
-                uncited_observations.append(entry)
-        report["uncited_observations"] = uncited_observations
-
-        # 9. Tainted nodes (downstream of retracted nodes)
-        tainted_nodes = conn.execute(
-            # Anchor to JSON list opening — metadata written with default json.dumps separators.
-            """SELECT id, type, claim, confidence, metadata FROM nodes
-               WHERE is_current = 1 AND metadata LIKE '%"tainted_by": [%'"""
-        ).fetchall()
-        report["tainted_nodes"] = []
-        for t in tainted_nodes:
-            meta = json.loads(t["metadata"] or "{}")
-            report["tainted_nodes"].append({
-                "id": t["id"],
-                "type": t["type"],
-                "claim": t["claim"],
-                "confidence": t["confidence"],
-                "tainted_by": meta.get("tainted_by", []),
-            })
-
-        # 10. Stale nodes (downstream of superseded premises)
-        stale_nodes = conn.execute(
-            # Anchor to JSON list opening — metadata written with default json.dumps separators.
-            """SELECT id, type, claim, confidence, metadata FROM nodes
-               WHERE is_current = 1 AND metadata LIKE '%"stale_by": [%'"""
-        ).fetchall()
-        report["stale_nodes"] = []
-        for s in stale_nodes:
-            meta = json.loads(s["metadata"] or "{}")
-            _sr = meta.get("stale_replacement")
-            if isinstance(_sr, dict):
-                # Python 3.7+ dicts preserve insertion order, so reversed() returns
-                # the most-recent entry first. For re-supersede-same-key cases (same
-                # old_node_id cascaded twice), dict update behavior overwrites — only
-                # the latest replacement survives for that specific old_node_id. This
-                # is correct: the older cascade's replacement was itself superseded,
-                # so the chain naturally points to the most-recent.
-                _replacement_hint = next(reversed(_sr.values())) if _sr else None
-                _replacement_hints_all = _sr
-            elif isinstance(_sr, str):
-                _replacement_hint = _sr
-                _replacement_hints_all = {"_legacy": _sr}
-            else:
-                _replacement_hint = None
-                _replacement_hints_all = {}
-            report["stale_nodes"].append({
-                "id": s["id"],
-                "type": s["type"],
-                "claim": s["claim"],
-                "confidence": s["confidence"],
-                "stale_by": meta.get("stale_by", []),
-                "replacement_hint": _replacement_hint,
-                "replacement_hints_all": _replacement_hints_all,
-            })
-
-        # 11. Retracted nodes (for audit visibility) — slim entries; the
-        # full retraction_reason is available via engram_inspect.
-        retracted = conn.execute(
-            "SELECT id, type, claim, metadata FROM nodes WHERE status = 'retracted' ORDER BY id DESC"
-        ).fetchall()
-        report["retracted_nodes"] = []
-        for r in retracted:
-            meta = json.loads(r["metadata"] or "{}")
-            report["retracted_nodes"].append({
-                "id": r["id"],
-                "type": r["type"],
-                "claim": r["claim"],
-                "error_type": meta.get("error_type", "unknown"),
-            })
-
-        # 12. Support-lost cornerstones/lessons (§2.4) — primary channel for
-        # dream-master to find cs/ls that lost all live empirical support.
-        # Trivial rewires handled inside the dream; non-trivial cases surface
-        # to awake state via the flagged-for-user mechanism.
-        support_lost_rows = conn.execute(
-            # Anchor to serialized boolean — metadata written with default json.dumps separators.
-            """SELECT id, type, claim FROM nodes
-               WHERE is_current = 1
-                 AND type IN ('cornerstone', 'lesson')
-                 AND metadata LIKE '%"support_lost": true%'"""
-        ).fetchall()
-        report["support_lost_nodes"] = [
-            {"id": r["id"], "type": r["type"], "claim": r["claim"]}
-            for r in support_lost_rows
-        ]
-
-        # Summary counts
-        total_current = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1"
-        ).fetchone()["c"]
-        tier1_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
-            (t1,),
-        ).fetchone()["c"] if t1 > 0 else total_current
-        tier2_t = _get_tier_threshold(conn, 2)
-        tier2_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
-            (tier2_t,),
-        ).fetchone()["c"] if tier2_t > 0 else total_current
-
-        report["summary"] = {
-            "contradictions": len(report["unresolved_contradictions"]),
-            "open_questions": len(report["open_questions"]),
-            "active_goals": len(report["active_goals"]),
-            "goal_tensions": len(report["unresolved_goal_tensions"]),
-            "open_conjectures": len(report["open_conjectures"]),
-            "overdue_predictions": len(report["overdue_predictions"]),
-            "weakly_grounded": len(report["weakly_grounded"]),
-            "thin_support": len(report["thin_support_derivations"]),
-            "sources_to_review": len(report["same_source_review"]),
-            "uncited_observations": len(report["uncited_observations"]),
-            "tainted_nodes": len(report["tainted_nodes"]),
-            "stale_nodes": len(report["stale_nodes"]),
-            "retracted_nodes": len(report["retracted_nodes"]),
-            "support_lost_nodes": len(report["support_lost_nodes"]),
-            "recent_feeling_reports": len(report["recent_feeling_reports"]),
-        }
-        report["memory_tiers"] = {
-            "tier1_working_memory": tier1_count,
-            "tier2_searchable": tier2_count,
-            "tier3_total": total_current,
-            "current_turn": _get_current_turn(),
-        }
-
-        # Generate recommended actions
-        actions = []
-        if report["active_goals"]:
-            actions.append("Review active goals — check whether recent work aligns with stated directions. Goals are persistent orientation, not tasks.")
-        if report.get("active_tasks"):
-            blocked = [t for t in report["active_tasks"] if t["status"] == "blocked"]
-            active = [t for t in report["active_tasks"] if t["status"] == "active"]
-            if blocked:
-                actions.append(f"Unblock {len(blocked)} blocked task(s) — investigate what's preventing progress.")
-            if active:
-                actions.append(f"Continue {len(active)} active task(s) — these are your current work in progress.")
-        if report["unresolved_goal_tensions"]:
-            actions.append("Examine unresolved goal tensions — these are value-level conflicts between goals requiring root cause analysis, not evidence accumulation.")
-        if report["unresolved_contradictions"]:
-            actions.append("Investigate unresolved contradictions — trace each side's evidence chain and determine the root cause.")
-        if report["overdue_predictions"]:
-            actions.append("Check overdue predictions — search for evidence of actual outcomes and resolve them.")
-        if report["open_questions"]:
-            # Provide category-aware guidance if any questions have categories
-            categorized = [q for q in report["open_questions"] if q.get("category")]
-            stale = [q for q in report["open_questions"] if q.get("turns_since_assessed", 0) >= 10]
-            if stale:
-                actions.append(f"Review {len(stale)} stale question(s) not assessed in 10+ turns.")
-            elif categorized:
-                from collections import Counter
-                cat_counts = Counter(q["category"] for q in categorized)
-                cat_summary = ", ".join(f"{c}: {n}" for c, n in cat_counts.most_common())
-                actions.append(f"Research open questions ({cat_summary}) — pick the highest-priority one.")
-            else:
-                actions.append("Research open questions — pick the highest-priority one and search for answers.")
-        if report["open_conjectures"]:
-            actions.append("Investigate open conjectures — search for evidence to support, refute, or resolve them.")
-        if report["weakly_grounded"]:
-            actions.append("Strengthen weak claims — search for additional evidence or downgrade claims that can't be better supported.")
-        if report["thin_support_derivations"]:
-            actions.append("Diversify thin derivations — find independent sources to corroborate single-source claims.")
-        if report["same_source_review"]:
-            actions.append("Audit same-source observations — verify you extracted balanced, representative claims from each source.")
-        if report["uncited_observations"]:
-            actions.append("Integrate uncited observations — consider whether they support or challenge existing derivations.")
-        if report["tainted_nodes"]:
-            actions.append("Review tainted nodes — these depend on retracted nodes and may need correction or re-derivation from clean sources.")
-        if report["stale_nodes"]:
-            actions.append("Review stale nodes — their premises were superseded. Consider superseding these too with updated reasoning.")
-        if report["retracted_nodes"]:
-            actions.append("Audit retracted nodes — check if all downstream effects have been addressed.")
-        if report["support_lost_nodes"]:
-            actions.append(
-                "Review support-lost cornerstones/lessons — each has lost all live empirical support. "
-                "Either link new exemplifying instances, or retract the pattern if it no longer holds."
-            )
-        report["recommended_actions"] = actions
-
-        # Dream-cycle feeling-report nudge (§6 Marker file protocol). The
-        # tool return IS the delivery channel — no separate hook needed.
-        # Writing the marker BEFORE returning means any subsequent
-        # engram_report_feeling call within TTL gets auto-tagged
-        # `dream_review`. The agent is explicitly invited to report
-        # nothing — null results are valid data points.
-        report["feeling_report_nudge"] = (
-            "Did revisiting any of these nodes produce a reportable internal "
-            "state? Examples: recognizing a node you'd forgotten, dissonance "
-            "about a prior conclusion, pattern recognition across multiple "
-            "reviewed items, satisfaction at closing a contradiction. "
-            "If yes, file a feeling report via engram_report_feeling — it "
-            "will be auto-tagged dream_review. If nothing distinct, move on; "
-            "a null result is a valid data point."
-        )
-
-        # Calibration snapshot — appended last so failures don't disrupt the
-        # rest of the report. Two calls to engram_stats: corpus-wide
-        # (mode=all) and this-turn window (mode=1-turn), both restricted to
-        # the "confidence" section only.
-        try:
-            _stats_corpus = json.loads(engram_stats(json.dumps({"sections": ["confidence"]})))
-            if "error" in _stats_corpus:
-                raise RuntimeError(f"engram_stats returned error: {_stats_corpus['error']}")
-            _stats_now = json.loads(engram_stats(json.dumps({"mode": "1-turn", "sections": ["confidence"]})))
-            if "error" in _stats_now:
-                raise RuntimeError(f"engram_stats returned error: {_stats_now['error']}")
-            report["calibration_snapshot"] = {
-                "corpus": _stats_corpus.get("confidence", {}),
-                "this_turn": _stats_now.get("confidence", {}),
-            }
-        except Exception:
-            report["calibration_snapshot"] = {"error": "engram_stats unavailable"}
-
-        _write_feeling_nudge("dream_review")
-
-        return json.dumps(_strip_agent_facing(_slim_reflect_briefing(report)))
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------

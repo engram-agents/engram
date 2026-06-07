@@ -43,6 +43,14 @@
       "tier": "essential"
     },
     {
+      "path": "engram_trust.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_lifecycle.py",
+      "tier": "essential"
+    },
+    {
       "path": "engram_walguard.py",
       "tier": "essential"
     },

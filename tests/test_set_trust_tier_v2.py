@@ -258,13 +258,15 @@ def test_set_tier_primary_user_multiple_allowed():
 # ── Test 7: tier rank ordering ────────────────────────────────────────────
 
 def test_tier_rank_ordering_self_above_primary_user_above_family():
-    """TIER_RANK has self > primary_user > user_family (6 > 5 > 4)."""
-    import server as srv
-    assert srv.TIER_RANK["self"] == 6, srv.TIER_RANK
-    assert srv.TIER_RANK["primary_user"] == 5, srv.TIER_RANK
-    assert srv.TIER_RANK["user_family"] == 4, srv.TIER_RANK
-    assert srv.TIER_RANK["self"] > srv.TIER_RANK["primary_user"] > srv.TIER_RANK["user_family"], (
-        f"Expected self > primary_user > user_family. TIER_RANK: {srv.TIER_RANK}"
+    """TIER_RANK has self > primary_user > user_family (6 > 5 > 4).
+    Wave 3: TIER_RANK moved to engram_trust; test migrated to family-module namespace.
+    """
+    import engram_trust as _trust_mod
+    assert _trust_mod.TIER_RANK["self"] == 6, _trust_mod.TIER_RANK
+    assert _trust_mod.TIER_RANK["primary_user"] == 5, _trust_mod.TIER_RANK
+    assert _trust_mod.TIER_RANK["user_family"] == 4, _trust_mod.TIER_RANK
+    assert _trust_mod.TIER_RANK["self"] > _trust_mod.TIER_RANK["primary_user"] > _trust_mod.TIER_RANK["user_family"], (
+        f"Expected self > primary_user > user_family. TIER_RANK: {_trust_mod.TIER_RANK}"
     )
 
 

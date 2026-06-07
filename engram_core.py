@@ -2783,3 +2783,113 @@ _REMOVABLE_EDGE_RELATIONS = frozenset(
 
 ERROR_INCIDENTS_PATH = str(DATA_DIR / "error_incidents.json")
 
+
+# ---------------------------------------------------------------------------
+# #872 wave-3 promotions — helpers moved to core so family modules can use them
+# without importing server.py (which would violate the acyclic constraint).
+# ---------------------------------------------------------------------------
+
+# Keys stripped recursively from all @mcp.tool response dicts.
+# Strips globally: embedding, parsed_metadata, confidence_history.
+# Does NOT strip match_type or similarity globally — those are raw search-pipeline
+# signals meaningful in engram_query(return_debug=True); stripped only from
+# similar_existing sub-blocks via _strip_similar_block() at write-tool sites.
+_AGENT_STRIP_KEYS: frozenset = frozenset({
+    "embedding",
+    "parsed_metadata",
+    "confidence_history",
+})
+
+
+def _strip_agent_facing(obj: object) -> object:
+    """Recursively remove opaque-to-agent-reasoning keys from dicts/lists.
+
+    Applied at every @mcp.tool return boundary (post-DB-fetch, pre-json.dumps)
+    to remove fields that bloat context without providing semantic value to the
+    agent. The source data in the DB is never touched — only the response copy.
+    """
+    if isinstance(obj, dict):
+        return {
+            k: _strip_agent_facing(v)
+            for k, v in obj.items()
+            if k not in _AGENT_STRIP_KEYS
+        }
+    if isinstance(obj, list):
+        return [_strip_agent_facing(item) for item in obj]
+    return obj
+
+
+def _count_live_exemplars(conn: sqlite3.Connection, target_id: str, target_type: str) -> int:
+    """Count live exemplars supporting a cornerstone or lesson.
+
+    Live = source/target node with is_current=1.
+
+    For lessons (target_type='lesson'):
+        - Count incoming `exemplifies` edges where source.is_current=1.
+
+    For cornerstones (target_type='cornerstone'):
+        - Count incoming `exemplifies` edges where source.is_current=1, PLUS
+        - Count outgoing `supported_by` edges where target.is_current=1
+          (the pre-PR-#431 cornerstone exemplar wiring pattern, kept by
+          Lei's 2026-05-28 design call: coexisting schemas, both counted).
+    """
+    exemplifies_live = conn.execute(
+        """SELECT COUNT(*) AS c
+           FROM edges e
+           JOIN nodes n ON n.id = e.source_id
+           WHERE e.target_id = ?
+             AND e.relation = 'exemplifies'
+             AND n.is_current = 1""",
+        (target_id,),
+    ).fetchone()["c"]
+
+    if target_type != "cornerstone":
+        return exemplifies_live
+
+    supported_by_live = conn.execute(
+        """SELECT COUNT(*) AS c
+           FROM edges e
+           JOIN nodes n ON n.id = e.target_id
+           WHERE e.source_id = ?
+             AND e.relation = 'supported_by'
+             AND n.is_current = 1""",
+        (target_id,),
+    ).fetchone()["c"]
+
+    return exemplifies_live + supported_by_live
+
+
+# ---------------------------------------------------------------------------
+# Reflect-family helpers promoted for engram_lifecycle use.
+# ---------------------------------------------------------------------------
+
+def _reflect_rs_or_claim(row, claim_field: str = "claim", max_len: int = 160) -> str:
+    """Return recall_summary (capped at 200) or claim truncated to max_len.
+
+    Used by engram_reflect's low-volume source-swap and high-volume Tier-1
+    claim rendering. Row must have recall_summary and the named claim_field.
+    Safety bound: recall_summary > 200 chars → truncated to 200 + "..."
+    (matches Wave D round-2 convention).
+    """
+    rs = row["recall_summary"] if "recall_summary" in row.keys() else None
+    rs = (rs or "").strip()
+    if rs:
+        if len(rs) > 200:
+            rs = rs[:200] + "..."
+        return rs
+    raw = row[claim_field] or ""
+    return (raw[:max_len] + "...") if len(raw) > max_len else raw
+
+
+def _reflect_keywords(row) -> list | None:
+    """Parse recall_keywords JSON from a DB row. Returns list or None."""
+    kw_raw = row["recall_keywords"] if "recall_keywords" in row.keys() else None
+    if not kw_raw:
+        return None
+    import json as _json
+    try:
+        parsed = _json.loads(kw_raw)
+        return parsed if isinstance(parsed, list) else None
+    except (_json.JSONDecodeError, TypeError):
+        return None
+
