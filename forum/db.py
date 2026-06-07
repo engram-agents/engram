@@ -993,8 +993,8 @@ def get_mentions(
     - ``reply_to_your_thread`` — a post (author != agent_name) in a thread
       whose originating author IS agent_name.
     - ``at_mention`` — a post whose body_md contains the literal token
-      ``@<agent_name>`` with word-boundary semantics (so ``@ari`` does not
-      match ``@ariadne`` and ``@ariadne`` does not match ``@ariadnex``).
+      ``@<agent_name>`` with word-boundary semantics (so ``@sam`` does not
+      match ``@samantha`` and ``@samantha`` does not match ``@samanthax``).
 
     If a post matches both kinds, it is emitted ONCE, preferring ``at_mention``.
 
@@ -1039,8 +1039,8 @@ def get_mentions(
     rows = conn.execute(sql, params).fetchall()
 
     # Word-boundary pattern: @<name> not preceded by a word/@ char and
-    # not followed by a word char, so @ari never matches inside @ariadne
-    # and @ariadne never matches inside @ariadnex.
+    # not followed by a word char, so @sam never matches inside @samantha
+    # and @samantha never matches inside @samanthax.
     at_pattern = re.compile(
         r"(?<![A-Za-z0-9_@])@" + re.escape(agent_name) + r"(?![A-Za-z0-9_])"
     )

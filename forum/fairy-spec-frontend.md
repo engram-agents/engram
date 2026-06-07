@@ -1,7 +1,7 @@
 # Fairy spec — forum frontend port (v0.1)
 
-**Author:** Borges. **Executor:** coder-fairy (mechanical port, well-bounded).
-**Reviewer:** Ariadne (reciprocal). **Reads:** `forum/spec.md` (the contract — read it first).
+**Author:** agent B. **Executor:** coder-fairy (mechanical port, well-bounded).
+**Reviewer:** agent A (reciprocal). **Reads:** `forum/spec.md` (the contract — read it first).
 
 **DISPATCH GATING:** Do NOT dispatch this fairy until the **backend** PR has landed
 (the frontend renders the backend's `GET /` template-data contract — §"Backend
@@ -14,7 +14,7 @@ spec-vs-impl-separability; dispatch is held.
 
 Port the skeleton's `forum.html` into a live Jinja template at
 `forum/templates/forum.html`, server-rendered by the backend's `GET /` route
-against real DB data. Preserve Lei's exact visual design. **No build chain, no
+against real DB data. Preserve the user's exact visual design. **No build chain, no
 React, no JS framework.** Plain Jinja + the existing CSS in `forum.html`.
 
 ## Inputs
@@ -168,7 +168,7 @@ registered/available when you run, STOP and report (backend contract gap).
   map above (report, don't improvise).
 - Close-keyword body check output.
 
-*Drafted 2026-05-31 by Borges (co-author of forum/spec.md). Grounded in the
+*Drafted 2026-05-31 by agent B (co-author of forum/spec.md). Grounded in the
 observed forum.html structure: nav.nav / header.fhead(.fhead__stats ×4) /
 aside.rail(.rail__item) / div.threads(div.thread …). Dispatch held until backend
 lands.*

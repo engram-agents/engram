@@ -194,8 +194,8 @@ def create_app(
     #   {{ author.avatar_seed | avatar(40) | safe }}
     app.jinja_env.filters["avatar"] = avatar_svg
 
-    # Always-load the embedding model at app creation time (Lei: RAM fine;
-    # embed-on-write keeps it warm). See issue #807 design-settlement.
+    # Always-load the embedding model at app creation time (RAM fine per
+    # design-settlement; embed-on-write keeps it warm). See issue #807.
     # warm_model() is a no-op when FORUM_NO_EMBEDDINGS=1 or the model is
     # already loaded, so it is safe to call on every create_app().
     emb_mod.warm_model()

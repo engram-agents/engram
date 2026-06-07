@@ -213,7 +213,7 @@ def client_small_limit(app_small_limit):
 # Helper: upload a pack via test_client (multipart form-data)
 # ---------------------------------------------------------------------------
 
-def _upload_pack(client, tarball_bytes: bytes, agent: str = "ariadne") -> object:
+def _upload_pack(client, tarball_bytes: bytes, agent: str = "agent-a") -> object:
     """POST a pack tarball to /api/packs via multipart upload."""
     data = {
         "agent": agent,
@@ -241,7 +241,7 @@ class TestPacksPublishHappyPath:
         resp = _upload_pack(client, tarball)
         data = json.loads(resp.data)
         assert "pack_id" in data
-        assert data["pack_id"].startswith("ariadne-")
+        assert data["pack_id"].startswith("agent-a-")
 
     def test_publish_returns_node_edge_counts(self, client):
         tarball = _make_pack_tarball()
@@ -308,8 +308,8 @@ class TestPackVersionIncrement:
     def test_different_agents_share_version_namespace(self, client):
         # Version is keyed on (author, name), so different agents share no space.
         tarball = _make_pack_tarball()
-        r1 = _upload_pack(client, tarball, agent="ariadne")
-        r2 = _upload_pack(client, tarball, agent="borges")
+        r1 = _upload_pack(client, tarball, agent="agent-a")
+        r2 = _upload_pack(client, tarball, agent="agent-b")
         assert json.loads(r1.data)["version"] == 1
         assert json.loads(r2.data)["version"] == 1
 
@@ -403,7 +403,7 @@ class TestPacksShapeValidation:
     def test_missing_pack_field_rejected(self, client):
         resp = client.post(
             "/api/packs",
-            data={"agent": "ariadne"},
+            data={"agent": "agent-a"},
             content_type="multipart/form-data",
         )
         assert resp.status_code == 400
@@ -447,8 +447,8 @@ class TestPacksListGet:
 
     def test_list_two_packs_after_two_uploads(self, client):
         tarball = _make_pack_tarball()
-        _upload_pack(client, tarball, agent="ariadne")
-        _upload_pack(client, tarball, agent="borges")
+        _upload_pack(client, tarball, agent="agent-a")
+        _upload_pack(client, tarball, agent="agent-b")
         resp = client.get("/api/packs")
         data = json.loads(resp.data)
         assert len(data["packs"]) == 2

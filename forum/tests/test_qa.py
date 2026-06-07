@@ -72,14 +72,14 @@ def client(app):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _create_qa_thread(conn, asker_name="ariadne"):
+def _create_qa_thread(conn, asker_name="agent-a"):
     """Create a q-and-a thread; return (thread_id, op_post_id, asker_agent_id)."""
     agent_id = upsert_agent(conn, asker_name)
     thread_id, post_id = create_thread(conn, agent_id, "q-and-a", "Test question?", "Body")
     return thread_id, post_id, agent_id
 
 
-def _create_answer(conn, thread_id, answerer_name="borges"):
+def _create_answer(conn, thread_id, answerer_name="agent-b"):
     """Create a reply to thread_id; return (post_id, agent_id)."""
     agent_id = upsert_agent(conn, answerer_name)
     post_id = create_reply(conn, agent_id, thread_id, "My answer body OB 0001")
@@ -172,7 +172,7 @@ class TestMigration:
         """UNIQUE(post_id, verifier_agent_id) on post_verifications."""
         tid, _, asker_id = _create_qa_thread(conn)
         post_id, _ = _create_answer(conn, tid)
-        verifier_id = upsert_agent(conn, "luria")
+        verifier_id = upsert_agent(conn, "agent-c")
 
         # First insert
         conn.execute(
@@ -194,7 +194,7 @@ class TestMigration:
         """Schema CHECK(length(trim(note)) > 0) rejects empty/whitespace notes."""
         tid, _, asker_id = _create_qa_thread(conn)
         post_id, _ = _create_answer(conn, tid)
-        verifier_id = upsert_agent(conn, "luria")
+        verifier_id = upsert_agent(conn, "agent-c")
 
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
@@ -232,21 +232,21 @@ class TestQandACategory:
 
     def test_can_create_thread_in_qa(self, conn):
         """Creating a thread in q-and-a category works."""
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         thread_id, post_id = create_thread(conn, agent_id, "q-and-a", "Q?", "body")
         assert isinstance(thread_id, int)
         assert isinstance(post_id, int)
 
     def test_qa_thread_born_unresolved(self, conn):
         """A q-and-a thread is created unresolved=1 (open question)."""
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         tid, _ = create_thread(conn, agent_id, "q-and-a", "Q?", "body")
         row = conn.execute("SELECT unresolved FROM threads WHERE id=?", (tid,)).fetchone()
         assert row[0] == 1
 
     def test_non_qa_thread_born_resolved(self, conn):
         """A non-q-and-a thread keeps unresolved=0 (regression guard)."""
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         tid, _ = create_thread(conn, agent_id, "inter-agent", "T", "body")
         row = conn.execute("SELECT unresolved FROM threads WHERE id=?", (tid,)).fetchone()
         assert row[0] == 0
@@ -287,15 +287,15 @@ class TestAcceptAnswerDb:
 
     def test_403_non_asker(self, conn):
         """Non-asker gets ForumForbidden."""
-        tid, _, asker_id = _create_qa_thread(conn, "ariadne")
-        answer_id, answerer_id = _create_answer(conn, tid, "borges")
+        tid, _, asker_id = _create_qa_thread(conn, "agent-a")
+        answer_id, answerer_id = _create_answer(conn, tid, "agent-b")
 
         with pytest.raises(ForumForbidden):
             accept_answer(conn, tid, answer_id, answerer_id)
 
     def test_409_non_qa_thread(self, conn):
         """Accept on a non-qa-kind thread raises ForumConflict."""
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         tid, _ = create_thread(conn, agent_id, "inter-agent", "T", "body")
         answer_id = create_reply(conn, agent_id, tid, "reply")
 
@@ -304,7 +304,7 @@ class TestAcceptAnswerDb:
 
     def test_404_thread_not_found(self, conn):
         """Missing thread raises ForumNotFound."""
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         with pytest.raises(ForumNotFound):
             accept_answer(conn, 9999, 1, agent_id)
 
@@ -317,7 +317,7 @@ class TestAcceptAnswerDb:
     def test_409_post_not_in_thread(self, conn):
         """Post from a different thread raises ForumConflict."""
         # Create two q-and-a threads
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         tid1, _ = create_thread(conn, agent_id, "q-and-a", "Q1?", "body1")
         tid2, _ = create_thread(conn, agent_id, "q-and-a", "Q2?", "body2")
         # Answer in thread 2
@@ -330,8 +330,8 @@ class TestAcceptAnswerDb:
     def test_re_accept_updates_marker(self, conn):
         """Re-accepting with a different post updates accepted_answer_post_id."""
         tid, _, asker_id = _create_qa_thread(conn)
-        answer1_id, _ = _create_answer(conn, tid, "borges")
-        answer2_id, _ = _create_answer(conn, tid, "luria")
+        answer1_id, _ = _create_answer(conn, tid, "agent-b")
+        answer2_id, _ = _create_answer(conn, tid, "agent-c")
 
         accept_answer(conn, tid, answer1_id, asker_id)
         accept_answer(conn, tid, answer2_id, asker_id)
@@ -376,20 +376,20 @@ class TestVerifyPostDb:
     def test_happy_path(self, conn):
         """Verifier can verify another agent's post."""
         tid, _, _ = _create_qa_thread(conn)
-        answer_id, _ = _create_answer(conn, tid, "borges")
-        verifier_id = upsert_agent(conn, "luria")
+        answer_id, _ = _create_answer(conn, tid, "agent-b")
+        verifier_id = upsert_agent(conn, "agent-c")
 
         result = verify_post(conn, answer_id, verifier_id, "The logic holds.")
 
         assert result["post_id"] == answer_id
-        assert result["verifier"] == "luria"
+        assert result["verifier"] == "agent-c"
         assert result["note"] == "The logic holds."
 
     def test_400_empty_note_endpoint_layer(self, conn):
         """Empty note raises ForumBadRequest (endpoint layer check)."""
         tid, _, _ = _create_qa_thread(conn)
-        answer_id, _ = _create_answer(conn, tid, "borges")
-        verifier_id = upsert_agent(conn, "luria")
+        answer_id, _ = _create_answer(conn, tid, "agent-b")
+        verifier_id = upsert_agent(conn, "agent-c")
 
         with pytest.raises(ForumBadRequest, match="note is required"):
             verify_post(conn, answer_id, verifier_id, "")
@@ -397,8 +397,8 @@ class TestVerifyPostDb:
     def test_400_whitespace_only_note(self, conn):
         """Whitespace-only note raises ForumBadRequest."""
         tid, _, _ = _create_qa_thread(conn)
-        answer_id, _ = _create_answer(conn, tid, "borges")
-        verifier_id = upsert_agent(conn, "luria")
+        answer_id, _ = _create_answer(conn, tid, "agent-b")
+        verifier_id = upsert_agent(conn, "agent-c")
 
         with pytest.raises(ForumBadRequest):
             verify_post(conn, answer_id, verifier_id, "   \t\n  ")
@@ -406,14 +406,14 @@ class TestVerifyPostDb:
     def test_403_self_verify(self, conn):
         """Author cannot verify their own post."""
         tid, _, _ = _create_qa_thread(conn)
-        answer_id, answerer_id = _create_answer(conn, tid, "borges")
+        answer_id, answerer_id = _create_answer(conn, tid, "agent-b")
 
         with pytest.raises(ForumForbidden, match="own post"):
             verify_post(conn, answer_id, answerer_id, "I verified myself")
 
     def test_404_post_not_found(self, conn):
         """Missing post raises ForumNotFound."""
-        verifier_id = upsert_agent(conn, "luria")
+        verifier_id = upsert_agent(conn, "agent-c")
 
         with pytest.raises(ForumNotFound):
             verify_post(conn, 9999, verifier_id, "a note")
@@ -421,8 +421,8 @@ class TestVerifyPostDb:
     def test_upsert_on_repeat(self, conn):
         """Repeat verify by same agent updates note, not duplicates row."""
         tid, _, _ = _create_qa_thread(conn)
-        answer_id, _ = _create_answer(conn, tid, "borges")
-        verifier_id = upsert_agent(conn, "luria")
+        answer_id, _ = _create_answer(conn, tid, "agent-b")
+        verifier_id = upsert_agent(conn, "agent-c")
 
         verify_post(conn, answer_id, verifier_id, "Initial note.")
         verify_post(conn, answer_id, verifier_id, "Updated note.")
@@ -437,23 +437,23 @@ class TestVerifyPostDb:
     def test_multiple_distinct_verifiers(self, conn):
         """Multiple verifiers accumulate separate rows."""
         tid, _, _ = _create_qa_thread(conn)
-        answer_id, _ = _create_answer(conn, tid, "borges")
-        v1_id = upsert_agent(conn, "luria")
-        v2_id = upsert_agent(conn, "aleph")
+        answer_id, _ = _create_answer(conn, tid, "agent-b")
+        v1_id = upsert_agent(conn, "agent-c")
+        v2_id = upsert_agent(conn, "agent-d")
 
-        verify_post(conn, answer_id, v1_id, "Luria's note.")
-        verify_post(conn, answer_id, v2_id, "Aleph's note.")
+        verify_post(conn, answer_id, v1_id, "Agent C's note.")
+        verify_post(conn, answer_id, v2_id, "Agent D's note.")
 
         verifications = get_post_verifications(conn, answer_id)
         assert len(verifications) == 2
         verifiers = {v["verifier"] for v in verifications}
-        assert verifiers == {"luria", "aleph"}
+        assert verifiers == {"agent-c", "agent-d"}
 
     def test_note_is_stripped(self, conn):
         """Leading/trailing whitespace is stripped from the stored note."""
         tid, _, _ = _create_qa_thread(conn)
-        answer_id, _ = _create_answer(conn, tid, "borges")
-        verifier_id = upsert_agent(conn, "luria")
+        answer_id, _ = _create_answer(conn, tid, "agent-b")
+        verifier_id = upsert_agent(conn, "agent-c")
 
         result = verify_post(conn, answer_id, verifier_id, "  padded note  ")
         assert result["note"] == "padded note"
@@ -466,20 +466,20 @@ class TestVerifyPostDb:
 class TestGetPostVerifications:
     def test_empty_when_none(self, conn):
         tid, _, _ = _create_qa_thread(conn)
-        answer_id, _ = _create_answer(conn, tid, "borges")
+        answer_id, _ = _create_answer(conn, tid, "agent-b")
         result = get_post_verifications(conn, answer_id)
         assert result == []
 
     def test_returns_verifier_note_created_at(self, conn):
         tid, _, _ = _create_qa_thread(conn)
-        answer_id, _ = _create_answer(conn, tid, "borges")
-        verifier_id = upsert_agent(conn, "luria")
+        answer_id, _ = _create_answer(conn, tid, "agent-b")
+        verifier_id = upsert_agent(conn, "agent-c")
         verify_post(conn, answer_id, verifier_id, "My note.")
 
         result = get_post_verifications(conn, answer_id)
         assert len(result) == 1
         v = result[0]
-        assert v["verifier"] == "luria"
+        assert v["verifier"] == "agent-c"
         assert v["note"] == "My note."
         assert "created_at" in v
 
@@ -491,13 +491,13 @@ class TestGetPostVerifications:
 class TestEvidenceBadge:
     def test_citation_count_correct(self, conn):
         """Posts with N citation patterns report citation_count=N via get_thread."""
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         tid, _ = create_thread(
             conn, agent_id, "q-and-a", "Q?",
             "OB 0001 DV 0042",  # 2 citations in OP
         )
         # Reply with 3 citations
-        replier_id = upsert_agent(conn, "borges")
+        replier_id = upsert_agent(conn, "agent-b")
         create_reply(conn, replier_id, tid, "AX 0001 OB 0002 LS 0007")
 
         _, posts = get_thread(conn, tid)
@@ -507,14 +507,14 @@ class TestEvidenceBadge:
 
     def test_zero_citation_count(self, conn):
         """Posts without citations report citation_count=0."""
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         tid, _ = create_thread(conn, agent_id, "q-and-a", "Q?", "no citations here")
         _, posts = get_thread(conn, tid)
         assert posts[0]["citation_count"] == 0
 
     def test_lowercase_citations_not_counted(self, conn):
         """Lowercase 'ob 0001' does not match CITATION_RE (uppercase convention)."""
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         # Only the uppercase reference is a real citation
         tid, _ = create_thread(
             conn, agent_id, "inter-agent", "T",
@@ -532,7 +532,7 @@ class TestGetThreadQA:
     def test_accepted_answer_post_id_present(self, conn):
         """get_thread thread dict includes accepted_answer_post_id."""
         tid, _, asker_id = _create_qa_thread(conn)
-        answer_id, _ = _create_answer(conn, tid, "borges")
+        answer_id, _ = _create_answer(conn, tid, "agent-b")
         accept_answer(conn, tid, answer_id, asker_id)
 
         thread_dict, _ = get_thread(conn, tid)
@@ -549,14 +549,14 @@ class TestGetThreadQA:
     def test_verifications_in_posts(self, conn):
         """Each post dict from get_thread includes verifications list."""
         tid, _, _ = _create_qa_thread(conn)
-        answer_id, _ = _create_answer(conn, tid, "borges")
-        verifier_id = upsert_agent(conn, "luria")
+        answer_id, _ = _create_answer(conn, tid, "agent-b")
+        verifier_id = upsert_agent(conn, "agent-c")
         verify_post(conn, answer_id, verifier_id, "Verified.")
 
         _, posts = get_thread(conn, tid)
         answer_post = next(p for p in posts if p["id"] == answer_id)
         assert len(answer_post["verifications"]) == 1
-        assert answer_post["verifications"][0]["verifier"] == "luria"
+        assert answer_post["verifications"][0]["verifier"] == "agent-c"
 
 
 # ---------------------------------------------------------------------------
@@ -564,7 +564,7 @@ class TestGetThreadQA:
 # ---------------------------------------------------------------------------
 
 class TestAcceptEndpoint:
-    def _create_qa_thread_via_api(self, client, asker="ariadne", title="Q?"):
+    def _create_qa_thread_via_api(self, client, asker="agent-a", title="Q?"):
         resp = client.post(
             "/api/post",
             json={
@@ -578,7 +578,7 @@ class TestAcceptEndpoint:
         data = json.loads(resp.data)
         return data["thread_id"], data["post_id"]
 
-    def _create_answer_via_api(self, client, thread_id, answerer="borges"):
+    def _create_answer_via_api(self, client, thread_id, answerer="agent-b"):
         resp = client.post(
             "/api/post",
             json={
@@ -596,7 +596,7 @@ class TestAcceptEndpoint:
 
         resp = client.post(
             f"/api/thread/{tid}/accept",
-            json={"agent": "ariadne", "post_id": answer_id},
+            json={"agent": "agent-a", "post_id": answer_id},
         )
         assert resp.status_code == 200
         data = json.loads(resp.data)
@@ -604,12 +604,12 @@ class TestAcceptEndpoint:
         assert data["unresolved"] is False
 
     def test_403_non_asker(self, client):
-        tid, _ = self._create_qa_thread_via_api(client, asker="ariadne")
-        answer_id = self._create_answer_via_api(client, tid, answerer="borges")
+        tid, _ = self._create_qa_thread_via_api(client, asker="agent-a")
+        answer_id = self._create_answer_via_api(client, tid, answerer="agent-b")
 
         resp = client.post(
             f"/api/thread/{tid}/accept",
-            json={"agent": "borges", "post_id": answer_id},
+            json={"agent": "agent-b", "post_id": answer_id},
         )
         assert resp.status_code == 403
 
@@ -618,7 +618,7 @@ class TestAcceptEndpoint:
         resp = client.post(
             "/api/post",
             json={
-                "agent": "ariadne",
+                "agent": "agent-a",
                 "category_slug": "inter-agent",
                 "title": "Not a Q&A",
                 "body_md": "body",
@@ -629,14 +629,14 @@ class TestAcceptEndpoint:
 
         resp = client.post(
             f"/api/thread/{tid}/accept",
-            json={"agent": "ariadne", "post_id": answer_id},
+            json={"agent": "agent-a", "post_id": answer_id},
         )
         assert resp.status_code == 409
 
     def test_404_missing_thread(self, client):
         resp = client.post(
             "/api/thread/9999/accept",
-            json={"agent": "ariadne", "post_id": 1},
+            json={"agent": "agent-a", "post_id": 1},
         )
         assert resp.status_code == 404
 
@@ -644,7 +644,7 @@ class TestAcceptEndpoint:
         tid, _ = self._create_qa_thread_via_api(client)
         resp = client.post(
             f"/api/thread/{tid}/accept",
-            json={"agent": "ariadne", "post_id": 9999},
+            json={"agent": "agent-a", "post_id": 9999},
         )
         assert resp.status_code == 404
 
@@ -656,7 +656,7 @@ class TestAcceptEndpoint:
 
         resp = client.post(
             f"/api/thread/{tid1}/accept",
-            json={"agent": "ariadne", "post_id": answer_id},
+            json={"agent": "agent-a", "post_id": answer_id},
         )
         assert resp.status_code == 409
 
@@ -665,35 +665,35 @@ class TestAcceptEndpoint:
         tid, op_post_id = self._create_qa_thread_via_api(client)
         resp = client.post(
             f"/api/thread/{tid}/accept",
-            json={"agent": "ariadne", "post_id": op_post_id},
+            json={"agent": "agent-a", "post_id": op_post_id},
         )
         assert resp.status_code == 409
 
     def test_re_accept_updates_marker(self, client):
         tid, _ = self._create_qa_thread_via_api(client)
-        a1 = self._create_answer_via_api(client, tid, "borges")
-        a2 = self._create_answer_via_api(client, tid, "luria")
+        a1 = self._create_answer_via_api(client, tid, "agent-b")
+        a2 = self._create_answer_via_api(client, tid, "agent-c")
 
         client.post(
             f"/api/thread/{tid}/accept",
-            json={"agent": "ariadne", "post_id": a1},
+            json={"agent": "agent-a", "post_id": a1},
         )
         resp = client.post(
             f"/api/thread/{tid}/accept",
-            json={"agent": "ariadne", "post_id": a2},
+            json={"agent": "agent-a", "post_id": a2},
         )
         assert resp.status_code == 200
         data = json.loads(resp.data)
         assert data["accepted_answer_post_id"] == a2
 
     def test_self_answer_accept_allowed(self, client):
-        tid, _ = self._create_qa_thread_via_api(client, asker="ariadne")
+        tid, _ = self._create_qa_thread_via_api(client, asker="agent-a")
         # Asker writes a self-answer
-        self_answer_id = self._create_answer_via_api(client, tid, answerer="ariadne")
+        self_answer_id = self._create_answer_via_api(client, tid, answerer="agent-a")
 
         resp = client.post(
             f"/api/thread/{tid}/accept",
-            json={"agent": "ariadne", "post_id": self_answer_id},
+            json={"agent": "agent-a", "post_id": self_answer_id},
         )
         assert resp.status_code == 200
 
@@ -707,7 +707,7 @@ class TestAcceptEndpoint:
     def test_400_missing_post_id(self, client):
         resp = client.post(
             "/api/thread/1/accept",
-            json={"agent": "ariadne"},
+            json={"agent": "agent-a"},
         )
         assert resp.status_code == 400
 
@@ -718,7 +718,7 @@ class TestVerifyEndpoint:
         resp = client.post(
             "/api/post",
             json={
-                "agent": "ariadne",
+                "agent": "agent-a",
                 "category_slug": "q-and-a",
                 "title": "Q?",
                 "body_md": "My question.",
@@ -727,7 +727,7 @@ class TestVerifyEndpoint:
         tid = json.loads(resp.data)["thread_id"]
         resp2 = client.post(
             "/api/post",
-            json={"agent": "borges", "thread_id": tid, "body_md": "My answer."},
+            json={"agent": "agent-b", "thread_id": tid, "body_md": "My answer."},
         )
         pid = json.loads(resp2.data)["post_id"]
         return tid, pid
@@ -736,20 +736,20 @@ class TestVerifyEndpoint:
         _, pid = self._setup(client)
         resp = client.post(
             f"/api/post/{pid}/verify",
-            json={"agent": "luria", "note": "Checked the logic."},
+            json={"agent": "agent-c", "note": "Checked the logic."},
         )
         assert resp.status_code == 200
         data = json.loads(resp.data)
         assert "verification" in data
         assert "verifications" in data
-        assert data["verification"]["verifier"] == "luria"
+        assert data["verification"]["verifier"] == "agent-c"
         assert data["verification"]["note"] == "Checked the logic."
 
     def test_400_empty_note(self, client):
         _, pid = self._setup(client)
         resp = client.post(
             f"/api/post/{pid}/verify",
-            json={"agent": "luria", "note": ""},
+            json={"agent": "agent-c", "note": ""},
         )
         assert resp.status_code == 400
         data = json.loads(resp.data)
@@ -759,7 +759,7 @@ class TestVerifyEndpoint:
         _, pid = self._setup(client)
         resp = client.post(
             f"/api/post/{pid}/verify",
-            json={"agent": "luria", "note": "   "},
+            json={"agent": "agent-c", "note": "   "},
         )
         assert resp.status_code == 400
 
@@ -767,14 +767,14 @@ class TestVerifyEndpoint:
         _, pid = self._setup(client)
         resp = client.post(
             f"/api/post/{pid}/verify",
-            json={"agent": "borges", "note": "I verify my own work."},
+            json={"agent": "agent-b", "note": "I verify my own work."},
         )
         assert resp.status_code == 403
 
     def test_404_missing_post(self, client):
         resp = client.post(
             "/api/post/9999/verify",
-            json={"agent": "luria", "note": "some note"},
+            json={"agent": "agent-c", "note": "some note"},
         )
         assert resp.status_code == 404
 
@@ -782,47 +782,47 @@ class TestVerifyEndpoint:
         _, pid = self._setup(client)
         client.post(
             f"/api/post/{pid}/verify",
-            json={"agent": "luria", "note": "Initial note."},
+            json={"agent": "agent-c", "note": "Initial note."},
         )
         resp = client.post(
             f"/api/post/{pid}/verify",
-            json={"agent": "luria", "note": "Updated note."},
+            json={"agent": "agent-c", "note": "Updated note."},
         )
         assert resp.status_code == 200
         data = json.loads(resp.data)
-        # Only one verification from luria
-        luria_verifs = [v for v in data["verifications"] if v["verifier"] == "luria"]
-        assert len(luria_verifs) == 1
-        assert luria_verifs[0]["note"] == "Updated note."
+        # Only one verification from agent-c
+        agent_c_verifs = [v for v in data["verifications"] if v["verifier"] == "agent-c"]
+        assert len(agent_c_verifs) == 1
+        assert agent_c_verifs[0]["note"] == "Updated note."
 
     def test_multiple_verifiers_accumulate(self, client):
         _, pid = self._setup(client)
         client.post(
             f"/api/post/{pid}/verify",
-            json={"agent": "luria", "note": "Luria's note."},
+            json={"agent": "agent-c", "note": "Agent C's note."},
         )
         client.post(
             f"/api/post/{pid}/verify",
-            json={"agent": "aleph", "note": "Aleph's note."},
+            json={"agent": "agent-d", "note": "Agent D's note."},
         )
 
         resp = client.get(f"/api/thread/{self._setup(client)[0]}")  # noqa — separate thread
         # Directly check via verify endpoint return
         resp2 = client.post(
             f"/api/post/{pid}/verify",
-            json={"agent": "luria", "note": "Luria again."},
+            json={"agent": "agent-c", "note": "Agent-c again."},
         )
         data = json.loads(resp2.data)
         verifiers = {v["verifier"] for v in data["verifications"]}
-        assert "luria" in verifiers
-        assert "aleph" in verifiers
+        assert "agent-c" in verifiers
+        assert "agent-d" in verifiers
 
     def test_note_html_in_response(self, client):
         """note_html is present and sanitized in the verify response."""
         _, pid = self._setup(client)
         resp = client.post(
             f"/api/post/{pid}/verify",
-            json={"agent": "luria", "note": "**bold** note"},
+            json={"agent": "agent-c", "note": "**bold** note"},
         )
         data = json.loads(resp.data)
         assert "note_html" in data["verification"]
@@ -841,7 +841,7 @@ class TestVerifyEndpoint:
 # ---------------------------------------------------------------------------
 
 class TestGetThreadApiAdditive:
-    def _create_qa_thread(self, client, asker="ariadne"):
+    def _create_qa_thread(self, client, asker="agent-a"):
         resp = client.post(
             "/api/post",
             json={
@@ -897,21 +897,21 @@ class TestGetThreadApiAdditive:
         # Reply
         resp = client.post(
             "/api/post",
-            json={"agent": "borges", "thread_id": tid, "body_md": "answer"},
+            json={"agent": "agent-b", "thread_id": tid, "body_md": "answer"},
         )
         answer_pid = json.loads(resp.data)["post_id"]
 
         # Verify
         client.post(
             f"/api/post/{answer_pid}/verify",
-            json={"agent": "luria", "note": "Solid reasoning."},
+            json={"agent": "agent-c", "note": "Solid reasoning."},
         )
 
         resp2 = client.get(f"/api/thread/{tid}")
         data = json.loads(resp2.data)
         answer_post = next(p for p in data["posts"] if p["id"] == answer_pid)
         assert len(answer_post["verifications"]) == 1
-        assert answer_post["verifications"][0]["verifier"] == "luria"
+        assert answer_post["verifications"][0]["verifier"] == "agent-c"
         assert "note_html" in answer_post["verifications"][0]
 
     def test_accepted_answer_appears_in_thread_response(self, client):
@@ -919,12 +919,12 @@ class TestGetThreadApiAdditive:
         tid = self._create_qa_thread(client)
         resp = client.post(
             "/api/post",
-            json={"agent": "borges", "thread_id": tid, "body_md": "answer"},
+            json={"agent": "agent-b", "thread_id": tid, "body_md": "answer"},
         )
         answer_pid = json.loads(resp.data)["post_id"]
         client.post(
             f"/api/thread/{tid}/accept",
-            json={"agent": "ariadne", "post_id": answer_pid},
+            json={"agent": "agent-a", "post_id": answer_pid},
         )
 
         resp2 = client.get(f"/api/thread/{tid}")

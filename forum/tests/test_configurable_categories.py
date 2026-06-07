@@ -360,7 +360,7 @@ class TestBehaviorFollowsKind:
     def test_non_qa_slug_with_qa_kind_born_unresolved(self):
         """A category with slug != 'q-and-a' but kind='qa' produces unresolved=1 threads."""
         c = self._conn_with_custom_qa_slug("questions")
-        agent_id = upsert_agent(c, "ariadne")
+        agent_id = upsert_agent(c, "agent-a")
         tid, _ = create_thread(c, agent_id, "questions", "A question?", "body")
         row = c.execute("SELECT unresolved FROM threads WHERE id=?", (tid,)).fetchone()
         assert row[0] == 1, "Thread in kind='qa' category should be born unresolved=1"
@@ -369,8 +369,8 @@ class TestBehaviorFollowsKind:
     def test_non_qa_slug_with_qa_kind_accept_answer_permitted(self):
         """accept_answer is permitted in a kind='qa' category regardless of slug."""
         c = self._conn_with_custom_qa_slug("questions")
-        asker_id = upsert_agent(c, "ariadne")
-        answerer_id = upsert_agent(c, "borges")
+        asker_id = upsert_agent(c, "agent-a")
+        answerer_id = upsert_agent(c, "agent-b")
         tid, _ = create_thread(c, asker_id, "questions", "A question?", "body")
         answer_id = create_reply(c, answerer_id, tid, "An answer")
 
@@ -387,7 +387,7 @@ class TestBehaviorFollowsKind:
     def test_discussion_kind_thread_born_resolved(self):
         """A category with kind='discussion' produces unresolved=0 threads."""
         c = self._conn_with_custom_qa_slug("questions")
-        agent_id = upsert_agent(c, "ariadne")
+        agent_id = upsert_agent(c, "agent-a")
         tid, _ = create_thread(c, agent_id, "discussion-cat", "A topic", "body")
         row = c.execute("SELECT unresolved FROM threads WHERE id=?", (tid,)).fetchone()
         assert row[0] == 0, "Thread in kind='discussion' category should be born unresolved=0"
@@ -396,7 +396,7 @@ class TestBehaviorFollowsKind:
     def test_discussion_kind_accept_answer_raises_conflict(self):
         """accept_answer raises ForumConflict in a kind='discussion' category."""
         c = self._conn_with_custom_qa_slug("questions")
-        agent_id = upsert_agent(c, "ariadne")
+        agent_id = upsert_agent(c, "agent-a")
         tid, _ = create_thread(c, agent_id, "discussion-cat", "A topic", "body")
         answer_id = create_reply(c, agent_id, tid, "A reply")
 
@@ -407,7 +407,7 @@ class TestBehaviorFollowsKind:
     def test_renamed_qa_slug_keeps_semantics(self):
         """Slug renamed to 'tech-questions' with kind='qa' retains question semantics."""
         c = self._conn_with_custom_qa_slug("tech-questions")
-        agent_id = upsert_agent(c, "ariadne")
+        agent_id = upsert_agent(c, "agent-a")
         kind = category_kind(c, "tech-questions")
         assert kind == "qa"
         tid, _ = create_thread(c, agent_id, "tech-questions", "Tech Q?", "body")

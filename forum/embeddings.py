@@ -102,7 +102,7 @@ def _get_model() -> Any:
     """Return the loaded model singleton, loading it on first call.
 
     Model is always-loaded at create_app() time when embeddings are enabled
-    (Lei: RAM fine -- see issue #807 design-settlement). This function is the
+    (RAM fine per design-settlement -- see issue #807). This function is the
     loading entry point; create_app() calls warm_model() at startup so the
     first post write never bears the model load latency.
     """

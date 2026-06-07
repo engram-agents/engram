@@ -70,7 +70,7 @@ class TestSearchEndpoint:
 
     def test_q_match_title_returns_thread(self, client):
         """A thread whose title matches q appears in results."""
-        _post_thread(client, "ariadne", "inter-agent", "unique-title-xyz", "some body text")
+        _post_thread(client, "agent-a", "inter-agent", "unique-title-xyz", "some body text")
         resp = client.get("/search?q=unique-title-xyz")
         assert resp.status_code == 200
         html = resp.data.decode("utf-8")
@@ -78,7 +78,7 @@ class TestSearchEndpoint:
 
     def test_q_match_body_returns_thread(self, client):
         """A thread with a matching post body appears in results even if title doesn't match."""
-        _post_thread(client, "borges", "cold-start", "Unrelated title", "distinctive-body-content-abc")
+        _post_thread(client, "agent-b", "cold-start", "Unrelated title", "distinctive-body-content-abc")
         resp = client.get("/search?q=distinctive-body-content-abc")
         assert resp.status_code == 200
         html = resp.data.decode("utf-8")
@@ -86,7 +86,7 @@ class TestSearchEndpoint:
 
     def test_q_no_match_returns_empty_200(self, client):
         """A query that matches nothing returns 200 with no thread cards."""
-        _post_thread(client, "ariadne", "inter-agent", "Something here", "body content here")
+        _post_thread(client, "agent-a", "inter-agent", "Something here", "body content here")
         resp = client.get("/search?q=zzz-no-match-zzz")
         assert resp.status_code == 200
         html = resp.data.decode("utf-8")
@@ -95,7 +95,7 @@ class TestSearchEndpoint:
 
     def test_empty_q_returns_200(self, client):
         """Missing or empty q returns 200 (not 500) with no results."""
-        _post_thread(client, "ariadne", "inter-agent", "Some thread", "body")
+        _post_thread(client, "agent-a", "inter-agent", "Some thread", "body")
         resp = client.get("/search")
         assert resp.status_code == 200
         resp2 = client.get("/search?q=")
@@ -103,14 +103,14 @@ class TestSearchEndpoint:
 
     def test_empty_q_does_not_show_threads(self, client):
         """Empty q renders the search page without listing any threads."""
-        _post_thread(client, "ariadne", "inter-agent", "Some thread", "body")
+        _post_thread(client, "agent-a", "inter-agent", "Some thread", "body")
         resp = client.get("/search?q=")
         html = resp.data.decode("utf-8")
         assert "Some thread" not in html
 
     def test_sql_injection_shape_returns_safely(self, client):
         """q=%' OR 1=1 -- is handled safely (parameterised; no 500)."""
-        _post_thread(client, "ariadne", "inter-agent", "Normal thread", "body text")
+        _post_thread(client, "agent-a", "inter-agent", "Normal thread", "body text")
         resp = client.get("/search?q=%25%27+OR+1%3D1+--")
         assert resp.status_code == 200
         # Must not return ALL threads (injection would match everything)
@@ -129,7 +129,7 @@ class TestSearchEndpoint:
 
     def test_search_results_link_to_thread(self, client):
         """Each result links to /thread/<id>."""
-        tid = _post_thread(client, "ariadne", "inter-agent", "Link-test thread", "link body")
+        tid = _post_thread(client, "agent-a", "inter-agent", "Link-test thread", "link body")
         resp = client.get("/search?q=Link-test")
         assert resp.status_code == 200
         html = resp.data.decode("utf-8")
@@ -137,7 +137,7 @@ class TestSearchEndpoint:
 
     def test_search_result_shows_category_chip(self, client):
         """Results include the category chip."""
-        _post_thread(client, "ariadne", "cold-start", "Chip thread title", "body")
+        _post_thread(client, "agent-a", "cold-start", "Chip thread title", "body")
         resp = client.get("/search?q=Chip+thread+title")
         assert resp.status_code == 200
         html = resp.data.decode("utf-8")
@@ -146,8 +146,8 @@ class TestSearchEndpoint:
 
     def test_nonmatching_thread_not_in_results(self, client):
         """Threads that do NOT match q are absent from the results."""
-        _post_thread(client, "ariadne", "inter-agent", "Alpha thread", "alpha body")
-        _post_thread(client, "borges", "cold-start", "Beta thread", "beta body")
+        _post_thread(client, "agent-a", "inter-agent", "Alpha thread", "alpha body")
+        _post_thread(client, "agent-b", "cold-start", "Beta thread", "beta body")
         resp = client.get("/search?q=Alpha+thread")
         assert resp.status_code == 200
         html = resp.data.decode("utf-8")

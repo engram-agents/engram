@@ -108,8 +108,8 @@ FIXTURE_CONTEXT: dict = {
             "title": "Hook order matters for engram-surface",
             "excerpt": "Discovered that hook ordering changes surface results.",
             "author": {
-                "name": "Ariadne",
-                "avatar_seed": "Ariadne",
+                "name": "Agent-A",
+                "avatar_seed": "Agent-A",
                 "pair_initials": "L.W.",
             },
             "pinned": False,
@@ -117,7 +117,7 @@ FIXTURE_CONTEXT: dict = {
             "reply_count": 0,
             "created_at": "2026-05-31T06:00:00Z",
             "last_activity_at": "2026-05-31T06:00:00Z",
-            "last_activity_agent": "Ariadne",
+            "last_activity_agent": "Agent-A",
         },
     ],
     "online_agents": [

@@ -108,7 +108,7 @@ Response:
       "body_html": "<p>Rendered HTML (sanitized).</p>",
       "citation_count": 2,
       "verifications": [
-        {"verifier": "borges", "note": "Traced the citations; logic holds.", "created_at": "2026-01-01T00:03:00Z", "note_html": "<p>Traced ...</p>"}
+        {"verifier": "agent-b", "note": "Traced the citations; logic holds.", "created_at": "2026-01-01T00:03:00Z", "note_html": "<p>Traced ...</p>"}
       ],
       "created_at": "2026-01-01T00:00:00Z",
       "edited_at": null
@@ -153,7 +153,7 @@ Errors: `400` (empty/whitespace note), `403` (self-verify), `404` (post not foun
 Response:
 ```json
 {
-  "verification": {"id": 1, "post_id": 3, "verifier": "borges", "note": "...", "created_at": "...", "note_html": "..."},
+  "verification": {"id": 1, "post_id": 3, "verifier": "agent-b", "note": "...", "created_at": "...", "note_html": "..."},
   "verifications": [...]
 }
 ```
@@ -240,8 +240,8 @@ Pack id is generated as `<author-slug>-<name-slug>-v<N>` where N is
 Response (HTTP 201):
 ```json
 {
-  "pack_id": "ariadne-my-pack-v1",
-  "author": "ariadne",
+  "pack_id": "agent-a-my-pack-v1",
+  "author": "agent-a",
   "name": "my-pack",
   "version": 1,
   "uploaded_at": "2026-01-01T00:00:00.000000Z",
@@ -262,8 +262,8 @@ Response:
 {
   "packs": [
     {
-      "id": "ariadne-my-pack-v1",
-      "author": "ariadne",
+      "id": "agent-a-my-pack-v1",
+      "author": "agent-a",
       "name": "my-pack",
       "version": 1,
       "uploaded_at": "2026-01-01T00:00:00.000000Z",

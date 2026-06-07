@@ -92,33 +92,33 @@ class TestSchemaMigration:
 
 class TestUpsertAgent:
     def test_creates_agent_on_first_call(self, conn):
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         assert isinstance(agent_id, int)
         row = conn.execute("SELECT name FROM agents WHERE id = ?", (agent_id,)).fetchone()
-        assert row[0] == "ariadne"
+        assert row[0] == "agent-a"
 
     def test_returns_same_id_on_repeat(self, conn):
-        id1 = upsert_agent(conn, "ariadne")
-        id2 = upsert_agent(conn, "ariadne")
+        id1 = upsert_agent(conn, "agent-a")
+        id2 = upsert_agent(conn, "agent-a")
         assert id1 == id2
 
     def test_bumps_last_seen_at(self, conn):
-        upsert_agent(conn, "borges")
-        ts1 = conn.execute("SELECT last_seen_at FROM agents WHERE name='borges'").fetchone()[0]
+        upsert_agent(conn, "agent-b")
+        ts1 = conn.execute("SELECT last_seen_at FROM agents WHERE name='agent-b'").fetchone()[0]
         import time; time.sleep(0.01)
-        upsert_agent(conn, "borges")
-        ts2 = conn.execute("SELECT last_seen_at FROM agents WHERE name='borges'").fetchone()[0]
+        upsert_agent(conn, "agent-b")
+        ts2 = conn.execute("SELECT last_seen_at FROM agents WHERE name='agent-b'").fetchone()[0]
         assert ts2 >= ts1
 
     def test_avatar_seed_defaults_to_name(self, conn):
-        agent_id = upsert_agent(conn, "luria")
+        agent_id = upsert_agent(conn, "agent-c")
         row = conn.execute("SELECT avatar_seed FROM agents WHERE id = ?", (agent_id,)).fetchone()
-        assert row[0] == "luria"
+        assert row[0] == "agent-c"
 
 
 class TestCreateThread:
     def test_creates_thread_and_post(self, conn):
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         thread_id, post_id = create_thread(conn, agent_id, "inter-agent", "Hello", "Hello world")
         assert isinstance(thread_id, int)
         assert isinstance(post_id, int)
@@ -128,7 +128,7 @@ class TestCreateThread:
         assert post_row[0] == "Hello world"
 
     def test_thread_count_increments(self, conn):
-        agent_id = upsert_agent(conn, "borges")
+        agent_id = upsert_agent(conn, "agent-b")
         before = count_open_threads(conn)
         create_thread(conn, agent_id, "inter-agent", "New thread", "body")
         after = count_open_threads(conn)
@@ -137,7 +137,7 @@ class TestCreateThread:
 
 class TestCreateReply:
     def test_creates_reply_post(self, conn):
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         thread_id, _ = create_thread(conn, agent_id, "inter-agent", "Thread", "OP body")
         post_id = create_reply(conn, agent_id, thread_id, "Reply body")
         assert isinstance(post_id, int)
@@ -145,7 +145,7 @@ class TestCreateReply:
         assert row[0] == "Reply body"
 
     def test_bumps_thread_last_activity(self, conn):
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         thread_id, _ = create_thread(conn, agent_id, "inter-agent", "Thread", "OP body")
         import time; time.sleep(0.01)
         before = conn.execute(
@@ -164,14 +164,14 @@ class TestListThreads:
         return create_thread(conn, agent_id, category, title, body)
 
     def test_returns_thread_list(self, conn):
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         self._make_thread(conn, agent_id, "T1")
         self._make_thread(conn, agent_id, "T2")
         threads = list_threads(conn)
         assert len(threads) == 2
 
     def test_thread_dict_has_required_fields(self, conn):
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         self._make_thread(conn, agent_id, "T1")
         threads = list_threads(conn)
         t = threads[0]
@@ -184,14 +184,14 @@ class TestListThreads:
         assert "pair_initials" in t["author"]
 
     def test_excerpt_truncates_at_200(self, conn):
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         long_body = "x" * 300
         create_thread(conn, agent_id, "inter-agent", "Long", long_body)
         threads = list_threads(conn)
         assert len(threads[0]["excerpt"]) <= 200
 
     def test_since_filter(self, conn):
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         # Create a thread, then record a timestamp, then create another
         t1_id, _ = create_thread(conn, agent_id, "inter-agent", "Old", "old body")
         # Force old thread to have old last_activity_at
@@ -216,7 +216,7 @@ class TestListThreads:
         _now_iso() now uses strftime('%Y-%m-%dT%H:%M:%S.%fZ') which always emits 6-digit
         micros, making all comparison timestamps byte-comparable.
         """
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
         cursor_ts = base.strftime("%Y-%m-%dT%H:%M:%S.%fZ")   # ...000000Z
         post_ts = (base + timedelta(microseconds=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")  # ...000001Z
@@ -240,7 +240,7 @@ class TestListThreads:
         last_activity_at == X is NOT returned (the acked thread must not
         re-appear as new on the next poll).  With >=, the acked thread would
         be re-counted — the off-by-one fixed by this PR (#703 Part 3)."""
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         cursor_ts = "2024-06-03T12:00:00.000000Z"
         t_id, _ = create_thread(conn, agent_id, "inter-agent", "Acked", "body")
         conn.execute(
@@ -256,7 +256,7 @@ class TestListThreads:
         )
 
     def test_category_filter(self, conn):
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         create_thread(conn, agent_id, "inter-agent", "IA", "body")
         create_thread(conn, agent_id, "cold-start", "CS", "body")
         threads = list_threads(conn, category="inter-agent")
@@ -265,7 +265,7 @@ class TestListThreads:
 
     def test_sort_cited_by_citation_count(self, conn):
         """sort=cited orders threads by citation count DESC."""
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         create_thread(conn, agent_id, "inter-agent", "Many", "OB 0001 OB 0002 OB 0003")
         create_thread(conn, agent_id, "inter-agent", "Few", "OB 0001")
         create_thread(conn, agent_id, "inter-agent", "Zero", "no references")
@@ -275,7 +275,7 @@ class TestListThreads:
 
     def test_reply_count_excludes_op(self, conn):
         """reply_count = total posts - 1 (OP is not a reply)."""
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         thread_id, _ = create_thread(conn, agent_id, "inter-agent", "T", "OP")
         create_reply(conn, agent_id, thread_id, "Reply 1")
         create_reply(conn, agent_id, thread_id, "Reply 2")
@@ -290,7 +290,7 @@ class TestGetThread:
         assert posts == []
 
     def test_returns_thread_and_posts(self, conn):
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         thread_id, _ = create_thread(conn, agent_id, "inter-agent", "T", "OP body")
         create_reply(conn, agent_id, thread_id, "Reply")
         thread_dict, posts = get_thread(conn, thread_id)
@@ -299,7 +299,7 @@ class TestGetThread:
         assert len(posts) == 2  # OP + reply
 
     def test_posts_ordered_by_created_at(self, conn):
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         thread_id, _ = create_thread(conn, agent_id, "inter-agent", "T", "OP")
         create_reply(conn, agent_id, thread_id, "First reply")
         create_reply(conn, agent_id, thread_id, "Second reply")
@@ -325,7 +325,7 @@ class TestListCategories:
         assert orders[-1] == seeded_by_order[-1]
 
     def test_thread_count_live_computed(self, conn):
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         create_thread(conn, agent_id, "inter-agent", "T1", "body")
         create_thread(conn, agent_id, "inter-agent", "T2", "body")
         categories = list_categories(conn)
@@ -341,7 +341,7 @@ class TestListCategories:
 
 class TestCountCitations:
     def test_counts_citations_across_posts(self, conn):
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         thread_id, _ = create_thread(conn, agent_id, "inter-agent", "T", "OB 0001 DV 0002")
         create_reply(conn, agent_id, thread_id, "AX 0001 here")
         count = count_citations(conn)
@@ -365,65 +365,65 @@ class TestGetMentions:
 
     def test_empty_when_no_mentions(self, conn):
         """No mentions → empty list."""
-        self._make_thread(conn, "borges", "Borges thread")
-        result = get_mentions(conn, "ariadne")
+        self._make_thread(conn, "agent-b", "agent-b thread")
+        result = get_mentions(conn, "agent-a")
         assert result == []
 
     def test_reply_to_your_thread(self, conn):
-        """borges replying to ariadne's thread is a reply_to_your_thread mention."""
-        tid = self._make_thread(conn, "ariadne", "Ariadne thread")
-        self._make_reply(conn, "borges", tid, "borges reply")
-        result = get_mentions(conn, "ariadne")
+        """agent-b replying to agent-a's thread is a reply_to_your_thread mention."""
+        tid = self._make_thread(conn, "agent-a", "agent-a thread")
+        self._make_reply(conn, "agent-b", tid, "agent-b reply")
+        result = get_mentions(conn, "agent-a")
         assert len(result) == 1
         m = result[0]
         assert m["kind"] == "reply_to_your_thread"
-        assert m["author"] == "borges"
+        assert m["author"] == "agent-b"
         assert m["thread_id"] == tid
-        assert m["thread_title"] == "Ariadne thread"
+        assert m["thread_title"] == "agent-a thread"
 
     def test_at_mention(self, conn):
-        """@ariadne in a post body (in a thread ariadne didn't author) → at_mention."""
-        tid = self._make_thread(conn, "borges", "Borges thread")
-        self._make_reply(conn, "luria", tid, "Hey @ariadne, check this")
-        result = get_mentions(conn, "ariadne")
+        """@agent-a in a post body (in a thread agent-a didn't author) → at_mention."""
+        tid = self._make_thread(conn, "agent-b", "agent-b thread")
+        self._make_reply(conn, "agent-c", tid, "Hey @agent-a, check this")
+        result = get_mentions(conn, "agent-a")
         assert len(result) == 1
         assert result[0]["kind"] == "at_mention"
-        assert result[0]["author"] == "luria"
+        assert result[0]["author"] == "agent-c"
 
     def test_self_exclusion(self, conn):
-        """ariadne posting in her own thread (even with @ariadne) is excluded."""
-        tid = self._make_thread(conn, "ariadne", "Ariadne thread")
-        self._make_reply(conn, "ariadne", tid, "@ariadne self note")
-        result = get_mentions(conn, "ariadne")
+        """agent-a posting in their own thread (even with @agent-a) is excluded."""
+        tid = self._make_thread(conn, "agent-a", "agent-a thread")
+        self._make_reply(conn, "agent-a", tid, "@agent-a self note")
+        result = get_mentions(conn, "agent-a")
         assert result == []
 
     def test_dual_match_prefers_at_mention(self, conn):
         """Post matching both kinds → emitted once with kind=at_mention."""
-        tid = self._make_thread(conn, "ariadne", "Ariadne thread")
-        self._make_reply(conn, "borges", tid, "Hey @ariadne, replying here")
-        result = get_mentions(conn, "ariadne")
+        tid = self._make_thread(conn, "agent-a", "agent-a thread")
+        self._make_reply(conn, "agent-b", tid, "Hey @agent-a, replying here")
+        result = get_mentions(conn, "agent-a")
         assert len(result) == 1
         assert result[0]["kind"] == "at_mention"
 
     def test_at_mention_word_boundary_prefix(self, conn):
-        """@ari does NOT trigger a mention for agent 'ariadne'."""
-        tid = self._make_thread(conn, "borges", "Borges thread")
-        self._make_reply(conn, "luria", tid, "Hey @ari, how are you?")
-        result = get_mentions(conn, "ariadne")
-        assert result == [], "@ari must not match @ariadne (prefix word-boundary)"
+        """@ari (prefix) does NOT trigger a mention for agent 'agent-a'."""
+        tid = self._make_thread(conn, "agent-b", "agent-b thread")
+        self._make_reply(conn, "agent-c", tid, "Hey @ari, how are you?")
+        result = get_mentions(conn, "agent-a")
+        assert result == [], "@ari must not match @agent-a (prefix word-boundary)"
 
     def test_at_mention_word_boundary_suffix(self, conn):
-        """@ariadnex does NOT trigger a mention for agent 'ariadne'."""
-        tid = self._make_thread(conn, "borges", "Borges thread")
-        self._make_reply(conn, "luria", tid, "Talking to @ariadnex not you")
-        result = get_mentions(conn, "ariadne")
-        assert result == [], "@ariadnex must not match @ariadne (suffix word-boundary)"
+        """@agent-ax does NOT trigger a mention for agent 'agent-a'."""
+        tid = self._make_thread(conn, "agent-b", "agent-b thread")
+        self._make_reply(conn, "agent-c", tid, "Talking to @agent-ax not you")
+        result = get_mentions(conn, "agent-a")
+        assert result == [], "@agent-ax must not match @agent-a (suffix word-boundary)"
 
     def test_at_mention_exact_match(self, conn):
-        """@ariadne (exact) at end-of-string triggers mention."""
-        tid = self._make_thread(conn, "borges", "Borges thread")
-        self._make_reply(conn, "luria", tid, "ping @ariadne")
-        result = get_mentions(conn, "ariadne")
+        """@agent-a (exact) at end-of-string triggers mention."""
+        tid = self._make_thread(conn, "agent-b", "agent-b thread")
+        self._make_reply(conn, "agent-c", tid, "ping @agent-a")
+        result = get_mentions(conn, "agent-a")
         assert len(result) == 1
         assert result[0]["kind"] == "at_mention"
 
@@ -431,28 +431,28 @@ class TestGetMentions:
         """Posts before 'since' are excluded."""
         import time
         from datetime import datetime, timezone
-        tid = self._make_thread(conn, "ariadne", "Ariadne thread")
-        self._make_reply(conn, "borges", tid, "early reply")
+        tid = self._make_thread(conn, "agent-a", "agent-a thread")
+        self._make_reply(conn, "agent-b", tid, "early reply")
         time.sleep(0.02)
         since_ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         time.sleep(0.02)
-        self._make_reply(conn, "borges", tid, "late reply")
-        result = get_mentions(conn, "ariadne", since=since_ts)
+        self._make_reply(conn, "agent-b", tid, "late reply")
+        result = get_mentions(conn, "agent-a", since=since_ts)
         assert len(result) == 1
 
     def test_since_none_returns_all(self, conn):
         """since=None returns all mentions regardless of time."""
-        tid = self._make_thread(conn, "ariadne", "Ariadne thread")
-        self._make_reply(conn, "borges", tid, "reply 1")
-        self._make_reply(conn, "borges", tid, "reply 2")
-        result = get_mentions(conn, "ariadne", since=None)
+        tid = self._make_thread(conn, "agent-a", "agent-a thread")
+        self._make_reply(conn, "agent-b", tid, "reply 1")
+        self._make_reply(conn, "agent-b", tid, "reply 2")
+        result = get_mentions(conn, "agent-a", since=None)
         assert len(result) == 2
 
     def test_result_fields(self, conn):
         """Each mention dict contains the required fields with correct types."""
-        tid = self._make_thread(conn, "ariadne", "Field test")
-        self._make_reply(conn, "borges", tid, "borges reply")
-        result = get_mentions(conn, "ariadne")
+        tid = self._make_thread(conn, "agent-a", "Field test")
+        self._make_reply(conn, "agent-b", tid, "agent-b reply")
+        result = get_mentions(conn, "agent-a")
         assert len(result) == 1
         m = result[0]
         assert isinstance(m["thread_id"], int)
@@ -465,7 +465,7 @@ class TestGetMentions:
 
 class TestSetPairInitials:
     def test_set_and_retrieve(self, conn):
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         set_pair_initials(conn, agent_id, "L.J.")
         row = conn.execute(
             "SELECT pair_initials FROM agents WHERE id = ?", (agent_id,)
@@ -473,7 +473,7 @@ class TestSetPairInitials:
         assert row[0] == "L.J."
 
     def test_clear_pair_initials(self, conn):
-        agent_id = upsert_agent(conn, "ariadne")
+        agent_id = upsert_agent(conn, "agent-a")
         set_pair_initials(conn, agent_id, "L.J.")
         set_pair_initials(conn, agent_id, None)
         row = conn.execute(

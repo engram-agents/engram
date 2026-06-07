@@ -88,7 +88,7 @@ class TestFTSSanitization:
 
     def test_colon_in_query(self, client):
         """Query with ':' does not raise a 500."""
-        _post_thread(client, "ariadne", "inter-agent", "Normal thread", "normal body")
+        _post_thread(client, "agent-a", "inter-agent", "Normal thread", "normal body")
         resp = client.get("/api/search?q=hello%3Aworld")
         assert resp.status_code == 200
 
@@ -140,14 +140,14 @@ class TestThreadDedupe:
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_LIKE", False)
 
         tid = _post_thread(
-            client, "ariadne", "inter-agent",
+            client, "agent-a", "inter-agent",
             "Dedupe test thread", "unique_dedup_keyword_xyz"
         )
         # Add a second post also matching the keyword.
         client.post(
             "/api/post",
             json={
-                "agent": "borges",
+                "agent": "agent-b",
                 "thread_id": tid,
                 "body_md": "second post also has unique_dedup_keyword_xyz",
             },
@@ -166,13 +166,13 @@ class TestThreadDedupe:
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_LIKE", False)
 
         tid = _post_thread(
-            client, "ariadne", "inter-agent",
+            client, "agent-a", "inter-agent",
             "Hybrid dedupe thread", "hybrid_dedup_keyword_abc"
         )
         client.post(
             "/api/post",
             json={
-                "agent": "borges",
+                "agent": "agent-b",
                 "thread_id": tid,
                 "body_md": "also contains hybrid_dedup_keyword_abc",
             },
@@ -194,7 +194,7 @@ class TestApiSearchEndpoint:
 
     def test_api_search_returns_json(self, client):
         """GET /api/search returns valid JSON."""
-        _post_thread(client, "ariadne", "inter-agent", "API shape test", "api body")
+        _post_thread(client, "agent-a", "inter-agent", "API shape test", "api body")
         resp = client.get("/api/search?q=api+body")
         assert resp.status_code == 200
         data = json.loads(resp.data)
@@ -206,7 +206,7 @@ class TestApiSearchEndpoint:
         """Each result has thread_id, title, score, match_count, url."""
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_FTS", False)
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_LIKE", False)
-        _post_thread(client, "ariadne", "inter-agent", "Field test thread", "field_unique_xyz")
+        _post_thread(client, "agent-a", "inter-agent", "Field test thread", "field_unique_xyz")
         resp = client.get("/api/search?q=field_unique_xyz&mode=like")
         assert resp.status_code == 200
         data = json.loads(resp.data)
@@ -230,7 +230,7 @@ class TestApiSearchEndpoint:
         """?mode=like returns mode_used=like."""
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_FTS", False)
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_LIKE", False)
-        _post_thread(client, "ariadne", "inter-agent", "Mode like test", "like_unique_token")
+        _post_thread(client, "agent-a", "inter-agent", "Mode like test", "like_unique_token")
         resp = client.get("/api/search?q=like_unique_token&mode=like")
         assert resp.status_code == 200
         data = json.loads(resp.data)
@@ -240,7 +240,7 @@ class TestApiSearchEndpoint:
         """?mode=fts returns mode_used=fts when the FTS table has matching results."""
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_FTS", False)
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_LIKE", False)
-        _post_thread(client, "ariadne", "inter-agent", "Mode fts test", "fts_unique_body_token")
+        _post_thread(client, "agent-a", "inter-agent", "Mode fts test", "fts_unique_body_token")
         resp = client.get("/api/search?q=fts_unique_body_token&mode=fts")
         assert resp.status_code == 200
         data = json.loads(resp.data)
@@ -250,7 +250,7 @@ class TestApiSearchEndpoint:
 
     def test_api_search_no_match_returns_empty(self, client):
         """Query matching nothing returns empty results (not 500)."""
-        _post_thread(client, "ariadne", "inter-agent", "Unrelated", "body text here")
+        _post_thread(client, "agent-a", "inter-agent", "Unrelated", "body text here")
         resp = client.get("/api/search?q=zzz_no_match_zzz_999")
         assert resp.status_code == 200
         data = json.loads(resp.data)
@@ -258,7 +258,7 @@ class TestApiSearchEndpoint:
 
     def test_api_search_url_field_contains_thread_id(self, client):
         """result.url contains the thread's /thread/<id> path."""
-        tid = _post_thread(client, "ariadne", "inter-agent", "URL test", "url_test_unique_token")
+        tid = _post_thread(client, "agent-a", "inter-agent", "URL test", "url_test_unique_token")
         resp = client.get("/api/search?q=url_test_unique_token")
         assert resp.status_code == 200
         data = json.loads(resp.data)
@@ -276,7 +276,7 @@ class TestApiSearchEndpoint:
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_FTS", False)
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_LIKE", False)
         for i in range(5):
-            _post_thread(client, "ariadne", "inter-agent", f"Limit thread {i}", "limit_body_shared")
+            _post_thread(client, "agent-a", "inter-agent", f"Limit thread {i}", "limit_body_shared")
         resp = client.get("/api/search?q=limit_body_shared&mode=fts&limit=2")
         assert resp.status_code == 200
         data = json.loads(resp.data)
@@ -295,7 +295,7 @@ class TestApiSearchEndpoint:
         # Seed 5 threads, all matching the same unique token.
         for i in range(5):
             _post_thread(
-                client, "ariadne", "inter-agent",
+                client, "agent-a", "inter-agent",
                 f"Like limit thread {i}", "like_limit_unique_body_tok",
             )
         resp = client.get("/api/search?q=like_limit_unique_body_tok&mode=like&limit=3")
@@ -314,7 +314,7 @@ class TestSearchHtmlEndpoint:
 
     def test_search_html_returns_200(self, client):
         """GET /search?q=... still returns 200 HTML."""
-        _post_thread(client, "ariadne", "inter-agent", "HTML search test", "html_body")
+        _post_thread(client, "agent-a", "inter-agent", "HTML search test", "html_body")
         resp = client.get("/search?q=html_body")
         assert resp.status_code == 200
         assert b"html" in resp.data.lower()
@@ -344,7 +344,7 @@ class TestDegradationLadder:
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_FTS", False)
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_LIKE", False)
         c = _conn()
-        agent_id = db.upsert_agent(c, "ariadne")
+        agent_id = db.upsert_agent(c, "agent-a")
         db.create_thread(c, agent_id, "cold-start", "Degradation test", "degradation_unique_tok")
 
         results, rung = db.search_threads_hybrid(c, "degradation_unique_tok", query_vector=None)
@@ -358,7 +358,7 @@ class TestDegradationLadder:
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_FTS", False)
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_LIKE", False)
         c = _conn()
-        agent_id = db.upsert_agent(c, "ariadne")
+        agent_id = db.upsert_agent(c, "agent-a")
         db.create_thread(c, agent_id, "cold-start", "Log test", "log_fts_degradation_xyz")
         _results, _rung = db.search_threads_hybrid(c, "log_fts_degradation_xyz", query_vector=None)
         captured = capsys.readouterr()
@@ -371,7 +371,7 @@ class TestDegradationLadder:
         """FTS degradation warning fires at most once per process (flag check)."""
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_FTS", False)
         c = _conn()
-        agent_id = db.upsert_agent(c, "ariadne")
+        agent_id = db.upsert_agent(c, "agent-a")
         db.create_thread(c, agent_id, "cold-start", "Once test", "once_unique_body")
         # First call: flag should flip to True.
         db.search_threads_hybrid(c, "once_unique_body", query_vector=None)
@@ -386,7 +386,7 @@ class TestDegradationLadder:
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_FTS", False)
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_LIKE", False)
         c = _conn()
-        agent_id = db.upsert_agent(c, "ariadne")
+        agent_id = db.upsert_agent(c, "agent-a")
         db.create_thread(c, agent_id, "cold-start", "FTS explicit test", "fts_explicit_tok_xyz")
         # Call with expected_rung="fts" — simulating an explicit mode=fts request.
         _results, rung = db.search_threads_hybrid(
@@ -406,7 +406,7 @@ class TestDegradationLadder:
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_FTS", False)
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_LIKE", False)
         c = _conn()
-        agent_id = db.upsert_agent(c, "ariadne")
+        agent_id = db.upsert_agent(c, "agent-a")
         db.create_thread(c, agent_id, "cold-start", "Unrelated content", "some_body_text_here")
         # Query that matches nothing: FTS returns 0 rows, vector=None → LIKE fallthrough.
         _results, rung = db.search_threads_hybrid(
@@ -424,7 +424,7 @@ class TestDegradationLadder:
         # app fixture already sets FORUM_NO_EMBEDDINGS=1.
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_FTS", False)
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_LIKE", False)
-        _post_thread(client, "ariadne", "inter-agent", "No model test", "no_model_body_xyz")
+        _post_thread(client, "agent-a", "inter-agent", "No model test", "no_model_body_xyz")
         resp = client.get("/api/search?q=no_model_body_xyz&mode=hybrid")
         assert resp.status_code == 200
         data = json.loads(resp.data)
@@ -452,7 +452,7 @@ class TestDegradationLadder:
         # where init_db created them on a vec-capable host.
         c.execute("DROP TABLE IF EXISTS vec_posts")
         c.execute("DROP TABLE IF EXISTS vec_threads")
-        agent_id = db.upsert_agent(c, "ariadne")
+        agent_id = db.upsert_agent(c, "agent-a")
         db.create_thread(c, agent_id, "cold-start", "Vec missing test", "vec_missing_unique_tok")
 
         fake_vec = _make_vec(1.0)  # unit-norm synthetic vector
@@ -512,7 +512,7 @@ class TestBlendOrdering:
         c = vec_conn
         fts_body = "distinctive_alpha_zero_keyword_zzz"
         other_body = "completely unrelated content here"
-        agent_id = db.upsert_agent(c, "ariadne")
+        agent_id = db.upsert_agent(c, "agent-a")
         fts_tid, _ = db.create_thread(c, agent_id, "cold-start", "FTS match", fts_body)
         other_tid, _ = db.create_thread(c, agent_id, "cold-start", "No match", other_body)
 
@@ -533,7 +533,7 @@ class TestBlendOrdering:
         """Hybrid results include a 'score' key on each dict."""
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_FTS", False)
         c = vec_conn
-        agent_id = db.upsert_agent(c, "ariadne")
+        agent_id = db.upsert_agent(c, "agent-a")
         db.create_thread(c, agent_id, "cold-start", "Score test", "score_test_unique_body_abc")
         results, _rung = db.search_threads_hybrid(
             c, "score_test_unique_body_abc", query_vector=None, alpha=0.0
@@ -546,7 +546,7 @@ class TestBlendOrdering:
         """Hybrid results include a 'match_count' key."""
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_FTS", False)
         c = vec_conn
-        agent_id = db.upsert_agent(c, "ariadne")
+        agent_id = db.upsert_agent(c, "agent-a")
         db.create_thread(c, agent_id, "cold-start", "Match count test", "matchcount_unique_xyz")
         results, _rung = db.search_threads_hybrid(
             c, "matchcount_unique_xyz", query_vector=None, alpha=0.0
@@ -558,7 +558,7 @@ class TestBlendOrdering:
         """Results are ordered by score descending."""
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_FTS", False)
         c = vec_conn
-        agent_id = db.upsert_agent(c, "ariadne")
+        agent_id = db.upsert_agent(c, "agent-a")
         db.create_thread(c, agent_id, "cold-start", "T1", "descend_order_keyword_abc")
         db.create_thread(c, agent_id, "cold-start", "T2", "descend_order_keyword_abc also here")
         results, _rung = db.search_threads_hybrid(
@@ -577,7 +577,7 @@ class TestBlendOrdering:
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_FTS", False)
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_LIKE", False)
         c = vec_conn
-        agent_id = db.upsert_agent(c, "ariadne")
+        agent_id = db.upsert_agent(c, "agent-a")
         db.create_thread(c, agent_id, "cold-start", "Something", "some body text here")
         results, rung = db.search_threads_hybrid(
             c, "zzz_absolutely_no_match_zzz_999", query_vector=None
@@ -590,7 +590,7 @@ class TestBlendOrdering:
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_FTS", False)
         monkeypatch.setattr(db, "_HYBRID_DEGRADED_TO_LIKE", False)
         c = vec_conn
-        agent_id = db.upsert_agent(c, "ariadne")
+        agent_id = db.upsert_agent(c, "agent-a")
         tid, _ = db.create_thread(
             c, agent_id, "cold-start", "Dedupe thread", "dedup_test_keyword_xyz"
         )

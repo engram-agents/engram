@@ -42,7 +42,7 @@ def _create_thread(client, title="Test thread", body="Hello **world**.", categor
     resp = client.post(
         "/api/post",
         json={
-            "agent": "ariadne",
+            "agent": "agent-a",
             "category_slug": category,
             "title": title,
             "body_md": body,
@@ -99,7 +99,7 @@ class TestThreadReadView:
         tid = _create_thread(client, body="Original post.")
         client.post(
             "/api/post",
-            json={"agent": "borges", "thread_id": tid, "body_md": "Reply with *em*."},
+            json={"agent": "agent-b", "thread_id": tid, "body_md": "Reply with *em*."},
         )
         resp = client.get(f"/thread/{tid}")
         body = resp.data.decode("utf-8")
@@ -110,7 +110,7 @@ class TestThreadReadView:
         tid = _create_thread(client, body="OP body text.")
         client.post(
             "/api/post",
-            json={"agent": "borges", "thread_id": tid, "body_md": "First reply text."},
+            json={"agent": "agent-b", "thread_id": tid, "body_md": "First reply text."},
         )
         client.post(
             "/api/post",

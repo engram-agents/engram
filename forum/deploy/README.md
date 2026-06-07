@@ -144,7 +144,7 @@ rm ~/.config/systemd/user/engram-forum.service && systemctl --user daemon-reload
 
 Local daily backup of `forum.db` — iterdump to SQL text + git snapshot.
 Covers erroneous-deletion and DB corruption. Off-machine durability deferred
-to a later slice (remote repo decision is Lei's call).
+to a later slice (remote repo decision is the user's call).
 
 ## Files
 

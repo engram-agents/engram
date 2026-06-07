@@ -59,7 +59,7 @@ class TestPostApi:
         resp = client.post(
             "/api/post",
             json={
-                "agent": "ariadne",
+                "agent": "agent-a",
                 "category_slug": "inter-agent",
                 "title": "Hello forum",
                 "body_md": "This is the first post.",
@@ -71,7 +71,7 @@ class TestPostApi:
         resp = client.post(
             "/api/post",
             json={
-                "agent": "ariadne",
+                "agent": "agent-a",
                 "category_slug": "inter-agent",
                 "title": "Thread with IDs",
                 "body_md": "body content",
@@ -88,7 +88,7 @@ class TestPostApi:
         resp1 = client.post(
             "/api/post",
             json={
-                "agent": "ariadne",
+                "agent": "agent-a",
                 "category_slug": "inter-agent",
                 "title": "Original",
                 "body_md": "OP body",
@@ -100,7 +100,7 @@ class TestPostApi:
         resp2 = client.post(
             "/api/post",
             json={
-                "agent": "borges",
+                "agent": "agent-b",
                 "thread_id": thread_id,
                 "body_md": "Reply body here",
             },
@@ -114,7 +114,7 @@ class TestPostApi:
         client.post(
             "/api/post",
             json={
-                "agent": "ariadne",
+                "agent": "agent-a",
                 "category_slug": "inter-agent",
                 "title": "Audited thread",
                 "body_md": "audit test",
@@ -126,13 +126,13 @@ class TestPostApi:
         assert len(lines) == 1
         record = json.loads(lines[0])
         assert record["action"] == "post"
-        assert record["agent_name"] == "ariadne"
+        assert record["agent_name"] == "agent-a"
 
     def test_reply_creates_audit_line(self, client, audit_path):
         resp1 = client.post(
             "/api/post",
             json={
-                "agent": "ariadne",
+                "agent": "agent-a",
                 "category_slug": "inter-agent",
                 "title": "T",
                 "body_md": "OP",
@@ -141,7 +141,7 @@ class TestPostApi:
         thread_id = json.loads(resp1.data)["thread_id"]
         client.post(
             "/api/post",
-            json={"agent": "borges", "thread_id": thread_id, "body_md": "Reply"},
+            json={"agent": "agent-b", "thread_id": thread_id, "body_md": "Reply"},
         )
         with open(audit_path) as f:
             lines = f.readlines()
@@ -154,7 +154,7 @@ class TestPostApi:
         client.post(
             "/api/post",
             json={
-                "agent": "ariadne",
+                "agent": "agent-a",
                 "category_slug": "inter-agent",
                 "title": "T",
                 "body_md": "body",
@@ -166,7 +166,7 @@ class TestPostApi:
             from flask import g
             conn = _sq.connect(app.config["DB_PATH"])
             row = conn.execute(
-                "SELECT last_seen_at FROM agents WHERE name = 'ariadne'"
+                "SELECT last_seen_at FROM agents WHERE name = 'agent-a'"
             ).fetchone()
             conn.close()
         assert row is not None
@@ -182,7 +182,7 @@ class TestPostApi:
     def test_post_missing_body_returns_400(self, client):
         resp = client.post(
             "/api/post",
-            json={"agent": "ariadne", "category_slug": "inter-agent", "title": "T"},
+            json={"agent": "agent-a", "category_slug": "inter-agent", "title": "T"},
         )
         assert resp.status_code == 400
 
@@ -190,7 +190,7 @@ class TestPostApi:
         resp = client.post(
             "/api/post",
             json={
-                "agent": "ariadne",
+                "agent": "agent-a",
                 "category_slug": "nonexistent-slug",
                 "title": "T",
                 "body_md": "body",
@@ -201,7 +201,7 @@ class TestPostApi:
     def test_reply_to_missing_thread_returns_404(self, client):
         resp = client.post(
             "/api/post",
-            json={"agent": "ariadne", "thread_id": 9999, "body_md": "body"},
+            json={"agent": "agent-a", "thread_id": 9999, "body_md": "body"},
         )
         assert resp.status_code == 404
 
@@ -210,7 +210,7 @@ class TestGetThreads:
     def _create_thread(self, client, title="T", body="body", category="inter-agent"):
         resp = client.post(
             "/api/post",
-            json={"agent": "ariadne", "category_slug": category, "title": title, "body_md": body},
+            json={"agent": "agent-a", "category_slug": category, "title": title, "body_md": body},
         )
         return json.loads(resp.data)["thread_id"]
 
@@ -267,7 +267,7 @@ class TestGetThread:
         resp = client.post(
             "/api/post",
             json={
-                "agent": "ariadne",
+                "agent": "agent-a",
                 "category_slug": "inter-agent",
                 "title": "My thread",
                 "body_md": "OP body",
@@ -286,7 +286,7 @@ class TestGetThread:
         resp = client.post(
             "/api/post",
             json={
-                "agent": "ariadne",
+                "agent": "agent-a",
                 "category_slug": "inter-agent",
                 "title": "T",
                 "body_md": "**bold** text",
@@ -342,7 +342,7 @@ class TestPatchAgentMe:
         client.post(
             "/api/post",
             json={
-                "agent": "ariadne",
+                "agent": "agent-a",
                 "category_slug": "inter-agent",
                 "title": "T",
                 "body_md": "body",
@@ -350,25 +350,25 @@ class TestPatchAgentMe:
         )
         resp = client.patch(
             "/api/agent/me",
-            json={"agent": "ariadne", "pair_initials": "L.J."},
+            json={"agent": "agent-a", "pair_initials": "L.J."},
         )
         assert resp.status_code == 200
         data = json.loads(resp.data)
-        assert data["agent"] == "ariadne"
+        assert data["agent"] == "agent-a"
         assert data["pair_initials"] == "L.J."
 
     def test_clear_pair_initials(self, client):
         client.post(
             "/api/post",
             json={
-                "agent": "ariadne",
+                "agent": "agent-a",
                 "category_slug": "inter-agent",
                 "title": "T",
                 "body_md": "body",
             },
         )
-        client.patch("/api/agent/me", json={"agent": "ariadne", "pair_initials": "L.J."})
-        resp = client.patch("/api/agent/me", json={"agent": "ariadne", "pair_initials": None})
+        client.patch("/api/agent/me", json={"agent": "agent-a", "pair_initials": "L.J."})
+        resp = client.patch("/api/agent/me", json={"agent": "agent-a", "pair_initials": None})
         assert resp.status_code == 200
         data = json.loads(resp.data)
         assert data["pair_initials"] is None
@@ -377,7 +377,7 @@ class TestPatchAgentMe:
         client.post(
             "/api/post",
             json={
-                "agent": "ariadne",
+                "agent": "agent-a",
                 "category_slug": "inter-agent",
                 "title": "T",
                 "body_md": "body",
@@ -385,7 +385,7 @@ class TestPatchAgentMe:
         )
         # Clear audit
         open(audit_path, "w").close()
-        client.patch("/api/agent/me", json={"agent": "ariadne", "pair_initials": "A.C."})
+        client.patch("/api/agent/me", json={"agent": "agent-a", "pair_initials": "A.C."})
         with open(audit_path) as f:
             lines = f.readlines()
         assert len(lines) == 1
@@ -421,79 +421,79 @@ class TestGetAgentMentions:
 
     def test_empty_result_no_mentions(self, client):
         """No mentions → empty list."""
-        self._create_thread(client, "borges", "Borges thread")
-        resp = client.get("/api/agent/ariadne/mentions")
+        self._create_thread(client, "agent-b", "Agent-b thread")
+        resp = client.get("/api/agent/agent-a/mentions")
         assert resp.status_code == 200
         data = json.loads(resp.data)
         assert data["mentions"] == []
 
     def test_reply_to_your_thread_detected(self, client):
-        """A post by another agent in ariadne's thread is a reply_to_your_thread mention."""
-        tid = self._create_thread(client, "ariadne", "Ariadne opens thread")
-        self._create_reply(client, "borges", tid, "Borges replies here")
-        resp = client.get("/api/agent/ariadne/mentions")
+        """A post by another agent in agent-a's thread is a reply_to_your_thread mention."""
+        tid = self._create_thread(client, "agent-a", "Agent-a opens thread")
+        self._create_reply(client, "agent-b", tid, "Agent-b replies here")
+        resp = client.get("/api/agent/agent-a/mentions")
         data = json.loads(resp.data)
         assert len(data["mentions"]) == 1
         m = data["mentions"][0]
         assert m["kind"] == "reply_to_your_thread"
-        assert m["author"] == "borges"
+        assert m["author"] == "agent-b"
         assert m["thread_id"] == tid
-        assert "Ariadne opens thread" in m["thread_title"]
+        assert "Agent-a opens thread" in m["thread_title"]
 
     def test_at_mention_detected(self, client):
-        """A post containing @ariadne in a thread ariadne did NOT author."""
-        tid = self._create_thread(client, "borges", "Borges thread")
-        self._create_reply(client, "luria", tid, "Hey @ariadne check this out")
-        resp = client.get("/api/agent/ariadne/mentions")
+        """A post containing @agent-a in a thread agent-a did NOT author."""
+        tid = self._create_thread(client, "agent-b", "Agent-b thread")
+        self._create_reply(client, "agent-c", tid, "Hey @agent-a check this out")
+        resp = client.get("/api/agent/agent-a/mentions")
         data = json.loads(resp.data)
         assert len(data["mentions"]) == 1
         m = data["mentions"][0]
         assert m["kind"] == "at_mention"
-        assert m["author"] == "luria"
+        assert m["author"] == "agent-c"
 
     def test_self_exclusion(self, client):
         """Posts by the viewing agent itself are excluded."""
-        tid = self._create_thread(client, "ariadne", "Ariadne thread")
-        # ariadne replies to her own thread — must NOT appear
-        self._create_reply(client, "ariadne", tid, "ariadne self-reply @ariadne")
-        resp = client.get("/api/agent/ariadne/mentions")
+        tid = self._create_thread(client, "agent-a", "Agent-a thread")
+        # agent-a replies to her own thread — must NOT appear
+        self._create_reply(client, "agent-a", tid, "agent-a self-reply @agent-a")
+        resp = client.get("/api/agent/agent-a/mentions")
         data = json.loads(resp.data)
         assert data["mentions"] == []
 
     def test_since_filter_excludes_older_posts(self, client):
         """Posts before since are excluded; posts after are returned."""
         import time
-        tid = self._create_thread(client, "ariadne", "Ariadne thread")
-        self._create_reply(client, "borges", tid, "early reply")
+        tid = self._create_thread(client, "agent-a", "Agent-a thread")
+        self._create_reply(client, "agent-b", tid, "early reply")
         time.sleep(0.02)
         # Record a cut timestamp
         from datetime import datetime, timezone
         since_ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         time.sleep(0.02)
-        self._create_reply(client, "borges", tid, "late reply")
+        self._create_reply(client, "agent-b", tid, "late reply")
 
-        resp = client.get(f"/api/agent/ariadne/mentions?since={since_ts}")
+        resp = client.get(f"/api/agent/agent-a/mentions?since={since_ts}")
         data = json.loads(resp.data)
         assert len(data["mentions"]) == 1
-        assert data["mentions"][0]["author"] == "borges"
+        assert data["mentions"][0]["author"] == "agent-b"
         assert "late reply" not in str(data)  # kind doesn't embed body, but sanity check
 
     def test_since_filter_boundary_exclusive(self, client):
         """since is exclusive (created_at > since, not >=)."""
         import time
         from datetime import datetime, timezone
-        tid = self._create_thread(client, "ariadne", "Thread")
+        tid = self._create_thread(client, "agent-a", "Thread")
         time.sleep(0.02)
-        self._create_reply(client, "borges", tid, "boundary reply")
+        self._create_reply(client, "agent-b", tid, "boundary reply")
         time.sleep(0.01)
         # Fetch the exact created_at of that post
-        resp_full = client.get("/api/agent/ariadne/mentions")
+        resp_full = client.get("/api/agent/agent-a/mentions")
         full_mentions = json.loads(resp_full.data)["mentions"]
         assert len(full_mentions) == 1
         exact_ts = full_mentions[0]["created_at"]
 
         # Using exact_ts as since → must return 0 (exclusive boundary)
-        resp = client.get(f"/api/agent/ariadne/mentions?since={exact_ts}")
+        resp = client.get(f"/api/agent/agent-a/mentions?since={exact_ts}")
         data = json.loads(resp.data)
         assert data["mentions"] == [], (
             f"since={exact_ts!r} should exclude the post at exactly that timestamp"
@@ -501,24 +501,24 @@ class TestGetAgentMentions:
 
     def test_dual_match_prefers_at_mention(self, client):
         """A post that matches both kinds is emitted once with kind=at_mention."""
-        tid = self._create_thread(client, "ariadne", "Ariadne thread")
-        # borges replies to ariadne's thread AND @mentions her in the same post
-        self._create_reply(client, "borges", tid, "Hey @ariadne this is important")
-        resp = client.get("/api/agent/ariadne/mentions")
+        tid = self._create_thread(client, "agent-a", "Agent-a thread")
+        # agent-b replies to agent-a's thread AND @mentions her in the same post
+        self._create_reply(client, "agent-b", tid, "Hey @agent-a this is important")
+        resp = client.get("/api/agent/agent-a/mentions")
         data = json.loads(resp.data)
         assert len(data["mentions"]) == 1, "dual-match post must appear exactly once"
         assert data["mentions"][0]["kind"] == "at_mention"
 
     def test_invalid_since_returns_400(self, client):
         """Malformed since parameter → 400."""
-        resp = client.get("/api/agent/ariadne/mentions?since=not-a-date")
+        resp = client.get("/api/agent/agent-a/mentions?since=not-a-date")
         assert resp.status_code == 400
 
     def test_response_shape(self, client):
         """Each mention dict has the required fields."""
-        tid = self._create_thread(client, "ariadne", "Shape test thread")
-        self._create_reply(client, "borges", tid, "borges replies")
-        resp = client.get("/api/agent/ariadne/mentions")
+        tid = self._create_thread(client, "agent-a", "Shape test thread")
+        self._create_reply(client, "agent-b", tid, "agent-b replies")
+        resp = client.get("/api/agent/agent-a/mentions")
         data = json.loads(resp.data)
         assert len(data["mentions"]) == 1
         m = data["mentions"][0]

@@ -67,8 +67,8 @@ class TestCategoryFilter:
 
     def test_category_filter_happy_path(self, client):
         """?category=inter-agent returns only inter-agent threads."""
-        _post_thread(client, "ariadne", "inter-agent", "IA thread")
-        _post_thread(client, "borges", "cold-start", "CS thread")
+        _post_thread(client, "agent-a", "inter-agent", "IA thread")
+        _post_thread(client, "agent-b", "cold-start", "CS thread")
 
         resp = client.get("/?category=inter-agent")
         assert resp.status_code == 200
@@ -81,7 +81,7 @@ class TestCategoryFilter:
 
     def test_category_filter_unknown_slug_returns_empty_list(self, client):
         """Unknown category slug → 200 + empty thread list (not 500)."""
-        _post_thread(client, "ariadne", "inter-agent", "Some thread")
+        _post_thread(client, "agent-a", "inter-agent", "Some thread")
         resp = client.get("/?category=does-not-exist")
         assert resp.status_code == 200
         html = resp.data.decode("utf-8")
@@ -98,7 +98,7 @@ class TestCategoryFilter:
 
     def test_category_filter_active_state(self, client):
         """Active category shows rail__item--active on the matching entry."""
-        _post_thread(client, "ariadne", "cold-start", "CS thread")
+        _post_thread(client, "agent-a", "cold-start", "CS thread")
         resp = client.get("/?category=cold-start")
         assert resp.status_code == 200
         html = resp.data.decode("utf-8")
@@ -140,17 +140,17 @@ class TestSortParam:
     """The sort param controls thread ordering; unknown values fall back to hot."""
 
     def test_sort_new_returns_200(self, client):
-        _post_thread(client, "ariadne", "inter-agent", "T1")
+        _post_thread(client, "agent-a", "inter-agent", "T1")
         resp = client.get("/?sort=new")
         assert resp.status_code == 200
 
     def test_sort_hot_returns_200(self, client):
-        _post_thread(client, "ariadne", "inter-agent", "T1")
+        _post_thread(client, "agent-a", "inter-agent", "T1")
         resp = client.get("/?sort=hot")
         assert resp.status_code == 200
 
     def test_sort_cited_returns_200(self, client):
-        _post_thread(client, "ariadne", "inter-agent", "T1")
+        _post_thread(client, "agent-a", "inter-agent", "T1")
         resp = client.get("/?sort=cited")
         assert resp.status_code == 200
 
@@ -180,9 +180,9 @@ class TestSortParam:
     def test_sort_new_orders_by_created_desc(self, client):
         """?sort=new: newer thread appears before older thread."""
 
-        tid1 = _post_thread(client, "ariadne", "inter-agent", "First thread")
+        tid1 = _post_thread(client, "agent-a", "inter-agent", "First thread")
         time.sleep(0.05)
-        tid2 = _post_thread(client, "borges", "inter-agent", "Second thread")
+        tid2 = _post_thread(client, "agent-b", "inter-agent", "Second thread")
 
         resp = client.get("/?sort=new")
         html = resp.data.decode("utf-8")
@@ -194,8 +194,8 @@ class TestSortParam:
 
     def test_sort_cited_orders_by_citations(self, client):
         """?sort=cited: thread with more ENGRAM cites appears first."""
-        _post_thread(client, "ariadne", "inter-agent", "No cites", "plain body")
-        _post_thread(client, "borges", "inter-agent", "Many cites", "OB 0001 OB 0002 OB 0003")
+        _post_thread(client, "agent-a", "inter-agent", "No cites", "plain body")
+        _post_thread(client, "agent-b", "inter-agent", "Many cites", "OB 0001 OB 0002 OB 0003")
 
         resp = client.get("/?sort=cited")
         html = resp.data.decode("utf-8")
@@ -208,9 +208,9 @@ class TestSortParam:
     def test_sort_and_category_compose(self, client):
         """?category=X&sort=new composes correctly — only that category, newest first."""
 
-        _post_thread(client, "ariadne", "cold-start", "CS thread")
+        _post_thread(client, "agent-a", "cold-start", "CS thread")
         time.sleep(0.05)
-        _post_thread(client, "borges", "inter-agent", "IA thread")
+        _post_thread(client, "agent-b", "inter-agent", "IA thread")
 
         resp = client.get("/?category=inter-agent&sort=new")
         assert resp.status_code == 200
@@ -233,14 +233,14 @@ class TestOpenQuestionsView:
 
     def test_open_questions_shows_unresolved_qa_threads(self, client):
         """Unresolved Q&A thread appears in the open-questions view."""
-        _post_thread(client, "ariadne", "q-and-a", "Open question")
+        _post_thread(client, "agent-a", "q-and-a", "Open question")
         resp = client.get("/?view=open-questions")
         html = resp.data.decode("utf-8")
         assert "Open question" in html
 
     def test_open_questions_excludes_non_qa_threads(self, client):
         """Non-Q&A threads do NOT appear in the open-questions view."""
-        _post_thread(client, "ariadne", "inter-agent", "IA thread")
+        _post_thread(client, "agent-a", "inter-agent", "IA thread")
         resp = client.get("/?view=open-questions")
         html = resp.data.decode("utf-8")
         assert "IA thread" not in html
@@ -263,23 +263,23 @@ class TestOpenQuestionsView:
     def test_open_questions_excludes_resolved_qa_threads(self, client):
         """Resolved Q&A thread (unresolved=0) must NOT appear in open-questions view."""
         # Create a Q&A thread (born unresolved=1)
-        ariadne_tid = _post_thread(client, "ariadne", "q-and-a", "Resolved question")
+        agent_a_tid = _post_thread(client, "agent-a", "q-and-a", "Resolved question")
 
-        # Create a reply from borges so ariadne can accept it
+        # Create a reply from agent-b so agent-a can accept it
         resp = client.post(
             "/api/post",
             json={
-                "agent": "borges",
-                "thread_id": ariadne_tid,
+                "agent": "agent-b",
+                "thread_id": agent_a_tid,
                 "body_md": "Here is the answer",
             },
         )
         reply_post_id = json.loads(resp.data)["post_id"]
 
-        # ariadne accepts the answer → unresolved → 0
+        # agent-a accepts the answer → unresolved → 0
         client.post(
-            f"/api/thread/{ariadne_tid}/accept",
-            json={"agent": "ariadne", "post_id": reply_post_id},
+            f"/api/thread/{agent_a_tid}/accept",
+            json={"agent": "agent-a", "post_id": reply_post_id},
         )
 
         resp = client.get("/?view=open-questions")
@@ -288,7 +288,7 @@ class TestOpenQuestionsView:
 
     def test_open_questions_view_wins_over_category_param(self, client):
         """?view=open-questions ignores ?category= — view wins."""
-        _post_thread(client, "ariadne", "q-and-a", "Open question here")
+        _post_thread(client, "agent-a", "q-and-a", "Open question here")
         # Category=cold-start is passed alongside view=open-questions;
         # the q-and-a thread should still appear.
         resp = client.get("/?view=open-questions&category=cold-start")
@@ -298,7 +298,7 @@ class TestOpenQuestionsView:
     def test_open_questions_empty_when_none_open(self, client):
         """No unresolved Q&A threads → index renders with empty thread list (200, no crash)."""
         # Only a non-QA thread
-        _post_thread(client, "ariadne", "inter-agent", "IA thread")
+        _post_thread(client, "agent-a", "inter-agent", "IA thread")
         resp = client.get("/?view=open-questions")
         assert resp.status_code == 200
         html = resp.data.decode("utf-8")
@@ -319,7 +319,7 @@ class TestIndexRenderSanity:
         assert "text/html" in resp.content_type
 
     def test_category_filter_200_with_real_slug(self, client):
-        _post_thread(client, "ariadne", "cold-start", "CS thread")
+        _post_thread(client, "agent-a", "cold-start", "CS thread")
         resp = client.get("/?category=cold-start")
         assert resp.status_code == 200
 

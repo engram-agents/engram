@@ -133,8 +133,8 @@ class TestPacksIndex:
         """The author (from the published pack) appears on the index page."""
         resp = client.get("/packs")
         assert resp.status_code == 200
-        # The default agent used by _upload_pack is "ariadne".
-        assert b"ariadne" in resp.data
+        # The default agent used by _upload_pack is "agent-a".
+        assert b"agent-a" in resp.data
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +152,7 @@ class TestPackDetail:
 
     def test_detail_shows_author(self, client, published_pack_id):
         resp = client.get(f"/packs/{published_pack_id}")
-        assert b"ariadne" in resp.data
+        assert b"agent-a" in resp.data
 
     def test_detail_contains_download_link(self, client, published_pack_id):
         resp = client.get(f"/packs/{published_pack_id}")
@@ -205,18 +205,18 @@ class TestPackDetail:
 class TestPackRefRender:
     def test_valid_slug_becomes_link(self):
         """pack:<valid-slug> in body text → <a href="/packs/<id>">."""
-        out = render_post_body("See pack:ariadne-epistemics-v1 for details.")
-        assert 'href="/packs/ariadne-epistemics-v1"' in out
+        out = render_post_body("See pack:agent-a-epistemics-v1 for details.")
+        assert 'href="/packs/agent-a-epistemics-v1"' in out
 
     def test_link_text_is_pack_id(self):
         """The link text should be 'pack:<id>'."""
-        out = render_post_body("pack:borges-history-v2 is relevant here.")
-        assert "pack:borges-history-v2" in out
-        assert 'href="/packs/borges-history-v2"' in out
+        out = render_post_body("pack:agent-b-history-v2 is relevant here.")
+        assert "pack:agent-b-history-v2" in out
+        assert 'href="/packs/agent-b-history-v2"' in out
 
     def test_pack_ref_has_pack_ref_class(self):
         """The emitted <a> carries class='pack-ref'."""
-        out = render_post_body("pack:ariadne-test-v1")
+        out = render_post_body("pack:agent-a-test-v1")
         assert 'class="pack-ref"' in out
 
     def test_path_traversal_not_linked(self):
@@ -241,22 +241,22 @@ class TestPackRefRender:
 
     def test_pack_ref_in_code_not_linked(self):
         """pack:<id> inside inline code does NOT become a link."""
-        out = render_post_body("`pack:ariadne-test-v1`")
+        out = render_post_body("`pack:agent-a-test-v1`")
         # Should be inside a <code> element without a link.
-        assert 'href="/packs/ariadne-test-v1"' not in out
+        assert 'href="/packs/agent-a-test-v1"' not in out
         # The text itself may still appear verbatim in <code>.
-        assert "pack:ariadne-test-v1" in out
+        assert "pack:agent-a-test-v1" in out
 
     def test_multiple_pack_refs(self):
         """Multiple pack: references in one body are all linked."""
         out = render_post_body(
-            "Compare pack:ariadne-alpha-v1 with pack:borges-beta-v2."
+            "Compare pack:agent-a-alpha-v1 with pack:agent-b-beta-v2."
         )
-        assert 'href="/packs/ariadne-alpha-v1"' in out
-        assert 'href="/packs/borges-beta-v2"' in out
+        assert 'href="/packs/agent-a-alpha-v1"' in out
+        assert 'href="/packs/agent-b-beta-v2"' in out
 
     def test_pack_ref_coexists_with_citation_chip(self):
         """pack: reference and ENGRAM citation chip both render in the same body."""
-        out = render_post_body("See OB 0001 and also pack:ariadne-epistemics-v1.")
+        out = render_post_body("See OB 0001 and also pack:agent-a-epistemics-v1.")
         assert '<span class="citation citation--ob">OB 0001</span>' in out
-        assert 'href="/packs/ariadne-epistemics-v1"' in out
+        assert 'href="/packs/agent-a-epistemics-v1"' in out

@@ -6,7 +6,7 @@ import pytest
 from forum.avatar import avatar_svg
 
 
-SEEDS = ["ariadne", "borges", "luria-hebb", "aleph", "atlas", "mnemo"]
+SEEDS = ["agent-a", "agent-b", "agent-c", "agent-d", "atlas", "mnemo"]
 
 
 class TestAvatarDeterminism:
@@ -76,17 +76,17 @@ class TestAvatarSVGStructure:
 
     def test_custom_size(self):
         """Custom size parameter is reflected in the SVG dimensions."""
-        svg = avatar_svg("ariadne", size=64)
+        svg = avatar_svg("agent-a", size=64)
         assert 'width="64"' in svg
         assert 'height="64"' in svg
         # Default size
-        svg32 = avatar_svg("ariadne", size=32)
+        svg32 = avatar_svg("agent-a", size=32)
         assert 'width="32"' in svg32
         assert 'height="32"' in svg32
 
     def test_svg_root_element(self):
         """Output starts with <svg and has correct root element."""
-        svg = avatar_svg("borges")
+        svg = avatar_svg("agent-b")
         assert svg.startswith("<svg ")
         root = ET.fromstring(svg)
         assert root.tag == "svg"
