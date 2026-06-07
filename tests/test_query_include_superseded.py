@@ -381,7 +381,11 @@ def test_query_include_superseded_semantic_path():
             return dot / (norm_a * norm_b)
 
     original_embedder = server._embedder
-    server._embedder = _MockEmbedder()
+    original_core_embedder = server.core._embedder
+    mock_embedder = _MockEmbedder()
+    server._embedder = mock_embedder
+    # _semantic_search now lives in engram_core — patch core._embedder too.
+    server.core._embedder = mock_embedder
     try:
         conn2 = server._get_db()
         try:
@@ -424,6 +428,7 @@ def test_query_include_superseded_semantic_path():
             conn2.close()
     finally:
         server._embedder = original_embedder
+        server.core._embedder = original_core_embedder
 
 
 if __name__ == "__main__":

@@ -107,7 +107,8 @@ def _stub_semantic_with(server, similarity, target_id, target_claim):
             "quote_type": "attributed_analysis",
             "importance_score": 1.0,
         }]
-    server._semantic_search = stub
+    # _similar_existing_matches now lives in engram_core, so patch core.
+    server.core._semantic_search = stub
 
 
 def _seed_first_obs(server):
@@ -210,7 +211,7 @@ def test_polarity_alert_fires_on_same_source():
             "importance_score": 1.0,
             "evidence_id": first_ev,
         }]
-    server._semantic_search = stub_with_ev
+    server.core._semantic_search = stub_with_ev
 
     payload2 = {
         "evidence_id": first_ev,
@@ -403,7 +404,7 @@ def test_batched_polarity_one_call_per_write():
             }
             for i in range(5)
         ]
-    server._semantic_search = stub_multi
+    server.core._semantic_search = stub_multi
 
     r = _add_second_obs(server, claim="Topic Z disputed claim.")
 
@@ -458,7 +459,7 @@ def test_batched_polarity_filters_below_min_sim():
                 "quote_type": "attributed_analysis", "importance_score": 1.0,
             })
         return rows
-    server._semantic_search = stub_mixed
+    server.core._semantic_search = stub_mixed
 
     # min_similarity_for_check is 0.30 by default; with sim=0.20 both
     # the dedup floor (0.40 default) AND the polarity floor (0.30) are below

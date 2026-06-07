@@ -55,12 +55,13 @@ def _stub_semantic_with(server, similarity, target_id, target_claim):
             "quote_type": "attributed_analysis",
             "importance_score": 1.0,
         }]
-    server._semantic_search = stub
+    # _similar_existing_matches now lives in engram_core, so patch core.
+    server.core._semantic_search = stub
 
     # Force the embedder gate so the semantic-search branch fires
     class _StubEmb:
         def is_available(self_): return True
-    server._embedder = _StubEmb()
+    server.core._embedder = _StubEmb()
     server.core._get_embedding_config = lambda: {"enabled": True}
 
 

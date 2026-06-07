@@ -28,7 +28,18 @@ from pathlib import Path
 from typing import Optional, Union
 from urllib.parse import urlparse
 
-from engram_confidence import CONFIDENCE_MAP, PREDICTIVE_CONFIDENCE_CAP  # noqa: E402
+from engram_confidence import (  # noqa: E402
+    CONFIDENCE_MAP,
+    PREDICTIVE_CONFIDENCE_CAP,
+    SOURCE_CLASS_CONFIDENCE_DISCOUNT,
+    CONJECTURE_CONFIDENCE_DEFAULT,
+    CONJECTURE_CONFIDENCE_MIN,
+    CONJECTURE_CONFIDENCE_MAX,
+    REASONING_TYPES,
+    REASONING_CLASS,
+    REASONING_DISCOUNT,
+    ABDUCTIVE_CONFIDENCE_CAP,
+)
 
 
 try:
@@ -2892,4 +2903,459 @@ def _reflect_keywords(row) -> list | None:
         return parsed if isinstance(parsed, list) else None
     except (_json.JSONDecodeError, TypeError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# #872 wave-4 promotions — helpers moved to core so family modules K
+# (engram_epistemic) and L (engram_cornerstone) can use them without
+# importing server.py (acyclic constraint).
+# ---------------------------------------------------------------------------
+
+
+def _semantic_search(
+    conn: sqlite3.Connection,
+    query_text: str,
+    top_k: int = 10,
+    min_similarity: float = 0.3,
+    type_filter: set = None,
+    importance_threshold: float = 0.0,
+    include_superseded: bool = False,
+) -> list[dict]:
+    """Search nodes by embedding similarity.
+
+    Fast path: sqlite-vec vec0 KNN on the vec_nodes virtual table
+    (SIMD cosine distance). Joined back to nodes for metadata + filtered
+    by is_current, importance_threshold, type_filter, min_similarity.
+    KNN is applied before filtering, so overfetch (top_k * OVERFETCH) to
+    allow post-filtering without starving the result set.
+
+    Slow path (fallback): O(N) pure-Python cosine — only used when the
+    sqlite-vec extension failed to load.
+
+    include_superseded: when True, allow non-current (superseded) nodes to
+    surface. Retracted nodes are always excluded regardless of this flag —
+    they were never valid (defense-in-depth, mirrors PR #280 FTS-side filter).
+
+    Returns list of {"id", "type", "claim", "similarity", ...} sorted by
+    similarity descending. Falls back to empty list on any error.
+    """
+    try:
+        emb_config = _get_embedding_config()
+        if not emb_config.get("enabled", True) or not _embedder.is_available():
+            return []
+
+        model_name = emb_config.get("model", DEFAULT_EMBEDDING_MODEL)
+        query_vector = _embedder.embed(query_text, model_name)
+        if not query_vector:
+            return []
+
+        # ── Fast path: sqlite-vec KNN ──────────────────────────────────────
+        if _VEC_BACKEND_AVAILABLE and _sqlite_vec is not None and len(query_vector) == 384:
+            try:
+                # Overfetch so post-filter by is_current / importance / type
+                # can still yield top_k. Cap at a reasonable ceiling — KNN
+                # cost grows with k, and we rarely need more than ~40 rows
+                # surviving the filter.
+                overfetch = max(top_k * 4, 40)
+                vec_rows = conn.execute(
+                    "SELECT node_id, distance FROM vec_nodes "
+                    "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                    (_sqlite_vec.serialize_float32(query_vector), overfetch),
+                ).fetchall()
+                if not vec_rows:
+                    return []
+
+                # Distance → similarity: distance_metric=cosine returns
+                # (1 - cos_sim). Pre-filter by min_similarity before the JOIN
+                # to avoid fetching nodes we'll discard.
+                keep = []
+                for row in vec_rows:
+                    sim = 1.0 - float(row[1])
+                    if sim >= min_similarity:
+                        keep.append((row[0], sim))
+                if not keep:
+                    return []
+
+                ids = [k[0] for k in keep]
+                placeholders = ",".join("?" * len(ids))
+                # When include_superseded=False: require is_current=1 (excludes
+                # both superseded and retracted). When include_superseded=True:
+                # allow superseded (is_current=0) but always exclude retracted —
+                # retracted nodes were never valid (defense-in-depth).
+                where_parts = [f"id IN ({placeholders})"]
+                if not include_superseded:
+                    where_parts.append("is_current = 1")
+                where_parts.append("(status IS NULL OR status != 'retracted')")
+                where_parts.append("COALESCE(importance_score, 0) >= ?")
+                where_clause = " AND ".join(where_parts)
+                meta_rows = conn.execute(
+                    f"SELECT id, type, claim, confidence, quote_type, importance_score "
+                    f"FROM nodes WHERE {where_clause}",
+                    ids + [importance_threshold],
+                ).fetchall()
+                meta = {r["id"]: r for r in meta_rows}
+
+                scored = []
+                for node_id, sim in keep:
+                    r = meta.get(node_id)
+                    if r is None:
+                        continue  # filtered out (non-current / retracted / below threshold)
+                    if type_filter and r["type"] not in type_filter:
+                        continue
+                    scored.append({
+                        "id": r["id"],
+                        "type": r["type"],
+                        "claim": r["claim"],
+                        "confidence": r["confidence"],
+                        "quote_type": r["quote_type"],
+                        "similarity": round(sim, 4),
+                    })
+                    if len(scored) >= top_k:
+                        break
+                return scored
+            except sqlite3.OperationalError:
+                pass  # fall through to Python cosine
+
+        # ── Slow path: pure-Python O(N) cosine (legacy fallback) ──────────
+        # When include_superseded=False: require is_current=1 (excludes both
+        # superseded and retracted). When include_superseded=True: allow
+        # superseded but always exclude retracted (defense-in-depth).
+        if include_superseded:
+            sql = """SELECT id, type, claim, confidence, is_current, embedding,
+                            importance_score, quote_type
+                     FROM nodes
+                     WHERE (status IS NULL OR status != 'retracted')
+                     AND embedding IS NOT NULL
+                     AND COALESCE(importance_score, 0) >= ?"""
+        else:
+            sql = """SELECT id, type, claim, confidence, is_current, embedding,
+                            importance_score, quote_type
+                     FROM nodes
+                     WHERE is_current = 1
+                     AND (status IS NULL OR status != 'retracted')
+                     AND embedding IS NOT NULL
+                     AND COALESCE(importance_score, 0) >= ?"""
+        rows = conn.execute(sql, (importance_threshold,)).fetchall()
+
+        scored = []
+        for r in rows:
+            if type_filter and r["type"] not in type_filter:
+                continue
+            try:
+                node_vector = json.loads(r["embedding"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            sim = _embedder.cosine_similarity(query_vector, node_vector)
+            if sim >= min_similarity:
+                scored.append({
+                    "id": r["id"],
+                    "type": r["type"],
+                    "claim": r["claim"],
+                    "confidence": r["confidence"],
+                    "quote_type": r["quote_type"],
+                    "similarity": round(sim, 4),
+                })
+
+        scored.sort(key=lambda x: x["similarity"], reverse=True)
+        return scored[:top_k]
+    except Exception as e:
+        logging.warning("_semantic_search failed: %s", e)
+        return []
+
+
+def _similar_existing_matches(
+    conn: sqlite3.Connection,
+    claim: str,
+    *,
+    type_filter: set[str],
+    extra_columns: tuple[str, ...] = (),
+    extra_metadata_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """Return advisory similar-existing matches via FTS + semantic complement.
+
+    Called on write by engram_add_observation and engram_add_lesson BEFORE
+    the new node is inserted, so the new node doesn't match itself. The
+    returned records are advisory (non-blocking): a non-empty list surfaces
+    as a similar_existing action_hint nudging the agent to dedupe, but the
+    insert proceeds regardless. Best-effort: any exception returns an
+    empty list rather than blocking creation.
+
+    Both paths share the type_filter and the tier-2 importance floor —
+    the FTS path filters by importance_score in the WHERE clause; the
+    semantic path passes the same threshold to _semantic_search. Uniform
+    behavior across observation and lesson callers (#143 §3.1 drift
+    cleanup; the prior divergence where lesson FTS skipped the importance
+    filter was accidental, not designed).
+
+    Args:
+        conn: sqlite connection.
+        claim: claim text to scan against.
+        type_filter: node types to include (e.g. {"lesson"} or
+            {"observation_factual", "observation_predictive"}).
+        extra_columns: `nodes` table columns to include in each returned
+            record (e.g. ("evidence_id",) for observations).
+        extra_metadata_keys: JSON keys to pull from each node's metadata
+            blob and include in each returned record (e.g.
+            ("scaffolding_nudge",) for lessons).
+
+    Returns:
+        List of dicts with keys {id, claim, confidence, match_type} plus
+        `similarity` on semantic matches, plus any requested
+        extra_columns / extra_metadata_keys. Empty list on any failure
+        (FTS syntax error, semantic backend unavailable, exception).
+    """
+    if not type_filter:
+        return []
+    matches: list[dict] = []
+    try:
+        tier2_threshold = _get_tier_threshold(conn, 2)
+
+        # FTS keyword search. Importance floor in the WHERE clause for
+        # both callers — uniform with the semantic path's
+        # importance_threshold arg (drift cleanup; see docstring).
+        fts_ids: set[str] = set()
+        fts_query = _sanitize_fts_query(claim, conn)
+        try:
+            if not fts_query:
+                raise sqlite3.OperationalError("empty FTS query")
+            type_placeholders = ", ".join(["?"] * len(type_filter))
+            extra_col_select = (
+                ", " + ", ".join(f"n.{c}" for c in extra_columns)
+                if extra_columns else ""
+            )
+            meta_col_select = ", n.metadata" if extra_metadata_keys else ""
+            fts_sql = (
+                "SELECT n.id, n.type, n.claim, n.confidence, "
+                "n.is_current, n.importance_score"
+                f"{extra_col_select}{meta_col_select} "
+                "FROM nodes_fts fts "
+                "JOIN nodes n ON n.rowid = fts.rowid "
+                f"WHERE nodes_fts MATCH ? AND n.is_current = 1 "
+                f"AND n.type IN ({type_placeholders}) "
+                "AND COALESCE(n.importance_score, 0) >= ? "
+                "ORDER BY rank "
+                "LIMIT 5"
+            )
+            params = (fts_query, *tuple(type_filter), tier2_threshold)
+            for r in conn.execute(fts_sql, params).fetchall():
+                rec = {
+                    "id": r["id"],
+                    "claim": r["claim"],
+                    "confidence": r["confidence"],
+                    "match_type": "keyword",
+                }
+                for col in extra_columns:
+                    rec[col] = r[col]
+                if extra_metadata_keys:
+                    meta = json.loads(r["metadata"]) if r["metadata"] else {}
+                    for key in extra_metadata_keys:
+                        rec[key] = meta.get(key, "")
+                matches.append(rec)
+                fts_ids.add(r["id"])
+        except sqlite3.OperationalError:
+            pass  # FTS syntax error; semantic complement still runs
+
+        # Semantic complement. _semantic_search returns standardized
+        # records (no per-caller column augmentation), so extras come
+        # from a per-match SELECT against `nodes`.
+        if _embedder.is_available() and _get_embedding_config().get("enabled", True):
+            _th = _get_thresholds_config()
+            sem_results = _semantic_search(
+                conn, claim,
+                top_k=int(_th["dedup_top_k"]),
+                min_similarity=float(_th["dedup_min_similarity"]),
+                type_filter=type_filter,
+                importance_threshold=tier2_threshold,
+            )
+            extras_cols: list[str] = list(extra_columns)
+            if extra_metadata_keys:
+                extras_cols.append("metadata")
+            extras_select = ", ".join(extras_cols) if extras_cols else None
+            for s in sem_results:
+                if s["id"] in fts_ids:
+                    continue
+                rec = {
+                    "id": s["id"],
+                    "claim": s["claim"],
+                    "confidence": s.get("confidence"),
+                    "match_type": "semantic",
+                    "similarity": s.get("similarity"),
+                }
+                if extras_select:
+                    row = conn.execute(
+                        f"SELECT {extras_select} FROM nodes WHERE id = ?",
+                        (s["id"],),
+                    ).fetchone()
+                    if row:
+                        for col in extra_columns:
+                            rec[col] = row[col]
+                        if extra_metadata_keys:
+                            meta = json.loads(row["metadata"]) if row["metadata"] else {}
+                            for key in extra_metadata_keys:
+                                rec[key] = meta.get(key, "")
+                matches.append(rec)
+    except Exception as e:
+        logging.warning("_similar_existing_matches failed: %s", e)
+        return []
+    return matches
+
+
+# Keys stripped from similar_existing / similar_existing_lessons entries
+# via _strip_similar_block(). These raw search-pipeline signals are opaque
+# to agent reasoning for dedup decisions; action_hint encodes the actionable
+# summary and is KEPT. NOT stripped globally — meaningful in
+# engram_query(return_debug=True) results (eval-harness contract, §6348).
+_SIMILAR_STRIP_KEYS: frozenset[str] = frozenset({
+    "match_type",
+    "similarity",
+})
+
+
+def _strip_similar_block(entries: list[dict]) -> list[dict]:
+    """Strip match_type + similarity from similar_existing / similar_existing_lessons entries.
+
+    These raw search-pipeline signals are opaque to agent reasoning for dedup
+    decisions; action_hint encodes the actionable summary and is KEPT.
+
+    Applied ONLY at the assembly points for similar_existing and
+    similar_existing_lessons blocks (engram_add_observation, engram_add_lesson),
+    NOT globally — preserving these fields in engram_query debug-mode results.
+    """
+    return [
+        {k: v for k, v in entry.items() if k not in _SIMILAR_STRIP_KEYS}
+        for entry in entries
+    ]
+
+
+def _compute_confidence(
+    conn: sqlite3.Connection,
+    node_type: str,
+    quote_type: Optional[str] = None,
+    supporting_ids: Optional[list[str]] = None,
+    is_predictive: bool = False,
+    derivation_mode: str = "chain",
+    reasoning_type: Optional[str] = None,
+    source_class: Optional[str] = None,
+) -> float:
+    """Compute confidence for a node based on type and support.
+
+    For observations: confidence comes from quote_type (hard_data=0.95, etc.)
+      - source_class modifies this: user_stated overrides to official_statement,
+        introspective applies ×0.95 discount, external is standard.
+    For derivations with reasoning_type: confidence depends on the reasoning class:
+      - deductive: min(cᵢ) × type_discount (truth-preserving, tiny discount)
+      - inductive_corroboration: (1 - ∏(1-cᵢ)) × type_discount (reinforcing)
+      - inductive_chain: min(cᵢ) × type_discount (weaker discounts for analogy etc.)
+      - abductive: min(cᵢ) × type_discount, capped at ceiling (always provisional)
+      - authority: pass-through with small discount
+    For derivations without reasoning_type (legacy): uses derivation_mode as before.
+    """
+    if quote_type and quote_type in CONFIDENCE_MAP:
+        # user_stated overrides quote_type to official_statement
+        if source_class == "user_stated":
+            conf = CONFIDENCE_MAP["official_statement"]
+        else:
+            conf = CONFIDENCE_MAP[quote_type]
+            # introspective gets a discount — agent's own prior output
+            if source_class == "introspective":
+                conf = conf * SOURCE_CLASS_CONFIDENCE_DISCOUNT["introspective"]
+        if is_predictive:
+            conf = min(conf, PREDICTIVE_CONFIDENCE_CAP)
+        return round(conf, 3)
+
+    if supporting_ids:
+        confidences = []
+        for sid in supporting_ids:
+            row = conn.execute(
+                "SELECT confidence FROM nodes WHERE id = ?", (sid,)
+            ).fetchone()
+            if row and row["confidence"] is not None:
+                confidences.append(row["confidence"])
+        if confidences:
+            # If reasoning_type is provided, use type-specific computation
+            if reasoning_type and reasoning_type in REASONING_TYPES:
+                rclass = REASONING_CLASS[reasoning_type]
+                discount = REASONING_DISCOUNT[reasoning_type]
+
+                if rclass == "inductive_corroboration":
+                    # Independent evidence: 1 - ∏(1-cᵢ)
+                    product = 1.0
+                    for c in confidences:
+                        product *= (1.0 - c)
+                    conf = (1.0 - product) * discount
+                elif rclass == "abductive":
+                    # Chain formula but capped
+                    cap = ABDUCTIVE_CONFIDENCE_CAP.get(reasoning_type, 0.85)
+                    conf = min(min(confidences) * discount, cap)
+                else:
+                    # Deductive, inductive_chain, authority: weakest link × discount
+                    conf = min(confidences) * discount
+
+                return round(conf, 3)
+
+            # Legacy fallback: use derivation_mode
+            config = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
+            chain_decay = config.get("chain_decay", 0.95)
+            corrob_decay = config.get("corroboration_decay", 0.98)
+
+            if derivation_mode == "corroboration":
+                product = 1.0
+                for c in confidences:
+                    product *= (1.0 - c)
+                return round((1.0 - product) * corrob_decay, 3)
+            else:
+                return round(min(confidences) * chain_decay, 3)
+
+    return 0.5  # default
+
+
+def _rebuild_incidents_cache() -> dict:
+    """Rebuild the error_incidents.json cache from the graph.
+
+    Walks all `exemplifies` edges (incident → lesson), pairs each incident
+    with its lesson's claim + scaffolding_nudge from metadata, and writes
+    the full index from scratch. Idempotent. Used by
+    `engram_lesson_register_incident` to resync the hot-path cache after
+    an incremental append, and available for manual recovery if the cache
+    drifts (e.g. after a backfill migration, or if the JSON was deleted).
+
+    Returns a summary dict with counts — never raises.
+    """
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """SELECT e.source_id AS incident_id, e.target_id AS lesson_id,
+                      n.claim AS lesson_claim, n.metadata AS lesson_meta
+               FROM edges e
+               JOIN nodes n ON n.id = e.target_id
+               WHERE e.relation = 'exemplifies' AND n.type = 'lesson'
+                 AND n.is_current = 1"""
+        ).fetchall()
+
+        index: dict[str, dict] = {}
+        lesson_count: set[str] = set()
+        for r in rows:
+            try:
+                meta = json.loads(r["lesson_meta"]) if r["lesson_meta"] else {}
+            except (TypeError, json.JSONDecodeError):
+                meta = {}
+            index[r["incident_id"]] = {
+                "lesson_id": r["lesson_id"],
+                "lesson_claim": r["lesson_claim"],
+                "scaffolding_nudge": meta.get("scaffolding_nudge", ""),
+            }
+            lesson_count.add(r["lesson_id"])
+
+        os.makedirs(os.path.dirname(ERROR_INCIDENTS_PATH), exist_ok=True)
+        with open(ERROR_INCIDENTS_PATH, "w") as f:
+            json.dump(index, f, indent=2)
+
+        return {
+            "status": "rebuilt",
+            "incident_count": len(index),
+            "lesson_count": len(lesson_count),
+            "path": ERROR_INCIDENTS_PATH,
+        }
+    finally:
+        conn.close()
 

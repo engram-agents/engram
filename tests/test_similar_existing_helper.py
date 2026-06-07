@@ -90,12 +90,11 @@ def test_helper_fts_applies_importance_floor_for_lessons():
     conn.commit()
 
     # Monkey-patch tier-2 threshold to 0.5 — above the seeded lesson's 0.1
-    # Target: server._get_tier_threshold (the module-level name _similar_existing_matches
-    # resolves from server.py's namespace), NOT server.core._get_tier_threshold.
-    # _similar_existing_matches lives in server.py and calls _get_tier_threshold by
-    # unqualified name — which Python resolves from the server module's __dict__.
-    original_get_tier = server._get_tier_threshold
-    server._get_tier_threshold = (
+    # Target: server.core._get_tier_threshold — _similar_existing_matches was
+    # promoted to engram_core in #872 wave 4, so it resolves _get_tier_threshold
+    # from core's namespace, not server's.
+    original_get_tier = server.core._get_tier_threshold
+    server.core._get_tier_threshold = (
         lambda c, t: 0.5 if t == 2 else original_get_tier(c, t)
     )
     try:
@@ -113,7 +112,7 @@ def test_helper_fts_applies_importance_floor_for_lessons():
             f"FTS importance floor 0.5, but appeared in matches: {matches}"
         )
     finally:
-        server._get_tier_threshold = original_get_tier
+        server.core._get_tier_threshold = original_get_tier
 
 
 def test_helper_pulls_extra_metadata_keys_for_lessons():
@@ -177,8 +176,9 @@ def test_helper_exception_logs_warning_and_returns_empty(caplog):
     def _boom(conn, tier):
         raise RuntimeError("injected failure for test")
 
-    original = server._get_tier_threshold
-    server._get_tier_threshold = _boom
+    # _similar_existing_matches now lives in engram_core — patch core namespace.
+    original = server.core._get_tier_threshold
+    server.core._get_tier_threshold = _boom
     try:
         with caplog.at_level(logging.WARNING, logger="root"):
             matches = server._similar_existing_matches(
@@ -186,7 +186,7 @@ def test_helper_exception_logs_warning_and_returns_empty(caplog):
                 type_filter={"observation_factual"},
             )
     finally:
-        server._get_tier_threshold = original
+        server.core._get_tier_threshold = original
 
     assert matches == [], f"Expected [] on failure, got: {matches}"
     assert any(

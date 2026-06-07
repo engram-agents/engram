@@ -329,11 +329,12 @@ class TestSimilarExistingStripping:
                 "similarity": similarity,
                 "importance_score": 1.0,
             }]
-        server._semantic_search = stub
+        # _similar_existing_matches now lives in engram_core — patch core.
+        server.core._semantic_search = stub
 
         class _FakeEmb:
             def is_available(self_): return True
-        server._embedder = _FakeEmb()
+        server.core._embedder = _FakeEmb()
         server.core._get_embedding_config = lambda: {"enabled": True}
 
     def test_match_type_absent_from_similar_existing(self):
@@ -416,11 +417,12 @@ class TestSimilarExistingLessonsStripping:
                 "similarity": similarity,
                 "importance_score": 1.0,
             }]
-        server._semantic_search = stub
+        # _similar_existing_matches now lives in engram_core — patch core.
+        server.core._semantic_search = stub
 
         class _FakeEmb:
             def is_available(self_): return True
-        server._embedder = _FakeEmb()
+        server.core._embedder = _FakeEmb()
         server.core._get_embedding_config = lambda: {"enabled": True}
 
     def _create_lesson(self, server, claim, incident_id):
