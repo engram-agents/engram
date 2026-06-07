@@ -348,7 +348,7 @@ def test_mixed_state_only_mine_active_surfaced(engram_home, projects_dir):
 
     # My active baton
     _write_project(projects_dir, "PR-901", turn="borges", status="in-review")
-    # Ariadne's baton (not mine)
+    # the counterpart's baton (not mine)
     _write_project(projects_dir, "PR-902", turn="ariadne", status="in-review")
     # My merged project (closed)
     _write_project(projects_dir, "PR-903", turn="borges", status="merged")

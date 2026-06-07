@@ -940,14 +940,14 @@ class TestIntegration:
         _write_letter(
             inter_agent_dir, "2026-05-23T11-00-00Z_mneme.md",
             from_agent="mneme", to_agent="ariadne",
-            timestamp=_ts(-20), heading="From Mneme",
+            timestamp=_ts(-20), heading="From Zephyr",
         )
         rc, stdout, stderr = _run_ia(
             engram_home, inter_agent_dir, "list", "--from", "borges",
         )
         assert rc == 0
         assert "From borges" in stdout
-        assert "From Mneme" not in stdout
+        assert "From Zephyr" not in stdout
 
     def test_read_latest_no_unread_message_on_stdout(self, engram_home, inter_agent_dir):
         """Nit 1: 'no unread' message lands on stdout (informational), not stderr."""
@@ -1896,8 +1896,8 @@ class TestMultiRecipient:
     def test_membership_case_insensitive(self, engram_home, inter_agent_dir):
         """Membership test is case-insensitive."""
         from tools.ia import _is_recipient
-        assert _is_recipient("Ariadne, BORGES", "ariadne")
-        assert _is_recipient("Ariadne, BORGES", "borges")
+        assert _is_recipient("Alexa, ZEPHYR", "alexa")
+        assert _is_recipient("Alexa, ZEPHYR", "zephyr")
 
     def test_membership_no_match_empty_agent_name(self, engram_home, inter_agent_dir):
         """Empty agent_name never matches."""

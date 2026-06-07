@@ -460,7 +460,7 @@ def test_mentions_persist_when_inbox_still_returns_item(
 
     _write_cursor_file(tmp_cursor, datetime(2026, 1, 2, 0, 0, 0, tzinfo=timezone.utc))
 
-    mention = _make_inbox_item(tid="7", title="Luria needs you", author="luria")
+    mention = _make_inbox_item(tid="7", title="A colleague needs you", author="colleague-a")
 
     monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
 

@@ -180,7 +180,7 @@ def test_delete_on_empty_fts_raises_database_error(tmp_path):
     """Verify that 'delete'-inserting against an empty FTS index raises
     sqlite3.DatabaseError (NOT OperationalError).
 
-    This is the exact crash Ariadne hit: OperationalError is a subclass of
+    This is the exact crash the live install hit: OperationalError is a subclass of
     DatabaseError, but the FTS5 phantom-malformed comes out as DatabaseError
     directly — the old 'except sqlite3.OperationalError' did not catch it.
     """
@@ -272,7 +272,7 @@ def test_database_error_is_not_operational_error(tmp_path):
     conn.close()
 
     assert raised_exc is not None
-    # Informational only — not a gate: on Ariadne's SQLite this raised
+    # Informational only — not a gate: on one production SQLite build this raised
     # MismatchError (a DatabaseError subclass, NOT OperationalError).  On a
     # different SQLite build it could raise OperationalError instead; that
     # would still be caught by the widened `except sqlite3.DatabaseError`
@@ -290,7 +290,7 @@ def test_migration_block_with_widened_except_survives_empty_index(tmp_path):
     (user_version=0, empty FTS index, retracted nodes present) and assert no
     exception escapes — verifying that the DatabaseError widening is sufficient.
 
-    This is the exact scenario that killed Ariadne's restore: server starts,
+    This is the exact scenario that killed the live install's restore: server starts,
     nodes_fts was just created (empty), user_version=0 so migration fires,
     delete-on-empty raises DatabaseError — the widened except absorbs it.
     """

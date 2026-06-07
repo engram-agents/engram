@@ -241,7 +241,7 @@ def test_letter_to_other_agent_not_surfaced(engram_home, inter_agent_dir):
         inter_agent_dir, "2026-05-21T20-00-00Z_ariadne.md",
         from_agent="ariadne", to_agent="mneme",   # <-- different agent
         timestamp=datetime.now(timezone.utc) - timedelta(minutes=5),
-        heading="Message for Mneme",
+        heading="Message for Zephyr",
     )
     rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
     assert rc == 0
@@ -799,7 +799,7 @@ def test_four_new_letter_senders_cap_in_header(engram_home, inter_agent_dir):
     """Four distinct new-letter senders: first 2 + '+ 2 other(s)' in header line."""
     _write_config(engram_home, mode="multi", agent_name="borges")
     now = datetime.now(timezone.utc)
-    senders = ["zephyr", "ariadne", "mneme", "lei"]
+    senders = ["zephyr", "alexa", "quill", "alex"]
     for i, sender in enumerate(senders):
         _write_letter(
             inter_agent_dir, f"2026-05-23T12-0{i}-00Z_{sender}.md",
@@ -811,8 +811,8 @@ def test_four_new_letter_senders_cap_in_header(engram_home, inter_agent_dir):
     assert rc == 0
     ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
     first_line = ctx.splitlines()[0]
-    # sorted: ariadne, lei, mneme, zephyr → show ariadne, lei + 2 other(s)
-    assert "from ariadne, lei, + 2 other(s)" in first_line, (
+    # sorted: alex, alexa, quill, zephyr → show alex, alexa + 2 other(s)
+    assert "from alex, alexa, + 2 other(s)" in first_line, (
         f"Expected cap-rule output in header; got: {first_line!r}"
     )
 
@@ -1264,7 +1264,7 @@ def test_is_recipient_hook_and_ia_parity():
         ("ariadne, borges", "ariadne", "multi-recipient — first name match"),
         ("ariadne, borges", "borges", "multi-recipient — second name match"),
         ("mira", "mir", "substring non-match: 'mir' vs 'mira'"),
-        ("Ariadne, BORGES", "ariadne", "case-insensitive match"),
+        ("Alexa, ZEPHYR", "alexa", "case-insensitive match"),
         ("ariadne, borges", "", "empty agent_name — no match"),
         ("", "ariadne", "empty to_field — no match"),
     ]

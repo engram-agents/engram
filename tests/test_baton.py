@@ -52,12 +52,12 @@ def _run_baton(
 def _write_config(
     engram_home: Path,
     agent_name: str = "borges",
-    primary_user: str = "lei",
+    primary_user: str = "casey",
 ) -> None:
     """Write a minimal config.json into engram_home.
 
-    primary_user defaults to "lei" so that the pool sentinel resolves to
-    "lei" on all existing tests (issue #606 fix — the sentinel is now
+    primary_user defaults to "casey" so that the pool sentinel resolves to
+    "casey" on all existing tests (issue #606 fix — the sentinel is now
     read from config.json, not hardcoded).
     """
     cfg = {"mode": "multi", "agent_name": agent_name, "primary_user": primary_user}
@@ -283,15 +283,15 @@ class TestValidation:
         assert rc == 1
         assert "not a participant" in stderr or "participant" in stderr
 
-    def test_flip_to_lei_allowed(self, engram_home, projects_dir):
-        """flip to 'lei' is always valid regardless of participants list."""
+    def test_flip_to_casey_allowed(self, engram_home, projects_dir):
+        """flip to 'casey' is always valid regardless of participants list."""
         _write_config(engram_home, "borges")
         _write_project(projects_dir, "PR-104", participants=["borges", "ariadne"])
         rc, stdout, stderr = _run_baton(
             engram_home, projects_dir,
-            "flip", "PR-104", "lei", "need human decision",
+            "flip", "PR-104", "casey", "need human decision",
         )
-        assert rc == 0, f"flip to lei failed; stderr: {stderr}"
+        assert rc == 0, f"flip to casey failed; stderr: {stderr}"
 
     def test_flip_closed_project_fails(self, engram_home, projects_dir):
         """flip on merged project → exit 1, closed error."""
@@ -348,7 +348,7 @@ class TestValidation:
         assert "already" in stderr
 
     def test_init_turn_outside_participants_fails(self, engram_home, projects_dir):
-        """init with --turn not in participants (and not lei) → exit 1."""
+        """init with --turn not in participants (and not casey) → exit 1."""
         _write_config(engram_home, "borges")
         rc, stdout, stderr = _run_baton(
             engram_home, projects_dir,
@@ -742,17 +742,17 @@ class TestIntegration:
         turn = _read_project_field(projects_dir, "PR-802", "turn")
         assert turn == "ariadne"
 
-    def test_init_lei_as_participant_allowed(self, engram_home, projects_dir):
-        """lei can be a participant in a project."""
+    def test_init_casey_as_participant_allowed(self, engram_home, projects_dir):
+        """casey can be a participant in a project."""
         _write_config(engram_home, "borges")
         rc, stdout, stderr = _run_baton(
             engram_home, projects_dir,
             "init", "PR-803",
-            "--title", "with lei",
-            "--participants", "borges,ariadne,lei",
-            "--turn", "lei",
+            "--title", "with casey",
+            "--participants", "borges,ariadne,casey",
+            "--turn", "casey",
         )
-        assert rc == 0, f"init with lei failed; stderr: {stderr}"
+        assert rc == 0, f"init with casey failed; stderr: {stderr}"
 
     def test_descriptive_project_id_accepted(self, engram_home, projects_dir):
         """DESIGN-style IDs are accepted."""
@@ -920,11 +920,11 @@ class TestClaim:
     def test_claim_happy_path(self, engram_home, projects_dir):
         """Claim from pool: turn→borges; turn_reason→claimed; audit log appended; no .tmp."""
         _write_config(engram_home, "borges")
-        # Project sits in pool (turn=lei)
+        # Project sits in pool (turn=casey)
         _write_project(
             projects_dir, "PR-1001",
             title="pool project",
-            turn="lei",
+            turn="casey",
             participants=["borges", "ariadne"],
             turn_reason="released",
         )
@@ -972,7 +972,7 @@ class TestClaim:
         # Pool-ready but borges not listed as participant
         _write_project(
             projects_dir, "PR-1003",
-            turn="lei",
+            turn="casey",
             participants=["ariadne", "mneme"],
         )
         rc, stdout, stderr = _run_baton(
@@ -1001,7 +1001,7 @@ class TestRelease:
     """baton release: happy path, state-guard refusals, --done flag tests."""
 
     def test_release_happy_path(self, engram_home, projects_dir):
-        """Release to pool: turn→lei; default turn_reason; audit log appended; no .tmp."""
+        """Release to pool: turn→casey; default turn_reason; audit log appended; no .tmp."""
         _write_config(engram_home, "borges")
         _write_project(
             projects_dir, "PR-1101",
@@ -1017,7 +1017,7 @@ class TestRelease:
 
         # turn field updated to pool sentinel
         turn = _read_project_field(projects_dir, "PR-1101", "turn")
-        assert turn == "lei"
+        assert turn == "casey"
 
         # turn_reason defaults to "released"
         reason = _read_project_field(projects_dir, "PR-1101", "turn_reason")
@@ -1025,7 +1025,7 @@ class TestRelease:
 
         # Audit log entry appended
         content = (projects_dir / "PR-1101.md").read_text()
-        assert "→ lei: released" in content
+        assert "→ casey: released" in content
 
         # No .tmp file leftover
         tmp_files = list(projects_dir.glob("*.tmp"))
@@ -1521,21 +1521,21 @@ class TestReopen:
 class TestPoolSentinel:
     """Pool sentinel is derived from config primary_user, not hardcoded."""
 
-    def test_sentinel_resolves_to_non_lei_primary_user(
+    def test_sentinel_resolves_to_non_casey_primary_user(
         self, engram_home, projects_dir
     ):
         """With primary_user='alice' in config, the pool sentinel is 'alice'.
 
         This is the core fresh-install correctness test from issue #606:
-        a non-lei primary_user install must work end-to-end.
+        a non-casey primary_user install must work end-to-end.
         """
-        # Write config with primary_user=alice (non-lei install).
+        # Write config with primary_user=alice (non-casey install).
         _write_config(engram_home, agent_name="borges", primary_user="alice")
 
         # Create a pool project: turn=alice (the sentinel for this install).
         _write_project(
             projects_dir, "pool-alice-test",
-            title="non-lei sentinel test",
+            title="non-casey sentinel test",
             turn="alice",
             participants=["borges", "ariadne"],
             status="in-progress",
@@ -1552,7 +1552,7 @@ class TestPoolSentinel:
         turn = _read_project_field(projects_dir, "pool-alice-test", "turn")
         assert turn == "borges", f"Expected turn=borges after claim; got {turn!r}"
 
-        # release must put the baton back to alice (the sentinel), not "lei".
+        # release must put the baton back to alice (the sentinel), not "casey".
         rc, stdout, stderr = _run_baton(
             engram_home, projects_dir,
             "release", "pool-alice-test",
@@ -1565,12 +1565,12 @@ class TestPoolSentinel:
             f"Expected turn=alice (sentinel) after release; got {turn_after!r}"
         )
 
-        # Confirm the audit log uses alice, not lei.
+        # Confirm the audit log uses alice, not casey.
         content = (projects_dir / "pool-alice-test.md").read_text()
         assert "→ borges: claimed" in content, "Claim audit entry missing"
         assert "→ alice: released" in content, "Release audit entry uses wrong sentinel"
-        assert "lei" not in content.split("## Turn log")[-1], (
-            "Literal 'lei' must not appear in the turn log for an alice install"
+        assert "casey" not in content.split("## Turn log")[-1], (
+            "Literal 'casey' must not appear in the turn log for an alice install"
         )
 
     def test_sentinel_case_normalizes_capitalized_primary_user(
