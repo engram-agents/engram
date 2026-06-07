@@ -35,6 +35,7 @@ mode-gate foundation (is_multi_agent_mode, get_counterparts helpers).
 Design doc: see project design notes.
 """
 
+import hashlib
 import json
 import os
 import pwd
@@ -332,10 +333,76 @@ def _scan_letters(agent_name: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Shared-bin drift detection
+# ---------------------------------------------------------------------------
+
+def _shared_bin_drift_lines(engram_home: Path, session_id: str) -> list[str]:
+    """Return banner lines for drifted shared-bin CLIs, or [] if clean/skip."""
+    shared_bin = Path("/home/agents-shared/bin")
+    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
+    if not shared_bin.exists() or not plugin_root:
+        return []
+
+    FAMILY = [("ia", "ia.py"), ("baton", "baton.py"), ("forum", "forum.py")]
+
+    def _md5(p: Path) -> str:
+        return hashlib.md5(p.read_bytes()).hexdigest()
+
+    drifted = []
+    for cli_name, src_name in FAMILY:
+        shared = shared_bin / cli_name
+        src = Path(plugin_root) / "tools" / src_name
+        if not shared.exists() or not src.exists():
+            continue
+        if _md5(shared) != _md5(src):
+            drifted.append((cli_name, src_name))
+
+    if not drifted:
+        return []
+
+    # Compute fingerprint of the drift set
+    fingerprint = hashlib.md5(str(sorted(drifted)).encode()).hexdigest()
+
+    # Once-per-session throttle: skip if same fingerprint + session already warned
+    state_file = engram_home / "shared-bin-drift.state"
+    try:
+        state = json.loads(state_file.read_text())
+        if state.get("fingerprint") == fingerprint and state.get("session_id") == session_id:
+            return []  # throttled — already warned this session
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+
+    # Write state (update fingerprint + session)
+    try:
+        state_file.write_text(json.dumps({"fingerprint": fingerprint, "session_id": session_id}))
+    except OSError:
+        pass  # non-fatal: if we can't write state, we'll warn again next prompt
+
+    lines = ["⚠️ shared-bin CLI drift detected (multi-agent):"]
+    for cli_name, src_name in drifted:
+        lines.append(
+            f"  - {cli_name}: sudo cp \"$CLAUDE_PLUGIN_ROOT/tools/{src_name}\""
+            f" /home/agents-shared/bin/{cli_name}"
+        )
+    lines.append(
+        "Refresh before agents resume to avoid silent divergence. "
+        "Use `engram_diagnose` for the on-demand check."
+    )
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # ── Read stdin payload (session_id for drift throttle) ────────────────────
+    try:
+        hook_input = json.load(sys.stdin)
+    except (json.JSONDecodeError, EOFError):
+        hook_input = {}
+    session_id = hook_input.get("session_id", "")
+
     # ── Config (single load) ──────────────────────────────────────────────────
     config = _load_config()
 
@@ -385,12 +452,21 @@ def main() -> None:
     # Read cursor is NOT touched here; only explicit acknowledgment advances it.
     _write_cursor(SURFACED_CURSOR_PATH, now)
 
+    # ── Shared-bin drift check (inside mode gate; prepend when present) ───────
+    # Fail-open: drift check is advisory; letters channel is primary.
+    # An unreadable file during a shared-bin refresh must never kill the hook.
+    try:
+        drift_lines = _shared_bin_drift_lines(Path(ENGRAM_HOME), session_id)
+    except Exception:
+        drift_lines = []
+
     # ── Exit silently if nothing to report ────────────────────────────────────
-    if not new_letters and not unread_letters:
+    if not new_letters and not unread_letters and not drift_lines:
         sys.exit(0)
 
     # ── Build injection block ─────────────────────────────────────────────────
-    lines = []
+    # Drift warning comes first — it is more operationally urgent than the letter list.
+    lines = list(drift_lines)
 
     n_new = len(new_letters)
     if n_new > 0:
@@ -435,11 +511,13 @@ def main() -> None:
             )
 
     # Footer: name the CLI so the natural-affordance path IS the cursor-aware one.
-    lines.append(
-        "Tools: `ia read <filename>` (read + advance cursor) · "
-        "`ia write --re <filename>` (reply with reference) · "
-        "`ia status` (show cursor + counts)."
-    )
+    # Only add if there are letters (the footer is letter-context — not drift-only).
+    if new_letters or unread_letters:
+        lines.append(
+            "Tools: `ia read <filename>` (read + advance cursor) · "
+            "`ia write --re <filename>` (reply with reference) · "
+            "`ia status` (show cursor + counts)."
+        )
 
     context = "\n".join(lines)
 

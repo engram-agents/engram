@@ -146,6 +146,12 @@ The plugin tree/cache now has the new `server.py`, but the running MCP server ma
 
 ---
 
+## Step 5a — Shared-bin CLI refresh (multi-agent only)
+
+**If multi-agent:** After the plugin rebuild, check shared-bin CLI drift — the next prompt will surface a `⚠️ shared-bin drift` banner if drift is detected. To refresh proactively: for each of `{ia,baton,forum}`, compare `/home/agents-shared/bin/<cli>` with `$CLAUDE_PLUGIN_ROOT/tools/<src>.py` (use `diff` or `md5sum`) and `sudo cp` to refresh any that differ before other agents resume. This prevents the silent-degradation class where agents run a stale shared CLI against a newly-upgraded hook.
+
+---
+
 ## Step 6 — CLAUDE.md template inverse-merge (HARD GATE, the residual)
 
 If Step 2 found the host identity template changed in the range, **do not skip this**. On Claude, check `templates/CLAUDE.md.template` against `~/.claude/CLAUDE.md`. On Codex, check `templates/AGENTS.md.template` and any local first-person instructions in `~/.codex/config.toml`/project `AGENTS.md`. The plugin upgrade did not touch these user-scope identity surfaces, so template-side additions may NOT have reached the running agent.
