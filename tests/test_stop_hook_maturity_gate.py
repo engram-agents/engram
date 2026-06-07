@@ -478,3 +478,55 @@ def test_young_graph_emitted_nudge_preserves_824_envelope(tmp_path):
     ctx = hso.get("additionalContext")
     assert isinstance(ctx, str) and ctx, "additionalContext must be a non-empty string"
     assert "ENGRAM Write Check" in ctx, "Write-check text missing from additionalContext"
+
+
+# ---------------------------------------------------------------------------
+# Regression: #841 nudge text — explicit NO-output instruction, no 'carry on'
+# ---------------------------------------------------------------------------
+
+def _get_nudge_ctx(tmp_path) -> str:
+    """Helper: run hook on a young graph and return the emitted additionalContext."""
+    engram_home = tmp_path / "engram"
+    engram_home.mkdir()
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("", encoding="utf-8")
+
+    _make_db(engram_home, n_current=50)
+
+    # Fire 1: establish idle-gate state
+    _run_hook(_make_stop_payload(str(transcript)), engram_home)
+    _append_tool_use(transcript)
+
+    # Fire 2: nudge emits
+    stdout, rc = _run_hook(_make_stop_payload(str(transcript)), engram_home)
+    assert rc == 0 and stdout, f"Expected nudge emit; stdout={stdout!r}"
+    parsed = json.loads(stdout)
+    return parsed["hookSpecificOutput"]["additionalContext"]
+
+
+def test_nudge_contains_no_output_instruction(tmp_path):
+    """Emitted nudge must say 'NO output', not 'carry on' (#841 fix).
+
+    Mutation note: restoring the old 'carry on' text would make the 'carry on'
+    assertion below fail immediately, catching any regression to the ambiguous
+    wording this fix replaced.
+    """
+    ctx = _get_nudge_ctx(tmp_path)
+    assert "NO output" in ctx, (
+        f"Nudge must contain 'NO output' (explicit zero-output instruction); ctx={ctx!r}"
+    )
+    assert "carry on" not in ctx, (
+        f"Nudge must NOT contain 'carry on' (ambiguous old text replaced by #841); ctx={ctx!r}"
+    )
+
+
+def test_nudge_contains_space_after_insight_comma(tmp_path):
+    """Emitted nudge must contain 'insight, or design' (space after comma) — missing-space fix.
+
+    The pre-fix string concatenation 'insight,' + 'or design' rendered as
+    'insight,or design' (no space). This test pins the corrected form.
+    """
+    ctx = _get_nudge_ctx(tmp_path)
+    assert "insight, or design" in ctx, (
+        f"Nudge must contain 'insight, or design' (space after comma); ctx={ctx!r}"
+    )

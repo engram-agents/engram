@@ -603,9 +603,11 @@ def check_write_reminder() -> str:
             with open(WRITE_REMINDER_PATH, "w") as f:
                 json.dump(marker, f)
             return (
-                "[ENGRAM Write Check: Did your last response contain a decision, insight,"
+                "[ENGRAM Write Check: Did your last response contain a decision, insight, "
                 "or design choice worth recording? If so, write to ENGRAM now (observation, "
-                "derivation, question, or conjecture). If not, carry on.]"
+                "derivation, question, or conjecture). "
+                "If not, end the turn with NO output - do not reply to or acknowledge this check; "
+                "a text-only acknowledgment wastes a turn.]"
             )
     except (FileNotFoundError, json.JSONDecodeError):
         pass

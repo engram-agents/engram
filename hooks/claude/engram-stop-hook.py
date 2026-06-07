@@ -578,9 +578,11 @@ def main() -> None:
         return
 
     output = (
-        "[ENGRAM Write Check: Did your last response contain a decision, insight,"
+        "[ENGRAM Write Check: Did your last response contain a decision, insight, "
         "or design choice worth recording? If so, write to ENGRAM now "
-        "(observation, derivation, question, or conjecture). If not, carry on.]"
+        "(observation, derivation, question, or conjecture). "
+        "If not, end the turn with NO output - do not reply to or acknowledge this check; "
+        "a text-only acknowledgment wastes a turn.]"
     )
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": output}}))
 
