@@ -545,9 +545,6 @@ def _trace_evidence_roots(*args, **kwargs):
 
 def _validate_reasoning_structure(*args, **kwargs):
     return core._validate_reasoning_structure(*args, **kwargs)
-
-def _capture_feeling_context(*args, **kwargs):
-    return _tasks_mod._capture_feeling_context(*args, **kwargs)
 # ---- end #872 wave-5 compat forwarders --------------------------------
 
 # ---- #872 wave-6 compat forwarders -----------------------------------
@@ -1192,18 +1189,6 @@ def _log_engram_tool_event(
 #
 # Diagnostic access to stripped fields: tools/inspect_raw.py <node_id>
 # ---------------------------------------------------------------------------
-_AGENT_STRIP_KEYS: frozenset[str] = frozenset({
-    "embedding",
-    # content_hash and git_sha are stored inside the metadata JSON blob, not
-    # surfaced as top-level keys by _node_to_dict, so they never appear at
-    # the top level of a response dict. Kept here as dead-code documentation
-    # — they have no effect on the recursive strip but clarify intent.
-    # "content_hash",  # dead: stored in metadata blob, not a top-level key
-    # "git_sha",       # dead: stored in metadata blob, not a top-level key
-    "parsed_metadata",
-    "confidence_history",
-})
-
 def _strip_similar_block(*args, **kwargs):
     return core._strip_similar_block(*args, **kwargs)
 
@@ -2352,15 +2337,10 @@ def engram_stats(payload_json: str = "{}") -> str:
             "error": f"Invalid mode '{mode}'. Must be one of: {sorted(_VALID_MODES)}"
         })
 
-    # Section name → response key(s) mapping.
+    # Section name validation is handled inside _stats_impl (engram_stats.py).
     # "health_score" is a recognized name but engram_stats doesn't compute
     # it (that's engram_diagnose's domain); including it in sections is a
     # no-op that doesn't error.
-    _VALID_SECTIONS = {
-        "structure", "edges", "confidence", "open_questions",
-        "open_predictions", "reasoning_breakdown", "weakest_nodes",
-        "health_score", "memory",
-    }
     if sections_param is not None:
         if not isinstance(sections_param, list):
             return json.dumps({"error": "sections must be a list of strings"})

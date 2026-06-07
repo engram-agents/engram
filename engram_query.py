@@ -1659,7 +1659,10 @@ def _build_tiered_results(
 def _conn_total_count(where_clause: str, params: list) -> int:
     """Run COUNT(*) for the given WHERE clause. Helper for _list_impl."""
     conn = core._get_db()
-    return conn.execute(f"SELECT COUNT(*) FROM nodes WHERE {where_clause}", params).fetchone()[0]
+    try:
+        return conn.execute(f"SELECT COUNT(*) FROM nodes WHERE {where_clause}", params).fetchone()[0]
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

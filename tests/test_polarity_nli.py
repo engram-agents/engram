@@ -307,8 +307,7 @@ def test_polarity_skipped_when_sim_below_min_check():
             call_count["n"] += len(pairs)
             return [0.99] * len(pairs)
     _counting_nli = _CountingNLI()
-    server._nli_classifier = _counting_nli
-    import engram_core as _ec; _ec._nli_classifier = _counting_nli
+    server.core._nli_classifier = _counting_nli
 
     first_id = _seed_first_obs(server)
     # sim 0.25 < default min_similarity_for_check 0.30, but we also need it
@@ -363,8 +362,7 @@ def test_polarity_nli_returning_none_is_safe():
         def score(self_, prem, hyp, model_name): return None
         def score_batch(self_, pairs, model_name): return None
     _failing_nli = _FailingNLI()
-    server._nli_classifier = _failing_nli
-    import engram_core as _ec; _ec._nli_classifier = _failing_nli
+    server.core._nli_classifier = _failing_nli
 
     first_id = _seed_first_obs(server)
     _stub_semantic_with(server, similarity=0.70, target_id=first_id,
@@ -401,8 +399,7 @@ def test_batched_polarity_one_call_per_write():
             return [0.70] * len(pairs)
 
     _batch_counting_nli = _BatchCountingNLI()
-    server._nli_classifier = _batch_counting_nli
-    import engram_core as _ec; _ec._nli_classifier = _batch_counting_nli
+    server.core._nli_classifier = _batch_counting_nli
 
     first_id = _seed_first_obs(server)
 
@@ -454,8 +451,7 @@ def test_batched_polarity_filters_below_min_sim():
             return [0.70] * len(pairs)
 
     _pair_count_nli = _PairCountNLI()
-    server._nli_classifier = _pair_count_nli
-    import engram_core as _ec; _ec._nli_classifier = _pair_count_nli
+    server.core._nli_classifier = _pair_count_nli
 
     first_id = _seed_first_obs(server)
 
