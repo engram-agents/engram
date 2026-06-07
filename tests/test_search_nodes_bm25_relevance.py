@@ -192,6 +192,10 @@ def test_fts_sim_merge_floor_drops_low_similarity(monkeypatch):
     class _StubEmbedder:
         def is_available(self): return True
     monkeypatch.setattr(server, "_embedder", _StubEmbedder())
+    # Dual-patch: _search_nodes moved to engram_query.py (wave 8); it calls
+    # core._embedder directly. Patch both the server compat forwarder and the
+    # core object so both call sites are intercepted.
+    monkeypatch.setattr(server.core, "_embedder", _StubEmbedder())
     monkeypatch.setattr(server.core, "_get_embedding_config", lambda: {"enabled": True})
 
     # Stub _semantic_search to assert the FTS hit is found AND assigned
@@ -202,6 +206,8 @@ def test_fts_sim_merge_floor_drops_low_similarity(monkeypatch):
         return [{"id": row["id"], "similarity": 0.05, "type": "observation_factual",
                  "claim": "x", "confidence": 0.8}]
     monkeypatch.setattr(server, "_semantic_search", _stub_sem)
+    # Dual-patch: _search_nodes calls core._semantic_search; patch core too.
+    monkeypatch.setattr(server.core, "_semantic_search", _stub_sem)
 
     result = server._search_nodes(conn, "xylophone", top_k=5, use_semantic=True)
     # Sub-floor FTS hit should be dropped — no results from the FTS path,
@@ -230,6 +236,9 @@ def test_fts_sim_merge_bump_promotes_above_floor(monkeypatch):
     class _StubEmbedder:
         def is_available(self): return True
     monkeypatch.setattr(server, "_embedder", _StubEmbedder())
+    # Dual-patch: _search_nodes moved to engram_query.py (wave 8); it calls
+    # core._embedder directly. Patch both.
+    monkeypatch.setattr(server.core, "_embedder", _StubEmbedder())
     monkeypatch.setattr(server.core, "_get_embedding_config", lambda: {"enabled": True})
 
     captured_sim = 0.50
@@ -238,6 +247,8 @@ def test_fts_sim_merge_bump_promotes_above_floor(monkeypatch):
         return [{"id": row["id"], "similarity": captured_sim, "type": "observation_factual",
                  "claim": "x", "confidence": 0.8}]
     monkeypatch.setattr(server, "_semantic_search", _stub_sem)
+    # Dual-patch: _search_nodes calls core._semantic_search; patch core too.
+    monkeypatch.setattr(server.core, "_semantic_search", _stub_sem)
 
     result = server._search_nodes(
         conn, "xylophone", top_k=5, use_semantic=True, return_debug=True,

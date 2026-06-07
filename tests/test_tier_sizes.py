@@ -181,19 +181,28 @@ def test_semantic_top_k_scales_with_tier1_multiplier():
     server_module = sys.modules.get("server", srv)
 
     semantic_top_k_calls: list[int] = []
-    original_semantic = server_module._semantic_search
+    # Dual-patch: _search_nodes moved to engram_query.py (wave 8). It calls
+    # core._semantic_search directly, not server._semantic_search. Save the
+    # canonical from core (not the compat forwarder) to avoid circular call.
+    original_semantic_compat = server_module._semantic_search
+    original_semantic_core = server_module.core._semantic_search
 
     def capturing_semantic(conn, query, top_k, **kwargs):
         semantic_top_k_calls.append(top_k)
-        return original_semantic(conn, query, top_k=top_k, **kwargs)
+        # Call the core original to avoid the circular forwarder path.
+        return original_semantic_core(conn, query, top_k=top_k, **kwargs)
 
     server_module._semantic_search = capturing_semantic
+    server_module.core._semantic_search = capturing_semantic
 
     # Patch embedder to report available so the semantic path is taken.
+    # Dual-patch: _search_nodes calls core._embedder; patch both.
     original_is_available = server_module._embedder.is_available
     server_module._embedder.is_available = lambda: True
+    server_module.core._embedder.is_available = lambda: True
     original_get_emb_config = server_module._get_embedding_config
     server_module._get_embedding_config = lambda: {"enabled": True}
+    server_module.core._get_embedding_config = lambda: {"enabled": True}
 
     try:
         conn = srv._get_db()
@@ -202,9 +211,12 @@ def test_semantic_top_k_scales_with_tier1_multiplier():
         finally:
             conn.close()
     finally:
-        server_module._semantic_search = original_semantic
+        server_module._semantic_search = original_semantic_compat
+        server_module.core._semantic_search = original_semantic_core
         server_module._embedder.is_available = original_is_available
+        server_module.core._embedder.is_available = original_is_available
         server_module._get_embedding_config = original_get_emb_config
+        server_module.core._get_embedding_config = original_get_emb_config
 
     assert semantic_top_k_calls, (
         "semantic_search was never called — check use_semantic path + embedder mock"
