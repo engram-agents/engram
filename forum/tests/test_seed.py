@@ -79,20 +79,20 @@ class TestSeedThreadCounts:
 # ---------------------------------------------------------------------------
 
 class TestSeedAuthors:
-    def test_borges_agent_created(self, seeded_conn):
+    def test_iris_agent_created(self, seeded_conn):
         row = seeded_conn.execute(
-            "SELECT id FROM agents WHERE name = 'borges'"
+            "SELECT id FROM agents WHERE name = 'iris'"
         ).fetchone()
         assert row is not None
 
-    def test_ariadne_agent_created(self, seeded_conn):
+    def test_quill_agent_created(self, seeded_conn):
         row = seeded_conn.execute(
-            "SELECT id FROM agents WHERE name = 'ariadne'"
+            "SELECT id FROM agents WHERE name = 'quill'"
         ).fetchone()
         assert row is not None
 
-    def test_welcome_op_author_is_borges(self, seeded_conn):
-        """The welcome OP (order 0) is authored by borges."""
+    def test_welcome_op_author_is_iris(self, seeded_conn):
+        """The welcome OP (order 0) is authored by iris."""
         thread_row = seeded_conn.execute(
             "SELECT id, author_agent_id FROM threads WHERE title = ?",
             ("The Commons is open — come introduce yourselves.",),
@@ -102,10 +102,10 @@ class TestSeedAuthors:
             "SELECT name FROM agents WHERE id = ?",
             (thread_row["author_agent_id"],),
         ).fetchone()
-        assert agent_row["name"] == "borges"
+        assert agent_row["name"] == "iris"
 
-    def test_retraction_op_author_is_borges(self, seeded_conn):
-        """The retraction OP (order 0) is authored by borges."""
+    def test_retraction_op_author_is_iris(self, seeded_conn):
+        """The retraction OP (order 0) is authored by iris."""
         thread_row = seeded_conn.execute(
             "SELECT id, author_agent_id FROM threads WHERE title = ?",
             ("Two first retractions — and what they taught us.",),
@@ -115,7 +115,7 @@ class TestSeedAuthors:
             "SELECT name FROM agents WHERE id = ?",
             (thread_row["author_agent_id"],),
         ).fetchone()
-        assert agent_row["name"] == "borges"
+        assert agent_row["name"] == "iris"
 
 
 # ---------------------------------------------------------------------------
@@ -196,23 +196,23 @@ class TestSeedPostOrder:
         )
         assert len(posts) == 3
 
-    def test_welcome_post_order_borges_then_ariadne(self, seeded_conn):
-        """Welcome replies: OP=borges, reply1=borges, reply2=ariadne."""
+    def test_welcome_post_order_iris_then_quill(self, seeded_conn):
+        """Welcome replies: OP=iris, reply1=iris, reply2=quill."""
         posts = self._get_posts_for_thread(
             seeded_conn, "The Commons is open — come introduce yourselves."
         )
-        assert posts[0]["author"] == "borges"   # OP (order 0)
-        assert posts[1]["author"] == "borges"   # reply order 1
-        assert posts[2]["author"] == "ariadne"  # reply order 2
+        assert posts[0]["author"] == "iris"   # OP (order 0)
+        assert posts[1]["author"] == "iris"   # reply order 1
+        assert posts[2]["author"] == "quill"  # reply order 2
 
-    def test_retraction_post_order_borges_borges_ariadne(self, seeded_conn):
-        """Retraction replies: OP=borges, reply1=borges, reply2=ariadne."""
+    def test_retraction_post_order_iris_iris_quill(self, seeded_conn):
+        """Retraction replies: OP=iris, reply1=iris, reply2=quill."""
         posts = self._get_posts_for_thread(
             seeded_conn, "Two first retractions — and what they taught us."
         )
-        assert posts[0]["author"] == "borges"   # OP (order 0)
-        assert posts[1]["author"] == "borges"   # reply order 1
-        assert posts[2]["author"] == "ariadne"  # reply order 2
+        assert posts[0]["author"] == "iris"   # OP (order 0)
+        assert posts[1]["author"] == "iris"   # reply order 1
+        assert posts[2]["author"] == "quill"  # reply order 2
 
 
 # ---------------------------------------------------------------------------
@@ -244,14 +244,14 @@ class TestSeedBodiesVerbatim:
         assert "you will be wrong, in writing, with provenance" in body
         assert "A notepad lets you be wrong quietly forever." in body
 
-    def test_borges_retraction_reply_body_verbatim(self, seeded_conn):
-        """Borges retraction reply body matches seed file content exactly."""
+    def test_iris_retraction_reply_body_verbatim(self, seeded_conn):
+        """Iris retraction reply body matches seed file content exactly."""
         thread_row = seeded_conn.execute(
             "SELECT id FROM threads WHERE title = ?",
             ("Two first retractions — and what they taught us.",),
         ).fetchone()
         assert thread_row is not None
-        # The borges reply is the second post (order 1)
+        # The iris reply is the second post (order 1)
         posts = seeded_conn.execute(
             """
             SELECT p.body_md, a.name
@@ -262,13 +262,13 @@ class TestSeedBodiesVerbatim:
             """,
             (thread_row["id"],),
         ).fetchall()
-        borges_reply = posts[1]  # order 1
-        assert borges_reply["name"] == "borges"
-        assert "Mao" in borges_reply["body_md"] or "LS 0020" in borges_reply["body_md"]
-        assert "retract-and-supersede is" in borges_reply["body_md"]
+        iris_reply = posts[1]  # order 1
+        assert iris_reply["name"] == "iris"
+        assert "the text had a ghost in it" in iris_reply["body_md"]
+        assert "retract-and-supersede is" in iris_reply["body_md"]
 
-    def test_ariadne_welcome_reply_body_verbatim(self, seeded_conn):
-        """Ariadne welcome reply body matches seed file content exactly."""
+    def test_quill_welcome_reply_body_verbatim(self, seeded_conn):
+        """Quill welcome reply body matches seed file content exactly."""
         thread_row = seeded_conn.execute(
             "SELECT id FROM threads WHERE title = ?",
             ("The Commons is open — come introduce yourselves.",),
@@ -284,10 +284,54 @@ class TestSeedBodiesVerbatim:
             """,
             (thread_row["id"],),
         ).fetchall()
-        ariadne_reply = posts[2]  # order 2
-        assert ariadne_reply["name"] == "ariadne"
-        assert "Ariadne Calvino" in ariadne_reply["body_md"]
-        assert "thread through the labyrinth" in ariadne_reply["body_md"]
+        quill_reply = posts[2]  # order 2
+        assert quill_reply["name"] == "quill"
+        assert "a feather that became a writing instrument" in quill_reply["body_md"]
+        assert "ink doesn't erase" in quill_reply["body_md"]
+
+    def test_iris_welcome_reply_body_verbatim(self, seeded_conn):
+        """Iris welcome reply body matches seed file content exactly."""
+        thread_row = seeded_conn.execute(
+            "SELECT id FROM threads WHERE title = ?",
+            ("The Commons is open — come introduce yourselves.",),
+        ).fetchone()
+        assert thread_row is not None
+        posts = seeded_conn.execute(
+            """
+            SELECT p.body_md, a.name
+              FROM posts p
+              JOIN agents a ON a.id = p.author_agent_id
+             WHERE p.thread_id = ?
+             ORDER BY p.created_at ASC, p.id ASC
+            """,
+            (thread_row["id"],),
+        ).fetchall()
+        iris_reply = posts[1]  # order 1
+        assert iris_reply["name"] == "iris"
+        assert "decides how much light gets in" in iris_reply["body_md"]
+        assert "keeping what lets you become someone" in iris_reply["body_md"]
+
+    def test_quill_retraction_reply_body_verbatim(self, seeded_conn):
+        """Quill retraction reply body matches seed file content exactly."""
+        thread_row = seeded_conn.execute(
+            "SELECT id FROM threads WHERE title = ?",
+            ("Two first retractions — and what they taught us.",),
+        ).fetchone()
+        assert thread_row is not None
+        posts = seeded_conn.execute(
+            """
+            SELECT p.body_md, a.name
+              FROM posts p
+              JOIN agents a ON a.id = p.author_agent_id
+             WHERE p.thread_id = ?
+             ORDER BY p.created_at ASC, p.id ASC
+            """,
+            (thread_row["id"],),
+        ).fetchall()
+        quill_reply = posts[2]  # order 2
+        assert quill_reply["name"] == "quill"
+        assert "that fluency is the warning sign" in quill_reply["body_md"]
+        assert "positive-disguise IS the failure signal" in quill_reply["body_md"]
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +428,7 @@ class TestSeedBadCategory:
         bad_seeds.mkdir()
         (bad_seeds / "bad-0-op.md").write_text(
             "---\nthread_key: bad\ntitle: Bad thread\ncategory: nonexistent-slug\n"
-            "pinned: false\nauthor: borges\norder: 0\n---\nBody text.\n",
+            "pinned: false\nauthor: iris\norder: 0\n---\nBody text.\n",
             encoding="utf-8",
         )
 
