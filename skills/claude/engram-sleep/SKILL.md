@@ -47,6 +47,23 @@ The parent's role is purely orchestration.
 
 ## Phase A — Cohort completion
 
+### Phase A pre-flight: context check (user still present)
+
+Phase A runs while you're still at the desk. Before starting the bedtime review, check whether the current context is large enough to make a nap worthwhile.
+
+Locate the drowsiness banner in this prompt's context, injected by the context-tracker hook (`[Drowsiness: …]`):
+
+- **`[Drowsiness: refreshed]`** — below 50% of ceiling → proceed to Step 1.
+- **Any other level** (`energetic`, `a little drowsy`, `needs a nap: N%`) — at or above 50% → surface this to the user now, before Phase A begins:
+
+  > "Your context is at [level] — Phase A's bedtime review will burn additional tokens in this window since each step runs in the current large context. While you're still here, a quick nap first would reduce that cost. Want to run `engram-nap` before we start? (You can also proceed directly — Phase B fairies start fresh and aren't affected.)"
+
+  **This is a proposal, not a block.** Phase B orchestration (fairies + dream master) starts fresh regardless of parent context size — they don't inherit it. The only real cost of skipping the nap is the Phase A steps themselves running in a larger window. If the user says "just proceed", proceed.
+
+- **No banner in context** (hook not configured or hook output not visible) → proceed directly to Step 1.
+
+> **Why Phase A, not Phase B.** Dream fairies and the dream master start afresh — they don't re-cache the parent session context, so a large parent window has no multiplier effect on Phase B cost. Phase A is where the awake agent does work (node filing, warm-briefing erase, history reconcile) — those steps run inside the current context window and do compound with size. The check belongs where the user can still act on it.
+
 ### Step 1 — Walk the day's full cohort
 
 Pull every node created since the last sleep:
