@@ -140,20 +140,41 @@ def compare_suite_residual(
     return (STATUS_PASS, "0 failures", "")
 
 
-def compare_version_strings(ver_a: str, ver_b: str) -> tuple[str, str, str]:
-    """Compare two build version strings for G2 upgrade-smoke.
+# sha component is \w+ (not [0-9a-f]+): the producer (tools/engine/build.py
+# compute_build_version) emits two non-hex fallback shapes that still carry a
+# valid per-rebuild stamp — "unknown" (git unavailable) and "g<digits>"
+# (pure-numeric sha7 g-prefixed per semver §9 / git-describe convention).
+_STAMP_RE = re.compile(r"-dev\.\d{14}\.\w+")
 
-    PRE-#897: plugin.json carries a static version; both builds produce
-    identical strings. Spec says DEGRADED in that case, not FAIL.
+
+def check_stamp_pattern(version: str) -> tuple[str, str, str]:
+    """Check a build version string for the per-rebuild stamp pattern (G2 upgrade-smoke).
+
+    POST-#897: plugin.json carries a per-rebuild stamped version of the form
+    ``0.1.0-dev.<YYYYMMDDHHMMSS>.<sha>`` (14-digit timestamp + hex sha).
+
+    Property under test: the version string carries a per-build stamp.
+    Two consecutive same-second builds produce identical stamps — that collision
+    is not a regression; stamp presence is the invariant that matters.
 
     Returns (status, metric, detail).
+      PASS — version matches the stamped pattern (#897 landed correctly)
+      FAIL — version does not match (static/unstamped version is a regression
+             after #897 merged)
     """
-    if ver_a != ver_b:
-        return (STATUS_PASS, "versions differ", f"{ver_a!r} → {ver_b!r}")
+    if _STAMP_RE.search(version):
+        return (
+            STATUS_PASS,
+            "stamp present",
+            f"version={version!r} matches per-rebuild stamp pattern",
+        )
     return (
-        STATUS_DEGRADED,
-        "identical versions",
-        f"version={ver_a!r} — version stamping not yet merged (#897)",
+        STATUS_FAIL,
+        "stamp absent",
+        (
+            f"version={version!r} — no per-rebuild stamp "
+            "(expected -dev.<YYYYMMDDHHMMSS>.<sha> format; regression after #897?)"
+        ),
     )
 
 
@@ -599,81 +620,81 @@ def run_G1(repo_root: str, python: str) -> dict[str, Any]:
 def run_G2(repo_root: str, python: str) -> dict[str, Any]:
     """G2 — upgrade smoke (upgrade dimension).
 
-    Runs two consecutive G1 builds to different tmp dirs and compares the
-    plugin.json version field.
+    Runs a single build and checks whether the plugin.json version carries the
+    per-rebuild stamp pattern introduced by #897
+    (format: ``0.1.0-dev.<YYYYMMDDHHMMSS>.<sha>``).
 
-    PRE-#897: version is static → DEGRADED, not FAIL.
+    Property under test: version stamping is active.  Two consecutive sub-second
+    builds may produce identical stamps (granularity is one second); that is not
+    a regression — stamp presence is the invariant.  A second build is therefore
+    not needed; comparing two versions would produce a false DEGRADED/FAIL on
+    same-second collisions.
+
+    PASS    — version matches the stamped pattern
+    FAIL    — version does not match (unstamped = regression after #897)
+    SKIP    — engine not importable or Python not found
     """
-    versions: list[str] = []
-    for i in range(2):
-        with tempfile.TemporaryDirectory(prefix=f"rg_g2_{i}_") as tmp_out:
-            try:
-                proc = subprocess.run(
-                    [
-                        python, "-m", "tools.engine.cli",
-                        "build",
-                        "--tier", "essential",
-                        "--target", "claude-code",
-                        "--output", tmp_out,
-                    ],
-                    cwd=repo_root,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                )
-            except FileNotFoundError:
+    with tempfile.TemporaryDirectory(prefix="rg_g2_") as tmp_out:
+        try:
+            proc = subprocess.run(
+                [
+                    python, "-m", "tools.engine.cli",
+                    "build",
+                    "--tier", "essential",
+                    "--target", "claude-code",
+                    "--output", tmp_out,
+                ],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except FileNotFoundError:
+            return make_result(
+                "G2", "upgrade",
+                STATUS_SKIP, "skipped", f"Python not found: {python}",
+            )
+        except subprocess.TimeoutExpired:
+            return make_result(
+                "G2", "upgrade",
+                STATUS_FAIL, "timeout", "Build timed out",
+            )
+
+        if proc.returncode != 0:
+            output = proc.stdout + proc.stderr
+            if "ModuleNotFoundError" in output or "ImportError" in output:
                 return make_result(
                     "G2", "upgrade",
-                    STATUS_SKIP, "skipped", f"Python not found: {python}",
+                    STATUS_SKIP, "skipped",
+                    "Engine import failed",
                 )
-            except subprocess.TimeoutExpired:
-                return make_result(
-                    "G2", "upgrade",
-                    STATUS_FAIL, "timeout", f"Build {i+1} timed out",
-                )
+            return make_result(
+                "G2", "upgrade",
+                STATUS_FAIL,
+                f"exit={proc.returncode}",
+                "Build failed",
+            )
 
-            if proc.returncode != 0:
-                output = proc.stdout + proc.stderr
-                if "ModuleNotFoundError" in output or "ImportError" in output:
-                    return make_result(
-                        "G2", "upgrade",
-                        STATUS_SKIP, "skipped",
-                        f"Engine import failed on build {i+1}",
-                    )
-                return make_result(
-                    "G2", "upgrade",
-                    STATUS_FAIL,
-                    f"exit={proc.returncode}",
-                    f"Build {i+1} failed",
-                )
+        plugin_json = os.path.join(tmp_out, "plugin.json")
+        if not os.path.isfile(plugin_json):
+            return make_result(
+                "G2", "upgrade",
+                STATUS_FAIL, "no plugin.json",
+                "Build produced no plugin.json",
+            )
 
-            plugin_json = os.path.join(tmp_out, "plugin.json")
-            if not os.path.isfile(plugin_json):
-                return make_result(
-                    "G2", "upgrade",
-                    STATUS_FAIL, "no plugin.json",
-                    f"Build {i+1} produced no plugin.json",
-                )
+        try:
+            with open(plugin_json, encoding="utf-8") as f:
+                data = json.load(f)
+            version = data.get("version", "")
+        except (json.JSONDecodeError, OSError) as e:
+            return make_result(
+                "G2", "upgrade",
+                STATUS_FAIL, "parse-error",
+                f"plugin.json unreadable: {e}",
+            )
 
-            try:
-                with open(plugin_json, encoding="utf-8") as f:
-                    data = json.load(f)
-                versions.append(data.get("version", ""))
-            except (json.JSONDecodeError, OSError) as e:
-                return make_result(
-                    "G2", "upgrade",
-                    STATUS_FAIL, "parse-error",
-                    f"Build {i+1} plugin.json unreadable: {e}",
-                )
-
-    if len(versions) < 2:
-        return make_result(
-            "G2", "upgrade",
-            STATUS_FAIL, "incomplete",
-            "Could not complete two builds",
-        )
-
-    status, metric, detail = compare_version_strings(versions[0], versions[1])
+    status, metric, detail = check_stamp_pattern(version)
     return make_result("G2", "upgrade", status, metric, detail)
 
 

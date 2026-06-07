@@ -5,7 +5,7 @@ Test categories:
   - JSONSchema:         --json output parses and has required fields
   - SuiteResidual:      compare_suite_residual logic (pure function; no real pytest)
   - ForbiddenTeachings: G4b on a tmp fixture tree (match + clean cases)
-  - VersionCompare:     compare_version_strings logic (pure function)
+  - StampPattern:       check_stamp_pattern logic (pure function)
   - G6Offline:          G6 with gh CLI unavailable → SKIP
   - MarkdownBlock:      --markdown output contains the scorecard marker + all gate rows
   - MutationCheck:      G3a residual comparison + returncode backstop sabotage tests
@@ -59,8 +59,8 @@ from tools.release_gates import (
     STATUS_PASS,
     STATUS_SKIP,
     check_forbidden_teachings_in_content,
+    check_stamp_pattern,
     compare_suite_residual,
-    compare_version_strings,
     format_json_output,
     format_markdown,
     is_releasable,
@@ -360,26 +360,106 @@ class TestForbiddenTeachings(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# VersionCompare (pure function)
+# StampPattern (pure function) — G2 per-rebuild stamp check
 # ---------------------------------------------------------------------------
 
-class TestVersionCompare(unittest.TestCase):
-    """compare_version_strings covers PASS/DEGRADED branches."""
+class TestStampPattern(unittest.TestCase):
+    """check_stamp_pattern covers PASS (stamp present) and FAIL (stamp absent).
 
-    def test_different_versions_is_pass(self):
-        status, metric, detail = compare_version_strings("0.1.0", "0.1.0+build.2")
+    Property under test (post-#897): the version string carries a per-rebuild
+    stamp matching ``-dev.<YYYYMMDDHHMMSS>.<sha>``.
+
+    Mutation-check discipline:
+      (a) stamped version → PASS
+          Mutation: if the regex never matched, this would be FAIL — the assert
+          on STATUS_PASS would fail, confirming the guard is live.
+      (b) static/unstamped version → FAIL
+          Mutation: if the function returned PASS for any input, this would be
+          PASS — the assert on STATUS_FAIL would fail.
+      (c) two identical stamped versions (same-second collision) → both PASS
+          Confirms the property-check approach resolves the collision false-DEGRADED.
+          Mutation: if the function returned FAIL for identical stamps, the assert
+          on STATUS_PASS would fail.
+    """
+
+    # --- (a) stamped version → PASS ---
+
+    def test_stamped_version_is_pass(self):
+        """Canonical stamped format → PASS."""
+        stamped = "0.1.0-dev.20260607143022.a1b2c3d"
+        status, metric, detail = check_stamp_pattern(stamped)
         self.assertEqual(status, STATUS_PASS)
-        self.assertIn("differ", metric)
+        self.assertIn("stamp present", metric)
+        self.assertIn(stamped, detail)
 
-    def test_same_version_is_degraded(self):
-        status, metric, detail = compare_version_strings("0.1.0", "0.1.0")
-        self.assertEqual(status, STATUS_DEGRADED)
-        self.assertIn("identical", metric)
-        self.assertIn("#897", detail)
+    def test_stamped_version_various_sha_lengths_is_pass(self):
+        """Stamp regex accepts any hex-character sha suffix."""
+        for sha in ("abc1234", "deadbeef", "0" * 40):
+            with self.subTest(sha=sha):
+                version = f"0.1.0-dev.20260607120000.{sha}"
+                status, metric, detail = check_stamp_pattern(version)
+                self.assertEqual(status, STATUS_PASS, f"Expected PASS for version={version!r}")
 
-    def test_empty_strings_same_is_degraded(self):
-        status, metric, detail = compare_version_strings("", "")
-        self.assertEqual(status, STATUS_DEGRADED)
+    # --- (b) static/unstamped version → FAIL ---
+
+    def test_static_version_is_fail(self):
+        """Plain semver (no stamp) → FAIL (regression after #897)."""
+        static = "0.1.0"
+        status, metric, detail = check_stamp_pattern(static)
+        self.assertEqual(status, STATUS_FAIL)
+        self.assertIn("stamp absent", metric)
+        self.assertIn(static, detail)
+
+    def test_empty_version_is_fail(self):
+        """Empty version string (plugin.json had no version key) → FAIL."""
+        status, metric, detail = check_stamp_pattern("")
+        self.assertEqual(status, STATUS_FAIL)
+        self.assertIn("stamp absent", metric)
+
+    def test_partial_stamp_missing_sha_is_fail(self):
+        """Timestamp present but no sha component → FAIL (incomplete stamp)."""
+        partial = "0.1.0-dev.20260607143022"
+        status, metric, detail = check_stamp_pattern(partial)
+        self.assertEqual(status, STATUS_FAIL)
+
+    def test_wrong_timestamp_length_is_fail(self):
+        """13-digit timestamp (not 14) must not match → FAIL."""
+        wrong = "0.1.0-dev.2026060714302.abc123"
+        status, metric, detail = check_stamp_pattern(wrong)
+        self.assertEqual(status, STATUS_FAIL)
+
+    # --- producer fallback sha shapes (tools/engine/build.py) → PASS ---
+
+    def test_git_unavailable_fallback_is_pass(self):
+        """git-unavailable fallback sha 'unknown' → PASS (stamp IS present)."""
+        version = "0.1.0-dev.20260607140831.unknown"
+        status, metric, detail = check_stamp_pattern(version)
+        self.assertEqual(status, STATUS_PASS)
+
+    def test_g_prefixed_numeric_sha_is_pass(self):
+        """Pure-digit sha7 gets g-prefix from producer (semver §9); stamp is still present → PASS."""
+        version = "0.1.0-dev.20260607140831.g0149257"
+        status, metric, detail = check_stamp_pattern(version)
+        self.assertEqual(status, STATUS_PASS)
+
+    # --- (c) two identical stamped versions (same-second collision) → both PASS ---
+
+    def test_identical_stamped_versions_both_pass(self):
+        """Same-second build collision: both calls return PASS.
+
+        This is the core regression for issue #910: when two consecutive builds
+        complete within the same second, they emit identical version stamps.
+        The old compare_version_strings() returned DEGRADED for identical inputs.
+        check_stamp_pattern() checks the property (stamp present) not equality,
+        so both return PASS independently.
+        """
+        stamped = "0.1.0-dev.20260607143022.a1b2c3d"
+        status_a, metric_a, _ = check_stamp_pattern(stamped)
+        status_b, metric_b, _ = check_stamp_pattern(stamped)  # same string, same second
+        self.assertEqual(status_a, STATUS_PASS, "First build should PASS with stamped version")
+        self.assertEqual(status_b, STATUS_PASS, "Second build (same stamp) should also PASS")
+        self.assertEqual(metric_a, "stamp present")
+        self.assertEqual(metric_b, "stamp present")
 
 
 # ---------------------------------------------------------------------------
