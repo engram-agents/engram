@@ -13,6 +13,9 @@ Prior incidents this test exists to prevent:
 - 2026-05-11: engram_query_pattern shipped in PR #29 (2026-05-07) but SKILL.md
   had ZERO mention for 4 days until Lei caught it; same incident motivated
   this test.
+- 2026-06-06: engram_add_evidence appeared in §5 prose (internal helper, not
+  an MCP tool); the §4-only test was green throughout, surfaced by PR #892's
+  scrub. test_no_phantom_tools_in_full_prose closes the gap (issue #893).
 
 Scope: function-name matching only (MVP). Signature matching is a future
 extension when names alone produce too many false-positives or too few
@@ -21,8 +24,10 @@ real catches.
 Allowlist semantics: a tool may be intentionally undocumented in SKILL.md
 (internal helpers, deprecated-but-still-callable shims). Add to
 SERVER_ONLY_ALLOWLIST below with a one-line reason. A tool documented in
-SKILL.md that's not in server.py is ALWAYS a bug (you cannot use a tool
-that doesn't exist) — there is no symmetric allowlist.
+SKILL.md §4 that's not in server.py is ALWAYS a bug (you cannot use a tool
+that doesn't exist) — there is no symmetric allowlist for §4.
+
+For prose references outside §4, see PROSE_ALLOWLIST below.
 """
 
 from __future__ import annotations
@@ -40,6 +45,17 @@ SKILL_MD = REPO_ROOT / "SKILL.md"
 # allowlist remains short.
 SERVER_ONLY_ALLOWLIST: dict[str, str] = {
     # No entries currently — every shipped tool should be in SKILL.md.
+}
+
+# Backtick-enclosed engram_ names that appear in SKILL.md prose (outside §4)
+# but are NOT MCP tools. These are internal helpers or explicitly-absent
+# operations mentioned for documentation/explanation purposes. Add entries here
+# ONLY with a documented reason.
+PROSE_ALLOWLIST: dict[str, str] = {
+    # Empty — every backtick-enclosed engram_ name in SKILL.md prose must be
+    # a real MCP tool. Add entries only when a name legitimately appears for
+    # documentation purposes (internal helpers, explicitly-absent operations)
+    # and document the reason. Keep this list short.
 }
 
 
@@ -158,9 +174,9 @@ def test_no_phantom_tools_in_skill_md() -> None:
 
 
 def test_allowlist_entries_have_reasons() -> None:
-    """Every SERVER_ONLY_ALLOWLIST entry must have a non-empty reason.
+    """Every SERVER_ONLY_ALLOWLIST and PROSE_ALLOWLIST entry must have a non-empty reason.
 
-    Prevents the allowlist from becoming a silent suppression channel.
+    Prevents the allowlists from becoming silent suppression channels.
     """
     for tool_name, reason in SERVER_ONLY_ALLOWLIST.items():
         assert reason.strip(), (
@@ -168,3 +184,42 @@ def test_allowlist_entries_have_reasons() -> None:
             f"Either document why this tool is intentionally undocumented "
             f"in SKILL.md, or remove from the allowlist."
         )
+    for name, reason in PROSE_ALLOWLIST.items():
+        assert reason.strip(), (
+            f"PROSE_ALLOWLIST entry for {name!r} has empty reason. "
+            f"Document why this non-tool name legitimately appears in SKILL.md prose."
+        )
+
+
+def test_no_phantom_tools_in_full_prose() -> None:
+    """Every backtick-enclosed engram_ name in SKILL.md (full doc) is a real MCP tool.
+
+    test_no_phantom_tools_in_skill_md only checks §4 bold-bullet entries. This
+    test closes the one-directional gap: a prose reference outside §4 (e.g. in
+    §5 or §6 workflow prose) that names a non-existent tool is invisible to the
+    §4 scanner but implies the name is callable. Agents reading prose like
+    "call `engram_add_evidence`" will fail if that name is not an MCP tool.
+
+    Incident: engram_add_evidence appeared in §5 yellow-card prose; the §4 test
+    was green throughout (issue #893, surfaced by PR #892).
+
+    Allowlist: use PROSE_ALLOWLIST for names that legitimately appear in prose
+    for documentation/explanation purposes (internal helpers, explicitly-absent
+    operations). Keep the allowlist short; each entry must have a reason.
+    """
+    server_tools = extract_server_tools(SERVER_PY)
+    text = SKILL_MD.read_text()
+    # Match standalone backtick-enclosed engram_* names: `engram_name`
+    pattern = re.compile(r"`(engram_[a-z0-9_]+)`")
+    phantoms: set[str] = set()
+    for match in pattern.finditer(text):
+        name = match.group(1)
+        if name not in server_tools and name not in PROSE_ALLOWLIST:
+            phantoms.add(name)
+    assert not phantoms, (
+        f"Backtick-enclosed engram_ names in SKILL.md prose that are not MCP "
+        f"tools: {sorted(phantoms)}. Options: (a) tool was renamed/removed — "
+        f"update the prose; (b) internal helper referenced as if callable — "
+        f"rewrite prose to avoid tool-call implication; (c) legitimately-named "
+        f"non-tool — add to PROSE_ALLOWLIST with a documented reason."
+    )
