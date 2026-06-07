@@ -35,6 +35,14 @@
       "tier": "essential"
     },
     {
+      "path": "engram_focus.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_recall_summaries.py",
+      "tier": "essential"
+    },
+    {
       "path": "engram_walguard.py",
       "tier": "essential"
     },

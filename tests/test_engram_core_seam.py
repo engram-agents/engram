@@ -185,6 +185,93 @@ def test_engram_client_reset_survives_state_extraction(tmp_path):
     assert not probe.exists(), "old contents gone after reset"
 
 
+def test_family_modules_no_from_engram_core_and_no_mutable_assignments():
+    """Each engram_<family>.py module must honour two house rules.
+
+    Rule A — no 'from engram_core import': family modules must access shared
+    state ONLY via 'import engram_core as core; core.NAME', never via a naked
+    'from engram_core import' that binds names locally and bypasses the live
+    core namespace.
+
+    Rule B — no module-level assignment of any MUTABLE_NAMES member: family
+    modules must not re-bind mutable state at module scope (e.g.
+    'DATA_DIR = ...'). All mutable state lives in engram_core; a module-level
+    assignment in a family module would create a stale shadow.
+
+    Covers all engram_<family>.py files currently in the repo root (glob
+    pattern 'engram_*.py', excluding engram_core.py itself).
+    """
+    family_modules = sorted(REPO_ROOT.glob("engram_*.py"))
+    # Exclude engram_core.py itself — it IS the canonical state home
+    family_modules = [p for p in family_modules if p.name != "engram_core.py"]
+    assert family_modules, "No engram_*.py family modules found — glob may need adjustment"
+
+    # Rule A pattern
+    from_core_pattern = re.compile(r'\bfrom\s+engram_core\s+import\b')
+    # Rule B pattern — module-level assignment: line that assigns one of the mutable names
+    # A module-level assignment looks like: NAME = ... (at column 0, not inside a def/class)
+    # We detect with a simple heuristic: line starts with NAME followed by space/=
+    mutable_assign_pattern = re.compile(
+        r'^(' + '|'.join(re.escape(n) for n in MUTABLE_NAMES) + r')\s*='
+    )
+
+    rule_a_violations = []
+    rule_b_violations = []
+
+    for module_path in family_modules:
+        src = module_path.read_text(encoding="utf-8")
+        lines = src.splitlines()
+
+        # Rule A — only actual import statements at column 0 (not docstring/comment mentions)
+        for i, line in enumerate(lines, 1):
+            stripped = line.lstrip()
+            # Skip pure comment lines and lines that don't start with 'from'
+            if stripped.startswith('#') or not stripped.startswith('from'):
+                continue
+            if from_core_pattern.search(line):
+                rule_a_violations.append((module_path.name, i, line.rstrip()))
+
+        # Rule B — module-level assignments (at column 0, before first def/class)
+        # KNOWN BLINDSPOT (deliberate, heuristic-scope): `inside_block` latches True
+        # at the FIRST col-0 def/class and never resets, so a col-0 mutable-name
+        # assignment placed AFTER the first function definition is NOT caught.
+        # Family modules conventionally declare constants before any def, so the
+        # heuristic covers the intended shape; a full AST walk is the upgrade path
+        # if a wave ever places state below the first def. "Not caught" here is a
+        # scope choice, not an impossibility.
+        inside_block = False  # track whether we're past a def/class boundary
+        for i, line in enumerate(lines, 1):
+            stripped = line.rstrip()
+            # A def or class at col 0 starts a block; subsequent lines may be indented
+            if re.match(r'^(def |class )', stripped):
+                inside_block = True
+            # Only check col-0 lines outside function/class bodies
+            if not inside_block and mutable_assign_pattern.match(stripped):
+                rule_b_violations.append((module_path.name, i, stripped))
+
+    errors = []
+    if rule_a_violations:
+        formatted = "\n".join(
+            f"  {fname} line {lineno}: {src!r}"
+            for fname, lineno, src in rule_a_violations
+        )
+        errors.append(
+            f"Rule A — 'from engram_core import' forbidden in family modules "
+            f"({len(rule_a_violations)} occurrence(s)):\n{formatted}"
+        )
+    if rule_b_violations:
+        formatted = "\n".join(
+            f"  {fname} line {lineno}: {src!r}"
+            for fname, lineno, src in rule_b_violations
+        )
+        errors.append(
+            f"Rule B — module-level mutable-name assignment in family module "
+            f"({len(rule_b_violations)} occurrence(s)):\n{formatted}"
+        )
+
+    assert not errors, "\n\n".join(errors)
+
+
 def test_two_clients_two_dirs_isolated(tmp_path):
     """The multi-client isolation contract: constructing client #2 with a
     different db_dir must NOT redirect client #1's live path state.

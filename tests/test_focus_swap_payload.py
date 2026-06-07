@@ -80,13 +80,14 @@ def test_impl_callable_with_kwargs():
     ax_b = r_b["axiom_id"]
 
     # Focus ax_b and save as a named set, then switch active list to ax_a.
-    server._focus_impl(node_ids=ax_b, reason="setup: save b as load target")
-    server._focus_save_impl(name="swap-target-set", description="set to load in swap")
-    server._unfocus_impl(node_ids=ax_b)
-    server._focus_impl(node_ids=ax_a, reason="setup: ax_a is current active")
+    import engram_focus
+    engram_focus._focus_impl(node_ids=ax_b, reason="setup: save b as load target")
+    engram_focus._focus_save_impl(name="swap-target-set", description="set to load in swap")
+    engram_focus._unfocus_impl(node_ids=ax_b)
+    engram_focus._focus_impl(node_ids=ax_a, reason="setup: ax_a is current active")
 
     # Call _focus_swap_impl directly with named kwargs — must not raise, must return valid JSON.
-    result_str = server._focus_swap_impl(save_as="swap-source-set", load="swap-target-set")
+    result_str = engram_focus._focus_swap_impl(save_as="swap-source-set", load="swap-target-set")
     r = json.loads(result_str)
     assert "error" not in r, f"_focus_swap_impl returned error: {r}"
     assert "status" in r and "saved" in r, (

@@ -82,7 +82,8 @@ def test_impl_callable_with_kwargs():
     ax_id = r_add["axiom_id"]
 
     # Call _focus_impl directly with named kwargs — must not raise, must return valid JSON.
-    result_str = server._focus_impl(node_ids=ax_id, reason="impl kwargs test reason")
+    import engram_focus
+    result_str = engram_focus._focus_impl(node_ids=ax_id, reason="impl kwargs test reason")
     r = json.loads(result_str)
     assert "error" not in r, f"_focus_impl returned error: {r}"
     assert "status" in r and "focused" in r, (

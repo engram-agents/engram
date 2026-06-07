@@ -73,12 +73,13 @@ def test_impl_callable_with_kwargs():
     ax_id = r_add["axiom_id"]
 
     # Focus and save so there's a set to load.
-    server._focus_impl(node_ids=ax_id, reason="setup for focus_load test")
-    server._focus_save_impl(name="load-kwargs-set", description="test set for load")
-    server._unfocus_impl(node_ids=ax_id)
+    import engram_focus
+    engram_focus._focus_impl(node_ids=ax_id, reason="setup for focus_load test")
+    engram_focus._focus_save_impl(name="load-kwargs-set", description="test set for load")
+    engram_focus._unfocus_impl(node_ids=ax_id)
 
     # Call _focus_load_impl directly with named kwargs — must not raise, must return valid JSON.
-    result_str = server._focus_load_impl(name="load-kwargs-set")
+    result_str = engram_focus._focus_load_impl(name="load-kwargs-set")
     r = json.loads(result_str)
     assert "error" not in r, f"_focus_load_impl returned error: {r}"
     assert "status" in r and "loaded" in r, (

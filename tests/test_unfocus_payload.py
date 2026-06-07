@@ -73,10 +73,11 @@ def test_impl_callable_with_kwargs():
     ax_id = r_add["axiom_id"]
 
     # Focus it first so there's something to unfocus.
-    server._focus_impl(node_ids=ax_id, reason="setup for unfocus test")
+    import engram_focus
+    engram_focus._focus_impl(node_ids=ax_id, reason="setup for unfocus test")
 
     # Call _unfocus_impl directly with named kwargs — must not raise, must return valid JSON.
-    result_str = server._unfocus_impl(node_ids=ax_id)
+    result_str = engram_focus._unfocus_impl(node_ids=ax_id)
     r = json.loads(result_str)
     assert "error" not in r, f"_unfocus_impl returned error: {r}"
     assert "status" in r and "released" in r, (
