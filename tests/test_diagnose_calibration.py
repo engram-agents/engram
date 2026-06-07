@@ -306,9 +306,7 @@ def test_health_score_unaffected_by_calibration():
         "by_reasoning_type": {},
         "by_source_class": {},
     }
-    with mock.patch.object(
-        server, "_compute_confidence_distribution", return_value=extreme_confidence
-    ):
+    with mock.patch("engram_stats._compute_confidence_distribution", return_value=extreme_confidence):
         r2 = json.loads(server.engram_diagnose())
     score2 = r2["health_score"]
 
@@ -331,8 +329,8 @@ def test_calibration_defensive_on_engram_stats_failure():
     server = fresh_server()
     _seed_observation(server, "Defensive test obs")
 
-    with mock.patch.object(
-        server, "_compute_confidence_distribution",
+    with mock.patch(
+        "engram_stats._compute_confidence_distribution",
         side_effect=RuntimeError("stats broken"),
     ):
         r = json.loads(server.engram_diagnose())
@@ -361,8 +359,8 @@ def test_calibration_defensive_on_engram_stats_bad_json():
     server = fresh_server()
     _seed_observation(server, "Bad JSON defensive test obs")
 
-    with mock.patch.object(
-        server, "_compute_confidence_distribution",
+    with mock.patch(
+        "engram_stats._compute_confidence_distribution",
         side_effect=ValueError("simulated helper failure"),
     ):
         r = json.loads(server.engram_diagnose())
