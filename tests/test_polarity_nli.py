@@ -84,6 +84,13 @@ def fresh_server(*, polarity_enabled: bool, nli_score: float | None = None):
     # Provides BOTH score() and score_batch() since the production code path
     # uses score_batch() (one batched call per write) and tests + back-compat
     # callers use score() (single-pair).
+    #
+    # Dual-patch (wave-9 seam migration): _compute_polarity_alerts now lives in
+    # engram_observation.py and reads core._nli_classifier. Patching only the
+    # server-module alias would leave the module-local call reading the
+    # un-stubbed engram_core instance. Mirror the _embedder dual-patch pattern
+    # (lines 54-55 above): set BOTH server._nli_classifier AND
+    # engram_core._nli_classifier so the stub is visible at all call sites.
     if nli_score is not None:
         class _StubNLI:
             def __init__(self_): self_._loaded = True
@@ -91,7 +98,10 @@ def fresh_server(*, polarity_enabled: bool, nli_score: float | None = None):
             def score(self_, prem, hyp, model_name): return nli_score
             def score_batch(self_, pairs, model_name):
                 return [nli_score] * len(pairs)
-        server._nli_classifier = _StubNLI()
+        stub_nli = _StubNLI()
+        server._nli_classifier = stub_nli
+        import engram_core as _ec
+        _ec._nli_classifier = stub_nli
 
     return server
 
@@ -296,7 +306,9 @@ def test_polarity_skipped_when_sim_below_min_check():
         def score_batch(self_, pairs, model_name):
             call_count["n"] += len(pairs)
             return [0.99] * len(pairs)
-    server._nli_classifier = _CountingNLI()
+    _counting_nli = _CountingNLI()
+    server._nli_classifier = _counting_nli
+    import engram_core as _ec; _ec._nli_classifier = _counting_nli
 
     first_id = _seed_first_obs(server)
     # sim 0.25 < default min_similarity_for_check 0.30, but we also need it
@@ -350,7 +362,9 @@ def test_polarity_nli_returning_none_is_safe():
         def available(self_): return False
         def score(self_, prem, hyp, model_name): return None
         def score_batch(self_, pairs, model_name): return None
-    server._nli_classifier = _FailingNLI()
+    _failing_nli = _FailingNLI()
+    server._nli_classifier = _failing_nli
+    import engram_core as _ec; _ec._nli_classifier = _failing_nli
 
     first_id = _seed_first_obs(server)
     _stub_semantic_with(server, similarity=0.70, target_id=first_id,
@@ -386,7 +400,9 @@ def test_batched_polarity_one_call_per_write():
             )
             return [0.70] * len(pairs)
 
-    server._nli_classifier = _BatchCountingNLI()
+    _batch_counting_nli = _BatchCountingNLI()
+    server._nli_classifier = _batch_counting_nli
+    import engram_core as _ec; _ec._nli_classifier = _batch_counting_nli
 
     first_id = _seed_first_obs(server)
 
@@ -437,7 +453,9 @@ def test_batched_polarity_filters_below_min_sim():
             batch_calls["pairs_seen"] = len(pairs)
             return [0.70] * len(pairs)
 
-    server._nli_classifier = _PairCountNLI()
+    _pair_count_nli = _PairCountNLI()
+    server._nli_classifier = _pair_count_nli
+    import engram_core as _ec; _ec._nli_classifier = _pair_count_nli
 
     first_id = _seed_first_obs(server)
 
