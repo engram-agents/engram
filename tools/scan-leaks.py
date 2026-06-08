@@ -35,6 +35,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -89,27 +90,88 @@ def load_local_patterns(root: Path, config_path: Path | None = None) -> tuple[li
     return patterns, True
 
 
-def scan(root: Path, leak_patterns: list) -> list[tuple[str, int, str, str]]:
+def _git_tracked_files(root: Path) -> list[Path] | None:
+    """Return the list of git-tracked files under root, or None on failure.
+
+    Uses ``git ls-files -z`` so filenames with spaces/newlines are handled
+    correctly.  Returns None if git is unavailable or the command fails (e.g.
+    root is not inside a git repo), so the caller can fall back to os.walk.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=root,
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        # git not installed
+        return None
+    if result.returncode != 0:
+        return None
+    raw = result.stdout
+    if not raw:
+        return []
+    # NUL-split; decode each path; filter empty strings from trailing NUL
+    return [root / p.decode("utf-8", errors="replace") for p in raw.split(b"\x00") if p]
+
+
+def scan(root: Path, leak_patterns: list, use_git: bool = True) -> list[tuple[str, int, str, str]]:
+    """Scan root for leak_patterns and return a list of (relpath, lineno, label, snippet).
+
+    When use_git is True (default), candidate files are enumerated via
+    ``git ls-files -z`` so that untracked files — gitignored local notes,
+    developer scratch, active-work dirs — are invisible to the scan.  This
+    keeps the repo-clean test (test_real_repo_scan_no_config_exits_clean) env-
+    independent: it passes on both CI fresh checkouts and developer machines
+    with local untracked cruft.
+
+    If git is unavailable or the command fails the scanner falls back to an
+    os.walk of root — scanning too much is safer than scanning nothing.
+
+    When use_git is False (explicit-path invocation), the os.walk path is used
+    unconditionally so that callers can target specific non-repo directories.
+    """
     leaks = []
-    for dirpath, dirs, files in os.walk(root):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-        for fname in files:
-            if fname in SKIP_FILES:
+
+    tracked = _git_tracked_files(root) if use_git else None
+
+    if tracked is not None:
+        # Git-tracked enumeration: skip SKIP_DIRS and SKIP_FILES by name,
+        # and apply the same extension filter as the os.walk path.
+        candidates = []
+        for fpath in tracked:
+            # Check every component for SKIP_DIRS membership
+            parts = fpath.relative_to(root).parts
+            if any(p in SKIP_DIRS for p in parts):
                 continue
-            ext = Path(fname).suffix
-            if ext not in SCAN_EXTENSIONS:
+            if fpath.name in SKIP_FILES:
                 continue
-            fpath = Path(dirpath) / fname
-            try:
-                content = fpath.read_text()
-            except (UnicodeDecodeError, OSError):
+            if fpath.suffix not in SCAN_EXTENSIONS:
                 continue
-            rel = fpath.relative_to(root)
-            for i, line in enumerate(content.splitlines(), 1):
-                for pattern, label in leak_patterns:
-                    if pattern.search(line):
-                        leaks.append((str(rel), i, label, line.strip()[:120]))
-                        break
+            candidates.append(fpath)
+    else:
+        # Fallback: os.walk (original behavior)
+        candidates = []
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for fname in files:
+                if fname in SKIP_FILES:
+                    continue
+                if Path(fname).suffix not in SCAN_EXTENSIONS:
+                    continue
+                candidates.append(Path(dirpath) / fname)
+
+    for fpath in candidates:
+        try:
+            content = fpath.read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        rel = fpath.relative_to(root)
+        for i, line in enumerate(content.splitlines(), 1):
+            for pattern, label in leak_patterns:
+                if pattern.search(line):
+                    leaks.append((str(rel), i, label, line.strip()[:120]))
+                    break
     return leaks
 
 

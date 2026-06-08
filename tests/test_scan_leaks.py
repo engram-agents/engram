@@ -318,3 +318,121 @@ def test_real_repo_scan_no_config_exits_clean(tmp_path):
         "Expected advisory confirming personal-name net didn't run; "
         f"got stdout: {result.stdout!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 9: git-tracking — untracked file with a structural hit is invisible
+# ---------------------------------------------------------------------------
+
+def _init_git_repo(path: Path) -> None:
+    """Initialise a minimal git repo with a committer identity."""
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True)
+
+
+def test_repo_mode_ignores_untracked_hit(tmp_path):
+    """Repo-mode scan must NOT report a structural-pattern hit in an untracked file.
+
+    Fixture:
+      - git repo with one committed clean file (tracked.py)
+      - one gitignored/untracked file (dirty.py) containing the structural
+        hit (the committed pattern — written split in code to avoid self-match)
+
+    Expected: exit 0, 0 hits reported.
+
+    Mutation note: if the scanner used os.walk instead of git ls-files, it
+    would find dirty.py and exit 1 on the structural hit.  The git-enumeration
+    path makes untracked dirty files invisible.
+    """
+    _init_git_repo(tmp_path)
+
+    # Commit a clean tracked file
+    tracked = tmp_path / "tracked.py"
+    tracked.write_text("# nothing suspicious\n")
+    subprocess.run(["git", "add", "tracked.py"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp_path, check=True)
+
+    # Add an untracked (gitignored) file that contains the structural-pattern hit.
+    # Use concatenation so this test file itself does not trip the real-repo scan.
+    dirty = tmp_path / "dirty.py"
+    dirty.write_text("path = '" + "kg_protocol" + "_for_ai" + "/stuff'\n")
+
+    # Also .gitignore it so it's explicitly excluded
+    (tmp_path / ".gitignore").write_text("dirty.py\n")
+
+    absent_config = tmp_path / "no-config.json"
+    result = subprocess.run(
+        [
+            sys.executable, str(SCAN_LEAKS),
+            "--root", str(tmp_path),
+            "--config-path", str(absent_config),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"Repo-mode scan must exit 0: untracked hit in dirty.py must be invisible.\n"
+        f"returncode: {result.returncode}\n"
+        f"stdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )
+    assert "main repo path" not in result.stderr, (
+        "Structural hit in untracked file must not appear in stderr output; "
+        f"got stderr: {result.stderr!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 10: git-tracking inverse — tracked file with a hit is still detected
+# ---------------------------------------------------------------------------
+
+def test_repo_mode_detects_tracked_hit(tmp_path):
+    """Repo-mode scan MUST report a structural-pattern hit in a tracked file.
+
+    Fixture:
+      - git repo with one committed file (tracked.py) containing
+        the structural hit (the committed pattern — written split in code to avoid self-match)
+      - one clean untracked file (untracked.py) that is NOT hit
+
+    Expected: exit 1, hit reported from tracked.py.
+
+    Non-vacuity inverse of test_repo_mode_ignores_untracked_hit: proves that
+    switching to git ls-files enumeration does not silently drop real leaks
+    that ARE in tracked files.
+    """
+    _init_git_repo(tmp_path)
+
+    # Commit the file that contains the structural-pattern hit
+    bad = tmp_path / "bad.py"
+    bad.write_text("path = '" + "kg_protocol" + "_for_ai" + "/stuff'\n")
+    subprocess.run(["git", "add", "bad.py"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init with leak"], cwd=tmp_path, check=True)
+
+    # Untracked clean file (must NOT trigger a false positive)
+    (tmp_path / "untracked.py").write_text("# nothing here\n")
+
+    absent_config = tmp_path / "no-config.json"
+    result = subprocess.run(
+        [
+            sys.executable, str(SCAN_LEAKS),
+            "--root", str(tmp_path),
+            "--config-path", str(absent_config),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1, (
+        f"Repo-mode scan must exit 1 when a tracked file contains the structural hit.\n"
+        f"returncode: {result.returncode}\n"
+        f"stdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )
+    assert "main repo path" in result.stderr, (
+        "Expected 'main repo path' label in stderr for the tracked hit; "
+        f"got stderr: {result.stderr!r}"
+    )
+    assert "bad.py" in result.stderr, (
+        "Expected the filename bad.py to appear in the leak report; "
+        f"got stderr: {result.stderr!r}"
+    )
