@@ -20,7 +20,7 @@ Hot-seat dispatch fires IFF:
 - hot_seat_enabled == true
 - now < last_activity_at + expiry_ttl_seconds
 
-Otherwise: dispatcher skips (cron-poll heartbeat covers as fallback cadence).
+Otherwise: dispatcher skips (self-paced loop's ScheduleWakeup covers as fallback cadence).
 
 Shared between Borges + Mneme channel_dispatchers via this module — single
 source of truth for the session-state semantics.

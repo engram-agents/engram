@@ -149,12 +149,6 @@
       ]
     },
     {
-      "path_prefix_or_glob": "hooks/claude/engram-write-yield-hook.py",
-      "test_globs": [
-        "tests/test_write_yield_hook.py"
-      ]
-    },
-    {
       "path_prefix_or_glob": "hooks/claude/start-engram-daemon.sh",
       "full_suite_fallback": true,
       "note": "No dedicated test file for start-engram-daemon.sh"
@@ -227,12 +221,6 @@
       ]
     },
     {
-      "path_prefix_or_glob": "tools/render_cron.py",
-      "test_globs": [
-        "tests/test_engine_phase3.py"
-      ]
-    },
-    {
       "path_prefix_or_glob": "tools/run_touched_tests.py",
       "test_globs": [
         "tests/test_run_touched_tests.py"
@@ -276,20 +264,9 @@
       ]
     },
     {
-      "path_prefix_or_glob": "tools/sleep.sh",
-      "test_globs": [
-        "tests/test_end_of_day_hook.py"
-      ]
-    },
-    {
       "path_prefix_or_glob": "tools/engram-fix-git-backup.sh",
       "full_suite_fallback": true,
       "note": "No test file found for engram-fix-git-backup.sh"
-    },
-    {
-      "path_prefix_or_glob": "tools/heartbeat.sh",
-      "full_suite_fallback": true,
-      "note": "No test file found for heartbeat.sh"
     },
     {
       "path_prefix_or_glob": "tools/migrate-backup.sh",
@@ -300,11 +277,6 @@
       "path_prefix_or_glob": "tools/migrate-to-plugin.sh",
       "full_suite_fallback": true,
       "note": "No test file found for migrate-to-plugin.sh"
-    },
-    {
-      "path_prefix_or_glob": "tools/sync-cron.sh",
-      "full_suite_fallback": true,
-      "note": "No test file found for sync-cron.sh"
     },
     {
       "path_prefix_or_glob": "tools/collab-letter-monitor.sh",
@@ -420,20 +392,12 @@
       "reason": "No dedicated test file found"
     },
     {
-      "path": "tools/inter_agent_pulse.py",
-      "reason": "No dedicated test file found"
-    },
-    {
       "path": "tools/session.py",
       "reason": "No dedicated test file found"
     },
     {
       "path": "tools/verify_quote.py",
       "reason": "No dedicated test file found (verify_quote is tested indirectly via server tests)"
-    },
-    {
-      "path": "tools/verify_sleep.py",
-      "reason": "No dedicated test file found"
     },
     {
       "path": "tools/write_sleep_marker.py",

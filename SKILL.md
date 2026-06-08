@@ -542,9 +542,9 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
   `([mode, node_id, action, since, limit])`
 - **engram_scan_emergence** — Surface cornerstone candidates from clusters.
   `([min_cluster_size, similarity_threshold, focus, node_type_filter])`
-- **engram_nap** — Persist context to ENGRAM without advancing the turn counter. Arms a `nap_checkpoint` feeling-nudge marker. Use BEFORE compaction or at end of work-burst. Heartbeats and dispatchers must use this, not engram_advance_turn.
+- **engram_nap** — Persist context to ENGRAM without advancing the turn counter. Arms a `nap_checkpoint` feeling-nudge marker. Use BEFORE compaction or at end of work-burst.
   `(message)`
-- **engram_advance_turn** — End-of-day session checkpoint: commits session and advances the global turn counter (drives the forgetting mechanism). IRREVERSIBLE. Per the turn-advance-fires-after-dream rule, only the dedicated sleep cron should call this from cron-fired sessions.
+- **engram_advance_turn** — End-of-day session checkpoint: commits session and advances the global turn counter (drives the forgetting mechanism). IRREVERSIBLE. The in-session auto-sleep runs the full engram-sleep skill, which calls this at the end of consolidation. Do not call this directly outside of the sleep cycle.
   `(message)`
 
 ### Diagnostic CLI — stripped fields

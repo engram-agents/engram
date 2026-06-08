@@ -86,12 +86,6 @@
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-toolcall-repair.py\"",
             "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-write-yield-hook.py\"",
-            "timeout": 5,
-            "statusMessage": "Checking heartbeat write-yield marker..."
           }
         ]
       }

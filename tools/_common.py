@@ -1,5 +1,5 @@
-"""Shared helpers for inter-agent tooling — used by telegram_bot.py,
-inter_agent_pulse.py, and telegram_dispatcher.py.
+"""Shared helpers for inter-agent tooling — used by telegram_bot.py
+and telegram_dispatcher.py.
 
 Centralized here to avoid the helper-borrowing pattern (where one tool
 references helpers defined in another tool) that produced the cross-post

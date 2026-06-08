@@ -629,8 +629,8 @@ class TestIdentityAxis:
 
         The #778 safety property must hold at convenience, not only at essential.
         This is the primary regression test added by the round-2 review: the
-        self-inflicted hits (build.py pattern literals, render_cron.py hardcoded
-        path, operator-setup-viz.sh comment) were only caught here.
+        self-inflicted hits (build.py pattern literals, operator-setup-viz.sh
+        comment) were only caught here.
         """
         from tools.engine.build import build_plugin, scan_for_leaks, FOREIGN_LEAK_PATTERNS
         from tools.engine.manifest import load_manifest, resolve_tier
@@ -670,7 +670,7 @@ class TestIdentityAxis:
 
         # Plant a leak inside a tools/ Python file (convenience-tier surface)
         leak_content = '# installed at /home/' + 'agent-borges/.engram\n'
-        with open(os.path.join(bundle_dir, "tools", "render_cron.py"), "w") as f:
+        with open(os.path.join(bundle_dir, "tools", "config_schema.py"), "w") as f:
             f.write(leak_content)
 
         leaks = scan_for_leaks(bundle_dir, FOREIGN_LEAK_PATTERNS)

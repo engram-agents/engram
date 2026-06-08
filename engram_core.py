@@ -709,20 +709,15 @@ def _ensure_data_dir():
                 "enabled": True,
             },
             "cadence": {
-                # Cron + drowsiness tunables. Single source of truth for
-                # tools/sync-cron.sh to render the user's crontab from.
-                # Defaults match the production Borges crontab cadence.
-                # Multi-agent stagger: each agent edits its own config —
-                # no auto-offset (see tools/migration/migrate_config_v2.py header).
-                "heartbeat_minutes": [0, 30],
-                "sleep_hour": 20,
-                "sleep_minute": 30,
-                "sleep_protected_window_minutes": 60,
+                # Drowsiness meter + in-session auto-sleep scheduler tunables.
+                # drowsiness_caution_pct / drowsiness_urgent_pct trigger
+                # context_tracker warnings as the session fills.
+                # auto_sleep_enabled / auto_sleep_time are consumed by the
+                # SessionStart hook to register a nightly in-session CronCreate
+                # that fires /engram-sleep at the configured time.
+                # Changes take effect next session (restart_required).
                 "drowsiness_caution_pct": 80,
                 "drowsiness_urgent_pct": 90,
-                # Auto-sleep scheduler — consumed by SessionStart hook.
-                # Registers a nightly sleep cron at session start when enabled.
-                # Changes take effect next session (restart_required).
                 "auto_sleep_enabled": False,
                 "auto_sleep_time": "03:00",
             },

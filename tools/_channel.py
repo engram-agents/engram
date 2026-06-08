@@ -4,7 +4,6 @@ Centralizes the substance/pulse/mirror filename conventions, frontmatter
 parsing, and atomic file writes used by:
 - telegram_bot.py (cross-post mirror writes)
 - telegram_dispatcher.py (channel writes for failure status)
-- inter_agent_pulse.py (substance detection, pulse writes)
 - channel_dispatcher.py (future: hot-seat real-time dispatch)
 
 The single-source-of-truth principle (Lei 2026-04-29): any change to

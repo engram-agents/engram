@@ -451,7 +451,7 @@ def _report_feeling_impl(
 ) -> str:
     """Internal implementation — see engram_report_feeling MCP tool for the
     public payload schema. Kept callable with named kwargs for in-server
-    callers (heartbeat-hook callbacks, batch ingestion paths).
+    callers (hook callbacks, batch ingestion paths).
 
     Records a structured first-person self-report about an internal state.
 

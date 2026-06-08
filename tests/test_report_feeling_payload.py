@@ -129,7 +129,7 @@ def test_payload_json_missing_trigger_rejected():
 
 
 def test_impl_callable_with_kwargs():
-    """In-server callers (heartbeat hooks, batch paths) use _impl with kwargs."""
+    """In-server callers (hook callbacks, batch paths) use _impl with kwargs."""
     server = fresh_server()
     r = json.loads(server._report_feeling_impl(
         reported_state="Internal helper test.",

@@ -119,8 +119,8 @@ def _get_polarity_config() -> dict:
     min_similarity_for_check (float). Falls back to defaults if config
     absent.
 
-    `enabled` defaults to FALSE as of 2026-05-15 (per Lei: heartbeat-mode-
-    parallel — feature is not fully calibrated yet, the bake-off winner is
+    `enabled` defaults to FALSE as of 2026-05-15 (per Lei: polarity
+    parallel-mode — feature is not fully calibrated yet, the bake-off winner is
     a 1.5GB GPU model that's slow/unavailable on Macs without GPU, and
     issue #106 documents a high false-positive "wolf-cry" rate on real
     usage. Opt-in for users who explicitly want it AND have the hardware).

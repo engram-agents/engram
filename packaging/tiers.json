@@ -187,22 +187,6 @@
       "tier": "convenience"
     },
     {
-      "path": "tools/heartbeat.sh",
-      "tier": "convenience"
-    },
-    {
-      "path": "tools/sleep.sh",
-      "tier": "convenience"
-    },
-    {
-      "path": "tools/sync-cron.sh",
-      "tier": "convenience"
-    },
-    {
-      "path": "tools/render_cron.py",
-      "tier": "convenience"
-    },
-    {
       "path": "tools/config_schema.py",
       "tier": "convenience"
     },
@@ -212,10 +196,6 @@
     },
     {
       "path": "tools/compute_task_time.py",
-      "tier": "convenience"
-    },
-    {
-      "path": "tools/verify_sleep.py",
       "tier": "convenience"
     },
     {
@@ -260,11 +240,6 @@
     },
     {
       "path": "tools/_channel.py",
-      "tier": "convenience",
-      "multi_agent": true
-    },
-    {
-      "path": "tools/inter_agent_pulse.py",
       "tier": "convenience",
       "multi_agent": true
     },
@@ -330,10 +305,6 @@
     },
     {
       "path": "hooks/claude/engram-toolcall-repair.py",
-      "tier": "essential"
-    },
-    {
-      "path": "hooks/claude/engram-write-yield-hook.py",
       "tier": "essential"
     },
     {
@@ -541,18 +512,6 @@
     {
       "path": "templates/config.json.example",
       "tier": "essential"
-    },
-    {
-      "path": "templates/HEARTBEAT.md.template",
-      "tier": "convenience"
-    },
-    {
-      "path": "templates/crontab.template",
-      "tier": "convenience"
-    },
-    {
-      "path": "templates/heartbeat-queue",
-      "tier": "convenience"
     },
     {
       "path": "templates/engram-surface-daemon.service.template",

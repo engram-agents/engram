@@ -377,7 +377,7 @@ HISTORY_DIR = os.path.join(ENGRAM_HOME, "history")
 # Role → default purpose if ENGRAM_SESSION_PURPOSE not set by spawner.
 DEFAULT_PURPOSES = {
     "interactive": "Interactive session with user",
-    "heartbeat": "Coordination heartbeat (cron-fired, periodic)",
+    "heartbeat": "Coordination heartbeat (periodic automation session)",
     "telegram": "Telegram dispatch (user messages via Telegram bridge)",
     "sleep": "Coordinated daily sleep / consolidation",
 }

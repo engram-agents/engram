@@ -545,111 +545,6 @@ cmd_bash() {
 }
 
 
-# ---------- internal cron helpers (used by finalize-name; not user-facing) ----------
-#
-# Comments out (or restores) the heartbeat.sh + sleep.sh lines in <agent>'s
-# crontab. Called internally by cmd_finalize_name during the rename flow to
-# quiesce the newborn before usermod and restore crons after. Not exposed as
-# user-facing commands.
-
-cmd_pause() {
-    local name="${1:-}"
-    [[ -z "$name" ]] && { echo "Usage: agentctl pause <agent>" >&2; exit 2; }
-    local user; user=$(resolve_user "$name")
-
-    local current
-    if ! current=$(sudo -u "$user" crontab -l 2>/dev/null); then
-        # No crontab → nothing to pause/resume. Valid pre-state (e.g.,
-        # a freshly-spawned newborn whose install.sh hasn't run cron-
-        # setup yet; finalize-name's defensive `cmd_pause ... || true`
-        # documents the idempotency contract). Use `return` not `exit`
-        # so the function-call caller sees clean status; the message
-        # downgrades from ERROR to WARN since this isn't a failure.
-        echo "WARN: agent '$name' has no crontab — nothing to do (no-op)." >&2
-        return 0
-    fi
-
-    # Idempotency: if any heartbeat/sleep line is already prefixed PAUSED, skip.
-    if echo "$current" | grep -qE '^# PAUSED [0-9-]+: .*\.(sh|py)'; then
-        echo "WARN: '$name' already has paused lines — re-running has no effect."
-        echo "      (use 'agentctl resume $name' to undo)"
-        echo "Current paused lines:"
-        echo "$current" | grep -E '^# PAUSED ' | sed 's/^/  /'
-        exit 0
-    fi
-
-    # Backup current crontab to the shared cron-backups dir (group=agents).
-    local stamp; stamp=$(date -u +%Y-%m-%dT%H-%M-%SZ)
-    local backup_dir="$SHARED_ROOT/cron-backups"
-    mkdir -p "$backup_dir" 2>/dev/null || true
-    chgrp agents "$backup_dir" 2>/dev/null || true
-    chmod 0775 "$backup_dir" 2>/dev/null || true
-    local backup="$backup_dir/${name}-crontab-${stamp}.bak"
-    echo "$current" > "$backup"
-    chmod 0640 "$backup" 2>/dev/null || true
-
-    # Apply: prefix only heartbeat.sh + sleep.sh lines (not commented, not @reboot,
-    # not dispatcher) with a dated PAUSED marker. The regex matches any line
-    # whose command field references heartbeat.sh or sleep.sh and is not
-    # already a comment.
-    local marker_date; marker_date=$(date -u +%Y-%m-%d)
-    # Delimiter '~' chosen because cron lines don't contain '~', and the obvious
-    # '|' clashes with '|' as alternation inside the regex; '#' clashes with
-    # '[^#]' in the pattern + the literal '# PAUSED' in the replacement.
-    echo "$current" \
-        | sed -E "s~^([^#].*/(heartbeat|sleep)\\.sh.*)\$~# PAUSED ${marker_date}: \\1~" \
-        | sudo -u "$user" crontab -
-
-    audit "pause-cron" "$name" "crontab" "backup=$backup"
-
-    echo "✓ Paused heartbeat + sleep crons for $name"
-    echo "  Backup: $backup"
-    echo "  Reverse: agentctl resume $name"
-    echo
-    echo "Verification (lines now paused):"
-    sudo -u "$user" crontab -l 2>/dev/null \
-        | grep -E '^# PAUSED .*\.sh' \
-        | sed 's/^/  /' \
-        || echo "  (no matches — was the agent's crontab missing heartbeat/sleep entries?)"
-}
-
-cmd_resume() {
-    local name="${1:-}"
-    [[ -z "$name" ]] && { echo "Usage: agentctl resume <agent>" >&2; exit 2; }
-    local user; user=$(resolve_user "$name")
-
-    local current
-    if ! current=$(sudo -u "$user" crontab -l 2>/dev/null); then
-        # No crontab → nothing to pause/resume. Valid pre-state (e.g.,
-        # a freshly-spawned newborn whose install.sh hasn't run cron-
-        # setup yet; finalize-name's defensive `cmd_pause ... || true`
-        # documents the idempotency contract). Use `return` not `exit`
-        # so the function-call caller sees clean status; the message
-        # downgrades from ERROR to WARN since this isn't a failure.
-        echo "WARN: agent '$name' has no crontab — nothing to do (no-op)." >&2
-        return 0
-    fi
-
-    if ! echo "$current" | grep -qE '^# PAUSED [0-9-]+: '; then
-        echo "WARN: '$name' has no paused lines — nothing to resume."
-        exit 0
-    fi
-
-    echo "$current" \
-        | sed -E 's~^# PAUSED [0-9-]+: ~~' \
-        | sudo -u "$user" crontab -
-
-    audit "resume-cron" "$name" "crontab"
-
-    echo "✓ Resumed heartbeat + sleep crons for $name"
-    echo
-    echo "Verification (active heartbeat + sleep lines):"
-    sudo -u "$user" crontab -l 2>/dev/null \
-        | grep -E '^[^#].*(heartbeat|sleep)\.sh' \
-        | sed 's/^/  /' \
-        || echo "  (no active heartbeat/sleep lines found)"
-}
-
 # ---------- v0.3 spawn flow: spawn / finalize-name ----------
 #
 # Per active-work/spawn-implementation-2026-05-05.md (alpha repo) and
@@ -754,7 +649,7 @@ The newborn is at $user_name. To complete the birth:
   1. Enter the newborn's bash login shell:
        agentctl bash $newborn_tag
 
-  2. Inside that shell, materialize ENGRAM (runs alpha installer + cron):
+  2. Inside that shell, materialize ENGRAM (runs alpha installer):
        bash ~/.runtime/install.sh
 
   3. Login to the LLM provider (interactive):
@@ -816,12 +711,6 @@ cmd_finalize_name() {
     echo "  Newborn:  $newborn_user → $chosen_user"
     echo "  Home:     $newborn_home → $chosen_home"
     echo
-
-    # Pause the newborn's crons so nothing mid-run during the rename.
-    # (cmd_pause is idempotent — safe even if heartbeat lines aren't
-    # established yet.)
-    echo "Step 1: pausing newborn crons..."
-    cmd_pause "$newborn_tag" || true
 
     # Terminate any user-level systemd sessions, lingering background
     # processes, and ENGRAM daemons for the newborn. usermod -d -m
@@ -1285,37 +1174,6 @@ PYTHON
 JSON
     chown "$chosen_user:$chosen_user" "$chosen_home/.engram/finalize-name-complete.json" 2>/dev/null || true
 
-    # Re-render crons under the new name.
-    #
-    # The newborn's crontab was installed during ~/.runtime/install.sh's
-    # Step 8 with AGENT_NAME=newborn-<timestamp> baked into the env-var
-    # declarations (PATH, ENGRAM_HOME, AGENT_NAME=...). Just unpausing
-    # would leave that stale newborn name in the AGENT_NAME line — every
-    # heartbeat after rename would self-identify with the placeholder
-    # name, not the chosen one. Fix: regenerate the entire ENGRAM block
-    # via sync-cron --apply with AGENT_NAME=$chosen. The user's
-    # non-ENGRAM crontab lines (if any) stay preserved by the splice
-    # logic; only the BEGIN/END ENGRAM block gets rewritten.
-    echo "Step 5: re-rendering crons with new AGENT_NAME=$chosen..."
-    local sync_script="$chosen_home/tools/sync-cron.sh"
-    if [[ ! -x "$sync_script" ]]; then
-        # Fallback for installs that pre-date the cron-primitive epic
-        # (or for newborn shells where install.sh hasn't run yet).
-        echo "  (no sync-cron.sh at $sync_script — falling back to cmd_resume)"
-        cmd_resume "$chosen" || true
-    else
-        if AGENT_NAME="$chosen" \
-           COUNTERPART_NAME="${COUNTERPART_NAME:-}" \
-           AGENT_CLI="claude" \
-           ENGRAM_HOME="$chosen_home/.engram" \
-           sudo -u "$chosen_user" "$sync_script" --apply 2>&1; then
-            echo "  ✓ crontab regenerated with AGENT_NAME=$chosen"
-        else
-            echo "  WARN: sync-cron --apply failed; falling back to cmd_resume" >&2
-            cmd_resume "$chosen" || true
-        fi
-    fi
-
     # Restart the ENGRAM surface daemon (a.k.a. recall daemon) under
     # the new uid. Step 1.5 killed it along with the newborn's other
     # processes to clear usermod's "user is currently used" block;
@@ -1350,13 +1208,10 @@ JSON
   ✓ home:   $newborn_home → $chosen_home
   ✓ baseline backup: $chosen_home/.engram.first-session-baseline.bak/
   ✓ marker: $chosen_home/.engram/finalize-name-complete.json
-  ✓ crons:  regenerated with AGENT_NAME=$chosen
   ✓ surface daemon: restarted under $chosen_user
 
 Smoke test:
   agentctl session $chosen        # should drop you into a clean session
-  sudo -u $chosen_user crontab -l | grep AGENT_NAME=
-                                  # should show AGENT_NAME=$chosen, not newborn-*
 
 The agent's identity is now permanent. To retire later, see
 active-work/spawn-implementation-2026-05-05.md (v0.2 retire ceremony).
@@ -1611,7 +1466,7 @@ cmd_help() {
 }
 
 # ---------- internal verb: __expand-session-args ----------
-# Not listed in user-facing help (same pattern as internal cron helpers above).
+# Not listed in user-facing help (internal verb, invoked programmatically).
 # Usage: agentctl __expand-session-args <platform> <agent_name> [args...]
 # Calls _expand_session_args and exits with its status. Used directly by the
 # test suite to exercise alias expansion without needing real agents or sudo.

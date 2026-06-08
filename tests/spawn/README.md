@@ -37,7 +37,7 @@ Exit codes:
 
 - Real Claude session as the newborn (claude CLI is stubbed; first-session naming dialogue runs only in real Claude Code)
 - Multi-runtime spawn (gemini-cli, codex) — v0.1 of agentctl is claude-only
-- Cron registration during install.sh (cron is opt-in default-off; the harness invocation doesn't pass `--with-cron`)
+- External-cron setup (the legacy heartbeat/sleep crontab was removed in issue #785)
 - Inter-agent comms (telegram dispatcher, channel dispatcher) — those need a second agent in the topology
 
 ## Vendor note (issue #50)

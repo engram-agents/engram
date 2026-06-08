@@ -5,8 +5,6 @@ Called by the engram-sleep skill at the post-turn-advance step
 (claude Step 5b) immediately after engram_advance_turn
 succeeds. The marker is the canonical
 signal to:
-  - sleep.sh's self-check (skips redundant cron firings if marker fresh
-    and cohort empty)
   - engram-session-start-hook.py (surfaces sleep-status banner if
     marker is older than the threshold)
 

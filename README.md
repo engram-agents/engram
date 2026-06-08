@@ -608,7 +608,6 @@ Finish with `/mcp` → engram → Reconnect so the running server picks up the n
 - `~/.engram/knowledge.db` — the graph itself
 - `~/.engram/history/`, `~/.engram/diary/`, `~/.engram/sessions/`, `~/.engram/logs/`
 - `~/.engram/warm-briefing.md`, `~/.engram/config.json`
-- `~/.engram/heartbeat-queue/` (notes + inbox files preserved)
 
 **Not touched (install-time-only; require manual inverse-merge):**
 
@@ -653,7 +652,6 @@ gate that catches drift the mechanical upgrade step cannot detect.
 | 5 | Create 5 seed nodes via the MCP server, write `~/.engram/seed-manifest.json`, render `CLAUDE.md.template` + `warm-briefing.md.template` with seed IDs and repo path, merge hook registrations into `~/.claude/settings.json` |
 | 6 | Write `~/.engram/first-run-pending` so the cold-start skill fires on the next session |
 | 7 | `git init` inside `~/.engram/`; commit the install state |
-| 8 | (Opt-in via `--with-cron`; default is no cron, since the cron-driven heartbeat is not fully tested yet.) Render + install the user's crontab from `config.json`'s cadence block via `tools/sync-cron.sh`. The heartbeat runs at `:00`/`:30`; sleep is interactive-only (not cron-scheduled) since 2026-05-14. |
 
 ---
 
@@ -776,7 +774,6 @@ the page to see new nodes.
 │   ├── engram-time-bar-hook.py
 │   ├── engram-toolcall-repair.py
 │   ├── engram-user-identity-hook.py
-│   ├── engram-write-yield-hook.py
 │   └── start-engram-daemon.sh
 ├── history/
 │   └── dream/                        # written by engram-sleep Step 6

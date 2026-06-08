@@ -535,36 +535,6 @@ def main() -> None:
     )
     print(f"  warm-briefing.md → {ENGRAM_HOME}/warm-briefing.md", flush=True)
 
-    # HEARTBEAT.md — per-agent heartbeat checklist. Ships with
-    # {{AGENT_NAME}} / {{USER_NAME}} / {{COUNTERPART_NAME}} placeholders that
-    # first-session resolves alongside CLAUDE.md / AGENTS.md / warm-briefing.
-    # Single-agent installs leave {{COUNTERPART_NAME}} resolved to a no-op
-    # marker (handled by the first-session skill's counterpart prompt).
-    heartbeat_template = TEMPLATES_DIR / "HEARTBEAT.md.template"
-    if heartbeat_template.exists():
-        substitute_template(
-            heartbeat_template,
-            ENGRAM_HOME / "HEARTBEAT.md",
-            substitutions,
-        )
-        print(f"  HEARTBEAT.md → {ENGRAM_HOME}/HEARTBEAT.md", flush=True)
-
-    # heartbeat-queue/README.md — protocol documentation for the foreground ↔
-    # heartbeat hot-memory channel. HEARTBEAT.md.template cross-references this
-    # file at lines 38 + 49 (full protocol + inbox.md entry format). Subset of
-    # HEARTBEAT.md.template's placeholders ({{AGENT_NAME}}, {{COUNTERPART_NAME}},
-    # {{ENGRAM_HOME}} — no {{USER_NAME}}); first-session-skill resolves them
-    # alongside HEARTBEAT.md (the skill's Step 5 read+write enumeration was
-    # updated in this PR to include the README).
-    heartbeat_readme_template = TEMPLATES_DIR / "heartbeat-queue" / "README.md.template"
-    if heartbeat_readme_template.exists():
-        substitute_template(
-            heartbeat_readme_template,
-            ENGRAM_HOME / "heartbeat-queue" / "README.md",
-            substitutions,
-        )
-        print(f"  heartbeat-queue/README.md → {ENGRAM_HOME}/heartbeat-queue/README.md", flush=True)
-
     # Arm the first-run-pending marker — engram-first-session checks it to
     # gate the cold-start dialogue. bootstrap.py is the single source of
     # truth for the marker write (both plugin and any other install path).

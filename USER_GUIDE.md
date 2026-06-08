@@ -390,7 +390,7 @@ Once spawned, here are the verbs you'll use most:
 
 | Command | What it does |
 |---|---|
-| `agentctl health` | Health table — shows every agent + heartbeat freshness + any flags (no agent-name argument; always shows all) |
+| `agentctl health` | Health table — shows every agent + last-sleep freshness + any flags (no agent-name argument; always shows all) |
 | `agentctl session <agent>` | Open a working session as `<agent>`. Persistent tmux-backed; auto-attaches to an existing one if already running. **Prompts for your sudo password** (starts the CLI as the agent's Linux user) |
 | `agentctl bash <agent>` | Plain bash shell as the agent (no CLI) — useful for setup and debugging. **Prompts for your sudo password** (starts the shell as the agent's Linux user) |
 | `agentctl share-status [<agent>]` | List active directory shares (omit `<agent>` to see all) |

@@ -3,8 +3,7 @@
 
 Schema v2 adds two top-level fields:
   - schema_version: 2  (sentinel for re-run guard)
-  - cadence: {...}     (cron + drowsiness tunables, source of truth for
-                        the upcoming tools/sync-cron.sh primitive)
+  - cadence: {...}     (drowsiness meter + in-session auto-sleep tunables)
 
 Hard-cut migration with prod-safety guards (per active-work/
 engram-config-surface-2026-05-04.md decisions):
@@ -13,9 +12,8 @@ engram-config-surface-2026-05-04.md decisions):
     sibling backup BEFORE replacing config.json. Rollback is one cp.
   - Idempotent: if schema_version is already 2, exits cleanly without
     touching the file or writing a backup.
-  - Adds cadence with defaults matching the production Borges/Mneme
-    crontab cadence (heartbeat at :00/:30, skip hours 20-21, sleep at
-    20:30, protected window 60 min, drowsiness 80/90).
+  - Adds cadence with defaults for drowsiness meter (80/90) and in-session
+    auto-sleep scheduler (disabled, 03:00).
 
 Other top-level keys (trust_pool, confidence_map, memory, embedding,
 user, primary_user, etc.) are passed through unchanged. This is a
@@ -43,31 +41,17 @@ from pathlib import Path
 
 SCHEMA_VERSION = 2
 
-# Defaults match the production Borges crontab cadence as of 2026-05-04.
-# Each field has a single owner in the cron template (see tools/
-# render_cron.py).
-#
-# Multi-agent stagger: each agent has its own config.json with its own
-# cadence. Set sleep_hour/sleep_minute and heartbeat_minutes per agent
-# so the windows don't overlap on a shared host. Worked example:
-#   - Borges: sleep_hour=20, sleep_minute=30; heartbeat_minutes=[0, 30]
-#   - Mneme:  sleep_hour=20, sleep_minute=15; heartbeat_minutes=[15, 45]
-# render_cron.py does NOT auto-stagger — there's no "offset" knob to
-# avoid drift between docs and behavior. Adjust per agent directly.
+# Defaults for the drowsiness meter + in-session auto-sleep scheduler.
+# The external-cron heartbeat/sleep keys (heartbeat_minutes, sleep_hour,
+# sleep_minute, sleep_protected_window_minutes) were removed in #785.
 DEFAULT_CADENCE = {
-    # Minutes of the hour to fire heartbeat. Two entries = twice an hour.
-    "heartbeat_minutes": [0, 30],
-    # When the daily sleep cycle fires (local TZ from user.timezone).
-    "sleep_hour": 20,
-    "sleep_minute": 30,
-    # Minutes around sleep_hour:sleep_minute during which heartbeat is
-    # suppressed. The renderer computes per-slot skips from this window
-    # — there is no separate skip-list config.
-    "sleep_protected_window_minutes": 60,
     # Drowsiness threshold percentages (relative to mean auto-compaction
     # JSONL size). Calibrated 2026-05-04 per PR #9.
     "drowsiness_caution_pct": 80,
     "drowsiness_urgent_pct": 90,
+    # In-session auto-sleep scheduler — consumed by the SessionStart hook.
+    "auto_sleep_enabled": False,
+    "auto_sleep_time": "03:00",
 }
 
 

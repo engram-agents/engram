@@ -271,9 +271,9 @@ Then follow the branch for the detected target:
 
 ### Step 6 — Claude target (TARGET=claude)
 
-1. Read `~/.claude/CLAUDE.md`, `~/.engram/warm-briefing.md`, `~/.engram/HEARTBEAT.md`, and `~/.engram/heartbeat-queue/README.md` (the last two only if present — agents installed before those templates shipped won't have them).
-2. **Counterpart agent prompt** (only if HEARTBEAT.md is present, since both HEARTBEAT.md and heartbeat-queue/README.md use `{{COUNTERPART_NAME}}`): ask the user one short question — *"Will this agent have a peer counterpart agent (e.g., a separate uid running ENGRAM with cross-channel coordination), or is this a single-agent install?"* Most installs are single-agent. Substitute accordingly:
-   - Single-agent: substitute `{{COUNTERPART_NAME}}` → the literal string `(no counterpart)`. The HEARTBEAT.md sections referencing the counterpart still read as informational descriptions of what a peer-channel WOULD look like, but the agent skips the channel-related steps in practice.
+1. Read `~/.claude/CLAUDE.md` and `~/.engram/warm-briefing.md`.
+2. **Counterpart agent prompt**: ask the user one short question — *"Will this agent have a peer counterpart agent (e.g., a separate uid running ENGRAM with cross-channel coordination), or is this a single-agent install?"* Most installs are single-agent. Substitute accordingly:
+   - Single-agent: substitute `{{COUNTERPART_NAME}}` → the literal string `(no counterpart)`.
    - Multi-agent: substitute → the counterpart's chosen name (which the user states; the counterpart will run its own first-session separately).
 3. Substitute the rest:
    - `{{AGENT_NAME}}` → the chosen agent name
@@ -281,7 +281,7 @@ Then follow the branch for the detected target:
    - `{{TODAY}}` → today's date in ISO format (YYYY-MM-DD)
    - `{{SELF_NODE_ID}}` → the person node ID captured in Step 3 (e.g., `pn_NNNN`). To verify idempotency: if the placeholder is already resolved (no literal `{{SELF_NODE_ID}}` remains in the file), skip without error.
    - Any other `{{...}}` markers present — consult the user if ambiguous, do not guess.
-4. Write the resolved files back. Enumerate each one explicitly: `~/.claude/CLAUDE.md`, `~/.engram/warm-briefing.md`, `~/.engram/HEARTBEAT.md` (if it was present in step 6.1), `~/.engram/heartbeat-queue/README.md` (if present), `~/.claude/output-styles/proactive-with-carveouts.md` (if present — this file ships with the Proactive-with-Carveouts output style; older installs without it can skip), `~/.claude/skills/internal-external-decision/SKILL.md` (if present — same provenance), `~/.claude/skills/engram-upgrade/SKILL.md` (if present — references ask-{{USER_NAME}}.md in checkpoint + anti-pattern sections). Silent drop of any required file would leave it firing forever with raw `{{AGENT_NAME}}`/`{{USER_NAME}}`/`{{COUNTERPART_NAME}}` placeholders in the prose AND in the `to-heartbeat/to-{{COUNTERPART_NAME}}-drafts/` directory path — which would point at a literal-braces directory that never exists.
+4. Write the resolved files back. Enumerate each one explicitly: `~/.claude/CLAUDE.md`, `~/.engram/warm-briefing.md`, `~/.claude/output-styles/proactive-with-carveouts.md` (if present — this file ships with the Proactive-with-Carveouts output style; older installs without it can skip), `~/.claude/skills/internal-external-decision/SKILL.md` (if present — same provenance), `~/.claude/skills/engram-upgrade/SKILL.md` (if present — references ask-{{USER_NAME}}.md in checkpoint + anti-pattern sections). Silent drop of any required file would leave it firing forever with raw `{{AGENT_NAME}}`/`{{USER_NAME}}`/`{{COUNTERPART_NAME}}` placeholders in the prose.
 5. **Bootstrap the ask-{{USER_NAME}}.md auto-load surface.** Run `touch "$HOME/.engram/ask-<USER_NAME>.md"` substituting the resolved user name — e.g. for USER_NAME=alice, run `touch ~/.engram/ask-alice.md`. This ensures session-start reads don't silently no-op on a fresh install before the agent has written anything. The filename matches whatever the user's name is (resolved during this dialogue, not hard-coded at install time).
 6. **Verify**: no literal `{{...}}` placeholders remain in any of the written files. Check with:
    ```bash

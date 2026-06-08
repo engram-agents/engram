@@ -50,7 +50,6 @@ layers that diverge between models get sidecar dirs.
 |-------|----------|-----|
 | Engine (server, confidence, client, viz) | repo root | Agent-agnostic. Serves MCP. |
 | Shared utilities | `tools/` | Python helpers, plugin build script, surgical, telegram bot. Most of `tools/` is genuinely shared. |
-| Heartbeat / sleep launchers | `tools/` | Claude-coded (`claude -p` invocation in `heartbeat.sh`). Claude uses the plugin path. |
 | Hook scripts | `hooks/<model>/` | Read transcripts in model-specific JSONL formats; inject hook context with model-specific event JSON. |
 | Skill files | `skills/<model>/` | Frontmatter + Markdown conventions are per-CLI. |
 | Install scripts | repo root | Claude uses the plugin installer (`install.sh` retired). |
@@ -152,8 +151,8 @@ Three test surfaces, in order of preference:
 
 2. **Live runtime in a sandbox via the plugin path.**
    Use when you need to test against real MCP transport, hooks firing,
-   cron-scheduled scripts, or anything that requires an actual filesystem
-   tree. Build the local marketplace cache from your feature branch and
+   or anything that requires an actual filesystem tree. Build the local
+   marketplace cache from your feature branch and
    install it into a temporary Claude Code plugin environment:
 
    ```bash

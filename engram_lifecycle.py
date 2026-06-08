@@ -87,7 +87,7 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
     The two public tools (engram_nap and engram_advance_turn) exist as
     distinct MCP entry points so a missed kwarg cannot accidentally promote
     a nap into a turn-advancing checkpoint — the prior single-tool design
-    was bug-prone under context pressure (heartbeat sessions especially).
+    was bug-prone under context pressure (brief automated sessions especially).
 
     Note: the ``diagnostic_snapshot`` key is NOT in this function's return
     value. The server.py wrappers (engram_nap / engram_advance_turn) append

@@ -401,12 +401,14 @@ This is why the ordering is Phase A → Phase B, and why Phase A must complete b
 
 ## macOS auto-sleep timing
 
-When auto-sleep runs via cron on a macOS laptop in default sleep state (lid
-closed / idle / on AC), two sources of latency apply:
+When auto-sleep is enabled (`cadence.auto_sleep_enabled: true`), the SessionStart
+hook registers an in-session `CronCreate` (durable: false) that fires
+`/engram-sleep` at `cadence.auto_sleep_time`. On a macOS laptop in default sleep
+state (lid closed / idle / on AC), two sources of latency apply:
 
-1. **Cron-fire latency** — macOS suspends the system clock during DarkWake sleep.
-   The cron fires 30-90 min after the scheduled time once the system wakes enough
-   to process it.
+1. **CronCreate-fire latency** — macOS suspends the system clock during DarkWake
+   sleep. The in-session CronCreate fires 30-90 min after the scheduled time once
+   the system wakes enough to process it.
 2. **Per-tool-call DarkWake-wait latency** — each MCP tool call during
    consolidation waits for a brief DarkWake cycle to complete before the system
    responds. Empirically ~13 min/tool call, so a full consolidation cycle
@@ -414,21 +416,21 @@ closed / idle / on AC), two sources of latency apply:
 
 **Correctness is preserved.** The `last-sleep-success.json` marker + lock file
 mechanism (and PR #428's stale-lock recovery for crashed runs) ensure the graph
-stays correct regardless of when the cron fires or how long it runs.
+stays correct regardless of when the wake fires or how long the run takes.
 
 **This is a timing-expectation issue, not a correctness issue.** If precise
 nightly timing matters, three mitigation tiers in increasing complexity:
 
 - **Tier 1 — `caffeinate -i`**: run `caffeinate -i` in a terminal before going
-  idle. Prevents automatic sleep; cron fires on schedule. Simple, per-night,
-  burns power while on battery.
+  idle. Prevents automatic sleep; the in-session wake fires on schedule. Simple,
+  per-night, burns power while on battery.
 - **Tier 2 — System Settings**: System Settings → Battery → Power Adapter →
   "Prevent automatic sleep when the display is off". Persistent on AC;
-  cron always fires on schedule when plugged in.
+  the wake always fires on schedule when plugged in.
 - **Tier 3 — launchd plist** (deferred, not yet shipped): a `launchd` plist with
-  `StartCalendarInterval` + `WakeFromSleep: true` that wakes the system and
-  triggers the cron at the configured time. Architecturally cleanest; opt-in
-  setup is tracked as Action #3 in issue #407 for a follow-up PR.
+  `StartCalendarInterval` + `WakeFromSleep: true` that wakes the system at the
+  configured time. Architecturally cleanest; opt-in setup is tracked as Action #3
+  in issue #407 for a follow-up PR.
 
 ## Substrate anchor
 
