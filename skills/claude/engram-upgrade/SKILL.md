@@ -119,8 +119,10 @@ This single script is the whole agent-side upgrade: it **reads your `config.json
 **Claude Code:** the agent cannot run slash-commands. Tell the user:
 
 > Marketplace rebuilt at the new commit. In this Claude Code session please run:
-> `/plugin marketplace update` (refresh the local marketplace index)
-> `/plugin upgrade engram` (pull the new plugin version)
+> 1. `/plugin marketplace update engram-local` (refresh the marketplace registration — the marketplace NAME argument matters)
+> 2. `/plugin` → **Installed** → select the **engram plugin** entry (the plugin itself, NOT the engram MCP server listed under it) → **Update now**
+>
+> (The `/mcp` reconnect is Step 5, after the plugin updates.)
 
 **Codex:** `tools/install-local-marketplace.sh --target codex` runs `codex plugin add engram@engram-local` itself when `codex` is on PATH. Verify the cache actually changed:
 

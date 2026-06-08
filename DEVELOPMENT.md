@@ -125,7 +125,7 @@ git push -u origin feature/your-topic
 git checkout dev
 git pull origin dev
 tools/install-local-marketplace.sh        # rebuilds local plugin cache
-# Then run /plugin upgrade engram inside Claude Code, and /mcp to reconnect.
+# Then inside Claude Code: /plugin marketplace update engram-local, then /plugin -> Installed -> engram plugin -> Update now, then /mcp to reconnect.
 # Restart the MCP server so the new server.py loads.
 ```
 
@@ -158,13 +158,14 @@ Three test surfaces, in order of preference:
 
    ```bash
    tools/install-local-marketplace.sh
-   # Then inside Claude Code: /plugin upgrade engram
+   # Then inside Claude Code: /plugin marketplace update engram-local,
+   # then /plugin -> Installed -> engram plugin -> Update now
    # Run targeted tests. Inspect logs, daemon socket, etc.
    ```
 
 3. **Production runtime** (`~/.engram/`).
    Only after PR is merged to dev. Rebuild the local marketplace cache
-   (`tools/install-local-marketplace.sh`), then run `/plugin upgrade engram`
+   (`tools/install-local-marketplace.sh`), then `/plugin marketplace update engram-local`, then `/plugin` → Installed → engram plugin → Update now
    inside Claude Code and `/mcp` to reconnect the engram server so the new
    `server.py` loads. Hooks reload per-fire and don't need a restart.
 
@@ -428,9 +429,9 @@ the copy logic that reads the manifest.
 |------|---------|
 | Start work | `git checkout dev && git pull && git checkout -b feature/X` |
 | Run sandbox tests | `python3 -c 'import server; ...'` with `server.engram_sandbox()` |
-| Live-test in temp runtime | `tools/install-local-marketplace.sh` then `/plugin upgrade engram` |
+| Live-test in temp runtime | `tools/install-local-marketplace.sh` then `/plugin marketplace update engram-local` + `/plugin` → Installed → engram plugin → Update now |
 | Push and PR | `git push -u origin feature/X` then create PR base=dev |
-| Update runtime after merge | `git checkout dev && git pull && tools/install-local-marketplace.sh` then `/plugin upgrade engram` |
+| Update runtime after merge | `git checkout dev && git pull && tools/install-local-marketplace.sh` then `/plugin marketplace update engram-local` + `/plugin` → Installed → engram plugin → Update now |
 | What version am I running? | `cat $ENGRAM_HOME/.deployed-version` |
 | Delete a merged feature branch | `git branch -d feature/X && git push origin :feature/X` |
 

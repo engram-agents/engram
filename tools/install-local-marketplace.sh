@@ -89,8 +89,9 @@ To upgrade later:
   git pull origin dev
   bash tools/install-local-marketplace.sh    # builds + re-assembles, idempotent
   # then in Claude Code:
-  /plugin marketplace update
-  /plugin upgrade engram
+  /plugin marketplace update engram-local
+  /plugin -> Installed -> engram plugin (not the MCP under it) -> Update now
+  /mcp -> engram -> Reconnect
   # or in Codex:
   bash tools/install-local-marketplace.sh --target codex
 EOF
@@ -380,6 +381,7 @@ else
   log "   git pull origin dev"
   log "   bash tools/install-local-marketplace.sh"
   log "   # then in Claude Code:"
-  log "   /plugin marketplace update"
-  log "   /plugin upgrade engram"
+  log "   1. /plugin marketplace update engram-local"
+  log "   2. /plugin -> Installed -> engram plugin (not the MCP entry under it) -> Update now"
+  log "   3. /mcp -> engram -> Reconnect"
 fi

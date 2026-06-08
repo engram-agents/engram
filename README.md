@@ -227,8 +227,8 @@ bash tools/install-local-marketplace.sh
 pull the new plugin version:
 
 ```
-/plugin marketplace update
-/plugin upgrade engram
+/plugin marketplace update engram-local
+/plugin   # then: Installed -> engram plugin (not the MCP entry) -> Update now
 ```
 
 (Restart Claude Code if MCP doesn't pick up the new server.py automatically.)
@@ -236,8 +236,8 @@ pull the new plugin version:
 Then in a Claude Code session:
 
 ```
-/plugin marketplace update    # refresh local marketplace index
-/plugin upgrade engram        # pull the new version
+/plugin marketplace update engram-local   # refresh the marketplace registration
+/plugin   # Installed -> engram plugin (not the MCP entry under it) -> Update now
 ```
 
 Each rebuild stamps a unique version (`0.1.0-dev.<YYYYMMDDHHMMss>.<sha7>`) into the
@@ -419,7 +419,8 @@ on the plugin path).
      ```
   2. Upgrade the plugin inside Claude Code:
      ```
-     /plugin upgrade engram
+     /plugin marketplace update engram-local
+     /plugin   # Installed -> engram plugin -> Update now
      ```
   3. Reconnect the MCP server: run `/mcp` inside Claude Code and reconnect
      the engram server (or restart Claude Code entirely).
@@ -583,10 +584,12 @@ Code's `/plugin` command reads from.
 Run inside a Claude Code session:
 
 ```
-/plugin upgrade engram
+/plugin marketplace update engram-local
+/plugin   # then: Installed -> engram plugin (not the MCP entry under it) -> Update now
 ```
 
 This replaces the installed plugin with the freshly built cache from step 2.
+Finish with `/mcp` → engram → Reconnect so the running server picks up the new code.
 
 ### 4. What the plugin upgrade DOES and DOES NOT change
 
@@ -1052,7 +1055,7 @@ the full protocol and deployment instructions.
   fresh install starts with an empty graph; old data is preserved in the
   backup but not migrated. To upgrade an existing install while preserving
   the graph, use the plugin upgrade path (`tools/install-local-marketplace.sh`
-  + `/plugin upgrade engram`) instead — it updates the running plugin without
+  + `/plugin` → Installed → engram plugin → Update now) instead — it updates the running plugin without
   touching data files.
 - **Agency.** The hooks are advisory; the agent is never blocked from
   writing to the graph. The only mechanical guards are on the server side
