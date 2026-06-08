@@ -8,6 +8,7 @@ file uses when run as a script — keeping tests runnable both ways.
 import os
 import socket
 import sys
+import types
 
 import pytest
 
@@ -44,3 +45,37 @@ def mock_dns_resolution(request, monkeypatch):
         return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", port or 0))]
 
     monkeypatch.setattr("socket.getaddrinfo", fake_getaddrinfo)
+
+
+def fresh_module(mod: types.ModuleType) -> types.ModuleType:
+    """Return a freshly reloaded copy of a repo module, isolated for testing.
+
+    R4 rationale (import-pattern contract v1.1): the caller passes the imported
+    module **object** (e.g. ``fresh_module(engram_focus)``), not a string.  The
+    import statement ``import engram_focus`` at the call site is the AST-visible
+    dependency edge that ``run_touched_tests.py`` needs for precise selection.  A
+    string-parameterised helper would be invisible to ``ast.walk`` and would
+    reintroduce the opacity the contract removes.
+
+    The purge covers ``server`` and all ``engram_*`` family modules so that
+    cross-module state (e.g. ``engram_core.DATA_DIR`` shared between server and
+    family modules) resets consistently.  After purge the module is re-imported
+    by its ``__name__`` (the import machinery reloads all transitive deps too).
+
+    For modules that expose ``_configure_paths`` (server-backed family modules),
+    the caller is responsible for calling it with a temp dir *after* this
+    function returns — ``fresh_module`` does not know which temp dir to use.
+    See ``tests/IMPORT_RUBRIC.md`` §R4 for the full usage pattern.
+
+    Args:
+        mod: The imported module object whose family should be reloaded.
+
+    Returns:
+        The freshly imported module (same ``__name__`` as *mod*).
+    """
+    mod_name = mod.__name__
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
+    import importlib
+    return importlib.import_module(mod_name)

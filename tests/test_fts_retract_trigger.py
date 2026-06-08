@@ -28,49 +28,77 @@ Coverage:
     5. test_supersede_then_retract_still_removes_from_fts — reviewer-found gap
        (#280 round-1): node superseded first (is_current→0) then retracted must
        still be removed from FTS. Round-2 trigger fix (status transition gate).
+
+Import-pattern contract (#948 wave 0 pilot — R1):
+    This file imports engram_revision, engram_observation, engram_query, and
+    engram_core directly and contains no ``import server``. The module objects
+    are passed to fresh_module() (R4) for per-test reload isolation.
 """
 
 import atexit
+import importlib
 import json
 import os
 import shutil
-import sys
 import sqlite3
+import sys
 import tempfile
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Add tests/ dir so conftest.fresh_module is importable both under pytest and
+# when the file is run as a standalone script.
+_TESTS_DIR = str(Path(__file__).resolve().parent)
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+from conftest import fresh_module  # noqa: E402 — must follow sys.path setup
+
+import engram_core
+import engram_observation
+import engram_query
+import engram_revision
 
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_fts_retract_trigger_")
 atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
-def fresh_server():
-    """Reset state and return the server module bound to a clean test dir."""
+def _make_fresh_mods():
+    """Reload all family modules, configure a clean test DB, and return modules.
+
+    Uses conftest.fresh_module(engram_revision) per R4: the module object is
+    passed (not a string), so the ``import engram_revision`` at the top of
+    this file is the AST-visible dependency edge for run_touched_tests.py.
+
+    Returns (rev, obs, qry, core) — freshly reloaded module objects with
+    engram_core pointing to TEST_DIR.
+    """
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if sys.path[0] != repo_root:
-        sys.path.insert(0, repo_root)
-    for key in list(sys.modules):
-        if key == "server" or key.startswith("engram_"):
-            del sys.modules[key]
-    import server
-    server._configure_paths(TEST_DIR)
-    server._ensure_data_dir()
     os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
-    return server
+    # Purge server + engram_* from sys.modules and reload engram_revision
+    # (which also reloads its dep engram_core).
+    rev = fresh_module(engram_revision)
+    # engram_observation and engram_query are not transitive deps of
+    # engram_revision — import them fresh now that sys.modules is clean.
+    obs = importlib.import_module("engram_observation")
+    qry = importlib.import_module("engram_query")
+    core = sys.modules["engram_core"]
+    core._configure_paths(TEST_DIR)
+    core._ensure_data_dir()
+    return rev, obs, qry, core
 
 
-def _add_observation(server, claim: str, quoted_text: str = None, url: str = "https://example.com/fts274") -> str:
+def _add_observation(obs, claim: str, quoted_text: str = None, url: str = "https://example.com/fts274") -> str:
     qt = quoted_text if quoted_text is not None else claim[:80]
-    r = json.loads(server.engram_add_observation(payload_json=json.dumps({
-        "url": url,
-        "title": "FTS274 Test Source",
-        "quoted_text": qt,
-        "interpretation": "Test interpretation for FTS trigger tests.",
-        "claim": claim,
-        "quote_type": "hard_data",
-    })))
+    r = json.loads(obs._add_observation_impl(
+        url=url,
+        title="FTS274 Test Source",
+        quoted_text=qt,
+        interpretation="Test interpretation for FTS trigger tests.",
+        claim=claim,
+        quote_type="hard_data",
+    ))
     assert "observation_id" in r, f"add_observation failed: {r}"
     return r["observation_id"]
 
@@ -119,11 +147,11 @@ def test_retract_removes_from_fts():
     table (nodes), not the FTS index. The correct presence check is a MATCH query
     on a distinctive token from the indexed text.
     """
-    server = fresh_server()
+    rev, obs, _qry, _core = _make_fresh_mods()
 
     token = "fts274retracttrigger_uniquetokenA"
     ob_id = _add_observation(
-        server,
+        obs,
         claim=f"Claim containing {token} for trigger test.",
         quoted_text=f"Quote with {token} in it.",
     )
@@ -135,7 +163,7 @@ def test_retract_removes_from_fts():
     )
 
     # Retract the node.
-    ret = json.loads(server._retract_impl(
+    ret = json.loads(rev._retract_impl(
         node_id=ob_id,
         error_type="other",
         reason="FTS trigger regression test #274 — test 1",
@@ -165,14 +193,14 @@ def test_retract_does_not_remove_non_retracted_supersession():
     not accurate anymore" but they still exist and are recallable with
     include_superseded=True. Only retracted (wrong-from-start) nodes are removed.
     """
-    server = fresh_server()
+    rev, obs, _qry, _core = _make_fresh_mods()
 
     token_a = "fts274superseded_uniquetokenA2"
     token_b = "fts274retracted_uniquetokenB2"
 
     # Node A: will be superseded.
     a_id = _add_observation(
-        server,
+        obs,
         claim=f"Superseded claim {token_a} for trigger test 2.",
         quoted_text=f"Quote with {token_a}.",
         url="https://example.com/fts274-a",
@@ -181,7 +209,7 @@ def test_retract_does_not_remove_non_retracted_supersession():
 
     # Node C: replacement for A.
     c_id = _add_observation(
-        server,
+        obs,
         claim=f"Replacement claim {token_a} refined for trigger test 2.",
         quoted_text=f"Quote with {token_a} refined.",
         url="https://example.com/fts274-c",
@@ -189,7 +217,7 @@ def test_retract_does_not_remove_non_retracted_supersession():
 
     # Node B: will be retracted.
     b_id = _add_observation(
-        server,
+        obs,
         claim=f"Retracted claim {token_b} for trigger test 2.",
         quoted_text=f"Quote with {token_b}.",
         url="https://example.com/fts274-b",
@@ -197,13 +225,13 @@ def test_retract_does_not_remove_non_retracted_supersession():
     rowid_b = _get_node_rowid(b_id)
 
     # Supersede A with C — A becomes non-current but NOT retracted.
-    sup = json.loads(server._supersede_impl(
+    sup = json.loads(rev._supersede_impl(
         a_id, c_id, supersede_reason="FTS trigger regression test #274 — test 2"
     ))
     assert sup.get("status") == "superseded", f"supersede failed: {sup}"
 
     # Retract B.
-    ret = json.loads(server._retract_impl(
+    ret = json.loads(rev._retract_impl(
         node_id=b_id,
         error_type="other",
         reason="FTS trigger regression test #274 — test 2",
@@ -250,11 +278,11 @@ def test_retract_migration_cleans_existing_retracted():
     NOTE: FTS5 contentless-table presence is checked via MATCH on a distinctive
     token, not via SELECT WHERE rowid=? (which scans the content table).
     """
-    server = fresh_server()
+    _rev, obs, _qry, _core = _make_fresh_mods()
 
     token = "fts274migration_uniquetokenC3"
     ob_id = _add_observation(
-        server,
+        obs,
         claim=f"Pre-existing retracted claim {token} for migration test.",
         quoted_text=f"Quote with {token}.",
     )
@@ -319,22 +347,22 @@ def test_query_post_retract_does_not_return_retracted():
     Retracts it. Queries again — must not surface with include_superseded=False
     OR include_superseded=True (the bug documented in #274).
     """
-    server = fresh_server()
+    rev, obs, qry, _core = _make_fresh_mods()
 
     token = "fts274endtoend_uniquetokenD4"
     ob_id = _add_observation(
-        server,
+        obs,
         claim=f"End-to-end retract FTS test claim {token}.",
         quoted_text=f"Quote containing {token} end-to-end.",
     )
 
     def _query_ids(include_superseded: bool) -> set:
-        r = json.loads(server.engram_query(payload_json=json.dumps({
-            "query": token,
-            "include_superseded": include_superseded,
-            "top_k": 20,
-            "return_debug": True,
-        })))
+        r = json.loads(qry._query_impl(
+            query=token,
+            include_superseded=include_superseded,
+            top_k=20,
+            return_debug=True,
+        ))
         return {n["id"] for n in r.get("results", [])}
 
     # Before retraction: node surfaces in both modes.
@@ -345,7 +373,7 @@ def test_query_post_retract_does_not_return_retracted():
     )
 
     # Retract.
-    ret = json.loads(server._retract_impl(
+    ret = json.loads(rev._retract_impl(
         node_id=ob_id,
         error_type="other",
         reason="FTS end-to-end retract test #274",
@@ -383,14 +411,14 @@ def test_supersede_then_retract_still_removes_from_fts():
     and the node leaked into FTS (surfaced via include_superseded=True queries).
     Reviewer-found gap (PR #280 round-1).
     """
-    server = fresh_server()
+    rev, obs, qry, _core = _make_fresh_mods()
 
     token_a = "fts280supretract_uniquetokenA5"
     token_b = "fts280supretract_uniquetokenB5"
 
     # Node A: will be superseded, then retracted.
     a_id = _add_observation(
-        server,
+        obs,
         claim=f"Supersede-then-retract claim {token_a} for trigger test 5.",
         quoted_text=f"Quote with {token_a} to be superseded then retracted.",
         url="https://example.com/fts280-a5",
@@ -399,7 +427,7 @@ def test_supersede_then_retract_still_removes_from_fts():
 
     # Node B: the superseder (just needs to exist).
     b_id = _add_observation(
-        server,
+        obs,
         claim=f"Superseder claim {token_b} for trigger test 5.",
         quoted_text=f"Quote with {token_b} as superseder.",
         url="https://example.com/fts280-b5",
@@ -411,7 +439,7 @@ def test_supersede_then_retract_still_removes_from_fts():
     )
 
     # Step 1: Supersede A with B — A becomes is_current=0, status='superseded'.
-    sup = json.loads(server._supersede_impl(
+    sup = json.loads(rev._supersede_impl(
         a_id, b_id, supersede_reason="FTS trigger regression test #280 — test 5 step 1"
     ))
     assert sup.get("status") == "superseded", f"supersede failed: {sup}"
@@ -423,7 +451,7 @@ def test_supersede_then_retract_still_removes_from_fts():
     )
 
     # Step 2: Retract A — now is_current=0 AND status transitions to 'retracted'.
-    ret = json.loads(server._retract_impl(
+    ret = json.loads(rev._retract_impl(
         node_id=a_id,
         error_type="other",
         reason="FTS trigger regression test #280 — test 5 step 2",
@@ -442,12 +470,12 @@ def test_supersede_then_retract_still_removes_from_fts():
     )
 
     # Also verify via end-to-end query: include_superseded=True must not return A.
-    query_result = json.loads(server.engram_query(payload_json=json.dumps({
-        "query": token_a,
-        "include_superseded": True,
-        "top_k": 20,
-        "return_debug": True,
-    })))
+    query_result = json.loads(qry._query_impl(
+        query=token_a,
+        include_superseded=True,
+        top_k=20,
+        return_debug=True,
+    ))
     returned_ids = {n["id"] for n in query_result.get("results", [])}
     assert a_id not in returned_ids, (
         f"Retracted node {a_id} must not appear in engram_query with include_superseded=True "
