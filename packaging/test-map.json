@@ -443,5 +443,8 @@
       "path": "tools/migrate_db_trust_tier.py",
       "reason": "Listed in tiers.json as a dev tool but has no direct filename reference in tests (test_migrate_db_trust_tier.py imports it directly, so it IS covered by import graph)"
     }
+  ],
+  "server_import_allowlist": [
+    "test_engram_core_seam.py"
   ]
 }

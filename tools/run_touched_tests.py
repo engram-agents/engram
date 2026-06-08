@@ -26,6 +26,8 @@ Output honesty (the green-is-not-ground-truth discipline):
 Usage:
   python3 tools/run_touched_tests.py [--base REF] [--full] [--dry-run]
                                      [--repo-root PATH] [-- pytest args...]
+  python3 tools/run_touched_tests.py --audit-imports [--strict]
+  python3 tools/run_touched_tests.py --audit-patches [--strict]
 """
 
 from __future__ import annotations
@@ -284,7 +286,11 @@ def _build_import_graph(repo_root: str) -> dict[str, set[str]]:
 
 
 def _load_test_map(repo_root: str) -> dict:
-    """Load packaging/test-map.json.  Returns empty dict if absent."""
+    """Load packaging/test-map.json.  Returns empty dict if absent.
+
+    Tolerates absence of the ``server_import_allowlist`` key — existing maps
+    without it keep working; the key defaults to an empty list.
+    """
     path = Path(repo_root) / TEST_MAP_PATH
     if not path.exists():
         return {}
@@ -293,6 +299,25 @@ def _load_test_map(repo_root: str) -> dict:
             return json.load(f)
     except (json.JSONDecodeError, OSError):
         return {}
+
+
+def _get_server_import_allowlist(test_map: dict) -> set[str]:
+    """Return the set of basenames explicitly allowed to import 'server'.
+
+    Reads ``server_import_allowlist`` from the test-map dict.  Returns an
+    empty set when the key is absent (backwards-compatible with old maps).
+    """
+    return set(test_map.get("server_import_allowlist", []))
+
+
+def _is_contract_test(basename: str, allowlist: set[str]) -> bool:
+    """Return True if *basename* classifies as a contract test.
+
+    Contract tests are:
+      - Files whose basename matches the ``test_*_payload.py`` glob, OR
+      - Files explicitly named in the server_import_allowlist.
+    """
+    return fnmatch.fnmatch(basename, "test_*_payload.py") or basename in allowlist
 
 
 def _resolve_convention_map(
@@ -355,15 +380,18 @@ def select_tests(
     changed_files: list[str],
     repo_root: str,
     verbose: bool = False,
-) -> tuple[list[str], bool, list[str]]:
+) -> tuple[list[str], bool, list[str], set[str]]:
     """Two-layer selection pipeline.
 
     Returns:
-      (selected_test_paths, is_full_suite, full_suite_reasons)
+      (selected_test_paths, is_full_suite, full_suite_reasons, map_selected)
 
     selected_test_paths: repo-relative paths to selected test files
     is_full_suite: True → caller should run everything
     full_suite_reasons: human-readable trigger descriptions (when is_full_suite)
+    map_selected: subset of selected_test_paths that were reached via layer-2
+      convention map.  Used by the banner split to attribute the ``map-residue``
+      bucket without re-deriving selection attribution.
     """
     full_suite_reasons: list[str] = []
 
@@ -373,10 +401,10 @@ def select_tests(
             full_suite_reasons.append(cf)
 
     if full_suite_reasons:
-        return [], True, full_suite_reasons
+        return [], True, full_suite_reasons, set()
 
     if not changed_files:
-        return [], False, []
+        return [], False, [], set()
 
     # Build layer-1 reverse import graph (stateless per run)
     import_graph = _build_import_graph(repo_root)
@@ -385,31 +413,36 @@ def select_tests(
     test_map = _load_test_map(repo_root)
 
     selected: set[str] = set()
+    # Track files reached ONLY via layer-2 convention map.  A file that is
+    # reached by BOTH layers is attributed to layer-1 (import graph), which
+    # is the more specific attribution for banner-split purposes.
+    map_only_selected: set[str] = set()
     unresolved: list[str] = []
 
     for cf in changed_files:
         resolved = False
+        l1_hits: set[str] = set()
 
         # — Layer 1: import graph —
         stem = _path_to_module_stem(cf)
         if stem and stem in import_graph:
-            hits = import_graph[stem]
-            selected |= hits
+            l1_hits = import_graph[stem]
+            selected |= l1_hits
             resolved = True
             if verbose:
-                print(f"  [L1] {cf} → {len(hits)} test(s) via import graph")
+                print(f"  [L1] {cf} → {len(l1_hits)} test(s) via import graph")
         elif stem:
             # Fallback: for tools sub-package files (tools/engine/build.py → stem
             # "build", absent from graph), check the package root key "tools".
             # import_graph["tools"] holds all tests that import any tools.* module.
             pkg_root = _package_root_stem(cf)
             if pkg_root and pkg_root in import_graph:
-                hits = import_graph[pkg_root]
-                selected |= hits
+                l1_hits = import_graph[pkg_root]
+                selected |= l1_hits
                 resolved = True
                 if verbose:
                     print(
-                        f"  [L1-pkg] {cf} → {len(hits)} test(s) via package root "
+                        f"  [L1-pkg] {cf} → {len(l1_hits)} test(s) via package root "
                         f'"{pkg_root}" key'
                     )
 
@@ -419,8 +452,10 @@ def select_tests(
         map_tests, map_full = _resolve_convention_map(cf, test_map, repo_root)
         if map_full:
             full_suite_reasons.append(f"convention map: {cf} → full suite")
-            return [], True, full_suite_reasons
+            return [], True, full_suite_reasons, set()
         if map_tests:
+            # Only attribute to map-only when L1 did not already reach the file.
+            map_only_selected |= map_tests - l1_hits
             selected |= map_tests
             resolved = True
             if verbose:
@@ -435,6 +470,10 @@ def select_tests(
             and os.path.exists(os.path.join(repo_root, cf))
         ):
             selected.add(cf)
+            # Attribution: a directly-selected test file is not map-residue,
+            # even if a convention-map entry also reaches it — direct/L1 wins
+            # (reviewer catch: banner accuracy; selection itself unaffected).
+            map_only_selected.discard(cf)
             resolved = True
             if verbose:
                 print(f"  [direct] {cf} is a test file → selected directly")
@@ -446,7 +485,7 @@ def select_tests(
         full_suite_reasons.extend(
             f"unresolved by both layers: {cf}" for cf in unresolved
         )
-        return [], True, full_suite_reasons
+        return [], True, full_suite_reasons, set()
 
     # Filter to only existing files
     existing = [
@@ -455,7 +494,11 @@ def select_tests(
         if os.path.exists(os.path.join(repo_root, tf))
     ]
 
-    return existing, False, []
+    # map_only_selected constrained to files that actually exist
+    existing_set = set(existing)
+    map_selected_existing = map_only_selected & existing_set
+
+    return existing, False, [], map_selected_existing
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +512,155 @@ def _count_total_test_files(repo_root: str) -> int:
     if not tests_dir.is_dir():
         return 0
     return len(list(tests_dir.glob("test_*.py")))
+
+
+def _classify_selection(
+    selected: list[str],
+    map_selected: set[str],
+    allowlist: set[str],
+) -> tuple[int, int, int]:
+    """Split selected test files into banner bucket counts.
+
+    Buckets (mutually exclusive, all selected files accounted for):
+      contract    — basename matches test_*_payload.py OR in the allowlist
+      map-residue — reached via layer-2 convention map only (and not contract)
+      internals   — everything else (reached via layer-1 import graph / direct)
+
+    Returns (n_internals, n_contract, n_map_residue).
+    """
+    n_contract = 0
+    n_map_residue = 0
+    n_internals = 0
+    for tf in selected:
+        base = os.path.basename(tf)
+        if _is_contract_test(base, allowlist):
+            n_contract += 1
+        elif tf in map_selected:
+            n_map_residue += 1
+        else:
+            n_internals += 1
+    return n_internals, n_contract, n_map_residue
+
+
+# ---------------------------------------------------------------------------
+# Audit helpers — #948 contract
+# ---------------------------------------------------------------------------
+
+
+def _audit_imports(
+    repo_root: str,
+    test_map: dict,
+) -> list[str]:
+    """Return sorted list of test files that violate the server-import rule.
+
+    A file violates when it:
+      - is in tests/test_*.py,
+      - imports the 'server' module (via _parse_imports / _iter_imports), AND
+      - does NOT match the ``test_*_payload.py`` basename glob, AND
+      - is NOT named in the ``server_import_allowlist`` key of test-map.json.
+
+    Returns a sorted list of repo-relative paths of violating files.
+    """
+    allowlist = _get_server_import_allowlist(test_map)
+    tests_dir = Path(repo_root) / TESTS_DIR
+    if not tests_dir.is_dir():
+        return []
+
+    violations: list[str] = []
+    for tf in sorted(tests_dir.glob("test_*.py")):
+        base = tf.name
+        # Skip contract-tier and explicitly allowed files
+        if _is_contract_test(base, allowlist):
+            continue
+        # Check if this file imports server
+        imports = _parse_imports(str(tf))
+        if "server" in imports:
+            rel = str(tf.relative_to(repo_root))
+            violations.append(rel)
+
+    return sorted(violations)
+
+
+def _parse_monkeypatch_string_targets(path: str) -> list[str]:
+    """Return list of string-literal first args to monkeypatch.setattr/delattr/setitem.
+
+    Detects AST patterns of the form:
+      monkeypatch.setattr("module.attr", ...)
+      monkeypatch.delattr("module.attr", ...)
+      monkeypatch.setitem("module.attr", ...)
+
+    where the first argument is an ``ast.Constant`` string containing a dot.
+    Returns the list of such string values (e.g. ["server.some_func"]).
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            src = f.read()
+        tree = ast.parse(src, filename=path)
+    except (SyntaxError, OSError):
+        return []
+
+    targets: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        # Match: monkeypatch.<setattr|delattr|setitem>(...)
+        if not (
+            isinstance(func, ast.Attribute)
+            and func.attr in ("setattr", "delattr", "setitem")
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "monkeypatch"
+        ):
+            continue
+        # First positional argument must be a string constant containing a dot
+        if not node.args:
+            continue
+        first_arg = node.args[0]
+        if (
+            isinstance(first_arg, ast.Constant)
+            and isinstance(first_arg.value, str)
+            and "." in first_arg.value
+        ):
+            targets.append(first_arg.value)
+
+    return targets
+
+
+def _audit_patches(
+    repo_root: str,
+) -> list[str]:
+    """Known false-negative class: a renamed monkeypatch fixture
+    (e.g. 'def test_x(mp):' then 'mp.setattr(...)') is not detected --
+    the AST match keys on the literal name 'monkeypatch'.
+
+    Return sorted list of test files that violate the string-patch rule.
+
+    A file violates when it uses ``monkeypatch.setattr/delattr/setitem`` with a
+    string literal ``"module.attr..."`` whose module stem (text before the first
+    dot) is a repo module that is NOT present in the file's own import set.
+
+    ``_discover_repo_modules`` is used to determine the set of repo module stems.
+    Returns a sorted list of repo-relative paths of violating files.
+    """
+    repo_modules = _discover_repo_modules(repo_root)
+    tests_dir = Path(repo_root) / TESTS_DIR
+    if not tests_dir.is_dir():
+        return []
+
+    violations: list[str] = []
+    for tf in sorted(tests_dir.glob("test_*.py")):
+        string_targets = _parse_monkeypatch_string_targets(str(tf))
+        if not string_targets:
+            continue
+        file_imports = _parse_imports(str(tf))
+        for target in string_targets:
+            module_stem = target.split(".")[0]
+            if module_stem in repo_modules and module_stem not in file_imports:
+                rel = str(tf.relative_to(repo_root))
+                violations.append(rel)
+                break  # one violation per file is enough
+
+    return sorted(violations)
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +680,8 @@ def main(argv: list[str] | None = None) -> int:
             "  python3 tools/run_touched_tests.py --base origin/dev\n"
             "  python3 tools/run_touched_tests.py --dry-run\n"
             "  python3 tools/run_touched_tests.py -- -x -v\n"
+            "  python3 tools/run_touched_tests.py --audit-imports\n"
+            "  python3 tools/run_touched_tests.py --audit-patches --strict\n"
         ),
     )
     parser.add_argument(
@@ -512,6 +706,34 @@ def main(argv: list[str] | None = None) -> int:
         metavar="PATH",
         help="Repository root (default: parent dir of this script)",
     )
+    parser.add_argument(
+        "--audit-imports",
+        action="store_true",
+        help=(
+            "Scan tests/test_*.py and report files that import 'server' "
+            "but are not contract-tier (test_*_payload.py or allowlist). "
+            "Exit 0 by default; exit 1 with --strict when violations exist."
+        ),
+    )
+    parser.add_argument(
+        "--audit-patches",
+        action="store_true",
+        help=(
+            "Scan tests/test_*.py and report files that use "
+            "monkeypatch.setattr/delattr/setitem with a string-literal "
+            "\"module.attr\" first arg whose module stem is a repo module not "
+            "present in the file's own imports. "
+            "Exit 0 by default; exit 1 with --strict when violations exist."
+        ),
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "With --audit-imports or --audit-patches: exit 1 when violations "
+            "are found (future CI gate). Has no effect without an audit flag."
+        ),
+    )
 
     # Split argv on '--' to pass remaining args through to pytest
     if argv is None:
@@ -531,6 +753,39 @@ def main(argv: list[str] | None = None) -> int:
     else:
         # This script is at tools/run_touched_tests.py → parent is repo root
         repo_root = str(Path(__file__).resolve().parent.parent)
+
+    # --audit-imports: report server-import violations
+    if args.audit_imports:
+        test_map = _load_test_map(repo_root)
+        violations = _audit_imports(repo_root, test_map)
+        if violations:
+            print(
+                f"[audit-imports] {len(violations)} file(s) import 'server' "
+                f"but are not contract-tier (test_*_payload.py or allowlist):"
+            )
+            for v in violations:
+                print(f"  {v}")
+        else:
+            print("[audit-imports] no violations found")
+        if args.strict and violations:
+            return 1
+        return 0
+
+    # --audit-patches: report string-patch-without-import violations
+    if args.audit_patches:
+        violations = _audit_patches(repo_root)
+        if violations:
+            print(
+                f"[audit-patches] {len(violations)} file(s) use monkeypatch "
+                f"string targets for repo modules not in their import set:"
+            )
+            for v in violations:
+                print(f"  {v}")
+        else:
+            print("[audit-patches] no violations found")
+        if args.strict and violations:
+            return 1
+        return 0
 
     total_test_files = _count_total_test_files(repo_root)
 
@@ -552,7 +807,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {cf}")
 
     # Run selection pipeline
-    selected, is_full, reasons = select_tests(
+    selected, is_full, reasons, map_selected = select_tests(
         changed, repo_root, verbose=args.dry_run
     )
 
@@ -575,6 +830,10 @@ def main(argv: list[str] | None = None) -> int:
         cmd = [sys.executable, "-m", "pytest", "tests/"] + passthrough
         return subprocess.run(cmd, cwd=repo_root).returncode
 
+    # Load test-map and allowlist for banner classification
+    test_map = _load_test_map(repo_root)
+    allowlist = _get_server_import_allowlist(test_map)
+
     if not selected:
         msg = (
             f"SUBSET green (0/{total_test_files} selected for "
@@ -592,12 +851,20 @@ def main(argv: list[str] | None = None) -> int:
         f"{n_changed} changed files) — iteration signal, NOT a convergence claim. "
         "Full suite gates merge-readiness."
     )
+    n_internals, n_contract, n_map_residue = _classify_selection(
+        selected, map_selected, allowlist
+    )
+    bucket_line = (
+        f"[selection] {n_selected} selected: "
+        f"{n_internals} internals + {n_contract} contract + {n_map_residue} map-residue"
+    )
 
     if args.dry_run:
         print(f"\n[run_touched_tests] would run {n_selected}/{total_test_files} test files:")
         for tf in selected:
             print(f"  {tf}")
         print(f"\n{subset_msg}")
+        print(bucket_line)
         return 0
 
     cmd = [sys.executable, "-m", "pytest"] + selected + passthrough
@@ -605,6 +872,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if rc == 0:
         print(f"\n{subset_msg}")
+        print(bucket_line)
 
     return rc
 

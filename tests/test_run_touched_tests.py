@@ -335,7 +335,7 @@ class TestLayer1ImportGraph:
 
         # Monkeypatch _changed_files to simulate only module_a.py changed
         with patch.object(_runner, "_changed_files", return_value=["module_a.py"]):
-            selected, is_full, reasons = _runner.select_tests(
+            selected, is_full, reasons, _map_sel = _runner.select_tests(
                 ["module_a.py"], str(repo)
             )
 
@@ -348,7 +348,7 @@ class TestLayer1ImportGraph:
         repo = _make_tmp_repo(tmp_path)
 
         with patch.object(_runner, "_changed_files", return_value=["module_a.py"]):
-            selected, is_full, reasons = _runner.select_tests(
+            selected, is_full, reasons, _map_sel = _runner.select_tests(
                 ["module_a.py"], str(repo)
             )
 
@@ -364,7 +364,7 @@ class TestLayer1ImportGraph:
         repo = _make_tmp_repo(tmp_path)
 
         with patch.object(_runner, "_changed_files", return_value=["module_a.py"]):
-            selected, is_full, reasons = _runner.select_tests(
+            selected, is_full, reasons, _map_sel = _runner.select_tests(
                 ["module_a.py"], str(repo)
             )
 
@@ -379,7 +379,7 @@ class TestLayer1ImportGraph:
         repo = _make_tmp_repo(tmp_path)
 
         with patch.object(_runner, "_changed_files", return_value=["module_b.py"]):
-            selected, is_full, reasons = _runner.select_tests(
+            selected, is_full, reasons, _map_sel = _runner.select_tests(
                 ["module_b.py"], str(repo)
             )
 
@@ -419,7 +419,7 @@ class TestLayer1ImportGraph:
         # Changing module_a should now also select test_lazy
         # because module_lazy has a function-local import of module_a
         with patch.object(_runner, "_changed_files", return_value=["module_a.py"]):
-            selected, is_full, reasons = _runner.select_tests(
+            selected, is_full, reasons, _map_sel = _runner.select_tests(
                 ["module_a.py"], str(repo)
             )
 
@@ -459,7 +459,7 @@ class TestLayer2ConventionMap:
             json.dumps(test_map), encoding="utf-8"
         )
 
-        selected, is_full, reasons = _runner.select_tests(
+        selected, is_full, reasons, _map_sel = _runner.select_tests(
             ["hooks/myhook.py"], str(repo)
         )
 
@@ -495,7 +495,7 @@ class TestLayer2ConventionMap:
             json.dumps(test_map), encoding="utf-8"
         )
 
-        selected, is_full, reasons = _runner.select_tests(
+        selected, is_full, reasons, _map_sel = _runner.select_tests(
             ["skills/my_skill/SKILL.md"], str(repo)
         )
 
@@ -526,7 +526,7 @@ class TestLayer2ConventionMap:
             json.dumps(test_map), encoding="utf-8"
         )
 
-        selected, is_full, reasons = _runner.select_tests(
+        selected, is_full, reasons, _map_sel = _runner.select_tests(
             ["hooks/danger.sh"], str(repo)
         )
 
@@ -558,7 +558,7 @@ class TestFailOpenTriggers:
         """Each always-full file triggers full suite."""
         repo = _make_tmp_repo(tmp_path)
 
-        selected, is_full, reasons = _runner.select_tests(
+        selected, is_full, reasons, _map_sel = _runner.select_tests(
             [trigger_file], str(repo)
         )
 
@@ -572,7 +572,7 @@ class TestFailOpenTriggers:
         repo = _make_tmp_repo(tmp_path)
 
         # Change a file that has no test mapping and is not imported
-        selected, is_full, reasons = _runner.select_tests(
+        selected, is_full, reasons, _map_sel = _runner.select_tests(
             ["some/unknown/path.yaml"], str(repo)
         )
 
@@ -588,7 +588,7 @@ class TestOutputContract:
         repo = _make_tmp_repo(tmp_path)
 
         # Select test_a by changing module_a
-        selected, is_full, reasons = _runner.select_tests(
+        selected, is_full, reasons, _map_sel = _runner.select_tests(
             ["module_a.py"], str(repo)
         )
 
@@ -620,7 +620,7 @@ class TestOutputContract:
         """Full-suite trigger names the specific triggering file."""
         repo = _make_tmp_repo(tmp_path)
 
-        selected, is_full, reasons = _runner.select_tests(
+        selected, is_full, reasons, _map_sel = _runner.select_tests(
             ["conftest.py"], str(repo)
         )
 
@@ -737,7 +737,7 @@ class TestTransitiveClosureMutation:
         repo = _make_tmp_repo(tmp_path)
 
         # --- Real implementation: test_b IS selected ---
-        real_selected, is_full, _ = _runner.select_tests(["module_a.py"], str(repo))
+        real_selected, is_full, _, _ms = _runner.select_tests(["module_a.py"], str(repo))
         real_names = {Path(p).name for p in real_selected}
         assert "test_b.py" in real_names, (
             "Pre-condition: real implementation must select test_b transitively; "
@@ -771,7 +771,7 @@ class TestTransitiveClosureMutation:
             return reverse
 
         with patch.object(_runner, "_build_import_graph", _broken_build_import_graph):
-            broken_selected, is_full_b, _ = _runner.select_tests(
+            broken_selected, is_full_b, _, _ms2 = _runner.select_tests(
                 ["module_a.py"], str(repo)
             )
 
@@ -793,9 +793,495 @@ class TestTransitiveClosureMutation:
         )
 
         # --- Restore: real implementation selects test_b again ---
-        restored_selected, _, _ = _runner.select_tests(["module_a.py"], str(repo))
+        restored_selected, _, _, _ms3 = _runner.select_tests(["module_a.py"], str(repo))
         restored_names = {Path(p).name for p in restored_selected}
         assert "test_b.py" in restored_names, (
             "After restoring real implementation, test_b.py must be selected again; "
             f"got {restored_names}"
         )
+
+
+# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. #948 residue — selection banner split + audit gates
+# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+
+
+def _make_tmp_repo_with_contract(tmp_path: Path) -> Path:
+    """Extend _make_tmp_repo with contract-tier and map-selected test files.
+
+    Adds to the base repo:
+      module_c.py            — a simple module
+      tests/test_c_payload.py — contract-tier file (basename matches test_*_payload.py)
+      tests/test_map.py       — map-only file (will be mapped via convention map)
+      tests/test_server_import.py — internals file that imports 'server'
+      packaging/test-map.json — updated with a map entry for module_c.py
+    """
+    repo = _make_tmp_repo(tmp_path)
+
+    # module_c.py — a simple module with no imports
+    (repo / "module_c.py").write_text(
+        textwrap.dedent("""\
+            def greet():
+                return "hello from c"
+        """),
+        encoding="utf-8",
+    )
+
+    # test_c_payload.py — contract-tier (basename pattern test_*_payload.py)
+    (repo / "tests" / "test_c_payload.py").write_text(
+        textwrap.dedent("""\
+            # contract-tier: tests the MCP-payload contract for module_c
+            import module_c
+            import server  # allowed: contract-tier files may import server
+
+            def test_c_payload():
+                assert module_c.greet() == "hello from c"
+        """),
+        encoding="utf-8",
+    )
+
+    # test_map.py — will be reached via convention map only (not import graph)
+    (repo / "tests" / "test_map.py").write_text(
+        textwrap.dedent("""\
+            def test_via_map():
+                pass
+        """),
+        encoding="utf-8",
+    )
+
+    # test_server_import.py — internals file (L1-selected) that imports server
+    # This is a "violating" file for --audit-imports purposes
+    (repo / "tests" / "test_server_import.py").write_text(
+        textwrap.dedent("""\
+            import module_a
+            import server  # should be contract-tier; violation for audit
+
+            def test_server():
+                pass
+        """),
+        encoding="utf-8",
+    )
+
+    # server.py — a fake "server" module so _discover_repo_modules finds it
+    (repo / "server.py").write_text(
+        textwrap.dedent("""\
+            # fake server module for testing
+        """),
+        encoding="utf-8",
+    )
+
+    # Update test-map.json: map module_c.py → test_map.py via convention map,
+    # and seed server_import_allowlist with test_c_payload.py (the allowlisted file)
+    test_map = {
+        "schema_version": 1,
+        "mappings": [
+            {
+                "path_prefix_or_glob": "module_c.py",
+                "test_globs": ["tests/test_map.py"],
+            }
+        ],
+        "unmapped": [],
+        "server_import_allowlist": ["test_c_payload.py"],
+    }
+    (repo / "packaging" / "test-map.json").write_text(
+        json.dumps(test_map), encoding="utf-8"
+    )
+
+    # Re-commit so git state is clean
+    subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "add contract fixtures"],
+        cwd=str(repo),
+        capture_output=True,
+    )
+
+    return repo
+
+
+class TestBannerSplit:
+    """Feature 1: selection banner split into contract / internals / map-residue."""
+
+    def test_contract_file_counted_in_contract_bucket(self, tmp_path: Path):
+        """A test_*_payload.py file is attributed to the contract bucket."""
+        repo = _make_tmp_repo_with_contract(tmp_path)
+
+        # Changing module_c.py selects test_c_payload.py (via import graph)
+        # and test_map.py (via convention map)
+        selected, is_full, _, map_sel = _runner.select_tests(
+            ["module_c.py"], str(repo)
+        )
+        assert not is_full
+
+        test_map = _runner._load_test_map(str(repo))
+        allowlist = _runner._get_server_import_allowlist(test_map)
+        n_internals, n_contract, n_map_residue = _runner._classify_selection(
+            selected, map_sel, allowlist
+        )
+
+        sel_names = {Path(p).name for p in selected}
+        assert "test_c_payload.py" in sel_names, (
+            f"test_c_payload.py should be selected; got {sel_names}"
+        )
+        assert n_contract >= 1, (
+            f"contract bucket should be >= 1; got n_contract={n_contract}"
+        )
+
+    def test_internals_file_counted_in_internals_bucket(self, tmp_path: Path):
+        """A non-payload, non-map test file is attributed to internals."""
+        repo = _make_tmp_repo_with_contract(tmp_path)
+
+        # Changing module_a.py selects test_a.py and test_b.py via import graph
+        selected, is_full, _, map_sel = _runner.select_tests(
+            ["module_a.py"], str(repo)
+        )
+        assert not is_full
+
+        test_map = _runner._load_test_map(str(repo))
+        allowlist = _runner._get_server_import_allowlist(test_map)
+        n_internals, n_contract, n_map_residue = _runner._classify_selection(
+            selected, map_sel, allowlist
+        )
+
+        sel_names = {Path(p).name for p in selected}
+        # test_a.py and test_b.py are internals (not payload, not map-only)
+        assert "test_a.py" in sel_names or "test_b.py" in sel_names
+        assert n_internals >= 1, (
+            f"internals bucket should be >= 1; got n_internals={n_internals}"
+        )
+
+    def test_map_selected_file_counted_in_map_residue_bucket(self, tmp_path: Path):
+        """A file reached ONLY via convention map is attributed to map-residue."""
+        repo = _make_tmp_repo_with_contract(tmp_path)
+
+        # module_c.py is in the convention map → test_map.py is map-only selected
+        # (test_map.py doesn't import module_c, so L1 won't reach it)
+        selected, is_full, _, map_sel = _runner.select_tests(
+            ["module_c.py"], str(repo)
+        )
+        assert not is_full
+
+        test_map = _runner._load_test_map(str(repo))
+        allowlist = _runner._get_server_import_allowlist(test_map)
+        n_internals, n_contract, n_map_residue = _runner._classify_selection(
+            selected, map_sel, allowlist
+        )
+
+        sel_names = {Path(p).name for p in selected}
+        assert "test_map.py" in sel_names, (
+            f"test_map.py should be selected via convention map; got {sel_names}"
+        )
+        assert n_map_residue >= 1, (
+            f"map-residue bucket should be >= 1; got n_map_residue={n_map_residue}"
+        )
+
+    def test_bucket_counts_sum_to_total(self, tmp_path: Path):
+        """internals + contract + map-residue must equal the total selected count."""
+        repo = _make_tmp_repo_with_contract(tmp_path)
+
+        selected, is_full, _, map_sel = _runner.select_tests(
+            ["module_c.py"], str(repo)
+        )
+        assert not is_full
+
+        test_map = _runner._load_test_map(str(repo))
+        allowlist = _runner._get_server_import_allowlist(test_map)
+        n_internals, n_contract, n_map_residue = _runner._classify_selection(
+            selected, map_sel, allowlist
+        )
+
+        assert n_internals + n_contract + n_map_residue == len(selected), (
+            f"bucket counts must sum to total selected: "
+            f"{n_internals}+{n_contract}+{n_map_residue} != {len(selected)}"
+        )
+
+    def test_banner_line_present_in_dry_run_output(self, tmp_path: Path, capsys, monkeypatch):
+        """--dry-run output includes the [selection] bucket line."""
+        repo = _make_tmp_repo_with_contract(tmp_path)
+
+        monkeypatch.setattr(
+            _runner,
+            "_changed_files",
+            lambda base, repo_root: ["module_a.py"],
+        )
+
+        rc = _runner.main(["--dry-run", "--base", "HEAD", "--repo-root", str(repo)])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "[selection]" in out, f"Expected [selection] bucket line; got:\n{out}"
+        assert "internals" in out
+        assert "contract" in out
+        assert "map-residue" in out
+
+
+class TestAuditImports:
+    """Feature 2: --audit-imports flag (D3 dual-direction shape)."""
+
+    def test_audit_imports_catches_violating_file(self, tmp_path: Path):
+        """A file that imports server but is not contract-tier is flagged."""
+        repo = _make_tmp_repo_with_contract(tmp_path)
+        test_map = _runner._load_test_map(str(repo))
+
+        violations = _runner._audit_imports(str(repo), test_map)
+
+        # test_server_import.py imports server and is not test_*_payload.py
+        viol_names = {Path(v).name for v in violations}
+        assert "test_server_import.py" in viol_names, (
+            f"test_server_import.py should be a violation; got {viol_names}"
+        )
+
+    def test_audit_imports_respects_payload_pattern(self, tmp_path: Path):
+        """A test_*_payload.py file is NOT flagged even if it imports server."""
+        repo = _make_tmp_repo_with_contract(tmp_path)
+        test_map = _runner._load_test_map(str(repo))
+
+        violations = _runner._audit_imports(str(repo), test_map)
+
+        viol_names = {Path(v).name for v in violations}
+        assert "test_c_payload.py" not in viol_names, (
+            "test_c_payload.py is contract-tier and must not be flagged as a violation"
+        )
+
+    def test_audit_imports_respects_allowlist(self, tmp_path: Path):
+        """A file in server_import_allowlist is NOT flagged."""
+        repo = _make_tmp_repo_with_contract(tmp_path)
+
+        # Add an allowlisted file that imports server
+        (repo / "tests" / "test_allowlisted.py").write_text(
+            textwrap.dedent("""\
+                import server  # allowed via allowlist
+                def test_allowed(): pass
+            """),
+            encoding="utf-8",
+        )
+
+        # Update test-map to allowlist this file
+        test_map_data = {
+            "schema_version": 1,
+            "mappings": [],
+            "unmapped": [],
+            "server_import_allowlist": ["test_allowlisted.py"],
+        }
+        (repo / "packaging" / "test-map.json").write_text(
+            json.dumps(test_map_data), encoding="utf-8"
+        )
+        test_map = _runner._load_test_map(str(repo))
+
+        violations = _runner._audit_imports(str(repo), test_map)
+
+        viol_names = {Path(v).name for v in violations}
+        assert "test_allowlisted.py" not in viol_names, (
+            "test_allowlisted.py is in the allowlist and must not be flagged"
+        )
+
+    def test_audit_imports_absent_allowlist_key_tolerated(self, tmp_path: Path):
+        """Absent server_import_allowlist key doesn't crash — returns empty set."""
+        test_map_without_key = {"schema_version": 1, "mappings": [], "unmapped": []}
+        allowlist = _runner._get_server_import_allowlist(test_map_without_key)
+        assert allowlist == set(), (
+            "Missing server_import_allowlist key must yield empty set, not an error"
+        )
+
+    def test_audit_imports_strict_exit1_on_violations(self, tmp_path: Path, monkeypatch):
+        """--audit-imports --strict exits 1 when violations exist."""
+        repo = _make_tmp_repo_with_contract(tmp_path)
+
+        rc = _runner.main(
+            ["--audit-imports", "--strict", "--repo-root", str(repo)]
+        )
+        assert rc == 1, (
+            f"Expected exit code 1 with --strict and violations present; got {rc}"
+        )
+
+    def test_audit_imports_strict_exit0_when_clean(self, tmp_path: Path):
+        """--audit-imports --strict exits 0 when no violations exist."""
+        repo = _make_tmp_repo(tmp_path)
+        # Base repo has no server imports at all
+        rc = _runner.main(
+            ["--audit-imports", "--strict", "--repo-root", str(repo)]
+        )
+        assert rc == 0, (
+            f"Expected exit code 0 with --strict and no violations; got {rc}"
+        )
+
+    def test_audit_imports_default_exit0_even_with_violations(
+        self, tmp_path: Path, capsys
+    ):
+        """--audit-imports without --strict exits 0 regardless of violations."""
+        repo = _make_tmp_repo_with_contract(tmp_path)
+
+        rc = _runner.main(["--audit-imports", "--repo-root", str(repo)])
+        assert rc == 0, (
+            "Without --strict, --audit-imports must exit 0 even with violations"
+        )
+        out = capsys.readouterr().out
+        # Should still report
+        assert "audit-imports" in out
+
+
+class TestAuditPatches:
+    """Feature 3: --audit-patches flag (D3 dual-direction shape)."""
+
+    def _make_repo_with_patch_fixtures(self, tmp_path: Path) -> Path:
+        """Create a repo with monkeypatch fixture files for testing audit-patches."""
+        repo = _make_tmp_repo(tmp_path)
+
+        # server.py — a repo module
+        (repo / "server.py").write_text("# fake server", encoding="utf-8")
+
+        # test_patches_no_import.py — uses string monkeypatch on 'server' but
+        # does NOT import server → should be a violation
+        (repo / "tests" / "test_patches_no_import.py").write_text(
+            textwrap.dedent("""\
+                def test_patched(monkeypatch):
+                    monkeypatch.setattr("server.some_func", lambda: "mocked")
+            """),
+            encoding="utf-8",
+        )
+
+        # test_patches_with_import.py — uses string monkeypatch on 'server'
+        # AND imports server → should NOT be a violation
+        (repo / "tests" / "test_patches_with_import.py").write_text(
+            textwrap.dedent("""\
+                import server
+
+                def test_patched_ok(monkeypatch):
+                    monkeypatch.setattr("server.some_func", lambda: "mocked")
+            """),
+            encoding="utf-8",
+        )
+
+        # test_setitem_no_import.py — setitem string target without the import
+        # → should be a violation (dedicated D3 fire-direction for setitem)
+        (repo / "tests" / "test_setitem_no_import.py").write_text(
+            textwrap.dedent("""\
+                def test_item_patched(monkeypatch):
+                    monkeypatch.setitem("server.registry", "key", "val")
+            """),
+            encoding="utf-8",
+        )
+
+        # test_setitem_with_import.py — setitem string target WITH the import
+        # → should NOT be a violation (dedicated D3 no-fire direction)
+        (repo / "tests" / "test_setitem_with_import.py").write_text(
+            textwrap.dedent("""\
+                import server
+
+                def test_item_patched_ok(monkeypatch):
+                    monkeypatch.setitem("server.registry", "key", "val")
+            """),
+            encoding="utf-8",
+        )
+
+        # Re-commit
+        subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add patch fixtures"],
+            cwd=str(repo),
+            capture_output=True,
+        )
+
+        return repo
+
+    def test_audit_patches_catches_string_patch_without_import(self, tmp_path: Path):
+        """A file with monkeypatch string target but missing import is flagged."""
+        repo = self._make_repo_with_patch_fixtures(tmp_path)
+
+        violations = _runner._audit_patches(str(repo))
+
+        viol_names = {Path(v).name for v in violations}
+        assert "test_patches_no_import.py" in viol_names, (
+            "test_patches_no_import.py uses monkeypatch.setattr('server.X') "
+            f"without importing server; should be flagged; got {viol_names}"
+        )
+
+    def test_audit_patches_passes_string_patch_with_import(self, tmp_path: Path):
+        """A file with monkeypatch string target that also imports the module is NOT flagged."""
+        repo = self._make_repo_with_patch_fixtures(tmp_path)
+
+        violations = _runner._audit_patches(str(repo))
+
+        viol_names = {Path(v).name for v in violations}
+        assert "test_patches_with_import.py" not in viol_names, (
+            "test_patches_with_import.py imports server AND uses string patch; "
+            "must not be flagged as a violation"
+        )
+
+    def test_audit_patches_setitem_fires_without_import(self, tmp_path: Path):
+        """setitem string target without the import is flagged (dedicated pair)."""
+        repo = self._make_repo_with_patch_fixtures(tmp_path)
+
+        violations = _runner._audit_patches(str(repo))
+
+        viol_names = {Path(v).name for v in violations}
+        assert "test_setitem_no_import.py" in viol_names, (
+            f"setitem string patch without import must be flagged; got {viol_names}"
+        )
+
+    def test_audit_patches_setitem_clean_with_import(self, tmp_path: Path):
+        """setitem string target with the import present is NOT flagged."""
+        repo = self._make_repo_with_patch_fixtures(tmp_path)
+
+        violations = _runner._audit_patches(str(repo))
+
+        viol_names = {Path(v).name for v in violations}
+        assert "test_setitem_with_import.py" not in viol_names, (
+            "setitem with import present must not be flagged; "
+            f"got {viol_names}"
+        )
+
+    def test_audit_patches_strict_exit1_on_violations(self, tmp_path: Path):
+        """--audit-patches --strict exits 1 when violations exist."""
+        repo = self._make_repo_with_patch_fixtures(tmp_path)
+
+        rc = _runner.main(
+            ["--audit-patches", "--strict", "--repo-root", str(repo)]
+        )
+        assert rc == 1, (
+            f"Expected exit code 1 with --strict and patch violations; got {rc}"
+        )
+
+    def test_audit_patches_strict_exit0_when_clean(self, tmp_path: Path):
+        """--audit-patches --strict exits 0 when no violations."""
+        repo = _make_tmp_repo(tmp_path)
+        # Base repo has no monkeypatch string calls at all
+        rc = _runner.main(
+            ["--audit-patches", "--strict", "--repo-root", str(repo)]
+        )
+        assert rc == 0, (
+            f"Expected exit code 0 with --strict and no patch violations; got {rc}"
+        )
+
+    def test_audit_patches_default_exit0_even_with_violations(
+        self, tmp_path: Path, capsys
+    ):
+        """--audit-patches without --strict exits 0 regardless of violations."""
+        repo = self._make_repo_with_patch_fixtures(tmp_path)
+
+        rc = _runner.main(["--audit-patches", "--repo-root", str(repo)])
+        assert rc == 0, (
+            "Without --strict, --audit-patches must exit 0 even with violations"
+        )
+        out = capsys.readouterr().out
+        assert "audit-patches" in out
+
+    def test_parse_monkeypatch_targets_extracts_string_args(self, tmp_path: Path):
+        """_parse_monkeypatch_string_targets returns string-literal first args."""
+        test_file = tmp_path / "test_example.py"
+        test_file.write_text(
+            textwrap.dedent("""\
+                def test_x(monkeypatch):
+                    monkeypatch.setattr("server.fn", lambda: None)
+                    monkeypatch.delattr("server.other")
+                    monkeypatch.setitem("server.registry", "key", "val")
+                    monkeypatch.setattr(some_obj, "method", lambda: None)  # non-string: skip
+            """),
+            encoding="utf-8",
+        )
+        targets = _runner._parse_monkeypatch_string_targets(str(test_file))
+        assert "server.fn" in targets
+        assert "server.other" in targets
+        assert "server.registry" in targets
+        # Non-string first arg (some_obj) must not appear
+        assert not any("some_obj" in t for t in targets)
