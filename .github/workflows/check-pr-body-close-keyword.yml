@@ -1,0 +1,84 @@
+name: pr-body-close-keyword-trap
+
+# Issue #539 — structural enforcement of the project's PR-closure convention
+# (CLAUDE.md "PR — issue closure"; #572). GitHub's auto-close parser fires on
+# the PR BODY (not the title) and ignores negation, brackets, and backticks
+# ("does NOT close #N" still auto-closes #N). The #572 convention therefore
+# REQUIRES a legitimate `Closes #N.` in the body to fire auto-close for the
+# title's own target — so a fail-ANY-keyword gate is wrong (it would block
+# every correctly-closing PR). This gate is TRAP-DETECTION: it PASSES the
+# legitimate target-close and FAILS only an OFF-TARGET body close-keyword
+# (referencing #M != the title's [closes #N]) — the wrong-issue trap that hit
+# PR #516 ("does NOT close #510") and PR #537.
+# Spec: Borges #756 + Ariadne's review on #959; reconciles #539 with #572.
+#
+# Body-text grep is intentional: the GraphQL closingIssuesReferences field is
+# dormant ([]) on non-default-base/stacked PRs and would pass them vacuously
+# (verified on a stacked-PR review); the body regex works at creation time
+# regardless of base.
+
+on:
+  pull_request:
+    branches: [dev, master]
+
+jobs:
+  trap-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail on off-target close-keyword in the PR body
+        env:
+          # Title + body passed via env, NOT inline ${{ }} in run:, to avoid
+          # shell injection from author-controlled content.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # The title's intended close target(s): the [closes #N] / [close #N] /
+          # [closed #N] human-scan bracket form (GitHub's parser ignores it).
+          # A PR may legitimately close several issues, so collect a set.
+          TITLE_NS=$(printf '%s' "$PR_TITLE" \
+            | grep -ioE '\[clos[a-z]*[[:space:]]+#[0-9]+\]' \
+            | grep -oE '[0-9]+' | sort -u)
+
+          # Body close-keyword references (raw — the parser ignores negation /
+          # brackets / backticks, so we must too). Keywords: close/closes/closed,
+          # fix/fixes/fixed, resolve/resolves/resolved, each followed by #<number>.
+          BODY_MS=$(printf '%s' "$PR_BODY" \
+            | grep -ioE '(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]+#[0-9]+' \
+            | grep -oE '#[0-9]+' | tr -d '#' | sort -u)
+
+          if [ -z "$BODY_MS" ]; then
+            echo "No close-keyword references in the PR body. ✓"
+            exit 0
+          fi
+
+          # No title target → can't distinguish intended-close from trap.
+          # Per Borges #756: WARN, don't hard-fail — may be a partial/EPIC slice
+          # referencing an umbrella; the final PR in the series carries the title tag.
+          if [ -z "$TITLE_NS" ]; then
+            echo "::warning::PR body has close-keyword reference(s) [$(echo $BODY_MS | tr '\n' ' ')] but the title has no [closes #N] target."
+            echo "If this is the PR that should close an issue, add [closes #N] to the title AND keep 'Closes #N.' in the body (the body keyword fires GitHub's auto-close; the title bracket is human-scan only)."
+            echo "If it's a partial/EPIC slice that only references an umbrella issue, this is expected — warning only, not a failure."
+            exit 0
+          fi
+
+          # Title target(s) present → any body #M not in the title's target set
+          # is a TRAP. grep -vxF treats TITLE_NS as a newline-separated fixed-
+          # string set; -v -x keeps body M's matching NONE of the targets (the
+          # off-target traps). (A bare `for M in $BODY_MS` mis-splits the
+          # newline-separated list, so use set-difference grep instead.)
+          TRAPS=$(printf '%s\n' "$BODY_MS" | grep -vxF "$TITLE_NS" || true)
+
+          if [ -n "$TRAPS" ]; then
+            echo "::error::Off-target close-keyword in the PR body: $(printf '#%s ' $TRAPS) (the title's close target is $(printf '#%s ' $TITLE_NS))."
+            echo ""
+            echo "GitHub's auto-close parser ignores negation, brackets, and backticks, so a body close-keyword pointing at a NON-target issue auto-closes the WRONG issue on merge:"
+            echo "  \"this PR does NOT close #M\"          -> still auto-closes #M"
+            echo "  \"the scrub PR uses [closes #M]\"      -> still auto-closes #M"
+            echo ""
+            echo "The legitimate close for this PR's own target (the #N in the title's [closes #N]) passes — fix only the off-target reference(s). Paraphrase so no close-keyword precedes a non-target #number:"
+            echo "  instead of: \"does NOT close #M\"               use: \"#M stays open — this is a partial slice\""
+            echo "  instead of: \"the scrub PR uses [closes #M]\"   use: \"the scrub PR carries the close-tag for #M in its title\""
+            exit 1
+          fi
+
+          echo "Body close-keyword(s) all match the title's close target #$(echo $TITLE_NS | tr '\n' ' '). Legitimate. ✓"
