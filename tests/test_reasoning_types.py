@@ -378,7 +378,16 @@ def test_structural_warning_single_source_generalization():
 
 
 def test_no_warning_multi_source_generalization():
-    """Inductive generalization with premises from different sources: no warning."""
+    """Inductive generalization with premises from different sources: no
+    SOURCE-INDEPENDENCE structural warning.
+
+    (Updated for the #49 standpoint-v3 F-S un-nest: the FALSIFICATION advisory
+    is now decoupled from standpoint, so any 2+-premise derivation with a known
+    fs_class emits an informational FALSIFICATION ratio line — here "2/2
+    re-executable" for the two hard_data premises, which is benign/good F-S.
+    The test's real intent is that the multi_source check does NOT flag these as
+    same-source — so assert the absence of the source-independence warning, not
+    the absence of all warnings.)"""
     client = fresh_client()
     ids = setup_base_graph(client)
 
@@ -390,8 +399,15 @@ def test_no_warning_multi_source_generalization():
         "reasoning_type": "inductive_generalization",
     })
     assert result.get("status") == "created"
-    assert "structure_warnings" not in result, f"Unexpected warnings: {result.get('structure_warnings')}"
-    print(f"  PASS: No warning for multi-source generalization")
+    warns = result.get("structure_warnings", [])
+    assert not any(
+        ("independent sources" in w) or ("same evidence node" in w) for w in warns
+    ), f"multi-source generalization must not trip the source-independence warning: {warns}"
+    # Any other line present must be the benign informational F-S advisory only.
+    assert all(w.startswith("FALSIFICATION:") or w.startswith("STANDPOINT:") for w in warns), (
+        f"only standpoint-v3 advisory lines expected, got: {warns}"
+    )
+    print(f"  PASS: no source-independence warning for multi-source generalization (F-S advisory benign)")
 
 
 # ---------------------------------------------------------------------------

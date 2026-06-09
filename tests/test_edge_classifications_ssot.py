@@ -15,7 +15,12 @@ def test_dag_exempt_matches_pre_refactor_set():
     # If this test fails, EDGE_CLASSIFICATIONS has drifted; either
     # update this expected set (with a justifying observation) or
     # fix the dict.
-    expected = frozenset({"contradicts", "about", "exemplifies"})
+    # `instantiates` added 2026-06-07 (#530 c1, forum #44 three-graph
+    # convergence; the cite is the design-record observation in the
+    # implementing agent's graph + issue #530's consolidated spec):
+    # realization is not a temporal dependency — a goal may be articulated
+    # after the work that realizes it (the gl-0008-shaped first customer).
+    expected = frozenset({"contradicts", "about", "exemplifies", "instantiates"})
     # Allow the new constant to add `cites` ONLY if a separate ob/dv
     # cites the design call that allowed it.
     assert DAG_EXEMPT_RELATIONS == expected, (
@@ -24,7 +29,10 @@ def test_dag_exempt_matches_pre_refactor_set():
     )
 
 def test_removable_matches_pre_refactor_set():
-    expected = frozenset({"about", "tensions", "subtask_of", "serves", "exemplifies"})
+    # `instantiates` removable per #530 spec (pure relevance marker —
+    # over-applied wiring must be correctable without surgical tools).
+    expected = frozenset({"about", "tensions", "subtask_of", "serves", "exemplifies",
+                          "instantiates"})
     assert _REMOVABLE_EDGE_RELATIONS == expected, (
         f"_REMOVABLE_EDGE_RELATIONS drift: got {sorted(_REMOVABLE_EDGE_RELATIONS)}, "
         f"expected {sorted(expected)}."
@@ -50,6 +58,7 @@ def test_no_unclassified_relations_in_schema():
     # Hardcoded — extend when adding a relation.
     known_relations = {
         "about", "cites", "contradicts", "derives_from", "exemplifies",
+        "instantiates",  # #530 c1 (2026-06-07)
         "resolves", "retracts", "serves", "subtask_of", "supersedes",
         "supported_by", "tensions",
     }

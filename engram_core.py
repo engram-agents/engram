@@ -392,6 +392,17 @@ CLAIM_BEARING_TYPES = {
     "lesson",
 }
 
+# Valid TARGET types for the `instantiates` relation (#530): the principle-family
+# nodes a claim-bearing source can realize. Lessons are deliberately ABSENT —
+# incident → lesson membership is `exemplifies` territory (engine-coupled to the
+# tripwire cache); _add_edge_impl rejects lesson targets with a pointer there.
+INSTANTIATES_TARGET_TYPES = {
+    "goal",
+    "cornerstone",
+    "definition",
+    "axiom",
+}
+
 
 VALID_RELATIONS = {
     "cites",
@@ -412,6 +423,20 @@ VALID_RELATIONS = {
                     # logical dependency — no confidence propagation, DAG-exempt
                     # so post-hoc registration and initial-creation use the
                     # same relation regardless of chronological order.
+    "instantiates",  # Achievement-shaped relevance marker (#530, PR 3 of #510):
+                     # source (claim-bearing node) realizes / implements /
+                     # is-an-instance-of target (goal, cornerstone, definition,
+                     # axiom). Distinct from `serves` (intent-shaped: work
+                     # contributes TOWARD a goal) and from `exemplifies`
+                     # (incident → lesson, engine-coupled to the tripwire
+                     # cache). Lesson targets are mechanically REJECTED with a
+                     # pointer to `exemplifies` — the boundary is a gate, not a
+                     # doc. Pure relevance: no cascade, no confidence
+                     # propagation, DAG-exempt (realization is not a temporal
+                     # dependency — a goal may be articulated after the work
+                     # that realizes it). The dream-master's post-hoc wiring
+                     # tool; also the axiom-grounding shape for practice
+                     # observations ("ob_X instantiates ax_Y").
 }
 
 
@@ -447,6 +472,13 @@ EDGE_CLASSIFICATIONS = {
     "exemplifies": {
         "cascade": False,
         "dag_check": False,    # advisory check exempts exemplifies (lesson edges, the exemplifies-dag-exempt observation)
+        "removable": True,
+        "addable_after_creation": True,
+        "provenance": False,
+    },
+    "instantiates": {
+        "cascade": False,      # pure relevance marker — no confidence propagation
+        "dag_check": False,    # realization is not a temporal dependency (see VALID_RELATIONS note)
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -721,6 +753,14 @@ def _ensure_data_dir():
                 "auto_sleep_enabled": False,
                 "auto_sleep_time": "03:00",
             },
+            # Standpoint v3 null=self (D1 §2): the install's OWN training lineage
+            # (provider:family, e.g. "anthropic:claude"). Read by _self_lineage()
+            # so an unmarked observation counts as the filer's own lineage, which
+            # is what makes the standpoint/F-S advisory fire on own-unmarked
+            # derivations. Default "" = feature ships DARK (safe degradation —
+            # gate stays closed, same as pre-feature); the first-session skill
+            # prompts the user to set it. NOT auto-detected — the agent declares it.
+            "self_lineage": "",
             # Fairy delegation policies — consumed by SessionStart hook per-decision.
             # Three modes per policy: "explicit", "auto", "always".
             # "auto" uses the named judgement skill; "explicit" only spawns on
@@ -1312,6 +1352,27 @@ def _get_db() -> sqlite3.Connection:
         ("trust_signal_kind", "TEXT"),
         ("trust_signal_polarity", "REAL"),
         ("trust_signal_weight", "REAL"),
+        # ── standpoint (provenance-uniformity) columns ──
+        # standpoint_author_id: persistent cross-session entity ID for who produced
+        # the source claim ("who observes" axis). Used by _standpoint_cluster_key
+        # to detect whether premises in a derivation trace to a single viewpoint.
+        ("standpoint_author_id", "TEXT"),
+        # standpoint_collection_id: corpus or work identity for the source
+        # ("vantage" axis). Independent axis in per-axis standpoint cluster key.
+        ("standpoint_collection_id", "TEXT"),
+        # standpoint_override_tag: free-form standpoint label for when the computed
+        # cluster key is insufficient (lab measurements, personal comms,
+        # introspective self-reports).
+        ("standpoint_override_tag", "TEXT"),
+        # standpoint_lineage: training-lineage axis (v3), format "provider:family"
+        # (e.g. "anthropic:claude"). The most load-bearing bias axis for AI-agent
+        # premises: N same-lineage agents provide ~one witness of independent
+        # corroboration on substrate-prior bias, for any N.
+        ("standpoint_lineage", "TEXT"),
+        # fs_class: falsification-sensitivity native field (Phase 2).
+        # NULL = Phase-1 proxy applies; "re-executable" | "frozen" = native.
+        # No migration of existing rows — Phase-1 proxy covers all NULL cases.
+        ("fs_class", "TEXT"),
     ]:
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} {typedef}")
@@ -3547,6 +3608,241 @@ def _trace_evidence_roots(conn: sqlite3.Connection, node_id: str, max_depth: int
     return roots
 
 
+def _trace_observation_leaves(
+    conn: sqlite3.Connection, node_id: str, max_depth: int = 10
+) -> set:
+    """Trace a node back to the OBSERVATION leaves it rests on.
+
+    Walks the derivation spine (``derives_from`` / ``supported_by``) backward
+    and collects nodes of ``type LIKE 'observation_%'`` — the layer where the
+    standpoint axes (author/collection/lineage) and ``quote_type``/``fs_class``
+    actually live. Terminates AT each observation: it does NOT descend past an
+    observation into its own ``cites``→evidence hops, because evidence nodes
+    carry neither standpoint nor quote_type (descending would lose the data).
+    If the start node is itself an observation, returns ``{node_id}``.
+
+    Why not ``_trace_evidence_roots``: that returns ``type == 'evidence'`` roots,
+    which carry no standpoint/quote_type — aggregating standpoint or F-S over
+    those yields all-None/all-unknown and the block silently never fires on a
+    layered derivation (whose direct premises are themselves derivations).
+    The standpoint/F-S leaves are observations, one layer up from evidence.
+    (Ariadne #49 — the prior ``_trace_evidence_roots`` reuse was the wrong layer.)
+
+    Mirrors ``_trace_evidence_roots``'s node-budget semantics (``max_depth``
+    decremented per visited node) for behavioral parity.
+    """
+    visited = set()
+    queue = [node_id]
+    leaves = set()
+
+    while queue and max_depth > 0:
+        max_depth -= 1
+        current = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+
+        node = conn.execute("SELECT type FROM nodes WHERE id = ?", (current,)).fetchone()
+        if not node:
+            continue
+        if node["type"].startswith("observation"):
+            leaves.add(current)
+            continue  # terminate AT the observation — do not follow its cites→evidence
+
+        # Non-observation (derivation / goal / etc.): follow the premise spine
+        # only — NOT 'cites' (an observation's cites→evidence is the layer we
+        # stop above; a derivation's cites→context is not a premise).
+        edges = conn.execute(
+            "SELECT target_id FROM edges WHERE source_id = ? AND relation IN ('derives_from', 'supported_by')",
+            (current,),
+        ).fetchall()
+        for e in edges:
+            queue.append(e["target_id"])
+
+    return leaves
+
+
+_LINEAGE_RE = re.compile(r"[a-z0-9_-]+:[a-z0-9._-]+")
+
+
+def _self_lineage() -> str:
+    """The install's own training lineage (provider:family) from config.json's
+    'self_lineage' key; '' if unset or malformed (fail-closed).
+
+    Used by null=self (D1 §2, Borges #721): an unmarked observation is the
+    filer's own lineage by convention. Read-time only — never written to the
+    standpoint_lineage column, so the actionability gate (_graph_lineage_count)
+    still counts only explicitly-marked lineages. Returns '' on any error or
+    if the value does not match provider:family format — safe degradation: null=self
+    does not engage and the gate stays closed, same as pre-feature behavior
+    (Luria's #723 deployment note). Fail-closed is critical: a malformed value
+    would hash into a different cluster than correctly-marked same-lineage
+    premises, producing false diversity and suppressing ⚠⚠ (Mira #750)."""
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text())
+        val = (cfg.get("self_lineage") or "").strip()
+        if val and not _LINEAGE_RE.fullmatch(val):
+            return ""
+        return val
+    except Exception:
+        return ""
+
+
+def _standpoint_cluster_key(
+    conn: sqlite3.Connection, node_id: str
+) -> dict | None:
+    """Return per-axis cluster keys for a node's standpoint fields.
+
+    Returns {"author": sha256(author)[:12] | None, "collection": sha256(collection)[:12] | None,
+    "lineage": sha256(lineage)[:12] | None}.
+    Returns None if no standpoint field is set (can't distinguish from 'no data').
+
+    Note: standpoint_override_tag is annotation-only — it is NOT included in
+    cluster-key computation. It feeds the diagnostic prompt; a node with only
+    an override_tag set returns None here (treated as no standpoint data).
+    standpoint_override_tag will serve as the entry point for platform/env/locale
+    data until v3 makes those axes first-class.
+    """
+    row = conn.execute(
+        "SELECT standpoint_author_id, standpoint_collection_id, standpoint_lineage "
+        "FROM nodes WHERE id = ?",
+        (node_id,),
+    ).fetchone()
+    if not row:
+        return None
+    author = (row["standpoint_author_id"] or "").strip()
+    collection = (row["standpoint_collection_id"] or "").strip()
+    lineage = (row["standpoint_lineage"] or "").strip()
+    # null=self at the lineage axis (D1 §2 — Borges #721): an unmarked
+    # observation is the filer's OWN training lineage by convention. Fall back
+    # to config self_lineage so own-unmarked premises make the gate fire.
+    # Lineage axis ONLY — do NOT synthesize author/collection (the agent
+    # asserted neither). DB column stays NULL (read-time synthesis), so
+    # _graph_lineage_count still counts only explicitly-marked lineages
+    # (Luria's #723 sign-off: actionability gate unaffected).
+    if not lineage:
+        lineage = _self_lineage()
+    if not author and not collection and not lineage:
+        return None
+    return {
+        "author": hashlib.sha256(author.encode()).hexdigest()[:12] if author else None,
+        "collection": hashlib.sha256(collection.encode()).hexdigest()[:12] if collection else None,
+        "lineage": hashlib.sha256(lineage.encode()).hexdigest()[:12] if lineage else None,
+    }
+
+
+def _graph_lineage_count(conn: sqlite3.Connection) -> int:
+    """Distinct non-null standpoint_lineage values across the graph.
+
+    The v3 actionability gate for the standalone lineage ⚠: the warning's
+    remedy ("add cross-lineage support") is only available when a
+    cross-lineage premise is actually citable, which the gate reads from
+    GRAPH STATE, not install topology/config — a solo install that records
+    cross-lineage-sourced observations has earned the ⚠; a multi-agent
+    monoculture house has not. Self-adjusting: the first recorded
+    cross-lineage claim flips the axis live.
+    """
+    # Two filters ENFORCE the docstring's "citable claim-bearing premise" domain
+    # (rather than assert it), so the gate counts only rows that can actually be
+    # cited as a cross-lineage premise:
+    #   (1) is_current = 1 (Mira #48): a retracted/superseded node is not citable.
+    #   (2) type LIKE 'observation_%' (Mira #954): standpoint_lineage is a
+    #       SOURCE-provenance field, set only via the observation write path
+    #       (engram_observation.py) — derivations/goals/etc. take no standpoint and
+    #       are not citable cross-lineage premises, so a non-observation row
+    #       carrying a stray lineage value must not activate the gate. We match
+    #       the whole observation FAMILY by prefix rather than a hand-list of
+    #       specific types: today the family is {observation_factual,
+    #       observation_predictive} (both written by the same observation path and
+    #       both citable premises), and a hand-list 'observation_factual' silently
+    #       UNDER-counts predictive rows and re-opens this gap on every new
+    #       observation_* type. The prefix predicate covers new family members by
+    #       default — the growing-family guard closing form (glob the family, never
+    #       a hand-maintained positive list), applied here because this exact gap
+    #       has recurred three times (is_current, then type, then type-incomplete).
+    row = conn.execute(
+        "SELECT COUNT(DISTINCT standpoint_lineage) AS c FROM nodes "
+        "WHERE is_current = 1 "
+        "  AND type LIKE 'observation_%' "
+        "  AND standpoint_lineage IS NOT NULL AND TRIM(standpoint_lineage) != ''"
+    ).fetchone()
+    return row["c"] if row else 0
+
+
+# Phase-1 F-S proxy prior (D1: quote_type is the DEFAULT/prior, demoted the
+# moment the real F-S field exists). Middle quote_types (official_statement,
+# attributed_analysis, unnamed_source) deliberately map to "unknown" — they
+# are quote-checkable, not re-executable, and the prior should not overclaim.
+_FS_PROXY_MAP = {
+    "hard_data": "re-executable",
+    "editorial": "frozen",
+    "personal_communication": "frozen",
+}
+
+
+def _node_fs_class(conn: sqlite3.Connection, node_id: str) -> tuple[str, str]:
+    """Return (fs_class, source) for a node's falsification-sensitivity.
+
+    fs_class: "re-executable" | "frozen" | "unknown"
+    source:   "proxy:quote_type" (Phase-1 default) | "field" (Phase-2 real field)
+
+    Phase-1/Phase-2 contract seam (standpoint v3 design §4.2): Phase 1 derives
+    a proxy from quote_type at READ TIME — never persisted, so Phase 2's real
+    F-S field cannot collide with stale proxy data and needs no migration.
+    Phase 2 swaps these internals to read the field; no caller changes.
+    Surfaced text must always carry the proxy label while source is a proxy
+    (never present a default as a measurement).
+    """
+    row = conn.execute(
+        "SELECT fs_class, quote_type FROM nodes WHERE id = ?", (node_id,)
+    ).fetchone()
+    if not row:
+        return ("unknown", "proxy:quote_type")
+    # Phase-2 path: native field present
+    if row["fs_class"] in ("re-executable", "frozen"):
+        return (row["fs_class"], "field")
+    # Phase-1 fallback: derive from quote_type proxy
+    if not row["quote_type"]:
+        return ("unknown", "proxy:quote_type")
+    return (_FS_PROXY_MAP.get(row["quote_type"], "unknown"), "proxy:quote_type")
+
+
+def _prediction_resolved(conn: sqlite3.Connection, leaf_id: str) -> bool:
+    """Whether a predictive observation's event has been adjudicated by reality.
+
+    Phase-1: conservatively False — a prediction does not anchor until reality
+    closes it, and the substrate has no resolution field yet (predicted_event /
+    resolution_timeframe are descriptive only). Phase-2 can swap in a real
+    resolution check with no caller change. (Component D — Borges #721.)"""
+    return False
+
+
+def _leaf_verified(conn: sqlite3.Connection, leaf_id: str) -> bool:
+    """State-3 (reality-VERIFIED) proxy for an observation leaf (D1 §5,
+    Component D — Borges #721/#730).
+
+    verifi-ABILITY (state-2) is NOT enough — Lei's verifiable≠verified axis.
+    ONLY the claim's content-type earns state-3: hard_data (measured / observed
+    event) or official_statement (publicly-checkable record). A file:// quote-
+    check is quote-PROVENANCE, not claim-reality-grounding — Lei's ruling: "you
+    can verify my quote in the chat log, but it doesn't make the statement more
+    true" — so there is deliberately NO file:// branch; an accurately-quoted
+    opinion (personal_communication / editorial) stays state-2. Fully
+    determinate (no unknown bucket), so the ⚠⚠ composite drops its n_unknown
+    honesty floor (Luria #723)."""
+    row = conn.execute(
+        "SELECT type, quote_type FROM nodes WHERE id = ?", (leaf_id,)
+    ).fetchone()
+    if not row:
+        return False
+    # Predictive: unverified until the predicted event resolves — regardless of
+    # quote_type (an official statement about a FUTURE event is still a
+    # prediction, not reality-closure).
+    if row["type"] == "observation_predictive" and not _prediction_resolved(conn, leaf_id):
+        return False
+    return row["quote_type"] in ("hard_data", "official_statement")
+
+
 def _validate_reasoning_structure(
     conn: sqlite3.Connection,
     reasoning_type: str,
@@ -3597,6 +3893,181 @@ def _validate_reasoning_structure(
                 f"Multiple observations from the same source are not independent — "
                 f"consider 'deductive_hypothetical_syllogism' or 'inductive_causal' instead."
             )
+
+    # Standpoint uniformity check — advisory for ALL derivations with 2+ premises.
+    # Extends the multi_source check: maps each evidence root to its standpoint
+    # cluster and emits a positive-liveness probe (per the class-5 two-layer
+    # lesson: surface must ALWAYS name what axes were checked, even on clean).
+    #
+    # Implementation note: standpoint_author_id / standpoint_collection_id are
+    # filed on observation (premise) nodes, not on evidence nodes. We trace
+    # evidence roots to determine whether premises share the same source for the
+    # multi_source check above, but the standpoint cluster key is derived from
+    # the premise nodes themselves (where the standpoint data actually lives).
+    if n >= 2:
+        # Closure-walk to OBSERVATION leaves: standpoint (author/collection/
+        # lineage) + quote_type/fs_class live on observation nodes — NOT on the
+        # direct premises (which may themselves be derivations) and NOT on the
+        # evidence roots. For a layered derivation the direct premises are
+        # derivations → no standpoint, fs=unknown → the block would silently
+        # never fire. Aggregate standpoint + F-S over the observation_% leaves at
+        # the bottom of the derives_from/supported_by spine. (Ariadne #49 — the
+        # prior _trace_evidence_roots reuse was the wrong layer: it returns ev_
+        # roots, which carry neither standpoint nor quote_type.)
+        obs_leaves = sorted(
+            {leaf for pid in premise_ids
+             for leaf in _trace_observation_leaves(conn, pid)}
+        )
+        n_leaves = len(obs_leaves)
+
+        # Set by the lineage-axis block when all leaves carry lineage data and
+        # share one cluster; consumed by the ⚠⚠ composite (now in the sibling
+        # FALSIFICATION block). Initialized here so the F-S block can read it
+        # even when the standpoint block is skipped.
+        lineage_uniform = False
+
+        # --- STANDPOINT block: gated on all leaves carrying standpoint data ---
+        if obs_leaves:
+            axis_keys = [_standpoint_cluster_key(conn, lid) for lid in obs_leaves]
+            if all(k is not None for k in axis_keys):
+                # All premises have standpoint data — report per axis so
+                # author-diverse/collection-uniform can't hide behind the combined key.
+                def _axis_label(vals):
+                    # All-or-omit: if ANY premise has None for this axis, the
+                    # axis is partially tracked — omitting prevents asserting
+                    # uniformity from a single premise's data.
+                    if None in vals:
+                        return None
+                    n_clusters = len(vals)
+                    unit = "cluster" if n_clusters == 1 else "clusters"
+                    verdict = "diverse" if n_clusters > 1 else "⚠ uniform"
+                    return f"{n_clusters} {unit} ({verdict})"
+
+                parts = []
+                author_lbl = _axis_label({k["author"] for k in axis_keys})
+                collection_lbl = _axis_label({k["collection"] for k in axis_keys})
+                if author_lbl:
+                    parts.append(f"author: {author_lbl}")
+                if collection_lbl:
+                    parts.append(f"collection: {collection_lbl}")
+
+                # Lineage axis (v3): same all-or-omit guard as the other axes,
+                # but the UNIFORM verdict carries an actionability gate — the
+                # standalone ⚠ renders only when the graph itself demonstrates
+                # >= 2 distinct lineage values (a cross-lineage premise is
+                # actually citable). Otherwise informational, teaching the
+                # enable-path (a warning must point to an available action).
+                lineage_vals = {k["lineage"] for k in axis_keys}
+                if None not in lineage_vals:
+                    if len(lineage_vals) > 1:
+                        parts.append(f"lineage: {len(lineage_vals)} clusters (diverse)")
+                    else:
+                        lineage_uniform = True
+                        if _graph_lineage_count(conn) >= 2:
+                            parts.append(
+                                "lineage: 1 cluster (⚠ uniform — shared training "
+                                "lineage; zero independent corroboration on "
+                                "substrate-prior bias)"
+                            )
+                        # else: single-lineage graph — emit NO standalone line.
+                        # null=self (Component A) makes lineage uniform on EVERY
+                        # own derivation, so the old informational line would fire
+                        # constantly = the per-derivation fatigue Lei's precision
+                        # gate forbids (Borges #721). The ⚠⚠ composite carries the
+                        # only actionable signal here (when zero-verified).
+                # parts may be empty if all axes have partial coverage across
+                # premises — the guard is load-bearing in the mixed-axis case.
+                if parts:
+                    warnings.append(
+                        f"STANDPOINT: {'; '.join(parts)}; others unchecked."
+                    )
+
+            # If any key is None: some leaves lack standpoint data — skip the
+            # STANDPOINT report (can't distinguish no-data from same-cluster).
+            # The FALSIFICATION block below is NOT gated on this — it runs as a
+            # sibling so F-S (which needs no standpoint) is never suppressed by
+            # missing standpoint marks.
+
+        # --- FALSIFICATION block (UN-NESTED — sibling of STANDPOINT) ---
+        # F-S is a property of the EVIDENCE, derived from quote_type/fs_class via
+        # _node_fs_class — present on every observation, needs ZERO standpoint
+        # data. Previously this block was nested inside the standpoint
+        # all-non-None gate, so an unmarked premise silently suppressed the F-S
+        # line too. Un-nested here, guarded only by its own known_fs check, over
+        # the observation leaves. (Ariadne #49 — the un-nest.)
+        if obs_leaves:
+            fs_classes = [_node_fs_class(conn, lid) for lid in obs_leaves]
+            known_fs = [(c, s) for c, s in fs_classes if c != "unknown"]
+            if known_fs:
+                # Scan known_fs only — unknown leaves return proxy source and
+                # must not poison native-fielded sets.
+                any_proxy = any(s.startswith("proxy:") for c, s in known_fs)
+                # Per-source honesty (Ariadne #41/614, choice (a)): split by
+                # (class, source) pair — native leaves render without the proxy
+                # label and "-leaning" qualifier; proxy leaves carry both.
+                # Denominator = observation-leaf count.
+                n_re_native = sum(1 for c, s in known_fs if c == "re-executable" and s == "field")
+                n_re_proxy  = sum(1 for c, s in known_fs if c == "re-executable" and s != "field")
+                n_fr_native = sum(1 for c, s in known_fs if c == "frozen" and s == "field")
+                n_fr_proxy  = sum(1 for c, s in known_fs if c == "frozen" and s != "field")
+                n_re = n_re_native + n_re_proxy  # total re-executable for ⚠⚠ predicate
+                n_fr = n_fr_native + n_fr_proxy
+                n_unknown = n_leaves - len(known_fs)
+                fs_parts = []
+                if n_re_native:
+                    fs_parts.append(f"{n_re_native}/{n_leaves} re-executable")
+                if n_re_proxy:
+                    fs_parts.append(f"{n_re_proxy}/{n_leaves} re-executable-leaning (proxy:quote_type)")
+                if n_fr_native:
+                    fs_parts.append(f"{n_fr_native}/{n_leaves} frozen")
+                if n_fr_proxy:
+                    fs_parts.append(f"{n_fr_proxy}/{n_leaves} frozen-leaning (proxy:quote_type)")
+                if n_unknown:
+                    fs_parts.append(f"{n_unknown}/{n_leaves} unknown")
+                warnings.append(f"FALSIFICATION: {'; '.join(fs_parts)}.")
+
+                # ⚠⚠ composite escalation (v3 §4.1): lineage-uniform AND no leaf
+                # re-testable. Reads lineage_uniform from the STANDPOINT block —
+                # it is False unless that block ran AND found uniformity, so ⚠⚠
+                # stays gated on standpoint data being present. Honesty floor:
+                # fires only when ALL leaves have a KNOWN fs_class (no
+                # true-by-ignorance escalation). [Borges folds the verified-proxy
+                # here: retarget the `n_re == 0` predicate to "zero state-3 /
+                # verified leaves".]
+                # n_verified retarget (Component D, Borges #721): predicate is
+                # "zero state-3 (reality-VERIFIED) leaf", not "zero re-executable"
+                # (state-2). Per Lei's verifiable≠verified axis a
+                # re-executable-but-unrun leaf does NOT discharge. The old
+                # n_unknown==0 floor is dropped — _leaf_verified is fully
+                # determinate (no unknown bucket; Luria #723).
+                n_verified = sum(1 for leaf in obs_leaves if _leaf_verified(conn, leaf))
+                if lineage_uniform and n_verified == 0:
+                    proxy_suffix = (
+                        " [F-S via quote_type-proxy — Phase-2 field may revise]"
+                        if any_proxy else ""
+                    )
+                    # Discharge condition is a VERIFIED (state-3) premise, not
+                    # merely re-executable. (Borges owns the fuller own-vs-foreign
+                    # remedy menu: own/unverified → only "anchor it (verify a
+                    # premise)" resolves; "diversify standpoint" does not anchor
+                    # your own claim.)
+                    if _graph_lineage_count(conn) >= 2:
+                        remedy = (
+                            "treat as single-witness until a reality-verified "
+                            "premise or cross-lineage support is added"
+                        )
+                    else:
+                        remedy = (
+                            "treat as single-witness until a reality-verified "
+                            "premise is added (re-executable-but-unverified is "
+                            "not enough)"
+                        )
+                    warnings.append(
+                        f"⚠⚠ unverified + uniform: no premise is reality-verified "
+                        f"and all share training lineage — corroboration on this "
+                        f"derivation cannot be improved by re-checking; "
+                        f"{remedy}{proxy_suffix}."
+                    )
 
     return warnings
 

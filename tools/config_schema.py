@@ -39,6 +39,13 @@ SCHEMA: list[dict] = [
      "control": "text", "label": "Mode",
      "tooltip": "'single' or 'multi' — managed by agentctl when spawning peer agents.",
      "editable": False, "restart_required": False},
+    {"key": "self_lineage", "section": "identity", "tier": TIER_A, "type": "string",
+     "control": "text", "label": "Self lineage",
+     "tooltip": "This install's own training lineage as provider:family (e.g. "
+                "'anthropic:claude'). Powers standpoint v3 null=self: an unmarked "
+                "observation counts as your own lineage so the standpoint/F-S "
+                "advisory fires on own derivations. Empty = feature dark (safe).",
+     "editable": True, "restart_required": False},
     {"key": "counterparts", "section": "identity", "tier": TIER_A, "type": "list",
      "control": "list_display", "label": "Counterparts",
      "tooltip": "Peer agents on this host. Set by agentctl.",

@@ -75,6 +75,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -738,6 +739,11 @@ def _add_observation_impl(
     source_class: str = "external",
     content_hash: str = "",
     git_sha: str = "",
+    standpoint_author_id: str = "",
+    standpoint_collection_id: str = "",
+    standpoint_override_tag: str = "",
+    standpoint_lineage: str = "",
+    fs_class=None,
 ) -> str:
     """Internal implementation — see engram_add_observation MCP tool for the
     public payload schema. Kept callable with named kwargs for in-server
@@ -783,6 +789,33 @@ def _add_observation_impl(
                 "error": f"Invalid source_class '{source_class}'. Must be one of: {', '.join(sorted(VALID_SOURCE_CLASSES))}"
             }
         )
+
+    # standpoint_lineage format gate (v3): provider:family, lowercase. The
+    # error REDIRECTS (names the expected shape + example) rather than
+    # bare-rejecting; reject-never-normalize keeps the cluster hash a filing
+    # convention the agent can see, not a silent transformation.
+    if standpoint_lineage and not re.fullmatch(
+        r"[a-z0-9_-]+:[a-z0-9._-]+", standpoint_lineage
+    ):
+        return json.dumps(
+            {
+                "error": (
+                    f"standpoint_lineage must match provider:family "
+                    f'(e.g. "anthropic:claude"); got "{standpoint_lineage}"'
+                )
+            }
+        )
+
+    # fs_class validation (Phase 2): accepted values only, per D1 filing-time contract.
+    _VALID_FS_CLASSES = ("re-executable", "frozen")
+    if fs_class is not None and fs_class not in _VALID_FS_CLASSES:
+        return json.dumps({
+            "error": (
+                f"Invalid fs_class '{fs_class}'. "
+                f"Accepted values: {', '.join(repr(v) for v in _VALID_FS_CLASSES)} "
+                "or omit / pass null for Phase-1 proxy fallback."
+            )
+        })
 
     # Resolve evidence node: either from evidence_id or auto-create from url+title
     if not evidence_id and not url:
@@ -864,8 +897,10 @@ def _add_observation_impl(
 
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, evidence_id, quoted_text,
-               interpretation, quote_type, confidence, confidence_history, metadata)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               interpretation, quote_type, confidence, confidence_history, metadata,
+               standpoint_author_id, standpoint_collection_id, standpoint_override_tag,
+               standpoint_lineage, fs_class)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 node_id,
                 node_type,
@@ -878,6 +913,11 @@ def _add_observation_impl(
                 confidence,
                 json.dumps([{"timestamp": now, "value": confidence, "reason": conf_reason}]),
                 metadata,
+                standpoint_author_id or None,
+                standpoint_collection_id or None,
+                standpoint_override_tag or None,
+                standpoint_lineage or None,
+                fs_class if fs_class in ("re-executable", "frozen") else None,
             ),
         )
 
@@ -1128,6 +1168,10 @@ def _add_observation_batch_impl(
             - source_class (optional): 'external' (default), 'introspective', or 'user_stated'
             - content_hash (optional): SHA-256 of file content for file-based evidence
             - git_sha (optional): Git commit SHA for file-based evidence
+            - standpoint_author_id (optional): Persistent cross-session entity ID for who produced this observation's source claim ("who observes" axis).
+            - standpoint_collection_id (optional): Corpus or work identity for this observation's source ("vantage" axis).
+            - standpoint_override_tag (optional): Free-form standpoint label when the cluster key is insufficient.
+            - standpoint_lineage (optional): Training lineage "provider:family" (e.g. "anthropic:claude") for the source claim's producer.
         url: URL of the source document. The evidence node is auto-created or reused.
         title: Title of the source document (required if url is provided).
         domain: Source domain (auto-extracted from URL if omitted).
@@ -1190,6 +1234,11 @@ def _add_observation_batch_impl(
             source_class=obs.get("source_class", "external"),
             content_hash=content_hash,
             git_sha=git_sha,
+            standpoint_author_id=obs.get("standpoint_author_id", ""),
+            standpoint_collection_id=obs.get("standpoint_collection_id", ""),
+            standpoint_override_tag=obs.get("standpoint_override_tag", ""),
+            standpoint_lineage=obs.get("standpoint_lineage", ""),
+            fs_class=obs.get("fs_class"),
         ))
         r["index"] = i
         results.append(r)

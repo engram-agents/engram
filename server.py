@@ -545,6 +545,15 @@ def _trace_evidence_roots(*args, **kwargs):
 
 def _validate_reasoning_structure(*args, **kwargs):
     return core._validate_reasoning_structure(*args, **kwargs)
+
+def _standpoint_cluster_key(*args, **kwargs):
+    return core._standpoint_cluster_key(*args, **kwargs)
+
+def _node_fs_class(*args, **kwargs):
+    return core._node_fs_class(*args, **kwargs)
+
+def _graph_lineage_count(*args, **kwargs):
+    return core._graph_lineage_count(*args, **kwargs)
 # ---- end #872 wave-5 compat forwarders --------------------------------
 
 # ---- #872 wave-6 compat forwarders -----------------------------------
@@ -1312,6 +1321,9 @@ _ADD_OBSERVATION_FIELDS = frozenset({
     "url", "title", "domain", "source_date", "evidence_id",
     "is_predictive", "predicted_event", "resolution_timeframe",
     "source_class", "content_hash", "git_sha",
+    "standpoint_author_id", "standpoint_collection_id", "standpoint_override_tag",
+    "standpoint_lineage",
+    "fs_class",
 })
 
 
@@ -1404,6 +1416,11 @@ def engram_add_observation(payload_json: str) -> str:
             source_class (str, optional): Epistemic origin — 'external' (default), 'introspective' (×0.95 confidence discount), or 'user_stated'.
             content_hash (str, optional): SHA-256 hash of file content (for file-based evidence).
             git_sha (str, optional): Git commit SHA when the file was read (for file-based evidence).
+            standpoint_author_id (str, optional): Persistent cross-session entity ID for who produced the source claim (the "who observes" axis). Used for provenance-uniformity detection.
+            standpoint_collection_id (str, optional): Corpus or work identity for the source ("vantage" axis). Independent axis in per-axis standpoint cluster key.
+            standpoint_override_tag (str, optional): Free-form standpoint label for when the computed cluster key is insufficient (lab measurements, personal comms, introspective self-reports).
+            standpoint_lineage (str, optional): Training lineage of the source claim's producer, format "provider:family" (e.g. "anthropic:claude"). The most load-bearing bias axis for AI-agent premises; format-validated, rejected with a redirecting error if malformed.
+            fs_class (str, optional): Falsification-sensitivity class — "re-executable" (Class 1: claim can be re-tested by re-running the measurement) or "frozen" (Class 2: claim records a past event that cannot be re-executed). Omit or pass null to let the Phase-1 proxy (derived from quote_type) apply. When provided, takes priority over the proxy and the FALSIFICATION line drops the "(proxy:quote_type)" label. When the class is ambiguous (e.g. a re-readable file that records past state), omit and let the proxy apply — hesitation is the correct signal to omit.
 
     Returns:
         JSON with the new observation ID, confidence, evidence ID, and any prediction node created.
@@ -1482,7 +1499,9 @@ def engram_add_observation_batch(payload_json: str) -> str:
             observations_json (str, required): Stringified JSON array of
                 observation objects. Each observation must have quoted_text,
                 interpretation, claim, quote_type; optional is_predictive,
-                predicted_event, resolution_timeframe, source_class.
+                predicted_event, resolution_timeframe, source_class,
+                standpoint_author_id, standpoint_collection_id, standpoint_override_tag,
+                standpoint_lineage.
             url (str, optional): Source URL. The evidence node is auto-created
                 or reused. Use this+title OR evidence_id, not both.
             title (str, optional): Source title (required when url given).
@@ -3432,11 +3451,24 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 def engram_add_edge(payload_json: str) -> str:
     """Add a non-cascade edge between two existing nodes.
 
-    Whitelist-scoped (about, exemplifies, serves, subtask_of, tensions).
-    Cascade / structural / provenance edges blocked — those must be created
-    at node-add time (via the source node's payload) or via the dedicated
-    mutation tool (supersede / retract). Generic add-edge is only for
-    non-claim-bearing topological edges.
+    Whitelist-scoped (about, exemplifies, instantiates, serves, subtask_of,
+    tensions). Cascade / structural / provenance edges blocked — those must
+    be created at node-add time (via the source node's payload) or via the
+    dedicated mutation tool (supersede / retract). Generic add-edge is only
+    for non-claim-bearing topological edges.
+
+    Relation boundaries (the three-way split):
+      exemplifies  — this incident is an instance of this lesson's
+                     error/success pattern (incident → lesson ONLY; feeds
+                     the tripwire engine).
+      serves       — this work contributes toward this goal (intent-shaped,
+                     goal-targeted).
+      instantiates — this claim/artifact REALIZES this principle
+                     (achievement-shaped; targets: goal, cornerstone,
+                     definition, axiom; lesson targets rejected with a
+                     pointer to exemplifies). The post-hoc wiring tool for
+                     goal realizations and axiom grounding from practice
+                     observations.
 
     Idempotent: no_op_already_exists is a successful return.
 

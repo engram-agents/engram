@@ -203,6 +203,109 @@ def _percentile(sorted_vals: list, p: float) -> float:
 # ---------------------------------------------------------------------------
 
 
+
+def _compute_health_score(conn) -> float:
+    """THE health-score formula — single source of truth (charter §6 fold).
+
+    Self-contained: runs all of its own queries so both consuming surfaces
+    (engram_stats sections=["health_score"] and engram_diagnose) report the
+    SAME number from the SAME implementation. The cycle's frozen stability
+    metric reads this function; tests/test_health_score_pinning.py pins it
+    in both probe directions (D3), and the stats↔diagnose parity test pins
+    the single-source property itself.
+
+    Formula (frozen for the duration of the epistemic-foundations cycle):
+    100 minus capped penalties (DAG violations, tainted, stale, orphans,
+    embedding-coverage gap, excess retraction rate, excess uncited-obs
+    ratio) plus the question-resolution bonus, clamped to [0, 100].
+    """
+    score = 100.0
+
+    # DAG violations (source created_at < target created_at, non-exempt)
+    _exempt = ",".join("?" * len(core.DAG_EXEMPT_RELATIONS))
+    dag_violations = conn.execute(
+        f"""SELECT COUNT(*) as c FROM edges e
+            JOIN nodes s ON e.source_id = s.id
+            JOIN nodes t ON e.target_id = t.id
+            WHERE s.created_at < t.created_at
+              AND e.relation NOT IN ({_exempt})""",
+        tuple(core.DAG_EXEMPT_RELATIONS),
+    ).fetchone()["c"]
+    score -= min(dag_violations * 5, 20)
+
+    # Tainted nodes (downstream of retracted premises)
+    tainted = conn.execute(
+        "SELECT COUNT(*) as c FROM nodes"
+        " WHERE is_current = 1 AND metadata LIKE '%\"tainted_by\"%'"
+    ).fetchone()["c"]
+    score -= min(tainted * 3, 15)
+
+    # Stale nodes (downstream of superseded premises)
+    stale = conn.execute(
+        "SELECT COUNT(*) as c FROM nodes"
+        " WHERE is_current = 1 AND metadata LIKE '%\"stale_by\": [%'"
+    ).fetchone()["c"]
+    score -= min(stale * 2, 10)
+
+    # Orphan nodes (no edges at all)
+    orphans = conn.execute("""
+        SELECT COUNT(*) as c FROM nodes n
+        WHERE n.is_current = 1
+          AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.source_id = n.id)
+          AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.target_id = n.id)
+    """).fetchone()["c"]
+    score -= min(orphans * 1, 10)
+
+    # Embedding coverage gap
+    emb_row = conn.execute(
+        "SELECT COUNT(*) as total,"
+        " SUM(CASE WHEN embedding IS NOT NULL THEN 1 ELSE 0 END) as has_emb"
+        " FROM nodes WHERE is_current = 1"
+    ).fetchone()
+    emb_total = emb_row["total"] or 0
+    emb_has = emb_row["has_emb"] or 0
+    emb_pct = (100 * emb_has / emb_total) if emb_total else 100
+    score -= min((100 - emb_pct) * 0.1, 10)
+
+    # Excess retraction rate (>10% of total nodes)
+    all_row = conn.execute(
+        "SELECT COUNT(*) as total,"
+        " SUM(CASE WHEN status = 'retracted' THEN 1 ELSE 0 END) as retracted"
+        " FROM nodes"
+    ).fetchone()
+    all_total = all_row["total"] or 0
+    all_retracted = all_row["retracted"] or 0
+    if all_total > 0:
+        retract_rate = all_retracted / all_total
+        if retract_rate > 0.1:
+            score -= min((retract_rate - 0.1) * 100, 15)
+
+    # Excess uncited observations (>50% of observations)
+    obs_row = conn.execute(
+        "SELECT COUNT(*) as total,"
+        " SUM(CASE WHEN evidence_id IS NULL THEN 1 ELSE 0 END) as uncited"
+        " FROM nodes WHERE is_current = 1"
+        " AND type IN ('observation_factual', 'observation_predictive')"
+    ).fetchone()
+    obs_total = obs_row["total"] or 0
+    obs_uncited = obs_row["uncited"] or 0
+    if obs_total > 0 and obs_uncited / obs_total > 0.5:
+        score -= min((obs_uncited / obs_total - 0.5) * 20, 10)
+
+    # Bonus: active resolution work (+5 if >50% questions resolved)
+    qu_row = conn.execute(
+        "SELECT COUNT(*) as total,"
+        " SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) as resolved"
+        " FROM nodes WHERE type = 'question'"
+    ).fetchone()
+    qu_total = qu_row["total"] or 0
+    qu_resolved = qu_row["resolved"] or 0
+    if qu_total > 0 and qu_resolved / qu_total > 0.5:
+        score = min(score + 5, 100)
+
+    return round(max(score, 0), 1)
+
+
 def _stats_impl(mode: str = "all", sections=None) -> str:
     """Impl for engram_stats — callable with named kwargs for in-server callers.
 
@@ -397,6 +500,14 @@ def _stats_impl(mode: str = "all", sections=None) -> str:
             result["confidence"] = _compute_confidence_distribution(
                 conn, created_at_filter, filter_args
             )
+
+        # ── health_score ────────────────────────────────────────────────────
+        # Self-contained computation: all queries run inline so this section
+        # is correct whether or not "structure" was also requested.
+        # ── health_score ────────────────────────────────────────────────────
+        # Single source of truth: the shared helper (charter §6).
+        if _want("health_score"):
+            result["health_score"] = _compute_health_score(conn)
 
         banner = core._walguard_degraded_banner()
         if banner:
@@ -1066,37 +1177,10 @@ def _diagnose_impl() -> str:
         metrics["calibration"] = calibration
 
         # ── Health Score (0-100) ─────────────────────────────────────────
-        # Composite score: penalize structural/epistemic issues.
-        score = 100.0
-        # Penalty: DAG violations (-5 each, max -20)
-        score -= min(dag_violations * 5, 20)
-        # Penalty: tainted nodes (-3 each, max -15)
-        score -= min(tainted_count * 3, 15)
-        # Penalty: stale nodes (-2 each, max -10)
-        score -= min(stale_count * 2, 10)
-        # Penalty: orphan nodes (-1 each, max -10)
-        score -= min(orphans * 1, 10)
-        # Penalty: low embedding coverage (-0.2 per pct missing, max -10)
-        emb_pct = memory["embedding_coverage"]["coverage_pct"]
-        score -= min((100 - emb_pct) * 0.1, 10)
-        # Penalty: high retraction rate (>10% of total nodes)
-        if total_nodes > 0:
-            retract_rate = retracted_count / total_nodes
-            if retract_rate > 0.1:
-                score -= min((retract_rate - 0.1) * 100, 15)
-        # Penalty: many uncited observations (>50% of observations)
-        total_obs = sum(
-            v["current"] for k, v in type_counts.items()
-            if k in ("observation_factual", "observation_predictive")
-        )
-        if total_obs > 0 and uncited / total_obs > 0.5:
-            score -= min((uncited / total_obs - 0.5) * 20, 10)
-        # Bonus: active resolution work (+5 if >50% questions resolved)
-        q_rate = epistemic["question_resolution"]["rate"]
-        if q_rate > 0.5:
-            score = min(score + 5, 100)
-
-        metrics["health_score"] = round(max(score, 0), 1)
+        # Single source of truth: the shared helper (charter §6 fold). The
+        # intermediates computed above remain for their own report sections;
+        # the SCORE comes from one implementation shared with engram_stats.
+        metrics["health_score"] = _compute_health_score(conn)
 
         # ── Config Summary (the dream-mode context-hunger observation: prevent doc-config drift) ──────────
         mem = core._get_memory_config()

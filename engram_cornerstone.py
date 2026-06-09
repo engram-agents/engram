@@ -513,6 +513,40 @@ def _add_edge_impl(
         if not target:
             return json.dumps({"error": f"Target node '{target_id}' not found."})
 
+        # `instantiates` boundary gates (#530): the exemplifies/serves/instantiates
+        # three-way boundary is enforced mechanically here, not just documented
+        # (mechanical gate > vigilance — the redundant-near-synonym failure mode).
+        if relation == "instantiates":
+            if target["type"] == "lesson":
+                return json.dumps({
+                    "error": (
+                        f"'instantiates' does not accept lesson targets — an "
+                        f"incident that is an instance of a lesson's pattern is "
+                        f"wired via `exemplifies` (engram_register_exemplar / "
+                        f"engram_lesson_register_incident), which feeds the "
+                        f"tripwire engine. Target '{target_id}' is a lesson."
+                    )
+                })
+            if target["type"] not in core.INSTANTIATES_TARGET_TYPES:
+                return json.dumps({
+                    "error": (
+                        f"'instantiates' targets must be one of "
+                        f"{sorted(core.INSTANTIATES_TARGET_TYPES)} — the "
+                        f"principle-family node the source realizes. Target "
+                        f"'{target_id}' is type '{target['type']}'. For "
+                        f"intent-shaped task→goal contribution use `serves`; "
+                        f"for incident→lesson membership use `exemplifies`."
+                    )
+                })
+            if source["type"] not in core.CLAIM_BEARING_TYPES:
+                return json.dumps({
+                    "error": (
+                        f"'instantiates' sources must be claim-bearing "
+                        f"({sorted(core.CLAIM_BEARING_TYPES)}); source "
+                        f"'{source_id}' is type '{source['type']}'."
+                    )
+                })
+
         # DAG guard: `serves`, `subtask_of`, and `tensions` all have dag_check=True
         # AND addable_after_creation=True, so this guard fires today for those three.
         # It also covers any future addable relations that gain dag_check=True.

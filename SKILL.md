@@ -48,6 +48,27 @@ target node propagates to the source (dependent), never the reverse.
 | `subtask_of` | source → parent | source is a sub-task | — |
 | `serves` | source → goal | source serves a goal | — |
 | `exemplifies` | incident → lesson | incident illustrates the lesson (DAG-exempt) | — |
+| `instantiates` | claim → principle | source realizes a goal/cornerstone/definition/axiom (DAG-exempt) | — |
+
+**The exemplifies / serves / instantiates boundary (three different claims):**
+
+- `exemplifies` — *this incident is an instance of this lesson's error/success
+  pattern.* Incident → lesson ONLY; feeds the tripwire engine (incident cache +
+  lesson confidence). Wire via `engram_register_exemplar`.
+- `serves` — *this work contributes toward this goal.* Intent-shaped,
+  goal-targeted; says direction, not achievement.
+- `instantiates` — *this claim/artifact REALIZES this principle.*
+  Achievement-shaped; targets goal / cornerstone / definition / axiom (lesson
+  targets are mechanically rejected with a pointer to `exemplifies`). The
+  post-hoc wiring tool: goal realizations ("the harness instantiates the
+  memory-value goal") and axiom grounding from practice observations
+  ("ob_X instantiates ax_Y" — the practice observation IS an instance of the
+  axiom holding; not `serves` — direction is wrong; not derivation edges —
+  axioms are terminal, nothing derives them). The target set is deliberately
+  principle-family only: "new work realizes a declined/unpromoted CANDIDATE"
+  (a derivation) is NOT this relation — candidate-resurface wiring is owned
+  by the decline-record mechanism (#926); don't widen the target set to fix
+  that case.
 
 **`supported_by` convention (fixes direction bug, PR #406):**
 `(source, target, 'supported_by')` means "source is supported_by target":
@@ -455,7 +476,7 @@ Reflexes: before writing, reach sideways (dedup/corroborate). Before building on
   `(reported_state, trigger, [categorical_tag, intensity_hint, context_ids])`
 - **engram_link_about** — Attach a node to a person via an about-edge (defaults to self).
   `(node_id, [person_id])`
-- **engram_add_edge** — Add a non-cascade edge between two existing nodes after creation. Same whitelist as engram_remove_edge: `about`, `exemplifies`, `serves`, `subtask_of`, `tensions`. Cascade-bearing, structural-commitment, and provenance edges are blocked (must be established at node-creation time or via dedicated mutation tools). Idempotent: `no_op_already_exists` is a successful return. DAG guard fires for dag-checked relations.
+- **engram_add_edge** — Add a non-cascade edge between two existing nodes after creation. Addable whitelist: `about`, `exemplifies`, `instantiates`, `serves`, `subtask_of`, `tensions`. `instantiates` carries its own boundary gates (claim-bearing source; goal/cornerstone/definition/axiom target; lesson targets rejected → use `exemplifies`). Cascade-bearing, structural-commitment, and provenance edges are blocked (must be established at node-creation time or via dedicated mutation tools). Idempotent: `no_op_already_exists` is a successful return. DAG guard fires for dag-checked relations.
   `(source_id, target_id, relation)`
 - **engram_remove_edge** — Remove a non-cascade edge between two nodes (correction tool for over-applied `about` / other relational edges). Safe whitelist: `about`, `tensions`, `subtask_of`, `serves`, `exemplifies`. Cascade-bearing, structural-commitment, and provenance edges are blocked; use engram-surgical for those. Idempotent and audit-logged.
   `(source_id, target_id, relation)`
