@@ -18,62 +18,86 @@ Covers:
 """
 
 import atexit
+import importlib
 import json
 import os
 import shutil
 import sys
 import tempfile
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import types
 
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_query_view_modes_")
 atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
+_TESTS_DIR = str(os.path.dirname(os.path.abspath(__file__)))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+from conftest import fresh_module  # noqa: E402 — must follow sys.path setup
 
-def fresh_server():
-    """Reset state and return the server module rebound to the test dir."""
+import engram_core
+import engram_derive
+import engram_epistemic
+import engram_observation
+import engram_query
+import engram_recall_summaries
+import engram_revision
+
+
+def _fresh_mods():
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if sys.path[0] != repo_root:
-        sys.path.insert(0, repo_root)
-    for key in list(sys.modules):
-        if key == "server" or key.startswith("engram_"):
-            del sys.modules[key]
-    import server
-    server._configure_paths(TEST_DIR)
-    server._ensure_data_dir()
     os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
-    return server
+    fresh_module(engram_query)
+    for name in [
+        "engram_observation",
+        "engram_revision",
+        "engram_derive",
+        "engram_epistemic",
+        "engram_recall_summaries",
+    ]:
+        importlib.import_module(name)
+    core = sys.modules["engram_core"]
+    core._configure_paths(TEST_DIR)
+    core._ensure_data_dir()
+    return core
 
 
-def _add_observation(server, claim: str, url: str = "https://example.com/test") -> str:
-    r = json.loads(server.engram_add_observation(payload_json=json.dumps({
-        "url": url,
-        "title": "Test Source",
-        "quoted_text": claim[:80],
-        "interpretation": "Test interpretation.",
-        "claim": claim,
-        "quote_type": "hard_data",
-    })))
+def _mods():
+    qry = sys.modules["engram_query"]
+    obs = sys.modules["engram_observation"]
+    rev = sys.modules["engram_revision"]
+    drv = sys.modules["engram_derive"]
+    epi = sys.modules["engram_epistemic"]
+    rcs = sys.modules["engram_recall_summaries"]
+    core = sys.modules["engram_core"]
+    return qry, obs, rev, drv, epi, rcs, core
+
+
+def _add_observation(obs, claim: str, url: str = "https://example.com/test") -> str:
+    r = json.loads(obs._add_observation_impl(
+        url=url,
+        title="Test Source",
+        quoted_text=claim[:80],
+        interpretation="Test interpretation.",
+        claim=claim,
+        quote_type="hard_data",
+    ))
     assert "observation_id" in r, f"add_observation failed: {r}"
     return r["observation_id"]
 
 
-def _add_axiom(server, claim: str, basis: str = "Test basis.") -> str:
-    r = json.loads(server.engram_add_axiom(payload_json=json.dumps({
-        "claim": claim, "basis": basis,
-    })))
+def _add_axiom(epi, claim: str, basis: str = "Test basis.") -> str:
+    r = json.loads(epi._add_axiom_impl(claim=claim, basis=basis))
     assert "axiom_id" in r, f"add_axiom failed: {r}"
     return r["axiom_id"]
 
 
-def _set_recall_fields(server, node_id: str, summary: str, keywords: list) -> None:
+def _set_recall_fields(rcs, node_id: str, summary: str, keywords: list) -> None:
     # recall_keywords requires 3-5 elements — pad to 3 if caller passes fewer.
     kw = list(keywords)
     while len(kw) < 3:
         kw.append(f"pad{len(kw)}")
-    r = json.loads(server.engram_set_recall_summaries(payload_json=json.dumps({
+    r = json.loads(rcs._set_recall_summaries_impl(payload_json=json.dumps({
         "summaries": [{"node_id": node_id, "recall_summary": summary, "recall_keywords": kw}]
     })))
     assert r.get("applied") == 1, f"engram_set_recall_summaries failed: {r}"
@@ -85,17 +109,18 @@ def _set_recall_fields(server, node_id: str, summary: str, keywords: list) -> No
 
 def test_query_default_tiered_shape():
     """Default return has Tier 1 (summary) and Tier 2 (keywords) entries."""
-    server = fresh_server()
+    core = _fresh_mods()
+    qry, obs, rev, drv, epi, rcs, core = _mods()
     # Add several observations so we have > 3 results
     ids = []
     for i in range(5):
-        nid = _add_observation(server, f"Test claim number {i} about alpha protocol")
+        nid = _add_observation(obs, f"Test claim number {i} about alpha protocol")
         ids.append(nid)
     # Set recall fields on all nodes
     for i, nid in enumerate(ids):
-        _set_recall_fields(server, nid, f"Summary for node {i}.", [f"kw{i}a", f"kw{i}b"])
+        _set_recall_fields(rcs, nid, f"Summary for node {i}.", [f"kw{i}a", f"kw{i}b"])
 
-    r = json.loads(server.engram_query(payload_json=json.dumps({"query": "alpha protocol", "top_k": 5})))
+    r = json.loads(qry._query_impl(query="alpha protocol", top_k=5))
     assert "results" in r, f"'results' key missing: {r}"
     assert "query" in r, f"'query' key missing: {r}"
     assert "total_matches" in r, f"'total_matches' key missing: {r}"
@@ -130,13 +155,12 @@ def test_query_default_tiered_shape():
 
 def test_query_summary_top_k_zero_all_keywords():
     """summary_top_k=0 means all entries are Tier 2 (no summaries)."""
-    server = fresh_server()
-    nid = _add_observation(server, "Claim about zero summary setting.")
-    _set_recall_fields(server, nid, "Summary text.", ["keyword1", "keyword2"])
+    _fresh_mods()
+    qry, obs, rev, drv, epi, rcs, core = _mods()
+    nid = _add_observation(obs, "Claim about zero summary setting.")
+    _set_recall_fields(rcs, nid, "Summary text.", ["keyword1", "keyword2"])
 
-    r = json.loads(server.engram_query(payload_json=json.dumps(
-        {"query": "zero summary setting", "top_k": 5, "summary_top_k": 0}
-    )))
+    r = json.loads(qry._query_impl(query="zero summary setting", top_k=5, summary_top_k=0))
     results = r["results"]
     assert len(results) > 0, "Expected results"
 
@@ -150,14 +174,15 @@ def test_query_summary_top_k_zero_all_keywords():
 
 def test_query_summary_top_k_exceeds_results_all_summaries():
     """summary_top_k >= total results means all entries are Tier 1 (summaries)."""
-    server = fresh_server()
+    _fresh_mods()
+    qry, obs, rev, drv, epi, rcs, core = _mods()
     for i in range(2):
-        nid = _add_observation(server, f"Claim {i} about full summary coverage scenario")
-        _set_recall_fields(server, nid, f"Summary {i}.", [f"kw{i}"])
+        nid = _add_observation(obs, f"Claim {i} about full summary coverage scenario")
+        _set_recall_fields(rcs, nid, f"Summary {i}.", [f"kw{i}"])
 
-    r = json.loads(server.engram_query(payload_json=json.dumps(
-        {"query": "full summary coverage scenario", "top_k": 10, "summary_top_k": 100}
-    )))
+    r = json.loads(qry._query_impl(
+        query="full summary coverage scenario", top_k=10, summary_top_k=100
+    ))
     results = r["results"]
     assert len(results) > 0, "Expected results"
 
@@ -172,11 +197,11 @@ def test_query_summary_top_k_exceeds_results_all_summaries():
 
 def test_query_return_debug_preserves_legacy_shape():
     """return_debug=True returns full legacy shape with composite_score."""
-    server = fresh_server()
-    _add_observation(server, "Debug mode legacy shape test claim.")
+    _fresh_mods()
+    qry, obs, rev, drv, epi, rcs, core = _mods()
+    _add_observation(obs, "Debug mode legacy shape test claim.")
 
-    r = json.loads(server.engram_query(payload_json=json.dumps({"query": "debug mode legacy shape", "return_debug": True})))
-    # Legacy shape keys
+    r = json.loads(qry._query_impl(query="debug mode legacy shape", return_debug=True))
     assert "results" in r, f"'results' missing in debug mode: {r}"
     assert "query" in r
     assert "count" in r, f"'count' missing in debug mode (legacy field): {r}"
@@ -185,23 +210,17 @@ def test_query_return_debug_preserves_legacy_shape():
     # Results should have full node fields, not tiered
     if r["results"]:
         first = r["results"][0]
-        # Full shape has 'claim' (not just 'summary')
         assert "claim" in first, f"'claim' missing from debug result: {first}"
-        # No tier-specific 'summary' key on top-level entry (claim is the field)
-        # (note: recall_summary MAY be present if set — that's ok, 'claim' is the signal)
         assert "id" in first
 
 
 def test_query_return_debug_composite_score_present():
     """When return_debug=True and search has results with debug, composite_score appears."""
-    server = fresh_server()
-    _add_observation(server, "Composite score visibility test claim.")
+    _fresh_mods()
+    qry, obs, rev, drv, epi, rcs, core = _mods()
+    _add_observation(obs, "Composite score visibility test claim.")
 
-    r = json.loads(server.engram_query(payload_json=json.dumps(
-        {"query": "composite score visibility", "return_debug": True}
-    )))
-    # The debug key should appear (even if no per_result entries when FTS/semantic return nothing)
-    # At minimum, legacy 'count' field marks this as the debug path
+    r = json.loads(qry._query_impl(query="composite score visibility", return_debug=True))
     assert "count" in r
 
 
@@ -211,18 +230,18 @@ def test_query_return_debug_composite_score_present():
 
 def test_query_fallback_no_recall_summary_uses_claim():
     """Tier-1 entries without recall_summary fall back to (truncated) claim."""
-    server = fresh_server()
+    _fresh_mods()
+    qry, obs, rev, drv, epi, rcs, core = _mods()
     claim_text = "Fallback claim used when summary is absent."
-    nid = _add_observation(server, claim_text)
+    _add_observation(obs, claim_text)
     # Do NOT set recall_summary — leave it null
 
-    r = json.loads(server.engram_query(payload_json=json.dumps({"query": "fallback claim summary absent", "summary_top_k": 1})))
+    r = json.loads(qry._query_impl(query="fallback claim summary absent", summary_top_k=1))
     results = r["results"]
     assert len(results) > 0, "Expected results"
 
     tier1 = results[0]
     assert "summary" in tier1, f"Tier-1 entry should have 'summary' key: {tier1}"
-    # The summary should contain some portion of the claim text
     assert claim_text[:50] in tier1["summary"] or tier1["summary"] in claim_text, (
         f"Fallback summary doesn't contain claim text. summary={tier1['summary']!r}, "
         f"claim={claim_text!r}"
@@ -231,14 +250,13 @@ def test_query_fallback_no_recall_summary_uses_claim():
 
 def test_query_fallback_long_claim_truncated_at_160():
     """Claims longer than 160 chars are truncated with ellipsis in the fallback."""
-    server = fresh_server()
+    _fresh_mods()
+    qry, obs, rev, drv, epi, rcs, core = _mods()
     long_claim = "A" * 200 + " end marker"
-    nid = _add_observation(server, long_claim)
+    nid = _add_observation(obs, long_claim)
     # No recall_summary set
 
-    r = json.loads(server.engram_query(payload_json=json.dumps(
-        {"query": "A" * 30, "summary_top_k": 1, "top_k": 5}
-    )))
+    r = json.loads(qry._query_impl(query="A" * 30, summary_top_k=1, top_k=5))
     results = r["results"]
     if not results:
         return  # FTS may not match all-letter queries with ENGRAM_NO_EMBEDDINGS
@@ -257,18 +275,17 @@ def test_query_fallback_long_claim_truncated_at_160():
 
 def test_query_fallback_no_recall_keywords_bare_id():
     """Tier-2 entries without recall_keywords emit {id, confidence} — no 'keywords' key."""
-    server = fresh_server()
+    _fresh_mods()
+    qry, obs, rev, drv, epi, rcs, core = _mods()
     # Add multiple observations — first 3 will be tier-1 (summary), rest tier-2
     for i in range(5):
-        nid = _add_observation(server, f"Keyword fallback test claim {i} about retrieval system")
-    # Set recall_summary on first 3 only (they'll land in tier-1 via summary fallback anyway)
+        _add_observation(obs, f"Keyword fallback test claim {i} about retrieval system")
     # Do NOT set recall_keywords on any node — test bare-id behavior
 
-    r = json.loads(server.engram_query(payload_json=json.dumps(
-        {"query": "keyword fallback test retrieval", "top_k": 5, "summary_top_k": 3}
-    )))
+    r = json.loads(qry._query_impl(
+        query="keyword fallback test retrieval", top_k=5, summary_top_k=3
+    ))
     results = r["results"]
-    # Tier-2 entries (if any) should have id + confidence but no keywords
     for entry in results[3:]:
         assert "keywords" not in entry, (
             f"Tier-2 entry without recall_keywords should not have 'keywords': {entry}"
@@ -286,17 +303,11 @@ def test_query_fallback_no_recall_keywords_bare_id():
 
 def test_query_pattern_cornerstone_candidate_tiered_shape():
     """engram_query_pattern cornerstone_candidate returns tiered shape."""
-    server = fresh_server()
-    # Create a highly-cited high-importance node.
-    # Use engram_derive to create 3+ derives_from edges pointing at obs_id,
-    # meeting the min_citations=3 threshold in _pattern_cornerstone_candidate.
-    obs_id = _add_observation(server, "Load-bearing cornerstone candidate observation.")
-    conn = server._get_db()
+    _fresh_mods()
+    qry, obs, rev, drv, epi, rcs, core = _mods()
+    obs_id = _add_observation(obs, "Load-bearing cornerstone candidate observation.")
+    conn = core._get_db()
     try:
-        # importance_base=0.95 (from hard_data) is set explicitly here so the
-        # gate (importance_base > 0.7) is visibly satisfied. importance_score
-        # is set higher to simulate a heavily-recalled node — intentionally
-        # different from importance_base to show the inflation state.
         conn.execute(
             "UPDATE nodes SET importance_base=0.95, importance_score=3.0 WHERE id=?", (obs_id,)
         )
@@ -304,18 +315,17 @@ def test_query_pattern_cornerstone_candidate_tiered_shape():
     finally:
         conn.close()
 
-    # Derive 3 nodes from obs_id via the tool (creates proper edges with created_at)
     for i in range(3):
-        json.loads(server.engram_derive(payload_json=json.dumps({
-            "claim": f"Derived cornerstone candidate claim {i} citing load-bearing obs.",
-            "supporting_ids": obs_id,
-            "logical_chain": "Derives from the cornerstone candidate observation.",
-            "reasoning_type": "deductive_modus_ponens",
-        })))
+        json.loads(drv._derive_impl(
+            claim=f"Derived cornerstone candidate claim {i} citing load-bearing obs.",
+            supporting_ids=obs_id,
+            logical_chain="Derives from the cornerstone candidate observation.",
+            reasoning_type="deductive_modus_ponens",
+        ))
 
-    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({
-        "pattern_name": "cornerstone_candidate", "preset": "balanced",
-    })))
+    r = json.loads(qry._query_pattern_impl(
+        pattern_name="cornerstone_candidate", preset="balanced",
+    ))
     assert "results" in r, f"'results' key missing: {r}"
     assert "pattern_name" in r
     assert "preset" in r
@@ -324,52 +334,46 @@ def test_query_pattern_cornerstone_candidate_tiered_shape():
 
     results = r["results"]
     if results:
-        # All entries must have 'id'
         for entry in results:
             assert "id" in entry, f"Entry missing 'id': {entry}"
-        # No score/suggested_action in tiered output
         for entry in results:
             assert "score" not in entry, f"Score leaked into tiered pattern result: {entry}"
             assert "suggested_action" not in entry, (
                 f"suggested_action leaked into tiered result: {entry}"
             )
-        # Top entry (Tier 1) has 'summary'
         assert "summary" in results[0], f"Top entry should have 'summary': {results[0]}"
 
 
 def test_query_pattern_contradiction_obsolescence_tiered_shape():
     """engram_query_pattern contradiction_obsolescence_ready returns tiered shape."""
-    server = fresh_server()
-    # Create an active contradiction with one side retracted
-    obs_a = _add_observation(server, "Contradictory claim A for view mode test.")
-    obs_b = _add_observation(server, "Contradictory claim B for view mode test.")
-    r_ct = json.loads(server._contradict_impl(
+    _fresh_mods()
+    qry, obs, rev, drv, epi, rcs, core = _mods()
+    obs_a = _add_observation(obs, "Contradictory claim A for view mode test.")
+    obs_b = _add_observation(obs, "Contradictory claim B for view mode test.")
+    json.loads(drv._contradict_impl(
         node_id_a=obs_a,
         node_id_b=obs_b,
         description="Test contradiction for view modes",
         root_cause="test fixture",
     ))
-    server._retract_impl(
+    rev._retract_impl(
         node_id=obs_a, error_type="other",
         reason="test fixture: simulating retraction for view modes"
     )
 
-    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({
-        "pattern_name": "contradiction_obsolescence_ready", "preset": "balanced",
-    })))
+    r = json.loads(qry._query_pattern_impl(
+        pattern_name="contradiction_obsolescence_ready", preset="balanced",
+    ))
     assert "results" in r
     assert "total_matches" in r
     results = r["results"]
-    # Should have at least the contradiction we just created
     assert len(results) >= 1
 
-    # Verify tiered shape: no score, no suggested_action
     for entry in results:
         assert "id" in entry
         assert "score" not in entry
         assert "suggested_action" not in entry
 
-    # Top entry is Tier 1
     assert "summary" in results[0], f"Top result should be Tier 1: {results[0]}"
 
 
@@ -379,17 +383,18 @@ def test_query_pattern_contradiction_obsolescence_tiered_shape():
 
 def test_query_pattern_telemetry_preserved_after_tier_transform():
     """Tiered transformation does not affect telemetry log writes."""
-    server = fresh_server()
+    _fresh_mods()
+    qry, obs, rev, drv, epi, rcs, core = _mods()
     log_path = os.path.join(TEST_DIR, "pattern_query_telemetry.jsonl")
     if os.path.exists(log_path):
         os.remove(log_path)
 
-    json.loads(server.engram_query_pattern(payload_json=json.dumps({
-        "pattern_name": "stale_load_bearing", "preset": "balanced",
-    })))
-    json.loads(server.engram_query_pattern(payload_json=json.dumps({
-        "pattern_name": "cornerstone_candidate", "preset": "high_precision",
-    })))
+    json.loads(qry._query_pattern_impl(
+        pattern_name="stale_load_bearing", preset="balanced",
+    ))
+    json.loads(qry._query_pattern_impl(
+        pattern_name="cornerstone_candidate", preset="high_precision",
+    ))
 
     assert os.path.exists(log_path), "Telemetry log should have been created"
     with open(log_path) as f:
@@ -397,7 +402,6 @@ def test_query_pattern_telemetry_preserved_after_tier_transform():
     assert len(entries) == 2, f"Expected 2 telemetry entries, got {len(entries)}"
     assert entries[0]["pattern_name"] == "stale_load_bearing"
     assert entries[1]["preset"] == "high_precision"
-    # Telemetry still records raw candidate_count and scores (not tiered)
     assert "candidate_count" in entries[0]
     assert "scores" in entries[0]
 
@@ -408,16 +412,11 @@ def test_query_pattern_telemetry_preserved_after_tier_transform():
 
 def test_query_pattern_summary_top_k_zero():
     """summary_top_k=0 on engram_query_pattern emits all Tier-2 entries."""
-    server = fresh_server()
-    obs_id = _add_observation(server, "Stale load bearing test observation for top_k zero.")
-    conn = server._get_db()
+    _fresh_mods()
+    qry, obs, rev, drv, epi, rcs, core = _mods()
+    obs_id = _add_observation(obs, "Stale load bearing test observation for top_k zero.")
+    conn = core._get_db()
     try:
-        # importance_base=0.95 (from hard_data) is set explicitly so the gate
-        # (importance_base > 0.7) is visibly satisfied. importance_score is set
-        # higher than importance_base to simulate an inflated node — the
-        # inflation_gap will be negative in a fresh DB (current_turn=0), so
-        # this node may not surface at the top of rankings; the test only
-        # verifies that summary keys are absent regardless.
         conn.execute(
             "UPDATE nodes SET importance_base=0.95, importance_score=2.5, recall_count=0 WHERE id=?",
             (obs_id,),
@@ -425,13 +424,12 @@ def test_query_pattern_summary_top_k_zero():
         conn.commit()
     finally:
         conn.close()
-    _set_recall_fields(server, obs_id, "Load-bearing summary.", ["load-bearing", "stale"])
+    _set_recall_fields(rcs, obs_id, "Load-bearing summary.", ["load-bearing", "stale"])
 
-    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({
-        "pattern_name": "stale_load_bearing", "preset": "balanced", "summary_top_k": 0,
-    })))
+    r = json.loads(qry._query_pattern_impl(
+        pattern_name="stale_load_bearing", preset="balanced", summary_top_k=0,
+    ))
     results = r["results"]
-    # With summary_top_k=0, no entry should have 'summary'
     for entry in results:
         assert "summary" not in entry, (
             f"summary_top_k=0 should suppress all summaries: {entry}"
@@ -439,19 +437,19 @@ def test_query_pattern_summary_top_k_zero():
 
 
 # ---------------------------------------------------------------------------
-# 10 + 11. Return shape key checks (already covered above, but explicit tests)
+# 10 + 11. Return shape key checks
 # ---------------------------------------------------------------------------
 
 def test_query_return_shape_keys():
     """engram_query default return has exactly the required top-level keys."""
-    server = fresh_server()
-    _add_observation(server, "Shape key test observation.")
+    _fresh_mods()
+    qry, obs, rev, drv, epi, rcs, core = _mods()
+    _add_observation(obs, "Shape key test observation.")
 
-    r = json.loads(server.engram_query(payload_json=json.dumps({"query": "shape key test"})))
+    r = json.loads(qry._query_impl(query="shape key test"))
     assert "results" in r
     assert "query" in r
     assert "total_matches" in r
-    # Legacy keys must NOT appear in default mode
     assert "count" not in r, "'count' is a legacy key and should not appear in default mode"
     assert "search_methods" not in r, "'search_methods' is a legacy key"
     assert "message" not in r
@@ -459,14 +457,14 @@ def test_query_return_shape_keys():
 
 def test_query_pattern_return_shape_keys():
     """engram_query_pattern default return has the required top-level keys."""
-    server = fresh_server()
+    _fresh_mods()
+    qry, obs, rev, drv, epi, rcs, core = _mods()
 
-    r = json.loads(server.engram_query_pattern(payload_json=json.dumps({"pattern_name": "stale_load_bearing"})))
+    r = json.loads(qry._query_pattern_impl(pattern_name="stale_load_bearing"))
     assert "results" in r
     assert "pattern_name" in r
     assert "preset" in r
     assert "total_matches" in r
-    # Legacy keys must NOT appear
     assert "candidates" not in r, "'candidates' is the legacy key"
     assert "candidate_count" not in r, "'candidate_count' is the legacy key"
     assert "hint" not in r
@@ -478,13 +476,12 @@ def test_query_pattern_return_shape_keys():
 
 def test_query_negative_summary_top_k_clamped():
     """Negative summary_top_k is clamped to 0 (all Tier 2)."""
-    server = fresh_server()
-    nid = _add_observation(server, "Negative top_k clamping test claim.")
-    _set_recall_fields(server, nid, "Summary text.", ["kw1", "kw2"])
+    _fresh_mods()
+    qry, obs, rev, drv, epi, rcs, core = _mods()
+    nid = _add_observation(obs, "Negative top_k clamping test claim.")
+    _set_recall_fields(rcs, nid, "Summary text.", ["kw1", "kw2"])
 
-    r = json.loads(server.engram_query(payload_json=json.dumps(
-        {"query": "negative top_k clamping", "summary_top_k": -5}
-    )))
+    r = json.loads(qry._query_impl(query="negative top_k clamping", summary_top_k=-5))
     results = r["results"]
     for entry in results:
         assert "summary" not in entry, (

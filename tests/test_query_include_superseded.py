@@ -41,60 +41,81 @@ Coverage (one item per test function):
        for issue #273: _semantic_search honors include_superseded + always
        excludes retracted. Calls _semantic_search directly (slow path) with a
        mock embedder and a tiny fake corpus to bypass ENGRAM_NO_EMBEDDINGS=1.
+
+Import-pattern contract (#948 wave 1 — R1):
+    This file imports engram_query, engram_observation, engram_revision, and
+    engram_core directly and contains no ``import server``. The module objects
+    are passed to fresh_module() (R4) for per-test reload isolation.
 """
 
 import atexit
+import importlib
 import json
 import os
 import shutil
 import sys
 import tempfile
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+_TESTS_DIR = str(Path(__file__).resolve().parent)
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+from conftest import fresh_module  # noqa: E402 — must follow sys.path setup
+
+import engram_core
+import engram_observation
+import engram_query
+import engram_revision
 
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_query_include_superseded_")
 atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
-def fresh_server():
-    """Reset state and return the server module rebound to the test dir."""
+def _fresh_mods():
+    """Reload all family modules, configure a clean test DB, and return core.
+
+    Uses conftest.fresh_module(engram_query) per R4: the module object is
+    passed (not a string), so ``import engram_query`` at the top is the
+    AST-visible dependency edge for run_touched_tests.py.
+
+    Returns the reloaded engram_core (shared state root).
+    """
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if sys.path[0] != repo_root:
-        sys.path.insert(0, repo_root)
-    for key in list(sys.modules):
-        if key == "server" or key.startswith("engram_"):
-            del sys.modules[key]
-    import server
-    server._configure_paths(TEST_DIR)
-    server._ensure_data_dir()
     os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
-    return server
+    fresh_module(engram_query)  # purges server + engram_* and reloads engram_query
+    obs = importlib.import_module("engram_observation")
+    rev = importlib.import_module("engram_revision")
+    core = sys.modules["engram_core"]
+    core._configure_paths(TEST_DIR)
+    core._ensure_data_dir()
+    return core, obs, rev
 
 
-def _add_observation(server, claim: str, quoted_text: str = None, url: str = "https://example.com/test") -> str:
+def _add_observation(obs, claim: str, quoted_text: str = None, url: str = "https://example.com/test") -> str:
     qt = quoted_text if quoted_text is not None else claim[:80]
-    r = json.loads(server.engram_add_observation(payload_json=json.dumps({
-        "url": url,
-        "title": "Test Source",
-        "quoted_text": qt,
-        "interpretation": "Test interpretation.",
-        "claim": claim,
-        "quote_type": "hard_data",
-    })))
+    r = json.loads(obs._add_observation_impl(
+        url=url,
+        title="Test Source",
+        quoted_text=qt,
+        interpretation="Test interpretation.",
+        claim=claim,
+        quote_type="hard_data",
+    ))
     assert "observation_id" in r, f"add_observation failed: {r}"
     return r["observation_id"]
 
 
-def _query_ids(server, query: str, include_superseded: bool = False, top_k: int = 20) -> set:
+def _query_ids(qry, query: str, include_superseded: bool = False, top_k: int = 20) -> set:
     """Run engram_query in debug mode and return the set of result IDs."""
-    r = json.loads(server.engram_query(payload_json=json.dumps({
-        "query": query,
-        "include_superseded": include_superseded,
-        "top_k": top_k,
-        "return_debug": True,
-    })))
+    r = json.loads(qry._query_impl(
+        query=query,
+        include_superseded=include_superseded,
+        top_k=top_k,
+        return_debug=True,
+    ))
     return {n["id"] for n in r.get("results", [])}
 
 
@@ -112,24 +133,25 @@ def test_query_include_superseded_fts_path():
     Note: ENGRAM_NO_EMBEDDINGS=1 disables semantic search — this test exclusively
     exercises the FTS path. The semantic path is not yet fixed (see module docstring).
     """
-    server = fresh_server()
+    core, obs, rev = _fresh_mods()
+    qry = sys.modules["engram_query"]
 
     # B: will be superseded. Uses a highly unique token so FTS finds it reliably.
     b_id = _add_observation(
-        server,
+        obs,
         claim="superseded claim about fts191regression uniquemarker",
         quoted_text="fts191regression uniquemarker original quote",
     )
 
     # D: the replacement for B.
     d_id = _add_observation(
-        server,
+        obs,
         claim="replacement claim about fts191regression uniquemarker refined",
         quoted_text="fts191regression uniquemarker refined quote",
     )
 
     # Supersede B with D.
-    sup = json.loads(server._supersede_impl(
+    sup = json.loads(rev._supersede_impl(
         b_id, d_id, supersede_reason="regression test for issue #191"
     ))
     assert sup.get("status") == "superseded", f"supersede failed: {sup}"
@@ -137,7 +159,7 @@ def test_query_include_superseded_fts_path():
     query = "fts191regression uniquemarker"
 
     # With flag=False: only D (the current node) should appear.
-    ids_false = _query_ids(server, query, include_superseded=False)
+    ids_false = _query_ids(qry, query, include_superseded=False)
     assert d_id in ids_false, (
         f"Replacement node D ({d_id}) missing from include_superseded=False results: {ids_false}"
     )
@@ -147,7 +169,7 @@ def test_query_include_superseded_fts_path():
     )
 
     # With flag=True: both B (superseded) and D (current) should appear.
-    ids_true = _query_ids(server, query, include_superseded=True)
+    ids_true = _query_ids(qry, query, include_superseded=True)
     assert d_id in ids_true, (
         f"Replacement node D ({d_id}) missing from include_superseded=True results: {ids_true}"
     )
@@ -174,15 +196,16 @@ def test_query_retracted_behavior_with_include_superseded_flag():
     just the information is not accurate anymore." They continue to surface with
     include_superseded=True (see test 1 and test 4).
     """
-    server = fresh_server()
+    core, obs, rev = _fresh_mods()
+    qry = sys.modules["engram_query"]
 
     x_id = _add_observation(
-        server,
+        obs,
         claim="retracted claim retract191regression uniquemarkerX",
         quoted_text="retract191regression uniquemarkerX quote",
     )
 
-    ret = json.loads(server._retract_impl(
+    ret = json.loads(rev._retract_impl(
         node_id=x_id,
         error_type="other",
         reason="test retraction for issue #191 regression suite",
@@ -192,7 +215,7 @@ def test_query_retracted_behavior_with_include_superseded_flag():
     query = "retract191regression uniquemarkerX"
 
     # With flag=False: retracted node absent (expected and correct).
-    ids_false = _query_ids(server, query, include_superseded=False)
+    ids_false = _query_ids(qry, query, include_superseded=False)
     assert x_id not in ids_false, (
         f"Retracted node ({x_id}) should not appear with include_superseded=False. "
         f"Results: {ids_false}"
@@ -202,7 +225,7 @@ def test_query_retracted_behavior_with_include_superseded_flag():
     # The nodes_retract_remove_from_fts trigger (added in #274) removes retracted
     # nodes from nodes_fts at retraction time, so they never appear in FTS results
     # regardless of the include_superseded flag.
-    ids_true = _query_ids(server, query, include_superseded=True)
+    ids_true = _query_ids(qry, query, include_superseded=True)
     assert x_id not in ids_true, (
         f"Retracted node ({x_id}) must not appear with include_superseded=True "
         "after #274 fix (trigger removes retracted nodes from nodes_fts). "
@@ -221,20 +244,21 @@ def test_query_include_superseded_false_default_excludes_superseded():
     node must not appear. This makes the default-False behavior explicit so any
     regression that flips the default or breaks the is_current filter fires here.
     """
-    server = fresh_server()
+    core, obs, rev = _fresh_mods()
+    qry = sys.modules["engram_query"]
 
     old_id = _add_observation(
-        server,
+        obs,
         claim="old version baseline191regression uniquemarkerZ",
         quoted_text="baseline191regression uniquemarkerZ old quote",
     )
     new_id = _add_observation(
-        server,
+        obs,
         claim="new version baseline191regression uniquemarkerZ refined",
         quoted_text="baseline191regression uniquemarkerZ new quote",
     )
 
-    sup = json.loads(server._supersede_impl(
+    sup = json.loads(rev._supersede_impl(
         old_id, new_id, supersede_reason="baseline regression test"
     ))
     assert sup.get("status") == "superseded", f"supersede failed: {sup}"
@@ -242,9 +266,9 @@ def test_query_include_superseded_false_default_excludes_superseded():
     query = "baseline191regression uniquemarkerZ"
 
     # Default call (no include_superseded kwarg at all) — same as False.
-    r_default = json.loads(server.engram_query(payload_json=json.dumps(
-        {"query": query, "top_k": 20, "return_debug": True}
-    )))
+    r_default = json.loads(qry._query_impl(
+        query=query, top_k=20, return_debug=True
+    ))
     ids_default = {n["id"] for n in r_default.get("results", [])}
 
     assert old_id not in ids_default, (
@@ -269,32 +293,33 @@ def test_query_include_superseded_multiple_superseded_nodes():
     This catches edge cases in the FTS post-filter loop where only one of multiple
     superseded nodes might surface.
     """
-    server = fresh_server()
+    core, obs, rev = _fresh_mods()
+    qry = sys.modules["engram_query"]
 
     unique = "multi191regression uniquemarkerQ"
 
-    b_id = _add_observation(server, claim=f"B superseded {unique}", quoted_text=f"B {unique}")
-    c_id = _add_observation(server, claim=f"C replacement {unique}", quoted_text=f"C {unique}")
-    d_id = _add_observation(server, claim=f"D superseded {unique}", quoted_text=f"D {unique}")
-    e_id = _add_observation(server, claim=f"E replacement {unique}", quoted_text=f"E {unique}")
+    b_id = _add_observation(obs, claim=f"B superseded {unique}", quoted_text=f"B {unique}")
+    c_id = _add_observation(obs, claim=f"C replacement {unique}", quoted_text=f"C {unique}")
+    d_id = _add_observation(obs, claim=f"D superseded {unique}", quoted_text=f"D {unique}")
+    e_id = _add_observation(obs, claim=f"E replacement {unique}", quoted_text=f"E {unique}")
 
-    sup1 = json.loads(server._supersede_impl(b_id, c_id))
+    sup1 = json.loads(rev._supersede_impl(b_id, c_id))
     assert sup1.get("status") == "superseded", f"B→C supersede failed: {sup1}"
 
-    sup2 = json.loads(server._supersede_impl(d_id, e_id))
+    sup2 = json.loads(rev._supersede_impl(d_id, e_id))
     assert sup2.get("status") == "superseded", f"D→E supersede failed: {sup2}"
 
     query = "multi191regression uniquemarkerQ"
 
     # With flag=False: only current nodes (C, E) surface.
-    ids_false = _query_ids(server, query, include_superseded=False)
+    ids_false = _query_ids(qry, query, include_superseded=False)
     assert b_id not in ids_false, f"B (superseded) should not appear with flag=False: {ids_false}"
     assert d_id not in ids_false, f"D (superseded) should not appear with flag=False: {ids_false}"
     assert c_id in ids_false, f"C (current) should appear with flag=False: {ids_false}"
     assert e_id in ids_false, f"E (current) should appear with flag=False: {ids_false}"
 
     # With flag=True: all four nodes surface (B, C, D, E).
-    ids_true = _query_ids(server, query, include_superseded=True)
+    ids_true = _query_ids(qry, query, include_superseded=True)
     assert b_id in ids_true, f"B (superseded) should appear with flag=True: {ids_true}"
     assert c_id in ids_true, f"C (current) should appear with flag=True: {ids_true}"
     assert d_id in ids_true, f"D (superseded) should appear with flag=True: {ids_true}"
@@ -328,9 +353,9 @@ def test_query_include_superseded_semantic_path():
       include_superseded=False: only current_id surfaces.
       include_superseded=True:  current_id + superseded_id surface; retracted_id never does.
     """
-    server = fresh_server()
+    core, obs, rev = _fresh_mods()
 
-    conn = server._get_db()
+    conn = core._get_db()
     now = "2026-01-01T00:00:00"
     fake_emb = json.dumps([1.0, 0.0, 0.0])
 
@@ -380,15 +405,14 @@ def test_query_include_superseded_semantic_path():
                 return 0.0
             return dot / (norm_a * norm_b)
 
-    original_core_embedder = server.core._embedder
+    original_embedder = core._embedder
     mock_embedder = _MockEmbedder()
-    # _semantic_search now lives in engram_core — patch core._embedder.
-    server.core._embedder = mock_embedder
+    core._embedder = mock_embedder
     try:
-        conn2 = server._get_db()
+        conn2 = core._get_db()
         try:
             # Default (include_superseded=False): only current node.
-            results_false = server._semantic_search(
+            results_false = core._semantic_search(
                 conn2, "sem273regression uniquemarkersem",
                 top_k=10, min_similarity=0.5,
                 include_superseded=False,
@@ -405,7 +429,7 @@ def test_query_include_superseded_semantic_path():
             )
 
             # include_superseded=True: current + superseded; retracted still absent.
-            results_true = server._semantic_search(
+            results_true = core._semantic_search(
                 conn2, "sem273regression uniquemarkersem",
                 top_k=10, min_similarity=0.5,
                 include_superseded=True,
@@ -425,7 +449,7 @@ def test_query_include_superseded_semantic_path():
         finally:
             conn2.close()
     finally:
-        server.core._embedder = original_core_embedder
+        core._embedder = original_embedder
 
 
 if __name__ == "__main__":
