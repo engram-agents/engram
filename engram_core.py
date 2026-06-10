@@ -3664,6 +3664,10 @@ def _trace_observation_leaves(
 
 _LINEAGE_RE = re.compile(r"[a-z0-9_-]+:[a-z0-9._-]+")
 
+# Once-per-process sentinel: ensures the malformed-self_lineage warning fires
+# at most once, even if _self_lineage() is called on every observation (#960).
+_self_lineage_warned: bool = False
+
 
 def _self_lineage() -> str:
     """The install's own training lineage (provider:family) from config.json's
@@ -3678,10 +3682,19 @@ def _self_lineage() -> str:
     (Luria's #723 deployment note). Fail-closed is critical: a malformed value
     would hash into a different cluster than correctly-marked same-lineage
     premises, producing false diversity and suppressing ⚠⚠ (Mira #750)."""
+    global _self_lineage_warned
     try:
         cfg = json.loads(CONFIG_PATH.read_text())
         val = (cfg.get("self_lineage") or "").strip()
         if val and not _LINEAGE_RE.fullmatch(val):
+            if not _self_lineage_warned:
+                _self_lineage_warned = True
+                logging.getLogger(__name__).warning(
+                    "self_lineage config value %r is malformed — expected "
+                    "provider:family (e.g. 'anthropic:claude'); "
+                    "ignoring and treating as unset (fail-closed, #960).",
+                    val,
+                )
             return ""
         return val
     except Exception:

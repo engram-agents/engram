@@ -41,6 +41,7 @@ SCHEMA: list[dict] = [
      "editable": False, "restart_required": False},
     {"key": "self_lineage", "section": "identity", "tier": TIER_A, "type": "string",
      "control": "text", "label": "Self lineage",
+     "pattern": "^(|[a-z0-9_-]+:[a-z0-9._-]+)$",
      "tooltip": "This install's own training lineage as provider:family (e.g. "
                 "'anthropic:claude'). Powers standpoint v3 null=self: an unmarked "
                 "observation counts as your own lineage so the standpoint/F-S "

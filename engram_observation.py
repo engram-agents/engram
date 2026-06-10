@@ -794,9 +794,9 @@ def _add_observation_impl(
     # error REDIRECTS (names the expected shape + example) rather than
     # bare-rejecting; reject-never-normalize keeps the cluster hash a filing
     # convention the agent can see, not a silent transformation.
-    if standpoint_lineage and not re.fullmatch(
-        r"[a-z0-9_-]+:[a-z0-9._-]+", standpoint_lineage
-    ):
+    # SSoT: uses core._LINEAGE_RE — the single compiled regex for lineage
+    # validity shared with _self_lineage() (#960).
+    if standpoint_lineage and not core._LINEAGE_RE.fullmatch(standpoint_lineage):
         return json.dumps(
             {
                 "error": (
