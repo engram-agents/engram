@@ -236,6 +236,10 @@
       "tier": "convenience"
     },
     {
+      "path": ".githooks/pre-push",
+      "tier": "dev"
+    },
+    {
       "path": "tools/scan-leaks.py",
       "tier": "dev"
     },
