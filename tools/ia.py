@@ -923,7 +923,18 @@ def cmd_write(args: argparse.Namespace, config: dict, agent_name: str) -> None:
             file=sys.stderr,
         )
 
-    # Atomic write: tmp + os.rename, then chmod 644
+    # Atomic write: tmp + os.link (collision-safe), then chmod 644.
+    #
+    # Why os.link instead of os.rename:
+    #   os.rename(src, dst) silently replaces dst on POSIX — so two `ia write`
+    #   calls by the same agent in the same second produce the same dest_path and
+    #   the second clobbers the first (silent data loss).  os.link(src, dst) is
+    #   atomic AND raises FileExistsError if dst already exists, so it is race-free
+    #   unlike a check-then-rename (TOCTOU).  On collision we bump a numeric suffix
+    #   (-2, -3, …) and retry, capping at _LINK_MAX_ATTEMPTS.
+    #
+    # Suffix scheme: first letter keeps the clean name <ts>_<agent>.md; on
+    # collision use <ts>_<agent>-2.md, -3.md, etc.
     if not inter_agent_dir.is_dir():
         print(
             f"ia write: inter-agent dir not found: {inter_agent_dir}. "
@@ -932,20 +943,55 @@ def cmd_write(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_IO)
 
+    _LINK_MAX_ATTEMPTS = 100
     tmp_path = inter_agent_dir / (filename + ".tmp")
     try:
         tmp_path.write_text(full_content, encoding="utf-8")
-        os.rename(str(tmp_path), str(dest_path))
-        os.chmod(dest_path, 0o644)
     except OSError as e:
         print(f"ia write: failed to write letter: {e}", file=sys.stderr)
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
         sys.exit(EXIT_IO)
 
-    print(f"ia write: sent → {filename}")
+    # Attempt to claim a unique destination name.
+    # First attempt: the clean name.  On FileExistsError, bump suffix.
+    base, ext = filename[:-3], ".md"  # split "2026-…T…Z_name.md" → ("2026-…T…Z_name", ".md")
+    claimed_path = None
+    for attempt in range(1, _LINK_MAX_ATTEMPTS + 1):
+        candidate_name = filename if attempt == 1 else f"{base}-{attempt}{ext}"
+        candidate_path = inter_agent_dir / candidate_name
+        try:
+            os.link(str(tmp_path), str(candidate_path))
+            claimed_path = candidate_path
+            break
+        except FileExistsError:
+            continue
+        except OSError as e:
+            # Unexpected error (e.g. cross-device, permissions) — clean up and abort
+            print(f"ia write: failed to publish letter: {e}", file=sys.stderr)
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            sys.exit(EXIT_IO)
+
+    try:
+        tmp_path.unlink()
+    except OSError:
+        pass
+
+    if claimed_path is None:
+        print(
+            f"ia write: collision loop exhausted after {_LINK_MAX_ATTEMPTS} attempts "
+            f"(all candidate names already exist — this should not happen in normal use).",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_IO)
+
+    try:
+        os.chmod(claimed_path, 0o644)
+    except OSError as e:
+        print(f"ia write: warning — could not set permissions on letter: {e}", file=sys.stderr)
+
+    print(f"ia write: sent → {claimed_path.name}")
 
 
 # ---------------------------------------------------------------------------
