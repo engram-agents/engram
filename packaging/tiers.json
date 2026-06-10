@@ -272,6 +272,10 @@
       "tier": "dev"
     },
     {
+      "path": "tools/run_matrix.py",
+      "tier": "dev"
+    },
+    {
       "path": "packaging/test-map.json",
       "tier": "dev"
     },
