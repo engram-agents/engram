@@ -901,3 +901,90 @@ class TestIdentityLeakPremises:
             f"Revisit FOREIGN_LEAK_PATTERNS in tools/engine/build.py before proceeding. "
             f"See issue #778 and PR #803."
         )
+
+
+# ---------------------------------------------------------------------------
+# E. Root-file manifest derivation — #666 regression gate
+# ---------------------------------------------------------------------------
+
+
+class TestRootFileManifestDerivation:
+    """build_plugin() derives root-level files from tiers.json, not a hardcoded list.
+
+    Regression gate for #666: a convenience-tier root file (viz_server.py) was
+    silently omitted because the old implementation used a hardcoded list +
+    engram_*.py glob that never included it.  The fix makes section 1 manifest-
+    derived, so any root-level entry in tiers.json ships under its declared tier.
+    """
+
+    def test_convenience_root_file_present_at_convenience_tier(self, tmp_path):
+        """viz_server.py (convenience) is present in a convenience-tier build."""
+        from tools.engine.build import build_plugin
+        from tools.engine.manifest import load_manifest, resolve_tier
+
+        manifest = load_manifest(MANIFEST_PATH)
+        tier = resolve_tier(manifest, "convenience")
+        bundle_dir = str(tmp_path / "convenience_root")
+
+        build_plugin(
+            repo_root=REPO_ROOT,
+            plugin_root=bundle_dir,
+            tier=tier,
+            multi_agent=False,
+            manifest=manifest,
+        )
+
+        assert os.path.isfile(os.path.join(bundle_dir, "viz_server.py")), (
+            "viz_server.py (convenience tier, root-level) missing from convenience build — "
+            "manifest-derived root copy not including it (see #666)"
+        )
+
+    def test_convenience_root_file_absent_at_essential_tier(self, tmp_path):
+        """viz_server.py (convenience) is absent from an essential-tier build."""
+        from tools.engine.build import build_plugin
+        from tools.engine.manifest import load_manifest, resolve_tier
+
+        manifest = load_manifest(MANIFEST_PATH)
+        tier = resolve_tier(manifest, "essential")
+        bundle_dir = str(tmp_path / "essential_root")
+
+        build_plugin(
+            repo_root=REPO_ROOT,
+            plugin_root=bundle_dir,
+            tier=tier,
+            multi_agent=False,
+            manifest=manifest,
+        )
+
+        assert not os.path.isfile(os.path.join(bundle_dir, "viz_server.py")), (
+            "viz_server.py (convenience tier) should NOT appear in an essential build"
+        )
+
+    def test_all_shipped_root_entries_present_in_build(self, tmp_path):
+        """Every root-level mechanism entry ships under its declared tier.
+
+        Builds at dev tier (includes all tiers) and asserts that every root-level
+        entry in tiers.json mechanisms[] is present in the build output.
+        """
+        from tools.engine.build import build_plugin
+        from tools.engine.manifest import load_manifest, resolve_tier, select_shippables
+
+        manifest = load_manifest(MANIFEST_PATH)
+        tier = resolve_tier(manifest, "dev")
+        bundle_dir = str(tmp_path / "dev_all_root")
+
+        build_plugin(
+            repo_root=REPO_ROOT,
+            plugin_root=bundle_dir,
+            tier=tier,
+            multi_agent=True,
+            manifest=manifest,
+        )
+
+        shipped = select_shippables(manifest, tier, multi_agent=True)
+        root_paths = [e["path"] for e in shipped if "/" not in e["path"]]
+        missing = [p for p in root_paths if not os.path.isfile(os.path.join(bundle_dir, p))]
+        assert not missing, (
+            f"Root-level manifest entries missing from dev build: {missing} "
+            "(manifest-derived root copy must ship every declared root entry)"
+        )

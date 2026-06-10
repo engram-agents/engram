@@ -903,39 +903,31 @@ def build_plugin(
 
     copied_paths: list[str] = []
 
-    # ── 1. MCP server + runtime modules ──────────────────────────────────────
+    # ── 1. Root-level files — manifest-derived ───────────────────────────────
+    # Derive from shipped_entries (path contains no '/') so new root files
+    # added to tiers.json ship automatically — no hardcoded list to maintain.
+    # Previously this section hardcoded ["server.py", "bootstrap.py", "SKILL.md",
+    # "launch-engram-server.sh"] + an engram_*.py glob; a convenience-tier root
+    # file (viz_server.py) was silently omitted.  Fixes #666.
 
-    _log("Copying runtime modules → plugin root")
-    for p in ["server.py", "bootstrap.py", "SKILL.md", "launch-engram-server.sh"]:
-        if not _ships(ship_set, p):
-            _log(f"  (tier-filtered) {p}")
-            continue
+    _log("Copying root-level files → plugin root (manifest-derived)")
+    root_entries = [e for e in shipped_entries if "/" not in e["path"]]
+    if not any(e["path"] == "server.py" for e in root_entries):
+        _die("server.py not in shipped root entries — manifest may be misconfigured")
+    for entry in root_entries:
+        p = entry["path"]
         src = os.path.join(repo_root, p)
+        if not os.path.exists(src):
+            _die(f"Manifest root entry {p!r} does not exist at {src}")
         dst = os.path.join(plugin_root, p)
         shutil.copy2(src, dst)
         copied_paths.append(p)
+        _log(f"  {p}")
 
     # Ensure launch-engram-server.sh is executable after copy
     launch_sh = os.path.join(plugin_root, "launch-engram-server.sh")
     if os.path.isfile(launch_sh):
         os.chmod(launch_sh, os.stat(launch_sh).st_mode | 0o111)
-
-    # engram_*.py — all are essential per manifest; copy if they ship
-    engram_py_files = sorted(
-        f for f in os.listdir(repo_root)
-        if f.startswith("engram_") and f.endswith(".py")
-        and os.path.isfile(os.path.join(repo_root, f))
-    )
-    if not engram_py_files:
-        _die(f"No engram_*.py files found at {repo_root}")
-    for bname in engram_py_files:
-        if not _ships(ship_set, bname):
-            _log(f"  (tier-filtered) {bname}")
-            continue
-        src = os.path.join(repo_root, bname)
-        dst = os.path.join(plugin_root, bname)
-        shutil.copy2(src, dst)
-        copied_paths.append(bname)
 
     # ── 1b. tools/ — manifest-driven filtering ───────────────────────────────
 
