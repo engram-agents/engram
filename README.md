@@ -963,16 +963,32 @@ written in.
 
 **Uninstall**
 
-> **Warning: irreversible.** `~/.engram/` is your entire knowledge graph — back it up
-> first (`~/.engram/knowledge.db` is the graph). `~/.claude/CLAUDE.md` may contain
-> your customizations beyond the ENGRAM template — review before deleting.
+Two distinct scopes — pick the one that matches your intent:
+
+**Plugin-only uninstall** (safe — removes the plugin registration and assembled
+marketplace tree, preserves all ENGRAM data):
 
 ```bash
-rm -rf ~/.engram
-rm ~/.claude/CLAUDE.md
-claude mcp remove engram -s user
-# Edit ~/.claude/settings.json to remove ENGRAM hook entries
-# Edit ~/.claude/skills/ to remove engram-first-session
+bash tools/uninstall-local-marketplace.sh          # claude-code target
+bash tools/uninstall-local-marketplace.sh --target codex  # codex target
+bash tools/uninstall-local-marketplace.sh --dry-run       # preview first
+```
+
+Preserves: `~/.engram/knowledge.db` (your graph), history, diary,
+`warm-briefing.md`, `config.json`, venv, `~/.claude/CLAUDE.md`.
+
+To reinstall after: `bash tools/install-local-marketplace.sh`.
+
+**Full data reset** (irreversible — destroys your entire ENGRAM graph):
+
+> **Warning.** `~/.engram/knowledge.db` is your entire knowledge graph — back it
+> up first if you might want it later. `~/.claude/CLAUDE.md` may contain your
+> customizations beyond the ENGRAM template — review before deleting.
+
+```bash
+bash tools/uninstall-local-marketplace.sh   # remove plugin registration first
+rm -rf ~/.engram                            # then delete all ENGRAM data
+rm ~/.claude/CLAUDE.md                      # optional: remove agent identity
 ```
 
 ---

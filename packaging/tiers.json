@@ -167,6 +167,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/uninstall-local-marketplace.sh",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/engram-regenerate-embeddings.py",
       "tier": "essential"
     },
