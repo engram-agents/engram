@@ -412,14 +412,39 @@ def query_fts_fallback(prompt: str, top_k: int = 10) -> dict | None:
         return None
 
 
+_COMPACT_DAY_RE = re.compile(r"^(\d+d)")
+_COMPACT_SUBDAY_RE = re.compile(r"^\d+[sh]$|^\d+m$|^\d+h\d+m$")
+
+
+def _compact_age(created_ago: str | None) -> str:
+    """Compact a _humanized_ago string to a short recency tag for surface lines.
+
+    Maps the full "Xd4h ago" / "3h30m ago" forms from _humanized_ago to:
+      sub-day (s/m/h forms — careful: "m" not "mo")  → "0d"
+      Nd[Xh]           → "Nd"  (strip trailing hours)
+      Nw / Nmo / Ny    → unchanged
+      ? / parse-error / None → "?"
+    """
+    if not created_ago or created_ago in ("?", "parse-error", "future?"):
+        return "?"
+    s = created_ago.replace(" ago", "")
+    if _COMPACT_SUBDAY_RE.match(s):
+        return "0d"
+    m = _COMPACT_DAY_RE.match(s)
+    if m:
+        return m.group(1)
+    return s
+
+
 def render_one_node_line(entry: dict, *, conf_prefix: bool, type_tag: bool) -> str:
     """Render a single node as a compact line for the recall nudge.
 
     Format:
-        - [<id>] <conf or type-tag> <kw_prefix><summary_or_fallback>
+        - [<id>] <conf or type-tag> · <age>  <kw_prefix><summary_or_fallback>
 
     Args:
-        entry: node dict (id, claim, confidence, recall_summary, recall_keywords, type, …)
+        entry: node dict (id, claim, confidence, recall_summary, recall_keywords,
+            type, created_ago, …)
         conf_prefix: if True, render ``(conf X.XX)`` ONLY when
             ``entry.get("confidence") is not None``. Passed True for both
             specials and top_claims — the None-guard suppresses the prefix
@@ -444,6 +469,10 @@ def render_one_node_line(entry: dict, *, conf_prefix: bool, type_tag: bool) -> s
         prefix_parts.append(f"(conf {confidence:.2f})")
     prefix = (" ".join(prefix_parts) + " ") if prefix_parts else ""
 
+    # Compact recency tag (v1 autobiographical distance — filing date only)
+    age = _compact_age(entry.get("created_ago"))
+    age_tag = f"· {age}  "
+
     # Build keyword prefix: `kw1` · `kw2` · `kw3` —
     if isinstance(recall_keywords, list) and len(recall_keywords) >= 1:
         kw_prefix = " · ".join(f"`{kw}`" for kw in recall_keywords) + " — "
@@ -458,7 +487,7 @@ def render_one_node_line(entry: dict, *, conf_prefix: bool, type_tag: bool) -> s
     else:
         body = claim
 
-    return f"- [{nid}] {prefix}{kw_prefix}{body}"
+    return f"- [{nid}] {prefix}{age_tag}{kw_prefix}{body}"
 
 
 def format_nudge(result: dict, pack_results: list[dict] | None = None) -> str:

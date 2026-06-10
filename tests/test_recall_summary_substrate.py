@@ -364,7 +364,7 @@ def _claim_entry(
         "confidence": confidence,
         "recall_summary": recall_summary,
         "recall_keywords": recall_keywords,
-        "created_ago": "1 hour ago",
+        "created_ago": "1h ago",
     }
 
 
@@ -383,7 +383,7 @@ def _special_entry(
         "claim": claim,
         "recall_summary": recall_summary,
         "recall_keywords": recall_keywords,
-        "created_ago": "2 days ago",
+        "created_ago": "2d ago",
     }
     if confidence is not None:
         entry["confidence"] = confidence
@@ -442,8 +442,9 @@ def test_format_nudge_summary_only_no_kw_prefix():
     assert "Post-PR#209 composite formula with FTS floor." in output, (
         f"Expected summary in output:\n{output}"
     )
-    # No keyword prefix (no backticks before middot pattern)
-    assert " · " not in output, f"Unexpected middot (keyword prefix) in output:\n{output}"
+    # No keyword prefix (no backtick-middot-backtick pattern from keyword list)
+    # Note: age tag unconditionally adds "· Nd" — the keyword-specific pattern is "`kw` · `kw`"
+    assert "` · `" not in output, f"Unexpected keyword middot in output:\n{output}"
 
 
 def test_format_nudge_keywords_two_elements_renders_kw_prefix():
@@ -586,9 +587,10 @@ def test_format_nudge_recall_keywords_empty_no_kw_prefix():
     )
     result = _make_result(top_claims=[claim_entry])
     output = hook.format_nudge(result)
-    # Empty list → no keyword prefix → no middot
-    assert " · " not in output, (
-        f"Expected no middot for empty keyword list, but output had it:\n{output}"
+    # Empty list → no keyword prefix → no backtick-middot-backtick pattern
+    # Note: age tag unconditionally adds "· Nd" — the keyword-specific pattern is "`kw` · `kw`"
+    assert "` · `" not in output, (
+        f"Expected no keyword middot for empty keyword list, but output had it:\n{output}"
     )
     # Summary still renders
     assert "A curated summary that should still appear" in output, (
