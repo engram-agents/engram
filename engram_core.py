@@ -2926,6 +2926,40 @@ def _count_live_exemplars(conn: sqlite3.Connection, target_id: str, target_type:
     return exemplifies_live + supported_by_live
 
 
+def _current_successor(conn, node_id: str) -> "str | None":
+    """Walk the superseded_by chain from node_id to the current successor.
+
+    Returns the first is_current=1 node reached, or None when the chain
+    ends without one (retracted nodes have no successor; a chain may also
+    terminate on a non-current node). Cycle-guarded — a malformed chain
+    returns None rather than looping.
+
+    Promoted from engram_revision (#919/#1005 resolve guard) for shared
+    use by the is_current guard family — engram_derive's contradict guard
+    (#1010) consumes it too, and family→family imports are off-convention
+    (shared helpers live in core).
+    """
+    seen = {node_id}
+    row = conn.execute(
+        "SELECT superseded_by FROM nodes WHERE id = ?", (node_id,)
+    ).fetchone()
+    if not row:
+        return None
+    nxt = row["superseded_by"]
+    while nxt and nxt not in seen:
+        seen.add(nxt)
+        nrow = conn.execute(
+            "SELECT superseded_by, is_current FROM nodes WHERE id = ?",
+            (nxt,),
+        ).fetchone()
+        if not nrow:
+            return None
+        if nrow["is_current"] == 1:
+            return nxt
+        nxt = nrow["superseded_by"]
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Reflect-family helpers promoted for engram_lifecycle use.
 # ---------------------------------------------------------------------------

@@ -226,35 +226,6 @@ def _detect_zero_support(conn: sqlite3.Connection, affected_node_id: str) -> lis
 # E impls
 # ---------------------------------------------------------------------------
 
-def _current_successor(conn, node_id: str) -> "str | None":
-    """Walk the superseded_by chain from node_id to the current successor.
-
-    Returns the first is_current=1 node reached, or None when the chain
-    ends without one (retracted nodes have no successor; a chain may also
-    terminate on a non-current node). Cycle-guarded — a malformed chain
-    returns None rather than looping.
-    """
-    seen = {node_id}
-    row = conn.execute(
-        "SELECT superseded_by FROM nodes WHERE id = ?", (node_id,)
-    ).fetchone()
-    if not row:
-        return None
-    nxt = row["superseded_by"]
-    while nxt and nxt not in seen:
-        seen.add(nxt)
-        nrow = conn.execute(
-            "SELECT superseded_by, is_current FROM nodes WHERE id = ?",
-            (nxt,),
-        ).fetchone()
-        if not nrow:
-            return None
-        if nrow["is_current"] == 1:
-            return nxt
-        nxt = nrow["superseded_by"]
-    return None
-
-
 def _resolve_impl(
     target_id: str = "",
     resolving_node_id: str = "",
@@ -328,7 +299,7 @@ def _resolve_impl(
             # one. Symmetric with the resolver-side guard below. The error
             # walks the supersede chain so a late-arriving legitimate
             # resolution has a one-step path to the right target.
-            successor_id = _current_successor(conn, target_id)
+            successor_id = core._current_successor(conn, target_id)
             if successor_id:
                 hint = (
                     f"Its current successor is '{successor_id}' — resolve "

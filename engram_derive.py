@@ -251,8 +251,8 @@ def _contradict_impl(
     conn = core._get_db()
     try:
         # Validate both nodes exist and are claim-bearing
-        node_a = conn.execute("SELECT id, type, claim FROM nodes WHERE id = ?", (node_id_a,)).fetchone()
-        node_b = conn.execute("SELECT id, type, claim FROM nodes WHERE id = ?", (node_id_b,)).fetchone()
+        node_a = conn.execute("SELECT id, type, claim, is_current FROM nodes WHERE id = ?", (node_id_a,)).fetchone()
+        node_b = conn.execute("SELECT id, type, claim, is_current FROM nodes WHERE id = ?", (node_id_b,)).fetchone()
         if not node_a:
             return json.dumps({"error": f"Node '{node_id_a}' not found."})
         if not node_b:
@@ -269,6 +269,29 @@ def _contradict_impl(
                          f"(observations, derivations, theories, axioms, conjectures). Node '{node_id_b}' is type '{node_b['type']}'. "
                          f"Extract observations from evidence sources first, then flag contradictions between those observations.",
             })
+        # #1010: is_current guard — contradicting a superseded/retracted node
+        # corrupts bookkeeping on a claim that is no longer live. Hard-reject;
+        # walk the superseded_by chain to name the current successor so the
+        # caller has a one-step path to the legitimate target.
+        for nid, node in ((node_id_a, node_a), (node_id_b, node_b)):
+            if node["is_current"] != 1:
+                successor_id = core._current_successor(conn, nid)
+                if successor_id:
+                    hint = (
+                        f"Its current successor is '{successor_id}' — "
+                        f"contradict that node instead."
+                    )
+                else:
+                    hint = (
+                        "It has no current successor (retracted, or the "
+                        "supersede chain ends non-current) — filing a "
+                        "contradiction against a retracted node has no "
+                        "epistemic effect."
+                    )
+                return json.dumps({
+                    "error": f"Node '{nid}' is not current "
+                             f"(superseded or retracted). {hint}",
+                })
 
         full_desc = description
         if root_cause:
