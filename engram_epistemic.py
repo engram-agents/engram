@@ -103,7 +103,7 @@ def _add_axiom_impl(
              json.dumps([{"confidence": 1.0, "reason": "axiom — assumed true", "timestamp": now}])),
         )
 
-        context = [s.strip() for s in context_ids.split(",") if s.strip()]
+        context = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
         for cid in context:
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
@@ -176,7 +176,7 @@ def _add_definition_impl(
             (node_id, combined_claim, now, meta),
         )
 
-        context = [s.strip() for s in context_ids.split(",") if s.strip()]
+        context = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
         for cid in context:
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
@@ -275,7 +275,7 @@ def _add_conjecture_impl(
              json.dumps([{"confidence": conf, "reason": f"conjecture — initial hypothesis", "timestamp": now}])),
         )
 
-        context = [s.strip() for s in context_ids.split(",") if s.strip()]
+        context = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
         for cid in context:
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
@@ -355,7 +355,7 @@ def _scan_emergence_impl(
     """
     conn = core._get_db()
     try:
-        type_set = {t.strip() for t in node_type_filter.split(",") if t.strip()}
+        type_set = {t.strip() for t in core._as_csv(node_type_filter).split(",") if t.strip()}
 
         # ── Resolve focus scope ─────────────────────────────────────────────
         self_id = None
@@ -707,7 +707,7 @@ def _add_lesson_impl(
             "valid_types": sorted(core.REASONING_TYPES),
         })
 
-    ids = [s.strip() for s in incident_ids.split(",") if s.strip()]
+    ids = [s.strip() for s in core._as_csv(incident_ids).split(",") if s.strip()]
     if not ids:
         return json.dumps({"error": "At least one incident observation ID is required."})
 
@@ -786,7 +786,7 @@ def _add_lesson_impl(
             )
 
         # Create cites edges for context
-        ctx = [s.strip() for s in context_ids.split(",") if s.strip()]
+        ctx = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
         for cid in ctx:
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:

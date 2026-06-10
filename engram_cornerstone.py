@@ -104,7 +104,7 @@ def _add_cornerstone_impl(
 
         linked = []
         missing = []
-        for sid in [s.strip() for s in supporting_ids.split(",") if s.strip()]:
+        for sid in [s.strip() for s in core._as_csv(supporting_ids).split(",") if s.strip()]:
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (sid,)).fetchone()
             if exists:
                 try:
@@ -239,7 +239,7 @@ def _outgrow_cornerstone_impl(
         inherited_support_ids = [r["target_id"] for r in inherited_supports]
         inherited_about_ids = [r["target_id"] for r in inherited_about]
 
-        extra_support_ids = [s.strip() for s in new_supporting_ids.split(",") if s.strip()]
+        extra_support_ids = [s.strip() for s in core._as_csv(new_supporting_ids).split(",") if s.strip()]
         all_support_ids = list(dict.fromkeys(inherited_support_ids + extra_support_ids))
 
         linked_supports = []

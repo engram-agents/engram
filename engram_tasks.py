@@ -147,7 +147,7 @@ def _add_goal_impl(
             (node_id, claim, now, motivation, meta),
         )
 
-        context = [s.strip() for s in context_ids.split(",") if s.strip()]
+        context = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
         for cid in context:
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:
@@ -260,7 +260,7 @@ def _add_task_impl(
                 )
 
         # Edges: task implements conjectures/questions
-        impl_ids = [s.strip() for s in implements_ids.split(",") if s.strip()]
+        impl_ids = [s.strip() for s in core._as_csv(implements_ids).split(",") if s.strip()]
         for iid in impl_ids:
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (iid,)).fetchone()
             if exists:
@@ -650,7 +650,7 @@ def _report_feeling_impl(
         )
 
         # Optional context_ids → 'cites' edges (new → old convention).
-        context = [s.strip() for s in context_ids.split(",") if s.strip()]
+        context = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
         cited_ids: list = []
         for cid in context:
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()

@@ -39,6 +39,13 @@ from engram_log_emitter import emit_if_initialized
 # C-local constants (inspect view helpers)
 # ---------------------------------------------------------------------------
 
+# Type aliases for engram_query — allow shorthands and un-suffixed names that
+# agents commonly pass (e.g. "observation" instead of "observation_factual").
+_TYPE_ALIASES: dict[str, str] = {
+    "observation": "observation_factual",
+    "ob": "observation_factual",
+}
+
 # Edge relations that carry logical/epistemic weight — shown with full
 # recall_summary in the recall view.
 _LOGICAL_SUBSTRATE_RELATIONS = frozenset({
@@ -1231,7 +1238,9 @@ def _search_nodes(
     """
     # Default embed_query to query if not explicitly provided (backward compat).
     effective_embed_query = embed_query if embed_query is not None else query
-    type_filter = set(t.strip() for t in types.split(",") if t.strip()) if types else None
+    type_filter = set(t.strip() for t in core._as_csv(types).split(",") if t.strip()) or None
+    if type_filter:
+        type_filter = {_TYPE_ALIASES.get(t, t) for t in type_filter}
     tier2_threshold = core._get_tier_threshold(conn, 2)
 
     # --- Debug signal capture (pre-search) ---

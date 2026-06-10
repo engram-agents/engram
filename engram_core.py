@@ -360,6 +360,13 @@ def engram_sandbox(data_dir: str | Path | None = None, keep: bool = False):
     return _sandbox()
 
 
+def _as_csv(v) -> str:
+    """Coerce a list or None to a comma-string; pass strings through unchanged."""
+    if isinstance(v, list):
+        return ",".join(str(x) for x in v)
+    return v or ""
+
+
 VALID_NODE_TYPES = {
     "evidence",
     "observation_factual",

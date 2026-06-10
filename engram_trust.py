@@ -109,7 +109,7 @@ def _add_person_impl(
         now = core._now()
 
         claim_text = f"{name} — {role}"
-        alias_list = [s.strip() for s in aliases.split(",") if s.strip()]
+        alias_list = [s.strip() for s in core._as_csv(aliases).split(",") if s.strip()]
 
         meta_dict = {
             "name": name,
@@ -127,7 +127,7 @@ def _add_person_impl(
             (node_id, claim_text, now, description, meta),
         )
 
-        context = [s.strip() for s in context_ids.split(",") if s.strip()]
+        context = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
         for cid in context:
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:

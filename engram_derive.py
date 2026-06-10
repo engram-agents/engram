@@ -126,10 +126,10 @@ def _derive_impl(
         else:
             reasoning_type = "deductive_hypothetical_syllogism"
 
-    ids = [s.strip() for s in supporting_ids.split(",") if s.strip()]
+    ids = [s.strip() for s in core._as_csv(supporting_ids).split(",") if s.strip()]
     if not ids:
         return json.dumps({"error": "At least one supporting node ID is required."})
-    ctx = [s.strip() for s in context_ids.split(",") if s.strip()]
+    ctx = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
 
     conn = core._get_db()
     try:
@@ -415,7 +415,7 @@ def _ask_impl(
         )
 
         # Link to context nodes if provided
-        context = [s.strip() for s in context_ids.split(",") if s.strip()]
+        context = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
         for cid in context:
             exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (cid,)).fetchone()
             if exists:

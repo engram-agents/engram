@@ -162,7 +162,7 @@ def _clear_active_set_name_if_diverged(conn):
 # (pure-read inspection, no refresh).
 def _focus_impl(node_ids: str, reason: str) -> str:
     """Impl for engram_focus — callable with named kwargs for in-server callers."""
-    ids = [s.strip() for s in node_ids.split(",") if s.strip()]
+    ids = [s.strip() for s in core._as_csv(node_ids).split(",") if s.strip()]
     if not ids:
         return json.dumps({"status": "error", "error": "No node IDs provided"})
     if not reason or not reason.strip():
@@ -265,7 +265,7 @@ def _focus_impl(node_ids: str, reason: str) -> str:
 # (success), not error. Safe to call defensively over a mixed-state set.
 def _unfocus_impl(node_ids: str) -> str:
     """Impl for engram_unfocus — callable with named kwargs for in-server callers."""
-    ids = [s.strip() for s in node_ids.split(",") if s.strip()]
+    ids = [s.strip() for s in core._as_csv(node_ids).split(",") if s.strip()]
     if not ids:
         return json.dumps({"status": "error", "error": "No node IDs provided"})
 
