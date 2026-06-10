@@ -1,6 +1,7 @@
 # 07 — Packaging + Install (L6)
 
 > **STATUS: DRAFT — fairy archaeology + dispatcher recomputation 2026-06-05.**
+> **UPDATE 2026-06-09 — whole-tree default-deny tag-once gate MERGED (#968/#991):** `test_whole_tree_every_tracked_file_has_a_role` (tests/test_tiers_manifest.py) now enumerates ALL git-tracked files (`git ls-files`) and requires each to have EXACTLY ONE declared role across four manifest buckets — `mechanisms[]` (tiered shippable), `excluded[]` (in a candidate dir but intentionally not shipped), `repo_only[]` (tracked but not a shippable artifact — tests/CI/docs/root dev files), `build_inputs[]` (consumed by build/install — .mcp.json, platform.json, manifests); none → FAIL (unaccounted), more-than-one → FAIL (ambiguous). The narrower `test_every_shippable_path_is_tagged` (plugin-universe gate — build-plugin.sh source dirs, mechanisms-or-excluded) is kept alongside it as the authoritative shippable-universe check. This is default-deny, mechanically resolving the dir-level-vs-file-level policy question below. Counts refreshed below.
 > **Dispatcher corrections (two):**
 > 1. The fairy's "tools/engram-pkg is NOT tiered" is WRONG — `tools/engram-pkg` is
 >    tiered at tiers.json line 178 (the L4 sweep had it right; cross-sweep
@@ -24,7 +25,7 @@
 
 ## Manifest (packaging/tiers.json, schema v1)
 
-121 tiered mechanisms (51 essential / 64 convenience / 6 dev; cumulative ⊂-model) + 11 multi_agent-flagged + 5 identity-coupled (dropped for `--identity foreign`) + 9 excluded-with-reason (persona tools, operator tools, superseded hook, CI test files). **Zero dangling entries** (all tiered paths exist). Coverage gap: see header — 81 effective uncovered.
+125 tiered mechanisms (62 essential / 50 convenience / 13 dev; cumulative ⊂-model) + 12 multi_agent-flagged + 4 identity-coupled (dropped for `--identity foreign`) + 17 excluded-with-reason (persona tools, operator tools, superseded hook, CI test files). Plus the two whole-tree buckets #991 added: `repo_only[]` (23 — tracked non-shippables: tests/CI/docs/root) + `build_inputs[]` (5 — build/install inputs). **Zero dangling entries** (all tiered paths exist). Coverage: now whole-tree default-deny — every git-tracked file must carry exactly one declared role (see §CI gates).
 
 ## Build engine (tools/engine/ + build-plugin.sh wrapper)
 
@@ -49,14 +50,14 @@ claude-code.json (identity_doc CLAUDE.md, .mcp.json, hook envelope text-ok) · c
 
 - **tests.yml** — pytest matrix 3.11/3.12 over tests/ + forum/tests/ (ENGRAM_NO_EMBEDDINGS=1). Runs on master push/PR + dispatch. *(Dispatcher note: forum's tests ARE in CI even though forum isn't in the manifest — test coverage and ship coverage diverge, the L5 paradox.)*
 - **check-no-new-shipped-node-ids.yml** — blocks concrete node-ID shapes in shipped paths (tests/ etc. excluded). Live (fired twice today).
-- ~~MISSING: the tiers gate (A7)~~ **CORRECTED 2026-06-06 (see FINDINGS A7):** the tag-once + dangling gates EXIST (tests/test_tiers_manifest.py) — this page's "missing" claim repeated the same search-surface error (looked only in workflows/). The actual defect was trigger placement (master-only suite); **resolved same day**: manifest-gate.yml now runs the sub-second manifest tests on every dev PR (the A7 follow-through PR, merged). Still genuinely absent: platform-profile build validation + a foreign-leak-scan CI gate — candidates for the platform-noun gate family (see the build-time platform-shaping thread).
+- ~~MISSING: the tiers gate (A7)~~ **CORRECTED 2026-06-06 (see FINDINGS A7):** the tag-once + dangling gates EXIST (tests/test_tiers_manifest.py) — this page's "missing" claim repeated the same search-surface error (looked only in workflows/). The actual defect was trigger placement (master-only suite); **resolved same day**: manifest-gate.yml now runs the sub-second manifest tests on every dev PR (the A7 follow-through PR, merged). **Extended 2026-06-09 (#968/#991, merged):** a second, broader gate landed — `test_whole_tree_every_tracked_file_has_a_role` enumerates ALL git-tracked files and fails unless each has exactly one role across four buckets (`mechanisms`/`excluded`/`repo_only`/`build_inputs`); default-deny. The original `test_every_shippable_path_is_tagged` (plugin-universe — build-plugin.sh source dirs, mechanisms-or-excluded) is kept as the authoritative shippable-universe check. Two complementary scopes: plugin-universe catches untiered shippables; whole-tree additionally enforces a declared role for every tracked file (removed lanes are deleted, not bucketed — #865 precedent). Still genuinely absent: platform-profile build validation + a foreign-leak-scan CI gate — candidates for the platform-noun gate family (see the build-time platform-shaping thread).
 
 ## Zombie ranking (layer)
 
 | Rank | Suspect | Status |
 |---|---|---|
-| 1 | The ~52-file effective drift backlog (forum ~31 + infra-meta ~10 + misc ~11; gemini ~29 RETIRED by #865) | manifest gap — adjudication list |
-| 2 | Missing tiers CI gate (the structural cause) | documented-but-unbuilt (A7) |
+| 1 | Effective drift backlog (forum ~31 + infra-meta ~10 + misc ~11; gemini RETIRED #865) | now CI-enforced — whole-tree gate (#991) fails on any tracked file with no declared role; remaining = adjudicate the right bucket (tier/exclude/repo_only/build_input) per file |
+| 2 | Tiers CI gate (the structural cause) | **RESOLVED** — whole-tree tag-once gate merged 2026-06-09 (#968/#991); was master-only (A7), now dev-PR + whole-tree |
 | 3 | gemini lane | **RETIRED by #865** (2026-06-06; archived at tag `archive/gemini`) |
 | 4 | forum/fairy-spec-*.md (5) + inter-agent design docs (2) | PARKED — archive candidates |
-| 5 | Dir-level vs file-level tiering ambiguity | policy gap — needs one sentence in the manifest README |
+| 5 | Dir-level vs file-level tiering | **RESOLVED** by the whole-tree gate — "every tracked file → exactly one of four declared roles" is the mechanical policy (#991) |
