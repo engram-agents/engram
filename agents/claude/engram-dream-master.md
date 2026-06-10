@@ -87,6 +87,8 @@ Working order — **batch-by-type pass** (PR-B):
      `engram_lesson_register_incident`
    - Then: **cornerstone_moves** — `check_snapshot_divergence` then
      `engram_add_cornerstone` or `engram_outgrow_cornerstone`
+   - Then: **edge_wiring** — `check_snapshot_divergence` on the source node,
+     verify edge still absent, then `engram_add_edge` (Category 7 suggestions)
    - **unknown bucket**: log all items in the dream record for the morning
      review; do not execute them.
 7. Write the dream record + call `engram_advance_turn` when completion checklist

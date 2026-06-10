@@ -37,6 +37,7 @@ from tools.dream_master_batch import (
     BUCKET_LESSONS,
     BUCKET_CORNERSTONE_MOVES,
     BUCKET_GOAL_TENSION_RESOLUTIONS,
+    BUCKET_EDGE_WIRING,
     BUCKET_UNKNOWN,
     ALL_BUCKET_NAMES,
     BatchResult,
@@ -785,6 +786,128 @@ def test_missing_node_raises_snapshot_divergence_not_type_error():
             "check_snapshot_divergence raised TypeError instead of "
             "SnapshotDivergence for a missing node (None current_db_row)"
         )
+
+
+# ---------------------------------------------------------------------------
+# 20. edge_wiring bucket — Category 7 suggestion strings route correctly
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeWiringBucket:
+    """Category 7 missing-principle-edge suggestions route to BUCKET_EDGE_WIRING."""
+
+    def _single(self, suggestion: str) -> str:
+        """Run bucket_findings with one finding, return its bucket."""
+        finding = _make_finding("ob_0001", suggestion)
+        report = _make_report([finding])
+        buckets = bucket_findings([report])
+        for name, items in buckets.items():
+            for item in items:
+                if item["node_id"] == "ob_0001":
+                    return name
+        return BUCKET_UNKNOWN
+
+    def test_real_category7_format_routes_to_edge_wiring(self):
+        """The exact Category 7 output format from engram-dream-fairy.md routes correctly.
+
+        Verbatim category-7 format:
+          [source_id] → [target_id] (pattern-match) similarity <score> —
+          suggested_relation: <instantiates|serves> — evidence: <snippet> —
+          suggested action: dream-master wires via
+          `engram_add_edge(source_id=..., target_id=..., relation=...)`
+        """
+        suggestion = (
+            "[ob_0042] → [gl_0001] (pattern-match) similarity 0.82 — "
+            "suggested_relation: serves — evidence: task work product toward goal — "
+            "suggested action: dream-master wires via "
+            "`engram_add_edge(source_id=ob_0042, target_id=gl_0001, relation=serves)`"
+        )
+        assert self._single(suggestion) == BUCKET_EDGE_WIRING
+
+    def test_instantiates_category7_routes_to_edge_wiring(self):
+        """Category 7 suggestion with instantiates relation routes to BUCKET_EDGE_WIRING."""
+        suggestion = (
+            "[dv_0015] → [cs_0001] (pattern-match) similarity 0.79 — "
+            "suggested_relation: instantiates — evidence: derived conclusion realizes axiom — "
+            "suggested action: dream-master wires via "
+            "`engram_add_edge(source_id=dv_0015, target_id=cs_0001, relation=instantiates)`"
+        )
+        assert self._single(suggestion) == BUCKET_EDGE_WIRING
+
+    def test_engram_add_edge_alone_routes_to_edge_wiring(self):
+        """Any suggestion containing 'engram_add_edge' routes to BUCKET_EDGE_WIRING."""
+        assert self._single("wire via engram_add_edge to connect source to target") == BUCKET_EDGE_WIRING
+
+    def test_suggested_relation_alone_routes_to_edge_wiring(self):
+        """Any suggestion containing 'suggested_relation' routes to BUCKET_EDGE_WIRING."""
+        assert self._single("suggested_relation: serves — add edge between nodes") == BUCKET_EDGE_WIRING
+
+    def test_edge_wiring_does_not_shadow_cornerstone(self):
+        """engram_add_cornerstone still routes to BUCKET_CORNERSTONE_MOVES."""
+        assert self._single("anchor as cornerstone via engram_add_cornerstone") == BUCKET_CORNERSTONE_MOVES
+
+    def test_edge_wiring_does_not_shadow_resolution(self):
+        """Plain resolution suggestions still route to BUCKET_RESOLUTIONS."""
+        assert self._single("close as resolved") == BUCKET_RESOLUTIONS
+
+    def test_edge_wiring_does_not_shadow_goal_tension(self):
+        """Goal-tension suggestions still route to BUCKET_GOAL_TENSION_RESOLUTIONS."""
+        assert self._single("resolve goal-tension gt_0003 via synthesis") == BUCKET_GOAL_TENSION_RESOLUTIONS
+
+    def test_edge_wiring_bucket_in_all_bucket_names(self):
+        """BUCKET_EDGE_WIRING is registered in ALL_BUCKET_NAMES."""
+        assert BUCKET_EDGE_WIRING in ALL_BUCKET_NAMES
+
+    def test_edge_wiring_before_unknown_in_all_bucket_names(self):
+        """BUCKET_EDGE_WIRING appears before BUCKET_UNKNOWN in ALL_BUCKET_NAMES."""
+        names = list(ALL_BUCKET_NAMES)
+        assert names.index(BUCKET_EDGE_WIRING) < names.index(BUCKET_UNKNOWN)
+
+
+# ---------------------------------------------------------------------------
+# 21. Regression table — all existing buckets still route unchanged
+# ---------------------------------------------------------------------------
+
+
+class TestRoutingRegressionTable:
+    """Representative string for every pre-existing bucket still routes correctly.
+
+    Guards against the edge_wiring entries shadowing earlier semantics.
+    """
+
+    def _single(self, suggestion: str) -> str:
+        finding = _make_finding("ob_0001", suggestion)
+        report = _make_report([finding])
+        buckets = bucket_findings([report])
+        for name, items in buckets.items():
+            for item in items:
+                if item["node_id"] == "ob_0001":
+                    return name
+        return BUCKET_UNKNOWN
+
+    def test_resolutions_still_routes(self):
+        assert self._single("close as resolved") == BUCKET_RESOLUTIONS
+
+    def test_supersedes_still_routes(self):
+        assert self._single("supersede with fresher derivation") == BUCKET_SUPERSEDES
+
+    def test_retractions_still_routes(self):
+        assert self._single("retract — tainted by upstream removal") == BUCKET_RETRACTIONS
+
+    def test_new_derivations_still_routes(self):
+        assert self._single("derive synthesis from these three observations") == BUCKET_NEW_DERIVATIONS
+
+    def test_lessons_still_routes(self):
+        assert self._single("register incident for lesson ls_0014") == BUCKET_LESSONS
+
+    def test_cornerstone_moves_still_routes(self):
+        assert self._single("anchor as cornerstone via engram_add_cornerstone") == BUCKET_CORNERSTONE_MOVES
+
+    def test_goal_tension_resolutions_still_routes(self):
+        assert self._single("resolve goal-tension gt_0003 via synthesis") == BUCKET_GOAL_TENSION_RESOLUTIONS
+
+    def test_unknown_still_falls_through(self):
+        assert self._single("a completely novel action type no pattern knows") == BUCKET_UNKNOWN
 
 
 if __name__ == "__main__":

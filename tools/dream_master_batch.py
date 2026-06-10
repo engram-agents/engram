@@ -13,7 +13,7 @@ Architecture context (PR-B):
   all supersedes, …), calling check_snapshot_divergence() before each MCP
   write to guard against stale state.
 
-Bucket names match the dream-master's seven action categories:
+Bucket names match the dream-master's action categories:
   resolutions         — engram_resolve calls
   supersedes          — engram_supersede calls
   retractions         — engram_retract calls
@@ -21,6 +21,7 @@ Bucket names match the dream-master's seven action categories:
   lessons             — engram_lesson_register_incident calls
   cornerstone_moves   — engram_add_cornerstone / engram_outgrow_cornerstone
   goal_tension_resolutions — engram_resolve on gt_* nodes
+  edge_wiring         — engram_add_edge calls (Category 7 missing-edge suggestions)
 
 Suggestion-string → bucket routing uses the SUGGESTION_ROUTING table below;
 add new entries when the dream-fairy spec adds new suggestion types.
@@ -42,6 +43,7 @@ BUCKET_NEW_DERIVATIONS = "new_derivations"
 BUCKET_LESSONS = "lessons"
 BUCKET_CORNERSTONE_MOVES = "cornerstone_moves"
 BUCKET_GOAL_TENSION_RESOLUTIONS = "goal_tension_resolutions"
+BUCKET_EDGE_WIRING = "edge_wiring"
 BUCKET_UNKNOWN = "unknown"
 
 ALL_BUCKET_NAMES = (
@@ -52,6 +54,7 @@ ALL_BUCKET_NAMES = (
     BUCKET_LESSONS,
     BUCKET_CORNERSTONE_MOVES,
     BUCKET_GOAL_TENSION_RESOLUTIONS,
+    BUCKET_EDGE_WIRING,
     BUCKET_UNKNOWN,
 )
 
@@ -63,6 +66,14 @@ ALL_BUCKET_NAMES = (
 # First match wins.
 
 SUGGESTION_ROUTING: list[tuple[str, str]] = [
+    # Edge-wiring (Category 7 missing-principle-edge suggestions) — MUST precede
+    # all other patterns.  Category 7 suggestion lines contain "engram_add_edge",
+    # "suggested_relation", "instantiates", and "serves" — words that could
+    # collide with cornerstone (\banchors?\b), lesson, or other buckets.
+    # Anchoring on engram_add_edge and suggested_relation is unambiguous: no
+    # other bucket's suggestion format uses those strings.
+    (r"\bengram_add_edge\b", BUCKET_EDGE_WIRING),
+    (r"\bsuggested_relation\b", BUCKET_EDGE_WIRING),
     # Goal-tension resolution — MUST precede generic 'resolv' patterns because
     # goal-tension suggestions contain words like "resolve tension" that would
     # otherwise match the generic resolution pattern first.

@@ -779,9 +779,10 @@ NXDOMAIN_ERRNOS = _observation_mod.NXDOMAIN_ERRNOS
 
 # Relations permitted for after-creation edge addition via engram_add_edge.
 # Derived from the addable_after_creation flag in EDGE_CLASSIFICATIONS.
-# Currently equals _REMOVABLE_EDGE_RELATIONS (about, exemplifies, serves,
-# subtask_of, tensions) — coincidental; PR 3 will diverge them by adding the
-# new relevance-marker relation. Do NOT collapse into a single constant.
+# Currently equals _REMOVABLE_EDGE_RELATIONS (about, exemplifies, instantiates,
+# serves, subtask_of, tensions) — coincidental; PR 3 will diverge them by
+# adding the new relevance-marker relation. Do NOT collapse into a single
+# constant.
 
 # VALID_ERROR_TYPES and _THRESHOLD_GATE_DISCIPLINE_HINT moved to engram_revision.py
 # (family E) in #872 wave 6; aliased above in wave-6 compat forwarders block.
