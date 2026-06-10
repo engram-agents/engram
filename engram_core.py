@@ -3907,6 +3907,16 @@ def _validate_reasoning_structure(
                 f"consider 'deductive_hypothetical_syllogism' or 'inductive_causal' instead."
             )
 
+        # Register disclosure (issue #933): name the mechanical check that RAN
+        # — whether it passed or failed (its pass/fail is conveyed by the
+        # presence/absence of the same-evidence warning above). Without this
+        # line a clean pass reads as full premise-quality coverage. Per the
+        # class-5 two-layer lesson: a detector's silence must be
+        # distinguishable from a detector that never looked.
+        warnings.append(
+            "CHECKED (mechanical): same-evidence-root cluster across premises."
+        )
+
     # Standpoint uniformity check — advisory for ALL derivations with 2+ premises.
     # Extends the multi_source check: maps each evidence root to its standpoint
     # cluster and emits a positive-liveness probe (per the class-5 two-layer
@@ -4081,6 +4091,21 @@ def _validate_reasoning_structure(
                         f"derivation cannot be improved by re-checking; "
                         f"{remedy}{proxy_suffix}."
                     )
+
+        # Role-axis prompt (issue #933): the one premise-quality axis the
+        # substrate structurally CANNOT check — which premise carries the
+        # entailment. A contextual weak premise can floor a deduction
+        # (under-confidence) or pad a corroboration (over-confidence) with all
+        # evidence roots distinct, and every mechanical check above stays
+        # silent. Always a question on multi-premise derivations, never a
+        # pass/fail, never an auto-discount — an auto-discount would need to
+        # know which premise is load-bearing, and it can't (forum #19
+        # consensus, three graphs).
+        warnings.append(
+            "NOT CHECKED (agent judgment): premise role — is the load-bearing "
+            "premise the one driving the confidence? Context premises belong "
+            "in context_ids."
+        )
 
     return warnings
 

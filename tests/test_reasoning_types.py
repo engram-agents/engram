@@ -403,11 +403,126 @@ def test_no_warning_multi_source_generalization():
     assert not any(
         ("independent sources" in w) or ("same evidence node" in w) for w in warns
     ), f"multi-source generalization must not trip the source-independence warning: {warns}"
-    # Any other line present must be the benign informational F-S advisory only.
-    assert all(w.startswith("FALSIFICATION:") or w.startswith("STANDPOINT:") for w in warns), (
-        f"only standpoint-v3 advisory lines expected, got: {warns}"
+    # Any other line present must be a benign advisory: the standpoint-v3
+    # informational lines, or the #933 register-disclosure lines (the
+    # CHECKED/NOT-CHECKED pair is always present on multi-premise derivations).
+    _benign = ("FALSIFICATION:", "STANDPOINT:", "CHECKED (mechanical):",
+               "NOT CHECKED (agent judgment):")
+    assert all(w.startswith(_benign) for w in warns), (
+        f"only advisory/register lines expected, got: {warns}"
     )
     print(f"  PASS: no source-independence warning for multi-source generalization (F-S advisory benign)")
+
+
+# ---------------------------------------------------------------------------
+# Test: Register disclosure (issue #933) — mechanical vs agent-judgment
+# ---------------------------------------------------------------------------
+
+def test_register_disclosure_multi_premise():
+    """#933: every multi-premise derivation discloses BOTH registers — the
+    mechanical check that ran (CHECKED) and the role axis the substrate
+    structurally cannot check (NOT CHECKED, a question, never pass/fail)."""
+    client = fresh_client()
+    ids = setup_base_graph(client)
+
+    result = client.call("engram_derive", {
+        "claim": "Register disclosure probe — multi-source generalization",
+        "supporting_ids": f"{ids['ob1']},{ids['ob3']}",
+        "logical_chain": "Two independent sources; probing #933 output contract",
+        "reasoning_type": "inductive_generalization",
+    })
+    assert result.get("status") == "created"
+    warns = result.get("structure_warnings", [])
+    assert any(w.startswith("CHECKED (mechanical):") for w in warns), (
+        f"#933: multi_source derivation must disclose the mechanical cluster "
+        f"check ran, got: {warns}"
+    )
+    assert any(w.startswith("NOT CHECKED (agent judgment):") and "premise role" in w
+               for w in warns), (
+        f"#933: multi-premise derivation must surface the unchecked role axis "
+        f"as a question, got: {warns}"
+    )
+    print("  PASS: #933 register disclosure present on multi-premise derivation")
+
+
+def test_register_disclosure_role_prompt_without_multisource():
+    """#933: the role-axis prompt fires on ANY 2+-premise derivation (here
+    deductive modus ponens — not a multi_source type, so no CHECKED line for
+    the cluster check), because the role axis is unchecked regardless of
+    reasoning type."""
+    client = fresh_client()
+    ids = setup_base_graph(client)
+
+    result = client.call("engram_derive", {
+        "claim": "Role prompt probe — deductive with two premises",
+        "supporting_ids": f"{ids['ob1']},{ids['ob3']}",
+        "logical_chain": "If P then Q; P; therefore Q — probing #933",
+        "reasoning_type": "deductive_modus_ponens",
+    })
+    assert result.get("status") == "created"
+    warns = result.get("structure_warnings", [])
+    assert any(w.startswith("NOT CHECKED (agent judgment):") for w in warns), (
+        f"#933: role prompt must be present on any multi-premise derivation, "
+        f"got: {warns}"
+    )
+    assert not any(w.startswith("CHECKED (mechanical):") for w in warns), (
+        f"#933: non-multi_source type must not claim the cluster check ran, "
+        f"got: {warns}"
+    )
+    print("  PASS: #933 role prompt on non-multi_source derivation, no false CHECKED claim")
+
+
+def test_register_disclosure_absent_single_premise():
+    """#933: single-premise derivations get NEITHER register line — the role
+    question is only meaningful when there is more than one premise to weigh."""
+    client = fresh_client()
+    ids = setup_base_graph(client)
+
+    result = client.call("engram_derive", {
+        "claim": "Single premise probe — no register lines",
+        "supporting_ids": f"{ids['ob1']}",
+        "logical_chain": "Restating one source's claim — probing #933",
+        "reasoning_type": "authority_expert",
+    })
+    assert result.get("status") == "created"
+    warns = result.get("structure_warnings", [])
+    assert not any(w.startswith(("CHECKED (mechanical):",
+                                 "NOT CHECKED (agent judgment):"))
+                   for w in warns), (
+        f"#933: single-premise derivation must carry no register lines, "
+        f"got: {warns}"
+    )
+    print("  PASS: #933 no register lines on single-premise derivation")
+
+
+def test_register_disclosure_absent_single_premise_multisource_type():
+    """#933 (reviewer-fairy round 1): a multi_source TYPE at n=1 exercises the
+    `spec.get(\"multi_source\") and n >= 2` guard's n=1 branch directly — the
+    cluster check does not run, so the CHECKED line must not claim it did,
+    and the role prompt stays absent (nothing to weigh against)."""
+    client = fresh_client()
+    ids = setup_base_graph(client)
+
+    result = client.call("engram_derive", {
+        "claim": "Single premise on a multi_source type — no register lines",
+        "supporting_ids": f"{ids['ob1']}",
+        "logical_chain": "Generalizing from one case — probing #933 n=1 branch",
+        "reasoning_type": "inductive_generalization",
+    })
+    assert result.get("status") == "created"
+    warns = result.get("structure_warnings", [])
+    assert not any(w.startswith(("CHECKED (mechanical):",
+                                 "NOT CHECKED (agent judgment):"))
+                   for w in warns), (
+        f"#933: multi_source type at n=1 must carry no register lines, "
+        f"got: {warns}"
+    )
+    # The premise-count warning (min 2) should still fire — unchanged behavior.
+    assert any("at least 2" in w for w in warns), (
+        f"#933: the pre-existing min-premise warning must be unaffected, "
+        f"got: {warns}"
+    )
+    print("  PASS: #933 no register lines on n=1 multi_source type; count warning intact")
 
 
 # ---------------------------------------------------------------------------
