@@ -260,13 +260,16 @@ def _outgrow_cornerstone_impl(
 
         linked_abouts = []
         non_current_about_ids = []
+        missing_about_ids = []
         for pid in inherited_about_ids:
             row = conn.execute(
                 "SELECT id, is_current FROM nodes WHERE id = ?", (pid,)
             ).fetchone()
-            if not row or not row["is_current"]:
-                if row:
-                    non_current_about_ids.append(pid)
+            if not row:
+                missing_about_ids.append(pid)
+                continue
+            if not row["is_current"]:
+                non_current_about_ids.append(pid)
                 continue
             try:
                 conn.execute(
@@ -315,6 +318,7 @@ def _outgrow_cornerstone_impl(
             "missing_supporting_ids": missing_supports,
             "preserved_about_edges": linked_abouts,
             **({"non_current_about_ids": non_current_about_ids} if non_current_about_ids else {}),
+            **({"missing_about_ids": missing_about_ids} if missing_about_ids else {}),
         })
     finally:
         conn.close()

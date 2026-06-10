@@ -10,12 +10,17 @@ Coverage:
   2. Schema enforcement — invalid JSON, non-object, unknown fields.
   3. Required-field validation — missing old_cornerstone_id / new_new_frame.
   4. Internal helper — _outgrow_cornerstone_impl callable with named kwargs.
+  5. is_current guards (PR #1023): non-current about node skipped + warned;
+     current about node inherited normally.
+  6. missing_about_ids (issue #1024): absent (DB-deleted) person node in about
+     edges reported in missing_about_ids, not silently dropped.
 """
 
 import atexit
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 
@@ -188,3 +193,67 @@ def test_outgrow_preserves_current_about_person_node():
     assert r.get("status") == "outgrown"
     assert pn_id in r.get("preserved_about_edges", []), r
     assert "non_current_about_ids" not in r, r
+
+
+def test_outgrow_reports_absent_about_person_node():
+    """An about-edge pointing to a DB-deleted person node is reported in missing_about_ids."""
+    server = fresh_server()
+    cs_id = _seed_cornerstone(server)
+
+    # Create a person node, link it, then hard-delete the node row so the edge is orphaned
+    pr = json.loads(server._add_person_impl(name="Deleted Person", role="test subject"))
+    pn_id = pr["person_id"]
+    json.loads(server._link_about_impl(node_id=cs_id, person_id=pn_id))
+
+    # Hard-delete the person node directly — the about edge remains but the node is absent
+    db_path = os.path.join(TEST_DIR, "knowledge.db")
+    with sqlite3.connect(db_path) as db:
+        db.execute("DELETE FROM nodes WHERE id = ?", (pn_id,))
+
+    r = json.loads(server._outgrow_cornerstone_impl(
+        old_cornerstone_id=cs_id,
+        new_new_frame="Successor frame after person-node hard deletion.",
+    ))
+    assert "error" not in r, r
+    assert r.get("status") == "outgrown"
+    assert pn_id in r.get("missing_about_ids", []), r
+    assert pn_id not in r.get("preserved_about_edges", []), r
+    assert pn_id not in r.get("non_current_about_ids", []), r
+
+
+def test_outgrow_missing_and_noncurrent_about_nodes_reported_separately():
+    """Both absent and non-current about nodes are tracked in separate fields."""
+    server = fresh_server()
+    cs_id = _seed_cornerstone(server)
+
+    # Person node 1: link then retract (non-current)
+    pr1 = json.loads(server._add_person_impl(name="Retracted Person", role="test"))
+    pn_retracted = pr1["person_id"]
+    json.loads(server._link_about_impl(node_id=cs_id, person_id=pn_retracted))
+    json.loads(server._retract_impl(node_id=pn_retracted, error_type="other", reason="test"))
+
+    # Person node 2: link then hard-delete (absent)
+    pr2 = json.loads(server._add_person_impl(name="Deleted Person", role="test"))
+    pn_deleted = pr2["person_id"]
+    json.loads(server._link_about_impl(node_id=cs_id, person_id=pn_deleted))
+    db_path = os.path.join(TEST_DIR, "knowledge.db")
+    with sqlite3.connect(db_path) as db:
+        db.execute("DELETE FROM nodes WHERE id = ?", (pn_deleted,))
+
+    # Person node 3: active — should be preserved
+    pr3 = json.loads(server._add_person_impl(name="Active Person", role="test"))
+    pn_active = pr3["person_id"]
+    json.loads(server._link_about_impl(node_id=cs_id, person_id=pn_active))
+
+    r = json.loads(server._outgrow_cornerstone_impl(
+        old_cornerstone_id=cs_id,
+        new_new_frame="Successor frame with mixed about-edge states.",
+    ))
+    assert "error" not in r, r
+    assert r.get("status") == "outgrown"
+    assert pn_retracted in r.get("non_current_about_ids", []), r
+    assert pn_deleted in r.get("missing_about_ids", []), r
+    assert pn_active in r.get("preserved_about_edges", []), r
+    # Ensure correct separation: no cross-contamination
+    assert pn_retracted not in r.get("missing_about_ids", []), r
+    assert pn_deleted not in r.get("non_current_about_ids", []), r
