@@ -179,6 +179,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/pre-dispatch-check.sh",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/operator-setup-viz.sh",
       "tier": "convenience"
     },
@@ -567,6 +571,10 @@
     {
       "path": "tools/test_baton_merge_gate.py",
       "reason": "test file for tools/baton.py merge verb (#999/#1000) — CI tooling only, never ships"
+    },
+    {
+      "path": "tools/test_pre_dispatch_check.py",
+      "reason": "test file for tools/pre-dispatch-check.sh (#1006) — CI tooling only, never ships"
     },
     {
       "path": "tools/test_migrate_to_plugin.sh",

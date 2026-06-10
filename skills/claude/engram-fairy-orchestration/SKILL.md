@@ -17,11 +17,13 @@ The empirical record this skill rests on is catalogued in §7 (References).
 
 Fairies are contractors, not colleagues. The spec is the contract. A fairy has no access to your mind, conversation history, ENGRAM, or accumulated context. Anything load-bearing must be in the spec.
 
-- **Pre-spec coordination check** (BEFORE drafting the spec). If the spec names an issue number, verify no open PR already addresses it. Two checks, both cheap (substitute the actual issue / PR number for `NN` in each):
-    - `gh pr list --search 'in:title "#NN"' --state open` — catches a counterpart's open PR with the issue number in its title.
-    - `ls /home/agents-shared/projects/ 2>/dev/null | grep -E '#NN|PR-NN'` — multi-agent mode only; surfaces a counterpart's in-flight baton for that issue or PR.
+- **Pre-spec coordination check** (BEFORE drafting the spec). If the spec names an issue number, run:
+    ```
+    tools/pre-dispatch-check.sh <NN>
+    ```
+    Exit 0 (CLEAR) → safe to proceed. Exit 1 (DUPLICATE RISK) → review the listed hits before dispatching. Exit 3 (UNKNOWN) → gh unavailable; fall back to manual check. The script handles both checks — open PRs via `gh` and in-flight baton files — and uses an exact-token match so `#100` does not falsely hit when you search for `#1006`.
   - Skipping this is the failure mode that produced PR-517 (issue #486) on 2026-05-30 — a duplicate of the counterpart's PR-502, which had already converged. Same lines, guaranteed merge conflict. The pre-check would have caught it in 5 seconds.
-  - Single-agent mode: only the `gh pr list` check applies. Shared-projects path doesn't exist.
+  - Single-agent mode: the script notes "baton check skipped" when `/home/agents-shared/projects/` is absent; the PR check still runs.
 - **Self-contained prompt.** Include repo path, branch baseline, template commit/PR to read, scope, validation step. Inline (don't link to) any node IDs or context-laden references the fairy needs.
 - **Hard scope bounds.** Explicit "DO NOT modify X" for adjacent surfaces. Anti-patterns enumerated. Stop conditions named.
 - **Escape valve.** Always include some form of: *"if you hit anything that doesn't match the template, STOP and report back."* Silent improvisation is the failure mode.
