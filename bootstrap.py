@@ -360,20 +360,37 @@ def _render_codex_target(substitutions: dict[str, str]) -> None:
 
 def _db_node_count(db_path: Path) -> int:
     """Return the number of rows in the nodes table, or 0 if the table
-    doesn't exist yet (e.g. file exists but schema hasn't been created)."""
+    doesn't exist yet (e.g. file exists but schema hasn't been created).
+
+    Raises SystemExit on connection-level failures (PermissionError, locked DB,
+    etc.) so FORCE=1 / FORCE_RESEED_EMPTY=1 refuse rather than silently
+    treating an unreadable DB as empty and proceeding to seed live data.
+    """
     import sqlite3
     try:
-        conn = sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(str(db_path), timeout=0)
         try:
             row = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()
             return row[0] if row else 0
-        except sqlite3.OperationalError:
-            # nodes table doesn't exist — DB is effectively empty
-            return 0
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                # nodes table not created yet — DB is effectively empty (new install)
+                return 0
+            raise SystemExit(
+                f"[bootstrap] ERROR: cannot query {db_path}: {exc}\n"
+                "  Refusing to proceed — DB state is ambiguous.\n"
+                "  Release any DB locks, then re-run bootstrap."
+            ) from exc
         finally:
             conn.close()
-    except Exception:
-        return 0
+    except SystemExit:
+        raise  # let the inner SystemExit propagate unchanged
+    except Exception as exc:
+        raise SystemExit(
+            f"[bootstrap] ERROR: cannot read {db_path}: {exc}\n"
+            "  Refusing to proceed — DB state is ambiguous.\n"
+            "  Fix the file permissions or remove the lock, then re-run bootstrap."
+        ) from exc
 
 
 def main() -> None:

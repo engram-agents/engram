@@ -303,6 +303,156 @@ def test_bootstrap_force_on_nonempty_db_refuses():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def test_bootstrap_force_on_unreadable_db_refuses():
+    """FORCE=1 on an unreadable DB (PermissionError) refuses with non-zero exit.
+
+    Origin: issue #1051 — outer except Exception: return 0 treated unreadable
+    DB as empty. A PermissionError or locked file caused _db_node_count() to
+    return 0, so FORCE=1 / FORCE_RESEED_EMPTY=1 would proceed to seed on top
+    of potentially live data. The fix raises SystemExit with a clear message
+    instead of silently treating the unreadable DB as empty.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="engram_bootstrap_force_unreadable_"))
+    db_path = None
+    try:
+        engram_home = workdir / ".engram"
+        engram_home.mkdir(parents=True)
+        db_path = engram_home / "knowledge.db"
+
+        # Plant a nodes table with one row so the DB is non-empty (distinct
+        # from the no-schema empty case).
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE nodes (id TEXT PRIMARY KEY, type TEXT, claim TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO nodes VALUES ('ax_0001', 'axiom', 'test axiom')"
+        )
+        conn.commit()
+        conn.close()
+
+        # Make the DB unreadable — simulates PermissionError / locked file.
+        os.chmod(db_path, 0o000)
+
+        env = os.environ.copy()
+        env.update({
+            "ALPHA_DIR": str(REPO_ROOT),
+            "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "templates"),
+            "ENGRAM_HOME": str(engram_home),
+            "CLAUDE_HOME": str(workdir / ".claude"),
+            "PYTHON_BIN": sys.executable,
+            "TARGET": "claude",
+            "FORCE": "1",
+        })
+        env.pop("FORCE_RESEED_EMPTY", None)
+
+        result = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "bootstrap.py")],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode != 0, (
+            "FORCE=1 on unreadable DB should refuse (non-zero exit), but it succeeded"
+        )
+        combined = result.stdout + result.stderr
+        assert "cannot read" in combined.lower(), (
+            f"Expected 'cannot read' in output, got:\n{combined}"
+        )
+
+    finally:
+        # Restore permissions before rmtree so cleanup can delete the file.
+        if db_path is not None and db_path.exists():
+            try:
+                os.chmod(db_path, 0o644)
+            except OSError:
+                pass
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_bootstrap_force_on_locked_db_refuses():
+    """FORCE=1 on a locked DB (database is locked OperationalError) refuses.
+
+    Origin: Ariadne's round-2 review of PR #1075 — 'database is locked' is a
+    sqlite3.OperationalError that surfaces at the SELECT (not at connect), so the
+    original broad inner except sqlite3.OperationalError: return 0 silently
+    treated a locked DB as empty, allowing FORCE=1 to proceed to seed on top of
+    potentially live data. The fix narrows the inner catch to 'no such table' only
+    and raises SystemExit on any other OperationalError including lock errors.
+    """
+    import threading
+
+    workdir = Path(tempfile.mkdtemp(prefix="engram_bootstrap_force_locked_"))
+    lock_held = threading.Event()
+    lock_released = threading.Event()
+
+    def hold_exclusive_lock(db_path_str):
+        conn = sqlite3.connect(db_path_str)
+        try:
+            conn.execute("BEGIN EXCLUSIVE")
+            lock_held.set()
+            lock_released.wait(timeout=30)
+        finally:
+            conn.close()
+
+    try:
+        engram_home = workdir / ".engram"
+        engram_home.mkdir(parents=True)
+        db_path = engram_home / "knowledge.db"
+
+        # Create DB with nodes table + one row so the DB is non-empty.
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE nodes (id TEXT PRIMARY KEY, type TEXT, claim TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO nodes VALUES ('ax_0001', 'axiom', 'test axiom')"
+        )
+        conn.commit()
+        conn.close()
+
+        # Hold an EXCLUSIVE lock in a background thread — simulates a running
+        # process that has the DB locked. The SELECT inside _db_node_count will
+        # fail with "database is locked" OperationalError.
+        locker = threading.Thread(
+            target=hold_exclusive_lock, args=(str(db_path),), daemon=True
+        )
+        locker.start()
+        lock_held.wait(timeout=5)
+
+        env = os.environ.copy()
+        env.update({
+            "ALPHA_DIR": str(REPO_ROOT),
+            "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "templates"),
+            "ENGRAM_HOME": str(engram_home),
+            "CLAUDE_HOME": str(workdir / ".claude"),
+            "PYTHON_BIN": sys.executable,
+            "TARGET": "claude",
+            "FORCE": "1",
+        })
+        env.pop("FORCE_RESEED_EMPTY", None)
+
+        result = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "bootstrap.py")],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode != 0, (
+            "FORCE=1 on locked DB should refuse (non-zero exit), but it succeeded"
+        )
+        combined = result.stdout + result.stderr
+        assert "cannot query" in combined.lower(), (
+            f"Expected 'cannot query' in output, got:\n{combined}"
+        )
+
+    finally:
+        lock_released.set()
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def test_bootstrap_force_reseed_empty_on_empty_db_proceeds():
     """FORCE_RESEED_EMPTY=1 on an empty DB (0 nodes) proceeds and seeds the graph.
 
