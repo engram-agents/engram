@@ -132,3 +132,59 @@ def test_impl_callable_with_kwargs():
     ))
     assert "error" not in r, r
     assert r.get("status") == "outgrown"
+
+
+def test_outgrow_skips_retracted_about_person_node():
+    """Non-current (retracted) person node in about edges is skipped with warning."""
+    server = fresh_server()
+    cs_id = _seed_cornerstone(server)
+
+    # Add a person node and link it to the cornerstone
+    pr = json.loads(server._add_person_impl(name="Ghost Person", role="test subject"))
+    assert "error" not in pr, pr
+    pn_id = pr["person_id"]
+
+    lr = json.loads(server._link_about_impl(node_id=cs_id, person_id=pn_id))
+    assert "error" not in lr, lr
+
+    # Retract the person node so it becomes non-current
+    rr = json.loads(server._retract_impl(
+        node_id=pn_id,
+        error_type="other",
+        reason="test: verify non-current about-edge guard",
+    ))
+    assert "error" not in rr, rr
+
+    # Outgrow the cornerstone — should succeed; non-current person skipped
+    r = json.loads(server._outgrow_cornerstone_impl(
+        old_cornerstone_id=cs_id,
+        new_new_frame="Successor frame after person-node retraction.",
+    ))
+    assert "error" not in r, r
+    assert r.get("status") == "outgrown"
+    assert pn_id in r.get("non_current_about_ids", []), r
+    assert pn_id not in r.get("preserved_about_edges", []), r
+
+
+def test_outgrow_preserves_current_about_person_node():
+    """Current person node in about edges is inherited normally."""
+    server = fresh_server()
+    cs_id = _seed_cornerstone(server)
+
+    # Add a current person node and link it to the cornerstone
+    pr = json.loads(server._add_person_impl(name="Active Person", role="test subject"))
+    assert "error" not in pr, pr
+    pn_id = pr["person_id"]
+
+    lr = json.loads(server._link_about_impl(node_id=cs_id, person_id=pn_id))
+    assert "error" not in lr, lr
+
+    # Outgrow — current person node should be inherited
+    r = json.loads(server._outgrow_cornerstone_impl(
+        old_cornerstone_id=cs_id,
+        new_new_frame="Successor frame with active person.",
+    ))
+    assert "error" not in r, r
+    assert r.get("status") == "outgrown"
+    assert pn_id in r.get("preserved_about_edges", []), r
+    assert "non_current_about_ids" not in r, r

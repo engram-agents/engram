@@ -258,12 +258,22 @@ def _outgrow_cornerstone_impl(
             except sqlite3.IntegrityError:
                 pass
 
+        linked_abouts = []
+        non_current_about_ids = []
         for pid in inherited_about_ids:
+            row = conn.execute(
+                "SELECT id, is_current FROM nodes WHERE id = ?", (pid,)
+            ).fetchone()
+            if not row or not row["is_current"]:
+                if row:
+                    non_current_about_ids.append(pid)
+                continue
             try:
                 conn.execute(
                     "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'about', ?)",
                     (new_id, pid, now),
                 )
+                linked_abouts.append(pid)
             except sqlite3.IntegrityError:
                 pass
 
@@ -303,7 +313,8 @@ def _outgrow_cornerstone_impl(
             "additional_supports": extra_support_ids,
             "supporting_nodes_linked": linked_supports,
             "missing_supporting_ids": missing_supports,
-            "preserved_about_edges": inherited_about_ids,
+            "preserved_about_edges": linked_abouts,
+            **({"non_current_about_ids": non_current_about_ids} if non_current_about_ids else {}),
         })
     finally:
         conn.close()
