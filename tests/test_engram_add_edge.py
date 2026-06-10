@@ -19,6 +19,10 @@ Coverage:
       in metadata JSON.
   11. DAG guard fires for `serves` when source is older than target.
   12. Happy path — add `serves` edge with correctly-ordered timestamps succeeds.
+  13. is_current guard — retracted source_id rejected (#1017).
+  14. is_current guard — retracted target_id rejected (#1017).
+  15. is_current guard — superseded source_id rejected (#1017).
+  16. is_current guard — superseded target_id rejected (#1017).
 """
 
 import atexit
@@ -552,3 +556,103 @@ def test_add_serves_edge_correct_order_succeeds():
     assert "error" not in r, r
     assert r["status"] == "created", r
     assert r["relation"] == "serves"
+
+
+# ── 13-14. is_current guard — retracted source/target (#1017) ─────────────
+
+
+def _retract_node(server, node_id):
+    """Retract a node so it becomes is_current=0."""
+    r = json.loads(server.engram_retract(payload_json=json.dumps({
+        "node_id": node_id,
+        "error_type": "hallucinated_claim",
+        "reason": "Test retraction — is_current guard test.",
+    })))
+    assert "error" not in r, f"retract failed: {r}"
+
+
+def _supersede_node(server, old_id, new_id):
+    """Supersede old_id with new_id so old_id becomes is_current=0."""
+    r = json.loads(server.engram_supersede(payload_json=json.dumps({
+        "old_node_id": old_id,
+        "new_node_id": new_id,
+        "supersede_reason": "Test supersede — is_current guard test.",
+    })))
+    assert "error" not in r, f"supersede failed: {r}"
+
+
+def test_retracted_source_rejected_by_is_current_guard():
+    """_add_edge_impl rejects a retracted source_id (#1017)."""
+    server = fresh_server()
+    person_id, obs_id = _seed_self_anchor_and_obs(server)
+    _retract_node(server, obs_id)
+    r = json.loads(server.engram_add_edge(payload_json=json.dumps({
+        "source_id": obs_id,
+        "target_id": person_id,
+        "relation": "about",
+    })))
+    assert "error" in r, r
+    assert "not current" in r["error"], r
+
+
+def test_retracted_target_rejected_by_is_current_guard():
+    """_add_edge_impl rejects a retracted target_id (#1017)."""
+    server = fresh_server()
+    person_id, obs_id = _seed_self_anchor_and_obs(server)
+    # Create a second observation to use as source (person can't be retracted easily)
+    obs2_id = json.loads(server.engram_add_observation(payload_json=json.dumps({
+        "url": "https://example.com/b", "title": "B",
+        "quoted_text": "B says C.", "interpretation": "B claims C.", "claim": "C.",
+        "quote_type": "attributed_analysis",
+    })))["observation_id"]
+    _retract_node(server, obs_id)
+    r = json.loads(server.engram_add_edge(payload_json=json.dumps({
+        "source_id": obs2_id,
+        "target_id": obs_id,
+        "relation": "about",
+    })))
+    assert "error" in r, r
+    assert "not current" in r["error"], r
+
+
+def test_superseded_source_rejected_by_is_current_guard():
+    """_add_edge_impl rejects a superseded source_id (#1017)."""
+    server = fresh_server()
+    person_id, obs_id = _seed_self_anchor_and_obs(server)
+    obs2_id = json.loads(server.engram_add_observation(payload_json=json.dumps({
+        "url": "https://example.com/b", "title": "B",
+        "quoted_text": "B says C.", "interpretation": "B claims C.", "claim": "C.",
+        "quote_type": "attributed_analysis",
+    })))["observation_id"]
+    _supersede_node(server, obs_id, obs2_id)
+    r = json.loads(server.engram_add_edge(payload_json=json.dumps({
+        "source_id": obs_id,
+        "target_id": person_id,
+        "relation": "about",
+    })))
+    assert "error" in r, r
+    assert "not current" in r["error"], r
+
+
+def test_superseded_target_rejected_by_is_current_guard():
+    """_add_edge_impl rejects a superseded target_id (#1017)."""
+    server = fresh_server()
+    person_id, obs_id = _seed_self_anchor_and_obs(server)
+    obs2_id = json.loads(server.engram_add_observation(payload_json=json.dumps({
+        "url": "https://example.com/b", "title": "B",
+        "quoted_text": "B says C.", "interpretation": "B claims C.", "claim": "C.",
+        "quote_type": "attributed_analysis",
+    })))["observation_id"]
+    obs3_id = json.loads(server.engram_add_observation(payload_json=json.dumps({
+        "url": "https://example.com/c", "title": "C",
+        "quoted_text": "C says D.", "interpretation": "C claims D.", "claim": "D.",
+        "quote_type": "attributed_analysis",
+    })))["observation_id"]
+    _supersede_node(server, obs_id, obs2_id)
+    r = json.loads(server.engram_add_edge(payload_json=json.dumps({
+        "source_id": obs3_id,
+        "target_id": obs_id,
+        "relation": "about",
+    })))
+    assert "error" in r, r
+    assert "not current" in r["error"], r

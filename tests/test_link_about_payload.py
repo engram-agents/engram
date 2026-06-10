@@ -9,6 +9,9 @@ Coverage:
   2. Schema enforcement — invalid JSON, non-object, unknown fields.
   3. Required-field validation — missing node_id rejected.
   4. Internal helper — _link_about_impl works with named kwargs.
+  5. is_current guard — retracted node_id rejected (#1017).
+  6. is_current guard — retracted explicit person_id rejected (#1017).
+  7. is_current guard — superseded node_id rejected (#1017).
 """
 
 import atexit
@@ -134,3 +137,72 @@ def test_impl_callable_with_kwargs():
     _, obs_id = _seed_self_anchor_and_obs(server)
     r = json.loads(server._link_about_impl(node_id=obs_id))
     assert "error" not in r, r
+
+
+# ── 5-6. is_current guard — retracted node_id / person_id (#1017) ─────────
+
+
+def _retract_node(server, node_id):
+    r = json.loads(server.engram_retract(payload_json=json.dumps({
+        "node_id": node_id,
+        "error_type": "hallucinated_claim",
+        "reason": "Test retraction — is_current guard test.",
+    })))
+    assert "error" not in r, f"retract failed: {r}"
+
+
+def _supersede_node(server, old_id, new_id):
+    r = json.loads(server.engram_supersede(payload_json=json.dumps({
+        "old_node_id": old_id,
+        "new_node_id": new_id,
+        "supersede_reason": "Test supersede — is_current guard test.",
+    })))
+    assert "error" not in r, f"supersede failed: {r}"
+
+
+def test_retracted_node_id_rejected_by_is_current_guard():
+    """_link_about_impl rejects a retracted node_id (#1017)."""
+    server = fresh_server()
+    _, obs_id = _seed_self_anchor_and_obs(server)
+    _retract_node(server, obs_id)
+    r = json.loads(server.engram_link_about(payload_json=json.dumps({"node_id": obs_id})))
+    assert "error" in r, r
+    assert "not current" in r["error"], r
+
+
+def test_retracted_explicit_person_id_rejected_by_is_current_guard():
+    """_link_about_impl rejects a retracted explicit person_id (#1017)."""
+    server = fresh_server()
+    _, obs_id = _seed_self_anchor_and_obs(server)
+    # Create a second person node (non-self) to retract
+    p2 = json.loads(server.engram_add_person(payload_json=json.dumps({
+        "name": "Other Person",
+        "role": "user",
+        "description": "Non-self person for retraction test.",
+    })))
+    p2_id = p2.get("person_id") or p2.get("node_id")
+    _retract_node(server, p2_id)
+    r = json.loads(server.engram_link_about(payload_json=json.dumps({
+        "node_id": obs_id,
+        "person_id": p2_id,
+    })))
+    assert "error" in r, r
+    assert "not current" in r["error"], r
+
+
+# ── 7. is_current guard — superseded node_id (#1017) ──────────────────────────
+
+
+def test_superseded_node_id_rejected_by_is_current_guard():
+    """_link_about_impl rejects a superseded node_id (#1017)."""
+    server = fresh_server()
+    _, obs_id = _seed_self_anchor_and_obs(server)
+    obs2_id = json.loads(server.engram_add_observation(payload_json=json.dumps({
+        "url": "https://example.com/b", "title": "B",
+        "quoted_text": "B says C.", "interpretation": "B claims C.", "claim": "C.",
+        "quote_type": "attributed_analysis",
+    })))["observation_id"]
+    _supersede_node(server, obs_id, obs2_id)
+    r = json.loads(server.engram_link_about(payload_json=json.dumps({"node_id": obs_id})))
+    assert "error" in r, r
+    assert "not current" in r["error"], r

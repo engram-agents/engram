@@ -358,9 +358,21 @@ def _link_about_impl(
 
     conn = core._get_db()
     try:
-        node = conn.execute("SELECT id, type FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        node = conn.execute(
+            "SELECT id, type, is_current FROM nodes WHERE id = ?", (node_id,)
+        ).fetchone()
         if not node:
             return json.dumps({"error": f"Node '{node_id}' not found."})
+        if not node["is_current"]:
+            return json.dumps({
+                "error": (
+                    f"Node '{node_id}' is not current (retracted or superseded). "
+                    f"node_id is used as the source of the `about` edge "
+                    f"and must be current. "
+                    f"If this node was superseded, use engram_inspect('{node_id}') "
+                    f"to find its current successor."
+                )
+            })
 
         if not person_id:
             self_row = conn.execute(
@@ -372,9 +384,18 @@ def _link_about_impl(
                 })
             person_id = self_row["id"]
 
-        person = conn.execute("SELECT id, type FROM nodes WHERE id = ?", (person_id,)).fetchone()
+        person = conn.execute(
+            "SELECT id, type, is_current FROM nodes WHERE id = ?", (person_id,)
+        ).fetchone()
         if not person:
             return json.dumps({"error": f"Person '{person_id}' not found."})
+        if not person["is_current"]:
+            return json.dumps({
+                "error": (
+                    f"Person node '{person_id}' is not current (retracted or superseded). "
+                    f"Use engram_inspect('{person_id}') to find the current person node."
+                )
+            })
         if person["type"] != "person":
             return json.dumps({
                 "error": f"Target '{person_id}' is type '{person['type']}', not 'person'. `about` edges must target person nodes."
@@ -518,15 +539,31 @@ def _add_edge_impl(
     conn = core._get_db()
     try:
         source = conn.execute(
-            "SELECT id, type, created_at FROM nodes WHERE id = ?", (source_id,)
+            "SELECT id, type, created_at, is_current FROM nodes WHERE id = ?", (source_id,)
         ).fetchone()
         if not source:
             return json.dumps({"error": f"Source node '{source_id}' not found."})
+        if not source["is_current"]:
+            return json.dumps({
+                "error": (
+                    f"Source node '{source_id}' is not current (retracted or superseded). "
+                    f"Edges must connect current nodes. "
+                    f"Use engram_inspect('{source_id}') to find the current successor."
+                )
+            })
         target = conn.execute(
-            "SELECT id, type, created_at FROM nodes WHERE id = ?", (target_id,)
+            "SELECT id, type, created_at, is_current FROM nodes WHERE id = ?", (target_id,)
         ).fetchone()
         if not target:
             return json.dumps({"error": f"Target node '{target_id}' not found."})
+        if not target["is_current"]:
+            return json.dumps({
+                "error": (
+                    f"Target node '{target_id}' is not current (retracted or superseded). "
+                    f"Edges must connect current nodes. "
+                    f"Use engram_inspect('{target_id}') to find the current successor."
+                )
+            })
 
         # `instantiates` boundary gates (#530): the exemplifies/serves/instantiates
         # three-way boundary is enforced mechanically here, not just documented
