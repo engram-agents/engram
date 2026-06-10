@@ -21,9 +21,9 @@ Steps map 1-to-1 with the skill's numbered sections:
   marketplace-rebuilt     Step 2:  calls Phase-1 build_plugin(); PRECONDITION: branch==dev
                                    (unless ctx.allow_branch — guard per #794)
   flags-match-config      Step 3:  tier + multi_agent in built manifest match config.json
-  plugin-marketplace-update  Step 4: [operator] /plugin marketplace update
+  plugin-marketplace-update  Step 4: [operator] /plugin marketplace update engram-local
                                      (requires substrate-health + flags-match-config)
-  plugin-upgrade          Step 5:  [operator] /plugin upgrade engram
+  plugin-upgrade          Step 5:  [operator] /plugin → Installed → engram plugin entry → Update now
   mcp-reconnect           Step 6:  [operator, conditional] /mcp reconnect — only when
                                    server.py or engram_*.py changed in deployed..target range
   template-gate           Step 7:  [agent, judgment] detect CLAUDE.md.template diff;
@@ -372,12 +372,14 @@ def upgrade_flow() -> list[Step]:
             verify=lambda ctx: bool(ctx.get("_plugin_marketplace_updated")),
             instruction=(
                 "Please run in this Claude Code session:\n"
-                "  /plugin marketplace update\n"
+                "  /plugin marketplace update engram-local\n"
                 "Then set ctx['_plugin_marketplace_updated'] = True and re-run."
             ),
         ),
 
         # ── Step 5: plugin-upgrade [operator] ────────────────────────────
+        # Uses the interactive plugin menu, not '/plugin upgrade engram' (stale).
+        # The correct UX (per #945/#947): /plugin → Installed → engram plugin → Update now.
         Step(
             id="plugin-upgrade",
             requires=["plugin-marketplace-update"],
@@ -386,8 +388,8 @@ def upgrade_flow() -> list[Step]:
             apply=None,
             verify=lambda ctx: bool(ctx.get("_plugin_upgrade_done")),
             instruction=(
-                "Please run in this Claude Code session:\n"
-                "  /plugin upgrade engram\n"
+                "Please upgrade the plugin using the interactive menu in this Claude Code session:\n"
+                "  /plugin → Installed → engram plugin entry (not the MCP listed under it) → Update now\n"
                 "Then set ctx['_plugin_upgrade_done'] = True and re-run."
             ),
         ),
