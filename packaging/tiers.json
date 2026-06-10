@@ -549,6 +549,10 @@
       "reason": "test file for tools/forum_backup.py — CI tooling only, never ships"
     },
     {
+      "path": "tools/test_pr_body_close_keyword_gate.py",
+      "reason": "test file for the .github close-keyword trap-gate workflow — CI tooling only, never ships"
+    },
+    {
       "path": "tools/test_baton_ci_guard.py",
       "reason": "test file for tools/baton.py CI-green flip guard (#685) — CI tooling only, never ships"
     },
