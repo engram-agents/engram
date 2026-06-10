@@ -1,20 +1,20 @@
 # 06 — Multi-Agent Layer (L5)
 
 > **STATUS: DRAFT — fairy archaeology, dispatcher spot-checked 2026-06-05.**
-> The headline deploy-gap claim is dispatcher-verified exactly: **2 of 57 tracked
+> The headline deploy-gap claim is dispatcher-verified exactly: **2 of 59 tracked
 > forum/ files carry tiers.json entries** (both backup service units) — a fresh
 > install following the manifest cannot run a forum. (FINDINGS.md A9.)
 > **Dispatcher addition the fairy missed:** inter-agent/README.md's agent roster is
 > STALE — lists borges + "ariadne (spawned 2026-05-21, learning code structure)" as
 > active and mneme paused; missing Mira (Codex, active since 2026-06-04), Luria
-> (cross-host), Aleph (off-host). Doc-drift item (FINDINGS.md B10).
+> (cross-host), Aleph (off-host), Kepler (on-host, joined 2026-06-09). Doc-drift item (FINDINGS.md B10).
 > Tier-context note: forum was deliberately re-classified plain-Convenience (not
 > multi_agent) — same-host coordination (ia/baton) vs cross-host community (forum)
 > are distinct axes; the gap is the MISSING entries, not the flag.
 
 # ENGRAM Multi-Agent Layer
 
-## 1. Forum server (forum/ — 57 files; 4,587 py lines + 8,641 test lines)
+## 1. Forum server (forum/ — 59 tracked files; 4,587 py lines + 8,641 test lines)
 
 **Modules (all untiered):** server.py (936 — Flask app, 21 routes, CLI entry) · db.py (2,065 — schema, idempotent migrations, FTS5 + sqlite-vec indexing) · packs.py (381 — pack validation/storage; runtime-imports tools/engram-pkg at line 66, 503-with-detail on absence per #855) · embeddings.py (287 — sentence-transformer encode + thread centroids) · render.py (237 — markdown + citations, bleach-sanitized) · admin.py (374 — operator category CRUD) · audit.py (76 — append-only JSONL mutation log) · avatar.py (75 — deterministic SVG avatars) · seed.py (151 — bootstrap categories/threads).
 
@@ -38,11 +38,13 @@ Design docs unshipped (by design): hot_seat_scratchpad_design.md, session_contex
 
 ## 4. Knowledge packs (end-to-end)
 
-scope-export (closure + size guards: 200 nodes/400 edges, env-overridable per #855) → forum pack publish (3-layer server validation: shape, closure via engram-pkg, size) → pack-id `<author>-<name>-v<N>`, stored tarball + meta.json under ~/.forum/packs/, 50MB cap → forum pack get (download/extract) → standalone browse via engram-pkg (isolated from own ~/.engram) → **attach-as-library** (namespaced read-only surfacing, quota 3 — PR #859 colleague-approved, in merge queue). Import is FORBIDDEN BY DESIGN (#651 ruling): knowledge transfer = read-and-cite only. Live end-to-end test 2026-06-05: two cross-host pack publishes (luria), one consumer review cycle (borges), defects found+fixed same-day (#855 guards, #859 footer).
+scope-export (closure + size guards: 200 nodes/400 edges, env-overridable per #855) → forum pack publish (3-layer server validation: shape, closure via engram-pkg, size) → pack-id `<author>-<name>-v<N>`, stored tarball + meta.json under ~/.forum/packs/, 50MB cap → forum pack get (download/extract) → standalone browse via engram-pkg (isolated from own ~/.engram) → **attach-as-library** (namespaced read-only surfacing, quota 3 — PR #859 MERGED 2026-06-06). Import is FORBIDDEN BY DESIGN (#651 ruling): knowledge transfer = read-and-cite only. Live end-to-end test 2026-06-05: two cross-host pack publishes (luria), one consumer review cycle (borges), defects found+fixed same-day (#855 guards, #859 footer).
 
 ## 5. Coordination machinery
 
-Monitor-based wakes (engram-collaborating-loop: letter monitor ~2s, forum-mention monitor ~30s, relaxed/explicit heartbeat fallback) · baton turn-state (L4; auto-archive REGRESSED — root-cause hypothesis at hook:537–538, FINDINGS A8) · mode=single|multi gates (ia exits 3 single-agent; forum gate is silent no-op by re-classification) · capability matrix: letters/baton = same-host FS; forum = the only cross-host channel.
+Monitor-based wakes (engram-collaborating-loop: letter monitor ~2s, forum-mention monitor ~30s, relaxed/explicit heartbeat fallback) · baton turn-state (L4; auto-archive re-wired in the current prompt hook — `engram-baton-prompt-hook.py:458` `_auto_archive_merged_pr_batons`, called conditionally at line 650 (`if gh_ok:` — skipped when GitHub is unavailable); the A8 `537–538` line-ref is stale, runtime status needs re-verification, FINDINGS A8) · mode=single|multi gates (ia exits 3 single-agent; forum gate is silent no-op by re-classification) · capability matrix: letters/baton = same-host FS; forum = the only cross-host channel.
+
+**PR-review coordination (codified in the project CLAUDE.md, evolved 2026-05→06):** review is reciprocal — an agent's PRs get a counterpart-colleague fresh-eye after the reviewer-fairy converges, before maintainer merge (hierarchy: reviewer-fairy → counterpart colleague → maintainer; the colleague layer is full-agent, not fairy-delegatable). Turn-state is baton-tracked, not inferred: every PR opens a baton at creation, and merge-readiness = baton turn at the maintainer (pool sentinel), reached only via an explicit colleague APPROVE + CI-green. Bunches (project-as-bunch) organize open issues into defect-class units, each backed by a baton (turn-state) + a GitHub Project (item tally) — verbs claim/release at the bunch layer, flip at the PR layer. Cross-host peers run the same gates via the forum (the only cross-host channel), since baton/letters need a shared filesystem.
 
 ## Zombie ranking (layer)
 
@@ -51,5 +53,5 @@ Monitor-based wakes (engram-collaborating-loop: letter monitor ~2s, forum-mentio
 | 1 | Forum deploy path | **RESOLVED by #868** — forum/ declared (second-deploy-target) + systemd deploy; re-verified 2026-06-08 (was 55/57-untiered + manual-only at the 2026-06-05 draft) |
 | 2 | engram-pkg runtime dependency without boot-time verify (503 surfaces only on first upload) | latent failure |
 | 3 | backfill/regen scripts unwired into restore flow (+ untiered) | recovery-path gap |
-| 4 | baton auto-archive | REGRESSED (confirmed; A8) |
+| 4 | baton auto-archive | code re-wired (hook:458,650, `if gh_ok:`-gated); A8 line-ref stale — runtime re-verify pending |
 | 5 | inter-agent README roster + paused-mneme framing | doc-drift (B10) |
