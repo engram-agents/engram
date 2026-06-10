@@ -561,6 +561,10 @@
       "reason": "test file for tools/forum_backup.py — CI tooling only, never ships"
     },
     {
+      "path": "tools/test_baton_ci_guard.py",
+      "reason": "test file for tools/baton.py CI-green flip guard (#685) — CI tooling only, never ships"
+    },
+    {
       "path": "tools/test_migrate_to_plugin.sh",
       "reason": "test file for tools/migrate-to-plugin.sh — CI tooling only, never ships"
     },

@@ -31,6 +31,7 @@ import json
 import os
 import pwd
 import re
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -297,6 +298,98 @@ def _update_frontmatter(text: str, updates: dict) -> str:
 
     new_fm_block = "\n".join(new_lines)
     return f"---\n{new_fm_block}\n---\n{body}"
+
+
+# ---------------------------------------------------------------------------
+# CI-state helper for the flip guard (#685)
+# ---------------------------------------------------------------------------
+
+# Conclusions that constitute a hard failure
+_CI_RED_CONCLUSIONS = frozenset({
+    "FAILURE", "ERROR", "CANCELLED", "TIMED_OUT",
+    "ACTION_REQUIRED", "STARTUP_FAILURE",
+})
+
+# Statuses (or conclusions) that indicate a check is still running
+_CI_PENDING_STATUSES = frozenset({
+    "QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED",
+})
+
+
+def _pr_ci_state(pr_number: str) -> tuple:
+    """Query GitHub CI state for a pull request via `gh`.
+
+    Returns (state, detail) where state is one of:
+      "green"   — all checks passed (or no checks registered)
+      "red"     — at least one check failed
+      "pending" — no failure, but at least one check still running
+      "unknown" — could not obtain a verdict (degraded; advisory only)
+
+    The gh call uses cwd-based repo inference; a failure here is expected
+    when invoked outside the repo tree and must NOT hard-block the caller.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", pr_number,
+             "--json", "statusCheckRollup,mergeStateStatus"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except FileNotFoundError:
+        return ("unknown", "gh not found on PATH")
+    except subprocess.TimeoutExpired:
+        return ("unknown", "gh timed out after 15s")
+    except OSError as exc:
+        return ("unknown", f"gh exec error: {exc}")
+
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip() or f"gh exit {result.returncode}"
+        return ("unknown", detail)
+
+    raw = (result.stdout or "").strip()
+    if not raw:
+        return ("unknown", "gh returned empty output")
+
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return ("unknown", "gh returned unparseable JSON")
+
+    checks = data.get("statusCheckRollup")
+    if not isinstance(checks, list):
+        return ("unknown", "statusCheckRollup missing or not a list")
+
+    if not checks:
+        # No checks registered — treat as green
+        return ("green", "no checks registered")
+
+    for check in checks:
+        # Handle both check-run shape (conclusion) and status-context shape (state/status)
+        conclusion = (check.get("conclusion") or "").upper()
+        state = (check.get("state") or check.get("status") or "").upper()
+
+        if conclusion in _CI_RED_CONCLUSIONS:
+            name = check.get("name") or check.get("context") or "unknown check"
+            return ("red", f"check '{name}' conclusion={conclusion}")
+        if state in _CI_RED_CONCLUSIONS:
+            name = check.get("name") or check.get("context") or "unknown check"
+            return ("red", f"check '{name}' state={state}")
+
+    # Second pass: look for pending (no reds found above)
+    for check in checks:
+        conclusion = (check.get("conclusion") or "").upper()
+        state = (check.get("state") or check.get("status") or "").upper()
+
+        if state in _CI_PENDING_STATUSES:
+            name = check.get("name") or check.get("context") or "unknown check"
+            return ("pending", f"check '{name}' status={state}")
+        if not conclusion and not state:
+            # conclusion=null + no status means it hasn't started yet
+            name = check.get("name") or check.get("context") or "unknown check"
+            return ("pending", f"check '{name}' not yet started")
+
+    return ("green", "all checks passed")
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +663,39 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
+
+    # CI-green guard (#685): run only when flipping a PR-baton to the pool
+    # sentinel (the "presenting for merge" signal per #51 protocol).
+    # .strip().lower() is intentional case-normalization — the github: field is
+    # user-authored YAML and may be mixed-case; matching _pool_sentinel()'s lowering.
+    github_anchor = fields.get("github", "").strip().lower()
+    _flip_force = args.force
+    _pr_anchor_match = re.match(r"^pr/(\d+)$", github_anchor)
+    if _pr_anchor_match and to_agent == _pool_sentinel():
+        _pr_num = _pr_anchor_match.group(1)
+        _ci_state, _ci_detail = _pr_ci_state(_pr_num)
+        if _ci_state in ("red", "pending"):
+            if _flip_force:
+                print(
+                    f"warning: --force — flipping despite CI {_ci_state} "
+                    f"on PR #{_pr_num} ({_ci_detail})",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"baton flip: CI is {_ci_state} on PR #{_pr_num} "
+                    f"(the current tip is not merge-ready). "
+                    "Re-flip when checks are green, or pass --force to override.",
+                    file=sys.stderr,
+                )
+                sys.exit(EXIT_VALIDATION)
+        elif _ci_state == "unknown":
+            print(
+                f"warning: could not verify CI state for PR #{_pr_num} "
+                f"({_ci_detail}) — proceeding anyway",
+                file=sys.stderr,
+            )
+        # green: proceed silently
 
     now = _now_iso()
     from_agent = fields.get("turn", agent_name or "unknown").strip().lower()
@@ -1380,6 +1506,10 @@ def build_parser() -> argparse.ArgumentParser:
         "reason",
         metavar="REASON",
         help="Short description of why the baton is being passed",
+    )
+    p_flip.add_argument(
+        "--force", action="store_true", default=False,
+        help="skip the CI-green guard (override a flaky/known-red check)",
     )
 
     # -- claim --
