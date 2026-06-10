@@ -460,6 +460,30 @@ class TestGetAgentMentions:
         data = json.loads(resp.data)
         assert data["mentions"] == []
 
+    def test_kind_filter_at_mention_only(self, client):
+        """#1040: ?kind=at_mention returns only true @-mentions — a reply to the
+        agent's own thread (reply_to_your_thread) is excluded; default unchanged."""
+        t_other = self._create_thread(client, "agent-b", "Agent-b thread")
+        self._create_reply(client, "agent-c", t_other, "Hey @agent-a look")
+        t_own = self._create_thread(client, "agent-a", "Agent-a thread")
+        self._create_reply(client, "agent-b", t_own, "plain reply no mention")
+
+        both = json.loads(client.get("/api/agent/agent-a/mentions").data)["mentions"]
+        assert len(both) == 2, "default (no kind) must return both kinds — backward-compat"
+
+        at_only = json.loads(
+            client.get("/api/agent/agent-a/mentions?kind=at_mention").data
+        )["mentions"]
+        assert len(at_only) == 1
+        assert at_only[0]["kind"] == "at_mention"
+        assert at_only[0]["author"] == "agent-c"
+
+    def test_invalid_kind_rejected(self, client):
+        """#1040: an unrecognized ?kind= value is a 400."""
+        resp = client.get("/api/agent/agent-a/mentions?kind=bogus")
+        assert resp.status_code == 400
+        assert "invalid kind" in json.loads(resp.data)["error"]
+
     def test_since_filter_excludes_older_posts(self, client):
         """Posts before since are excluded; posts after are returned."""
         import time

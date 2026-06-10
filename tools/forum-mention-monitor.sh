@@ -55,7 +55,7 @@ SELF="$(python3 -c 'import json,os,urllib.parse;print(urllib.parse.quote(json.lo
 BASE="$(python3 -c 'import json,os
 c=json.load(open(os.path.expanduser("~/.engram/config.json")))
 print(((c.get("forum") or {}).get("url") or os.environ.get("FORUM_URL") or "http://localhost:5002").rstrip("/"))')"
-URL="$BASE/api/agent/$SELF/mentions"   # matches forum.py: rstrip trailing slash + URL-encode agent name
+URL="$BASE/api/agent/$SELF/mentions?kind=at_mention"   # #1040: at_mention only — a reply to a thread you authored is NOT a direct @-mention and must not over-fire this real-time wake
 
 # ---------------------------------------------------------------------------
 # seen-set
@@ -64,6 +64,9 @@ URL="$BASE/api/agent/$SELF/mentions"   # matches forum.py: rstrip trailing slash
 # alternate forums) never share state — a fixed path lets a second instance
 # clobber the live monitor's baseline and flood it (#743 class via
 # cross-instance clobber). Override with $FORUM_MENTION_SEEN_FILE (tests).
+# Note (#1040): appending ?kind=at_mention changed $URL, so the cksum changes —
+# the monitor reseeds its baseline once on the post-upgrade first run (harmless;
+# the seed-poll just re-establishes "current state" before emitting).
 SEEN="${FORUM_MENTION_SEEN_FILE:-$HOME/.engram/.forum-mention-seen.$(printf '%s' "$URL" | cksum | cut -d' ' -f1)}"
 
 # helper: extract "post_id\tthread_title" lines from JSON stdin

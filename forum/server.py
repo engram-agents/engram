@@ -780,7 +780,17 @@ def create_app(
             except ValueError:
                 return jsonify({"error": f"invalid since format: {since!r}"}), 400
 
-        mentions = db.get_mentions(g.conn, name, since=since)
+        # #1040: optional ?kind= filter. The forum-mention Monitor passes
+        # kind=at_mention so it wakes only on true @<name> mentions, not on
+        # every reply to a thread the agent authored. Omitted → both kinds.
+        kind = request.args.get("kind", "").strip() or None
+        if kind is not None and kind not in ("at_mention", "reply_to_your_thread"):
+            return jsonify({
+                "error": f"invalid kind: {kind!r} "
+                         "(expected 'at_mention' or 'reply_to_your_thread')",
+            }), 400
+
+        mentions = db.get_mentions(g.conn, name, since=since, kind_filter=kind)
         return jsonify({"mentions": mentions})
 
     # ------------------------------------------------------------------

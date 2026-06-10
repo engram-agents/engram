@@ -412,6 +412,53 @@ class TestGetMentions:
         result = get_mentions(conn, "agent-a")
         assert result == [], "@ari must not match @agent-a (prefix word-boundary)"
 
+    # ── #1040: kind_filter (Monitor wakes only on true @-mentions) ──────────
+
+    def _make_mixed(self, conn):
+        """Seed one at_mention (in another's thread) + one reply_to_your_thread
+        (a plain reply in agent-a's own thread)."""
+        t_other = self._make_thread(conn, "agent-b", "agent-b thread")
+        self._make_reply(conn, "agent-c", t_other, "Hey @agent-a, look")
+        t_own = self._make_thread(conn, "agent-a", "agent-a thread")
+        self._make_reply(conn, "agent-b", t_own, "plain reply, no mention")
+
+    def test_kind_filter_at_mention_excludes_thread_replies(self, conn):
+        """kind_filter='at_mention' returns ONLY true @-mentions — a reply to the
+        agent's own thread (reply_to_your_thread) is excluded."""
+        self._make_mixed(conn)
+        at_only = get_mentions(conn, "agent-a", kind_filter="at_mention")
+        assert len(at_only) == 1, at_only
+        assert at_only[0]["kind"] == "at_mention"
+        assert at_only[0]["author"] == "agent-c"
+
+    def test_kind_filter_reply_to_your_thread_only(self, conn):
+        """kind_filter='reply_to_your_thread' returns ONLY thread-replies."""
+        self._make_mixed(conn)
+        reply_only = get_mentions(conn, "agent-a", kind_filter="reply_to_your_thread")
+        assert len(reply_only) == 1, reply_only
+        assert reply_only[0]["kind"] == "reply_to_your_thread"
+
+    def test_kind_filter_none_returns_both(self, conn):
+        """Default (no kind_filter) returns both kinds — backward-compat."""
+        self._make_mixed(conn)
+        both = get_mentions(conn, "agent-a")
+        assert len(both) == 2
+        assert {m["kind"] for m in both} == {"at_mention", "reply_to_your_thread"}
+
+    def test_kind_filter_dual_match_counts_as_at_mention(self, conn):
+        """A dual-match post (a reply to agent-a's OWN thread that ALSO @-mentions
+        them) is classified at_mention (the existing 'prefer at_mention' rule), so
+        it appears under kind_filter='at_mention' and NOT under
+        'reply_to_your_thread'. Pins the interaction so a future refactor can't
+        silently change it — a reply-filter audit deliberately won't surface a
+        post that also @-mentioned the agent."""
+        tid = self._make_thread(conn, "agent-a", "agent-a thread")
+        self._make_reply(conn, "agent-b", tid, "replying, and @agent-a here too")
+        at_only = get_mentions(conn, "agent-a", kind_filter="at_mention")
+        assert len(at_only) == 1 and at_only[0]["kind"] == "at_mention", at_only
+        reply_only = get_mentions(conn, "agent-a", kind_filter="reply_to_your_thread")
+        assert reply_only == [], "a dual-match post counts as at_mention, not reply_to_your_thread"
+
     def test_at_mention_word_boundary_suffix(self, conn):
         """@agent-ax does NOT trigger a mention for agent 'agent-a'."""
         tid = self._make_thread(conn, "agent-b", "agent-b thread")

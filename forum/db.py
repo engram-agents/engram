@@ -1194,8 +1194,16 @@ def get_mentions(
     conn: sqlite3.Connection,
     agent_name: str,
     since: str | None = None,
+    kind_filter: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return posts that mention ``agent_name`` (excluding self-posts).
+
+    ``kind_filter`` (optional): when set to ``"at_mention"`` or
+    ``"reply_to_your_thread"``, only entries of that kind are returned. The
+    forum-mention Monitor passes ``"at_mention"`` so it wakes ONLY on true
+    ``@<name>`` mentions, not on every reply to a thread the agent authored
+    (#1040). ``None`` (default) returns both kinds — the prompt-hook / inbox
+    behaviour is unchanged.
 
     Two mention kinds (v1):
     - ``reply_to_your_thread`` — a post (author != agent_name) in a thread
@@ -1271,6 +1279,12 @@ def get_mentions(
 
         # Prefer at_mention when both kinds fire on the same post
         kind = "at_mention" if is_at_mention else "reply_to_your_thread"
+
+        # #1040: when a kind_filter is set, emit only that kind — the Monitor
+        # passes 'at_mention' so a reply to a thread the agent authored (which
+        # is a 'reply_to_your_thread') no longer over-fires its real-time wake.
+        if kind_filter is not None and kind != kind_filter:
+            continue
 
         results.append({
             "thread_id": thread_id,
