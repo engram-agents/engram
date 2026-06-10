@@ -251,14 +251,16 @@ def _enumerate_candidate_paths() -> set[str]:
             if os.path.isfile(full):
                 candidates.add(f"output-styles/claude/{fname}")
 
-    # tools/*: per top-level item (files and directories), excluding __pycache__
-    # build-plugin.sh copies only manifest-listed entries, never __pycache__
-    tools_dir = os.path.join(REPO_ROOT, "tools")
-    if os.path.isdir(tools_dir):
-        for fname in os.listdir(tools_dir):
-            if fname == "__pycache__" or fname.endswith(".pyc"):
-                continue
-            candidates.add(f"tools/{fname}")
+    # tools/*: per top-level item — derived from git-tracked files only.
+    # Using git ls-files (via _enumerate_all_tracked_paths) avoids false-positives
+    # from empty dirs left over after file archival (e.g. tools/migration/ after #984).
+    # An empty untracked directory has no tracked files and is not a shippable candidate.
+    all_tracked = _enumerate_all_tracked_paths()
+    for p in all_tracked:
+        if p.startswith("tools/"):
+            parts = p.split("/")
+            if len(parts) >= 2 and parts[1] != "__pycache__":
+                candidates.add(f"tools/{parts[1]}")
 
     # Top-level named files
     for fname in [
