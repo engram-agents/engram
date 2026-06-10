@@ -393,6 +393,87 @@ def _pr_ci_state(pr_number: str) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Approval-staleness helper for the flip guard (#1002)
+# ---------------------------------------------------------------------------
+
+def _pr_approval_state(pr_number: str) -> tuple:
+    """Query GitHub for post-approval tip movement on a pull request via `gh`.
+
+    Companion to _pr_ci_state (#974): that guard checks CI is green NOW;
+    this one checks the green tip is the APPROVED tip — a commit pushed
+    after the latest approval re-triggers CI and invalidates the reviewed
+    state ("re-check after ANY post-approval commit", CLAUDE.md).
+
+    Returns (state, detail) where state is one of:
+      "fresh"       — latest approval is at-or-after the latest commit
+      "stale"       — at least one commit is newer than the latest approval
+      "no_approval" — PR has no APPROVED review; this gate passes through
+                      (approval-existence is the colleague-layer's
+                      jurisdiction, not a timestamp question)
+      "unknown"     — could not obtain a verdict (degraded; advisory only)
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", pr_number,
+             "--json", "commits,reviews"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except FileNotFoundError:
+        return ("unknown", "gh not found on PATH")
+    except subprocess.TimeoutExpired:
+        return ("unknown", "gh timed out after 15s")
+    except OSError as exc:
+        return ("unknown", f"gh exec error: {exc}")
+
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip() or f"gh exit {result.returncode}"
+        return ("unknown", detail)
+
+    raw = (result.stdout or "").strip()
+    if not raw:
+        return ("unknown", "gh returned empty output")
+
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return ("unknown", "gh returned unparseable JSON")
+
+    commits = data.get("commits")
+    reviews = data.get("reviews")
+    if not isinstance(commits, list) or not commits:
+        return ("unknown", "commits missing or empty")
+    if not isinstance(reviews, list):
+        return ("unknown", "reviews missing or not a list")
+
+    # Latest commit timestamp. The commits list carries committedDate per
+    # entry; ISO-8601 UTC strings compare correctly as strings, but guard
+    # against missing fields rather than assuming shape.
+    commit_dates = [c.get("committedDate") for c in commits
+                    if isinstance(c, dict) and c.get("committedDate")]
+    if not commit_dates:
+        return ("unknown", "no committedDate on any commit")
+    latest_commit = max(commit_dates)
+
+    approval_dates = [r.get("submittedAt") for r in reviews
+                      if isinstance(r, dict)
+                      and (r.get("state") or "").upper() == "APPROVED"
+                      and r.get("submittedAt")]
+    if not approval_dates:
+        return ("no_approval", "no APPROVED review on the PR")
+    latest_approval = max(approval_dates)
+
+    if latest_commit > latest_approval:
+        return (
+            "stale",
+            f"tip committed {latest_commit} is newer than the latest "
+            f"approval {latest_approval}",
+        )
+    return ("fresh", f"latest approval {latest_approval} covers the tip")
+
+
+# ---------------------------------------------------------------------------
 # Turn log helpers
 # ---------------------------------------------------------------------------
 
@@ -696,6 +777,37 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
                 file=sys.stderr,
             )
         # green: proceed silently
+
+        # Post-approval re-check guard (#1002): companion to the CI-green
+        # guard above. Even with CI green on the current tip, a commit
+        # pushed AFTER the latest approval means the maintainer would merge
+        # a tip nobody approved — reject the flip until re-review (or
+        # --force). no_approval passes through: approval-existence is the
+        # colleague-layer's gate, not this timestamp compare's.
+        _ap_state, _ap_detail = _pr_approval_state(_pr_num)
+        if _ap_state == "stale":
+            if _flip_force:
+                print(
+                    f"warning: --force — flipping despite post-approval tip "
+                    f"movement on PR #{_pr_num} ({_ap_detail})",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"baton flip: tip moved after approval on PR #{_pr_num} "
+                    f"({_ap_detail}). The approved commit is not the commit "
+                    "the maintainer would merge — request a re-review of the "
+                    "new tip, or pass --force to override.",
+                    file=sys.stderr,
+                )
+                sys.exit(EXIT_VALIDATION)
+        elif _ap_state == "unknown":
+            print(
+                f"warning: could not verify post-approval state for PR "
+                f"#{_pr_num} ({_ap_detail}) — proceeding anyway",
+                file=sys.stderr,
+            )
+        # fresh / no_approval: proceed silently
 
     now = _now_iso()
     from_agent = fields.get("turn", agent_name or "unknown").strip().lower()

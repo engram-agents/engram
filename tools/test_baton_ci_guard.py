@@ -50,6 +50,18 @@ def reset_pool_sentinel_cache():
     baton._POOL_SENTINEL_CACHE.clear()
 
 
+@pytest.fixture(autouse=True)
+def approval_always_fresh(monkeypatch):
+    """The post-approval guard (#1002) now runs on the same sentinel-flip path
+    after the CI guard; pin it fresh so this file keeps isolating the #685/#974
+    CI guard (and stays hermetic — no real gh call from the new helper).
+    The #1002 guard has its own suite: test_baton_approval_guard.py."""
+    monkeypatch.setattr(
+        baton, "_pr_approval_state",
+        lambda pr_num: ("fresh", "latest approval covers the tip"),
+    )
+
+
 @pytest.fixture
 def projects_dir(tmp_path, monkeypatch):
     """Temporary baton projects directory; patched into the module."""
