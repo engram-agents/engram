@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from context_tracker import find_active_jsonl, write_baseline
+from context_tracker import find_active_jsonl
 
 # Inter-agent dir (mirrors ia.py convention)
 INTER_AGENT_DIR = os.environ.get("INTER_AGENT_DIR", "/home/agents-shared/inter-agent")
@@ -183,16 +183,6 @@ def main() -> None:
             json.dump(marker, f)
     except OSError:
         pass
-
-    # Legacy call retained for back-compat with the old write_baseline
-    # signature; it's a no-op in the current stateless tracker, but importing
-    # and calling it preserves the structural contract for any older
-    # context_tracker still in flight.
-    try:
-        write_baseline(use_compact_boundary=False)
-    except TypeError:
-        # Newer signature — safe to ignore the kwarg.
-        write_baseline()
 
     # Starred letters surface: emit as additionalContext so load-bearing
     # cross-session agreements survive the experiential reset. Silent skip on

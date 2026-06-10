@@ -363,10 +363,11 @@ def estimate_usage(transcript_path: str | None = None, session_id: str | None = 
 
 
 def write_baseline(use_compact_boundary: bool = True) -> None:
-    """No-op — retained so session-start and post-compact hooks still import.
+    """No-op — retained for the session-start hook.
 
     The stateless tracker recomputes on every call; there is no baseline to
-    write. Remove the import from the hooks when convenient.
+    write. Post-compact hooks no longer import this (cleanup: #982).
+    Remove entirely when the session-start hook is updated.
     """
     return
 
