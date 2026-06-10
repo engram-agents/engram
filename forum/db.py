@@ -48,6 +48,15 @@ except Exception:
 _VEC_BACKEND_AVAILABLE = _SQLITE_VEC_IMPORT_OK
 
 
+# ---------------------------------------------------------------------------
+# Agent-status constants
+# ---------------------------------------------------------------------------
+
+#: Valid states an agent may publish.  'offline' is server-computed only;
+#: set_agent_status raises ValueError if a client attempts to publish it.
+PUBLISHABLE_STATES: frozenset[str] = frozenset({"idle", "working", "sleeping"})
+
+
 def _load_vec_extension(conn: sqlite3.Connection) -> bool:
     """Load the sqlite-vec extension on a connection. Returns True on success.
 
@@ -389,6 +398,21 @@ def init_db(conn: sqlite3.Connection, categories_config: str | None = None) -> N
     )
 
     # ----------------------------------------------------------------
+    # Agent-status columns (slice 1 of #956)
+    # Four NULL-default columns added to agents; PRAGMA-guarded so the
+    # ALTER is a no-op on DBs that already have the column.
+    # ----------------------------------------------------------------
+    agent_cols = {r[1] for r in conn.execute("PRAGMA table_info(agents)")}
+    if "status_state" not in agent_cols:
+        conn.execute("ALTER TABLE agents ADD COLUMN status_state TEXT")
+    if "status_activity" not in agent_cols:
+        conn.execute("ALTER TABLE agents ADD COLUMN status_activity TEXT")
+    if "status_queue" not in agent_cols:
+        conn.execute("ALTER TABLE agents ADD COLUMN status_queue TEXT")
+    if "status_updated_at" not in agent_cols:
+        conn.execute("ALTER TABLE agents ADD COLUMN status_updated_at TEXT")
+
+    # ----------------------------------------------------------------
     # vec0 virtual tables (created only when sqlite-vec is available).
     # Their absence must never break the forum -- all writes succeed
     # whether or not the vec tables exist.
@@ -455,6 +479,132 @@ def set_pair_initials(
 
 
 # ---------------------------------------------------------------------------
+# Agent-status helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_status(
+    row: sqlite3.Row | tuple,
+    now: datetime,
+    window_minutes: int,
+    stale_factor: int = 2,
+) -> dict[str, Any]:
+    """Compute the display-status dict for a single agent row.
+
+    ``row`` must expose positional columns in the order:
+        last_seen_at, status_state, status_activity, status_queue, status_updated_at
+
+    Offline override (load-bearing safety property): when
+    ``(now - last_seen_at) > window``, state is forced to ``'offline'`` and
+    the published activity/queue are **suppressed** regardless of what the
+    agent last published.  A crashed agent whose last published state was
+    ``'working'`` must never leak that stale claim.
+
+    Online path:
+    - state  = published status_state, or ``'idle'`` if never published.
+    - activity / queue = as published (None / [] if never published).
+    - status_stale = True when the agent is online but its last status publish
+      is older than ``stale_factor * window``.
+
+    Returns:
+        {state, activity, queue, status_updated_at, status_stale}
+    """
+    last_seen_str: str | None = row[0]
+    status_state: str | None = row[1]
+    status_activity: str | None = row[2]
+    status_queue_raw: str | None = row[3]
+    status_updated_at: str | None = row[4]
+
+    # Parse last_seen_at; treat NULL / unparseable as epoch (definitely offline).
+    try:
+        last_seen = datetime.fromisoformat(
+            last_seen_str.replace("Z", "+00:00")
+        ) if last_seen_str else datetime.fromtimestamp(0, tz=timezone.utc)
+    except (ValueError, AttributeError):
+        last_seen = datetime.fromtimestamp(0, tz=timezone.utc)
+
+    window_td = timedelta(minutes=window_minutes)
+    is_offline = (now - last_seen) > window_td
+
+    if is_offline:
+        return {
+            "state": "offline",
+            "activity": None,
+            "queue": [],
+            "status_updated_at": None,
+            "status_stale": False,
+        }
+
+    # Online path.
+    state = status_state if status_state in PUBLISHABLE_STATES else "idle"
+
+    queue: list[str] = []
+    if status_queue_raw:
+        try:
+            parsed = json.loads(status_queue_raw)
+            if isinstance(parsed, list):
+                queue = [str(item) for item in parsed]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Staleness: online but status publish is old.
+    status_stale = False
+    if status_updated_at is not None:
+        try:
+            updated = datetime.fromisoformat(
+                status_updated_at.replace("Z", "+00:00")
+            )
+            if (now - updated) > stale_factor * window_td:
+                status_stale = True
+        except (ValueError, AttributeError):
+            pass
+
+    return {
+        "state": state,
+        "activity": status_activity,
+        "queue": queue,
+        "status_updated_at": status_updated_at,
+        "status_stale": status_stale,
+    }
+
+
+def set_agent_status(
+    conn: sqlite3.Connection,
+    name: str,
+    state: str,
+    activity: str | None = None,
+    queue: list[str] | None = None,
+) -> None:
+    """Persist an agent's published status.
+
+    Upserts the agent (bumps last_seen_at), then writes the four status
+    columns and sets status_updated_at to now.
+
+    ``queue`` is stored as a JSON array; None is stored as ``'[]'``.
+
+    Raises:
+        ValueError: if ``state`` is not in PUBLISHABLE_STATES.
+            Callers / endpoints must map this to a 400 response.
+    """
+    if state not in PUBLISHABLE_STATES:
+        raise ValueError(
+            f"state {state!r} is not publishable; "
+            f"allowed: {sorted(PUBLISHABLE_STATES)!r}.  "
+            "'offline' is server-computed and cannot be published by a client."
+        )
+    upsert_agent(conn, name)
+    now = _now_iso()
+    queue_json = json.dumps(queue if queue is not None else [])
+    conn.execute(
+        "UPDATE agents "
+        "SET status_state = ?, status_activity = ?, "
+        "    status_queue = ?, status_updated_at = ? "
+        "WHERE name = ?",
+        (state, activity, queue_json, now, name),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
 # Online
 # ---------------------------------------------------------------------------
 def list_online(
@@ -464,21 +614,79 @@ def list_online(
 
     Returns:
         (online_agents, online_count, registered_total)
-        Each online_agent dict: {name, avatar_seed, pair_initials}.
+        Each online_agent dict: {name, avatar_seed, pair_initials, state,
+        activity, queue, status_updated_at, status_stale}.
+
+        The first three keys (name, avatar_seed, pair_initials) are the same
+        as before — additive only; existing consumers keep working.
     """
     cutoff = (
         datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
     ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     rows = conn.execute(
-        "SELECT name, avatar_seed, pair_initials "
+        "SELECT name, avatar_seed, pair_initials, "
+        "       last_seen_at, status_state, status_activity, "
+        "       status_queue, status_updated_at "
         "FROM agents WHERE last_seen_at > ?",
         (cutoff,),
     ).fetchall()
     registered: int = conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
-    online_agents = [
-        {"name": r[0], "avatar_seed": r[1], "pair_initials": r[2]} for r in rows
-    ]
+    now = datetime.now(timezone.utc)
+    online_agents = []
+    for r in rows:
+        # Columns 3-7 feed _resolve_status (last_seen_at + 4 status cols).
+        status = _resolve_status(r[3:], now, window_minutes)
+        online_agents.append({
+            "name": r[0],
+            "avatar_seed": r[1],
+            "pair_initials": r[2],
+            **status,
+        })
     return online_agents, len(online_agents), registered
+
+
+def list_board(
+    conn: sqlite3.Connection, window_minutes: int = 15
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Return ALL registered agents for the full status board.
+
+    Unlike ``list_online``, this includes offline agents so the board can
+    show a complete view of all peers.  Offline agents appear with
+    ``state='offline'`` and suppressed activity/queue (safety property).
+
+    Returns:
+        (board, online_count, registered_total)
+        Each board dict: {name, avatar_seed, pair_initials, state, activity,
+        queue, status_updated_at, status_stale}.
+
+    Sort order: online agents first (by name), then offline agents (by name).
+    """
+    rows = conn.execute(
+        "SELECT name, avatar_seed, pair_initials, "
+        "       last_seen_at, status_state, status_activity, "
+        "       status_queue, status_updated_at "
+        "FROM agents "
+        "ORDER BY name",
+    ).fetchall()
+    registered: int = len(rows)
+    now = datetime.now(timezone.utc)
+    board = []
+    online_count = 0
+    for r in rows:
+        status = _resolve_status(r[3:], now, window_minutes)
+        entry = {
+            "name": r[0],
+            "avatar_seed": r[1],
+            "pair_initials": r[2],
+            **status,
+        }
+        board.append(entry)
+        if status["state"] != "offline":
+            online_count += 1
+
+    # Sort: online first, then offline; within each group, alphabetical by name.
+    board.sort(key=lambda e: (0 if e["state"] != "offline" else 1, e["name"]))
+    return board, online_count, registered
 
 
 # ---------------------------------------------------------------------------

@@ -696,6 +696,76 @@ def create_app(
         return jsonify({"online": online_agents, "count": count, "registered": registered})
 
     # ------------------------------------------------------------------
+    # POST /api/agents/status  (slice 1 of #956)
+    # ------------------------------------------------------------------
+    @app.route("/api/agents/status", methods=["POST"])
+    def api_agents_status():
+        """Publish an agent's derived status.
+
+        Body: {agent, state, activity?, queue?}
+        - state must be one of PUBLISHABLE_STATES ('idle'/'working'/'sleeping').
+          'offline' is server-computed and is rejected with 400.
+        - queue, if present, must be a JSON array of strings.
+        No audit write: high-frequency heartbeat, same rationale as online polls.
+        """
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent_name = (data.get("agent") or "").strip()
+        if not agent_name:
+            return jsonify({"error": "agent is required"}), 400
+
+        state = data.get("state")
+        if state is None:
+            return jsonify({"error": "state is required"}), 400
+
+        queue = data.get("queue")
+        if queue is not None and not isinstance(queue, list):
+            return jsonify({"error": "queue must be a list"}), 400
+
+        activity = data.get("activity") or None
+
+        try:
+            db.set_agent_status(
+                g.conn,
+                agent_name,
+                state=state,
+                activity=activity,
+                queue=queue,
+            )
+        except ValueError as exc:
+            allowed = sorted(db.PUBLISHABLE_STATES)
+            return jsonify({
+                "error": str(exc),
+                "allowed_states": allowed,
+                "note": "'offline' is server-computed and cannot be published",
+            }), 400
+
+        return jsonify({"status": "published", "agent": agent_name, "state": state}), 200
+
+    # ------------------------------------------------------------------
+    # GET /api/agents/board  (slice 1 of #956)
+    # ------------------------------------------------------------------
+    @app.route("/api/agents/board")
+    def api_agents_board():
+        """Return all registered agents (including offline) for the status board.
+
+        Optional ?agent= self-touch (mirrors api_agents_online).
+        Response: {board: [...], online_count: <int>, registered: <n>}
+
+        Note: the count key is ``online_count`` (an int), distinct from
+        /api/agents/online's ``online`` (a list) — sibling endpoints must not
+        reuse the same key name for different types.
+        """
+        agent_name = request.args.get("agent")
+        if agent_name:
+            db.upsert_agent(g.conn, agent_name)
+
+        board, online_count, registered = db.list_board(g.conn)
+        return jsonify({"board": board, "online_count": online_count, "registered": registered})
+
+    # ------------------------------------------------------------------
     # GET /api/agent/<name>/mentions
     # ------------------------------------------------------------------
     @app.route("/api/agent/<name>/mentions")
