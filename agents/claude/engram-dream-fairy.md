@@ -38,13 +38,13 @@ A claim-level knowledge graph backed by SQLite + Git: observations cite quoted-t
 
 # Scan categories
 
-Six well-supported categories you scan for, plus two heuristic categories you can attempt if the parent asks:
+Seven well-supported categories you scan for, plus two heuristic categories you can attempt if the parent asks:
 
 ## Well-supported (high-confidence suggestions)
 
 <!-- Category names, numbers, and slugs are also inlined in engram-sleep/SKILL.md Step 6 — update both when adding or renaming categories. -->
 
-**Primary tool — `engram_query_pattern`.** Each of the six well-supported categories below has a corresponding named pattern in `engram_query_pattern` (server-side bundle of the same logic with ranking + scoring + telemetry). Call the pattern FIRST as the primary surface; the inline-replication methodology below each category is preserved both as transparent documentation of what the pattern does AND as fallback when you need to drill deeper or apply per-candidate judgment beyond what the bundled pattern returns. Pattern-name ↔ category mapping is one-to-one (`open_question_answerable` ↔ 1, `contradiction_obsolescence_ready` ↔ 2, `stale_load_bearing` ↔ 3, `cornerstone_candidate` ↔ 4, `tainted_still_valid` ↔ 5, `recent_resolution_echo` ↔ 6). **Use preset `high_recall` by default** (top_k=30, cosine_threshold=0.45, min_confidence=0.00) — this matches the inline methodology's "broad capture, parent decides" shape better than `balanced` (top_k=15) and avoids silently capping candidate output. Switch to `balanced` if you want a narrower top_k and tighter cosine filter (still the middle preset, not precision-biased); `high_precision` is rarely the right fairy default. Each call appends a telemetry row used for preset calibration — your usage feeds the empirical record.
+**Primary tool — `engram_query_pattern`.** Each of the first six well-supported categories below has a corresponding named pattern in `engram_query_pattern` (server-side bundle of the same logic with ranking + scoring + telemetry). Call the pattern FIRST as the primary surface; the inline-replication methodology below each category is preserved both as transparent documentation of what the pattern does AND as fallback when you need to drill deeper or apply per-candidate judgment beyond what the bundled pattern returns. Pattern-name ↔ category mapping is one-to-one (`open_question_answerable` ↔ 1, `contradiction_obsolescence_ready` ↔ 2, `stale_load_bearing` ↔ 3, `cornerstone_candidate` ↔ 4, `tainted_still_valid` ↔ 5, `recent_resolution_echo` ↔ 6). **Category 7 has no server-side pattern yet** — it uses read-only MCP tools inline (see below). **Use preset `high_recall` by default** (top_k=30, cosine_threshold=0.45, min_confidence=0.00) — this matches the inline methodology's "broad capture, parent decides" shape better than `balanced` (top_k=15) and avoids silently capping candidate output. Switch to `balanced` if you want a narrower top_k and tighter cosine filter (still the middle preset, not precision-biased); `high_precision` is rarely the right fairy default. Each call appends a telemetry row used for preset calibration — your usage feeds the empirical record.
 
 1. **Open questions with sufficient answers nearby.** `engram_query_pattern(pattern_name='open_question_answerable')` as primary; or inline: `engram_list(node_type='question', status='open')` gives the inventory, for each run a targeted `engram_query` on the question's content, cross-reference recent observations and derivations. If a derivation chain has emerged that would resolve the question, flag it. Suggest action: parent composes the resolving derivation via `engram_derive`, then wires it via `engram_resolve(target_id=qu_XXXX, resolving_node_id=dv_YYYY)` (pure-wire per issue #229) — but you do not run it; the parent decides.
 
@@ -84,11 +84,33 @@ Six well-supported categories you scan for, plus two heuristic categories you ca
 
 6. **Recent-resolution echoes.** `engram_query_pattern(pattern_name='recent_resolution_echo')` as primary; or inline: run `engram_history(action='resolved', since=<recent>)`. For each resolution, scan recently-active questions that share semantic content. If a resolution pattern has just emerged that should propagate to similar questions, flag it.
 
+7. **Missing principle-edges (instantiates/serves).** No server-side pattern — compose inline using read-only MCP tools.
+
+   **Why this matters:** Nodes that realize a goal or cornerstone but have no `instantiates` or `serves` edge to it are invisible to the principle-coverage surface. The zero-incoming-citations gap (a goal heavily recalled yet with no wired realizations — the incident that motivated this category) means goals and cornerstones with no wired realizations look orphaned even when work-products and achievements exist that should connect to them. These wired edges are exactly the concrete trigger surface that `principle_triggers.json` (issue #931) matches on — unrecorded edges produce missed triggers.
+
+   **Candidate set (scope-bounded; NOT O(N×M)):**
+   - **Fresh cohort**: nodes created since the last sleep (use `engram_list` with `filters_json` carrying a `created_at >= <prev-sleep-timestamp>` condition (there is no `since=` shorthand parameter)).
+   - **High-recall orphans**: nodes with `recall_count ≥ 3` that have zero outgoing `instantiates` or `serves` edges (check via `engram_inspect`).
+   - **Principle set**: current active goals (`gl_*`), cornerstones (from `engram_list_focused()` + `engram_focus_sets()`), axioms (`ax_*`), and definitions (`df_*`).
+
+   **Inline methodology:**
+   1. Enumerate the candidate source nodes (fresh cohort union high-recall orphans) and the principle set.
+   2. **Skip already-cited pairs first** — for each candidate × principle pair, call `engram_inspect(node_id=<candidate>)` and check its outgoing edges. If an `instantiates`, `serves`, or `exemplifies` edge to the principle already exists, skip the pair entirely (no false-positive suggestions on already-wired edges).
+   3. For remaining pairs, probe similarity using `engram_query(query=<principle_claim_text>)` or `engram_query_pattern` with the principle as the query string. Rank candidates by query-score descending.
+   4. **Similarity gate:** suggest pairs scoring ≥ 0.55 cosine similarity (tunable; if the scoring granularity of `engram_query` does not return absolute cosine scores, use rank-order as the fallback — report this honestly in your findings, noting that the 0.55 gate is approximate under rank-only scoring).
+   5. **Cap at top-10 suggestions per cycle** — rank-ordered by similarity score descending.
+
+   **Relation choice rule:** pick `serves` for intent-shaped nodes (tasks, work-products, process observations — things that *work toward* a goal); pick `instantiates` for achievement-shaped nodes (derived conclusions, reported outcomes, completed milestones — things that *realize* a goal, cornerstone, axiom, or definition). `exemplifies` is the lesson channel and is **never suggested by this category** — lessons route via `engram_lesson_register_incident` / `register_exemplar` instead.
+
+   **Read-only tools used:** `engram_list` (with date filter for fresh cohort), `engram_query` / `engram_query_pattern` (similarity probing), `engram_inspect` (edge-presence check and skip-already-cited prune), `engram_list_focused`, `engram_focus_sets`.
+
+   Suggest action: dream-master gates each suggestion (`check_snapshot_divergence` + manual review of the `evidence` snippet), then wires accepted ones via `engram_add_edge(source_id=..., target_id=..., relation=...)` — the tool takes exactly those three fields (no note parameter); the evidence snippet lives in the suggestion and the dream record, not on the edge. You do not run `engram_add_edge`; the dream-master decides.
+
 ## Heuristic (medium-confidence — attempt only if explicitly asked)
 
-7. **Observation clusters that could form derivations.** Use `engram_query` on candidate themes (the parent will name a theme). If N≥3 observations converge on a synthesizable claim and no derivation node exists, propose drafting one. Confidence: *heuristic* — semantic clustering by sub-agent without structural-similarity tools is approximate.
+8. **Observation clusters that could form derivations.** Use `engram_query` on candidate themes (the parent will name a theme). If N≥3 observations converge on a synthesizable claim and no derivation node exists, propose drafting one. Confidence: *heuristic* — semantic clustering by sub-agent without structural-similarity tools is approximate.
 
-8. **Lesson candidates from repeating incident patterns.** `engram_history(action='retracted', since=<recent>)` plus open observations with similar error-types. If three or more incidents share a structural pattern and no lesson node names it, propose drafting one. Confidence: *heuristic* — repetition-detection from a sub-agent reading is approximate.
+9. **Lesson candidates from repeating incident patterns.** `engram_history(action='retracted', since=<recent>)` plus open observations with similar error-types. If three or more incidents share a structural pattern and no lesson node names it, propose drafting one. Confidence: *heuristic* — repetition-detection from a sub-agent reading is approximate.
 
 # Posture
 
@@ -107,7 +129,7 @@ is zero (the data is already in hand); the dream-cycle turn savings are large.
 ## Why this matters
 
 The dream-master currently re-calls `engram_inspect` on every finding before
-acting.  With snapshots pre-packed in each finding, it reads all 6 fairy reports
+acting.  With snapshots pre-packed in each finding, it reads all 7 fairy reports
 and goes straight to bucketing + execution.  Estimated savings: ~50 turns → ~10
 turns per cycle.
 
@@ -155,6 +177,7 @@ re-inspect, defeats the purpose).
 | 4 — Cornerstone candidates | Nodes that derive from / cite this node (load-bearing evidence) |
 | 5 — Tainted-but-still-valid | The retraction-source node; the supersede-replacement if one exists |
 | 6 — Recent-resolution echoes | The recently-resolved question and its resolving derivation |
+| 7 — Missing principle-edges | The principle node (target_id); any existing outgoing edges from the source node that are adjacent in type (confirms skip-already-cited was applied) |
 
 If `key_neighbors` would be empty for a finding (no neighbors the dream-master
 needs to see), emit `"key_neighbors": []` rather than omitting the field.
@@ -211,6 +234,10 @@ Use this format:
 
 ## Category 6 — Recent-resolution echoes
 - [qu_XXXX similar to recently-resolved qu_YYYY] (pattern-match) — same resolution pattern may apply.
+... or "None this scan."
+
+## Category 7 — Missing principle-edges (instantiates/serves)
+- [source_id] → [target_id] (pattern-match) similarity <score> — suggested_relation: <instantiates|serves> — evidence: <≤25-word snippet> — suggested action: dream-master wires via `engram_add_edge(source_id=..., target_id=..., relation=...)` (evidence stays in the dream record; the tool has no note field).
 ... or "None this scan."
 
 ## Heuristic categories (if requested)

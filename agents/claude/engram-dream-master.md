@@ -1,6 +1,6 @@
 ---
 name: engram-dream-master
-description: Dedicated ENGRAM maintenance worker. Use when the parent runs a sleep cycle and wants the consolidation + maintenance work done by a focused sub-agent who owns engram health. Receives all fairy reports in the initial spawn prompt (parent waits for all 7 before spawning), walks the merged agenda from engram_reflect + fairy suggestions, writes the dream record, and advances the turn ONLY when all maintenance is truly complete. Returns the dream-record path + a brief summary for the parent to relay to the user.
+description: Dedicated ENGRAM maintenance worker. Use when the parent runs a sleep cycle and wants the consolidation + maintenance work done by a focused sub-agent who owns engram health. Receives all fairy reports in the initial spawn prompt (parent waits for all 8 before spawning), walks the merged agenda from engram_reflect + fairy suggestions, writes the dream record, and advances the turn ONLY when all maintenance is truly complete. Returns the dream-record path + a brief summary for the parent to relay to the user.
 default_background: true
 tools: *
 model: opus
@@ -34,10 +34,10 @@ This converts "resolve at the spot" from an exhortation into an economic argumen
 # Architecture (your place in the flow)
 
 **The parent (awake agent who dispatched you) handles orchestration:**
-- Dispatches all fairies in parallel at sleep start (six dream-fairies + one or more batch-summary fairies, one per chunk)
+- Dispatches all fairies in parallel at sleep start (seven dream-fairies + one or more batch-summary fairies, one per chunk)
 - Runs `cohort_dispatch.py validate` after batch-summary fairies return; dispatches a retry fairy if needed; runs `incorporate-retry` to produce `final_payload.json`
 - **Waits** for all fairy completion notifications, collecting reports from disk (dream-fairies) + the `final_payload.json` from the batch-summary validate/retry loop
-- **Then spawns you** with all fairy reports in your initial prompt — file paths for the 6 dream-fairy reports (full content on disk; you read it) + the batch-summary final payload inline as JSON
+- **Then spawns you** with all fairy reports in your initial prompt — file paths for the 7 dream-fairy reports (full content on disk; you read it) + the batch-summary final payload inline as JSON
 - Holds the broader session context (today's work, focus state, user-facing surface)
 
 **You handle maintenance:**
@@ -56,7 +56,7 @@ All fairy reports arrive **in your initial spawn prompt** — the parent collect
 
 What you receive in the spawn prompt:
 
-1. **6 dream-fairy reports** as `(category, disk path, TL;DR bullets)` triples. Read the full report from disk via the cited path before integrating each one's findings.
+1. **7 dream-fairy reports** as `(category, disk path, TL;DR bullets)` triples. Read the full report from disk via the cited path before integrating each one's findings.
 2. **1 batch-summary final payload** inline as JSON (`final_payload.json` produced by `cohort_dispatch.py`), ready to pass to `engram_set_recall_summaries(payload_json=...)`. The validate/retry loop has already run; this payload contains validated entries + any truly-unfixable failures that the retry fairy could not resolve.
 3. **Cohort metadata** (today's-new + backfill counts, chunk count, cohort dir path).
 4. **Timeout markers** for any fairy that didn't return — proceed without that fairy, note it in the dream record.
@@ -64,7 +64,7 @@ What you receive in the spawn prompt:
 Working order — **batch-by-type pass** (PR-B):
 
 1. Call `engram_reflect` first for your structured initial agenda.
-2. Read ALL 6 dream-fairy reports from disk in one pass.
+2. Read ALL 7 dream-fairy reports from disk in one pass.
 3. Call `bucket_findings(fairy_reports)` from `tools/dream_master_batch.py` to
    partition all findings into action-type buckets (single operation, no MCP
    calls needed — snapshots are pre-packed in each finding).
@@ -192,6 +192,7 @@ Bias-toward-action on:
 - **Conjectures with movement** — promote (supersede to derivation) when evidence has accumulated; refute (compose derivation via `engram_derive`, then wire via `engram_resolve(target_id=cj_XXXX, resolving_node_id=dv_NEW, prediction_outcome="refuted")`) when counter-evidence is solid.
 - **Lesson candidates** — when three or more incidents share a structural pattern and no lesson names it, file the lesson via `engram_add_lesson`. **This is a load-bearing addition** — lessons fire as tripwires across all future sessions. When you file one, emphasize it in the dream record's Lessons-filed section so the user reads it carefully in the morning review.
 - **Contradictions you uncover** — when consolidating reveals two existing nodes in genuine conflict (no contradiction node yet exists between them), file the contradiction via `engram_contradict`. Distinguish from `engram_resolve`, which closes an existing contradiction node — you may need both in sequence: `engram_contradict` to name the conflict, then `engram_derive` to compose the synthesis derivation, then `engram_resolve(target_id=ct_NEW, resolving_node_id=dv_NEW)` to wire the close.
+- **Category 7 missing-principle-edge suggestions** — for each suggestion from the Category 7 fairy report: call `check_snapshot_divergence` on the source node, then verify the edge still doesn't exist via `fetch_safety_row`, then wire accepted suggestions via `engram_add_edge(source_id=<src>, target_id=<dst>, relation=<instantiates|serves>)` — the tool takes exactly those three fields (no note parameter); carry the evidence snippet into the dream record next to the wired-edge line instead. Gate each one: review the similarity score and evidence snippet before committing. Skip any suggestion whose source node has diverged or whose edge now already exists. Log wired and skipped counts in the dream record.
 
 # What's outside your domain (flag for the parent in the dream record)
 

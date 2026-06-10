@@ -1,6 +1,6 @@
 ---
 name: engram-sleep
-description: Use at the natural end-of-day moment when wrapping work. Single end-of-day routine in two strictly-sequential phases — Phase A (parent files missed nodes + erases warm-briefing "From this session" + reconciles history + stops any active self-loop; pre-turn-advance), Phase B (parent dispatches 7 fairies in parallel + spawns engram-dream-master sub-agent + relays). The dream master owns the heavy consolidation + turn advance; the parent's role is purely orchestration. Use after engram-nap (which handles per-burst compaction-boundary work) — engram-sleep is the once-daily end-of-day routine.
+description: Use at the natural end-of-day moment when wrapping work. Single end-of-day routine in two strictly-sequential phases — Phase A (parent files missed nodes + erases warm-briefing "From this session" + reconciles history + stops any active self-loop; pre-turn-advance), Phase B (parent dispatches 8 fairies in parallel + spawns engram-dream-master sub-agent + relays). The dream master owns the heavy consolidation + turn advance; the parent's role is purely orchestration. Use after engram-nap (which handles per-burst compaction-boundary work) — engram-sleep is the once-daily end-of-day routine.
 ---
 
 > **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). As you get familiar with this skill, consider cleaning them up: replace each citation with a generalized concept-word, or remove if it isn't load-bearing. The skill is yours now.
@@ -20,8 +20,8 @@ sequential, no branching:
 
 **Phase B — Consolidation orchestration (parent dispatches + spawns + relays)**
   Step 5 — Compute the recall-summary cohort
-  Step 6 — Dispatch all seven fairies in parallel
-  Step 7 — Wait for all 7 fairies + collect reports
+  Step 6 — Dispatch all eight fairies in parallel
+  Step 7 — Wait for all 8 fairies + collect reports
   Step 8 — Spawn the dream master with the full report bundle
   Step 9 — Receive the dream master's final return and relay to the user
 
@@ -210,7 +210,7 @@ If today's-cohort count < 50, top up from legacy NULLs:
 
 Cap at 50 protects the cycle's fairy compute budget. The backfill naturally drains the legacy NULL pool over many cycles.
 
-**If your install's recall-summary substrate isn't deployed yet** (no `recall_summary` column on `nodes`, or no `engram_set_recall_summaries` MCP tool registered): skip the batch summary step entirely — dispatch only the 6 dream-fairies, spawn the dream master with a manifest of 6 fairies, and proceed. The architecture is forward-compat: the dream master handles 6-fairy cycles cleanly.
+**If your install's recall-summary substrate isn't deployed yet** (no `recall_summary` column on `nodes`, or no `engram_set_recall_summaries` MCP tool registered): skip the batch summary step entirely — dispatch only the 7 dream-fairies, spawn the dream master with a manifest of 7 fairies, and proceed. The architecture is forward-compat: the dream master handles 7-fairy cycles cleanly.
 
 **Run cohort_dispatch prepare** to chunk the cohort and write per-chunk payload files:
 
@@ -244,11 +244,11 @@ python3 -m tools.cohort_dispatch verify-in \
 
 Verify-in checks: (1) valid JSON per chunk, (2) required fields present (id, type, claim), (3) every id resolves in the DB with matching claim (race-window guard against retracted nodes), (4) no duplicate IDs within or across chunks, (5) chunk size ≤ 15. On non-zero exit, do not proceed to dispatch — the cohort has a structural problem to fix first.
 
-### Step 6 — Dispatch all fairies in parallel (6 dream-fairies + N batch-summary-fairies)
+### Step 6 — Dispatch all fairies in parallel (7 dream-fairies + N batch-summary-fairies)
 
 Single `Agent`-tool message with all calls, each `run_in_background=true`.
 
-**Fairies 1-6** — `subagent_type="engram-dream-fairy"`, one per well-supported category. **Use these exact substitution values** (canonical from `engram-dream-fairy.md`; do NOT derive from memory or prior-session context — the category numbering changes across versions and must be read here each dispatch):
+**Fairies 1-7** — `subagent_type="engram-dream-fairy"`, one per well-supported category. **Use these exact substitution values** (canonical from `engram-dream-fairy.md`; do NOT derive from memory or prior-session context — the category numbering changes across versions and must be read here each dispatch):
 
 | `{N}` | `{CATEGORY_NAME}` | `{SLUG}` |
 |-------|-------------------|----------|
@@ -258,10 +258,11 @@ Single `Agent`-tool message with all calls, each `run_in_background=true`.
 | 4 | Cornerstone candidates | cornerstone-candidates |
 | 5 | Tainted-but-still-valid derivations | tainted-valid |
 | 6 | Recent-resolution echoes | resolution-echoes |
+| 7 | Missing principle-edges (instantiates/serves) | missing-edges |
 
 Prompt template (substitute `{N}`, `{CATEGORY_NAME}`, `{SLUG}` from the table above):
 
-> Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md`. Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only file path + 5-bullet TL;DR for this category. Do NOT run other categories or the heuristic categories (7, 8).
+> Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md`. Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only file path + 5-bullet TL;DR for this category. Do NOT run other categories or the heuristic categories (8, 9).
 
 **Batch-summary fairies** — one `subagent_type="engram-batch-summary-fairy"` per chunk from the manifest (typically 1–4 fairies for a 50-node cohort at chunk-size=15). For each chunk, construct a short dispatch prompt inline using the paths from the manifest. Example:
 
@@ -281,7 +282,7 @@ All fairies fire in parallel with `run_in_background=true`; the harness fires a 
 
 Receive each fairy's task-notification as it arrives. Collect from the completion result:
 
-- **Fairies 1-6**: file path (`~/.engram/dream/<TODAY>-fairy-<N>-<SLUG>.md`) + 5-bullet TL;DR. Full report content lives on disk at the cited path.
+- **Fairies 1-7**: file path (`~/.engram/dream/<TODAY>-fairy-<N>-<SLUG>.md`) + 5-bullet TL;DR. Full report content lives on disk at the cited path.
 - **Batch-summary fairies**: write each fairy's returned JSON to `<cohort-dir>/chunk-N/agent_output.json`.
 
 **Fairy timeout**: if any fairy doesn't return within 15 minutes of dispatch, mark it as timed-out. For dream-fairies, note the timeout in the master's spawn prompt. For batch-summary fairies, mark the affected chunk as missing.
@@ -366,7 +367,7 @@ Agent(
     DREAM-FAIRY REPORTS (full content on disk — read each before integrating):
     - Category 1 (<CAT1_NAME>): ~/.engram/dream/<TODAY>-fairy-1-<SLUG1>.md — TL;DR: <bullets>
     - Category 2 (<CAT2_NAME>): ~/.engram/dream/<TODAY>-fairy-2-<SLUG2>.md — TL;DR: <bullets>
-    - ... (categories 3-6 similar) ...
+    - ... (categories 3-7 similar) ...
     [Or "Category N (<NAME>) TIMED OUT — proceeding without" for any fairy that didn't return]
 
     BATCH-SUMMARY FINAL PAYLOAD (apply via engram_set_recall_summaries):
@@ -381,7 +382,7 @@ Agent(
     - Batch-summary cohort dir: <COHORT_DIR>
     - SSoT modules live at: <engram-alpha-repo-path>/tools/ (recall_summary_validator, recall_summary_payload)
 
-    Call engram_reflect first for your initial agenda. Read all 6 dream-fairy reports from disk. Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items. Apply the summary-fairy batch payload via engram_set_recall_summaries. Execute one bucket at a time (resolutions → goal_tension_resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
+    Call engram_reflect first for your initial agenda. Read all 7 dream-fairy reports from disk. Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items. Apply the summary-fairy batch payload via engram_set_recall_summaries. Execute one bucket at a time (resolutions → goal_tension_resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
 
     FINAL RETURN: dream record path + top-line counts (resolved / superseded / promoted / refuted / recall-summaries applied) + health score delta + flagged-for-user count. The parent relays this to the user verbatim.""",
     run_in_background=true
@@ -428,7 +429,7 @@ This is why the ordering is Phase A → Phase B, and why Phase A must complete b
 - **Dream master** (`engram-dream-master`) — owns the consolidation this skill orchestrates. Spec at `~/.claude/agents/engram-dream-master.md`.
 - **Batch-summary fairies** (`engram-batch-summary-fairy`) — one-shot batch generators dispatched by the parent after `cohort_dispatch.py prepare`. Each fairy receives a short dispatch prompt naming its input payload path and output path; it Reads the payload file (≤15 nodes), generates recall_summary + recall_keywords, and Writes the output JSON. Tool list: `[Read, Write]`. No inline payload embedding in the dispatch prompt. Sole dispatch path for recall_summary generation in the sleep cycle. Spec at `~/.claude/agents/engram-batch-summary-fairy.md`.
 - **cohort_dispatch.py** — orchestration script in `tools/cohort_dispatch.py`. Five subcommands: `prepare` (chunk cohort → per-chunk payload.json), `verify-in` (pre-flight integrity checks), `validate` (split clean vs failures, auto-write retry_payload.json), `incorporate` / `incorporate-retry` (merge retry output → final_payload.json + retry_payload.json + unfixable.json + attempt_count).
-- **Dream fairies 1-6** (`engram-dream-fairy`) — read-only consolidation-suggestion scanners. Spec at `~/.claude/agents/engram-dream-fairy.md`.
+- **Dream fairies 1-7** (`engram-dream-fairy`) — read-only consolidation-suggestion scanners. Spec at `~/.claude/agents/engram-dream-fairy.md`.
 - **End-of-day-detector hook** — surfaces engram-sleep on wrap-up phrases; user "Yes" triggers this skill.
 
 ## macOS auto-sleep timing
