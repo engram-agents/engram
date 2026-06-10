@@ -404,18 +404,41 @@ def _pr_approval_state(pr_number: str) -> tuple:
     after the latest approval re-triggers CI and invalidates the reviewed
     state ("re-check after ANY post-approval commit", CLAUDE.md).
 
+    Uses commit-identity comparison (headRefOid vs approval commit oid)
+    rather than timestamp comparison. Timestamp comparison is evadable: a
+    rebased or backdated commit can carry a committedDate older than the
+    approval and falsely read as fresh. Oid comparison is exact — a rebased
+    tip produces a new oid even when content is identical, and therefore
+    reads stale BY DESIGN (conservative: a rebased tip was not the reviewed
+    tip; the colleague must re-approve).
+
+    Two gh calls:
+      1. gh repo view --json nameWithOwner  (cwd-inferred repo identity)
+      2. gh api graphql querying headRefOid and reviews(last:50){state,commit{oid}}
+
     Returns (state, detail) where state is one of:
-      "fresh"       — latest approval is at-or-after the latest commit
-      "stale"       — at least one commit is newer than the latest approval
+      "fresh"       — at least one APPROVED review has commit.oid == headRefOid
+                      (an approval that reviewed exactly the current tip)
+      "stale"       — APPROVED review(s) exist but none match the tip oid
+                      (tip moved after approval, or tip was rebased)
       "no_approval" — PR has no APPROVED review; this gate passes through
                       (approval-existence is the colleague-layer's
-                      jurisdiction, not a timestamp question)
+                      jurisdiction, not an oid question)
       "unknown"     — could not obtain a verdict (degraded; advisory only)
     """
+    # pr_number is interpolated into the GraphQL query string below (unlike
+    # the old argv-passed form, which the shell layer kept inert) — require a
+    # bare integer so a malformed anchor can't inject query text.
+    pr_str = str(pr_number).lstrip("#")
+    if not pr_str.isdigit():
+        return ("unknown", f"PR number {pr_number!r} is not numeric")
+    pr_number = pr_str
+
+    # Step 1: resolve repo nameWithOwner (same effective scoping as today's
+    # `gh pr view` — cwd-inferred from the working tree).
     try:
-        result = subprocess.run(
-            ["gh", "pr", "view", pr_number,
-             "--json", "commits,reviews"],
+        repo_result = subprocess.run(
+            ["gh", "repo", "view", "--json", "nameWithOwner"],
             capture_output=True,
             text=True,
             timeout=15,
@@ -427,50 +450,94 @@ def _pr_approval_state(pr_number: str) -> tuple:
     except OSError as exc:
         return ("unknown", f"gh exec error: {exc}")
 
-    if result.returncode != 0:
-        detail = (result.stderr or "").strip() or f"gh exit {result.returncode}"
+    if repo_result.returncode != 0:
+        detail = (repo_result.stderr or "").strip() or f"gh exit {repo_result.returncode}"
         return ("unknown", detail)
 
-    raw = (result.stdout or "").strip()
-    if not raw:
+    raw_repo = (repo_result.stdout or "").strip()
+    if not raw_repo:
+        return ("unknown", "gh repo view returned empty output")
+
+    try:
+        repo_data = json.loads(raw_repo)
+        name_with_owner = repo_data["nameWithOwner"]
+        owner, repo_name = name_with_owner.split("/", 1)
+    except (json.JSONDecodeError, ValueError, KeyError):
+        return ("unknown", "gh repo view returned unparseable JSON or missing nameWithOwner")
+
+    # Step 2: GraphQL — fetch headRefOid and last 50 reviews with commit oid.
+    query = (
+        "{ repository(owner: \"%s\", name: \"%s\") {"
+        " pullRequest(number: %s) {"
+        "  headRefOid"
+        "  reviews(last: 50) { nodes { state commit { oid } } }"
+        " } } }"
+    ) % (owner, repo_name, pr_number)
+
+    try:
+        gql_result = subprocess.run(
+            ["gh", "api", "graphql", "-f", f"query={query}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except FileNotFoundError:
+        return ("unknown", "gh not found on PATH")
+    except subprocess.TimeoutExpired:
+        return ("unknown", "gh timed out after 15s")
+    except OSError as exc:
+        return ("unknown", f"gh exec error: {exc}")
+
+    if gql_result.returncode != 0:
+        detail = (gql_result.stderr or "").strip() or f"gh exit {gql_result.returncode}"
+        return ("unknown", detail)
+
+    raw_gql = (gql_result.stdout or "").strip()
+    if not raw_gql:
         return ("unknown", "gh returned empty output")
 
     try:
-        data = json.loads(raw)
+        gql_data = json.loads(raw_gql)
+        pr_data = gql_data["data"]["repository"]["pullRequest"]
+        head_oid = pr_data["headRefOid"]
+        review_nodes = pr_data["reviews"]["nodes"]
     except (json.JSONDecodeError, ValueError):
         return ("unknown", "gh returned unparseable JSON")
+    except (KeyError, TypeError):
+        return ("unknown", "gh response missing expected fields")
 
-    commits = data.get("commits")
-    reviews = data.get("reviews")
-    if not isinstance(commits, list) or not commits:
-        return ("unknown", "commits missing or empty")
-    if not isinstance(reviews, list):
-        return ("unknown", "reviews missing or not a list")
+    if not head_oid:
+        return ("unknown", "headRefOid missing or empty")
+    if not isinstance(review_nodes, list):
+        return ("unknown", "reviews.nodes missing or not a list")
 
-    # Latest commit timestamp. The commits list carries committedDate per
-    # entry; ISO-8601 UTC strings compare correctly as strings, but guard
-    # against missing fields rather than assuming shape.
-    commit_dates = [c.get("committedDate") for c in commits
-                    if isinstance(c, dict) and c.get("committedDate")]
-    if not commit_dates:
-        return ("unknown", "no committedDate on any commit")
-    latest_commit = max(commit_dates)
+    # Walk review nodes: collect APPROVED reviews and check oid match.
+    # A review node with commit: null is simply non-matching, never an error.
+    has_approval = False
+    latest_approval_oid = None
+    for node in review_nodes:
+        if not isinstance(node, dict):
+            continue
+        if (node.get("state") or "").upper() != "APPROVED":
+            continue
+        has_approval = True
+        commit = node.get("commit")
+        node_oid = commit.get("oid") if isinstance(commit, dict) else None
+        latest_approval_oid = node_oid  # last APPROVED node in list = most recent
+        if node_oid and node_oid == head_oid:
+            short = head_oid[:8]
+            return ("fresh", f"approval covers tip oid {short}")
 
-    approval_dates = [r.get("submittedAt") for r in reviews
-                      if isinstance(r, dict)
-                      and (r.get("state") or "").upper() == "APPROVED"
-                      and r.get("submittedAt")]
-    if not approval_dates:
+    if not has_approval:
         return ("no_approval", "no APPROVED review on the PR")
-    latest_approval = max(approval_dates)
 
-    if latest_commit > latest_approval:
-        return (
-            "stale",
-            f"tip committed {latest_commit} is newer than the latest "
-            f"approval {latest_approval}",
-        )
-    return ("fresh", f"latest approval {latest_approval} covers the tip")
+    tip_short = head_oid[:8]
+    approval_short = (latest_approval_oid or "unknown")[:8]
+    return (
+        "stale",
+        f"tip oid {tip_short} not covered by any approval "
+        f"(latest approval oid {approval_short})",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -783,7 +850,7 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         # pushed AFTER the latest approval means the maintainer would merge
         # a tip nobody approved — reject the flip until re-review (or
         # --force). no_approval passes through: approval-existence is the
-        # colleague-layer's gate, not this timestamp compare's.
+        # colleague-layer's gate, not this oid compare's.
         _ap_state, _ap_detail = _pr_approval_state(_pr_num)
         if _ap_state == "stale":
             if _flip_force:

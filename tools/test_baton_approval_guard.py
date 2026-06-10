@@ -12,12 +12,14 @@ Coverage — wiring (cmd_flip):
   6. flip to NON-sentinel participant → guard not consulted
   7. red CI rejects BEFORE the approval guard runs (fail-fast ordering)
 
-Coverage — _pr_approval_state parsing (mocked subprocess):
-  8. commit newer than latest approval → stale
-  9. approval at/after latest commit → fresh
- 10. approvals absent (only COMMENTED/CHANGES_REQUESTED) → no_approval
- 11. gh failure / empty / unparseable → unknown
- 12. multiple approvals: the LATEST approval is the comparand
+Coverage — _pr_approval_state parsing (mocked subprocess, two-call shape):
+  8. approved-review oid == tip oid → fresh
+  9. approved review exists, oid != tip (rebase case) → stale
+ 10. no APPROVED review (COMMENTED/CHANGES_REQUESTED only) → no_approval
+ 11. DISMISSED only → no_approval
+ 12. review with commit null + one matching approval → fresh (null tolerated)
+ 13. gh GraphQL failure / empty / unparseable → unknown
+ 14. repo-view (first call) failure → unknown
 
 All tests are hermetic: no real `gh` calls, no real baton files outside tmp_path.
 """
@@ -230,10 +232,20 @@ def test_red_ci_rejects_before_approval_guard(projects_dir, engram_home, monkeyp
 
 
 # ---------------------------------------------------------------------------
-# _pr_approval_state parsing tests (mocked subprocess)
+# _pr_approval_state parsing tests (mocked subprocess — two-call shape)
+#
+# _pr_approval_state now makes TWO subprocess.run calls:
+#   call 1: gh repo view --json nameWithOwner
+#   call 2: gh api graphql -f query=...
+#
+# Helpers below build mock side-effect sequences for the two-call shape.
 # ---------------------------------------------------------------------------
 
-def _gh_result(payload: dict, returncode: int = 0, stderr: str = ""):
+_REPO_PAYLOAD = {"nameWithOwner": "engram-agents/engram-alpha"}
+
+
+def _gh_result(payload, returncode: int = 0, stderr: str = ""):
+    """Build a mock subprocess.CompletedProcess-like object."""
     m = mock.Mock()
     m.returncode = returncode
     m.stdout = json.dumps(payload) if payload is not None else ""
@@ -241,79 +253,182 @@ def _gh_result(payload: dict, returncode: int = 0, stderr: str = ""):
     return m
 
 
-def _patch_gh(monkeypatch, payload, returncode=0, stderr=""):
+def _gql_payload(head_oid: str, review_nodes: list) -> dict:
+    """Build the GraphQL response envelope expected by _pr_approval_state."""
+    return {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "headRefOid": head_oid,
+                    "reviews": {"nodes": review_nodes},
+                }
+            }
+        }
+    }
+
+
+def _patch_two_calls(monkeypatch, gql_payload, *, repo_returncode=0,
+                     gql_returncode=0, repo_stderr="", gql_stderr=""):
+    """Mock subprocess.run to return repo-view result then graphql result."""
+    repo_result = _gh_result(_REPO_PAYLOAD, returncode=repo_returncode,
+                             stderr=repo_stderr)
+    gql_result = _gh_result(gql_payload, returncode=gql_returncode,
+                            stderr=gql_stderr)
+    side_effects = [repo_result, gql_result]
     monkeypatch.setattr(
         baton.subprocess, "run",
-        lambda *a, **k: _gh_result(payload, returncode, stderr),
+        mock.Mock(side_effect=side_effects),
     )
 
 
-def test_state_stale_when_commit_newer(monkeypatch):
-    _patch_gh(monkeypatch, {
-        "commits": [
-            {"committedDate": "2026-01-01T00:00:00Z"},
-            {"committedDate": "2026-01-03T00:00:00Z"},
-        ],
-        "reviews": [
-            {"state": "APPROVED", "submittedAt": "2026-01-02T00:00:00Z"},
-        ],
-    })
+def _patch_repo_fail(monkeypatch, returncode=1, stderr="gh: auth error"):
+    """Mock subprocess.run so repo-view call fails (only one call made)."""
+    repo_result = _gh_result(None, returncode=returncode, stderr=stderr)
+    monkeypatch.setattr(
+        baton.subprocess, "run",
+        mock.Mock(side_effect=[repo_result]),
+    )
+
+
+# --- core verdict tests ---
+
+def test_state_fresh_when_approval_oid_matches_tip(monkeypatch):
+    """APPROVED review with commit.oid == headRefOid → fresh."""
+    tip = "aabbccdd1122334455667788"
+    _patch_two_calls(monkeypatch, _gql_payload(tip, [
+        {"state": "APPROVED", "commit": {"oid": tip}},
+    ]))
+    state, detail = baton._pr_approval_state("1")
+    assert state == "fresh"
+    assert tip[:8] in detail
+
+
+def test_state_stale_when_approval_oid_differs(monkeypatch):
+    """APPROVED review exists but commit.oid != headRefOid (rebase case)
+    — stale even if the approval's committedDate would be OLDER than the tip."""
+    tip = "aaaa0000111122223333"
+    old_oid = "bbbb9999888877776666"
+    _patch_two_calls(monkeypatch, _gql_payload(tip, [
+        {"state": "APPROVED", "commit": {"oid": old_oid}},
+    ]))
     state, detail = baton._pr_approval_state("1")
     assert state == "stale"
-    assert "2026-01-03T00:00:00Z" in detail
-
-
-def test_state_fresh_when_approval_covers_tip(monkeypatch):
-    _patch_gh(monkeypatch, {
-        "commits": [{"committedDate": "2026-01-01T00:00:00Z"}],
-        "reviews": [
-            {"state": "APPROVED", "submittedAt": "2026-01-02T00:00:00Z"},
-        ],
-    })
-    state, _ = baton._pr_approval_state("1")
-    assert state == "fresh"
+    assert tip[:8] in detail
+    assert old_oid[:8] in detail
 
 
 def test_state_no_approval_without_approved_reviews(monkeypatch):
-    _patch_gh(monkeypatch, {
-        "commits": [{"committedDate": "2026-01-01T00:00:00Z"}],
-        "reviews": [
-            {"state": "COMMENTED", "submittedAt": "2026-01-02T00:00:00Z"},
-            {"state": "CHANGES_REQUESTED", "submittedAt": "2026-01-03T00:00:00Z"},
-        ],
-    })
+    """Only COMMENTED / CHANGES_REQUESTED reviews → no_approval."""
+    tip = "deadbeef00001111"
+    _patch_two_calls(monkeypatch, _gql_payload(tip, [
+        {"state": "COMMENTED", "commit": {"oid": "old111"}},
+        {"state": "CHANGES_REQUESTED", "commit": {"oid": "old222"}},
+    ]))
     state, _ = baton._pr_approval_state("1")
     assert state == "no_approval"
 
 
-def test_state_latest_approval_is_comparand(monkeypatch):
-    """An old stale approval must not shadow a newer one that covers the tip."""
-    _patch_gh(monkeypatch, {
-        "commits": [{"committedDate": "2026-01-02T00:00:00Z"}],
-        "reviews": [
-            {"state": "APPROVED", "submittedAt": "2026-01-01T00:00:00Z"},
-            {"state": "APPROVED", "submittedAt": "2026-01-03T00:00:00Z"},
-        ],
-    })
+def test_state_dismissed_only_is_no_approval(monkeypatch):
+    """DISMISSED reviews only → no_approval (not stale)."""
+    tip = "cafebabe12345678"
+    _patch_two_calls(monkeypatch, _gql_payload(tip, [
+        {"state": "DISMISSED", "commit": {"oid": "old333"}},
+    ]))
     state, _ = baton._pr_approval_state("1")
+    assert state == "no_approval"
+
+
+def test_state_fresh_with_commit_null_and_matching_approval(monkeypatch):
+    """A review node with commit: null is non-matching but not an error;
+    a second node that matches the tip still produces fresh."""
+    tip = "1234567890abcdef"
+    _patch_two_calls(monkeypatch, _gql_payload(tip, [
+        {"state": "APPROVED", "commit": None},
+        {"state": "APPROVED", "commit": {"oid": tip}},
+    ]))
+    state, detail = baton._pr_approval_state("1")
     assert state == "fresh"
+    assert tip[:8] in detail
 
 
-def test_state_unknown_on_gh_failure(monkeypatch):
-    _patch_gh(monkeypatch, None, returncode=1, stderr="gh: not logged in")
+# --- gh failure ladder tests ---
+
+def test_state_unknown_on_gql_failure(monkeypatch):
+    """GraphQL call failure → unknown (with gh's stderr text)."""
+    _patch_two_calls(monkeypatch, None,
+                     gql_returncode=1, gql_stderr="gh: not logged in")
     state, detail = baton._pr_approval_state("1")
     assert state == "unknown"
     assert "not logged in" in detail
 
 
-def test_state_unknown_on_empty_or_malformed(monkeypatch):
-    _patch_gh(monkeypatch, {"commits": [], "reviews": []})
-    state, _ = baton._pr_approval_state("1")
-    assert state == "unknown"
-
+def test_state_unknown_on_gql_malformed_json(monkeypatch):
+    """GraphQL returns non-JSON → unknown."""
+    repo_result = _gh_result(_REPO_PAYLOAD)
+    bad_result = mock.Mock(returncode=0, stdout="not json", stderr="")
     monkeypatch.setattr(
         baton.subprocess, "run",
-        lambda *a, **k: mock.Mock(returncode=0, stdout="not json", stderr=""),
+        mock.Mock(side_effect=[repo_result, bad_result]),
     )
     state, _ = baton._pr_approval_state("1")
     assert state == "unknown"
+
+
+def test_state_unknown_on_repo_view_failure(monkeypatch):
+    """repo-view call failure → unknown before GraphQL is attempted."""
+    _patch_repo_fail(monkeypatch, returncode=1, stderr="gh: auth error")
+    state, detail = baton._pr_approval_state("1")
+    assert state == "unknown"
+    assert "auth error" in detail
+
+
+def test_state_unknown_on_empty_gql_response(monkeypatch):
+    """GraphQL returns empty body → unknown."""
+    repo_result = _gh_result(_REPO_PAYLOAD)
+    empty_result = mock.Mock(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(
+        baton.subprocess, "run",
+        mock.Mock(side_effect=[repo_result, empty_result]),
+    )
+    state, _ = baton._pr_approval_state("1")
+    assert state == "unknown"
+
+
+def test_state_non_numeric_pr_number_is_unknown(monkeypatch):
+    """#1007 hardening: pr_number is interpolated into the GraphQL query, so a
+    non-numeric value must return unknown without invoking gh at all."""
+    def _boom(*args, **kwargs):
+        raise AssertionError("gh must not be invoked for a non-numeric PR number")
+    monkeypatch.setattr(baton.subprocess, "run", _boom)
+    state, detail = baton._pr_approval_state('123") { id } } evil')
+    assert state == "unknown"
+    assert "not numeric" in detail
+
+
+def test_state_hash_prefixed_numeric_pr_number_ok(monkeypatch):
+    """A '#123'-shaped value is tolerated (stripped), matching CLI ergonomics."""
+    calls = []
+    def _fake_run(argv, **kwargs):
+        calls.append(argv)
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = (
+                '{"nameWithOwner": "o/r"}' if argv[:3] == ["gh", "repo", "view"]
+                else '{"data": {"repository": {"pullRequest": {"headRefOid": "abc123ff",'
+                     ' "reviews": {"nodes": [{"state": "APPROVED", "commit": {"oid": "abc123ff"}}]}}}}}'
+            )
+        return R()
+    monkeypatch.setattr(baton.subprocess, "run", _fake_run)
+    state, detail = baton._pr_approval_state("#123")
+    assert state == "fresh"
+    assert any("123" in " ".join(c) for c in calls if c[:2] == ["gh", "api"])
+
+
+def test_state_no_approval_empty_review_list(monkeypatch):
+    """A PR with zero reviews of any kind is no_approval (reviewer-fairy
+    suggestion on PR #1064: pin the empty-list path so a future edit can't
+    silently turn it into unknown)."""
+    _patch_two_calls(monkeypatch, _gql_payload("abc123ff", []))
+    state, detail = baton._pr_approval_state("123")
+    assert state == "no_approval"
