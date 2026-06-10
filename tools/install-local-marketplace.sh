@@ -59,20 +59,22 @@ die() { printf '[install-local-marketplace] ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-Usage: bash tools/install-local-marketplace.sh [--help] [--skip-add] [--skip-build] [--target <claude-code|codex>]
+Usage: bash tools/install-local-marketplace.sh [--help] [--skip-add] [--skip-build] [--target <claude-code|codex>] [--allow-branch]
 
 Assembles a local ENGRAM marketplace at $ENGRAM_HOME/marketplace/ from
 build/plugin/. With --target claude-code it registers via `claude plugin marketplace add`;
 with --target codex it installs via `codex plugin add engram@engram-local`.
 
 Options:
-  --help        Show this help and exit.
-  --skip-add    Assemble but skip the `claude plugin marketplace add` step.
-  --skip-build  Skip the internal build-plugin.sh invocation. Use when the
-                caller has already built build/plugin/ with the correct flags.
-                build/plugin/plugin.json must already exist.
-  --target T    Build target to pass through when not using --skip-build:
-                claude-code (default) or codex.
+  --help          Show this help and exit.
+  --skip-add      Assemble but skip the `claude plugin marketplace add` step.
+  --skip-build    Skip the internal build-plugin.sh invocation. Use when the
+                  caller has already built build/plugin/ with the correct flags.
+                  build/plugin/plugin.json must already exist.
+  --target T      Build target to pass through when not using --skip-build:
+                  claude-code (default) or codex.
+  --allow-branch  Allow building from a non-dev branch (overrides #794's guard).
+                  Use only for deliberate branch builds (e.g. metric-eval checkouts).
 
 After running:
   $ENGRAM_HOME/marketplace/.claude-plugin/marketplace.json
@@ -101,11 +103,13 @@ EOF
 SKIP_ADD=0
 SKIP_BUILD=0
 TARGET="claude-code"
+ALLOW_BRANCH=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --help|-h) usage ;;
     --skip-add) SKIP_ADD=1; shift ;;
     --skip-build) SKIP_BUILD=1; shift ;;
+    --allow-branch) ALLOW_BRANCH=1; shift ;;
     --target)
       [[ $# -ge 2 ]] || die "--target requires a value: claude-code or codex"
       TARGET="$2"
@@ -123,6 +127,12 @@ esac
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ ! -f "$REPO_ROOT/server.py" ]]; then
   die "Must be run from the repo root (expected server.py at $REPO_ROOT/server.py)"
+fi
+
+# #794 branch guard: refuse non-dev builds unless --allow-branch is set.
+CURRENT_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+if [[ "$CURRENT_BRANCH" != "dev" && $ALLOW_BRANCH -eq 0 ]]; then
+  die "Source repo is on branch '$CURRENT_BRANCH', not 'dev'. Building from a PR branch can deploy unmerged code. Pass --allow-branch to override (e.g. for metric-eval checkouts). Guard per #794."
 fi
 
 ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"

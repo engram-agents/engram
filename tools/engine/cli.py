@@ -98,6 +98,12 @@ def build_command(args: list[str]) -> int:
         metavar="PATH",
         help="ENGRAM_HOME path to embed in hook commands and MCP config",
     )
+    parser.add_argument(
+        "--allow-branch",
+        dest="allow_branch",
+        action="store_true",
+        help="Allow building from non-dev branch (overrides #794's guard)",
+    )
     parser.add_argument("--help", "-h", action="store_true")
 
     parsed, unknown = parser.parse_known_args(args)
@@ -131,6 +137,7 @@ def build_command(args: list[str]) -> int:
             "                      foreign drops identity_coupled entries and runs a\n"
             "                      leak-scan over the emitted bundle.\n"
             "  --engram-home PATH  ENGRAM_HOME path to embed in hook commands and MCP config.\n"
+            "  --allow-branch      Allow building from a non-dev branch (overrides #794's guard).\n"
             "  --help              Show this help message and exit.\n"
             "\n"
             "Tier filtering uses packaging/tiers.json as the single source of truth.\n"
@@ -171,6 +178,25 @@ def build_command(args: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
+
+    # #794 branch guard: refuse non-dev builds unless --allow-branch is set.
+    # git branch --show-current returns "" in detached HEAD — treat as a block (fail safe).
+    if not parsed.allow_branch:
+        import subprocess as _sp
+        _br = _sp.run(
+            ["git", "branch", "--show-current"],
+            cwd=repo_root, capture_output=True, text=True,
+        ).stdout.strip()
+        if not _br or _br != "dev":
+            _br_desc = "detached HEAD (not on a named branch)" if not _br else f"branch {_br!r}"
+            print(
+                f"[build-plugin] ERROR: Source repo is at {_br_desc}, not 'dev'. "
+                "Building from a non-dev state can deploy unmerged code. "
+                "Pass --allow-branch to override (e.g. for metric-eval checkouts). "
+                "Guard per #794.",
+                file=sys.stderr,
+            )
+            return 1
 
     manifest_path = os.path.join(repo_root, "packaging", "tiers.json")
     if not os.path.isfile(manifest_path):

@@ -483,3 +483,97 @@ class TestComputeBuildVersion:
             f"Prerelease sha identifier is not an alphanumeric non-numeric identifier: "
             f"{sha_part!r} (full version: {version_str!r})"
         )
+
+
+# ---------------------------------------------------------------------------
+# 5. build_command — #794 branch guard
+# ---------------------------------------------------------------------------
+
+
+class TestBuildCommandBranchGuard:
+    """build_command refuses non-dev branch without --allow-branch (#794)."""
+
+    def _run_build_command(self, monkeypatch, tmp_path, extra_args=None):
+        """Run build_command with repo_root pointing at tmp_path (has server.py)."""
+        import subprocess as _sp
+        from tools.engine.cli import build_command
+
+        # Minimal repo layout — tiers.json includes required top-level fields
+        (tmp_path / "server.py").write_text("")
+        (tmp_path / "packaging").mkdir()
+        import json as _json
+        (tmp_path / "packaging" / "tiers.json").write_text(_json.dumps({
+            "schema_version": 1,
+            "default_tier": "convenience",
+            "depth_tiers": {"essential": 1, "convenience": 2, "dev": 3},
+            "mechanisms": {},
+            "excluded": [],
+            "repo_only": [],
+            "build_inputs": [],
+        }))
+
+        monkeypatch.chdir(tmp_path)
+        args = list(extra_args) if extra_args else []
+        return build_command(args)
+
+    def test_non_dev_branch_without_allow_branch_fails(self, monkeypatch, tmp_path, capsys):
+        """build_command returns 1 and emits #794 error on a non-dev branch."""
+        import subprocess as _sp
+
+        def _fake_run(cmd, **kwargs):
+            if cmd[:2] == ["git", "branch"]:
+                return _sp.CompletedProcess(cmd, 0, stdout="my-feature-branch\n", stderr="")
+            return _sp.run.__wrapped__(cmd, **kwargs) if hasattr(_sp.run, "__wrapped__") else _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(_sp, "run", _fake_run)
+        rc = self._run_build_command(monkeypatch, tmp_path)
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "794" in captured.err
+        assert "my-feature-branch" in captured.err
+
+    def test_dev_branch_proceeds_past_guard(self, monkeypatch, tmp_path, capsys):
+        """On dev, build_command passes the branch guard (may fail later — NOT on the guard)."""
+        import subprocess as _sp
+
+        def _fake_run(cmd, **kwargs):
+            if cmd[:2] == ["git", "branch"]:
+                return _sp.CompletedProcess(cmd, 0, stdout="dev\n", stderr="")
+            return _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(_sp, "run", _fake_run)
+        self._run_build_command(monkeypatch, tmp_path)
+        captured = capsys.readouterr()
+        # The branch guard must NOT have fired — any failure is from later steps
+        assert "794" not in captured.err
+
+    def test_detached_head_blocked_without_allow_branch(self, monkeypatch, tmp_path, capsys):
+        """Detached HEAD (empty branch name) is blocked just like a non-dev branch."""
+        import subprocess as _sp
+
+        def _fake_run(cmd, **kwargs):
+            if cmd[:2] == ["git", "branch"]:
+                return _sp.CompletedProcess(cmd, 0, stdout="\n", stderr="")
+            return _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(_sp, "run", _fake_run)
+        rc = self._run_build_command(monkeypatch, tmp_path)
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "794" in captured.err
+        assert "detached HEAD" in captured.err
+
+    def test_allow_branch_overrides_guard(self, monkeypatch, tmp_path, capsys):
+        """--allow-branch skips the guard even on a non-dev branch."""
+        import subprocess as _sp
+
+        def _fake_run(cmd, **kwargs):
+            if cmd[:2] == ["git", "branch"]:
+                return _sp.CompletedProcess(cmd, 0, stdout="my-feature-branch\n", stderr="")
+            return _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(_sp, "run", _fake_run)
+        rc = self._run_build_command(monkeypatch, tmp_path, extra_args=["--allow-branch"])
+        # Guard skipped; 794 error must NOT appear
+        captured = capsys.readouterr()
+        assert "794" not in captured.err
