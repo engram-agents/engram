@@ -1,6 +1,7 @@
 # 05 — Agent-Facing CLIs (L4)
 
 > **STATUS: DRAFT — fairy archaeology, dispatcher spot-checked 2026-06-05.**
+> **UPDATE 2026-06-09 — the A7 meta-zombie is RESOLVED:** the tag-once CI gate now EXISTS. #968/#991 (merged 2026-06-10) added a whole-tree default-deny gate (`test_whole_tree_every_tracked_file_has_a_role` — every git-tracked file must declare exactly one role across `mechanisms`/`excluded`/`repo_only`/`build_inputs`) plus the narrower plugin-universe gate (`test_every_shippable_path_is_tagged`), both run by manifest-gate.yml on dev PRs. Consequently the two forum utility scripts below are no longer untiered — they are now in tiers.json `excluded[]` (separately-deployed forum service). And the baton auto-archive silent-catch is fixed (see §2). The "documented-but-unbuilt" framing throughout this draft is superseded.
 > Mechanical claims verified: the two manifest-gap files exist with zero tiers.json
 > entries — and both landed TODAY with the #810 hybrid-search merge, which led the
 > dispatcher to check the gate itself: **the tag-once CI gate does not exist**
@@ -36,7 +37,7 @@
 **verbs** — init · flip · claim · release · status · mine · show · close · reopen · rename · anchor (baton.py:1318–1531).
 **state surfaces** — RW: shared projects dir; R: config.json.
 **tier** — convenience, multi_agent.
-**status** — CLI PROD-VERIFIED (daily use); **auto-archive sub-mechanism REGRESSED (confirmed)** — design: PR-batons auto-close when the GitHub PR is MERGED; implementation lives in engram-baton-prompt-hook.py:521–538; empirics: 52 stale batons 2026-06-02. **Root-cause hypothesis located by sweep: silent catch-all `except Exception: pass` at hook lines 537–538** (failures invisible), and/or hook cadence. Fix direction: log the exception + verify the gh-API call path. (FINDINGS.md A3 — now with a code-located hypothesis.)
+**status** — CLI PROD-VERIFIED (daily use); **auto-archive sub-mechanism re-wired + instrumented (runtime re-verify pending)** — design: PR-batons auto-close when the GitHub PR is MERGED. Current implementation: `_auto_archive_merged_pr_batons` (engram-baton-prompt-hook.py:458), called gh_ok-gated (~line 570); the former silent catch-all is now `except Exception as e:` at line 541 (the "log the exception" fix direction landed). The old `537–538` silent-except-pass line-ref is stale. Original empirics: 52 stale batons 2026-06-02. Runtime confirmation that the re-wired path actually archives is still pending. (FINDINGS.md A3.)
 **tests** — test_baton.py, test_baton_autopull.py, test_baton_hook.py.
 
 ### 3. forum — LAN forum client
@@ -60,8 +61,8 @@ engram-pkg (convenience — package authoring, isolated namespace) · inspect_ra
 
 ## Manifest gaps (dispatcher-verified)
 
-- **tools/forum_backfill_embeddings.py** and **tools/forum_regen_derived.py** — git-tracked, executable, ZERO tiers.json entries; **merged today with #810** (hybrid-search slice 1). Adjudicate: tier (likely convenience) or move to excluded with reason.
-- **Root cause is structural**: no tiers CI gate exists (.github/workflows/ = node-ID gate + tests only). The tag-once mechanical gate from the tiering design is unbuilt — until it lands, untiered drift recurs by construction.
+- **tools/forum_backfill_embeddings.py** and **tools/forum_regen_derived.py** — RESOLVED 2026-06-09: both now in tiers.json `excluded[]` (reason: "separately-deployed forum community service"), forced-accounted by the whole-tree gate (#991).
+- **Root cause RESOLVED 2026-06-09**: the tag-once gate now exists (#968/#991 whole-tree default-deny gate, run by manifest-gate.yml on dev PRs). The two forum scripts above are now in tiers.json `excluded[]` ("separately-deployed forum community service"). Untiered drift is now caught by construction — any new tracked file with no declared role fails CI.
 
 ## Correctly excluded (operator/persona tier)
 
@@ -72,10 +73,10 @@ agentctl + agent-bootstrap (operator host tools) · borges_session_eval.py, tele
 | Status | Items |
 |---|---|
 | PROD-VERIFIED | ia, baton CLI, forum CLI, engine (claude-code target) |
-| REGRESSED | baton auto-archive (root-cause hypothesis: silent except-pass at hook:537–538) |
+| RE-WIRED (re-verify pending) | baton auto-archive — instrumented (`except Exception as e:` hook:541), gh_ok-gated; runtime confirmation pending |
 | SCAFFOLDED-UNTESTED | engine codex target |
 | RESOLVED (#868) | forum server deploy path — forum/ declared + systemd deploy (was outside-manifest at the 2026-06-05 draft; L5) |
-| MANIFEST GAP | 2 forum utility scripts (+ the missing CI gate itself) |
+| RESOLVED (#991) | 2 forum utility scripts now in excluded[]; tag-once gate now exists (whole-tree default-deny) |
 | DEV-ONLY | selftest.py |
 
 ## Open verification items for the accuracy pass
