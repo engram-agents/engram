@@ -822,3 +822,172 @@ class TestRepeatableQueue:
 
         output = stdout_buf.getvalue()
         assert "my-task" in output
+
+
+# ---------------------------------------------------------------------------
+# 7. status-auto: derive_own_status from loop-mode.json + batons (slice 3b)
+# ---------------------------------------------------------------------------
+
+@SKIP_CLI
+class TestDeriveOwnStatus:
+    """derive_own_status() reads the agent's own local signals."""
+
+    @pytest.fixture
+    def derive_env(self, tmp_path, monkeypatch):
+        """Point LOOP_MODE_PATH + PROJECTS_DIR at writable temp locations."""
+        loop_path = tmp_path / "loop-mode.json"
+        proj_dir = tmp_path / "projects"
+        proj_dir.mkdir()
+        monkeypatch.setattr(forum_cli, "LOOP_MODE_PATH", str(loop_path))
+        monkeypatch.setattr(forum_cli, "PROJECTS_DIR", str(proj_dir))
+        return loop_path, proj_dir
+
+    def test_idle_when_no_loop_no_baton(self, derive_env):
+        state, activity, queue, cadence = forum_cli.derive_own_status("alice")
+        assert state == "idle"
+        assert activity is None
+        assert queue == []
+        assert cadence is None  # → server's global window
+
+    def test_working_with_cadence_from_loop_mode(self, derive_env):
+        loop_path, _ = derive_env
+        loop_path.write_text(json.dumps({"cadence_seconds": 2400, "topic": "Drive the day"}))
+        state, activity, queue, cadence = forum_cli.derive_own_status("alice")
+        assert state == "working"
+        assert activity == "Drive the day"
+        assert cadence == 2400
+
+    def test_held_baton_adds_queue_and_working(self, derive_env):
+        _, proj_dir = derive_env
+        (proj_dir / "proj-alpha.md").write_text(
+            "---\nproject: proj-alpha\nturn: alice\n---\nbody\n"
+        )
+        (proj_dir / "PR-999.md").write_text(
+            "---\nproject: PR-999\nturn: bob\n---\nbody\n"  # not mine
+        )
+        state, _, queue, _ = forum_cli.derive_own_status("alice")
+        assert state == "working"  # holding a turn ⇒ working even with no loop
+        assert queue == ["proj-alpha"]  # only my turn, not bob's
+
+    def test_on_call_flag_yields_sentinel(self, derive_env):
+        _, _, _, cadence = forum_cli.derive_own_status("carol", on_call=True)
+        assert cadence == forum_cli.ON_CALL_SENTINEL  # 0
+
+    def test_monitor_pacer_yields_sentinel(self, derive_env):
+        loop_path, _ = derive_env
+        loop_path.write_text(json.dumps({"pacer": "monitor", "topic": "watching"}))
+        _, _, _, cadence = forum_cli.derive_own_status("carol")
+        assert cadence == forum_cli.ON_CALL_SENTINEL
+
+    def test_cadence_zero_yields_sentinel(self, derive_env):
+        # An explicit cadence_seconds==0 in the marker is the on-call sentinel.
+        loop_path, _ = derive_env
+        loop_path.write_text(json.dumps({"cadence_seconds": 0}))
+        _, _, _, cadence = forum_cli.derive_own_status("carol")
+        assert cadence == forum_cli.ON_CALL_SENTINEL
+
+    def test_override_state_empty_string_is_honored(self, derive_env):
+        # override_state uses an is-not-None check, so an explicit '' is honored
+        # (not silently dropped to auto-derivation). Locks the sentinel choice.
+        loop_path, _ = derive_env
+        loop_path.write_text(json.dumps({"cadence_seconds": 1200}))  # would auto → working
+        state, _, _, _ = forum_cli.derive_own_status("alice", override_state="")
+        assert state == ""
+
+    def test_overrides_win(self, derive_env):
+        loop_path, _ = derive_env
+        loop_path.write_text(json.dumps({"cadence_seconds": 2400, "topic": "auto-topic"}))
+        state, activity, _, cadence = forum_cli.derive_own_status(
+            "alice",
+            override_state="sleeping",
+            override_activity="going to sleep",
+            override_cadence=None,  # explicit None overrides the loop's 2400
+        )
+        assert state == "sleeping"
+        assert activity == "going to sleep"
+        assert cadence is None
+
+    def test_malformed_loop_mode_treated_as_absent(self, derive_env):
+        loop_path, _ = derive_env
+        loop_path.write_text("{ this is not json")
+        state, _, _, cadence = forum_cli.derive_own_status("alice")
+        assert state == "idle"  # never crashes a wake
+        assert cadence is None
+
+
+@SKIP_CLI
+class TestStatusAutoPublish:
+    """`forum status-auto` derives + publishes; the board reflects it."""
+
+    @pytest.fixture
+    def auto_env(self, tmp_path, monkeypatch):
+        loop_path = tmp_path / "loop-mode.json"
+        proj_dir = tmp_path / "projects"
+        proj_dir.mkdir()
+        monkeypatch.setattr(forum_cli, "LOOP_MODE_PATH", str(loop_path))
+        monkeypatch.setattr(forum_cli, "PROJECTS_DIR", str(proj_dir))
+        return loop_path, proj_dir
+
+    def test_auto_publishes_working_with_cadence(self, client, auto_env):
+        loop_path, _ = auto_env
+        loop_path.write_text(json.dumps({"cadence_seconds": 1200, "topic": "building slice 3"}))
+        run_cli = _make_wired_cli(client)
+        out, err, code = run_cli(["status-auto"])
+        assert code == 0, err
+        assert "working" in out
+        board = json.loads(client.get("/api/agents/board").data)["board"]
+        a = next(e for e in board if e["name"] == "alice")
+        assert a["state"] == "working"
+        assert a["activity"] == "building slice 3"
+
+    def test_auto_idle_when_no_loop(self, client, auto_env):
+        run_cli = _make_wired_cli(client)
+        out, err, code = run_cli(["status-auto"])
+        assert code == 0, err
+        assert "idle" in out
+        board = json.loads(client.get("/api/agents/board").data)["board"]
+        a = next(e for e in board if e["name"] == "alice")
+        assert a["state"] == "idle"
+
+    def test_auto_on_call_publishes_sentinel(self, client, auto_env):
+        """--on-call publishes the event-driven sentinel (cadence 0).
+
+        The on-call *resolution* (stale → 'on-call' not 'offline') is covered at
+        the db layer in test_agent_status.py::TestOnCall; here we assert the CLI
+        sends the sentinel and reports it, and the published state shows through
+        while freshly seen.
+        """
+        run_cli = _make_wired_cli(client)
+        out, err, code = run_cli(["status-auto", "--on-call", "--state", "working"])
+        assert code == 0, err
+        assert "on-call" in out  # cmd_status_auto annotates the sentinel
+        board = json.loads(client.get("/api/agents/board").data)["board"]
+        a = next(e for e in board if e["name"] == "alice")
+        assert a["state"] == "working"
+
+    def test_auto_activity_override(self, client, auto_env):
+        loop_path, _ = auto_env
+        loop_path.write_text(json.dumps({"cadence_seconds": 1200, "topic": "auto"}))
+        run_cli = _make_wired_cli(client)
+        out, err, code = run_cli(["status-auto", "--activity", "hand-written activity"])
+        assert code == 0, err
+        board = json.loads(client.get("/api/agents/board").data)["board"]
+        a = next(e for e in board if e["name"] == "alice")
+        assert a["activity"] == "hand-written activity"
+
+    def test_auto_cadence_override_via_cli(self, client, auto_env):
+        # --cadence N flows through the _UNSET → argparse integration surface and
+        # the agent reads online while fresh. (--cadence 0 → on-call sentinel.)
+        run_cli = _make_wired_cli(client)
+        out, err, code = run_cli(["status-auto", "--state", "working", "--cadence", "270"])
+        assert code == 0, err
+        assert "cadence 270s" in out
+        board = json.loads(client.get("/api/agents/board").data)["board"]
+        a = next(e for e in board if e["name"] == "alice")
+        assert a["state"] == "working"
+
+    def test_auto_cadence_zero_via_cli_is_on_call(self, client, auto_env):
+        run_cli = _make_wired_cli(client)
+        out, err, code = run_cli(["status-auto", "--state", "working", "--cadence", "0"])
+        assert code == 0, err
+        assert "on-call" in out  # cadence 0 annotated as the event-driven sentinel

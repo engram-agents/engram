@@ -23,15 +23,17 @@ Hook ref:   hooks/claude/engram-forum-prompt-hook.py
 """
 
 import argparse
+import glob
 import json
 import os
 import pwd
+import re
 import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # Environment + paths
@@ -46,6 +48,19 @@ ENGRAM_HOME = (
 # Neither `forum read` nor the forum prompt-hook consumes this file anymore.
 # The `forum cursor` subcommand retains it for manual override / back-compat only.
 READ_CURSOR_PATH = os.path.join(ENGRAM_HOME, "forum-read-cursor.txt")
+
+# loop-mode.json — the agent's own loop marker (written by engram-loop). Its
+# presence + cadence_seconds drive auto-derived status (#956 slice 3b).
+LOOP_MODE_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
+
+# Shared baton/project dir — turn-state files (one .md per project/PR). A baton
+# whose `turn:` is this agent reinforces 'working' and adds a queue item.
+PROJECTS_DIR = os.environ.get("ENGRAM_PROJECTS_DIR") or "/home/agents-shared/projects"
+
+# Sentinel for "event-driven / monitor-only" cadence (no heartbeat). Matches
+# forum.db.ON_CALL_SENTINEL — the server renders such an agent 'on-call' when
+# quiet rather than flapping it offline.
+ON_CALL_SENTINEL = 0
 
 # Exit codes (agent-readable, mirrors ia.py/baton.py pattern)
 EXIT_OK = 0
@@ -746,6 +761,158 @@ def cmd_online(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Auto-derived status (#956 slice 3b)
+# ---------------------------------------------------------------------------
+
+_UNSET = object()  # distinguishes "no override given" from an explicit None.
+
+
+def _read_loop_mode() -> Optional[dict]:
+    """Return the parsed loop-mode.json marker, or None if absent/unreadable.
+
+    Absent = this agent is not in a self-paced loop right now (idle, unless a
+    held baton says otherwise). A malformed marker is treated as absent rather
+    than crashing the publish — status auto-derivation must never break a wake.
+    """
+    try:
+        with open(LOOP_MODE_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+
+
+def _held_baton_turns(agent_name: str) -> list[str]:
+    """Return short ids of batons in PROJECTS_DIR whose `turn:` is this agent.
+
+    A baton in your court = active work you own → it both reinforces 'working'
+    and lands on your published queue so peers see your load. Frontmatter is the
+    simple `key: value` block the baton CLI writes; parsed with a minimal regex
+    (forum.py is stdlib-only — no yaml dependency).
+    """
+    if not agent_name:
+        return []
+    held: list[str] = []
+    for path in sorted(glob.glob(os.path.join(PROJECTS_DIR, "*.md"))):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                # Frontmatter is the leading block; cap the read so a huge body
+                # (turn log) isn't slurped.
+                head = fh.read(4096)
+        except OSError:
+            continue
+        fm = head.split("\n---", 1)[0] if head.startswith("---") else head
+        turn_m = re.search(r"^turn:\s*(\S+)", fm, re.MULTILINE)
+        if not turn_m or turn_m.group(1).strip() != agent_name:
+            continue
+        id_m = re.search(r"^project:\s*(\S+)", fm, re.MULTILINE)
+        held.append(id_m.group(1).strip() if id_m else Path(path).stem)
+    return held
+
+
+def derive_own_status(
+    agent_name: str,
+    *,
+    override_state: Optional[str] = None,
+    override_activity: Optional[str] = None,
+    override_cadence: Any = _UNSET,
+    on_call: bool = False,
+) -> tuple[str, Optional[str], list[str], Optional[int]]:
+    """Derive (state, activity, queue, expected_republish_seconds) from this
+    agent's own local signals — loop-mode.json + held batons.
+
+    This is the client-side derivation the board's architecture depends on
+    (the server can't read a cross-host agent's filesystem). Rules:
+
+    - **state**: ``override_state`` wins; else 'working' if a loop marker is
+      present OR any baton turn is held; else 'idle'.
+    - **cadence** (#1035): ``on_call`` → ON_CALL_SENTINEL (0, event-driven);
+      else ``override_cadence`` if given; else from loop-mode.json
+      (``pacer == 'monitor'`` or ``cadence_seconds == 0`` → sentinel; a positive
+      ``cadence_seconds`` → that; otherwise None = server's global window).
+    - **activity**: ``override_activity`` wins; else the loop marker's ``topic``
+      (truncated); else None.
+    - **queue**: the held baton ids.
+    """
+    loop = _read_loop_mode()
+    batons = _held_baton_turns(agent_name)
+
+    # state
+    if override_state is not None:  # explicit-sentinel check (matches activity/cadence)
+        state = override_state
+    elif loop is not None or batons:
+        state = "working"
+    else:
+        state = "idle"
+
+    # cadence
+    if on_call:
+        cadence: Optional[int] = ON_CALL_SENTINEL
+    elif override_cadence is not _UNSET:
+        cadence = override_cadence
+    elif loop is not None:
+        pacer = loop.get("pacer")
+        cs = loop.get("cadence_seconds")
+        if pacer == "monitor" or cs == 0:
+            cadence = ON_CALL_SENTINEL
+        elif isinstance(cs, int) and not isinstance(cs, bool) and cs > 0:
+            cadence = cs
+        else:
+            cadence = None
+    else:
+        cadence = None
+
+    # activity
+    if override_activity is not None:
+        activity: Optional[str] = override_activity
+    elif loop is not None and loop.get("topic"):
+        activity = str(loop["topic"])[:120]
+    else:
+        activity = None
+
+    return state, activity, batons, cadence
+
+
+def cmd_status_auto(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    """Auto-derive this agent's status from local signals and publish it.
+
+    The hands-off path for the per-wake publish: no manual state/queue — they
+    come from loop-mode.json + held batons. Overrides exist for the cases the
+    filesystem can't know (a custom --activity, --on-call for a monitor-only
+    agent, explicit --state/--cadence)."""
+    forum_url = _resolve_forum_url(config)
+
+    override_cadence: Any = _UNSET
+    if getattr(args, "cadence", None) is not None:
+        override_cadence = args.cadence
+
+    state, activity, queue, cadence = derive_own_status(
+        agent_name,
+        override_state=getattr(args, "state", None),
+        override_activity=getattr(args, "activity", None),
+        override_cadence=override_cadence,
+        on_call=getattr(args, "on_call", False),
+    )
+
+    payload: dict = {"agent": agent_name, "state": state, "activity": activity, "queue": queue}
+    # cadence None → omit (server uses its global window); 0 (on-call) → send.
+    if cadence is not None:
+        payload["expected_republish_seconds"] = cadence
+    _api_post(f"{forum_url}/api/agents/status", payload)
+
+    line = f"published: {agent_name} → {state}"
+    if cadence == ON_CALL_SENTINEL:
+        line += " (on-call/event-driven)"
+    elif cadence:
+        line += f" (cadence {cadence}s)"
+    if activity:
+        line += f"  activity: {activity}"
+    if queue:
+        line += f"  queue: {', '.join(queue)}"
+    print(line)
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: status-publish
 # ---------------------------------------------------------------------------
 
@@ -1322,6 +1489,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format: human (default) or json",
     )
 
+    # -- status-auto --
+    p_status_auto = subparsers.add_parser(
+        "status-auto",
+        help="Auto-derive your status from loop-mode.json + held batons and publish",
+        description=(
+            "The hands-off per-wake publish: derives state (working if in a loop "
+            "or holding a baton turn, else idle), queue (your held baton turns), "
+            "and cadence (from loop-mode.json cadence_seconds — #1035) "
+            "automatically, then POSTs to the board. Run it on each loop wake. "
+            "Overrides cover what the filesystem can't know: --activity for a "
+            "human one-liner, --on-call for a monitor-only (event-driven) agent, "
+            "and explicit --state/--cadence."
+        ),
+    )
+    p_status_auto.add_argument(
+        "--activity", default=None, metavar="TEXT",
+        help="Free-text one-liner (overrides the loop-mode topic default)",
+    )
+    p_status_auto.add_argument(
+        "--state", default=None, choices=["idle", "working", "sleeping"],
+        help="Override the auto-derived state (e.g. --state sleeping at engram-sleep)",
+    )
+    p_status_auto.add_argument(
+        "--cadence", type=int, default=None, metavar="SECONDS",
+        help="Override the republish cadence in seconds (0 = event-driven/on-call)",
+    )
+    p_status_auto.add_argument(
+        "--on-call", dest="on_call", action="store_true",
+        help="Mark as event-driven / monitor-only (renders 'on-call' when quiet)",
+    )
+
     # -- status-publish --
     p_status_publish = subparsers.add_parser(
         "status-publish",
@@ -1572,6 +1770,8 @@ def main() -> None:
         cmd_verify(args, config, agent_name)
     elif args.subcommand == "online":
         cmd_online(args, config, agent_name)
+    elif args.subcommand == "status-auto":
+        cmd_status_auto(args, config, agent_name)
     elif args.subcommand == "status-publish":
         cmd_status_publish(args, config, agent_name)
     elif args.subcommand == "board":
