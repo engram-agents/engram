@@ -175,14 +175,6 @@
       "tier": "convenience"
     },
     {
-      "path": "tools/migrate-backup.sh",
-      "tier": "convenience"
-    },
-    {
-      "path": "tools/migrate-to-plugin.sh",
-      "tier": "convenience"
-    },
-    {
       "path": "tools/operator-setup-viz.sh",
       "tier": "convenience"
     },
@@ -208,10 +200,6 @@
     },
     {
       "path": "tools/engram-pkg",
-      "tier": "convenience"
-    },
-    {
-      "path": "tools/migration",
       "tier": "convenience"
     },
     {
@@ -257,10 +245,6 @@
     },
     {
       "path": "tools/antml_repair_baseline.py",
-      "tier": "dev"
-    },
-    {
-      "path": "tools/migrate_db_trust_tier.py",
       "tier": "dev"
     },
     {
@@ -693,6 +677,10 @@
     {
       "path": "cycle/",
       "reason": "epistemic research cycle design documents and artifacts (CHARTER, CHRONICLE, charter-inputs, mira-package, standpoint design) — in-development research material, not shipped in the plugin bundle"
+    },
+    {
+      "path": "archive/",
+      "reason": "historical one-time migration artifacts preserved for reference — ran during early development and are not shipped in any install tier"
     }
   ],
   "build_inputs": [

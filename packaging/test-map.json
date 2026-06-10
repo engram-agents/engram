@@ -261,16 +261,6 @@
       "note": "No test file found for engram-fix-git-backup.sh"
     },
     {
-      "path_prefix_or_glob": "tools/migrate-backup.sh",
-      "full_suite_fallback": true,
-      "note": "No test file found for migrate-backup.sh"
-    },
-    {
-      "path_prefix_or_glob": "tools/migrate-to-plugin.sh",
-      "full_suite_fallback": true,
-      "note": "No test file found for migrate-to-plugin.sh"
-    },
-    {
       "path_prefix_or_glob": "tools/collab-letter-monitor.sh",
       "full_suite_fallback": true,
       "note": "No test file found for collab-letter-monitor.sh"
@@ -394,10 +384,6 @@
     {
       "path": "tools/write_sleep_marker.py",
       "reason": "No dedicated test file found"
-    },
-    {
-      "path": "tools/migrate_db_trust_tier.py",
-      "reason": "Listed in tiers.json as a dev tool but has no direct filename reference in tests (test_migrate_db_trust_tier.py imports it directly, so it IS covered by import graph)"
     }
   ],
   "server_import_allowlist": [

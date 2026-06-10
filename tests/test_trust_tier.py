@@ -1,28 +1,26 @@
 """Tests for Layer-1 trust-tier mechanism (PR-Layer1-V1).
 
-Coverage (16 tests; test 4b extracted to test_trust_tier_payload.py):
-  1.  Migration idempotency — run twice, clean no-op second time.
-  2.  Migration data backfill — pn_* get 'unknown'; non-person nodes unaffected.
-  3.  engram_set_trust_tier — below threshold, no approval required.
-  4.  engram_set_trust_tier — at/above threshold without approval → error contains
+Coverage (15 tests; test 4b extracted to test_trust_tier_payload.py):
+  1.  engram_set_trust_tier — below threshold, no approval required.
+  2.  engram_set_trust_tier — at/above threshold without approval → error contains
       literal "primary_user_approval_obtained".
-  5.  engram_set_trust_tier — at/above threshold with approval → succeeds, writes
+  3.  engram_set_trust_tier — at/above threshold with approval → succeeds, writes
       edit_history row.
-  6.  engram_set_trust_tier — primary_user tier without approval → approval-gate error
+  4.  engram_set_trust_tier — primary_user tier without approval → approval-gate error
       (primary_user is now assignable; this test verifies the approval gate fires, not
       a structural rejection).
-  7.  engram_set_trust_tier — invalid tier → allowlist error (7-tier list, no trailer).
-  8.  engram_set_trust_tier — invalid justification_obs_id (non-existent, wrong type,
+  5.  engram_set_trust_tier — invalid tier → allowlist error (7-tier list, no trailer).
+  6.  engram_set_trust_tier — invalid justification_obs_id (non-existent, wrong type,
       retracted).
-  9.  engram_set_trust_tier — same-tier no-op → no edit_history row.
-  10. engram_add_person — new pn_ has trust_tier='unknown'.
-  11. engram_add_trust_signal — happy path: ts_ + 2 edges in single transaction.
-  12. engram_add_trust_signal — invalid subject_pn → rejected.
-  13. engram_add_trust_signal — invalid source_obs_id → rejected.
-  14. engram_add_trust_signal — polarity out of range → rejected.
-  15. engram_derive — rejects ts_ as supporting_id (CLAIM_BEARING_TYPES enforcement).
-  16. Cascade — retract source ob_ → ts_ is tainted.
-  17. Cascade — supersede source ob_ → ts_ is staled.
+  7.  engram_set_trust_tier — same-tier no-op → no edit_history row.
+  8.  engram_add_person — new pn_ has trust_tier='unknown'.
+  9.  engram_add_trust_signal — happy path: ts_ + 2 edges in single transaction.
+  10. engram_add_trust_signal — invalid subject_pn → rejected.
+  11. engram_add_trust_signal — invalid source_obs_id → rejected.
+  12. engram_add_trust_signal — polarity out of range → rejected.
+  13. engram_derive — rejects ts_ as supporting_id (CLAIM_BEARING_TYPES enforcement).
+  14. Cascade — retract source ob_ → ts_ is tainted.
+  15. Cascade — supersede source ob_ → ts_ is staled.
 """
 
 import atexit
@@ -42,11 +40,6 @@ _TESTS_DIR = str(os.path.dirname(os.path.abspath(__file__)))
 if _TESTS_DIR not in sys.path:
     sys.path.insert(0, _TESTS_DIR)
 from conftest import fresh_module  # noqa: E402 — must follow sys.path setup
-
-# Add tools/ to path for the migration script.
-_TOOLS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
-if _TOOLS_DIR not in sys.path:
-    sys.path.insert(0, _TOOLS_DIR)
 
 import engram_core
 import engram_derive
@@ -109,65 +102,6 @@ def _mk_obs(obs, claim: str = "Test claim.") -> str:
     ))
     assert "observation_id" in r, f"Failed to create obs: {r}"
     return r["observation_id"]
-
-
-# ── Test 1: Migration idempotency ──────────────────────────────────────────
-
-def test_migration_idempotent():
-    """Run migration twice; second run is a clean no-op."""
-    from migrate_db_trust_tier import run_migration, NEW_COLUMNS
-    from pathlib import Path
-
-    _fresh_mods()
-    tru, obs, rev, drv, qry, core = _mods()
-    _mk_person(tru, "MigrationIdempotentSeed")
-    db_path = Path(os.path.join(TEST_DIR, "knowledge.db"))
-    assert db_path.exists(), f"DB not found at {db_path}"
-
-    result1 = run_migration(db_path, dry_run=False)
-    assert result1 == 0, f"First migration run failed with exit code {result1}"
-
-    result2 = run_migration(db_path, dry_run=False)
-    assert result2 == 0, f"Second migration run failed with exit code {result2}"
-
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(nodes)").fetchall()}
-    conn.close()
-    for col, _ in NEW_COLUMNS:
-        assert col in cols, f"Column '{col}' missing after double migration"
-
-
-# ── Test 2: Migration data backfill ────────────────────────────────────────
-
-def test_migration_backfill():
-    """Existing pn_* get trust_tier='unknown'; non-person nodes unaffected."""
-    from migrate_db_trust_tier import run_migration
-    from pathlib import Path
-
-    _fresh_mods()
-    tru, obs, rev, drv, qry, core = _mods()
-    db_path = Path(os.path.join(TEST_DIR, "knowledge.db"))
-
-    pn_id = _mk_person(tru, "BackfillTest")
-    ob_id = _mk_obs(obs, "Non-person node — trust_tier should remain NULL.")
-
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("UPDATE nodes SET trust_tier = NULL WHERE id = ?", (pn_id,))
-    conn.commit()
-    conn.close()
-
-    result = run_migration(db_path, dry_run=False)
-    assert result == 0
-
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    pn_row = conn.execute("SELECT trust_tier FROM nodes WHERE id = ?", (pn_id,)).fetchone()
-    ob_row = conn.execute("SELECT trust_tier FROM nodes WHERE id = ?", (ob_id,)).fetchone()
-    conn.close()
-
-    assert pn_row["trust_tier"] == "unknown", f"pn_ trust_tier should be 'unknown', got {pn_row['trust_tier']}"
-    assert ob_row["trust_tier"] is None, f"ob_ trust_tier should be NULL, got {ob_row['trust_tier']}"
 
 
 # ── Test 3: set_trust_tier — below threshold ───────────────────────────────

@@ -5,8 +5,7 @@ Coverage:
   §5.2 Retract cascade — new correct behavior (cs/ls types skip taint + recursion)
   §5.3 Supersede cascade — mirror of §5.1/§5.2 for stale_by
   §5.4 Zero-support detection (retract and supersede paths; exemplifies edge)
-  §5.5 Migration script (clear old markers; idempotency; support_lost on zero support)
-  §5.6 Reflect surfacing (support_lost_nodes in engram_reflect output)
+  §5.5 Reflect surfacing (support_lost_nodes in engram_reflect output)
 
 Import-pattern contract (#948 wave B — R1):
     This file imports engram_revision, engram_cornerstone, engram_derive,
@@ -27,12 +26,6 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TOOLS_MIGRATION_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "migration",
-)
-sys.path.insert(0, TOOLS_MIGRATION_DIR)
-
 # Add tests/ dir so conftest.fresh_module is importable both under pytest and
 # when the file is run as a standalone script.
 _TESTS_DIR = str(Path(__file__).resolve().parent)
@@ -47,6 +40,7 @@ import engram_epistemic
 import engram_lifecycle
 import engram_observation
 import engram_revision
+
 
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_cascade_semantics_")
 atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
@@ -553,156 +547,7 @@ def test_support_lost_logged_in_edit_log():
 
 
 # ---------------------------------------------------------------------------
-# §5.5 Migration script
-# ---------------------------------------------------------------------------
-
-
-def _get_test_db_path():
-    return os.path.join(TEST_DIR, "knowledge.db")
-
-
-def _inject_false_positive_markers(core, node_id, tainted_by=None, stale_by=None):
-    """Directly inject tainted_by / stale_by into a node's metadata (simulates old cascade)."""
-    conn = core._get_db()
-    try:
-        row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (node_id,)).fetchone()
-        meta = json.loads(row["metadata"] or "{}") if row else {}
-        if tainted_by:
-            meta["tainted_by"] = tainted_by
-        if stale_by:
-            meta["stale_by"] = stale_by
-        conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?", (json.dumps(meta), node_id))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def test_migration_clears_cs_taint_and_stale():
-    """Migration clears false-positive tainted_by + stale_by from a cornerstone.
-
-    Simulates the cs_0003 case: one taint entry + one stale entry injected
-    manually (as the old cascade would have created them). Migration should
-    clear both; live-support count > 1 → no support_lost.
-    """
-    import migrate_cascade_semantics_v1 as mig
-
-    rev, obs, derive, cs, epistemic, lifecycle, core = _make_fresh_mods()
-    # Two live supporters so support_lost is NOT set after clearing.
-    ob1 = _seed_ob(obs, "Live supporter 1.")
-    ob2 = _seed_ob(obs, "Live supporter 2.")
-    ob_retracted_sim = _seed_ob(obs, "Now-retracted obs (old taint source).")
-    cs_id = _seed_cs(cs, [ob1, ob2, ob_retracted_sim], tag="migration-test-cs")
-
-    # Inject false-positive markers as the old engine would have.
-    _inject_false_positive_markers(core, cs_id,
-                                   tainted_by=[ob_retracted_sim],
-                                   stale_by=["dv_0004"])
-
-    db_path = _get_test_db_path()
-    conn = mig._get_db(db_path)
-    try:
-        p = mig.plan(conn)
-    finally:
-        conn.close()
-
-    assert p["total"] >= 1, f"Expected at least 1 affected node, got: {p}"
-    affected_ids = {e["id"] for e in p["affected"]}
-    assert cs_id in affected_ids, f"Expected {cs_id} in affected set, got: {affected_ids}"
-
-    # Apply migration
-    conn = mig._get_db(db_path)
-    try:
-        result = mig.apply_migration(conn, p)
-        conn.commit()
-    finally:
-        conn.close()
-
-    assert result["cleared_taint"] >= 1
-    assert result["cleared_stale"] >= 1
-    # 3 live supporters remain → no support_lost
-    assert result["support_lost_set"] == 0, (
-        f"Expected support_lost_set=0 (live supporters remain), got: {result}"
-    )
-
-    meta = _get_meta(core, cs_id)
-    assert "tainted_by" not in meta, f"tainted_by not cleared from {cs_id}: {meta}"
-    assert "stale_by" not in meta, f"stale_by not cleared from {cs_id}: {meta}"
-    assert not meta.get("support_lost"), f"support_lost should not be set: {meta}"
-
-
-def test_migration_idempotent():
-    """Running migration twice is a no-op on the second pass."""
-    import migrate_cascade_semantics_v1 as mig
-
-    rev, obs, derive, cs, epistemic, lifecycle, core = _make_fresh_mods()
-    ob_id = _seed_ob(obs, "Supporter.")
-    cs_id = _seed_cs(cs, ob_id, tag="idempotent-cs")
-    _inject_false_positive_markers(core, cs_id, tainted_by=["ob_0001"])
-
-    db_path = _get_test_db_path()
-
-    # First run
-    conn = mig._get_db(db_path)
-    try:
-        p = mig.plan(conn)
-        result1 = mig.apply_migration(conn, p)
-        conn.commit()
-    finally:
-        conn.close()
-
-    assert result1["total_processed"] >= 1
-
-    # Second run — should find nothing
-    conn = mig._get_db(db_path)
-    try:
-        p2 = mig.plan(conn)
-    finally:
-        conn.close()
-
-    assert p2["total"] == 0, (
-        f"Second migration run found {p2['total']} affected nodes — expected 0 (idempotent)"
-    )
-
-
-def test_migration_sets_support_lost_when_zero_live_supporters():
-    """Migration flags support_lost when a cs has zero live supporting nodes."""
-    import migrate_cascade_semantics_v1 as mig
-
-    rev, obs, derive, cs, epistemic, lifecycle, core = _make_fresh_mods()
-    ob_id = _seed_ob(obs, "Sole supporter.")
-    cs_id = _seed_cs(cs, ob_id, tag="zero-support-migration-cs")
-
-    # Simulate: ob was retracted externally (set is_current=0) + old cascade
-    # left a tainted_by entry in the cs.
-    conn = core._get_db()
-    try:
-        conn.execute("UPDATE nodes SET is_current = 0 WHERE id = ?", (ob_id,))
-        conn.commit()
-    finally:
-        conn.close()
-
-    _inject_false_positive_markers(core, cs_id, tainted_by=[ob_id])
-
-    db_path = _get_test_db_path()
-    conn = mig._get_db(db_path)
-    try:
-        p = mig.plan(conn)
-        result = mig.apply_migration(conn, p)
-        conn.commit()
-    finally:
-        conn.close()
-
-    assert result["support_lost_set"] >= 1, (
-        f"Expected support_lost_set >= 1, got: {result}"
-    )
-    meta = _get_meta(core, cs_id)
-    assert meta.get("support_lost") is True, (
-        f"cs {cs_id} should have support_lost=True after migration: {meta}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# §5.6 Surfacing — engram_reflect
+# §5.5 Surfacing — engram_reflect
 # ---------------------------------------------------------------------------
 
 
