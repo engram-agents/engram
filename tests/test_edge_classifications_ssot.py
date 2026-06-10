@@ -26,7 +26,16 @@ def test_dag_exempt_matches_pre_refactor_set():
     # implementing agent's graph + issue #530's consolidated spec):
     # realization is not a temporal dependency — a goal may be articulated
     # after the work that realizes it (the gl-0008-shaped first customer).
-    expected = frozenset({"contradicts", "about", "exemplifies", "instantiates"})
+    # `resolves` added 2026-06-10 (issue #1076): back-reference edge where
+    # the resolver legitimately pre-dates the question — a question asked
+    # retroactively about a pre-existing answer must not fire a DAG warning.
+    # `tensions` added 2026-06-10 (issue #1076, three-tier edge taxonomy):
+    # relational tier, symmetric/cross-temporal — same class as contradicts.
+    # `serves` added 2026-06-10 (issue #1076, three-tier edge taxonomy):
+    # classification tier — a goal can be articulated after the node that serves
+    # it, same shape as instantiates (already exempt).
+    expected = frozenset({"contradicts", "about", "exemplifies", "instantiates",
+                          "resolves", "tensions", "serves"})
     # Allow the new constant to add `cites` ONLY if a separate ob/dv
     # cites the design call that allowed it.
     assert DAG_EXEMPT_RELATIONS == expected, (

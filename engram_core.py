@@ -492,7 +492,10 @@ EDGE_CLASSIFICATIONS = {
     },
     "resolves": {
         "cascade": False,      # not a confidence-propagating edge
-        "dag_check": True,
+        "dag_check": False,    # back-reference edge: resolver legitimately pre-dates the question
+                               # (a question filed and immediately resolved by a pre-existing node
+                               # has resolver.created_at < question.created_at — correct, not a
+                               # violation). Exemption added 2026-06-10, issue #1076.
         "removable": False,    # structural commitment
         "addable_after_creation": False,
         "provenance": False,
@@ -506,7 +509,9 @@ EDGE_CLASSIFICATIONS = {
     },
     "serves": {
         "cascade": False,
-        "dag_check": True,
+        "dag_check": False,    # same shape as instantiates: a goal can be articulated after the node
+                               # that serves it — serves.source legitimately pre-dates serves.target.
+                               # Exemption added 2026-06-10, issue #1076 (three-tier edge taxonomy).
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -534,7 +539,10 @@ EDGE_CLASSIFICATIONS = {
     },
     "tensions": {
         "cascade": False,
-        "dag_check": True,
+        "dag_check": False,    # relational tier (dependency/relational/classification): symmetric/cross-temporal
+                               # like contradicts (already exempt). A tension between nodes has no causal
+                               # direction; either can pre-date the other legitimately.
+                               # Exemption added 2026-06-10, issue #1076 (three-tier edge taxonomy).
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
