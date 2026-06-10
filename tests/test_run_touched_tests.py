@@ -1285,3 +1285,109 @@ class TestAuditPatches:
         assert "server.registry" in targets
         # Non-string first arg (some_obj) must not appear
         assert not any("some_obj" in t for t in targets)
+
+
+# ---------------------------------------------------------------------------
+# --json emitter (#864 P0 §3): machine-readable selection for run_matrix.py.
+# Structured stdout instead of scraped banner prose. Selection internals are
+# patched so each path is exercised deterministically (no reliance on git
+# state); json.loads on captured stdout is itself the "stdout is pure JSON"
+# guard (a banner-prose leak would make it fail).
+# ---------------------------------------------------------------------------
+
+_JSON_KEYS = [
+    "base", "buckets", "changed_files", "full",
+    "full_reasons", "selected", "total_test_files",
+]
+
+
+def _run_json(monkeypatch, argv, *, changed=None, select_ret=None,
+              classify=None, total=172):
+    import io
+    import contextlib
+    if changed is not None:
+        monkeypatch.setattr(_runner, "_changed_files", lambda base, root: changed)
+    if select_ret is not None:
+        monkeypatch.setattr(_runner, "select_tests",
+                            lambda c, r, verbose=False: select_ret)
+    if classify is not None:
+        monkeypatch.setattr(_runner, "_classify_selection", lambda *a, **k: classify)
+    monkeypatch.setattr(_runner, "_count_total_test_files", lambda root: total)
+    monkeypatch.setattr(_runner, "_load_test_map", lambda root: {})
+    monkeypatch.setattr(_runner, "_get_server_import_allowlist", lambda m: set())
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = _runner.main(argv)
+    assert rc == 0, f"--json must exit 0, got {rc}"
+    return json.loads(buf.getvalue())  # also asserts stdout is pure, valid JSON
+
+
+def test_json_full_flag(monkeypatch):
+    d = _run_json(monkeypatch, ["--json", "--full"])
+    assert d["full"] is True
+    assert d["full_reasons"] == ["--full flag"]
+    assert d["selected"] == []
+    assert d["buckets"] == {"internals": 0, "contract": 0, "map_residue": 0}
+    assert sorted(d) == _JSON_KEYS
+
+
+def test_json_trigger_full(monkeypatch):
+    # select_tests reports is_full=True (e.g. a full-trigger file changed).
+    d = _run_json(
+        monkeypatch, ["--json"],
+        changed=["packaging/test-map.json"],
+        select_ret=([], True, ["packaging/test-map.json changed → full"], {}),
+    )
+    assert d["full"] is True
+    assert "test-map.json" in d["full_reasons"][0]
+    assert d["selected"] == []
+    assert sorted(d) == _JSON_KEYS
+
+
+def test_json_subset_with_buckets(monkeypatch):
+    d = _run_json(
+        monkeypatch, ["--json"],
+        changed=["engram_core.py"],
+        select_ret=(["tests/test_core_x.py", "tests/test_core_y.py"], False, [],
+                    {"tests/test_core_y.py"}),
+        classify=(1, 1, 0),
+    )
+    assert d["full"] is False
+    assert d["selected"] == ["tests/test_core_x.py", "tests/test_core_y.py"]
+    assert d["changed_files"] == ["engram_core.py"]
+    assert d["buckets"] == {"internals": 1, "contract": 1, "map_residue": 0}
+    assert d["total_test_files"] == 172
+    assert sorted(d) == _JSON_KEYS  # schema-key regression guard (subset path)
+
+
+def test_json_empty_selection(monkeypatch):
+    # Changed files resolve to no tests → full=false, selected empty, zero buckets.
+    d = _run_json(
+        monkeypatch, ["--json"],
+        changed=["README.md"],
+        select_ret=([], False, [], {}),
+    )
+    assert d["full"] is False
+    assert d["selected"] == []
+    assert d["buckets"] == {"internals": 0, "contract": 0, "map_residue": 0}
+    assert sorted(d) == _JSON_KEYS  # schema-key regression guard (empty path)
+
+
+def test_json_stdout_is_single_line_pure_json(monkeypatch):
+    # Hard guard for the run_matrix consumer: exactly one line, no banner prose
+    # (select_tests must run verbose=False so its [L1]/[direct] lines don't leak).
+    import io
+    import contextlib
+    monkeypatch.setattr(_runner, "_changed_files", lambda b, r: ["engram_core.py"])
+    monkeypatch.setattr(_runner, "select_tests",
+                        lambda c, r, verbose=False: (["tests/test_a.py"], False, [], set()))
+    monkeypatch.setattr(_runner, "_classify_selection", lambda *a, **k: (1, 0, 0))
+    monkeypatch.setattr(_runner, "_count_total_test_files", lambda r: 5)
+    monkeypatch.setattr(_runner, "_load_test_map", lambda r: {})
+    monkeypatch.setattr(_runner, "_get_server_import_allowlist", lambda m: set())
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _runner.main(["--json"])
+    out = buf.getvalue().strip()
+    assert out.count("\n") == 0, f"--json stdout must be a single line, got: {out!r}"
+    json.loads(out)

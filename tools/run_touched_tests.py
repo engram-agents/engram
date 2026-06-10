@@ -668,6 +668,78 @@ def _audit_patches(
 # ---------------------------------------------------------------------------
 
 
+def _emit_json_selection(args, repo_root: str) -> int:
+    """Emit the touched-test selection as a single JSON object on stdout.
+
+    Machine-readable interface for run_matrix.py / CI (#864 §3): structured
+    output instead of scraping the human banner (the parse-the-printed-text
+    construction-vacuity surface the green-is-not-ground-truth lesson warns
+    against). No pytest run; selection is computed once on the host. Schema:
+
+        {
+          "base":             <git ref the diff was taken against>,
+          "changed_files":    [<repo-relative paths>],
+          "full":             <bool — whole suite selected>,
+          "full_reasons":     [<trigger descriptions when full>],
+          "selected":         [<test files>; [] when full or none>],
+          "total_test_files": <int>,
+          "buckets":          {"internals": N, "contract": N, "map_residue": N}
+        }
+
+    full=true means the convergence-gate whole suite is selected (selected is []
+    then — the consumer runs `pytest tests/`, not the listed subset). Buckets are
+    zero when full or when nothing is selected. select_tests runs with
+    verbose=False so no banner prose leaks onto stdout and corrupts the JSON.
+    """
+    empty_buckets = {"internals": 0, "contract": 0, "map_residue": 0}
+    total_test_files = _count_total_test_files(repo_root)
+
+    if args.full:
+        out = {
+            "base": args.base, "changed_files": [], "full": True,
+            "full_reasons": ["--full flag"], "selected": [],
+            "total_test_files": total_test_files, "buckets": empty_buckets,
+        }
+        print(json.dumps(out))
+        return 0
+
+    changed = _changed_files(args.base, repo_root)
+    selected, is_full, reasons, map_selected = select_tests(
+        changed, repo_root, verbose=False
+    )
+
+    if is_full:
+        out = {
+            "base": args.base, "changed_files": changed, "full": True,
+            "full_reasons": reasons, "selected": [],
+            "total_test_files": total_test_files, "buckets": empty_buckets,
+        }
+        print(json.dumps(out))
+        return 0
+
+    if selected:
+        test_map = _load_test_map(repo_root)
+        allowlist = _get_server_import_allowlist(test_map)
+        n_internals, n_contract, n_map_residue = _classify_selection(
+            selected, map_selected, allowlist
+        )
+        buckets = {
+            "internals": n_internals,
+            "contract": n_contract,
+            "map_residue": n_map_residue,
+        }
+    else:
+        buckets = dict(empty_buckets)
+
+    out = {
+        "base": args.base, "changed_files": changed, "full": False,
+        "full_reasons": [], "selected": selected,
+        "total_test_files": total_test_files, "buckets": buckets,
+    }
+    print(json.dumps(out))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -734,6 +806,16 @@ def main(argv: list[str] | None = None) -> int:
             "are found (future CI gate). Has no effect without an audit flag."
         ),
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Emit the selection as a single JSON object on stdout and exit 0 "
+            "(machine-readable interface for run_matrix.py / CI — no pytest run, "
+            "no human banner). Composes with --base; ignores --dry-run/passthrough. "
+            "With --full the diff is skipped, so changed_files is emitted as []."
+        ),
+    )
 
     # Split argv on '--' to pass remaining args through to pytest
     if argv is None:
@@ -786,6 +868,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.strict and violations:
             return 1
         return 0
+
+    # --json: machine-readable selection for run_matrix.py / CI (no pytest run,
+    # no human banner — structured output, never scraped prose).
+    if args.json:
+        return _emit_json_selection(args, repo_root)
 
     total_test_files = _count_total_test_files(repo_root)
 
