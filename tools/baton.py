@@ -6,7 +6,7 @@ A thin CLI wrapping the baton file protocol at
 shared projects (PRs, designs, etc.) so agents always know whose move it
 is next.
 
-Eleven subcommands:
+Twelve subcommands:
   init        Create a new project baton file
   flip        Pass the baton to another participant (PR layer)
   claim       Take a Project-layer baton from the pool (pool → self)
@@ -18,6 +18,7 @@ Eleven subcommands:
   reopen      Flip a closed baton back to an active status (inverse of close)
   rename      Update the human-readable project title
   anchor      Set or update the github: anchor on an existing baton
+  merge       Gate-checked squash merge: baton-turn + CI-green + approval-fresh
 
 Design: Lei + Borges, 2026-05-28 (solving the importance-inflation-derivation-shaped misalignment
 incident where Borges and Ariadne disagreed about whose court PR #425 was in).
@@ -1600,6 +1601,247 @@ def cmd_anchor(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: merge  (gate-checked merge verb — #999 + #1000)
+# ---------------------------------------------------------------------------
+
+def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    """Squash-merge a PR through the baton gate ladder.
+
+    Gate ladder (all must pass in order):
+      1. Baton exists at projects dir for PR-N.           (never forceable)
+      2. turn == pool sentinel.                            (never forceable)
+      3. CI green via _pr_ci_state.                       (--force skips)
+      4. Approval fresh via _pr_approval_state (oid).     (--force skips)
+      5. gh pr merge <N> --squash.
+      6. On success: append turn-log + set baton status → merged.
+
+    --force skips gates 3-4 only; never skips 1-2.
+    --dry-run prints the ladder verdict without merging.
+    """
+    projects_dir = Path(BATON_PROJECTS_DIR)
+
+    # Resolve project_id and pr_number from the argument (PR-N or bare N)
+    raw = args.pr.strip()
+    m = re.match(r"^(?:PR-|pr-)(\d+)$", raw)
+    if m:
+        pr_number = m.group(1)
+        project_id = f"PR-{pr_number}"
+    else:
+        pr_number = raw.lstrip("#")
+        project_id = f"PR-{pr_number}"
+
+    if not pr_number.isdigit():
+        print(
+            f"baton merge: cannot resolve PR number from '{args.pr}'. "
+            "Expected 'PR-123' or a bare number.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    force = getattr(args, "force", False)
+    dry_run = getattr(args, "dry_run", False)
+
+    # ---- Gate 1: baton exists ----------------------------------------
+    dest = _project_path(project_id, projects_dir)
+    if not dest.exists():
+        print(
+            f"baton merge: no baton — a PR without a baton is not merge-ready "
+            "(init + run the review pipeline). "
+            f"Looked for {dest}.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    try:
+        text = dest.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        print(f"baton merge: cannot read '{dest}': {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+
+    fields, body = _parse_frontmatter(text)
+    if not fields:
+        print(
+            f"baton merge: cannot parse frontmatter from '{dest}'. "
+            "The file may be malformed.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    # Reject already-closed batons (merging a merged/cancelled baton is
+    # almost certainly an operator error)
+    current_status = fields.get("status", "").strip().lower()
+    if current_status in CLOSED_STATUSES:
+        print(
+            f"baton merge: project '{project_id}' is already {current_status} — "
+            "nothing to merge.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    # ---- Gate 2: turn == pool sentinel --------------------------------
+    sentinel = _pool_sentinel()
+    current_turn = fields.get("turn", "").strip().lower()
+    if current_turn != sentinel:
+        holder = current_turn or "(unknown)"
+        print(
+            f"baton merge: turn is with {holder} — not presented for merge. "
+            f"The baton must be flipped to the pool sentinel ('{sentinel}') "
+            "before merging.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    # ---- Gate 3: CI green (skippable with --force) --------------------
+    _ci_verdict = "green"
+    if force:
+        # Audit-trail parity with cmd_flip --force: still query the actual
+        # state so the forced merge's warning (and turn-log) record what was
+        # bypassed, not just that something was.
+        _ci_state, _ci_detail = _pr_ci_state(pr_number)
+        print(
+            f"warning: --force — skipping CI-green check for PR #{pr_number} "
+            f"(actual: {_ci_state} — {_ci_detail})",
+            file=sys.stderr,
+        )
+        _ci_verdict = f"skipped (--force; actual: {_ci_state})"
+    else:
+        _ci_state, _ci_detail = _pr_ci_state(pr_number)
+        if _ci_state in ("red", "pending"):
+            print(
+                f"baton merge: CI is {_ci_state} on PR #{pr_number} "
+                f"({_ci_detail}). "
+                "Re-merge when checks are green, or pass --force to override.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        elif _ci_state == "unknown":
+            print(
+                f"warning: could not verify CI state for PR #{pr_number} "
+                f"({_ci_detail}) — proceeding anyway",
+                file=sys.stderr,
+            )
+            _ci_verdict = f"unknown ({_ci_detail})"
+        else:
+            _ci_verdict = f"green ({_ci_detail})"
+
+    # ---- Gate 4: approval fresh (skippable with --force) --------------
+    _ap_verdict = "fresh"
+    if force:
+        _ap_state, _ap_detail = _pr_approval_state(pr_number)
+        print(
+            f"warning: --force — skipping approval-fresh check for PR "
+            f"#{pr_number} (actual: {_ap_state} — {_ap_detail})",
+            file=sys.stderr,
+        )
+        _ap_verdict = f"skipped (--force; actual: {_ap_state})"
+    else:
+        _ap_state, _ap_detail = _pr_approval_state(pr_number)
+        if _ap_state == "stale":
+            print(
+                f"baton merge: tip moved after approval on PR #{pr_number} "
+                f"({_ap_detail}). The approved commit is not the commit "
+                "that would be merged — request a re-review of the new tip, "
+                "or pass --force to override.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        elif _ap_state == "unknown":
+            print(
+                f"warning: could not verify post-approval state for PR "
+                f"#{pr_number} ({_ap_detail}) — proceeding anyway",
+                file=sys.stderr,
+            )
+            _ap_verdict = f"unknown ({_ap_detail})"
+        else:
+            # fresh or no_approval — both pass through
+            _ap_verdict = f"{_ap_state} ({_ap_detail})"
+
+    # ---- dry-run: print verdict and exit cleanly ---------------------
+    if dry_run:
+        print(f"baton merge --dry-run: PR #{pr_number} ({project_id})")
+        print(f"  gate 1 (baton exists): PASS")
+        print(f"  gate 2 (turn=sentinel): PASS — turn={current_turn}")
+        print(f"  gate 3 (CI):            {_ci_verdict}")
+        print(f"  gate 4 (approval):      {_ap_verdict}")
+        print(f"  merge: DRY-RUN — no merge performed")
+        return
+
+    # ---- Gate 5: gh pr merge --squash --------------------------------
+    try:
+        merge_result = subprocess.run(
+            ["gh", "pr", "merge", pr_number, "--squash"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except FileNotFoundError:
+        print(
+            f"baton merge: gh not found on PATH — cannot merge PR #{pr_number}. "
+            "Baton state unchanged.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_IO)
+    except subprocess.TimeoutExpired:
+        print(
+            f"baton merge: gh timed out after 60s merging PR #{pr_number}. "
+            "Baton state unchanged.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_IO)
+    except OSError as exc:
+        print(
+            f"baton merge: gh exec error: {exc}. "
+            "Baton state unchanged.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_IO)
+
+    if merge_result.returncode != 0:
+        gh_err = (merge_result.stderr or "").strip() or f"gh exit {merge_result.returncode}"
+        print(
+            f"baton merge: gh pr merge failed for PR #{pr_number}: {gh_err}. "
+            "Baton state unchanged.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_IO)
+
+    # ---- Gate 6: post-merge baton closure ----------------------------
+    now = _now_iso()
+    merge_by = agent_name or "unknown"
+    if force:
+        log_entry = (
+            f"- {now} merged via baton merge by {merge_by} "
+            "(FORCED past gates 3-4)"
+        )
+    else:
+        log_entry = f"- {now} merged via baton merge by {merge_by}"
+
+    # Update frontmatter: set status → merged
+    updated_text = _update_frontmatter(text, {"status": "merged"})
+
+    # Re-parse to get the body after frontmatter update, then append log entry
+    _uf, updated_body = _parse_frontmatter(updated_text)
+    final_body = _append_turn_log(updated_body, log_entry)
+
+    # Reconstruct: frontmatter section + updated body
+    fm_m = _FRONTMATTER_RE.match(updated_text)
+    if fm_m:
+        fm_section = updated_text[:fm_m.end()]
+        final_content = fm_section.rstrip("\n") + "\n" + final_body
+    else:
+        final_content = updated_text
+
+    # The GitHub merge above is irreversible; say so BEFORE the local write so
+    # an _atomic_write failure is diagnosable as merged-on-GitHub/baton-stale.
+    print(f"baton merge: PR #{pr_number} merged on GitHub; writing baton closure...")
+    _atomic_write(dest, final_content)
+
+    print(f"baton merge: PR #{pr_number} merged (squash)")
+    print(f"  baton: {project_id} → merged")
+    print(f"  at:    {now}")
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -1860,6 +2102,43 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # -- merge --
+    p_merge = subparsers.add_parser(
+        "merge",
+        help="Gate-checked squash merge for a PR baton",
+        description=(
+            "Squash-merge a PR after passing the baton gate ladder:\n"
+            "  1. Baton exists for PR-N          (never forceable)\n"
+            "  2. turn == pool sentinel            (never forceable)\n"
+            "  3. CI green                         (--force skips)\n"
+            "  4. Approval fresh (oid-compare)     (--force skips)\n"
+            "  5. gh pr merge N --squash\n"
+            "  6. Baton status → merged\n\n"
+            "Prevents merging a PR that hasn't been presented to the maintainer\n"
+            "via the baton flip pipeline, or merging with failing CI or a stale\n"
+            "approval. --force overrides only the CI and approval gates (3-4);\n"
+            "a missing baton or unflipped turn is never forceable."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_merge.add_argument(
+        "pr",
+        metavar="PR-N",
+        help="PR number in PR-N or bare-N form (e.g. PR-123 or 123)",
+    )
+    p_merge.add_argument(
+        "--force", action="store_true", default=False,
+        help=(
+            "Skip CI-green and approval-fresh gates (3-4). "
+            "Does NOT skip baton-exists or turn-sentinel gates (1-2)."
+        ),
+    )
+    p_merge.add_argument(
+        "--dry-run", action="store_true", default=False,
+        dest="dry_run",
+        help="Evaluate all gates and print the verdict; do not merge.",
+    )
+
     return parser
 
 
@@ -1897,6 +2176,8 @@ def main() -> None:
         cmd_rename(args, config, agent_name)
     elif args.subcommand == "anchor":
         cmd_anchor(args, config, agent_name)
+    elif args.subcommand == "merge":
+        cmd_merge(args, config, agent_name)
     else:
         parser.print_help()
         sys.exit(EXIT_VALIDATION)
