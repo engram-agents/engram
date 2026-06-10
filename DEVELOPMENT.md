@@ -422,6 +422,28 @@ the runtime tree's data files into the alpha repo:
 plugin bundle (and therefore gets deployed). See `tools/build-plugin.sh` for
 the copy logic that reads the manifest.
 
+The manifest has four sections:
+
+- **`mechanisms[]`** — shippable artifacts with tier + multi-agent assignments.
+  Every new file destined for the plugin goes here.
+- **`excluded[]`** — files that exist in candidate directories but are
+  intentionally NOT shipped via `build-plugin.sh`. Examples: the `forum/`
+  community service (second deploy target, deployed separately on the forum
+  host — the canonical case), persona-specific agent tools, and operator
+  infrastructure scripts that live under `tools/` but are never agent-plugin
+  payload. Putting a path here is the correct accounting when a file exists in
+  a candidate directory but should not ship. Adding it to `mechanisms[]`
+  instead would be a silent no-op for paths the build engine doesn't know how
+  to copy (e.g., `forum/`).
+- **`repo_only[]`** — tracked files that are never shipping candidates at all
+  (tests, CI scripts, dev tooling). These don't belong in either of the above.
+- **`build_inputs[]`** — files consumed by the build process itself (not
+  shipped as output).
+
+The `tag-once` CI gate (`tests/test_tiers_manifest.py`) enforces that every
+path in a candidate directory is accounted for in exactly one section — no
+silent omissions.
+
 ## Quick reference
 
 | Task | Command |
