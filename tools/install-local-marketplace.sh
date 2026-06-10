@@ -237,6 +237,9 @@ log "Marketplace assembled at $MARKETPLACE_ROOT"
 # plugin upgrade — the engram-upgrade skill's change-set review
 # (deployed..target) and post-upgrade verification both anchor on it. Same
 # format the scatter-era writer used.
+# Capture the OLD sha BEFORE overwriting the marker — used below to detect
+# whether hooks/hooks.json changed in this upgrade (requires a full restart).
+OLD_ALPHA_SHA="$(grep '^alpha_sha=' "$ENGRAM_HOME/.deployed-version" 2>/dev/null | cut -d= -f2- || true)"
 ALPHA_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 ALPHA_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
 if [[ -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
@@ -252,6 +255,20 @@ deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 deployed_from=$REPO_ROOT
 MARKER
 log "Version marker refreshed: $ENGRAM_HOME/.deployed-version (alpha_sha=$ALPHA_SHA)"
+
+# ── Hook-registration-change detection ────────────────────────────────────────
+# Claude Code only reloads the hook set on a FULL restart — /mcp reconnect
+# reloads the MCP server but NOT the hook registration.  If hooks/hooks.json
+# changed in this upgrade, a removed hook will throw a dangling-file error and
+# an added hook won't fire until Claude Code is restarted.
+if [[ -n "$OLD_ALPHA_SHA" ]] && git -C "$REPO_ROOT" cat-file -e "${OLD_ALPHA_SHA}^{commit}" 2>/dev/null && ! git -C "$REPO_ROOT" diff --quiet "$OLD_ALPHA_SHA" HEAD -- hooks/hooks.json 2>/dev/null; then
+  echo ""
+  echo "  ⚠️  HOOK REGISTRATION CHANGED in this upgrade."
+  echo "      You MUST fully RESTART Claude Code (not just /mcp) to reload the hook set —"
+  echo "      otherwise removed hooks will error and added hooks won't fire."
+  echo "      (/mcp reconnect reloads the MCP server, not the hook registration.)"
+  echo ""
+fi
 
 if [[ $SKIP_ADD -eq 1 ]]; then
   log "Skipping host CLI marketplace registration (--skip-add)"

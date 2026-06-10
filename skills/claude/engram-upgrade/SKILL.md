@@ -144,6 +144,8 @@ The plugin tree/cache now has the new `server.py`, but the running MCP server ma
 
 **Do NOT** kill the MCP subprocess yourself — the stdio-MCP contract is user-restart only; killing it from an agent breaks the harness transport.
 
+**If Step 2's change set touched `hooks/hooks.json`, a `/mcp` reconnect is NOT enough — you need a full Claude Code restart.** `/mcp` reloads the MCP server process but does NOT reload the hook registration; a removed hook will throw a dangling-file error on the next event, and an added hook won't fire at all, until Claude Code is fully restarted. The `install-local-marketplace.sh` script will have printed an `⚠️  HOOK REGISTRATION CHANGED` banner if this applies.
+
 **Checkpoint**: user reconnected (or explicitly deferred, noted as code-not-yet-running).
 
 ---
