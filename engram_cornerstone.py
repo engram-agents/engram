@@ -104,9 +104,16 @@ def _add_cornerstone_impl(
 
         linked = []
         missing = []
+        non_current = []
         for sid in [s.strip() for s in core._as_csv(supporting_ids).split(",") if s.strip()]:
-            exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (sid,)).fetchone()
-            if exists:
+            row = conn.execute(
+                "SELECT id, is_current FROM nodes WHERE id = ?", (sid,)
+            ).fetchone()
+            if not row:
+                missing.append(sid)
+            elif not row["is_current"]:
+                non_current.append(sid)
+            else:
                 try:
                     conn.execute(
                         "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'supported_by', ?)",
@@ -115,8 +122,6 @@ def _add_cornerstone_impl(
                     linked.append(sid)
                 except sqlite3.IntegrityError:
                     pass
-            else:
-                missing.append(sid)
 
         core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
         anchored_score = core._compute_importance(2.0, core._get_current_turn())
@@ -127,14 +132,17 @@ def _add_cornerstone_impl(
         if linked:
             core._utility_reward(conn, linked, action="citation")
         conn.commit()
-        return json.dumps({
+        result = {
             "status": "created",
             "cornerstone_id": node_id,
             "tag": tag,
             "title": title,
             "supporting_nodes": linked,
             "missing_supporting_ids": missing,
-        })
+        }
+        if non_current:
+            result["non_current_supporting_ids"] = non_current
+        return json.dumps(result)
     finally:
         conn.close()
 
@@ -244,10 +252,16 @@ def _outgrow_cornerstone_impl(
 
         linked_supports = []
         missing_supports = []
+        non_current_supports = []
         for sid in all_support_ids:
-            exists = conn.execute("SELECT id FROM nodes WHERE id = ?", (sid,)).fetchone()
-            if not exists:
+            row = conn.execute(
+                "SELECT id, is_current FROM nodes WHERE id = ?", (sid,)
+            ).fetchone()
+            if not row:
                 missing_supports.append(sid)
+                continue
+            if not row["is_current"]:
+                non_current_supports.append(sid)
                 continue
             try:
                 conn.execute(
@@ -317,6 +331,7 @@ def _outgrow_cornerstone_impl(
             "supporting_nodes_linked": linked_supports,
             "missing_supporting_ids": missing_supports,
             "preserved_about_edges": linked_abouts,
+            **({"non_current_supporting_ids": non_current_supports} if non_current_supports else {}),
             **({"non_current_about_ids": non_current_about_ids} if non_current_about_ids else {}),
             **({"missing_about_ids": missing_about_ids} if missing_about_ids else {}),
         })

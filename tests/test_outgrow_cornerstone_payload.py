@@ -14,6 +14,8 @@ Coverage:
      current about node inherited normally.
   6. missing_about_ids (issue #1024): absent (DB-deleted) person node in about
      edges reported in missing_about_ids, not silently dropped.
+  7. is_current guard — retracted new_supporting_id skipped, non_current_supporting_ids populated (#1019).
+  8. is_current guard — superseded new_supporting_id skipped, non_current_supporting_ids populated (#1019).
 """
 
 import atexit
@@ -257,3 +259,69 @@ def test_outgrow_missing_and_noncurrent_about_nodes_reported_separately():
     # Ensure correct separation: no cross-contamination
     assert pn_retracted not in r.get("missing_about_ids", []), r
     assert pn_deleted not in r.get("non_current_about_ids", []), r
+
+
+# ── 7-8. is_current guard — new_supporting_ids with non-current nodes (#1019) ──
+
+
+def _seed_obs(server, url_suffix="a"):
+    r = json.loads(server.engram_add_observation(payload_json=json.dumps({
+        "url": f"https://example.com/{url_suffix}",
+        "title": url_suffix.upper(),
+        "quoted_text": "Test quote.", "interpretation": "Test interp.", "claim": "Test claim.",
+        "quote_type": "attributed_analysis",
+    })))
+    return r["observation_id"]
+
+
+def _retract_node(server, node_id):
+    r = json.loads(server.engram_retract(payload_json=json.dumps({
+        "node_id": node_id,
+        "error_type": "hallucinated_claim",
+        "reason": "Test retraction — is_current guard test.",
+    })))
+    assert "error" not in r, f"retract failed: {r}"
+
+
+def _supersede_node(server, old_id, new_id):
+    r = json.loads(server.engram_supersede(payload_json=json.dumps({
+        "old_node_id": old_id,
+        "new_node_id": new_id,
+        "supersede_reason": "Test supersede — is_current guard test.",
+    })))
+    assert "error" not in r, f"supersede failed: {r}"
+
+
+def test_retracted_new_supporting_id_skipped_with_warning():
+    """Retracted new_supporting_id is skipped, non_current_supporting_ids populated (#1019)."""
+    server = fresh_server()
+    cs_id = _seed_cornerstone(server)
+    obs_id = _seed_obs(server, "retract-support")
+    _retract_node(server, obs_id)
+    r = json.loads(server.engram_outgrow_cornerstone(payload_json=json.dumps({
+        "old_cornerstone_id": cs_id,
+        "new_new_frame": "Updated frame.",
+        "new_supporting_ids": obs_id,
+    })))
+    assert "error" not in r, r
+    assert r.get("status") == "outgrown", r
+    assert obs_id not in r.get("supporting_nodes_linked", []), r
+    assert obs_id in r.get("non_current_supporting_ids", []), r
+
+
+def test_superseded_new_supporting_id_skipped_with_warning():
+    """Superseded new_supporting_id is skipped, non_current_supporting_ids populated (#1019)."""
+    server = fresh_server()
+    cs_id = _seed_cornerstone(server)
+    obs_id = _seed_obs(server, "supersede-old")
+    obs2_id = _seed_obs(server, "supersede-new")
+    _supersede_node(server, obs_id, obs2_id)
+    r = json.loads(server.engram_outgrow_cornerstone(payload_json=json.dumps({
+        "old_cornerstone_id": cs_id,
+        "new_new_frame": "Updated frame.",
+        "new_supporting_ids": obs_id,
+    })))
+    assert "error" not in r, r
+    assert r.get("status") == "outgrown", r
+    assert obs_id not in r.get("supporting_nodes_linked", []), r
+    assert obs_id in r.get("non_current_supporting_ids", []), r

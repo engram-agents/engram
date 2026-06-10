@@ -6,6 +6,8 @@ Coverage:
   3. Schema enforcement — invalid JSON, non-object, unknown fields.
   4. Required-field validation — missing tag / title / new_frame rejected.
   5. Internal helper — _add_cornerstone_impl works with named kwargs.
+  6. is_current guard — retracted supporting_id skipped, non_current_supporting_ids populated (#1019).
+  7. is_current guard — superseded supporting_id skipped, non_current_supporting_ids populated (#1019).
 """
 
 import atexit
@@ -121,3 +123,69 @@ def test_impl_callable_with_kwargs():
     ))
     assert "error" not in r, r
     assert "cornerstone_id" in r
+
+
+# ── 6-7. is_current guard — supporting_ids with non-current nodes (#1019) ──
+
+
+def _seed_obs(server, url_suffix="a"):
+    r = json.loads(server.engram_add_observation(payload_json=json.dumps({
+        "url": f"https://example.com/{url_suffix}",
+        "title": url_suffix.upper(),
+        "quoted_text": "Test quote.", "interpretation": "Test interp.", "claim": "Test claim.",
+        "quote_type": "attributed_analysis",
+    })))
+    return r["observation_id"]
+
+
+def _retract_node(server, node_id):
+    r = json.loads(server.engram_retract(payload_json=json.dumps({
+        "node_id": node_id,
+        "error_type": "hallucinated_claim",
+        "reason": "Test retraction — is_current guard test.",
+    })))
+    assert "error" not in r, f"retract failed: {r}"
+
+
+def _supersede_node(server, old_id, new_id):
+    r = json.loads(server.engram_supersede(payload_json=json.dumps({
+        "old_node_id": old_id,
+        "new_node_id": new_id,
+        "supersede_reason": "Test supersede — is_current guard test.",
+    })))
+    assert "error" not in r, f"supersede failed: {r}"
+
+
+def test_retracted_supporting_id_skipped_with_warning():
+    """Retracted supporting_id is skipped and appears in non_current_supporting_ids (#1019)."""
+    server = fresh_server()
+    obs_id = _seed_obs(server, "retract-support")
+    _retract_node(server, obs_id)
+    r = json.loads(server.engram_add_cornerstone(payload_json=json.dumps({
+        "tag": "test-axis",
+        "title": "Cornerstone with retracted support",
+        "new_frame": "New frame.",
+        "supporting_ids": obs_id,
+    })))
+    assert "error" not in r, r
+    assert r.get("status") == "created", r
+    assert obs_id not in r.get("supporting_nodes", []), r
+    assert obs_id in r.get("non_current_supporting_ids", []), r
+
+
+def test_superseded_supporting_id_skipped_with_warning():
+    """Superseded supporting_id is skipped and appears in non_current_supporting_ids (#1019)."""
+    server = fresh_server()
+    obs_id = _seed_obs(server, "supersede-old")
+    obs2_id = _seed_obs(server, "supersede-new")
+    _supersede_node(server, obs_id, obs2_id)
+    r = json.loads(server.engram_add_cornerstone(payload_json=json.dumps({
+        "tag": "test-axis",
+        "title": "Cornerstone with superseded support",
+        "new_frame": "New frame.",
+        "supporting_ids": obs_id,
+    })))
+    assert "error" not in r, r
+    assert r.get("status") == "created", r
+    assert obs_id not in r.get("supporting_nodes", []), r
+    assert obs_id in r.get("non_current_supporting_ids", []), r
