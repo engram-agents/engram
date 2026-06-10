@@ -457,10 +457,9 @@ on the plugin path).
   migrated in):
   - **Claude plugin path** — manually move or delete `~/.engram/knowledge.db`
     first (back it up yourself if you might want it later), then rebuild the
-    plugin and run `bootstrap.py`. Note: `FORCE=1` does NOT delete anything —
-    it only bypasses the existing-install guard and bootstraps on top of the
-    existing DB, adding seed nodes alongside your data. For a clean slate the
-    manual delete is the required step.
+    plugin and run `bootstrap.py`. Note: `FORCE=1` (and `FORCE_RESEED_EMPTY=1`)
+    now **refuse on a non-empty DB** — they only proceed on a 0-node DB.
+    For a clean slate the manual delete is the only path.
 
 **Why git clone, not zip download?** GitHub's "Source code (tar.gz)" tarball on
 Releases works for a one-shot install, but you lose easy upgrades — you'd need
@@ -523,8 +522,8 @@ Only proceed with a fresh start if the user has explicitly said they want
 one. In that case the clean-slate step is manual: move or delete
 `~/.engram/knowledge.db` (offer to back it up first), then re-run
 `bootstrap.py` — no `FORCE` needed once the DB is gone. Do NOT reach for
-`FORCE=1` here: it only bypasses the guard and bootstraps on top of the
-existing DB without removing anything. Ask the user:
+`FORCE=1` here: it will **refuse** if the DB still has nodes (disciplined-
+refusal gate). Ask the user:
 
 > You already have an ENGRAM install. A fresh start means deleting the
 > existing knowledge.db — your agent loses every node it has written.
@@ -580,9 +579,9 @@ upgrade path below. Everything below is deterministic.
 
 If you see `~/.engram/knowledge.db` present, the user has an existing install.
 **Default to upgrade.** A fresh start means deleting the existing graph —
-the user's agent loses every node it has ever written. (`FORCE=1` is not a
-fresh start: it bypasses the guard and bootstraps on top of the existing
-DB.) Default to the upgrade path instead. Suggest:
+the user's agent loses every node it has ever written. (`FORCE=1` on a
+non-empty DB now **refuses** — it is not a bypass path.) Default to the
+upgrade path instead. Suggest:
 
 > You already have an ENGRAM install at `~/.engram/`. I can run the plugin
 > upgrade flow to update the running code (server, hooks, tools, SKILL.md,
@@ -898,8 +897,8 @@ Intentional. Two paths forward:
 - **Fresh reinstall** (start over with empty graph):
   - **Claude plugin path** — manually move or delete `~/.engram/knowledge.db`
     (no automatic backup is made — keep a copy yourself), then re-run
-    `bootstrap.py`. `FORCE=1` does not delete data; it only bypasses the
-    existing-install guard.
+    `bootstrap.py`. `FORCE=1` now **refuses on a non-empty DB** (disciplined-
+    refusal gate per #774); delete the DB first, then bootstrap without FORCE.
 
 **`/plugin install engram` reports "Plugin not found" (reinstall on existing machine)**
 The plugin is already in Claude Code's cache from a previous install. Recovery:

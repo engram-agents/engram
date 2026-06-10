@@ -125,7 +125,7 @@ def test_bootstrap_seeds_fresh_db_under_env_bypass():
 
 
 def test_bootstrap_refuses_overwrite_existing_db():
-    """bootstrap.py with an existing knowledge.db raises SystemExit unless FORCE=1.
+    """bootstrap.py with an existing knowledge.db raises SystemExit (no escape set).
 
     Origin: PR #577 added the refuse-overwrite gate as defense-in-depth for
     the plugin path (the retired scatter installer carried the same gate).
@@ -147,7 +147,8 @@ def test_bootstrap_refuses_overwrite_existing_db():
             "PYTHON_BIN": sys.executable,
             "TARGET": "claude",
         })
-        env.pop("FORCE", None)  # ensure no inherited FORCE bypass
+        env.pop("FORCE", None)               # ensure no inherited escape vars
+        env.pop("FORCE_RESEED_EMPTY", None)
 
         result = subprocess.run(
             [sys.executable, str(REPO_ROOT / "bootstrap.py")],
@@ -165,29 +166,105 @@ def test_bootstrap_refuses_overwrite_existing_db():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def test_bootstrap_force_preserves_existing_data():
-    """FORCE=1 bypasses the guard WITHOUT deleting the existing DB.
+def _make_empty_db_env(workdir: Path) -> tuple[Path, dict]:
+    """Helper: create an engram_home with an empty knowledge.db and matching env."""
+    engram_home = workdir / ".engram"
+    engram_home.mkdir(parents=True)
+    db_path = engram_home / "knowledge.db"
 
-    Pins the actual FORCE=1 semantics so docs can't drift: bootstrap with
-    FORCE=1 runs on top of the existing knowledge.db — pre-existing tables
-    and rows survive, seed nodes are added alongside. FORCE=1 is neither
-    an archive (the retired install.sh --force archived the data dir) nor
-    a discard; a true clean slate requires manually deleting knowledge.db.
-    Origin: PR-C review of the scatter-retirement EPIC — two successive doc
-    sweeps mislabeled FORCE=1 ("archives" → "discards") because neither was
-    pinned by a behavioral test.
+    # Copy runtime modules so bootstrap can import server.py.
+    runtime_files = [
+        "server.py", "engram_client.py", "engram_confidence.py",
+        "engram_filter.py", "engram_idf.py", "engram_ids.py",
+        "engram_log_emitter.py", "engram_log_indexer.py",
+    ]
+    for fname in runtime_files:
+        src = REPO_ROOT / fname
+        if src.exists():
+            shutil.copy2(src, engram_home / fname)
+
+    # Create the DB file but leave it with no nodes (no tables at all).
+    conn = sqlite3.connect(str(db_path))
+    conn.close()
+
+    env = os.environ.copy()
+    env.update({
+        "ALPHA_DIR": str(REPO_ROOT),
+        "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "templates"),
+        "ENGRAM_HOME": str(engram_home),
+        "CLAUDE_HOME": str(workdir / ".claude"),
+        "PYTHON_BIN": sys.executable,
+        "TARGET": "claude",
+    })
+    env.pop("FORCE", None)
+    env.pop("FORCE_RESEED_EMPTY", None)
+    return db_path, env
+
+
+def test_bootstrap_force_on_empty_db_proceeds():
+    """FORCE=1 on an empty DB (0 nodes) proceeds and seeds the graph.
+
+    Legitimate use: DB file exists (e.g. from a failed first bootstrap that
+    created the file but died before the schema was written) but contains
+    no nodes. FORCE=1 is safe here — nothing to corrupt.
+
+    Origin: issue #774 — replacing the old bypass with disciplined-refusal
+    + named-escape semantics.
     """
-    workdir = Path(tempfile.mkdtemp(prefix="engram_bootstrap_force_"))
+    workdir = Path(tempfile.mkdtemp(prefix="engram_bootstrap_force_empty_"))
+    try:
+        db_path, env = _make_empty_db_env(workdir)
+        env["FORCE"] = "1"
+
+        result = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "bootstrap.py")],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, (
+            f"FORCE=1 on empty DB failed (expected success):\n"
+            f"stdout={result.stdout}\nstderr={result.stderr}"
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            axiom_count = conn.execute(
+                "SELECT COUNT(*) FROM nodes WHERE type='axiom'"
+            ).fetchone()[0]
+            assert axiom_count == 3, f"expected 3 seed axioms, got {axiom_count}"
+        finally:
+            conn.close()
+
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_bootstrap_force_on_nonempty_db_refuses():
+    """FORCE=1 on a non-empty DB (nodes present) refuses with exit code 1.
+
+    The old FORCE=1 behavior silently inserted duplicate seed nodes into a
+    live identity graph — neither a fresh start nor a safe no-op, just
+    silent corruption. The new behavior refuses loudly and points the user
+    at the correct recovery path.
+
+    Origin: issue #774 — replacing the old bypass with disciplined-refusal
+    + named-escape semantics.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="engram_bootstrap_force_nonempty_"))
     try:
         engram_home = workdir / ".engram"
         engram_home.mkdir(parents=True)
-        # Plant a REAL sqlite DB with a sentinel table + row, so we can
-        # assert survival after the FORCE=1 bootstrap.
         db_path = engram_home / "knowledge.db"
+
+        # Plant a nodes table with one row to simulate a live (non-empty) graph.
         conn = sqlite3.connect(str(db_path))
-        conn.execute("CREATE TABLE sentinel_pre_force (note TEXT)")
         conn.execute(
-            "INSERT INTO sentinel_pre_force VALUES ('planted-before-force')"
+            "CREATE TABLE nodes (id TEXT PRIMARY KEY, type TEXT, claim TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO nodes VALUES ('ax_0001', 'axiom', 'test axiom')"
         )
         conn.commit()
         conn.close()
@@ -202,6 +279,42 @@ def test_bootstrap_force_preserves_existing_data():
             "TARGET": "claude",
             "FORCE": "1",
         })
+        env.pop("FORCE_RESEED_EMPTY", None)
+
+        result = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "bootstrap.py")],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode != 0, (
+            "FORCE=1 on non-empty DB should refuse (non-zero exit), but it succeeded"
+        )
+        combined = result.stdout + result.stderr
+        assert "refused" in combined, (
+            f"Expected 'refused' in output, got:\n{combined}"
+        )
+        assert "non-empty" in combined, (
+            f"Expected 'non-empty' in output, got:\n{combined}"
+        )
+
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_bootstrap_force_reseed_empty_on_empty_db_proceeds():
+    """FORCE_RESEED_EMPTY=1 on an empty DB (0 nodes) proceeds and seeds the graph.
+
+    Named escape valve for callers that want explicit intent at the call site.
+    Semantics identical to FORCE=1-on-empty-DB.
+
+    Origin: issue #774.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="engram_bootstrap_reseed_empty_"))
+    try:
+        db_path, env = _make_empty_db_env(workdir)
+        env["FORCE_RESEED_EMPTY"] = "1"
 
         result = subprocess.run(
             [sys.executable, str(REPO_ROOT / "bootstrap.py")],
@@ -211,27 +324,79 @@ def test_bootstrap_force_preserves_existing_data():
             timeout=60,
         )
         assert result.returncode == 0, (
-            f"FORCE=1 bootstrap failed:\nstdout={result.stdout}\n"
-            f"stderr={result.stderr}"
+            f"FORCE_RESEED_EMPTY=1 on empty DB failed (expected success):\n"
+            f"stdout={result.stdout}\nstderr={result.stderr}"
         )
 
         conn = sqlite3.connect(str(db_path))
         try:
-            # The pre-existing data SURVIVED — FORCE=1 deleted nothing.
-            row = conn.execute("SELECT note FROM sentinel_pre_force").fetchone()
-            assert row == ("planted-before-force",), (
-                "pre-existing data should survive FORCE=1 bootstrap"
-            )
-            # Seed nodes were added ALONGSIDE the surviving data.
             axiom_count = conn.execute(
                 "SELECT COUNT(*) FROM nodes WHERE type='axiom'"
             ).fetchone()[0]
-            assert axiom_count >= 3, (
-                f"expected seed axioms added alongside existing data, "
-                f"got {axiom_count}"
-            )
+            assert axiom_count == 3, f"expected 3 seed axioms, got {axiom_count}"
         finally:
             conn.close()
+
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_bootstrap_force_reseed_empty_on_nonempty_db_refuses():
+    """FORCE_RESEED_EMPTY=1 on a non-empty DB refuses with exit code 1.
+
+    The named escape valve has the same node-count guard as FORCE=1. If the
+    DB already has nodes, FORCE_RESEED_EMPTY=1 refuses with the same helpful
+    message pointing at manual deletion.
+
+    Origin: issue #774.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="engram_bootstrap_reseed_nonempty_"))
+    try:
+        engram_home = workdir / ".engram"
+        engram_home.mkdir(parents=True)
+        db_path = engram_home / "knowledge.db"
+
+        # Plant a nodes table with one row.
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE nodes (id TEXT PRIMARY KEY, type TEXT, claim TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO nodes VALUES ('ax_0001', 'axiom', 'test axiom')"
+        )
+        conn.commit()
+        conn.close()
+
+        env = os.environ.copy()
+        env.update({
+            "ALPHA_DIR": str(REPO_ROOT),
+            "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "templates"),
+            "ENGRAM_HOME": str(engram_home),
+            "CLAUDE_HOME": str(workdir / ".claude"),
+            "PYTHON_BIN": sys.executable,
+            "TARGET": "claude",
+            "FORCE_RESEED_EMPTY": "1",
+        })
+        env.pop("FORCE", None)
+
+        result = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "bootstrap.py")],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode != 0, (
+            "FORCE_RESEED_EMPTY=1 on non-empty DB should refuse (non-zero exit), "
+            "but it succeeded"
+        )
+        combined = result.stdout + result.stderr
+        assert "refused" in combined, (
+            f"Expected 'refused' in output, got:\n{combined}"
+        )
+        assert "non-empty" in combined, (
+            f"Expected 'non-empty' in output, got:\n{combined}"
+        )
 
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

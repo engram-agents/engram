@@ -217,7 +217,7 @@ Do **not** cite `file://~/.engram/.deployed-version` directly unless it is commi
 - **Running Claude slash-commands yourself.** `/plugin …` and `/mcp` are Claude user actions. Codex is different: `codex plugin add engram@engram-local` is an ordinary CLI command and can be run by the agent.
 - **Skipping Step 6 because the template diff "looked fine."** The identity-surface inverse-merge is the one place a plugin upgrade still needs judgment. If deferring, write it to the ask-user queue immediately.
 - **Building without checking the feature-set flags.** A wrong-flag build *succeeds* and silently drops surfaces (#704/#707 class). The Step 3 checkpoint exists for this.
-- **Re-bootstrapping (`FORCE=1`) to "refresh" anything.** `FORCE=1` only bypasses the existing-install guard — bootstrap then writes seed nodes INTO the existing graph (it deletes nothing). Never the upgrade path; a true fresh start is a manual `knowledge.db` delete.
+- **Re-bootstrapping (`FORCE=1`) to "refresh" anything.** `FORCE=1` (and `FORCE_RESEED_EMPTY=1`) now **refuse on a non-empty DB** — they are not bypass paths for live graphs. Never the upgrade path; a true fresh start requires manually deleting `knowledge.db` first.
 - **Killing the MCP subprocess to "restart" it.** User-restart only.
 - **Reaching for the retired scatter path** (`tools/deploy.sh` rsync into `~/.engram/`) on a plugin install — it does not serve the plugin layout and will not update the running plugin.
 

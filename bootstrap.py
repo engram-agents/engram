@@ -358,17 +358,57 @@ def _render_codex_target(substitutions: dict[str, str]) -> None:
     print(f"  AGENTS.md → {CODEX_HOME}/AGENTS.md", flush=True)
 
 
+def _db_node_count(db_path: Path) -> int:
+    """Return the number of rows in the nodes table, or 0 if the table
+    doesn't exist yet (e.g. file exists but schema hasn't been created)."""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()
+            return row[0] if row else 0
+        except sqlite3.OperationalError:
+            # nodes table doesn't exist — DB is effectively empty
+            return 0
+        finally:
+            conn.close()
+    except Exception:
+        return 0
+
+
 def main() -> None:
     # Refuse to overwrite an existing install — defense-in-depth for the
     # plugin path.
-    # FORCE=1 in env bypasses the guard ONLY — it does not delete anything;
-    # bootstrap then runs on top of the existing DB (seed nodes added
-    # alongside existing data). A clean slate requires manually deleting
-    # knowledge.db first.
+    #
+    # Named escape valves (in order of check):
+    #   FORCE=1             — on an EMPTY DB (0 nodes): proceed with seeding.
+    #                         On a non-empty DB: REFUSE (would corrupt the graph).
+    #   FORCE_RESEED_EMPTY=1 — same semantics as FORCE=1-on-empty-DB; explicit
+    #                         name for callers that want clarity at the call site.
+    #
+    # Neither escape valve deletes anything. A true clean slate requires
+    # manually deleting knowledge.db first, then re-running bootstrap.
     db_path = ENGRAM_HOME / "knowledge.db"
     if db_path.exists():
         force = os.environ.get("FORCE", "0") == "1"
-        if not force:
+        force_reseed_empty = os.environ.get("FORCE_RESEED_EMPTY", "0") == "1"
+        if force or force_reseed_empty:
+            node_count = _db_node_count(db_path)
+            escape_var = "FORCE" if force else "FORCE_RESEED_EMPTY"
+            if node_count > 0:
+                raise SystemExit(
+                    f"[bootstrap] {escape_var}=1 refused: knowledge.db is non-empty "
+                    f"({node_count} nodes).\n"
+                    f"  Both FORCE=1 and FORCE_RESEED_EMPTY=1 require an empty (0-node) DB.\n"
+                    f"  To start fresh: delete {db_path} manually (copy it first if unsure),\n"
+                    f"  then re-run bootstrap without any FORCE variable."
+                )
+            print(
+                f"[bootstrap] {escape_var}=1 on empty DB — proceeding with seeding.",
+                flush=True,
+            )
+            # DB file exists but has 0 nodes — safe to seed.
+        else:
             raise SystemExit(
                 f"ERROR: knowledge.db already exists at {db_path}.\n"
                 "  bootstrap.py refuses to overwrite an existing install.\n"
@@ -376,9 +416,8 @@ def main() -> None:
                 "    the engram-upgrade skill.\n"
                 "  - If this is an aborted prior bootstrap (verify the DB is\n"
                 "    truly empty first), delete the file and re-run.\n"
-                "  - FORCE=1 in the environment bypasses this guard WITHOUT\n"
-                "    deleting anything (bootstrap runs on top of the existing\n"
-                "    DB). For a true fresh start, delete the file first."
+                "  - FORCE_RESEED_EMPTY=1 re-seeds an empty (0-node) DB.\n"
+                "  - For a true fresh start, delete the file first."
             )
 
     # In plugin mode, symlink ~/.engram/tools -> <plugin-root>/tools so that
