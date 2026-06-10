@@ -565,6 +565,29 @@ def test_feeling_reflect_nudge_text_present():
     assert "engram_report_feeling" in report["feeling_report_nudge"]
 
 
+def test_feeling_reflect_nudge_no_output_instruction():
+    """The dream_review nudge must use the explicit no-output wording, not the
+    ambiguous 'move on' — the same ack-loop hazard #841/#934 retired from the
+    write-check nudge and #942 retired from the nap_checkpoint nudge.
+
+    Mutation note: restoring the old 'move on' text would fail the 'move on'
+    assertion below, catching any regression to the ambiguous wording.
+    """
+    client, _ = fresh_client()
+    report = client.call("engram_reflect", {})
+    nudge = report["feeling_report_nudge"]
+    assert "NO output" in nudge, (
+        f"dream_review nudge must contain 'NO output' (explicit zero-output instruction); nudge={nudge!r}"
+    )
+    assert "move on" not in nudge, (
+        f"dream_review nudge must NOT contain 'move on' (ambiguous old text replaced); nudge={nudge!r}"
+    )
+    # The dream-specific semantics — a null result being valid — must survive.
+    assert "valid data point" in nudge, (
+        f"dream_review nudge must preserve the 'null result is a valid data point' framing; nudge={nudge!r}"
+    )
+
+
 def test_feeling_reflect_arms_dream_review_marker():
     """Calling engram_reflect should arm a dream_review nudge marker."""
     client, server = fresh_client()

@@ -855,8 +855,10 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
             "about a prior conclusion, pattern recognition across multiple "
             "reviewed items, satisfaction at closing a contradiction. "
             "If yes, file a feeling report via engram_report_feeling — it "
-            "will be auto-tagged dream_review. If nothing distinct, move on; "
-            "a null result is a valid data point."
+            "will be auto-tagged dream_review. If not, end the turn with NO "
+            "output - do not reply to or acknowledge this check; a text-only "
+            "acknowledgment wastes a turn. A null result is a valid data "
+            "point — emitting no output is how you record it."
         )
 
         core._write_feeling_nudge("dream_review")
