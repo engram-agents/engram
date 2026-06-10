@@ -848,8 +848,8 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
 # Pool sentinel: the name held between active agent claims.
 # Derived from $ENGRAM_HOME/config.json's primary_user field (issue #606 —
-# the former hardcoded "lei" was a fresh-install bug; any non-lei install
-# could not use the pool sentinel correctly).
+# the former hardcoded primary_user default was a fresh-install bug; any
+# install with a different primary_user could not use the pool sentinel correctly).
 _POOL_SENTINEL_CACHE: list = []  # one-element list; empty = not yet resolved
 
 

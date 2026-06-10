@@ -7,7 +7,7 @@ threads with TTL-based hot-seat eligibility. Schema:
     {
       "session_id": "string (e.g., cj_NNNN or hot-seat-design)",
       "status": "active" | "paused" | "archived",
-      "participants": ["mneme", "borges", "lei"],
+      "participants": ["mneme", "borges", "maintainer"],
       "last_activity_at": "ISO8601",
       "expiry_ttl_seconds": 300,
       "hot_seat_enabled": true,

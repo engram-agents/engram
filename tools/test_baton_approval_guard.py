@@ -41,7 +41,7 @@ if str(_ROOT) not in sys.path:
 import tools.baton as baton  # noqa: E402
 
 
-SENTINEL = "lei"
+SENTINEL = "maintainer"
 
 
 @pytest.fixture(autouse=True)

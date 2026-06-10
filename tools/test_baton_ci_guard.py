@@ -39,7 +39,7 @@ import tools.baton as baton  # noqa: E402
 # Fixtures
 # ---------------------------------------------------------------------------
 
-SENTINEL = "lei"  # used as the pool sentinel in all tests
+SENTINEL = "maintainer"  # generic pool-sentinel name used in all tests
 
 
 @pytest.fixture(autouse=True)
