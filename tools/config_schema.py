@@ -188,6 +188,26 @@ SCHEMA: list[dict] = [
      "label": "Min similarity for NLI",
      "tooltip": "Cosine floor below which NLI is skipped (truly unrelated observations — no contradiction possible). Default 0.30.",
      "editable": True, "restart_required": False, "depends_on": "polarity.enabled"},
+
+    # ---- Deference detector ----
+    {
+        "key": "deference_detector.cooldown_minutes",
+        "section": "deference_detector",
+        "tier": TIER_B,
+        "type": "integer",
+        "control": "int",
+        "min": 0,
+        "max": 120,
+        "label": "Cooldown after user message (min)",
+        "tooltip": (
+            "After a real user message lands during loop mode, the deference detector "
+            "suppresses for this many minutes. The phrases it detects ('Should I proceed?', "
+            "'Let me know if you want me to...') are appropriate when responding to a human — "
+            "this window prevents false alarms. Set to 0 to disable the cooldown. Default: 10."
+        ),
+        "editable": True,
+        "restart_required": False,
+    },
 ]
 
 SECTIONS: list[dict] = [
@@ -199,6 +219,7 @@ SECTIONS: list[dict] = [
     {"id": "fairy_policy", "label": "Fairy Delegation Policies", "tier": TIER_A, "order": 7},
     {"id": "memory",       "label": "Memory",                  "tier": TIER_B, "order": 8},
     {"id": "polarity",     "label": "Polarity-dedup (NLI)",    "tier": TIER_B, "order": 9, "section_gate": "polarity.enabled"},
+    {"id": "deference_detector", "label": "Deference detector", "tier": TIER_B, "order": 10},
 ]
 
 

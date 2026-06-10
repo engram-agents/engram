@@ -84,7 +84,8 @@ cat > ~/.engram/loop-mode.json <<JSON
   "instructions": "<what to do each iteration — the loop's standing brief>",
   "state": "<live handoff: pending work, in-flight fairies, key node IDs, next step>",
   "cadence_seconds": 270,
-  "pacer": "scheduleWakeup"
+  "pacer": "scheduleWakeup",
+  "loop_prompt": "<exact text passed to ScheduleWakeup prompt= parameter>"
 }
 JSON
 ```
@@ -94,6 +95,9 @@ JSON
 - `state` — the live handoff, **rewritten each iteration** (Step 2.3) so the
   marker always reflects where the loop is. This is what a post-compaction self
   (or a teammate) reads to resume.
+- `loop_prompt` — the exact text passed to `ScheduleWakeup`'s `prompt` parameter.
+  The deference-detector cooldown hook uses this to distinguish cron heartbeats
+  from real user messages.
 
 **Why the marker carries the state, not the wakeup prompt:** it makes the armed
 prompt a tiny self-declaring stub (Step 2), and keeps the canonical loop state on

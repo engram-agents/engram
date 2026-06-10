@@ -47,7 +47,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 ENGRAM_HOME = (
@@ -58,6 +58,8 @@ SESSIONS_DIR = os.path.join(ENGRAM_HOME, "sessions")
 DEFERENCE_MARKER_PATH = os.path.join(ENGRAM_HOME, "deference-detected.json")
 LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
 LOG_PATH = os.path.join(ENGRAM_HOME, "deference-detector.log")
+DEFERENCE_COOLDOWN_PATH = os.path.join(ENGRAM_HOME, "deference-cooldown-at.txt")
+CONFIG_PATH = os.path.join(ENGRAM_HOME, "config.json")
 
 # Deference PHRASE patterns — surface markers for "asking permission for
 # something I could have just done". Each is a (label, compiled-regex)
@@ -114,6 +116,19 @@ _INTENT_RULES = [
     ("ill-pick-X-next",  re.compile(r"\bI(?:'ll| will) (pick|grab|tackle|tackle next|continue with|come back to|return to|revisit) [^.!?]+? (next|later|tomorrow|tonight|after|when)\b", re.I)),
     ("preserved-for",    re.compile(r"\b(preserved|saved|queued|deferred|reserved) for (?:the )?(next|later|tomorrow|future)\b", re.I)),
 ]
+
+
+def _cooldown_minutes() -> float:
+    """Return configured cooldown window in minutes (default 10)."""
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+        val = cfg.get("deference_detector", {}).get("cooldown_minutes")
+        if isinstance(val, (int, float)) and val >= 0:
+            return float(val)
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    return 10.0
 
 
 def _last_assistant_structure(jsonl_path: str | None = None, session_id: str | None = None) -> dict | None:
@@ -321,6 +336,19 @@ def main() -> None:
         # entirely — no marker write, no disk I/O beyond this check.
         _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000))
         sys.exit(0)
+
+    # Cooldown: suppress if a real user message landed within the cooldown window.
+    cooldown_mins = _cooldown_minutes()
+    if cooldown_mins > 0 and os.path.exists(DEFERENCE_COOLDOWN_PATH):
+        try:
+            ts_str = Path(DEFERENCE_COOLDOWN_PATH).read_text().strip()
+            last_user_at = datetime.fromisoformat(ts_str)
+            if datetime.now(timezone.utc) - last_user_at < timedelta(minutes=cooldown_mins):
+                _log(f"Scanned: 0 hits (suppressed — user message within {cooldown_mins:.0f}min cooldown)")
+                _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000))
+                sys.exit(0)
+        except Exception:
+            pass
 
     if stdin_msg is not None:
         # Stdin path — flat string, no tool_use boundary info.

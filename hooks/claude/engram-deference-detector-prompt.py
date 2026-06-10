@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 ENGRAM_HOME = (
@@ -24,6 +25,31 @@ ENGRAM_HOME = (
 )
 DEFERENCE_MARKER_PATH = os.path.join(ENGRAM_HOME, "deference-detected.json")
 LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
+DEFERENCE_COOLDOWN_PATH = os.path.join(ENGRAM_HOME, "deference-cooldown-at.txt")
+
+
+def _is_cron_prompt(prompt: str, loop_marker_path: str) -> bool:
+    """Return True if the prompt looks like a cron-fired heartbeat, not a real user message."""
+    stripped = prompt.strip()
+    # Autonomous-loop sentinels
+    if stripped in ("<<autonomous-loop>>", "<<autonomous-loop-dynamic>>"):
+        return True
+    # Canonical ScheduleWakeup stub prefix — loop continuations that don't set
+    # loop_prompt in the marker (covers markers written by the standard
+    # engram-loop skill which uses the stub "Loop continuation. Read ...").
+    if stripped.startswith("Loop continuation."):
+        return True
+    # Compare against stored loop_prompt in loop-mode.json (present if loop started
+    # with the updated engram-loop skill that writes loop_prompt to the marker)
+    try:
+        with open(loop_marker_path) as f:
+            marker = json.load(f)
+        stored = marker.get("loop_prompt", "")
+        if stored and stripped == stored.strip():
+            return True
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    return False
 
 
 def _emit_hook_fire(session_id: str, transcript_path: str, duration_ms: int, stdout_bytes: int) -> None:
@@ -54,9 +80,10 @@ def _emit_hook_fire(session_id: str, transcript_path: str, duration_ms: int, std
 def main() -> None:
     _t0 = time.perf_counter()
 
-    # Parse stdin for session_id + transcript_path (hook protocol).
+    # Parse stdin for session_id + transcript_path + prompt (hook protocol).
     session_id = "unknown"
     transcript_path = ""
+    prompt_text = ""
     try:
         raw = sys.stdin.read()
         if raw:
@@ -67,6 +94,9 @@ def main() -> None:
             tp = payload.get("transcript_path")
             if isinstance(tp, str) and tp:
                 transcript_path = tp
+            p = payload.get("prompt")
+            if isinstance(p, str):
+                prompt_text = p
     except Exception:
         pass
 
@@ -81,6 +111,16 @@ def main() -> None:
                 pass
         _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000), 0)
         sys.exit(0)
+
+    # Write cooldown marker if this is a real user message (not a cron heartbeat).
+    # Guard: empty/absent prompt (headless or older CC) must not trigger cooldown.
+    if prompt_text and not _is_cron_prompt(prompt_text, LOOP_MARKER_PATH):
+        try:
+            Path(DEFERENCE_COOLDOWN_PATH).write_text(
+                datetime.now(timezone.utc).isoformat()
+            )
+        except Exception:
+            pass
 
     if not os.path.exists(DEFERENCE_MARKER_PATH):
         _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000), 0)
