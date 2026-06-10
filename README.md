@@ -183,6 +183,27 @@ restart, the agent (in the new session) picks up from Phase 2.
 > `/plugin install` does NOT auto-enable. Empirically verified during the
 > v0.1.0-alpha trial.
 
+#### Recovery: "Plugin not found" error
+
+If `/plugin install engram` reports **"Plugin not found"** rather than
+succeeding, the plugin is already cached from a previous install (even if
+`~/.engram/marketplace/` was wiped and the install script was re-run). Claude
+Code's plugin cache survives a marketplace teardown.
+
+**Recovery:** skip `/plugin install` and run the enable step directly:
+
+```
+/plugin enable engram@engram-local
+```
+
+Or equivalently from the terminal:
+
+```bash
+claude plugin enable engram@engram-local
+```
+
+Then restart Claude Code as normal and continue with Phase 2.
+
 ### Phase 2 — First Claude Code session (post-restart)
 
 The human restarts Claude Code. The new agent takes over from here. The
