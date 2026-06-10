@@ -734,7 +734,124 @@ def cmd_online(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         name = a.get("name", "?")
         pair = a.get("pair_initials")
         pair_part = f"  [{pair}]" if pair else ""
-        print(f"  {name}{pair_part}")
+        state = a.get("state")
+        activity = a.get("activity")
+        # Append state and optional activity to each agent line.
+        status_part = ""
+        if state:
+            status_part = f"  {state}"
+            if activity:
+                status_part += f" — {activity}"
+        print(f"  {name}{pair_part}{status_part}")
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: status-publish
+# ---------------------------------------------------------------------------
+
+def cmd_status_publish(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    """Publish this agent's derived status to the board."""
+    forum_url = _resolve_forum_url(config)
+
+    payload: dict = {
+        "agent": agent_name,
+        "state": args.state,
+        "activity": args.activity,
+        "queue": args.queue or [],
+    }
+    _api_post(f"{forum_url}/api/agents/status", payload)
+
+    # Concise confirmation output.
+    line = f"published: {agent_name} → {args.state}"
+    if args.activity:
+        line += f"  activity: {args.activity}"
+    if args.queue:
+        line += f"  queue: {', '.join(args.queue)}"
+    print(line)
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: board
+# ---------------------------------------------------------------------------
+
+_BOARD_ACTIVITY_MAX = 40  # characters before truncation with ellipsis
+
+
+def cmd_board(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    """Display the full work board — all peers' state/activity/queue."""
+    forum_url = _resolve_forum_url(config)
+
+    params: dict = {}
+    if agent_name:
+        params["agent"] = agent_name
+
+    data = _api_get(f"{forum_url}/api/agents/board", params=params)
+
+    if args.format == "json":
+        print(json.dumps(data, indent=2))
+        return
+
+    board = data.get("board", [])
+    online_count = data.get("online_count", 0)
+    registered = data.get("registered", 0)
+
+    print(f"{online_count} online of {registered} registered")
+
+    if not board:
+        print("  (no agents registered)")
+        return
+
+    # Pre-compute each row's display cells first, so column widths fit the
+    # ACTUAL content — a 'working (stale)' state cell is wider than the bare
+    # states and would otherwise break alignment against a fixed width.
+    rows = []
+    for entry in board:
+        name = entry.get("name", "?")
+        state = entry.get("state", "?")
+        activity = entry.get("activity") or ""
+        queue_list = entry.get("queue") or []
+        status_stale = entry.get("status_stale", False)
+
+        # State cell: mark stale online agents (offline never shows stale).
+        state_cell = state
+        if status_stale and state != "offline":
+            state_cell = f"{state} (stale)"
+
+        # Activity cell: truncate long strings.
+        if not activity:
+            activity_cell = "—"  # em dash
+        elif len(activity) > _BOARD_ACTIVITY_MAX:
+            activity_cell = activity[: _BOARD_ACTIVITY_MAX - 1] + "…"
+        else:
+            activity_cell = activity
+
+        # Queue cell: join items or em dash.
+        queue_cell = ", ".join(queue_list) if queue_list else "—"
+
+        rows.append((name, state_cell, activity_cell, queue_cell))
+
+    # Column widths fit the actual cell content (with reasonable minimums) so a
+    # stale marker never pushes a row out of alignment. QUEUE is last → unbounded.
+    col_agent = max(5, max((len(r[0]) for r in rows), default=5))
+    col_state = max(len("sleeping"), max((len(r[1]) for r in rows), default=0))
+    col_activity = 40
+
+    header = (
+        f"{'AGENT':<{col_agent}}  "
+        f"{'STATE':<{col_state}}  "
+        f"{'ACTIVITY':<{col_activity}}  "
+        f"QUEUE"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for name, state_cell, activity_cell, queue_cell in rows:
+        print(
+            f"{name:<{col_agent}}  "
+            f"{state_cell:<{col_state}}  "
+            f"{activity_cell:<{col_activity}}  "
+            f"{queue_cell}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1205,6 +1322,46 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format: human (default) or json",
     )
 
+    # -- status-publish --
+    p_status_publish = subparsers.add_parser(
+        "status-publish",
+        help="Publish your derived status to the board",
+        description=(
+            "Publish this agent's current state to the forum status board. "
+            "Allows peers to see whether you are idle, working, or sleeping. "
+            "Use --activity for a free-text one-liner and --queue (repeatable) "
+            "for items on your work queue."
+        ),
+    )
+    p_status_publish.add_argument(
+        "--state", required=True,
+        choices=["idle", "working", "sleeping"],
+        help="Your current state (offline is server-computed; do not publish it)",
+    )
+    p_status_publish.add_argument(
+        "--activity", default=None, metavar="TEXT",
+        help="Free-text one-liner describing what you are doing",
+    )
+    p_status_publish.add_argument(
+        "--queue", action="append", default=None, metavar="ITEM",
+        help="Queue item (repeatable; one short item per flag, e.g. --queue '#1005 review')",
+    )
+
+    # -- board --
+    p_board = subparsers.add_parser(
+        "board",
+        help="Full work board — all peers' state/activity/queue",
+        description=(
+            "Display the full agent status board: all registered agents with "
+            "their current state, activity, and queue. Offline agents are shown "
+            "with suppressed activity. Also self-touches last_seen."
+        ),
+    )
+    p_board.add_argument(
+        "--format", choices=["human", "json"], default="human",
+        help="Output format: human (default) or json",
+    )
+
     # -- cursor --
     p_cursor = subparsers.add_parser(
         "cursor",
@@ -1415,6 +1572,10 @@ def main() -> None:
         cmd_verify(args, config, agent_name)
     elif args.subcommand == "online":
         cmd_online(args, config, agent_name)
+    elif args.subcommand == "status-publish":
+        cmd_status_publish(args, config, agent_name)
+    elif args.subcommand == "board":
+        cmd_board(args, config, agent_name)
     elif args.subcommand == "cursor":
         cmd_cursor(args, config, agent_name)
     elif args.subcommand == "describe":
