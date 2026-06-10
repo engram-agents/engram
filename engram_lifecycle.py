@@ -205,8 +205,10 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
                 "recognition, dissonance, unusual satisfaction, discomfort "
                 "that isn't task-friction? If yes, file via "
                 "engram_report_feeling — it will be auto-tagged "
-                "nap_checkpoint. If no, carry on; a null result is a valid "
-                "data point."
+                "nap_checkpoint. If not, end the turn with NO output - do not "
+                "reply to or acknowledge this check; a text-only acknowledgment "
+                "wastes a turn. A null result is a valid data point — emitting "
+                "no output is how you record it."
             )
             core._write_feeling_nudge("nap_checkpoint")
 

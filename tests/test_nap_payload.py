@@ -126,3 +126,35 @@ def test_impl_callable_with_kwargs():
     assert r["previous_turn"] == r["current_turn"], (
         f"_nap_impl changed turn in nap mode: previous={r['previous_turn']}, current={r['current_turn']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. Regression (#942): nap_checkpoint nudge wording — explicit NO-output
+#    instruction, no ambiguous 'carry on' (converges with the #841/#934
+#    write-check nudge wording family), while preserving the nap-specific
+#    "a null result is valid" semantics.
+# ---------------------------------------------------------------------------
+
+def test_nap_nudge_contains_no_output_instruction():
+    """The nap_checkpoint feeling-nudge must use the explicit no-output wording,
+    not the ambiguous 'carry on' that #841/#934 retired from the write-check
+    nudge — the same ack-loop hazard (#942).
+
+    Mutation note: restoring the old 'If no, carry on' text would fail the
+    'carry on' assertion below, catching any regression to the ambiguous
+    wording this fix replaced.
+    """
+    server = fresh_server()
+    r = json.loads(server._nap_impl(message="Test nap nudge wording."))
+    nudge = r.get("feeling_report_nudge", "")
+    assert nudge, f"nap result missing feeling_report_nudge: {r}"
+    assert "NO output" in nudge, (
+        f"Nap nudge must contain 'NO output' (explicit zero-output instruction); nudge={nudge!r}"
+    )
+    assert "carry on" not in nudge, (
+        f"Nap nudge must NOT contain 'carry on' (ambiguous old text replaced by #942); nudge={nudge!r}"
+    )
+    # The nap-specific semantics — a null result being valid — must survive.
+    assert "valid data point" in nudge, (
+        f"Nap nudge must preserve the 'null result is a valid data point' framing; nudge={nudge!r}"
+    )
