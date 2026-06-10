@@ -592,5 +592,121 @@
       "path": "forum/deploy/engram-forum-backup.timer",
       "reason": "separately-deployed forum community service — second deploy target, see forum/deploy/; systemd timer unit for the forum host, not part of the plugin bundle (issue #868)"
     }
+  ],
+  "repo_only": [
+    {
+      "path": "tests/",
+      "reason": "dev test suite — never shipped in any install tier; CI-only"
+    },
+    {
+      "path": ".github/",
+      "reason": "GitHub Actions CI configuration — runs in GitHub's cloud, never part of the plugin install"
+    },
+    {
+      "path": "docs/",
+      "reason": "documentation files — developer reference, not shipped in any install tier"
+    },
+    {
+      "path": "README.md",
+      "reason": "repository landing-page documentation — not shipped in the plugin bundle"
+    },
+    {
+      "path": "CHANGELOG.md",
+      "reason": "release changelog — developer reference, not shipped in the plugin bundle"
+    },
+    {
+      "path": "LICENSE",
+      "reason": "project license file — not shipped in the plugin bundle"
+    },
+    {
+      "path": "CLAUDE.md",
+      "reason": "developer-facing project conventions (project-level CLAUDE.md) — not shipped in the plugin bundle"
+    },
+    {
+      "path": "DEVELOPMENT.md",
+      "reason": "contributor development guide — not shipped in the plugin bundle"
+    },
+    {
+      "path": "RELEASING.md",
+      "reason": "release process documentation — not shipped in the plugin bundle"
+    },
+    {
+      "path": "USER_GUIDE.md",
+      "reason": "user guide documentation — not shipped in the plugin bundle"
+    },
+    {
+      "path": "pytest.ini",
+      "reason": "pytest configuration — dev test config, never shipped"
+    },
+    {
+      "path": "requirements.txt",
+      "reason": "runtime Python dependency pins — installation handled by build-plugin.sh separately; not copied as a repo artifact"
+    },
+    {
+      "path": "requirements-dev.txt",
+      "reason": "dev-only Python dependency pins — dev tooling, never shipped in the plugin bundle"
+    },
+    {
+      "path": "requirements-lock.txt",
+      "reason": "locked Python dependency pins — reproducible build artifact, not shipped as a repo file in the plugin bundle"
+    },
+    {
+      "path": ".gitignore",
+      "reason": "git ignore rules — repo configuration, not shipped in the plugin bundle"
+    },
+    {
+      "path": ".scan-leaks-local.json.example",
+      "reason": "example config for scan-leaks tool — developer reference, not shipped in the plugin bundle"
+    },
+    {
+      "path": "selftest.py",
+      "reason": "pre-deploy smoke test runner — dev tooling that invokes pytest against tests/; not shipped in the plugin bundle"
+    },
+    {
+      "path": "packaging/README.md",
+      "reason": "README for the packaging directory — documentation, not shipped inside the plugin bundle"
+    },
+    {
+      "path": "upgrade-guides/",
+      "reason": "operator upgrade guides — developer/operator reference documentation, not shipped in the plugin bundle"
+    },
+    {
+      "path": "inter-agent/",
+      "reason": "inter-agent protocol design documents — developer reference, not shipped in the plugin bundle"
+    },
+    {
+      "path": ".claude/",
+      "reason": "per-developer local Claude Code agent definitions (developer-local working files for Ariadne/Borges) — not part of the shared plugin bundle"
+    },
+    {
+      "path": "agents/claude/README.md",
+      "reason": "README for the agents/claude directory — documentation only, not a shippable agent file (build-plugin.sh copies *.md files excluding README.md)"
+    },
+    {
+      "path": "cycle/",
+      "reason": "epistemic research cycle design documents and artifacts (CHARTER, CHRONICLE, charter-inputs, mira-package, standpoint design) — in-development research material, not shipped in the plugin bundle"
+    }
+  ],
+  "build_inputs": [
+    {
+      "path": "plugin.json",
+      "reason": "Claude Code plugin manifest — copied into the bundle root by the build engine (tools/engine/build.py) as the bundle's own manifest; structural build input, not a depth-tier-gated mechanism"
+    },
+    {
+      "path": "hooks/hooks.json",
+      "reason": "Hooks registration — the build engine writes a tier/identity-filtered copy into the bundle (hooks/hooks.json); structural build input, not itself a depth-tier-gated mechanism"
+    },
+    {
+      "path": "packaging/mcp.json",
+      "reason": "MCP server registration source — the build engine transforms it into the bundle's .mcp.json (renamed at the plugin root); build input, not a depth-tier-gated mechanism"
+    },
+    {
+      "path": "packaging/platforms/",
+      "reason": "Per-platform profile sources (claude-code.json, codex.json) — baked by the build engine into the bundle's platform.json; build input, not a depth-tier-gated mechanism"
+    },
+    {
+      "path": "packaging/tiers.json",
+      "reason": "The tier manifest itself — consumed by the build engine to select shippable mechanisms; build configuration input, not a depth-tier-gated mechanism"
+    }
   ]
 }

@@ -1,6 +1,39 @@
-"""Tag-once gate: every path in the build-plugin.sh shippable universe must appear
-in packaging/tiers.json (either as a tiered mechanism or in the explicit excluded list),
-with no dangling manifest entries.
+"""Tag-once gate: every tracked file in the repository must have exactly one
+declared role in packaging/tiers.json — default-deny, not default-ignore.
+
+Two complementary scopes
+========================
+
+**Whole-tree gate** (``test_whole_tree_every_tracked_file_has_a_role``):
+  Enumerates ALL files tracked by git (``git ls-files``) and asserts that every
+  one of them is accounted for in EXACTLY ONE of four manifest buckets:
+
+  * ``mechanisms[]`` — tiered shippable (the plugin install universe).
+  * ``excluded[]`` — exists in a candidate dir but intentionally not shipped
+    (each entry carries a ``reason``).
+  * ``repo_only[]`` — tracked but not a shippable artifact at all (tests, CI
+    config, docs, root dev files); each entry carries a ``reason``.
+  * ``build_inputs[]`` — consumed by the build/install process and not a
+    depth-tier-gated mechanism: the plugin/hooks manifests copied or filtered
+    into the bundle, and the packaging sources baked into bundle artifacts
+    (``.mcp.json``, ``platform.json``); each entry carries a ``reason``.
+
+  Matching is prefix-aware: a manifest entry ``skills/claude/engram-sleep``
+  (a directory) covers the tracked file ``skills/claude/engram-sleep/SKILL.md``
+  (a file inside it).  This mirrors the granularity used by build-plugin.sh
+  (per-directory for skills, per-directory for tools sub-packages like
+  tools/engine, tools/migration, tools/engram-pkg).
+
+  Any tracked file in NONE of the four buckets → test FAILS, naming the
+  unaccounted path(s).  Any tracked file matched by MORE than one bucket
+  (overlap/ambiguity) → test ALSO FAILS.
+
+**Plugin-universe gate** (``test_every_shippable_path_is_tagged``):
+  Enumerates only the files that ``build-plugin.sh`` draws from (the original
+  hand-coded surface), and asserts each is in ``mechanisms[]`` or
+  ``excluded[]``.  This gate is more precise within its narrow scope (same
+  granularity as the manifest for hooks, agents, skills, etc.) and is kept
+  alongside the whole-tree gate as the authoritative shippable-universe check.
 
 Enumeration unit choices (load-bearing design decision)
 =======================================================
@@ -29,11 +62,11 @@ build-plugin.sh uses DIFFERENT copy granularities for different surfaces:
     Manifest unit = per-top-level-item inside templates/, e.g.
     ``templates/CLAUDE.md.template`` and ``templates/config.json.example``.
 
-The test enumerates each surface at the SAME granularity the manifest uses, so
-the cross-check is 1:1 with no false mismatches.
+The plugin-universe test enumerates each surface at the SAME granularity the
+manifest uses, so the cross-check is 1:1 with no false mismatches.
 
-Scope boundary
-==============
+Scope boundary (plugin-universe gate)
+======================================
 The CI test only checks paths that build-plugin.sh ships (the plugin install
 path). The manifest intentionally covers MORE than this — scatter-install paths
 (tools/baton.py, viz_server.py, etc.) and operator tools (tools/agentctl,
@@ -42,37 +75,15 @@ tools/agent-bootstrap) also have manifest entries. Those extra entries are valid
 in the repo, not if it falls outside the plugin-copy scope). This gives the
 manifest broader coverage while keeping the CI gate mechanical and offline.
 
-Completeness gate (filesystem → manifest)
-=========================================
-``test_every_shippable_path_is_tagged`` enumerates candidate files from the
-FILESYSTEM (the actual repo dirs that build-plugin.sh draws from), then asserts
-that every candidate file appears in the manifest EITHER as a tiered mechanism
-OR in the manifest's ``excluded`` list.  A candidate that is neither tiered
-nor excluded FAILS the test — this is the "forgot-to-tag" catch.
-
-The complementary ``test_no_dangling_manifest_entries`` runs in the other
-direction (manifest → filesystem) and catches mechanisms that were removed or
-renamed without updating the manifest.
-
 The ``excluded`` list in packaging/tiers.json is the explicit accounting of
 candidate-dir files that are intentionally NOT shipped, each carrying a short
 ``reason``.  It replaces the deleted HOOKS_EXCLUDE concept by moving the
 "do not ship" intent INTO the manifest where it is auditable.
 
-Candidate-universe policy
-=========================
-The universe is the set of source directories that ``build-plugin.sh`` draws
-from (see ``_enumerate_candidate_paths`` above for the exact surface list).
-The following subtrees are deliberately OUTSIDE the universe and are not
-enumerated by this test:
-
-  * ``forum/`` — a separately-deployed second target (issue #868); its
-    files ship via a distinct build path, not through ``build-plugin.sh``.
-  * ``tests/`` — test fixtures, never shipped.
-  * ``docs/`` — documentation, never shipped.
-  * ``.github/`` — CI configuration, never shipped.
-  * Dev-only local agents (e.g. per-developer working files) that do not
-    belong to the shared plugin bundle.
+The ``repo_only`` list accounts for tracked files that are NEVER candidates for
+shipping through any deploy path — test suite, CI config, docs, root dev files,
+per-developer local config, build infrastructure.  Each entry carries a
+``reason`` so the intent is auditable.
 
 Removed integration lanes are DELETED from the repo, not excluded via
 the ``excluded`` list — removed lanes are deleted from the tree rather
@@ -81,7 +92,8 @@ the canonical precedent.  An ``excluded`` entry is correct only for
 a file that EXISTS in the repo's candidate dirs but is intentionally
 withheld from the plugin bundle.
 
-Untiered drift WITHIN the universe fails ``test_every_shippable_path_is_tagged``.
+Untiered drift WITHIN the plugin universe fails ``test_every_shippable_path_is_tagged``.
+Unaccounted drift anywhere in the tree fails ``test_whole_tree_every_tracked_file_has_a_role``.
 Manifest entries pointing at deleted or renamed files fail
 ``test_no_dangling_manifest_entries``.
 """
@@ -90,6 +102,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 
 import pytest
 
@@ -119,6 +132,60 @@ def _manifest_path_set(manifest: dict) -> set[str]:
 def _excluded_path_set(manifest: dict) -> set[str]:
     """Return the set of paths in manifest['excluded'] (intentionally-not-shipped)."""
     return {entry["path"] for entry in manifest.get("excluded", [])}
+
+
+def _repo_only_path_set(manifest: dict) -> set[str]:
+    """Return the set of paths in manifest['repo_only'] (tracked but never shipped)."""
+    return {entry["path"] for entry in manifest.get("repo_only", [])}
+
+
+def _build_inputs_path_set(manifest: dict) -> set[str]:
+    """Return the set of paths in manifest['build_inputs'].
+
+    Build/install-consumed files that are not depth-tier-gated mechanisms:
+    the plugin/hooks manifests copied or filtered into the bundle, and the
+    packaging sources baked into bundle artifacts (.mcp.json, platform.json).
+    """
+    return {entry["path"] for entry in manifest.get("build_inputs", [])}
+
+
+def _enumerate_all_tracked_paths() -> set[str]:
+    """Enumerate every file tracked by git in the repository.
+
+    Returns paths relative to the repo root, using ``git ls-files``.
+    This is the whole-tree universe for the default-deny gate.
+    """
+    result = subprocess.run(
+        ["git", "ls-files"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return {p for p in result.stdout.splitlines() if p}
+
+
+def _path_is_covered(tracked_path: str, bucket_paths: set[str]) -> bool:
+    """Return True if ``tracked_path`` is covered by any entry in ``bucket_paths``.
+
+    Matching is prefix-aware: a bucket entry ending with ``/`` (or matching a
+    directory prefix of the tracked path) covers all files inside it.  This
+    mirrors the build-plugin.sh granularity for skills/, tools/engine/,
+    tools/migration/, tools/engram-pkg/, etc. — where the manifest carries a
+    directory-level entry but ``git ls-files`` yields individual files.
+
+    Exact match also counts (for file-level manifest entries).
+    """
+    # Exact match
+    if tracked_path in bucket_paths:
+        return True
+    # Prefix match: bucket entry is a directory prefix of the tracked path
+    for bp in bucket_paths:
+        # Normalise: treat "foo/" and "foo" both as directory prefixes
+        prefix = bp if bp.endswith("/") else bp + "/"
+        if tracked_path.startswith(prefix):
+            return True
+    return False
 
 
 def _shipping_set_for_tier(
@@ -253,6 +320,114 @@ def test_every_shippable_path_is_tagged():
         "(add each as a tiered mechanism in mechanisms[] or as an intentionally-excluded "
         "entry in excluded[]):\n"
         + "\n".join(f"  {p}" for p in unaccounted)
+    )
+
+
+def test_whole_tree_every_tracked_file_has_a_role():
+    """Every git-tracked file must have exactly one declared role in packaging/tiers.json.
+
+    Four buckets, each carrying ``reason`` strings:
+      - ``mechanisms[]`` — tiered shippable (plugin install universe)
+      - ``excluded[]`` — exists in a candidate dir but intentionally not shipped
+      - ``repo_only[]`` — tracked but not a shippable artifact (tests, CI, docs, etc.)
+      - ``build_inputs[]`` — build/install-consumed, not a depth-tier mechanism
+        (plugin/hooks manifests, packaging sources baked into bundle artifacts)
+
+    Any tracked file in NONE of the four buckets → FAIL (unaccounted).
+    Any tracked file matched by MORE than one bucket → FAIL (ambiguous).
+
+    Matching is prefix-aware: a manifest entry for a directory covers all
+    tracked files inside it (see ``_path_is_covered``).
+
+    This is the whole-tree default-deny gate (issue #968).
+    """
+    manifest = _load_manifest()
+    tiered_paths = _manifest_path_set(manifest)
+    excluded_paths = _excluded_path_set(manifest)
+    repo_only_paths = _repo_only_path_set(manifest)
+    build_inputs_paths = _build_inputs_path_set(manifest)
+
+    tracked = _enumerate_all_tracked_paths()
+
+    unaccounted: list[str] = []
+    ambiguous: list[str] = []
+
+    for p in sorted(tracked):
+        in_tiered = _path_is_covered(p, tiered_paths)
+        in_excluded = _path_is_covered(p, excluded_paths)
+        in_repo_only = _path_is_covered(p, repo_only_paths)
+        in_build_inputs = _path_is_covered(p, build_inputs_paths)
+
+        matches = sum([in_tiered, in_excluded, in_repo_only, in_build_inputs])
+        if matches == 0:
+            unaccounted.append(p)
+        elif matches > 1:
+            ambiguous.append(p)
+
+    errors: list[str] = []
+    if unaccounted:
+        errors.append(
+            "Tracked files with no declared role in packaging/tiers.json "
+            "(add to mechanisms[], excluded[], repo_only[], or build_inputs[]):\n"
+            + "\n".join(f"  {p}" for p in unaccounted)
+        )
+    if ambiguous:
+        errors.append(
+            "Tracked files matched by more than one bucket (overlap — "
+            "each file must have exactly one role):\n"
+            + "\n".join(f"  {p}" for p in ambiguous)
+        )
+
+    assert not errors, "\n\n".join(errors)
+
+
+def test_whole_tree_synthetic_undeclared_path_is_flagged():
+    """Synthetic RED-detector: a new tracked file in an undeclared location must fail.
+
+    Injects a fake path ``newfeature/foo.py`` into the git-ls-files result and
+    asserts the whole-tree gate would flag it as unaccounted.  Verifies the gate
+    is non-vacuous — it cannot be trivially satisfied by a path that isn't in
+    any bucket.
+    """
+    manifest = _load_manifest()
+    tiered_paths = _manifest_path_set(manifest)
+    excluded_paths = _excluded_path_set(manifest)
+    repo_only_paths = _repo_only_path_set(manifest)
+    build_inputs_paths = _build_inputs_path_set(manifest)
+
+    fake_path = "newfeature/foo.py"
+
+    # Confirm the fake path is not covered by any bucket (it shouldn't be)
+    assert not _path_is_covered(fake_path, tiered_paths), (
+        f"Test setup error: {fake_path!r} unexpectedly covered by mechanisms[]"
+    )
+    assert not _path_is_covered(fake_path, excluded_paths), (
+        f"Test setup error: {fake_path!r} unexpectedly covered by excluded[]"
+    )
+    assert not _path_is_covered(fake_path, repo_only_paths), (
+        f"Test setup error: {fake_path!r} unexpectedly covered by repo_only[]"
+    )
+    assert not _path_is_covered(fake_path, build_inputs_paths), (
+        f"Test setup error: {fake_path!r} unexpectedly covered by build_inputs[]"
+    )
+
+    # Inject the fake path into the real tracked set and run the gate's
+    # accounting logic over it — the fake must come out unaccounted.
+    real_tracked = _enumerate_all_tracked_paths()
+    injected = real_tracked | {fake_path}
+
+    unaccounted: list[str] = []
+    for p in sorted(injected):
+        in_tiered = _path_is_covered(p, tiered_paths)
+        in_excluded = _path_is_covered(p, excluded_paths)
+        in_repo_only = _path_is_covered(p, repo_only_paths)
+        in_build_inputs = _path_is_covered(p, build_inputs_paths)
+        if not (in_tiered or in_excluded or in_repo_only or in_build_inputs):
+            unaccounted.append(p)
+
+    assert fake_path in unaccounted, (
+        f"RED-detector failure: {fake_path!r} was NOT flagged as unaccounted. "
+        "The whole-tree gate is not detecting undeclared paths."
     )
 
 
