@@ -10,6 +10,13 @@ Tests cover:
 6. Default source_class is 'external'
 7. Batch observations with per-observation source_class
 8. source_class appears in observation result
+
+Import-pattern contract (#948 wave C — R1):
+    This file imports engram_core directly and contains no ``import server``.
+    DB_PATH is defined in engram_core; _get_confidence_history_from_db uses
+    a function-local ``import engram_core`` to get the freshly-reloaded module
+    after fresh_client() purges and re-imports the engram_* family.
+    The top-level ``import engram_core`` is the AST-visible selection edge.
 """
 
 import atexit
@@ -21,6 +28,8 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import engram_core  # noqa: E402 — top-level import for AST-visible selection edge
 
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_source_class_")
 atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
@@ -226,8 +235,10 @@ def test_batch_with_source_class():
 
 def _get_confidence_history_from_db(client, node_id):
     """Read confidence_history from DB (stripped from MCP returns per #358)."""
-    import server as _server
-    conn = sqlite3.connect(str(_server.core.DB_PATH))
+    # Use function-local import to get the freshly-reloaded engram_core after
+    # fresh_client() has purged and re-imported the engram_* family.
+    import engram_core as _core
+    conn = sqlite3.connect(str(_core.DB_PATH))
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute(

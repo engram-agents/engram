@@ -8,7 +8,7 @@ These tests are the **unification regression guard**: they set a *stray*
 ENGRAM_DATA_DIR and assert it is IGNORED, so the removed fallback cannot creep
 back in. (Originally an ENGRAM_HOME-vs-ENGRAM_DATA_DIR precedence test, #489.)
 
-Coverage (× 3 consumers: engram_client._load_engram_config, server.py DATA_DIR,
+Coverage (× 3 consumers: engram_client._load_engram_config, engram_core DATA_DIR,
 tools/inspect_raw.py DATA_DIR):
   1. ENGRAM_HOME set + a stray ENGRAM_DATA_DIR set → resolves to ENGRAM_HOME
      (the stray ENGRAM_DATA_DIR has no effect).
@@ -18,6 +18,11 @@ tools/inspect_raw.py DATA_DIR):
 
 Each test explicitly clears both vars at the start so a leaked global from another
 test module cannot contaminate results.
+
+Import-pattern contract (#948 wave C — R1):
+    This file imports engram_core directly and contains no ``import server``.
+    DATA_DIR is defined in engram_core; server.py re-exports it via the core
+    alias (``core = engram_core``).
 """
 
 from __future__ import annotations
@@ -35,6 +40,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+import engram_core  # noqa: E402 — must follow sys.path setup
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -47,17 +54,23 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ENGRAM_DATA_DIR", raising=False)
 
 
-def _reload_server(monkeypatch: pytest.MonkeyPatch, tmp_dir: str) -> object:
-    """Reload server module under patched env, then call _configure_paths."""
+def _reload_core(monkeypatch: pytest.MonkeyPatch, tmp_dir: str) -> object:
+    """Reload engram_core module under patched env, then call _configure_paths.
+
+    DATA_DIR is computed from the env at module import time; to test different
+    env-var combinations we must purge and re-import engram_core after setting
+    the vars. server.py re-exports core.DATA_DIR, so reloading engram_core is
+    the authoritative test of the resolution logic.
+    """
     # Ensure no embeddings overhead in tests
     monkeypatch.setenv("ENGRAM_NO_EMBEDDINGS", "1")
     for key in list(sys.modules):
         if key == "server" or key.startswith("engram_"):
             del sys.modules[key]
-    import server  # type: ignore[import]
-    server._configure_paths(tmp_dir)
-    server._ensure_data_dir()
-    return server
+    import engram_core as _core  # type: ignore[import]
+    _core._configure_paths(tmp_dir)
+    _core._ensure_data_dir()
+    return _core
 
 
 def _reload_inspect_raw(monkeypatch: pytest.MonkeyPatch) -> object:
@@ -155,11 +168,15 @@ class TestEngramClientConfigResolution:
 
 
 # ---------------------------------------------------------------------------
-# 4-6. server.py DATA_DIR
+# 4-6. engram_core DATA_DIR
 # ---------------------------------------------------------------------------
 
 class TestServerDataDirResolution:
-    """server.core.DATA_DIR resolves from env vars at module import time."""
+    """engram_core.DATA_DIR resolves from env vars at module import time.
+
+    server.py re-exports DATA_DIR via ``core = engram_core``, so testing
+    engram_core directly is equivalent to testing server.core.DATA_DIR.
+    """
 
     def test_home_used_stray_data_dir_ignored(self, monkeypatch, tmp_path):
         """ENGRAM_HOME set + a stray ENGRAM_DATA_DIR set to a different path →
@@ -177,10 +194,10 @@ class TestServerDataDirResolution:
         for key in list(sys.modules):
             if key == "server" or key.startswith("engram_"):
                 del sys.modules[key]
-        import server  # type: ignore[import]
+        import engram_core as _core  # type: ignore[import]
         # DATA_DIR is set at import time from the env
-        assert server.core.DATA_DIR == Path(home_dir), (
-            f"Expected DATA_DIR={home_dir} (stray ENGRAM_DATA_DIR ignored); got {server.core.DATA_DIR}"
+        assert _core.DATA_DIR == Path(home_dir), (
+            f"Expected DATA_DIR={home_dir} (stray ENGRAM_DATA_DIR ignored); got {_core.DATA_DIR}"
         )
 
     def test_data_dir_ignored_when_home_unset(self, monkeypatch, tmp_path):
@@ -204,9 +221,9 @@ class TestServerDataDirResolution:
         for key in list(sys.modules):
             if key == "server" or key.startswith("engram_"):
                 del sys.modules[key]
-        import server  # type: ignore[import]
-        assert server.core.DATA_DIR == Path(tmp_path / "default_engram"), (
-            f"Expected DATA_DIR=default (stray ENGRAM_DATA_DIR ignored); got {server.core.DATA_DIR}"
+        import engram_core as _core  # type: ignore[import]
+        assert _core.DATA_DIR == Path(tmp_path / "default_engram"), (
+            f"Expected DATA_DIR=default (stray ENGRAM_DATA_DIR ignored); got {_core.DATA_DIR}"
         )
 
     def test_default_when_neither_set(self, monkeypatch, tmp_path):
@@ -225,9 +242,9 @@ class TestServerDataDirResolution:
         for key in list(sys.modules):
             if key == "server" or key.startswith("engram_"):
                 del sys.modules[key]
-        import server  # type: ignore[import]
-        assert server.core.DATA_DIR == Path(tmp_path / "default_engram"), (
-            f"Expected DATA_DIR to use expanduser default; got {server.core.DATA_DIR}"
+        import engram_core as _core  # type: ignore[import]
+        assert _core.DATA_DIR == Path(tmp_path / "default_engram"), (
+            f"Expected DATA_DIR to use expanduser default; got {_core.DATA_DIR}"
         )
 
 

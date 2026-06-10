@@ -9,6 +9,13 @@ Covers:
 5. Goal rejected as derivation premise (non-claim-bearing)
 6. Goal appears in engram_reflect output
 7. Goal supersede preserves no-confidence semantics
+
+Import-pattern contract (#948 wave C — R1):
+    This file imports engram_core directly and contains no ``import server``.
+    DB_PATH is defined in engram_core; _get_metadata_from_db uses a
+    function-local ``import engram_core`` to get the freshly-reloaded module
+    after fresh_client() purges and re-imports the engram_* family.
+    The top-level ``import engram_core`` is the AST-visible selection edge.
 """
 
 import atexit
@@ -22,6 +29,8 @@ import tempfile
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import engram_core  # noqa: E402 — top-level import for AST-visible selection edge
 
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_goal_")
 atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
@@ -53,8 +62,10 @@ def test_goal_creation():
 
 def _get_metadata_from_db(goal_id):
     """Read node metadata from DB directly (parsed_metadata stripped from MCP returns per #358)."""
-    import server as _server
-    conn = sqlite3.connect(str(_server.core.DB_PATH))
+    # Use function-local import to get the freshly-reloaded engram_core after
+    # fresh_client() has purged and re-imported the engram_* family.
+    import engram_core as _core
+    conn = sqlite3.connect(str(_core.DB_PATH))
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (goal_id,)).fetchone()

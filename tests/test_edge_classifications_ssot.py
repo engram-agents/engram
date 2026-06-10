@@ -3,8 +3,14 @@
 Closes the regression channel where edits to EDGE_CLASSIFICATIONS could
 silently drift DAG_EXEMPT_RELATIONS or _REMOVABLE_EDGE_RELATIONS away
 from their pre-refactor values.
+
+Import-pattern contract (#948 wave C — R1):
+    This file imports engram_core directly and contains no ``import server``.
+    EDGE_CLASSIFICATIONS, DAG_EXEMPT_RELATIONS, and _REMOVABLE_EDGE_RELATIONS
+    are defined in engram_core (server.py re-exports them via the core alias).
 """
-from server import (
+import engram_core
+from engram_core import (
     EDGE_CLASSIFICATIONS,
     DAG_EXEMPT_RELATIONS,
     _REMOVABLE_EDGE_RELATIONS,

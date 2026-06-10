@@ -10,6 +10,11 @@ Five tests covering the bi-gram OR-of-AND-pairs variant + fallback paths:
 
 Bi-gram structure locked 2026-05-18 PM after 7-variant harness comparison;
 +0.061 MRR vs baseline. See PR #197 description for full empirical data.
+
+Import-pattern contract (#948 wave C — R1):
+    This file imports engram_core directly and contains no ``import server``.
+    _sanitize_fts_query and _sanitize_fts_query_legacy are defined in
+    engram_core; server.py wraps them via thin forwarding functions.
 """
 
 from __future__ import annotations
@@ -23,8 +28,9 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import engram_core  # noqa: E402 — must follow sys.path setup
+from engram_core import _sanitize_fts_query, _sanitize_fts_query_legacy  # noqa: E402
 from engram_idf import ensure_vocab_table  # noqa: E402
-from server import _sanitize_fts_query, _sanitize_fts_query_legacy  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

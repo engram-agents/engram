@@ -17,75 +17,93 @@ Coverage:
   7. Cascade resolution — supersede auto-follow, retract drop, missing drop
   8. active_set_name tracking — focus/unfocus diverge clear; list_focused
      includes the field
+
+Import-pattern contract (#948 wave C — R1):
+    This file imports engram_focus, engram_observation, engram_revision, and
+    engram_core directly and contains no ``import server``. The module objects
+    are passed to fresh_module() (R4) for per-test reload isolation. All tool
+    calls use _impl functions directly (no MCP payload_json wrapper). Wrapper-
+    contract behavior (JSON-parse / missing-required-field errors) is not
+    asserted here and belongs to a separate _payload file if needed.
 """
 
 import atexit
-import inspect
+import importlib
 import json
 import os
 import shutil
 import sys
 import tempfile
+from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Add tests/ dir so conftest.fresh_module is importable both under pytest and
+# when the file is run as a standalone script.
+_TESTS_DIR = str(Path(__file__).resolve().parent)
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+from conftest import fresh_module  # noqa: E402 — must follow sys.path setup
+
+import engram_core
+import engram_focus
+import engram_observation
+import engram_revision
 
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_focus_sets_")
 atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
-class _DirectClient:
-    """Minimal shim — calls server functions directly and parses JSON output.
+# Tool-name → _impl dispatch table (focus family + setup helpers).
+# This lets _DirectClient.call() use string tool names from the existing test
+# bodies without rewriting every call site.
+_TOOL_IMPLS = {
+    "engram_focus":           lambda mods, **kw: mods["focus"]._focus_impl(**kw),
+    "engram_unfocus":         lambda mods, **kw: mods["focus"]._unfocus_impl(**kw),
+    "engram_list_focused":    lambda mods, **kw: mods["focus"]._list_focused_impl(),
+    "engram_focus_save":      lambda mods, **kw: mods["focus"]._focus_save_impl(**kw),
+    "engram_focus_load":      lambda mods, **kw: mods["focus"]._focus_load_impl(**kw),
+    "engram_focus_swap":      lambda mods, **kw: mods["focus"]._focus_swap_impl(**kw),
+    "engram_focus_sets":      lambda mods, **kw: mods["focus"]._focus_sets_impl(),
+    "engram_focus_delete_set":lambda mods, **kw: mods["focus"]._focus_delete_set_impl(**kw),
+    "engram_add_observation": lambda mods, **kw: mods["obs"]._add_observation_impl(**kw),
+    "engram_supersede":       lambda mods, **kw: mods["rev"]._supersede_impl(**kw),
+    "engram_retract":         lambda mods, **kw: mods["rev"]._retract_impl(**kw),
+}
 
-    The focus tools are not registered in engram_client.py's TOOL_SCHEMAS
-    (pre-existing gap; even the legacy engram_focus isn't exposed via the
-    client wrapper). Tests dispatch through server module functions directly,
-    mirroring the EngramClient.call signature for readability.
+
+class _DirectClient:
+    """Minimal shim — calls _impl functions directly and parses JSON output.
+
+    Replaces the old server-dispatch shim (#948 wave C R1): all tool calls now
+    go to family-module _impl functions rather than server.py MCP wrappers.
+    Interface is kept identical to the old shim so test bodies need no changes.
     """
 
     def __init__(self, db_dir):
-        for key in list(sys.modules):
-            if key == "server" or key.startswith("engram_"):
-                del sys.modules[key]
-        import server
-        server._configure_paths(db_dir)
-        server._ensure_data_dir()
-        self._server = server
+        if os.path.exists(db_dir):
+            shutil.rmtree(db_dir)
+        os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
+        # Reload the primary family module; importlib picks up all engram_* deps.
+        focus = fresh_module(engram_focus)
+        obs = importlib.import_module("engram_observation")
+        rev = importlib.import_module("engram_revision")
+        core = sys.modules["engram_core"]
+        core._configure_paths(db_dir)
+        core._ensure_data_dir()
+        self._mods = {"focus": focus, "obs": obs, "rev": rev, "core": core}
 
     def call(self, tool_name, arguments=None):
-        fn = getattr(self._server, tool_name)
         args = arguments or {}
-        # Mirror EngramClient.call's legacy-form auto-wrap for single-payload
-        # tools: if the caller passes the legacy named-field dict, wrap as
-        # payload_json.  Primary check: TOOL_SCHEMAS (for registered tools).
-        # Fallback: inspect the function signature directly (for focus tools
-        # that are not in TOOL_SCHEMAS but were migrated to payload_json in
-        # the wave-3 single-payload migration, 2026-05-27).
-        wrapped = False
-        try:
-            from engram_client import TOOL_SCHEMAS
-            schema = TOOL_SCHEMAS.get(tool_name)
-            if (schema
-                    and list(schema.get("parameters", {}).keys()) == ["payload_json"]
-                    and "payload_json" not in args):
-                args = {"payload_json": json.dumps(args)}
-                wrapped = True
-        except ImportError:
-            pass
-        if not wrapped and "payload_json" not in args:
-            sig = inspect.signature(fn)
-            params = list(sig.parameters.keys())
-            if params == ["payload_json"] and args:
-                args = {"payload_json": json.dumps(args)}
-        result_str = fn(**args)
+        fn = _TOOL_IMPLS[tool_name]
+        result_str = fn(self._mods, **args)
         return json.loads(result_str)
 
 
 def fresh_client():
     """Return a clean client on a fresh sandbox DB."""
-    if os.path.exists(TEST_DIR):
-        shutil.rmtree(TEST_DIR)
     return _DirectClient(TEST_DIR)
 
 

@@ -4,6 +4,11 @@ Regression guard for the auto-sleep config fields added in the auto-sleep
 config schema PR. Both auto_sleep_enabled and auto_sleep_time are consumed
 by the SessionStart hook at session start — their restart_required=True
 semantics are load-bearing (a change takes effect next session, not mid-session).
+
+Import-pattern contract (#948 wave C — R1):
+    This file imports engram_core directly and contains no ``import server``.
+    _configure_paths and _ensure_data_dir are defined in engram_core;
+    server.py wraps them via thin forwarding functions.
 """
 
 from __future__ import annotations
@@ -16,6 +21,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "tools"))
+
+import engram_core  # noqa: E402 — must follow sys.path setup
 
 from tools.config_schema import SCHEMA  # noqa: E402
 
@@ -108,18 +115,21 @@ class TestDefaultConfigCadence:
     def test_default_config_cadence_has_auto_sleep_enabled(self):
         """_default_config() cadence block must include auto_sleep_enabled=False."""
         import importlib
+        import json
         import shutil
         import tempfile
 
         tmp = tempfile.mkdtemp()
         try:
-            import server
-            # Reload to avoid cached module state from other tests
-            importlib.reload(server)
-            server._configure_paths(tmp)
-            server._ensure_data_dir()
+            # Reload engram_core to avoid cached module state from other tests,
+            # then configure paths and write defaults. A prior test may have purged
+            # engram_* from sys.modules, so import (idempotent) before reload() —
+            # reload() raises ImportError if the module isn't currently imported.
+            import engram_core
+            core = importlib.reload(engram_core)
+            core._configure_paths(tmp)
+            core._ensure_data_dir()
 
-            import json
             config_path = Path(tmp) / "config.json"
             config = json.loads(config_path.read_text())
             cadence = config.get("cadence", {})
@@ -135,17 +145,21 @@ class TestDefaultConfigCadence:
     def test_default_config_cadence_has_auto_sleep_time(self):
         """_default_config() cadence block must include auto_sleep_time='03:00'."""
         import importlib
+        import json
         import shutil
         import tempfile
 
         tmp = tempfile.mkdtemp()
         try:
-            import server
-            importlib.reload(server)
-            server._configure_paths(tmp)
-            server._ensure_data_dir()
+            # Reload engram_core to avoid cached module state from other tests,
+            # then configure paths and write defaults. A prior test may have purged
+            # engram_* from sys.modules, so import (idempotent) before reload() —
+            # reload() raises ImportError if the module isn't currently imported.
+            import engram_core
+            core = importlib.reload(engram_core)
+            core._configure_paths(tmp)
+            core._ensure_data_dir()
 
-            import json
             config_path = Path(tmp) / "config.json"
             config = json.loads(config_path.read_text())
             cadence = config.get("cadence", {})

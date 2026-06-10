@@ -12,6 +12,11 @@ These tests verify:
   - counterparts field absent → get_counterparts() returns []
   - config.json absent → both helpers return their defaults (False / [])
   - config.json malformed JSON → both helpers return their defaults
+
+Import-pattern contract (#948 wave C — R1):
+    This file imports engram_core and engram_client directly and contains no
+    ``import server``. _configure_paths and _ensure_data_dir are defined in
+    engram_core; server.py wraps them via thin forwarding functions.
 """
 
 import json
@@ -26,6 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 import engram_client
+import engram_core
 
 
 class TestIsMultiAgentMode(unittest.TestCase):
@@ -146,17 +152,14 @@ class TestGetCounterparts(unittest.TestCase):
 
 
 class TestDefaultConfigHasNewFields(unittest.TestCase):
-    """Verify server.py's _ensure_data_dir() writes mode + counterparts defaults."""
+    """Verify engram_core's _ensure_data_dir() writes mode + counterparts defaults."""
 
     def test_fresh_config_has_mode_single(self):
         """A freshly created config.json contains mode='single'."""
-        import importlib
-        import server as srv
-
         with tempfile.TemporaryDirectory() as tmp:
-            srv._configure_paths(tmp)
+            engram_core._configure_paths(tmp)
             # _ensure_data_dir creates config.json when it doesn't exist.
-            srv._ensure_data_dir()
+            engram_core._ensure_data_dir()
             config_path = Path(tmp) / "config.json"
             self.assertTrue(config_path.exists())
             data = json.loads(config_path.read_text())
@@ -164,11 +167,9 @@ class TestDefaultConfigHasNewFields(unittest.TestCase):
 
     def test_fresh_config_has_empty_counterparts(self):
         """A freshly created config.json contains counterparts=[]."""
-        import server as srv
-
         with tempfile.TemporaryDirectory() as tmp:
-            srv._configure_paths(tmp)
-            srv._ensure_data_dir()
+            engram_core._configure_paths(tmp)
+            engram_core._ensure_data_dir()
             config_path = Path(tmp) / "config.json"
             data = json.loads(config_path.read_text())
             self.assertEqual(data.get("counterparts"), [])
