@@ -478,10 +478,6 @@
       "tier": "essential"
     },
     {
-      "path": "agents/claude/engram-summary-fairy.md",
-      "tier": "essential"
-    },
-    {
       "path": "agents/claude/engram-batch-summary-fairy.md",
       "tier": "essential"
     },

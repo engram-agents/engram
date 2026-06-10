@@ -359,9 +359,8 @@ class TestCodexAgentEmission:
         assert reviewer.get("mcp_servers") == {}
 
     def test_codex_agent_allowlists_declared_mcp_tools(self, codex_convenience_bundle):
-        """MCP-using dream/summary fairies preserve Claude tool whitelists."""
+        """MCP-using dream fairy preserves Claude tool whitelists."""
         dream = self._read_agent(codex_convenience_bundle, "engram-dream-fairy")
-        summary = self._read_agent(codex_convenience_bundle, "engram-summary-fairy")
         dream_tools = dream["plugins"]["engram@engram-local"]["mcp_servers"]["engram"]["enabled_tools"]
         assert set(dream_tools) == {
             "engram_query",
@@ -375,12 +374,6 @@ class TestCodexAgentEmission:
             "engram_stats",
             "engram_focus_sets",
             "engram_list_focused",
-        }
-        summary_tools = summary["plugins"]["engram@engram-local"]["mcp_servers"]["engram"]["enabled_tools"]
-        assert set(summary_tools) == {
-            "engram_inspect",
-            "engram_list",
-            "engram_query",
         }
 
     def test_codex_agent_full_tool_spec_inherits_full_mcp(self, codex_convenience_bundle):

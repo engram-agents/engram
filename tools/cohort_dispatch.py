@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """cohort_dispatch.py — Batch-summary cohort orchestration for the sleep cycle.
 
-Five subcommands drive the mechanical pipeline that replaces the serial
-engram-summary-fairy pattern:
+Five subcommands drive the mechanical pipeline for batch-summary cohort
+orchestration:
 
   prepare         Sample/chunk a cohort into per-chunk payload files.
   verify-in       Pre-flight integrity checks on a cohort before dispatch.

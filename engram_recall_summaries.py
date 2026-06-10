@@ -30,7 +30,7 @@ from tools.recall_summary_validator import validate_summary_entry
 # Quality of recall_summary directly determines whether the right nodes
 # surface when the agent needs them.
 #
-# Sleep-cycle workflow: the engram-sleep skill's summary-fairy dispatches
+# Sleep-cycle workflow: the engram-sleep skill's batch-summary-fairy dispatches
 # generate recall_summary/keywords for the day's cohort, then the dream-master
 # applies via this batch tool. Bulk-backfill workflow: when an agent first
 # enables recall_summary curation, this tool seeds the whole graph at once.
@@ -41,7 +41,7 @@ from tools.recall_summary_validator import validate_summary_entry
 #
 # Idempotent: re-writing the same node with the same summary is a no-op.
 # Constants + per-entry validation live in tools/recall_summary_validator.py
-# (single source of truth — used both here and by the summary-fairy).
+# (single source of truth — used both here and by the batch-summary-fairy).
 def _set_recall_summaries_impl(payload_json: str) -> str:
     """Impl for engram_set_recall_summaries — takes raw payload_json string."""
     # -- Parse payload --
