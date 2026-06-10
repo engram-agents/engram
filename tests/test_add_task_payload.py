@@ -7,6 +7,8 @@ Coverage:
   4. Required-field validation — missing description rejected.
   5. Scope validator preserved — invalid scope rejected.
   6. Internal helper — _add_task_impl works with named kwargs.
+  7. is_current guards (issue #1031): non-current goal_id skipped + warned;
+     non-current parent_task_id skipped + warned; current nodes linked normally.
 """
 
 import atexit
@@ -105,3 +107,85 @@ def test_impl_callable_with_kwargs():
     ))
     assert "error" not in r, r
     assert "task_id" in r
+
+
+def _seed_goal(server):
+    """Create a current goal and return its id."""
+    r = json.loads(server.engram_add_goal(payload_json=json.dumps({
+        "claim": "Test goal for task is_current guard.",
+        "motivation": "Fixture.",
+    })))
+    assert "error" not in r, r
+    return r["goal_id"]
+
+
+def _retract_node(server, node_id):
+    """Retract a node so is_current = 0."""
+    r = json.loads(server._retract_impl(
+        node_id=node_id,
+        error_type="other",
+        reason="test: verify non-current guard",
+    ))
+    assert "error" not in r, r
+
+
+def test_add_task_skips_non_current_goal():
+    """Non-current goal_id: serves edge skipped; non_current_goal_id reported."""
+    server = fresh_server()
+    goal_id = _seed_goal(server)
+    _retract_node(server, goal_id)
+
+    r = json.loads(server._add_task_impl(
+        description="Task with retracted goal.",
+        goal_id=goal_id,
+    ))
+    assert "error" not in r, r
+    assert r.get("status") == "created"
+    assert r.get("non_current_goal_id") == goal_id, r
+    assert "serves_goal" not in r, r
+
+
+def test_add_task_links_current_goal():
+    """Current goal_id: serves edge created normally."""
+    server = fresh_server()
+    goal_id = _seed_goal(server)
+
+    r = json.loads(server._add_task_impl(
+        description="Task with active goal.",
+        goal_id=goal_id,
+    ))
+    assert "error" not in r, r
+    assert r.get("serves_goal") == goal_id, r
+    assert "non_current_goal_id" not in r, r
+
+
+def test_add_task_skips_non_current_parent():
+    """Non-current parent_task_id: subtask_of edge skipped; non_current_parent_task_id reported."""
+    server = fresh_server()
+    parent_r = json.loads(server._add_task_impl(description="Parent task."))
+    parent_id = parent_r["task_id"]
+    _retract_node(server, parent_id)
+
+    r = json.loads(server._add_task_impl(
+        description="Subtask with retracted parent.",
+        parent_task_id=parent_id,
+    ))
+    assert "error" not in r, r
+    assert r.get("status") == "created"
+    assert r.get("non_current_parent_task_id") == parent_id, r
+    assert "parent_task" not in r, r
+
+
+def test_add_task_links_current_parent():
+    """Current parent_task_id: subtask_of edge created; parent auto-promoted to milestone."""
+    server = fresh_server()
+    parent_r = json.loads(server._add_task_impl(description="Parent task."))
+    parent_id = parent_r["task_id"]
+
+    r = json.loads(server._add_task_impl(
+        description="Subtask with active parent.",
+        parent_task_id=parent_id,
+    ))
+    assert "error" not in r, r
+    assert r.get("parent_task") == parent_id, r
+    assert "non_current_parent_task_id" not in r, r

@@ -240,18 +240,24 @@ def _add_task_impl(
         )
 
         # Edge: task serves goal
+        non_current_goal_id = None
         if goal_id:
-            goal = conn.execute("SELECT id, claim FROM nodes WHERE id = ?", (goal_id,)).fetchone()
+            goal = conn.execute(
+                "SELECT id, claim, is_current FROM nodes WHERE id = ?", (goal_id,)
+            ).fetchone()
             if not goal:
                 conn.rollback()
                 return json.dumps({"error": f"Goal '{goal_id}' not found."})
             if not goal["id"].startswith("gl_"):
                 conn.rollback()
                 return json.dumps({"error": f"'{goal_id}' is not a goal node."})
-            conn.execute(
-                "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'serves', ?)",
-                (node_id, goal_id, now),
-            )
+            if not goal["is_current"]:
+                non_current_goal_id = goal_id
+            else:
+                conn.execute(
+                    "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'serves', ?)",
+                    (node_id, goal_id, now),
+                )
 
         # Edges: task implements conjectures/questions
         impl_ids = [s.strip() for s in implements_ids.split(",") if s.strip()]
@@ -267,23 +273,29 @@ def _add_task_impl(
                     pass
 
         # Edge: subtask_of parent
+        non_current_parent_task_id = None
         if parent_task_id:
-            parent = conn.execute("SELECT id, type, metadata FROM nodes WHERE id = ?", (parent_task_id,)).fetchone()
+            parent = conn.execute(
+                "SELECT id, type, is_current, metadata FROM nodes WHERE id = ?", (parent_task_id,)
+            ).fetchone()
             if not parent or parent["type"] != "task":
                 conn.rollback()
                 return json.dumps({"error": f"Parent task '{parent_task_id}' not found or not a task."})
-            conn.execute(
-                "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'subtask_of', ?)",
-                (node_id, parent_task_id, now),
-            )
-            # Auto-promote parent to milestone scope
-            parent_meta = json.loads(parent["metadata"]) if parent["metadata"] else {}
-            if parent_meta.get("scope") != "milestone":
-                parent_meta["scope"] = "milestone"
+            if not parent["is_current"]:
+                non_current_parent_task_id = parent_task_id
+            else:
                 conn.execute(
-                    "UPDATE nodes SET metadata = ? WHERE id = ?",
-                    (json.dumps(parent_meta), parent_task_id),
+                    "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'subtask_of', ?)",
+                    (node_id, parent_task_id, now),
                 )
+                # Auto-promote parent to milestone scope
+                parent_meta = json.loads(parent["metadata"]) if parent["metadata"] else {}
+                if parent_meta.get("scope") != "milestone":
+                    parent_meta["scope"] = "milestone"
+                    conn.execute(
+                        "UPDATE nodes SET metadata = ? WHERE id = ?",
+                        (json.dumps(parent_meta), parent_task_id),
+                    )
 
         # Stamp with planned importance (2.0)
         core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
@@ -296,8 +308,9 @@ def _add_task_impl(
         # Citation USE-bumps (alpha #177 area 4, Lei 2026-05-19 tier-2):
         # implements_ids (cites edges) and goal_id (serves edge) are
         # deliberate references to existing nodes — bump as tier-2 citations.
+        # Only bump goal_id if the serves edge was actually created (is_current).
         cite_targets: list[str] = []
-        if goal_id:
+        if goal_id and not non_current_goal_id:
             cite_targets.append(goal_id)
         cite_targets.extend(impl_ids)
         if cite_targets:
@@ -313,12 +326,16 @@ def _add_task_impl(
             "task_status": "planned",
             "importance_base": TASK_IMPORTANCE["planned"],
         }
-        if goal_id:
+        if goal_id and not non_current_goal_id:
             result["serves_goal"] = goal_id
+        if non_current_goal_id:
+            result["non_current_goal_id"] = non_current_goal_id
         if impl_ids:
             result["implements"] = impl_ids
-        if parent_task_id:
+        if parent_task_id and not non_current_parent_task_id:
             result["parent_task"] = parent_task_id
+        if non_current_parent_task_id:
+            result["non_current_parent_task_id"] = non_current_parent_task_id
 
         return json.dumps(result)
     finally:
