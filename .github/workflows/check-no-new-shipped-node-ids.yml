@@ -35,6 +35,10 @@ jobs:
           #     (cycle/ = self-improvement-cycle process docs — charter, chronicle,
           #      review packages, dream-pass protocol; node IDs are load-bearing
           #      provenance there by design, and build-plugin.sh does not bundle it)
+          #   docs/handbook/ — dev-internal developer handbook (accuracy-pass
+          #     reference docs; concrete node IDs are load-bearing provenance
+          #     by design, and the build engine does not bundle docs/ into the
+          #     plugin — same rationale as cycle/ and the other non-shipped surfaces)
           #   README.md — documents seed-graph IDs that ARE in every install
           #   CHANGELOG.md — historical record; scrub planned separately
           #   this workflow file — contains the pattern literally
@@ -48,6 +52,7 @@ jobs:
             ':(exclude)paper_draft/'
             ':(exclude)active-work/'
             ':(exclude)cycle/'
+            ':(exclude)docs/handbook/'
             ':(exclude)README.md'
             ':(exclude)CHANGELOG.md'
             ':(exclude).github/workflows/check-no-new-shipped-node-ids.yml'

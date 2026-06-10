@@ -3,7 +3,7 @@
 *Generated 2026-06-05 from dev tip; every file in the repo, its ship status per `packaging/tiers.json`, and its mechanism assignment (filled during the sweep). Regenerate mechanically (generation script: see PR #856 thread; tools/ home pending); never hand-edit counts. The handbook's own files are not indexed.*
 
 
-**Census** (2026-06-05 snapshot; Gemini CLI lane files removed by #865 2026-06-06): 385 files · 121 shipped (tier-mapped) · 9 manifest-excluded (tracked, deliberately not shipped) · 206 dev-only · 4 zombie-suspect (remaining after #865 removed 30 gemini-lane zombie-suspects) · 45 unmapped (need adjudication)
+**Census** (2026-06-05 snapshot; Gemini CLI lane files removed by #865 2026-06-06): 385 files · 121 shipped (tier-mapped) · 9 manifest-excluded (tracked, deliberately not shipped) · 204 dev-only · 13 repo-only (outside build-plugin.sh universe, repo-clone-only by design) · 33 forum-deploy (manifest-excluded, ships via forum deploy path, issue #868) · 4 zombie-suspect (remaining after #865 removed 30 gemini-lane zombie-suspects) · 1 unmapped ⚠ (in-universe gap, needs adjudication)
 
 
 **Status legend** (per-mechanism, assigned during sweep): `prod-verified` (behavior checked against ground truth, dated) · `prod-presumed` (ships, believed live, unverified this audit) · `dormant` (ships, inert by design) · `zombie-suspect` (ships, evidence of silent breakage — the #824 class) · `regressed` · `parked` · `retired` · `dev-only`
@@ -14,14 +14,14 @@
 | file | ship | tier/reason | mechanism | status |
 |---|---|---|---|---|
 | `.gitignore` | dev-only | — | _?_ | _unswept_ |
-| `CHANGELOG.md` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `CLAUDE.md` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `DEVELOPMENT.md` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `LICENSE` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `README.md` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `RELEASING.md` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
+| `CHANGELOG.md` | repo-only | — | _?_ | _unswept_ |
+| `CLAUDE.md` | repo-only | — | _?_ | _unswept_ |
+| `DEVELOPMENT.md` | repo-only | — | _?_ | _unswept_ |
+| `LICENSE` | repo-only | — | _?_ | _unswept_ |
+| `README.md` | repo-only | — | _?_ | _unswept_ |
+| `RELEASING.md` | repo-only | — | _?_ | _unswept_ |
 | `SKILL.md` | shipped | essential | _?_ | _unswept_ |
-| `USER_GUIDE.md` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
+| `USER_GUIDE.md` | repo-only | — | _?_ | _unswept_ |
 | `bootstrap.py` | shipped | essential | _?_ | _unswept_ |
 | `engram_backup.py` | shipped | essential | _?_ | _unswept_ |
 | `engram_client.py` | shipped | essential | _?_ | _unswept_ |
@@ -33,11 +33,11 @@
 | `engram_log_indexer.py` | shipped | essential | _?_ | _unswept_ |
 | `engram_walguard.py` | shipped | essential | _?_ | _unswept_ |
 | `launch-engram-server.sh` | shipped | essential | _?_ | _unswept_ |
-| `plugin.json` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `pytest.ini` | dev-only | — | _?_ | _unswept_ |
-| `requirements-dev.txt` | dev-only | — | _?_ | _unswept_ |
-| `requirements-lock.txt` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `requirements.txt` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
+| `plugin.json` | repo-only | — | _?_ | _unswept_ |
+| `pytest.ini` | repo-only | — | _?_ | _unswept_ |
+| `requirements-dev.txt` | repo-only | — | _?_ | _unswept_ |
+| `requirements-lock.txt` | repo-only | — | _?_ | _unswept_ |
+| `requirements.txt` | repo-only | — | _?_ | _unswept_ |
 | `selftest.py` | ZOMBIE-SUSPECT ⚠ | — | _?_ | _unswept_ |
 | `server.py` | shipped | essential | _?_ | _unswept_ |
 | `viz_server.py` | shipped | convenience | _?_ | _unswept_ |
@@ -63,7 +63,7 @@
 
 | file | ship | tier/reason | mechanism | status |
 |---|---|---|---|---|
-| `agents/claude/README.md` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
+| `agents/claude/README.md` | repo-only | — | _?_ | _unswept_ |
 | `agents/claude/engram-batch-summary-fairy.md` | shipped | essential | _?_ | _unswept_ |
 | `agents/claude/engram-coder-fairy.md` | shipped | convenience | _?_ | _unswept_ |
 | `agents/claude/engram-dream-fairy.md` | shipped | essential | _?_ | _unswept_ |
@@ -81,42 +81,42 @@
 
 | file | ship | tier/reason | mechanism | status |
 |---|---|---|---|---|
-| `forum/FORUM.md` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/README.md` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/__init__.py` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/__main__.py` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/admin.py` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/audit.py` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/avatar.py` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/db.py` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/deploy/README.md` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
+| `forum/FORUM.md` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/README.md` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/__init__.py` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/__main__.py` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/admin.py` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/audit.py` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/avatar.py` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/db.py` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/deploy/README.md` | forum-deploy | — | _?_ | _unswept_ |
 | `forum/deploy/engram-forum-backup.service` | shipped | convenience | _?_ | _unswept_ |
 | `forum/deploy/engram-forum-backup.timer` | shipped | convenience | _?_ | _unswept_ |
-| `forum/deploy/engram-forum.service.template` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/deploy/install-forum-service.sh` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/embeddings.py` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
+| `forum/deploy/engram-forum.service.template` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/deploy/install-forum-service.sh` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/embeddings.py` | forum-deploy | — | _?_ | _unswept_ |
 | `forum/fairy-spec-backend.md` | ZOMBIE-SUSPECT ⚠ | — | _?_ | _unswept_ |
 | `forum/fairy-spec-configurable-categories-slice2.md` | ZOMBIE-SUSPECT ⚠ | — | _?_ | _unswept_ |
 | `forum/fairy-spec-frontend.md` | ZOMBIE-SUSPECT ⚠ | — | _?_ | _unswept_ |
-| `forum/packs.py` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/render.py` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/requirements.txt` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/seed.py` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/seeds/categories.default.json` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/seeds/retraction-0-op.md` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/seeds/retraction-1-borges.md` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/seeds/retraction-2-ariadne.md` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/seeds/welcome-0-op.md` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/seeds/welcome-1-borges.md` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/seeds/welcome-2-ariadne.md` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/server.py` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/spec.md` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/static/.gitkeep` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/templates/forum.html` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/templates/pack_detail.html` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/templates/packs.html` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/templates/search.html` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
-| `forum/templates/thread.html` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
+| `forum/packs.py` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/render.py` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/requirements.txt` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/seed.py` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/seeds/categories.default.json` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/seeds/retraction-0-op.md` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/seeds/retraction-1-borges.md` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/seeds/retraction-2-ariadne.md` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/seeds/welcome-0-op.md` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/seeds/welcome-1-borges.md` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/seeds/welcome-2-ariadne.md` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/server.py` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/spec.md` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/static/.gitkeep` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/templates/forum.html` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/templates/pack_detail.html` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/templates/packs.html` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/templates/search.html` | forum-deploy | — | _?_ | _unswept_ |
+| `forum/templates/thread.html` | forum-deploy | — | _?_ | _unswept_ |
 
 ## forum/tests (21 files)
 
@@ -438,9 +438,9 @@
 | `tools/engram-fix-git-backup.sh` | shipped | convenience | _?_ | _unswept_ |
 | `tools/engram-regenerate-embeddings.py` | shipped | essential | _?_ | _unswept_ |
 | `tools/forum.py` | shipped | convenience | _?_ | _unswept_ |
-| `tools/forum_backfill_embeddings.py` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
+| `tools/forum_backfill_embeddings.py` | forum-deploy | — | _?_ | _unswept_ |
 | `tools/forum_backup.py` | shipped | convenience | _?_ | _unswept_ |
-| `tools/forum_regen_derived.py` | UNMAPPED ⚠ | — | _?_ | _unswept_ |
+| `tools/forum_regen_derived.py` | forum-deploy | — | _?_ | _unswept_ |
 | `tools/ia.py` | shipped | convenience+MA | _?_ | _unswept_ |
 | `tools/inspect_raw.py` | shipped | essential | _?_ | _unswept_ |
 | `tools/install-local-marketplace.sh` | shipped | convenience | _?_ | _unswept_ |

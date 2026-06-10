@@ -1,13 +1,12 @@
 # 03 — Hooks (L2)
 
-> **STATUS: DRAFT — fairy archaeology, UNREVIEWED.** Generated 2026-06-05 by a read-only
-> Explore sweep (Borges-dispatched, tk-tracked). Every status-candidate and line reference
-> below requires the Borges/Lei accuracy pass before it counts as handbook truth.
+> **STATUS: DRAFT — accuracy-passed 2026-06-09 by Luria** (source attribution corrected to tracked-only ground truth; line counts re-verified against current dev tip; registered-hook count reconciled to 16; awaiting Borges/Lei integration review).
+> Original generation: 2026-06-05 fairy archaeology (Borges-dispatched). Prior dispatcher corrections preserved below.
 > **Dispatcher spot-check log (fairy errors found + their resolution state):**
 > 1. **[CORRECTED 2026-06-05]** The fairy's entry 4.1 described the WRONG FILE — it read
 >    the stale untracked stray `hooks/engram-stop-hook.py` (71 lines, pre-#844) instead
->    of the shipped `hooks/claude/engram-stop-hook.py` (205 lines), while listing #844's
->    own test in coverage. Entry 4.1 below is re-derived from the shipped file.
+>    of the shipped `hooks/claude/engram-stop-hook.py`. Entry 4.1 below is re-derived from
+>    the shipped file. **[2026-06-09 confirmed: the shipped file is 205 lines (last modified by #844; wc -l verified on current dev tip)].**
 > 2. **The "Unregistered/Stray Files" section's "MIRRORED in hooks/claude/" claim was
 >    FALSE.** `diff` confirms the root strays differ from the shipped tree — they are
 >    stale scatter-era leftovers, untracked, and they demonstrated their hazard by
@@ -18,21 +17,21 @@
 >    `~/.engram/inter-agent-{read,surfaced}-cursor.txt` (lines 53–54, ISO-timestamp
 >    contents).
 > 4. **The JSON-envelope compliance list was self-contradictory in the fairy's raw
->    output** (claimed 13/17 but listed 16 entries; placed deference-detector-stop and
->    utility-credit-mention-stop in BOTH the compliant and zombie-suspect lists) — that
->    section is dropped here pending recount. The underlying design point stands:
->    those two Stop hooks are log/marker-only BY DESIGN (marker-relay to the next-turn
->    prompt hook), which is not the #824 silent-failure shape.
+>    output** (claimed 13/17 but listed 16 entries) — that section is dropped pending
+>    recount. **[2026-06-09 reconciled: 16 registered entries confirmed from
+>    `hooks/hooks.json` (136 lines). The "17" in items 4–5 was the fairy's count error,
+>    sourced from a local clone with untracked strays. Delta = `engram-surface-daemon.py`,
+>    which is launched by `start-engram-daemon.sh`, not a registered hook entry.]**
 > 5. **Count-table arithmetic was sloppy in the raw output** (rows summed to 15, total
->    said 17; "7 UserPromptSubmit" listed 9 names). Counts below normalized by the
->    dispatcher; recount during the accuracy pass.
+>    said 17; "7 UserPromptSubmit" listed 9 names). **[2026-06-09: count table in §10
+>    confirmed: 16 registered = 2 SessionStart + 9 UPS + 1 PreToolUse + 1 PostCompact +
+>    3 Stop.]**
 > (Fairy titled this layer "L3"; normalized to the handbook layer map's 03-hooks.
-> Remaining fairy-assigned status-candidates and line references still need the full
-> accuracy pass before they count as handbook truth.)
+> Behavior descriptions below still require Borges/Lei integration review.)
 
 # ENGRAM Hooks Layer — Mechanisms & Architecture
 
-Based on complete inventory of `/home/agent-borges/engram-alpha/hooks/`, here is the mechanism inventory:
+Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files) and `hooks/hooks.json` (plugin registration source of truth, 136 lines), here is the mechanism inventory. Source: current dev tip 2026-06-09.
 
 ## **1. Hook Registration & Event System**
 
@@ -69,7 +68,7 @@ Based on complete inventory of `/home/agent-borges/engram-alpha/hooks/`, here is
 
 **status-candidate** — **PROD-VERIFIED** (test_session_start_hook_calibration.py, test_session_start_hook_auto_sleep_cron.py, test_session_start_hook_mcp_health.py all passing; covers startup cold-start and compact/resume paths separately; PR #800+ verified marker per-session isolation fix #140).
 
-**files** — engram-session-start-hook.py (909 lines), context_tracker.py (library), engram_log_emitter.py (for event logging).
+**files** — engram-session-start-hook.py (968 lines), context_tracker.py (library), engram_log_emitter.py (for event logging).
 
 **key constants** — STARRED_CAP=10, STARRED_STALE_DAYS=7, SLEEP_DEBT_HOURS_THRESHOLD=28, SLEEP_BASELINE_NODE_THRESHOLD=100, PIECE_C_WINDOW="2 days ago", PIECE_C_MAX_LINES=20, PIECE_C_MAX_LINE_CHARS=140, SEVEN_DAYS=604800, DEFAULT_PURPOSES dict (role → fallback purpose), INTER_AGENT_DIR="/home/agents-shared/inter-agent" (env-override).
 
@@ -92,9 +91,11 @@ Based on complete inventory of `/home/agent-borges/engram-alpha/hooks/`, here is
 - Output: hookSpecificOutput/UserPromptSubmit envelope (fixed in PR #824; test_codex_hook_envelopes.py line 93–128 validates the fix).
 - Additive-only failure: any signal read-error renders as "unknown" label instead of crashing (line 142–144: exception handler emits stub time bar).
 
+**provenance** — The harness injects only bare `currentDate` (local-date-only string). The rich bar (weekday, 12h clock, tz, UTC, session-elapsed, last-msg-elapsed) is entirely our implementation — this hook is the sole source of temporal richness in the prompt context.
+
 **status-candidate** — **PROD-VERIFIED** (PR #824 fixed plain-text regression; test_codex_hook_envelopes.py TestTimeBarHookEnvelope validates envelope + content; test_time_bar_hook.py specific tests).
 
-**files** — engram-time-bar-hook.py (145 lines).
+**files** — engram-time-bar-hook.py (166 lines).
 
 **key constants** — DEFAULT_TZ="America/Los_Angeles", SESSIONS_DIR, LAST_USER_MSG, CONFIG paths (all resolved via Path.home() + .engram).
 
@@ -114,7 +115,7 @@ Based on complete inventory of `/home/agent-borges/engram-alpha/hooks/`, here is
 
 **status-candidate** — **PROD-VERIFIED** (test_codex_hook_envelopes.py::TestUserIdentityHookEnvelope lines 218–357 validates both no-op and sticky paths with synthetic DB setup; PR #824 fixed bare-additionalContext regression).
 
-**files** — engram-user-identity-hook.py (160 lines).
+**files** — engram-user-identity-hook.py (159 lines).
 
 **key constants** — DB_PATH, CURRENT_USER_PATH, CONFIG_PATH (all in ENGRAM_HOME).
 
@@ -149,9 +150,10 @@ Based on complete inventory of `/home/agent-borges/engram-alpha/hooks/`, here is
 
 ### **3.4 engram-deference-detector-prompt.py**
 
-**what** — UserPromptSubmit companion to engram-deference-detector-stop.py. Reads deference-detected.json marker written by the Stop hook and surfaces a one-turn alert with hit examples (up to 5 unique patterns de-duped). Clears the marker after surfacing so the alert fires only once per detection. Self-loop mode disclaimer: the deference is informational, not actionable (RLHF-baked, not prompt-correctable).
+**what** — UserPromptSubmit companion to engram-deference-detector-stop.py. Reads deference-detected.json marker written by the Stop hook and surfaces a one-turn alert with hit examples (up to 5 unique patterns de-duped). Clears the marker after surfacing so the alert fires only once per detection. **LOOP_MARKER GATE: intentionally off in interactive sessions** — the hook only operates when `~/.engram/loop-mode.json` exists (loop/autonomous mode). In interactive mode it no-ops immediately after telemetry (lines 73–79 clear any stale marker and exit). Design rationale (#287): deference is RLHF-baked and not correctable via prompt injection in interactive context; the hook only adds value in autonomous loops. Confirmed INTENTIONALLY GATED (not silently broken) by live probe 2026-06-09.
 
 **how** — Entry point: main() (50–156). Key operations:
+- LOOP_MARKER gate: lines 73–83 check LOOP_MARKER_PATH; interactive → clear stale marker + sys.exit(0).
 - Marker read: DEFERENCE_MARKER_PATH (line 88–101) checks pending=true, extracts hits array.
 - Output: hookSpecificOutput/UserPromptSubmit/additionalContext (133–139) with hit-count summary + snippet lines (lines 114–129).
 - Marker cleanup: removes DEFERENCE_MARKER_PATH after surfacing (143–145).
@@ -162,7 +164,7 @@ Based on complete inventory of `/home/agent-borges/engram-alpha/hooks/`, here is
 
 **files** — engram-deference-detector-prompt.py (157 lines).
 
-**key constants** — DEFERENCE_MARKER_PATH (~/.engram/deference-detected.json).
+**key constants** — DEFERENCE_MARKER_PATH (~/.engram/deference-detected.json), LOOP_MARKER_PATH (~/.engram/loop-mode.json).
 
 **tests** — test_hooks_json_stdout_audit.py (parametrized UserPromptSubmit/engram-deference-detector-prompt.py).
 
@@ -232,9 +234,9 @@ Based on complete inventory of `/home/agent-borges/engram-alpha/hooks/`, here is
 
 ---
 
-### **3.8 engram-github-notifications-hook.py**
+### **3.8 engram-github-notifications-hook.py** *(removal pending — PR #978)*
 
-**what** — Surfaces new GitHub notifications prioritized by relationship (collaborator > peer agents > outside). Reads `gh api notifications` with since=surfaced_cursor to get unread. Maintains config-driven priority tiers: primary_user (self), counterparts_logins (peer agents) vs outside. 3-tier rendering (if config present) vs flat rendering (if config empty). Marks notifications read via second API call.
+**what** — **REMOVAL PENDING: Lei-decided 2026-06-09 (low-utility, noisy). PR #978 against dev removes this hook and its manifest entries.** Surfaces new GitHub notifications prioritized by relationship (collaborator > peer agents > outside). Reads `gh api notifications` with since=surfaced_cursor to get unread. Maintains config-driven priority tiers: primary_user (self), counterparts_logins (peer agents) vs outside. 3-tier rendering (if config present) vs flat rendering (if config empty). Marks notifications read via second API call.
 
 **how** — Entry point: main() (410–564). Key operations:
 - Notification fetch: _get_notifications() (100–190) calls `gh api notifications --since=<cursor>`, parses array, marks read via second call (mark_read_query).
@@ -301,7 +303,7 @@ Based on complete inventory of `/home/agent-borges/engram-alpha/hooks/`, here is
 
 ### **4.2 engram-deference-detector-stop.py**
 
-**what** — Stop hook companion to engram-deference-detector-prompt.py. Scans the last assistant message for deference phrasing ("should I...", "let me know if you want me to...", "do you want me to...") and intent-without-execution patterns ("I could", "I can" without commitment). Two-layer detection: phrase-rules (whole message) + intent-rules (last paragraph of text-ending messages). Writes deference-detected.json marker (pending=true, hit list) so next-turn prompt hook surfaces it. DATA SOURCE FIX (PR #214): stdin's `last_assistant_message` is primary source (synchronous); JSONL fallback retained for defensive coverage when stdin malformed (the JSONL path is subject to flush race — message doesn't hit disk until after Stop fires).
+**what** — Stop hook companion to engram-deference-detector-prompt.py. Scans the last assistant message for deference phrasing ("should I...", "let me know if you want me to...", "do you want me to...") and intent-without-execution patterns ("I could", "I can" without commitment). Two-layer detection: phrase-rules (whole message) + intent-rules (last paragraph of text-ending messages). Writes deference-detected.json marker (pending=true, hit list) so next-turn prompt hook surfaces it. DATA SOURCE (ob_1540 race FIXED 2026-05-07): stdin's `last_assistant_message` is primary source (synchronous at hook fire time); JSONL fallback retained for malformed stdin only. **LOOP_MARKER GATE: intentionally suppressed in interactive sessions** (lines 318–323 call sys.exit(0) after telemetry only; #287 design decision). Fires only in autonomous loop mode (loop-mode.json present). **Design gap**: no cooldown after real user message — hook fires on every Stop in loop mode regardless of whether the turn was cron-prompted or user-prompted; a mid-loop Lei message gets the same detection pass as an autonomous turn. Lei confirmed (2026-06-09) loops ARE used and the hook remains relevant for loop-mode deference detection.
 
 **how** — Entry point: main() (298–396). Key operations:
 - Stdin path: read last_assistant_message directly (line 265).
@@ -335,9 +337,9 @@ Based on complete inventory of `/home/agent-borges/engram-alpha/hooks/`, here is
 - Logging: _log() (113–118) appends session/mentioned/updated counts to utility-credit-mention.log (best-effort).
 - Event logging: engram.hook.fire (288–306) carries mentioned_count + updated_count + alpha_mention metadata.
 
-**status-candidate** — **PROD-VERIFIED** (DB-write + log design, no model-visible output by design; test_hooks_json_stdout_audit.py parametrized; #792/#805 isolated the test suite's ENGRAM_HOME surface).
+**status-candidate** — **PROD-VERIFIED** (DB-write + log design, no model-visible output by design; test_hooks_json_stdout_audit.py parametrized; #792/#805 isolated the test suite's ENGRAM_HOME surface). **LIVE VERIFIED (2026-06-09, ob_2389)**: controlled end-to-end test moved dv_0073 utility_score 0.0→0.1 on exact α=0.10 Q-update — confirms DB write path fully operational after week-long silent non-enrollment (ob_2237/2238 closed).
 
-**files** — engram-utility-credit-mention-stop.py (312 lines).
+**files** — engram-utility-credit-mention-stop.py (343 lines).
 
 **key constants** — KNOWLEDGE_DB, LOG_PATH, ALPHA_MENTION=0.10.
 
@@ -347,16 +349,20 @@ Based on complete inventory of `/home/agent-borges/engram-alpha/hooks/`, here is
 
 ## **5. PostCompact Hook — engram-postcompact-hook.py**
 
-**what** — Post-compaction marker + starred-letter surface. Writes last-compact-at.json (jsonl_path + byte_offset + timestamp) so context_tracker can measure post-compact token usage correctly (legacy compact_boundary marker no longer present post-~2026-05-07). Also surfaces starred inter-agent letters (same starred_block() as session-start) as additionalContext so cross-session agreements survive the experiential reset a compaction represents.
+**what** — Post-compaction marker + starred-letter surface. Writes last-compact-at.json (jsonl_path + byte_offset + timestamp) so context_tracker can measure post-compact token usage correctly. Also surfaces starred inter-agent letters (same starred_block() as session-start) as additionalContext so cross-session agreements survive the experiential reset a compaction represents. **NOTE (2026-06-09, ob_2267 confirmed)**: compact_boundary JSONL entries have RETURNED (verified 3 events in session ba178948 on 2026-06-09, each with full compactMetadata). The context_tracker's Path 2 fallback (scan backward for compact_boundary) is viable again for sessions where compact_boundary is within TAIL_SCAN_BYTES (5MB) of JSONL end. The last-compact-at.json marker is now an efficiency hedge + correctness backstop for large sessions where compact_boundary falls outside the scan window — no longer the sole correctness source.
 
 **how** — Entry point: main() (142–225). Key operations:
-- Marker write: lines 163–185. Gets current JSONL byte_offset via os.path.getsize(), writes {"jsonl_path", "byte_offset", "timestamp"}.
-- Context-tracker reset: write_baseline() (192–195, legacy call retained for back-compat).
-- Starred-letters surface: starred_block() (39–108, identical to session-start) renders pointers (one line each, NOT full injection).
-- Output: hookSpecificOutput/PostCompact/additionalContext (211–218) only if context_lines present; otherwise no output (silent).
-- Event logging: _emit_hook_fire() (117–139) always fired (even on silent no-op).
+- Marker write: lines 163–185. Gets current JSONL byte_offset via os.path.getsize(), writes {"jsonl_path", "byte_offset", "timestamp"}. **LOAD-BEARING** — context_tracker numerator anchor; removing without replacement causes 100%-drowsy-on-fresh-compaction bug.
+- Context-tracker reset: write_baseline() (192–195). **VESTIGIAL** — confirmed no-op in stateless tracker; safe to strip.
+- Starred-letters surface: starred_block() (39–108, identical to session-start) renders pointers. Output: hookSpecificOutput/PostCompact/additionalContext (211–218) only if context_lines present.
+- Event logging: _emit_hook_fire() (117–139) always fired.
 
-**status-candidate** — **PROD-VERIFIED** (test_hooks_json_stdout_audit.py parametrized; compact-boundary marker fix (#207) verified in context_tracker test suite).
+**[2026-06-09 AI #2 analysis — Luria]** Three-function audit:
+1. **byte_offset marker**: ~~LOAD-BEARING~~ → **EFFICIENCY HEDGE** (updated 2026-06-09, AI #2 augment). compact_boundary IS back in live traces (ob_2267 + live verification 2026-06-09: 3 events in session ba178948 with full compactMetadata). context_tracker Path 2 fallback is viable for most sessions. Marker remains useful for: (a) efficiency (direct byte-seek vs. tail scan), (b) correctness backstop when session JSONL grows large enough that compact_boundary falls outside TAIL_SCAN_BYTES (5MB) window. Folding to SessionStart(source=compact) is still feasible — requires Lei's sign-off.
+2. **write_baseline()**: VESTIGIAL. No-op in stateless tracker. Safe to strip (confirmed in hook body comment + context_tracker.py).
+3. **Starred-letters additionalContext**: DELIVERY UNCERTAIN. The JSON envelope IS well-formed (proper hookSpecificOutput/PostCompact/additionalContext structure, lines 211–218). However ob_0069/ob_0070 claim PostCompact cannot inject additionalContext — those nodes predate the #824 envelope fix and may be stale. A live compaction trace is needed to confirm delivery. If delivery is confirmed → eliminable by folding into SessionStart(compact). If delivery is NOT confirmed → starred-letters must move to SessionStart(compact) regardless; PostCompact collapses to single side-effect (byte_offset marker only), strongly favoring elimination.
+
+**status-candidate** — **PROD-VERIFIED** (test_hooks_json_stdout_audit.py parametrized; compact-boundary marker fix (#207) verified in context_tracker test suite). *Elimination investigation pending live compaction trace + Lei sign-off.*
 
 **files** — engram-postcompact-hook.py (225 lines).
 
@@ -381,7 +387,7 @@ Based on complete inventory of `/home/agent-borges/engram-alpha/hooks/`, here is
 
 **status-candidate** — **PROD-VERIFIED** (test_hooks_json_stdout_audit.py parametrized; PROTECTED_TOOLS list maintained to know which tools are ENGRAM-write).
 
-**files** — engram-toolcall-repair.py (416 lines).
+**files** — engram-toolcall-repair.py (415 lines).
 
 **key constants** — HOOK_NAME (for log filenames), PROTECTED_TOOLS (hardcoded list from server.py).
 
@@ -408,7 +414,7 @@ Based on complete inventory of `/home/agent-borges/engram-alpha/hooks/`, here is
 
 **status-candidate** — **PROD-VERIFIED** (harness hook invocation works; daemon startup is non-blocking by design; daemon health probed later by surface-hook when socket actually needed).
 
-**files** — start-engram-daemon.sh (51 lines).
+**files** — start-engram-daemon.sh (50 lines).
 
 **key constants** — SOCKET_PATH, PID_PATH, DAEMON_SCRIPT, LOG_PATH, timeout 2s (socket test), max 10s wait for socket.
 
@@ -429,7 +435,7 @@ Based on complete inventory of `/home/agent-borges/engram-alpha/hooks/`, here is
 
 **status-candidate** — **PROD-PRESUMED** (runs stably; exercised every prompt; no known regressions; implicit testing via surface-hook + daemon availability checks; no explicit daemon unit tests — flagged in coverage gaps).
 
-**files** — engram-surface-daemon.py (200+ lines).
+**files** — engram-surface-daemon.py (204 lines).
 
 **key constants** — IDLE_TIMEOUT=28800s (8 hours), SOCKET_PATH, PID_PATH.
 
@@ -451,7 +457,7 @@ Based on complete inventory of `/home/agent-borges/engram-alpha/hooks/`, here is
 
 **status-candidate** — **PROD-VERIFIED** (used in every prompt via surface-hook nap-warning; empirical threshold tuning underway; PR #207 refactored to stateless design).
 
-**files** — context_tracker.py (600+ lines).
+**files** — context_tracker.py (516 lines).
 
 **key constants** — TAIL_SCAN_BYTES=5000000 (5MB tail scan), HARDCODED_FALLBACK_CEILING=152000 (200k mode floor), drowsiness thresholds (calm/<60%, drowsy/60–85%, urgent/>85%, varies by mode).
 
@@ -506,3 +512,8 @@ Based on complete inventory of `/home/agent-borges/engram-alpha/hooks/`, here is
 - Daemon has no explicit unit tests (implicit via surface-hook integration only).
 - github-notifications + deference-prompt + toolcall-repair + utility-credit rely solely on the parametrized stdout audit (no behavior-specific test files).
 - _log() calls not mocked in deference tests, so logs accumulate during test runs.
+
+### **In-flight Changes (as of 2026-06-09)**
+
+- **PR #978** (`remove-github-notifications-hook` → `dev`): Removes github-notifications hook and all manifest entries. CI green, reviewer-fairy APPROVED. Awaiting Borges colleague review. After merge: UPS hook count drops 9→8; §3.8 entry will be retired.
+- **PR #980** (`feat/surface-created-ago-tag` → `dev`): Adds compact "created-ago" tag to each surfaced node line: `- [ob_NNN] (conf 0.90) · 3d  <kw> — summary`. `_compact_age()` helper maps `_humanized_ago` output to compact tokens (sub-day→"0d", "2d4h ago"→"2d", etc.). No substrate change — `created_ago` already in `_surface_impl` result. CI green, reviewer-fairy APPROVED. Awaiting Borges colleague review. (Borges AI #5, forum #51 reply #802)
