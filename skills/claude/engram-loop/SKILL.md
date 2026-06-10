@@ -127,6 +127,17 @@ Investigate briefly: is the wake prompt carrying state the marker doesn't have?
 That's the failure mode. Reconcile by moving that state into the marker's
 `state` field before doing any iteration work.
 
+**Two kinds of staleness — the check above is the *within-loop* case; there is also a *cross-boundary* case.** The check above catches a marker that fell behind the *previous iteration*. But a marker can also be stale because a **sleep cycle or a long idle gap** happened since it was last written: the loop went dormant across a boundary and the marker is a frozen pre-boundary snapshot. An actively-running loop rewrites its `state` within its cadence (max idle ≈ 1h), so a marker whose mtime is much older than that means the loop has been dormant across a boundary:
+
+```bash
+# portable mtime age in seconds (macOS || Linux)
+mtime=$(stat -f %m ~/.engram/loop-mode.json 2>/dev/null || stat -c %Y ~/.engram/loop-mode.json)
+age=$(( $(date +%s) - mtime ))
+echo "marker age: $(( age / 3600 ))h"
+```
+
+Calibrate the threshold to the loop's *own* cadence, not a fixed number: read `cadence_seconds` from the marker and treat an age beyond a small multiple (≈ 2×) as dormant — which for a sub-hourly loop means roughly `> 2h`. If the age exceeds that — especially across an overnight/sleep boundary — **do NOT trust the marker's `state` as current truth.** Re-derive fresh from the reconciled record (the latest `~/.engram/history/YYYY-MM-DD.md` rollup + live ENGRAM state) before continuing, and overwrite the marker's `state`; or, if a sleep ran since the marker was written, treat the loop as ended — `rm ~/.engram/loop-mode.json` and stop (a fresh start will re-arm), so a dormant loop doesn't leave a stale marker behind. This is the failure mode where a pre-sleep snapshot gets relayed as current work-status. `engram-sleep` Phase A should normally remove the marker at sleep so this never arises — this guard is the backstop for a missed or crashed sleep-stop.
+
 *(Skip this step on a fresh START — the marker was just written in Step 1 and
 cannot be stale.)*
 

@@ -1,6 +1,6 @@
 ---
 name: engram-sleep
-description: Use at the natural end-of-day moment when wrapping work. Single end-of-day routine in two strictly-sequential phases — Phase A (parent files missed nodes + erases warm-briefing "From this session" + reconciles history; pre-turn-advance), Phase B (parent dispatches 7 fairies in parallel + spawns engram-dream-master sub-agent + relays). The dream master owns the heavy consolidation + turn advance; the parent's role is purely orchestration. Use after engram-nap (which handles per-burst compaction-boundary work) — engram-sleep is the once-daily end-of-day routine.
+description: Use at the natural end-of-day moment when wrapping work. Single end-of-day routine in two strictly-sequential phases — Phase A (parent files missed nodes + erases warm-briefing "From this session" + reconciles history + stops any active self-loop; pre-turn-advance), Phase B (parent dispatches 7 fairies in parallel + spawns engram-dream-master sub-agent + relays). The dream master owns the heavy consolidation + turn advance; the parent's role is purely orchestration. Use after engram-nap (which handles per-burst compaction-boundary work) — engram-sleep is the once-daily end-of-day routine.
 ---
 
 > **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). As you get familiar with this skill, consider cleaning them up: replace each citation with a generalized concept-word, or remove if it isn't load-bearing. The skill is yours now.
@@ -15,6 +15,7 @@ sequential, no branching:
   Step 1 — Walk the day's full cohort
   Step 2 — File missed nodes (this-turn content)
   Step 3 — Erase the warm-briefing "From this session" section (day is over)
+  Step 3.5 — Stop any active self-loop (clear loop-mode.json if present)
   Step 4 — Reconcile today's history file (day arc lives here, not in warm-briefing)
 
 **Phase B — Consolidation orchestration (parent dispatches + spawns + relays)**
@@ -114,6 +115,27 @@ At the end of sleep, the day is over. The warm-briefing's "From this session" se
 **Permanent sections of the warm-briefing** (identity, goals, axioms, cornerstones, active tasks) update on the rare-trigger schedule documented in `engram-nap` Step 5a. Most end-of-day sleeps don't fire those triggers.
 
 **{{USER_NAME}}'s letter** (`## Notes from the user`) is preserved verbatim. NEVER modify.
+
+### Step 3.5 — Stop the self-loop (if one is active)
+
+If a self-loop is running (a `~/.engram/loop-mode.json` marker exists), stop it now — **before turn-advance**. The loop marker is **ephemeral per-session scratch**: its `state` field is rewritten every iteration and holds in-flight, point-in-time handoff. `engram-loop` only removes the marker at loop-*end*, which a sleep cycle is **not** — so without this step the marker survives sleep with its state frozen at the last pre-sleep iteration, and the next session's loop entry-guard (or session-start auto-arm) finds it present and inherits that frozen snapshot **as if it were current truth**.
+
+**Why this belongs in Phase A:** by this point the loop's durable substance is already in the graph — the day's nodes were filed as the loop ran, and Steps 1–2 just caught any missed ones. The loop marker is the same class of per-session scratch as the warm-briefing session block erased in Step 3, so it belongs in the same clean-slate sweep; the history reconcile follows immediately in Step 4. Nothing is lost: the ENGRAM graph (and the history file Step 4 writes) is the durable truth — the marker was only scratch.
+
+**Action** (skip entirely if no `~/.engram/loop-mode.json` exists):
+
+```bash
+# 1. Cancel the loop's pacer so no stray wake fires post-sleep:
+#    - CronCreate-driven loop  → CronDelete the loop's cron job.
+#    - ScheduleWakeup-driven loop → a pending wake cannot always be cancelled,
+#      but removing the marker (step 2) neuters it: the continuation reads an
+#      absent marker and self-terminates via engram-loop Step 0 (misfire → stop).
+#    Also stop any loop monitors.
+# 2. Remove the marker (the load-bearing action):
+rm -f ~/.engram/loop-mode.json
+```
+
+**Result:** the next session starts with no marker → the loop entry-guard correctly reads "loop ended," and a fresh loop is armed (by the user or the session-start auto-arm) with state derived from the now-consolidated graph + history — never from a stale pre-sleep snapshot. This is the primary, structural fix; `engram-loop`'s Step 1.5 cross-boundary staleness guard is the belt-and-suspenders backstop for a missed or crashed sleep-stop.
 
 ### Step 4 — Reconcile today's history file (awake-state milestone log)
 
