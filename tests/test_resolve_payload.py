@@ -710,3 +710,106 @@ def test_retract_one_of_two_resolvers_updates_resolved_by():
         f"resolved_by must be updated to remaining resolver {dv_weak_id!r}, got {row['resolved_by']!r}"
     )
     conn.close()
+
+
+# ── #919: target is_current guard ──────────────────────────────────────────
+
+
+def test_resolve_superseded_target_rejected_names_successor():
+    """#919: resolving a superseded target is rejected, and the error walks
+    the supersede chain to name the current successor."""
+    server = fresh_server()
+    q_id, ob_id, dv_id = _seed_strong_resolution(server)
+
+    cj1 = json.loads(server.engram_add_conjecture(payload_json=json.dumps({
+        "claim": "Y might generalize beyond X's account.",
+        "basis": "Single attestation so far.",
+    })))
+    cj1_id = cj1["conjecture_id"]
+    cj2 = json.loads(server.engram_add_conjecture(payload_json=json.dumps({
+        "claim": "Y might generalize beyond X's account, within domain D only.",
+        "basis": "Scoped refinement of the earlier conjecture.",
+    })))
+    cj2_id = cj2["conjecture_id"]
+    sup = json.loads(server.engram_supersede(payload_json=json.dumps({
+        "old_node_id": cj1_id,
+        "new_node_id": cj2_id,
+        "supersede_reason": "Scope refinement (test).",
+    })))
+    assert sup.get("status") == "superseded", sup
+
+    res = json.loads(server.engram_resolve(payload_json=json.dumps({
+        "target_id": cj1_id,
+        "resolving_node_id": dv_id,
+        "prediction_outcome": "supported",
+    })))
+    assert "error" in res, f"resolving a superseded target must be rejected, got: {res}"
+    assert "not current" in res["error"], res["error"]
+    assert cj2_id in res["error"], (
+        f"error must name the current successor {cj2_id}, got: {res['error']}"
+    )
+
+
+def test_resolve_retracted_target_rejected_no_successor():
+    """#919: resolving a retracted target is rejected with the
+    no-current-successor hint (retracted nodes have no replacement)."""
+    server = fresh_server()
+    q_id, ob_id, dv_id = _seed_strong_resolution(server)
+
+    q2 = json.loads(server.engram_ask(payload_json=json.dumps({
+        "question": "Transient question to retract (test #919)?",
+    })))
+    q2_id = q2["question_id"]
+    ret = json.loads(server.engram_retract(payload_json=json.dumps({
+        "node_id": q2_id,
+        "error_type": "other",
+        "reason": "Retracting target for #919 guard test.",
+    })))
+    assert ret.get("status") in ("retracted", "retraction_recorded"), ret
+
+    res = json.loads(server.engram_resolve(payload_json=json.dumps({
+        "target_id": q2_id,
+        "resolving_node_id": dv_id,
+    })))
+    assert "error" in res, f"resolving a retracted target must be rejected, got: {res}"
+    assert "not current" in res["error"], res["error"]
+    assert "no current successor" in res["error"], (
+        f"error must carry the no-successor hint, got: {res['error']}"
+    )
+
+
+def test_resolve_chain_walk_names_final_successor():
+    """#919: a two-hop supersede chain (A → B → C) resolves to the FINAL
+    current successor C, not the intermediate B."""
+    server = fresh_server()
+    q_id, ob_id, dv_id = _seed_strong_resolution(server)
+
+    ids = []
+    for label in ("v1", "v2", "v3"):
+        cj = json.loads(server.engram_add_conjecture(payload_json=json.dumps({
+            "claim": f"Chain conjecture {label} about Y's scope.",
+            "basis": f"Iteration {label} (test #919 chain).",
+        })))
+        ids.append(cj["conjecture_id"])
+    for old, new in ((ids[0], ids[1]), (ids[1], ids[2])):
+        sup = json.loads(server.engram_supersede(payload_json=json.dumps({
+            "old_node_id": old,
+            "new_node_id": new,
+            "supersede_reason": "Chain step (test).",
+        })))
+        assert sup.get("status") == "superseded", sup
+
+    res = json.loads(server.engram_resolve(payload_json=json.dumps({
+        "target_id": ids[0],
+        "resolving_node_id": dv_id,
+        "prediction_outcome": "supported",
+    })))
+    assert "error" in res, f"resolving chain-root must be rejected, got: {res}"
+    assert ids[2] in res["error"], (
+        f"error must name the final successor {ids[2]} (not the intermediate "
+        f"{ids[1]}), got: {res['error']}"
+    )
+    assert ids[1] not in res["error"], (
+        f"intermediate successor must not be presented as the resolution "
+        f"target, got: {res['error']}"
+    )
