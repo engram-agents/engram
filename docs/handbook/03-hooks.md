@@ -403,12 +403,12 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 ## **7. SessionStart Hook (Shell) — start-engram-daemon.sh**
 
-**what** — Bash script that ensures the engram-surface-daemon.py process is running. Checks if PID exists and socket is responsive; if alive, exits 0. If dead/missing, starts daemon via nohup in background, waits up to 10s for socket to appear (checks every 0.5s), exits 0 (non-blocking — daemon startup failure never blocks session start).
+**what** — Bash script that ensures the engram-surface-daemon.py process is running. Checks if PID exists and socket is responsive; if alive, exits 0. If dead/missing, starts daemon in background (stdin redirected from /dev/null for no-TTY compatibility), waits up to 10s for socket to appear (checks every 0.5s), exits 0 (non-blocking — daemon startup failure never blocks session start).
 
 **how** — Entry point: bash script (lines 1–50). Key steps:
 - PID check: reads recall-daemon.pid, runs kill -0 (no-op test-kill), verifies socket responsiveness via Python socket connect (timeout 2s).
 - Socket test: Python one-liner at lines 16–25 tests socket.AF_UNIX connection.
-- Daemon start: line 38 nohup env ENGRAM_HOME python3 daemon.py >> log 2>&1 &.
+- Daemon start: line 38 env ENGRAM_HOME python3 daemon.py >> log 2>&1 < /dev/null & (stdin redirect instead of nohup for no-TTY environments).
 - Socket wait: lines 41–46 poll for socket file existence (20 iterations × 0.5s = 10s max).
 - Failure handling: line 49 emits stderr warning (JSON format, but to stderr not stdout, so harness ignores it). Exit 0 (non-blocking).
 

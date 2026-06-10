@@ -35,7 +35,7 @@ fi
 
 # Start daemon in background
 mkdir -p "$ENGRAM_HOME"
-nohup env ENGRAM_HOME="$ENGRAM_HOME" {{PYTHON}} "$DAEMON_SCRIPT" >> "$LOG_PATH" 2>&1 &
+env ENGRAM_HOME="$ENGRAM_HOME" {{PYTHON}} "$DAEMON_SCRIPT" >> "$LOG_PATH" 2>&1 < /dev/null &
 
 # Wait briefly for socket to appear
 for i in $(seq 1 20); do
