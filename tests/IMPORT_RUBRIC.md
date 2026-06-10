@@ -73,11 +73,14 @@ server.py's source text) belong in a small explicit allow-list:
 ```json
 {
   "server_import_allowlist": [
-    "tests/test_engram_core_seam.py",
+    "test_engram_core_seam.py",
     ...
   ]
 }
 ```
+
+Entries are **bare basenames** (e.g. `test_engram_core_seam.py`), not
+`tests/`-prefixed paths — the gate matches `basename in allowlist`.
 
 This allow-list lives in `packaging/test-map.json` under the top-level key
 `"server_import_allowlist"`. It is seeded at wave 0 with all current

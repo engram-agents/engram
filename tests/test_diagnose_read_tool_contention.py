@@ -5,6 +5,11 @@ Coverage:
   2. Section omitted entirely when all tool_timing rows are fast (< 1s).
   3. 7-day window is respected: old high-contention rows (30 days ago)
      do not trigger the section.
+
+Import-pattern contract (#948 wave A — R1):
+    This file imports engram_stats and engram_core directly and contains no
+    ``import server``. The module objects are passed to fresh_module() (R4)
+    for per-test reload isolation.
 """
 
 from __future__ import annotations
@@ -17,30 +22,46 @@ import sqlite3
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Add tests/ dir so conftest.fresh_module is importable both under pytest and
+# when the file is run as a standalone script.
+_TESTS_DIR = str(Path(__file__).resolve().parent)
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+from conftest import fresh_module  # noqa: E402 — must follow sys.path setup
+
+import engram_core
+import engram_stats
 
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_diagnose_read_tool_contention_")
 atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
-def fresh_server():
-    """Return a freshly initialised server module with an empty test DB."""
+def _make_fresh_mods():
+    """Reload all family modules, configure a clean test DB, and return modules.
+
+    Uses conftest.fresh_module(engram_stats) per R4: the module object is
+    passed (not a string), so the ``import engram_stats`` at the top of
+    this file is the AST-visible dependency edge for run_touched_tests.py.
+
+    Returns (stats, core) — freshly reloaded module objects with
+    engram_core pointing to TEST_DIR.
+    """
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
-    for key in list(sys.modules):
-        if key == "server" or key.startswith("engram_"):
-            del sys.modules[key]
-    import server
-
-    server._configure_paths(TEST_DIR)
-    server._ensure_data_dir()
     os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
+    # Purge server + engram_* from sys.modules and reload engram_stats.
+    stats = fresh_module(engram_stats)
+    core = sys.modules["engram_core"]
+    core._configure_paths(TEST_DIR)
+    core._ensure_data_dir()
     # Trigger schema creation so tool_timing (and all other tables) exist
     # before any direct SQLite inserts in test fixtures.
-    server._get_db().close()
-    return server
+    core._get_db().close()
+    return stats, core
 
 
 def _insert_timing_rows(
@@ -62,7 +83,7 @@ def _insert_timing_rows(
     conn.close()
 
 
-def _db_path(server) -> str:
+def _db_path() -> str:
     return os.path.join(TEST_DIR, "knowledge.db")
 
 
@@ -71,21 +92,21 @@ def _db_path(server) -> str:
 
 def test_contention_section_fires_on_high_mean():
     """read_tool_contention must appear when mean duration > 5000ms."""
-    server = fresh_server()
+    stats, _core = _make_fresh_mods()
     # Use a recent timestamp within the 7-day window.
     recent_hour = (
         datetime.now(timezone.utc) - timedelta(days=1)
     ).strftime("%Y-%m-%dT%H:00:00")
 
     _insert_timing_rows(
-        _db_path(server),
+        _db_path(),
         tool_name="engram_inspect",
         duration_ms=6000,
         count=100,
         timestamp_iso=recent_hour,
     )
 
-    r = json.loads(server.engram_diagnose())
+    r = json.loads(stats._diagnose_impl())
 
     assert "read_tool_contention" in r, (
         f"read_tool_contention section missing despite high-mean hour. "
@@ -118,18 +139,18 @@ def test_contention_section_fires_on_high_mean():
 
 def test_contention_section_fires_on_high_max():
     """read_tool_contention must appear when max duration > 15000ms (even if mean is low)."""
-    server = fresh_server()
+    stats, _core = _make_fresh_mods()
     recent_hour = (
         datetime.now(timezone.utc) - timedelta(days=1)
     ).strftime("%Y-%m-%dT%H:00:00")
 
     # Mean will be low: 99 rows at 100ms + 1 row at 20000ms
     # Max = 20000ms > 15000ms threshold
-    db = _db_path(server)
+    db = _db_path()
     _insert_timing_rows(db, "engram_query", 100, 99, recent_hour)
     _insert_timing_rows(db, "engram_query", 20000, 1, recent_hour)
 
-    r = json.loads(server.engram_diagnose())
+    r = json.loads(stats._diagnose_impl())
 
     assert "read_tool_contention" in r, (
         "read_tool_contention section missing despite max > 15000ms"
@@ -143,21 +164,21 @@ def test_contention_section_fires_on_high_max():
 
 def test_contention_section_absent_when_clean():
     """read_tool_contention must NOT appear when all durations are well below thresholds."""
-    server = fresh_server()
+    stats, _core = _make_fresh_mods()
     recent_hour = (
         datetime.now(timezone.utc) - timedelta(days=1)
     ).strftime("%Y-%m-%dT%H:00:00")
 
     # 200 fast rows (500ms each) — mean=500ms, max=500ms — both below thresholds.
     _insert_timing_rows(
-        _db_path(server),
+        _db_path(),
         tool_name="engram_inspect",
         duration_ms=500,
         count=200,
         timestamp_iso=recent_hour,
     )
 
-    r = json.loads(server.engram_diagnose())
+    r = json.loads(stats._diagnose_impl())
 
     assert "read_tool_contention" not in r, (
         f"read_tool_contention section appeared unexpectedly with fast rows. "
@@ -167,9 +188,9 @@ def test_contention_section_absent_when_clean():
 
 def test_contention_section_absent_with_empty_timing():
     """read_tool_contention must NOT appear when tool_timing table is empty."""
-    server = fresh_server()
+    stats, _core = _make_fresh_mods()
     # Fresh DB: no rows at all.
-    r = json.loads(server.engram_diagnose())
+    r = json.loads(stats._diagnose_impl())
     assert "read_tool_contention" not in r, (
         "read_tool_contention appeared with empty tool_timing table"
     )
@@ -180,21 +201,21 @@ def test_contention_section_absent_with_empty_timing():
 
 def test_contention_7day_window_excludes_old_rows():
     """High-contention rows older than 7 days must NOT trigger the section."""
-    server = fresh_server()
+    stats, _core = _make_fresh_mods()
     # 30 days ago — outside the 7-day window.
     old_hour = (
         datetime.now(timezone.utc) - timedelta(days=30)
     ).strftime("%Y-%m-%dT%H:00:00")
 
     _insert_timing_rows(
-        _db_path(server),
+        _db_path(),
         tool_name="engram_inspect",
         duration_ms=12000,
         count=500,
         timestamp_iso=old_hour,
     )
 
-    r = json.loads(server.engram_diagnose())
+    r = json.loads(stats._diagnose_impl())
 
     assert "read_tool_contention" not in r, (
         "read_tool_contention fired on 30-day-old rows (window not respected). "
@@ -204,21 +225,21 @@ def test_contention_7day_window_excludes_old_rows():
 
 def test_contention_7day_window_includes_6day_old_rows():
     """High-contention rows from 6 days ago (within window) must trigger the section."""
-    server = fresh_server()
+    stats, _core = _make_fresh_mods()
     # 6 days ago — within the 7-day window.
     recent_enough = (
         datetime.now(timezone.utc) - timedelta(days=6)
     ).strftime("%Y-%m-%dT%H:00:00")
 
     _insert_timing_rows(
-        _db_path(server),
+        _db_path(),
         tool_name="engram_list",
         duration_ms=8000,
         count=50,
         timestamp_iso=recent_enough,
     )
 
-    r = json.loads(server.engram_diagnose())
+    r = json.loads(stats._diagnose_impl())
 
     assert "read_tool_contention" in r, (
         "read_tool_contention missing for 6-day-old high-contention rows (should be in window)"
@@ -232,8 +253,8 @@ def test_total_flagged_buckets_exceeds_worst_hours_shown_when_many_flagged():
     across 11 different hours in the last 6 days, then checks that
     total_flagged_buckets > worst_hours_shown (which is capped at 10).
     """
-    server = fresh_server()
-    db = _db_path(server)
+    stats, _core = _make_fresh_mods()
+    db = _db_path()
 
     # Insert high-contention rows in 11 distinct hours within the 7-day window.
     base = datetime.now(timezone.utc) - timedelta(days=6)
@@ -241,7 +262,7 @@ def test_total_flagged_buckets_exceeds_worst_hours_shown_when_many_flagged():
         hour_ts = (base + timedelta(hours=i)).strftime("%Y-%m-%dT%H:00:00")
         _insert_timing_rows(db, "engram_query", 8000, 5, hour_ts)
 
-    r = json.loads(server.engram_diagnose())
+    r = json.loads(stats._diagnose_impl())
 
     assert "read_tool_contention" in r, (
         "read_tool_contention section missing despite 11 flagged hours"

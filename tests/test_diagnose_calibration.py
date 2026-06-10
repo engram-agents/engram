@@ -9,11 +9,17 @@ Coverage:
      and confirming health_score is unchanged).
   6. Defensive: when engram_stats raises, calibration key contains error and other dimensions
      still complete.
+
+Import-pattern contract (#948 wave A — R1):
+    This file imports engram_stats, engram_observation, engram_derive, engram_epistemic,
+    and engram_core directly and contains no ``import server``. The module objects are
+    passed to fresh_module() (R4) for per-test reload isolation.
 """
 
 from __future__ import annotations
 
 import atexit
+import importlib
 import json
 import os
 import shutil
@@ -21,63 +27,86 @@ import sqlite3
 import sys
 import tempfile
 import unittest.mock as mock
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Add tests/ dir so conftest.fresh_module is importable both under pytest and
+# when the file is run as a standalone script.
+_TESTS_DIR = str(Path(__file__).resolve().parent)
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+from conftest import fresh_module  # noqa: E402 — must follow sys.path setup
+
+import engram_core
+import engram_derive
+import engram_epistemic
+import engram_observation
+import engram_stats
 
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_diagnose_calibration_")
 atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
-def fresh_server():
-    """Return a freshly initialised server module with an empty test DB."""
+def _make_fresh_mods():
+    """Reload all family modules, configure a clean test DB, and return modules.
+
+    Uses conftest.fresh_module(engram_stats) per R4: the module object is
+    passed (not a string), so the ``import engram_stats`` at the top of
+    this file is the AST-visible dependency edge for run_touched_tests.py.
+
+    Returns (stats, obs, derive, epistemic, core) — freshly reloaded module
+    objects with engram_core pointing to TEST_DIR.
+    """
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
-    for key in list(sys.modules):
-        if key == "server" or key.startswith("engram_"):
-            del sys.modules[key]
-    import server
-    server._configure_paths(TEST_DIR)
-    server._ensure_data_dir()
     os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
-    return server
+    # Purge server + engram_* from sys.modules and reload engram_stats.
+    stats = fresh_module(engram_stats)
+    obs = importlib.import_module("engram_observation")
+    derive = importlib.import_module("engram_derive")
+    epistemic = importlib.import_module("engram_epistemic")
+    core = sys.modules["engram_core"]
+    core._configure_paths(TEST_DIR)
+    core._ensure_data_dir()
+    return stats, obs, derive, epistemic, core
 
 
-def _seed_observation(server, claim: str, quote_type: str = "hard_data",
+def _seed_observation(obs, claim: str, quote_type: str = "hard_data",
                       source_class: str = "external") -> str:
     """Insert an observation and return its ID."""
-    r = json.loads(server.engram_add_observation(payload_json=json.dumps({
-        "url": "https://example.com/article",
-        "title": "Test Article",
-        "quoted_text": f"Test quoted text for: {claim}",
-        "interpretation": f"Test interpretation for: {claim}",
-        "claim": claim,
-        "quote_type": quote_type,
-        "source_class": source_class,
-    })))
+    r = json.loads(obs._add_observation_impl(
+        url="https://example.com/article",
+        title="Test Article",
+        quoted_text=f"Test quoted text for: {claim}",
+        interpretation=f"Test interpretation for: {claim}",
+        claim=claim,
+        quote_type=quote_type,
+        source_class=source_class,
+    ))
     assert r.get("status") == "created", f"observation creation failed: {r}"
     return r["observation_id"]
 
 
-def _seed_axiom(server, claim: str) -> str:
+def _seed_axiom(epistemic, claim: str) -> str:
     """Insert a single axiom and return its ID."""
-    r = json.loads(server.engram_add_axiom(payload_json=json.dumps({
-        "claim": claim,
-        "basis": "test fixture basis",
-    })))
+    r = json.loads(epistemic._add_axiom_impl(
+        claim=claim,
+        basis="test fixture basis",
+    ))
     assert "axiom_id" in r, f"axiom creation failed: {r}"
     return r["axiom_id"]
 
 
-def _seed_derivation(server, claim: str, supporting_ids: list[str],
+def _seed_derivation(derive, claim: str, supporting_ids: list,
                      reasoning_type: str = "deductive_modus_ponens") -> str:
     """Insert a derivation and return its ID."""
-    r = json.loads(server.engram_derive(payload_json=json.dumps({
-        "claim": claim,
-        "supporting_ids": ",".join(supporting_ids),
-        "logical_chain": f"Test chain for: {claim}",
-        "reasoning_type": reasoning_type,
-    })))
+    r = json.loads(derive._derive_impl(
+        claim=claim,
+        supporting_ids=",".join(supporting_ids),
+        logical_chain=f"Test chain for: {claim}",
+        reasoning_type=reasoning_type,
+    ))
     assert "derivation_id" in r, f"derivation creation failed: {r}"
     return r["derivation_id"]
 
@@ -87,9 +116,9 @@ def _seed_derivation(server, claim: str, supporting_ids: list[str],
 
 def test_calibration_key_present():
     """engram_diagnose must include a 'calibration' key in its response."""
-    server = fresh_server()
-    _seed_observation(server, "Calibration presence test obs")
-    r = json.loads(server.engram_diagnose())
+    stats, obs, _derive, _epistemic, _core = _make_fresh_mods()
+    _seed_observation(obs, "Calibration presence test obs")
+    r = json.loads(stats._diagnose_impl())
     assert "metrics" in r or "calibration" in r, (
         "expected calibration in top-level or under metrics"
     )
@@ -102,10 +131,10 @@ def test_calibration_key_present():
 
 def test_calibration_corpus_and_this_turn_present():
     """calibration must have corpus and this_turn sub-dicts."""
-    server = fresh_server()
-    _seed_observation(server, "Corpus/this_turn test obs 1")
-    _seed_observation(server, "Corpus/this_turn test obs 2")
-    r = json.loads(server.engram_diagnose())
+    stats, obs, _derive, _epistemic, _core = _make_fresh_mods()
+    _seed_observation(obs, "Corpus/this_turn test obs 1")
+    _seed_observation(obs, "Corpus/this_turn test obs 2")
+    r = json.loads(stats._diagnose_impl())
     cal = r["calibration"]
     assert "corpus" in cal, f"calibration.corpus missing: {cal}"
     assert "this_turn" in cal, f"calibration.this_turn missing: {cal}"
@@ -115,10 +144,10 @@ def test_calibration_corpus_and_this_turn_present():
 
 def test_calibration_corpus_has_confidence_subkeys():
     """calibration.corpus must contain the standard confidence-section subkeys."""
-    server = fresh_server()
+    stats, obs, _derive, _epistemic, _core = _make_fresh_mods()
     for i in range(3):
-        _seed_observation(server, f"Confidence corpus obs {i}")
-    r = json.loads(server.engram_diagnose())
+        _seed_observation(obs, f"Confidence corpus obs {i}")
+    r = json.loads(stats._diagnose_impl())
     corpus = r["calibration"]["corpus"]
     # engram_stats confidence section always returns these 4 sub-dicts
     for key in ("by_type", "by_quote_type", "by_reasoning_type", "by_source_class"):
@@ -130,12 +159,12 @@ def test_calibration_corpus_has_confidence_subkeys():
 
 def test_drift_by_type_requires_3_samples():
     """drift_by_type must exclude types where this_turn has fewer than 3 samples."""
-    server = fresh_server()
+    stats, obs, _derive, _epistemic, _core = _make_fresh_mods()
     # Seed 2 corpus observations (backdated so they're older than 24h)
     # The 48h backdate ensures these fall outside the 1-turn (24h) window so
     # they do not count toward this_turn — only toward the corpus baseline.
-    obs_old_1 = _seed_observation(server, "Old obs for drift test 1")
-    obs_old_2 = _seed_observation(server, "Old obs for drift test 2")
+    obs_old_1 = _seed_observation(obs, "Old obs for drift test 1")
+    obs_old_2 = _seed_observation(obs, "Old obs for drift test 2")
 
     db_path = os.path.join(TEST_DIR, "knowledge.db")
     conn = sqlite3.connect(db_path)
@@ -148,10 +177,10 @@ def test_drift_by_type_requires_3_samples():
     conn.close()
 
     # Seed only 2 recent observations — not enough for drift reporting (need ≥3)
-    _seed_observation(server, "Recent obs for drift test 1")
-    _seed_observation(server, "Recent obs for drift test 2")
+    _seed_observation(obs, "Recent obs for drift test 1")
+    _seed_observation(obs, "Recent obs for drift test 2")
 
-    r = json.loads(server.engram_diagnose())
+    r = json.loads(stats._diagnose_impl())
     drift = r["calibration"]["drift_by_type"]
     # observation_factual has only 2 this_turn samples — must NOT appear in drift
     assert "observation_factual" not in drift, (
@@ -161,9 +190,9 @@ def test_drift_by_type_requires_3_samples():
 
 def test_drift_by_type_includes_types_with_3_or_more_samples():
     """drift_by_type must include types where this_turn has ≥3 samples and corpus exists."""
-    server = fresh_server()
+    stats, obs, _derive, _epistemic, _core = _make_fresh_mods()
     # Seed corpus observations (older than 24h)
-    corpus_obs = [_seed_observation(server, f"Corpus obs {i}") for i in range(5)]
+    corpus_obs = [_seed_observation(obs, f"Corpus obs {i}") for i in range(5)]
     db_path = os.path.join(TEST_DIR, "knowledge.db")
     conn = sqlite3.connect(db_path)
     for obs_id in corpus_obs:
@@ -176,9 +205,9 @@ def test_drift_by_type_includes_types_with_3_or_more_samples():
 
     # Seed ≥3 recent observations (within 1-turn window)
     for i in range(3):
-        _seed_observation(server, f"Recent obs for drift ≥3 test {i}")
+        _seed_observation(obs, f"Recent obs for drift ≥3 test {i}")
 
-    r = json.loads(server.engram_diagnose())
+    r = json.loads(stats._diagnose_impl())
     drift = r["calibration"]["drift_by_type"]
     # observation_factual now has 3 this_turn samples and corpus exists — must appear
     assert "observation_factual" in drift, (
@@ -197,18 +226,12 @@ def test_drift_by_type_includes_types_with_3_or_more_samples():
 
 def test_drift_delta_signed_positive_when_this_turn_higher():
     """delta must be positive when this_turn p50 exceeds corpus p50."""
-    server = fresh_server()
-    # Seed corpus derivations with lower confidence (manually set via supersede pattern
-    # is complex; instead, seed axioms which get 0.95 confidence, then seed derivations
-    # with lower-confidence premises.
-    # Simpler approach: use axioms for corpus (high conf ~0.95), then derivations for
-    # this_turn — but derivation confidence inherits from premises.
-    # Cleanest: backdated observations (editorial, conf ~0.35) for corpus,
-    # recent observations (hard_data, conf ~0.95) for this_turn.
+    stats, obs, _derive, _epistemic, _core = _make_fresh_mods()
+    # Corpus: editorial (low conf ~0.35); recent: hard_data (higher conf ~0.95).
     # hard_data conf > editorial conf → delta positive for observation_factual.
 
     corpus_obs = [
-        _seed_observation(server, f"Editorial corpus obs {i}", quote_type="editorial")
+        _seed_observation(obs, f"Editorial corpus obs {i}", quote_type="editorial")
         for i in range(5)
     ]
     db_path = os.path.join(TEST_DIR, "knowledge.db")
@@ -223,9 +246,9 @@ def test_drift_delta_signed_positive_when_this_turn_higher():
 
     # Seed 3 recent hard_data observations (higher confidence than editorial)
     for i in range(3):
-        _seed_observation(server, f"Hard data recent obs {i}", quote_type="hard_data")
+        _seed_observation(obs, f"Hard data recent obs {i}", quote_type="hard_data")
 
-    r = json.loads(server.engram_diagnose())
+    r = json.loads(stats._diagnose_impl())
     drift = r["calibration"]["drift_by_type"]
     assert "observation_factual" in drift, f"drift missing obs_factual: {drift}"
     entry = drift["observation_factual"]
@@ -237,10 +260,10 @@ def test_drift_delta_signed_positive_when_this_turn_higher():
 
 def test_drift_delta_signed_negative_when_this_turn_lower():
     """delta must be negative when this_turn p50 is below corpus p50."""
-    server = fresh_server()
+    stats, obs, _derive, _epistemic, _core = _make_fresh_mods()
     # Corpus: hard_data (high conf); recent: editorial (lower conf)
     corpus_obs = [
-        _seed_observation(server, f"HD corpus obs {i}", quote_type="hard_data")
+        _seed_observation(obs, f"HD corpus obs {i}", quote_type="hard_data")
         for i in range(5)
     ]
     db_path = os.path.join(TEST_DIR, "knowledge.db")
@@ -255,9 +278,9 @@ def test_drift_delta_signed_negative_when_this_turn_lower():
 
     # Seed 3 recent editorial observations (lower confidence)
     for i in range(3):
-        _seed_observation(server, f"Editorial recent obs {i}", quote_type="editorial")
+        _seed_observation(obs, f"Editorial recent obs {i}", quote_type="editorial")
 
-    r = json.loads(server.engram_diagnose())
+    r = json.loads(stats._diagnose_impl())
     drift = r["calibration"]["drift_by_type"]
     assert "observation_factual" in drift, f"drift missing obs_factual: {drift}"
     entry = drift["observation_factual"]
@@ -280,12 +303,12 @@ def test_health_score_unaffected_by_calibration():
     After Fix 1 (PR #245 round-2), engram_diagnose calls _compute_confidence_distribution
     directly (not engram_stats), so we mock the helper instead.
     """
-    server = fresh_server()
+    stats, obs, _derive, _epistemic, _core = _make_fresh_mods()
     for i in range(3):
-        _seed_observation(server, f"Health score weight=0 obs {i}")
+        _seed_observation(obs, f"Health score weight=0 obs {i}")
 
     # First run: real calibration
-    r1 = json.loads(server.engram_diagnose())
+    r1 = json.loads(stats._diagnose_impl())
     score1 = r1["health_score"]
     assert score1 is not None, "health_score missing from first run"
 
@@ -307,7 +330,7 @@ def test_health_score_unaffected_by_calibration():
         "by_source_class": {},
     }
     with mock.patch("engram_stats._compute_confidence_distribution", return_value=extreme_confidence):
-        r2 = json.loads(server.engram_diagnose())
+        r2 = json.loads(stats._diagnose_impl())
     score2 = r2["health_score"]
 
     assert score1 == score2, (
@@ -326,14 +349,14 @@ def test_calibration_defensive_on_engram_stats_failure():
     After Fix 1 (PR #245 round-2), engram_diagnose calls _compute_confidence_distribution
     directly (not engram_stats), so we mock the helper instead.
     """
-    server = fresh_server()
-    _seed_observation(server, "Defensive test obs")
+    stats, obs, _derive, _epistemic, _core = _make_fresh_mods()
+    _seed_observation(obs, "Defensive test obs")
 
     with mock.patch(
         "engram_stats._compute_confidence_distribution",
         side_effect=RuntimeError("stats broken"),
     ):
-        r = json.loads(server.engram_diagnose())
+        r = json.loads(stats._diagnose_impl())
 
     # calibration section must exist and contain the error sentinel
     assert "calibration" in r, f"calibration key missing: {list(r.keys())}"
@@ -356,14 +379,14 @@ def test_calibration_defensive_on_engram_stats_bad_json():
     directly. We mock it to raise (the old 'bad JSON' surface no longer applies since
     direct helper calls return dicts, not JSON strings).
     """
-    server = fresh_server()
-    _seed_observation(server, "Bad JSON defensive test obs")
+    stats, obs, _derive, _epistemic, _core = _make_fresh_mods()
+    _seed_observation(obs, "Bad JSON defensive test obs")
 
     with mock.patch(
         "engram_stats._compute_confidence_distribution",
         side_effect=ValueError("simulated helper failure"),
     ):
-        r = json.loads(server.engram_diagnose())
+        r = json.loads(stats._diagnose_impl())
 
     assert "calibration" in r
     cal = r["calibration"]
@@ -375,9 +398,9 @@ def test_calibration_defensive_on_engram_stats_bad_json():
 
 def test_drift_by_type_entry_structure():
     """Each entry in drift_by_type has the expected 4 keys."""
-    server = fresh_server()
+    stats, obs, _derive, _epistemic, _core = _make_fresh_mods()
     # corpus: 5 backdated obs; this_turn: 3 recent obs
-    corpus_obs = [_seed_observation(server, f"Drift struct corpus obs {i}") for i in range(5)]
+    corpus_obs = [_seed_observation(obs, f"Drift struct corpus obs {i}") for i in range(5)]
     db_path = os.path.join(TEST_DIR, "knowledge.db")
     conn = sqlite3.connect(db_path)
     for obs_id in corpus_obs:
@@ -388,9 +411,9 @@ def test_drift_by_type_entry_structure():
     conn.commit()
     conn.close()
     for i in range(3):
-        _seed_observation(server, f"Drift struct recent obs {i}")
+        _seed_observation(obs, f"Drift struct recent obs {i}")
 
-    r = json.loads(server.engram_diagnose())
+    r = json.loads(stats._diagnose_impl())
     drift = r["calibration"]["drift_by_type"]
     assert "observation_factual" in drift, drift
     entry = drift["observation_factual"]
