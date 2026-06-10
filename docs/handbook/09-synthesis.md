@@ -30,22 +30,22 @@ Trace one day of an installed agent, bottom-up:
 | L3 skills/agents | 25 skills (9/15/1 by tier) + 6 agents (all four disciplines verified) |
 | L4 CLIs | 4 primary (ia, baton, forum, engine) + ~13 secondary tools |
 | L5 multi-agent | forum: 21 routes, 20 test files; packs pipeline complete minus import (by design) |
-| L6 packaging | 121 tiered + 9 excluded; engine 3-phase + 2 platform profiles; 2 CI gates |
-| L7 docs/identity | 7 root docs, 13 templates (14 placeholders), 6-node seed, 1 output style |
+| L6 packaging | 125 tiered + 17 excluded (+ repo_only 23 / build_inputs 5); engine 3-phase + 2 platform profiles; tag-once gate now exists (#991: whole-tree default-deny + plugin-universe) |
+| L7 docs/identity | 7 root docs, 9 templates (14 placeholders), 6-node seed, 1 output style |
 
 ## 3. The zombie census (FINDINGS.md is the ledger; this is the shape)
 
-- **Confirmed broken/regressed (3)**: baton auto-archive (root-cause hypothesis: silent except-pass), `resolved_by` vestigial column, hooks/ root strays (stale scatter copies — poisoned a sweep). *(viz stats tab #861 — listed here at draft as undiagnosed — was DIAGNOSED + data-restored 2026-06-06 + #861 closed; see FINDINGS A5. No longer a live zombie; this line was out of sync with A5.)*
+- **Confirmed broken/regressed (3, 2026-06-05 snapshot)**: baton auto-archive (since re-wired + instrumented 2026-06-09 — `except Exception as e:` at hook:541, gh_ok-gated; runtime re-verify pending), `resolved_by` vestigial column, hooks/ root strays (stale scatter copies — poisoned a sweep). *(viz stats tab #861 — listed here at draft as undiagnosed — was DIAGNOSED + data-restored 2026-06-06 + #861 closed; see FINDINGS A5. No longer a live zombie; this line was out of sync with A5.)*
 - **Dormant lanes**: none remaining (the gemini lane, 29 files CI-blind with partial-manifest coherence gap, was **RETIRED by #865** 2026-06-06; archived at tag `archive/gemini`).
-- **Deploy/manifest gaps (3)**: forum 2/57 tiered (production runs on Ari's separately-deployed systemd service — formalize or tier), 81-file effective manifest drift, **the tiering CI gate itself does not exist** (A7 — the structural cause of the rest).
-- **Doc-teaching drift (4)**: deploy.sh upgrade path (script deleted), settings.json hooks, dead design-doc refs, SKILL.md §4 listing an internal helper.
+- **Deploy/manifest gaps (largely resolved 2026-06-09)**: the tiering CI gate now EXISTS (#968/#991 whole-tree default-deny + plugin-universe, run by manifest-gate.yml on dev PRs — A7 resolved, the structural cause is fixed); forum deploy formalized (#868 systemd second-deploy-target); the ~52-file drift is now CI-enforced (every tracked file must declare a role). Remaining: per-file bucket adjudication.
+- **Doc-teaching drift — RESOLVED 2026-06-09**: deploy.sh upgrade path (README no longer references it), settings.json hooks (template now reads hooks.json), dead design-doc refs (SKILL.md refs gone), SKILL.md §4 internal-helper listing (gone) — all four fixed; verified vs origin/dev in the 08-docs-identity pass.
 - **Latent risks**: engram-pkg runtime dep without boot-verify; codex build target untested; placeholder orphans ({{ENGRAM_VIZ_HOME}} could break viz systemd render).
 - **Healthy beyond expectation**: the L1 tool surface (zero undiscoverable tools, uniform error shape, migration complete) and the forum's test depth (8.6k lines).
 
 ## 4. Structural patterns behind the zombies
 
 1. **Silent-output surfaces rot invisibly.** A hook that emits the wrong envelope is indistinguishable from a healthy quiet one (#824 ran mute for its whole life). Anything whose output the model/user never directly observes needs a delivery-verification gate, not vigilance.
-2. **Documented-but-unbuilt gates guarantee drift.** The tiering gate exists in prose, not CI — and drift arrived the same day twice (#810). A discipline without its mechanical gate is a wish.
+2. **Documented-but-unbuilt gates guarantee drift.** The tiering gate existed in prose, not CI — and drift arrived the same day twice (#810). A discipline without its mechanical gate is a wish. *(Resolved 2026-06-09: the gate is now built — #968/#991 — closing this instance; the pattern stands as the lesson.)*
 3. **Partial manifestation is worse than absence.** A shipped stub pointing at an unshipped lane misleads installers; the gate, when built, must check dependency coherence both directions. The gemini lane was the live instance of this pattern at survey time — it is now resolved by #865 (lane retired). The forum's second-deploy model (partial-deploy-with-docs) is the remaining live instance; the lesson stands.
 4. **Test coverage ≠ ship coverage.** The forum is simultaneously the best-tested and least-deployable subsystem. CI exercises code the manifest doesn't ship; neither surface implies the other.
 5. **Docs drift toward the era they were written in.** Every retired mechanism (scatter, deploy.sh, settings-hooks) survives somewhere in prose. Doc-teaching needs the same sweep cadence as code.
@@ -61,12 +61,12 @@ And twice this same day, the live system caught what fixture suites could not (w
 
 ## 6. Release-readiness shortlist (proposed priorities for Lei's review)
 
-1. **Build the tiering CI gate** (A7) — cheap set-difference; encodes the dir-coverage policy; checks dangling + dependency coherence. Structural fix for half the census.
+1. **Build the tiering CI gate** (A7) — ✅ **DONE 2026-06-09 (#968/#991):** whole-tree default-deny gate (every tracked file declares one role across mechanisms/excluded/repo_only/build_inputs) + plugin-universe gate, run on dev PRs. The structural fix for half the census has landed.
 2. **Adjudicate the remaining ~52-file drift list** (A10) — the gemini ~29 portion resolved by #865; remaining: forum ~31 + infra-meta ~10 + misc ~11; plus an "infrastructure" manifest category for the meta-files.
 3. **Forum deploy model decision** (A9) — formalize the separately-deployed systemd model (production reality, Ari-owned) or tier it into the plugin.
 4. **Gemini lane decision** (B7) — **DECIDED: RETIRED by #865** (2026-06-06; archived at tag `archive/gemini`). The half-state is resolved.
 5. **Fix the four confirmed-broken** (A3/A5 + strays + vestigial column) — each small, all post-review.
-6. **Doc scrub** (B11) — deploy.sh/settings.json/dead-refs; one PR.
+6. **Doc scrub** (B11) — ✅ **DONE 2026-06-09:** deploy.sh / settings.json / dead-refs all fixed (S1/S2/S3/B1; see the §3 census).
 7. **Close the latent risks** — engram-pkg boot-verify, codex target test, placeholder orphans.
 
 The codebase under this census is healthier than the finding count suggests: the core epistemic machinery (L0/L1) surveyed essentially clean, the failure mass concentrates in delivery and documentation seams — exactly the seams a pre-release survey exists to find.
