@@ -226,7 +226,18 @@ Verify-in checks: (1) valid JSON per chunk, (2) required fields present (id, typ
 
 Single `Agent`-tool message with all calls, each `run_in_background=true`.
 
-**Fairies 1-6** — `subagent_type="engram-dream-fairy"`, one per well-supported category (per `engram-dream-fairy.md`'s six categories). Prompt template (substitute `{N}`, `{CATEGORY_NAME}`, `{SLUG}`):
+**Fairies 1-6** — `subagent_type="engram-dream-fairy"`, one per well-supported category. **Use these exact substitution values** (canonical from `engram-dream-fairy.md`; do NOT derive from memory or prior-session context — the category numbering changes across versions and must be read here each dispatch):
+
+| `{N}` | `{CATEGORY_NAME}` | `{SLUG}` |
+|-------|-------------------|----------|
+| 1 | Open questions with sufficient answers nearby | open-questions |
+| 2 | Contradictions ripe for resolution | contradictions |
+| 3 | Stale-but-load-bearing nodes | stale-load-bearing |
+| 4 | Cornerstone candidates | cornerstone-candidates |
+| 5 | Tainted-but-still-valid derivations | tainted-valid |
+| 6 | Recent-resolution echoes | resolution-echoes |
+
+Prompt template (substitute `{N}`, `{CATEGORY_NAME}`, `{SLUG}` from the table above):
 
 > Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md`. Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only file path + 5-bullet TL;DR for this category. Do NOT run other categories or the heuristic categories (7, 8).
 
