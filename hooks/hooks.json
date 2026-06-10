@@ -65,12 +65,6 @@
           },
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-github-notifications-hook.py\"",
-            "timeout": 5,
-            "statusMessage": "Checking GitHub notifications..."
-          },
-          {
-            "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-forum-prompt-hook.py\"",
             "timeout": 5,
             "statusMessage": "Checking forum..."

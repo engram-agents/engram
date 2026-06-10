@@ -332,11 +332,6 @@
       "tier": "convenience"
     },
     {
-      "path": "hooks/claude/engram-github-notifications-hook.py",
-      "tier": "convenience",
-      "identity_coupled": true
-    },
-    {
       "path": "hooks/claude/engram-end-of-day-hook.py",
       "tier": "convenience",
       "identity_coupled": true

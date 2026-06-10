@@ -52,14 +52,6 @@
       ]
     },
     {
-      "path_prefix_or_glob": "hooks/claude/engram-github-notifications-hook.py",
-      "test_globs": [
-        "tests/test_engine_phase3.py",
-        "tests/test_tiers_manifest.py"
-      ],
-      "note": "No dedicated unit test; engine_phase3 and tiers_manifest verify integration"
-    },
-    {
       "path_prefix_or_glob": "hooks/claude/engram-inter-agent-prompt-hook.py",
       "test_globs": [
         "tests/test_inter_agent_hook.py",

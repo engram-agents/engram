@@ -357,9 +357,10 @@ def test_identity_coupled_flag_is_bool_when_present():
 
 
 def test_identity_coupled_hooks_are_known():
-    """The 5 identity-coupled hooks from spec #778 must all be tagged identity_coupled=true.
+    """The 4 identity-coupled hooks from spec #778 must all be tagged identity_coupled=true.
 
     Ensures the tag-once gate covers the load-bearing set.
+    (engram-github-notifications-hook.py removed — hook deleted, low-utility.)
     """
     manifest = _load_manifest()
     ic_paths = {
@@ -372,7 +373,6 @@ def test_identity_coupled_hooks_are_known():
         "hooks/claude/engram-baton-prompt-hook.py",
         "hooks/claude/engram-inter-agent-prompt-hook.py",
         "hooks/claude/engram-forum-prompt-hook.py",
-        "hooks/claude/engram-github-notifications-hook.py",
         "hooks/claude/engram-end-of-day-hook.py",
     }
     missing = expected - ic_paths

@@ -484,7 +484,6 @@ class TestIdentityAxis:
             "hooks/claude/engram-baton-prompt-hook.py",
             "hooks/claude/engram-inter-agent-prompt-hook.py",
             "hooks/claude/engram-forum-prompt-hook.py",
-            "hooks/claude/engram-github-notifications-hook.py",
             "hooks/claude/engram-end-of-day-hook.py",
         ]
         for hook in identity_coupled_hooks:
