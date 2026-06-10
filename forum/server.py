@@ -702,10 +702,13 @@ def create_app(
     def api_agents_status():
         """Publish an agent's derived status.
 
-        Body: {agent, state, activity?, queue?}
+        Body: {agent, state, activity?, queue?, expected_republish_seconds?}
         - state must be one of PUBLISHABLE_STATES ('idle'/'working'/'sleeping').
-          'offline' is server-computed and is rejected with 400.
+          'offline'/'on-call' are server-computed and rejected with 400.
         - queue, if present, must be a JSON array of strings.
+        - expected_republish_seconds (#1035), if present, must be a non-negative
+          int or null (0 = event-driven/on-call). Drives the per-agent offline
+          window; rejected with 400 if malformed.
         No audit write: high-frequency heartbeat, same rationale as online polls.
         """
         data = request.get_json(silent=True)
@@ -726,6 +729,10 @@ def create_app(
 
         activity = data.get("activity") or None
 
+        # expected_republish_seconds: absent key → None (global window).
+        # Present-but-malformed is validated by set_agent_status → 400.
+        expected_republish = data.get("expected_republish_seconds")
+
         try:
             db.set_agent_status(
                 g.conn,
@@ -733,13 +740,14 @@ def create_app(
                 state=state,
                 activity=activity,
                 queue=queue,
+                expected_republish_seconds=expected_republish,
             )
         except ValueError as exc:
             allowed = sorted(db.PUBLISHABLE_STATES)
             return jsonify({
                 "error": str(exc),
                 "allowed_states": allowed,
-                "note": "'offline' is server-computed and cannot be published",
+                "note": "'offline'/'on-call' are server-computed and cannot be published",
             }), 400
 
         return jsonify({"status": "published", "agent": agent_name, "state": state}), 200

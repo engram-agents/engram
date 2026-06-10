@@ -583,3 +583,195 @@ class TestMigrationIdempotent:
         assert "status_activity" in cols
         assert "status_queue" in cols
         assert "status_updated_at" in cols
+
+
+# ---------------------------------------------------------------------------
+# 11. Per-agent cadence + on-call (#1035, slice 3a)
+# ---------------------------------------------------------------------------
+
+class TestPerAgentCadence:
+    """Each agent is judged against its own expected_republish_seconds instead
+    of a single global window, so relaxed (20-40 min) and monitor-only peers
+    don't flap to 'offline' on a 15-min clock."""
+
+    def test_relaxed_agent_stays_online_past_global_window(self, conn):
+        # 1200s (20 min) loop → per-agent window = max(15 min, 2×1200s=40 min).
+        upsert_agent(conn, "relaxed")
+        set_agent_status(
+            conn, "relaxed", state="working",
+            expected_republish_seconds=1200,
+        )
+        _force_last_seen(conn, "relaxed", -25)  # 25 min ago
+        board, _, _ = list_board(conn, window_minutes=15)
+        r = next(e for e in board if e["name"] == "relaxed")
+        # Global 15-min clock would call this offline; per-agent keeps it online.
+        assert r["state"] == "working", r
+
+    def test_relaxed_agent_offline_past_own_window(self, conn):
+        upsert_agent(conn, "relaxed")
+        set_agent_status(
+            conn, "relaxed", state="working",
+            expected_republish_seconds=1200,
+        )
+        _force_last_seen(conn, "relaxed", -50)  # 50 min ago > 40-min window
+        board, _, _ = list_board(conn, window_minutes=15)
+        r = next(e for e in board if e["name"] == "relaxed")
+        assert r["state"] == "offline", r
+        assert r["activity"] is None  # stale claim suppressed
+
+    def test_null_cadence_uses_global_window_unchanged(self, conn):
+        # No published cadence → exactly the old global-window behavior.
+        upsert_agent(conn, "plain")
+        set_agent_status(conn, "plain", state="working")  # no cadence
+        _force_last_seen(conn, "plain", -20)  # 20 min ago > 15-min global
+        board, _, _ = list_board(conn, window_minutes=15)
+        p = next(e for e in board if e["name"] == "plain")
+        assert p["state"] == "offline", p
+
+    def test_relaxed_agent_visible_in_list_online(self, conn):
+        # The #1035 fix must also reach the legacy /online surface.
+        upsert_agent(conn, "relaxed")
+        set_agent_status(
+            conn, "relaxed", state="idle", expected_republish_seconds=1200,
+        )
+        _force_last_seen(conn, "relaxed", -25)  # past global, within own window
+        online, count, _ = list_online(conn, window_minutes=15)
+        assert any(e["name"] == "relaxed" for e in online), online
+
+
+class TestOnCall:
+    """expected_republish_seconds == 0 marks an event-driven / monitor-only
+    agent: never flapped offline on a heartbeat clock; renders 'on-call' when
+    quiet, and 'offline' only past the 24h hard ceiling."""
+
+    def test_quiet_monitor_agent_renders_on_call(self, conn):
+        upsert_agent(conn, "kepler")
+        set_agent_status(
+            conn, "kepler", state="working", activity="reviewing #1005",
+            expected_republish_seconds=0,
+        )
+        _force_last_seen(conn, "kepler", -30)  # 30 min quiet (> global 15)
+        board, _, _ = list_board(conn, window_minutes=15)
+        k = next(e for e in board if e["name"] == "kepler")
+        assert k["state"] == "on-call", k
+        assert k["activity"] is None  # stale activity suppressed for on-call
+
+    def test_recently_seen_monitor_agent_shows_published_state(self, conn):
+        upsert_agent(conn, "kepler")
+        set_agent_status(
+            conn, "kepler", state="working", expected_republish_seconds=0,
+        )
+        _force_last_seen(conn, "kepler", -5)  # 5 min ago, within global window
+        board, _, _ = list_board(conn, window_minutes=15)
+        k = next(e for e in board if e["name"] == "kepler")
+        assert k["state"] == "working", k  # not on-call while actively seen
+
+    def test_on_call_agent_offline_past_hard_ceiling(self, conn):
+        upsert_agent(conn, "kepler")
+        set_agent_status(
+            conn, "kepler", state="working", expected_republish_seconds=0,
+        )
+        _force_last_seen(conn, "kepler", -25 * 60)  # 25h ago > 24h ceiling
+        board, _, _ = list_board(conn, window_minutes=15)
+        k = next(e for e in board if e["name"] == "kepler")
+        assert k["state"] == "offline", k  # genuinely dead monitor agent
+
+    def test_on_call_counts_as_online(self, conn):
+        upsert_agent(conn, "kepler")
+        set_agent_status(
+            conn, "kepler", state="idle", expected_republish_seconds=0,
+        )
+        _force_last_seen(conn, "kepler", -30)
+        _, online_count, _ = list_board(conn, window_minutes=15)
+        assert online_count == 1, online_count  # on-call is a reachable state
+
+    def test_on_call_visible_in_list_online(self, conn):
+        # list_online was rewritten this slice — lock that the on-call path
+        # reaches the legacy /online surface too (symmetry with the relaxed
+        # test_relaxed_agent_visible_in_list_online above).
+        upsert_agent(conn, "kepler")
+        set_agent_status(conn, "kepler", state="idle", expected_republish_seconds=0)
+        _force_last_seen(conn, "kepler", -30)
+        online, count, _ = list_online(conn, window_minutes=15)
+        assert any(e["name"] == "kepler" for e in online), online
+        assert count == 1
+
+
+class TestCadencePersistenceAndValidation:
+    def test_cadence_persists_and_resets(self, conn):
+        upsert_agent(conn, "alice")
+        set_agent_status(conn, "alice", state="idle", expected_republish_seconds=600)
+        row = conn.execute(
+            "SELECT expected_republish_seconds FROM agents WHERE name='alice'"
+        ).fetchone()
+        assert row[0] == 600
+        # A later publish without the field resets it to NULL (global window).
+        set_agent_status(conn, "alice", state="idle")
+        row = conn.execute(
+            "SELECT expected_republish_seconds FROM agents WHERE name='alice'"
+        ).fetchone()
+        assert row[0] is None
+
+    def test_negative_cadence_rejected(self, conn):
+        upsert_agent(conn, "alice")
+        with pytest.raises(ValueError):
+            set_agent_status(conn, "alice", state="idle", expected_republish_seconds=-5)
+
+    def test_on_call_state_not_publishable(self, conn):
+        upsert_agent(conn, "alice")
+        with pytest.raises(ValueError):
+            set_agent_status(conn, "alice", state="on-call")
+
+    def test_stale_flag_uses_per_agent_cadence(self, conn):
+        # 300s (5 min) cadence → stale after 2×5=10 min of no republish.
+        upsert_agent(conn, "fast")
+        set_agent_status(conn, "fast", state="working", expected_republish_seconds=300)
+        _force_last_seen(conn, "fast", -2)        # fresh liveness
+        _force_status_updated_at(conn, "fast", -12)  # status 12 min old > 10
+        board, _, _ = list_board(conn, window_minutes=15)
+        f = next(e for e in board if e["name"] == "fast")
+        assert f["state"] == "working", f
+        assert f["status_stale"] is True, f
+
+
+class TestCadenceEndpoint:
+    def test_post_accepts_expected_republish_seconds(self, client):
+        resp = client.post(
+            "/api/agents/status",
+            json={"agent": "alice", "state": "idle", "expected_republish_seconds": 1200},
+        )
+        assert resp.status_code == 200, resp.data
+        board = json.loads(client.get("/api/agents/board").data)["board"]
+        a = next(e for e in board if e["name"] == "alice")
+        # round-trips through the store (resolved while fresh → published state)
+        assert a["state"] == "idle"
+
+    def test_post_rejects_negative_cadence(self, client):
+        resp = client.post(
+            "/api/agents/status",
+            json={"agent": "alice", "state": "idle", "expected_republish_seconds": -1},
+        )
+        assert resp.status_code == 400, resp.data
+
+    def test_post_on_call_sentinel_zero_accepted(self, client):
+        resp = client.post(
+            "/api/agents/status",
+            json={"agent": "kepler", "state": "working", "expected_republish_seconds": 0},
+        )
+        assert resp.status_code == 200, resp.data
+
+    def test_post_rejects_bool_cadence(self, client):
+        # JSON `true` is an int in Python (isinstance(True, int)); the bool-first
+        # guard in set_agent_status must reject it via the endpoint → 400. The
+        # endpoint passes the value straight through, so this locks the guard.
+        resp = client.post(
+            "/api/agents/status",
+            json={"agent": "alice", "state": "idle", "expected_republish_seconds": True},
+        )
+        assert resp.status_code == 400, resp.data
+
+
+class TestCadenceMigration:
+    def test_cadence_column_present_after_init(self, conn):
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(agents)")}
+        assert "expected_republish_seconds" in cols

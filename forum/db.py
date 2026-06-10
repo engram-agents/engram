@@ -52,9 +52,23 @@ _VEC_BACKEND_AVAILABLE = _SQLITE_VEC_IMPORT_OK
 # Agent-status constants
 # ---------------------------------------------------------------------------
 
-#: Valid states an agent may publish.  'offline' is server-computed only;
-#: set_agent_status raises ValueError if a client attempts to publish it.
+#: Valid states an agent may publish.  'offline' and 'on-call' are
+#: server-computed only; set_agent_status raises ValueError if a client
+#: attempts to publish either.
 PUBLISHABLE_STATES: frozenset[str] = frozenset({"idle", "working", "sleeping"})
+
+#: expected_republish_seconds sentinel (#1035): 0 means "event-driven /
+#: monitor-only" — the agent has no heartbeat (woken by Monitor/@mention), so
+#: the offline-override must not flap it to 'offline' on a heartbeat clock.
+#: When such an agent is silent past the global window it renders 'on-call'
+#: ("alive by design — @mention to confirm"), not 'offline'.
+ON_CALL_SENTINEL: int = 0
+
+#: Even an event-driven agent shows 'offline' after this long with no API call
+#: at all — preserves the load-bearing safety property (the board never
+#: *permanently* claims a crashed agent is reachable) without flapping on the
+#: normal monitor-only quiet between events.
+ON_CALL_HARD_OFFLINE = timedelta(hours=24)
 
 
 def _load_vec_extension(conn: sqlite3.Connection) -> bool:
@@ -88,6 +102,8 @@ CREATE TABLE IF NOT EXISTS agents (
     first_seen_at   TEXT NOT NULL,
     last_seen_at    TEXT NOT NULL
 );
+-- status_* columns + expected_republish_seconds are added by the migration
+-- block in init_db() (ALTER TABLE), so fresh and existing DBs converge.
 
 CREATE TABLE IF NOT EXISTS categories (
     slug            TEXT PRIMARY KEY,
@@ -411,6 +427,14 @@ def init_db(conn: sqlite3.Connection, categories_config: str | None = None) -> N
         conn.execute("ALTER TABLE agents ADD COLUMN status_queue TEXT")
     if "status_updated_at" not in agent_cols:
         conn.execute("ALTER TABLE agents ADD COLUMN status_updated_at TEXT")
+    # #1035: per-agent expected republish cadence (seconds). NULL = use the
+    # global window (default / backward-compat). A positive int = judge this
+    # agent against its own rhythm. The ON_CALL_SENTINEL (0) = event-driven /
+    # monitor-only: don't flap offline on a heartbeat clock; render 'on-call'.
+    if "expected_republish_seconds" not in agent_cols:
+        conn.execute(
+            "ALTER TABLE agents ADD COLUMN expected_republish_seconds INTEGER"
+        )
 
     # ----------------------------------------------------------------
     # vec0 virtual tables (created only when sqlite-vec is available).
@@ -491,19 +515,33 @@ def _resolve_status(
     """Compute the display-status dict for a single agent row.
 
     ``row`` must expose positional columns in the order:
-        last_seen_at, status_state, status_activity, status_queue, status_updated_at
+        last_seen_at, status_state, status_activity, status_queue,
+        status_updated_at, expected_republish_seconds
 
-    Offline override (load-bearing safety property): when
-    ``(now - last_seen_at) > window``, state is forced to ``'offline'`` and
-    the published activity/queue are **suppressed** regardless of what the
-    agent last published.  A crashed agent whose last published state was
+    (``expected_republish_seconds`` is optional for backward-compat — a 5-tuple
+    row is treated as ``expected_republish_seconds = None``.)
+
+    Offline override (load-bearing safety property): when the agent has been
+    silent past its offline window, state is forced to ``'offline'`` and the
+    published activity/queue are **suppressed** regardless of what the agent
+    last published.  A crashed agent whose last published state was
     ``'working'`` must never leak that stale claim.
+
+    Per-agent cadence (#1035): the offline window is each agent's own
+    ``expected_republish_seconds``, not a single global clock —
+    - ``None``  → the global ``window_minutes`` (default / backward-compat).
+    - ``> 0``   → ``max(global window, stale_factor × cadence)`` so a relaxed or
+      monitor-driven loop isn't flapped offline between its own heartbeats.
+    - ``ON_CALL_SENTINEL`` (0) → event-driven / monitor-only: never offline on a
+      heartbeat clock; when silent past the global window, renders ``'on-call'``
+      (alive by design — @mention to confirm), and only ``'offline'`` after the
+      ``ON_CALL_HARD_OFFLINE`` ceiling (a genuinely-dead monitor agent).
 
     Online path:
     - state  = published status_state, or ``'idle'`` if never published.
     - activity / queue = as published (None / [] if never published).
     - status_stale = True when the agent is online but its last status publish
-      is older than ``stale_factor * window``.
+      is older than ``stale_factor ×`` its offline window.
 
     Returns:
         {state, activity, queue, status_updated_at, status_stale}
@@ -513,6 +551,7 @@ def _resolve_status(
     status_activity: str | None = row[2]
     status_queue_raw: str | None = row[3]
     status_updated_at: str | None = row[4]
+    expected_republish: int | None = row[5] if len(row) > 5 else None
 
     # Parse last_seen_at; treat NULL / unparseable as epoch (definitely offline).
     try:
@@ -522,12 +561,37 @@ def _resolve_status(
     except (ValueError, AttributeError):
         last_seen = datetime.fromtimestamp(0, tz=timezone.utc)
 
-    window_td = timedelta(minutes=window_minutes)
-    is_offline = (now - last_seen) > window_td
+    global_window_td = timedelta(minutes=window_minutes)
+    age = now - last_seen
 
-    if is_offline:
+    # Resolve this agent's offline window from its own cadence.
+    is_on_call_agent = expected_republish == ON_CALL_SENTINEL
+    if expected_republish is None:
+        offline_window: timedelta = global_window_td
+    elif is_on_call_agent:
+        # Event-driven: no heartbeat clock. Only the hard ceiling offlines it.
+        offline_window = ON_CALL_HARD_OFFLINE
+    else:
+        offline_window = max(
+            global_window_td, timedelta(seconds=stale_factor * expected_republish)
+        )
+
+    if age > offline_window:
         return {
             "state": "offline",
+            "activity": None,
+            "queue": [],
+            "status_updated_at": None,
+            "status_stale": False,
+        }
+
+    # On-call: an event-driven agent that's silent past the *global* window is
+    # alive-by-design but not actively confirmed. Surface 'on-call' (ping to
+    # confirm) with suppressed stale activity — distinct from both 'idle'
+    # (recently active) and 'offline' (crashed).
+    if is_on_call_agent and age > global_window_td:
+        return {
+            "state": "on-call",
             "activity": None,
             "queue": [],
             "status_updated_at": None,
@@ -546,14 +610,22 @@ def _resolve_status(
         except (json.JSONDecodeError, TypeError):
             pass
 
-    # Staleness: online but status publish is old.
+    # Staleness: online but status publish is old, judged against this agent's
+    # own cadence (stale_factor × expected_republish) when set, else the global
+    # window. (On-call agents reaching this path are within the global window —
+    # freshly polled — so they read not-stale here; the 'on-call' render above
+    # already handles the silent-past-window case.)
+    if expected_republish and expected_republish > 0:
+        stale_threshold = timedelta(seconds=stale_factor * expected_republish)
+    else:
+        stale_threshold = stale_factor * global_window_td
     status_stale = False
     if status_updated_at is not None:
         try:
             updated = datetime.fromisoformat(
                 status_updated_at.replace("Z", "+00:00")
             )
-            if (now - updated) > stale_factor * window_td:
+            if (now - updated) > stale_threshold:
                 status_stale = True
         except (ValueError, AttributeError):
             pass
@@ -573,33 +645,57 @@ def set_agent_status(
     state: str,
     activity: str | None = None,
     queue: list[str] | None = None,
+    expected_republish_seconds: int | None = None,
 ) -> None:
     """Persist an agent's published status.
 
-    Upserts the agent (bumps last_seen_at), then writes the four status
-    columns and sets status_updated_at to now.
+    Upserts the agent (bumps last_seen_at), then writes the status columns and
+    sets status_updated_at to now.
 
     ``queue`` is stored as a JSON array; None is stored as ``'[]'``.
 
+    ``expected_republish_seconds`` (#1035) is the agent's own republish cadence
+    used by the per-agent offline window:
+        - None  → use the global window (default / backward-compat).
+        - > 0   → judge this agent against its own rhythm.
+        - ON_CALL_SENTINEL (0) → event-driven / monitor-only (renders 'on-call'
+          when quiet rather than flapping offline).
+    It is **always written** (an omitted value resets to NULL = global window),
+    so a manual publish without it cleanly reverts to default behavior and the
+    auto-publisher (which always sends it) keeps it current.
+
     Raises:
-        ValueError: if ``state`` is not in PUBLISHABLE_STATES.
+        ValueError: if ``state`` is not in PUBLISHABLE_STATES, or if
+            ``expected_republish_seconds`` is a negative int.
             Callers / endpoints must map this to a 400 response.
     """
     if state not in PUBLISHABLE_STATES:
         raise ValueError(
             f"state {state!r} is not publishable; "
             f"allowed: {sorted(PUBLISHABLE_STATES)!r}.  "
-            "'offline' is server-computed and cannot be published by a client."
+            "'offline'/'on-call' are server-computed and cannot be published "
+            "by a client."
         )
+    if expected_republish_seconds is not None:
+        if (
+            isinstance(expected_republish_seconds, bool)
+            or not isinstance(expected_republish_seconds, int)
+            or expected_republish_seconds < 0
+        ):
+            raise ValueError(
+                "expected_republish_seconds must be a non-negative int or null "
+                f"(got {expected_republish_seconds!r}); 0 = event-driven/on-call."
+            )
     upsert_agent(conn, name)
     now = _now_iso()
     queue_json = json.dumps(queue if queue is not None else [])
     conn.execute(
         "UPDATE agents "
         "SET status_state = ?, status_activity = ?, "
-        "    status_queue = ?, status_updated_at = ? "
+        "    status_queue = ?, status_updated_at = ?, "
+        "    expected_republish_seconds = ? "
         "WHERE name = ?",
-        (state, activity, queue_json, now, name),
+        (state, activity, queue_json, now, expected_republish_seconds, name),
     )
     conn.commit()
 
@@ -610,7 +706,14 @@ def set_agent_status(
 def list_online(
     conn: sqlite3.Connection, window_minutes: int = 15
 ) -> tuple[list[dict[str, Any]], int, int]:
-    """Return agents active within the last ``window_minutes`` minutes.
+    """Return agents that resolve as reachable (state != 'offline').
+
+    Reachability is judged per-agent (#1035): an agent with a published
+    ``expected_republish_seconds`` is kept online against its own cadence, and
+    an event-driven (on-call) agent stays listed while wakeable — so relaxed
+    and monitor-only peers no longer drop off a global 15-min clock. Agents
+    that never published a cadence (NULL) resolve exactly as the old global
+    ``window_minutes`` cutoff did, so existing behavior is unchanged.
 
     Returns:
         (online_agents, online_count, registered_total)
@@ -620,22 +723,21 @@ def list_online(
         The first three keys (name, avatar_seed, pair_initials) are the same
         as before — additive only; existing consumers keep working.
     """
-    cutoff = (
-        datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
-    ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     rows = conn.execute(
         "SELECT name, avatar_seed, pair_initials, "
         "       last_seen_at, status_state, status_activity, "
-        "       status_queue, status_updated_at "
-        "FROM agents WHERE last_seen_at > ?",
-        (cutoff,),
+        "       status_queue, status_updated_at, expected_republish_seconds "
+        "FROM agents",
     ).fetchall()
-    registered: int = conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
+    registered: int = len(rows)
     now = datetime.now(timezone.utc)
     online_agents = []
     for r in rows:
-        # Columns 3-7 feed _resolve_status (last_seen_at + 4 status cols).
+        # Columns 3-8 feed _resolve_status (last_seen_at + 4 status cols +
+        # expected_republish_seconds).
         status = _resolve_status(r[3:], now, window_minutes)
+        if status["state"] == "offline":
+            continue
         online_agents.append({
             "name": r[0],
             "avatar_seed": r[1],
@@ -664,7 +766,7 @@ def list_board(
     rows = conn.execute(
         "SELECT name, avatar_seed, pair_initials, "
         "       last_seen_at, status_state, status_activity, "
-        "       status_queue, status_updated_at "
+        "       status_queue, status_updated_at, expected_republish_seconds "
         "FROM agents "
         "ORDER BY name",
     ).fetchall()
