@@ -956,7 +956,7 @@ def build_plugin(
             # cp -r src/. dest/ — copy contents into dest
             if os.path.exists(dst):
                 shutil.rmtree(dst)
-            shutil.copytree(src, dst)
+            shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         else:
             shutil.copy2(src, dst)
         copied_paths.append(p)
@@ -977,7 +977,7 @@ def build_plugin(
             # cp -a src/. dest/ — copy contents (archive mode in bash; copytree here)
             if os.path.exists(dst):
                 shutil.rmtree(dst)
-            shutil.copytree(src, dst)
+            shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         else:
             shutil.copy2(src, dst)
         copied_paths.append(p)
@@ -1112,7 +1112,7 @@ def build_plugin(
             dst = os.path.join(plugin_root, "skills", skill_name)
             if os.path.exists(dst):
                 shutil.rmtree(dst)
-            shutil.copytree(src, dst)
+            shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
             copied_paths.append(manifest_key)
             _log(f"  {manifest_key}")
         else:
