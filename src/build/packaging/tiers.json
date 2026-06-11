@@ -157,11 +157,13 @@
     },
     {
       "path": "tools/build-plugin.sh",
-      "tier": "convenience"
+      "tier": "convenience",
+      "source": "src/build/build-plugin.sh"
     },
     {
       "path": "tools/engine",
-      "tier": "convenience"
+      "tier": "convenience",
+      "source": "src/build/engine"
     },
     {
       "path": "tools/install-local-marketplace.sh",
@@ -730,6 +732,14 @@
     {
       "path": "templates",
       "reason": "backward-compat directory symlink pointing to src/engram/templates/ (Phase 1 relocation)"
+    },
+    {
+      "path": "packaging",
+      "reason": "backward-compat directory symlink pointing to src/build/packaging/ (Phase 2 relocation)"
+    },
+    {
+      "path": "src/build/packaging/README.md",
+      "reason": "README for the src/build/packaging directory — documentation, not shipped inside the plugin bundle"
     }
   ],
   "build_inputs": [
@@ -742,15 +752,15 @@
       "reason": "Hooks registration — the build engine writes a tier/identity-filtered copy into the bundle (hooks/hooks.json); structural build input, not itself a depth-tier-gated mechanism"
     },
     {
-      "path": "packaging/mcp.json",
+      "path": "src/build/packaging/mcp.json",
       "reason": "MCP server registration source — the build engine transforms it into the bundle's .mcp.json (renamed at the plugin root); build input, not a depth-tier-gated mechanism"
     },
     {
-      "path": "packaging/platforms/",
+      "path": "src/build/packaging/platforms/",
       "reason": "Per-platform profile sources (claude-code.json, codex.json) — baked by the build engine into the bundle's platform.json; build input, not a depth-tier-gated mechanism"
     },
     {
-      "path": "packaging/tiers.json",
+      "path": "src/build/packaging/tiers.json",
       "reason": "The tier manifest itself — consumed by the build engine to select shippable mechanisms; build configuration input, not a depth-tier-gated mechanism"
     }
   ]

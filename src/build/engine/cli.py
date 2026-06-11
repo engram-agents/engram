@@ -140,7 +140,7 @@ def build_command(args: list[str]) -> int:
             "  --allow-branch      Allow building from a non-dev branch (overrides #794's guard).\n"
             "  --help              Show this help message and exit.\n"
             "\n"
-            "Tier filtering uses packaging/tiers.json as the single source of truth.\n"
+            "Tier filtering uses src/build/packaging/tiers.json as the single source of truth.\n"
             "The build manifest is written to <output>/.engram-build-manifest.json.\n"
             "\n"
             "The command must be run from the repo root (the directory containing server.py).\n"
@@ -198,10 +198,10 @@ def build_command(args: list[str]) -> int:
             )
             return 1
 
-    manifest_path = os.path.join(repo_root, "packaging", "tiers.json")
+    manifest_path = os.path.join(repo_root, "src", "build", "packaging", "tiers.json")
     if not os.path.isfile(manifest_path):
         print(
-            f"[build-plugin] ERROR: packaging/tiers.json not found at {manifest_path} "
+            f"[build-plugin] ERROR: src/build/packaging/tiers.json not found at {manifest_path} "
             "— is PR-1 merged?",
             file=sys.stderr,
         )

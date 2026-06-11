@@ -16,6 +16,14 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_ENGRAM = os.path.join(REPO_ROOT, "src", "engram")
 if SRC_ENGRAM not in sys.path:
     sys.path.insert(0, SRC_ENGRAM)
+# Phase 2: tools/engine moved to src/build/engine; tools/engine is a compat
+# symlink at repo root. REPO_ROOT must come BEFORE SRC_ENGRAM in sys.path so
+# Python finds tools/ at REPO_ROOT/tools/ (which has the engine symlink) rather
+# than at src/engram/tools/ (which no longer has engine/ after Phase 2).
+# pytest may have already added REPO_ROOT at a later position; force it to front.
+if REPO_ROOT in sys.path:
+    sys.path.remove(REPO_ROOT)
+sys.path.insert(0, REPO_ROOT)
 
 # Test-mode bypass for the _get_db() fail-loud guards added with the plugin
 # bootstrap contract. Test fixtures monkey-patch DATA_DIR/DB_PATH to a tempdir

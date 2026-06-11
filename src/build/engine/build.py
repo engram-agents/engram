@@ -36,7 +36,7 @@ REPLICATION NOTES (bash oddities / edge cases faithfully ported):
   - The consistency gate (step 6b) is all-or-nothing: every reference in the
     built hooks.json must exist on disk.
   - plugin.json is copied from repo_root/plugin.json.
-  - .mcp.json is written from packaging/mcp.json (NOT repo-root .mcp.json) and
+  - .mcp.json is written from src/build/packaging/mcp.json (NOT repo-root .mcp.json) and
     renamed to .mcp.json at the plugin root.
   - Build manifest paths list is ordered by the copy sequence (not alphabetical),
     matching COPIED_PATHS accumulation order in the bash script.
@@ -48,7 +48,7 @@ shipped_paths of the build manifest.
 
 Phase 3 additions
 -----------------
-  - Platform profiles (packaging/platforms/): loaded at build time and baked
+  - Platform profiles (src/build/packaging/platforms/): loaded at build time and baked
     into the bundle root as ``platform.json`` (read-only runtime fact).
   - --target claude-code|codex (default: claude-code = today's behavior).
     For codex: emits .codex-plugin/plugin.json, hooks.json references
@@ -207,7 +207,7 @@ def load_platform_profile(repo_root: str, target: str) -> dict[str, Any]:
     ValueError
         If the profile is missing a required "platform" field.
     """
-    profile_path = os.path.join(repo_root, "packaging", "platforms", f"{target}.json")
+    profile_path = os.path.join(repo_root, "src", "build", "packaging", "platforms", f"{target}.json")
     if not os.path.isfile(profile_path):
         raise FileNotFoundError(
             f"Platform profile not found: {profile_path} "
@@ -877,10 +877,13 @@ def build_plugin(
     """
     # Load manifest if not supplied
     if manifest is None:
-        manifest_path = os.path.join(repo_root, "packaging", "tiers.json")
+        manifest_path = os.path.join(repo_root, "src", "build", "packaging", "tiers.json")
         manifest = load_manifest(manifest_path)
 
-    # source_root — relative to repo_root; default "." preserves current behavior
+    # source_root — relative to repo_root; default "." preserves current behavior.
+    # Individual mechanism entries may carry a "source" field (repo-root-relative path)
+    # to override source_root for that entry — used when a mechanism's source lives
+    # outside the source_root tree (e.g. src/build/engine ships as bundle tools/engine).
     source_root = manifest.get("source_root", ".")
 
     # Compute build version once — threaded through to all version-bearing outputs
@@ -946,10 +949,16 @@ def build_plugin(
     os.makedirs(os.path.join(plugin_root, "tools"), exist_ok=True)
 
     # Iterate SHIPPED_PATHS that match '^tools/'
-    for p in [e["path"] for e in shipped_entries if e["path"].startswith("tools/")]:
-        src = os.path.join(repo_root, source_root, p)
+    for entry in [e for e in shipped_entries if e["path"].startswith("tools/")]:
+        p = entry["path"]
+        # Per-mechanism "source" field: repo-root-relative override for entries
+        # whose source lives outside source_root (e.g. src/build/engine → bundle tools/engine).
+        if "source" in entry:
+            src = os.path.join(repo_root, entry["source"])
+        else:
+            src = os.path.join(repo_root, source_root, p)
         if not os.path.exists(src):
-            _die(f"Manifest entry {p} does not exist at {src}")
+            _die(f"Manifest entry {p!r} does not exist at {src}")
         dst = os.path.join(plugin_root, p)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         if os.path.isdir(src):
@@ -1004,9 +1013,9 @@ def build_plugin(
         copied_paths.append(".codex-plugin/plugin.json")
         copied_paths.append(".mcp.json")
     else:
-        # claude-code: Source: packaging/mcp.json → destination: .mcp.json at plugin root
+        # claude-code: Source: src/build/packaging/mcp.json → destination: .mcp.json at plugin root
         shutil.copy2(
-            os.path.join(repo_root, "packaging", "mcp.json"),
+            os.path.join(repo_root, "src", "build", "packaging", "mcp.json"),
             os.path.join(plugin_root, ".mcp.json"),
         )
         copied_paths.append("packaging/mcp.json")

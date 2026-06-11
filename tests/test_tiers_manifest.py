@@ -126,7 +126,19 @@ def _load_manifest() -> dict:
 
 
 def _manifest_path_set(manifest: dict) -> set[str]:
-    return {entry["path"] for entry in manifest["mechanisms"]}
+    """Return the set of paths (and source paths) for all mechanism entries.
+
+    When an entry carries a "source" field (repo-root-relative override used
+    when the real source lives outside source_root, e.g. src/build/engine ships
+    as bundle tools/engine), include that source path directly — it IS the
+    tracked file and must count as covered.
+    """
+    paths: set[str] = set()
+    for entry in manifest["mechanisms"]:
+        paths.add(entry["path"])
+        if "source" in entry:
+            paths.add(entry["source"])
+    return paths
 
 
 def _excluded_path_set(manifest: dict) -> set[str]:
@@ -460,13 +472,20 @@ def test_no_dangling_manifest_entries():
 
     Fails naming the specific dangling path(s). This catches the inverse drift:
     a mechanism was removed/renamed but the manifest entry wasn't cleaned up.
+
+    For entries with a "source" field (repo-root-relative override), the source
+    path is checked instead of source_root + path.
     """
     manifest = _load_manifest()
     source_root = manifest.get("source_root", ".")
     dangling: list[str] = []
     for entry in manifest["mechanisms"]:
         p = entry["path"]
-        full = os.path.join(REPO_ROOT, source_root, p)
+        if "source" in entry:
+            # source field is repo-root-relative; check it directly
+            full = os.path.join(REPO_ROOT, entry["source"])
+        else:
+            full = os.path.join(REPO_ROOT, source_root, p)
         if not os.path.exists(full):
             dangling.append(p)
 

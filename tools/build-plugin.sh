@@ -1,1 +1,1 @@
-../src/engram/tools/build-plugin.sh
+../src/build/build-plugin.sh
