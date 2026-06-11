@@ -13,8 +13,9 @@ import types
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
+SRC_ENGRAM = os.path.join(REPO_ROOT, "src", "engram")
+if SRC_ENGRAM not in sys.path:
+    sys.path.insert(0, SRC_ENGRAM)
 
 # Test-mode bypass for the _get_db() fail-loud guards added with the plugin
 # bootstrap contract. Test fixtures monkey-patch DATA_DIR/DB_PATH to a tempdir

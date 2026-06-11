@@ -38,9 +38,9 @@ import pytest
 # ---------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-RUNNER_PATH = REPO_ROOT / "tools" / "run_touched_tests.py"
+RUNNER_PATH = REPO_ROOT / "src" / "engram" / "tools" / "run_touched_tests.py"
 TIERS_PATH = REPO_ROOT / "packaging" / "tiers.json"
-TEST_MAP_PATH = REPO_ROOT / "packaging" / "test-map.json"
+TEST_MAP_PATH = REPO_ROOT / "src" / "engram" / "packaging" / "test-map.json"
 TESTS_DIR = REPO_ROOT / "tests"
 
 # ---------------------------------------------------------------------------
@@ -241,6 +241,7 @@ def _make_tmp_repo(tmp_path: Path) -> Path:
     repo.mkdir()
     (repo / "tests").mkdir()
     (repo / "packaging").mkdir()
+    (repo / "src" / "engram" / "packaging").mkdir(parents=True, exist_ok=True)
 
     # module_a.py
     (repo / "module_a.py").write_text(
@@ -294,7 +295,7 @@ def _make_tmp_repo(tmp_path: Path) -> Path:
     )
 
     # Minimal test-map.json (no mappings needed for basic tests)
-    (repo / "packaging" / "test-map.json").write_text(
+    (repo / "src" / "engram" / "packaging" / "test-map.json").write_text(
         json.dumps({"schema_version": 1, "mappings": [], "unmapped": []}),
         encoding="utf-8",
     )
@@ -455,7 +456,7 @@ class TestLayer2ConventionMap:
             ],
             "unmapped": [],
         }
-        (repo / "packaging" / "test-map.json").write_text(
+        (repo / "src" / "engram" / "packaging" / "test-map.json").write_text(
             json.dumps(test_map), encoding="utf-8"
         )
 
@@ -491,7 +492,7 @@ class TestLayer2ConventionMap:
             ],
             "unmapped": [],
         }
-        (repo / "packaging" / "test-map.json").write_text(
+        (repo / "src" / "engram" / "packaging" / "test-map.json").write_text(
             json.dumps(test_map), encoding="utf-8"
         )
 
@@ -522,7 +523,7 @@ class TestLayer2ConventionMap:
             ],
             "unmapped": [],
         }
-        (repo / "packaging" / "test-map.json").write_text(
+        (repo / "src" / "engram" / "packaging" / "test-map.json").write_text(
             json.dumps(test_map), encoding="utf-8"
         )
 
@@ -885,7 +886,7 @@ def _make_tmp_repo_with_contract(tmp_path: Path) -> Path:
         "unmapped": [],
         "server_import_allowlist": ["test_c_payload.py"],
     }
-    (repo / "packaging" / "test-map.json").write_text(
+    (repo / "src" / "engram" / "packaging" / "test-map.json").write_text(
         json.dumps(test_map), encoding="utf-8"
     )
 
@@ -1063,7 +1064,7 @@ class TestAuditImports:
             "unmapped": [],
             "server_import_allowlist": ["test_allowlisted.py"],
         }
-        (repo / "packaging" / "test-map.json").write_text(
+        (repo / "src" / "engram" / "packaging" / "test-map.json").write_text(
             json.dumps(test_map_data), encoding="utf-8"
         )
         test_map = _runner._load_test_map(str(repo))

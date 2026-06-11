@@ -25,10 +25,10 @@ def _import_engram_pkg_helpers():
     as tests/test_scope_export.py's _import_scope_export_helpers().
     """
     candidates = [
-        os.path.join(REPO_ROOT, "tools", "engram-pkg", "engram-pkg"),
+        os.path.join(REPO_ROOT, "src", "engram", "tools", "engram-pkg", "engram-pkg"),
         os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "tools", "engram-pkg", "engram-pkg",
+            "src", "engram", "tools", "engram-pkg", "engram-pkg",
         ),
     ]
     cli_path = None

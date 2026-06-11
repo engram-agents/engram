@@ -26,7 +26,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 # Make the hook module importable.
-HOOKS_DIR = Path(__file__).parent.parent / "hooks" / "claude"
+HOOKS_DIR = Path(__file__).parent.parent / "src" / "engram" / "hooks" / "claude"
 sys.path.insert(0, str(HOOKS_DIR))
 
 import context_tracker as ct

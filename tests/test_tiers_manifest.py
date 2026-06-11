@@ -344,10 +344,32 @@ def test_whole_tree_every_tracked_file_has_a_role():
     This is the whole-tree default-deny gate (issue #968).
     """
     manifest = _load_manifest()
-    tiered_paths = _manifest_path_set(manifest)
-    excluded_paths = _excluded_path_set(manifest)
-    repo_only_paths = _repo_only_path_set(manifest)
-    build_inputs_paths = _build_inputs_path_set(manifest)
+    source_root = manifest.get("source_root", ".")
+
+    def _with_prefix(paths: set[str], skip_dir_symlinks: bool = False) -> set[str]:
+        """Expand each path to cover both the bare form and source-root-prefixed form.
+
+        When skip_dir_symlinks=True, directory symlinks are not expanded: git
+        tracks them as single blob entries (not directory prefixes pointing into
+        their targets), so adding src/engram/<symlink> would prefix-match real
+        files in src/engram/<symlink>/ already covered by mechanisms[].
+        Pass skip_dir_symlinks=True only for repo_only[] expansion.
+        """
+        if source_root == ".":
+            return paths
+        expanded: set[str] = set(paths)
+        for p in paths:
+            if skip_dir_symlinks:
+                full = os.path.join(REPO_ROOT, p)
+                if os.path.islink(full) and os.path.isdir(os.path.realpath(full)):
+                    continue  # directory symlink — keep bare form only
+            expanded.add(source_root + "/" + p)
+        return expanded
+
+    tiered_paths = _with_prefix(_manifest_path_set(manifest))
+    excluded_paths = _with_prefix(_excluded_path_set(manifest))
+    repo_only_paths = _with_prefix(_repo_only_path_set(manifest), skip_dir_symlinks=True)
+    build_inputs_paths = _with_prefix(_build_inputs_path_set(manifest))
 
     tracked = _enumerate_all_tracked_paths()
 
@@ -440,10 +462,11 @@ def test_no_dangling_manifest_entries():
     a mechanism was removed/renamed but the manifest entry wasn't cleaned up.
     """
     manifest = _load_manifest()
+    source_root = manifest.get("source_root", ".")
     dangling: list[str] = []
     for entry in manifest["mechanisms"]:
         p = entry["path"]
-        full = os.path.join(REPO_ROOT, p)
+        full = os.path.join(REPO_ROOT, source_root, p)
         if not os.path.exists(full):
             dangling.append(p)
 

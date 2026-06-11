@@ -36,10 +36,10 @@ def test_absent_source_root_defaults_to_dot():
 
 
 def test_explicit_source_root_in_tiers_json():
-    """packaging/tiers.json must contain source_root == "."."""
+    """packaging/tiers.json must contain source_root == "src/engram"."""
     with open(MANIFEST_PATH, encoding="utf-8") as f:
         manifest = json.load(f)
-    assert manifest["source_root"] == "."
+    assert manifest["source_root"] == "src/engram"
 
 
 # ---------------------------------------------------------------------------

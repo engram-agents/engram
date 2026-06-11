@@ -43,7 +43,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 # Load the hook module from its hooks/claude/ path (not normally importable).
-HOOK_PATH = REPO_ROOT / "hooks" / "claude" / "engram-utility-credit-mention-stop.py"
+HOOK_PATH = REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-utility-credit-mention-stop.py"
 
 # The real ENGRAM_HOME — used only to verify the real log is NOT written.
 _REAL_ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")

@@ -150,11 +150,11 @@ def _import_scope_export_helpers():
     import importlib.util
 
     candidates = [
-        os.path.join(REPO_ROOT, "tools", "engram-pkg", "engram-pkg"),
+        os.path.join(REPO_ROOT, "src", "engram", "tools", "engram-pkg", "engram-pkg"),
         # Also try resolving via __file__ in case REPO_ROOT detection is off.
         os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "tools", "engram-pkg", "engram-pkg",
+            "src", "engram", "tools", "engram-pkg", "engram-pkg",
         ),
     ]
     cli_path = None

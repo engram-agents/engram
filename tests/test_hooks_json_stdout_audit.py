@@ -19,8 +19,8 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).parent.parent
-HOOKS_JSON = REPO_ROOT / "hooks" / "hooks.json"
-HOOKS_DIR = REPO_ROOT / "hooks" / "claude"
+HOOKS_JSON = REPO_ROOT / "src" / "engram" / "hooks" / "hooks.json"
+HOOKS_DIR = REPO_ROOT / "src" / "engram" / "hooks" / "claude"
 
 
 def _referenced_hooks() -> list[tuple[str, str, str]]:

@@ -1038,9 +1038,9 @@ class TestFindServerPy:
         to the third candidate (parent of tools/ == REPO_ROOT).
         REPO_ROOT/server.py must exist for this test to be meaningful.
         """
-        repo_server = REPO_ROOT / "server.py"
+        repo_server = REPO_ROOT / "src" / "engram" / "server.py"
         if not repo_server.exists():
-            pytest.skip("REPO_ROOT/server.py not present — skipping dev-repo fallback scenario")
+            pytest.skip("REPO_ROOT/src/engram/server.py not present — skipping dev-repo fallback scenario")
 
         # Ensure neither plugin nor scatter exist in tmp_home
         assert not self._plugin_path().exists()

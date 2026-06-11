@@ -9,7 +9,7 @@
     "multi_agent": "orthogonal flag — composes with any depth tier"
   },
   "default_tier": "convenience",
-  "source_root": ".",
+  "source_root": "src/engram",
   "mechanisms": [
     {
       "path": "server.py",
@@ -710,6 +710,26 @@
     {
       "path": "archive/",
       "reason": "historical one-time migration artifacts preserved for reference — ran during early development and are not shipped in any install tier"
+    },
+    {
+      "path": "agents",
+      "reason": "backward-compat directory symlink pointing to src/engram/agents/ (Phase 1 relocation)"
+    },
+    {
+      "path": "hooks",
+      "reason": "backward-compat directory symlink pointing to src/engram/hooks/ (Phase 1 relocation)"
+    },
+    {
+      "path": "output-styles",
+      "reason": "backward-compat directory symlink pointing to src/engram/output-styles/ (Phase 1 relocation)"
+    },
+    {
+      "path": "skills",
+      "reason": "backward-compat directory symlink pointing to src/engram/skills/ (Phase 1 relocation)"
+    },
+    {
+      "path": "templates",
+      "reason": "backward-compat directory symlink pointing to src/engram/templates/ (Phase 1 relocation)"
     }
   ],
   "build_inputs": [

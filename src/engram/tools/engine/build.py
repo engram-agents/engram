@@ -986,7 +986,7 @@ def build_plugin(
     # ── 2. Manifests ─────────────────────────────────────────────────────────
 
     _log(f"Writing plugin.json (version={build_version!r})")
-    src_plugin_path = os.path.join(repo_root, source_root, "plugin.json")
+    src_plugin_path = os.path.join(repo_root, "plugin.json")
     with open(src_plugin_path, encoding="utf-8") as f:
         plugin_data = json.load(f)
     plugin_data["version"] = build_version

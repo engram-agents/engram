@@ -15,7 +15,7 @@ import pytest
 
 HOOK_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "hooks", "claude", "engram-time-bar-hook.py",
+    "src", "engram", "hooks", "claude", "engram-time-bar-hook.py",
 )
 spec = importlib.util.spec_from_file_location("time_bar_hook", HOOK_PATH)
 tbh = importlib.util.module_from_spec(spec)
