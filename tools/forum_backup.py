@@ -25,6 +25,12 @@ Design notes
 - The snapshot temp DB is mutated before iterdump (NULL embedding columns, drop
   derived tables/triggers). This is safe by construction -- the snapshot is a
   throwaway copy created by the sqlite3 backup API, never the live DB.
+- vec0 virtual table removal is extension-free (#1057): vec_posts and vec_threads
+  are removed via PRAGMA writable_schema (deleting their sqlite_master rows)
+  rather than DROP TABLE, which would require the sqlite-vec extension loaded.
+  The plain shadow tables (vec_posts_chunks, etc.) are then dropped normally.
+  This preserves the stdlib-only-runs-under-system-python contract so the systemd
+  backup unit works without sqlite_vec installed.
 - Forum server is NOT stopped during backup -- the sqlite3.backup() API handles
   live-consistency at the C library level.
 
@@ -144,17 +150,25 @@ def _strip_derived_from_snapshot(conn: sqlite3.Connection) -> dict[str, int]:
     it never touches the live DB.  Steps:
       1. NULL the embedding columns on posts + threads (if they exist).
       2. Drop FTS triggers (posts_fts_insert, posts_fts_delete, posts_fts_update).
-      3. Load sqlite-vec (best-effort) so vec0 tables can be dropped.
-      4. Drop derived virtual tables: vec_posts, vec_threads, posts_fts.
-         Dropping posts_fts also removes all its shadow tables automatically.
+      3. Remove vec0 virtual-table declarations extension-free via writable_schema
+         (only when vec0 virtual tables exist; vec-less DBs skip this block).
+      4. Drop remaining derived tables: vec shadow tables (vec_posts_chunks etc.)
+         and posts_fts via normal DROP TABLE IF EXISTS.  Dropping posts_fts also
+         removes all its shadow tables automatically.
+
+    vec0 removal detail (#1057): DROP TABLE on a vec0 virtual table requires the
+    sqlite-vec extension loaded on the connection.  The systemd backup unit runs
+    system python3 (no sqlite_vec), so we instead remove the vec0 virtual-table
+    rows directly from sqlite_master (PRAGMA writable_schema=ON) and then drop the
+    plain shadow tables normally.  This is extension-free and stdlib-only.
+    writable_schema is turned OFF and committed before returning; the block is
+    entered only when vec0 virtual tables actually exist.
+
+    FTS5 (posts_fts) is unaffected: FTS5 is compiled into stdlib sqlite3, so
+    DROP TABLE posts_fts works under system python3 and is unchanged.
 
     Returns a stats dict: {embeddings_nulled, triggers_dropped, tables_dropped}.
-
-    Note on vec0 drops: dropping a vec0 virtual table requires the sqlite-vec
-    extension loaded on that connection. We load it best-effort; if unavailable
-    and the tables don't exist (i.e. sqlite-vec was never loaded on the source
-    DB either), this is a no-op. If the tables DO exist but the extension is
-    unavailable, the DROP raises -- loud failure is intentional (#720 pattern).
+    tables_dropped counts all removed tables: vec0 virtual + vec shadow + fts.
     """
     stats: dict[str, int] = {
         "embeddings_nulled": 0,
@@ -199,15 +213,46 @@ def _strip_derived_from_snapshot(conn: sqlite3.Connection) -> dict[str, int]:
         conn.execute(f"DROP TRIGGER IF EXISTS [{tn}]")
         stats["triggers_dropped"] += 1
 
-    # --- 3. Load sqlite-vec so we can drop vec0 tables (best-effort) ---
-    # Absence of the extension is fine when the source DB never had vec tables
-    # (no sqlite-vec loaded on source). If the tables DO exist and the extension
-    # cannot be loaded, DROP TABLE will raise -- loud failure is intentional.
-    _load_vec_best_effort(conn)
+    # --- 3. Remove vec0 virtual-table declarations via writable_schema (extension-free) ---
+    # Dropping a vec0 virtual table normally requires the sqlite-vec extension loaded
+    # on the connection; the systemd backup unit runs system python3 without it (#1057).
+    # Instead: identify vec0 virtual tables, delete their sqlite_master rows directly
+    # (writable_schema=ON), then commit.  The remaining vec shadow tables (plain btree)
+    # are dropped normally in step 4.
+    # Guard: only enter the writable_schema block when vec0 virtual tables exist, so
+    # vec-less DBs never touch writable_schema at all.
+    vec0_virtual = [
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND sql LIKE 'CREATE VIRTUAL TABLE%vec0%'"
+        ).fetchall()
+    ]
+    if vec0_virtual:
+        conn.execute("PRAGMA writable_schema=ON")
+        try:
+            for vt in vec0_virtual:
+                conn.execute(
+                    "DELETE FROM sqlite_master WHERE type='table' AND name=?", (vt,)
+                )
+                stats["tables_dropped"] += 1
+        finally:
+            # try/finally so writable_schema is ALWAYS turned back OFF even if a
+            # DELETE raises -- leaving it ON would let later statements on this
+            # connection corrupt the schema. (Reviewer-fairy suggestion, #1089.)
+            conn.execute("PRAGMA writable_schema=OFF")
+        conn.commit()
 
-    # --- 4. Drop derived virtual tables ---
-    # vec tables first (vec0, no shadow-table cascade needed), then posts_fts
-    # (parent FTS5 table -- SQLite automatically drops its shadow tables).
+    # --- 4. Drop remaining derived tables via normal DROP TABLE IF EXISTS ---
+    # After step 3, vec0 virtual-table rows are gone from sqlite_master, so the
+    # remaining vec_posts*/vec_threads* entries are plain shadow tables (btree) --
+    # no extension needed to drop them.  posts_fts is an FTS5 virtual table (stdlib,
+    # always droppable); dropping it automatically removes its shadow tables.
+    # NOTE: these patterns cover the two known vec0 table prefixes (vec_posts,
+    # vec_threads). Step 3's detection is name-agnostic (matches any CREATE VIRTUAL
+    # TABLE...vec0), so a new vec0 table with a different prefix would have its
+    # virtual-table row removed there but its shadow tables left behind here --
+    # add its prefix to this query if a new vec0 table is ever introduced.
     derived_tables = [
         r[0]
         for r in conn.execute(
@@ -216,9 +261,7 @@ def _strip_derived_from_snapshot(conn: sqlite3.Connection) -> dict[str, int]:
             "     OR name LIKE 'posts_fts%')"
         ).fetchall()
     ]
-    vec_tables = [t for t in derived_tables if t.startswith("vec_")]
-    fts_tables = [t for t in derived_tables if t.startswith("posts_fts")]
-    for tn in vec_tables + fts_tables:
+    for tn in derived_tables:
         conn.execute(f"DROP TABLE IF EXISTS [{tn}]")
         stats["tables_dropped"] += 1
 
@@ -279,9 +322,12 @@ def _dump_to_sql(snap_path: str, keep_derived: bool = False) -> str:
     debugging via --keep-derived).
     """
     conn = sqlite3.connect(snap_path)
-    # Load vec best-effort so _row_counts (called by callers) doesn't raise on
-    # vec-bearing DBs.  _strip_derived_from_snapshot also loads it internally,
-    # but this covers the keep_derived=True path too.
+    # Load vec best-effort so iterdump/row-counts don't raise on vec-bearing DBs
+    # in the --keep-derived path (which retains vec0 DDL and needs the extension).
+    # The strip path (keep_derived=False) no longer needs the extension: step 3 of
+    # _strip_derived_from_snapshot removes vec0 tables extension-free via
+    # writable_schema.  This call is a no-op on the strip path (harmless) and
+    # required on the keep_derived=True path.
     _load_vec_best_effort(conn)
     try:
         if not keep_derived:
