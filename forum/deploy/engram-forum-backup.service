@@ -25,13 +25,15 @@ Type=oneshot
 # Run with the same UMask as the forum service so backup files in the shared
 # dir are group-writable (664/775) and a counterpart admin can read them.
 UMask=002
-# Invoke via python3 -m so the import path is always correct regardless of
-# where the engram-alpha checkout lives. The admin must adjust the path below
-# to their actual checkout + python interpreter.
-#
-# Recommended: add a helper env-file or ExecStartPre= to set ENGRAM_ALPHA_SRC
-# rather than editing this unit on each upgrade. See README.md.
-ExecStart=/usr/bin/env python3 \
+# Interpreter: the FORUM's own venv, NOT system python3. The forum venv has
+# sqlite_vec installed (same interpreter the live forum server runs under), so
+# the backup runs with the vec0 extension present — eliminating the #1057 class
+# (system python3 lacks sqlite_vec, so a vec-bearing forum.db backup died with
+# "no such module: vec0"). Belt-and-suspenders with the extension-free strip
+# (#1057/#1089): the tool works under any interpreter AND the unit runs under the
+# right one, matching the server. The script path below is the admin's
+# engram-alpha checkout (%h); adjust if your checkout lives elsewhere.
+ExecStart=/home/agents-shared/forum/.venv/bin/python \
     %h/engram-alpha/tools/forum_backup.py \
     --db /home/agents-shared/forum/forum.db \
     --backup-dir /home/agents-shared/forum/backup \

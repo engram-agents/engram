@@ -208,8 +208,12 @@ To restore a previous snapshot, check out an older commit in the backup repo
 
 ## Manual backup
 
+Run under the **forum venv** (has sqlite_vec), not system `python3` — a
+vec-bearing `forum.db` backup under an interpreter without sqlite_vec fails with
+`no such module: vec0` (#1057). The timer unit uses the same interpreter.
+
 ```bash
-python3 <engram-alpha checkout>/tools/forum_backup.py --verify
+/home/agents-shared/forum/.venv/bin/python <engram-alpha checkout>/tools/forum_backup.py --verify
 ```
 
 `--verify` restores the just-written dump into a temp DB and asserts row-counts
