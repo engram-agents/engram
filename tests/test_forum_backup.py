@@ -538,3 +538,138 @@ class TestEndToEndDumpExcludesVec:
             rc.execute("SELECT COUNT(*) FROM posts").fetchone()
         finally:
             rc.close()
+
+
+class TestAutoincrementProbe:
+    """#834: the ground-truth AUTOINCREMENT probe must match the EXACT
+    'PRIMARY KEY AUTOINCREMENT' token, not a bare 'AUTOINCREMENT' substring.
+
+    No sqlite_vec needed: sqlite_sequence is materialized via a create+drop of a
+    real AUTOINCREMENT table (it persists, empty, after the table is dropped),
+    leaving sqlite_sequence present with NO surviving AUTOINCREMENT base table —
+    exactly the condition where a false-positive probe would keep the bare
+    DELETE FROM sqlite_sequence and DOA a fresh-DB restore.
+    """
+
+    @staticmethod
+    def _materialize_empty_sqlite_sequence(conn):
+        # Create + populate + drop a real AUTOINCREMENT table: sqlite_sequence
+        # is created and survives the drop (empty), with no AUTOINCREMENT table left.
+        conn.executescript(
+            "CREATE TABLE _seq_tmp (id INTEGER PRIMARY KEY AUTOINCREMENT);"
+            "INSERT INTO _seq_tmp DEFAULT VALUES;"
+            "DROP TABLE _seq_tmp;"
+        )
+
+    def test_bait_column_does_not_false_positive(self, tmp_path):
+        """A column NAMED with the keyword (not PRIMARY KEY AUTOINCREMENT) must
+        NOT trip the probe -> sqlite_sequence filtered -> fresh restore succeeds."""
+        db_path = str(tmp_path / "forum_bait.db")
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            "CREATE TABLE posts (id INTEGER PRIMARY KEY, body_md TEXT);"
+            # bait: keyword appears as a column name, NOT as PRIMARY KEY AUTOINCREMENT
+            "CREATE TABLE bait (notautoincrement_marker INTEGER, note TEXT);"
+        )
+        self._materialize_empty_sqlite_sequence(conn)
+        conn.execute("INSERT INTO posts(id, body_md) VALUES (1, 'hi')")
+        conn.commit()
+        conn.close()
+
+        # sanity: sqlite_sequence exists, but no real AUTOINCREMENT base table.
+        c = sqlite3.connect(db_path)
+        assert c.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='sqlite_sequence'"
+        ).fetchone(), "test setup: sqlite_sequence should be present"
+        c.close()
+
+        snap_path = str(tmp_path / "snap.db")
+        src = sqlite3.connect(db_path)
+        dst = sqlite3.connect(snap_path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+
+        sql_text = forum_backup._dump_to_sql(snap_path, keep_derived=False)
+
+        # The bait must NOT have been read as a real AUTOINCREMENT table, so the
+        # sqlite_sequence statement must be filtered out.
+        assert "sqlite_sequence" not in sql_text, (
+            "bait column false-positived the AUTOINCREMENT probe -> "
+            "sqlite_sequence kept -> fresh restore would DOA (#834)"
+        )
+
+        # Restore into a FRESH empty DB must succeed (the #834 failure axis).
+        fresh = sqlite3.connect(":memory:")
+        try:
+            fresh.executescript(sql_text)
+            assert fresh.execute("SELECT COUNT(*) FROM posts").fetchone()[0] == 1
+        finally:
+            fresh.close()
+
+    def test_real_autoincrement_still_fires(self, tmp_path):
+        """Positive control (ls_0014 mutation guard): a REAL PRIMARY KEY
+        AUTOINCREMENT base table makes the probe True, so sqlite_sequence
+        statements are KEPT (they're load-bearing) and restore still works."""
+        db_path = str(tmp_path / "forum_real_ai.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT, body_md TEXT)"
+        )
+        conn.execute("INSERT INTO posts(body_md) VALUES ('hi')")
+        conn.commit()
+        conn.close()
+
+        snap_path = str(tmp_path / "snap.db")
+        src = sqlite3.connect(db_path)
+        dst = sqlite3.connect(snap_path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+
+        sql_text = forum_backup._dump_to_sql(snap_path, keep_derived=False)
+
+        # Real AUTOINCREMENT -> sequence rows are meaningful -> NOT filtered.
+        assert "sqlite_sequence" in sql_text, (
+            "real PRIMARY KEY AUTOINCREMENT table should keep sqlite_sequence"
+        )
+        # And it still restores into a fresh DB (the CREATE recreates the table).
+        fresh = sqlite3.connect(":memory:")
+        try:
+            fresh.executescript(sql_text)
+            assert fresh.execute("SELECT COUNT(*) FROM posts").fetchone()[0] == 1
+        finally:
+            fresh.close()
+
+    def test_whitespace_normalized_in_probe(self, tmp_path):
+        """A real AUTOINCREMENT table with non-standard internal whitespace
+        (PRIMARY  KEY  AUTOINCREMENT) must still be detected — sqlite_master
+        stores CREATE sql verbatim, so the probe normalizes whitespace runs."""
+        db_path = str(tmp_path / "forum_ws.db")
+        conn = sqlite3.connect(db_path)
+        # Extra spaces between the keywords; SQLite stores this verbatim.
+        conn.execute(
+            "CREATE TABLE posts (id INTEGER PRIMARY  KEY  AUTOINCREMENT, body_md TEXT)"
+        )
+        conn.execute("INSERT INTO posts(body_md) VALUES ('hi')")
+        conn.commit()
+        conn.close()
+
+        snap_path = str(tmp_path / "snap.db")
+        src = sqlite3.connect(db_path)
+        dst = sqlite3.connect(snap_path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+
+        sql_text = forum_backup._dump_to_sql(snap_path, keep_derived=False)
+        # Whitespace-normalized probe must still see it as real AUTOINCREMENT.
+        assert "sqlite_sequence" in sql_text, (
+            "whitespace-variant PRIMARY KEY AUTOINCREMENT was missed by the probe"
+        )

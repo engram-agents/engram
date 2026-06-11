@@ -343,12 +343,25 @@ def _dump_to_sql(snap_path: str, keep_derived: bool = False) -> str:
         # Note: if a future forum base table adds AUTOINCREMENT, this query
         # will return a row and sqlite_sequence filtering is skipped -- correct
         # behaviour, because the sequence rows are then load-bearing.
-        has_autoincrement = bool(
-            conn.execute(
-                "SELECT 1 FROM sqlite_master"
-                " WHERE type='table' AND instr(upper(sql),'AUTOINCREMENT')"
-            ).fetchone()
-        ) if not keep_derived else False
+        #
+        # #834: probe for the EXACT 'PRIMARY KEY AUTOINCREMENT' token, not a bare
+        # 'AUTOINCREMENT' substring.  SQLite only accepts AUTOINCREMENT in that
+        # one position, so a bare substring also matches a column named e.g.
+        # 'notautoincrement' or a DDL comment mentioning the keyword -- a false
+        # positive that would keep sqlite_sequence statements and make a
+        # fresh-DB restore die ("no such table: sqlite_sequence").  sqlite_master
+        # stores CREATE sql verbatim (the author's whitespace), so normalize
+        # whitespace runs to single spaces before the check ('PRIMARY  KEY' etc).
+        if keep_derived:
+            has_autoincrement = False
+        else:
+            has_autoincrement = any(
+                "PRIMARY KEY AUTOINCREMENT" in " ".join(row[0].upper().split())
+                for row in conn.execute(
+                    "SELECT sql FROM sqlite_master"
+                    " WHERE type='table' AND sql IS NOT NULL"
+                ).fetchall()
+            )
         lines = list(conn.iterdump())
     finally:
         conn.close()
