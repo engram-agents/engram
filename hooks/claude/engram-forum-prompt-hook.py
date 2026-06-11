@@ -11,6 +11,12 @@ then injects a 🔔 mention line ABOVE the generic 📢 threads line when pendin
 (p.id > COALESCE(r.last_read_post_id, 0)), so reading a thread server-side
 clears the mention automatically — no local read-cursor involved.
 
+Also auto-publishes derived agent status to /api/agents/status on a throttled
+schedule (Q1–Q4 from spec #1077 part 1): synchronous POST with timeout=2,
+swallow-all-errors, throttle on max(cadence_seconds, 60), always-publish-on-
+state-change, mid-sleep guard. The publish never breaks the existing thread/
+mention surfacing.
+
 Two-cursor state for threads (surfaced cursor is still hook-owned):
   - forum-surfaced-cursor.txt: advances on every hook fire. Drives "new since
     last prompt." After the hook fires, threads that were "new" appear in the
@@ -23,11 +29,16 @@ hammering the server on rapid successive prompts. Cache stores both threads and
 inbox mentions together. Stale-cache fallback on server-unreachable (never break
 the hook chain if the forum is down).
 
+Publish state: separate ~/.engram/forum-status-publish.json tracks last-published
+status with its own throttle interval (never shares the 30s-TTL cache).
+
 Silent no-op conditions:
   - forum.url and agent_name not configured.
   - Server unreachable (uses cached data if available, else silent skip).
   - No new threads since last prompt and no pending @mentions.
   - Inbox endpoint absent / error -> no mention line; generic behavior unchanged.
+  - Status publish failure (forum-status-publish.json) -> silently swallowed;
+    existing output unaffected.
 
 Design doc: forum/spec.md
 """
@@ -59,9 +70,38 @@ SURFACED_CURSOR_PATH = os.path.join(ENGRAM_HOME, "forum-surfaced-cursor.txt")
 # for manual override / back-compat only.
 HOOK_CACHE_PATH = os.path.join(ENGRAM_HOME, "forum-hook-cache.json")
 
+# Publish state file — separate from the 30s-TTL cache; its own throttle interval.
+STATUS_PUBLISH_PATH = os.path.join(ENGRAM_HOME, "forum-status-publish.json")
+
 CACHE_TTL_SECONDS = 30
 
 _DEFAULT_FORUM_URL = "http://localhost:5002"
+
+# ---------------------------------------------------------------------------
+# _status_derive import (spec §2, Q2)
+#
+# Resolve tools/ in BOTH topologies: plugin (CLAUDE_PLUGIN_ROOT/tools) AND
+# source-tree/dev (hooks/claude/ -> ../../tools). Keying solely off
+# CLAUDE_PLUGIN_ROOT would silently no-op auto-publish in a dev checkout —
+# exactly where the feature is most likely to be dogfooded (Kepler S1, #1087).
+# If the import fails for ANY reason, derive_own_status is set to None and the
+# publish silently no-ops — the existing thread/mention surfacing is unaffected.
+# ---------------------------------------------------------------------------
+
+_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
+_candidates = []
+if _plugin_root:
+    _candidates.append(Path(_plugin_root) / "tools")          # plugin: hooks/ -> tools/
+_candidates.append(Path(__file__).resolve().parents[2] / "tools")  # repo: hooks/claude/ -> tools/
+for _c in _candidates:
+    if (_c / "_status_derive.py").exists():
+        sys.path.insert(0, str(_c))
+        break
+try:
+    from _status_derive import derive_own_status, _read_loop_mode
+except Exception:
+    derive_own_status = None  # publish becomes a no-op; never break the hook
+    _read_loop_mode = None    # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +233,135 @@ def _save_cache(threads: list, mentions: list) -> None:
             tmp.unlink()
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Publish state helpers (separate from the 30s cache)
+# ---------------------------------------------------------------------------
+
+def _load_publish_state() -> Optional[dict]:
+    """Load the last-published status state. Returns None if absent/invalid."""
+    try:
+        return json.loads(Path(STATUS_PUBLISH_PATH).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _save_publish_state(state: str, activity: Optional[str],
+                        queue: list, cadence: Optional[int],
+                        published_at: float) -> None:
+    """Save publish state atomically (same discipline as _save_cache)."""
+    dest = Path(STATUS_PUBLISH_PATH)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    try:
+        payload = {
+            "state": state,
+            "activity": activity,
+            "queue": queue,
+            "cadence": cadence,
+            "published_at": published_at,
+        }
+        tmp.write_text(json.dumps(payload))
+        os.replace(tmp, dest)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Publish decision helpers (pure — unit-testable without a live server)
+# ---------------------------------------------------------------------------
+
+def _should_publish(
+    last: Optional[dict],
+    current_tuple: tuple,
+    now: float,
+    throttle: float,
+) -> bool:
+    """Return True if a status publish should fire.
+
+    Rules (spec Q3):
+      (a) No last file → publish.
+      (b) Status tuple changed since last publish → publish.
+      (c) Unchanged AND within throttle window → skip.
+      (d) Unchanged AND past throttle window → publish.
+
+    Args:
+        last:           The last-published state dict (None if no file).
+        current_tuple:  (state, activity, queue_tuple, cadence) — queue must be
+                        a hashable type (tuple) so equality works correctly.
+        now:            Current epoch float.
+        throttle:       Throttle interval in seconds.
+    """
+    if last is None:
+        return True
+
+    # Compare current tuple against last-published tuple.
+    # queue is stored as a list in JSON; normalise both sides to tuple for equality.
+    last_tuple = (
+        last.get("state"),
+        last.get("activity"),
+        tuple(last.get("queue") or []),
+        last.get("cadence"),
+    )
+    if current_tuple != last_tuple:
+        return True
+
+    # Unchanged — check throttle window.
+    last_published_at = last.get("published_at", 0) or 0
+    return (now - last_published_at) > throttle
+
+
+def _apply_sleep_guard(
+    state: str,
+    activity: Optional[str],
+    queue: list,
+    cadence: Optional[int],
+    last: Optional[dict],
+    now: float,
+) -> tuple:
+    """Apply the Q4 mid-sleep guard.
+
+    If there is no loop marker AND the last-published state was 'sleeping' AND
+    we are still within the throttle window, keep ALL of the derived fields at
+    their last-published 'sleeping' values (state, activity, queue, AND cadence)
+    to suppress the false-wake publish. Common case self-corrects on the next
+    genuine wake.
+
+    Cadence must be restored alongside the other fields: derive_own_status with
+    no loop marker returns cadence=None, but the last sleeping publish carried
+    the sleep cadence (e.g. 270). If only state/activity/queue were restored,
+    the cadence mismatch (None vs 270) would make _should_publish see a changed
+    tuple and fire a spurious POST that DROPS expected_republish_seconds — the
+    server would then fall back to its global window. (Reviewer catch, #1077 r2.)
+
+    Returns (state, activity, queue, cadence) — possibly overridden.
+    """
+    if _read_loop_mode is None:
+        return state, activity, queue, cadence
+
+    loop = _read_loop_mode()
+    if loop is not None:
+        # Loop marker present — genuine wake. No guard needed.
+        return state, activity, queue, cadence
+
+    if last is None:
+        return state, activity, queue, cadence
+
+    if last.get("state") != "sleeping":
+        return state, activity, queue, cadence
+
+    last_published_at = last.get("published_at", 0) or 0
+    last_cadence = last.get("cadence")
+    throttle = max(last_cadence or 0, 60)
+    if (now - last_published_at) <= throttle:
+        # Within the window — keep ALL last-sleeping fields (incl. cadence).
+        return "sleeping", last.get("activity"), last.get("queue") or [], last_cadence
+
+    return state, activity, queue, cadence
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +550,65 @@ def main() -> None:
     # ── Build injection block ─────────────────────────────────────────────────
     # Mention line (higher priority) goes ABOVE the generic threads line.
     mention_line = _format_mention_line(mentions or [])
+
+    # ── Auto-publish derived status (Q1–Q4, spec #1077 part 1) ───────────────
+    # This block runs AFTER the fetch/format above but BEFORE the final output.
+    # Its success/failure must NEVER gate the existing thread/mention output.
+    try:
+        if derive_own_status is not None and agent_name:
+            _now = time.time()
+
+            # Step 2: derive status from local signals.
+            state, activity, queue, cadence = derive_own_status(agent_name)
+
+            # Step 3: apply Q4 sleep guard (restores cadence too — see fn doc).
+            last_pub = _load_publish_state()
+            state, activity, queue, cadence = _apply_sleep_guard(
+                state, activity, queue, cadence, last_pub, _now
+            )
+
+            # Step 4: compute throttle interval.
+            throttle = max(cadence or 0, 60)
+
+            # Step 5: decide whether to publish.
+            current_tuple = (state, activity, tuple(queue), cadence)
+            if _should_publish(last_pub, current_tuple, _now, throttle):
+                # Step 6: POST to /api/agents/status with timeout=2.
+                # Only on success, write the publish state file.
+                payload: dict = {
+                    "agent": agent_name,
+                    "state": state,
+                    "activity": activity,
+                    "queue": queue,
+                }
+                # cadence None → omit (server uses its global window);
+                # 0 (on-call) or positive → include (mirror cmd_status_auto).
+                if cadence is not None:
+                    payload["expected_republish_seconds"] = cadence
+
+                post_data = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(
+                    f"{forum_url}/api/agents/status",
+                    data=post_data,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=2) as resp:
+                        resp.read()  # consume response body; discard result
+                    # POST succeeded — advance the throttle timestamp.
+                    _save_publish_state(state, activity, queue, cadence, _now)
+                except Exception:
+                    # POST failed — do NOT advance the timestamp so the next
+                    # prompt retries.
+                    pass
+    except Exception:
+        # Whole publish block raised — swallow completely. The existing
+        # thread/mention output is unaffected.
+        pass
 
     # ── Exit silently if nothing to report ────────────────────────────────────
     if not threads and not mention_line:

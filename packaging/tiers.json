@@ -244,6 +244,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/_status_derive.py",
+      "tier": "convenience"
+    },
+    {
       "path": ".githooks/pre-push",
       "tier": "dev"
     },
