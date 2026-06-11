@@ -120,9 +120,14 @@ FIXTURE_CONTEXT: dict = {
             "last_activity_agent": "Agent-A",
         },
     ],
-    "online_agents": [
-        {"name": "Cipher", "avatar_seed": "Cipher", "pair_initials": "L.S."},
-        {"name": "Ledger", "avatar_seed": "Ledger", "pair_initials": None},
+    "board": [
+        {"name": "Cipher", "avatar_seed": "Cipher", "pair_initials": "L.S.",
+         "state": "working", "activity": "reviewing PR #42",
+         "queue": ["PR-42", "PR-43"], "status_stale": False},
+        {"name": "Ledger", "avatar_seed": "Ledger", "pair_initials": None,
+         "state": "idle", "activity": None, "queue": [], "status_stale": True},
+        {"name": "Dozer", "avatar_seed": "Dozer", "pair_initials": None,
+         "state": "offline", "activity": None, "queue": [], "status_stale": False},
     ],
 }
 
@@ -155,6 +160,46 @@ def render_forum(app) -> str:
     with app.app_context():
         from flask import render_template
         return render_template("forum.html", **FIXTURE_CONTEXT)
+
+
+# Shared sidebar context (stats + board) reused by the thread/search render
+# helpers — these three pages all carry the status-board sidebar (#1105).
+_SIDEBAR_CTX = {
+    "stats": FIXTURE_CONTEXT["stats"],
+    "categories": FIXTURE_CONTEXT["categories"],
+    "board": FIXTURE_CONTEXT["board"],
+}
+
+# Minimal thread stub — thread.html's sidebar only needs stats+board; the body
+# just needs to render without error. Mirrors the thread-list entry shape.
+_FIXTURE_THREAD = {
+    "id": 1,
+    "title": "Test thread",
+    "slug": "general",
+    "category": "general",
+    "category_slug": "general",
+    "author": {"name": "Agent-A", "avatar_seed": "Agent-A", "pair_initials": "L.W."},
+    "created_at": "2026-05-31T06:00:00Z",
+    "last_activity_at": "2026-05-31T06:00:00Z",
+    "reply_count": 0,
+    "pinned": False,
+    "unresolved": False,
+    "kind": "discussion",
+}
+
+
+def render_thread(app) -> str:
+    """Render thread.html (a status-board surface — the #1105 r1 regression site)."""
+    with app.app_context(), app.test_request_context("/thread/1"):
+        from flask import render_template
+        return render_template("thread.html", thread=_FIXTURE_THREAD, posts=[], **_SIDEBAR_CTX)
+
+
+def render_search(app) -> str:
+    """Render search.html (a status-board surface — the #1105 r1 regression site)."""
+    with app.app_context(), app.test_request_context("/search?q=engram"):
+        from flask import render_template
+        return render_template("search.html", q="engram", results=[], mode_used="hybrid", **_SIDEBAR_CTX)
 
 
 # ---------------------------------------------------------------------------
@@ -288,18 +333,53 @@ class TestTagClasses:
         assert ".thread__tag--tools-hooks" in html
 
 
-class TestOnlineSidebar:
-    """Online agents are rendered in the sidebar."""
+class TestStatusBoardSidebar:
+    """The full status board is rendered in the sidebar (#956 webpage view)."""
 
-    def test_online_agent_names(self, app):
+    def test_board_agent_names(self, app):
         html = render_forum(app)
-        for a in FIXTURE_CONTEXT["online_agents"]:
+        for a in FIXTURE_CONTEXT["board"]:
             assert a["name"] in html
 
-    def test_online_count_in_sidebar(self, app):
+    def test_status_board_heading(self, app):
         html = render_forum(app)
-        # stats.online = 5 appears in sidebar heading "Online now · 5"
-        assert "Online now" in html
+        assert "Status board" in html
+
+    def test_state_emoji_rendered(self, app):
+        html = render_forum(app)
+        assert "🟢" in html  # working (Cipher)
+        assert "🟡" in html  # idle (Ledger)
+        assert "⚪" in html  # offline (Dozer)
+
+    def test_activity_and_queue_rendered(self, app):
+        html = render_forum(app)
+        assert "reviewing PR #42" in html  # Cipher's activity
+        assert "in queue" in html          # queue chip (Cipher has 2 queued)
+
+    def test_offline_row_muted(self, app):
+        html = render_forum(app)
+        assert "board__row--offline" in html  # Dozer is offline
+
+    def test_stale_marker_rendered(self, app):
+        html = render_forum(app)
+        assert "⏳" in html  # ⏳ — Ledger is stale
+
+    # The status-board sidebar is duplicated across all three page templates
+    # (forum.html / thread.html / search.html). #1105 r1 shipped a regression
+    # because only forum.html was updated + only forum.html was test-covered.
+    # These two assert the board renders on the other two surfaces too, so a
+    # thread/search sidebar regression fails CI rather than shipping silently.
+    def test_thread_page_renders_board(self, app):
+        html = render_thread(app)
+        assert "Status board" in html
+        assert "board__row" in html
+        assert "🟢" in html  # working agent (Cipher) from the shared fixture
+
+    def test_search_page_renders_board(self, app):
+        html = render_search(app)
+        assert "Status board" in html
+        assert "board__row" in html
+        assert "🟢" in html
 
 
 class TestAvatarFilterIsConsumed:

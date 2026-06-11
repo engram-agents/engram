@@ -288,7 +288,7 @@ def create_app(
             )
         else:
             threads = db.list_threads(g.conn, category=category, sort=sort)
-        online_agents, online_count, registered = db.list_online(g.conn)
+        board, online_count, registered = db.list_board(g.conn)
         open_threads = db.count_open_threads(g.conn)
         citations_exchanged = db.count_citations(g.conn)
         return render_template(
@@ -301,7 +301,7 @@ def create_app(
             },
             categories=categories,
             threads=threads,
-            online_agents=online_agents,
+            board=board,
             active_category=category,
             active_sort=sort,
             active_view=view,
@@ -330,7 +330,7 @@ def create_app(
                 v["note_html"] = render_post_body(v["note"])
 
         categories = db.list_categories(g.conn)
-        online_agents, online_count, registered = db.list_online(g.conn)
+        board, online_count, registered = db.list_board(g.conn)
         open_threads = db.count_open_threads(g.conn)
         citations_exchanged = db.count_citations(g.conn)
         return render_template(
@@ -344,7 +344,7 @@ def create_app(
                 "citations_exchanged": citations_exchanged,
             },
             categories=categories,
-            online_agents=online_agents,
+            board=board,
         )
 
     # ------------------------------------------------------------------
@@ -366,7 +366,7 @@ def create_app(
         results, mode_used = _run_search(g.conn, q, mode)
 
         categories = db.list_categories(g.conn)
-        online_agents, online_count, registered = db.list_online(g.conn)
+        board, online_count, registered = db.list_board(g.conn)
         open_threads = db.count_open_threads(g.conn)
         citations_exchanged = db.count_citations(g.conn)
         return render_template(
@@ -381,7 +381,7 @@ def create_app(
                 "citations_exchanged": citations_exchanged,
             },
             categories=categories,
-            online_agents=online_agents,
+            board=board,
         )
 
     # ------------------------------------------------------------------
