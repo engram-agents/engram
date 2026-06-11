@@ -286,6 +286,7 @@ def emit_codex_plugin_json(
     repo_root: str,
     profile: dict[str, Any],
     build_version: str | None = None,
+    plugin_data: dict | None = None,
 ) -> None:
     """Emit .codex-plugin/plugin.json at the bundle root.
 
@@ -306,10 +307,17 @@ def emit_codex_plugin_json(
         Pre-computed build version string (from compute_build_version).
         When provided, this overrides the version in the source plugin.json.
         When None, falls back to the source plugin.json version.
+    plugin_data:
+        Pre-loaded plugin.json dict (already resolved via source_root in the
+        caller). When provided, the file read is skipped — avoids a redundant
+        open and ensures source_root is honoured correctly.
     """
-    src_plugin = os.path.join(repo_root, "plugin.json")
-    with open(src_plugin, encoding="utf-8") as f:
-        src_data = json.load(f)
+    if plugin_data is not None:
+        src_data = plugin_data
+    else:
+        src_plugin = os.path.join(repo_root, "plugin.json")
+        with open(src_plugin, encoding="utf-8") as f:
+            src_data = json.load(f)
 
     codex_plugin_dir = os.path.join(plugin_root, ".codex-plugin")
     os.makedirs(codex_plugin_dir, exist_ok=True)
@@ -872,6 +880,9 @@ def build_plugin(
         manifest_path = os.path.join(repo_root, "packaging", "tiers.json")
         manifest = load_manifest(manifest_path)
 
+    # source_root — relative to repo_root; default "." preserves current behavior
+    source_root = manifest.get("source_root", ".")
+
     # Compute build version once — threaded through to all version-bearing outputs
     # so all emitted files carry the same stamp within a single build invocation.
     build_version = compute_build_version(repo_root)
@@ -916,7 +927,7 @@ def build_plugin(
         _die("server.py not in shipped root entries — manifest may be misconfigured")
     for entry in root_entries:
         p = entry["path"]
-        src = os.path.join(repo_root, p)
+        src = os.path.join(repo_root, source_root, p)
         if not os.path.exists(src):
             _die(f"Manifest root entry {p!r} does not exist at {src}")
         dst = os.path.join(plugin_root, p)
@@ -936,7 +947,7 @@ def build_plugin(
 
     # Iterate SHIPPED_PATHS that match '^tools/'
     for p in [e["path"] for e in shipped_entries if e["path"].startswith("tools/")]:
-        src = os.path.join(repo_root, p)
+        src = os.path.join(repo_root, source_root, p)
         if not os.path.exists(src):
             _die(f"Manifest entry {p} does not exist at {src}")
         dst = os.path.join(plugin_root, p)
@@ -957,7 +968,7 @@ def build_plugin(
     os.makedirs(os.path.join(plugin_root, "templates"), exist_ok=True)
 
     for p in [e["path"] for e in shipped_entries if e["path"].startswith("templates/")]:
-        src = os.path.join(repo_root, p)
+        src = os.path.join(repo_root, source_root, p)
         if not os.path.exists(src):
             _die(f"Manifest entry {p} does not exist at {src}")
         dst = os.path.join(plugin_root, p)
@@ -975,7 +986,7 @@ def build_plugin(
     # ── 2. Manifests ─────────────────────────────────────────────────────────
 
     _log(f"Writing plugin.json (version={build_version!r})")
-    src_plugin_path = os.path.join(repo_root, "plugin.json")
+    src_plugin_path = os.path.join(repo_root, source_root, "plugin.json")
     with open(src_plugin_path, encoding="utf-8") as f:
         plugin_data = json.load(f)
     plugin_data["version"] = build_version
@@ -987,7 +998,7 @@ def build_plugin(
     if target == "codex":
         # Codex: emit .codex-plugin/plugin.json instead of a raw .mcp.json copy
         _log("  (codex) emitting .codex-plugin/plugin.json")
-        emit_codex_plugin_json(plugin_root, repo_root, profile, build_version=build_version)
+        emit_codex_plugin_json(plugin_root, repo_root, profile, build_version=build_version, plugin_data=plugin_data)
         _log("  (codex) emitting .mcp.json (no ${CLAUDE_PLUGIN_ROOT})")
         emit_codex_mcp_json(plugin_root, repo_root, profile, engram_home)
         copied_paths.append(".codex-plugin/plugin.json")
@@ -1016,7 +1027,7 @@ def build_plugin(
     )
 
     # Read source hooks.json
-    src_hooks_path = os.path.join(repo_root, "hooks", "hooks.json")
+    src_hooks_path = os.path.join(repo_root, source_root, "hooks", "hooks.json")
     with open(src_hooks_path, encoding="utf-8") as f:
         hooks_data = json.load(f)
 
@@ -1048,7 +1059,7 @@ def build_plugin(
     copied_paths.append("hooks/hooks.json")
 
     # Copy hook scripts filtered through the manifest predicate
-    hooks_dir = os.path.join(repo_root, "hooks", "claude")
+    hooks_dir = os.path.join(repo_root, source_root, "hooks", "claude")
     # Enumerate: find hooks/claude -maxdepth 1 \( -name '*.py' -o -name '*.sh' \) | sort
     hook_sources = sorted(
         os.path.join(hooks_dir, fname)
@@ -1084,7 +1095,7 @@ def build_plugin(
     _log("Copying skills → plugin skills/ (manifest-filtered)")
     os.makedirs(os.path.join(plugin_root, "skills"), exist_ok=True)
 
-    skills_dir = os.path.join(repo_root, "skills", "claude")
+    skills_dir = os.path.join(repo_root, source_root, "skills", "claude")
     if not os.path.isdir(skills_dir):
         _die(f"skills/claude/ not found at {skills_dir}")
 
@@ -1112,7 +1123,7 @@ def build_plugin(
     _log("Copying agents → plugin agents/ (manifest-filtered)")
     os.makedirs(os.path.join(plugin_root, "agents"), exist_ok=True)
 
-    agents_dir = os.path.join(repo_root, "agents", "claude")
+    agents_dir = os.path.join(repo_root, source_root, "agents", "claude")
     if not os.path.isdir(agents_dir):
         _die(f"agents/claude/ not found at {agents_dir}")
 
@@ -1148,7 +1159,7 @@ def build_plugin(
     _log("Copying output-styles → plugin output-styles/ (manifest-filtered)")
     os.makedirs(os.path.join(plugin_root, "output-styles"), exist_ok=True)
 
-    styles_dir = os.path.join(repo_root, "output-styles", "claude")
+    styles_dir = os.path.join(repo_root, source_root, "output-styles", "claude")
     if not os.path.isdir(styles_dir):
         _die(f"output-styles/claude/ not found at {styles_dir}")
 
