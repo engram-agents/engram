@@ -46,7 +46,12 @@ decides whether you write the marker or check it:
 - **A CONTINUATION** — you re-entered on your own: a `ScheduleWakeup` fired (its
   prompt is the formalized stub from Step 2 — *"read the marker; if absent,
   stop"*), or a `/loop` prompt persisted across compaction. You were NOT freshly
-  asked. → Run the stale-check:
+  asked. → **Context-reset check first**: if warm-briefing is NOT already in your
+  context (your context was just reset — you'll see a `[source=compact]` or
+  `[source=startup]` session banner, or a compaction summary at the top of your
+  context), **read `~/.engram/warm-briefing.md` before anything else** — the same
+  rule as any session start after a context reset. Normal same-session wakes skip
+  this (warm-briefing is already in context). Then run the stale-check:
 
   ```bash
   cat ~/.engram/loop-mode.json 2>/dev/null
@@ -57,14 +62,27 @@ decides whether you write the marker or check it:
     re-fire is a **MISFIRE** (stale-marker misfire failure mode). Do NOT run the loop body, and do NOT
     re-arm. Note "stale loop — marker absent, stopping" and stop.
 
+  **Why warm-briefing on post-compaction wakes — two live incidents:**
+  - *Post-compaction*: when a compaction fires mid-loop, the stub is the entire
+    user message on the next turn. The PostCompact hook injects an advisory, but
+    the loop's task-momentum overrides it. Without an explicit warm-briefing step
+    here, the agent jumps straight to work — skipping the relational reset on every
+    compaction boundary. Over N compactions, relational continuity degrades silently
+    while task-thread continuity looks fine. (Luria incident, 2026-06-10 — issue #1081.)
+  - *Fresh terminal / cross-day*: if a sleep cycle failed to disarm the loop (the
+    primary fix is `engram-sleep` removing the marker; this is the backstop), the
+    stub fires into a fresh session with no prior context at all. Reading the marker
+    first produces a stale "continue from yesterday" orientation. Warm-briefing
+    re-grounds identity before the marker is consulted. (Aleph incident, 2026-06-10.)
+
 **The marker is the source of truth — anchor on it, not on recollection.** It
 lives on the filesystem, so it survives compaction; your memory of "did I
 already start this loop?" does not. A fresh start and a continuation are
 distinct events — and with the formalized stub (Step 2), textually distinct too:
 a START is a real `/loop <topic>` from the user; a CONTINUATION is the stub whose
-own first instruction is "read the marker; if absent, stop." You never have to
-tell them apart from memory: a START writes the marker (Step 1), a CONTINUATION
-reads it (above). Both paths converge on the marker, which is why the guard is
+opening phrase is "Loop continuation." — unambiguous regardless of what the stub
+asks the agent to do first. You never have to tell them apart from memory: a START
+writes the marker (Step 1), a CONTINUATION reads it (above). Both paths converge on the marker, which is why the guard is
 robust across compaction.
 
 ---
@@ -197,17 +215,18 @@ cannot be stale.)*
    state.** Don't pack the loop's brief into the `ScheduleWakeup` prompt; point
    at the marker. Arm every wakeup with the same self-declaring stub:
 
-   > *Loop continuation. Read `~/.engram/loop-mode.json` for the loop topic,
-   > instructions, and current state. **If the file is absent → the loop already
-   > ended; STOP, do not execute, do not re-arm.** If present → continue per its
-   > contents.*
+   > *Loop continuation. **If warm-briefing is not already in your context**
+   > (your context was just reset — you'll see a `[source=compact]` or
+   > `[source=startup]` session banner, or a compaction summary in your prior
+   > context), **read `~/.engram/warm-briefing.md` first** before proceeding.
+   > Then: read `~/.engram/loop-mode.json` for the loop topic, instructions, and
+   > current state. **If the file is absent → the loop already ended; STOP, do
+   > not execute, do not re-arm.** If present → continue per its contents.*
 
-   This makes the Step-0 guard the prompt's FIRST instruction (nothing to
-   detect), and makes a continuation-stub textually distinct from a fresh user
-   start (`/loop <real topic>`) — which is what removes the fresh-vs-misfire
-   ambiguity at the root. (A UserPromptSubmit hook emitting the same misfire line
-   on an absent marker is an optional deterministic backstop — not needed given
-   the self-declaring stub.)
+   The warm-briefing step is conditional — only when context was just reset
+   (post-compaction `[source=compact]`, or fresh-terminal/cross-day
+   `[source=startup]`). Same-session wakes skip it (warm-briefing is already in
+   context). (Rationale: Step 0 CONTINUATION incident note above.)
 3. **Update-then-arm ritual (every iteration end, in this order):**
 
    a. **Compose current state**: pending work, in-flight fairies, key node IDs, next step.
