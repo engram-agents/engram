@@ -39,11 +39,11 @@ def main() -> int:
         return 2
     cohort_start = sys.argv[3]
 
-    # Derive home from THIS script's location (script lives at <home>/tools/),
-    # so each agent's copy writes to its own sessions dir by construction —
-    # cross-contamination via missing ENGRAM_HOME is impossible. ENGRAM_HOME
-    # env override remains for sandbox testing.
-    engram_home = os.environ.get("ENGRAM_HOME") or str(Path(__file__).resolve().parent.parent)
+    # Default to ~/.engram regardless of where this script is installed.
+    # Path(__file__).resolve() would follow symlinks (tools/ is a symlink in
+    # plugin topology) and land in the plugin root, not the data home. ENGRAM_HOME
+    # env override remains for sandbox / multi-agent testing.
+    engram_home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
     sessions_dir = os.path.join(engram_home, "sessions")
     marker_path = os.path.join(sessions_dir, "last-sleep-success.json")
 
