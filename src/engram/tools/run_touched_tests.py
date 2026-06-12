@@ -65,6 +65,30 @@ ALWAYS_FULL_PATTERNS: list[str] = [
 
 
 # ---------------------------------------------------------------------------
+# Repo-root resolution
+# ---------------------------------------------------------------------------
+
+
+def _find_repo_root(start: Path) -> Path:
+    """Walk upward from *start* to find the repo root.
+
+    The repo root is the lowest ancestor directory that contains BOTH
+    ``pytest.ini`` and a ``tests/`` sub-directory.  This marker-walk is
+    robust to file moves: adding one more ``parent`` call in the caller
+    re-breaks after the next restructure, but the markers travel with the
+    project.
+
+    Raises RuntimeError if no qualifying ancestor is found.
+    """
+    for p in [start, *start.parents]:
+        if (p / "pytest.ini").exists() and (p / "tests").is_dir():
+            return p
+    raise RuntimeError(
+        f"repo root (pytest.ini + tests/) not found above {start}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Git helpers
 # ---------------------------------------------------------------------------
 
@@ -833,8 +857,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.repo_root:
         repo_root = os.path.abspath(args.repo_root)
     else:
-        # This script is at src/engram/tools/run_touched_tests.py → parent.parent.parent is repo root
-        repo_root = str(Path(__file__).resolve().parent.parent.parent)
+        # Walk upward from this file's directory until we find the repo root
+        # (the directory containing both pytest.ini and tests/).  A fixed
+        # parent-count such as .parent.parent.parent was off-by-one after the
+        # Phase-1 restructure moved this file from tools/ to src/engram/tools/,
+        # and would break again on any future move.  The marker-walk is stable.
+        repo_root = str(_find_repo_root(Path(__file__).resolve().parent))
 
     # --audit-imports: report server-import violations
     if args.audit_imports:

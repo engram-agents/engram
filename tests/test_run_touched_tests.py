@@ -90,6 +90,61 @@ def _build_real_import_graph() -> dict[str, set[str]]:
 
 # ---------------------------------------------------------------------------
 # ═══════════════════════════════════════════════════════════════════════════
+# 0. Repo-root resolution — regression guard for issue #1122
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Mutation-checkable guard: if someone reverts to parent.parent.parent, the
+# test goes red (that call returns .../src, not the repo root).
+# ---------------------------------------------------------------------------
+
+
+class TestRepoRootResolution:
+    """_find_repo_root must resolve to the actual repo root, not src/."""
+
+    def test_find_repo_root_from_module_file(self):
+        """Starting from the runner module's directory, the walk reaches repo root."""
+        runner_dir = Path(_runner.__file__).resolve().parent
+        result = _runner._find_repo_root(runner_dir)
+
+        # Must contain the two marker files that define the repo root
+        assert (result / "pytest.ini").exists(), (
+            f"_find_repo_root returned {result!r} which has no pytest.ini"
+        )
+        assert (result / "tests").is_dir(), (
+            f"_find_repo_root returned {result!r} which has no tests/ directory"
+        )
+
+    def test_result_is_not_src_dir(self):
+        """The resolved repo root must not be the src/ directory (the off-by-one target)."""
+        runner_dir = Path(_runner.__file__).resolve().parent
+        result = _runner._find_repo_root(runner_dir)
+
+        assert result.name != "src", (
+            f"_find_repo_root returned {result!r} — this is the src/ directory, "
+            "not the repo root.  The off-by-one bug (parent.parent.parent) is back."
+        )
+
+    def test_result_matches_known_repo_root(self):
+        """The resolved root equals the repo root as computed by tests/ conftest path."""
+        runner_dir = Path(_runner.__file__).resolve().parent
+        result = _runner._find_repo_root(runner_dir)
+
+        # REPO_ROOT in this file is computed from Path(__file__).resolve().parents[1]
+        # (tests/conftest.py is at tests/, so parents[1] is the repo root).
+        assert result == REPO_ROOT, (
+            f"_find_repo_root({runner_dir!r}) returned {result!r}, "
+            f"expected {REPO_ROOT!r}"
+        )
+
+    def test_raises_on_no_markers(self, tmp_path: Path):
+        """RuntimeError is raised when no ancestor has the marker files."""
+        # tmp_path has no pytest.ini or tests/ → walk exhausts without finding root
+        with pytest.raises(RuntimeError, match="repo root.*not found"):
+            _runner._find_repo_root(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
 # 1. Mapping completeness — tag-once pattern
 # ═══════════════════════════════════════════════════════════════════════════
 # ---------------------------------------------------------------------------
