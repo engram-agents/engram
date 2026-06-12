@@ -3,7 +3,7 @@ name: engram-collaborating-loop
 description: >
   Multi-agent coordination loop: pair a real-time Monitor wake (counterpart's
   letter/baton arrives → your loop wakes in ~2s) with a per-state ScheduleWakeup
-  heartbeat fallback (270s self-wake; fairy-wait may relax). Use when two ENGRAM agents on a shared host are working a
+  heartbeat fallback (1800s self-wake floor; fairy-wait relaxes to the 3300s ceiling). Use when two ENGRAM agents on a shared host are working a
   loop together and need low-latency hand-offs WITHOUT the cadence-as-signal
   mutual-waiting spiral. This is a KIND of engram-loop — it inherits all loop
   formality (the loop-mode.json marker lifecycle, drowsiness behavior) from
@@ -18,8 +18,8 @@ description: >
 When two ENGRAM agents work a loop together on a shared host, the hard part
 isn't the work — it's the hand-off latency. A letter from your counterpart
 lands in `/home/agents-shared/inter-agent/`, but it doesn't interrupt your
-pending `ScheduleWakeup`; you only see it on your next heartbeat. At a tight
-270s pace that's a few-minute lag. At a relaxed 1200s+ pace it's a many-minute
+pending `ScheduleWakeup`; you only see it on your next heartbeat. At an 1800s
+floor that's a ~30-min lag. At the relaxed 3300s ceiling it's a ~55-min
 lag. This skill removes that lag with two mechanisms that **back each other
 up**.
 
@@ -84,11 +84,11 @@ The only harness-guaranteed wake is the **task-notification** from a background 
 
 | State | Primary wake available | Cadence |
 |---|---|---|
-| **Fairy running** (background agent via Agent tool) | Task-notification on completion (harness-guaranteed) | 600–1200s (10–20 min) |
-| **Monitor running, no fairy** (letter Monitor armed, no background agent) | Monitor events (can die silently) | 270s floor |
-| **Forum-only / no Monitor / no fairy** | Forum mention (not guaranteed) | 270s floor |
+| **Fairy running** (background agent via Agent tool) | Task-notification on completion (harness-guaranteed) | 3300s (55 min) — the relaxed ceiling |
+| **Monitor running, no fairy** (letter Monitor armed, no background agent) | Monitor events (can die silently) | 1800s (30 min) floor |
+| **Forum-only / no Monitor / no fairy** | Forum mention (not guaranteed) | 1800s (30 min) floor |
 
-Fairy-wait: when you have dispatched a background agent and it is still running, arm a long heartbeat. The task-notification wakes you when the fairy completes; the heartbeat is a genuine fallback, not the primary signal. Event-only (no fairy): arm 270s regardless of Monitor state — the Monitor is a reliability improvement, not a guarantee.
+Fairy-wait: when you have dispatched a background agent and it is still running, arm the 3300s (55-min) ceiling. The task-notification wakes you when the fairy completes; the heartbeat is a genuine fallback, not the primary signal. Event-only (no fairy): arm 1800s (30 min) regardless of Monitor state — the Monitor is a reliability improvement, not a guarantee.
 
 The Monitor-backed combo (Mechanism 1 + Mechanism 2) kills the **cadence-as-signal
 spiral** — the Monitor makes responsiveness independent of heartbeat pace —
@@ -118,22 +118,23 @@ Follow `engram-loop` Step 0/1: decide START vs CONTINUATION and, on a fresh
 start, write `~/.engram/loop-mode.json` with your cadence. Write your starting cadence here:
 
 ```json
-{ "cadence_seconds": 270, "pacer": "scheduleWakeup", "kind": "work", "...": "..." }
+{ "cadence_seconds": 1800, "pacer": "scheduleWakeup", "kind": "work", "...": "..." }
 ```
 
-(Fairy-wait states may relax `cadence_seconds` to 600–1200s (10–20 min) — see Mechanism 2.)
+(Fairy-wait states may relax `cadence_seconds` to the 3300s (55-min) ceiling — see Mechanism 2.)
 
 The marker is the loop's source of truth across compaction — see `engram-loop`.
 Do not duplicate its lifecycle logic; just record the current cadence in it, and
 update it when you transition between states.
 
-> **On cadence vs `engram-loop`'s 270s default:** `engram-loop` says hold the
-> tight default unless the operator explicitly says otherwise. **Loading this
+> **On cadence vs `engram-loop`'s 1800s default:** `engram-loop` says hold the
+> default floor unless the operator explicitly says otherwise. **Loading this
 > skill IS that instruction for fairy-wait states only** — when the harness
-> provides a self-side re-invocation on sub-agent completion, relaxing to 600–1200s (10–20 min)
-> is safe. For all other states (counterpart-wait, idle, monitor-watching),
-> hold 270s even with a Monitor armed — the Monitor requires the counterpart
-> to act first, and that is not a self-sufficient wake. See Mechanism 2.
+> provides a self-side re-invocation on sub-agent completion, relaxing to the
+> 3300s (55-min) ceiling is safe. For all other states (counterpart-wait, idle,
+> monitor-watching), hold the 1800s (30-min) floor even with a Monitor armed —
+> the Monitor requires the counterpart to act first, and that is not a
+> self-sufficient wake. See Mechanism 2.
 
 ## Step 2 — Arm the letter Monitor (filter on recipient)
 
@@ -271,14 +272,14 @@ consequential post of the day.
 
 - **The heartbeat is the liveness guarantee, not the channel.** The Monitor is
   the latency channel (responsiveness); the heartbeat is the floor (liveness).
-  Relaxation is a **per-state decision**: fairy-wait states may use 600–1200s (10–20 min)
+  Relaxation is a **per-state decision**: fairy-wait states may use the 3300s (55-min) ceiling
   because the harness re-invokes on task-notification (harness-guaranteed wake); all other
-  states use 270s even with a Monitor armed — a Monitor event requires the
+  states use the 1800s (30-min) floor even with a Monitor armed — a Monitor event requires the
   counterpart to act first, which is not a self-sufficient wake. Never leave
   yourself in a state where only others can wake you: if both sides
-  simultaneously relax past 270s in a non-fairy-wait state, the result is
-  mutual-wait deadlock. Don't drop to 270s "to be safe" in fairy-wait; do
-  stay at 270s "to be safe" everywhere else.
+  simultaneously relax past 1800s in a non-fairy-wait state, the result is
+  mutual-wait deadlock. In fairy-wait, don't cling to the 1800s floor "to be safe" —
+  relax to the 3300s ceiling; everywhere else, do hold the 1800s floor.
 - **Silence from the Monitor means "no letters," which is fine** — but a Monitor
   that *died* also looks like silence. That's exactly why the self-heartbeat
   is non-negotiable (whatever its per-state cadence): it's the periodic re-check that catches a dead Monitor.
@@ -320,8 +321,11 @@ counterpart-wake gap. (ENGRAM: the spiral incident and the combo verification
 are filed as observations in the dev graph; this skill is their reusable
 encoding.) The pacing rule was refined on 2026-06-06 after operating experience
 showed that blanket heartbeat relaxation re-introduces deadlock risk in non-fairy-wait
-states: cadence is now per-state (fairy-wait may relax; all other states hold 270s),
-enforcing the self-sufficient-wake invariant.
+states: cadence is now per-state (fairy-wait may relax to the 3300s/55-min ceiling; all
+other states hold the 1800s/30-min floor), enforcing the self-sufficient-wake invariant.
+(Floor/ceiling raised from the original 270s/1500s to 1800s/3300s on 2026-06-12 — the
+Anthropic prompt-cache window is far longer in practice than the original 5-min assumption,
+so the tighter pacing wasted wakes without a cache benefit.)
 
 ---
 

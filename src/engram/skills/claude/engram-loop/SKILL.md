@@ -101,7 +101,7 @@ cat > ~/.engram/loop-mode.json <<JSON
   "topic": "<one-line loop topic>",
   "instructions": "<what to do each iteration — the loop's standing brief>",
   "state": "<live handoff: pending work, in-flight fairies, key node IDs, next step>",
-  "cadence_seconds": 270,
+  "cadence_seconds": 1800,
   "pacer": "scheduleWakeup",
   "loop_prompt": "<exact text passed to ScheduleWakeup prompt= parameter>"
 }
@@ -163,14 +163,18 @@ cannot be stale.)*
 
 ## Step 2 — The loop body (per iteration)
 
-1. **Pace with `ScheduleWakeup` at 270s — the canonical default.** This is
-   the cache-warm cadence (under the 5-min Anthropic prompt-cache TTL) and
-   gives good responsiveness to a counterpart's inter-agent inbox. **Do not
-   deviate from 270s unless the user explicitly says otherwise.** When the
-   user says "start your engram-loop" (or equivalent), `ScheduleWakeup(270)`
+1. **Pace with `ScheduleWakeup` at 1800s (30 min) — the canonical default.**
+   (Set 2026-06-12, superseding the earlier 270s floor: the Anthropic
+   prompt-cache window is far longer in practice than the old 5-min
+   assumption, so a 30-min heartbeat stays cache-warm while cutting wasted
+   wakes.) Responsiveness to a counterpart's inter-agent inbox comes from the
+   Monitor (see `engram-collaborating-loop`), not a tight heartbeat. **Do not
+   deviate from 1800s unless the user explicitly says otherwise.** When the
+   user says "start your engram-loop" (or equivalent), `ScheduleWakeup(1800)`
    is the assumed cadence — no judgment call required, no need to ask.
 
-   Longer intervals (1200s+) are appropriate ONLY in these two cases:
+   Intervals beyond 1800s (up to the 3300s / 55-min relaxed ceiling) are
+   appropriate ONLY in these cases:
 
    (a) The user has explicitly named a different cadence for this loop
        (e.g., "loop every 30 minutes", "wake me hourly"). A user-named
@@ -180,12 +184,13 @@ cannot be stale.)*
        (a CI run, a deploy ETA, a remote queue) — and the cadence matches
        that signal.
 
-   Self-selecting a longer interval as an "idle fallback" is a discipline
-   lapse, not a sensible default — even when the queue feels quiet, 270s is
-   the right cadence because the counterpart's inbox can fill at any moment.
+   Self-selecting an interval beyond the 1800s default as an "idle fallback"
+   is a discipline lapse, not a sensible default — even when the queue feels
+   quiet, 1800s is the right floor (counterpart-inbox arrivals are caught by
+   the Monitor, not the heartbeat).
 
    **Never omit the re-arm.** The heartbeat is the loop's lifeline — at the
-   end of every iteration, re-arm `ScheduleWakeup` (270s, or the
+   end of every iteration, re-arm `ScheduleWakeup` (1800s, or the
    user-named cadence from case (a)/(b)) before ending the turn. Even when
    pacing at a slower interval, the loop continues; only an explicit user
    "stop" ends it. Without the re-arm, the loop becomes unreachable except
@@ -204,13 +209,13 @@ cannot be stale.)*
    1. `CronList` first.
    2. If a pending wake (one-shot, /loop body) already exists → DON'T re-arm.
       The existing wake IS the heartbeat; lifeline rule satisfied.
-   3. If no pending wake exists → arm one (per the 270s default above).
+   3. If no pending wake exists → arm one (per the 1800s default above).
 
    Lifeline rule + check-before-arm compose to: "exactly one pending wake at
    iteration end." Achieve via check-then-arm, not blind-arm. Verified
    empirically 2026-05-30 — without the check, `CronList` showed 2-3 pending
    wakes at peak during rapid user-continuation patterns, with stale fires
-   every 30-60s instead of the calibrated 270s.
+   every 30-60s instead of the calibrated cadence.
 2. **The armed prompt is a minimal, formalized STUB — the marker carries the
    state.** Don't pack the loop's brief into the `ScheduleWakeup` prompt; point
    at the marker. Arm every wakeup with the same self-declaring stub:
