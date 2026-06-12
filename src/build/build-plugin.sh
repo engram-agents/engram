@@ -17,7 +17,9 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
+_self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+REPO_ROOT="$(git -C "$(dirname "$_self")" rev-parse --show-toplevel 2>/dev/null)"
+[ -n "$REPO_ROOT" ] || { echo "build-plugin: ERROR — could not resolve repo root via git" >&2; exit 1; }
 
 cd "$REPO_ROOT"
 exec python3 -m tools.engine.cli build "$@"

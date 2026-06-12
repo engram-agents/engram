@@ -45,8 +45,9 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+_self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+REPO_ROOT="$(git -C "$(dirname "$_self")" rev-parse --show-toplevel 2>/dev/null)"
+[ -n "$REPO_ROOT" ] || { echo "operator-setup-viz: ERROR — could not resolve repo root via git" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Source directory (where to copy viz_server.py from)

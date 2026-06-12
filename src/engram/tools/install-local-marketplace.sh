@@ -124,7 +124,9 @@ case "$TARGET" in
   *) die "Invalid --target: $TARGET (expected claude-code or codex)" ;;
 esac
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+_self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+REPO_ROOT="$(git -C "$(dirname "$_self")" rev-parse --show-toplevel 2>/dev/null)"
+[ -n "$REPO_ROOT" ] || { echo "install-local-marketplace: ERROR — could not resolve repo root via git" >&2; exit 1; }
 if [[ ! -f "$REPO_ROOT/src/engram/server.py" ]]; then
   die "Must be run from the repo root (expected src/engram/server.py at $REPO_ROOT/src/engram/server.py)"
 fi

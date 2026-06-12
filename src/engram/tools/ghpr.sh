@@ -26,11 +26,11 @@
 # stand-in we measure against.
 set -uo pipefail
 
-# Resolve the symlink (tools/ghpr.sh -> src/engram/tools/ghpr.sh) so ../../.. lands
-# on the repo root regardless of which path invoked us. Fall back to git toplevel.
+# Resolve the real script path (handles symlink invocation from tools/ghpr.sh),
+# then use git to find the repo root — robust regardless of script location.
 _self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
-REPO_ROOT="$(cd "$(dirname "$_self")/../../.." 2>/dev/null && pwd)"
-[ -d "${REPO_ROOT}/.git" ] || REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "$REPO_ROOT")"
+REPO_ROOT="$(git -C "$(dirname "$_self")" rev-parse --show-toplevel 2>/dev/null)"
+[ -n "$REPO_ROOT" ] || { echo "ghpr: ERROR — could not resolve repo root via git" >&2; exit 1; }
 LOG_DIR="${HOME}/.engram/ci-cost-sim"
 # Resolve the test python BEFORE any HOME override (run_touched_tests runs pytest
 # via sys.executable, so it must be the venv that actually has pytest). Per-agent
