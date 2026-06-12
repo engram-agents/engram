@@ -169,6 +169,7 @@ else
     [[ -n "$_tier" ]] && build_flags+=("--tier" "$_tier")
   fi
   build_flags+=("--target" "$TARGET")
+  [[ $ALLOW_BRANCH -eq 1 ]] && build_flags+=("--allow-branch")
   log "Building plugin tree (target: $TARGET, flags: ${build_flags[*]:-none})"
   bash "$REPO_ROOT/tools/build-plugin.sh" ${build_flags[@]+"${build_flags[@]}"}
 fi

@@ -42,7 +42,7 @@ def test_install_local_marketplace_builds_codex_target(tmp_path):
     )
 
     result = subprocess.run(
-        ["bash", str(INSTALLER), "--target", "codex", "--skip-add"],
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-add", "--allow-branch"],
         cwd=REPO_ROOT,
         env=_env(tmp_path),
         text=True,
@@ -69,7 +69,7 @@ def test_install_local_marketplace_accepts_equals_target_form(tmp_path):
     )
 
     result = subprocess.run(
-        ["bash", str(INSTALLER), "--target=codex", "--skip-add"],
+        ["bash", str(INSTALLER), "--target=codex", "--skip-add", "--allow-branch"],
         cwd=REPO_ROOT,
         env=_env(tmp_path),
         text=True,
@@ -89,7 +89,7 @@ def test_install_local_marketplace_defaults_to_claude_code_target(tmp_path):
     )
 
     result = subprocess.run(
-        ["bash", str(INSTALLER), "--skip-add"],
+        ["bash", str(INSTALLER), "--skip-add", "--allow-branch"],
         cwd=REPO_ROOT,
         env=_env(tmp_path),
         text=True,
@@ -108,7 +108,7 @@ def test_install_local_marketplace_skip_build_rejects_target_mismatch(tmp_path):
     _write_fake_plugin(build_root, platform="claude-code")
 
     result = subprocess.run(
-        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--skip-add"],
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--skip-add", "--allow-branch"],
         cwd=REPO_ROOT,
         env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root),
         text=True,
@@ -127,7 +127,7 @@ def test_install_local_marketplace_skip_build_rejects_missing_platform_json(tmp_
     _write_fake_plugin(build_root)
 
     result = subprocess.run(
-        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--skip-add"],
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--skip-add", "--allow-branch"],
         cwd=REPO_ROOT,
         env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root),
         text=True,
@@ -175,7 +175,7 @@ def test_install_local_marketplace_installs_codex_agent_toml(tmp_path):
     )
 
     result = subprocess.run(
-        ["bash", str(INSTALLER), "--target", "codex", "--skip-build"],
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--allow-branch"],
         cwd=REPO_ROOT,
         env=_env(
             tmp_path,
