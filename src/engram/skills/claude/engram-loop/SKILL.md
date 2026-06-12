@@ -301,12 +301,12 @@ or the stale-guard into them — point here, so the formality drifts in exactly
 one place when it evolves.
 
 **Migration status:** `engram-curiosity-loop`, `engram-meta-loop`, and
-`engram-deep-research` reference this SSoT (migrated). `engram-school-day` is
-also a kind of self-paced loop but is **not yet migrated** — it still carries
-its own marker write/remove and a pre-rescope stale-guard, and it uses the
-marker for school-day-specific cycle/iteration state (the careful part).
-Migration is tracked in #507; until it lands, school-day is the one place the
-formality is duplicated.
+`engram-deep-research` reference this SSoT (migrated). `engram-school-day`
+keeps its own marker write/remove and a pre-rescope stale-guard — it stores
+school-day-specific cycle/iteration state in the marker (the legitimately-
+specialized part) — but follows the SSoT cadence (the 1800s floor). The
+migration question (#507) is closed; the remaining duplication is the
+school-day-specific marker handling, not a cadence gap.
 
 Use `engram-loop` directly for a loop that doesn't fit a specialized one (e.g. a
 directed multi-agent work-loop); pick the most specific skill when one fits, and

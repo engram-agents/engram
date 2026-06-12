@@ -66,7 +66,7 @@ Both checks must pass before proceeding to the iteration body.
 This is engram-loop's Step 1 marker write (see engram-loop SKILL.md). School-day extends the generic schema with skill-identification + per-iteration state:
 
 ```bash
-echo '{"activated":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","kind":"research","topic":"school-day Phase 1 curriculum","instructions":"7-iteration fixed rotation (aspiration, research ×3, consolidation, audit, debrief); baseline data collection","state":"Cycle 1, Iteration 1 — starting","cadence_seconds":270,"pacer":"scheduleWakeup","skill":"school-day","cycle":1,"iteration":1}' > ~/.engram/loop-mode.json
+echo '{"activated":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","kind":"research","topic":"school-day Phase 1 curriculum","instructions":"7-iteration fixed rotation (aspiration, research ×3, consolidation, audit, debrief); baseline data collection","state":"Cycle 1, Iteration 1 — starting","cadence_seconds":1800,"pacer":"scheduleWakeup","skill":"school-day","cycle":1,"iteration":1}' > ~/.engram/loop-mode.json
 ```
 
 The base fields (`activated`, `kind`, `topic`, `instructions`, `state`, `cadence_seconds`, `pacer`) match engram-loop's Step 1 contract; `skill`, `cycle`, `iteration` are school-day extras that the Step 0 stale-check (above) keys off of.
