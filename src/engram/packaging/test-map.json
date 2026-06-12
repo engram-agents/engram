@@ -396,6 +396,10 @@
     {
       "path": "tools/uninstall-local-marketplace.sh",
       "reason": "Uninstall script; no dedicated test file. Inverse of install-local-marketplace.sh; covered by manual verification."
+    },
+    {
+      "path": "tools/run-all-tests.sh",
+      "reason": "Unified test runner script; no dedicated test file. Verified manually by running it end-to-end against both suites."
     }
   ],
   "server_import_allowlist": [

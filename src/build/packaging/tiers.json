@@ -279,6 +279,10 @@
       "tier": "dev"
     },
     {
+      "path": "tools/run-all-tests.sh",
+      "tier": "dev"
+    },
+    {
       "path": "tools/run_matrix.py",
       "tier": "dev"
     },
