@@ -3,22 +3,29 @@
 ENGRAM Visualization Server
 
 Serves a D3.js force-directed graph of an ENGRAM knowledge graph in the
-browser. Stdlib-only. Two operating modes:
+browser. Stdlib-only. Three operating modes:
 
-* Single-agent (--db PATH or default ~/.engram/knowledge.db):
-  one anonymous "default" agent.
-* Multi-agent (--config agents.json): a registered set of agents,
-  each with its own DB; UI dropdown switches between them, all API
-  endpoints accept ?agent=<name>.
+* Auto-detect (default — no flags): scan accessible /home/* dirs + running
+  user's home for .engram*/ folders; read agent_name from each config.json.
+  If nothing found, falls back to single-agent default (~/.engram/knowledge.db).
+  An optional --config layered on top overrides labels/default/exclude and can
+  add agents that weren't auto-detected (back-compat with explicit-db entries).
+* Single-agent (--db PATH): register one anonymous 'default' agent at PATH
+  (a knowledge.db file or a directory containing one).
+* Explicit-only (--no-autodetect [--config PATH]): skip auto-discovery; use
+  only the explicit config or the single-agent default.
 
 Usage:
-    python viz_server.py                                 # single-agent default
+    python viz_server.py                                 # auto-detect (new default)
     python viz_server.py --db /path/to/knowledge.db      # single-agent custom
-    python viz_server.py --config /path/to/agents.json   # multi-agent
+    python viz_server.py --config /path/to/agents.json   # auto-detect + override
+    python viz_server.py --no-autodetect --config agents.json  # explicit-only
 """
 
 import argparse
+import glob
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -28,6 +35,8 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+
+_disc_log = logging.getLogger("viz_server.discover")
 
 # config_schema lives in tools/ (sibling directory relative to this file).
 # Insert the parent of tools/ into sys.path so `from tools.config_schema import ...`
@@ -2122,6 +2131,168 @@ def _load_config(path: str) -> tuple[dict, str]:
     default = cfg.get("default") or next(iter(agents))
     if default not in agents:
         raise ValueError(f"{path}: default '{default}' is not in the agents list")
+    return agents, default
+
+
+def discover_agents(scan_roots=None) -> dict:
+    """Auto-discover local ENGRAM agents by scanning home directories.
+
+    For each root in scan_roots (default: every /home/* entry plus the running
+    user's own home), glob '<root>/.engram*', skip backup/baseline dirs, and
+    for each candidate require both knowledge.db and config.json. Read
+    agent_name from config.json (the canonical field). Register the agent under
+    that name with its db path.
+
+    Returns a dict: agent_name -> {"name": str, "label": str, "db": str}.
+    Never raises — a partial result (only readable agents) is correct behavior.
+    """
+    if scan_roots is None:
+        roots: list = []
+        try:
+            roots = [Path(p) for p in glob.glob("/home/*") if Path(p).is_dir()]
+        except Exception as e:
+            _disc_log.debug("discover_agents: /home/* glob failed: %s", e)
+        try:
+            own_home = Path.home()
+            if own_home not in roots:
+                roots.append(own_home)
+        except Exception as e:
+            _disc_log.debug("discover_agents: Path.home() failed: %s", e)
+    else:
+        roots = [Path(r) for r in scan_roots]
+
+    agents: dict = {}
+
+    for root in roots:
+        try:
+            candidates = sorted(root.glob(".engram*"))
+        except Exception as e:
+            _disc_log.debug("discover_agents: glob failed for root %s: %s", root, e)
+            continue
+
+        for candidate in candidates:
+            try:
+                name_part = candidate.name
+                # Skip backup and baseline dirs.
+                if name_part.endswith(".bak") or "baseline" in name_part:
+                    continue
+                if not candidate.is_dir():
+                    continue
+
+                db_path = candidate / "knowledge.db"
+                config_path = candidate / "config.json"
+
+                if not db_path.exists() or not config_path.exists():
+                    continue
+
+                try:
+                    with open(config_path) as f:
+                        cfg = json.load(f)
+                except Exception as e:
+                    _disc_log.debug(
+                        "discover_agents: could not read config %s: %s", config_path, e
+                    )
+                    continue
+
+                agent_name = cfg.get("agent_name", "")
+                if not agent_name or not isinstance(agent_name, str):
+                    _disc_log.debug(
+                        "discover_agents: no agent_name in %s, skipping", config_path
+                    )
+                    continue
+
+                if agent_name in agents:
+                    _disc_log.debug(
+                        "discover_agents: collision — '%s' already registered "
+                        "(db=%s), skipping %s",
+                        agent_name, agents[agent_name]["db"], db_path,
+                    )
+                    continue
+
+                agents[agent_name] = {
+                    "name": agent_name,
+                    "label": agent_name,
+                    "db": str(db_path),
+                }
+            except Exception as e:
+                _disc_log.debug(
+                    "discover_agents: error processing candidate %s: %s", candidate, e
+                )
+                continue
+
+    return agents
+
+
+def _merge_config_over_discovered(discovered: dict, config_path: str) -> tuple[dict, str]:
+    """Layer an explicit config file on top of a discovered agent registry.
+
+    Merge semantics (auto-detect is base, config is override layer):
+    1. Start from 'discovered' (auto-detected agents).
+    2. Apply 'exclude' list — drop named agents.
+    3. For each entry in config 'agents':
+       - If already discovered: override label (and db if explicitly given).
+         'db' is optional for override entries — label-only override is valid.
+       - If not discovered and has 'db': add the agent (back-compat).
+       - If not discovered and no 'db': warn and skip.
+    4. Default: config 'default' field wins; else first agent by sorted name.
+
+    Returns (merged_agents_dict, default_name).
+    """
+    with open(config_path) as f:
+        cfg = json.load(f)
+
+    # Deep-copy the inner dicts too: a shallow dict(discovered) would share the
+    # inner {name,label,db} objects, so the label/db overrides below would mutate
+    # the caller's discovered dict. main() doesn't reuse it today, but the
+    # don't-mutate-the-caller invariant must hold for any future caller/test.
+    agents = {k: dict(v) for k, v in discovered.items()}
+
+    # Step 2: exclude
+    for name in cfg.get("exclude", []):
+        if name in agents:
+            agents.pop(name)
+        else:
+            _disc_log.debug("_merge_config: exclude '%s' not in registry, ignoring", name)
+
+    # Step 3: layer explicit entries
+    for a in cfg.get("agents", []):
+        name = a.get("name")
+        if not name:
+            continue
+        if name in agents:
+            # Override fields on an already-discovered entry.
+            if "label" in a:
+                agents[name]["label"] = a["label"]
+            if "db" in a:
+                agents[name]["db"] = os.path.expanduser(a["db"])
+        else:
+            # Not auto-detected — add if db is provided, skip otherwise.
+            if "db" in a:
+                agents[name] = {
+                    "name": name,
+                    "label": a.get("label", name),
+                    "db": os.path.expanduser(a["db"]),
+                }
+            else:
+                _disc_log.warning(
+                    "_merge_config: agent '%s' not auto-detected and no db given — skipping",
+                    name,
+                )
+
+    # Step 4: default
+    explicit_default = cfg.get("default")
+    if explicit_default:
+        if explicit_default not in agents:
+            raise ValueError(
+                f"{config_path}: default '{explicit_default}' is not in the "
+                "merged agent registry"
+            )
+        default = explicit_default
+    elif agents:
+        default = sorted(agents.keys())[0]
+    else:
+        default = ""
+
     return agents, default
 
 
@@ -4595,25 +4766,50 @@ def main():
                              "'default' agent at PATH (a knowledge.db file or "
                              f"a directory containing one). Default: {DEFAULT_DB}")
     parser.add_argument("--config", default=None,
-                        help="Multi-agent mode: JSON config registering several "
-                             "agents (see agents.json.example)")
+                        help="Optional config JSON: override labels/default/exclude "
+                             "for auto-detected agents, or add agents with explicit db. "
+                             "Without --no-autodetect, auto-detect is always the base.")
     parser.add_argument("--bind", default="127.0.0.1",
                         help="Address to bind to (default: 127.0.0.1)")
+    parser.add_argument("--no-autodetect", action="store_true",
+                        help="Disable auto-discovery; use only --config or --db.")
     args = parser.parse_args()
 
     if args.config and args.db:
         parser.error("--config and --db are mutually exclusive")
 
     global AGENTS, DEFAULT_AGENT
-    if args.config:
-        AGENTS, DEFAULT_AGENT = _load_config(args.config)
-    else:
-        db = os.path.expanduser(args.db) if args.db else DEFAULT_DB
-        # Accept either a directory or a direct .db file path
+
+    if args.db:
+        # Explicit --db always forces single-agent mode (unchanged behavior).
+        db = os.path.expanduser(args.db)
         if os.path.isdir(db):
             db = os.path.join(db, "knowledge.db")
         AGENTS = {"default": {"name": "default", "label": "Default", "db": db}}
         DEFAULT_AGENT = "default"
+    elif args.no_autodetect:
+        # Opt-out: explicit-config-only path (old behavior).
+        if args.config:
+            AGENTS, DEFAULT_AGENT = _load_config(args.config)
+        else:
+            db = DEFAULT_DB
+            AGENTS = {"default": {"name": "default", "label": "Default", "db": db}}
+            DEFAULT_AGENT = "default"
+    else:
+        # Default path: auto-detect is the base.
+        discovered = discover_agents()
+        if args.config:
+            # Layer explicit config on top of discovered.
+            AGENTS, DEFAULT_AGENT = _merge_config_over_discovered(discovered, args.config)
+        elif discovered:
+            # Pure auto-detect: sort for deterministic default.
+            AGENTS = discovered
+            DEFAULT_AGENT = sorted(AGENTS.keys())[0]
+        else:
+            # Nothing discovered and no config — fall back to single-agent default.
+            db = DEFAULT_DB
+            AGENTS = {"default": {"name": "default", "label": "Default", "db": db}}
+            DEFAULT_AGENT = "default"
 
     HTTPServer.allow_reuse_address = True
     bind = args.bind or "127.0.0.1"
