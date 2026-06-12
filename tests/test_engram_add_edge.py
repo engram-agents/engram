@@ -490,7 +490,7 @@ def test_dag_guard_fires_for_subtask_of_when_source_older():
     obs2 = json.loads(server.engram_add_observation(payload_json=json.dumps(obs2_payload)))
     obs2_id = obs2["observation_id"]
 
-    # Patch obs_id (source) to be OLDER than obs2_id (target) — dag-exempt, so must succeed.
+    # Patch obs_id (source) to be OLDER than obs2_id (target) — subtask_of is NOT dag-exempt, so the guard must fire.
     conn = server._get_db()
     try:
         conn.execute(
