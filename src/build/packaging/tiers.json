@@ -275,6 +275,10 @@
       "tier": "dev"
     },
     {
+      "path": "tools/ghpr.sh",
+      "tier": "dev"
+    },
+    {
       "path": "tools/run_matrix.py",
       "tier": "dev"
     },
