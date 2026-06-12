@@ -26,7 +26,7 @@ from unittest.mock import MagicMock, patch
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_HOOK_PATH = _REPO_ROOT / "hooks" / "claude" / "engram-session-start-hook.py"
+_HOOK_PATH = _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
 
 
 def _load_hook_module(engram_home: Path):

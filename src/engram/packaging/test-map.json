@@ -384,6 +384,18 @@
     {
       "path": "tools/write_sleep_marker.py",
       "reason": "No dedicated test file found"
+    },
+    {
+      "path": "tools/_status_derive.py",
+      "reason": "Internal helper for status derivation; no dedicated test file. Changes covered indirectly by callers."
+    },
+    {
+      "path": "tools/pre-dispatch-check.sh",
+      "reason": "Shell pre-dispatch guard; no dedicated test file. Tested manually as part of the dispatch workflow."
+    },
+    {
+      "path": "tools/uninstall-local-marketplace.sh",
+      "reason": "Uninstall script; no dedicated test file. Inverse of install-local-marketplace.sh; covered by manual verification."
     }
   ],
   "server_import_allowlist": [

@@ -25,7 +25,7 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-TEMPLATES_DIR = REPO_ROOT / "templates"
+TEMPLATES_DIR = REPO_ROOT / "src" / "engram" / "templates"
 
 
 def _bootstrap_env(
@@ -46,7 +46,7 @@ def _bootstrap_env(
         "engram_log_emitter.py", "engram_log_indexer.py",
     ]
     for fname in runtime_files:
-        src = REPO_ROOT / fname
+        src = REPO_ROOT / "src" / "engram" / fname
         if src.exists():
             shutil.copy2(src, engram_home / fname)
 
@@ -70,7 +70,7 @@ def _run_bootstrap(workdir: Path, target: str, extra: dict[str, str] | None = No
     """Run bootstrap.py and return the CompletedProcess."""
     env = _bootstrap_env(workdir, target, extra)
     return subprocess.run(
-        [sys.executable, str(REPO_ROOT / "bootstrap.py")],
+        [sys.executable, str(REPO_ROOT / "src" / "engram" / "bootstrap.py")],
         env=env,
         capture_output=True,
         text=True,

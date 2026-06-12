@@ -30,7 +30,7 @@ def _load_context_tracker(engram_home: Path):
     """Load hooks/claude/context_tracker.py with ENGRAM_HOME pointing at engram_home."""
     os.environ["ENGRAM_HOME"] = str(engram_home)
     repo_root = Path(__file__).resolve().parents[1]
-    module_path = repo_root / "hooks" / "claude" / "context_tracker.py"
+    module_path = repo_root / "src" / "engram" / "hooks" / "claude" / "context_tracker.py"
     # Force a fresh import so module-level ENGRAM_HOME picks up the env var.
     if "context_tracker" in sys.modules:
         del sys.modules["context_tracker"]

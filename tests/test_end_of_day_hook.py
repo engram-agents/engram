@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 HOOK_PATH = (
-    Path(__file__).parent.parent / "hooks" / "claude" / "engram-end-of-day-hook.py"
+    Path(__file__).parent.parent / "src" / "engram" / "hooks" / "claude" / "engram-end-of-day-hook.py"
 )
 
 

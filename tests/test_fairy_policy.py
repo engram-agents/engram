@@ -31,7 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 
-_HOOK_PATH = REPO_ROOT / "hooks" / "claude" / "engram-session-start-hook.py"
+_HOOK_PATH = REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
 
 # ---------------------------------------------------------------------------
 # Schema helpers

@@ -38,16 +38,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
-          # forum/tests/ import forum.server (Flask + bleach + markdown-it-py +
-          # beautifulsoup4 + html5lib); those deps live in forum/requirements.txt,
+          # src/forum/tests/ import forum.server (Flask + bleach + markdown-it-py +
+          # beautifulsoup4 + html5lib); those deps live in src/forum/requirements.txt,
           # not the main requirements. Without this the forum suite errors on
-          # import and the gate red-X's. (forum/ shipped in #615.)
-          pip install -r forum/requirements.txt
+          # import and the gate red-X's. (forum/ shipped in #615; moved to src/forum/
+          # in Phase 3 of #1093.)
+          pip install -r src/forum/requirements.txt
 
       - name: Run pytest
         # Explicit paths (pytest.ini sets no testpaths). Covers the main suite
-        # AND forum/tests/ (8 files) — the latter was silently skipped by the
+        # AND src/forum/tests/ (8 files) — the latter was silently skipped by the
         # original `pytest tests/` since forum/ postdates this workflow.
         # tools/ forum-CLI tests arrive with #616; add `tools/` to this path
         # once #616 merges (omitted now — empty tools/ test set would exit-5).
-        run: pytest tests/ forum/tests/ -v --tb=short
+        run: pytest tests/ src/forum/tests/ -v --tb=short

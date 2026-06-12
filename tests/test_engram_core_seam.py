@@ -92,7 +92,7 @@ def test_server_py_no_from_engram_core_import():
     to reference them via the server module instead of via the live core object —
     exactly the regression this seam migration eliminates.
     """
-    server_src = (REPO_ROOT / "server.py").read_text(encoding="utf-8")
+    server_src = (REPO_ROOT / "src" / "engram" / "server.py").read_text(encoding="utf-8")
     # Match any variant: 'from engram_core import X', 'from engram_core import *', etc.
     pattern = re.compile(r'\bfrom\s+engram_core\s+import\b')
     matches = pattern.findall(server_src)
@@ -121,7 +121,7 @@ def test_server_py_no_bare_mutable_name_outside_compat_block():
         within the same line, e.g. ``core._VEC_BACKEND_AVAILABLE``).
     """
 
-    server_path = REPO_ROOT / "server.py"
+    server_path = REPO_ROOT / "src" / "engram" / "server.py"
     lines = server_path.read_text(encoding="utf-8").splitlines()
     compat_start, compat_end = _compat_bounds(lines)
 
@@ -201,7 +201,7 @@ def test_family_modules_no_from_engram_core_and_no_mutable_assignments():
     Covers all engram_<family>.py files currently in the repo root (glob
     pattern 'engram_*.py', excluding engram_core.py itself).
     """
-    family_modules = sorted(REPO_ROOT.glob("engram_*.py"))
+    family_modules = sorted((REPO_ROOT / "src" / "engram").glob("engram_*.py"))
     # Exclude engram_core.py itself — it IS the canonical state home
     family_modules = [p for p in family_modules if p.name != "engram_core.py"]
     assert family_modules, "No engram_*.py family modules found — glob may need adjustment"

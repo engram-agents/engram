@@ -38,7 +38,7 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MANIFEST_PATH = os.path.join(REPO_ROOT, "packaging", "tiers.json")
+MANIFEST_PATH = os.path.join(REPO_ROOT, "src", "build", "packaging", "tiers.json")
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -54,7 +54,8 @@ def _load_manifest() -> dict:
 
 def _run_build(args: list[str], output_dir: str | None = None) -> "subprocess.CompletedProcess":
     import subprocess
-    cmd = [sys.executable, "-m", "tools.engine.cli", "build"] + args
+    # --allow-branch: tests may run on feature branches, not just dev (#794 guard override)
+    cmd = [sys.executable, "-m", "tools.engine.cli", "build", "--allow-branch"] + args
     if output_dir:
         cmd += ["--output", output_dir]
     return subprocess.run(
@@ -97,7 +98,7 @@ class TestPlatformProfiles:
 
     def test_claude_code_profile_parses(self):
         """packaging/platforms/claude-code.json is valid JSON."""
-        path = os.path.join(REPO_ROOT, "packaging", "platforms", "claude-code.json")
+        path = os.path.join(REPO_ROOT, "src", "build", "packaging", "platforms", "claude-code.json")
         assert os.path.isfile(path), f"claude-code.json not found at {path}"
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
@@ -105,7 +106,7 @@ class TestPlatformProfiles:
 
     def test_codex_profile_parses(self):
         """packaging/platforms/codex.json is valid JSON."""
-        path = os.path.join(REPO_ROOT, "packaging", "platforms", "codex.json")
+        path = os.path.join(REPO_ROOT, "src", "build", "packaging", "platforms", "codex.json")
         assert os.path.isfile(path), f"codex.json not found at {path}"
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
@@ -113,7 +114,7 @@ class TestPlatformProfiles:
 
     def test_claude_code_profile_has_required_fields(self):
         """claude-code.json has plugin_root_env, hooks_config, skills_dir."""
-        path = os.path.join(REPO_ROOT, "packaging", "platforms", "claude-code.json")
+        path = os.path.join(REPO_ROOT, "src", "build", "packaging", "platforms", "claude-code.json")
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         for field in ("plugin_root_env", "hooks_config", "skills_dir"):
@@ -122,7 +123,7 @@ class TestPlatformProfiles:
 
     def test_codex_profile_has_required_fields(self):
         """codex.json has plugin_root_env, hooks_config, skills_dir, plugin_manifest."""
-        path = os.path.join(REPO_ROOT, "packaging", "platforms", "codex.json")
+        path = os.path.join(REPO_ROOT, "src", "build", "packaging", "platforms", "codex.json")
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         for field in ("plugin_root_env", "hooks_config", "skills_dir", "plugin_manifest"):

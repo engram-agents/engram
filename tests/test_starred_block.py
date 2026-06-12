@@ -25,8 +25,8 @@ from unittest.mock import MagicMock
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_SESSION_START_HOOK_PATH = _REPO_ROOT / "hooks" / "claude" / "engram-session-start-hook.py"
-_POSTCOMPACT_HOOK_PATH = _REPO_ROOT / "hooks" / "claude" / "engram-postcompact-hook.py"
+_SESSION_START_HOOK_PATH = _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
+_POSTCOMPACT_HOOK_PATH = _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-postcompact-hook.py"
 
 
 # ---------------------------------------------------------------------------

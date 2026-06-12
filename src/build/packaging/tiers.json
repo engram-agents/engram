@@ -694,8 +694,8 @@
       "reason": "operator upgrade guides — developer/operator reference documentation, not shipped in the plugin bundle"
     },
     {
-      "path": "inter-agent/",
-      "reason": "inter-agent protocol design documents — developer reference, not shipped in the plugin bundle"
+      "path": "docs/inter-agent/",
+      "reason": "inter-agent protocol design documents — developer reference, not shipped in the plugin bundle (moved from root in Phase 4 of #1093)"
     },
     {
       "path": ".claude/",
@@ -706,40 +706,12 @@
       "reason": "README for the agents/claude directory — documentation only, not a shippable agent file (build-plugin.sh copies *.md files excluding README.md)"
     },
     {
-      "path": "cycle/",
-      "reason": "epistemic research cycle design documents and artifacts (CHARTER, CHRONICLE, charter-inputs, mira-package, standpoint design) — in-development research material, not shipped in the plugin bundle"
+      "path": "docs/cycle/",
+      "reason": "epistemic research cycle design documents and artifacts (CHARTER, CHRONICLE, charter-inputs, mira-package, standpoint design) — in-development research material, not shipped in the plugin bundle (moved from root in Phase 4 of #1093)"
     },
     {
-      "path": "archive/",
-      "reason": "historical one-time migration artifacts preserved for reference — ran during early development and are not shipped in any install tier"
-    },
-    {
-      "path": "agents",
-      "reason": "backward-compat directory symlink pointing to src/engram/agents/ (Phase 1 relocation)"
-    },
-    {
-      "path": "hooks",
-      "reason": "backward-compat directory symlink pointing to src/engram/hooks/ (Phase 1 relocation)"
-    },
-    {
-      "path": "output-styles",
-      "reason": "backward-compat directory symlink pointing to src/engram/output-styles/ (Phase 1 relocation)"
-    },
-    {
-      "path": "skills",
-      "reason": "backward-compat directory symlink pointing to src/engram/skills/ (Phase 1 relocation)"
-    },
-    {
-      "path": "templates",
-      "reason": "backward-compat directory symlink pointing to src/engram/templates/ (Phase 1 relocation)"
-    },
-    {
-      "path": "packaging",
-      "reason": "backward-compat directory symlink pointing to src/build/packaging/ (Phase 2 relocation)"
-    },
-    {
-      "path": "forum",
-      "reason": "backward-compat directory symlink pointing to src/forum/ (Phase 3 relocation)"
+      "path": "docs/archive/",
+      "reason": "historical one-time migration artifacts preserved for reference — ran during early development and are not shipped in any install tier (moved from root in Phase 4 of #1093)"
     },
     {
       "path": "src/build/packaging/README.md",

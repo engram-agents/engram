@@ -33,7 +33,7 @@ if PROJECT_ROOT not in sys.path:
 
 # The daemon module is not on sys.path by default (it lives under hooks/claude/).
 # Add it so we can import the helper functions directly without running main().
-DAEMON_DIR = str(Path(__file__).resolve().parent.parent / "hooks" / "claude")
+DAEMON_DIR = str(Path(__file__).resolve().parent.parent / "src" / "engram" / "hooks" / "claude")
 if DAEMON_DIR not in sys.path:
     sys.path.insert(0, DAEMON_DIR)
 
@@ -42,7 +42,7 @@ if DAEMON_DIR not in sys.path:
 import importlib.util
 
 _DAEMON_MODULE_PATH = str(
-    Path(__file__).resolve().parent.parent / "hooks" / "claude" / "engram-surface-daemon.py"
+    Path(__file__).resolve().parent.parent / "src" / "engram" / "hooks" / "claude" / "engram-surface-daemon.py"
 )
 
 

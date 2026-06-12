@@ -21,7 +21,7 @@ import pytest
 import yaml
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SKILLS_DIR = os.path.join(REPO_ROOT, "skills", "claude")
+SKILLS_DIR = os.path.join(REPO_ROOT, "src", "engram", "skills", "claude")
 
 
 # ---------------------------------------------------------------------------

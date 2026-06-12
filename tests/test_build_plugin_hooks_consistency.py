@@ -39,7 +39,7 @@ import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD_PLUGIN_SH = os.path.join(REPO_ROOT, "tools", "build-plugin.sh")
-MANIFEST_PATH = os.path.join(REPO_ROOT, "packaging", "tiers.json")
+MANIFEST_PATH = os.path.join(REPO_ROOT, "src", "build", "packaging", "tiers.json")
 
 HOOK_REF_RE = re.compile(r'\bhooks/([A-Za-z0-9_\-]+\.(?:py|sh))\b')
 
@@ -104,7 +104,8 @@ def _hooks_referenced_in_built_json(plugin_root: str) -> set[str]:
 
 def _run_build(extra_args: list[str]) -> subprocess.CompletedProcess:
     """Run build-plugin.sh from repo root with given extra args."""
-    cmd = ["bash", BUILD_PLUGIN_SH] + extra_args
+    # --allow-branch: tests may run on feature branches, not just dev (#794 guard override)
+    cmd = ["bash", BUILD_PLUGIN_SH, "--allow-branch"] + extra_args
     return subprocess.run(
         cmd,
         cwd=REPO_ROOT,

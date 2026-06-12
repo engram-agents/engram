@@ -51,7 +51,7 @@ jobs:
             ':(exclude)src/forum/tests/'
             ':(exclude)paper_draft/'
             ':(exclude)active-work/'
-            ':(exclude)cycle/'
+            ':(exclude)docs/cycle/'
             ':(exclude)docs/handbook/'
             ':(exclude)README.md'
             ':(exclude)CHANGELOG.md'
@@ -60,7 +60,9 @@ jobs:
             # Its doctests must use ≥4-digit IDs (matching \d{4,}) to be correct.
             # These are regex-illustration examples, not developer-graph citations.
             ':(exclude)src/engram/engram_ids.py'
-            ':(exclude)engram_ids.py'
+            # engram_ids.py moved from root to src/engram/ in Phase 1 #1093;
+            # root compat symlink removed in Phase 4. Only the src/ path is tracked.
+            # ':(exclude)engram_ids.py' entry removed (dead after Phase 4).
           )
 
           # Capture lines ADDED in this PR (start with '+', skip diff headers

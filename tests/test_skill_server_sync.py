@@ -37,8 +37,8 @@ import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SERVER_PY = REPO_ROOT / "server.py"
-SKILL_MD = REPO_ROOT / "SKILL.md"
+SERVER_PY = REPO_ROOT / "src" / "engram" / "server.py"
+SKILL_MD = REPO_ROOT / "src" / "engram" / "SKILL.md"
 
 # Tools defined in server.py but intentionally not documented in SKILL.md.
 # Add entries here ONLY with a documented reason; the test enforces this

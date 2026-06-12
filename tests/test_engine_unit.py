@@ -26,7 +26,7 @@ import os
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MANIFEST_PATH = os.path.join(REPO_ROOT, "packaging", "tiers.json")
+MANIFEST_PATH = os.path.join(REPO_ROOT, "src", "build", "packaging", "tiers.json")
 
 
 def _load_manifest() -> dict:
@@ -498,11 +498,13 @@ class TestBuildCommandBranchGuard:
         import subprocess as _sp
         from tools.engine.cli import build_command
 
-        # Minimal repo layout — tiers.json includes required top-level fields
-        (tmp_path / "server.py").write_text("")
-        (tmp_path / "packaging").mkdir()
+        # Minimal repo layout — after Phase 4 #1093, server.py lives at
+        # src/engram/server.py and tiers.json at src/build/packaging/tiers.json.
+        (tmp_path / "src" / "engram").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "src" / "engram" / "server.py").write_text("")
+        (tmp_path / "src" / "build" / "packaging").mkdir(parents=True, exist_ok=True)
         import json as _json
-        (tmp_path / "packaging" / "tiers.json").write_text(_json.dumps({
+        (tmp_path / "src" / "build" / "packaging" / "tiers.json").write_text(_json.dumps({
             "schema_version": 1,
             "default_tier": "convenience",
             "depth_tiers": {"essential": 1, "convenience": 2, "dev": 3},

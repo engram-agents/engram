@@ -25,7 +25,7 @@ def _load_hook(engram_home: Path):
     """
     os.environ["ENGRAM_HOME"] = str(engram_home)
     repo_root = Path(__file__).resolve().parents[1]
-    module_path = repo_root / "hooks" / "claude" / "engram-session-start-hook.py"
+    module_path = repo_root / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
     module_name = "engram_session_start_hook_prune_test"
     # Force a fresh import so module-level ENGRAM_HOME and SESSIONS_DIR pick
     # up the env var pointing at our temp directory.
@@ -33,7 +33,7 @@ def _load_hook(engram_home: Path):
         del sys.modules[module_name]
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     module = importlib.util.module_from_spec(spec)
-    sys.path.insert(0, str(repo_root / "hooks" / "claude"))
+    sys.path.insert(0, str(repo_root / "src" / "engram" / "hooks" / "claude"))
     try:
         spec.loader.exec_module(module)
     finally:

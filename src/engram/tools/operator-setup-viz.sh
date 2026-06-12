@@ -51,7 +51,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # ---------------------------------------------------------------------------
 # Source directory (where to copy viz_server.py from)
 # ---------------------------------------------------------------------------
-SOURCE_DIR="${1:-$REPO_ROOT}"
+SOURCE_DIR="${1:-$REPO_ROOT/src/engram}"
 
 if [[ ! -f "$SOURCE_DIR/viz_server.py" ]]; then
   echo "ERROR: viz_server.py not found in SOURCE_DIR: $SOURCE_DIR" >&2
@@ -149,7 +149,7 @@ echo "Step 3: Installing systemd user unit"
 # Unit TEMPLATE always comes from the repo clone (REPO_ROOT), not SOURCE_DIR —
 # SOURCE_DIR is the viz_server.py source, which the operator may override to a
 # pinned install path; the template is repo-infrastructure, not user-overridable.
-SERVICE_TEMPLATE="$REPO_ROOT/templates/engram-viz-user.service.template"
+SERVICE_TEMPLATE="$REPO_ROOT/src/engram/templates/engram-viz-user.service.template"
 SERVICE_NAME="engram-viz-user.service"
 SERVICE_DEST="$HOME/.config/systemd/user/$SERVICE_NAME"
 

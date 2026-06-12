@@ -27,7 +27,7 @@ import pytest
 
 HOOK_PATH = (
     Path(__file__).parent.parent
-    / "hooks" / "claude" / "engram-inter-agent-prompt-hook.py"
+    / "src" / "engram" / "hooks" / "claude" / "engram-inter-agent-prompt-hook.py"
 )
 
 # ---------------------------------------------------------------------------
@@ -544,7 +544,7 @@ def _load_hook_module():
     import importlib.util
     spec = importlib.util.spec_from_file_location(
         "engram_inter_agent_hook",
-        Path(__file__).parent.parent / "hooks" / "claude" / "engram-inter-agent-prompt-hook.py",
+        Path(__file__).parent.parent / "src" / "engram" / "hooks" / "claude" / "engram-inter-agent-prompt-hook.py",
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -1241,7 +1241,7 @@ def test_is_recipient_hook_and_ia_parity():
     # Load hook module (not importable by normal name — use spec_from_file_location)
     hook_spec = importlib.util.spec_from_file_location(
         "engram_inter_agent_hook",
-        Path(__file__).parent.parent / "hooks" / "claude" / "engram-inter-agent-prompt-hook.py",
+        Path(__file__).parent.parent / "src" / "engram" / "hooks" / "claude" / "engram-inter-agent-prompt-hook.py",
     )
     hook_module = importlib.util.module_from_spec(hook_spec)
     hook_spec.loader.exec_module(hook_module)

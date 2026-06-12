@@ -288,7 +288,7 @@ import sys, os, json
 sys.path.insert(0, os.getcwd())
 try:
     import ast, pathlib
-    src = pathlib.Path('server.py').read_text()
+    src = pathlib.Path('src', 'engram', 'server.py').read_text()
     tree = ast.parse(src)
     # Count top-level function defs decorated with @mcp.tool(...)
     count = 0

@@ -59,7 +59,7 @@ def _usage() -> None:
         "\n"
         "Exit codes for `run`: 0=DONE  3=PAUSED  1=FAILED\n"
         "\n"
-        "The command must be run from the repo root (the directory containing server.py).\n"
+        "The command must be run from the repo root (the directory containing src/engram/server.py).\n"
         "Output is written to build/plugin/ by default — this directory is gitignored.\n"
         "Re-running is safe: the output tree is cleaned and rebuilt each time."
     )
@@ -143,7 +143,7 @@ def build_command(args: list[str]) -> int:
             "Tier filtering uses src/build/packaging/tiers.json as the single source of truth.\n"
             "The build manifest is written to <output>/.engram-build-manifest.json.\n"
             "\n"
-            "The command must be run from the repo root (the directory containing server.py).\n"
+            "The command must be run from the repo root (the directory containing src/engram/server.py).\n"
             "Output is written to build/plugin/ by default — this directory is gitignored.\n"
             "Re-running is safe: the output tree is cleaned and rebuilt each time."
         )
@@ -169,12 +169,14 @@ def build_command(args: list[str]) -> int:
         )
         return 1
 
-    # Repo root guard: must be run from a directory containing server.py
+    # Repo root guard: must be run from a directory containing src/engram/server.py
+    # (server.py moved from repo root to src/engram/ in Phase 1 of #1093;
+    # root-level compat symlink removed in Phase 4).
     repo_root = os.getcwd()
-    if not os.path.isfile(os.path.join(repo_root, "server.py")):
+    if not os.path.isfile(os.path.join(repo_root, "src", "engram", "server.py")):
         print(
             f"[build-plugin] ERROR: Must be run from the repo root "
-            f"(expected server.py at {os.path.join(repo_root, 'server.py')})",
+            f"(expected src/engram/server.py at {os.path.join(repo_root, 'src', 'engram', 'server.py')})",
             file=sys.stderr,
         )
         return 1

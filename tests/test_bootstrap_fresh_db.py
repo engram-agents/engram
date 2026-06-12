@@ -41,7 +41,7 @@ def test_bootstrap_seeds_fresh_db_under_env_bypass():
         env = os.environ.copy()
         env.update({
             "ALPHA_DIR": str(REPO_ROOT),
-            "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "templates"),
+            "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "src" / "engram" / "templates"),
             "ENGRAM_HOME": str(engram_home),
             "CLAUDE_HOME": str(claude_home),
             "PYTHON_BIN": sys.executable,
@@ -71,7 +71,7 @@ def test_bootstrap_seeds_fresh_db_under_env_bypass():
                 shutil.copy2(src, engram_home / fname)
 
         result = subprocess.run(
-            [sys.executable, str(REPO_ROOT / "bootstrap.py")],
+            [sys.executable, str(REPO_ROOT / "src" / "engram" / "bootstrap.py")],
             env=env,
             capture_output=True,
             text=True,
@@ -141,7 +141,7 @@ def test_bootstrap_refuses_overwrite_existing_db():
         env = os.environ.copy()
         env.update({
             "ALPHA_DIR": str(REPO_ROOT),
-            "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "templates"),
+            "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "src" / "engram" / "templates"),
             "ENGRAM_HOME": str(engram_home),
             "CLAUDE_HOME": str(workdir / ".claude"),
             "PYTHON_BIN": sys.executable,
@@ -151,7 +151,7 @@ def test_bootstrap_refuses_overwrite_existing_db():
         env.pop("FORCE_RESEED_EMPTY", None)
 
         result = subprocess.run(
-            [sys.executable, str(REPO_ROOT / "bootstrap.py")],
+            [sys.executable, str(REPO_ROOT / "src" / "engram" / "bootstrap.py")],
             env=env,
             capture_output=True,
             text=True,
@@ -190,7 +190,7 @@ def _make_empty_db_env(workdir: Path) -> tuple[Path, dict]:
     env = os.environ.copy()
     env.update({
         "ALPHA_DIR": str(REPO_ROOT),
-        "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "templates"),
+        "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "src" / "engram" / "templates"),
         "ENGRAM_HOME": str(engram_home),
         "CLAUDE_HOME": str(workdir / ".claude"),
         "PYTHON_BIN": sys.executable,
@@ -217,7 +217,7 @@ def test_bootstrap_force_on_empty_db_proceeds():
         env["FORCE"] = "1"
 
         result = subprocess.run(
-            [sys.executable, str(REPO_ROOT / "bootstrap.py")],
+            [sys.executable, str(REPO_ROOT / "src" / "engram" / "bootstrap.py")],
             env=env,
             capture_output=True,
             text=True,
@@ -272,7 +272,7 @@ def test_bootstrap_force_on_nonempty_db_refuses():
         env = os.environ.copy()
         env.update({
             "ALPHA_DIR": str(REPO_ROOT),
-            "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "templates"),
+            "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "src" / "engram" / "templates"),
             "ENGRAM_HOME": str(engram_home),
             "CLAUDE_HOME": str(workdir / ".claude"),
             "PYTHON_BIN": sys.executable,
@@ -282,7 +282,7 @@ def test_bootstrap_force_on_nonempty_db_refuses():
         env.pop("FORCE_RESEED_EMPTY", None)
 
         result = subprocess.run(
-            [sys.executable, str(REPO_ROOT / "bootstrap.py")],
+            [sys.executable, str(REPO_ROOT / "src" / "engram" / "bootstrap.py")],
             env=env,
             capture_output=True,
             text=True,
@@ -337,7 +337,7 @@ def test_bootstrap_force_on_unreadable_db_refuses():
         env = os.environ.copy()
         env.update({
             "ALPHA_DIR": str(REPO_ROOT),
-            "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "templates"),
+            "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "src" / "engram" / "templates"),
             "ENGRAM_HOME": str(engram_home),
             "CLAUDE_HOME": str(workdir / ".claude"),
             "PYTHON_BIN": sys.executable,
@@ -347,7 +347,7 @@ def test_bootstrap_force_on_unreadable_db_refuses():
         env.pop("FORCE_RESEED_EMPTY", None)
 
         result = subprocess.run(
-            [sys.executable, str(REPO_ROOT / "bootstrap.py")],
+            [sys.executable, str(REPO_ROOT / "src" / "engram" / "bootstrap.py")],
             env=env,
             capture_output=True,
             text=True,
@@ -424,7 +424,7 @@ def test_bootstrap_force_on_locked_db_refuses():
         env = os.environ.copy()
         env.update({
             "ALPHA_DIR": str(REPO_ROOT),
-            "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "templates"),
+            "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "src" / "engram" / "templates"),
             "ENGRAM_HOME": str(engram_home),
             "CLAUDE_HOME": str(workdir / ".claude"),
             "PYTHON_BIN": sys.executable,
@@ -434,7 +434,7 @@ def test_bootstrap_force_on_locked_db_refuses():
         env.pop("FORCE_RESEED_EMPTY", None)
 
         result = subprocess.run(
-            [sys.executable, str(REPO_ROOT / "bootstrap.py")],
+            [sys.executable, str(REPO_ROOT / "src" / "engram" / "bootstrap.py")],
             env=env,
             capture_output=True,
             text=True,
@@ -467,7 +467,7 @@ def test_bootstrap_force_reseed_empty_on_empty_db_proceeds():
         env["FORCE_RESEED_EMPTY"] = "1"
 
         result = subprocess.run(
-            [sys.executable, str(REPO_ROOT / "bootstrap.py")],
+            [sys.executable, str(REPO_ROOT / "src" / "engram" / "bootstrap.py")],
             env=env,
             capture_output=True,
             text=True,
@@ -520,7 +520,7 @@ def test_bootstrap_force_reseed_empty_on_nonempty_db_refuses():
         env = os.environ.copy()
         env.update({
             "ALPHA_DIR": str(REPO_ROOT),
-            "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "templates"),
+            "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "src" / "engram" / "templates"),
             "ENGRAM_HOME": str(engram_home),
             "CLAUDE_HOME": str(workdir / ".claude"),
             "PYTHON_BIN": sys.executable,
@@ -530,7 +530,7 @@ def test_bootstrap_force_reseed_empty_on_nonempty_db_refuses():
         env.pop("FORCE", None)
 
         result = subprocess.run(
-            [sys.executable, str(REPO_ROOT / "bootstrap.py")],
+            [sys.executable, str(REPO_ROOT / "src" / "engram" / "bootstrap.py")],
             env=env,
             capture_output=True,
             text=True,

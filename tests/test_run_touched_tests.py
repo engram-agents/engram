@@ -39,7 +39,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNNER_PATH = REPO_ROOT / "src" / "engram" / "tools" / "run_touched_tests.py"
-TIERS_PATH = REPO_ROOT / "packaging" / "tiers.json"
+TIERS_PATH = REPO_ROOT / "src" / "build" / "packaging" / "tiers.json"
 TEST_MAP_PATH = REPO_ROOT / "src" / "engram" / "packaging" / "test-map.json"
 TESTS_DIR = REPO_ROOT / "tests"
 
@@ -125,7 +125,7 @@ class TestMappingCompleteness:
             map_covered.add(entry.get("path", "").rstrip("/"))
 
         # Enumerate hooks
-        hooks_dir = REPO_ROOT / "hooks" / "claude"
+        hooks_dir = REPO_ROOT / "src" / "engram" / "hooks" / "claude"
         uncovered: list[str] = []
         for hook in sorted(hooks_dir.glob("*.py")):
             rel = f"hooks/claude/{hook.name}"

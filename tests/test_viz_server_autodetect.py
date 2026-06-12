@@ -22,7 +22,7 @@ import sys
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "engram"))
 
 import viz_server
 from viz_server import discover_agents, _merge_config_over_discovered

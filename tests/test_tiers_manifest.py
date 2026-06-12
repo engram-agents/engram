@@ -107,7 +107,7 @@ import subprocess
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MANIFEST_PATH = os.path.join(REPO_ROOT, "packaging", "tiers.json")
+MANIFEST_PATH = os.path.join(REPO_ROOT, "src", "build", "packaging", "tiers.json")
 BUILD_PLUGIN_SH = os.path.join(REPO_ROOT, "tools", "build-plugin.sh")
 
 VALID_TIERS = {"essential", "convenience", "dev"}
@@ -234,29 +234,33 @@ def _enumerate_candidate_paths() -> set[str]:
     """
     candidates: set[str] = set()
 
+    # Resolve actual source root from the manifest (Phase 1 #1093 moved sources
+    # to src/engram/; root-level compat symlinks removed in Phase 4).
+    src_root = os.path.join(REPO_ROOT, _load_manifest().get("source_root", "."))
+
     # hooks/claude: per .py / .sh file
-    hooks_dir = os.path.join(REPO_ROOT, "hooks", "claude")
+    hooks_dir = os.path.join(src_root, "hooks", "claude")
     if os.path.isdir(hooks_dir):
         for fname in os.listdir(hooks_dir):
             if fname.endswith(".py") or fname.endswith(".sh"):
                 candidates.add(f"hooks/claude/{fname}")
 
     # skills/claude: per subdirectory
-    skills_dir = os.path.join(REPO_ROOT, "skills", "claude")
+    skills_dir = os.path.join(src_root, "skills", "claude")
     if os.path.isdir(skills_dir):
         for dname in os.listdir(skills_dir):
             if os.path.isdir(os.path.join(skills_dir, dname)):
                 candidates.add(f"skills/claude/{dname}")
 
     # agents/claude: per .md file (excluding README.md)
-    agents_dir = os.path.join(REPO_ROOT, "agents", "claude")
+    agents_dir = os.path.join(src_root, "agents", "claude")
     if os.path.isdir(agents_dir):
         for fname in os.listdir(agents_dir):
             if fname.endswith(".md") and fname != "README.md":
                 candidates.add(f"agents/claude/{fname}")
 
     # output-styles/claude: per file
-    styles_dir = os.path.join(REPO_ROOT, "output-styles", "claude")
+    styles_dir = os.path.join(src_root, "output-styles", "claude")
     if os.path.isdir(styles_dir):
         for fname in os.listdir(styles_dir):
             full = os.path.join(styles_dir, fname)
@@ -274,7 +278,7 @@ def _enumerate_candidate_paths() -> set[str]:
             if len(parts) >= 2 and parts[1] != "__pycache__":
                 candidates.add(f"tools/{parts[1]}")
 
-    # Top-level named files
+    # Top-level named files (relative to source_root, not repo root — Phase 4)
     for fname in [
         "server.py",
         "bootstrap.py",
@@ -282,16 +286,16 @@ def _enumerate_candidate_paths() -> set[str]:
         "launch-engram-server.sh",
         "viz_server.py",
     ]:
-        if os.path.exists(os.path.join(REPO_ROOT, fname)):
+        if os.path.exists(os.path.join(src_root, fname)):
             candidates.add(fname)
 
-    # engram_*.py runtime modules
-    for fname in os.listdir(REPO_ROOT):
+    # engram_*.py runtime modules (live in source_root after Phase 1 #1093)
+    for fname in os.listdir(src_root):
         if fname.startswith("engram_") and fname.endswith(".py"):
             candidates.add(fname)
 
     # templates: per top-level item (files and directories)
-    templates_dir = os.path.join(REPO_ROOT, "templates")
+    templates_dir = os.path.join(src_root, "templates")
     if os.path.isdir(templates_dir):
         for fname in os.listdir(templates_dir):
             candidates.add(f"templates/{fname}")

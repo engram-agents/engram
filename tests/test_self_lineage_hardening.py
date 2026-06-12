@@ -189,7 +189,7 @@ def test_observation_lineage_gate_uses_core_ssot():
     the de-duplication was reverted.
     """
     repo_root = Path(__file__).parent.parent
-    obs_path = repo_root / "engram_observation.py"
+    obs_path = repo_root / "src" / "engram" / "engram_observation.py"
     content = obs_path.read_text(encoding="utf-8")
 
     # The inline fullmatch with a literal regex string must no longer appear.

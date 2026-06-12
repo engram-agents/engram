@@ -20,8 +20,8 @@ import re
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MANIFEST_PATH = os.path.join(REPO_ROOT, "packaging", "tiers.json")
-SERVER_PY = os.path.join(REPO_ROOT, "server.py")
+MANIFEST_PATH = os.path.join(REPO_ROOT, "src", "build", "packaging", "tiers.json")
+SERVER_PY = os.path.join(REPO_ROOT, "src", "engram", "server.py")
 
 TIER_RANKS = {"essential": 0, "convenience": 1, "dev": 2}
 

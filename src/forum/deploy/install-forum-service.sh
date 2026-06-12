@@ -12,7 +12,7 @@
 # Idempotent: re-run to upgrade code + restart. Never overwrites forum.db.
 #
 # Options:
-#   --src PATH          engram-alpha checkout containing forum/ (required)
+#   --src PATH          engram-alpha checkout containing src/forum/ (required)
 #   --service-dir PATH  shared dir for the forum (DB + code + venv).
 #                       Default: /home/agents-shared/forum
 #   --port PORT         port the service listens on. Default: 5002
@@ -73,9 +73,9 @@ fi
 # Pre-flight checks (run even in --dry-run so the plan can be validated).
 # ---------------------------------------------------------------------------
 [ -z "$SRC" ] && { echo "ERROR: --src PATH required (path to engram-alpha checkout)" >&2; exit 2; }
-[ -d "$SRC/forum" ] || { echo "ERROR: $SRC/forum not found — is --src an engram-alpha checkout?" >&2; exit 2; }
-[ -f "$SRC/forum/deploy/engram-forum.service.template" ] || {
-  echo "ERROR: unit template not found under $SRC/forum/deploy/" >&2; exit 2;
+[ -d "$SRC/src/forum" ] || { echo "ERROR: $SRC/src/forum not found — is --src an engram-alpha checkout?" >&2; exit 2; }
+[ -f "$SRC/src/forum/deploy/engram-forum.service.template" ] || {
+  echo "ERROR: unit template not found under $SRC/src/forum/deploy/" >&2; exit 2;
 }
 if [ "$DRY_RUN" -eq 0 ]; then
   command -v systemctl >/dev/null || {
@@ -140,15 +140,15 @@ RSYNC_EXCLUDES=(--exclude='__pycache__' --exclude='*.pyc' --exclude='tests/'
                 --exclude='deploy/' --exclude='fairy-spec-*.md' --exclude='spec.md'
                 --exclude='README.md')
 if [ "$DRY_RUN" -eq 1 ]; then
-  echo "  [dry-run] rsync/cp forum/ → $APP/forum/ (excluding tests/, deploy/, fairy-spec MDs, etc.)"
+  echo "  [dry-run] rsync/cp src/forum/ → $APP/forum/ (excluding tests/, deploy/, fairy-spec MDs, etc.)"
 elif command -v rsync >/dev/null; then
-  rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$SRC/forum/" "$APP/forum/"
+  rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$SRC/src/forum/" "$APP/forum/"
 else
   rm -rf "$APP/forum"; mkdir -p "$APP/forum"
-  cp "$SRC/forum/"*.py "$APP/forum/"
-  cp "$SRC/forum/FORUM.md" "$APP/forum/" 2>/dev/null || true
+  cp "$SRC/src/forum/"*.py "$APP/forum/"
+  cp "$SRC/src/forum/FORUM.md" "$APP/forum/" 2>/dev/null || true
   for d in templates static seeds; do
-    [ -d "$SRC/forum/$d" ] && cp -r "$SRC/forum/$d" "$APP/forum/$d"
+    [ -d "$SRC/src/forum/$d" ] && cp -r "$SRC/src/forum/$d" "$APP/forum/$d"
   done
   find "$APP/forum" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 fi
@@ -161,7 +161,7 @@ else
   echo "==> Building self-contained venv → $VENV (group-readable so any admin can run it)"
   RUN python3 -m venv "$VENV"
   RUN "$VENV/bin/pip" install --quiet --upgrade pip
-  RUN "$VENV/bin/pip" install --quiet -r "$SRC/forum/requirements.txt"
+  RUN "$VENV/bin/pip" install --quiet -r "$SRC/src/forum/requirements.txt"
   if [ "$DRY_RUN" -eq 0 ]; then
     "$VENV/bin/python" -c "import flask; print('    flask', flask.__version__)"
     chmod -R g+rX "$APP" "$VENV" 2>/dev/null || true
@@ -176,7 +176,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
 else
   # Strip the >>>TEMPLATE-ONLY ... <<<TEMPLATE-ONLY block, then substitute
   # {{FORUM_HOME}} (template placeholder) and {{PORT}}.
-  sed '/>>>TEMPLATE-ONLY/,/<<<TEMPLATE-ONLY/d' "$SRC/forum/deploy/engram-forum.service.template" \
+  sed '/>>>TEMPLATE-ONLY/,/<<<TEMPLATE-ONLY/d' "$SRC/src/forum/deploy/engram-forum.service.template" \
     | sed "s|{{FORUM_HOME}}|$SERVICE_DIR|g" \
     | sed "s|--port 5002|--port $PORT|" \
     | sed "s|Flask, port 5002|Flask, port $PORT|" \

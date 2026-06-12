@@ -307,9 +307,9 @@ def test_valid_file_url_accepted():
     client = fresh_client()
     # Use SKILL.md — a committed file in our repo that we haven't modified
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    skill_file = os.path.join(repo_root, "SKILL.md")
+    skill_file = os.path.join(repo_root, "src", "engram", "SKILL.md")
     # Verify the file is clean (no uncommitted changes) — skip test if not
-    status = subprocess.run(["git", "status", "--porcelain", "--", "SKILL.md"],
+    status = subprocess.run(["git", "status", "--porcelain", "--", "src/engram/SKILL.md"],
                             cwd=repo_root, capture_output=True, text=True)
     if status.stdout.strip():
         import pytest

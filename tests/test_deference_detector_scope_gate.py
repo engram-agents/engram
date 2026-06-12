@@ -18,8 +18,8 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).parent.parent
-PROMPT_HOOK = REPO_ROOT / "hooks" / "claude" / "engram-deference-detector-prompt.py"
-STOP_HOOK   = REPO_ROOT / "hooks" / "claude" / "engram-deference-detector-stop.py"
+PROMPT_HOOK = REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-deference-detector-prompt.py"
+STOP_HOOK   = REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-deference-detector-stop.py"
 
 _VALID_MARKER = {
     "pending": True,

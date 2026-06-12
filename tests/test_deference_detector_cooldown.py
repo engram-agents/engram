@@ -23,8 +23,8 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).parent.parent
-PROMPT_HOOK = REPO_ROOT / "hooks" / "claude" / "engram-deference-detector-prompt.py"
-STOP_HOOK   = REPO_ROOT / "hooks" / "claude" / "engram-deference-detector-stop.py"
+PROMPT_HOOK = REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-deference-detector-prompt.py"
+STOP_HOOK   = REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-deference-detector-stop.py"
 
 _STOP_STDIN_WITH_HIT = json.dumps({
     "session_id": "test-session",

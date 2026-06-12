@@ -125,8 +125,8 @@ case "$TARGET" in
 esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-if [[ ! -f "$REPO_ROOT/server.py" ]]; then
-  die "Must be run from the repo root (expected server.py at $REPO_ROOT/server.py)"
+if [[ ! -f "$REPO_ROOT/src/engram/server.py" ]]; then
+  die "Must be run from the repo root (expected src/engram/server.py at $REPO_ROOT/src/engram/server.py)"
 fi
 
 # #794 branch guard: refuse non-dev builds unless --allow-branch is set.

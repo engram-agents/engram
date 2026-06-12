@@ -370,7 +370,7 @@ class TestRegenerateEmbeddings:
              mock.patch.object(srv._embedder, "embed", side_effect=_fake_embed), \
              mock.patch("engram_core._embedding_text_for_node", side_effect=_fake_embedding_text):
             # Patch _find_server_py to return our server.py
-            with mock.patch.object(regen_mod, "_find_server_py", return_value=REPO_ROOT / "server.py"), \
+            with mock.patch.object(regen_mod, "_find_server_py", return_value=REPO_ROOT / "src" / "engram" / "server.py"), \
                  mock.patch.object(regen_mod, "_import_server", return_value=srv):
                 regen_mod.backfill_embeddings(engram_home)
 

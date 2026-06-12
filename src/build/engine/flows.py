@@ -508,9 +508,10 @@ def _apply_changeset_reviewed(ctx: dict[str, Any]) -> None:
         commits = _git_log_range(source_dir, deployed_sha, target_sha)
         ctx["_changeset_commits"] = commits
 
-        # Check whether templates/CLAUDE.md.template changed
+        # Check whether CLAUDE.md.template changed (path from Phase 1 #1093;
+        # root compat symlink removed in Phase 4).
         files = _files_in_range(source_dir, deployed_sha, target_sha)
-        ctx["_template_changed"] = "templates/CLAUDE.md.template" in files
+        ctx["_template_changed"] = "src/engram/templates/CLAUDE.md.template" in files
         ctx["_changed_files"] = files
 
     # Note: we do NOT set ack_changeset here — that requires explicit operator
@@ -571,7 +572,9 @@ def _apply_marketplace_rebuilt(ctx: dict[str, Any]) -> None:
     from .build import build_plugin
     from .manifest import load_manifest, resolve_tier
 
-    manifest_path = os.path.join(source_dir, "packaging", "tiers.json")
+    # packaging/ moved to src/build/packaging/ in Phase 2 #1093;
+    # root compat symlink removed in Phase 4.
+    manifest_path = os.path.join(source_dir, "src", "build", "packaging", "tiers.json")
     manifest = load_manifest(manifest_path)
     tier = resolve_tier(manifest, tier)
 
@@ -623,7 +626,10 @@ def _check_mcp_reconnect(ctx: dict[str, Any]) -> bool:
     """
     changed_files = ctx.get("_changed_files", [])
     needs_reconnect = any(
-        f == "server.py" or (f.startswith("engram_") and f.endswith(".py"))
+        # Accept both old root path (pre-Phase4) and new src/engram/ path (post-Phase4 #1093)
+        f in ("server.py", "src/engram/server.py")
+        or (f.startswith("engram_") and f.endswith(".py"))
+        or (f.startswith("src/engram/engram_") and f.endswith(".py"))
         for f in changed_files
     )
     if not needs_reconnect:
@@ -649,7 +655,9 @@ def _apply_template_gate(ctx: dict[str, Any]) -> None:
         ctx["_template_gate_done"] = True
         return
 
-    template_path = os.path.join(source_dir, "templates", "CLAUDE.md.template")
+    # templates/ moved to src/engram/templates/ in Phase 1 #1093;
+    # root compat symlink removed in Phase 4.
+    template_path = os.path.join(source_dir, "src", "engram", "templates", "CLAUDE.md.template")
 
     # Compute a simple unified diff (stdlib only)
     import difflib

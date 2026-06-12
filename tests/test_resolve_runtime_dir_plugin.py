@@ -114,9 +114,9 @@ def _load_function_clean(hook_path: Path) -> types.FunctionType:
 # ---------------------------------------------------------------------------
 
 _HOOK_FILES = [
-    _REPO_ROOT / "hooks" / "claude" / "engram-surface-hook.py",
-    _REPO_ROOT / "hooks" / "claude" / "engram-session-start-hook.py",
-    _REPO_ROOT / "hooks" / "claude" / "engram-surface-daemon.py",
+    _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py",
+    _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py",
+    _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-daemon.py",
 ]
 
 
@@ -242,34 +242,34 @@ class TestResolveRuntimeDirPluginProbe(unittest.TestCase):
 
     def test_plugin_layout_claude_surface_hook(self):
         self._run_plugin_layout_test(
-            _REPO_ROOT / "hooks" / "claude" / "engram-surface-hook.py"
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py"
         )
 
     def test_plugin_layout_claude_session_start_hook(self):
         self._run_plugin_layout_test(
-            _REPO_ROOT / "hooks" / "claude" / "engram-session-start-hook.py"
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
         )
 
     def test_plugin_layout_claude_surface_daemon(self):
         self._run_plugin_layout_test(
-            _REPO_ROOT / "hooks" / "claude" / "engram-surface-daemon.py"
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-daemon.py"
         )
 
     # -- Scatter no-regression tests (one per hook file) --
 
     def test_scatter_no_regression_claude_surface_hook(self):
         self._run_scatter_layout_test(
-            _REPO_ROOT / "hooks" / "claude" / "engram-surface-hook.py"
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py"
         )
 
     def test_scatter_no_regression_claude_session_start_hook(self):
         self._run_scatter_layout_test(
-            _REPO_ROOT / "hooks" / "claude" / "engram-session-start-hook.py"
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
         )
 
     def test_scatter_no_regression_claude_surface_daemon(self):
         self._run_scatter_layout_test(
-            _REPO_ROOT / "hooks" / "claude" / "engram-surface-daemon.py"
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-daemon.py"
         )
 
 

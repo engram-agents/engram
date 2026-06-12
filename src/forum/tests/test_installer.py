@@ -24,9 +24,9 @@ import pytest
 # Locate installer and template paths (relative to worktree).
 # ---------------------------------------------------------------------------
 _THIS_DIR = Path(__file__).parent
-_REPO_ROOT = _THIS_DIR.parent.parent
-_INSTALLER = _REPO_ROOT / "forum" / "deploy" / "install-forum-service.sh"
-_TEMPLATE = _REPO_ROOT / "forum" / "deploy" / "engram-forum.service.template"
+_REPO_ROOT = _THIS_DIR.parent.parent.parent  # src/forum/tests/ → src/forum/ → src/ → repo root
+_INSTALLER = _REPO_ROOT / "src" / "forum" / "deploy" / "install-forum-service.sh"
+_TEMPLATE = _REPO_ROOT / "src" / "forum" / "deploy" / "engram-forum.service.template"
 
 
 def _run_installer(args: list[str], **kwargs) -> subprocess.CompletedProcess:

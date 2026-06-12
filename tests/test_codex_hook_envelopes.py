@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-HOOKS_DIR = Path(__file__).parent.parent / "hooks" / "claude"
+HOOKS_DIR = Path(__file__).parent.parent / "src" / "engram" / "hooks" / "claude"
 
 PYTHON = sys.executable
 

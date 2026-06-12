@@ -27,7 +27,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 def _load_hook_module():
     """Import the surface hook as a module despite the hyphenated filename."""
-    hook_path = PROJECT_ROOT / "hooks" / "claude" / "engram-surface-hook.py"
+    hook_path = PROJECT_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py"
     spec = importlib.util.spec_from_file_location("engram_surface_hook", hook_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

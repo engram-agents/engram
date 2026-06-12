@@ -31,7 +31,7 @@ import pytest
 
 HOOK_PATH = (
     Path(__file__).parent.parent
-    / "hooks" / "claude" / "engram-baton-prompt-hook.py"
+    / "src" / "engram" / "hooks" / "claude" / "engram-baton-prompt-hook.py"
 )
 
 

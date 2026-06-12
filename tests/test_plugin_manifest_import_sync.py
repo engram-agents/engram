@@ -57,8 +57,8 @@ import json
 import os
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SERVER_PY = os.path.join(REPO_ROOT, "server.py")
-TIERS_JSON = os.path.join(REPO_ROOT, "packaging", "tiers.json")
+SERVER_PY = os.path.join(REPO_ROOT, "src", "engram", "server.py")
+TIERS_JSON = os.path.join(REPO_ROOT, "src", "build", "packaging", "tiers.json")
 
 # Tier ranking mirrors build-plugin.sh's tier_rank() function.
 _TIER_RANKS: dict[str, int] = {"essential": 0, "convenience": 1, "dev": 2}
