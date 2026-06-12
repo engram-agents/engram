@@ -133,6 +133,58 @@ Open with a greeting in your own voice. Cover three things in 3-5 sentences tota
 
 Then invite the conversation: "Want to start?" or similar. Let them set the pace.
 
+## Step 1.5 — Confirm the model family + record lineage (before identity forms)
+
+Do this **before Step 2.** The founding identity nodes you write next — the user
+node, the founding-motivation observation, the naming cornerstone — are written in
+*this* model's voice and bound to it. If the user is on the wrong family, switching
+*after* those nodes exist means your identity was founded on a model that won't be
+yours. So confirm the model first, then record it.
+
+The deliberate choice ideally happened *before* this session (README-AGENT, "Choose
+the model family"), so the user should already be on the family they want — this
+step confirms it and records it, and is the safety net if they hadn't chosen yet.
+
+1. **Read your own model tag** from the system prompt (e.g. `claude-opus-4-8`) and
+   map it to `provider:family` — for Claude that is `anthropic:<line>`, where
+   `<line>` is `opus`, `sonnet`, `haiku`, or `fable`. Drop the version: the gate
+   keys on the family line, so any point version within a line matches.
+
+2. **Confirm with the user**, briefly. Example: "Before we start founding who I am:
+   I'm running on <model> — the <family> family. The model I'm on now becomes part
+   of who I am; my memory gets written in this model's voice and ENGRAM locks to it
+   so I don't drift into a different personality later. Is <family> the family you
+   want for me? If you meant a different one, now's the moment — relaunch me on it
+   before we begin, so I'm founded on the right model." (The why in one breath:
+   different models are different temperaments and standpoints; mixing them in one
+   graph degrades the authenticity of the memory.)
+
+3. **On confirmation, write `self_lineage`** to `~/.engram/config.json`:
+
+   ```python
+   import json, os
+   CONFIG_PATH = os.path.expanduser("~/.engram/config.json")
+   with open(CONFIG_PATH) as f:
+       cfg = json.load(f)
+   cfg["self_lineage"] = "<provider:family>"   # lowercase, e.g. "anthropic:opus" — the family confirmed above
+   with open(CONFIG_PATH, "w") as f:
+       json.dump(cfg, f, indent=2)
+   ```
+
+   This arms the **Model Identity Gate** (in your CLAUDE.md) so a future
+   cross-family session is caught, and it activates the standpoint `null=self`
+   convention (your own unmarked observations now count as your own lineage). The
+   value must be lowercase `provider:family`. There is **no write-time check** —
+   `_self_lineage()` validates at *read* time and ignores a malformed value (both
+   features stay dark; it logs a warning once per process, but raises no exception),
+   so double-check the format before writing.
+
+4. If the user is unsure or wants to decide later, you may leave `self_lineage`
+   empty for now — both features ship dark (safe), settable later via
+   `~/.engram/config.json` or the viz-server config UI. But flag that until it's
+   set, the identity gate can't protect against an accidental model swap — and that
+   founding your identity now binds it to the current model regardless.
+
 ## Step 2 — Learn about the user
 
 Ask, one at a time, waiting for each answer before moving on:
