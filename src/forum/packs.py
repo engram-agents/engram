@@ -70,6 +70,23 @@ def _get_size_limits() -> tuple[int, int]:
 _CLI_MODULE = None  # lazy-loaded
 
 
+def _engram_pkg_cli_path() -> Path:
+    """Locate the engram-pkg CLI via upward search — layout-agnostic.
+
+    Works in both layouts:
+      repo source:  src/forum/packs.py → walks to repo root → tools/engram-pkg/
+      deployed copy: app/forum/packs.py → walks to app/    → tools/engram-pkg/
+    A fixed parent count can't serve both after the forum/ → src/forum/ move.
+    """
+    here = Path(__file__).resolve()
+    for anc in here.parents:
+        cand = anc / "tools" / "engram-pkg" / "engram-pkg"
+        if cand.exists():
+            return cand
+    # not found — return conventional location for the error message
+    return here.parents[2] / "tools" / "engram-pkg" / "engram-pkg"
+
+
 def _load_engram_pkg_cli():
     """Import the engram-pkg CLI as a module (cached after first call).
 
@@ -80,10 +97,7 @@ def _load_engram_pkg_cli():
     if _CLI_MODULE is not None:
         return _CLI_MODULE
 
-    # Walk up from this file to locate the repo root, then find the CLI.
-    here = Path(__file__).resolve()
-    repo_root = here.parent.parent  # forum/ -> repo root
-    cli_path = repo_root / "tools" / "engram-pkg" / "engram-pkg"
+    cli_path = _engram_pkg_cli_path()
 
     if not cli_path.exists():
         raise FileNotFoundError(

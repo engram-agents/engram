@@ -1104,14 +1104,13 @@ def probe_deps(db_path: str, audit_path: str) -> dict:
 
     # ------------------------------------------------------------------
     # Hard dep 3: engram-pkg CLI file existence.
-    # Mirrors packs._load_engram_pkg_cli(): same path resolution, same
-    # consumption pattern (file-existence check before importlib load).
+    # Delegates to packs_mod._engram_pkg_cli_path() — the layout-agnostic
+    # upward search — so the two copies can't drift across layouts
+    # (repo source: src/forum/ = 3 hops to root; deployed: app/forum/ = 2).
     # The pack-validation endpoints raise FileNotFoundError when the file
     # is absent, producing a 503 on every upload; we fail start instead.
     # ------------------------------------------------------------------
-    here = Path(__file__).resolve()
-    repo_root = here.parent.parent  # forum/ -> repo root
-    cli_path = repo_root / "tools" / "engram-pkg" / "engram-pkg"
+    cli_path = packs_mod._engram_pkg_cli_path()
     if cli_path.exists():
         results["engram_pkg"] = "ok"
     else:

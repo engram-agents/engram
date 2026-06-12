@@ -31,7 +31,7 @@ import pytest
 # Ensure repo root is on path (mirrors pattern in existing forum tests).
 # ---------------------------------------------------------------------------
 _THIS_DIR = Path(__file__).parent
-_REPO_ROOT = _THIS_DIR.parent.parent
+_REPO_ROOT = _THIS_DIR.parent.parent.parent  # src/forum/tests/ → repo root
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
@@ -202,31 +202,23 @@ class TestProbeDepsAuditLogFailure:
 
 
 class TestProbeDepsEngramPkgFailure:
-    """engram-pkg probe failure cases."""
+    """engram-pkg probe failure cases.
+
+    probe_deps() delegates to packs_mod._engram_pkg_cli_path() (layout-agnostic
+    upward search) so we monkeypatch that function directly — no __file__ tricks.
+    """
 
     def test_missing_engram_pkg(self, tmp_path, monkeypatch):
-        """Point repo_root at a dir with no engram-pkg → engram_pkg: missing."""
+        """_engram_pkg_cli_path returns a nonexistent path → engram_pkg: missing."""
         db_path = str(tmp_path / "forum.db")
         audit_path = str(tmp_path / "audit.jsonl")
         sqlite3.connect(db_path).close()
 
-        # Monkeypatch Path(__file__).resolve() indirectly by patching
-        # the path resolution inside probe_deps via the server module's Path.
-        # Simpler: monkeypatch packs._load_engram_pkg_cli's path by making
-        # the engram-pkg file not exist at the expected path.
-        # We do this by pointing the "forum/server.py" __file__ at a temp location
-        # where tools/engram-pkg/engram-pkg does NOT exist.
-        #
-        # Cleanest approach: mock the cli_path existence check directly by
-        # monkeypatching the probe's Path.exists via a controlled temp tree.
-        fake_root = tmp_path / "fake_repo"
-        fake_root.mkdir()
-        fake_forum = fake_root / "forum"
-        fake_forum.mkdir()
-        # No tools/engram-pkg/engram-pkg created → exists() returns False.
-
-        # Patch __file__ on the server module so probe_deps resolves from fake_root.
-        monkeypatch.setattr(_server, "__file__", str(fake_forum / "server.py"))
+        fake_cli = tmp_path / "tools" / "engram-pkg" / "engram-pkg"
+        # NOT created — exists() returns False.
+        monkeypatch.setattr(
+            _server.packs_mod, "_engram_pkg_cli_path", lambda: fake_cli
+        )
 
         results = probe_deps(db_path, audit_path)
         assert results["engram_pkg"] == "missing", (
@@ -235,19 +227,17 @@ class TestProbeDepsEngramPkgFailure:
         assert "_engram_pkg_path" in results, "Expected _engram_pkg_path diagnostic key"
 
     def test_present_engram_pkg(self, tmp_path, monkeypatch):
-        """Create the engram-pkg file → engram_pkg: ok."""
+        """_engram_pkg_cli_path returns an existing file → engram_pkg: ok."""
         db_path = str(tmp_path / "forum.db")
         audit_path = str(tmp_path / "audit.jsonl")
         sqlite3.connect(db_path).close()
 
-        fake_root = tmp_path / "fake_repo"
-        fake_forum = fake_root / "forum"
-        fake_forum.mkdir(parents=True)
-        cli_file = fake_root / "tools" / "engram-pkg" / "engram-pkg"
-        cli_file.parent.mkdir(parents=True)
-        cli_file.write_text("# stub\n")
-
-        monkeypatch.setattr(_server, "__file__", str(fake_forum / "server.py"))
+        fake_cli = tmp_path / "tools" / "engram-pkg" / "engram-pkg"
+        fake_cli.parent.mkdir(parents=True)
+        fake_cli.write_text("# stub\n")
+        monkeypatch.setattr(
+            _server.packs_mod, "_engram_pkg_cli_path", lambda: fake_cli
+        )
 
         results = probe_deps(db_path, audit_path)
         assert results["engram_pkg"] == "ok", (

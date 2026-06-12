@@ -48,7 +48,7 @@ jobs:
           #   server.py and engram_*.py modules, tools/ (most of it).
           EXCLUDES=(
             ':(exclude)tests/'
-            ':(exclude)forum/tests/'
+            ':(exclude)src/forum/tests/'
             ':(exclude)paper_draft/'
             ':(exclude)active-work/'
             ':(exclude)cycle/'
