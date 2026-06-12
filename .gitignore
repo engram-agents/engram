@@ -43,7 +43,7 @@ active-work/
 # Plugin build output — assembled by tools/build-plugin.sh from canonical
 # sources. Not checked in (it's a build artifact, not source). Rebuild with:
 #   bash tools/build-plugin.sh
-build/
+/build/
 /.claude/scheduled_tasks.lock
 
 # Personal-name roster for scan-leaks.py — gitignored by design.
