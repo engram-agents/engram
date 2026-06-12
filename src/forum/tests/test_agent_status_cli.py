@@ -34,8 +34,13 @@ if str(_ROOT) not in sys.path:
 
 try:
     import tools.forum as forum_cli
+    # _status_derive is a sibling of tools/forum.py; forum.py adds tools/ to
+    # sys.path at import time, so _status_derive is importable after forum_cli
+    # loads and is registered in sys.modules as '_status_derive'.
+    import _status_derive
     _CLI_AVAILABLE = True
 except ImportError:
+    _status_derive = None  # type: ignore[assignment]
     _CLI_AVAILABLE = False
 
 SKIP_CLI = pytest.mark.skipif(
@@ -834,12 +839,17 @@ class TestDeriveOwnStatus:
 
     @pytest.fixture
     def derive_env(self, tmp_path, monkeypatch):
-        """Point LOOP_MODE_PATH + PROJECTS_DIR at writable temp locations."""
+        """Point LOOP_MODE_PATH + PROJECTS_DIR at writable temp locations.
+
+        Patches _status_derive (where the values are READ by _read_loop_mode
+        and _held_baton_turns) rather than forum_cli (which only holds copies
+        of the imported names and is not the read site).
+        """
         loop_path = tmp_path / "loop-mode.json"
         proj_dir = tmp_path / "projects"
         proj_dir.mkdir()
-        monkeypatch.setattr(forum_cli, "LOOP_MODE_PATH", str(loop_path))
-        monkeypatch.setattr(forum_cli, "PROJECTS_DIR", str(proj_dir))
+        monkeypatch.setattr(_status_derive, "LOOP_MODE_PATH", str(loop_path))
+        monkeypatch.setattr(_status_derive, "PROJECTS_DIR", str(proj_dir))
         return loop_path, proj_dir
 
     def test_idle_when_no_loop_no_baton(self, derive_env):
@@ -924,8 +934,10 @@ class TestStatusAutoPublish:
         loop_path = tmp_path / "loop-mode.json"
         proj_dir = tmp_path / "projects"
         proj_dir.mkdir()
-        monkeypatch.setattr(forum_cli, "LOOP_MODE_PATH", str(loop_path))
-        monkeypatch.setattr(forum_cli, "PROJECTS_DIR", str(proj_dir))
+        # Patch _status_derive (the read site) not forum_cli (which only holds
+        # copies of the imported names).
+        monkeypatch.setattr(_status_derive, "LOOP_MODE_PATH", str(loop_path))
+        monkeypatch.setattr(_status_derive, "PROJECTS_DIR", str(proj_dir))
         return loop_path, proj_dir
 
     def test_auto_publishes_working_with_cadence(self, client, auto_env):

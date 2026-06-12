@@ -1184,11 +1184,15 @@ class TestHookCursorNotAdvancedOnUnreachableNoCache:
 
     @classmethod
     def _load_hook_module(cls):
-        """Load engram-forum-prompt-hook.py via importlib (hyphenated filename)."""
+        """Load engram-forum-prompt-hook.py via importlib (hyphenated filename).
+
+        The hook moved from hooks/claude/ to src/engram/hooks/claude/ in the
+        Phase 3/4 restructure (#1093/#1116).
+        """
         import importlib.util
         hook_path = (
             Path(__file__).parent.parent
-            / "hooks" / "claude" / "engram-forum-prompt-hook.py"
+            / "src" / "engram" / "hooks" / "claude" / "engram-forum-prompt-hook.py"
         )
         spec = importlib.util.spec_from_file_location("engram_forum_prompt_hook", hook_path)
         module = importlib.util.module_from_spec(spec)
