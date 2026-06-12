@@ -490,7 +490,7 @@ def test_dag_guard_fires_for_subtask_of_when_source_older():
     obs2 = json.loads(server.engram_add_observation(payload_json=json.dumps(obs2_payload)))
     obs2_id = obs2["observation_id"]
 
-    # Manually patch obs_id (source) to have an older timestamp than obs2_id (target).
+    # Patch obs_id (source) to be OLDER than obs2_id (target) — dag-exempt, so must succeed.
     conn = server._get_db()
     try:
         conn.execute(
@@ -569,7 +569,7 @@ def test_serves_allows_source_older_than_target():
 
 
 def test_add_serves_edge_correct_order_succeeds():
-    """Adding a `serves` edge with source newer than target returns status='created'.
+    """Adding a `serves` edge returns status='created' regardless of timestamp order.
 
     Confirms the dag_check=False path works end-to-end for `serves`.
     Source newer than target also works (just not the only valid ordering).

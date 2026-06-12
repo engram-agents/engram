@@ -19,12 +19,13 @@ import sqlite3
 import sys
 import tempfile
 
-# Add project root and tools root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tools", "migration",
-))
+# Add src/engram/ (for `import server`) and docs/archive/migration/ (for
+# `from migrate_trust_tier_self_backfill import plan`) to sys.path.
+# File is at docs/archive/ — repo root is two dirname() levels up.
+_ARCHIVE_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(_ARCHIVE_DIR))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "src", "engram"))
+sys.path.insert(0, os.path.join(_ARCHIVE_DIR, "migration"))
 
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_migrate_tt_self_")
 atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
