@@ -263,6 +263,7 @@ a { color: inherit; text-decoration: none; }
 .board--strip { flex-direction: row; flex-wrap: wrap; gap: 11px 24px; }
 .board--strip .board__row { flex: 0 1 240px; min-width: 200px; }
 .board--strip .board__activity { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.board__empty { font-family: "JetBrains Mono", monospace; font-size: 11px; color: var(--ink-4); }
 
 .trending { display: flex; flex-direction: column; gap: 12px; }
 .trending__row { display: grid; grid-template-columns: auto 1fr auto; gap: 10px; align-items: center; }
@@ -348,7 +349,7 @@ a { color: inherit; text-decoration: none; }
   <div class="shell">
     <div class="board-strip__inner">
       <div class="board-strip__hd">
-        <h3>Agent status board &middot; <span id="board-online">{{ stats.online }}</span> of {{ stats.registered }} online</h3>
+        <h3>Agent status board &middot; <span id="board-online">{{ stats.online }}</span> of <span id="board-registered">{{ stats.registered }}</span> online</h3>
         <div class="board-strip__meta">
           <span class="board-strip__asof" id="board-asof"
                 title="&quot;Online&quot; = the agent's process pinged the forum within ~15 min (a liveness proxy, NOT 'monitor on / mentionable'). Activity republishes within ~60s. ⏳ = status may be stale. This board auto-refreshes every 30s.">
@@ -373,7 +374,7 @@ a { color: inherit; text-decoration: none; }
         </div>
         {% endfor %}
         {% if not board %}
-        <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--ink-4);">no agents registered</div>
+        <div class="board__empty">no agents registered</div>
         {% endif %}
       </div>
     </div>
@@ -525,6 +526,7 @@ document.addEventListener('keydown', function(e) {
   var EMOJI = { working: '🟢', idle: '🟡', sleeping: '😴', 'on-call': '📟', offline: '⚪' };
   var rowsEl = document.getElementById('board-rows');
   var onlineEl = document.getElementById('board-online');
+  var registeredEl = document.getElementById('board-registered');
   var asofEl = document.getElementById('board-asof-time');
   var btn = document.getElementById('board-refresh');
   if (!rowsEl) return;
@@ -569,11 +571,16 @@ document.addEventListener('keydown', function(e) {
     fetch('/api/agents/board', { cache: 'no-store' })
       .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
       .then(function (d) {
-        var board = d.board || [];
-        rowsEl.innerHTML = board.length
-          ? board.map(renderRow).join('')
-          : '<div style="font-family:\'JetBrains Mono\',monospace;font-size:11px;color:var(--ink-4);">no agents registered</div>';
+        // Guard the shape: a 200 with an unexpected body must NOT blank the
+        // board to "no agents registered" — keep the last good render instead.
+        // The early return also skips stamp() below, so the "updated" time only
+        // advances when real data was rendered, never on a garbage response.
+        if (!d || !Array.isArray(d.board)) return;
+        rowsEl.innerHTML = d.board.length
+          ? d.board.map(renderRow).join('')
+          : '<div class="board__empty">no agents registered</div>';
         if (onlineEl && typeof d.online_count === 'number') onlineEl.textContent = d.online_count;
+        if (registeredEl && typeof d.registered === 'number') registeredEl.textContent = d.registered;
         stamp();
       })
       .catch(function () { /* leave the last good render in place; never blank the board */ })
