@@ -3432,11 +3432,11 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # Audit-logged: every successful addition writes to edit_history so mutation
 # tooling can trace the edge's origin post-hoc.
 #
-# DAG guard: fires today for `serves`, `subtask_of`, and `tensions` (all three
-# have dag_check=True AND addable_after_creation=True in EDGE_CLASSIFICATIONS).
-# It also protects any future addable relations that gain dag_check=True. The
+# DAG guard: among addable-after-creation relations, only `subtask_of` has
+# dag_check=True today (`serves` and `tensions` were exempted in #1076 —
+# three-tier edge taxonomy, those edges are cross-temporal by design). The
 # guard enforces the temporal-DAG invariant (source newer than target) for any
-# dag_check relation that reaches the addable set.
+# dag_check relation that reaches the addable set, including future additions.
 #
 # Single-payload signature.
 @mcp.tool(

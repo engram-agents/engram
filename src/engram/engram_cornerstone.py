@@ -614,9 +614,10 @@ def _add_edge_impl(
                     )
                 })
 
-        # DAG guard: `serves`, `subtask_of`, and `tensions` all have dag_check=True
-        # AND addable_after_creation=True, so this guard fires today for those three.
-        # It also covers any future addable relations that gain dag_check=True.
+        # DAG guard: among addable-after-creation relations, only `subtask_of` has
+        # dag_check=True today. `serves` and `tensions` were exempted in #1076
+        # (three-tier edge taxonomy — those edges are cross-temporal by design).
+        # This guard also covers any future addable relations that gain dag_check=True.
         # Convention (from startup check at _ensure_data_dir and engram_inspect):
         # a violation is source.created_at < target.created_at — i.e. the source
         # is OLDER than the target. Valid edges have source newer-or-equal.

@@ -17,8 +17,9 @@ Coverage:
   9. Payload validation — empty relation returns error.
   10. Audit log — edit_history row with kind='edge_added', target_id + relation
       in metadata JSON.
-  11. DAG guard fires for `serves` when source is older than target.
-  12. Happy path — add `serves` edge with correctly-ordered timestamps succeeds.
+  11. DAG guard fires for `subtask_of` when source is older than target (#1076 retarget).
+  11b. Positive regression — `serves` allows source older than target (#1076 exemption).
+  12. Happy path — add `serves` edge with source newer than target succeeds.
   13. is_current guard — retracted source_id rejected (#1017).
   14. is_current guard — retracted target_id rejected (#1017).
   15. is_current guard — superseded source_id rejected (#1017).
@@ -461,14 +462,18 @@ def test_add_non_exemplifies_omits_cache_rebuild():
     )
 
 
-# ── 11. DAG guard fires for `serves` (dag_check=True) ─────────────────────
+# ── 11. DAG guard fires for `subtask_of` (dag_check=True) ─────────────────
 
 
-def test_dag_guard_fires_for_serves_when_source_older():
-    """DAG guard blocks `serves` when source.created_at < target.created_at.
+def test_dag_guard_fires_for_subtask_of_when_source_older():
+    """DAG guard blocks `subtask_of` when source.created_at < target.created_at.
 
-    `serves` has dag_check=True + addable_after_creation=True — so the guard
-    fires today, not only for hypothetical future relations.
+    `subtask_of` has dag_check=True + addable_after_creation=True — so the
+    guard fires today, not only for hypothetical future relations.
+
+    NOTE: `serves` was originally tested here but gained a dag_check=False
+    exemption in #1076 (a goal can be articulated after the work serving it).
+    `subtask_of` remains dag_check=True and is now the canonical test case.
     """
     server = fresh_server()
     person_id, obs_id = _seed_self_anchor_and_obs(server)
@@ -503,20 +508,71 @@ def test_dag_guard_fires_for_serves_when_source_older():
     r = json.loads(server.engram_add_edge(payload_json=json.dumps({
         "source_id": obs_id,
         "target_id": obs2_id,
-        "relation": "serves",
+        "relation": "subtask_of",
     })))
     assert "error" in r, r
     assert "DAG" in r["error"] or "invariant" in r["error"], r
 
 
-# ── 12. Happy path for `serves` (dag_check=True, correct timestamp order) ──
+# ── 11b. Positive regression: `serves` allows source older than target (#1076) ──
+
+
+def test_serves_allows_source_older_than_target():
+    """serves.source can legitimately pre-date serves.target — #1076 exemption.
+
+    A goal can be articulated after the work that serves it, so `serves` has
+    dag_check=False (exempted in #1076, three-tier edge taxonomy). This test
+    guards that exemption against future regression: back-dating the source
+    older than the target must NOT produce a DAG error.
+    """
+    server = fresh_server()
+    person_id, obs_id = _seed_self_anchor_and_obs(server)
+
+    obs2_payload = {
+        "url": "https://example.com/add-edge-serves-older-source",
+        "title": "Serves Older Source Obs",
+        "quoted_text": "Source claim text — older than target.",
+        "interpretation": "Source interpretation.",
+        "claim": "Source claim.",
+        "quote_type": "attributed_analysis",
+    }
+    obs2 = json.loads(server.engram_add_observation(payload_json=json.dumps(obs2_payload)))
+    obs2_id = obs2["observation_id"]
+
+    # Back-date obs_id (source) so it is older than obs2_id (target).
+    # For dag_check=False relations this must succeed, not raise a DAG error.
+    conn = server._get_db()
+    try:
+        conn.execute(
+            "UPDATE nodes SET created_at = '2026-01-01T00:00:00+00:00' WHERE id = ?",
+            (obs_id,),
+        )
+        conn.execute(
+            "UPDATE nodes SET created_at = '2026-06-01T00:00:00+00:00' WHERE id = ?",
+            (obs2_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = json.loads(server.engram_add_edge(payload_json=json.dumps({
+        "source_id": obs_id,
+        "target_id": obs2_id,
+        "relation": "serves",
+    })))
+    assert "error" not in r, r
+    assert r["status"] == "created", r
+    assert r["relation"] == "serves"
+
+
+# ── 12. Happy path for `serves` (dag_check=False, any timestamp order) ──
 
 
 def test_add_serves_edge_correct_order_succeeds():
     """Adding a `serves` edge with source newer than target returns status='created'.
 
-    Confirms the dag_check=True whitelist path works end-to-end for `serves`.
-    Source must be newer (or equal) than target for dag_check relations.
+    Confirms the dag_check=False path works end-to-end for `serves`.
+    Source newer than target also works (just not the only valid ordering).
     """
     server = fresh_server()
     person_id, obs_id = _seed_self_anchor_and_obs(server)
