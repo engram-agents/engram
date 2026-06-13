@@ -34,6 +34,7 @@ import json
 import os
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -57,7 +58,21 @@ def _load_hook():
     return module, spec
 
 
-hook, _HOOK_SPEC = _load_hook()
+# Load the hook with a sandboxed ENGRAM_HOME so the hook's module-level
+# sys.path.insert() does not inject the real ~/.engram into the global
+# sys.path.  The isolated_engram_home autouse fixture reloads the hook with a
+# fresh tmp_path for every test, so this bootstrap value is never visible to
+# any test body — it only governs the initial sys.path side-effect.
+_bootstrap_tmp = tempfile.mkdtemp(prefix="engram_hook_bootstrap_")
+_prev_engram_home = os.environ.get("ENGRAM_HOME")
+os.environ["ENGRAM_HOME"] = _bootstrap_tmp
+try:
+    hook, _HOOK_SPEC = _load_hook()
+finally:
+    if _prev_engram_home is None:
+        os.environ.pop("ENGRAM_HOME", None)
+    else:
+        os.environ["ENGRAM_HOME"] = _prev_engram_home
 
 
 def _reload_hook() -> None:
