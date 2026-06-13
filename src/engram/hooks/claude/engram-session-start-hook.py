@@ -186,6 +186,49 @@ def _check_mcp_health(engram_home: str) -> tuple[bool, str | None]:
         return True, None
 
 
+def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
+    """Check whether the MCP server wrote its initialization-complete marker.
+
+    Two-signal check: process existence (pgrep, done by _check_mcp_health) PLUS
+    initialization-complete evidence (marker file with PID that's still running).
+    Only call this when _check_mcp_health already returned ok=True.
+
+    Known ceiling: the marker attests "init complete + about to serve," not
+    "serving." A hang inside mcp.run()'s serve-setup would still false-confirm.
+    The probe cleanly detects the slow-import blocking class (server started
+    but blocked before mcp.run(), causing a connect-timeout in the client).
+
+    Uses os.kill(pid, 0) — zero-signal, just tests whether the PID is alive.
+    EPERM means the process exists (we lack signal permission) — treat as ok.
+
+    Returns:
+        (True, None) if marker exists and its PID is still running, or if
+                     the probe is deferred on this platform, or on any error.
+        (False, reason) if marker is absent or its PID is no longer running.
+    """
+    if not _startup_mcp_health_probe_allowed():
+        return True, None
+    import errno as _errno
+    try:
+        marker_path = os.path.join(engram_home, "mcp-tools-ready.json")
+        if not os.path.exists(marker_path):
+            return False, "mcp-tools-ready.json absent (server may not have completed initialization)"
+        with open(marker_path) as f:
+            data = json.load(f)
+        pid = int(data.get("pid", 0))
+        if not pid:
+            return False, "mcp-tools-ready.json has no valid pid field"
+        try:
+            os.kill(pid, 0)
+            return True, None  # PID is running
+        except OSError as e:
+            if e.errno == _errno.EPERM:
+                return True, None  # exists, no permission to signal — still running
+            return False, f"mcp-tools-ready.json stale (server PID {pid} no longer running)"
+    except Exception:
+        return True, None  # advisory — never block session start
+
+
 def format_calibration_block(conf_all: dict, conf_7d: dict, current_turn: int) -> str:
     """Render a 6-10 line calibration anchor for session start.
 
@@ -926,6 +969,13 @@ def main() -> None:
         lines.append("⚠️  ENGRAM substrate health:")
         lines.append(f"  MCP server: OFFLINE ({mcp_reason})")
         lines.append("  → Tell the user immediately. ENGRAM tool calls will fail.")
+    else:
+        write_ok, write_reason = _check_mcp_write_tool_marker(ENGRAM_HOME)
+        if not write_ok:
+            lines.append("")
+            lines.append("⚠️  ENGRAM substrate health:")
+            lines.append(f"  MCP write-tool liveness: UNCONFIRMED ({write_reason})")
+            lines.append("  → ENGRAM write calls will fail silently. Recovery: restart the MCP server.")
 
     output_obj = {
         "hookSpecificOutput": {

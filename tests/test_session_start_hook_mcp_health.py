@@ -60,9 +60,9 @@ def _run_hook_main(module, hook_input: dict) -> dict:
 
 
 class _Completed:
-    def __init__(self, returncode: int):
+    def __init__(self, returncode: int, stdout: str = ""):
         self.returncode = returncode
-        self.stdout = ""
+        self.stdout = stdout
         self.stderr = ""
 
 
@@ -181,3 +181,89 @@ def test_session_start_claude_still_emits_mcp_offline_when_probe_reliable(
     ctx = result["hookSpecificOutput"]["additionalContext"]
     assert "ENGRAM substrate health" in ctx
     assert "MCP server: OFFLINE (no engram server process found)" in ctx
+
+
+def test_marker_absent_returns_false(tmp_path, monkeypatch):
+    """When server running but marker absent → write-tool liveness is False."""
+    engram_home = tmp_path / "engram"
+    engram_home.mkdir()
+    mod = _load_hook_module(monkeypatch, engram_home)
+    _set_runtime_platform(monkeypatch, mod, tmp_path, "claude-code")
+    monkeypatch.delenv("CODEX_PLUGIN_ROOT", raising=False)
+
+    write_ok, write_reason = mod._check_mcp_write_tool_marker(str(engram_home))
+    assert write_ok is False
+    assert "absent" in write_reason
+
+
+def test_marker_with_running_pid_returns_ok(tmp_path, monkeypatch):
+    """When marker exists with a live PID → write-tool liveness is True."""
+    import os as _os
+    engram_home = tmp_path / "engram"
+    engram_home.mkdir()
+    mod = _load_hook_module(monkeypatch, engram_home)
+    _set_runtime_platform(monkeypatch, mod, tmp_path, "claude-code")
+    monkeypatch.delenv("CODEX_PLUGIN_ROOT", raising=False)
+    # Write marker with the current process PID — guaranteed running.
+    marker = {"pid": _os.getpid(), "registered_at": "2026-06-13T00:00:00Z"}
+    (engram_home / "mcp-tools-ready.json").write_text(json.dumps(marker))
+
+    write_ok, write_reason = mod._check_mcp_write_tool_marker(str(engram_home))
+    assert write_ok is True
+    assert write_reason is None
+
+
+def test_marker_with_dead_pid_returns_false(tmp_path, monkeypatch):
+    """When marker PID is no longer running → write-tool liveness is False."""
+    engram_home = tmp_path / "engram"
+    engram_home.mkdir()
+    mod = _load_hook_module(monkeypatch, engram_home)
+    _set_runtime_platform(monkeypatch, mod, tmp_path, "claude-code")
+    monkeypatch.delenv("CODEX_PLUGIN_ROOT", raising=False)
+    # PID 9999999 almost certainly does not exist on any Linux system.
+    marker = {"pid": 9999999, "registered_at": "2026-06-13T00:00:00Z"}
+    (engram_home / "mcp-tools-ready.json").write_text(json.dumps(marker))
+
+    write_ok, write_reason = mod._check_mcp_write_tool_marker(str(engram_home))
+    assert write_ok is False
+    assert "stale" in write_reason
+
+
+def test_codex_platform_defers_write_tool_marker_check(tmp_path, monkeypatch):
+    """Codex platform defers the marker check (no probe on Codex)."""
+    engram_home = tmp_path / "engram"
+    engram_home.mkdir()
+    mod = _load_hook_module(monkeypatch, engram_home)
+    _set_runtime_platform(monkeypatch, mod, tmp_path, "codex")
+    # No marker file — but Codex defers, so should return True.
+    write_ok, write_reason = mod._check_mcp_write_tool_marker(str(engram_home))
+    assert write_ok is True
+    assert write_reason is None
+
+
+def test_session_start_emits_write_tool_warning_when_marker_absent(
+    tmp_path, monkeypatch
+):
+    """Full hook integration: server running, no marker → write-tool warning emitted."""
+    engram_home = tmp_path / "engram"
+    (engram_home / "sessions").mkdir(parents=True)
+    mod = _load_hook_module(monkeypatch, engram_home)
+    runtime_root = _set_runtime_platform(monkeypatch, mod, tmp_path, "claude-code")
+    (runtime_root / "server.py").write_text("# test server\n")
+    monkeypatch.delenv("CODEX_PLUGIN_ROOT", raising=False)
+    # pgrep succeeds (server running) but no mcp-tools-ready.json written
+    monkeypatch.setattr(mod.subprocess, "run", MagicMock(return_value=_Completed(0)))
+
+    result = _run_hook_main(
+        mod,
+        {
+            "session_id": "test-session",
+            "transcript_path": str(tmp_path / "transcript.jsonl"),
+            "source": "startup",
+        },
+    )
+    ctx = result["hookSpecificOutput"]["additionalContext"]
+    assert "ENGRAM substrate health" in ctx
+    assert "MCP write-tool liveness: UNCONFIRMED" in ctx
+    # The OFFLINE message should NOT appear (server IS running)
+    assert "MCP server: OFFLINE" not in ctx

@@ -5462,6 +5462,34 @@ def _prewarm_embeddings(model_name: str) -> None:
         _embedder._failed_models.add(model_name)
 
 
+def _write_mcp_ready_marker() -> None:
+    """Write ~/.engram/mcp-tools-ready.json before mcp.run().
+
+    Signals that the server process successfully completed initialization
+    (all heavy imports done, pre-warm thread spawned) and is about to
+    serve tools. The SessionStart hook reads this as a two-signal liveness
+    check: process-existence (pgrep) + initialization-complete (marker PID).
+
+    Best-effort: any exception is silently swallowed — never block mcp.run().
+
+    No shutdown cleanup needed: a stopped server leaves a dead-PID marker that
+    correctly self-invalidates when the hook calls os.kill(pid, 0) on the stale PID.
+    """
+    try:
+        import datetime
+        # Canonical pattern: $ENGRAM_HOME > ~/.engram (matches engram_core.DATA_DIR).
+        engram_home = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
+        marker_path = os.path.join(engram_home, "mcp-tools-ready.json")
+        data = {
+            "pid": os.getpid(),
+            "registered_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        with open(marker_path, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     _ensure_data_dir()
     # Initialize ~/.engram/.git for the durable version-controlled snapshot.
@@ -5488,4 +5516,5 @@ if __name__ == "__main__":
             name="engram-prewarm",
         ).start()
 
+    _write_mcp_ready_marker()   # two-signal liveness: written after init, before serve
     mcp.run()
