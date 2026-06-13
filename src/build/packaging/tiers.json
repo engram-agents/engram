@@ -190,6 +190,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/setup-surface-daemon-service.sh",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/config_schema.py",
       "tier": "convenience"
     },
@@ -521,6 +525,10 @@
     },
     {
       "path": "templates/engram-surface-daemon.service.template",
+      "tier": "convenience"
+    },
+    {
+      "path": "templates/engram-surface-daemon.plist.template",
       "tier": "convenience"
     },
     {

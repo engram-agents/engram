@@ -5,7 +5,8 @@ Description=ENGRAM surface daemon (semantic recall)
 Type=simple
 ExecStart={{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-surface-daemon.py
 Environment=ENGRAM_HOME={{ENGRAM_HOME}}
-Restart=on-failure
+Environment=ENGRAM_DAEMON_IDLE_TIMEOUT=0
+Restart=always
 RestartSec=5s
 # `append:` log-routing requires systemd >= 240 (2018-10-03).
 # Pre-v240 systemd (Ubuntu 18.04 ships 237) would fail to parse this unit.

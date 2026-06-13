@@ -20,7 +20,26 @@ import sys
 import threading
 import time
 
-IDLE_TIMEOUT = 28800  # 8 hours without queries -> exit
+IDLE_TIMEOUT = 28800  # 8 hours without queries -> exit (default)
+
+
+def _resolve_idle_timeout() -> int:
+    """Return the idle-shutdown timeout in seconds.
+
+    Reads ENGRAM_DAEMON_IDLE_TIMEOUT from the environment:
+      - Unset or empty        → default 28800 (8 h), same behaviour as before.
+      - Valid positive integer → use that value.
+      - 0 or negative         → disable idle-shutdown (persistent-service mode).
+      - Non-integer garbage   → fall back to 28800; do not crash.
+    """
+    raw = os.environ.get("ENGRAM_DAEMON_IDLE_TIMEOUT", "")
+    if not raw:
+        return IDLE_TIMEOUT
+    try:
+        val = int(raw)
+    except (ValueError, TypeError):
+        return IDLE_TIMEOUT
+    return val  # 0 / negative → caller interprets as "disabled"
 
 # ---------------------------------------------------------------------------
 # Indexer ownership (issue #861)
@@ -196,12 +215,21 @@ def handle_client(conn, client):
         conn.close()
 
 
-def idle_watchdog():
-    """Exit if no queries received within IDLE_TIMEOUT."""
+def idle_watchdog(idle_timeout: int):
+    """Exit if no queries received within idle_timeout seconds.
+
+    When idle_timeout <= 0, idle-shutdown is disabled — the watchdog
+    returns immediately without setting _shutdown (persistent-service mode).
+    """
+    if idle_timeout <= 0:
+        return  # persistent-service mode: never self-exit on idle
     while not _shutdown.is_set():
         elapsed = time.time() - _last_activity
-        if elapsed > IDLE_TIMEOUT:
-            print(f"[engram-daemon] Idle for {IDLE_TIMEOUT}s, shutting down.", file=sys.stderr)
+        if elapsed > idle_timeout:
+            print(
+                f"[engram-daemon] Idle for {idle_timeout}s, shutting down.",
+                file=sys.stderr,
+            )
             _shutdown.set()
             break
         _shutdown.wait(timeout=60)  # check every minute
@@ -250,8 +278,13 @@ def main():
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGINT, cleanup)
 
-    # Start idle watchdog
-    watchdog = threading.Thread(target=idle_watchdog, daemon=True)
+    # Resolve idle-shutdown timeout (env-gate: 0/negative → disabled)
+    _idle_timeout = _resolve_idle_timeout()
+
+    # Start idle watchdog (passes immediately when idle_timeout <= 0)
+    watchdog = threading.Thread(
+        target=idle_watchdog, args=(_idle_timeout,), daemon=True
+    )
     watchdog.start()
 
     # Start periodic JSONL→index.db indexer (issue #861: daemon owns this pass)

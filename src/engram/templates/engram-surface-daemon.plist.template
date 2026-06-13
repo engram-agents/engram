@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.engram.surface-daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PYTHON}}</string>
+        <string>{{ENGRAM_HOOKS_DIR}}/engram-surface-daemon.py</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ENGRAM_HOME</key>
+        <string>{{ENGRAM_HOME}}</string>
+        <key>ENGRAM_DAEMON_IDLE_TIMEOUT</key>
+        <string>0</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>{{ENGRAM_HOME}}/surface-daemon.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{ENGRAM_HOME}}/surface-daemon.log</string>
+</dict>
+</plist>
