@@ -52,6 +52,13 @@ except ImportError:
     annotate_schema = None  # type: ignore[assignment]
     _CONFIG_SCHEMA = []  # type: ignore[assignment]
 
+try:
+    from engram_stats import _compute_health_score  # noqa: E402
+    _HEALTH_SCORE_AVAILABLE = True
+except ImportError:
+    _HEALTH_SCORE_AVAILABLE = False
+    _compute_health_score = None  # type: ignore[assignment]
+
 DEFAULT_DB = str(Path.home() / ".engram" / "knowledge.db")
 DEFAULT_PORT = 5001
 
@@ -2621,20 +2628,16 @@ def get_health_data(db_path: str) -> dict:
             data["health_trend"] = []
 
         # ── Compute live health score ────────────────────────────────
-        score = 100.0
-        dag_v = conn.execute("""
-            SELECT COUNT(*) as c FROM edges e
-            JOIN nodes s ON e.source_id = s.id JOIN nodes t ON e.target_id = t.id
-            WHERE s.created_at < t.created_at AND e.relation NOT IN ('contradicts')
-        """).fetchone()["c"]
-        score -= min(dag_v * 5, 20)
-        score -= min(data["tainted"] * 3, 15)
-        score -= min(data["stale"] * 2, 10)
-        score -= min(data["orphans"], 10)
-        score -= min((100 - data["embedding_pct"]) * 0.1, 10)
-        if total_nodes > 0 and data["retracted"] / total_nodes > 0.1:
-            score -= min((data["retracted"] / total_nodes - 0.1) * 100, 15)
-        data["health_score"] = round(max(score, 0), 1)
+        # Use the canonical single-source-of-truth formula from engram_stats
+        # (_compute_health_score) so the viz dashboard always matches
+        # engram_diagnose / engram_stats. The previous reimplementation here
+        # excluded only 'contradicts' from DAG-exempt relations, over-counting
+        # dag-exempt edges (exemplifies/instantiates/serves/resolves) as
+        # violations → full -20 penalty → wrong score (issue #1148).
+        if _HEALTH_SCORE_AVAILABLE:
+            data["health_score"] = _compute_health_score(conn)
+        else:
+            data["health_score"] = 0.0
 
         conn.close()
         return data
