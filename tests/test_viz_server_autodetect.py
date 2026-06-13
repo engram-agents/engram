@@ -12,6 +12,8 @@ Test inventory:
 4. Merge/override: discovery base + explicit config that (a) overrides a label,
    (b) sets default, (c) excludes one, (d) adds a non-detected agent with db.
 5. db-derivation: registered db == <engram_dir>/knowledge.db.
+6. Default-selection: _pick_default prefers own-agent from $ENGRAM_HOME
+   config.json; falls back to sorted-first when own-agent is absent or unknown.
 """
 from __future__ import annotations
 
@@ -20,12 +22,13 @@ import os
 import stat
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "engram"))
 
 import viz_server
-from viz_server import discover_agents, _merge_config_over_discovered
+from viz_server import discover_agents, _merge_config_over_discovered, _pick_default
 
 
 # ---------------------------------------------------------------------------
@@ -422,14 +425,20 @@ class TestMergeConfig(unittest.TestCase):
         self.assertIn("alpha-agent", agents)
         self.assertIn("beta-agent", agents)
 
-    def test_default_sorted_first_when_no_explicit_default(self):
-        """Without explicit default, first agent by sorted name is the default."""
+    def test_default_sorted_first_when_no_explicit_default_and_own_absent(self):
+        """No explicit default + own-agent not resolvable → sorted-first fallback.
+
+        Hermetic: `_own_agent_name` is patched to '' so the result doesn't depend
+        on the real $ENGRAM_HOME/config.json of the machine running the test
+        (which otherwise makes the assertion pass only by environmental accident).
+        """
         discovered = self._make_discovered()
         cfg_path = self._write_config({"agents": []})
 
-        agents, default = _merge_config_over_discovered(discovered, cfg_path)
+        with unittest.mock.patch.object(viz_server, "_own_agent_name", return_value=""):
+            agents, default = _merge_config_over_discovered(discovered, cfg_path)
 
-        # 'alpha-agent' sorts before 'beta-agent'.
+        # own-agent unknown → 'alpha-agent' sorts before 'beta-agent'.
         self.assertEqual(default, "alpha-agent")
 
     def test_invalid_default_raises(self):
@@ -558,6 +567,133 @@ class TestCollisionHandling(unittest.TestCase):
         # home_a was passed first → its db should win.
         expected_db = str(dir_a / "knowledge.db")
         self.assertEqual(result["shared-name"]["db"], expected_db)
+
+
+# ---------------------------------------------------------------------------
+# 6. Default-selection: _pick_default prefers own-agent from $ENGRAM_HOME
+# ---------------------------------------------------------------------------
+
+class TestPickDefault(unittest.TestCase):
+    """_pick_default uses own-agent from $ENGRAM_HOME/config.json when present."""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="engram_pick_default_"))
+        # Build a fake ENGRAM_HOME with a config.json that names the own agent.
+        self.fake_engram_home = self.tmpdir / ".engram"
+        self.fake_engram_home.mkdir()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_own_config(self, agent_name: str) -> None:
+        (self.fake_engram_home / "config.json").write_text(
+            json.dumps({"agent_name": agent_name, "schema_version": 2})
+        )
+
+    def _agents(self, *names) -> dict:
+        """Return a minimal agents dict with the given names."""
+        return {name: {"name": name, "label": name, "db": "/fake/db"} for name in names}
+
+    def test_own_agent_preferred_over_alphabetical_first(self):
+        """When the own-agent is among discovered agents, it wins over sorted first."""
+        # "borges" sorts before "kepler" alphabetically, but own agent is "kepler".
+        self._write_own_config("kepler")
+        agents = self._agents("borges", "kepler", "zara")
+
+        with unittest.mock.patch.dict(os.environ, {"ENGRAM_HOME": str(self.fake_engram_home)}):
+            default = _pick_default(agents)
+
+        self.assertEqual(default, "kepler",
+                         "own-agent 'kepler' should win over alphabetical 'borges'")
+
+    def test_fallback_to_sorted_first_when_own_agent_absent(self):
+        """When own-agent is not among discovered agents, fall back to sorted first."""
+        # Own agent is "phantom" but it's not in the discovered set.
+        self._write_own_config("phantom")
+        agents = self._agents("ariadne", "borges")
+
+        with unittest.mock.patch.dict(os.environ, {"ENGRAM_HOME": str(self.fake_engram_home)}):
+            default = _pick_default(agents)
+
+        self.assertEqual(default, "ariadne",
+                         "fallback should be alphabetically first when own-agent absent")
+
+    def test_fallback_to_sorted_first_when_config_missing(self):
+        """When $ENGRAM_HOME/config.json doesn't exist, fall back to sorted first."""
+        # No config.json written — fake_engram_home exists but is empty.
+        agents = self._agents("ariadne", "borges")
+
+        with unittest.mock.patch.dict(os.environ, {"ENGRAM_HOME": str(self.fake_engram_home)}):
+            default = _pick_default(agents)
+
+        self.assertEqual(default, "ariadne")
+
+    def test_fallback_when_engram_home_not_set(self):
+        """When ENGRAM_HOME is unset and ~/.engram/config.json absent, sorted first."""
+        agents = self._agents("ariadne", "borges")
+
+        # Remove ENGRAM_HOME from the environment so _own_agent_name uses the
+        # default (~/.engram) — which almost certainly does not match "ariadne" or
+        # "borges", so the fallback fires.
+        env = {k: v for k, v in os.environ.items() if k != "ENGRAM_HOME"}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            default = _pick_default(agents)
+
+        # We can only assert it's one of the valid agent names, not which one,
+        # because the real ~/.engram/config.json might name one of the agents.
+        self.assertIn(default, agents,
+                      "default must be a member of the agents dict")
+
+    def test_empty_agents_returns_empty_string(self):
+        """_pick_default returns '' when agents dict is empty."""
+        self._write_own_config("kepler")
+        with unittest.mock.patch.dict(os.environ, {"ENGRAM_HOME": str(self.fake_engram_home)}):
+            default = _pick_default({})
+        self.assertEqual(default, "")
+
+    def test_merge_fallback_uses_own_agent(self):
+        """_merge_config_over_discovered uses own-agent as default when config has none."""
+        home_a = self.tmpdir / "home_a"
+        home_b = self.tmpdir / "home_b"
+        home_a.mkdir(exist_ok=True)
+        home_b.mkdir(exist_ok=True)
+        # "borges" sorts before "kepler" — own-agent is "kepler".
+        _make_engram_dir(home_a, ".engram", "borges")
+        _make_engram_dir(home_b, ".engram", "kepler")
+        self._write_own_config("kepler")
+
+        discovered = discover_agents(scan_roots=[home_a, home_b])
+        cfg_path = self.tmpdir / "agents.json"
+        cfg_path.write_text(json.dumps({"agents": []}))  # no 'default' key
+
+        with unittest.mock.patch.dict(os.environ, {"ENGRAM_HOME": str(self.fake_engram_home)}):
+            agents, default = _merge_config_over_discovered(discovered, str(cfg_path))
+
+        self.assertEqual(default, "kepler",
+                         "merge fallback should prefer own-agent 'kepler' over 'borges'")
+
+    def test_merge_explicit_default_still_wins(self):
+        """Explicit 'default' in the config file overrides the own-agent preference."""
+        home_a = self.tmpdir / "home_a"
+        home_b = self.tmpdir / "home_b"
+        home_a.mkdir(exist_ok=True)
+        home_b.mkdir(exist_ok=True)
+        _make_engram_dir(home_a, ".engram", "borges")
+        _make_engram_dir(home_b, ".engram", "kepler")
+        # Own agent is "kepler", but config explicitly points to "borges".
+        self._write_own_config("kepler")
+
+        discovered = discover_agents(scan_roots=[home_a, home_b])
+        cfg_path = self.tmpdir / "agents.json"
+        cfg_path.write_text(json.dumps({"agents": [], "default": "borges"}))
+
+        with unittest.mock.patch.dict(os.environ, {"ENGRAM_HOME": str(self.fake_engram_home)}):
+            agents, default = _merge_config_over_discovered(discovered, str(cfg_path))
+
+        self.assertEqual(default, "borges",
+                         "explicit 'default' in config must override own-agent preference")
 
 
 if __name__ == "__main__":

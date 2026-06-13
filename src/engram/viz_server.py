@@ -2113,6 +2113,41 @@ loadAgents().then(() => {
 # Agent registry helpers
 # ---------------------------------------------------------------------------
 
+def _own_agent_name() -> str:
+    """Return the agent_name from $ENGRAM_HOME/config.json, or '' on any error.
+
+    $ENGRAM_HOME defaults to ~/.engram when the env var is absent.  Never
+    raises — callers treat a blank return as "own agent unknown, fall back".
+    """
+    try:
+        engram_home = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
+        config_path = os.path.join(engram_home, "config.json")
+        with open(config_path) as f:
+            cfg = json.load(f)
+        name = cfg.get("agent_name", "")
+        return name if isinstance(name, str) else ""
+    except Exception:
+        return ""
+
+
+def _pick_default(agents: dict) -> str:
+    """Pick the default agent for auto-detect mode.
+
+    Preference order:
+    1. The launching context's own agent ($ENGRAM_HOME/config.json agent_name),
+       if present among *agents*.
+    2. Alphabetically first agent name (deterministic fallback).
+
+    Returns '' when *agents* is empty (callers should handle that case).
+    """
+    if not agents:
+        return ""
+    own = _own_agent_name()
+    if own and own in agents:
+        return own
+    return sorted(agents.keys())[0]
+
+
 def _load_config(path: str) -> tuple[dict, str]:
     """Parse a multi-agent config JSON. Returns (agents_dict, default_name).
 
@@ -2241,7 +2276,9 @@ def _merge_config_over_discovered(discovered: dict, config_path: str) -> tuple[d
          'db' is optional for override entries — label-only override is valid.
        - If not discovered and has 'db': add the agent (back-compat).
        - If not discovered and no 'db': warn and skip.
-    4. Default: config 'default' field wins; else first agent by sorted name.
+    4. Default: config 'default' field wins; else `_pick_default` — the
+       own-agent ($ENGRAM_HOME/config.json agent_name) if present among the
+       merged agents, else the first agent by sorted name.
 
     Returns (merged_agents_dict, default_name).
     """
@@ -2295,10 +2332,8 @@ def _merge_config_over_discovered(discovered: dict, config_path: str) -> tuple[d
                 "merged agent registry"
             )
         default = explicit_default
-    elif agents:
-        default = sorted(agents.keys())[0]
     else:
-        default = ""
+        default = _pick_default(agents)
 
     return agents, default
 
@@ -4805,9 +4840,10 @@ def main():
             # Layer explicit config on top of discovered.
             AGENTS, DEFAULT_AGENT = _merge_config_over_discovered(discovered, args.config)
         elif discovered:
-            # Pure auto-detect: sort for deterministic default.
+            # Pure auto-detect: prefer the launching context's own agent as
+            # default; fall back to alphabetically first for determinism.
             AGENTS = discovered
-            DEFAULT_AGENT = sorted(AGENTS.keys())[0]
+            DEFAULT_AGENT = _pick_default(AGENTS)
         else:
             # Nothing discovered and no config — fall back to single-agent default.
             db = DEFAULT_DB
