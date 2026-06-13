@@ -222,7 +222,7 @@ automation here, by design. Mechanically:
    template changes before each upgrade by running:
 
    ```bash
-   git log <last-upgrade-commit>..HEAD -- templates/CLAUDE.md.template
+   git log <last-upgrade-commit>..HEAD -- templates/template.CLAUDE.md
    ```
 
    That tells you the template has changes you may want to port back
@@ -233,7 +233,7 @@ automation here, by design. Mechanically:
 2. **Inspection**: read the change history with the embedded command:
 
    ```bash
-   git log <old>..<new> -- templates/CLAUDE.md.template
+   git log <old>..<new> -- templates/template.CLAUDE.md
    ```
 
 3. **Judgment** (the load-bearing step): for each change, classify:
@@ -254,8 +254,8 @@ automation here, by design. Mechanically:
 
 5. **Reverse direction**: if your local edit IS universal, open a PR
    that updates the template. Concrete file paths:
-   - `templates/CLAUDE.md.template` for Claude-runtime agents
-   - `templates/warm-briefing.md.template` for the relational letter
+   - `templates/template.CLAUDE.md` for Claude-runtime agents
+   - `templates/template.warm-briefing.md` for the relational letter
 
    Omit anything agent-specific from the template — it will be rendered
    verbatim for every new install. The drift surface will then appear

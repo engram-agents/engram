@@ -234,16 +234,16 @@
 
 | file | ship | tier/reason | mechanism | status |
 |---|---|---|---|---|
-| `templates/AGENTS.md.template` | shipped | essential | _?_ | _unswept_ |
-| `templates/CLAUDE.md.multi-agent.template` | shipped | convenience+MA | _?_ | _unswept_ |
-| `templates/CLAUDE.md.template` | shipped | essential | _?_ | _unswept_ |
+| `templates/template.AGENTS.md` | shipped | essential | _?_ | _unswept_ |
+| `templates/template.CLAUDE.multi-agent.md` | shipped | convenience+MA | _?_ | _unswept_ |
+| `templates/template.CLAUDE.md` | shipped | essential | _?_ | _unswept_ |
 | `templates/agents.json.example` | shipped | convenience+MA | _?_ | _unswept_ |
 | `templates/compact-instructions.md` | shipped | essential | _?_ | _unswept_ |
 | `templates/config.json.example` | shipped | essential | _?_ | _unswept_ |
 | `templates/engram-surface-daemon.service.template` | shipped | convenience | _?_ | _unswept_ |
 | `templates/engram-viz-user.service.template` | shipped | convenience | _?_ | _unswept_ |
 | `templates/engram-viz.service` | shipped | convenience | _?_ | _unswept_ |
-| `templates/warm-briefing.md.template` | shipped | essential | _?_ | _unswept_ |
+| `templates/template.warm-briefing.md` | shipped | essential | _?_ | _unswept_ |
 
 ## tests (165 files)
 

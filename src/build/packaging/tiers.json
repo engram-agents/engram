@@ -500,7 +500,7 @@
       "tier": "convenience"
     },
     {
-      "path": "templates/CLAUDE.md.template",
+      "path": "templates/template.CLAUDE.md",
       "tier": "essential"
     },
     {
@@ -508,11 +508,11 @@
       "tier": "essential"
     },
     {
-      "path": "templates/AGENTS.md.template",
+      "path": "templates/template.AGENTS.md",
       "tier": "essential"
     },
     {
-      "path": "templates/warm-briefing.md.template",
+      "path": "templates/template.warm-briefing.md",
       "tier": "essential"
     },
     {
@@ -528,7 +528,7 @@
       "tier": "convenience"
     },
     {
-      "path": "templates/CLAUDE.md.multi-agent.template",
+      "path": "templates/template.CLAUDE.multi-agent.md",
       "tier": "convenience",
       "multi_agent": true
     },

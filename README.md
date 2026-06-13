@@ -633,7 +633,7 @@ Finish with `/mcp` → engram → Reconnect so the running server picks up the n
 
 - `~/.claude/CLAUDE.md` — rendered from template once at install-time. If the
   template changed since the user's last upgrade, the `engram-upgrade` skill's
-  Step 2 (`git log -- templates/CLAUDE.md.template`) surfaces those changes for
+  Step 2 (`git log -- templates/template.CLAUDE.md`) surfaces those changes for
   review. Inverse-merging template changes into the live config is judgment
   work — both directions can drift.
 - `~/.claude/settings.json` — similar; the hooks fragment is install-time-only.
@@ -669,7 +669,7 @@ gate that catches drift the mechanical upgrade step cannot detect.
 | 2 | Refuse to overwrite an existing `~/.engram/knowledge.db` (unless `--force`) |
 | 3 | Create `~/.engram/`, `~/.engram/hooks/`, `~/.engram/diary/`, `~/.claude/skills/`, `~/.claude/agents/` |
 | 4 | Copy `skills/*` → `~/.claude/skills/`, `agents/*` → `~/.claude/agents/` (sleep-routine and PR-review sub-agents), `hooks/*` → `~/.engram/hooks/`, `viz_server.py` → `~/.engram/viz_server.py`, register the `engram` MCP server via `claude mcp add -s user` (writes into `~/.claude.json`), pre-warm the sentence-transformers embedding cache so the first MCP launch doesn't trip the harness's stdio handshake timeout |
-| 5 | Create 5 seed nodes via the MCP server, write `~/.engram/seed-manifest.json`, render `CLAUDE.md.template` + `warm-briefing.md.template` with seed IDs and repo path, merge hook registrations into `~/.claude/settings.json` |
+| 5 | Create 5 seed nodes via the MCP server, write `~/.engram/seed-manifest.json`, render `template.CLAUDE.md` + `template.warm-briefing.md` with seed IDs and repo path, merge hook registrations into `~/.claude/settings.json` |
 | 6 | Write `~/.engram/first-run-pending` so the cold-start skill fires on the next session |
 | 7 | `git init` inside `~/.engram/`; commit the install state |
 

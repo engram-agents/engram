@@ -60,7 +60,7 @@ build-plugin.sh uses DIFFERENT copy granularities for different surfaces:
 
   * templates: per-top-level-item (files AND sub-directories).
     Manifest unit = per-top-level-item inside templates/, e.g.
-    ``templates/CLAUDE.md.template`` and ``templates/config.json.example``.
+    ``templates/template.CLAUDE.md`` and ``templates/config.json.example``.
 
 The plugin-universe test enumerates each surface at the SAME granularity the
 manifest uses, so the cross-check is 1:1 with no false mismatches.

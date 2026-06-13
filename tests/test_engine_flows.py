@@ -138,10 +138,10 @@ def _make_fake_env(
     for d in ["skills/claude", "agents/claude", "output-styles/claude"]:
         os.makedirs(os.path.join(source_dir, d), exist_ok=True)
 
-    # Fake templates/CLAUDE.md.template
+    # Fake templates/template.CLAUDE.md
     templates_dir = os.path.join(source_dir, "templates")
     os.makedirs(templates_dir, exist_ok=True)
-    with open(os.path.join(templates_dir, "CLAUDE.md.template"), "w") as f:
+    with open(os.path.join(templates_dir, "template.CLAUDE.md"), "w") as f:
         f.write("# ENGRAM CLAUDE.md template\nsome content\n")
 
     # Fake launch-engram-server.sh (needed for build step)

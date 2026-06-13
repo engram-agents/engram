@@ -11,14 +11,14 @@ real file per agent.
 ## What ships
 
 - `engram-coder-fairy.md` — dispatched for all PR coding work per
-  `CLAUDE.md.template`'s delegation rule. Carries `isolation: worktree`
+  `template.CLAUDE.md`'s delegation rule. Carries `isolation: worktree`
   and `default_background: true`; the canonical source is here so local
   `.claude/agents/` picks up frontmatter additions automatically via symlink.
 - `engram-dream-fairy.md` — dispatched by `engram-sleep` Step 0 for
   parallel six-category consolidation scans. The sleep skill has a
   graceful fallback if the agent definition is missing, but the fairy
   scan is the high-leverage path.
-- `engram-pr-reviewer.md` — referenced by `CLAUDE.md.template`'s PR
+- `engram-pr-reviewer.md` — referenced by `template.CLAUDE.md`'s PR
   Workflow Standards section; dispatched after `gh pr create` and
   re-dispatched after every round-N commit until convergence.
 

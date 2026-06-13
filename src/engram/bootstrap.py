@@ -291,7 +291,7 @@ def _render_codex_target(substitutions: dict[str, str]) -> None:
     2. ~/.codex/config.toml               — identity keys (merge-not-clobber)
     3. ~/.codex/AGENTS.md                 — project conventions placeholder
 
-    The instructions= body is the full CLAUDE.md.template rendered with
+    The instructions= body is the full template.CLAUDE.md rendered with
     seed-IDs/ENGRAM_HOME, then adapted for Codex (CLAUDE_PLUGIN_ROOT →
     CODEX_PLUGIN_ROOT; ~/.claude/CLAUDE.md self-refs → ~/.codex/config.toml;
     output-styles ref → personality/#816) with the ## Compact Instructions
@@ -315,9 +315,9 @@ def _render_codex_target(substitutions: dict[str, str]) -> None:
     print(f"  codex-compact-prompt.md → {compact_out}", flush=True)
 
     # 2. ~/.codex/config.toml — instructions= body
-    # Start from the CLAUDE.md.template, substitute seed-IDs + ENGRAM_HOME,
+    # Start from the template.CLAUDE.md, substitute seed-IDs + ENGRAM_HOME,
     # then apply Codex-specific adaptations, then remove compact section.
-    claude_template_path = TEMPLATES_DIR / "CLAUDE.md.template"
+    claude_template_path = TEMPLATES_DIR / "template.CLAUDE.md"
     raw = claude_template_path.read_text()
 
     # Apply all substitutions (this folds {{COMPACT_INSTRUCTIONS}} back in,
@@ -351,7 +351,7 @@ def _render_codex_target(substitutions: dict[str, str]) -> None:
 
     # 3. ~/.codex/AGENTS.md — project conventions placeholder
     substitute_template(
-        TEMPLATES_DIR / "AGENTS.md.template",
+        TEMPLATES_DIR / "template.AGENTS.md",
         CODEX_HOME / "AGENTS.md",
         substitutions,
     )
@@ -496,7 +496,7 @@ def main() -> None:
 
         # Same symlink shape for ~/.engram/hooks/ — many existing surfaces
         # (README troubleshooting, learn-from-error diagnostic command,
-        # CLAUDE.md.template hook-path table, etc.) reference the scatter
+        # template.CLAUDE.md hook-path table, etc.) reference the scatter
         # path. The symlink lets those references resolve through to the
         # plugin's hook scripts without doc churn, and plugin upgrades
         # auto-propagate (Lei Chromebook trial 2026-05-31).
@@ -585,7 +585,7 @@ def main() -> None:
 
     # Shared (both targets): warm briefing lives in ENGRAM_HOME.
     substitute_template(
-        TEMPLATES_DIR / "warm-briefing.md.template",
+        TEMPLATES_DIR / "template.warm-briefing.md",
         ENGRAM_HOME / "warm-briefing.md",
         substitutions,
     )
@@ -604,7 +604,7 @@ def main() -> None:
     # Target-specific identity doc + hook config
     if TARGET == "claude":
         substitute_template(
-            TEMPLATES_DIR / "CLAUDE.md.template",
+            TEMPLATES_DIR / "template.CLAUDE.md",
             CLAUDE_HOME / "CLAUDE.md",
             substitutions,
         )

@@ -26,7 +26,7 @@ Steps map 1-to-1 with the skill's numbered sections:
   plugin-upgrade          Step 5:  [operator] /plugin → Installed → engram plugin entry → Update now
   mcp-reconnect           Step 6:  [operator, conditional] /mcp reconnect — only when
                                    server.py or engram_*.py changed in deployed..target range
-  template-gate           Step 7:  [agent, judgment] detect CLAUDE.md.template diff;
+  template-gate           Step 7:  [agent, judgment] detect template.CLAUDE.md diff;
                                    NEVER edits ~/.claude/CLAUDE.md — surfaces only
   stats-verify-instruction   Step 8: [operator] verify engram_stats via MCP
   record-reminder         Step 9:  [operator] remind agent to file the upgrade obs
@@ -47,7 +47,7 @@ Optional keys (computed by steps, stored back into ctx):
 
   _deployed_sha: str        SHA from .deployed-version
   _changeset_commits: list  git log lines deployed..target
-  _template_changed: bool   whether templates/CLAUDE.md.template changed
+  _template_changed: bool   whether templates/template.CLAUDE.md changed
   _build_manifest: dict     loaded from built plugin .engram-build-manifest.json
   _built_plugin_root: str   path to the assembled plugin tree
 """
@@ -412,7 +412,7 @@ def upgrade_flow() -> list[Step]:
         ),
 
         # ── Step 7: template-gate [agent, judgment] ───────────────────────
-        # Detects CLAUDE.md.template changes; surfaces diff; NEVER edits
+        # Detects template.CLAUDE.md changes; surfaces diff; NEVER edits
         # ~/.claude/CLAUDE.md — that is hard-boundary agent judgment.
         Step(
             id="template-gate",
@@ -508,10 +508,10 @@ def _apply_changeset_reviewed(ctx: dict[str, Any]) -> None:
         commits = _git_log_range(source_dir, deployed_sha, target_sha)
         ctx["_changeset_commits"] = commits
 
-        # Check whether CLAUDE.md.template changed (path from Phase 1 #1093;
-        # root compat symlink removed in Phase 4).
+        # Check whether template.CLAUDE.md changed (path from Phase 1 #1093;
+        # root compat symlink removed in Phase 4; renamed from CLAUDE.md.template).
         files = _files_in_range(source_dir, deployed_sha, target_sha)
-        ctx["_template_changed"] = "src/engram/templates/CLAUDE.md.template" in files
+        ctx["_template_changed"] = "src/engram/templates/template.CLAUDE.md" in files
         ctx["_changed_files"] = files
 
     # Note: we do NOT set ack_changeset here — that requires explicit operator
@@ -639,7 +639,7 @@ def _check_mcp_reconnect(ctx: dict[str, Any]) -> bool:
 
 
 def _apply_template_gate(ctx: dict[str, Any]) -> None:
-    """Detect CLAUDE.md.template diff; surface it; mark gate done.
+    """Detect template.CLAUDE.md diff; surface it; mark gate done.
 
     Hard boundary: this function NEVER edits ~/.claude/CLAUDE.md.
     It only reads the template and the live file, computes the diff,
@@ -656,8 +656,8 @@ def _apply_template_gate(ctx: dict[str, Any]) -> None:
         return
 
     # templates/ moved to src/engram/templates/ in Phase 1 #1093;
-    # root compat symlink removed in Phase 4.
-    template_path = os.path.join(source_dir, "src", "engram", "templates", "CLAUDE.md.template")
+    # root compat symlink removed in Phase 4; renamed from CLAUDE.md.template.
+    template_path = os.path.join(source_dir, "src", "engram", "templates", "template.CLAUDE.md")
 
     # Compute a simple unified diff (stdlib only)
     import difflib

@@ -36,7 +36,7 @@
 
 **3. engram-nap** — Pre-compaction shallow consolidation, no turn advance; arms nap_checkpoint feeling nudge. Activation: explicit; drowsiness-meter integration. Status: PROD-VERIFIED (daily live use).
 
-**4. engram-retract** — Error-correction workflow (6 error classes → engram_retract → cascade-taint). Activation: explicit / "I found an error"; referenced in CLAUDE.md.template write discipline. Status: PROD-VERIFIED.
+**4. engram-retract** — Error-correction workflow (6 error classes → engram_retract → cascade-taint). Activation: explicit / "I found an error"; referenced in template.CLAUDE.md write discipline. Status: PROD-VERIFIED.
 
 **5. engram-resolve-cascade** — Clears cascade markers (tainted_by/stale_by/support_lost) by node type after retract/supersede. Activation: explicit; dream-cycle discovery. Status: PROD-VERIFIED.
 

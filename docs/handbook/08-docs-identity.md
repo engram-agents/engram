@@ -20,7 +20,7 @@
 ## Identity template system
 
 **Templates (9)** rendered by bootstrap.py + the first-session skill (re-counted 2026-06-09 via `git ls-tree origin/dev templates/`):
-- CLAUDE.md.template (essential) + multi-agent variant → `~/.claude/CLAUDE.md`; AGENTS.md.template (codex); warm-briefing.md.template → `~/.engram/warm-briefing.md`; compact-instructions.md (inlined via {{COMPACT_INSTRUCTIONS}}); 2 systemd unit templates (surface-daemon, viz-user); 2 config examples. (3 external-cron heartbeat templates retired by #957 — see 03-hooks.md §6.2.)
+- template.CLAUDE.md (essential) + multi-agent variant → `~/.claude/CLAUDE.md`; template.AGENTS.md (codex); template.warm-briefing.md → `~/.engram/warm-briefing.md`; compact-instructions.md (inlined via {{COMPACT_INSTRUCTIONS}}); 2 systemd unit templates (surface-daemon, viz-user); 2 config examples. (3 external-cron heartbeat templates retired by #957 — see 03-hooks.md §6.2.)
 - **Placeholder ledger (14 unique)**: bootstrap-substituted: ENGRAM_HOME, ENGRAM_HOOKS_DIR, PYTHON, COMPACT_INSTRUCTIONS + seed-IDs (AX_HONESTY, AX_HONESTY_DISCRETION, AX_PROVENANCE, GL_EPISTEMIC_HUMILITY, DF_ENGRAM, DF_EPISTEMIC_IDENTITY); first-session-rendered: AGENT_NAME, USER_NAME, TODAY, SELF_NODE_ID.
 - **Placeholder orphans (verify in accuracy pass):** O1 `{{COUNTERPART_NAME}}` (warm-briefing/HEARTBEAT/crontab, multi-agent) — no bootstrap substitution; depends on first-session handling, literal-render risk otherwise. O2 `{{ENGRAM_VIZ_HOME}}` (viz service templates) — no substitution found; systemd literal-render risk. O3 seed-ID keys AX_PROVENANCE + DF_ENGRAM are substitution-ready but referenced by NO template (unused substitution slots — or templates dropped the references).
 - Bootstrap's gemini render path (GEMINI.md, lines ~598–607 at draft time) is **GONE** — bootstrap.py has zero gemini references post-#865; B7 is resolved.
@@ -34,7 +34,7 @@ Three-tier doc architecture (CLAUDE.md identity / SKILL.md what-and-why / docstr
 
 ## User/dev docs (root, 7)
 
-README (**S2 RESOLVED 2026-06-09** — no longer references `tools/deploy.sh`; re-verify scatter-section historical markers on next pass) · USER_GUIDE (2026-06-04) · CLAUDE.md project conventions (2026-06-04; **S1 RESOLVED 2026-06-09** — CLAUDE.md.template line ~63 now correctly reads `hooks/hooks.json`) · DEVELOPMENT (current; documents plugin-native hooks correctly) · CHANGELOG (scatter-era refs are historical record — acceptable) · RELEASING.
+README (**S2 RESOLVED 2026-06-09** — no longer references `tools/deploy.sh`; re-verify scatter-section historical markers on next pass) · USER_GUIDE (2026-06-04) · CLAUDE.md project conventions (2026-06-04; **S1 RESOLVED 2026-06-09** — template.CLAUDE.md line ~63 now correctly reads `hooks/hooks.json`) · DEVELOPMENT (current; documents plugin-native hooks correctly) · CHANGELOG (scatter-era refs are historical record — acceptable) · RELEASING.
 
 ## Seed content
 
@@ -48,7 +48,7 @@ output-styles/claude/proactive-with-carveouts.md — shipped, referenced by the 
 
 | ID | Where | Wrong teaching | Status (re-verified 2026-06-09 vs origin/dev) |
 |----|-------|----------------|------|
-| S1 | CLAUDE.md.template ~63 | hooks live in settings.json | ✅ RESOLVED — template now reads `hooks/hooks.json` |
+| S1 | template.CLAUDE.md ~63 | hooks live in settings.json | ✅ RESOLVED — template now reads `hooks/hooks.json` |
 | S2 | README ~74/78 | upgrade via tools/deploy.sh | ✅ RESOLVED — README no longer references `deploy.sh` |
 | S3 | SKILL.md 302/665 | cites nonexistent engram_feeling_node_design.md | ✅ RESOLVED — 0 refs in SKILL.md |
 | B1 | SKILL.md §4 | engram_add_evidence listed as tool | ✅ RESOLVED — 0 refs in SKILL.md |

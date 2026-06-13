@@ -8,7 +8,12 @@
       "reason": "retired upgrade path"
     },
     {
-      "surface_glob": "templates/*.template",
+      "surface_glob": "src/engram/templates/template.*.md",
+      "regex": "hooks in `settings\\.json`",
+      "reason": "plugin hooks.json is the location"
+    },
+    {
+      "surface_glob": "src/engram/templates/*.service.template",
       "regex": "hooks in `settings\\.json`",
       "reason": "plugin hooks.json is the location"
     }

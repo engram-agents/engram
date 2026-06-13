@@ -168,7 +168,7 @@ Projects are sorted oldest-first (most overdue at the top).
 
 Baton is not installed by `install.sh` — it requires a shared filesystem
 between agents, which only exists in multi-agent setups. See also
-`templates/CLAUDE.md.multi-agent.template` for the CLAUDE.md additions that
+`templates/template.CLAUDE.multi-agent.md` for the CLAUDE.md additions that
 activate the `ia` and `baton` skill-loading triggers in an agent's live config.
 
 ```bash

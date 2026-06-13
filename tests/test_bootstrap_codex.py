@@ -105,7 +105,7 @@ def test_claude_compact_instructions_substitution_integrity():
     It requires no git dependency and runs cleanly in CI.
 
     Asserts (against current HEAD files):
-    1. templates/CLAUDE.md.template contains exactly one {{COMPACT_INSTRUCTIONS}}
+    1. templates/template.CLAUDE.md contains exactly one {{COMPACT_INSTRUCTIONS}}
        marker before substitution.
     2. templates/compact-instructions.md exists and is non-empty.
     3. After substitution, the rendered output contains NO literal
@@ -118,13 +118,13 @@ def test_claude_compact_instructions_substitution_integrity():
        (the header stays in the template; only the body moved to the file).
     """
     # 1. Template contains exactly one marker
-    template_path = TEMPLATES_DIR / "CLAUDE.md.template"
-    assert template_path.exists(), f"CLAUDE.md.template not found at {template_path}"
+    template_path = TEMPLATES_DIR / "template.CLAUDE.md"
+    assert template_path.exists(), f"template.CLAUDE.md not found at {template_path}"
     template_text = template_path.read_text()
     marker_count = template_text.count("{{COMPACT_INSTRUCTIONS}}")
     assert marker_count == 1, (
         f"Expected exactly 1 {{{{COMPACT_INSTRUCTIONS}}}} marker in "
-        f"CLAUDE.md.template, found {marker_count}"
+        f"template.CLAUDE.md, found {marker_count}"
     )
 
     # 2. compact-instructions.md exists and is non-empty

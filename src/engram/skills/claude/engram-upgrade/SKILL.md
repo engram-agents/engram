@@ -9,7 +9,7 @@ Upgrading a plugin-mode ENGRAM install is mechanically simple but keeps one well
 
 **The architecture that makes plugin upgrades simple:** your *data* (`~/.engram/knowledge.db`, history, diary, sessions) and your *identity surfaces* (`~/.claude/CLAUDE.md`, warm-briefing) are **never touched** by a plugin upgrade. The *code* (server, hooks, tools, skills, agents) lives in the plugin tree (`~/.engram/marketplace/plugins/engram/`) and the host plugin cache. Claude Code replaces the cache via `/plugin upgrade`; Codex refreshes it via `codex plugin add engram@engram-local`. That's why the scatter-era manual steps are gone: **hooks, skills, agents, and tools upgrade with the plugin automatically**. Helper paths are host-dependent: use the installed plugin tree/cache (e.g. `~/.codex/plugins/cache/.../tools/verify_quote.py` on Codex). Note: `~/.engram/marketplace/plugins/engram/` IS the plugin tree replaced atomically by `/plugin upgrade`; `~/.engram/hooks` and `~/.engram/tools` are independent data directories with separate inodes — they are NOT symlinks into the plugin tree and are NOT touched by the upgrade.
 
-**The one residual hard gate:** the host identity surface is user-scope identity and is *not* plugin-owned. On Claude this is usually `~/.claude/CLAUDE.md` rendered from `templates/CLAUDE.md.template`; on Codex it may be `~/.codex/config.toml` instructions plus project `AGENTS.md` from `templates/AGENTS.md.template`. If the relevant upstream template changed, the live surface needs an inverse-merge (Step 6). That's the load-bearing judgment step of this skill.
+**The one residual hard gate:** the host identity surface is user-scope identity and is *not* plugin-owned. On Claude this is usually `~/.claude/CLAUDE.md` rendered from `templates/template.CLAUDE.md`; on Codex it may be `~/.codex/config.toml` instructions plus project `AGENTS.md` from `templates/template.AGENTS.md`. If the relevant upstream template changed, the live surface needs an inverse-merge (Step 6). That's the load-bearing judgment step of this skill.
 
 **When to use:**
 - The install is plugin-mode (`~/.engram/marketplace/plugins/engram/plugin.json` exists) and the user wants newer alpha code without losing data
@@ -83,10 +83,10 @@ git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/dev"
 - You may `gh pr view <N>` on at most ONE PR for depth. Do NOT loop over all PRs fetching bodies (token budget).
 - Write a ≤4-bullet summary: what surfaces are touched, anything deploy-fragile (`server.py` / hooks / migrations), anything user-facing. Surface it; pause on anything concerning.
 
-**Also note here** whether `templates/CLAUDE.md.template` appears in the change set — that pre-announces Step 6's gate:
+**Also note here** whether `templates/template.CLAUDE.md` appears in the change set — that pre-announces Step 6's gate:
 
 ```bash
-git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/dev" -- templates/CLAUDE.md.template
+git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/dev" -- templates/template.CLAUDE.md
 ```
 
 **Checkpoint**: change-set summary surfaced + user confirmed proceed (or concern resolved) + CLAUDE.md-template-changed noted yes/no.
@@ -158,16 +158,16 @@ The plugin tree/cache now has the new `server.py`, but the running MCP server ma
 
 ## Step 6 — CLAUDE.md template inverse-merge (HARD GATE, the residual)
 
-If Step 2 found the host identity template changed in the range, **do not skip this**. On Claude, check `templates/CLAUDE.md.template` against `~/.claude/CLAUDE.md`. On Codex, check `templates/AGENTS.md.template` and any local first-person instructions in `~/.codex/config.toml`/project `AGENTS.md`. The plugin upgrade did not touch these user-scope identity surfaces, so template-side additions may NOT have reached the running agent.
+If Step 2 found the host identity template changed in the range, **do not skip this**. On Claude, check `templates/template.CLAUDE.md` against `~/.claude/CLAUDE.md`. On Codex, check `templates/template.AGENTS.md` and any local first-person instructions in `~/.codex/config.toml`/project `AGENTS.md`. The plugin upgrade did not touch these user-scope identity surfaces, so template-side additions may NOT have reached the running agent.
 
 **The "I'll come back to it" failure mode is real** (2026-05-16: a template discipline-change was deferred post-deploy, never merged, and misfired for days before diagnosis). Resolve it now or track it explicitly — never silent-defer.
 
 ```bash
 SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)
 # Claude:
-diff "$SOURCE_DIR"/templates/CLAUDE.md.template ~/.claude/CLAUDE.md
+diff "$SOURCE_DIR"/templates/template.CLAUDE.md ~/.claude/CLAUDE.md
 # Codex (adapt live path to the install):
-diff "$SOURCE_DIR"/templates/AGENTS.md.template /path/to/live/AGENTS.md
+diff "$SOURCE_DIR"/templates/template.AGENTS.md /path/to/live/AGENTS.md
 ```
 
 - Inverse-merge template-side additions that are identity- or discipline-forming into the live file; **preserve agent-local customizations** (the template is the floor, not the ceiling).

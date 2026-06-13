@@ -305,15 +305,15 @@ class TestForbiddenTeachings(unittest.TestCase):
 
     def test_multiple_entries_one_match(self):
         self._write("README.md", "clean README\n")
-        os.makedirs(os.path.join(self.tmpdir, "templates"), exist_ok=True)
+        os.makedirs(os.path.join(self.tmpdir, "src", "engram", "templates"), exist_ok=True)
         self._write(
-            "templates/CLAUDE.md.template",
+            "src/engram/templates/template.CLAUDE.md",
             "Register hooks in `settings.json` to enable.\n",
         )
         teachings = [
             {"surface_glob": "README.md", "regex": r"deploy\.sh", "reason": "retired path"},
             {
-                "surface_glob": "templates/*.template",
+                "surface_glob": "src/engram/templates/template.*.md",
                 "regex": r"hooks in `settings\.json`",
                 "reason": "plugin hooks.json is the location",
             },
