@@ -30,6 +30,7 @@ label ('unknown', 'parse-error', etc) rather than crashing. The hook writes to
 stdout only; stderr is reserved for diagnostics the agent shouldn't see.
 """
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,11 +40,22 @@ try:
 except ImportError:
     ZoneInfo = None
 
-ENGRAM_DIR = Path.home() / ".engram"
+ENGRAM_DIR = Path(os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram"))
 SESSIONS_DIR = ENGRAM_DIR / "sessions"
 LAST_USER_MSG = ENGRAM_DIR / "last-user-msg.json"
+LAST_USER_ACTIVITY = ENGRAM_DIR / "last-user-activity"
 CONFIG = ENGRAM_DIR / "config.json"
 DEFAULT_TZ = "America/Los_Angeles"
+
+# Prompt-body prefixes that identify non-human events (loop self-wakes and
+# monitor notifications). Used as the fallback discriminator when promptSource
+# is absent from the hook payload.
+_NON_HUMAN_PREFIXES = (
+    "<task-notification",
+    "<command-message",
+    "<command-name",
+    "<local-command",
+)
 
 
 def _read_json(path: Path):
@@ -114,30 +126,81 @@ def _format_time_field(now_utc: datetime, tz_name: str) -> str:
     return f"{now_utc.strftime('%a')} {now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')} UTC (local tz unavailable)"
 
 
-def _read_session_id_from_stdin():
-    """Pull session_id off this hook's stdin payload. Returns None on any error."""
+def _read_stdin_payload() -> dict:
+    """Read and parse the hook's stdin payload once. Returns {} on any error."""
     try:
         raw = sys.stdin.read()
         if not raw:
-            return None
-        payload = json.loads(raw)
-        sid = payload.get("session_id")
-        if isinstance(sid, str) and sid:
-            return sid
+            return {}
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _is_human_prompt(payload: dict) -> bool:
+    """Return True if the payload represents a genuine human-typed prompt.
+
+    Discriminator (per spec, verified in transcript 2026-06-13):
+      1. If promptSource is present: stamp only when promptSource == "typed".
+         - "typed" = genuine human keyboard input
+         - "system" = monitor task-notification event
+         - absent = loop self-wake (ScheduleWakeup) carrying a <command-*> body
+      2. Fallback when promptSource absent: check whether the prompt body starts
+         with any known non-human prefix (<task-notification>, <command-message>,
+         <command-name>, <local-command>). If yes → not human.
+
+    Fail-safe: on any parsing problem, returns False (no stamp) rather than
+    risking a false "human" classification.
+    """
+    try:
+        prompt_source = payload.get("promptSource")
+        if prompt_source is not None:
+            # promptSource is present in payload — trust it directly.
+            return prompt_source == "typed"
+        # promptSource absent: fall back to body-prefix exclusion.
+        prompt = payload.get("prompt") or ""
+        if isinstance(prompt, str):
+            stripped = prompt.lstrip()
+            for prefix in _NON_HUMAN_PREFIXES:
+                if stripped.startswith(prefix):
+                    return False
+            # No known non-human prefix AND a non-empty body = positive
+            # evidence of a human prompt. An empty/absent body (absence of
+            # evidence — e.g. an unreadable or empty payload) is NOT treated
+            # as human: stamping on it would falsely mark 'engaged'.
+            return bool(stripped)
     except Exception:
         pass
-    return None
+    return False
+
+
+def _stamp_user_activity(now_epoch: float) -> None:
+    """Write epoch seconds to LAST_USER_ACTIVITY. Fail-safe: swallow all errors."""
+    try:
+        LAST_USER_ACTIVITY.write_text(str(int(now_epoch)))
+    except Exception:
+        pass
 
 
 def main():
     now_utc = datetime.now(timezone.utc)
     utc_iso = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")  # retained: stamps last-user-msg.json below
 
+    # Read stdin once; extract all needed fields from it.
+    payload = _read_stdin_payload()
+
+    # --- Stamp last-user-activity EARLY, before any other work (spec requirement).
+    # Only on genuine human-typed prompts — loop self-wakes and monitor events
+    # must NOT update the stamp (they would falsely mark the agent as "engaged").
+    if _is_human_prompt(payload):
+        _stamp_user_activity(now_utc.timestamp())
+
     # Per-session marker keyed by session_id (issue #140 retired the global
     # active-session.json). Falls through to unknown when stdin is empty.
     session = {}
-    session_id = _read_session_id_from_stdin()
-    if session_id:
+    session_id = payload.get("session_id")
+    if isinstance(session_id, str) and session_id:
         session = _read_json(SESSIONS_DIR / f"{session_id}.json") or {}
     session_ago = _hms_ago(now_utc, session.get("started_at"))
 

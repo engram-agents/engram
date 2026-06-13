@@ -1,15 +1,20 @@
-"""Tests for engram-time-bar-hook's time-field formatting (#721).
+"""Tests for engram-time-bar-hook's time-field formatting (#721) and
+last-user-activity stamping (#1077 part 2).
 
-The fix makes USER-LOCAL time prominent (weekday/date/12-hour/tz from the user's
-timezone) and reduces UTC to a small parenthetical — because an agent read the
-leading UTC field as the local time and confabulated 'it's 2am'. The load-bearing
-cases: the local fields (esp. weekday + date) derive from local, not UTC, so they
-stay correct across the UTC/local date boundary near midnight.
+The formatting fix makes USER-LOCAL time prominent (weekday/date/12-hour/tz from
+the user's timezone) and reduces UTC to a small parenthetical — because an agent
+read the leading UTC field as the local time and confabulated 'it's 2am'. The
+load-bearing cases: the local fields (esp. weekday + date) derive from local, not
+UTC, so they stay correct across the UTC/local date boundary near midnight.
+
+The stamping tests (spec case 7) verify that last-user-activity is written only
+on genuine human-typed prompts and not on loop self-wakes or monitor events.
 """
 
 import importlib.util
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -88,3 +93,101 @@ def test_fallback_when_zoneinfo_module_absent(monkeypatch):
     field = tbh._format_time_field(datetime(2026, 6, 3, 2, 55, tzinfo=timezone.utc), "America/New_York")
     assert "UTC (local tz unavailable)" in field
     assert "2026-06-03T02:55" in field
+
+
+# ---------------------------------------------------------------------------
+# Spec case 7 — last-user-activity stamp discriminator
+# ---------------------------------------------------------------------------
+
+class TestIsHumanPrompt:
+    """_is_human_prompt correctly identifies human vs non-human payloads."""
+
+    def test_typed_prompt_source_is_human(self):
+        payload = {"promptSource": "typed", "prompt": "hello there"}
+        assert tbh._is_human_prompt(payload) is True
+
+    def test_system_prompt_source_is_not_human(self):
+        """Monitor task-notification events carry promptSource=='system'."""
+        payload = {"promptSource": "system", "prompt": "<task-notification>done</task-notification>"}
+        assert tbh._is_human_prompt(payload) is False
+
+    def test_no_prompt_source_task_notification_is_not_human(self):
+        """No promptSource + task-notification body → not human (fallback path)."""
+        payload = {"prompt": "<task-notification>wakeup</task-notification>"}
+        assert tbh._is_human_prompt(payload) is False
+
+    def test_no_prompt_source_command_message_is_not_human(self):
+        """No promptSource + <command-message> body → loop self-wake → not human."""
+        payload = {"prompt": "<command-message>...</command-message>"}
+        assert tbh._is_human_prompt(payload) is False
+
+    def test_no_prompt_source_command_name_is_not_human(self):
+        """No promptSource + <command-name> body → not human."""
+        payload = {"prompt": "<command-name>loop</command-name>"}
+        assert tbh._is_human_prompt(payload) is False
+
+    def test_no_prompt_source_local_command_is_not_human(self):
+        """No promptSource + <local-command body → not human."""
+        payload = {"prompt": "<local-command>run</local-command>"}
+        assert tbh._is_human_prompt(payload) is False
+
+    def test_no_prompt_source_plain_text_is_human(self):
+        """No promptSource + plain text body → treated as human (fallback)."""
+        payload = {"prompt": "What is the status of #1077?"}
+        assert tbh._is_human_prompt(payload) is True
+
+    def test_empty_prompt_body_fallback_is_not_human(self):
+        """No promptSource + empty body → NOT human (positive-evidence default).
+
+        The discriminator stamps only on positive evidence of a human prompt.
+        An empty/absent body (e.g. an unreadable or empty payload) is absence of
+        evidence, not evidence of a human — so it must NOT classify as human
+        (which would falsely mark 'engaged'). A non-empty body with no machine
+        prefix IS human.
+        """
+        assert tbh._is_human_prompt({}) is False
+        # ...but a real, non-empty body with no machine prefix still reads human:
+        assert tbh._is_human_prompt({"prompt": "fix the bug please"}) is True
+
+    def test_unknown_prompt_source_is_not_human(self):
+        """An unrecognised promptSource value (not 'typed') → not human."""
+        payload = {"promptSource": "api", "prompt": "hello"}
+        assert tbh._is_human_prompt(payload) is False
+
+
+class TestStampUserActivity:
+    """_stamp_user_activity writes the epoch stamp; errors are swallowed."""
+
+    def test_stamp_written_on_human_prompt(self, tmp_path, monkeypatch):
+        """Spec case 7a: stamp is written when _is_human_prompt is True."""
+        activity_path = tmp_path / "last-user-activity"
+        monkeypatch.setattr(tbh, "LAST_USER_ACTIVITY", activity_path)
+        import time as _time
+        epoch = _time.time()
+        tbh._stamp_user_activity(epoch)
+        assert activity_path.exists()
+        written = int(activity_path.read_text().strip())
+        assert written == int(epoch)
+
+    def test_stamp_not_written_on_non_human_prompt(self, tmp_path, monkeypatch):
+        """Spec case 7b: the gate blocks the stamp for a task-notification payload."""
+        activity_path = tmp_path / "last-user-activity"
+        monkeypatch.setattr(tbh, "LAST_USER_ACTIVITY", activity_path)
+        import time as _time
+        payload = {
+            "promptSource": "system",
+            "prompt": "<task-notification>monitor event</task-notification>",
+        }
+        # Exercise the REAL gate: the stamp fires only when _is_human_prompt is True.
+        if tbh._is_human_prompt(payload):
+            tbh._stamp_user_activity(_time.time())
+        assert not activity_path.exists()  # gate correctly blocked the write
+
+    def test_stamp_write_error_is_swallowed(self, tmp_path, monkeypatch):
+        """Write to a path that will fail (directory, not file) → no exception raised."""
+        bad_path = tmp_path / "last-user-activity"
+        bad_path.mkdir()  # Make it a directory so write_text fails.
+        monkeypatch.setattr(tbh, "LAST_USER_ACTIVITY", bad_path)
+        import time as _time
+        # Must not raise.
+        tbh._stamp_user_activity(_time.time())

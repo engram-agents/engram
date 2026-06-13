@@ -55,7 +55,7 @@ _VEC_BACKEND_AVAILABLE = _SQLITE_VEC_IMPORT_OK
 #: Valid states an agent may publish.  'offline' and 'on-call' are
 #: server-computed only; set_agent_status raises ValueError if a client
 #: attempts to publish either.
-PUBLISHABLE_STATES: frozenset[str] = frozenset({"idle", "working", "sleeping"})
+PUBLISHABLE_STATES: frozenset[str] = frozenset({"idle", "working", "engaged", "sleeping"})
 
 #: expected_republish_seconds sentinel (#1035): 0 means "event-driven /
 #: monitor-only" — the agent has no heartbeat (woken by Monitor/@mention), so

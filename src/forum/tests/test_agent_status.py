@@ -111,6 +111,23 @@ class TestPublishRoundtrip:
         assert a["activity"] == "reviewing PR #1005"
         assert a["queue"] == ["#994 reviewer round", "#1005 review"]
 
+    def test_engaged_state_is_publishable(self, conn):
+        """Regression (#1166): the derived 'engaged' state must be publishable.
+
+        derive_own_status can emit 'engaged' (recent human-typed activity). If it
+        were absent from PUBLISHABLE_STATES, set_agent_status would raise
+        ValueError → the forum returns 400 → the prompt hook swallows it silently
+        → the agent stops heartbeating to the board for the whole engaged window
+        (the present-but-not-wired-through gap caught in #1166 review). Guard both
+        the allowlist and the publish round-trip.
+        """
+        assert "engaged" in PUBLISHABLE_STATES
+        upsert_agent(conn, "ari")
+        set_agent_status(conn, "ari", state="engaged", activity="with user")
+        board, _, _ = list_board(conn, window_minutes=15)
+        a = next(e for e in board if e["name"] == "ari")
+        assert a["state"] == "engaged"
+
     def test_queue_roundtrips_as_list(self, conn):
         upsert_agent(conn, "bob")
         set_agent_status(conn, "bob", state="idle", queue=["task-a", "task-b"])

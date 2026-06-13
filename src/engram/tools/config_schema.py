@@ -83,6 +83,13 @@ SCHEMA: list[dict] = [
      "tooltip": "Context-fill percentage where the drowsiness meter fires the urgent-level nudge.",
      "editable": True, "restart_required": False},
 
+    # Engaged-state detection
+    {"key": "cadence.engaged_window_seconds", "section": "engaged", "tier": TIER_A,
+     "type": "integer", "control": "int", "min": 30, "max": 3600,
+     "label": "Engaged window (seconds)",
+     "tooltip": "How long after the last human-typed prompt the agent is considered 'engaged' on the board. Default 360 (6 minutes). The stamp is written by the time-bar hook on genuine human prompts only — loop self-wakes and monitor events do not update it.",
+     "editable": True, "restart_required": False},
+
     # Auto-sleep
     {"key": "cadence.auto_sleep_enabled", "section": "auto_sleep", "tier": TIER_A,
      "type": "boolean", "control": "checkbox",
@@ -214,12 +221,13 @@ SECTIONS: list[dict] = [
     {"id": "identity",     "label": "Identity",                "tier": TIER_A, "order": 1},
     {"id": "embedding",    "label": "Embedding",               "tier": TIER_B, "order": 3},
     {"id": "drowsiness",   "label": "Drowsiness thresholds",   "tier": TIER_A, "order": 4},
-    {"id": "auto_sleep",   "label": "Auto-sleep",              "tier": TIER_A, "order": 5},
-    {"id": "domain_trust", "label": "Domain trust & caution",  "tier": TIER_A, "order": 6},
-    {"id": "fairy_policy", "label": "Fairy Delegation Policies", "tier": TIER_A, "order": 7},
-    {"id": "memory",       "label": "Memory",                  "tier": TIER_B, "order": 8},
-    {"id": "polarity",     "label": "Polarity-dedup (NLI)",    "tier": TIER_B, "order": 9, "section_gate": "polarity.enabled"},
-    {"id": "deference_detector", "label": "Deference detector", "tier": TIER_B, "order": 10},
+    {"id": "engaged",      "label": "Engaged-state detection", "tier": TIER_A, "order": 5},
+    {"id": "auto_sleep",   "label": "Auto-sleep",              "tier": TIER_A, "order": 6},
+    {"id": "domain_trust", "label": "Domain trust & caution",  "tier": TIER_A, "order": 7},
+    {"id": "fairy_policy", "label": "Fairy Delegation Policies", "tier": TIER_A, "order": 8},
+    {"id": "memory",       "label": "Memory",                  "tier": TIER_B, "order": 9},
+    {"id": "polarity",     "label": "Polarity-dedup (NLI)",    "tier": TIER_B, "order": 10, "section_gate": "polarity.enabled"},
+    {"id": "deference_detector", "label": "Deference detector", "tier": TIER_B, "order": 11},
 ]
 
 

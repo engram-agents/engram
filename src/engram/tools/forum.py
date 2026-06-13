@@ -1394,7 +1394,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Free-text one-liner (overrides the loop-mode topic default)",
     )
     p_status_auto.add_argument(
-        "--state", default=None, choices=["idle", "working", "sleeping"],
+        "--state", default=None, choices=["idle", "working", "engaged", "sleeping"],
         help="Override the auto-derived state (e.g. --state sleeping at engram-sleep)",
     )
     p_status_auto.add_argument(
@@ -1419,7 +1419,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_status_publish.add_argument(
         "--state", required=True,
-        choices=["idle", "working", "sleeping"],
+        choices=["idle", "working", "engaged", "sleeping"],
         help="Your current state (offline is server-computed; do not publish it)",
     )
     p_status_publish.add_argument(

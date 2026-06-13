@@ -18,15 +18,23 @@ _read_loop_mode()
 _held_baton_turns(agent_name)
     → list[str]
 
+_recently_engaged()
+    → bool
+
+_read_engaged_window()
+    → int
+
 Constants
 ---------
-LOOP_MODE_PATH, PROJECTS_DIR, ON_CALL_SENTINEL, _UNSET, ENGRAM_HOME
+LOOP_MODE_PATH, PROJECTS_DIR, ON_CALL_SENTINEL, _UNSET, ENGRAM_HOME,
+LAST_USER_ACTIVITY_PATH
 """
 
 import glob
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -42,6 +50,10 @@ ENGRAM_HOME: str = (
 # loop-mode.json — the agent's own loop marker (written by engram-loop).
 LOOP_MODE_PATH: str = os.path.join(ENGRAM_HOME, "loop-mode.json")
 
+# last-user-activity — epoch-seconds stamp written by the time-bar hook on
+# genuine human-typed prompts. Used to derive "engaged" state.
+LAST_USER_ACTIVITY_PATH: str = os.path.join(ENGRAM_HOME, "last-user-activity")
+
 # Shared baton/project dir — turn-state files (one .md per project/PR).
 PROJECTS_DIR: str = (
     os.environ.get("ENGRAM_PROJECTS_DIR") or "/home/agents-shared/projects"
@@ -54,6 +66,10 @@ ON_CALL_SENTINEL: int = 0
 
 # Distinguishes "no override given" from an explicit None.
 _UNSET = object()
+
+# Default engaged window in seconds (6 minutes). Overridable via
+# cadence.engaged_window_seconds in config.json.
+_DEFAULT_ENGAGED_WINDOW: int = 360
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +119,50 @@ def _held_baton_turns(agent_name: str) -> list:
     return held
 
 
+def _read_engaged_window() -> int:
+    """Return engaged_window_seconds from config.json (cadence.engaged_window_seconds).
+
+    Default 360 (6 minutes). Any read/parse error → default. Stdlib-only.
+    """
+    try:
+        config_path = os.path.join(ENGRAM_HOME, "config.json")
+        with open(config_path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        if not isinstance(cfg, dict):
+            return _DEFAULT_ENGAGED_WINDOW
+        cadence = cfg.get("cadence")
+        if not isinstance(cadence, dict):
+            return _DEFAULT_ENGAGED_WINDOW
+        val = cadence.get("engaged_window_seconds")
+        if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+            return val
+    except Exception:
+        pass
+    return _DEFAULT_ENGAGED_WINDOW
+
+
+def _recently_engaged() -> bool:
+    """True if last-user-activity stamp is within the engaged window of now.
+
+    Fail-open: missing / unparseable / future-dated stamp → False (never
+    stuck-engaged). Window read from config.json cadence.engaged_window_seconds,
+    default 360 seconds.
+    """
+    try:
+        with open(LAST_USER_ACTIVITY_PATH, encoding="utf-8") as fh:
+            raw = fh.read().strip()
+        stamp = float(raw)
+        now = time.time()
+        age = now - stamp
+        # Future-dated stamp (age < 0) → fail-open, not engaged.
+        if age < 0:
+            return False
+        window = _read_engaged_window()
+        return age <= window
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Public derivation function
 # ---------------------------------------------------------------------------
@@ -116,13 +176,15 @@ def derive_own_status(
     on_call: bool = False,
 ) -> tuple:
     """Derive (state, activity, queue, expected_republish_seconds) from this
-    agent's own local signals — loop-mode.json + held batons.
+    agent's own local signals — loop-mode.json + held batons + last-user-activity.
 
     This is the client-side derivation the board's architecture depends on
     (the server can't read a cross-host agent's filesystem). Rules:
 
-    - **state**: ``override_state`` wins; else 'working' if a loop marker is
-      present OR any baton turn is held; else 'idle'.
+    - **state**: ``override_state`` wins; else 'engaged' if a recent human-typed
+      prompt was detected (within cadence.engaged_window_seconds, default 360s);
+      else 'working' if a loop marker is present OR any baton turn is held;
+      else 'idle'.
     - **cadence** (#1035): ``on_call`` → ON_CALL_SENTINEL (0, event-driven);
       else ``override_cadence`` if given; else from loop-mode.json
       (``pacer == 'monitor'`` or ``cadence_seconds == 0`` → sentinel; a positive
@@ -137,6 +199,8 @@ def derive_own_status(
     # state
     if override_state is not None:
         state = override_state
+    elif _recently_engaged():
+        state = "engaged"
     elif loop is not None or batons:
         state = "working"
     else:
