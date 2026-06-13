@@ -727,6 +727,10 @@ HTML = r"""<!DOCTYPE html>
       <input type="checkbox" id="show-tier-opacity-cb" checked />
       Tier opacity
     </label>
+    <label class="toggle">
+      <input type="checkbox" id="show-full-graph-cb" />
+      Show full graph
+    </label>
   </div>
 
   <div class="section">
@@ -812,6 +816,7 @@ let activeTypes = new Set(Object.keys(NODE_TYPES));
 let showSuperseded = false;
 let showLabels = true;
 let showTierOpacity = true;
+let showFullGraph = false;
 let selectedNodeId = null;
 let autoRefreshInterval = null;
 let highlightedNodeIds = new Set();
@@ -827,6 +832,24 @@ let highlightDepth = 2;
 // overrides these from the meta response.
 let TIER1_MAX = 200;
 let TIER2_MAX = 1000;
+
+// ═══════════════════════════════════════════════════════════════════
+// Legible-default constants (#1169)
+// ═══════════════════════════════════════════════════════════════════
+
+// Identity-backbone node types: always shown in legible-default mode.
+// cornerstone is intentionally included even though it is not in NODE_TYPES
+// (and therefore not rendered in full-graph mode via the type-filter panel) —
+// backbone types bypass the activeTypes gate so they are always visible when
+// showFullGraph is false.
+const BACKBONE_TYPES = new Set(['cornerstone', 'axiom', 'goal', 'person']);
+
+// How many recent nodes (by created_at DESC, excluding backbone) to include.
+const LEGIBLE_RECENT_LIMIT = 60;
+
+// If the total node count is at or below this threshold, skip the subset filter
+// entirely and render all nodes (avoids awkward partial view on a sparse graph).
+const LEGIBLE_SMALL_GRAPH = 80;
 
 // ═══════════════════════════════════════════════════════════════════
 // D3 setup
@@ -959,10 +982,59 @@ function nodeClasses(d) {
 // Data filtering
 // ═══════════════════════════════════════════════════════════════════
 
+// Build the legible-default node set: identity backbone + 60 most-recent others.
+// Returns a Set of node IDs that should be included in legible mode.
+// Does NOT apply showSuperseded or activeTypes — those are applied on top by
+// filteredData() so all three controls remain composable.
+function legibleNodeIds() {
+  const all = rawData.nodes;
+  // Small-graph no-op: if total nodes <= threshold, show everything.
+  if (all.length <= LEGIBLE_SMALL_GRAPH) {
+    return new Set(all.map(n => n.id));
+  }
+
+  // 1. Identity backbone -- all cornerstone/axiom/goal/person nodes.
+  const backboneIds = new Set();
+  all.forEach(n => {
+    if (BACKBONE_TYPES.has(n.type)) backboneIds.add(n.id);
+  });
+
+  // 2. Recent activity -- 60 most-recent nodes (by created_at DESC) not already in backbone.
+  const nonBackbone = all
+    .filter(n => !backboneIds.has(n.id))
+    .slice()
+    .sort((a, b) => {
+      // created_at is an ISO string; lexicographic sort works for ISO 8601.
+      // Nulls sort to the end (oldest).
+      const ta = a.created_at || '';
+      const tb = b.created_at || '';
+      return tb < ta ? -1 : tb > ta ? 1 : 0;
+    })
+    .slice(0, LEGIBLE_RECENT_LIMIT);
+
+  const result = new Set(backboneIds);
+  nonBackbone.forEach(n => result.add(n.id));
+  return result;
+}
+
 function filteredData() {
-  let nodes = rawData.nodes.filter(n =>
-    activeTypes.has(n.type) && (showSuperseded || n.is_current)
-  );
+  // In legible-default mode, restrict to the backbone+recent subset first.
+  // Backbone nodes bypass the activeTypes check (cornerstone is not in NODE_TYPES
+  // and would otherwise be dropped by the activeTypes gate).
+  // The showSuperseded filter is applied uniformly to both modes.
+  let nodes;
+  if (!showFullGraph) {
+    const allowed = legibleNodeIds();
+    nodes = rawData.nodes.filter(n =>
+      allowed.has(n.id) &&
+      (BACKBONE_TYPES.has(n.type) || activeTypes.has(n.type)) &&
+      (showSuperseded || n.is_current)
+    );
+  } else {
+    nodes = rawData.nodes.filter(n =>
+      activeTypes.has(n.type) && (showSuperseded || n.is_current)
+    );
+  }
   const nodeIds = new Set(nodes.map(n => n.id));
   let edges = rawData.edges
     .map(e => ({
@@ -1737,6 +1809,16 @@ function searchAndFocus(query) {
     render();
   }
 
+  // If the node is outside the legible default subset (not backbone, not in the
+  // most-recent set), switch to full-graph so it actually renders and gets x/y
+  // coords from the force sim before we zoom — otherwise d.x/d.y are undefined
+  // and the zoom transform becomes NaN, silently corrupting pan/zoom.
+  if (!showFullGraph && !legibleNodeIds().has(d.id)) {
+    showFullGraph = true;
+    document.getElementById('show-full-graph-cb').checked = true;
+    render();
+  }
+
   // Select the node (opens detail panel)
   selectNode(d);
 
@@ -2051,6 +2133,11 @@ document.getElementById('show-labels-cb').onchange = function() {
 
 document.getElementById('show-tier-opacity-cb').onchange = function() {
   showTierOpacity = this.checked;
+  render();
+};
+
+document.getElementById('show-full-graph-cb').onchange = function() {
+  showFullGraph = this.checked;
   render();
 };
 
