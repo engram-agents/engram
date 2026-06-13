@@ -400,6 +400,10 @@
     {
       "path": "tools/run-all-tests.sh",
       "reason": "Unified test runner script; no dedicated test file. Verified manually by running it end-to-end against both suites."
+    },
+    {
+      "path": "tools/ghpr.sh",
+      "reason": "Local CI-cost simulator (git+gh wrapper bundling touched-test selection, cost logging, and gated PR push); no dedicated test file. Verified manually."
     }
   ],
   "server_import_allowlist": [
