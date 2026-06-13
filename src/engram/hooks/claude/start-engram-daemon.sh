@@ -37,14 +37,15 @@ fi
 mkdir -p "$ENGRAM_HOME"
 env ENGRAM_HOME="$ENGRAM_HOME" {{PYTHON}} "$DAEMON_SCRIPT" >> "$LOG_PATH" 2>&1 < /dev/null &
 
-# Wait briefly for socket to appear
-for i in $(seq 1 20); do
-    if [ -S "$SOCKET_PATH" ]; then
-        exit 0
-    fi
-    sleep 0.5
-done
+# Fire-and-forget: the daemon warms asynchronously (cold model-load
+# routinely exceeds any fixed wait); the per-turn UserPromptSubmit
+# surface hook is the liveness check and emits a CRITICAL warning only
+# on a genuine daemon-down. No blocking wait here -> no cold-start-race
+# false alarm.
 
-# Daemon didn't start in time — non-blocking, hook will fall back to FTS
-echo '{"warning": "engram surface daemon did not start within 10s"}' >&2
+# Stamp the launch attempt so the per-turn surface hook can tell a
+# cold-start warmup (recent stamp → SOFT "warming up") from a genuinely
+# down daemon (stale/absent stamp → CRITICAL).
+date +%s > "$ENGRAM_HOME/daemon-launch-attempt" 2>/dev/null || true
+
 exit 0

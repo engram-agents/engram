@@ -96,6 +96,12 @@ DEFAULT_IDF_GATE_MIN_IDF = 4.0
 DEFAULT_IDF_GATE_SHORT_PROMPT_FLOOR_CHARS = 40
 DEFAULT_IDF_GATE_ENABLED = True  # feature flag for safe rollout
 
+# Duration after a daemon launch attempt during which the per-turn surface hook
+# treats daemon-unreachable as a warmup state (SOFT message) rather than a genuine
+# outage (CRITICAL). The daemon writes its PID and binds its socket only after the
+# ~7s model load; this window covers that cold-start gap.
+_DAEMON_WARMUP_WINDOW_SECONDS = 20
+
 # Attached-pack surfacing quota — max results pulled across all packs combined.
 _PACK_SURFACE_QUOTA = 3
 
@@ -933,7 +939,11 @@ def main():
     if tripwire:
         parts.append(tripwire)
 
-    # Warn if daemon is down (semantic search degraded)
+    # Warn if daemon is down (semantic search degraded).
+    # Distinguish a cold-start warmup (recent launch attempt) from a
+    # genuinely-down daemon. The daemon writes its PID + binds its socket
+    # only AFTER the ~7s model load, so during warmup neither exists; the
+    # start script stamps daemon-launch-attempt at launch, before warmup.
     if not used_daemon:
         user_name = get_user_name()
         # Resolve the daemon script path relative to this hook's own location.
@@ -948,12 +958,34 @@ def main():
             os.path.dirname(os.path.abspath(__file__)),
             "start-engram-daemon.sh",
         )
-        parts.append(
-            f"[⚠️ ENGRAM CRITICAL — surface daemon offline; semantic recall "
-            f"DISABLED, ranking degraded to lexical-only. Notify {user_name} "
-            f"immediately — recall quality is severely impaired. "
-            f"Recovery: bash {daemon_script}]"
-        )
+        warming_up = False
+        try:
+            marker = os.path.join(ENGRAM_HOME, "daemon-launch-attempt")
+            with open(marker) as _f:
+                launched_at = int(_f.read().strip())
+            if 0 <= (int(time.time()) - launched_at) < _DAEMON_WARMUP_WINDOW_SECONDS:
+                warming_up = True
+        except Exception:
+            warming_up = False   # fail-safe: when in doubt, the louder CRITICAL
+        if warming_up:
+            parts.append(
+                f"[ENGRAM: surface daemon warming up (cold model load) — "
+                f"semantic recall resumes in a few seconds; ranking is "
+                f"lexical-only meanwhile. No action needed unless this "
+                f"persists past the next prompt.]"
+            )
+        else:
+            parts.append(
+                f"[⚠️ ENGRAM CRITICAL — surface daemon offline; semantic recall "
+                f"DISABLED, ranking degraded to lexical-only. Notify {user_name} "
+                f"immediately — recall quality is severely impaired. "
+                f"Recovery: bash {daemon_script} — then re-check the socket. "
+                f"If this warning persists after re-launching, it is NOT a "
+                f"cold-start race: something on this machine is conflicting with "
+                f"the daemon (port already bound, permissions, or resource "
+                f"limits) — investigate the root cause before continuing, don't "
+                f"just re-launch.]"
+            )
 
     # Attached-pack surfacing — queried AFTER own-graph result, guarded
     # fail-open so any pack error never breaks the hook.

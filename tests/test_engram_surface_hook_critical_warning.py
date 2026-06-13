@@ -169,6 +169,109 @@ class TestCriticalWarningIntegration(unittest.TestCase):
             additional_context,
             "CRITICAL warning must include 'Notify Alex' when primary_user is 'Alex'",
         )
+        self.assertIn(
+            "persists after re-launching",
+            additional_context,
+            "recurrence-hint must appear in the CRITICAL warning",
+        )
+
+
+
+
+class TestWarmingUpSoft(unittest.TestCase):
+    """SOFT warming-up message fires when launch attempt is recent."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_warmup_soft_test_")
+        config_path = os.path.join(self.tmp, "config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump({"primary_user": "Alex"}, f)
+        self.hook = _load_hook_module()
+        self.hook.ENGRAM_HOME = self.tmp
+        self.hook.SOCKET_PATH = os.path.join(self.tmp, "recall-daemon.sock")
+        self.hook.KNOWLEDGE_DB_PATH = os.path.join(self.tmp, "knowledge.db")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_warming_up_soft_when_launch_attempt_recent(self):
+        """SOFT 'warming up' fires (not CRITICAL) when daemon-launch-attempt is recent."""
+        import time
+        # Write a current-epoch launch-attempt marker
+        marker_path = os.path.join(self.tmp, "daemon-launch-attempt")
+        with open(marker_path, "w") as f:
+            f.write(str(int(time.time())))
+
+        raw_output = _run_main_capture(self.hook, _make_hook_input())
+        self.assertTrue(
+            raw_output.strip(),
+            "main() produced no stdout — expected a JSON response",
+        )
+        response = json.loads(raw_output.strip())
+        additional_context = (
+            response
+            .get("hookSpecificOutput", {})
+            .get("additionalContext", "")
+        )
+        self.assertIn(
+            "warming up",
+            additional_context,
+            "SOFT 'warming up' text must appear in additionalContext during cold-start window",
+        )
+        self.assertNotIn(
+            "⚠️ ENGRAM CRITICAL",
+            additional_context,
+            "CRITICAL warning must NOT fire during the cold-start warmup window",
+        )
+
+
+class TestCriticalWhenLaunchAttemptStale(unittest.TestCase):
+    """CRITICAL fires when daemon-launch-attempt stamp is stale (outside warmup window)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_stale_stamp_test_")
+        config_path = os.path.join(self.tmp, "config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump({"primary_user": "Alex"}, f)
+        self.hook = _load_hook_module()
+        self.hook.ENGRAM_HOME = self.tmp
+        self.hook.SOCKET_PATH = os.path.join(self.tmp, "recall-daemon.sock")
+        self.hook.KNOWLEDGE_DB_PATH = os.path.join(self.tmp, "knowledge.db")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_critical_when_launch_attempt_stale(self):
+        """CRITICAL fires (not SOFT) when daemon-launch-attempt is older than the warmup window."""
+        import time
+        # Write a stale launch-attempt marker (100 seconds in the past, well outside window)
+        marker_path = os.path.join(self.tmp, "daemon-launch-attempt")
+        with open(marker_path, "w") as f:
+            f.write(str(int(time.time()) - 100))
+
+        raw_output = _run_main_capture(self.hook, _make_hook_input())
+        self.assertTrue(
+            raw_output.strip(),
+            "main() produced no stdout — expected a JSON response with CRITICAL warning",
+        )
+        response = json.loads(raw_output.strip())
+        additional_context = (
+            response
+            .get("hookSpecificOutput", {})
+            .get("additionalContext", "")
+        )
+        self.assertIn(
+            "⚠️ ENGRAM CRITICAL",
+            additional_context,
+            "CRITICAL warning must fire when launch-attempt stamp is stale",
+        )
+        self.assertNotIn(
+            "warming up",
+            additional_context,
+            "SOFT 'warming up' text must NOT appear when launch-attempt is stale",
+        )
 
 
 if __name__ == "__main__":
