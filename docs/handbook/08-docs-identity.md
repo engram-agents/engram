@@ -53,7 +53,7 @@ output-styles/claude/proactive-with-carveouts.md — shipped, referenced by the 
 | S3 | SKILL.md 302/665 | cites nonexistent engram_feeling_node_design.md | ✅ RESOLVED — 0 refs in SKILL.md |
 | B1 | SKILL.md §4 | engram_add_evidence listed as tool | ✅ RESOLVED — 0 refs in SKILL.md |
 | O1 | warm-briefing template | {{COUNTERPART_NAME}} unsubstituted | ✅ RESOLVED — no longer present in any template |
-| O2 | viz service template | {{ENGRAM_VIZ_HOME}} unsubstituted | ⚠ STANDS — still 2× in `engram-viz-user.service.template`, no bootstrap substitution (viz-install path unverified) |
+| O2 | viz service template | {{ENGRAM_VIZ_HOME}} unsubstituted | ✅ RESOLVED — placeholder renamed to `{{PLUGIN_ENGRAM_DIR}}` and substituted by operator-setup-viz.sh (run-in-place deploy, #1167) |
 | O3 | seed-ID keys AX_PROVENANCE/DF_ENGRAM | unused substitution slots | ❓ not re-verified this pass |
 
 ## Counts
