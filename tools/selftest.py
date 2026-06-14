@@ -7,9 +7,9 @@ Exit codes:
     other  pytest's own exit code (test failures, collection errors, etc.)
 
 Usage:
-    python3 selftest.py            # run full suite
-    python3 selftest.py --smoke    # quieter output (-q) for quick confidence check
-    python3 selftest.py --quiet    # short summary only
+    python3 tools/selftest.py            # run full suite
+    python3 tools/selftest.py --smoke    # quieter output (-q) for quick confidence check
+    python3 tools/selftest.py --quiet    # short summary only
 
 Migrated from monolithic test_full_lifecycle.py to pytest 2026-05-06.
 Tests live under tests/. CI runs the same invocation via
@@ -17,9 +17,9 @@ Tests live under tests/. CI runs the same invocation via
 """
 
 import importlib.util
-import os
 import subprocess
 import sys
+from pathlib import Path
 
 
 def _pytest_available() -> bool:
@@ -44,7 +44,7 @@ def main():
         )
         sys.exit(2)
 
-    here = os.path.dirname(os.path.abspath(__file__))
+    here = str(Path(__file__).resolve().parent.parent)
     extra = sys.argv[1:]
 
     if "--smoke" in extra or "--quiet" in extra:

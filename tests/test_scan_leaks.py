@@ -28,7 +28,7 @@ from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCAN_LEAKS = REPO_ROOT / "src" / "engram" / "tools" / "scan-leaks.py"
-EXAMPLE_CONFIG = REPO_ROOT / ".scan-leaks-local.json.example"
+EXAMPLE_CONFIG = REPO_ROOT / "docs" / ".scan-leaks-local.json.example"
 
 # Insert tools/ parent so we can import scan-leaks as a module.
 sys.path.insert(0, str(REPO_ROOT / "src" / "engram" / "tools"))

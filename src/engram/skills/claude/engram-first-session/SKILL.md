@@ -100,7 +100,7 @@ VENV_PY="$HOME/.engram/venv/bin/python3"
     echo "Run Phase 0 setup:"
     echo "  python3 -m venv ~/.engram/venv"
     echo "  source ~/.engram/venv/bin/activate"
-    echo "  pip install -r requirements.txt"
+    echo "  pip install -r requirements/requirements.txt"
     echo ""
     echo "Then restart Claude Code so MCP picks up the updated environment."
     exit 1

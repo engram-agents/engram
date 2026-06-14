@@ -548,6 +548,10 @@
   ],
   "excluded": [
     {
+      "path": "tools/selftest.py",
+      "reason": "developer pre-deploy test runner — wraps pytest for quick confidence checks; not shipped in any install tier"
+    },
+    {
       "path": "hooks/claude/context_tracker_hook.py",
       "reason": "superseded by hooks/claude/context_tracker.py (Issue #140 session-isolation rewrite); context_tracker_hook.py is the old hook wrapper, now replaced by the multi-session-safe hook embedded in engram-session-start-hook.py"
     },
@@ -650,24 +654,12 @@
       "reason": "repository landing-page documentation — not shipped in the plugin bundle"
     },
     {
-      "path": "CHANGELOG.md",
-      "reason": "release changelog — developer reference, not shipped in the plugin bundle"
-    },
-    {
       "path": "LICENSE",
       "reason": "project license file — not shipped in the plugin bundle"
     },
     {
       "path": "CLAUDE.md",
       "reason": "developer-facing project conventions (project-level CLAUDE.md) — not shipped in the plugin bundle"
-    },
-    {
-      "path": "DEVELOPMENT.md",
-      "reason": "contributor development guide — not shipped in the plugin bundle"
-    },
-    {
-      "path": "RELEASING.md",
-      "reason": "release process documentation — not shipped in the plugin bundle"
     },
     {
       "path": "USER_GUIDE.md",
@@ -678,28 +670,12 @@
       "reason": "pytest configuration — dev test config, never shipped"
     },
     {
-      "path": "requirements.txt",
-      "reason": "runtime Python dependency pins — installation handled by build-plugin.sh separately; not copied as a repo artifact"
-    },
-    {
-      "path": "requirements-dev.txt",
-      "reason": "dev-only Python dependency pins — dev tooling, never shipped in the plugin bundle"
-    },
-    {
-      "path": "requirements-lock.txt",
-      "reason": "locked Python dependency pins — reproducible build artifact, not shipped as a repo file in the plugin bundle"
+      "path": "requirements/",
+      "reason": "Python dependency pin files — installation tooling only, not shipped in the plugin bundle"
     },
     {
       "path": ".gitignore",
       "reason": "git ignore rules — repo configuration, not shipped in the plugin bundle"
-    },
-    {
-      "path": ".scan-leaks-local.json.example",
-      "reason": "example config for scan-leaks tool — developer reference, not shipped in the plugin bundle"
-    },
-    {
-      "path": "selftest.py",
-      "reason": "pre-deploy smoke test runner — dev tooling that invokes pytest against tests/; not shipped in the plugin bundle"
     },
     {
       "path": "packaging/README.md",

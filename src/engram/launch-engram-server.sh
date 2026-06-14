@@ -6,7 +6,7 @@ if [ ! -x "$VENV_PY" ]; then
   echo "  Run Phase 0 setup:" >&2
   echo "    python3 -m venv ~/.engram/venv" >&2
   echo "    source ~/.engram/venv/bin/activate" >&2
-  echo "    pip install -r requirements.txt" >&2
+  echo "    pip install -r requirements/requirements.txt" >&2
   exit 1
 fi
 exec "$VENV_PY" "$SCRIPT_DIR/server.py" "$@"

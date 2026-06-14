@@ -90,11 +90,11 @@ your graph.
   server).
 - A writable `~/.claude/` and `~/.engram/`.
 
-Python packages declared in `requirements.txt` (currently: `fastmcp`,
+Python packages declared in `requirements/requirements.txt` (currently: `fastmcp`,
 `sentence-transformers`) — install instructions below depend on the install
 path.
 
-(`requirements-lock.txt` is also in the repo but is Linux-x86_64 CI-only —
+(`requirements/requirements-lock.txt` is also in the repo but is Linux-x86_64 CI-only —
 pinned to the CPU-torch wheel that only resolves on Linux. Do not use it on
 macOS or Windows.)
 
@@ -127,7 +127,7 @@ and asks the agent to continue ENGRAM install from this README.
 ```bash
 python3 -m venv ~/.engram/venv
 source ~/.engram/venv/bin/activate
-pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements/requirements.txt
 ```
 
 The venv MUST live at `~/.engram/venv/` — the plugin's launcher script looks
@@ -293,7 +293,7 @@ regardless of runtime):
 ```bash
 python3 -m venv ~/.engram/venv
 source ~/.engram/venv/bin/activate
-pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements/requirements.txt
 ```
 
 **CODEX-DELTA — Codex CLI install:**
@@ -483,15 +483,15 @@ install them yourself — leave those choices to the user.
 ```bash
 python3 --version             # require >=3.10.7 (or any 3.11.0 final or later)
 command -v git                # require present
-pip install -r requirements.txt
+pip install -r requirements/requirements.txt
 ```
 
 If the `pip install` step fails or reports version conflicts, tell the user:
 
-> `pip install -r requirements.txt` is required before installing ENGRAM.
+> `pip install -r requirements/requirements.txt` is required before installing ENGRAM.
 > Please install these and run me again. (If you see version conflicts,
 > share the error — we'll need to bump the supported range in
-> `requirements.txt`.)
+> `requirements/requirements.txt`.)
 
 ### 2. Run the installer
 
@@ -1012,14 +1012,14 @@ who need to spawn additional agents copy or symlink it from `tools/agentctl`.
 
 ## Running the test suite (for contributors)
 
-`selftest.py` runs the test suite under `tests/`. It requires `pytest` in
+`tools/selftest.py` runs the test suite under `tests/`. It requires `pytest` in
 the same Python environment as the alpha's other dependencies. Fresh dev
 boxes (a fresh Docker container, a clean VM, a new venv) won't have it pre-installed:
 
 ```bash
 pip install pytest                # one-time
-python3 selftest.py               # full suite
-python3 selftest.py --quiet       # one-line summary
+python3 tools/selftest.py               # full suite
+python3 tools/selftest.py --quiet       # one-line summary
 ```
 
 If pytest is missing, selftest prints a clear actionable message and exits

@@ -204,14 +204,14 @@ if ! python3 -c 'import venv' 2>/dev/null; then
 fi
 
 VENV_CREATED=0
-if [[ -n "$ALPHA_SOURCE" && -f "$ALPHA_SOURCE/requirements.txt" && "${SKIP_VENV}" != "1" ]]; then
+if [[ -n "$ALPHA_SOURCE" && -f "$ALPHA_SOURCE/requirements/requirements.txt" && "${SKIP_VENV}" != "1" ]]; then
     echo "Creating Python venv at $USER_HOME/.engram-venv..."
     sudo -u "$USER_NAME" python3 -m venv "$USER_HOME/.engram-venv"
     echo "Installing ENGRAM Python dependencies into venv..."
     sudo -u "$USER_NAME" "$USER_HOME/.engram-venv/bin/pip" install \
         --quiet --upgrade pip
     sudo -u "$USER_NAME" "$USER_HOME/.engram-venv/bin/pip" install \
-        --quiet -r "$ALPHA_SOURCE/requirements.txt"
+        --quiet -r "$ALPHA_SOURCE/requirements/requirements.txt"
     VENV_CREATED=1
 
     # Append venv auto-activation to the existing .bashrc (which Section 2
@@ -393,7 +393,7 @@ HINT
 )
 fi
 
-VENV_LINE="Python venv: (not created — ALPHA_SOURCE or requirements.txt missing)"
+VENV_LINE="Python venv: (not created — ALPHA_SOURCE or requirements/requirements.txt missing)"
 if [[ "${VENV_CREATED:-0}" == "1" ]]; then
     VENV_LINE="Python venv: $USER_HOME/.engram-venv (auto-activated via .bashrc)"
 fi

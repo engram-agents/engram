@@ -54,7 +54,7 @@ jobs:
             ':(exclude)docs/cycle/'
             ':(exclude)docs/handbook/'
             ':(exclude)README.md'
-            ':(exclude)CHANGELOG.md'
+            ':(exclude)docs/CHANGELOG.md'
             ':(exclude).github/workflows/check-no-new-shipped-node-ids.yml'
             # engram_ids.py is the schema-defining module for the node-ID regex.
             # Its doctests must use ≥4-digit IDs (matching \d{4,}) to be correct.

@@ -56,7 +56,6 @@ ALWAYS_FULL_PATTERNS: list[str] = [
     "pytest.ini",
     "setup.cfg",
     "pyproject.toml",
-    "requirements.txt",
     "requirements*.txt",
     "requirements*.in",
     "src/engram/packaging/test-map.json",
