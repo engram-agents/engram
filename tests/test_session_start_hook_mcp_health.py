@@ -241,10 +241,17 @@ def test_codex_platform_defers_write_tool_marker_check(tmp_path, monkeypatch):
     assert write_reason is None
 
 
-def test_session_start_emits_write_tool_warning_when_marker_absent(
+def test_session_start_does_not_emit_write_tool_warning(
     tmp_path, monkeypatch
 ):
-    """Full hook integration: server running, no marker → write-tool warning emitted."""
+    """Anti-regression: write-tool liveness check is deferred to UserPromptSubmit.
+
+    Even when the server is running but the marker is absent, the SessionStart
+    hook must NOT emit the write-tool warning — the timing race (marker still
+    has old PID when session fires) would produce a false alarm every restart.
+    The check moved to the surface hook (UserPromptSubmit) where the race
+    window is long past.
+    """
     engram_home = tmp_path / "engram"
     (engram_home / "sessions").mkdir(parents=True)
     mod = _load_hook_module(monkeypatch, engram_home)
@@ -263,7 +270,6 @@ def test_session_start_emits_write_tool_warning_when_marker_absent(
         },
     )
     ctx = result["hookSpecificOutput"]["additionalContext"]
-    assert "ENGRAM substrate health" in ctx
-    assert "MCP write-tool liveness: UNCONFIRMED" in ctx
-    # The OFFLINE message should NOT appear (server IS running)
+    # Neither write-tool warning nor offline should appear when server is running
+    assert "MCP write-tool liveness: UNCONFIRMED" not in ctx
     assert "MCP server: OFFLINE" not in ctx

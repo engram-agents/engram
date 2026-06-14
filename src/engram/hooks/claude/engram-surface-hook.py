@@ -66,6 +66,38 @@ PROJECT_DIR = _resolve_runtime_dir(ENGRAM_HOME)
 
 # Bridge for downstream callers: ensure ENGRAM_HOME is set so any sibling process inherits it.
 os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
+
+
+def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
+    """Check whether the MCP server wrote its initialization-complete marker.
+
+    Deferred from SessionStart to here (UserPromptSubmit) to avoid a timing
+    race: the new server's PID hasn't replaced the old PID in the marker yet
+    at SessionStart time. By the first user prompt the race window is long past.
+
+    Returns (True, None) if marker exists and its PID is still running, or on
+    any unexpected error (advisory probe — never block).
+    Returns (False, reason) if marker absent or its PID is no longer running.
+    """
+    import errno as _errno
+    try:
+        marker_path = os.path.join(engram_home, "mcp-tools-ready.json")
+        if not os.path.exists(marker_path):
+            return False, "mcp-tools-ready.json absent (server may not have completed initialization)"
+        with open(marker_path) as f:
+            data = json.load(f)
+        pid = int(data.get("pid", 0))
+        if not pid:
+            return False, "mcp-tools-ready.json has no valid pid field"
+        try:
+            os.kill(pid, 0)
+            return True, None
+        except OSError as e:
+            if e.errno == _errno.EPERM:
+                return True, None  # process exists, no permission to signal — ok
+            return False, f"mcp-tools-ready.json stale (server PID {pid} no longer running)"
+    except Exception:
+        return True, None  # advisory — never block
 SOCKET_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.sock")
 COUNTER_PATH = os.path.join(ENGRAM_HOME, "prompt-counter.json")
 WRITE_REMINDER_PATH = os.path.join(ENGRAM_HOME, "write-reminder.json")
@@ -990,6 +1022,17 @@ def main():
                 f"limits) — investigate the root cause before continuing, don't "
                 f"just re-launch.]"
             )
+
+    # MCP write-tool liveness check — deferred from SessionStart to avoid the
+    # timing race (marker still has old PID when session starts). By the first
+    # user prompt the server has had time to write the updated marker.
+    write_ok, write_reason = _check_mcp_write_tool_marker(ENGRAM_HOME)
+    if not write_ok:
+        parts.append(
+            f"⚠️  ENGRAM substrate health:\n"
+            f"  MCP write-tool liveness: UNCONFIRMED ({write_reason})\n"
+            f"  → ENGRAM write calls will fail silently. Recovery: restart the MCP server."
+        )
 
     # Attached-pack surfacing — queried AFTER own-graph result, guarded
     # fail-open so any pack error never breaks the hook.

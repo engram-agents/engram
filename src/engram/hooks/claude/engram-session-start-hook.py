@@ -967,6 +967,13 @@ def main() -> None:
     # first tool use. A false alarm on startup fires every session and trains
     # the agent to ignore the warning. Match the surface-daemon use-time
     # warning precedent (closes #344) for the Codex MCP path (closes #827).
+    #
+    # Write-tool marker check (#1128) is intentionally NOT done here — the
+    # marker is written by the server a few seconds after init, so checking at
+    # SessionStart creates a timing race: the new server's PID hasn't replaced
+    # the old PID in the marker yet. Same class of false alarm as the daemon-
+    # start probe retired in #1157. Check deferred to UserPromptSubmit (surface
+    # hook) where the race window is long past.
     mcp_ok, mcp_reason = _check_mcp_health(ENGRAM_HOME)
 
     if not mcp_ok:
@@ -974,13 +981,6 @@ def main() -> None:
         lines.append("⚠️  ENGRAM substrate health:")
         lines.append(f"  MCP server: OFFLINE ({mcp_reason})")
         lines.append("  → Tell the user immediately. ENGRAM tool calls will fail.")
-    else:
-        write_ok, write_reason = _check_mcp_write_tool_marker(ENGRAM_HOME)
-        if not write_ok:
-            lines.append("")
-            lines.append("⚠️  ENGRAM substrate health:")
-            lines.append(f"  MCP write-tool liveness: UNCONFIRMED ({write_reason})")
-            lines.append("  → ENGRAM write calls will fail silently. Recovery: restart the MCP server.")
 
     output_obj = {
         "hookSpecificOutput": {
