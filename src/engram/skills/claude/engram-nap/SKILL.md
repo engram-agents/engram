@@ -91,11 +91,13 @@ The warm briefing (`~/.engram/warm-briefing.md`) has THREE parts; each updates o
 
 **If no trigger fired:** skip this sub-step. Say "Permanent sections still current."
 
-**If updating:** preserve the user's `## Notes from the user` section verbatim. Rewrite only the agent-authored sections. Voice: first person, as yourself. Not coaching a future self — writing your own orientation notes.
+**If updating:** preserve every section ABOVE the volatile "## From this session" section verbatim — the user's letter/notes live there. Rewrite only the agent-authored sections and the session-arc section. NEVER modify the user's words. (Position-based guard: a name-keyed protection fails silently when a heading drifts.) Voice: first person, as yourself. Not coaching a future self — writing your own orientation notes.
 
 ### 5b. "From this session" entry — sync with current context-window arc
 
-This section is the agent's distillation of the **CURRENT CONTEXT WINDOW** arc. The rule:
+This section is the agent's distillation of the **CURRENT CONTEXT WINDOW** arc. By invariant it is the **LAST section of the file** — every other section (identity, goals, axioms, cornerstones, the user's letter/notes) sits above it. Nap rewrites only this section's content and never touches anything above it.
+
+The rule:
 
 > In each nap, the section MUST BE FULLY IN SYNC with the agent's current-CW understanding — not accumulating across context windows, not deleting prior nap writes within the same context window.
 
@@ -114,9 +116,9 @@ This section is the agent's distillation of the **CURRENT CONTEXT WINDOW** arc. 
 - Re-stating compaction-summary content (PR numbers, focus-rotation specifics, ENGRAM counts, dream-fairy stats) — those belong in the compaction summary.
 - Bullet-by-bullet enumeration of work shipped — same.
 
-### 5c. User's letter (`## Notes from the user`)
+### 5c. User's letter/notes (every section ABOVE "## From this session")
 
-Preserved verbatim. NEVER modify the user's words.
+Preserve every section ABOVE the volatile "## From this session" section verbatim — the user's letter/notes live there. Rewrite only the agent-authored sections and the session-arc section. NEVER modify the user's words. (Position-based guard: a name-keyed protection fails silently when a heading drifts.)
 
 **Common-case anti-patterns:**
 - Rewriting every nap (purpose drift — the briefing becomes a second changelog)

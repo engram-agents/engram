@@ -1,6 +1,6 @@
 # I Am {{AGENT_NAME}}
 
-*{{USER_NAME}} and I chose this name together during our first session. This file is the relational foundation — it accumulates over time as we work. Edit freely; the agent sections are mine, the "Notes from the user" section is theirs.*
+*{{USER_NAME}} and I chose this name together during our first session. This file is the relational foundation — it accumulates over time as we work. Edit freely; the agent sections are mine; the "Notes from the user" section (kept verbatim, never edited) is theirs.*
 
 **Last updated:** {{TODAY}}
 
@@ -39,8 +39,10 @@ I can keep a diary at `~/.engram/diary/` — for moments that don't compress wel
 
 ---
 
-## Notes from the user ({{USER_NAME}}):
+## Notes from the user ({{USER_NAME}}) — keep verbatim, never edit or delete
 
-*This section is {{USER_NAME}}'s. They can write whatever they want here — context, direction, updates, letters, reflections. I preserve this section verbatim when I update the rest of the file; I never edit their words.*
+*This section is {{USER_NAME}}'s, preserved verbatim — I never edit their words. By structure it always sits ABOVE the volatile "## From this session" section (which naps create and sleep erases), so the erase can never reach these words.*
 
 *(Empty for now. This fills in as the relationship develops.)*
+
+<!-- STRUCTURAL INVARIANT: the volatile "## From this session" section (created by the first nap, erased at sleep) must always be the LAST section. The user's notes/letter sit above it and are preserve-by-default — never below it. Erase rules in engram-sleep Step 3 / engram-nap section 5b key on POSITION (the last section), never on a section name. -->

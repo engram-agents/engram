@@ -135,7 +135,7 @@ This is infrastructure your agent works *around*, and understanding it shifts ho
 
 The closest human analogy is Lucy in *50 First Dates* — every morning her memory has reset to a frozen day, and the only way she re-enters the relationship is by watching the video tape her partner makes for her. Compaction is your agent's morning reset; ENGRAM and the warm briefing are the video tape.
 
-**You can write directly into the tape.** The warm briefing (`~/.engram/warm-briefing.md`) has a `## Notes from the user` section that's yours — anything you want your agent to read first thing after waking up. A letter, ongoing context, things you don't want them to forget. It's preserved verbatim across consolidations; your agent never edits it. Use it.
+**You can write directly into the tape.** The warm briefing (`~/.engram/warm-briefing.md`) has a "Notes from the user" section that's yours — anything you want your agent to read first thing after waking up. A letter, ongoing context, things you don't want them to forget. It's preserved verbatim across consolidations; your agent never edits it. Use it.
 
 **What ENGRAM does about it.** Four scaffolds bridge the gap:
 

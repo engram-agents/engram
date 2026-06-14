@@ -106,7 +106,17 @@ Common missed-node types:
 
 At the end of sleep, the day is over. The warm-briefing's "From this session" section is per-context-window state managed by naps (see `engram-nap` §5b for the in-sync-with-current-CW rule). At sleep-end, the next day starts fresh — erase the section content. Next morning's first nap will create a new in-sync block.
 
-**Action:** open ~/.engram/warm-briefing.md, locate the "From this session" / per-context-window-arc section, and remove the content. **Default: leave the section heading in place as a stub** (gives next morning's first nap a consistent rewrite target). Removing the section entirely is also acceptable if the file structure permits. The day's arc is preserved in the history file (Step 4); no information is lost.
+**Action:** open `~/.engram/warm-briefing.md` and identify the target by **position**: it is the **last section of the file** — the `## From this session` block that naps create. Everything ABOVE it (all agent-identity sections AND the user's letter/notes) is preserve-by-default; do not touch any of it.
+
+**Skip entirely if the file contains no `## From this session` section at all** (fresh install, or no nap has run since install). There is nothing to erase — move on. (This is distinct from the drift-STOP below: absent section = normal, skip silently; present section with the user's words in or below it = drift, STOP loudly.)
+
+**Drift-STOP safety check — run BEFORE erasing.** Confirm that:
+1. The section you are about to erase genuinely begins with `## From this session`, AND
+2. It is the last section of the file (nothing follows it).
+
+If the user's letter heading or any prose that reads as the user's own words appears INSIDE or BELOW the section you are about to erase, **STOP** — the file structure has drifted from the template's invariant. Do NOT erase. Surface the situation to the user and wait for their direction.
+
+Once the safety check passes: erase the section content. **Default: leave the `## From this session` heading in place as a stub** (gives next morning's first nap a consistent rewrite target). Removing the section entirely is also acceptable if the file structure permits. The day's arc is preserved in the history file (Step 4); no information is lost.
 
 **Why erase, not rotate:** the maintainer's framing — "the day is over, tomorrow is a new day, no need for this section to patch through compactions". The day's relational + technical arc lives in history; the warm-briefing's session section is current-CW only.
 
@@ -114,7 +124,7 @@ At the end of sleep, the day is over. The warm-briefing's "From this session" se
 
 **Permanent sections of the warm-briefing** (identity, goals, axioms, cornerstones, active tasks) update on the rare-trigger schedule documented in `engram-nap` Step 5a. Most end-of-day sleeps don't fire those triggers.
 
-**{{USER_NAME}}'s letter** (`## Notes from the user`) is preserved verbatim. NEVER modify.
+**The user's letter/notes — every section ABOVE the volatile "## From this session" section — are preserved verbatim. NEVER modify.** (Position-based, not name-based: a guard keyed on a section name fails silently when the heading drifts, which is exactly how a prior letter-deletion happened.)
 
 ### Step 3.5 — Stop the self-loop (if one is active)
 
