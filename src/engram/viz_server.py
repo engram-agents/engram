@@ -702,7 +702,7 @@ HTML = r"""<!DOCTYPE html>
   </header>
 
   <div class="section">
-    <div id="status-line">Nodes: <span id="stat-nodes">—</span> &nbsp; Edges: <span id="stat-edges">—</span></div>
+    <div id="status-line"><span id="stat-nodes">—</span></div>
     <div id="new-nodes-indicator"></div>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
       <div class="btn" id="refresh-btn">↻ Refresh</div>
@@ -903,11 +903,15 @@ function initWhatsNew(nodes) {
   const lsKey = 'engram-viz-lastvisit-' + agentName;
   const prevLastVisit = localStorage.getItem(lsKey);  // ISO string or null
 
-  // Compute: nodes created AFTER the last visit timestamp.
+  // Compute: current nodes created AFTER the last visit timestamp.
   // ISO 8601 strings are lexicographically comparable.
+  // Filter to is_current=true so superseded/retracted nodes don't inflate
+  // the count (#1172: full payload includes superseded nodes, which caused
+  // "1095 new" when only ~1064 current nodes exist — superseded nodes are
+  // not visible in the default view and should not count as "new").
   if (prevLastVisit) {
     nodes.forEach(n => {
-      if (n.created_at && n.created_at > prevLastVisit) {
+      if (n.is_current && n.created_at && n.created_at > prevLastVisit) {
         newNodeIds.add(n.id);
       }
     });
@@ -1262,6 +1266,25 @@ function render() {
   // Gently reheat if new nodes arrived
   const wasEmpty = posMap.size === 0;
   simulation.alpha(wasEmpty ? 1 : 0.15).restart();
+
+  // Update "Showing N of M" counter on every render so it reflects the
+  // current rendered subset (#1172: was stuck at fetchGraph totals and
+  // never updated when Show full graph / type filters / Show superseded toggled).
+  // M (the denominator) is the size of the universe the toggles filter FROM,
+  // which depends on showSuperseded: with it ON, superseded nodes are part of
+  // the rendered set, so M must include them too — otherwise rendered (incl
+  // superseded) can exceed a current-only total and the counter shows the
+  // nonsensical "Showing 1095 of 1064" (N > M).
+  if (rawData && rawData.nodes) {
+    const totalUniverse = showSuperseded
+      ? rawData.nodes.length
+      : rawData.nodes.filter(n => n.is_current).length;
+    const renderedCount = nodes.length;
+    const nodeText = renderedCount === totalUniverse
+      ? `${totalUniverse} nodes`
+      : `Showing ${renderedCount} of ${totalUniverse} nodes`;
+    document.getElementById('stat-nodes').textContent = nodeText;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2145,10 +2168,7 @@ async function fetchGraph() {
       initWhatsNew(data.nodes);
     }
 
-    // Update stats bar
-    const current = data.nodes.filter(n => n.is_current).length;
-    document.getElementById('stat-nodes').textContent = `${current} (${data.nodes.length} total)`;
-    document.getElementById('stat-edges').textContent = data.edges.length;
+    // stat-nodes is now updated inside render() on every re-render (#1172).
 
     // Type counts for stats panel
     const byCurrent = {};
