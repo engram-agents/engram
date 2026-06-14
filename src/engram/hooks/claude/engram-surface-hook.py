@@ -35,25 +35,29 @@ def _resolve_runtime_dir(engram_home: str) -> str:
 
     Priority:
       1. $ENGRAM_RUNTIME_DIR if set explicitly.
-      2. $ENGRAM_HOME if it bundles a snapshot (alpha-install pattern).
-      3. Plugin root: hook lives at <plugin_root>/hooks/hook.py (flat layout —
+      2. Plugin root: hook lives at <plugin_root>/hooks/hook.py (flat layout —
          tools/build-plugin.sh copies hooks into <plugin_root>/hooks/ without
          a platform subdir), so the plugin root is two dirname() levels up
-         from __file__. engram_client.py lives at <plugin_root>/. This
-         resolves clean plugin installs where ENGRAM_HOME is data-only.
-      4. ~/engram-alpha (live-source fallback for dev installs that
-         haven't bundled a snapshot into $ENGRAM_HOME).
+         from __file__. engram_client.py lives at <plugin_root>/. The plugin
+         bundle is the canonical runtime; when present it MUST win so a stale
+         data-dir snapshot can never shadow it (fixes #1152: scatter cleanup
+         can leave ~/.engram/engram_client.py that does `import server` against
+         a removed ~/.engram/server.py, crash-looping the daemon).
+      3. $ENGRAM_HOME if it bundles a snapshot (scatter-install fallback only —
+         reached only when there is no plugin bundle; covers scatter installs
+         that copy engram_client.py into the data dir).
+      4. ~/engram-alpha (live-source fallback for dev installs).
     """
     explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
     if explicit:
         return explicit
-    if os.path.exists(os.path.join(engram_home, "engram_client.py")):
-        return engram_home
     plugin_root = os.path.dirname(
         os.path.dirname(os.path.abspath(__file__))
     )
     if os.path.exists(os.path.join(plugin_root, "engram_client.py")):
         return plugin_root
+    if os.path.exists(os.path.join(engram_home, "engram_client.py")):
+        return engram_home
     return os.path.expanduser("~/engram-alpha")
 
 

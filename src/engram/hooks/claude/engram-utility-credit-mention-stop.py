@@ -72,22 +72,26 @@ def _resolve_runtime_dir(engram_home: str) -> str:
     differs (engram_ids.py here vs engram_client.py there) because each hook
     probes for the module it actually imports.
       1. $ENGRAM_RUNTIME_DIR if set explicitly.
-      2. $ENGRAM_HOME if it bundles runtime modules (scatter / snapshot install).
-      3. Plugin root: hook lives at <plugin_root>/hooks/hook.py, so the plugin
-         root is two dirname() levels up from __file__. Runtime modules live at
-         <plugin_root>/. Resolves clean plugin installs where ENGRAM_HOME is
-         data-only (issue #782 class: stale scatter copy at ENGRAM_HOME must
-         not shadow the plugin's live copy).
-      4. ~/engram-alpha live-source fallback for dev installs.
+      2. Plugin root: hook lives at <plugin_root>/hooks/hook.py (flat layout —
+         tools/build-plugin.sh copies hooks into <plugin_root>/hooks/ without
+         a platform subdir), so the plugin root is two dirname() levels up
+         from __file__. engram_ids.py lives at <plugin_root>/. This
+         resolves clean plugin installs where ENGRAM_HOME is data-only
+         (issue #782 class: stale scatter copy at ENGRAM_HOME must not shadow
+         the plugin's live copy).
+      3. $ENGRAM_HOME if it bundles a snapshot (alpha-install pattern). Reached
+         only when no plugin bundle is present — scatter-install fallback.
+      4. ~/engram-alpha (live-source fallback for dev installs that
+         haven't bundled a snapshot into $ENGRAM_HOME).
     """
     explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
     if explicit:
         return explicit
-    if os.path.exists(os.path.join(engram_home, "engram_ids.py")):
-        return engram_home
     plugin_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if os.path.exists(os.path.join(plugin_root, "engram_ids.py")):
         return plugin_root
+    if os.path.exists(os.path.join(engram_home, "engram_ids.py")):
+        return engram_home
     return os.path.expanduser("~/engram-alpha")
 
 

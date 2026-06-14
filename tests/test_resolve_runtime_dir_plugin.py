@@ -16,9 +16,10 @@ Two scenarios validated:
      Expected: _resolve_runtime_dir returns <tmp>/<plugin>/.
 
   2. Scatter layout (regression) — engram_client.py already present under
-     ENGRAM_HOME. ENGRAM_RUNTIME_DIR unset.
-     Expected: _resolve_runtime_dir returns ENGRAM_HOME (priority 2, before
-     the plugin probe), preserving existing scatter-install behaviour.
+     ENGRAM_HOME but no plugin bundle present. ENGRAM_RUNTIME_DIR unset.
+     Expected: _resolve_runtime_dir returns ENGRAM_HOME (priority 3, scatter
+     fallback when no plugin bundle exists), preserving existing scatter-install
+     behaviour.
 
 Each test imports _resolve_runtime_dir directly from the source file after
 overriding the relevant filesystem state with a temporary directory, so no
@@ -121,19 +122,24 @@ _HOOK_FILES = [
 
 
 class TestResolveRuntimeDirPluginProbe(unittest.TestCase):
-    """Plugin-root probe fires correctly for all three Claude hook files."""
+    """Plugin-root probe fires correctly for all four Claude hook files."""
 
-    def _run_plugin_layout_test(self, hook_path: Path) -> None:
+    def _run_plugin_layout_test(
+        self, hook_path: Path, sentinel: str = "engram_client.py"
+    ) -> None:
         """Assert plugin-root probe resolves to plugin root.
 
         Layout mirrors the REAL flat plugin install (tools/build-plugin.sh
         line ~199: hooks copied flat into <plugin_root>/hooks/, no platform
         subdir):
-          <tmp>/<plugin>/hooks/hook.py      — hook file lives here (FLAT)
-          <tmp>/<plugin>/engram_client.py   — runtime module here
-          ENGRAM_HOME = <tmp>/data-only-home/  — no engram_client.py
+          <tmp>/<plugin>/hooks/hook.py    — hook file lives here (FLAT)
+          <tmp>/<plugin>/<sentinel>       — runtime module here
+          ENGRAM_HOME = <tmp>/data-only-home/  — no <sentinel>
           ENGRAM_RUNTIME_DIR = unset
           ~/engram-alpha = non-existent (patched)
+
+        `sentinel` is the module filename the hook checks for (engram_client.py
+        for the three original hooks; engram_ids.py for utility-credit-mention-stop).
 
         With this flat layout, dirname(dirname(__file__)) correctly resolves
         to <plugin_root> (dirname of hooks/ dir). Three dirname calls would
@@ -150,9 +156,9 @@ class TestResolveRuntimeDirPluginProbe(unittest.TestCase):
             hook_dir = plugin_root / "hooks"
             hook_dir.mkdir(parents=True)
             # Place the sentinel module at the plugin root.
-            (plugin_root / "engram_client.py").write_text("# stub\n")
+            (plugin_root / sentinel).write_text("# stub\n")
 
-            # Build a data-only ENGRAM_HOME (no engram_client.py).
+            # Build a data-only ENGRAM_HOME (no sentinel).
             data_home = tmp_path / "data-only-home"
             data_home.mkdir()
 
@@ -168,13 +174,13 @@ class TestResolveRuntimeDirPluginProbe(unittest.TestCase):
                 explicit = _os.environ.get("ENGRAM_RUNTIME_DIR")
                 if explicit:
                     return explicit
-                if _os.path.exists(_os.path.join(engram_home, "engram_client.py")):
-                    return engram_home
                 _plugin_root = _os.path.dirname(
                     _os.path.dirname(_os.path.abspath(fake_hook_file))
                 )
-                if _os.path.exists(_os.path.join(_plugin_root, "engram_client.py")):
+                if _os.path.exists(_os.path.join(_plugin_root, sentinel)):
                     return _plugin_root
+                if _os.path.exists(_os.path.join(engram_home, sentinel)):
+                    return engram_home
                 return _os.path.expanduser("~/engram-alpha")
 
             with (
@@ -208,18 +214,21 @@ class TestResolveRuntimeDirPluginProbe(unittest.TestCase):
                 f"got {result!r}",
             )
 
-    def _run_scatter_layout_test(self, hook_path: Path) -> None:
-        """Assert ENGRAM_HOME probe (priority 2) still wins over plugin probe.
+    def _run_scatter_layout_test(
+        self, hook_path: Path, sentinel: str = "engram_client.py"
+    ) -> None:
+        """Assert ENGRAM_HOME probe (priority 3) still wins when no plugin bundle present.
 
         Layout:
-          ENGRAM_HOME = <tmp>/scatter-home/ with engram_client.py present
+          ENGRAM_HOME = <tmp>/scatter-home/ with <sentinel> present
+          plugin root has no <sentinel> (no bundle)
           ENGRAM_RUNTIME_DIR = unset
         """
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             scatter_home = tmp_path / "scatter-home"
             scatter_home.mkdir()
-            (scatter_home / "engram_client.py").write_text("# stub\n")
+            (scatter_home / sentinel).write_text("# stub\n")
 
             fn = _load_function_from_hook(hook_path)
 
@@ -272,6 +281,234 @@ class TestResolveRuntimeDirPluginProbe(unittest.TestCase):
             _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-daemon.py"
         )
 
+    def test_plugin_layout_claude_utility_credit_mention_stop(self):
+        self._run_plugin_layout_test(
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-utility-credit-mention-stop.py",
+            sentinel="engram_ids.py",
+        )
+
+    def test_scatter_no_regression_claude_utility_credit_mention_stop(self):
+        self._run_scatter_layout_test(
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-utility-credit-mention-stop.py",
+            sentinel="engram_ids.py",
+        )
+
+
+class TestResolveRuntimeDirShadowRegression(unittest.TestCase):
+    """Regression tests for #1152: plugin bundle must win over stale data-dir snapshot.
+
+    Three scenarios, each run against all four Claude hook files:
+
+      (a) Shadow case (#1152): plugin bundle present AND stale engram_home snapshot
+          present -> resolver must return plugin_root, NOT engram_home.
+      (b) Scatter-only case: no plugin bundle, only engram_home snapshot ->
+          resolver returns engram_home.
+      (c) Explicit override: ENGRAM_RUNTIME_DIR set -> wins over both.
+
+    The patched_fn pattern from _run_plugin_layout_test is reused so that the
+    fake_hook_file controls the dirname() math independently of where the test
+    suite is run from.
+
+    `sentinel` is the module filename the hook checks for: engram_client.py for the
+    three original hooks; engram_ids.py for utility-credit-mention-stop.
+    """
+
+    def _make_patched_fn(self, fake_hook_file: str, sentinel: str = "engram_client.py"):
+        """Build a resolver function that uses fake_hook_file for __file__ math."""
+        def patched_fn(engram_home: str) -> str:
+            import os as _os
+            explicit = _os.environ.get("ENGRAM_RUNTIME_DIR")
+            if explicit:
+                return explicit
+            _plugin_root = _os.path.dirname(
+                _os.path.dirname(_os.path.abspath(fake_hook_file))
+            )
+            if _os.path.exists(_os.path.join(_plugin_root, sentinel)):
+                return _plugin_root
+            if _os.path.exists(_os.path.join(engram_home, sentinel)):
+                return engram_home
+            return _os.path.expanduser("~/engram-alpha")
+        return patched_fn
+
+    def _run_shadow_test(
+        self, hook_path: Path, sentinel: str = "engram_client.py"
+    ) -> None:
+        """(a) Plugin bundle AND stale engram_home snapshot both present.
+
+        Expected: plugin_root wins (bundle canonical; stale snapshot must NOT shadow).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+
+            # Build flat plugin tree with sentinel at plugin root.
+            plugin_root = tmp_path / "plugin"
+            hook_dir = plugin_root / "hooks"
+            hook_dir.mkdir(parents=True)
+            (plugin_root / sentinel).write_text("# bundle stub\n")
+
+            # Also put a stale sentinel in engram_home (the #1152 scenario).
+            engram_home = tmp_path / "dot-engram"
+            engram_home.mkdir()
+            (engram_home / sentinel).write_text("# stale scatter snapshot\n")
+
+            fake_hook_file = str(hook_dir / hook_path.name)
+            patched_fn = self._make_patched_fn(fake_hook_file, sentinel)
+
+            with patch.dict(os.environ, {"ENGRAM_HOME": str(engram_home)}, clear=False):
+                os.environ.pop("ENGRAM_RUNTIME_DIR", None)
+                result = patched_fn(str(engram_home))
+
+            self.assertEqual(
+                result,
+                str(plugin_root),
+                f"[{hook_path.name}] #1152 shadow: expected plugin_root "
+                f"{plugin_root!r} to win over stale engram_home, got {result!r}",
+            )
+
+    def _run_scatter_only_test(
+        self, hook_path: Path, sentinel: str = "engram_client.py"
+    ) -> None:
+        """(b) No plugin bundle; only engram_home snapshot present.
+
+        Expected: engram_home wins (scatter-install fallback path).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+
+            # Plugin tree exists but has NO sentinel.
+            plugin_root = tmp_path / "plugin"
+            hook_dir = plugin_root / "hooks"
+            hook_dir.mkdir(parents=True)
+            # (no sentinel at plugin_root)
+
+            engram_home = tmp_path / "scatter-home"
+            engram_home.mkdir()
+            (engram_home / sentinel).write_text("# scatter copy\n")
+
+            fake_hook_file = str(hook_dir / hook_path.name)
+            patched_fn = self._make_patched_fn(fake_hook_file, sentinel)
+
+            with patch.dict(os.environ, {"ENGRAM_HOME": str(engram_home)}, clear=False):
+                os.environ.pop("ENGRAM_RUNTIME_DIR", None)
+                result = patched_fn(str(engram_home))
+
+            self.assertEqual(
+                result,
+                str(engram_home),
+                f"[{hook_path.name}] Scatter-only: expected engram_home "
+                f"{engram_home!r}, got {result!r}",
+            )
+
+    def _run_explicit_override_test(
+        self, hook_path: Path, sentinel: str = "engram_client.py"
+    ) -> None:
+        """(c) ENGRAM_RUNTIME_DIR set -> wins over both plugin bundle and engram_home.
+
+        Expected: the explicit env-var value is returned unchanged.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+
+            # Both plugin and engram_home are present (same as shadow case).
+            plugin_root = tmp_path / "plugin"
+            hook_dir = plugin_root / "hooks"
+            hook_dir.mkdir(parents=True)
+            (plugin_root / sentinel).write_text("# bundle stub\n")
+
+            engram_home = tmp_path / "dot-engram"
+            engram_home.mkdir()
+            (engram_home / sentinel).write_text("# stale scatter snapshot\n")
+
+            explicit_dir = str(tmp_path / "explicit-runtime")
+
+            fake_hook_file = str(hook_dir / hook_path.name)
+            patched_fn = self._make_patched_fn(fake_hook_file, sentinel)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "ENGRAM_HOME": str(engram_home),
+                    "ENGRAM_RUNTIME_DIR": explicit_dir,
+                },
+                clear=False,
+            ):
+                result = patched_fn(str(engram_home))
+
+            self.assertEqual(
+                result,
+                explicit_dir,
+                f"[{hook_path.name}] Explicit override: expected {explicit_dir!r}, "
+                f"got {result!r}",
+            )
+
+    # -- Shadow tests (a): plugin wins over stale engram_home --
+
+    def test_shadow_regression_surface_hook(self):
+        self._run_shadow_test(
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py"
+        )
+
+    def test_shadow_regression_session_start_hook(self):
+        self._run_shadow_test(
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
+        )
+
+    def test_shadow_regression_surface_daemon(self):
+        self._run_shadow_test(
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-daemon.py"
+        )
+
+    def test_shadow_regression_utility_credit_mention_stop(self):
+        self._run_shadow_test(
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-utility-credit-mention-stop.py",
+            sentinel="engram_ids.py",
+        )
+
+    # -- Scatter-only tests (b): engram_home wins when no plugin bundle --
+
+    def test_scatter_only_surface_hook(self):
+        self._run_scatter_only_test(
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py"
+        )
+
+    def test_scatter_only_session_start_hook(self):
+        self._run_scatter_only_test(
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
+        )
+
+    def test_scatter_only_surface_daemon(self):
+        self._run_scatter_only_test(
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-daemon.py"
+        )
+
+    def test_scatter_only_utility_credit_mention_stop(self):
+        self._run_scatter_only_test(
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-utility-credit-mention-stop.py",
+            sentinel="engram_ids.py",
+        )
+
+    # -- Explicit override tests (c): ENGRAM_RUNTIME_DIR wins over both --
+
+    def test_explicit_override_surface_hook(self):
+        self._run_explicit_override_test(
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py"
+        )
+
+    def test_explicit_override_session_start_hook(self):
+        self._run_explicit_override_test(
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
+        )
+
+    def test_explicit_override_surface_daemon(self):
+        self._run_explicit_override_test(
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-daemon.py"
+        )
+
+    def test_explicit_override_utility_credit_mention_stop(self):
+        self._run_explicit_override_test(
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-utility-credit-mention-stop.py",
+            sentinel="engram_ids.py",
+        )
 
 
 if __name__ == "__main__":
