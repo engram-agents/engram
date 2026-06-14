@@ -600,6 +600,23 @@ HTML = r"""<!DOCTYPE html>
     .node-circle.sg-highlight { filter: brightness(1.3); stroke-width: 2.5; }
     .status-ring.sg-dimmed { opacity: 0.05 !important; }
 
+    /* What's new since last visit (#1169 slice-2) — distinct from sg-highlight
+       (which is a brightness boost + thick stroke for subgraph traversal) and
+       from the pulse-ring (a one-shot animated ring on search-focus).
+       new-node-glow uses a cyan outer-glow filter + thicker stroke to signal
+       "created since your last visit" without clashing with node-type fill. */
+    .node-circle.new-node-glow {
+      stroke: #00d4ff !important;
+      stroke-width: 2.5;
+      filter: drop-shadow(0 0 4px #00d4ffaa);
+    }
+    #new-nodes-indicator {
+      font-size: 11px;
+      color: #00d4ff;
+      margin-top: 5px;
+      display: none;
+    }
+
     .superseded-badge {
       background: #3a2000;
       color: #f0ad4e;
@@ -686,6 +703,7 @@ HTML = r"""<!DOCTYPE html>
 
   <div class="section">
     <div id="status-line">Nodes: <span id="stat-nodes">—</span> &nbsp; Edges: <span id="stat-edges">—</span></div>
+    <div id="new-nodes-indicator"></div>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
       <div class="btn" id="refresh-btn">↻ Refresh</div>
       <label class="toggle" style="margin:0">
@@ -822,6 +840,14 @@ let autoRefreshInterval = null;
 let highlightedNodeIds = new Set();
 let highlightDepth = 2;
 
+// What's new since last visit (#1169 slice-2).
+// Computed ONCE on initial load (first fetchGraph call) and cached for the
+// session. Re-renders (toggle/search/type-filter) re-use the cached set so
+// the "new" designation doesn't shift under the user's feet.
+// The boolean flag prevents the set from being recomputed on auto-refresh.
+let newNodeIds = new Set();
+let _whatsNewInitialised = false;
+
 // Memory tier thresholds. These mirror the agent's $ENGRAM_HOME/config.json
 // values (memory.tier1_max_nodes / tier2_max_nodes) — fetched at page load
 // from /api/meta so the viz reflects the ACTUAL config, not the historical
@@ -850,6 +876,62 @@ const LEGIBLE_RECENT_LIMIT = 60;
 // If the total node count is at or below this threshold, skip the subset filter
 // entirely and render all nodes (avoids awkward partial view on a sparse graph).
 const LEGIBLE_SMALL_GRAPH = 80;
+
+// ═══════════════════════════════════════════════════════════════════
+// What's new since last visit (#1169 slice-2)
+// ═══════════════════════════════════════════════════════════════════
+
+// Call ONCE after the first fetchGraph() resolves with node data.
+// Reads prevLastVisit from localStorage (per-agent key), builds newNodeIds
+// from nodes whose created_at > prevLastVisit, then advances lastVisit to now.
+//
+// Per-agent key: engram-viz-lastvisit-<agentName>
+// First visit (null prevLastVisit): empty set, no indicator, just sets baseline.
+// Subsequent re-renders (toggle/search/type-filter) reuse the cached newNodeIds
+// — _whatsNewInitialised guards against recomputing on auto-refresh.
+function initWhatsNew(nodes) {
+  // Per-agent localStorage key. In single-agent mode currentAgent() is null
+  // (loadAgents() leaves the ?agent= param unset when there's only one agent),
+  // so we fall back to '__default__' — a clearly-synthetic sentinel that won't
+  // collide with a real agent name. Intentional consequence: if the install
+  // later adds a second agent, that agent's visit-history starts fresh under
+  // its real name (first-visit semantics: no highlights on the first multi-agent
+  // visit). We deliberately do NOT carry the '__default__' history forward —
+  // a one-time "everything looks new" pass on the multi-agent transition is an
+  // acceptable cost versus mis-attributing one agent's history to another.
+  const agentName = currentAgent() || '__default__';
+  const lsKey = 'engram-viz-lastvisit-' + agentName;
+  const prevLastVisit = localStorage.getItem(lsKey);  // ISO string or null
+
+  // Compute: nodes created AFTER the last visit timestamp.
+  // ISO 8601 strings are lexicographically comparable.
+  if (prevLastVisit) {
+    nodes.forEach(n => {
+      if (n.created_at && n.created_at > prevLastVisit) {
+        newNodeIds.add(n.id);
+      }
+    });
+  }
+  // else: first visit — leave newNodeIds empty (no highlights, no indicator).
+
+  // Advance the baseline: THIS visit becomes NEXT visit's prevLastVisit.
+  // Write AFTER computing so the nodes just seen don't appear new next time.
+  localStorage.setItem(lsKey, new Date().toISOString());
+
+  // Update indicator in sidebar.
+  const el = document.getElementById('new-nodes-indicator');
+  if (el) {
+    if (newNodeIds.size > 0) {
+      el.textContent = '✨ ' + newNodeIds.size + ' new since your last visit';
+      el.style.display = 'block';
+    } else {
+      el.textContent = '';
+      el.style.display = 'none';
+    }
+  }
+
+  _whatsNewInitialised = true;
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // D3 setup
@@ -975,6 +1057,9 @@ function nodeClasses(d) {
   else if (!d.is_current) cls += ' superseded';
   if (isTainted(d)) cls += ' tainted';
   if (selectedNodeId === d.id) cls += ' selected';
+  // What's new since last visit (#1169 slice-2): newNodeIds is frozen after
+  // initWhatsNew() and never recomputed per-render, so this is stable.
+  if (newNodeIds.has(d.id)) cls += ' new-node-glow';
   return cls;
 }
 
@@ -2053,6 +2138,12 @@ async function fetchGraph() {
     }
 
     rawData = data;
+
+    // What's new since last visit (#1169 slice-2): initialise ONCE on first
+    // fetch so the new-set is stable across auto-refresh re-renders.
+    if (!_whatsNewInitialised) {
+      initWhatsNew(data.nodes);
+    }
 
     // Update stats bar
     const current = data.nodes.filter(n => n.is_current).length;
