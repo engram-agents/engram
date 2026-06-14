@@ -27,7 +27,7 @@ The trajectory should be dense with node references — the post-compaction self
 
 **4. REQUIRED — Currently focused (carry these forward verbatim):**
 
-Focus-mode semantics (what to pin, when to rotate, the 15-node cap) are in SKILL.md §7. This section only covers how to render the current focus list into the pre-compaction summary.
+Focus-mode semantics (what to pin, when to rotate, the 15-node cap) live in the focus-mode tool schemas + the `engram-nap` / `engram-loop` skills (the live reference). This section only covers how to render the current focus list into the pre-compaction summary.
 
 Before writing the summary, call `engram_list_focused()`. For every focused node, include a line: `id`, a short claim (≤80 chars), and the `focus_reason`. Example format:
 
@@ -42,12 +42,12 @@ This section is load-bearing. Focused nodes are the deterministic channel from p
 - Open work, pending decisions, questions for {{USER_NAME}}
 - Specific next action (not "continue working" — be concrete)
 
-**6. IF IN LOOP MODE — Derivation coordinates:**
+**6. IF IN LOOP MODE — pick up the thread:**
 
-If `~/.engram/loop-mode.json` exists at compaction time, I am mid-loop. I need to pick up where I left off without re-deriving from scratch. Include:
+If `~/.engram/loop-mode.json` exists at compaction time, I am mid-loop. **Read that file first** — it is the source of truth for *which* loop I'm running and its live state (kind, focus, open obligations). Loops come in several kinds — single working loop, collaborating / coordinating loop, research or curiosity loop, others to come — so don't assume; the marker says which. Do NOT copy the marker's contents into this summary; the post-compaction self reads the marker directly.
 
-- **Research question** — the qu_ ID and one-line summary of what I'm investigating
-- **Planned derivations** — derivations I was building toward but hadn't written yet. For each: the claim I intended to make, the supporting node IDs I planned to cite, and the reasoning type. This is the most important thing to preserve — an unwritten derivation is a lost thought.
-- **Evidence gathered but not yet synthesized** — observations written this burst that haven't been connected into derivations yet
-- **Current sub-question** — which branch of the research tree I was exploring
-- **Next step** — what I should do first (not "continue research" — be specific: "search for X", "derive Y from ob_XXXX + ob_YYYY", "read paper Z")
+What this summary adds is the in-flight thinking the marker doesn't already hold — the part a compaction would actually destroy:
+
+- **Done this burst** — a few concrete lines of what I completed since the last checkpoint (not a restatement of the marker's state field).
+- **Next step** — the specific next action, concrete enough to start cold (not "continue the loop").
+- **Unwritten thoughts** — anything I was building toward but hadn't committed to ENGRAM yet: a derivation I meant to file (claim + supporting IDs + reasoning type), a decision reached but not recorded, evidence gathered but not synthesized. This is the irreplaceable part — an unwritten thought is what a compaction loses.

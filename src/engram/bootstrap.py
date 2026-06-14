@@ -573,6 +573,18 @@ def main() -> None:
             flush=True,
         )
 
+    # Strip the source-of-truth breadcrumb that sits above the marker in
+    # template.CLAUDE.md. It's a guide for whoever edits the template (the real
+    # Compact Instructions live in compact-instructions.md), not for the rendered
+    # install — so it must not leak into the agent's ~/.claude/CLAUDE.md or the
+    # Codex prompt. Both render paths iterate `substitutions` and .replace(), so
+    # one empty-value entry removes the whole comment line in every target. The
+    # string MUST match the template line exactly (kept single-line for that
+    # reason); tests/test_bootstrap_codex.py fails loudly if it ever drifts and
+    # the breadcrumb would leak into a render.
+    _compact_breadcrumb_line = "<!-- Source of truth: compact-instructions.md — edit there, not in this template. This comment and the marker below are both replaced at install-time. -->\n"  # noqa: E501
+    substitutions[_compact_breadcrumb_line] = ""
+
     manifest = {
         "seed_ids": ids,
         "alpha_dir": str(ALPHA_DIR),

@@ -178,6 +178,33 @@ def test_claude_compact_instructions_substitution_integrity():
         "was extracted to compact-instructions.md."
     )
 
+    # 6. Source-of-truth breadcrumb: present in the template (so template editors
+    #    know the real content lives in compact-instructions.md), carried by a
+    #    matching strip entry in bootstrap.py, and GONE once stripped (so it never
+    #    leaks into the rendered ~/.claude/CLAUDE.md or the Codex prompt). This is
+    #    the drift guard: if the template wording and the bootstrap strip ever
+    #    diverge, the breadcrumb survives the strip and this test fails loudly.
+    m = re.search(
+        r"<!-- Source of truth: compact-instructions\.md.*?-->", template_text
+    )
+    assert m, (
+        "Source-of-truth breadcrumb comment missing from template.CLAUDE.md — "
+        "template editors lose the pointer to compact-instructions.md."
+    )
+    breadcrumb = m.group(0)
+    bootstrap_src = (
+        REPO_ROOT / "src" / "engram" / "bootstrap.py"
+    ).read_text()
+    assert breadcrumb in bootstrap_src, (
+        "bootstrap.py has no strip entry matching the template breadcrumb "
+        f"({breadcrumb!r}) — it would leak into the rendered install. Keep the "
+        "strip string in bootstrap.py identical to the template line."
+    )
+    stripped = rendered.replace(breadcrumb + "\n", "")
+    assert breadcrumb not in stripped, (
+        "Breadcrumb survived the strip — the rendered CLAUDE.md would carry it."
+    )
+
 
 # ---------------------------------------------------------------------------
 # Component B: Codex target renders all three files
