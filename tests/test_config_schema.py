@@ -109,6 +109,61 @@ class TestAutoSleepSchemaEntries:
         )
 
 
+class TestEngagedWindowDefault:
+    """The engaged-window schema `default` surfaces the effective value the
+    config UI shows as a placeholder when the key is absent (#1172 finding).
+    """
+
+    def test_engaged_row_has_default(self):
+        """cadence.engaged_window_seconds must carry a `default` for placeholder display."""
+        row = _schema_by_key()["cadence.engaged_window_seconds"]
+        assert "default" in row, (
+            "cadence.engaged_window_seconds missing `default` — the config UI "
+            "would render an empty box with no hint of the effective value"
+        )
+
+    def test_engaged_default_matches_status_derive(self):
+        """Drift guard: the schema `default` must equal the value the hook actually
+        uses (_status_derive._DEFAULT_ENGAGED_WINDOW). Two sources, one truth —
+        this test is the mechanical link, so a change to one fails loudly if the
+        other isn't updated.
+        """
+        from _status_derive import _DEFAULT_ENGAGED_WINDOW
+        row = _schema_by_key()["cadence.engaged_window_seconds"]
+        assert row["default"] == _DEFAULT_ENGAGED_WINDOW, (
+            f"schema default {row['default']!r} != hook default "
+            f"{_DEFAULT_ENGAGED_WINDOW!r} — config UI placeholder would lie about "
+            f"the effective engaged window"
+        )
+
+    def test_annotate_schema_carries_default_when_value_absent(self):
+        """With the key absent from config, annotate_schema surfaces value=None
+        AND the `default` (so the renderer can show it as a placeholder)."""
+        from tools.config_schema import annotate_schema
+        out = annotate_schema({})  # empty config — nothing set
+        engaged_rows = [
+            r for sec in out["sections"] for r in sec["rows"]
+            if r["key"] == "cadence.engaged_window_seconds"
+        ]
+        assert len(engaged_rows) == 1
+        row = engaged_rows[0]
+        assert row["value"] is None, f"expected value=None for absent key; got {row['value']!r}"
+        assert row.get("default") == 360, f"expected default=360 to pass through; got {row.get('default')!r}"
+
+    def test_annotate_schema_value_present_suppresses_placeholder(self):
+        """When the key IS set, annotate_schema returns the configured value (not
+        None) — so the renderer shows the value and the placeholder never fires
+        (the JS condition is `val === '' && row.default`). Guards against a future
+        widening of the placeholder condition that would mask a real value."""
+        from tools.config_schema import annotate_schema
+        out = annotate_schema({"cadence": {"engaged_window_seconds": 300}})
+        row = next(
+            r for sec in out["sections"] for r in sec["rows"]
+            if r["key"] == "cadence.engaged_window_seconds"
+        )
+        assert row["value"] == 300, f"expected configured value 300; got {row['value']!r}"
+
+
 class TestDefaultConfigCadence:
     """_ensure_data_dir writes default config with the two new cadence keys."""
 

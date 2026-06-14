@@ -86,6 +86,22 @@ class TestConfigHtmlStructure(unittest.TestCase):
         self.assertIn('.btn-save', self.html,
                       ".btn-save CSS class missing from CONFIG_HTML")
 
+    def test_readonly_badge_present(self):
+        """Non-editable fields get a visible read-only badge (#1172 finding —
+        agent_name/mode/counterparts were ambiguous: disabled but unmarked)."""
+        self.assertIn('badge-readonly', self.html,
+                      "badge-readonly CSS class missing from CONFIG_HTML")
+        self.assertIn('read-only</span>', self.html,
+                      "read-only badge markup missing from CONFIG_HTML")
+
+    def test_default_placeholder_logic_present(self):
+        """Editable numeric fields surface the effective default as a placeholder
+        when unset (#1172 finding — engaged-window rendered as a blank box)."""
+        self.assertIn('row.default', self.html,
+                      "default-placeholder logic missing from CONFIG_HTML")
+        self.assertIn('(default)"', self.html,
+                      "'(default)' placeholder suffix missing from CONFIG_HTML")
+
     def test_save_field_js_function_present(self):
         """saveField() JS function must be defined."""
         self.assertIn('async function saveField(', self.html,

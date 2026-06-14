@@ -4289,6 +4289,7 @@ CONFIG_HTML = r"""<!DOCTYPE html>
              white-space: nowrap; }
     .badge-restart { background: #1a3a5c; color: #7ecfff; border: 1px solid #1a4a8a; }
     .badge-legacy  { background: #3a2a0a; color: #ffb74d; border: 1px solid #7a4500; cursor: help; }
+    .badge-readonly { background: #2a2a32; color: #999; border: 1px solid #44444c; cursor: help; }
 
     /* Controls */
     input[type="text"], input[type="number"] {
@@ -4489,9 +4490,16 @@ CONFIG_HTML = r"""<!DOCTYPE html>
         return `<input type="number" value="${esc(String(v))}" disabled class="${alertPulse.trim()}">`;
       }
       const val = (v === null || v === undefined) ? '' : esc(String(v));
+      // When unset, surface the effective code default as a placeholder so the
+      // box isn't a blank with no hint of what's active (config_schema `default`).
+      // Scope: this lives in the int/float branch only — the sole schema field
+      // with a `default` today is numeric. A future text field with a `default`
+      // would need the same line added to the text branch above.
+      const ph = (val === '' && row.default !== null && row.default !== undefined)
+        ? ` placeholder="${esc(String(row.default))} (default)"` : '';
       const step = (ctrl === 'float') ? 'any' : '1';
       return `<div class="field-edit-wrap">
-        <input type="number" id="field-${esc(key)}" value="${val}" step="${step}"
+        <input type="number" id="field-${esc(key)}" value="${val}"${ph} step="${step}"
                class="${alertPulse.trim()}"
                onkeydown="if(event.key==='Enter')saveFieldFromInput('${esc(key)}')">
         <button class="btn-save" onclick="saveFieldFromInput('${esc(key)}')">Save</button>
@@ -4568,6 +4576,9 @@ CONFIG_HTML = r"""<!DOCTYPE html>
   function renderRow(row, isGated) {
     const editable = row.editable !== false;
     const badges = [];
+    if (!editable) {
+      badges.push(`<span class="badge badge-readonly" title="Managed elsewhere (set at install time / by agentctl, or read-only by design) — not editable here">&#128274; read-only</span>`);
+    }
     if (row.restart_required) {
       badges.push(`<span class="badge badge-restart" title="Restart needed after this change">&#x27F3; restart needed</span>`);
     }

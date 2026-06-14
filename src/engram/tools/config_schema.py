@@ -84,9 +84,12 @@ SCHEMA: list[dict] = [
      "editable": True, "restart_required": False},
 
     # Engaged-state detection
+    # `default` mirrors _status_derive._DEFAULT_ENGAGED_WINDOW (the value the hook
+    # actually uses when the key is absent from config.json). Kept in sync by
+    # test_config_schema.test_engaged_default_matches_status_derive (drift guard).
     {"key": "cadence.engaged_window_seconds", "section": "engaged", "tier": TIER_A,
      "type": "integer", "control": "int", "min": 30, "max": 3600,
-     "label": "Engaged window (seconds)",
+     "label": "Engaged window (seconds)", "default": 360,
      "tooltip": "How long after the last human-typed prompt the agent is considered 'engaged' on the board. Default 360 (6 minutes). The stamp is written by the time-bar hook on genuine human prompts only — loop self-wakes and monitor events do not update it.",
      "editable": True, "restart_required": False},
 
