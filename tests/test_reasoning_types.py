@@ -414,6 +414,95 @@ def test_no_warning_multi_source_generalization():
     print(f"  PASS: no source-independence warning for multi-source generalization (F-S advisory benign)")
 
 
+def test_no_false_same_source_on_deep_premise():
+    """#1186 regression: a premise whose evidence sits deep down a layered
+    derivation spine must NOT be false-flagged as 'same evidence node'.
+
+    Reproduces Aleph's dv_0103 shape: generalize over (A) a derivation many
+    hops above its evidence root ev1, and (B) a shallow observation on a DISJOINT
+    root ev2. Pre-#1186, _trace_evidence_roots' 10-VISIT budget truncated A's
+    trace before reaching ev1 → A returned an EMPTY root set → all_roots={ev2},
+    and `len(all_roots) <= 1` fired the false 'same evidence node' warning on
+    genuinely-independent premises. Post-fix: the raised budget resolves A→{ev1}
+    (and the rooted-subset gate would stay silent even if it hadn't), so no
+    source-independence warning fires. Fails on the pre-fix code; passes after.
+    """
+    client = fresh_client()
+    ids = setup_base_graph(client)
+
+    # Build a LINEAR chain of 12 single-premise derivations above ob1 (rooted in
+    # ev1). The chain top is ~14 node-visits from ev1 — beyond the old budget of
+    # 10, so the old tracer returned {} for it. deductive_reductio takes a single
+    # premise cleanly (no min-premise noise warning per link).
+    prev = ids["ob1"]
+    for i in range(12):
+        r = client.call("engram_derive", {
+            "claim": f"deep chain link {i}",
+            "supporting_ids": prev,
+            "logical_chain": "deep layered spine for #1186 repro",
+            "reasoning_type": "deductive_reductio",  # min_premises=1
+        })
+        assert r.get("status") == "created", f"chain link {i} not created: {r}"
+        prev = r["derivation_id"]
+    deep_top = prev  # a derivation ~14 visits above ev1
+
+    # Generalize over the DEEP premise (root ev1) and a SHALLOW one (ob3, root ev2).
+    result = client.call("engram_derive", {
+        "claim": "Generalization over a deep premise and a shallow disjoint one",
+        "supporting_ids": f"{deep_top},{ids['ob3']}",
+        "logical_chain": "deep ev1 chain + shallow ev2 observation, independent",
+        "reasoning_type": "inductive_generalization",
+    })
+    assert result.get("status") == "created", f"generalization not created: {result}"
+    warns = result.get("structure_warnings", [])
+    assert not any(
+        ("independent sources" in w) or ("same evidence node" in w) for w in warns
+    ), f"#1186: deep-premise generalization must not false-flag same-source: {warns}"
+    # Positive-liveness (#933 / reviewer-fairy): confirm the multi_source check
+    # actually RAN and passed, not that it was silently skipped.
+    assert any("CHECKED (mechanical)" in w for w in warns), (
+        f"multi_source check must disclose it ran: {warns}"
+    )
+    print("  PASS: deep premise not false-flagged as same-source (#1186)")
+
+
+def test_same_source_warns_despite_rootless_premise():
+    """#1188 colleague review (Aleph): a rootless premise must NOT veto a genuine
+    same-source warning among the other premises (the false-negative the
+    rooted-subset gate fixes — and the case that distinguishes it from a blunt
+    all-or-omit `all(rooted)`).
+
+    Generalize over [ob1→ev1, ob2→ev1, axiom]. ob1/ob2 are genuinely
+    non-independent (same ev1); the axiom is rootless (no evidence root). A blunt
+    all-or-omit gate would see the rootless axiom and stay silent — masking the
+    real same-source signal. The rooted-subset gate judges over the 2 rooted
+    premises (both → ev1, one shared root) and correctly WARNS.
+    """
+    client = fresh_client()
+    ids = setup_base_graph(client)
+
+    ax = client.call("engram_add_axiom", {
+        "claim": "Provenance traces to evidence (rootless test axiom).",
+        "basis": "A premise with no evidence root, for the #1188 FN case.",
+    })
+    assert ax.get("status") == "created", f"axiom not created: {ax}"
+    ax_id = ax.get("axiom_id") or ax.get("node_id") or ax.get("id")
+    assert ax_id, f"no axiom id in {ax}"
+
+    result = client.call("engram_derive", {
+        "claim": "Same-source pair plus an incidental rootless axiom premise",
+        "supporting_ids": f"{ids['ob1']},{ids['ob2']},{ax_id}",
+        "logical_chain": "ob1+ob2 both from ev1; axiom is rootless and must not veto",
+        "reasoning_type": "inductive_generalization",
+    })
+    assert result.get("status") == "created", f"generalization not created: {result}"
+    warns = result.get("structure_warnings", [])
+    assert any(
+        ("independent sources" in w) or ("same evidence node" in w) for w in warns
+    ), f"#1188: rootless premise must not suppress real same-source warning: {warns}"
+    print("  PASS: same-source warning fires despite a rootless premise (#1188)")
+
+
 # ---------------------------------------------------------------------------
 # Test: Register disclosure (issue #933) — mechanical vs agent-judgment
 # ---------------------------------------------------------------------------

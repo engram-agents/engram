@@ -3626,8 +3626,18 @@ def _validate_premises(
     return (None, stale_ids)
 
 
-def _trace_evidence_roots(conn: sqlite3.Connection, node_id: str, max_depth: int = 10) -> set:
-    """Trace a node back to its evidence root(s) through citation edges."""
+def _trace_evidence_roots(conn: sqlite3.Connection, node_id: str, max_depth: int = 4096) -> set:
+    """Trace a node back to its evidence root(s) through citation edges.
+
+    ``max_depth`` is a per-VISIT budget (decremented once per dequeued node),
+    NOT a depth limit — the name is historical. Termination is already
+    guaranteed by the ``visited`` set (each node is processed once over a
+    finite reachable subgraph); the budget is only an anti-pathological cap.
+    It was formerly 10, which silently TRUNCATED any premise whose evidence sat
+    more than ~10 node-visits down a layered derivation spine, returning a
+    partial or empty root set — the root cause of the #1186 multi_source
+    false-positive. 4096 cannot truncate a real provenance graph.
+    """
     visited = set()
     queue = [node_id]
     roots = set()
@@ -3658,7 +3668,7 @@ def _trace_evidence_roots(conn: sqlite3.Connection, node_id: str, max_depth: int
 
 
 def _trace_observation_leaves(
-    conn: sqlite3.Connection, node_id: str, max_depth: int = 10
+    conn: sqlite3.Connection, node_id: str, max_depth: int = 4096
 ) -> set:
     """Trace a node back to the OBSERVATION leaves it rests on.
 
@@ -3677,8 +3687,12 @@ def _trace_observation_leaves(
     The standpoint/F-S leaves are observations, one layer up from evidence.
     (Ariadne #49 — the prior ``_trace_evidence_roots`` reuse was the wrong layer.)
 
-    Mirrors ``_trace_evidence_roots``'s node-budget semantics (``max_depth``
-    decremented per visited node) for behavioral parity.
+    Mirrors ``_trace_evidence_roots``'s per-visit-budget semantics (``max_depth``
+    decremented per dequeued node, NOT a depth limit; termination guaranteed by
+    ``visited``) for behavioral parity — including the raised budget (#1186): at
+    the former 10 a deep derivation spine truncated the leaf set, which on this
+    (all-or-omit-gated) consumer caused silent under-credit rather than a
+    false-positive, but is the same latent defect.
     """
     visited = set()
     queue = [node_id]
@@ -3948,7 +3962,20 @@ def _validate_reasoning_structure(
         for roots in evidence_roots.values():
             all_roots.update(roots)
 
-        if len(all_roots) <= 1 and len(premise_ids) >= 2:
+        # Judge same-source over the ROOTED SUBSET (Aleph, #1188 colleague
+        # review): warn only when >= 2 premises actually RESOLVED evidence roots
+        # AND those roots collapse to a single shared one. Rootless premises (an
+        # axiom cited as support, or — pre-#1186 — a budget-truncated trace)
+        # contribute nothing to all_roots and are EXCLUDED from the judgment,
+        # never allowed to veto it. This closes both failure modes:
+        #   * old `len(all_roots) <= 1` fired on the len==0 case → false-flagged
+        #     genuinely-disjoint premises as same-source (#1186);
+        #   * a blunt all-or-omit `all(rooted)` would let a single rootless
+        #     premise SUPPRESS a real same-source warning among the others
+        #     (the false-negative — e.g. [ob_A->ev1, ob_B->ev1, ax_C]).
+        # (rooted premises' roots == all_roots, since rootless add the empty set.)
+        rooted_count = sum(1 for r in evidence_roots.values() if r)
+        if rooted_count >= 2 and len(all_roots) == 1:
             warnings.append(
                 f"Reasoning type '{reasoning_type}' requires independent sources, "
                 f"but all premises trace back to the same evidence node. "
