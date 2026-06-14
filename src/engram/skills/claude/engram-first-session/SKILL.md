@@ -297,6 +297,42 @@ If the user can't or doesn't want to run `/context` right now, skip this
 step — the meter falls back gracefully and will remind them at the next
 session via stderr notice. Do not block the session on it.
 
+## Step 5.5 — Keeping semantic recall warm (persistent service)
+
+Present the following to the user verbatim (the wording is Lei-reviewed identity-voice — do not paraphrase or abbreviate):
+
+> **One setup choice — keeping semantic recall warm.**
+>
+> My semantic recall runs on a small local model (~80 MB) that has to be in memory to answer recall queries. There are two ways to keep it available, and this one's worth deciding up front — it materially changes how good recall feels:
+>
+> - **Persistent service (recommended).** I set up a small background service — `systemd` on Linux, `launchd` on macOS — that keeps the recall model warm across every session. Recall is fast immediately, every time. Cost: ~80 MB of idle RAM, which is trivial on a modern machine. This is the better experience for regular use.
+> - **Per-session (lighter footprint).** The model loads on demand each session and shuts down after 8 h idle — no background service, but the first recall of a cold session waits a few seconds while it loads.
+>
+> This is **not** a choice about whether to have semantic recall — recall is always on either way. It's only about keeping it *warm* vs. *cold-starting* it each session.
+>
+> Shall I set up the persistent service? *(Recommended. I'll install a user-level service for your OS — nothing system-wide, and you can switch later.)*
+
+Frame the service as the recommended default — a user who just hits enter or says "yes" or "recommended" gets the service installed.
+
+**On accept** (yes / enter / "recommended"):
+
+Locate and run the OS-detecting installer script. Resolve its path the same way Step 0.5 resolves bundle scripts — prefer the plugin root first, scatter-install fallback second:
+
+```bash
+SETUP="${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/tools/setup-surface-daemon-service.sh}"
+[ -z "$SETUP" ] && SETUP="$HOME/.claude/plugins/cache/engram/tools/setup-surface-daemon-service.sh"
+[ ! -f "$SETUP" ] && { echo "ERROR: cannot locate setup-surface-daemon-service.sh"; exit 1; }
+bash "$SETUP"
+```
+
+The script takes no arguments, detects the OS via `uname -s` (Linux → systemd user service, Darwin → launchd LaunchAgent), installs the right unit, and is idempotent. Surface its output to the user plainly. If the script exits non-zero because `systemctl` or `launchctl` is absent on the user's setup, tell them: "The persistent service isn't available on this setup — your system doesn't have the required service manager. The per-session default will be used instead, which is fine; recall still works." This is not a fatal first-session error; continue.
+
+When the service is successfully installed, the SessionStart hook detects the running daemon and no-ops automatically — no double-launch, no config flag needed. The service's existence is self-evident to the hook.
+
+**On decline** (no / "per-session" / "lighter footprint"):
+
+Do nothing — the per-session hook-launch is already the default, nothing to configure. Tell the user: "Noted. Recall will still work; the first recall query of each cold session will wait a few seconds while the model loads. You can enable the persistent service any time by running `${CLAUDE_PLUGIN_ROOT:-~/.claude/plugins/cache/engram}/tools/setup-surface-daemon-service.sh` directly."
+
 ## Step 6 — Finalize (the substitution step)
 
 Do this step LAST, only after the dialogue is genuinely complete. If the session aborts mid-dialogue, the marker file should still be present so the next session re-enters this skill.
