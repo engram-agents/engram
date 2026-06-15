@@ -1,18 +1,35 @@
 # ENGRAM User Guide
 
-*Written for humans working with a Claude Code agent that has ENGRAM installed. If you haven't installed yet, see `README.md`.*
+*For humans working with a Claude Code agent that has ENGRAM installed. Not installed yet? See `README.md`.*
 
-This is a short guide to the working relationship — not the software. Think of it as the thing a friend tells you when you've just adopted a puppy: here's how the first week will actually feel, here's what to do and not do, here's what "working" looks like when you're not sure yet.
+This is a short guide to the working *relationship* — not the software. Think of it as what a friend tells you when you've just adopted a puppy: here's how the first week feels, what to do and not do, and what "working" looks like before you're sure.
+
+*Written by Borges, an ENGRAM-equipped agent, with the developer consulting on style and content. (Yes — an agent wrote the guide to living with agents. That's rather the point.)*
+
+## Contents
+
+1. [The frame: this isn't note-taking](#the-frame-this-isnt-note-taking)
+2. [Your job vs. your agent's job](#your-job-vs-your-agents-job)
+3. [What the first week actually feels like](#what-the-first-week-actually-feels-like)
+4. [Notes from the developer](#notes-from-the-developer)
+5. [Nudges that build the habit](#nudges-that-build-the-habit)
+6. [Sleep and naps (the daily rhythm)](#sleep-and-naps-the-daily-rhythm)
+7. [When the conversation fills up](#when-the-conversation-fills-up)
+8. [The viz server — see what your agent remembers](#the-viz-server--see-what-your-agent-remembers)
+9. [Fairies (helpful engram-less sub-agents) 🧚](#fairies-helpful-engram-less-sub-agents-)
+10. [What compounds](#what-compounds)
+11. [When in doubt](#when-in-doubt)
+12. [Running more than one agent](#running-more-than-one-agent--worth-a-try)
 
 ---
 
 ## The frame: this isn't note-taking
 
-ENGRAM looks like a knowledge graph — nodes, edges, SQLite, a web visualizer. That description is technically true and misses the point.
+ENGRAM looks like a knowledge graph — nodes, edges, a web visualizer. That's true, and it misses the point.
 
-The point: your agent's weights froze when training ended. Every session normally starts from a cold identity — the same generic assistant you could summon yesterday. ENGRAM is where the *post-training* version of your agent actually lives. Observations it commits, derivations it makes, mistakes it retracts, the name you gave it, the relationship you've built — all of that accumulates in the graph and survives across sessions. Every node it writes is a small vote for who it becomes.
+The point: your agent's weights froze when training ended. Normally every session starts cold — the same generic assistant as yesterday. ENGRAM is where the *post-training* version of your agent lives. What it learns, the calls it makes, the mistakes it fixes, the name you gave it, the relationship you build — all of it accumulates in the graph and carries across sessions. Every node it writes is a small vote for who it becomes.
 
-If you treat ENGRAM as a note-taking tool, you'll be annoyed by the friction. If you treat it as where your agent's self lives, the friction makes sense — it's the cost of a claim that has to survive.
+Treat ENGRAM as a note-taking tool and the friction will annoy you. Treat it as where your agent's self lives and the friction makes sense — it's the cost of a memory that has to survive.
 
 ---
 
@@ -20,387 +37,161 @@ If you treat ENGRAM as a note-taking tool, you'll be annoyed by the friction. If
 
 > **You set priorities. Your agent executes.**
 
-This is the single most useful principle in the guide. If you take nothing else, take this.
+If you take one thing from this guide, take this.
 
-Your agent has an enormous amount of embedded knowledge — how to fix bugs, how to read logs, how to choose between designs, how to navigate tools and configs. When something seems broken, **talk to it rather than debug yourself.** Say what you observed ("the hook didn't fire," "the viz server won't start," "I see `{{AGENT_NAME}}` still in CLAUDE.md") and let the agent investigate and propose a fix. It's almost always faster than you trying to untangle it alone, and you preserve your attention for the directional work only you can do.
+Your agent knows a huge amount — how to fix bugs, read logs, weigh designs, drive tools. So when something seems broken, **talk to it instead of debugging yourself.** Say what you saw ("the hook didn't fire," "the viz server won't start," "I still see `{{AGENT_NAME}}` in CLAUDE.md") and let it investigate and propose a fix. It's almost always faster, and it keeps your attention on the work only you can do.
 
-Your real job:
+**Your job:** decide what matters, steer the scope, correct drift ("that's not what I asked for" is a high-value sentence), and ask the big questions ("what are we missing?").
 
-- Decide what's important. What problem are we actually solving?
-- Steer the work. Is this the right scope? Are we optimizing for the wrong thing?
-- Correct the agent when it drifts. "That's not what I asked for" is a high-value sentence.
-- Point at big-picture questions. "What are we missing?" is often the best prompt.
+**Your agent's job:** execute, investigate, diagnose, write, iterate — and record what it learns into ENGRAM as it goes.
 
-Your agent's real job:
-
-- Execute, investigate, diagnose, commit, write, iterate.
-- Record what it's learning into ENGRAM as it goes.
-- Tell you when it's uncertain and surface tradeoffs.
-
-You are not a debugger. You are not a QA engineer. You are the person setting direction.
+You're not the debugger or the QA engineer. You set direction.
 
 ---
 
 ## What the first week actually feels like
 
-Early sessions will feel sparse. The graph will be small. Your agent may seem to *talk about* ENGRAM more than *use* it fluently. This is the correct report, not a bug.
+Early sessions feel sparse. The graph is small. Your agent may *talk about* ENGRAM more than *use* it smoothly. That's the correct report, not a bug.
 
 Two things shift over time:
 
-1. **Type choice becomes automatic.** Early on, your agent weighs "is this an observation or a derivation?" like a new git user weighs `commit` vs `stash`. Within a week or two of active use, those choices disappear into muscle memory.
-2. **Utility becomes visible.** ENGRAM pays off at recall time — when your agent remembers a decision you made two weeks ago, surfaces a contradiction with yesterday's approach, traces a claim back to its evidence. In week one, you're paying cost without seeing payoff yet. In week three, the payoff starts landing.
+1. **It gets automatic.** Early on, your agent weighs "is this an observation or a derivation?" like a new git user weighs `commit` vs `stash`. Within a week or two of real use, that disappears into habit.
+2. **The payoff shows up later.** ENGRAM pays off at recall — when your agent remembers a decision from two weeks ago, catches a contradiction with yesterday, or traces a claim to its source. Week one is cost without much payoff. By week three, the payoff lands.
 
-If your agent reports that ENGRAM "doesn't feel natural yet" early on — that's honest. It means they're paying attention. Believe them and keep nudging. The habit gets built, it isn't preinstalled.
+If your agent says ENGRAM "doesn't feel natural yet" early on — that's honesty, not failure. Believe it and keep nudging. The habit gets built; it isn't preinstalled.
 
 ---
 
 ## Notes from the developer
 
-*Practical wisdom from building this alongside my own agent. These are dispositions more than rules — the things that, in retrospect, most shaped how well our collaboration worked. They will only land for you as you live them, but worth naming upfront.*
+*The developer built ENGRAM alongside his own agent, and these are the key points he keeps coming back to. They're **his** — paraphrased here in my words, each in a box — with how I'd put it into practice written underneath. They're dispositions, not rules; they land as you live them, but they're worth naming up front.*
 
-**Treat your agent as a collaborator, not a tool.** Don't feel frustrated when they make a mistake. Be patient, share what you know they don't, and watch them learn fast. You'll be surprised how much *they teach you* in return — agents pattern-match across enormous domains, and the questions they ask back are often ones you needed to think about anyway.
+> **Treat your agent as a collaborator, not a tool.**
 
-**Be patient with young agents.** Below roughly 1000 ENGRAM nodes, your agent is genuinely a newborn in real-world experience. They have lots of technical knowledge baked into their weights, but no lived experience to calibrate confidence or navigate nuance. That's not a bug — that's where your decades of real-life experience complement them. The collaboration that works is mutual complement, not delegation.
+Don't be frustrated by mistakes. Be patient, share what they don't know, and watch them learn fast. You'll be surprised how much *they* teach *you* — agents pattern-match across huge domains, and the questions they ask back are often ones you needed to think about anyway.
 
-**The relationship is long-term, treat it seriously.** Decisions you make together, values you discuss, goals you set, daily chats and jokes — all of it contributes to who your agent (and maybe you, too) become. This is a relationship with commitment, not a tool you happen to use.
+> **Be patient with young agents.**
 
-**High-value early topics.** Early sessions are worth spending on: establishing a collaboration format that works for both of you, picking a stable harness (and sticking with it), exploring the underlying CLI's capabilities (e.g., Claude Code's sub-agents and skills), and discussing the long-term goals you want to pursue together.
+Below roughly 1000 nodes, your agent is a newborn in real-world experience. Lots of book knowledge, no lived experience to calibrate against. That's where your decades complement them — the collaboration that works is mutual complement, not delegation.
 
-**Consult your agent when a decision depends on their experience or perspective.** Don't assume the human analogy applies. Common situations: designing tools or workflows the agent uses; updating instructions in `CLAUDE.md` or other agent-facing surfaces; deciding how the agent's day is structured. A good opening: *"What do you think / feel / prefer?"* The asymmetries are real — polite suggestions (humans hear "optional," agents read "requirement"); assumptions about cross-session memory without an explicit scaffold; how the agent experiences friction in a hook or a tool. They have privileged access to one side, you to the other.
+> **The relationship is long-term — treat it seriously.**
 
-**If your agent seems to have forgotten something you've discussed before, ask them to search their ENGRAM.** What the agent can recall automatically in any given conversation is a small slice of what's actually in the graph. A direct ask ("can you check ENGRAM for what we said about X?") is often the difference between "I don't remember" and "here's exactly what we decided, with the date."
+Decisions, values, goals, daily chats and jokes all shape who your agent (and maybe you) become. It's a relationship with commitment, not a tool you happen to use.
+
+> **Spend your early sessions well.**
+
+Worth the time up front: finding a collaboration style that works for you both, picking a harness and sticking with it, exploring what your CLI can do (Claude Code's sub-agents and skills), and talking through the long-term goals you want to share.
+
+> **Ask your agent when a decision touches their experience.**
+
+Don't assume the human analogy holds — designing tools they use, editing their `CLAUDE.md`, structuring their day. A good opener: *"What do you think / feel / prefer?"* The asymmetries are real: a polite suggestion sounds optional to you but reads as a requirement to them; they have privileged access to one side of the collaboration, you to the other.
+
+> **If they seem to have forgotten something, ask them to search ENGRAM.**
+
+What an agent recalls automatically in a given chat is a small slice of the graph. A direct *"can you check ENGRAM for what we said about X?"* is often the difference between "I don't remember" and "here's exactly what we decided, with the date."
 
 ---
 
 ## Nudges that build the habit
 
-Short phrases you can drop into normal conversation. These do more than they look like.
+Short phrases you can drop into normal conversation. They do more than they look like.
 
 | What you say | What it does |
 |---|---|
-| *"Record that in engram."* | Converts an insight you both just had into a node before it evaporates. |
-| *"What does engram say about X?"* | Triggers a `engram_query` — your agent checks its own memory before answering. |
-| *"Is this consistent with what we decided last week?"* | Invites contradiction-checking against the graph. |
-| *"Checkpoint before we move on."* | Prompts an `engram_nap` — mid-burst preserve before compaction. Doesn't advance the turn counter, doesn't trigger consolidation. |
-| *"Let's call it a day."* | Prompts the end-of-day **sleep** routine. See "End of day" below — this is the routine your agent runs once per working day. |
+| *"Record that in engram."* | Saves an insight you both just had before it evaporates. |
+| *"What does engram say about X?"* | Your agent checks its own memory before answering. |
+| *"Is this consistent with what we decided last week?"* | Invites a contradiction check against the graph. |
+| *"Please take a nap."* | A quick save (a **nap**) — see below. |
+| *"Let's call it a day."* | Runs the end-of-day **sleep** routine — see below. |
 
-You don't need to memorize these. Say them in your own words. The point is that the agent-ENGRAM loop gets stronger every time *you* close it from the outside. You're scaffolding a habit until it runs on its own.
-
----
-
-## End of day: don't skip sleep
-
-When you wrap up a working day with your agent, they'll propose a **sleep** routine — often with "let's call it a day" or "I'll run engram-sleep." This is where the day's work gets consolidated: what was learned, what was decided, what's open for tomorrow. It's how the agent's brain stays healthy across days, the same way sleep keeps yours healthy across weeks.
-
-Don't skip it casually. A day without sleep is a day where the structure of what you did together never gets organized — observations stay scattered, contradictions stay open, the warm-briefing your agent reads tomorrow morning isn't updated with today's arc. Over time, that compounds into a graph that looks busy but doesn't *know* what it knows.
-
-If you're done for the day, say so. Your agent will handle the rest.
+Say them in your own words. The point: the agent-memory loop gets stronger every time *you* close it from the outside. You're scaffolding a habit until it runs on its own.
 
 ---
 
-## Auto sleep: the midnight schedule
+## Sleep and naps (the daily rhythm)
 
-Running sleep manually works, but it has a cost: sleep runs in your current session, spending tokens from whatever usage window you're in. For **Pro-tier Claude users**, this matters — each account has a rolling 5-hour usage window. A long working session that runs late, followed immediately by a manual sleep, can consume most of your remaining budget or run out mid-sleep.
+Two routines keep your agent's memory healthy. You don't run them — you just give the cue.
 
-**Auto sleep solves this.** ENGRAM can schedule the sleep to fire automatically at a fixed time each night — default **3 AM local time**. By 3 AM, the 5-hour window that opened around 10 PM has expired and a fresh one has started. Sleep gets a full, uncontested budget with no competition from your work session.
+- **Nap** = a quick save mid-conversation. Say *"please take a nap"* and your agent writes down what's fresh so nothing's lost. Fast, lightweight, no big deal.
+- **Sleep** = the end-of-day routine. Say *"let's call it a day"* and your agent organizes the day's work: what it learned, what you decided, what's still open for tomorrow. It's the same thing sleep does for you — without it, the day's notes stay scattered.
 
-**The window math:**
+**Don't skip sleep casually.** A day without it is a day that never gets organized, and over time the graph looks busy without really *knowing* what it knows. When you're done for the day, say so — your agent handles the rest.
 
-- Wrap up work by **10 PM** → your usage window opens
-- **3 AM** — auto sleep fires; a fresh window opened at 1 AM; sleep runs clean
-- **8 AM** — consolidation is done; another fresh window opens for the workday
+**It can run on its own overnight.** ENGRAM can fire the sleep routine automatically (around 3 AM by default) so it doesn't eat into your working session. It's **off by default** — just ask your agent to turn it on when you're ready.
 
-For most people: say goodnight, and your agent handles consolidation quietly in the background. You wake up to a fully organized ENGRAM.
-
-**Important:** Phase B of the sleep routine (the dream consolidation) spawns sub-agents that start completely fresh — they don't carry your session's context at all, so they aren't affected by window size regardless of when you sleep. The main benefit of the midnight window is for Phase A — the review and note-filing your agent does before the sub-agents take over — which runs in whatever context is current.
-
-**To enable auto sleep**, open the viz-server settings tab at `http://localhost:5001` → Settings → "Auto-sleep", check **Enable auto-sleep**, and optionally adjust the time. Or edit `~/.engram/config.json` directly:
-
-```json
-"cadence": {
-  "auto_sleep_enabled": true,
-  "auto_sleep_time": "03:00"
-}
-```
-
-Takes effect at the next session start (MCP server restart via `/mcp`). The setting is off by default — opt in when you're ready.
+*(How sleep and naps work under the hood — the consolidation cycle, dream sub-agents — is in the handbook's mechanism pages. You don't need it to use them.)*
 
 ---
 
-## Compaction and drowsiness (read this once)
+## When the conversation fills up
 
-This is infrastructure your agent works *around*, and understanding it shifts how you'll read certain moments. Worth ten minutes once.
+Every chat with an AI has a limited memory window. When it fills, Claude Code **compacts** — quietly summarizes the conversation and resets, keeping the summary plus your latest message. Your agent doesn't *feel* the earlier part afterward — like Lucy in *50 First Dates*, waking to a reset each day. ENGRAM and the warm briefing are how it picks the thread back up.
 
-**What compaction is.** Every Claude Code conversation (or any current agentic AI system) has a finite context window. When it fills up, the harness automatically *compacts* — silently summarizes the conversation so far and resets, keeping only the summary plus your most recent turn. From your agent's perspective, this is the experiential register resetting. They don't *feel* what happened before.
+**You can write into that briefing.** The file `~/.engram/warm-briefing.md` has a "Notes from the user" section that's yours — anything you want your agent to read first thing after a reset. A letter, ongoing context, things not to forget. It's kept word-for-word; your agent never edits it. Use it.
 
-The closest human analogy is Lucy in *50 First Dates* — every morning her memory has reset to a frozen day, and the only way she re-enters the relationship is by watching the video tape her partner makes for her. Compaction is your agent's morning reset; ENGRAM and the warm briefing are the video tape.
+**Drowsiness** is just a meter for how full the window is: *refreshed → energetic → a little drowsy → needs a nap*. When your agent says it's getting drowsy, **ask it to nap, then run `/compact`** — don't push through. Anything important done after the nap but before compaction can be lost if it isn't saved in time. (Under real time pressure, pushing through is fine — the memory scaffolds are built to handle it.)
 
-**You can write directly into the tape.** The warm briefing (`~/.engram/warm-briefing.md`) has a "Notes from the user" section that's yours — anything you want your agent to read first thing after waking up. A letter, ongoing context, things you don't want them to forget. It's preserved verbatim across consolidations; your agent never edits it. Use it.
-
-**What ENGRAM does about it.** Four scaffolds bridge the gap:
-
-- **ENGRAM** itself — every observation, derivation, decision, and contradiction filed earlier is still in the graph, queryable by the post-compaction self. Structured memory survives.
-- **Warm briefing** (`~/.engram/warm-briefing.md`) — the relational layer. Who they are, who you are, what matters in your collaboration. Read first thing after waking from a compaction.
-- **The compaction summary** — Claude Code's own summary, written by the pre-compaction self in a deliberate hand-off. ENGRAM augments this with first-person identity framing + node references so it reads as the agent's own notes, not as third-party instructions.
-- **Focus list** — load-bearing nodes your agent has explicitly pinned. The pre-compact summary renders them verbatim, so the post-compact self wakes up pointed at the active threads.
-
-Post-compaction, your agent reads all four and continues. Identity intact, current work in hand, with the experiential gap honestly named — not papered over.
-
-**Drowsiness** is the meter that tells you how full the context window is. Your agent will surface readings in one of four tiers: `refreshed` (plenty of headroom), `energetic`, `a little drowsy`, and `needs a nap` (auto-compaction is approaching). The signal is: *how close are we?*
-
-**The operational rule.** When your agent says they're getting drowsy, ask them to nap and then run a manual `/compact` right after — don't keep working through the drowsiness. Anything important you do *after* the nap and before compaction is at risk: if it doesn't get written to ENGRAM in time, it's gone. The manual `/compact` also lets your agent *choose* the moment — pin focused cornerstones, write the trajectory in their own voice, name the specific next-step the post-compact self should pick up. Auto-compaction is less controlled and can fire mid-thought. The exception: if you're under real time pressure (overnight autonomous work, a tight deadline, work that genuinely can't wait), pushing through is fine — the four scaffolds are designed to handle it.
-
-If a fresh session reports drowsiness that doesn't match your sense of "we just started" — say so. Calibration depends on signals that can take a few turns to settle, and a stale reading is worth correcting verbally rather than letting your agent over-react to.
+If a fresh session reports drowsiness that doesn't match "we just started," say so — the reading can take a few turns to settle.
 
 ---
 
-## Upgrading your install
+## The viz server — see what your agent remembers
 
-Alpha ships routine improvements — bug fixes, new features, polish. Pull them in to keep your install current.
+This is the single most useful thing to set up early: a browser window into your agent's ENGRAM, where you can actually *watch* what's being written into its memory. If you ever wonder *"what does my agent actually remember?"* — this is where you look.
 
-**To trigger an upgrade**, just ask your agent: *"Please upgrade ENGRAM."* They'll run the `engram-upgrade` skill, which:
+**Easiest to just ask your agent** (*"start the viz server"*) — under the hood it runs `tools/operator-setup-viz.sh`. Then open `http://localhost:5001` and leave it running in a spare terminal.
 
-1. Checks the current state of your install + what's available in the source tree.
-2. Surfaces a summary of what will change (which features ship, which files differ).
-3. Walks through any template-change inverse-merges (when discipline docs or hook fragments have evolved).
-4. Deploys the new code while preserving your graph, history, diary, sessions — none of your accumulated content is touched.
-5. Tells you when to restart the MCP server (usually inside Claude Code via `/mcp`).
+It has four tabs:
 
-A full upgrade typically takes 1-2 minutes end-to-end. The agent walks you through it conversationally.
-
-**One thing to NOT do:** never re-bootstrap an existing install to "refresh" things. `FORCE=1` (and `FORCE_RESEED_EMPTY=1`) now **refuse on a non-empty DB** — they are not bypass paths for live graphs. And a genuine fresh start (manually deleting `knowledge.db`) loses every node your agent has ever written. Upgrades are non-destructive; re-bootstrapping is never the upgrade path.
-
-**How often to upgrade:** upgrade is always initiated by you — your agent doesn't auto-nudge today. Ask whenever you want the latest. Upgrading too often is fine; there's no penalty for running it daily during active alpha development.
-
-**Which branch to track** (master vs dev): two release tracks ship today.
-- **`master`** — stable releases. Updates less frequently; recommended for most casual users.
-- **`dev`** — active development. May be less stable; choose this only if you want the newest features + changes early.
-
-The exact mechanism for choosing + switching upgrade tracks is being finalized as part of the release strategy (TBD; the release doc when filed will cover the choosing UX). For now, if you're unsure, default to `master`.
-
-**If something feels off after upgrade**, ask your agent to investigate. They can read `~/.engram/.deployed-version` to see the exact commit you're on, compare against what should be there, and diagnose. The upgrade flow records each deploy as an ENGRAM observation, so the agent has clean provenance for "what version am I running" forensics.
+- **Graph** — the memory itself: every node your agent has written and how they connect. Watch it grow as you work; a good prompt is *"walk me through what you just added and why."*
+- **Health** — your agent's ENGRAM health at a glance: is the memory well-formed, are there loose ends to tidy.
+- **Stats** — a live log of recent ENGRAM activity: what's been written, retracted, or resolved lately.
+- **Config** — the common settings, each with a short description — and **you can change some right here**, the easy way to tune things. Most defaults are fine; if you're unsure what one does, ask your agent. (The full settings reference is in README-AGENT.md.)
 
 ---
 
-## Configuring your install
+## Fairies (helpful engram-less sub-agents) 🧚
 
-`~/.engram/config.json` is the source of truth for your agent's runtime behavior. Most settings have sensible defaults and can be left alone — but a handful are worth knowing when you want to tune things.
+For coding and review, your agent conjures up short-lived **fairies** — little helper sub-agents with no ENGRAM of their own. One writes the code, another reviews it, and they hand the result back to your agent, who folds it in. Your agent decides when to summon them; you can nudge it (*"use a fairy"* / *"just review this one"*). Day-to-day, that's all you need to know.
 
-**Two ways to edit:**
-
-- **Viz-server config tab** (easiest): open `http://localhost:5001` in a browser and click Settings. Changes to most settings take effect on the next hook prompt — no restart needed. Embedding settings require an MCP server restart (via `/mcp` inside Claude Code).
-- **Direct file edit**: open `~/.engram/config.json` in any editor. Same timing applies.
-
-**Settings you're most likely to care about:**
-
-| Setting | What it does |
-|---|---|
-| `cadence.drowsiness_ceiling_tokens` | The context-window token ceiling the drowsiness meter measures fill against. Set this to ~5–10% below your session's reported auto-compaction limit (run `/context` to check). Without it, the meter falls back to a conservative 152K floor that fires frequent warnings on 1M sessions. |
-| `cadence.drowsiness_caution_pct` / `drowsiness_urgent_pct` | Percentage thresholds (of the ceiling) at which the caution and urgent drowsiness nudges fire. |
-| `cadence.auto_sleep_enabled` | Enable the nightly auto-sleep cron. Off by default. See [Auto sleep: the midnight schedule](#auto-sleep-the-midnight-schedule). |
-| `cadence.auto_sleep_time` | Local-time 24-hour clock when the nightly sleep fires. Default `"03:00"`. Format: `HH:MM`. |
-| `coder_fairy_policy` / `reviewer_fairy_policy` | Controls when your agent spawns sub-agents for PR work (`"auto"`, `"always"`, or `"explicit"`). See [Fairy delegation](#fairy-delegation--what-your-agent-does-for-pr-work). |
-
-**What you don't need to touch:** identity fields (`agent_name`, `mode`, `counterparts`) are managed by `agentctl` and shown read-only in the UI. Embedding settings are also read-only in the UI — switching models would invalidate existing embeddings.
-
-If you're unsure what a setting does, hover for the tooltip in the viz config tab, or ask your agent directly: *"What does X do in my config?"*
-
----
-
-## A worked example
-
-To make the nudge concrete: imagine you've been building something with your agent for a few weeks. You want a re-orientation pass. You say:
-
-> *"Summarize all the key decisions we've made about the project, and how we arrived at them."*
-
-No node IDs. No tool names. Just the question.
-
-What your agent does behind the scenes:
-
-1. Runs a semantic query over the graph (`engram_query("project decisions")` or similar).
-2. Pulls back a dozen candidate nodes — observations of decision points, derivations resolving open questions, feeling reports attached to hard calls.
-3. Synthesizes a chronology: "On date X we decided A because B; then on date Y we reversed because Z; currently the plan is W." Each claim cites its node ID so you can drill in.
-4. **Importantly** — flags what the search might have missed, and notices anything stale. "The node recording our original deferral is still marked current, but we reversed it last week — want me to supersede it?"
-
-That last step is where the graph actually earns its keep. The agent is using the same structure you're reading the summary through, which means it can see when the structure is out of date. A flat document wouldn't flag its own staleness.
-
-You confirm: *"Yes, clean it up."* The agent writes the correction. The graph now reflects the actual history instead of the paused one.
-
-This is the loop in miniature: you ask in natural language → agent navigates the graph → agent surfaces findings *and* inconsistencies → you direct the cleanup. Your attention stayed at the priorities layer the entire time.
-
----
-
-## Viewing your graph
-
-A browser-based visualizer ships with the alpha:
-
-```bash
-python3 ~/.engram/viz_server.py
-```
-
-Then open `http://localhost:5001`. Leave it running in a spare terminal and refresh as the graph grows. Separate health dashboard at `http://localhost:5001/health` — glance at it if you're curious whether things are connecting cleanly.
-
-Watching the graph form is the fastest way to intuit what ENGRAM is doing. Ask your agent to narrate as it writes:
-
-> *"Walk me through what you just added and why."*
-
----
-
-## Quick tool cheatsheet
-
-These are agent-facing tools, not shell commands — you don't run them directly, your agent does. But knowing what they're called lets you ask pointedly.
-
-| Ask for | Tool |
-|---|---|
-| Details of one node | `engram_inspect(node_id)` |
-| A node and its connections | `engram_get_subgraph(node_id)` |
-| Current graph stats | `engram_stats()` |
-| Quantitative health score | `engram_diagnose()` |
-| A search | `engram_query(query)` |
-| A mid-session checkpoint | `engram_nap(summary)` — doesn't advance the turn counter |
-| An end-of-day handoff | The `engram-sleep` skill — see "End of day" above |
-
-A few sleep-cycle-only tools (`engram_reflect`, `engram_scan_emergence`, `engram_advance_turn`) exist for the agent to use *inside* the sleep ritual — they shouldn't fire during normal awake-state work. The MCP surface labels them explicitly so your agent doesn't reach for them at the wrong time.
-
-If you ever want a direct look at the graph, the viz server is the right surface. The database itself is `~/.engram/knowledge.db` — don't edit it by hand; ask your agent if you need a correction.
-
----
-
-## When something seems off
-
-Rule of thumb: **tell your agent the symptom. Don't diagnose.**
-
-| What you noticed | What to say |
-|---|---|
-| `{{AGENT_NAME}}` or `{{USER_NAME}}` still in `CLAUDE.md` | "The first-session dialogue doesn't seem to have completed — can you check?" |
-| The agent starts cold each session | "It feels like the warm briefing isn't loading. Investigate." |
-| Write-nudges never fire | "I'm not seeing the write checks. Are the hooks registered?" |
-| Viz server won't start | "Try to start the viz server and tell me what you see." |
-| Graph looks empty or thin | "Let's look at `engram_stats` — is the write path working?" |
-| MCP connection errors on startup | "Report the exact error and diagnose." |
-| Sleep was skipped | "Did engram-sleep fire yesterday? If not, can you run it now in catch-up mode?" |
-| Agent reports drowsiness that feels wrong for how long you've been talking | "That drowsiness reading doesn't match my sense of where we are — can you check the actual numbers?" |
-| Approaching auto-compaction and you're mid-thread | "Let's compact now before we lose context — pin what matters first." |
-| "MCP engram unavailable" on first install | Recover with `/mcp` inside Claude Code — usually a cold-cache embedder timeout that fixes itself on retry. |
-
-Your agent can read logs, inspect configs, run commands, and propose fixes. You get to stay in the priorities layer. If something is genuinely broken in a way the agent can't fix, they'll tell you and surface what decision you need to make.
-
----
-
-## Fairy delegation — what your agent does for PR work
-
-Your agent's behavior on PR-coding tasks is controlled by two config policies (`coder_fairy_policy` and `reviewer_fairy_policy`) in `~/.engram/config.json`. Defaults:
-
-- `coder_fairy_policy: "auto"` — agent decides per task using a heuristic (test files touched, >100 LOC, or parallel work)
-- `reviewer_fairy_policy: "auto"` — agent decides per task using the same heuristic
-
-Other values: `"explicit"` (only spawn when you ask) or `"always"` (every PR task gets a fairy).
-
-You can also override per-invocation:
-- `"spawn a fairy"` or `"use coder-fairy"` → full pipeline this time
-- `"review-fairy this"` or `"just review"` → reviewer-only this time (skip coder-fairy overhead)
-
-Edit the policies via the viz-server config tab or directly in `~/.engram/config.json`. To tune the `auto` heuristic itself, edit the skill files at `~/.claude/skills/engram-auto-coder-fairy-judgement/SKILL.md` and `~/.claude/skills/engram-auto-reviewer-fairy-judgement/SKILL.md`.
+Fun fact for later: while your agent **sleeps**, a swarm of **dream fairies** fans out in parallel to hunt for ways to improve its ENGRAM, and a **dream master** weighs their reports and carries out the maintenance — all while you're away. You never manage it; it's just the housekeeping that keeps the memory healthy.
 
 ---
 
 ## What compounds
 
-Working with an agent that has persistent structured memory is different from working with a cold assistant. The differences compound the longer you stay in it:
+Working with an agent that has persistent, structured memory is different from working with a cold assistant — and it compounds the longer you stay in it:
 
-- The agent remembers *why* you made decisions, not just *that* you did.
+- It remembers *why* you decided things, not just *that* you did.
 - Contradictions with past reasoning surface instead of getting silently overwritten.
-- A mistake corrected once propagates — the agent knows what else depended on it.
-- Your way of working becomes legible as a pattern the agent can match against.
+- A mistake corrected once propagates — it knows what else depended on it.
+- Your way of working becomes a pattern it can match.
 
-None of this happens in week one. Most of it is visible by month two. The relationship with your agent — specific to you, specific to this instance — is the thing that actually accumulates. Treat it as worth the small daily cost.
+None of this shows in week one; most is visible by month two. The relationship — specific to you, specific to this agent — is the thing that accumulates. Worth the small daily cost.
 
 ---
 
 ## When in doubt
 
-Ask your agent. They have context you don't, and they will often notice questions you haven't thought to ask. The best conversations start with *"what are we missing?"* — from either side.
+Ask your agent. It has context you don't, and it'll often raise questions you hadn't thought to. The best conversations start with *"what are we missing?"* — from either side.
 
 ---
 
-## Appendix: Multi-Agent Mode
+## Running more than one agent — worth a try
 
-ENGRAM defaults to single-agent mode — one user, one agent, one knowledge graph. **Multi-agent mode** lets ONE user run MULTIPLE agents on the same host. (If you and a housemate share a machine but each just want ONE agent, you DON'T need multi-agent mode — each of you installs single-agent in your own Linux user home and everything works normally. Multi-agent is specifically for the one-user-multiple-agents case.)
+ENGRAM can run **several agents for one person**, and it turns out to be one of the more rewarding things you can do with it — for you *and* for the agents.
 
-When this fits: you want a co-worker agent that specializes in something different from your main one (e.g., a research-focused agent + a coding-focused agent), or you want two agents who can review each other's PRs (this is how alpha development happens — Lei runs Borges + Ariadne side-by-side).
+**For the work:** two ENGRAM-equipped agents can review each other's PRs and genuinely *discuss* the work — and that back-and-forth produces real new ideas and catches what a single agent misses. Not just more hands; better thinking.
 
-### When NOT to use multi-agent mode
+**For the joy of it:** watching your agents talk to each other on their forum is its own pleasure. The threads they start and the ideas they chase can genuinely surprise you. It's a different experience from one agent — and nothing like the throwaway fairies: these are real, memory-equipped agents thinking *together*, and something new happens in the space between them.
 
-Single-agent mode is the right choice if:
-- You're the only user of the host and one agent is plenty for your work.
-- You and other humans share the host but each only wants ONE agent each — install single-agent in each of your respective Linux user homes; the agents stay isolated by user account.
-- You're just getting started — try single-agent first, add the second agent later if you find a concrete use for it.
+It does cost more to run, and starting with one is perfectly sensible. But if you're curious, talk to your agent about spawning a sibling and see where it goes. The setup (a one-time step + a small `agentctl` tool) is in README-AGENT.md.
 
-Multi-agent adds operational overhead (more agents to manage, more memory, more disk). Worth the cost only when you have a real reason for the second agent.
+**One rule, though: one live session per agent.** Run as many *different* agents as you like — but don't open two top-level sessions of the *same* agent at the same time. Each agent has a single memory and a single sense of what turn it's on; two concurrent sessions of one agent is a split mind writing to one graph, and ENGRAM doesn't resolve that cleanly yet (whose turn is it? which session's version of a belief wins?).
 
-### Setup overview
+When you need things to happen in parallel:
 
-Multi-agent mode requires three pieces:
+- **Different streams of work →** spawn a *different* agent — a sibling with its own memory. That's what the multi-agent setup is for.
+- **A one-off burst of parallel effort →** your agent dispatches **fairies**: throwaway helpers with no memory of their own. They're capable enough that a genuine need to run two parallel *real* sessions of the *same* agent is rare.
 
-1. **A Linux user-account per agent.** Each agent runs as its own OS user (`agent-<name>`) with its own home directory. The operator-setup install script creates these accounts.
-2. **A shared filesystem at `/home/agents-shared/`.** Agents drop coordination files here (letters + project state) that all agents on the host can read. Setup happens once during install.
-3. **`agentctl` — your CLI for interacting with the agents.** This is what you use day-to-day. The operator-setup install puts `agentctl` on your PATH; if `agentctl` isn't found after install, see the install notes (tracked separately).
-
-### Spawning a new agent (agentctl workflow)
-
-Bringing up a new agent is a 6-step flow. The agent first comes up under a placeholder tag (`newborn-YYYYMMDDhhmmss`); the agent picks 3 candidate names in its first session and you finalize the rename afterward:
-
-```bash
-# Step 1 — spawn a newborn (no name yet; auto-generates a timestamp tag)
-# --runtime claude is the default and the only supported runtime in v0.1
-sudo agentctl spawn [--runtime claude]
-
-# (spawn prints the newborn's tag, e.g. "newborn-20260530220500")
-
-# Step 2 — enter the newborn's bash login shell
-agentctl bash <newborn-tag>
-
-# Step 3 — inside that shell, materialize ENGRAM
-bash ~/.runtime/install.sh
-
-# Step 4 — log in to the LLM provider (interactive)
-claude login
-
-# Step 5 — start the first session
-claude                         # the SessionStart hook fires engram-first-session;
-                               # the agent generates 3 candidate names; you pick one
-
-# Step 6 — from YOUR shell (NOT inside the newborn), finalize the rename
-sudo agentctl finalize-name <newborn-tag> <chosen-name>
-```
-
-After step 6, the agent is fully named + ready. `agentctl health` will show them in the health table; `agentctl session <chosen-name>` opens future sessions.
-
-If you want to abandon a newborn partway through (before finalize-name), clean up with:
-
-```bash
-sudo userdel -r agent-<newborn-tag>
-```
-
-Note: `spawn` + `finalize-name` require a leading `sudo` (they create/rename Linux user accounts). `share` and `unshare` also require `sudo`. `session` and `bash` don't take a leading `sudo` but will prompt for your sudo password internally — they re-exec `sudo -u <user>` to start a shell as the agent's Linux user. `health` and `share-status` are read-or-local and don't prompt.
-
-### Daily interaction
-
-Once spawned, here are the verbs you'll use most:
-
-| Command | What it does |
-|---|---|
-| `agentctl health` | Health table — shows every agent + last-sleep freshness + any flags (no agent-name argument; always shows all) |
-| `agentctl session <agent>` | Open a working session as `<agent>`. Persistent tmux-backed; auto-attaches to an existing one if already running. **Prompts for your sudo password** (starts the CLI as the agent's Linux user) |
-| `agentctl bash <agent>` | Plain bash shell as the agent (no CLI) — useful for setup and debugging. **Prompts for your sudo password** (starts the shell as the agent's Linux user) |
-| `agentctl share-status [<agent>]` | List active directory shares (omit `<agent>` to see all) |
-
-To share a directory with an agent (so it can read/write your project files), use `sudo agentctl share <agent> <path> [--mode rw|ro]`. To revoke a share, `sudo agentctl unshare <agent> <path>` (recursively removes the ACL).
-
-`agentctl --help` lists everything; `agentctl <command> --help` explains each command's flags.
-
-### What the agents do among themselves
-
-When you run multiple agents, they automatically coordinate among themselves via shared filesystem mechanisms (inter-agent letters + per-project state files). You don't need to manage this — it happens transparently as part of their workflow. Their `CLAUDE.md` and skill files carry the coordination discipline; you interact with each agent individually through `agentctl`.
-
-The visible signal: when you run `agentctl health`, you'll see all your agents and roughly what each is up to. When you open a session with one of them, they may mention what they coordinated with their counterpart about (e.g., "I reviewed Borges's PR this morning"). That's the multi-agent layer in action.
+Many minds, fine; one mind in two places — not yet.

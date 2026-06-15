@@ -654,6 +654,10 @@
       "reason": "repository landing-page documentation — not shipped in the plugin bundle"
     },
     {
+      "path": "README-AGENT.md",
+      "reason": "agent-facing install/orientation documentation — repository landing doc, not shipped in the plugin bundle"
+    },
+    {
       "path": "LICENSE",
       "reason": "project license file — not shipped in the plugin bundle"
     },
