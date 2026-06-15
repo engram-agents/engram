@@ -352,9 +352,20 @@ what remains, so the scope is durable.
 ### Body-text trap discipline (referencing the wrong number)
 
 The auto-close parser sees `(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\s+#?\d+`
-in the body **regardless of negation, brackets, or backticks**. This is the
-mechanism that fires intentional auto-close — and the same mechanism that fires
-*accidental* auto-close when the body references a NON-target issue.
+in the body **regardless of negation or brackets** (the `NOT` and the `[ ]` are
+invisible to it). This is the mechanism that fires intentional auto-close — and the
+same mechanism that fires *accidental* auto-close when the body references a
+NON-target issue.
+
+**Backticks are the one exception** (measured on PR #1191): GitHub's
+auto-close parser ignores keywords inside inline-code spans, so a backticked
+`` `Closes #M` `` does **not** populate `closingIssuesReferences` and will **not**
+auto-close on merge. Two consequences: (a) an *intentional* `Closes #N` must be
+**plain text** — a backticked one silently fails to auto-close (caught pre-merge on
+#1191 by the `closingIssuesReferences` verify step below); (b) the verification grep
+below is a plain regex that **does** match inside backticks, so it conservatively
+over-flags backticked refs — a backticked match is safe-from-the-real-parser, so
+confirm it rather than treating it as an auto-close risk.
 
 **Empirical traps caught (2026-05-30):**
 - PR #516 body said `"this PR does NOT close #510"` → auto-closed #510 on merge
@@ -367,7 +378,7 @@ mechanism that fires intentional auto-close — and the same mechanism that fire
 | Trap shape | Problem | Safe paraphrase |
 |------------|---------|-----------------|
 | "this PR does NOT close #M" | parser closes #M (negation invisible) | "first slice of #M's EPIC — umbrella stays open" |
-| "the final scrub PR uses `[closes #M]`" (example) | parser closes #M (backticks don't escape) | "the final scrub PR carries the closing tag in its title" |
+| the final scrub PR uses closes #M (example aside, **unbackticked**) | parser closes #M (plain-text keyword fires, even in an aside) | "the final scrub PR carries the closing tag in its title" — or backtick the example (`` `closes #M` ``), which the parser ignores |
 | "fixes #M partially" | parser closes #M | "addresses one slice of #M; remainder tracked in next PR" |
 
 **Safe forms for referencing without closing**: `#M`, `issue #M`, `umbrella #M`,
