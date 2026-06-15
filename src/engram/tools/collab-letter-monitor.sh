@@ -63,6 +63,28 @@ SELF="$(python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.e
 [ -z "$SELF" ] && { echo "collab-letter-monitor: agent_name not set in ~/.engram/config.json — refusing to arm" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
+# single-instance: last-arm-wins. A persistent Monitor's bash process outlives
+# its arming session — it survives compaction and session-end. Without this, a
+# fresh arm after a compaction runs ALONGSIDE the surviving orphan and BOTH poll
+# the same dir, so every new letter fires the wake TWICE (double-delivery
+# incident, 2026-06-13). Reap any prior instance of THIS monitor owned by THIS
+# user, so the fresh arm cleanly takes over (and is the one that delivers to the
+# current session). Scoped to our own uid (never touches another agent's
+# monitor) and excludes our own pid and launching wrapper. NOTE: pgrep -f is a
+# substring match, so a process merely *mentioning* this script name (e.g. an
+# editor with the file open in a dev shell) could also match — harmless in
+# production (agents don't edit a running monitor; SIGTERM + reseed-on-restart
+# is recoverable). Set $COLLAB_MONITOR_NO_REAP to any non-empty value to disable.
+# ---------------------------------------------------------------------------
+if [ -z "${COLLAB_MONITOR_NO_REAP:-}" ] && command -v pgrep >/dev/null 2>&1; then
+    for _pid in $(pgrep -u "$(id -u)" -f 'collab-letter-monitor\.sh' 2>/dev/null); do
+        [ "$_pid" = "$$" ] && continue
+        [ "$_pid" = "${PPID:-0}" ] && continue
+        kill "$_pid" 2>/dev/null || true
+    done
+fi
+
+# ---------------------------------------------------------------------------
 # resolve watch directory
 # ---------------------------------------------------------------------------
 DIR="${1:-${INTER_AGENT_DIR:-/home/agents-shared/inter-agent}}"

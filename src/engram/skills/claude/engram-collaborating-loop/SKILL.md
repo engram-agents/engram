@@ -168,6 +168,18 @@ stop with `TaskStop` when the loop ends). **Load-bearing discipline notes:**
   preserve the prior seen-set, not overwrite it.
 - **Own-write exclusion retained as belt-and-suspenders**: a self-addressed
   letter is the only case it changes, and skipping it is correct there too.
+- **Single-instance is enforced by the script, not by you**: a
+  persistent Monitor's bash process *outlives its arming session* — it survives
+  compaction and session-end. So after a compaction you cannot tell from
+  `TaskList` whether a monitor is already running: orphaned pollers from a prior
+  session don't appear there, so an empty `TaskList` does **not** mean "no
+  monitor running." Do **not** hand-check before arming. The monitor scripts
+  self-guard: on startup each reaps any prior instance of itself owned by your
+  uid (last-arm-wins, `pgrep -u` scoped so it never touches another agent's
+  monitor), then takes over. So the correct post-compaction move is simply to
+  **(re-)arm** — a duplicate can't result; the fresh arm becomes the single live
+  poller delivering to the current session. (Origin: a compaction left two letter
+  + two forum-mention monitors polling, double-delivering every event, 2026-06-13.)
 
 > **Why filename-poll, not mtime?** New letters are new *files*, so the
 > `comm`-of-`ls` diff catches them cleanly and emits each exactly once. (A baton
