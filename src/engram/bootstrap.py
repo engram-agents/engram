@@ -70,6 +70,7 @@ CODEX_HOME = Path(os.environ["CODEX_HOME"]) if TARGET == "codex" else None
 # resolve DATA_DIR — that's a separate concern from where server.py lives.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import server  # noqa: E402
+from template_render import COMPACT_BREADCRUMB_LINE  # noqa: E402
 
 
 def _add(fn, **kwargs) -> str:
@@ -578,12 +579,10 @@ def main() -> None:
     # Compact Instructions live in compact-instructions.md), not for the rendered
     # install — so it must not leak into the agent's ~/.claude/CLAUDE.md or the
     # Codex prompt. Both render paths iterate `substitutions` and .replace(), so
-    # one empty-value entry removes the whole comment line in every target. The
-    # string MUST match the template line exactly (kept single-line for that
-    # reason); tests/test_bootstrap_codex.py fails loudly if it ever drifts and
-    # the breadcrumb would leak into a render.
-    _compact_breadcrumb_line = "<!-- Source of truth: compact-instructions.md — edit there, not in this template. This comment and the marker below are both replaced at install-time. -->\n"  # noqa: E501
-    substitutions[_compact_breadcrumb_line] = ""
+    # one empty-value entry removes the whole comment line in every target.
+    # COMPACT_BREADCRUMB_LINE is the canonical string from template_render.py
+    # (SSoT); tests/test_bootstrap_codex.py asserts it matches the template.
+    substitutions[COMPACT_BREADCRUMB_LINE] = ""
 
     manifest = {
         "seed_ids": ids,

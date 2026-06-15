@@ -20,6 +20,10 @@
       "tier": "essential"
     },
     {
+      "path": "template_render.py",
+      "tier": "essential"
+    },
+    {
       "path": "SKILL.md",
       "tier": "essential"
     },
@@ -260,6 +264,10 @@
     },
     {
       "path": "tools/scan-leaks.py",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/check-claude-md-drift.py",
       "tier": "dev"
     },
     {

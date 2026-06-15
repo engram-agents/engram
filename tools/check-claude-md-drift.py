@@ -1,0 +1,1 @@
+../src/engram/tools/check-claude-md-drift.py

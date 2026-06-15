@@ -179,11 +179,12 @@ def test_claude_compact_instructions_substitution_integrity():
     )
 
     # 6. Source-of-truth breadcrumb: present in the template (so template editors
-    #    know the real content lives in compact-instructions.md), carried by a
-    #    matching strip entry in bootstrap.py, and GONE once stripped (so it never
+    #    know the real content lives in compact-instructions.md), declared as the
+    #    SSoT constant COMPACT_BREADCRUMB_LINE in template_render.py (not as a
+    #    second literal in bootstrap.py), and GONE once stripped (so it never
     #    leaks into the rendered ~/.claude/CLAUDE.md or the Codex prompt). This is
-    #    the drift guard: if the template wording and the bootstrap strip ever
-    #    diverge, the breadcrumb survives the strip and this test fails loudly.
+    #    the drift guard: if the template wording and template_render.COMPACT_BREADCRUMB_LINE
+    #    ever diverge, the breadcrumb survives the strip and this test fails loudly.
     m = re.search(
         r"<!-- Source of truth: compact-instructions\.md.*?-->", template_text
     )
@@ -192,13 +193,14 @@ def test_claude_compact_instructions_substitution_integrity():
         "template editors lose the pointer to compact-instructions.md."
     )
     breadcrumb = m.group(0)
-    bootstrap_src = (
-        REPO_ROOT / "src" / "engram" / "bootstrap.py"
+    template_render_src = (
+        REPO_ROOT / "src" / "engram" / "template_render.py"
     ).read_text()
-    assert breadcrumb in bootstrap_src, (
-        "bootstrap.py has no strip entry matching the template breadcrumb "
-        f"({breadcrumb!r}) — it would leak into the rendered install. Keep the "
-        "strip string in bootstrap.py identical to the template line."
+    assert breadcrumb in template_render_src, (
+        "template_render.py COMPACT_BREADCRUMB_LINE does not match the template "
+        f"breadcrumb ({breadcrumb!r}) — the strip would miss it and the breadcrumb "
+        "would leak into the rendered install. Keep COMPACT_BREADCRUMB_LINE in "
+        "template_render.py identical to the template line."
     )
     stripped = rendered.replace(breadcrumb + "\n", "")
     assert breadcrumb not in stripped, (

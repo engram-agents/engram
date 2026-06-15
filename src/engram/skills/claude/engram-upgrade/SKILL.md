@@ -83,10 +83,10 @@ git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/dev"
 - You may `gh pr view <N>` on at most ONE PR for depth. Do NOT loop over all PRs fetching bodies (token budget).
 - Write a ≤4-bullet summary: what surfaces are touched, anything deploy-fragile (`server.py` / hooks / migrations), anything user-facing. Surface it; pause on anything concerning.
 
-**Also note here** whether `templates/template.CLAUDE.md` appears in the change set — that pre-announces Step 6's gate:
+**Also note here** whether any CLAUDE.md render source appears in the change set — that pre-announces Step 6's gate. The rendered `~/.claude/CLAUDE.md` is assembled from **multiple** upstream sources: `templates/template.CLAUDE.md` + `templates/compact-instructions.md` (folded in by bootstrap at install-time). A change to either file produces rendered-CLAUDE.md drift. Check both:
 
 ```bash
-git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/dev" -- templates/template.CLAUDE.md
+git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/dev" -- src/engram/templates/template.CLAUDE.md src/engram/templates/compact-instructions.md
 ```
 
 **Checkpoint**: change-set summary surfaced + user confirmed proceed (or concern resolved) + CLAUDE.md-template-changed noted yes/no.
@@ -158,16 +158,23 @@ The plugin tree/cache now has the new `server.py`, but the running MCP server ma
 
 ## Step 6 — CLAUDE.md template inverse-merge (HARD GATE, the residual)
 
-If Step 2 found the host identity template changed in the range, **do not skip this**. On Claude, check `templates/template.CLAUDE.md` against `~/.claude/CLAUDE.md`. On Codex, check `templates/template.AGENTS.md` and any local first-person instructions in `~/.codex/config.toml`/project `AGENTS.md`. The plugin upgrade did not touch these user-scope identity surfaces, so template-side additions may NOT have reached the running agent.
+If Step 2 found any CLAUDE.md render source changed in the range, **do not skip this**. The rendered `~/.claude/CLAUDE.md` is assembled from multiple upstream sources — `templates/template.CLAUDE.md` AND `templates/compact-instructions.md` — so a `compact-instructions.md`-only change is just as drift-producing as a template change. On Codex, also check `templates/template.AGENTS.md` and any local first-person instructions in `~/.codex/config.toml`/project `AGENTS.md`. The plugin upgrade did not touch these user-scope identity surfaces, so source-side additions may NOT have reached the running agent.
 
 **The "I'll come back to it" failure mode is real** (2026-05-16: a template discipline-change was deferred post-deploy, never merged, and misfired for days before diagnosis). Resolve it now or track it explicitly — never silent-defer.
 
+Use the rendered-diff tool (catches changes to ALL render sources, not just the main template):
+
 ```bash
 SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)
-# Claude:
-diff "$SOURCE_DIR"/templates/template.CLAUDE.md ~/.claude/CLAUDE.md
-# Codex (adapt live path to the install):
-diff "$SOURCE_DIR"/templates/template.AGENTS.md /path/to/live/AGENTS.md
+DEPLOYED=$(grep '^alpha_sha=' ~/.engram/.deployed-version | cut -d= -f2-)
+# Claude — compare rendered output between the deployed commit and current dev:
+python "$SOURCE_DIR/tools/check-claude-md-drift.py" \
+    --repo "$SOURCE_DIR" \
+    --base "$DEPLOYED" \
+    --head origin/dev
+# Exit 0 = no drift; exit 1 = diff printed to stdout; any other exit = tool/git error (investigate, do NOT read as drift).
+# Codex (template.AGENTS.md is single-source; raw diff is sufficient):
+diff "$SOURCE_DIR"/src/engram/templates/template.AGENTS.md /path/to/live/AGENTS.md
 ```
 
 - Inverse-merge template-side additions that are identity- or discipline-forming into the live file; **preserve agent-local customizations** (the template is the floor, not the ceiling).
