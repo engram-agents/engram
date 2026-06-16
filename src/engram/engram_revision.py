@@ -673,6 +673,41 @@ def _supersede_impl(
                     core._log_edit(conn, "about_migrated", new_node_id, new["type"],
                               {"about_source_id": src, "migrated_from": old_node_id})
 
+            # Self-anchor transfer: if the superseded person was the agent's
+            # self-anchor (metadata.is_self=1, paired with trust_tier='self'),
+            # carry BOTH onto the replacement. Supersede has already flipped
+            # old.is_current=0; every self-anchor lookup is `is_self=1 AND
+            # is_current=1`, so without this transfer a self-anchor supersede
+            # would leave ZERO current self-anchors — silently breaking
+            # link_about default-targeting, focus='self' emergence-scan, and
+            # tier='self' assignment. The add_person singleton guard blocks
+            # setting is_self on the replacement at creation time (the old
+            # anchor is still current then), and no metadata-edit tool exists,
+            # so supersede is the only correct locus for the carry-over.
+            #
+            # The old node KEEPS its is_self in metadata as a historical
+            # snapshot — consistent with how superseded nodes retain all their
+            # other metadata; the singleton guard is is_current-scoped, so the
+            # "one current self-anchor" invariant holds regardless.
+            old_self = conn.execute(
+                "SELECT metadata, trust_tier FROM nodes WHERE id = ?",
+                (old_node_id,),
+            ).fetchone()
+            old_self_meta = json.loads(old_self["metadata"]) if old_self["metadata"] else {}
+            if old_self_meta.get("is_self"):
+                new_row = conn.execute(
+                    "SELECT metadata FROM nodes WHERE id = ?", (new_node_id,)
+                ).fetchone()
+                new_self_meta = json.loads(new_row["metadata"]) if new_row["metadata"] else {}
+                new_self_meta["is_self"] = True
+                conn.execute(
+                    "UPDATE nodes SET metadata = ?, trust_tier = ? WHERE id = ?",
+                    (json.dumps(new_self_meta), old_self["trust_tier"], new_node_id),
+                )
+                core._log_edit(conn, "self_anchor_transferred", new_node_id, new["type"],
+                          {"transferred_from": old_node_id,
+                           "trust_tier": old_self["trust_tier"]})
+
         # Flag downstream dependents of the old node as stale.
         # Uses shared walker (_walk_cascade_downstream) — PR-AA SSoT refactor.
         visited = {old_node_id}  # seed superseded node so walker won't process it

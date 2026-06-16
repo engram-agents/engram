@@ -418,6 +418,170 @@ def test_supersede_person_migrates_about_edges():
     assert failed == 0, f"{failed} sub-test(s) failed"
 
 
+def test_supersede_person_transfers_self_anchor():
+    """Superseding the self-anchor must carry is_self + trust_tier='self' onto
+    the replacement. Without the transfer, supersede flips old.is_current=0 and
+    leaves no current self-anchor (every lookup is `is_self=1 AND is_current=1`),
+    silently breaking link_about-default / focus='self' / tier='self'."""
+    passed = 0
+    failed = 0
+
+    def _current_selves(conn):
+        return conn.execute(
+            "SELECT id FROM nodes WHERE type = 'person' "
+            "AND json_extract(metadata, '$.is_self') = 1 AND is_current = 1"
+        ).fetchall()
+
+    with engram_core.engram_sandbox():
+
+        # ---- Test A: self-anchor supersede transfers is_self + trust_tier ----
+        old_self = json.loads(engram_trust._add_person_impl(
+            name="Self Old", role="agent self-anchor", is_self=True,
+        ))["person_id"]
+        # The live self-anchor carries trust_tier='self' (set by backfill at
+        # install); mirror that so the transfer is exercised on a real value.
+        _s = engram_core._get_db()
+        try:
+            _s.execute("UPDATE nodes SET trust_tier = 'self' WHERE id = ?", (old_self,))
+            _s.commit()
+        finally:
+            _s.close()
+
+        # The singleton guard blocks creating the replacement WITH is_self while
+        # the old anchor is still current — this is exactly why supersede has to
+        # carry the flag over rather than the caller setting it at creation.
+        blocked = json.loads(engram_trust._add_person_impl(
+            name="Self New (blocked)", role="agent self-anchor", is_self=True,
+        ))
+        assert "error" in blocked and blocked.get("existing_self_id") == old_self, \
+            f"TA: singleton guard should block a second is_self while old is current: {blocked}"
+
+        new_self = _mk_person("Self New", role="agent self-anchor")
+        sup = json.loads(engram_revision._supersede_impl(
+            old_self, new_self, supersede_reason="model lineage update"))
+        assert sup["status"] == "superseded", f"TA supersede failed: {sup}"
+
+        conn = engram_core._get_db()
+        try:
+            row = conn.execute(
+                "SELECT metadata, trust_tier, is_current FROM nodes WHERE id = ?",
+                (new_self,),
+            ).fetchone()
+            meta = json.loads(row["metadata"]) if row["metadata"] else {}
+            assert meta.get("is_self") is True, f"TA: new node missing is_self: {meta}"
+            assert row["trust_tier"] == "self", f"TA: new trust_tier not 'self': {row['trust_tier']}"
+            assert row["is_current"] == 1, "TA: new node should be current"
+            # Exactly one current self-anchor, and it's the replacement.
+            selves = _current_selves(conn)
+            assert len(selves) == 1 and selves[0]["id"] == new_self, \
+                f"TA: expected exactly the new node as current self-anchor, got {[s['id'] for s in selves]}"
+            # Old node retains is_self as a historical snapshot, but non-current.
+            old_row = conn.execute(
+                "SELECT metadata, is_current FROM nodes WHERE id = ?", (old_self,),
+            ).fetchone()
+            old_meta = json.loads(old_row["metadata"]) if old_row["metadata"] else {}
+            assert old_meta.get("is_self") is True, "TA: old node should retain is_self snapshot"
+            assert old_row["is_current"] == 0, "TA: old node should be non-current"
+        finally:
+            conn.close()
+        print("  TA  PASS — self-anchor supersede transfers is_self + trust_tier='self'; exactly one current self-anchor")
+        passed += 1
+
+        # ---- Test B: superseding a NON-self person mints no spurious self-anchor ----
+        pn_x = _mk_person("Plain X")
+        pn_y = _mk_person("Plain Y")
+        sup2 = json.loads(engram_revision._supersede_impl(pn_x, pn_y))
+        assert sup2["status"] == "superseded", f"TB supersede failed: {sup2}"
+        conn = engram_core._get_db()
+        try:
+            row = conn.execute(
+                "SELECT metadata, trust_tier FROM nodes WHERE id = ?", (pn_y,),
+            ).fetchone()
+            meta = json.loads(row["metadata"]) if row["metadata"] else {}
+            assert not meta.get("is_self"), f"TB: non-self supersede wrongly set is_self: {meta}"
+            assert row["trust_tier"] != "self", f"TB: non-self supersede wrongly set trust_tier='self': {row['trust_tier']}"
+            # The current self-anchor is unchanged (still new_self from Test A).
+            selves = _current_selves(conn)
+            assert len(selves) == 1 and selves[0]["id"] == new_self, \
+                f"TB: non-self supersede must not change the current self-anchor: {[s['id'] for s in selves]}"
+        finally:
+            conn.close()
+        print("  TB  PASS — non-self person supersede does not create a spurious self-anchor")
+        passed += 1
+
+        # ---- Test C: chain supersede of the self-anchor (A→B→C) propagates ----
+        # Every future model-version bump is a *chain* supersede of the anchor,
+        # so the transfer must survive multiple hops. We continue the chain from
+        # new_self (the current self-anchor after Test A) so the singleton guard
+        # isn't tripped by a second is_self at creation time.
+        chain_b = _mk_person("Self Chain B", role="agent self-anchor")
+        sup_cb = json.loads(engram_revision._supersede_impl(
+            new_self, chain_b, supersede_reason="chain hop 1"))
+        assert sup_cb["status"] == "superseded", f"TC hop1 failed: {sup_cb}"
+        chain_c = _mk_person("Self Chain C", role="agent self-anchor")
+        sup_cc = json.loads(engram_revision._supersede_impl(
+            chain_b, chain_c, supersede_reason="chain hop 2"))
+        assert sup_cc["status"] == "superseded", f"TC hop2 failed: {sup_cc}"
+
+        conn = engram_core._get_db()
+        try:
+            row = conn.execute(
+                "SELECT metadata, trust_tier FROM nodes WHERE id = ?", (chain_c,),
+            ).fetchone()
+            meta = json.loads(row["metadata"]) if row["metadata"] else {}
+            assert meta.get("is_self") is True, f"TC: is_self lost across chain: {meta}"
+            assert row["trust_tier"] == "self", f"TC: trust_tier lost across chain: {row['trust_tier']}"
+            selves = _current_selves(conn)
+            assert len(selves) == 1 and selves[0]["id"] == chain_c, \
+                f"TC: chain end must be the sole current self-anchor: {[s['id'] for s in selves]}"
+        finally:
+            conn.close()
+        print("  TC  PASS — chain supersede (A→B→C) propagates the self-anchor across every hop")
+        passed += 1
+
+        # ---- Test D: about-migration AND self-transfer fire together ----
+        # The two person-branch sub-paths are independent, but the combined path
+        # (a self-anchor that also has incoming about-edges) is the real-world
+        # case — exercise both at once. chain_c is the current self-anchor.
+        ob_z = _mk_observation("Observation about the self-anchor")
+        link_z = json.loads(engram_cornerstone._link_about_impl(
+            node_id=ob_z, person_id=chain_c))
+        assert link_z.get("status") in ("linked", "already_linked"), f"TD link failed: {link_z}"
+        d_new = _mk_person("Self D-new", role="agent self-anchor")
+        sup_d = json.loads(engram_revision._supersede_impl(
+            chain_c, d_new, supersede_reason="self-anchor with about-edges"))
+        assert sup_d["status"] == "superseded", f"TD supersede failed: {sup_d}"
+
+        conn = engram_core._get_db()
+        try:
+            # self-transfer fired
+            row = conn.execute(
+                "SELECT metadata, trust_tier FROM nodes WHERE id = ?", (d_new,),
+            ).fetchone()
+            meta = json.loads(row["metadata"]) if row["metadata"] else {}
+            assert meta.get("is_self") is True, f"TD: is_self not transferred on combined path: {meta}"
+            assert row["trust_tier"] == "self", f"TD: trust_tier not transferred on combined path: {row['trust_tier']}"
+            # about-migration fired
+            about_edge = conn.execute(
+                "SELECT 1 FROM edges WHERE source_id = ? AND target_id = ? AND relation = 'about'",
+                (ob_z, d_new),
+            ).fetchone()
+            assert about_edge is not None, f"TD: about-edge {ob_z}→{d_new} not migrated on combined path"
+            selves = _current_selves(conn)
+            assert len(selves) == 1 and selves[0]["id"] == d_new, \
+                f"TD: combined-path replacement must be the sole current self-anchor: {[s['id'] for s in selves]}"
+        finally:
+            conn.close()
+        print("  TD  PASS — about-migration and self-transfer both fire on a self-anchor with about-edges")
+        passed += 1
+
+    print(f"\n{'='*56}")
+    print(f"  {passed} passed, {failed} failed")
+    print('='*56)
+    assert failed == 0, f"{failed} sub-test(s) failed"
+
+
 if __name__ == "__main__":
     test_supersede_relational()
     test_supersede_person_migrates_about_edges()
+    test_supersede_person_transfers_self_anchor()
