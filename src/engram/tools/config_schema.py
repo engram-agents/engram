@@ -43,7 +43,7 @@ SCHEMA: list[dict] = [
      "control": "text", "label": "Self lineage",
      "pattern": "^(|[a-z0-9_-]+:[a-z0-9._-]+)$",
      "tooltip": "This install's own training lineage as provider:family (e.g. "
-                "'anthropic:claude'). Powers standpoint v3 null=self: an unmarked "
+                "'anthropic:opus'). Powers standpoint v3 null=self: an unmarked "
                 "observation counts as your own lineage so the standpoint/F-S "
                 "advisory fires on own derivations. Empty = feature dark (safe).",
      "editable": True, "restart_required": False},

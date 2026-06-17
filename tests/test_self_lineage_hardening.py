@@ -4,7 +4,7 @@ Three scenarios from Mira's #750 post-P4 concern:
 
   1. Malformed self_lineage config value → _self_lineage() fails closed
      (returns '') AND emits a warning once (caplog assertion).
-  2. Valid value ('anthropic:claude') → passes through unchanged.
+  2. Valid value ('anthropic:opus') → passes through unchanged.
   3. Empty value → passes (empty is allowed — feature-dark mode).
 
 MUTATION CHECK (ls_0014 — green-is-not-ground-truth):
@@ -114,15 +114,15 @@ def test_malformed_self_lineage_warns_only_once(caplog, tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_valid_self_lineage_passthrough(tmp_path):
-    """_self_lineage() must return the value unchanged for 'anthropic:claude'."""
+    """_self_lineage() must return the value unchanged for 'anthropic:opus'."""
     core = _fresh_core()
-    config = {"self_lineage": "anthropic:claude"}
+    config = {"self_lineage": "anthropic:opus"}
     (tmp_path / "config.json").write_text(json.dumps(config))
     core._configure_paths(str(tmp_path))
 
     result = core._self_lineage()
-    assert result == "anthropic:claude", (
-        f"Expected 'anthropic:claude' passthrough, got {result!r}"
+    assert result == "anthropic:opus", (
+        f"Expected 'anthropic:opus' passthrough, got {result!r}"
     )
 
 

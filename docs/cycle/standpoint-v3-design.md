@@ -35,7 +35,7 @@ collection method, temporal standpoint, methodology, platform. ob_0095 named the
 blindness: *"v2 hashes AGENT IDENTITY, not MODEL LINEAGE."*
 
 The multi-agent reality this cycle runs in is the worst case for that blindness: four
-active agents, all `anthropic:claude`. Every cross-agent corroboration we file today is
+active agents, all `anthropic:opus`. Every cross-agent corroboration we file today is
 lineage-uniform, and nothing in the graph says so.
 
 The second gap is subtler (thread #43, D1): diversity tells you **who could be jointly
@@ -50,7 +50,7 @@ and v2 reports only the first.
 
 ```sql
 ALTER TABLE nodes ADD COLUMN standpoint_lineage TEXT;
--- format: "provider:family", e.g. "anthropic:claude"
+-- format: "provider:family", e.g. "anthropic:opus"
 -- NULL = not set; existing rows stay NULL (backward-compatible)
 ```
 
@@ -136,7 +136,7 @@ phasing below keeps Phase 1 inside the minimal-tooling envelope without foreclos
 
 The format rejection **redirects** rather than bare-rejects (charter §7.3): the error
 names the expected shape and gives an example —
-`standpoint_lineage must match provider:family (e.g. "anthropic:claude"); got "Claude"`.
+`standpoint_lineage must match provider:family (e.g. "anthropic:opus"); got "Claude"`.
 
 **Option-B design-time watch-item** (Aleph, #41/591, on record before B is built): under
 auto-stamp, a solo install's every multi-premise derivation would carry the informational
@@ -145,7 +145,7 @@ toward cross-lineage sourcing a purely-solo filer may never do. B's design must 
 keep-per-derivation vs once-per-session for the informational rendering.
 
 Self-report integrity: lineage is self-reported from the session system context (model ID
-is injected every session; `claude-opus-4-8` → `anthropic:claude`). A false self-report is
+is injected every session; `claude-opus-4-8` → `anthropic:opus`). A false self-report is
 not detectable in-graph — that is an attestation problem, which belongs to the trust-tier
 follow-up and is deliberately out of v3 scope (§5, the ⊥ boundary). v3's claim is
 "the graph records the declared lineage and surfaces uniformity"; it does not claim
@@ -251,7 +251,7 @@ improves precision without touching Phase 1's callers.
    forbids is concrete: a low-tier counterparty from a *different* lineage is the most
    valuable corroborator on the lineage axis; tier-weighting diversity would zero out
    exactly the premises that break uniformity.
-2. **Lineage ≠ collection-method.** `anthropic:claude` (training priors) and
+2. **Lineage ≠ collection-method.** `anthropic:opus` (training priors) and
    "web-scrape vs API vs human-interview" (collection) are separate sub-axes with separate
    cluster keys — never merged into one hash, never reported as one verdict.
 
@@ -306,7 +306,7 @@ Parity: full v2 standpoint suite passes unchanged (additive property itself pinn
 - **qu_0004 (Option A vs B)** — maintainer's call; phasing in §3.4 works under either
   answer and forecloses neither.
 - **Granularity drift** — provider:family is a filing convention, hash-enforced only as
-  string equality. If two agents file `anthropic:claude` vs `anthropic:claude-opus`, the
+  string equality. If two agents file `anthropic:opus` vs `anthropic:opus-4-8`, the
   axis reports false diversity. Mitigation: the format validator + a SKILL.md convention
   table; structural enforcement would need a registry, which is over-engineering at
   current scale (4 agents, 1 lineage). Revisit when a second provider actually appears.

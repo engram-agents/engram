@@ -769,7 +769,7 @@ def _ensure_data_dir():
                 "auto_sleep_time": "03:00",
             },
             # Standpoint v3 null=self (D1 §2): the install's OWN training lineage
-            # (provider:family, e.g. "anthropic:claude"). Read by _self_lineage()
+            # (provider:family, e.g. "anthropic:opus"). Read by _self_lineage()
             # so an unmarked observation counts as the filer's own lineage, which
             # is what makes the standpoint/F-S advisory fire on own-unmarked
             # derivations. Default "" = feature ships DARK (safe degradation —
@@ -1380,7 +1380,7 @@ def _get_db() -> sqlite3.Connection:
         # introspective self-reports).
         ("standpoint_override_tag", "TEXT"),
         # standpoint_lineage: training-lineage axis (v3), format "provider:family"
-        # (e.g. "anthropic:claude"). The most load-bearing bias axis for AI-agent
+        # (e.g. "anthropic:opus"). The most load-bearing bias axis for AI-agent
         # premises: N same-lineage agents provide ~one witness of independent
         # corroboration on substrate-prior bias, for any N.
         ("standpoint_lineage", "TEXT"),
@@ -3754,7 +3754,7 @@ def _self_lineage() -> str:
                 _self_lineage_warned = True
                 logging.getLogger(__name__).warning(
                     "self_lineage config value %r is malformed — expected "
-                    "provider:family (e.g. 'anthropic:claude'); "
+                    "provider:family (e.g. 'anthropic:opus'); "
                     "ignoring and treating as unset (fail-closed, #960).",
                     val,
                 )

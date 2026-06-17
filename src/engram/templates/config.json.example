@@ -3,7 +3,7 @@
 
   "schema_version": 2,
 
-  "_comment_self_lineage": "Standpoint v3 null=self: this install's OWN training lineage as provider:family (e.g. 'anthropic:claude', 'openai:gpt'). An unmarked observation counts as your own lineage, which makes the standpoint/F-S advisory fire on own derivations. Empty string = feature ships dark (safe; gate stays closed). The first-session skill prompts for this. NOT auto-detected — declare it.",
+  "_comment_self_lineage": "Standpoint v3 null=self AND the model-identity gate: this install's OWN training lineage in the hard format provider:model_family (the MODEL FAMILY, e.g. 'anthropic:opus' / 'anthropic:sonnet' — NOT the generic model line like 'claude'). An unmarked observation counts as your own lineage, which makes the standpoint/F-S advisory fire on own derivations. Empty string = feature ships dark (safe; gate stays closed). The first-session skill prompts for this. NOT auto-detected — declare it.",
   "self_lineage": "",
 
   "trust_pool": [
