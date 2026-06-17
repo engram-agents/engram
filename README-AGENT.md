@@ -525,41 +525,84 @@ skill's inverse-merge gate above.
 
 ## `~/.engram/config.json` reference
 
-Created at install, updated by the first-session dialogue and hook machinery,
-**preserved across upgrades**. All fields optional unless noted. You (the agent) edit
-it directly; the human can also use the viz-server config tab.
+Created at install, updated by the first-session dialogue, `agentctl`, and the hook
+machinery, **preserved across upgrades**. All fields optional unless noted. You (the
+agent) edit it directly; the human can change the daily/advanced subset in the
+viz-server **Config** tab. The canonical list of what the UI surfaces (and which
+tier / control / restart-semantics) is `tools/config_schema.py` — this reference is
+the human-readable companion. *(read-only)* = set by install/`agentctl`, don't
+hand-edit; *(restart)* = takes effect after a Claude Code restart.
 
-**Identity (set by first-session skill):**
+**Identity:**
 
 | Field | Type | Description |
 |---|---|---|
-| `agent_name` | str | The name you chose (e.g. `"borges"`). Hooks read it to identify self. |
+| `agent_name` | str | The name you chose (e.g. `"borges"`). Hooks read it to identify self. *(read-only — set at install)* |
 | `primary_user` | str | Human collaborator's first name, lowercased. |
+| `mode` | str | `"single"` or `"multi"` — managed by `agentctl` when spawning peer agents. *(read-only)* |
+| `self_lineage` | str | This install's own training lineage in the hard format `provider:model_family` (e.g. `"anthropic:opus"` — the **model family** opus/sonnet/haiku/fable, *not* the generic model line). Backs the model-identity gate, and powers standpoint v3 *null=self*: an unmarked observation counts as your own lineage, so the standpoint / falsification-sensitivity advisory fires on your own derivations. Empty = feature dark (safe). Pattern: `provider:family`. |
+| `counterparts` | list | Peer agents on this host. Set by `agentctl`. *(read-only)* |
+
+**Embedding** — *(read-only; changing would orphan existing nodes' embeddings):*
+
+| Field | Type | Description |
+|---|---|---|
+| `embedding.enabled` | bool | Semantic recall via sentence-transformer embeddings. |
+| `embedding.model` | str | Sentence-transformer model identifier. |
 
 **Drowsiness / cadence:**
 
 | Field | Type | Description |
 |---|---|---|
-| `cadence.drowsiness_ceiling_tokens` | int | The token ceiling the drowsiness meter measures fill against. Set ~5–10% below the auto-compaction limit (`/context` reports it). If absent, falls back to a conservative 152K floor that over-warns on 1M sessions — the intended nudge to configure it. |
-| `cadence.drowsiness_caution_pct` / `drowsiness_urgent_pct` | float | Percent-of-ceiling thresholds for the caution / urgent nudges. |
-| `cadence.auto_sleep_enabled` | bool | Enable the nightly auto-sleep cron. Off by default. |
-| `cadence.auto_sleep_time` | str | `"HH:MM"` local time for the nightly sleep. Default `"03:00"`. |
+| `cadence.drowsiness_ceiling_tokens` | int | Explicit context-window token ceiling the drowsiness meter measures fill against. Set per your context mode (~190000 for 200K mode, ~807000 for 1M). If absent, falls back to a conservative floor that over-warns on 1M sessions — the intended nudge to configure it. |
+| `cadence.drowsiness_caution_pct` / `cadence.drowsiness_urgent_pct` | int | Percent-of-ceiling thresholds for the caution / urgent nudges. |
+| `cadence.engaged_window_seconds` | int | How long after the last human-typed prompt the agent counts as "engaged" on the board (default 360 = 6 min). Loop self-wakes and monitor events do **not** refresh it. |
 | `cadence.drowsiness_ceiling_max` | map | **Deprecated** — migrate to `drowsiness_ceiling_tokens`. Read once as a migration fallback with a one-time deprecation notice; will be dropped. |
+
+**Auto-sleep:**
+
+| Field | Type | Description |
+|---|---|---|
+| `cadence.auto_sleep_enabled` | bool | Register the nightly sleep cron from the SessionStart hook. Off by default. *(restart — effective next session)* |
+| `cadence.auto_sleep_time` | str | `"HH:MM"` local 24-h time the nightly sleep fires. Default `"03:00"`. *(restart)* |
+
+**Domain trust & caution:**
+
+| Field | Type | Description |
+|---|---|---|
+| `trust_pool` | list | Domains given higher source-confidence weighting (news / official / academic sources you treat as reliable). |
+| `yellow_domains` | list of objects | Domains flagged for caution; each entry `{domain, reason, engram_node?}`. Cited yellow domains render warning-level in evidence reports. |
 
 **Fairy delegation:**
 
 | Field | Type | Description |
 |---|---|---|
-| `coder_fairy_policy` / `reviewer_fairy_policy` | str | `"auto"` (heuristic per task), `"always"`, or `"explicit"`. Controls when you spawn PR sub-agents. |
+| `coder_fairy_policy` / `reviewer_fairy_policy` | str | `"explicit"` (only when you ask), `"auto"` (heuristic per task, per the `engram-auto-*-fairy-judgement` skill), or `"always"` (max review-convergence). Controls when you spawn PR sub-agents. |
 
-**GitHub notifications hook** (under `github`, disabled by default — set
-`github.enabled: true` to activate):
+**Memory** — *(advanced):*
 
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `github.enabled` | bool | `false` | Section gate. When false/absent, the hook returns silently (no API calls). |
-| `github.primary_user_login` | str | — | GH login of the human (shown tier-1). Case-insensitive match. |
-| `github.counterparts_logins` | list | — | GH logins of same-install peer agents (tier-2). Only agents on *this* install — not other users' agents. |
+| Field | Type | Description |
+|---|---|---|
+| `memory.tier1_max_nodes` | int | Nodes held in actively-searchable working memory. Higher = better long-session recall, more compute per query. |
+| `memory.tier2_max_nodes` | int | Background-decay cap; nodes beyond it are subject to forgetting-curve decay. |
+| `memory.decay_base` | float | Forgetting-curve exponential base (default 1.014). 1.0 = no decay; higher = faster. |
+
+**Polarity-dedup (NLI)** — *(advanced; off by default, needs a ~1.5GB GPU model):*
+
+| Field | Type | Description |
+|---|---|---|
+| `polarity.enabled` | bool | Detect contradicting observations on write via an NLI model. *(restart — model loads at startup)* |
+| `polarity.model` | str | Hugging Face NLI model id. Default `dleemiller/ModernCE-large-nli`. *(restart)* |
+| `polarity.threshold` | float | Cosine threshold for flagging a contradiction. Default 0.46. |
+| `polarity.min_similarity_for_check` | float | Cosine floor below which NLI is skipped (unrelated observations). Default 0.30. |
+
+**Deference detector** — *(advanced):*
+
+| Field | Type | Description |
+|---|---|---|
+| `deference_detector.cooldown_minutes` | int | After a real user message during loop mode, suppress the deference detector for this many minutes (its trigger phrases are appropriate when answering a human). `0` disables. Default 10. |
+
+> Protocol-level parameters not surfaced in the viz UI also live in `config.json`; edit those directly. When in doubt about a field, ask your agent or read `tools/config_schema.py`.
 
 ---
 
