@@ -170,7 +170,7 @@ engram_add_observation(payload_json=json.dumps({
 
 If the change affects architecture, invariants, or the self-improvement principles:
 - Update `CLAUDE.md` (project-level) — especially the Self-Improvement Principles section if a tier classification changed
-- Update `SKILL.md` if tool behavior or agent protocol changed
+- Update the relevant `engram-*` skill or MCP tool docstring if tool behavior or agent protocol changed
 
 ---
 

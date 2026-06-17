@@ -282,7 +282,6 @@ def _enumerate_candidate_paths() -> set[str]:
     for fname in [
         "server.py",
         "bootstrap.py",
-        "SKILL.md",
         "launch-engram-server.sh",
         "viz_server.py",
     ]:

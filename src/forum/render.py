@@ -18,7 +18,7 @@ forum/fairy-spec-backend.md §3):
 
 18 prefixes — verified against server.py:637 TYPE_PREFIX map (observation_factual
 and observation_predictive both map to 'ob'; unique prefix count is 18).
-Upstream reference: SKILL.md claim-bearing + structural type tables.
+Upstream reference: server.py TYPE_PREFIX map (claim-bearing + structural type tables).
 """
 
 from __future__ import annotations
@@ -30,8 +30,8 @@ from bs4 import BeautifulSoup
 from markdown_it import MarkdownIt
 
 # ---------------------------------------------------------------------------
-# Citation regex — sourced from SKILL.md's claim-bearing + structural type
-# tables. Update here (and regenerate CITATION_RE) when ENGRAM adds a type.
+# Citation regex — sourced from server.py's TYPE_PREFIX map (claim-bearing + structural type
+# tables). Update here (and regenerate CITATION_RE) when ENGRAM adds a type.
 # ---------------------------------------------------------------------------
 ENGRAM_TYPE_PREFIXES = (
     # Claim-bearing (6)

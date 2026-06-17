@@ -37,7 +37,7 @@ engram-alpha/
 │   └── claude/  ← Claude Code hooks (transcript paths + event JSON)
 ├── skills/
 │   └── claude/  ← Claude skill format (frontmatter + Markdown)
-└── README.md, SKILL.md, USER_GUIDE.md, DEVELOPMENT.md
+└── README.md, USER_GUIDE.md, DEVELOPMENT.md
 ```
 
 **Why hybrid not pure-3-way-split:** the engine is genuinely shared and

@@ -305,21 +305,21 @@ def test_valid_file_url_accepted():
     """file:// URLs pointing to real, committed files should work."""
     import os, subprocess
     client = fresh_client()
-    # Use SKILL.md — a committed file in our repo that we haven't modified
+    # Use the archived SKILL.md — a committed file in our repo that we haven't modified
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    skill_file = os.path.join(repo_root, "src", "engram", "SKILL.md")
+    skill_file = os.path.join(repo_root, "docs", "archive", "SKILL.md")
     # Verify the file is clean (no uncommitted changes) — skip test if not
-    status = subprocess.run(["git", "status", "--porcelain", "--", "src/engram/SKILL.md"],
+    status = subprocess.run(["git", "status", "--porcelain", "--", "docs/archive/SKILL.md"],
                             cwd=repo_root, capture_output=True, text=True)
     if status.stdout.strip():
         import pytest
-        pytest.skip("SKILL.md has uncommitted changes")
+        pytest.skip("docs/archive/SKILL.md has uncommitted changes")
     r = client.call("engram_add_observation", {
         "url": f"file://{skill_file}",
-        "title": "SKILL.md agent protocol",
+        "title": "SKILL.md agent protocol (archived)",
         "quoted_text": "# SKILL.md — ENGRAM Agent Protocol",
-        "interpretation": "The SKILL.md file exists and is committed.",
-        "claim": "SKILL.md exists and is committed in the repo",
+        "interpretation": "The archived SKILL.md file exists and is committed.",
+        "claim": "docs/archive/SKILL.md exists and is committed in the repo",
         "quote_type": "hard_data",
         "source_class": "introspective",
     })

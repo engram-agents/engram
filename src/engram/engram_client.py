@@ -604,7 +604,7 @@ class EngramClient:
         return tools
 
     def system_prompt(self) -> str:
-        """Return the SKILL.md + RESPONSE_STYLE.md content for use as a system prompt."""
+        """Return RESPONSE_STYLE.md content for use as a system prompt (legacy; SKILL.md retired #1149)."""
         base_dir = Path(__file__).parent
         parts = []
         skill_path = base_dir / "SKILL.md"

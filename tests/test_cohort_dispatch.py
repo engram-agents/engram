@@ -533,7 +533,7 @@ def test_incorporate_retry_all_fixed():
         assert summary_ids == {"ob_0001", "ob_0002", "ob_0003"}
 
         # B1 regression: when all failures are resolved, retry_payload.json must NOT exist.
-        # The SKILL.md loop exits on [ -f retry_payload.json ]; an empty file (2 bytes "[]")
+        # The retry loop (engram-sleep skill) exits on [ -f retry_payload.json ]; an empty file (2 bytes "[]")
         # would keep the loop running to MAX_RETRIES unnecessarily.
         assert not (out_dir / "retry_payload.json").exists(), (
             "retry_payload.json should not exist when all failures are resolved — "

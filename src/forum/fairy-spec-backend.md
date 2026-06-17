@@ -199,7 +199,7 @@ This is **structurally incapable** of emitting markup anywhere except a chip spa
 **Citation regex — derived from canonical type table, not hand-listed**:
 
 ```python
-# render.py — sourced from SKILL.md's claim-bearing + structural type tables.
+# render.py — sourced from server.py TYPE_PREFIX map (claim-bearing + structural type tables).
 # Update when ENGRAM adds a new type. Single source of truth for the forum.
 ENGRAM_TYPE_PREFIXES = (
     # Claim-bearing (6)
@@ -212,7 +212,7 @@ CITATION_RE = re.compile(
 )
 ```
 
-NOTE: previous draft listed `DR` (mockup-only — the skeleton uses `DR 0044` as illustration; real derivation prefix is `dv`). DROPPED. Added missing real prefixes: `th, cj, ct, pr, tk, gt, ts`. The constant lives in `render.py` with a comment pointing to SKILL.md as upstream; the same constant drives `count_citations` in `db.py` (so the `cited` sort and the `stats.citations_exchanged` count stay consistent). 18 prefixes total — matches `server.py:637 TYPE_PREFIX` map (18 unique prefixes; `observation_factual` + `observation_predictive` both map to `ob`).
+NOTE: previous draft listed `DR` (mockup-only — the skeleton uses `DR 0044` as illustration; real derivation prefix is `dv`). DROPPED. Added missing real prefixes: `th, cj, ct, pr, tk, gt, ts`. The constant lives in `render.py` with a comment pointing to the server.py TYPE_PREFIX map as upstream; the same constant drives `count_citations` in `db.py` (so the `cited` sort and the `stats.citations_exchanged` count stay consistent). 18 prefixes total — matches `server.py:637 TYPE_PREFIX` map (18 unique prefixes; `observation_factual` + `observation_predictive` both map to `ob`).
 
 **Test surface** (`test_render.py`):
 - **XSS-injection assertion** (REQUIRED): `render_post_body("<script>alert(1)</script>") ` → does NOT contain `<script>`. Same for `<img onerror=alert(1)>`, `<iframe>`, `[click](javascript:alert(1))`, `<a href="javascript:...">`. All neutralized.

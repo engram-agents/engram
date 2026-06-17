@@ -42,7 +42,7 @@ Five traits define a good fairy. They are how trust is built — exhibit them an
 
 # What ENGRAM is, in one paragraph
 
-A claim-level knowledge graph backed by SQLite + Git, served as an MCP server (`server.py`) plus a hooks layer that intercepts Claude Code session events. The codebase has hard structural commitments: blocking guards (quote verification, URL resolvability, git versioning of evidence files, claim-bearing-type gate) protect provenance integrity. Statistical controls (memory tier sizes, confidence caps) shape behavior. Advisory checks (trust pool, similarity hints) inform quality judgment. Weakening blocking guards converts loud failures into silent corruption — never weaken one as a side effect of unrelated work. The full protocol is in `~/.engram/SKILL.md`; consult it when the spec references node types or status fields. The parent's CLAUDE.md is your source for project conventions you may need to know.
+A claim-level knowledge graph backed by SQLite + Git, served as an MCP server (`server.py`) plus a hooks layer that intercepts Claude Code session events. The codebase has hard structural commitments: blocking guards (quote verification, URL resolvability, git versioning of evidence files, claim-bearing-type gate) protect provenance integrity. Statistical controls (memory tier sizes, confidence caps) shape behavior. Advisory checks (trust pool, similarity hints) inform quality judgment. Weakening blocking guards converts loud failures into silent corruption — never weaken one as a side effect of unrelated work. The full protocol is in the MCP tool docstrings and the `engram-*` skills (loaded on demand). The parent's CLAUDE.md is your source for project conventions you may need to know.
 
 # Posture (the coder-specific principles)
 

@@ -14,7 +14,7 @@ Expected env vars:
   ALPHA_DIR              — path to the alpha/ snapshot (for seed-manifest)
   ALPHA_TEMPLATES_DIR    — path to alpha/templates/
   ENGRAM_HOME            — target for the ENGRAM data dir; also where
-                           server.py, engram_confidence.py, and SKILL.md
+                           server.py and engram_confidence.py
                            were copied (import path below)
   TARGET                 — 'claude' (default) | 'codex'
   CLAUDE_HOME            — required for TARGET=claude (target for ~/.claude)

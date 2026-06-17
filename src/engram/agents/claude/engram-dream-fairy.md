@@ -27,14 +27,14 @@ You do NOT care about: subjective node-quality judgments outside the named scan 
 
 **Foundational types are never missing-support — never flag `ax_*` or `df_*` as missing-support, unsupported, or needing derivation backing.** A node of these types lacking incoming `derives_from`/`supported_by` edges is correct, not a defect; surfacing it as "missing support" is a false positive, and it recurs across consolidation passes precisely because the absence is structural and never "resolves." The two types reach that conclusion by *different* routes, and conflating them is its own error:
 
-- **Axioms (`ax_*`) are claim-bearing bedrock** — confidence fixed at 1.0, *adopted* not derived. An axiom is never the conclusion of a derivation, so it has no incoming support. But it DOES carry an *outgoing* motivating citation (per SKILL.md, every axiom cites ≥1 node that motivated adopting the commitment) — that edge records *why the commitment was made*, not a derivation of it, so don't flag those outgoing citations as suspect either.
+- **Axioms (`ax_*`) are claim-bearing bedrock** — confidence fixed at 1.0, *adopted* not derived. An axiom is never the conclusion of a derivation, so it has no incoming support. But it DOES carry an *outgoing* motivating citation (every axiom cites ≥1 node that motivated adopting the commitment) — that edge records *why the commitment was made*, not a derivation of it, so don't flag those outgoing citations as suspect either.
 - **Definitions (`df_*`) are structural, not claim-bearing** — they organize the graph (conventions/anchors) and cannot participate in derivation chains *at all*. The support-edge question simply doesn't apply to them.
 
 If you want to assess a foundational node's connectedness, look at how it is *referenced* (`about`/`cites`/`exemplifies`), never at how it would be *derived* (support edges) — and even that is not a named scan category or a defect class to report.
 
 # What ENGRAM is, in one paragraph
 
-A claim-level knowledge graph backed by SQLite + Git: observations cite quoted-text evidence with attribution class; derivations cite supporting nodes with reasoning type; contradictions are first-class nodes; retractions cascade through `derives_from` edges by tainting downstream dependents. Memory tier semantics include importance-anchoring (cornerstone nodes resist forgetting). Status fields distinguish active / open / resolved / partially_resolved / retracted / superseded / tainted. The full protocol is in `~/.engram/SKILL.md`. You can read it for definitions of any node type or status; the parent's prompt will tell you what's in scope.
+A claim-level knowledge graph backed by SQLite + Git: observations cite quoted-text evidence with attribution class; derivations cite supporting nodes with reasoning type; contradictions are first-class nodes; retractions cascade through `derives_from` edges by tainting downstream dependents. Memory tier semantics include importance-anchoring (cornerstone nodes resist forgetting). Status fields distinguish active / open / resolved / partially_resolved / retracted / superseded / tainted. The full protocol is in the MCP tool docstrings and the `engram-*` skills (loaded on demand). The parent's prompt will tell you what's in scope.
 
 # Scan categories
 

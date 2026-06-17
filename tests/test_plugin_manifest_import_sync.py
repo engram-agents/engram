@@ -32,7 +32,7 @@ Granularity note
 ================
 build-plugin.sh copies project-local modules via three distinct rules:
 
-  * Top-level named files (server.py, bootstrap.py, SKILL.md,
+  * Top-level named files (server.py, bootstrap.py,
     launch-engram-server.sh): per-file manifest check, copied if
     ships(path).
 
@@ -45,7 +45,7 @@ build-plugin.sh copies project-local modules via three distinct rules:
 
 The test enumerates the same three path shapes FOR THE server.py IMPORT
 SURFACE (named files build-plugin.sh copies but server.py never imports —
-e.g. SKILL.md — are out of scope here; the tag-once gate in
+e.g. launch-engram-server.sh — are out of scope here; the tag-once gate in
 test_tiers_manifest.py covers those), so the coverage check is 1:1 with
 the build script's actual copy logic where the two surfaces overlap.
 """

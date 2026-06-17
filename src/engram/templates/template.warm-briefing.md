@@ -27,7 +27,7 @@ Other goals, as they emerge from work with {{USER_NAME}}, go here with their `gl
 
 *The handful of principles I want in front of me **every** session. Pinned here on purpose: per issue #61, this letter IS the cornerstone surfacing mechanism — a cornerstone I have to look up has already failed at its one job. Keep each entry short and powerful; the full reasoning lives in the cited node.*
 
-*(This section starts empty and fills as axioms, goals, and cornerstones accumulate. Pin each as a short bold handle + node ID + one line. Axioms constrain, goals orient, cornerstones execute — see SKILL.md §2.17. The engram-nap routine's Step 5a instructs the agent to pin new cornerstones here; see its Step 5a.)*
+*(This section starts empty and fills as axioms, goals, and cornerstones accumulate. Pin each as a short bold handle + node ID + one line. Axioms constrain, goals orient, cornerstones execute. The engram-nap routine's Step 5a instructs the agent to pin new cornerstones here; see its Step 5a.)*
 
 ## What's continuous and what isn't
 

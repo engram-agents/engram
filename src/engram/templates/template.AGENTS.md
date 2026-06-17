@@ -2,7 +2,7 @@
 
 This file carries project-specific conventions. Identity lives in
 `~/.codex/config.toml` (the `instructions=` field). ENGRAM mechanics
-live in `~/.engram/SKILL.md`.
+live in the MCP tool docstrings, the `engram-*` skills, and the AGENTS.md disciplines.
 
 ## Project conventions
 

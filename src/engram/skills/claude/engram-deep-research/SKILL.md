@@ -96,7 +96,7 @@ Each derivation or observation may open new sub-questions. Follow them. This is 
 
 **In loop mode (marker file active):** See **engram-loop** Step 4 for loop-mode drowsiness behavior.
 
-**In interactive mode (no marker):** Follow normal nap discipline (see `SKILL.md` §8.1) — nap when approaching a compaction boundary or when the drowsiness nudge suggests it. Wrap the current research thread before napping so the cohort stays coherent.
+**In interactive mode (no marker):** Follow normal nap discipline (see the **engram-nap** skill) — nap when approaching a compaction boundary or when the drowsiness nudge suggests it. Wrap the current research thread before napping so the cohort stays coherent.
 
 ## Step 5 — Nap checkpoint
 

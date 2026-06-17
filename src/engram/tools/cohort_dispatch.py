@@ -14,7 +14,7 @@ orchestration:
                   When still_failing is non-empty: writes retry_payload.json
                   (same schema as validate's, for the next retry round).
                   When still_failing is empty: DELETES retry_payload.json so
-                  the SKILL.md retry loop exits on [ -f retry_payload.json ].
+                  the retry loop exits on [ -f retry_payload.json ].
                   Also writes unfixable.json + increments attempt_count.
   incorporate-retry  Alias for incorporate (backward compat).
 
@@ -901,7 +901,7 @@ def cmd_incorporate_retry(args: argparse.Namespace) -> int:
 
     # Write or delete retry_payload.json.
     # File-presence semantic: retry_payload.json exists ⟺ items left to retry.
-    # The SKILL.md retry loop uses [ -f retry_payload.json ] as its exit condition;
+    # The retry loop (engram-sleep skill) uses [ -f retry_payload.json ] as its exit condition;
     # writing an empty list would cause the loop to run to MAX_RETRIES unnecessarily.
     retry_payload_path = out_dir / "retry_payload.json"
     if still_failing:

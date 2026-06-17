@@ -24,10 +24,6 @@
       "tier": "essential"
     },
     {
-      "path": "SKILL.md",
-      "tier": "essential"
-    },
-    {
       "path": "launch-engram-server.sh",
       "tier": "essential"
     },

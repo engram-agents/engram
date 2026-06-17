@@ -1929,7 +1929,7 @@ def _read_and_clear_feeling_nudge() -> Optional[str]:
 def _git_sha_for_file(path: Path) -> Optional[str]:
     """Return the git SHA of a file's HEAD content, or 'dirty' if uncommitted.
 
-    Used to fingerprint CLAUDE.md / SKILL.md at feeling-report write time.
+    Used to fingerprint CLAUDE.md at feeling-report write time.
     Returns None if the file is not in any git repo or git is unavailable.
     """
     try:

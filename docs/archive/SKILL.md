@@ -1,3 +1,6 @@
+<!-- ARCHIVED 2026-06-16 (#1149) — retired in favor of the MCP tool docstrings + engram-* skills + CLAUDE.md disciplines. Kept for history; not shipped. -->
+<!-- Live reference: the MCP tool schemas (at tool-call) + skills/claude/engram-* + CLAUDE.md §ENGRAM Reference. -->
+
 # SKILL.md — ENGRAM Agent Protocol
 
 The working protocol for using ENGRAM: how the node types fit together, which tool to reach for, how to run the canonical workflows, and how memory time flows across nap, sleep, and compaction. Paired with CLAUDE.md (identity + write discipline) and the MCP tool docstrings (behavioral detail).

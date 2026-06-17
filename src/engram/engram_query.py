@@ -353,7 +353,7 @@ def _pattern_cornerstone_candidate(
     and definitions are categorically excluded: they are fundamental *by type*
     (declared at creation), so their high type-anchored importance_base is not
     an emergence signal — nominating them was the #180 false-positive. See
-    SKILL.md §2.17 for the axiom/goal/cornerstone semantic distinctions.
+    the engram-* skills / MCP docstrings for the axiom/goal/cornerstone semantic distinctions.
 
     A cornerstone candidate is a node that has been load-bearing in the
     graph (cited by many derivations / observations) but isn't yet anchored

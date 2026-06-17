@@ -5373,7 +5373,7 @@ def engram_query_pattern(payload_json: str) -> str:
                 - cornerstone_candidate: heavily-cited high-importance
                   observations/derivations only (emergent-practice anchoring
                   candidates; axioms/goals/definitions excluded as
-                  fundamental-by-type — see SKILL.md §2.17 / #180).
+                  fundamental-by-type — see the engram-* skills / MCP docstrings / #180).
                 - tainted_still_valid: tainted derivations whose substantive
                   claim may survive the upstream retraction.
                 - recent_resolution_echo: still-open questions semantically
