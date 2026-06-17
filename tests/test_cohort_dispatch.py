@@ -1064,6 +1064,204 @@ def test_incorporate_increments_attempt_count():
         )
 
 
+def test_incorporate_prior_clean_revalidation_failure_surfaces_in_unfixable():
+    """A prior-clean item that fails re-validation lands in unfixable.json (not just
+    a builder failure), and is excluded from the cumulative clean set (#1216 fold).
+
+    'Shouldn't happen' in practice (deterministic validator), but if the validator
+    tightens mid-cohort the stranded item must be operator-visible, not silently
+    dropped into final_payload only.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        # prior_clean carries an item that is NO LONGER valid (overcap summary) —
+        # simulates a validator tightening between the round-0 clean write and now.
+        prior_clean = [
+            {"node_id": "ob_0001", "recall_summary": "Clean.", "recall_keywords": ["a", "b", "c"]},
+            {"node_id": "ob_0009", "recall_summary": "Q" * 201, "recall_keywords": ["a", "b", "c"]},  # now invalid
+        ]
+        prior_failures = [
+            {"node_id": "ob_0002", "payload": {"id": "ob_0002", "type": "observation_factual", "claim": "t"}, "error": "overcap"},
+        ]
+        retry_items = [_valid_item("ob_0002")]
+        out_dir, retry_path = _setup_incorporate_retry(tmp_dir, prior_clean, prior_failures, retry_items)
+        _write_manifest(out_dir, [])
+
+        exit_code = _run(["incorporate", "--retry-output", str(retry_path), "--out", str(out_dir)])
+        assert exit_code == 0
+
+        # The stranded item appears in unfixable.json with a re-validation reason.
+        unfixable = json.loads((out_dir / "unfixable.json").read_text())
+        stranded = [u for u in unfixable if u["node_id"] == "ob_0009"]
+        assert stranded, f"ob_0009 should surface in unfixable.json, got {unfixable}"
+        assert "re-validation" in stranded[0]["reason"]
+
+        # It must NOT be re-asserted into the cumulative clean set.
+        clean = json.loads((out_dir / "clean_items.json").read_text())
+        clean_ids = {c["node_id"] for c in clean}
+        assert "ob_0009" not in clean_ids, "re-validation-failed item must not stay clean"
+        assert {"ob_0001", "ob_0002"} <= clean_ids, "valid items (prior + fixed) must be clean"
+
+
+# ---------------------------------------------------------------------------
+# Test 29: multi-round cumulative-clean / bad-pool-only acceptance (#1215)
+# ---------------------------------------------------------------------------
+
+
+def _overcap_item(node_id: str) -> dict:
+    """A still-failing retry item (summary over the 200-char hard cap)."""
+    return {
+        "node_id": node_id,
+        "recall_summary": "Z" * 201,
+        "recall_keywords": ["kw1", "kw2", "kw3"],
+    }
+
+
+def test_incorporate_multiround_cumulative_clean_no_regression():
+    """≥3-round retry: clean count is monotonic non-decreasing and the failure
+    pool shrinks to exactly the previous round's still-failing items (#1215).
+
+    Reproduces the 2026-06-16 live-cycle regression in miniature: each retry
+    round fixes a STRICT SUBSET of the previous round's failures, and the test
+    re-runs `incorporate` WITHOUT manually resetting clean_items.json/failures.json
+    between rounds — exactly the orchestrator's loop. The pre-fix bug re-read
+    round-0's baseline each round and silently dropped intermediate fixes, so
+    the clean count could go backwards. Here it must only ever go up.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        out_dir = tmp_dir / "out"
+        out_dir.mkdir(parents=True)
+
+        # Round-0 baseline (what cmd_validate would write): 5 clean, 6 failing.
+        initial_clean = [_valid_item(f"ob_{i:04d}") for i in range(1, 6)]  # ob_0001..ob_0005
+        fail_ids = [f"ob_{i:04d}" for i in range(10, 16)]                  # ob_0010..ob_0015
+        round0_failures = [
+            {"node_id": nid, "payload": {"id": nid, "type": "observation_factual", "claim": "test"}, "error": "overcap"}
+            for nid in fail_ids
+        ]
+        (out_dir / "clean_items.json").write_text(json.dumps(initial_clean))
+        (out_dir / "failures.json").write_text(json.dumps(round0_failures))
+        _write_manifest(out_dir, [], attempt_count=0)
+
+        # Each round's retry fairy output fixes a STRICT SUBSET; the rest stay overcap.
+        # Round 1 fixes 3 (ob_0010-12), round 2 fixes 2 (ob_0013-14), round 3 fixes 1 (ob_0015).
+        rounds = [
+            # round 1: fix 0010,0011,0012 ; 0013,0014,0015 still fail
+            [_valid_item("ob_0010"), _valid_item("ob_0011"), _valid_item("ob_0012"),
+             _overcap_item("ob_0013"), _overcap_item("ob_0014"), _overcap_item("ob_0015")],
+            # round 2: pool is now only 0013,0014,0015 — fix 0013,0014 ; 0015 still fails
+            [_valid_item("ob_0013"), _valid_item("ob_0014"), _overcap_item("ob_0015")],
+            # round 3: pool is now only 0015 — fix it
+            [_valid_item("ob_0015")],
+        ]
+        expected_pool_sizes = [6, 3, 1]   # failures.json read at the START of each round
+        expected_clean_after = [8, 10, 11]  # cumulative clean after each round
+        prev_clean_count = len(initial_clean)  # 5
+
+        retry_path = tmp_dir / "retry_output.json"
+        for rnd, retry_items in enumerate(rounds):
+            # This asserts the EXTERNAL-loop invariant: the orchestrator reads the
+            # current (already-shrunken) failures.json as the round's bad-only pool —
+            # it does not exercise an internal code path. Against the pre-fix code this
+            # check fails on round 2 (failures.json still held all 6 round-0 items, so
+            # pool_ids != the 3-item retry_ids).
+            pool = json.loads((out_dir / "failures.json").read_text())
+            assert len(pool) == expected_pool_sizes[rnd], (
+                f"round {rnd+1}: failure pool should be {expected_pool_sizes[rnd]} "
+                f"(bad-only, shrinking), got {len(pool)}"
+            )
+            # Bad-pool-only: every item dispatched this round must be one that failed last round.
+            retry_ids = {it["node_id"] for it in retry_items}
+            pool_ids = {f["node_id"] for f in pool}
+            assert retry_ids == pool_ids, (
+                f"round {rnd+1}: retry input {retry_ids} must equal the prior-round "
+                f"failure pool {pool_ids} (never re-dispatch already-clean items)"
+            )
+
+            retry_path.write_text(json.dumps({"items": retry_items}))
+            exit_code = _run(["incorporate", "--retry-output", str(retry_path), "--out", str(out_dir)])
+            assert exit_code == 0
+
+            final = json.loads((out_dir / "final_payload.json").read_text())
+            clean_count = len(final["summaries"])
+            # Monotonic non-decreasing — the core #1215 invariant.
+            assert clean_count >= prev_clean_count, (
+                f"round {rnd+1}: clean count regressed {prev_clean_count} -> {clean_count}"
+            )
+            assert clean_count == expected_clean_after[rnd], (
+                f"round {rnd+1}: expected {expected_clean_after[rnd]} clean, got {clean_count}"
+            )
+            prev_clean_count = clean_count
+
+        # End state: all 11 nodes clean (5 initial + 6 fixed across 3 rounds), no failures,
+        # and retry_payload.json removed so the orchestrator loop exits.
+        final = json.loads((out_dir / "final_payload.json").read_text())
+        assert len(final["summaries"]) == 11
+        assert len(final["failures"]) == 0
+        summary_ids = {s["node_id"] for s in final["summaries"]}
+        assert summary_ids == {f"ob_{i:04d}" for i in (1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15)}
+        assert not (out_dir / "retry_payload.json").exists(), (
+            "retry_payload.json must be removed once the pool is empty (loop-exit signal)"
+        )
+        # attempt_count tracked all three rounds.
+        manifest = json.loads((out_dir / "manifest.json").read_text())
+        assert manifest["attempt_count"] == 3
+
+
+def test_incorporate_unfixable_accumulates_across_rounds():
+    """Unfixable items (invented IDs) recorded in an early round survive in
+    unfixable.json after later rounds (#1215 cumulative-unfixable).
+
+    An unfixable item drops out of the active failure pool, so if unfixable.json
+    were overwritten per-round it would vanish. It must persist.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        out_dir = tmp_dir / "out"
+        out_dir.mkdir(parents=True)
+
+        # Round-0: two failing items.
+        round0_failures = [
+            {"node_id": "ob_0010", "payload": {"id": "ob_0010", "type": "observation_factual", "claim": "t"}, "error": "overcap"},
+            {"node_id": "ob_0011", "payload": {"id": "ob_0011", "type": "observation_factual", "claim": "t"}, "error": "overcap"},
+        ]
+        (out_dir / "clean_items.json").write_text(json.dumps([]))
+        (out_dir / "failures.json").write_text(json.dumps(round0_failures))
+        _write_manifest(out_dir, [], attempt_count=0)
+
+        retry_path = tmp_dir / "retry_output.json"
+
+        # Round 1: fairy fixes ob_0010 but invents an unknown ID instead of ob_0011.
+        # ob_0011 gets "no output" (stays retryable); the invented ID → unfixable.
+        retry_path.write_text(json.dumps({"items": [
+            _valid_item("ob_0010"),
+            _valid_item("ob_INVENTED_1"),
+        ]}))
+        _run(["incorporate", "--retry-output", str(retry_path), "--out", str(out_dir)])
+
+        unfixable_r1 = json.loads((out_dir / "unfixable.json").read_text())
+        assert any("INVENTED_1" in u["node_id"] for u in unfixable_r1)
+
+        # Round 2: pool is now just ob_0011 — fix it. A different invented ID appears too.
+        retry_path.write_text(json.dumps({"items": [
+            _valid_item("ob_0011"),
+            _valid_item("ob_INVENTED_2"),
+        ]}))
+        _run(["incorporate", "--retry-output", str(retry_path), "--out", str(out_dir)])
+
+        unfixable_r2 = json.loads((out_dir / "unfixable.json").read_text())
+        ids = {u["node_id"] for u in unfixable_r2}
+        # Round-1's invented ID must STILL be present (cumulative), plus round-2's.
+        assert any("INVENTED_1" in i for i in ids), "round-1 unfixable item was dropped"
+        assert any("INVENTED_2" in i for i in ids), "round-2 unfixable item missing"
+
+        # And the real nodes both ended up clean.
+        final = json.loads((out_dir / "final_payload.json").read_text())
+        clean_ids = {s["node_id"] for s in final["summaries"]}
+        assert {"ob_0010", "ob_0011"} <= clean_ids
+
+
 # ---------------------------------------------------------------------------
 # Test 27: dispatch prompt size regression
 # ---------------------------------------------------------------------------

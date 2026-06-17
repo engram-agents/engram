@@ -345,7 +345,8 @@ python3 -m tools.cohort_dispatch incorporate \
   --out "$COHORT_DIR"
 # When still-failing items remain: writes retry_payload.json → loop continues.
 # When all resolved: DELETES retry_payload.json → [ -f ] check exits the loop.
-# Also writes/updates: final_payload.json, unfixable.json, attempt_count in manifest.json.
+# Also writes/updates: final_payload.json, clean_items.json, failures.json,
+#   unfixable.json, attempt_count in manifest.json.
 ```
 
 Go back to shell step 1.
@@ -354,12 +355,17 @@ Go back to shell step 1.
 # After loop: final_payload.json is ready (best-effort); unfixable.json holds structurally unrecoverable items.
 ```
 
-The `incorporate` subcommand auto-builds:
-- `retry_payload.json` — items still failing (retryable validator errors); feeds the next loop iteration. Deleted (not emptied) when all items resolve, so `[ -f retry_payload.json ]` is the correct exit test.
-- `unfixable.json` — items with structural failures (invented IDs, malformed output)
-- Updates `attempt_count` in `manifest.json` each round
+**Cumulative-clean / bad-pool-only invariant (the loop's correctness contract — #1215):**
+Each retry round operates on **only the previous round's failures**, and the clean set is **cumulative and monotonic** — once a node validates clean it is never re-dispatched or re-validated, and `len(clean)` only ever goes up. The tool enforces this for you: `cmd_validate` writes the **round-0 baseline** (`clean_items.json` + `failures.json`); `incorporate` then **owns the per-round accumulation** — it rewrites `clean_items.json` to the grown clean set and `failures.json` to the shrunken pool of items still failing, so the next round's retry fairy is dispatched on `retry_payload.json` (= exactly that round's bad-only pool). **Do not hand-reset, merge, or re-incorporate a stale `clean_items.json` / `failures.json` between rounds** — that re-introduces the round-0-snapshot regression (round N silently dropping rounds 1…N-1's fixes; clean count going backwards). Just loop `incorporate` and trust the files it persists.
 
-Loop exit conditions: `retry_payload.json` absent (all resolved) OR `attempt_count >= MAX_RETRIES`.
+The `incorporate` subcommand auto-builds / accumulates:
+- `clean_items.json` — **cumulative** clean set (prior rounds' fixes ∪ this round's); monotonic non-decreasing. Read as `prior_clean` by the next round.
+- `failures.json` — **shrunken** failure pool: only this round's still-failing items (cmd_validate's failures schema). Read as `prior_failures` by the next round.
+- `retry_payload.json` — items still failing (retryable validator errors); feeds the next loop iteration's fairy. Deleted (not emptied) when all items resolve, so `[ -f retry_payload.json ]` is the correct exit test.
+- `unfixable.json` — items with structural failures (invented IDs, malformed output); **cumulative** across rounds (terminal items drop out of the active pool, so they must persist here).
+- Updates `attempt_count` in `manifest.json` each round.
+
+Loop exit conditions: `retry_payload.json` absent (all resolved) OR `attempt_count >= MAX_RETRIES`. On the MAX_RETRIES exit, `final_payload.json` carries the cumulative clean set, and `retry_payload.json` + `unfixable.json` together hold the deferred remainder (→ next cycle's cohort via attrition).
 
 This is the **wait-then-spawn pattern** using filesystem-as-channel. Claude Code's standard subagent mode does not support cross-agent SendMessage (gated behind `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, which we don't enable per ENGRAM-isolation safety). Mid-execution streaming isn't an option; all fairy reports are collected before the master is spawned.
 

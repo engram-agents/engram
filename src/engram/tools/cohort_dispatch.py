@@ -770,7 +770,19 @@ def cmd_incorporate_retry(args: argparse.Namespace) -> int:
       <out-dir>/unfixable.json       — items that failed in structurally non-retryable ways
                                        (fairy invented IDs, malformed output beyond recovery)
     Updates:
+      <out-dir>/clean_items.json     — CUMULATIVE clean set: prior_clean ∪ this round's
+                                       newly-passing items (monotonic; len only ever grows)
+      <out-dir>/failures.json        — SHRUNKEN failure pool: only this round's still-failing
+                                       items, in cmd_validate's failures schema. The next
+                                       retry round reads this as its prior_failures.
       <out-dir>/manifest.json        — increments attempt_count
+
+    Cumulative-retry invariant (#1215): `cmd_validate` writes the round-0 baseline
+    (clean_items.json + failures.json); `incorporate` OWNS the per-round accumulation.
+    Each round persists the grown clean set and the shrunken failure pool back to those
+    same files, so a multi-round retry reads the *updated* clean set + *shrunken* failures
+    — never the round-0 snapshot. Without this, round N re-read round-0's clean/failures
+    and silently dropped every intermediate round's fixes (clean count could regress).
 
     Exit code: 0.
     """
@@ -834,16 +846,45 @@ def cmd_incorporate_retry(args: argparse.Namespace) -> int:
                 retry_by_id[nid] = item
 
     builder = PayloadBuilder()
-    still_failing: list[dict] = []  # retryable (validator error, not structural)
+    still_failing: list[dict] = []  # retryable (validator error, not structural) — retry_payload schema
+    newly_clean: list[dict] = []    # items this round fixed — clean_items schema (cumulative append)
+    next_round_failures: list[dict] = []  # shrunken failure pool — failures.json schema for next round
+
+    def _record_still_failing(failure: dict, node_id: str, err_text: str) -> None:
+        """Append an item that is still validator-fixable to BOTH the retry_payload
+        list (still_failing, payload-schema + previous_error) and the next-round
+        failures pool (next_round_failures, cmd_validate's {node_id, payload, error}
+        schema). Keeping the two in lockstep is what makes the failure pool shrink
+        monotonically across rounds."""
+        payload = failure.get("payload", {"id": node_id})
+        still_failing.append({**payload, "previous_error": err_text})
+        next_round_failures.append({
+            "node_id": node_id,
+            "payload": payload,
+            "error": err_text,
+        })
 
     # Carry forward all previously clean items
+    prior_clean_revalidation_failed: set[str] = set()
     for item in prior_clean:
         err = builder.add_summary(
             item["node_id"], item["recall_summary"], item["recall_keywords"]
         )
         if err is not None:
-            # Shouldn't happen — these were already validated — but record if so
+            # Shouldn't happen — these were already validated — but record if so.
+            # Exclude from the cumulative-clean write below: re-asserting an item
+            # the validator now rejects would re-add it every round (it can never
+            # resolve), so it must NOT count as "clean" going forward. Also surface
+            # it in unfixable.json — a re-validation rejection is terminal (it lands
+            # in neither the active pool nor a retry), so without this it would be
+            # operator-invisible (only a builder failure in final_payload). Recording
+            # it keeps the diagnostic trail complete.
             builder.add_failure(item["node_id"], f"re-validation rejected: {err['error']}")
+            prior_clean_revalidation_failed.add(item["node_id"])
+            unfixable_items.append({
+                "node_id": item["node_id"],
+                "reason": f"re-validation rejected: {err['error']}",
+            })
 
     # For each prior failure, check if the retry fixed it
     for failure in prior_failures:
@@ -869,9 +910,13 @@ def cmd_incorporate_retry(args: argparse.Namespace) -> int:
                         f"validation failed after one retry: {add_err['error']}",
                     )
                     # Still validator-fixable — goes to retry_payload for next round
-                    still_failing.append({
-                        **failure.get("payload", {"id": node_id}),
-                        "previous_error": add_err["error"],
+                    _record_still_failing(failure, node_id, add_err["error"])
+                else:
+                    # Fixed this round — join the cumulative clean set
+                    newly_clean.append({
+                        "node_id": retry_item["node_id"],
+                        "recall_summary": retry_item["recall_summary"],
+                        "recall_keywords": retry_item["recall_keywords"],
                     })
             else:
                 builder.add_failure(
@@ -879,10 +924,7 @@ def cmd_incorporate_retry(args: argparse.Namespace) -> int:
                     f"validation failed after one retry: {err['error']}",
                 )
                 # Still validator-fixable — goes to retry_payload for next round
-                still_failing.append({
-                    **failure.get("payload", {"id": node_id}),
-                    "previous_error": err["error"],
-                })
+                _record_still_failing(failure, node_id, err["error"])
         else:
             # Retry fairy did not produce output for this node
             builder.add_failure(
@@ -890,14 +932,42 @@ def cmd_incorporate_retry(args: argparse.Namespace) -> int:
                 "validation failed after one retry: no output produced by retry fairy",
             )
             # No output = potentially recoverable (fairy may have skipped it) — retryable
-            still_failing.append({
-                **failure.get("payload", {"id": node_id}),
-                "previous_error": "no output produced by retry fairy",
-            })
+            _record_still_failing(failure, node_id, "no output produced by retry fairy")
 
     final_payload = builder.to_json()
     final_payload_path = out_dir / "final_payload.json"
     final_payload_path.write_text(final_payload)
+
+    # Persist the CUMULATIVE clean set (#1215). prior_clean already holds every
+    # round's accumulated fixes; append this round's newly-passing items. Dedup by
+    # node_id (last-wins) defensively — prior_clean and newly_clean are disjoint by
+    # construction, but a dup would otherwise double-apply downstream. len(cumulative)
+    # is monotonic non-decreasing: it only ever gains newly_clean, never loses prior.
+    cumulative_clean: list[dict] = []
+    _seen_clean: set[str] = set()
+    for item in (*prior_clean, *newly_clean):
+        nid = item.get("node_id")
+        # Drop any prior-clean item the validator just rejected on re-check — it is
+        # no longer clean (recorded as a builder failure above), so it must not be
+        # re-asserted into the cumulative clean set (would loop forever otherwise).
+        if nid in prior_clean_revalidation_failed:
+            continue
+        if nid in _seen_clean:
+            # Replace the earlier entry with the later (newly_clean) one.
+            cumulative_clean = [c for c in cumulative_clean if c.get("node_id") != nid]
+        else:
+            _seen_clean.add(nid)
+        cumulative_clean.append(item)
+    (out_dir / "clean_items.json").write_text(
+        json.dumps(cumulative_clean, indent=2, ensure_ascii=False)
+    )
+
+    # Persist the SHRUNKEN failure pool (#1215) — only this round's still-failing
+    # items, in cmd_validate's failures schema. The next retry round reads THIS as
+    # its prior_failures, so it never re-processes already-fixed items.
+    (out_dir / "failures.json").write_text(
+        json.dumps(next_round_failures, indent=2, ensure_ascii=False)
+    )
 
     # Write or delete retry_payload.json.
     # File-presence semantic: retry_payload.json exists ⟺ items left to retry.
@@ -909,8 +979,28 @@ def cmd_incorporate_retry(args: argparse.Namespace) -> int:
     else:
         retry_payload_path.unlink(missing_ok=True)
 
-    # Write unfixable.json
+    # Write unfixable.json CUMULATIVELY (#1215). Unfixable items are terminal — once
+    # an item is deemed unfixable it drops out of the active failure pool, so if this
+    # file were overwritten per-round, an earlier round's unfixable items would be lost
+    # (no longer in failures.json to re-surface). Merge with any prior unfixable,
+    # dedup by node_id (first-wins keeps the original diagnosis).
     unfixable_path = out_dir / "unfixable.json"
+    prior_unfixable: list[dict] = []
+    if unfixable_path.exists():
+        try:
+            prior_unfixable = json.loads(unfixable_path.read_text())
+        except (json.JSONDecodeError, ValueError):
+            prior_unfixable = []
+    unfixable_this_round = len(unfixable_items)  # before merge with prior rounds
+    cumulative_unfixable: list[dict] = []
+    _seen_unfixable: set[str] = set()
+    for item in (*prior_unfixable, *unfixable_items):
+        nid = item.get("node_id")
+        if nid in _seen_unfixable:
+            continue
+        _seen_unfixable.add(nid)
+        cumulative_unfixable.append(item)
+    unfixable_items = cumulative_unfixable
     unfixable_path.write_text(json.dumps(unfixable_items, indent=2, ensure_ascii=False))
 
     # Increment attempt_count in manifest.json
@@ -928,7 +1018,8 @@ def cmd_incorporate_retry(args: argparse.Namespace) -> int:
         "summaries": len(payload_data.get("summaries", [])),
         "failures": len(payload_data.get("failures", [])),
         "still_retryable": len(still_failing),
-        "unfixable": len(unfixable_items),
+        "unfixable": len(unfixable_items),  # cumulative across all rounds so far
+        "unfixable_this_round": unfixable_this_round,  # newly detected this round only
         "final_payload_path": str(final_payload_path),
         "retry_payload_path": str(retry_payload_path) if retry_payload_path.exists() else None,
         "unfixable_path": str(unfixable_path),
