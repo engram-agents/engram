@@ -1122,3 +1122,375 @@ class TestDisabledGuardObservability:
             f"Expected exactly 1 'walguard ... disabled' line; got {len(lines)}.\n"
             f"Full stderr:\n{output}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 11. #786 ordering + read-mark regression tests
+# ---------------------------------------------------------------------------
+
+class TestNapWalShmRaceOrderingFix:
+    """Regression tests for the #786 nap WAL/shm race fix.
+
+    Two tests:
+      A. Ordering test: dump_stripped is called BEFORE wal_checkpoint(TRUNCATE).
+         Spies on both calls, records invocation order, asserts backup precedes
+         checkpoint.  This test would FAIL against the pre-fix code.
+
+      B. Round-trip freshness test: write data that sits in the WAL
+         (uncommitted to the main file at checkpoint time), run _commit_snapshot,
+         restore knowledge.sql into a fresh DB, assert row counts match —
+         proving no committed write is lost across the new ordering.
+    """
+
+    def setup_method(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="engram_test_786_ordering_"))
+        for key in list(sys.modules):
+            if key == "server" or (key.startswith("engram_") and key != "engram_walguard"):
+                del sys.modules[key]
+        os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
+        os.environ["ENGRAM_NO_DB_GUARDS"] = "1"
+        import server
+        server._configure_paths(self.tmp)
+        server._ensure_data_dir()
+        server.core._git_available = True
+        self.server = server
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_minimal_db(self) -> sqlite3.Connection:
+        """Bootstrap a minimal WAL-mode DB via server._get_db()."""
+        db_path = self.tmp / "knowledge.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS nodes (
+                id TEXT PRIMARY KEY, type TEXT NOT NULL, claim TEXT,
+                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00',
+                source_url TEXT, source_title TEXT, source_domain TEXT,
+                source_date TEXT, source_accessed TEXT, content_snippet TEXT,
+                evidence_id TEXT, quoted_text TEXT, interpretation TEXT, quote_type TEXT,
+                predicted_event TEXT, resolution_timeframe TEXT,
+                status TEXT DEFAULT 'active', resolved_by TEXT,
+                logical_chain TEXT, confidence REAL, confidence_history TEXT DEFAULT '[]',
+                supersedes TEXT, superseded_by TEXT, is_current INTEGER DEFAULT 1,
+                metadata TEXT DEFAULT '{}', importance_base REAL DEFAULT 0.5,
+                importance_score REAL DEFAULT 0.5, recall_turn INTEGER DEFAULT 0,
+                recall_count INTEGER DEFAULT 0, memory_status TEXT DEFAULT 'active',
+                utility_score REAL DEFAULT 0.0, embedding TEXT
+            );
+            CREATE TABLE IF NOT EXISTS edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id TEXT NOT NULL, target_id TEXT NOT NULL,
+                relation TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00',
+                UNIQUE(source_id, target_id, relation)
+            );
+            CREATE TABLE IF NOT EXISTS sequences (
+                node_type TEXT PRIMARY KEY, last_num INTEGER NOT NULL DEFAULT 0
+            );
+        """)
+        conn.execute(
+            "INSERT OR IGNORE INTO nodes (id, type, claim, created_at) "
+            "VALUES ('ax_0001', 'axiom', 'test axiom', '2026-01-01T00:00:00')"
+        )
+        conn.commit()
+        conn.close()
+        return self.server._get_db()
+
+    def _make_fake_git_result(self, returncode=0, stdout="", stderr=""):
+        r = mock.MagicMock()
+        r.returncode = returncode
+        r.stdout = stdout
+        r.stderr = stderr
+        return r
+
+    def _mock_git(self, *args, **kwargs):
+        if args and args[0] == "check-ignore":
+            return self._make_fake_git_result(returncode=1)
+        if args and args[0] == "status":
+            return self._make_fake_git_result(returncode=0, stdout="M knowledge.sql")
+        if args and args[0] == "commit":
+            return self._make_fake_git_result(returncode=0)
+        if args and args[0] == "rev-parse":
+            return self._make_fake_git_result(returncode=0, stdout="abc123fake")
+        if args and args[0] == "push":
+            return self._make_fake_git_result(returncode=0)
+        return self._make_fake_git_result(returncode=0)
+
+    def test_dump_before_checkpoint_ordering(self):
+        """dump_stripped is invoked BEFORE wal_checkpoint — the #786 Option A fix.
+
+        Spies on engram_backup.dump_stripped and on the PRAGMA wal_checkpoint
+        call via a wrapper around engram_core's ``_commit_snapshot`` internals.
+        sqlite3.Connection.execute is a C-extension method and cannot be monkey-
+        patched directly; instead we intercept at the engram_backup module level
+        (spy on dump_stripped) and intercept the checkpoint PRAGMA by wrapping
+        the connection in a subclass that records checkpoint calls.
+
+        Strategy: pass a custom Connection subclass that logs wal_checkpoint
+        calls, then assert dump_stripped precedes any checkpoint.  The subclass
+        technique works because sqlite3.Connection supports subclassing.
+
+        This test would FAIL against the pre-fix ordering (checkpoint at step 2,
+        dump at step 2b).
+        """
+        call_order = []
+
+        import engram_backup as _eb
+
+        original_dump_stripped = _eb.dump_stripped
+
+        def spy_dump_stripped(*args, **kwargs):
+            call_order.append("dump_stripped")
+            return original_dump_stripped(*args, **kwargs)
+
+        # Build a subclass of sqlite3.Connection that records wal_checkpoint calls.
+        class SpyConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                if isinstance(sql, str) and "wal_checkpoint" in sql.lower():
+                    call_order.append("wal_checkpoint")
+                return super().execute(sql, parameters)
+
+        # Bootstrap the DB using the server helper, then reopen via SpyConnection.
+        self._make_minimal_db()  # creates schema + seeds data; returns and closes conn
+        db_path = str(self.tmp / "knowledge.db")
+        spy_conn = SpyConnection(db_path)
+        spy_conn.row_factory = sqlite3.Row
+
+        with mock.patch.object(_eb, "dump_stripped", side_effect=spy_dump_stripped), \
+             mock.patch.object(self.server.core, "_git", side_effect=self._mock_git):
+            result = self.server._commit_snapshot(spy_conn, "ordering test", "test")
+        spy_conn.close()
+
+        assert "dump_stripped" in call_order, (
+            f"dump_stripped was never called; result={result}"
+        )
+        # Under skip_checkpoint=False (default) and _dump_error=None the checkpoint
+        # must fire exactly once.  Assert unconditionally so the test fails closed
+        # if the checkpoint never fires rather than passing vacuously.
+        assert call_order.count("wal_checkpoint") == 1, (
+            f"expected exactly one wal_checkpoint call; call_order={call_order}"
+        )
+        dump_idx = call_order.index("dump_stripped")
+        ckpt_idx = call_order.index("wal_checkpoint")
+        assert dump_idx < ckpt_idx, (
+            f"wal_checkpoint fired BEFORE dump_stripped — #786 ordering regression!\n"
+            f"call_order={call_order}"
+        )
+
+    def test_dump_failure_skips_checkpoint_and_releases_read_mark(self):
+        """dump_stripped failure: no wal_checkpoint, wal_warning reflects skip, conn not in txn.
+
+        Regression test for the dump-failure safety branch of _commit_snapshot
+        (PR #1219, #786 fix).  When dump_stripped raises, the function must:
+
+          (a) NOT call wal_checkpoint — skipping WAL compaction is conservative
+              (WAL carries to next nap); checkpointing after a failed dump risks
+              losing the WAL-resident data that the dump was meant to capture.
+
+          (b) Set wal_warning to a string that indicates the checkpoint was
+              skipped due to the failed dump (contains "skipped" + "dump failed").
+
+          (c) Leave conn with no dangling open transaction: the finally-COMMIT
+              in the read-mark acquisition block must fire regardless of the
+              dump exception, so conn.in_transaction is False after the call.
+        """
+        import engram_backup as _eb
+
+        call_order = []
+
+        class SpyConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                if isinstance(sql, str) and "wal_checkpoint" in sql.lower():
+                    call_order.append("wal_checkpoint")
+                return super().execute(sql, parameters)
+
+        # Bootstrap the DB using the server helper, then reopen via SpyConnection.
+        self._make_minimal_db()
+        db_path = str(self.tmp / "knowledge.db")
+        spy_conn = SpyConnection(db_path)
+        spy_conn.row_factory = sqlite3.Row
+
+        def failing_dump_stripped(*args, **kwargs):
+            raise RuntimeError("simulated dump failure")
+
+        with mock.patch.object(_eb, "dump_stripped", side_effect=failing_dump_stripped), \
+             mock.patch.object(self.server.core, "_git", side_effect=self._mock_git):
+            result = self.server._commit_snapshot(spy_conn, "dump failure test", "test")
+
+        # (a) wal_checkpoint must NOT have been called.
+        assert "wal_checkpoint" not in call_order, (
+            f"wal_checkpoint was called despite dump_stripped raising; "
+            f"call_order={call_order}. The dump-failure safety branch is broken: "
+            f"checkpointing after a failed dump risks losing WAL-resident data."
+        )
+
+        # (b) wal_warning must reflect the skipped checkpoint due to dump failure.
+        assert "wal_warning" in result, (
+            f"wal_warning key absent from result after dump failure; result={result}. "
+            f"The agent has no visibility that the checkpoint was skipped."
+        )
+        wal_warning = result["wal_warning"]
+        assert "skipped" in wal_warning, (
+            f"wal_warning does not contain 'skipped': {wal_warning!r}"
+        )
+        assert "dump failed" in wal_warning, (
+            f"wal_warning does not contain 'dump failed': {wal_warning!r}"
+        )
+
+        # (c) The read-mark's finally-COMMIT must have fired: no dangling txn.
+        assert not spy_conn.in_transaction, (
+            f"conn.in_transaction is True after _commit_snapshot — the read-mark's "
+            f"finally-COMMIT did not fire after dump_stripped raised. "
+            f"This leaves a dangling open transaction on the connection."
+        )
+
+        spy_conn.close()
+
+    def test_wal_data_survives_in_roundtrip(self):
+        """Data written to the WAL before _commit_snapshot survives in the SQL dump.
+
+        Empirical proof of the fix: write nodes to a WAL-mode DB so the data
+        lives in the WAL (not yet checkpointed to the main file), run
+        _commit_snapshot (which now dumps THEN checkpoints), restore
+        knowledge.sql into a fresh DB, and verify row counts match.
+
+        This confirms Connection.backup() captures WAL-resident writes without
+        a prior checkpoint — the theoretical basis for Option A being safe.
+        """
+        import sys as _sys
+
+        conn = self._make_minimal_db()
+
+        # Write two extra nodes — they land in the WAL, not the main db file.
+        for i in range(2):
+            conn.execute(
+                "INSERT OR IGNORE INTO nodes (id, type, claim, created_at) VALUES (?, ?, ?, ?)",
+                (f"ob_wal_{i}", "observation", f"wal-resident claim {i}", "2026-01-01T00:00:00"),
+            )
+        conn.commit()
+
+        # Record expected row count from the live DB before the snapshot.
+        expected_nodes = conn.execute("SELECT count(*) FROM nodes").fetchone()[0]
+        assert expected_nodes >= 3, f"fixture must have >= 3 nodes; got {expected_nodes}"
+
+        with mock.patch.object(self.server.core, "_git", side_effect=self._mock_git):
+            result = self.server._commit_snapshot(conn, "wal freshness test", "test")
+        conn.close()
+
+        # knowledge.sql must have been written.
+        sql_path = self.tmp / "knowledge.sql"
+        assert sql_path.exists(), f"knowledge.sql was not written; result={result}"
+        assert sql_path.stat().st_size > 0, "knowledge.sql is empty"
+
+        # Restore into a fresh DB and verify counts.
+        recon_path = self.tmp / "recon.db"
+        rc = sqlite3.connect(str(recon_path))
+        rc.executescript(sql_path.read_text(encoding="utf-8"))
+        restored_nodes = rc.execute("SELECT count(*) FROM nodes").fetchone()[0]
+        rc.close()
+
+        assert restored_nodes == expected_nodes, (
+            f"WAL-resident data lost in round-trip: "
+            f"expected {expected_nodes} nodes, restored {restored_nodes}.\n"
+            f"This means dump_stripped missed WAL-resident writes — #786 fix broken."
+        )
+
+
+# ---------------------------------------------------------------------------
+# 12. Read-mark statement actually acquires a WAL read mark
+# ---------------------------------------------------------------------------
+
+class TestReadMarkStatementActuallyHoldsMark:
+    """Regression test proving that the read-mark statement reads a real page.
+
+    `SELECT 1` is a constant-expression query — SQLite evaluates it without
+    touching any database page, so it acquires NO WAL read mark.  A concurrent
+    `wal_checkpoint(TRUNCATE)` from another connection therefore returns
+    busy=0 (not blocked), which means the Option B belt does nothing.
+
+    `SELECT count(*) FROM sqlite_master` reads page 1 (the schema page, always
+    present), which forces SQLite to assign a read mark in the WAL read-lock
+    table.  The same concurrent TRUNCATE checkpoint then returns busy=1
+    (blocked), confirming the mark is held.
+
+    Two sub-tests:
+      - Positive control: the production statement (sqlite_master count) holds
+        the mark → checkpoint returns busy == 1.
+      - Negative control: the old statement (`SELECT 1`) does NOT hold the
+        mark → checkpoint returns busy == 0.
+
+    This test would have caught the silent no-op before the fix landed.
+    """
+
+    def _run_read_mark_scenario(self, read_stmt: str) -> int:
+        """Return the busy count from TRUNCATE checkpoint after read_stmt.
+
+        Opens a WAL-mode temp DB, writes WAL frames from connection W,
+        then from connection R does BEGIN DEFERRED + read_stmt, and
+        concurrently from connection W runs PRAGMA wal_checkpoint(TRUNCATE).
+        Returns the busy value (0 = not blocked, 1 = blocked by R's read mark).
+        """
+        import tempfile as _tmp
+        import os as _os
+
+        db_dir = _tmp.mkdtemp(prefix="engram_readmark_")
+        db_path = _os.path.join(db_dir, "test.db")
+        try:
+            # W: set up WAL-mode DB and write frames into the WAL.
+            w = sqlite3.connect(db_path)
+            w.execute("PRAGMA journal_mode=WAL")
+            w.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            w.execute("INSERT INTO t VALUES (1, 'hello')")
+            w.commit()
+            # Force a second WAL frame so there's real content to checkpoint.
+            w.execute("INSERT INTO t VALUES (2, 'world')")
+            w.commit()
+
+            # R: open a reader, start a deferred transaction, execute the
+            # candidate read-mark statement.
+            r = sqlite3.connect(db_path)
+            r.execute("BEGIN DEFERRED")
+            r.execute(read_stmt)
+            # R now holds (or does not hold) a WAL read mark depending on
+            # whether read_stmt touched a real page.
+
+            # W: attempt TRUNCATE checkpoint while R has the "read mark".
+            row = w.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            # row = (busy, log, ckpt): busy==1 means at least one reader
+            # blocked the truncation.
+            busy = row[0]
+
+            # Cleanup
+            r.execute("COMMIT")
+            r.close()
+            w.close()
+            return busy
+        finally:
+            import shutil as _shutil
+            _shutil.rmtree(db_dir, ignore_errors=True)
+
+    def test_read_mark_statement_actually_holds_mark(self):
+        """Positive control: sqlite_master count blocks TRUNCATE (busy == 1)."""
+        busy = self._run_read_mark_scenario("SELECT count(*) FROM sqlite_master")
+        assert busy == 1, (
+            f"Expected busy=1 (TRUNCATE blocked by read mark) with "
+            f"'SELECT count(*) FROM sqlite_master'; got busy={busy}. "
+            f"The read-mark statement is NOT acquiring a real WAL read mark — "
+            f"Option B belt is a silent no-op."
+        )
+
+    def test_select_one_does_not_hold_mark(self):
+        """Negative control: SELECT 1 does NOT block TRUNCATE (busy == 0).
+
+        This is the pre-fix behaviour that prompted the defect report.
+        If this assertion fails it means SQLite's behaviour changed and
+        SELECT 1 now touches a page (unlikely but worth knowing).
+        """
+        busy = self._run_read_mark_scenario("SELECT 1")
+        assert busy == 0, (
+            f"Expected busy=0 (TRUNCATE NOT blocked) with 'SELECT 1'; "
+            f"got busy={busy}. SQLite may have changed how it handles "
+            f"constant-expression queries — re-evaluate whether 'SELECT 1' "
+            f"now acquires a WAL read mark."
+        )
