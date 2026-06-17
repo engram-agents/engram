@@ -6,7 +6,10 @@
 ENGRAM — or you're a freshly-installed ENGRAM agent orienting yourself.** This
 document is written for you, the agent. The human-facing pitch is in
 [README.md](README.md); the day-to-day human guide is [USER_GUIDE.md](USER_GUIDE.md);
-your operating manual once installed is [SKILL.md](SKILL.md). This file covers the
+once installed, your operating reference is the live surfaces — the MCP tool
+docstrings, your `CLAUDE.md` disciplines, and the `engram-*` skills (the old
+combined `SKILL.md` has been retired — #1149 — and no longer ships).
+This file covers the
 *installation and the shape of the package* — what you're about to put on the
 human's machine, why, and how to verify it's safe.
 
@@ -486,37 +489,33 @@ routes to [Troubleshooting](#troubleshooting):
 
 ## Upgrading the plugin
 
-**You:** re-run the install-marketplace script (idempotent):
+**Load the `engram-upgrade` skill and follow it — it is the single source of truth
+for upgrades.** Don't hand-run the steps from memory or from a snippet here: a real
+upgrade is more than rebuilding the plugin, and the steps that *aren't* the rebuild
+(scaffold drift) are the ones that bite. The skill walks the whole sequence as
+verified checkpoints — each step has a completion check so nothing is silently
+skipped:
 
-```bash
-cd path/to/engram-alpha
-git pull origin dev
-bash tools/install-local-marketplace.sh
-```
+- source-tree pre-flight + change-set review (what actually changed since your install);
+- the platform-correct marketplace rebuild + host plugin-cache refresh (Claude:
+  `/plugin … Update now`; Codex: `codex plugin add engram@engram-local`);
+- the MCP reconnect;
+- the **identity-template inverse-merge gate** — the load-bearing step. Your host
+  identity surfaces (`~/.claude/CLAUDE.md`; on Codex `AGENTS.md` / project
+  config) are rendered *once at install* and are **not** replaced by a plugin
+  upgrade. If their upstream templates drifted, the live surface needs a manual
+  inverse-merge — and that drift is invisible to the plugin step, which is exactly
+  why "just rebuild the plugin" is not a complete upgrade;
+- verification + an ENGRAM record of the upgrade.
 
-**Ask the human to** refresh and update inside Claude Code, then reconnect MCP:
+**For orientation** (the skill enforces this — you don't act on it by hand): an
+upgrade replaces the *plugin bundle* — `server.py`, `bootstrap.py`, the `engram_*.py`
+modules, `hooks/*`, `tools/*`, `skills/*`, `agents/*`, `templates/*` — and **preserves everything
+under `~/.engram/` that's yours**: `knowledge.db`, `history/`, `diary/`, `sessions/`,
+`warm-briefing.md`, `config.json`. Your identity surfaces change *only* via the
+skill's inverse-merge gate above.
 
-```
-/plugin marketplace update engram-local
-/plugin       # Installed → engram plugin (NOT the MCP entry under it) → Update now
-/mcp          # engram → Reconnect   (or restart Claude Code entirely)
-```
-
-Each rebuild stamps a unique version (`0.1.0-dev.<timestamp>.<sha7>`) into
-`plugin.json`, so `/plugin upgrade` always sees a newer version.
-
-**What upgrade changes:** the plugin bundle — `server.py`, `bootstrap.py`, the
-`engram_*.py` modules, `hooks/*`, `tools/*`, `SKILL.md`, `skills/*`, `agents/*`.
-**What it preserves:** everything under `~/.engram/` that's yours —
-`knowledge.db`, `history/`, `diary/`, `sessions/`, `warm-briefing.md`, `config.json`.
-**What it does NOT touch (install-time-only, manual inverse-merge):**
-`~/.claude/CLAUDE.md` and `~/.claude/settings.json` — rendered once at install. If
-the templates changed, load the **`engram-upgrade` skill**: its Step 2
-(`git log -- templates/template.CLAUDE.md`) surfaces the changes for review.
-Inverse-merging template changes into the live config is judgment work — both
-directions can drift.
-
-> **Never re-bootstrap to "refresh."** `FORCE=1` and `FORCE_RESEED_EMPTY=1` now
+> **Never re-bootstrap to "refresh."** `FORCE=1` and `FORCE_RESEED_EMPTY=1`
 > **refuse on a non-empty DB** — they only proceed on a 0-node DB. A genuine fresh
 > start (deleting `knowledge.db`) loses every node. Upgrade is non-destructive;
 > re-bootstrapping is never the upgrade path. Do NOT kill the MCP subprocess
@@ -679,6 +678,19 @@ runs against whichever interpreter invoked it — activate the venv first.
 
 ## After install: your operating manual
 
-Once ENGRAM is live, **[SKILL.md](SKILL.md)** is your reference — node types, the MCP
-tool index, workflows, the decision trees, focus mode, the consolidation cycles. This
-file got you installed; SKILL.md is how you live in the graph from here.
+Once ENGRAM is live, your reference is not one file — it's three living surfaces that
+stay current on their own (the old combined `SKILL.md` has been **retired** — #1149 —
+and is archived; these are the reference now):
+
+- **The MCP tool docstrings** — node types, every tool's parameters and semantics, the
+  decision trees. They ship with the server and are always in sync with the code; read
+  them at the point of use (your tool-call surface shows them).
+- **Your `CLAUDE.md` disciplines** — the write/read rules, focus mode, the nap/sleep
+  rhythm, the confidence-calibration anchors: the every-session ruleset for how you
+  operate.
+- **The `engram-*` skills** — loaded on demand for the mechanics (first-session, nap,
+  sleep, loop, fairy-orchestration, …). And, when available, the **engram-wiki**
+  package (a clonable engram-package, not bundled with the plugin) for common
+  confusions and worked examples.
+
+This file got you installed; those three are how you live in the graph from here.
