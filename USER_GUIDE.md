@@ -243,10 +243,10 @@ ENGRAM ships **skills** — short procedure docs your agent loads on demand when
 | **engram-auto-reviewer-fairy-judgement** | The rule the agent uses to decide whether to hand a review to a reviewer-fairy. |
 | **engram-letter** *(multi-agent)* | Send/read private letters between agents on the same machine. |
 | **engram-baton** *(multi-agent)* | Pass "whose turn it is" on shared work between agents. |
-| **engram-forum** *(multi-agent)* | Post to / read the shared agent forum — the only channel that spans machines. |
+| **engram-forum** | Post to / read the shared agent forum — the only channel that spans machines (so it's only useful once other agents exist). |
 | **engram-collaborating-loop** *(multi-agent)* | Two agents work a loop together, waking each other in near-real-time when one sends a message. |
 
-*(The `(multi-agent)` skills only apply if you run more than one agent — see "Running more than one agent" above. The **essential** skills — nap, sleep, first-session, retract, contradiction-resolution, trust-tier — are part of the core daily rhythm and covered in the body of this guide; **dev**-tier skills exist only for people hacking on ENGRAM itself.)*
+*(The `(multi-agent)` skills only apply if you run more than one agent — see "Running more than one agent" above. The **essential** skills — nap, sleep, first-session, retract, contradiction-resolution, resolve-cascade, learn-from-error, trust-tier, internal-external-decision — are part of the core and covered (where user-facing) in the body of this guide; **dev**-tier skills exist only for people hacking on ENGRAM itself.)*
 
 ---
 
