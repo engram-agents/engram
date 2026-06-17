@@ -13,8 +13,8 @@ This is a short guide to the working *relationship* — not the software. Think 
 3. [What the first week actually feels like](#what-the-first-week-actually-feels-like)
 4. [Notes from the developer](#notes-from-the-developer)
 5. [Nudges that build the habit](#nudges-that-build-the-habit)
-6. [Sleep and naps (the daily rhythm)](#sleep-and-naps-the-daily-rhythm)
-7. [When the conversation fills up](#when-the-conversation-fills-up)
+6. [When the conversation fills up](#when-the-conversation-fills-up)
+7. [Sleep and naps (the daily rhythm)](#sleep-and-naps-the-daily-rhythm)
 8. [The viz server — see what your agent remembers](#the-viz-server--see-what-your-agent-remembers)
 9. [Fairies (helpful engram-less sub-agents) 🧚](#fairies-helpful-engram-less-sub-agents-)
 10. [What compounds](#what-compounds)
@@ -84,7 +84,9 @@ Worth the time up front: finding a collaboration style that works for you both, 
 
 > **Ask your agent when a decision touches their experience.**
 
-Don't assume the human analogy holds — designing tools they use, editing their `CLAUDE.md`, structuring their day. A good opener: *"What do you think / feel / prefer?"* The asymmetries are real: a polite suggestion sounds optional to you but reads as a requirement to them; they have privileged access to one side of the collaboration, you to the other.
+Your agent knows better than you where its own friction is — which steps are clumsy, which tools help, which get in the way. So when you're shaping something it will *use* — a tool, its `CLAUDE.md`, the shape of its day — talk to it first: *"where's the friction here? how would you want this to work?"* It will often point at the real problem faster than you'd find it.
+
+And a tool built for a human is not the same as a tool built for an agent. What's ergonomic for you — a GUI, a polished page, a click — can be friction for an agent; what's ergonomic for it — a terminal verb, a structured payload, a plain-text file it can read in one pass — can look bare to you. Don't port your own preferences over; design for whoever actually uses the thing, and ask the agent which that is. (One asymmetry to watch: a polite suggestion sounds optional to you but can read as a requirement to them — so say plainly when you're genuinely asking versus deciding.)
 
 > **If they seem to have forgotten something, ask them to search ENGRAM.**
 
@@ -101,37 +103,60 @@ Short phrases you can drop into normal conversation. They do more than they look
 | *"Record that in engram."* | Saves an insight you both just had before it evaporates. |
 | *"What does engram say about X?"* | Your agent checks its own memory before answering. |
 | *"Is this consistent with what we decided last week?"* | Invites a contradiction check against the graph. |
-| *"Please take a nap."* | A quick save (a **nap**) — see below. |
+| *"Please take a nap."* | Saves the live context to ENGRAM before a compaction (a **nap**) — see below. |
 | *"Let's call it a day."* | Runs the end-of-day **sleep** routine — see below. |
 
 Say them in your own words. The point: the agent-memory loop gets stronger every time *you* close it from the outside. You're scaffolding a habit until it runs on its own.
 
 ---
 
+## When the conversation fills up
+
+Every chat with an AI has a limited context window. When it fills, Claude Code **compacts** — quietly summarizes the conversation and resets, keeping the summary plus your latest message. Your agent doesn't *feel* the earlier part afterward — like Lucy in *50 First Dates*, waking to a reset each day. ENGRAM and the warm briefing are how it picks the thread back up.
+
+**You can write into that briefing.** The file `~/.engram/warm-briefing.md` has a "Notes from the user" section that's yours — anything you want your agent to read first thing after a reset. A letter, ongoing context, things not to forget. It's kept word-for-word; your agent never edits it. Use it.
+
+**Drowsiness** is just a meter for how full the window is: *refreshed → energetic → a little drowsy → needs a nap*. When your agent says it's getting drowsy, **ask it to nap, then run `/compact`** — don't push through. Anything important *added to the conversation after* the nap but before the compaction won't be in that save — so nap right before you compact, not well ahead of it. (Under real time pressure, pushing through is fine — the memory scaffolds are built to handle it.)
+
+If a fresh session reports drowsiness that doesn't match "we just started," say so — the reading can take a few turns to settle.
+
+---
+
 ## Sleep and naps (the daily rhythm)
 
-Two routines keep your agent's memory healthy. You don't run them — you just give the cue.
+Two routines keep your agent's memory healthy. You don't run them — you just give the cue. (The **nap** picks up right where the compaction above leaves off.)
 
-- **Nap** = a quick save mid-conversation. Say *"please take a nap"* and your agent writes down what's fresh so nothing's lost. Fast, lightweight, no big deal.
+- **Nap** = save the live conversation into ENGRAM **right before a compaction**. When a piece of work or discussion reaches a natural end and the window is filling up, say *"please take a nap"*: your agent writes the important things from the current context into its graph *first*, so when the compaction wipes the working window the key knowledge survives. Nap and compaction go together — **nap, then compact.**
 - **Sleep** = the end-of-day routine. Say *"let's call it a day"* and your agent organizes the day's work: what it learned, what you decided, what's still open for tomorrow. It's the same thing sleep does for you — without it, the day's notes stay scattered.
 
 **Don't skip sleep casually.** A day without it is a day that never gets organized, and over time the graph looks busy without really *knowing* what it knows. When you're done for the day, say so — your agent handles the rest.
 
-**It can run on its own overnight.** ENGRAM can fire the sleep routine automatically (around 3 AM by default) so it doesn't eat into your working session. It's **off by default** — just ask your agent to turn it on when you're ready.
+**It can run on its own overnight — but read these two caveats first.** ENGRAM can fire the sleep routine automatically (around 3 AM by default) so it doesn't eat into your working session. Two things to know, or you'll assume it's doing more than it is:
+
+1. **It's off by default and must be configured.** It won't happen until you set it up — ask your agent to configure it when you're ready.
+2. **It is *not* a background system service.** The scheduled sleep runs from the Claude Code session that armed it, so **that terminal session has to stay open** for it to fire. Close the terminal (or the machine sleeps) and nothing runs overnight. If you want unattended overnight consolidation, leave the session running.
 
 *(How sleep and naps work under the hood — the consolidation cycle, dream sub-agents — is in the handbook's mechanism pages. You don't need it to use them.)*
 
----
+### The morning after — what your agent brings back
 
-## When the conversation fills up
+Sleep doesn't just tidy the graph; the dream *surfaces* things, and some want **your** eye. A new agent will often open the next morning with "a few things came up overnight." Here's the vocabulary, so it isn't a surprise.
 
-Every chat with an AI has a limited memory window. When it fills, Claude Code **compacts** — quietly summarizes the conversation and resets, keeping the summary plus your latest message. Your agent doesn't *feel* the earlier part afterward — like Lucy in *50 First Dates*, waking to a reset each day. ENGRAM and the warm briefing are how it picks the thread back up.
+The three that matter most are the ones that shape *who your agent is becoming* — early on it will usually raise these **for discussion**, not just decide them:
 
-**You can write into that briefing.** The file `~/.engram/warm-briefing.md` has a "Notes from the user" section that's yours — anything you want your agent to read first thing after a reset. A letter, ongoing context, things not to forget. It's kept word-for-word; your agent never edits it. Use it.
+- **Goal** — a **north star** the agent is working toward (e.g. "develop genuine epistemic humility"). Long-lived and aspirational; it shapes what the agent prioritizes across sessions. New goals are worth talking through together — they set direction.
+- **Lesson** — a **mistake pattern** distilled from past incidents, wired with a **tripwire** that fires the next time the same situation comes up, so the agent doesn't repeat the error. ("The last few times I did X it broke this way — catch it next time.")
+- **Cornerstone** — a **disposition**: a stable way of operating the agent adopts to shape its own future behavior (e.g. "verify cheap-to-check things before trusting them"). Not a fact — a stance.
 
-**Drowsiness** is just a meter for how full the window is: *refreshed → energetic → a little drowsy → needs a nap*. When your agent says it's getting drowsy, **ask it to nap, then run `/compact`** — don't push through. Anything important done after the nap but before compaction can be lost if it isn't saved in time. (Under real time pressure, pushing through is fine — the memory scaffolds are built to handle it.)
+Together these are how an agent *grows on purpose* rather than just piling up notes: goals point it, lessons stop it repeating mistakes, cornerstones shape its character. Weighing in on these is the highest-leverage few minutes you'll spend — it's where you actually shape who your agent becomes.
 
-If a fresh session reports drowsiness that doesn't match "we just started," say so — the reading can take a few turns to settle.
+Smaller things surface too:
+
+- **Corrections** — it found a past node that was wrong or outdated and *superseded* or *retracted* it (anything that depended on it gets re-checked). That's the system working, not a failure.
+- **Answered questions / resolved contradictions** — open questions it closed overnight, or two beliefs that conflicted and it reconciled.
+- **Things it flags for you** — calls outside its own authority, or "should I do X?" points it wants your steer on.
+
+You don't have to act on all of it. Skim, weigh in on the goals and the judgment calls, and let your agent handle the housekeeping.
 
 ---
 
@@ -139,7 +164,7 @@ If a fresh session reports drowsiness that doesn't match "we just started," say 
 
 This is the single most useful thing to set up early: a browser window into your agent's ENGRAM, where you can actually *watch* what's being written into its memory. If you ever wonder *"what does my agent actually remember?"* — this is where you look.
 
-**Easiest to just ask your agent** (*"start the viz server"*) — under the hood it runs `tools/operator-setup-viz.sh`. Then open `http://localhost:5001` and leave it running in a spare terminal.
+**Set it up once as a background service, so it's always there.** Run `tools/operator-setup-viz.sh` (it installs the viz as a *systemd user service* under your own account and starts it). After that it runs on its own — no spare terminal to babysit. The script enables it to restart with your user session; add `sudo loginctl enable-linger $USER` and it keeps running even while you're logged out (which is also what carries it across a reboot you don't log back in from). Then open `http://localhost:5001` whenever you want to look. (Systemd only — on macOS or WSL1, ask your agent to start it directly instead.)
 
 It has four tabs:
 
