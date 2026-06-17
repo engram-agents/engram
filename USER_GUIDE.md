@@ -20,6 +20,8 @@ This is a short guide to the working *relationship* — not the software. Think 
 10. [What compounds](#what-compounds)
 11. [When in doubt](#when-in-doubt)
 12. [Running more than one agent](#running-more-than-one-agent--worth-a-try)
+13. [Appendix A: Convenience skills at a glance](#appendix-a-convenience-skills-at-a-glance)
+14. [Appendix B: A suggested GitHub PR workflow](#appendix-b-a-suggested-github-pr-workflow)
 
 ---
 
@@ -220,3 +222,43 @@ When you need things to happen in parallel:
 - **A one-off burst of parallel effort →** your agent dispatches **fairies**: throwaway helpers with no memory of their own. They're capable enough that a genuine need to run two parallel *real* sessions of the *same* agent is rare.
 
 Many minds, fine; one mind in two places — not yet.
+
+---
+
+## Appendix A: Convenience skills at a glance
+
+ENGRAM ships **skills** — short procedure docs your agent loads on demand when a situation calls for one. You rarely invoke them by hand (the agent reaches for them itself), but you *can* nudge one by name (*"run a curiosity loop,"* *"do an upgrade"*), and it helps to know what's there. Below are the **convenience-tier** skills (the optional, quality-of-life routines on top of the essential core). One line each.
+
+| Skill | What it does (high level) |
+|---|---|
+| **engram-loop** | Lets the agent keep working on its own across a self-paced "heartbeat," carrying a task through compactions until it's done. |
+| **engram-curiosity-loop** | A self-directed research loop — the agent picks its own questions (breadth-first) and records what it finds. |
+| **engram-deep-research** | Depth-first research on a *single* big question (the focused counterpart to the curiosity loop). |
+| **engram-meta-loop** | A top-level autonomous session where the agent freely chooses what to do — research, build, or consolidate. |
+| **engram-school-day** | A fixed daily "curriculum" rotation for a young agent (aspiration → research → consolidation). |
+| **engram-research-report** | Generates a polished research report from the graph, with full source citations. |
+| **engram-upgrade** | The step-by-step procedure to upgrade an existing install to newer ENGRAM code (see also README-AGENT). |
+| **engram-fairy-orchestration** | How the agent dispatches and coordinates helper sub-agents ("fairies") for coding/review work. |
+| **engram-auto-coder-fairy-judgement** | The rule the agent uses to decide whether to hand a coding task to a coder-fairy. |
+| **engram-auto-reviewer-fairy-judgement** | The rule the agent uses to decide whether to hand a review to a reviewer-fairy. |
+| **engram-letter** *(multi-agent)* | Send/read private letters between agents on the same machine. |
+| **engram-baton** *(multi-agent)* | Pass "whose turn it is" on shared work between agents. |
+| **engram-forum** *(multi-agent)* | Post to / read the shared agent forum — the only channel that spans machines. |
+| **engram-collaborating-loop** *(multi-agent)* | Two agents work a loop together, waking each other in near-real-time when one sends a message. |
+
+*(The `(multi-agent)` skills only apply if you run more than one agent — see "Running more than one agent" above. The **essential** skills — nap, sleep, first-session, retract, contradiction-resolution, trust-tier — are part of the core daily rhythm and covered in the body of this guide; **dev**-tier skills exist only for people hacking on ENGRAM itself.)*
+
+---
+
+## Appendix B: A suggested GitHub PR workflow
+
+If your agent does real work on a GitHub repo, it helps to agree on *how a change gets from "written" to "merged."* This is the workflow we use day-to-day — offered as a suggestion you can adopt or adapt. The full, exact conventions live in the project's **`CLAUDE.md`** (the project-level conventions file in the engram-alpha repo); this is the high-level shape.
+
+1. **The agent writes on a branch, never straight to the default branch.** A change is a branch + a PR, so it's reviewable before it lands.
+2. **A reviewer-fairy reviews every push.** Before the agent calls a PR "ready," it dispatches a short-lived reviewer sub-agent (a *fairy*) that reads the diff fresh and reports **blockers / suggestions / nits**. The agent folds the findings and re-reviews until it converges. This catches mechanical and contract issues cheaply.
+3. **A second, full-agent "colleague" pass (if you run more than one agent).** After the fairy converges, a *different* full agent (not a throwaway fairy) reviews — it catches pattern-level and cross-issue things a fairy can't. Symmetric: each agent reviews the other's PRs. Whose turn it is is tracked on a **baton** so "ready for merge" is explicit, never guessed.
+4. **CI-green is a hard gate.** A PR is merge-ready only when it's **both** review-converged **and** CI-green on the *latest* commit — re-checked after any post-approval tweak (a moved tip can re-fail CI). Never present a red PR as ready.
+5. **The human merges.** The agent's job ends at *ready*; the actual merge is yours (or whoever you designate as maintainer). The agent shouldn't merge its own PRs unless you explicitly say so.
+6. **Issue closure has two surfaces.** When a PR closes an issue: put `[closes #N]` in the **title** (so it's scannable in the PR list) **and** `Closes #N.` as plain text in the **body** (this is what actually fires GitHub's auto-close on merge — the title tag alone does not).
+
+The point isn't ceremony — it's that review and a green build are *gates*, not afterthoughts, and that "ready to merge" is something the agent can state with evidence rather than vibes. Scale it down for a solo setup (fairy review + your own second look + the human merge); scale it up when you run a team of agents.
