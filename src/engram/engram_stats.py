@@ -37,6 +37,19 @@ import engram_core as core
 # and _diagnose_impl
 # ---------------------------------------------------------------------------
 
+# Module-level SSoT for the node types that carry a calibratable confidence
+# distribution. Promoted from a function-local tuple so other surfaces (the viz
+# /api/schema endpoint, its CI drift gate) can import the canonical set instead
+# of replicating it (#1225).
+_CONFIDENCE_BEARING_TYPES = (
+    "observation_factual",
+    "derivation",
+    "conjecture",
+    "lesson",
+    "axiom",
+    "definition",
+)
+
 
 def _compute_confidence_distribution(
     conn: sqlite3.Connection,
@@ -62,14 +75,7 @@ def _compute_confidence_distribution(
     )
 
     # ── by_type: full quantile stats ──────────────────────────────────────
-    _CONFIDENCE_BEARING_TYPES = (
-        "observation_factual",
-        "derivation",
-        "conjecture",
-        "lesson",
-        "axiom",
-        "definition",
-    )
+    # _CONFIDENCE_BEARING_TYPES is now a module-level constant (promoted #1225).
     by_type: dict = {}
     for ntype in _CONFIDENCE_BEARING_TYPES:
         rows = conn.execute(

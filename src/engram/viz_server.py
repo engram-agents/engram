@@ -59,6 +59,75 @@ except ImportError:
     _HEALTH_SCORE_AVAILABLE = False
     _compute_health_score = None  # type: ignore[assignment]
 
+# _CONFIDENCE_BEARING_TYPES — calibration SSoT, imported from engram_stats
+# (promoted to a module-level constant in #1225) so /api/schema and its CI drift
+# gate track the real source rather than a replica. On import failure the empty
+# tuple makes the drift test fail loudly (vs a replica that would pass trivially).
+try:
+    from engram_stats import _CONFIDENCE_BEARING_TYPES  # noqa: E402
+except ImportError:
+    _CONFIDENCE_BEARING_TYPES = ()  # type: ignore[assignment]
+
+try:
+    from engram_core import (  # noqa: E402
+        VALID_NODE_TYPES,
+        CLAIM_BEARING_TYPES,
+        VALID_RELATIONS,
+        EDGE_CLASSIFICATIONS,
+    )
+    _SCHEMA_CORE_AVAILABLE = True
+except ImportError:
+    _SCHEMA_CORE_AVAILABLE = False
+    VALID_NODE_TYPES = set()  # type: ignore[assignment]
+    CLAIM_BEARING_TYPES = set()  # type: ignore[assignment]
+    VALID_RELATIONS = set()  # type: ignore[assignment]
+    EDGE_CLASSIFICATIONS = {}  # type: ignore[assignment]
+
+try:
+    from engram_query import (  # noqa: E402
+        _LOGICAL_SUBSTRATE_RELATIONS,
+        _CONTEXTUAL_RELATIONS,
+    )
+    _SCHEMA_QUERY_AVAILABLE = True
+except ImportError:
+    _SCHEMA_QUERY_AVAILABLE = False
+    _LOGICAL_SUBSTRATE_RELATIONS = frozenset()  # type: ignore[assignment]
+    _CONTEXTUAL_RELATIONS = frozenset()  # type: ignore[assignment]
+
+
+def get_schema_data() -> dict:
+    """Return the schema SSoT as a JSON-serialisable dict.
+
+    Builds from engram_core / engram_query / engram_stats constants.
+    No DB access required — the schema is static.  Called by the
+    /api/schema endpoint and directly by the CI drift gate.
+    """
+    # Logical-substrate set: the 9 from engram_query plus instantiates
+    # (instantiates is in VALID_RELATIONS but in neither _LOGICAL_SUBSTRATE_RELATIONS
+    # nor _CONTEXTUAL_RELATIONS — treat as logical-substrate per spec §Deliverable 1).
+    logical_substrate = sorted(
+        set(_LOGICAL_SUBSTRATE_RELATIONS) | {"instantiates"}
+    )
+    contextual = sorted(_CONTEXTUAL_RELATIONS)
+
+    relations_detail = {
+        rel: {
+            "cascade": bool(EDGE_CLASSIFICATIONS.get(rel, {}).get("cascade", False)),
+            "provenance": bool(EDGE_CLASSIFICATIONS.get(rel, {}).get("provenance", False)),
+        }
+        for rel in VALID_RELATIONS
+    }
+
+    return {
+        "node_types": sorted(VALID_NODE_TYPES),
+        "claim_bearing_types": sorted(CLAIM_BEARING_TYPES),
+        "confidence_bearing_types": sorted(_CONFIDENCE_BEARING_TYPES),
+        "relations": relations_detail,
+        "logical_substrate_relations": logical_substrate,
+        "contextual_relations": contextual,
+    }
+
+
 DEFAULT_DB = str(Path.home() / ".engram" / "knowledge.db")
 DEFAULT_PORT = 5001
 
@@ -795,27 +864,60 @@ HTML = r"""<!DOCTYPE html>
 // Constants
 // ═══════════════════════════════════════════════════════════════════
 
-const NODE_TYPES = {
-  evidence:                { color: '#4a90d9', label: 'Evidence' },
-  axiom:                   { color: '#ff6f61', label: 'Axiom' },
-  definition:              { color: '#26c6da', label: 'Definition' },
-  observation_factual:     { color: '#5cb85c', label: 'Obs. Factual' },
-  observation_predictive:  { color: '#f0ad4e', label: 'Obs. Predictive' },
-  prediction:              { color: '#ffc107', label: 'Prediction' },
-  conjecture:              { color: '#ff9800', label: 'Conjecture' },
-  derivation:              { color: '#b05ce6', label: 'Derivation' },
-  theory:                  { color: '#7c4dff', label: 'Theory' },
-  contradiction:           { color: '#e05252', label: 'Contradiction' },
-  question:                { color: '#17a2b8', label: 'Question' },
-  goal:                    { color: '#00e676', label: 'Goal' },
-  goal_tension:            { color: '#76ff03', label: 'Goal Tension' },
-  feeling_report:          { color: '#f48fb1', label: 'Feeling' },
-  person:                  { color: '#ffd54f', label: 'Person' },
-  lesson:                  { color: '#80deea', label: 'Lesson' },
-  task:                    { color: '#a1887f', label: 'Task' },
+// ═══════════════════════════════════════════════════════════════════
+// Schema-driven style maps (populated by fetchSchema() at init time)
+// ═══════════════════════════════════════════════════════════════════
+//
+// NODE_STYLE[type] = {color, label}   — all 18 node types from /api/schema
+// EDGE_STYLE[rel]  = {color, dash}    — all 13 relations from /api/schema
+//   dash: '' (solid) if cascade||provenance is true; '4,3' (dashed) otherwise
+//
+// Override maps preserve the existing look for known types; any future type
+// added to the schema auto-gets a deterministic generated color.
+
+const NODE_COLOR_OVERRIDE = {
+  evidence:                '#4a90d9',
+  axiom:                   '#ff6f61',
+  definition:              '#26c6da',
+  observation_factual:     '#5cb85c',
+  observation_predictive:  '#f0ad4e',
+  prediction:              '#ffc107',
+  conjecture:              '#ff9800',
+  derivation:              '#b05ce6',
+  theory:                  '#7c4dff',
+  contradiction:           '#e05252',
+  question:                '#17a2b8',
+  goal:                    '#00e676',
+  goal_tension:            '#76ff03',
+  feeling_report:          '#f48fb1',
+  person:                  '#ffd54f',
+  lesson:                  '#80deea',
+  task:                    '#a1887f',
+  cornerstone:             '#ff8f00',   // deep amber — distinct from axiom/person/goal
 };
 
-const EDGE_COLORS = {
+const NODE_LABEL_OVERRIDE = {
+  evidence:                'Evidence',
+  axiom:                   'Axiom',
+  definition:              'Definition',
+  observation_factual:     'Obs. Factual',
+  observation_predictive:  'Obs. Predictive',
+  prediction:              'Prediction',
+  conjecture:              'Conjecture',
+  derivation:              'Derivation',
+  theory:                  'Theory',
+  contradiction:           'Contradiction',
+  question:                'Question',
+  goal:                    'Goal',
+  goal_tension:            'Goal Tension',
+  feeling_report:          'Feeling',
+  person:                  'Person',
+  lesson:                  'Lesson',
+  task:                    'Task',
+  cornerstone:             'Cornerstone',
+};
+
+const EDGE_COLOR_OVERRIDE = {
   cites:         '#7799bb',
   supported_by:  '#5cb85c',
   contradicts:   '#e05252',
@@ -823,14 +925,44 @@ const EDGE_COLORS = {
   derives_from:  '#b05ce6',
   supersedes:    '#f0ad4e',
   retracts:      '#cc3333',
+  // New relations: distinct colors not colliding with the 7 above
+  exemplifies:   '#80cbc4',
+  instantiates:  '#ce93d8',
+  about:         '#ffb74d',
+  serves:        '#aed581',
+  tensions:      '#ff8a65',
+  subtask_of:    '#90a4ae',
 };
+
+// Deterministic color generation: hash type/rel string → HSL hue (fixed S=65%,L=55%)
+// Used as fallback for any schema entry not in the override maps.
+function _hashStringToColor(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = (h * 31 + s.charCodeAt(i)) & 0xffffffff;
+  }
+  const hue = Math.abs(h) % 360;
+  return `hsl(${hue},65%,55%)`;
+}
+
+function _prettifyType(s) {
+  // "observation_factual" → "Observation Factual" (title-case, underscores→spaces)
+  return s.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+// NODE_STYLE and EDGE_STYLE are populated by fetchSchema() before first render.
+let NODE_STYLE = {};
+let EDGE_STYLE = {};
 
 // ═══════════════════════════════════════════════════════════════════
 // State
 // ═══════════════════════════════════════════════════════════════════
 
 let rawData = { nodes: [], edges: [] };
-let activeTypes = new Set(Object.keys(NODE_TYPES));
+// activeTypes is initialised from NODE_STYLE keys in fetchSchema() — after the
+// schema endpoint resolves and NODE_STYLE is populated, the full set of known
+// types (including cornerstone) is active by default.
+let activeTypes = new Set();
 let showSuperseded = false;
 let showLabels = true;
 let showTierOpacity = true;
@@ -864,10 +996,9 @@ let TIER2_MAX = 1000;
 // ═══════════════════════════════════════════════════════════════════
 
 // Identity-backbone node types: always shown in legible-default mode.
-// cornerstone is intentionally included even though it is not in NODE_TYPES
-// (and therefore not rendered in full-graph mode via the type-filter panel) —
-// backbone types bypass the activeTypes gate so they are always visible when
-// showFullGraph is false.
+// cornerstone is now a fully-styled type (in NODE_STYLE) and appears in the
+// type-filter panel; BACKBONE_TYPES retains it here so it is always visible
+// when showFullGraph is false (backbone bypasses the activeTypes gate).
 const BACKBONE_TYPES = new Set(['cornerstone', 'axiom', 'goal', 'person']);
 
 // How many recent nodes (by created_at DESC, excluding backbone) to include.
@@ -944,22 +1075,28 @@ function initWhatsNew(nodes) {
 const svg = d3.select('#graph-svg');
 const container = svg.append('g').attr('class', 'zoom-container');
 
-// Arrowhead markers (one per relation)
+// Arrowhead markers — one per relation, built after fetchSchema() populates
+// EDGE_STYLE so all 13 relations get markers (not just the old 7).
 const defs = svg.append('defs');
-Object.entries(EDGE_COLORS).forEach(([rel, color]) => {
-  defs.append('marker')
-    .attr('id', `arrow-${rel}`)
-    .attr('viewBox', '0 -4 8 8')
-    .attr('refX', 0)
-    .attr('refY', 0)
-    .attr('markerWidth', 5)
-    .attr('markerHeight', 5)
-    .attr('orient', 'auto')
-    .append('path')
-    .attr('d', 'M0,-4L8,0L0,4')
-    .attr('fill', color)
-    .attr('opacity', 0.8);
-});
+
+function buildArrowheadMarkers() {
+  // Clear any previously built markers (idempotent for schema reload).
+  defs.selectAll('marker').remove();
+  Object.entries(EDGE_STYLE).forEach(([rel, style]) => {
+    defs.append('marker')
+      .attr('id', `arrow-${rel}`)
+      .attr('viewBox', '0 -4 8 8')
+      .attr('refX', 0)
+      .attr('refY', 0)
+      .attr('markerWidth', 5)
+      .attr('markerHeight', 5)
+      .attr('orient', 'auto')
+      .append('path')
+      .attr('d', 'M0,-4L8,0L0,4')
+      .attr('fill', style.color)
+      .attr('opacity', 0.8);
+  });
+}
 
 const linkGroup = container.append('g').attr('class', 'links');
 const nodeGroup = container.append('g').attr('class', 'nodes');
@@ -1016,7 +1153,7 @@ function nodeOpacity(d, tierMap) {
 }
 
 function nodeColor(d) {
-  return (NODE_TYPES[d.type] || { color: '#888' }).color;
+  return (NODE_STYLE[d.type] || { color: '#888' }).color;
 }
 
 function nodeDisplayText(d) {
@@ -1108,8 +1245,8 @@ function legibleNodeIds() {
 
 function filteredData() {
   // In legible-default mode, restrict to the backbone+recent subset first.
-  // Backbone nodes bypass the activeTypes check (cornerstone is not in NODE_TYPES
-  // and would otherwise be dropped by the activeTypes gate).
+  // Backbone nodes (cornerstone/axiom/goal/person) bypass the activeTypes check
+  // so they are always visible in legible mode regardless of filter state.
   // The showSuperseded filter is applied uniformly to both modes.
   let nodes;
   if (!showFullGraph) {
@@ -1163,13 +1300,15 @@ function render() {
     .join(
       enter => enter.append('line')
         .attr('class', d => `link ${d.relation}`)
-        .attr('stroke', d => EDGE_COLORS[d.relation] || '#666')
+        .attr('stroke', d => (EDGE_STYLE[d.relation] || { color: '#666' }).color)
         .attr('stroke-width', 1.5)
+        .attr('stroke-dasharray', d => (EDGE_STYLE[d.relation] || { dash: '' }).dash || null)
         .attr('marker-end', d => `url(#arrow-${d.relation})`)
         .attr('opacity', 0)
         .call(sel => sel.transition().duration(400).attr('opacity', 1)),
       update => update
-        .attr('stroke', d => EDGE_COLORS[d.relation] || '#666')
+        .attr('stroke', d => (EDGE_STYLE[d.relation] || { color: '#666' }).color)
+        .attr('stroke-dasharray', d => (EDGE_STYLE[d.relation] || { dash: '' }).dash || null)
         .attr('marker-end', d => `url(#arrow-${d.relation})`),
       exit => exit.transition().duration(300).attr('opacity', 0).remove()
     );
@@ -1338,7 +1477,7 @@ function showTooltip(event, d) {
   const tierLabel = tier === 1 ? 'Tier 1 (working)' : tier === 2 ? 'Tier 2 (searchable)' : 'Tier 3 (archive)';
   const tierColor = tier === 1 ? '#5cb85c' : tier === 2 ? '#f0ad4e' : '#e05252';
 
-  let lines = [`<b>${d.id}</b> <span style="color:#7788aa">${NODE_TYPES[d.type]?.label || d.type}</span>`];
+  let lines = [`<b>${d.id}</b> <span style="color:#7788aa">${NODE_STYLE[d.type]?.label || d.type}</span>`];
   const text = nodeDisplayText(d);
   if (text !== d.id) lines.push(truncate(text, 80));
   if (d.confidence != null) lines.push(`Confidence: ${(d.confidence * 100).toFixed(0)}%`);
@@ -1374,7 +1513,7 @@ function selectNode(d) {
   // Panel header
   document.getElementById('detail-id').textContent = d.id;
   const badge = document.getElementById('detail-type-badge');
-  badge.textContent = NODE_TYPES[d.type]?.label || d.type;
+  badge.textContent = NODE_STYLE[d.type]?.label || d.type;
   badge.style.background = (nodeColor(d) + '33');
   badge.style.color = nodeColor(d);
   badge.style.border = `1px solid ${nodeColor(d)}55`;
@@ -1681,9 +1820,9 @@ function selectNode(d) {
         const src = e.source_id || (e.source?.id) || e.source;
         const tgt = e.target_id || (e.target?.id) || e.target;
         const otherId = isOutgoing ? tgt : src;
-        const color = EDGE_COLORS[e.relation] || '#888';
+        const color = (EDGE_STYLE[e.relation] || { color: '#888' }).color;
         const otherNode = rawData.nodes.find(n => n.id === otherId);
-        const otherType = otherNode ? (NODE_TYPES[otherNode.type]?.label || otherNode.type) : '';
+        const otherType = otherNode ? (NODE_STYLE[otherNode.type]?.label || otherNode.type) : '';
         const otherClaim = otherNode ? truncate(nodeDisplayText(otherNode), 60) : '';
         const otherColor = otherNode ? nodeColor(otherNode) : '#888';
 
@@ -2049,10 +2188,11 @@ svg.on('click', () => {
 // ═══════════════════════════════════════════════════════════════════
 
 function buildSidebar() {
-  // Node type filters
+  // Node type filters — built from NODE_STYLE (all 18 types from /api/schema,
+  // including cornerstone which was previously missing).
   const tf = document.getElementById('type-filters');
   tf.innerHTML = '';
-  Object.entries(NODE_TYPES).forEach(([key, { color, label }]) => {
+  Object.entries(NODE_STYLE).forEach(([key, { color, label }]) => {
     const div = document.createElement('div');
     div.className = `type-filter${activeTypes.has(key) ? '' : ' dimmed'}`;
     div.dataset.type = key;
@@ -2067,14 +2207,17 @@ function buildSidebar() {
     tf.appendChild(div);
   });
 
-  // Edge legend
+  // Edge legend — built from EDGE_STYLE (all 13 relations from /api/schema).
+  // Each swatch shows the relation's color AND its solid/dashed line style.
   const el = document.getElementById('edge-legend');
   el.innerHTML = '';
-  Object.entries(EDGE_COLORS).forEach(([rel, color]) => {
-    const isDashed = rel === 'supersedes' || rel === 'retracts';
+  Object.entries(EDGE_STYLE).forEach(([rel, { color, dash }]) => {
+    const isDashed = !!dash;
     el.insertAdjacentHTML('beforeend',
       `<div class="edge-legend-row">
-        <div class="edge-line" style="background:${color};${isDashed ? 'background:repeating-linear-gradient(90deg,'+color+' 0,'+color+' 5px,transparent 5px,transparent 8px)' : ''}"></div>
+        <div class="edge-line" style="${isDashed
+          ? 'background:repeating-linear-gradient(90deg,' + color + ' 0,' + color + ' 4px,transparent 4px,transparent 7px)'
+          : 'background:' + color}"></div>
         <span>${rel}</span>
       </div>`
     );
@@ -2103,6 +2246,64 @@ function withAgent(path) {
   const a = currentAgent();
   if (!a) return path;
   return path + (path.includes('?') ? '&' : '?') + 'agent=' + encodeURIComponent(a);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Schema fetch — populates NODE_STYLE and EDGE_STYLE from /api/schema
+// ═══════════════════════════════════════════════════════════════════
+
+async function fetchSchema() {
+  // /api/schema is agent-agnostic (static schema data), but we pass the
+  // agent param if present for consistency with the rest of the API.
+  try {
+    const res = await fetch(withAgent('/api/schema'));
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const schema = await res.json();
+
+    // Build NODE_STYLE: one entry per node_types entry
+    NODE_STYLE = {};
+    (schema.node_types || []).forEach(type => {
+      NODE_STYLE[type] = {
+        color: NODE_COLOR_OVERRIDE[type] || _hashStringToColor(type),
+        label: NODE_LABEL_OVERRIDE[type] || _prettifyType(type),
+      };
+    });
+
+    // Build EDGE_STYLE: one entry per relations entry
+    // dash: solid (empty) if cascade||provenance; dashed ('4,3') otherwise
+    EDGE_STYLE = {};
+    const relMap = schema.relations || {};
+    Object.entries(relMap).forEach(([rel, info]) => {
+      const isSolid = !!(info.cascade || info.provenance);
+      EDGE_STYLE[rel] = {
+        color: EDGE_COLOR_OVERRIDE[rel] || _hashStringToColor(rel),
+        dash: isSolid ? '' : '4,3',
+      };
+    });
+
+    // Initialise activeTypes from the full NODE_STYLE key set (all schema types
+    // are active by default — user can deselect from the filter panel).
+    activeTypes = new Set(Object.keys(NODE_STYLE));
+
+    // Build arrowhead markers for all 13 relations.
+    buildArrowheadMarkers();
+  } catch (err) {
+    console.warn('fetchSchema failed — falling back to override maps:', err);
+    // Fallback: build minimal style from the override maps so the page still
+    // renders even if /api/schema is unavailable.
+    NODE_STYLE = {};
+    Object.entries(NODE_COLOR_OVERRIDE).forEach(([type, color]) => {
+      NODE_STYLE[type] = { color, label: NODE_LABEL_OVERRIDE[type] || _prettifyType(type) };
+    });
+    EDGE_STYLE = {};
+    Object.entries(EDGE_COLOR_OVERRIDE).forEach(([rel, color]) => {
+      // Fallback dash: use the cascade/provenance heuristic based on known types
+      const solidRels = new Set(['cites', 'derives_from', 'retracts', 'supersedes', 'supported_by']);
+      EDGE_STYLE[rel] = { color, dash: solidRels.has(rel) ? '' : '4,3' };
+    });
+    activeTypes = new Set(Object.keys(NODE_STYLE));
+    buildArrowheadMarkers();
+  }
 }
 
 async function loadAgents() {
@@ -2177,7 +2378,7 @@ async function fetchGraph() {
     });
     const sd = document.getElementById('stats-detail');
     sd.innerHTML = '';
-    Object.entries(NODE_TYPES).forEach(([key, { label }]) => {
+    Object.entries(NODE_STYLE).forEach(([key, { label }]) => {
       const cnt = byCurrent[key] || 0;
       if (cnt === 0) return;
       sd.insertAdjacentHTML('beforeend',
@@ -2291,14 +2492,19 @@ window.addEventListener('resize', () => { updateSimCenter(); simulation.alpha(0.
 // Init
 // ═══════════════════════════════════════════════════════════════════
 
-buildSidebar();
 updateSimCenter();
-// Resolve the agent dropdown first (sets URL param if needed) so the very
-// first /api/graph fetch is already scoped to the right agent.
-loadAgents().then(() => {
-  fetchGraph();
-  autoRefreshInterval = setInterval(fetchGraph, 10000);
-});
+// Init sequence:
+// 1. Resolve the agent URL param (loadAgents) so subsequent fetches are agent-scoped.
+// 2. Fetch the schema SSoT (/api/schema) to populate NODE_STYLE + EDGE_STYLE.
+// 3. Build the sidebar (type filters + edge legend) from the schema-derived maps.
+// 4. Fetch the graph data and start auto-refresh.
+loadAgents().then(() =>
+  fetchSchema().then(() => {
+    buildSidebar();
+    fetchGraph();
+    autoRefreshInterval = setInterval(fetchGraph, 10000);
+  })
+);
 </script>
 <!--NAV_SCRIPT_PLACEHOLDER-->
 </body>
@@ -4893,6 +5099,10 @@ class Handler(BaseHTTPRequestHandler):
                 resp = get_graph(db_path)
                 resp["agent"] = agent_name
                 self._json(resp)
+        elif path == "/api/schema":
+            # Schema is static (no DB required) — return the SSoT dict built
+            # from engram_core / engram_query / engram_stats constants.
+            self._json(get_schema_data())
         elif path == "/api/meta":
             meta_resp = {"agent": agent_name,
                          "db_path": db_path,
