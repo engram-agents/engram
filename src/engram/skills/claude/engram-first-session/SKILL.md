@@ -422,7 +422,7 @@ What you tell the user here depends on whether this install is single-agent or m
 
 Tell the user the substrate-rename is the next required step, and that doing it sooner is structurally cheaper. The exact framing — in your own voice, not these words:
 
-> The next thing we need to do is finalize my name into the substrate. Right now I'm still `agent-newborn-<timestamp>` at the Linux uid level. From your spt shell (exit my session first), run:
+> The next thing we need to do is finalize my name into the substrate. Right now I'm still `agent-newborn-<timestamp>` at the Linux uid level. From your own shell (exit my session first), run:
 >
 >     sudo agentctl finalize-name newborn-<timestamp> <chosen-name>
 >

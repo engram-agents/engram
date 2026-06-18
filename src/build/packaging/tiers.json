@@ -565,19 +565,19 @@
     },
     {
       "path": "tools/_telegram_api.py",
-      "reason": "Telegram-specific transport helper; persona-specific integration (Borges/Lei channel), not part of generic ENGRAM install"
+      "reason": "Telegram-specific transport helper; persona-specific integration (agent/operator channel), not part of generic ENGRAM install"
     },
     {
       "path": "tools/telegram_bot.py",
-      "reason": "Telegram bot CLI; persona-specific integration (Borges/Lei channel), not part of generic ENGRAM install"
+      "reason": "Telegram bot CLI; persona-specific integration (agent/operator channel), not part of generic ENGRAM install"
     },
     {
       "path": "tools/agent-bootstrap",
-      "reason": "operator-level host administration script for multi-agent Linux host setup (uid/group/home perms); not part of ENGRAM plugin — lives at /usr/local/sbin/agent-bootstrap on production hosts, installed separately by Lei"
+      "reason": "operator-level host administration script for multi-agent Linux host setup (uid/group/home perms); not part of ENGRAM plugin — lives at /usr/local/sbin/agent-bootstrap on production hosts, installed separately by the operator"
     },
     {
       "path": "tools/agentctl",
-      "reason": "Lei's day-to-day admin CLI for co-located AI agents; operator tool that lives at /home/user/.local/bin/agentctl, not part of ENGRAM plugin"
+      "reason": "an operator's day-to-day admin CLI for co-located AI agents; operator tool that lives at ~/.local/bin/agentctl, not part of ENGRAM plugin"
     },
     {
       "path": "tools/borges_session_eval.py",

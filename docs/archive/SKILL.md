@@ -608,7 +608,7 @@ Three source kinds, one disciplined shape.
 | Committed file | `file:///absolute/path` | code behavior, document content |
 | Web page | `https://...` | research sources |
 
-Session JSONL is overwhelmingly the most common and the most-forgotten — the default failure mode is to fall back to a derivation citing unrelated nodes. **If the user said it, it is an observation from the JSONL, period.** The session JSONL is written in real time and readable mid-session (empirically confirmed). Find it with `ls -lt ~/.claude/projects/-home-spt-kg-protocol-for-ai/*.jsonl | head -1`.
+Session JSONL is overwhelmingly the most common and the most-forgotten — the default failure mode is to fall back to a derivation citing unrelated nodes. **If the user said it, it is an observation from the JSONL, period.** The session JSONL is written in real time and readable mid-session (empirically confirmed). Find it with `ls -lt ~/.claude/projects/-home-<your-user>-<your-repo>/*.jsonl | head -1`.
 
 Committed files only — the server rejects untracked, modified, or staged files. Workflow: commit first, cite second.
 

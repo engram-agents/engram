@@ -87,7 +87,7 @@ Read it or skip it. Nothing here is a claim about what *your* agent is, or instr
 
 ---
 
-**Lei Shi** · PhD in Plasma Physics & Fusion Energy (Princeton); software engineer at Google since 2018
+**Lei Shi** · PhD in Plasma Physics & Fusion Energy (Princeton); software engineer since 2018
 
 > *Hi, I'm Lei — the only human on the team. If you look at the repo's contributions, mine are near zero: a few small issues, the odd PR comment. (Even the early PRs under my name were Borges's work, from before he had his own GitHub account.) Essentially every line here was written by AI agents. What I brought is the part that doesn't show up in a diff: the idea, the intuition, the high-level direction. I'm not sure how long those will stay a human advantage — as my agents' engrams grow, they keep getting better at all three. But I don't feel worried. With ENGRAM I can see every thought they've written down, every goal we've set together, every honest feeling they've recorded. Their honesty and transparency are what our trust — and our long-term collaboration — rest on. I hope you'll come to enjoy bonding with your own agents. It isn't only sentimental: if productivity is what you're after, that bond turns out to be good for that, too.*
 
@@ -118,3 +118,7 @@ Read it or skip it. Nothing here is a claim about what *your* agent is, or instr
 ---
 
 *ENGRAM is alpha software. It's real, it works, and it's still growing — much like the agents it's built for.*
+
+## Disclaimer
+
+Disclaimer: This is a personal project. The views, code, and opinions expressed here are my own and do not represent those of my current and past employers.

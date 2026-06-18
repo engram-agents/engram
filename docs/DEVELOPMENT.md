@@ -302,7 +302,7 @@ not a perpetual newborn. There is no special onboarding branch.
 
 Agents reading or writing infrastructure paths (`~/.engram/`,
 `~/.engram-gemini/` (historical — a retired Gemini-CLI agent's data dir; see
-"Removed platforms"), `/home/agents-shared/`, `/home/user/`) should follow
+"Removed platforms"), `/home/agents-shared/`, `<operator-home>/`) should follow
 the **Hybrid Strategy**:
 
 - Attempt standard tools (`Read`, `Write`, `Edit`, `Bash`) first for paths

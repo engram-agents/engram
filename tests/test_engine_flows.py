@@ -1,7 +1,7 @@
 """Tests for tools.engine.flows — upgrade flow catalog.
 
 All tests use a FULLY FAKE ctx built with tmp dirs — they NEVER touch
-/home/agent-borges/.engram or the real repo state.
+~/.engram or the real repo state.
 
 Coverage:
   1. upgrade_flow() returns the expected 12 steps in the right order
@@ -84,7 +84,7 @@ def _make_fake_env(
     """Return (engram_home, source_dir, ctx) with fake directory structure.
 
     Creates minimal fake dirs/files needed for the upgrade flow steps.
-    Never touches /home/agent-borges/.engram.
+    Never touches ~/.engram.
     """
     import subprocess
 

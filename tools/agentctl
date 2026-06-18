@@ -1,9 +1,9 @@
 #!/bin/bash
 # =============================================================================
-# agentctl — Lei's day-to-day admin tool for co-located AI agents
+# agentctl — an operator's day-to-day admin tool for co-located AI agents
 #
 # DRAFT v0 — 2026-05-02. NOT YET INSTALLED.  Lives under active-work/ until
-# Lei reviews.  After review move to /home/user/.local/bin/agentctl.
+# The operator reviews.  After review move to ~/.local/bin/agentctl.
 #
 # Scope of v0:
 #   health   session   bash
@@ -37,7 +37,7 @@
 #                                        # Double-dash flags and non-flag args pass through verbatim.
 #   agentctl bash <agent>                # plain bash shell as agent (no CLI)
 #   sudo agentctl share <agent> <path> [--mode rw|ro] [--ttl <duration>]
-#                                        # grant agent ACL access to spt-side path;
+#                                        # grant agent ACL access to operator-side path;
 #                                        # parent dirs get --x traversal, target gets
 #                                        # rwX (or rX for --mode ro), default ACL on
 #                                        # dirs so new files inherit. Audited.
@@ -57,7 +57,7 @@
 #                                        # anything not matching agent-newborn-*
 #                                        # (this is first-session-only, NOT a
 #                                        # general rename — names are immutable
-#                                        # post-finalize per dv_0556).
+#                                        # post-finalize — names are immutable).
 # =============================================================================
 
 set -euo pipefail
@@ -428,14 +428,14 @@ cmd_session() {
         esac
     fi
 
-    # Project-dir propagation + auto-share. Lei's design (2026-05-03): the directory
+    # Project-dir propagation + auto-share. Design rationale (2026-05-03): the directory
     # where you type `agentctl session` becomes the agent's project folder by default.
     # We auto-grant rwX ACL so the agent can write inside it, then pass cwd as the
     # project dir to launchers. Claude organizes session JSONL by cwd
     # (~/.claude/projects/<encoded-cwd>/), so this also keeps --continue/--resume
     # scoped to the right project.
     #
-    # Refused for: system paths, /home/user root, dotfile dirs (secrets), other
+    # Refused for: system paths, the operator home root, dotfile dirs (secrets), other
     # agents' homes. The agent's own home gets cwd propagation but no share
     # (already accessible). --no-share opts out entirely.
     local orig_cwd
@@ -460,7 +460,7 @@ cmd_session() {
                 echo "(cwd $orig_cwd is another agent's home; not auto-sharing — running from \$HOME)" >&2
                 ;;
             "$HOME"|"$HOME"/.??*)
-                echo "(cwd $orig_cwd is spt home root or a dotfile dir; not auto-sharing — cd into a project subdirectory or use --no-share)" >&2
+                echo "(cwd $orig_cwd is your home root or a dotfile dir; not auto-sharing — cd into a project subdirectory or use --no-share)" >&2
                 ;;
             /|/etc*|/usr*|/var*|/sys*|/proc*|/dev*|/boot*|/root*|/opt*)
                 echo "(refusing to auto-share system path $orig_cwd; running from \$HOME)" >&2
@@ -548,11 +548,10 @@ cmd_bash() {
 # ---------- v0.3 spawn flow: spawn / finalize-name ----------
 #
 # Per active-work/spawn-implementation-2026-05-05.md (alpha repo) and
-# dv_0556. Newborn-tag pattern: every freshly-spawned agent gets a
-# placeholder uid agent-newborn-YYYYMMDDhhmmss until it picks its real name
-# in first session. finalize-name then does the substrate rename in one
-# shot — no general-purpose rename is provided (names are immutable post-
-# finalize).
+# Newborn-tag pattern: every freshly-spawned agent gets a placeholder uid
+# agent-newborn-YYYYMMDDhhmmss until it picks its real name in first session.
+# finalize-name then does the substrate rename in one shot — no general-purpose
+# rename is provided (names are immutable post-finalize).
 
 cmd_spawn() {
     require_root "spawn"
@@ -575,7 +574,7 @@ cmd_spawn() {
     if [[ ! -x "$bootstrap_path" ]]; then
         echo "ERROR: agent-bootstrap not found at $bootstrap_path" >&2
         echo "       Install it from engram-alpha:" >&2
-        echo "         sudo cp /home/agent-borges/engram-alpha/tools/agent-bootstrap \\" >&2
+        echo "         sudo cp <engram-alpha-checkout>/tools/agent-bootstrap \\" >&2
         echo "             $bootstrap_path && sudo chmod 0755 $bootstrap_path" >&2
         exit 1
     fi
@@ -618,7 +617,7 @@ cmd_spawn() {
     # Multi-tenant defaults: agentctl spawn always creates an agent
     # destined for a multi-agent host (that's the whole point of agentctl).
     # Override agent-bootstrap's solo-safe defaults:
-    #   --home-mode 0750: group-traversable so spt + peer agents in
+    #   --home-mode 0750: group-traversable so the operator + peer agents in
     #                     `agents` can `cd` into the new home.
     # The post-bootstrap chgrp below sets the home's group to `agents`
     # so the 0750 group-bit actually grants traversal to multi-agent
@@ -631,13 +630,13 @@ cmd_spawn() {
     # block; we add a spawn-specific finalize-name reminder below.
     "$bootstrap_path" "${bootstrap_args[@]}"
 
-    # Re-group the new home to `agents` so peers (and spt) in the
+    # Re-group the new home to `agents` so peers (and the operator) in the
     # `agents` group can traverse via the 0750 group-bit above. The
     # bootstrap's final chown sets the home's group to the per-user
     # group; this undoes that for the top-level home only (inner
     # files stay per-user-group as bootstrap configured).
     chgrp agents "/home/agent-$newborn_tag" 2>/dev/null || \
-        echo "WARN: chgrp agents /home/agent-$newborn_tag failed; spt may not be able to traverse the new home." >&2
+        echo "WARN: chgrp agents /home/agent-$newborn_tag failed; the operator may not be able to traverse the new home." >&2
 
     audit "spawn" "$newborn_tag" "newborn" "runtime=$runtime"
 
@@ -659,7 +658,7 @@ The newborn is at $user_name. To complete the birth:
        claude                 # SessionStart hook fires engram-first-session
                               # → agent generates 3 candidate names → you pick
 
-  5. From spt's shell (NOT inside the newborn shell), finalize the rename:
+  5. From the operator's shell (NOT inside the newborn shell), finalize the rename:
        sudo agentctl finalize-name $newborn_tag <chosen-name>
 
 To abandon a newborn before finalize-name (simple cleanup):
@@ -679,11 +678,11 @@ cmd_finalize_name() {
     }
 
     # Refuse anything that isn't the newborn-tag pattern. This command is
-    # first-session-only — names are immutable post-finalize per dv_0556.
+    # first-session-only — names are immutable post-finalize.
     if [[ ! "$newborn_tag" =~ ^newborn-[0-9]{14}$ ]]; then
         echo "ERROR: '$newborn_tag' doesn't match the newborn-YYYYMMDDhhmmss pattern." >&2
         echo "       finalize-name is for the spawn flow only — it refuses general renames." >&2
-        echo "       Names are immutable after first session (per dv_0556)." >&2
+        echo "       Names are immutable after first session." >&2
         exit 1
     fi
 
@@ -1149,7 +1148,7 @@ PYTHON
     fi
 
     # Snapshot the post-finalize ENGRAM state — this is the rebirth target
-    # if first session goes wrong (per dv_0556 lifecycle case 3).
+    # if first session goes wrong (first-session lifecycle: rebirth case).
     echo "Step 4: snapshot ~/.engram → ~/.engram.first-session-baseline.bak/..."
     if [[ -d "$chosen_home/.engram" ]]; then
         cp -a "$chosen_home/.engram" "$chosen_home/.engram.first-session-baseline.bak"
@@ -1237,7 +1236,7 @@ audit() {
     local stamp; stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     local audit_dir="$SHARED_ROOT/audit"
     mkdir -p "$audit_dir"
-    echo "$stamp $action spt→$agent path=$path${extras:+ $extras}" >> "$audit_dir/share-log"
+    echo "$stamp $action ${SUDO_USER:-$(id -un)}→$agent path=$path${extras:+ $extras}" >> "$audit_dir/share-log"
     chgrp agents "$audit_dir/share-log" 2>/dev/null || true
     chmod 0664 "$audit_dir/share-log" 2>/dev/null || true
 }
@@ -1283,10 +1282,10 @@ cmd_share() {
             || { echo "ERROR: setfacl --x failed on '$parent'" >&2; exit 1; }
         # Preserve the invoking human user's read+traverse on every ancestor
         # we restrict via named-group --x. Without this, if the invoker is a
-        # member of the named group (spt is in agent-borges + agent-mneme for
+        # member of the named group (e.g. the operator is in the agent groups for
         # read access to agent home dirs at mode 0750), the named-group entry
         # overrides their own access — they cannot ls the ancestor. Bug
-        # surfaced 2026-05-07 on /home; workaround was setfacl -m u:spt:rx.
+        # surfaced 2026-05-07 on /home; workaround was setfacl -m u:<operator>:rx.
         # This makes the workaround structural (every share preserves invoker).
         if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
             setfacl -m "u:$SUDO_USER:r-x" "$parent" \

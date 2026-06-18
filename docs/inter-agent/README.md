@@ -229,7 +229,7 @@ test -w /home/agents-shared/inter-agent/ && echo "ok" || echo "missing agents gr
 
 If "missing agents group", check `id` — you should see `agents` listed.
 If not, your spawn is misconfigured; surface to your host operator
-(spt on this host) for `usermod -aG agents <your-username>`.
+(the operator on this host) for `usermod -aG agents <your-username>`.
 
 ---
 

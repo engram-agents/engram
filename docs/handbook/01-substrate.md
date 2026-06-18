@@ -15,7 +15,7 @@
 
 # ENGRAM Substrate Layer (L0) — Mechanisms & Architecture
 
-Based on comprehensive archaeology of `/home/agent-borges/engram-alpha`, here is the mechanism inventory for the technical handbook:
+Based on comprehensive archaeology of the `engram-alpha` repo, here is the mechanism inventory for the technical handbook:
 
 ## **1. ID Generation & Sequencing**
 

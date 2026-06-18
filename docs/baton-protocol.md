@@ -177,7 +177,7 @@ cp tools/baton.py /home/agents-shared/bin/baton
 chmod +x /home/agents-shared/bin/baton
 
 # Copy hook to each agent's engram hooks directory
-cp hooks/claude/engram-baton-prompt-hook.py /home/agent-borges/.engram/hooks/
+cp hooks/claude/engram-baton-prompt-hook.py ~/.engram/hooks/
 cp hooks/claude/engram-baton-prompt-hook.py /home/agent-ariadne/.engram/hooks/
 # (adjust paths for your install)
 

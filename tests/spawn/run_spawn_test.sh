@@ -207,7 +207,7 @@ echo "  Phase 2: install.sh as $NEWBORN_USER"
 echo "========================================================="
 
 # The newborn's ~/.runtime/install.sh wraps alpha's install.sh. Run it
-# under the newborn's uid via sudo (sudo present in the image; spt's
+# under the newborn's uid via sudo (sudo present in the image; the operator's
 # sudoers config doesn't apply here since we're running in a container).
 if ! sudo -u "$NEWBORN_USER" -H bash -lc 'bash ~/.runtime/install.sh'; then
     echo
