@@ -35,6 +35,40 @@ os.environ.setdefault("ENGRAM_NO_DB_GUARDS", "1")
 
 
 @pytest.fixture(autouse=True)
+def _restore_context_tracker_in_sys_modules():
+    """Restore sys.modules['context_tracker'] to its pre-test state after each test.
+
+    Several session-start hook test helpers (_load_hook_module in
+    test_session_start_hook_calibration.py, test_session_start_hook_auto_sleep_cron.py,
+    and test_fairy_policy.py) install a MagicMock stub as sys.modules['context_tracker']
+    so the hook's module-level `from context_tracker import write_baseline` succeeds,
+    but they never restore the entry on teardown.
+
+    A stale MagicMock in sys.modules['context_tracker'] poisons any later test that
+    runs code containing `from context_tracker import estimate_usage, format_drowsiness`
+    (e.g. the UserPromptSubmit hook's nap-warning path in engram-surface-hook.py):
+    estimate_usage returns a truthy MagicMock, format_drowsiness returns another
+    MagicMock, and that MagicMock lands in the `parts` list causing
+    `TypeError: sequence item N: expected str instance, MagicMock found`.
+
+    Root cause: test_surface_hook_mcp_liveness.py::TestMcpLivenessIntegration::
+    test_main_emits_write_tool_warning_on_stale_marker fails in the full suite
+    (G3a) but passes in isolation because the MagicMock stub from the session-start
+    hook tests is present in sys.modules when the liveness test's main() runs.
+
+    Fix: save the pre-test entry and restore it unconditionally on teardown.
+    This is the correct scope — the stub is an implementation detail of each
+    test, not a suite-wide assumption.
+    """
+    original = sys.modules.get("context_tracker")
+    yield
+    if original is None:
+        sys.modules.pop("context_tracker", None)
+    else:
+        sys.modules["context_tracker"] = original
+
+
+@pytest.fixture(autouse=True)
 def mock_dns_resolution(request, monkeypatch):
     """Mock socket.getaddrinfo so tests don't depend on DNS infra.
 
