@@ -232,6 +232,13 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/worktree-gc.py",
+      "test_globs": [
+        "tests/test_worktree_gc.py"
+      ],
+      "note": "classify() decision-matrix unit tests; _is_clean and _pr_state monkeypatched so no real git/gh calls are made."
+    },
+    {
       "path_prefix_or_glob": "tools/surgical.py",
       "test_globs": [
         "tests/test_engine_unit.py"

@@ -255,6 +255,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/worktree-gc.py",
+      "tier": "convenience"
+    },
+    {
       "path": ".githooks/pre-push",
       "tier": "dev"
     },
