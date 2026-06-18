@@ -232,6 +232,12 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/release-cutover.py",
+      "test_globs": [
+        "tests/test_release_cutover.py"
+      ]
+    },
+    {
       "path_prefix_or_glob": "tools/worktree-gc.py",
       "test_globs": [
         "tests/test_worktree_gc.py"

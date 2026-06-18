@@ -267,6 +267,10 @@
       "tier": "dev"
     },
     {
+      "path": "tools/release-cutover.py",
+      "tier": "dev"
+    },
+    {
       "path": "tools/check-claude-md-drift.py",
       "tier": "dev"
     },
@@ -720,6 +724,10 @@
     {
       "path": "src/build/packaging/README.md",
       "reason": "README for the src/build/packaging directory — documentation, not shipped inside the plugin bundle"
+    },
+    {
+      "path": "release-minus-set.txt",
+      "reason": "release-cutover exclude manifest — consumed by tools/release-cutover.py at cutover time; not shipped in any install tier"
     }
   ],
   "build_inputs": [
