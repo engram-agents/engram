@@ -4056,6 +4056,13 @@ STATS_HTML = r"""<!DOCTYPE html>
            background: #1a1a2e; color: #e0e0e0; padding: 24px; }
     h1 { color: #00d4ff; font-size: 1.5em; margin-bottom: 16px; }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; }
+    /* Bottom section: tall Tool Decision Context (left) beside a stacked column
+       of Cohort / Recent Errors / Confidence Trends (right). align-items:start
+       lets the short right-column cards pack from the top and fill the blank
+       under the tall left card instead of flowing below the fold (#1225 Item 8). */
+    .stats-bottom { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+    .stats-col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+    @media (max-width: 900px) { .stats-bottom { grid-template-columns: 1fr; } }
     .card { background: #16213e; border-radius: 8px; padding: 16px; border: 1px solid #0f3460; }
     .card h3 { color: #00d4ff; font-size: 0.95em; margin-bottom: 10px; }
     .metric { display: flex; justify-content: space-between; padding: 4px 0;
@@ -4161,38 +4168,62 @@ STATS_HTML = r"""<!DOCTYPE html>
       html += '</tbody></table></div>';
     }
 
-    // Panel 3: tool decision context
+    // ── Bottom section (#1225 Item 8) ───────────────────────────────────
+    // Tool Decision Context is tall; Cohort-Aligned is a fixed short 10-row
+    // block. Lay them out as two columns — tall card on the left, a stacked
+    // column of the short cards (Cohort / Recent Errors / Confidence Trends)
+    // on the right — so the short cards fill the blank beside Tool Decision
+    // and stay above the fold instead of flowing below it.
+    let leftHtml = '';
+    let rightHtml = '';
+
+    // Left column: tool decision context (the tall one)
     if (d.tools && d.tools.length) {
-      html += '<div class="card" style="grid-column: span 2"><h3>Tool Decision Context (7d)</h3>'
+      leftHtml += '<div class="card"><h3>Tool Decision Context (7d)</h3>'
         + '<table><thead><tr><th>Tool</th><th>Status</th><th style="text-align:right">N</th></tr></thead><tbody>';
       d.tools.forEach(t => {
-        html += '<tr><td>' + esc(t.tool_name) + '</td><td>' + esc(t.result_status) + '</td><td style="text-align:right">' + t.n + '</td></tr>';
+        leftHtml += '<tr><td>' + esc(t.tool_name) + '</td><td>' + esc(t.result_status) + '</td><td style="text-align:right">' + t.n + '</td></tr>';
       });
-      html += '</tbody></table></div>';
+      leftHtml += '</tbody></table></div>';
     }
 
-    // Panel 4: cohort-aligned (last 10 turns)
+    // Right column (stacked): cohort-aligned (last 10 turns)
     if (d.cohort && d.cohort.length) {
-      html += '<div class="card" style="grid-column: span 2"><h3>Cohort-Aligned View (last 10 turns)</h3>'
+      rightHtml += '<div class="card"><h3>Cohort-Aligned View (last 10 turns)</h3>'
         + '<table><thead><tr><th>Turn</th><th style="text-align:right">Events</th><th style="text-align:right">Surface</th><th style="text-align:right">Tools</th><th style="text-align:right">Hooks</th></tr></thead><tbody>';
       d.cohort.forEach(c => {
-        html += '<tr><td>' + c.turn + '</td><td style="text-align:right">' + c.events + '</td><td style="text-align:right">' + c.surface_fires + '</td><td style="text-align:right">' + c.tool_calls + '</td><td style="text-align:right">' + c.hook_fires + '</td></tr>';
+        rightHtml += '<tr><td>' + c.turn + '</td><td style="text-align:right">' + c.events + '</td><td style="text-align:right">' + c.surface_fires + '</td><td style="text-align:right">' + c.tool_calls + '</td><td style="text-align:right">' + c.hook_fires + '</td></tr>';
       });
-      html += '</tbody></table></div>';
+      rightHtml += '</tbody></table></div>';
     }
 
-    // Panel 5: recent errors
+    // Right column (stacked): recent errors
     if (d.errors) {
       if (d.errors.length === 0) {
-        html += '<div class="card"><h3>Recent Errors (24h)</h3><p class="empty">No errors in the last 24 hours.</p></div>';
+        rightHtml += '<div class="card"><h3>Recent Errors (24h)</h3><p class="empty">No errors in the last 24 hours.</p></div>';
       } else {
-        html += '<div class="card" style="grid-column: span 2"><h3>Recent Errors (24h)</h3>'
+        rightHtml += '<div class="card"><h3>Recent Errors (24h)</h3>'
           + '<table><thead><tr><th>Time</th><th>Event</th><th>Source</th><th>Detail</th></tr></thead><tbody>';
         d.errors.forEach(e => {
-          html += '<tr><td>' + esc(e.ts) + '</td><td>' + esc(e.event_type) + '</td><td>' + esc(e.tool_name || e.hook_name || '') + '</td><td>' + esc(e.detail) + '</td></tr>';
+          rightHtml += '<tr><td>' + esc(e.ts) + '</td><td>' + esc(e.event_type) + '</td><td>' + esc(e.tool_name || e.hook_name || '') + '</td><td>' + esc(e.detail) + '</td></tr>';
         });
-        html += '</tbody></table></div>';
+        rightHtml += '</tbody></table></div>';
       }
+    }
+
+    // Confidence Trends is appended into #stats-col-right by
+    // renderConfidenceTrends() once /api/calibration resolves.
+    if (leftHtml) {
+      // Two columns: tall left, stacked right.
+      html += '<div class="stats-bottom">'
+        + '<div class="stats-col stats-col-left">' + leftHtml + '</div>'
+        + '<div class="stats-col stats-col-right" id="stats-col-right">' + rightHtml + '</div>'
+        + '</div>';
+    } else if (rightHtml) {
+      // No left content (e.g. fresh install, no tool calls in 7d) — render the
+      // right column full-width rather than leaving a blank 50% left column.
+      // Keep id="stats-col-right" so the async Confidence Trends append lands here.
+      html += '<div class="stats-col stats-col-right" id="stats-col-right" style="grid-column: 1 / -1">' + rightHtml + '</div>';
     }
 
     document.getElementById('cards').innerHTML = html;
@@ -4231,12 +4262,18 @@ STATS_HTML = r"""<!DOCTYPE html>
     }
     tableHtml += '</tbody></table>';
 
-    const cardHtml = '<div class="card" style="grid-column: span 2"><h3>Confidence Trends</h3>'
+    const cardHtml = '<div class="card"><h3>Confidence Trends</h3>'
       + '<p style="font-size:0.78em;color:#888;margin-bottom:8px;">Per-type median confidence — All time / 7-turn window / 1-turn window. Divergence indicates recent filing drift.</p>'
       + tableHtml
       + '</div>';
 
-    cards.innerHTML += cardHtml;
+    // Append into the right-hand stacked column (#1225 Item 8) so Confidence
+    // Trends fills the blank under Cohort/Errors; fall back to #cards if the
+    // bottom section wasn't rendered (e.g. no tools/cohort/errors data).
+    const rightCol = document.getElementById('stats-col-right');
+    // insertAdjacentHTML('beforeend') appends without re-parsing existing
+    // children (no flicker, no listener loss) — preferred over innerHTML +=.
+    (rightCol || cards).insertAdjacentHTML('beforeend', cardHtml);
   }
 
   loadStats();
