@@ -1278,6 +1278,51 @@ class TestNapWalShmRaceOrderingFix:
             f"call_order={call_order}"
         )
 
+    def test_checkpoint_mode_is_restart_not_truncate(self):
+        """_commit_snapshot issues wal_checkpoint(RESTART), never wal_checkpoint(TRUNCATE).
+
+        Revert-guard for the shm-deletion fix (PR #1239): TRUNCATE calls
+        sqlite3OsShmUnmap(deleteFlag=1) which unlinks the shm while the
+        server's live fd still references it, corrupting the connection.
+        RESTART checkpoints all frames without deleting the shm.
+
+        Uses the same SpyConnection technique as test_dump_before_checkpoint_ordering
+        but captures the full SQL text so the mode can be inspected.
+        """
+        checkpoint_sqls: list[str] = []
+
+        class SpyConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                if isinstance(sql, str) and "wal_checkpoint" in sql.lower():
+                    checkpoint_sqls.append(sql)
+                return super().execute(sql, parameters)
+
+        import engram_backup as _eb
+
+        self._make_minimal_db()
+        db_path = str(self.tmp / "knowledge.db")
+        spy_conn = SpyConnection(db_path)
+        spy_conn.row_factory = sqlite3.Row
+
+        with mock.patch.object(self.server.core, "_git", side_effect=self._mock_git):
+            self.server._commit_snapshot(spy_conn, "mode guard test", "test")
+        spy_conn.close()
+
+        assert checkpoint_sqls, (
+            "_commit_snapshot issued no wal_checkpoint call — "
+            "either skip_checkpoint fired or the checkpoint path changed"
+        )
+        for sql in checkpoint_sqls:
+            assert "RESTART" in sql.upper(), (
+                f"wal_checkpoint call uses '{sql}' — expected RESTART mode. "
+                f"Switching back to TRUNCATE deletes the shm file via "
+                f"sqlite3OsShmUnmap(deleteFlag=1) and corrupts live connections."
+            )
+            assert "TRUNCATE" not in sql.upper(), (
+                f"wal_checkpoint(TRUNCATE) found in checkpoint SQL: {sql!r}. "
+                f"This is the shm-deletion regression this test guards against."
+            )
+
     def test_dump_failure_skips_checkpoint_and_releases_read_mark(self):
         """dump_stripped failure: no wal_checkpoint, wal_warning reflects skip, conn not in txn.
 

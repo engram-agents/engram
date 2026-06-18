@@ -2808,7 +2808,7 @@ def _commit_snapshot(
     wal_warning = None
     if not skip_checkpoint and _dump_error is None:
         try:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("PRAGMA wal_checkpoint(RESTART)")
         except Exception as e:
             # Non-fatal — continue, but record it
             wal_warning = f"wal_checkpoint failed: {e}"
