@@ -110,7 +110,7 @@ SCHEMA: list[dict] = [
     # Domain trust
     {"key": "trust_pool", "section": "domain_trust", "tier": TIER_A, "type": "list",
      "control": "list_edit", "label": "Trust pool",
-     "tooltip": "Domains in the trust pool get higher source-confidence weighting. Add news, official, or academic sources you consider reliable for your work.",
+     "tooltip": "Advisory only: domains NOT in this list get a soft warning at evidence creation and appear in engram_diagnose's untrusted-domain report. Does not change confidence scores (source-based confidence calibration is planned future-work, see #1230). Leave empty to suppress all trust-pool warnings.",
      "editable": True, "restart_required": False},
     {"key": "yellow_domains", "section": "domain_trust", "tier": TIER_A, "type": "list_of_objects",
      "control": "yellow_domains_edit", "label": "Yellow domains",

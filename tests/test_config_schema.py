@@ -226,3 +226,57 @@ class TestDefaultConfigCadence:
             )
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_default_config_trust_pool_is_empty(self):
+        """Fresh-install default config must have trust_pool == [] (#1228).
+
+        Previously seeded with 13 editorial domains; now ships empty so users
+        set their own trusted sources rather than inheriting our picks.
+        Regression guard: a revert to the old seed would fail loudly here.
+        """
+        import importlib
+        import json
+        import shutil
+        import tempfile
+
+        tmp = tempfile.mkdtemp()
+        try:
+            import engram_core
+            core = importlib.reload(engram_core)
+            core._configure_paths(tmp)
+            core._ensure_data_dir()
+
+            config_path = Path(tmp) / "config.json"
+            config = json.loads(config_path.read_text())
+            pool = config.get("trust_pool")
+            assert pool == [], (
+                f"trust_pool default must be [] (empty); got {pool!r}. "
+                "See #1228 — the 13-domain seed was removed so users set their own."
+            )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestTrustPoolTooltip:
+    """trust_pool schema entry must carry the honest (advisory-only) tooltip (#1228)."""
+
+    def test_trust_pool_tooltip_does_not_claim_confidence_effect(self):
+        """The old tooltip falsely said domains get 'higher source-confidence
+        weighting'. The corrected tooltip must NOT contain that claim."""
+        by_key = _schema_by_key()
+        row = by_key.get("trust_pool")
+        assert row is not None, "trust_pool missing from SCHEMA"
+        tooltip = row.get("tooltip", "")
+        assert "higher source-confidence" not in tooltip, (
+            f"trust_pool tooltip still claims a confidence effect — must be corrected. "
+            f"Got: {tooltip!r}"
+        )
+
+    def test_trust_pool_tooltip_describes_advisory_nature(self):
+        """The corrected tooltip must describe the advisory-only nature of the pool."""
+        by_key = _schema_by_key()
+        tooltip = by_key["trust_pool"].get("tooltip", "")
+        assert "advisory" in tooltip.lower() or "warning" in tooltip.lower(), (
+            f"trust_pool tooltip must mention advisory or warning behaviour. "
+            f"Got: {tooltip!r}"
+        )

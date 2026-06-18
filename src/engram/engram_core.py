@@ -725,21 +725,10 @@ def _ensure_data_dir():
             # Schema v2 (2026-05-05): adds cadence block. Migration from
             # v1 → v2 is in tools/migration/migrate_config_v2.py for existing installs.
             "schema_version": 2,
-            "trust_pool": [
-                "reuters.com",
-                "apnews.com",
-                "bloomberg.com",
-                "ft.com",
-                "wsj.com",
-                "economist.com",
-                "federalreserve.gov",
-                "bls.gov",
-                "treasury.gov",
-                "ecb.europa.eu",
-                "bbc.com",
-                "nytimes.com",
-                "cnbc.com",
-            ],
+            # Empty by default — users set their own trusted sources via the
+            # config tab (#1228); source-based confidence calibration is
+            # future-work (#1230).
+            "trust_pool": [],
             "confidence_map": CONFIDENCE_MAP,
             "predictive_confidence_cap": PREDICTIVE_CONFIDENCE_CAP,
             "chain_decay": 0.95,

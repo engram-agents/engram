@@ -167,3 +167,79 @@ def test_impl_callable_with_kwargs():
     assert "error" not in r, r
     assert "evidence_id" in r and r["evidence_id"].startswith("ev_"), r
     assert r.get("status") == "created"
+
+
+# ── trust_pool warning gate tests (#1228) ────────────────────────────────────
+
+def _write_trust_pool_config(pool):
+    """Overwrite the trust_pool field in the current test config with *pool*.
+
+    Reads CONFIG_PATH from the live engram_core module (set by fresh_server()
+    via _configure_paths) rather than from the server module, which does not
+    re-export the path global.
+    """
+    import json as _json
+    core = sys.modules["engram_core"]
+    config_path = core.CONFIG_PATH
+    config = _json.loads(config_path.read_text())
+    config["trust_pool"] = pool
+    config_path.write_text(_json.dumps(config))
+
+
+def test_empty_trust_pool_no_warning():
+    """With trust_pool=[], adding evidence must NOT produce a 'warning' key.
+
+    Regression guard for #1228: an empty pool previously caused every evidence
+    add to warn ("Domain X is NOT in the trusted source pool"), making the
+    default install noisy. The fix gates the warning on a non-empty pool.
+    """
+    server = fresh_server()
+    _write_trust_pool_config([])  # explicit empty pool (matches new default)
+    r = json.loads(server._add_evidence_impl(
+        url=_file_url(),
+        title="Empty-pool trust test",
+    ))
+    assert "error" not in r, r
+    assert r.get("status") == "created", r
+    assert r.get("in_trust_pool") is False, r
+    assert "warning" not in r, (
+        f"Expected no trust-pool warning with empty pool; got: {r.get('warning')!r}"
+    )
+
+
+def test_nonempty_pool_absent_domain_warns():
+    """With a non-empty trust_pool, a domain NOT in it must produce a warning.
+
+    Mutation sanity: confirms the empty-pool gate didn't silently delete the
+    warning for non-empty pools (the advisory signal must still fire for users
+    who configure a pool).
+    """
+    server = fresh_server()
+    _write_trust_pool_config(["trusted-example.org"])
+    r = json.loads(server._add_evidence_impl(
+        url=_file_url(),  # file:// → domain is the local filename, not in pool
+        title="Non-empty pool absent-domain test",
+    ))
+    assert "error" not in r, r
+    assert r.get("in_trust_pool") is False, r
+    assert "warning" in r, (
+        f"Expected trust-pool warning when domain absent from non-empty pool; got: {r}"
+    )
+
+
+def test_nonempty_pool_domain_in_pool_no_warning():
+    """With a non-empty trust_pool, a domain IN the pool must produce no warning
+    and in_trust_pool=True."""
+    server = fresh_server()
+    # Use domain= override to inject an in-pool domain for a file:// URL.
+    _write_trust_pool_config(["trusted-example.org"])
+    r = json.loads(server._add_evidence_impl(
+        url=_file_url(),
+        title="In-pool domain test",
+        domain="trusted-example.org",
+    ))
+    assert "error" not in r, r
+    assert r.get("in_trust_pool") is True, r
+    assert "warning" not in r, (
+        f"Expected no warning for in-pool domain; got: {r.get('warning')!r}"
+    )

@@ -711,7 +711,7 @@ def _add_evidence_impl(
             "source_date": source_date or None,
             "in_trust_pool": in_trust_pool,
         }
-        if not in_trust_pool:
+        if trust_pool and not in_trust_pool:
             result["warning"] = (
                 f"Domain '{domain}' is NOT in the trusted source pool. "
                 "Consider whether this source meets your quality standards."
