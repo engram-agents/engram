@@ -2670,18 +2670,19 @@ def _commit_snapshot(
     Ordering (#786 fix): dump_stripped runs BEFORE the WAL checkpoint.
     Connection.backup() (used inside dump_stripped) reads the live
     main-file+WAL merged state — the dump already captures all committed
-    writes without a prior checkpoint.  The TRUNCATE checkpoint runs AFTER
-    the dump so the WAL is compacted for the next nap cycle.
+    writes without a prior checkpoint.  The RESTART checkpoint runs AFTER
+    the dump so the WAL is checkpointed and its write-position reset for the
+    next nap cycle.
 
     Additionally, conn holds an active WAL read transaction across the dump
     (#786 Option B): this prevents the temporary ``src`` connection opened
     inside dump_stripped from ever being seen as the last WAL reader, which
     would let SQLite unlink the -shm file while the server still has it
-    mmap'd.  The read mark is released before the TRUNCATE checkpoint
-    (TRUNCATE needs all readers gone to compact the WAL).
+    mmap'd.  The read mark is released before the RESTART checkpoint
+    (RESTART needs all readers gone to reset the WAL write-position).
 
     If dump_stripped raises, the checkpoint does NOT run for that nap.
-    This is intentional: a failed backup skipping WAL compaction is
+    This is intentional: a failed backup skipping the WAL checkpoint is
     conservative — the WAL carries to the next nap, where the backup will
     be retried.
 
@@ -2692,7 +2693,7 @@ def _commit_snapshot(
         conn: Live database connection.
         message: Commit message body.
         mode: Commit mode tag (e.g. "nap", "sleep", "emergency").
-        skip_checkpoint: When True, omit the PRAGMA wal_checkpoint(TRUNCATE)
+        skip_checkpoint: When True, omit the PRAGMA wal_checkpoint(RESTART)
             step.  Forced True when a degraded marker is present (regardless of
             caller), to prevent checkpointing under a split-brain WAL-index.
     """
@@ -2729,9 +2730,9 @@ def _commit_snapshot(
     #     .git to GBs (verified 2026-06-02: 79.7 MB → 42.6 MB stripped, lossless rebuild).
     #     Method: engram_backup.dump_stripped (pure-Python, no sqlite3 CLI).
     #
-    #     Ordering (#786 fix — Option A): dump runs BEFORE wal_checkpoint(TRUNCATE).
+    #     Ordering (#786 fix — Option A): dump runs BEFORE wal_checkpoint(RESTART).
     #     Connection.backup() reads the live main-file+WAL merged view — no prior
-    #     checkpoint is needed for backup correctness.  The TRUNCATE runs AFTER so
+    #     checkpoint is needed for backup correctness.  The RESTART runs AFTER so
     #     the WAL is compacted without racing the dump's secondary connection.
     #
     #     Option B — WAL read-mark held across the dump: acquire a WAL read
@@ -2742,7 +2743,7 @@ def _commit_snapshot(
     #     while the server still has it mmap'd → "database disk image is malformed"
     #     (the Ariadne 06-03 + Luria 06-17 incident, #786).
     #
-    #     The read mark must be released before TRUNCATE: a TRUNCATE checkpoint
+    #     The read mark must be released before RESTART: a RESTART checkpoint
     #     needs all active WAL readers gone to compact the log.  Read mark is
     #     held only for the duration of dump_stripped, then released.
     #
@@ -2758,8 +2759,8 @@ def _commit_snapshot(
     # deferred BEGIN alone is not enough — SQLite only assigns a read mark when
     # a statement reads a real database page.  `SELECT 1` is a constant-value
     # expression that never touches any page, so it acquires NO read mark and a
-    # concurrent `wal_checkpoint(TRUNCATE)` from another connection will not see
-    # this connection as a reader (verified empirically: TRUNCATE returns busy=0
+    # concurrent `wal_checkpoint(RESTART)` from another connection will not see
+    # this connection as a reader (verified empirically: RESTART returns busy=0
     # with SELECT 1 vs busy=1 with a real-page read such as sqlite_master).
     # We use `SELECT count(*) FROM sqlite_master`: sqlite_master is page 1,
     # always present, always readable, and forces a genuine WAL read mark.
@@ -2789,9 +2790,9 @@ def _commit_snapshot(
         print(f"[engram backup] CRITICAL: knowledge.sql dump FAILED: {e}", file=_sys.stderr)
         _dump_error = str(e)
     finally:
-        # Release the WAL read mark before the TRUNCATE checkpoint below.
-        # TRUNCATE needs all WAL readers gone; holding the mark past this point
-        # would silently downgrade TRUNCATE to a partial checkpoint.
+        # Release the WAL read mark before the RESTART checkpoint below.
+        # RESTART needs all WAL readers gone; holding the mark past this point
+        # would silently downgrade RESTART to a partial checkpoint.
         if _held_read_txn:
             try:
                 conn.execute("COMMIT")

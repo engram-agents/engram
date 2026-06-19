@@ -1132,7 +1132,7 @@ class TestNapWalShmRaceOrderingFix:
     """Regression tests for the #786 nap WAL/shm race fix.
 
     Two tests:
-      A. Ordering test: dump_stripped is called BEFORE wal_checkpoint(TRUNCATE).
+      A. Ordering test: dump_stripped is called BEFORE wal_checkpoint(RESTART).
          Spies on both calls, records invocation order, asserts backup precedes
          checkpoint.  This test would FAIL against the pre-fix code.
 
@@ -1296,8 +1296,6 @@ class TestNapWalShmRaceOrderingFix:
                 if isinstance(sql, str) and "wal_checkpoint" in sql.lower():
                     checkpoint_sqls.append(sql)
                 return super().execute(sql, parameters)
-
-        import engram_backup as _eb
 
         self._make_minimal_db()
         db_path = str(self.tmp / "knowledge.db")
