@@ -102,7 +102,7 @@ def build_command(args: list[str]) -> int:
         "--allow-branch",
         dest="allow_branch",
         action="store_true",
-        help="Allow building from non-dev branch (overrides #794's guard)",
+        help="Allow building from a PR/feature branch (overrides #794's guard; 'dev' and 'main' are always allowed)",
     )
     parser.add_argument("--help", "-h", action="store_true")
 
@@ -137,7 +137,7 @@ def build_command(args: list[str]) -> int:
             "                      foreign drops identity_coupled entries and runs a\n"
             "                      leak-scan over the emitted bundle.\n"
             "  --engram-home PATH  ENGRAM_HOME path to embed in hook commands and MCP config.\n"
-            "  --allow-branch      Allow building from a non-dev branch (overrides #794's guard).\n"
+            "  --allow-branch      Allow building from a PR/feature branch (overrides #794's guard; 'dev'/'main' always allowed).\n"
             "  --help              Show this help message and exit.\n"
             "\n"
             "Tier filtering uses src/build/packaging/tiers.json as the single source of truth.\n"
@@ -181,7 +181,8 @@ def build_command(args: list[str]) -> int:
         )
         return 1
 
-    # #794 branch guard: refuse non-dev builds unless --allow-branch is set.
+    # #794 branch guard: refuse builds from PR/feature branches unless --allow-branch is set.
+    # Valid production branches: 'dev' (private dev source) and 'main' (public release branch).
     # git branch --show-current returns "" in detached HEAD — treat as a block (fail safe).
     if not parsed.allow_branch:
         import subprocess as _sp
@@ -189,11 +190,11 @@ def build_command(args: list[str]) -> int:
             ["git", "branch", "--show-current"],
             cwd=repo_root, capture_output=True, text=True,
         ).stdout.strip()
-        if not _br or _br != "dev":
+        if not _br or (_br != "dev" and _br != "main"):
             _br_desc = "detached HEAD (not on a named branch)" if not _br else f"branch {_br!r}"
             print(
-                f"[build-plugin] ERROR: Source repo is at {_br_desc}, not 'dev'. "
-                "Building from a non-dev state can deploy unmerged code. "
+                f"[build-plugin] ERROR: Source repo is at {_br_desc}, not 'dev' (private dev) or 'main' (public release). "
+                "Building from a PR/feature branch can deploy unmerged code. "
                 "Pass --allow-branch to override (e.g. for metric-eval checkouts). "
                 "Guard per #794.",
                 file=sys.stderr,
@@ -371,7 +372,7 @@ def run_command(args: list[str]) -> int:
         "--allow-branch",
         dest="allow_branch",
         action="store_true",
-        help="Allow building from non-dev branch (overrides #794's guard)",
+        help="Allow building from a PR/feature branch (overrides #794's guard; 'dev' and 'main' are always allowed)",
     )
     parser.add_argument("--help", "-h", action="store_true")
 
@@ -387,7 +388,7 @@ def run_command(args: list[str]) -> int:
             "\n"
             "Options:\n"
             "  --ack-changeset   Acknowledge the changeset review step.\n"
-            "  --allow-branch    Allow building from a non-dev branch.\n"
+            "  --allow-branch    Allow building from a PR/feature branch ('dev'/'main' always allowed).\n"
             "\n"
             "Exit codes: 0=DONE  3=PAUSED  1=FAILED\n"
         )

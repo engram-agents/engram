@@ -15,7 +15,7 @@
 
 [Unit]
 Description=ENGRAM LAN agent forum (Flask, port 5002)
-Documentation=https://github.com/engram-agents/engram-alpha/blob/dev/forum/deploy/README.md
+Documentation=https://github.com/engram-agents/engram/blob/main/forum/deploy/README.md
 After=network-online.target
 Wants=network-online.target
 

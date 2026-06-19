@@ -18,7 +18,7 @@ Steps map 1-to-1 with the skill's numbered sections:
   tree-at-commit          Step 0b: source tree is on dev and clean (or at expected SHA)
   changeset-reviewed      Step 1:  agent-judgment step — emits changeset summary;
                                    REQUIRES explicit ctx.ack_changeset = True to continue
-  marketplace-rebuilt     Step 2:  calls Phase-1 build_plugin(); PRECONDITION: branch==dev
+  marketplace-rebuilt     Step 2:  calls Phase-1 build_plugin(); PRECONDITION: branch==dev or main
                                    (unless ctx.allow_branch — guard per #794)
   flags-match-config      Step 3:  tier + multi_agent in built manifest match config.json
   plugin-marketplace-update  Step 4: [operator] /plugin marketplace update engram-local
@@ -340,7 +340,7 @@ def upgrade_flow() -> list[Step]:
 
         # ── Step 2: marketplace-rebuilt ──────────────────────────────────
         # Calls Phase-1 build_plugin().
-        # PRECONDITION: branch == dev unless ctx.allow_branch (#794's guard).
+        # PRECONDITION: branch == 'dev' or 'main' unless ctx.allow_branch (#794's guard).
         Step(
             id="marketplace-rebuilt",
             requires=["changeset-reviewed"],
@@ -535,23 +535,25 @@ def _check_marketplace_rebuilt(ctx: dict[str, Any]) -> bool:
 def _apply_marketplace_rebuilt(ctx: dict[str, Any]) -> None:
     """Call Phase-1 build_plugin() to rebuild the marketplace.
 
-    PRECONDITION: branch == dev unless ctx.allow_branch.
+    PRECONDITION: branch == 'dev' or 'main' unless ctx.allow_branch.
     This guard implements #794's requirement: the build step refuses to run
-    on a non-dev branch unless the caller explicitly passes allow_branch=True.
-    Rationale: shipping a non-dev branch's code as a plugin upgrade is almost
+    on a PR/feature branch unless the caller explicitly passes allow_branch=True.
+    Rationale: shipping a PR/feature branch's code as a plugin upgrade is almost
     always a mistake; the guard makes the unusual case explicit.
+    Valid production branches: 'dev' (private dev source), 'main' (public release).
     """
     source_dir = ctx.get("source_dir", "")
     if not source_dir:
         raise RuntimeError("source_dir not set in ctx — cannot rebuild marketplace")
 
-    # #794 branch guard: refuse non-dev branch unless allow_branch is set
+    # #794 branch guard: refuse PR/feature branches unless allow_branch is set.
+    # Valid production branches: 'dev' (private dev source) and 'main' (public release branch).
     current = _current_branch(source_dir)
-    if current != "dev" and not ctx.get("allow_branch"):
+    if current not in ("dev", "main") and not ctx.get("allow_branch"):
         raise RuntimeError(
-            f"marketplace-rebuilt: source tree is on branch {current!r}, not 'dev'. "
+            f"marketplace-rebuilt: source tree is on branch {current!r}, not 'dev' (private dev) or 'main' (public release). "
             "Pass allow_branch=True in ctx to override this guard. "
-            "(Guard per #794: shipping a non-dev branch is almost always a mistake.)"
+            "(Guard per #794: shipping a PR/feature branch is almost always a mistake.)"
         )
 
     # Load config.json for tier + multi_agent

@@ -73,7 +73,7 @@ Options:
                   build/plugin/plugin.json must already exist.
   --target T      Build target to pass through when not using --skip-build:
                   claude-code (default) or codex.
-  --allow-branch  Allow building from a non-dev branch (overrides #794's guard).
+  --allow-branch  Allow building from a PR/feature branch (overrides #794's guard; 'dev' and 'main' always allowed).
                   Use only for deliberate branch builds (e.g. metric-eval checkouts).
 
 After running:
@@ -87,8 +87,8 @@ Or for Codex:
   bash tools/install-local-marketplace.sh --target codex
 
 To upgrade later:
-  cd path/to/engram-alpha
-  git pull origin dev
+  cd path/to/engram
+  git pull origin main
   bash tools/install-local-marketplace.sh    # builds + re-assembles, idempotent
   # then in Claude Code:
   /plugin marketplace update engram-local
@@ -131,10 +131,12 @@ if [[ ! -f "$REPO_ROOT/src/engram/server.py" ]]; then
   die "Must be run from the repo root (expected src/engram/server.py at $REPO_ROOT/src/engram/server.py)"
 fi
 
-# #794 branch guard: refuse non-dev builds unless --allow-branch is set.
+# #794 branch guard: refuse builds from PR/feature branches unless --allow-branch is set.
+# Valid production branches: 'dev' (private dev source) and 'main' (public release branch).
+# Every other branch — PR branches, feature branches, etc. — requires --allow-branch to override.
 CURRENT_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-if [[ "$CURRENT_BRANCH" != "dev" && $ALLOW_BRANCH -eq 0 ]]; then
-  die "Source repo is on branch '$CURRENT_BRANCH', not 'dev'. Building from a PR branch can deploy unmerged code. Pass --allow-branch to override (e.g. for metric-eval checkouts). Guard per #794."
+if [[ "$CURRENT_BRANCH" != "dev" && "$CURRENT_BRANCH" != "main" && $ALLOW_BRANCH -eq 0 ]]; then
+  die "Source repo is on branch '$CURRENT_BRANCH', not 'dev' (private dev) or 'main' (public release). Building from a PR/feature branch can deploy unmerged code. Pass --allow-branch to override (e.g. for metric-eval checkouts). Guard per #794."
 fi
 
 ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
@@ -220,7 +222,7 @@ cat > "$MARKETPLACE_ROOT/.claude-plugin/marketplace.json" <<EOF
       "author": {
         "name": "engram-agents"
       },
-      "homepage": "https://github.com/engram-agents/engram-alpha",
+      "homepage": "https://github.com/engram-agents/engram",
       "tags": ["memory", "knowledge-graph", "mcp", "agent", "epistemics"]
     }
   ]
@@ -385,8 +387,8 @@ if [[ "$TARGET" == "codex" ]]; then
   log "  If hook trust changed, approve the refreshed hook definitions when prompted."
   log ""
   log " To upgrade later in Codex:"
-  log "   cd path/to/engram-alpha"
-  log "   git pull origin dev"
+  log "   cd path/to/engram"
+  log "   git pull origin main"
   log "   bash tools/install-local-marketplace.sh --target codex"
 else
   log " Marketplace registered. Next steps (in a Claude Code session):"
@@ -407,8 +409,8 @@ else
   log "  user must explicitly /plugin enable engram.)"
   log ""
   log " To upgrade later:"
-  log "   cd path/to/engram-alpha"
-  log "   git pull origin dev"
+  log "   cd path/to/engram"
+  log "   git pull origin main"
   log "   bash tools/install-local-marketplace.sh"
   log "   # then in Claude Code:"
   log "   1. /plugin marketplace update engram-local"

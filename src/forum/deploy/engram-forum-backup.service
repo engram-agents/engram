@@ -17,7 +17,7 @@
 
 [Unit]
 Description=ENGRAM forum DB backup (iterdump + git snapshot)
-Documentation=https://github.com/engram-agents/engram-alpha/blob/dev/forum/deploy/README.md
+Documentation=https://github.com/engram-agents/engram/blob/main/forum/deploy/README.md
 After=network-online.target
 
 [Service]

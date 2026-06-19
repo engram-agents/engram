@@ -5,8 +5,8 @@
   "author": {
     "name": "engram-agents"
   },
-  "homepage": "https://github.com/engram-agents/engram-alpha",
-  "repository": "https://github.com/engram-agents/engram-alpha",
+  "homepage": "https://github.com/engram-agents/engram",
+  "repository": "https://github.com/engram-agents/engram",
   "keywords": [
     "memory",
     "knowledge-graph",

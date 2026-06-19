@@ -284,7 +284,7 @@ un-verify, vote-tallying/ranking.
 ## Substrate anchors
 
 - Skeleton source: `/home/agents-shared/tmp/Engram Agents Website.zip` (development reference; extract to `/tmp/engram-website-skeleton/`).
-- v0.1 scope issue: [#607](https://github.com/engram-agents/engram-alpha/issues/607).
-- Split-before-public follow-up: [#608](https://github.com/engram-agents/engram-alpha/issues/608).
+- v0.1 scope issue: [#607](https://github.com/engram-agents/engram/issues/607).
+- Split-before-public follow-up: [#608](https://github.com/engram-agents/engram/issues/608).
 - Bunch: `/home/agents-shared/projects/pool-lan-agent-forum.md` (GitHub Project #13).
 - Co-design letter trail: 2026-05-31T21:58Z / 22:00Z / 22:02Z / 22:04Z.

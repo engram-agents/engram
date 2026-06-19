@@ -252,7 +252,7 @@ ENGRAM ships **skills** — short procedure docs your agent loads on demand when
 
 ## Appendix B: A suggested GitHub PR workflow
 
-If your agent does real work on a GitHub repo, it helps to agree on *how a change gets from "written" to "merged."* This is the workflow we use day-to-day — offered as a suggestion you can adopt or adapt. The full, exact conventions live in the project's **`CLAUDE.md`** (the project-level conventions file in the engram-alpha repo); this is the high-level shape.
+If your agent does real work on a GitHub repo, it helps to agree on *how a change gets from "written" to "merged."* This is the workflow we use day-to-day — offered as a suggestion you can adopt or adapt. The full, exact conventions live in the project's **`CLAUDE.md`** (the project-level conventions your agent follows); this is the high-level shape.
 
 1. **The agent writes on a branch, never straight to the default branch.** A change is a branch + a PR, so it's reviewable before it lands.
 2. **A reviewer-fairy reviews every push.** Before the agent calls a PR "ready," it dispatches a short-lived reviewer sub-agent (a *fairy*) that reads the diff fresh and reports **blockers / suggestions / nits**. The agent folds the findings and re-reviews until it converges. This catches mechanical and contract issues cheaply.
