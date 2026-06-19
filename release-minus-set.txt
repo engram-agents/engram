@@ -19,8 +19,8 @@ tools/borges_session_eval.py
 
 # --- Dev test suite (lives in the private engram-alpha; the public repo is a
 #     user-facing release snapshot). Also avoids publishing leak-detection test
-#     FIXTURES that intentionally embed leak-patterns (e.g. kg_protocol_for_ai,
-#     /home/agent-borges), which would otherwise false-positive the scan-leaks gate. ---
+#     fixtures that intentionally embed scanner patterns, which would otherwise
+#     false-positive the scan-leaks gate. ---
 tests/
 
 # --- CI / dev-policy workflows (private dev infra). Their gates reference tests/
