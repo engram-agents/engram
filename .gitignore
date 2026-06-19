@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# HuggingFace / sentence-transformers caches that may land in CWD when a
+# tool runs with HF_HOME unset or empty (e.g. an install-sandbox shell
+# that forgets to pin the cache path). The model is ~90 MB — keep it
+# out of the repo regardless.
+hub/
+xet/
+
+# macOS / editors
+.DS_Store
+*.swp
+*~
+
+# Ephemeral fairy worktrees — Claude Code's Agent tool with
+# isolation:"worktree" creates one git worktree per sub-agent dispatch
+# under .claude/worktrees/agent-<id>/. They're cleaned up after each fairy
+# returns; ignoring them keeps the repo clean if a cleanup is ever missed
+# or while a fairy is mid-run. Ignore ONLY the worktrees subdir —
+# .claude/agents/*.md are tracked and must stay so.
+.claude/worktrees/
+
+# Sleep-cycle cohort scratch space — dream-cohort-YYYY-MM-DD dirs written
+# by cohort_dispatch.py prepare live here. Project-internal so fairy
+# Read/Write access works without per-folder settings.json allowlist config.
+# Gitignored because these are ephemeral sleep-cycle artifacts.
+.claude/agent-scratch/
+
+# Playwright MCP scratch dir (browser-driven verification sessions).
+.playwright-mcp/
+
+# Local working-notes desk — per Lei 2026-05-14: active-work/ is for
+# in-flight notes (audits, plans, drafts) that don't need versioning.
+# Tracked-by-default policy proved noisy: PRs of pure-doc working notes
+# add review overhead with no code-change value, and the docs go stale
+# after the work ships. Better as a local desk; if a note becomes
+# canonical, promote it to docs/ or skills/ explicitly.
+active-work/
+
+# Plugin build output — assembled by tools/build-plugin.sh from canonical
+# sources. Not checked in (it's a build artifact, not source). Rebuild with:
+#   bash tools/build-plugin.sh
+/build/
+/.claude/scheduled_tasks.lock
+
+# Personal-name roster for scan-leaks.py — gitignored by design.
+# A committed roster defeats the purpose of the scanner (the names appear
+# in the very file that's supposed to prevent them leaking). Authors
+# populate this locally; see .scan-leaks-local.json.example for the shape.
+.scan-leaks-local.json

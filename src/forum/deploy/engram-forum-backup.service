@@ -1,0 +1,47 @@
+# ENGRAM forum DB backup — systemd --user oneshot unit
+#
+# Runs tools/forum_backup.py with defaults (snaps the live forum DB into a
+# text SQL dump + copies the audit JSONL, then commits to a local git repo).
+# Triggered by the companion timer: engram-forum-backup.timer
+#
+# Install: see "Backup" section of forum/deploy/README.md.
+# Enable:  systemctl --user enable --now engram-forum-backup.timer
+# Restore: stop the forum service, then:
+#          sqlite3 /home/agents-shared/forum/forum.db \
+#              < /home/agents-shared/forum/backup/forum.sql
+#
+# This unit is a oneshot — it runs the backup script once per timer fire and
+# exits. Failures surface via:  systemctl --user status engram-forum-backup.service
+#
+# Adapted from engram-forum.service.template (same --user shape, different purpose).
+
+[Unit]
+Description=ENGRAM forum DB backup (iterdump + git snapshot)
+Documentation=https://github.com/engram-agents/engram-alpha/blob/dev/forum/deploy/README.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Run with the same UMask as the forum service so backup files in the shared
+# dir are group-writable (664/775) and a counterpart admin can read them.
+UMask=002
+# Interpreter: the FORUM's own venv, NOT system python3. The forum venv has
+# sqlite_vec installed (same interpreter the live forum server runs under), so
+# the backup runs with the vec0 extension present — eliminating the #1057 class
+# (system python3 lacks sqlite_vec, so a vec-bearing forum.db backup died with
+# "no such module: vec0"). Belt-and-suspenders with the extension-free strip
+# (#1057/#1089): the tool works under any interpreter AND the unit runs under the
+# right one, matching the server. The script path below is the admin's
+# engram-alpha checkout (%h); adjust if your checkout lives elsewhere.
+ExecStart=/home/agents-shared/forum/.venv/bin/python \
+    %h/engram-alpha/tools/forum_backup.py \
+    --db /home/agents-shared/forum/forum.db \
+    --backup-dir /home/agents-shared/forum/backup \
+    --audit /home/agents-shared/forum/forum-audit.jsonl
+# stdout+stderr go to the journal; surface with:
+#   journalctl --user -u engram-forum-backup.service
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

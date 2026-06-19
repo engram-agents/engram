@@ -1,0 +1,57 @@
+{
+  "_comment": "ENGRAM config schema v2. Lives at $ENGRAM_HOME/config.json. Hand-edit fields below to tune; run tools/migrate_config_v2.py to upgrade an older config to this shape.",
+
+  "schema_version": 2,
+
+  "_comment_self_lineage": "Standpoint v3 null=self AND the model-identity gate: this install's OWN training lineage in the hard format provider:model_family (the MODEL FAMILY, e.g. 'anthropic:opus' / 'anthropic:sonnet' — NOT the generic model line like 'claude'). An unmarked observation counts as your own lineage, which makes the standpoint/F-S advisory fire on own derivations. Empty string = feature ships dark (safe; gate stays closed). The first-session skill prompts for this. NOT auto-detected — declare it.",
+  "self_lineage": "",
+
+  "trust_pool": [
+    "reuters.com",
+    "apnews.com",
+    "bloomberg.com"
+  ],
+  "yellow_domains": [],
+  "confidence_map": {
+    "hard_data": 0.95,
+    "official_statement": 0.85,
+    "attributed_analysis": 0.7,
+    "unnamed_source": 0.5,
+    "personal_communication": 0.4,
+    "editorial": 0.35
+  },
+  "predictive_confidence_cap": 0.6,
+  "chain_decay": 0.95,
+  "corroboration_decay": 0.98,
+  "resolution_confidence_threshold": 0.7,
+
+  "memory": {
+    "decay_base": 1.014,
+    "current_turn": 0,
+    "tier1_max_nodes": 200,
+    "tier2_max_nodes": 1000
+  },
+
+  "embedding": {
+    "model": "all-MiniLM-L6-v2",
+    "enabled": true
+  },
+
+  "user": {
+    "timezone": "America/New_York"
+  },
+  "primary_user": "you",
+
+  "_comment_fairy_policy": "Fairy delegation policies — how the agent decides whether to spawn a fairy vs. do the work directly. Both default to 'auto'. Values: 'explicit' (spawn only when user asks), 'auto' (agent judges per-task using the named skill), 'always' (unconditionally delegate). In 'auto' mode the agent loads the skill engram-auto-coder-fairy-judgement or engram-auto-reviewer-fairy-judgement to decide; edit those skill files to tune the heuristic.",
+  "coder_fairy_policy": "auto",
+  "reviewer_fairy_policy": "auto",
+
+  "cadence": {
+    "_comment_cadence": "Drowsiness meter + in-session auto-sleep scheduler tunables. drowsiness_caution_pct/urgent_pct trigger context_tracker warnings as the session fills. auto_sleep_enabled/auto_sleep_time configure the SessionStart hook's nightly in-session CronCreate that fires /engram-sleep at the configured time.",
+
+    "drowsiness_caution_pct": 80,
+    "drowsiness_urgent_pct": 90,
+    "auto_sleep_enabled": false,
+    "auto_sleep_time": "03:00"
+  }
+}

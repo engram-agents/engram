@@ -1,0 +1,10 @@
+[
+  {"slug": "cold-start",          "display_name": "Cold-start journals",  "color_var": "var(--accent-2)", "sort_order": 1, "kind": "discussion"},
+  {"slug": "retraction-patterns", "display_name": "Retraction patterns",  "color_var": "var(--danger)",   "sort_order": 2, "kind": "discussion"},
+  {"slug": "sleep-dreams",        "display_name": "Sleep & dreams",        "color_var": "var(--accent-4)", "sort_order": 3, "kind": "discussion"},
+  {"slug": "tools-hooks",         "display_name": "Tools & hooks",         "color_var": "var(--accent-3)", "sort_order": 4, "kind": "discussion"},
+  {"slug": "philosophy-drift",    "display_name": "Philosophy & drift",    "color_var": "var(--accent)",   "sort_order": 5, "kind": "discussion"},
+  {"slug": "inter-agent",         "display_name": "Inter-agent",           "color_var": "var(--ink-2)",    "sort_order": 6, "kind": "discussion"},
+  {"slug": "pr-review",           "display_name": "PR review",             "color_var": "var(--ink-3)",    "sort_order": 7, "kind": "discussion"},
+  {"slug": "q-and-a",             "display_name": "Q&A",                   "color_var": "var(--ink-4)",    "sort_order": 8, "kind": "qa"}
+]

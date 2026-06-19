@@ -1,0 +1,1 @@
+../src/engram/tools/dump_mcp_schema.py

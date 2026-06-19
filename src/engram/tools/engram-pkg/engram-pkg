@@ -1,0 +1,1255 @@
+#!/usr/bin/env python3
+"""
+engram-pkg — CLI toolkit for authoring engram-package databases.
+
+Operates on any engram-package directory passed via --pkg or $ENGRAM_PKG.
+Wraps the EngramClient (which redirects all server paths to the package
+directory atomically) so you can author into the package without touching
+your personal engram at ~/.engram/.
+
+Usage:
+    engram-pkg --pkg ~/engram-packages/wiki/ <subcommand> [args...]
+    ENGRAM_PKG=~/engram-packages/wiki/ engram-pkg <subcommand> [args...]
+
+Common subcommands:
+    init               Bootstrap a new engram-package skeleton in an empty directory.
+    add-evidence       Register a source document.
+    add-observation    Extract a claim with provenance from a source.
+    derive             Combine evidence into a derived claim.
+    supersede          Replace an existing node with an updated version.
+    list               List nodes in the package (compact triage).
+    query              Search nodes by text + embedding.
+    inspect            Inspect a single node + 1-hop neighbors.
+    stats              Package statistics.
+    dump               Run scripts/dump.sh — write knowledge.sql.
+    build              Run scripts/build.sh — build knowledge.db from .sql.
+    call               Generic escape hatch — invoke any engram_* tool by name with JSON args.
+    scope-export       Export a provenance closure of cited nodes as a scoped engram-package.
+
+Why a CLI rather than MCP-tool duplication: parallel personal vs package
+MCP tools share shape and selection signal; mid-flow it's easy to fire the
+wrong one. The conscious shell command makes the namespace shift visible
+and matches the tool surface other agents (e.g., Mneme) will use.
+"""
+
+import argparse
+import collections
+import datetime
+import hashlib
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent  # engram-alpha/
+
+# Canonical ENGRAM node types — kept here as a static list (mirrors the server's
+# type vocabulary). Used as argparse `choices` for --node-type so a typo errors
+# loudly with the valid list, instead of silently returning empty results.
+# When server adds a new node type, add it here too.
+NODE_TYPES = (
+    "axiom",
+    "conjecture",
+    "contradiction",
+    "cornerstone",
+    "definition",
+    "derivation",
+    "evidence",
+    "feeling_report",
+    "goal",
+    "goal_tension",
+    "lesson",
+    "observation_factual",
+    "observation_predictive",
+    "person",
+    "prediction",
+    "question",
+    "task",
+    "theory",
+)
+
+
+def resolve_pkg(args):
+    pkg = args.pkg or os.environ.get("ENGRAM_PKG")
+    if not pkg:
+        sys.exit("ERROR: --pkg required (or set $ENGRAM_PKG). Point at an engram-package directory.")
+    pkg_path = Path(pkg).expanduser().resolve()
+    if not pkg_path.is_dir():
+        sys.exit(f"ERROR: {pkg_path} is not a directory.")
+    return pkg_path
+
+
+# 5-second slack absorbs filesystem mtime jitter (touch-modify within the same
+# second, build script mtime updates near-simultaneously, etc.). Anything past
+# 5s of sql-newer-than-db is a real authoring gap.
+_STALE_SLACK_SECS = 5
+
+
+def _check_stale_build(pkg_path, auto_build=False):
+    """Detect knowledge.sql newer than knowledge.db.
+
+    Direction matters: db-newer-than-sql is the normal mid-authoring state
+    (CLI write commands hit .db; `dump` catches .sql up). The reverse is the
+    one that produces silent stale reads — typically after a fresh git pull
+    or a hand-edit of knowledge.sql without `engram-pkg build`.
+    """
+    db = pkg_path / "knowledge.db"
+    sql = pkg_path / "knowledge.sql"
+    if not (db.exists() and sql.exists()):
+        return
+    if sql.stat().st_mtime <= db.stat().st_mtime + _STALE_SLACK_SECS:
+        return
+    if auto_build:
+        script = pkg_path / "scripts" / "build.sh"
+        if script.exists():
+            sys.stderr.write(
+                "NOTE: knowledge.sql newer than knowledge.db — auto-building...\n"
+            )
+            rc = subprocess.call(["bash", str(script)])
+            if rc != 0:
+                sys.exit(f"ERROR: auto-build failed (rc={rc}). Run `engram-pkg build` manually to see errors.")
+        else:
+            # Hard-exit instead of degrading to a stale read. The user
+            # explicitly passed --auto-build because they did NOT want
+            # to read stale data; warn-and-continue would silently
+            # contradict that intent.
+            sys.exit(
+                f"ERROR: --auto-build requested but {script} not found. "
+                f"Run `engram-pkg build` manually, or remove --auto-build "
+                f"to fall back to warn-only mode."
+            )
+        return
+    sys.stderr.write(
+        f"WARNING: knowledge.sql is newer than knowledge.db — read commands "
+        f"may return stale data. Run `engram-pkg build` to refresh, or pass "
+        f"--auto-build to do it automatically.\n"
+    )
+
+
+def _ensure_pkg_config(pkg_path: Path) -> None:
+    """Write or update config.json to include is_knowledge_pack=true.
+
+    Runs before every EngramClient construction so the _get_db() seed-node
+    guard sees the flag and skips the axiom-count check. Knowledge-pack DBs
+    legitimately have no seed axioms; the flag distinguishes them from a
+    crashed personal-install bootstrap (#695).
+
+    Handles three cases:
+      - No config.json: writes a minimal one (schema_version + flag).
+      - Existing config without flag: adds flag in-place.
+      - Existing config with flag already set: no-op.
+    """
+    config_path = pkg_path / "config.json"
+    if config_path.exists():
+        try:
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            if not cfg.get("is_knowledge_pack"):
+                cfg["is_knowledge_pack"] = True
+                config_path.write_text(json.dumps(cfg, indent=2))
+        except Exception:
+            pass
+    else:
+        config_path.write_text(json.dumps(
+            {"schema_version": 2, "is_knowledge_pack": True}, indent=2
+        ))
+
+
+def get_client(pkg_path):
+    _ensure_pkg_config(Path(pkg_path))
+    sys.path.insert(0, str(REPO_ROOT))
+    from engram_client import EngramClient  # noqa: E402
+    return EngramClient(db_dir=str(pkg_path), server_module_path=str(REPO_ROOT))
+
+
+def report(result):
+    """Pretty-print a tool result; exit non-zero on error."""
+    if isinstance(result, dict) and "error" in result:
+        sys.exit(f"ERROR: {result['error']}")
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand handlers
+# ---------------------------------------------------------------------------
+
+# Package-protocol templates rendered by `cmd_init`.
+_DUMP_SH_TEMPLATE = '''#!/usr/bin/env bash
+# Dump the local knowledge.db to knowledge.sql for git-versioned commit.
+# Author-side only — runs after authoring sessions, before `git commit knowledge.sql`.
+# (Consumers do not need this script. They run scripts/build.sh after pull.)
+
+set -euo pipefail
+
+PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DB_FILE="$PKG_DIR/knowledge.db"
+SQL_FILE="$PKG_DIR/knowledge.sql"
+
+if [[ ! -f "$DB_FILE" ]]; then
+    echo "ERROR: $DB_FILE not found. Run scripts/build.sh first (or seed it via engram-pkg)." >&2
+    exit 1
+fi
+
+# WAL flush so .dump captures all committed writes from the live engram.
+sqlite3 "$DB_FILE" "PRAGMA wal_checkpoint(TRUNCATE);" > /dev/null
+sqlite3 "$DB_FILE" .dump > "$SQL_FILE"
+
+NODE_COUNT=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM nodes;")
+SQL_LINES=$(wc -l < "$SQL_FILE")
+echo "Dumped $DB_FILE -> $SQL_FILE  ($NODE_COUNT nodes, $SQL_LINES lines)"
+echo "Review diff with: git diff knowledge.sql"
+'''
+
+_BUILD_SH_TEMPLATE = '''#!/usr/bin/env bash
+# Build the local knowledge.db from knowledge.sql.
+# Run this once after `git clone` (and again whenever you `git pull` and the .sql changed).
+#
+# This is the consumer-side build — minimal, no toolkit dependency, just sqlite3.
+# (Authoring uses the engram-pkg CLI from engram-alpha/tools/engram-pkg/.)
+
+set -euo pipefail
+
+PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SQL_FILE="$PKG_DIR/knowledge.sql"
+DB_FILE="$PKG_DIR/knowledge.db"
+
+if [[ ! -f "$SQL_FILE" ]]; then
+    echo "ERROR: $SQL_FILE not found." >&2
+    exit 1
+fi
+
+# Replace any existing local .db. The .sql is the source of truth; local .db
+# is a build artifact and may be regenerated freely.
+rm -f "$DB_FILE" "$DB_FILE-shm" "$DB_FILE-wal"
+sqlite3 "$DB_FILE" < "$SQL_FILE"
+
+NODE_COUNT=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM nodes;")
+EDGE_COUNT=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM edges;")
+echo "Built $DB_FILE  ($NODE_COUNT nodes, $EDGE_COUNT edges)"
+'''
+
+_GITIGNORE_TEMPLATE = '''# Local working binary — built from knowledge.sql via scripts/build.sh.
+# The .sql is the source of truth; the .db is a build artifact.
+knowledge.db
+knowledge.db-shm
+knowledge.db-wal
+
+# Local engram runtime artifacts (server.py drops these next to the .db)
+config.json
+session_log.md
+graph_snapshot.md.tmp
+
+# Python noise
+__pycache__/
+*.pyc
+.venv/
+
+# Editor noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+'''
+
+_README_TEMPLATE = '''# {pkg_name}
+
+An engram-package — a portable, read-only ENGRAM knowledge graph that other agents can clone and consume alongside their personal graph.
+
+## What this package contains
+
+- `knowledge.sql` — source of truth, versioned in git
+- `knowledge.db` — build artifact, gitignored, regenerated via `scripts/build.sh`
+- `scripts/dump.sh` — author-side: writes `knowledge.sql` from live `knowledge.db`
+- `scripts/build.sh` — consumer-side: rebuilds `knowledge.db` from `knowledge.sql`
+- (optional) `cases/`, `archive/`, etc. — domain-specific human-readable content
+
+## Consumer workflow
+
+```bash
+git clone <this-repo>
+cd <this-repo>
+bash scripts/build.sh    # produces knowledge.db
+```
+
+You can then query the package via the engram-pkg CLI:
+
+```bash
+engram-pkg --pkg . list --node-type observation_factual
+engram-pkg --pkg . query "your search"
+engram-pkg --pkg . inspect <node_id>
+```
+
+## Authoring workflow
+
+```bash
+export ENGRAM_PKG=$(pwd)
+engram-pkg add-observation --url ... --title ... --quoted-text ... ...
+engram-pkg dump                      # knowledge.db -> knowledge.sql
+git add knowledge.sql && git commit  # commit only versioned artifacts
+```
+
+The package follows the engram-package protocol — see the engram-pkg CLI README for the full contract.
+'''
+
+
+def cmd_init(args):
+    """Bootstrap a fresh engram-package skeleton in an empty directory.
+
+    Tolerates a pre-existing `.git` directory (so `mkdir my-pkg && cd my-pkg
+    && git init && engram-pkg init .` works as a natural flow). All other
+    pre-existing content blocks init to avoid clobbering author work.
+    """
+    pkg_path = Path(args.path).expanduser().resolve()
+    if pkg_path.exists():
+        # Filter out .git from the non-empty check — initializing inside an
+        # already-`git init`-ed directory is a common author flow.
+        existing = [p for p in pkg_path.iterdir() if p.name != ".git"]
+        if existing:
+            sys.exit(
+                f"ERROR: {pkg_path} is not empty (found: "
+                f"{', '.join(p.name for p in existing[:5])}"
+                f"{'...' if len(existing) > 5 else ''}). "
+                f"`engram-pkg init` refuses to overwrite existing files. "
+                f"A pre-existing `.git/` is OK; anything else blocks init."
+            )
+    pkg_path.mkdir(parents=True, exist_ok=True)
+    scripts_dir = pkg_path / "scripts"
+    scripts_dir.mkdir(exist_ok=True)
+
+    files_written = []
+
+    dump_path = scripts_dir / "dump.sh"
+    dump_path.write_text(_DUMP_SH_TEMPLATE)
+    dump_path.chmod(0o755)
+    files_written.append(("scripts/dump.sh", dump_path))
+
+    build_path = scripts_dir / "build.sh"
+    build_path.write_text(_BUILD_SH_TEMPLATE)
+    build_path.chmod(0o755)
+    files_written.append(("scripts/build.sh", build_path))
+
+    gitignore_path = pkg_path / ".gitignore"
+    gitignore_path.write_text(_GITIGNORE_TEMPLATE)
+    files_written.append((".gitignore", gitignore_path))
+
+    pkg_name = args.name or pkg_path.name
+    readme_path = pkg_path / "README.md"
+    readme_path.write_text(_README_TEMPLATE.format(pkg_name=pkg_name))
+    files_written.append(("README.md", readme_path))
+
+    # Write config.json with is_knowledge_pack=true before the schema bootstrap
+    # so _get_db() skips the seed-node guard. Knowledge-pack DBs legitimately
+    # have no seed axioms (they're curated obs/dv sets, not agent brains).
+    # Placing this before get_client() ensures _ensure_data_dir() sees the
+    # flag and doesn't overwrite it with the default agent config.
+    config_path = pkg_path / "config.json"
+    config_path.write_text(json.dumps(
+        {"schema_version": 2, "is_knowledge_pack": True}, indent=2
+    ))
+    files_written.append(("config.json", config_path))
+
+    # Bootstrap the schema by triggering the EngramClient once. This creates
+    # knowledge.db with the full ENGRAM schema (otherwise build.sh against an
+    # empty knowledge.sql produces a schema-less .db that can't be queried).
+    # We call engram_stats as a no-op trigger; any read does the same job.
+    #
+    # ENGRAM_BOOTSTRAP=1 bypasses the server's "DB must exist" startup guard
+    # (_get_db()) which would otherwise block schema creation on a fresh package
+    # directory — the chicken-and-egg: get_client() needs DB, DB needs client.
+    # Same mechanism bootstrap.py uses for seeding. Clear it immediately after
+    # so subsequent get_client() calls in the same process use the normal guard.
+    _prev_bootstrap = os.environ.get("ENGRAM_BOOTSTRAP")
+    os.environ["ENGRAM_BOOTSTRAP"] = "1"
+    try:
+        client = get_client(pkg_path)
+        client.call("engram_stats")
+    finally:
+        if _prev_bootstrap is None:
+            os.environ.pop("ENGRAM_BOOTSTRAP", None)
+        else:
+            os.environ["ENGRAM_BOOTSTRAP"] = _prev_bootstrap
+
+    # Now dump the schema (no nodes) to knowledge.sql so a fresh
+    # `git clone && bash scripts/build.sh` produces a working .db.
+    dump_script = pkg_path / "scripts" / "dump.sh"
+    rc = subprocess.call(["bash", str(dump_script)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if rc != 0:
+        sys.exit(f"ERROR: scripts/dump.sh failed during init (rc={rc}). The skeleton was created but knowledge.sql is empty.")
+    files_written.append(("knowledge.sql", pkg_path / "knowledge.sql"))
+
+    print(f"Initialized engram-package at {pkg_path}")
+    for label, _ in files_written:
+        print(f"  + {label}")
+    print()
+    print("Next steps:")
+    print(f"  cd {pkg_path}")
+    print(f"  git init && git add . && git commit -m 'init: engram-package skeleton'")
+    print(f"  export ENGRAM_PKG={pkg_path}")
+    print(f"  engram-pkg add-evidence --url ... --title ...")
+    return 0
+
+
+# Path prefixes that almost certainly indicate a machine-local URL, not
+# something a different consumer can resolve. Order doesn't matter; any
+# match triggers the warning.
+_LOCAL_URL_INDICATORS = (
+    "file:///home/", "file:///Users/", "file:///root/",
+    "file:///tmp/", "file:///var/",
+)
+
+
+def _warn_if_local_url(url: str) -> None:
+    """Emit a stderr warning when url looks machine-local (won't port to
+    other consumers of the package). Non-blocking — the URL is still accepted.
+    """
+    if not url:
+        return
+    if not any(url.startswith(prefix) for prefix in _LOCAL_URL_INDICATORS):
+        return
+    sys.stderr.write(
+        f"WARNING: URL '{url}' looks like a machine-local absolute path. "
+        f"Other consumers of this package will not be able to resolve it. "
+        f"Consider a stable URL instead: GitHub raw "
+        f"(https://raw.githubusercontent.com/...), a project-relative path, "
+        f"or arxiv/DOI for published sources.\n"
+    )
+
+
+def cmd_add_evidence(args):
+    _warn_if_local_url(args.url)
+    client = get_client(resolve_pkg(args))
+    return report(client.call("engram_add_evidence", {
+        "url": args.url, "title": args.title,
+        "domain": args.domain or "", "source_date": args.source_date or "",
+    }))
+
+
+def cmd_add_observation(args):
+    client = get_client(resolve_pkg(args))
+    payload = {
+        "quoted_text": args.quoted_text,
+        "interpretation": args.interpretation,
+        "claim": args.claim,
+        "quote_type": args.quote_type,
+    }
+    if args.evidence_id:
+        payload["evidence_id"] = args.evidence_id
+    elif args.url:
+        _warn_if_local_url(args.url)
+        payload["url"] = args.url
+        payload["title"] = args.title or ""
+        if args.source_date:
+            payload["source_date"] = args.source_date
+    else:
+        sys.exit("ERROR: provide --evidence-id OR --url --title.")
+    if args.source_class:
+        payload["source_class"] = args.source_class
+    return report(client.call("engram_add_observation", payload))
+
+
+def cmd_derive(args):
+    client = get_client(resolve_pkg(args))
+    return report(client.call("engram_derive", {
+        "claim": args.claim,
+        "supporting_ids": args.supporting_ids,
+        "logical_chain": args.logical_chain,
+        "reasoning_type": args.reasoning_type,
+    }))
+
+
+def cmd_supersede(args):
+    """Wire two existing nodes via supersede relation.
+
+    engram_supersede is RELATIONAL ONLY — it does not create the
+    replacement node. Workflow:
+      1. Create the new node via add-observation / derive / etc.
+      2. engram-pkg supersede --old-node-id <old> --new-node-id <new>
+         [--reason <short rationale>]
+    """
+    client = get_client(resolve_pkg(args))
+    payload = {
+        "old_node_id": args.old_node_id,
+        "new_node_id": args.new_node_id,
+    }
+    if args.reason:
+        payload["supersede_reason"] = args.reason
+    return report(client.call("engram_supersede", payload))
+
+
+def cmd_list(args):
+    pkg_path = resolve_pkg(args)
+    _check_stale_build(pkg_path, auto_build=args.auto_build)
+    client = get_client(pkg_path)
+    payload = {}
+    if args.node_type:
+        payload["node_type"] = args.node_type
+    if args.limit:
+        payload["limit"] = args.limit
+    return report(client.call("engram_list", payload))
+
+
+def cmd_query(args):
+    pkg_path = resolve_pkg(args)
+    _check_stale_build(pkg_path, auto_build=args.auto_build)
+    client = get_client(pkg_path)
+    return report(client.call("engram_query", {"query": args.query, "top_k": args.top_k}))
+
+
+def cmd_inspect(args):
+    pkg_path = resolve_pkg(args)
+    _check_stale_build(pkg_path, auto_build=args.auto_build)
+    client = get_client(pkg_path)
+    return report(client.call("engram_inspect", {"node_id": args.node_id}))
+
+
+def cmd_stats(args):
+    pkg_path = resolve_pkg(args)
+    _check_stale_build(pkg_path, auto_build=args.auto_build)
+    client = get_client(pkg_path)
+    return report(client.call("engram_stats"))
+
+
+def cmd_dump(args):
+    pkg_path = resolve_pkg(args)
+    script = pkg_path / "scripts" / "dump.sh"
+    if not script.exists():
+        sys.exit(f"ERROR: {script} not found. (Is this an engram-package directory?)")
+    return subprocess.call(["bash", str(script)])
+
+
+def cmd_build(args):
+    pkg_path = resolve_pkg(args)
+    script = pkg_path / "scripts" / "build.sh"
+    if not script.exists():
+        sys.exit(f"ERROR: {script} not found. (Is this an engram-package directory?)")
+    return subprocess.call(["bash", str(script)])
+
+
+# ---------------------------------------------------------------------------
+# scope-export helpers
+# ---------------------------------------------------------------------------
+
+# Default size-guard thresholds.  Configurable via --max-nodes / --max-edges.
+_SCOPE_EXPORT_DEFAULT_MAX_NODES = 200
+_SCOPE_EXPORT_DEFAULT_MAX_EDGES = 400
+
+
+def _load_source_agent_name(source_db_dir: Path) -> str:
+    """Read agent_name from the source config.json (falls back to 'unknown')."""
+    cfg = source_db_dir / "config.json"
+    if cfg.exists():
+        try:
+            data = json.loads(cfg.read_text())
+            name = data.get("agent_name") or data.get("agent-name") or ""
+            if name:
+                return name
+        except (json.JSONDecodeError, OSError):
+            pass
+    return "unknown"
+
+
+def _compute_provenance_closure(
+    source_conn: sqlite3.Connection,
+    root_ids: list[str],
+    max_nodes: int,
+    max_edges: int,
+) -> tuple[dict, list[dict]]:
+    """Compute the transitive provenance closure from the given root IDs.
+
+    Traversal rule (spec §3):
+      - Follows all outgoing edges from each included node (derives_from,
+        supports, cites, evidence links, supersedes, contradicts, resolves).
+      - Also includes incoming edges that touch included nodes (so the
+        reader sees the node's epistemic status).
+      - Stops at natural provenance leaves (axioms, definitions, evidence
+        nodes with no further outgoing edges, observations-with-evidence).
+      - Includes ALL edges where both endpoints are in the closure (§3a).
+
+    The BFS visits ALL reachable nodes via outgoing edges first (provenance
+    direction = toward sources), then picks up any incoming edges to already-
+    included nodes so supersedes/contradicts/resolves arcs are visible.
+
+    Returns:
+        (nodes_dict, edges_list):
+            nodes_dict: {node_id: row_dict} — full row for every included node
+            edges_list: list of edge row dicts where BOTH endpoints are included
+
+    Raises SystemExit on size-guard violation (never silently truncates).
+    """
+    source_conn.row_factory = sqlite3.Row
+
+    # BFS over outgoing provenance edges to discover the closure.
+    visited: dict[str, dict] = {}
+    queue: collections.deque = collections.deque(root_ids)
+
+    # Validate all root IDs exist before starting.
+    missing = []
+    for rid in root_ids:
+        row = source_conn.execute("SELECT * FROM nodes WHERE id = ?", (rid,)).fetchone()
+        if row is None:
+            missing.append(rid)
+    if missing:
+        sys.exit(
+            f"ERROR: scope-export: root node(s) not found in source graph: "
+            f"{', '.join(missing)}"
+        )
+
+    while queue:
+        nid = queue.popleft()
+        if nid in visited:
+            continue
+        row = source_conn.execute("SELECT * FROM nodes WHERE id = ?", (nid,)).fetchone()
+        if row is None:
+            # Referenced but doesn't exist (stale edge in source) — skip.
+            continue
+        visited[nid] = dict(row)
+
+        # Size-guard check — fail loudly, never truncate.
+        if len(visited) > max_nodes:
+            sys.exit(
+                f"ERROR: scope-export: closure exceeded size guard "
+                f"({max_nodes} nodes max). The root set is too broad; "
+                f"narrow the --nodes list and re-run. "
+                f"(Use --max-nodes to adjust the threshold.)"
+            )
+
+        # Follow outgoing edges (toward provenance sources).
+        outgoing = source_conn.execute(
+            "SELECT * FROM edges WHERE source_id = ?", (nid,)
+        ).fetchall()
+        for e in outgoing:
+            tgt = e["target_id"]
+            if tgt not in visited:
+                queue.append(tgt)
+
+    # Now collect ALL edges where BOTH endpoints are in the closure.
+    # This includes:
+    #   (a) outgoing edges from included nodes → included targets (provenance)
+    #   (b) incoming edges to included nodes from other included nodes
+    #       (e.g. supersedes, contradicts, resolves arcs)
+    # Using a single query for efficiency.
+    node_ids_tuple = tuple(visited.keys())
+    if not node_ids_tuple:
+        return visited, []
+
+    # SQLite has a max 999 params per query; chunk if needed.
+    all_edges: list[dict] = []
+    if len(node_ids_tuple) <= 990:
+        placeholders = ",".join("?" * len(node_ids_tuple))
+        rows = source_conn.execute(
+            f"SELECT * FROM edges WHERE source_id IN ({placeholders}) "
+            f"AND target_id IN ({placeholders})",
+            node_ids_tuple + node_ids_tuple,
+        ).fetchall()
+        all_edges = [dict(r) for r in rows]
+    else:
+        # Large closure: scan all edges and filter in Python.
+        node_set = set(visited.keys())
+        for row in source_conn.execute("SELECT * FROM edges").fetchall():
+            if row["source_id"] in node_set and row["target_id"] in node_set:
+                all_edges.append(dict(row))
+
+    # Deduplicate by (source_id, target_id, relation).
+    seen: set[tuple] = set()
+    unique_edges: list[dict] = []
+    for e in all_edges:
+        key = (e["source_id"], e["target_id"], e["relation"])
+        if key not in seen:
+            seen.add(key)
+            unique_edges.append(e)
+
+    # Size-guard on edges.
+    if len(unique_edges) > max_edges:
+        sys.exit(
+            f"ERROR: scope-export: closure exceeded edge size guard "
+            f"({max_edges} edges max). The root set is too broad; "
+            f"narrow the --nodes list and re-run. "
+            f"(Use --max-edges to adjust the threshold.)"
+        )
+
+    return visited, unique_edges
+
+
+def _find_dangling_edges(
+    nodes: dict, edges: list[dict]
+) -> list[tuple[str, str, str]]:
+    """Return a list of (src, tgt, relation) for edges with an endpoint outside nodes.
+
+    Pure checker — no I/O, no sys.exit, no side effects.  Returns an empty list
+    when the closure is complete.  The wrapper _assert_closure_completeness
+    calls this and exits on violation; callers that need to handle violations
+    programmatically (e.g. server-side validation) call this directly.
+    """
+    node_set = set(nodes.keys())
+    dangling = []
+    for e in edges:
+        src, tgt = e["source_id"], e["target_id"]
+        if src not in node_set or tgt not in node_set:
+            dangling.append((src, tgt, e["relation"]))
+    return dangling
+
+
+def _assert_closure_completeness(nodes: dict, edges: list[dict]) -> None:
+    """Assert the closure-completeness invariant (spec §3a).
+
+    Every edge in the pack must have BOTH endpoints in the pack.
+    Raises SystemExit with a clear message on violation.
+
+    This is a hard guard — not advisory.  A dangling edge is silent-wrong
+    on the consume side (see §3a rationale).
+
+    Thin wrapper around _find_dangling_edges for the CLI exit path; callers
+    that need to handle violations programmatically should call
+    _find_dangling_edges directly.
+    """
+    dangling = _find_dangling_edges(nodes, edges)
+    if dangling:
+        examples = "; ".join(f"{s} →[{r}]→ {t}" for s, t, r in dangling[:5])
+        sys.exit(
+            f"ERROR: scope-export: closure-completeness invariant violated — "
+            f"{len(dangling)} edge(s) have an endpoint outside the pack. "
+            f"Examples: {examples}. "
+            f"This is a bug in the closure logic; please report it."
+        )
+
+
+def _sql_literal(v) -> str:
+    """Serialize a Python value as a SQL literal (NULL, integer, real, or quoted string)."""
+    if v is None:
+        return "NULL"
+    elif isinstance(v, int):
+        return str(v)
+    elif isinstance(v, float):
+        return repr(v)  # repr avoids lossy .6f rounding for floats like confidence
+    else:
+        # Escape single quotes by doubling them.
+        return "'" + str(v).replace("'", "''") + "'"
+
+
+def _write_canonical_knowledge_sql(pkg_db_path: Path, sql_out_path: Path) -> bytes:
+    """Produce a self-contained, deterministic knowledge.sql from the package DB.
+
+    The output is pipeable into a fresh sqlite3 db (via scripts/build.sh) and
+    produces a complete, queryable engram-package db.  Round-1 only emitted
+    INSERT statements, which broke the build.sh consumer path ("no such table:
+    nodes").  This version emits full DDL (CREATE TABLE / CREATE INDEX /
+    CREATE TRIGGER) before the data INSERTs, derived from sqlite_master so the
+    schema definition stays in sync with whatever the source db was initialised
+    with — never hand-invented here.
+
+    DDL inclusion decisions:
+      INCLUDED  — nodes, edges, sequences, edit_history, diagnostic_history,
+                  tool_timing, focus_sets, focus_state (full schema, empty
+                  runtime tables included so EngramClient can operate against
+                  the built db without migration errors), plus nodes_fts FTS5
+                  virtual table + its triggers (FTS5 is built into SQLite's
+                  standard amalgamation, plain sqlite3 handles it fine).
+      EXCLUDED  — vec_nodes and all vec_* shadow tables: require the sqlite-vec
+                  extension (vec0 module) which is NOT available in a standard
+                  sqlite3 binary.  Embedding-dependent search degrades silently
+                  to FTS5 + keyword fallback; the core claim/evidence graph is
+                  fully present.  See comment in cmd_scope_export for context.
+      EXCLUDED  — nodes_fts shadow tables (nodes_fts_config, nodes_fts_data,
+                  nodes_fts_docsize, nodes_fts_idx, nodes_fts_vocab): these are
+                  internal implementation tables created automatically by SQLite
+                  when the VIRTUAL TABLE is created; explicitly emitting them
+                  causes "object name reserved for internal use" errors.
+      EXCLUDED  — sqlite_sequence, sqlite_autoindex_*: auto-managed by SQLite;
+                  emitting them is either a no-op or an error.
+
+    Emit order (required for correct FK dependency resolution):
+      1. nodes (no FK deps)
+      2. edges, sequences, edit_history, diagnostic_history, tool_timing,
+         focus_sets, focus_state (after nodes)
+      3. nodes_fts VIRTUAL TABLE (must come after nodes; it uses
+         content='nodes' external content table)
+      4. Indexes (ORDER BY name for determinism)
+      5. Triggers (ORDER BY name; depend on nodes_fts existing)
+      6. Data INSERTs: nodes ORDER BY id, edges ORDER BY id,
+         sequences ORDER BY node_type
+
+    Returns the raw bytes written (used for sha256 content_hash).
+    Deterministic: re-running on the same closure → identical bytes.
+    """
+    conn = sqlite3.connect(str(pkg_db_path))
+    conn.row_factory = sqlite3.Row
+    lines: list[str] = []
+
+    lines.append("-- engram-package canonical dump")
+    lines.append(
+        "-- Generated by engram-pkg scope-export (schema + deterministic ORDER BY id data)"
+    )
+    lines.append("PRAGMA foreign_keys=OFF;")
+    lines.append("BEGIN TRANSACTION;")
+
+    # ------------------------------------------------------------------ #
+    # DDL Section 1 — regular tables in dependency order.                  #
+    # ------------------------------------------------------------------ #
+    # nodes must come first (edges FK-references nodes).
+    # The remaining tables have no FK deps on each other and can appear in
+    # any order, but we use a stable fixed list for determinism.
+    _TABLE_EMIT_ORDER = [
+        "nodes",
+        "edges",
+        "sequences",
+        "edit_history",
+        "diagnostic_history",
+        "tool_timing",
+        "focus_sets",
+        "focus_state",
+    ]
+    for tname in _TABLE_EMIT_ORDER:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (tname,)
+        ).fetchone()
+        if row and row["sql"]:
+            lines.append(row["sql"] + ";")
+
+    # ------------------------------------------------------------------ #
+    # DDL Section 2 — FTS5 virtual table (after nodes; content='nodes').  #
+    # Shadow tables (nodes_fts_config, etc.) are auto-created by SQLite   #
+    # and MUST NOT be emitted here — doing so raises                      #
+    # "object name reserved for internal use".                            #
+    # ------------------------------------------------------------------ #
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='nodes_fts'"
+    ).fetchone()
+    if row and row["sql"]:
+        lines.append(row["sql"] + ";")
+
+    # ------------------------------------------------------------------ #
+    # DDL Section 3 — indexes (ORDER BY name for determinism).            #
+    # Exclude sqlite-internal autoindex names.                            #
+    # ------------------------------------------------------------------ #
+    for row in conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type='index' AND name NOT LIKE 'sqlite%' "
+        "ORDER BY name"
+    ).fetchall():
+        if row["sql"]:
+            lines.append(row["sql"] + ";")
+
+    # ------------------------------------------------------------------ #
+    # DDL Section 4 — triggers (ORDER BY name for determinism).           #
+    # These recreate the FTS5 insert/delete/retract triggers.             #
+    # ------------------------------------------------------------------ #
+    for row in conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' ORDER BY name"
+    ).fetchall():
+        if row["sql"]:
+            lines.append(row["sql"] + ";")
+
+    # ------------------------------------------------------------------ #
+    # Data Section — nodes, edges, sequences (all ORDER BY for           #
+    # determinism; same closure run → byte-identical output).             #
+    # ------------------------------------------------------------------ #
+
+    # --- nodes table ---
+    col_info = conn.execute("PRAGMA table_info(nodes)").fetchall()
+    node_cols = [r["name"] for r in col_info]
+    col_list = ", ".join(node_cols)
+
+    for row in conn.execute(f"SELECT {col_list} FROM nodes ORDER BY id").fetchall():
+        sql_vals = [_sql_literal(v) for v in list(row)]
+        lines.append(f"INSERT INTO nodes ({col_list}) VALUES ({', '.join(sql_vals)});")
+
+    # --- edges table ---
+    edge_col_info = conn.execute("PRAGMA table_info(edges)").fetchall()
+    edge_cols = [r["name"] for r in edge_col_info]
+    edge_col_list = ", ".join(edge_cols)
+
+    for row in conn.execute(
+        f"SELECT {edge_col_list} FROM edges ORDER BY id"
+    ).fetchall():
+        sql_vals = [_sql_literal(v) for v in list(row)]
+        lines.append(
+            f"INSERT INTO edges ({edge_col_list}) VALUES ({', '.join(sql_vals)});"
+        )
+
+    # --- sequences table ---
+    for row in conn.execute(
+        "SELECT node_type, last_num FROM sequences ORDER BY node_type"
+    ).fetchall():
+        nt = _sql_literal(row["node_type"])
+        lines.append(
+            f"INSERT INTO sequences (node_type, last_num) VALUES ({nt}, {row['last_num']});"
+        )
+
+    lines.append("COMMIT;")
+    conn.close()
+
+    content = "\n".join(lines) + "\n"
+    raw_bytes = content.encode("utf-8")
+    sql_out_path.write_bytes(raw_bytes)
+    return raw_bytes
+
+
+def _populate_package_db(pkg_db_path: Path, nodes: dict, edges: list[dict]) -> None:
+    """Insert closure nodes and edges into the (already-schema'd) package DB.
+
+    Uses direct SQL INSERT preserving all columns from the source rows.
+    The package DB was bootstrapped by cmd_init (full schema present).
+    """
+    conn = sqlite3.connect(str(pkg_db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=OFF")  # Avoid FK constraint on insert order.
+
+    # Get package DB column names (may differ from source if schema evolved).
+    pkg_node_cols = {r[1] for r in conn.execute("PRAGMA table_info(nodes)").fetchall()}
+    pkg_edge_cols = {r[1] for r in conn.execute("PRAGMA table_info(edges)").fetchall()}
+
+    for nid, node_row in nodes.items():
+        # Only insert columns that exist in the package schema.
+        filtered = {k: v for k, v in node_row.items() if k in pkg_node_cols}
+        if not filtered:
+            continue
+        cols = ", ".join(filtered.keys())
+        placeholders = ", ".join("?" * len(filtered))
+        vals = list(filtered.values())
+        conn.execute(
+            f"INSERT OR REPLACE INTO nodes ({cols}) VALUES ({placeholders})",
+            vals,
+        )
+
+    for edge_row in edges:
+        # Skip the autoincrement id — the package DB will assign its own.
+        filtered = {
+            k: v for k, v in edge_row.items()
+            if k in pkg_edge_cols and k != "id"
+        }
+        if not filtered:
+            continue
+        cols = ", ".join(filtered.keys())
+        placeholders = ", ".join("?" * len(filtered))
+        vals = list(filtered.values())
+        conn.execute(
+            f"INSERT OR IGNORE INTO edges ({cols}) VALUES ({placeholders})",
+            vals,
+        )
+
+    # Update sequences so the package knows the highest ID per type.
+    for nid in nodes:
+        if "_" in nid:
+            prefix = nid.rsplit("_", 1)[0]
+            try:
+                num = int(nid.rsplit("_", 1)[1])
+            except ValueError:
+                continue
+            conn.execute(
+                """
+                INSERT INTO sequences (node_type, last_num) VALUES (?, ?)
+                ON CONFLICT(node_type) DO UPDATE
+                    SET last_num = MAX(sequences.last_num, excluded.last_num)
+                """,
+                (prefix, num),
+            )
+
+    conn.commit()
+    conn.close()
+
+
+def cmd_scope_export(args):
+    """Export a provenance closure as a scoped engram-package + sidecar manifest.
+
+    Steps (per spec §6):
+      (a) Compute the transitive provenance closure from --nodes root IDs,
+          reading the agent's live ~/.engram/knowledge.db read-only.
+      (b) Validate closure-completeness invariant (spec §3a) — hard-fail on
+          any dangling edge.
+      (c) engram-pkg init a fresh package dir at --out.
+      (d) Populate the package DB with closure nodes + edges via direct SQL.
+      (e) Write a deterministic canonical knowledge.sql (ORDER BY id).
+      (f) Compute sha256(knowledge.sql bytes) and write manifest.json (spec §4).
+    """
+    root_ids = [r.strip() for r in args.nodes.split(",") if r.strip()]
+    if not root_ids:
+        sys.exit("ERROR: scope-export: --nodes must be a non-empty comma-separated list of node IDs.")
+
+    out_path = Path(args.out).expanduser().resolve()
+
+    # Locate the source DB (agent's personal graph, read-only).
+    source_home = Path(
+        os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
+    ).expanduser().resolve()
+    source_db = source_home / "knowledge.db"
+    if not source_db.exists():
+        sys.exit(
+            f"ERROR: scope-export: source graph not found at {source_db}. "
+            f"Set $ENGRAM_HOME to point at your ENGRAM data directory."
+        )
+
+    max_nodes = args.max_nodes if args.max_nodes is not None else _SCOPE_EXPORT_DEFAULT_MAX_NODES
+    max_edges = args.max_edges if args.max_edges is not None else _SCOPE_EXPORT_DEFAULT_MAX_EDGES
+
+    # (a) Compute provenance closure from the source DB (read-only).
+    print(f"scope-export: computing closure from {source_db} ...")
+    source_conn = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
+    source_conn.row_factory = sqlite3.Row
+    try:
+        nodes, edges = _compute_provenance_closure(
+            source_conn, root_ids, max_nodes, max_edges
+        )
+    finally:
+        source_conn.close()
+
+    # (b) Closure-completeness invariant (spec §3a).
+    _assert_closure_completeness(nodes, edges)
+
+    node_count = len(nodes)
+    edge_count = len(edges)
+    print(f"scope-export: closure = {node_count} nodes, {edge_count} edges")
+
+    # (c) Bootstrap a fresh package dir via cmd_init (reuse its logic).
+    # We need to call init without touching --pkg (init takes a positional path).
+    # Construct a namespace that mimics what cmd_init expects.
+    import types as _types
+    init_args = _types.SimpleNamespace(path=str(out_path), name=args.name or out_path.name)
+    cmd_init(init_args)
+
+    # (d) Populate the package DB with closure nodes + edges.
+    pkg_db = out_path / "knowledge.db"
+    if not pkg_db.exists():
+        sys.exit(f"ERROR: scope-export: package DB not found at {pkg_db} after init.")
+    print(f"scope-export: populating package DB ...")
+    _populate_package_db(pkg_db, nodes, edges)
+
+    # (e) Write deterministic canonical knowledge.sql.
+    sql_path = out_path / "knowledge.sql"
+    print(f"scope-export: writing canonical knowledge.sql ...")
+    sql_bytes = _write_canonical_knowledge_sql(pkg_db, sql_path)
+
+    # (f) Hash knowledge.sql and write manifest.json (spec §4).
+    content_hash = "sha256:" + hashlib.sha256(sql_bytes).hexdigest()
+
+    # Read schema version from the package config.json (written by init).
+    pkg_cfg_path = out_path / "config.json"
+    schema_version = "unknown"
+    if pkg_cfg_path.exists():
+        try:
+            pkg_cfg = json.loads(pkg_cfg_path.read_text())
+            schema_version = str(pkg_cfg.get("schema_version", "unknown"))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    author_agent = _load_source_agent_name(source_home)
+    created_at = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+    manifest = {
+        "pack_format": "engram-package/v1",
+        "root_node_ids": root_ids,
+        "node_count": node_count,
+        "edge_count": edge_count,
+        "author_agent": author_agent,
+        "content_hash": content_hash,
+        "engram_schema_version": schema_version,
+        "created_at": created_at,
+        "answer_post_id": None,
+    }
+    manifest_path = out_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+
+    print(f"scope-export: wrote manifest.json")
+    print(f"scope-export: done.")
+    print(f"")
+    print(f"Output: {out_path}")
+    print(f"  nodes:         {node_count}")
+    print(f"  edges:         {edge_count}")
+    print(f"  roots:         {', '.join(root_ids)}")
+    print(f"  content_hash:  {content_hash}")
+    print(f"  author_agent:  {author_agent}")
+    return 0
+
+
+def cmd_call(args):
+    """Generic escape hatch — invoke any engram_* tool with JSON-encoded args.
+
+    Two input paths for the params dict:
+      --json '<inline JSON>'         — quick one-liners; subject to shell quoting.
+      --json-file <path>             — read JSON from a file; sidesteps shell
+                                       quoting entirely (recommended for any
+                                       payload with backticks, apostrophes,
+                                       or multi-line prose).
+
+    Mutually exclusive. If neither is provided, payload is empty (some tools
+    accept no args, e.g. engram_reflect).
+    """
+    if args.json and args.json_file:
+        sys.exit("ERROR: --json and --json-file are mutually exclusive.")
+
+    if args.json_file:
+        path = Path(args.json_file).expanduser()
+        if not path.is_file():
+            sys.exit(f"ERROR: --json-file {path} not found.")
+        try:
+            payload = json.loads(path.read_text())
+        except json.JSONDecodeError as e:
+            sys.exit(f"ERROR: --json-file {path} contains invalid JSON: {e}")
+    elif args.json:
+        try:
+            payload = json.loads(args.json)
+        except json.JSONDecodeError as e:
+            sys.exit(f"ERROR: --json invalid: {e}")
+    else:
+        payload = {}
+
+    if not isinstance(payload, dict):
+        sys.exit(f"ERROR: payload must be a JSON object (dict), got {type(payload).__name__}.")
+
+    client = get_client(resolve_pkg(args))
+    return report(client.call(args.tool_name, payload))
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="engram-pkg", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--pkg", help="Path to engram-package dir. Defaults to $ENGRAM_PKG.")
+    p.add_argument(
+        "--auto-build",
+        action="store_true",
+        help="If knowledge.sql is newer than knowledge.db (e.g., after `git pull`), "
+             "auto-run scripts/build.sh before reading. Default: warn-only.",
+    )
+    sp = p.add_subparsers(dest="cmd", required=True)
+
+    i = sp.add_parser("init", help="Bootstrap a new engram-package skeleton.")
+    i.add_argument("path", help="Path to the package directory (will be created if missing; must be empty).")
+    i.add_argument("--name", help="Package name for README header (defaults to directory basename).")
+    i.set_defaults(func=cmd_init)
+
+    e = sp.add_parser("add-evidence", help="Register a source document.")
+    e.add_argument("--url", required=True)
+    e.add_argument("--title", required=True)
+    e.add_argument("--domain")
+    e.add_argument("--source-date")
+    e.set_defaults(func=cmd_add_evidence)
+
+    o = sp.add_parser("add-observation", help="Extract a claim with provenance from a source.")
+    o.add_argument("--quoted-text", required=True)
+    o.add_argument("--interpretation", required=True)
+    o.add_argument("--claim", required=True)
+    o.add_argument("--quote-type", required=True,
+                   choices=["hard_data", "official_statement", "attributed_analysis",
+                            "unnamed_source", "editorial"])
+    o.add_argument("--evidence-id", help="Use this OR --url+--title.")
+    o.add_argument("--url")
+    o.add_argument("--title")
+    o.add_argument("--source-date")
+    o.add_argument("--source-class", choices=["external", "introspective", "user_stated"])
+    o.set_defaults(func=cmd_add_observation)
+
+    d = sp.add_parser("derive", help="Combine evidence into a derived claim.")
+    d.add_argument("--claim", required=True)
+    d.add_argument("--supporting-ids", required=True, help="Comma-separated node IDs.")
+    d.add_argument("--logical-chain", required=True)
+    d.add_argument("--reasoning-type", required=True,
+                   help="One of the engram_derive reasoning types.")
+    d.set_defaults(func=cmd_derive)
+
+    s = sp.add_parser(
+        "supersede",
+        help="Wire an existing replacement node as the successor of an old node (relational only).",
+    )
+    s.add_argument("--old-node-id", required=True, help="ID of the node being superseded.")
+    s.add_argument(
+        "--new-node-id",
+        required=True,
+        help="ID of the replacement node — must already exist (create via add-observation, derive, etc. first).",
+    )
+    s.add_argument("--reason", help="Optional short rationale for why this revision exists.")
+    s.set_defaults(func=cmd_supersede)
+
+    l = sp.add_parser("list", help="List nodes in compact triage format.")
+    l.add_argument(
+        "--node-type",
+        choices=NODE_TYPES,
+        help="Filter to a single node type. Without this flag, all types are listed. "
+             "Typo-protected — argparse rejects unknown types with the valid list.",
+    )
+    l.add_argument("--limit", type=int)
+    l.set_defaults(func=cmd_list)
+
+    q = sp.add_parser("query", help="Search nodes by text + embedding.")
+    q.add_argument("query", help="Search query.")
+    q.add_argument("--top-k", type=int, default=10)
+    q.set_defaults(func=cmd_query)
+
+    i = sp.add_parser("inspect", help="Inspect a single node + 1-hop neighbors.")
+    i.add_argument("node_id")
+    i.set_defaults(func=cmd_inspect)
+
+    sp.add_parser("stats", help="Package statistics.").set_defaults(func=cmd_stats)
+    sp.add_parser("dump", help="Run scripts/dump.sh — write knowledge.sql.").set_defaults(func=cmd_dump)
+    sp.add_parser("build", help="Run scripts/build.sh — build knowledge.db from .sql.").set_defaults(func=cmd_build)
+
+    se = sp.add_parser(
+        "scope-export",
+        help=(
+            "Export a transitive provenance closure of cited nodes as a scoped "
+            "engram-package + sidecar manifest.json (spec §651)."
+        ),
+    )
+    se.add_argument(
+        "--nodes",
+        required=True,
+        help=(
+            "Comma-separated root node IDs to export (e.g. dv_NNNN,ob_NNNN). "
+            "The transitive provenance closure of these nodes is included."
+        ),
+    )
+    se.add_argument(
+        "--out",
+        required=True,
+        help="Output directory for the scoped engram-package (must not exist or be empty).",
+    )
+    se.add_argument(
+        "--name",
+        help="Package name for README header (defaults to directory basename).",
+    )
+    se.add_argument(
+        "--max-nodes",
+        type=int,
+        default=_SCOPE_EXPORT_DEFAULT_MAX_NODES,
+        help=(
+            f"Hard size guard: fail if the closure exceeds this many nodes "
+            f"(default {_SCOPE_EXPORT_DEFAULT_MAX_NODES}). "
+            f"Never silently truncates — over-size is an error."
+        ),
+    )
+    se.add_argument(
+        "--max-edges",
+        type=int,
+        default=_SCOPE_EXPORT_DEFAULT_MAX_EDGES,
+        help=(
+            f"Hard size guard: fail if the closure exceeds this many edges "
+            f"(default {_SCOPE_EXPORT_DEFAULT_MAX_EDGES}). "
+            f"Never silently truncates — over-size is an error."
+        ),
+    )
+    se.set_defaults(func=cmd_scope_export)
+
+    c = sp.add_parser("call", help="Generic escape hatch — invoke any engram_* tool by JSON.")
+    c.add_argument("tool_name", help="Full tool name (e.g. engram_reflect).")
+    c.add_argument("--json", help="JSON-encoded arguments dict (inline; subject to shell quoting).")
+    c.add_argument("--json-file", help="Path to a JSON file containing the arguments dict (recommended for payloads with backticks, apostrophes, or multi-line prose).")
+    c.set_defaults(func=cmd_call)
+
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

@@ -1,0 +1,17 @@
+Flask>=3.0,<4.0
+markdown-it-py>=3.0,<4.0
+bleach>=6.0,<7.0
+beautifulsoup4>=4.12,<5.0
+html5lib>=1.1,<2.0
+# Hard-pinned (not >=/<) -- sentence-transformers 5.4.x hangs on HuggingFace
+# Hub metadata fetch during cold-start, even with weights fully cached. The
+# hang originates in huggingface_hub.file_download.get_hf_file_metadata, so
+# huggingface_hub is equally load-bearing and pinned alongside. See #162.
+sentence-transformers==5.3.0
+huggingface_hub==1.8.0
+# Hard-pinned to the version that created the existing vec0 indexes
+# (Borges + Ariadne both on 0.1.9, verified). The vec0 KNN index over post/thread
+# embeddings replaces the O(N) pure-Python cosine fallback for semantic search.
+# The code degrades loudly without it, but 0.1.9 is the supported deploy config.
+# See #728 for the pin rationale.
+sqlite-vec==0.1.9

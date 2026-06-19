@@ -1,0 +1,29 @@
+# release-minus-set.txt — paths excluded from the PUBLIC release snapshot.
+#
+# The two-repo release model: engram-alpha (private, full history) is the source;
+# the public release repo (engram-agents/engram) gets a clean squashed snapshot
+# per version, produced by tools/release-cutover.py, which reads THIS file.
+#
+# This is the ONLY hand-maintained part of the cutover. Add a path here to keep it
+# out of the public release. One entry per line; gitignore-style globs supported
+# (matched against repo-root-relative POSIX paths). Lines starting with # ignored.
+
+# --- Dev / Claude-project workspace (not part of the product) ---
+CLAUDE.md
+.claude/
+
+# --- Persona-specific dev tools (Borges/Lei integrations, not generic ENGRAM) ---
+tools/telegram_bot.py
+tools/_telegram_api.py
+tools/borges_session_eval.py
+
+# --- Dev test suite (lives in the private engram-alpha; the public repo is a
+#     user-facing release snapshot). Also avoids publishing leak-detection test
+#     fixtures that intentionally embed scanner patterns, which would otherwise
+#     false-positive the scan-leaks gate. ---
+tests/
+
+# --- CI / dev-policy workflows (private dev infra). Their gates reference tests/
+#     (excluded above) + the private repo's structure, so shipping them would show
+#     red CI on the public snapshot repo; a public CI can be added deliberately later. ---
+.github/

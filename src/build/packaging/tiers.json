@@ -1,0 +1,755 @@
+{
+  "schema_version": 1,
+  "depth_tiers": [
+    "essential",
+    "convenience",
+    "dev"
+  ],
+  "axes": {
+    "multi_agent": "orthogonal flag — composes with any depth tier"
+  },
+  "default_tier": "convenience",
+  "source_root": "src/engram",
+  "mechanisms": [
+    {
+      "path": "server.py",
+      "tier": "essential"
+    },
+    {
+      "path": "bootstrap.py",
+      "tier": "essential"
+    },
+    {
+      "path": "template_render.py",
+      "tier": "essential"
+    },
+    {
+      "path": "launch-engram-server.sh",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_backup.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_core.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_focus.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_recall_summaries.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_trust.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_lifecycle.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_epistemic.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_cornerstone.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_derive.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_tasks.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_revision.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_stats.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_query.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_observation.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_walguard.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_client.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_confidence.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_filter.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_idf.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_ids.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_log_emitter.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_log_indexer.py",
+      "tier": "essential"
+    },
+    {
+      "path": "viz_server.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/__init__.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/recall_summary_validator.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/verify_quote.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/inspect_raw.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/dream_master_batch.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/cohort_dispatch.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/recall_summary_payload.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/recall_summary_prompts.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/write_sleep_marker.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/build-plugin.sh",
+      "tier": "convenience",
+      "source": "src/build/build-plugin.sh"
+    },
+    {
+      "path": "tools/engine",
+      "tier": "convenience",
+      "source": "src/build/engine"
+    },
+    {
+      "path": "tools/install-local-marketplace.sh",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/uninstall-local-marketplace.sh",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/engram-regenerate-embeddings.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tools/engram-fix-git-backup.sh",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/pre-dispatch-check.sh",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/operator-setup-viz.sh",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/setup-surface-daemon-service.sh",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/config_schema.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/session.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/compute_task_time.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/_common.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/_session_context.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/engram-pkg",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/collab-letter-monitor.sh",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "tools/forum-mention-monitor.sh",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "tools/ia.py",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "tools/dump_mcp_schema.py",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/baton.py",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "tools/_channel.py",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "tools/forum.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/_status_derive.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/worktree-gc.py",
+      "tier": "convenience"
+    },
+    {
+      "path": ".githooks/pre-push",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/scan-leaks.py",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/release-cutover.py",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/check-claude-md-drift.py",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/deference_baseline.py",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/antml_repair_baseline.py",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/surgical.py",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/run_touched_tests.py",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/ghpr.sh",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/run-all-tests.sh",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/run_matrix.py",
+      "tier": "dev"
+    },
+    {
+      "path": "packaging/test-map.json",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/release_gates.py",
+      "tier": "dev"
+    },
+    {
+      "path": "packaging/release-gates.json",
+      "tier": "dev"
+    },
+    {
+      "path": "hooks/claude/start-engram-daemon.sh",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/engram-surface-daemon.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/engram-surface-hook.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/engram-session-start-hook.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/engram-postcompact-hook.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/engram-toolcall-repair.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/engram-user-identity-hook.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/engram-stop-hook.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/context_tracker.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/engram-deference-detector-prompt.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "hooks/claude/engram-deference-detector-stop.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "hooks/claude/engram-end-of-day-hook.py",
+      "tier": "convenience",
+      "identity_coupled": true
+    },
+    {
+      "path": "hooks/claude/engram-inter-agent-prompt-hook.py",
+      "tier": "convenience",
+      "multi_agent": true,
+      "identity_coupled": true
+    },
+    {
+      "path": "hooks/claude/engram-baton-prompt-hook.py",
+      "tier": "convenience",
+      "multi_agent": true,
+      "identity_coupled": true
+    },
+    {
+      "path": "hooks/claude/engram-forum-prompt-hook.py",
+      "tier": "convenience",
+      "identity_coupled": true
+    },
+    {
+      "path": "hooks/claude/engram-time-bar-hook.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "hooks/claude/engram-utility-credit-mention-stop.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-first-session",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-sleep",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-nap",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-retract",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-resolve-cascade",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-contradiction-resolution",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-learn-from-error",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-trust-tier",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/internal-external-decision",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-loop",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-curiosity-loop",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-meta-loop",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-deep-research",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-school-day",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-research-report",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-fairy-orchestration",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-auto-coder-fairy-judgement",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-auto-reviewer-fairy-judgement",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-upgrade",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-loop-diagnose",
+      "tier": "dev"
+    },
+    {
+      "path": "skills/claude/engram-letter",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "skills/claude/engram-baton",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "skills/claude/engram-forum",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-collaborating-loop",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "skills/claude/engram-self-improve",
+      "tier": "dev"
+    },
+    {
+      "path": "agents/claude/engram-dream-fairy.md",
+      "tier": "essential"
+    },
+    {
+      "path": "agents/claude/engram-dream-master.md",
+      "tier": "essential"
+    },
+    {
+      "path": "agents/claude/engram-batch-summary-fairy.md",
+      "tier": "essential"
+    },
+    {
+      "path": "agents/claude/engram-coder-fairy.md",
+      "tier": "convenience"
+    },
+    {
+      "path": "agents/claude/engram-pr-reviewer.md",
+      "tier": "convenience"
+    },
+    {
+      "path": "output-styles/claude/proactive-with-carveouts.md",
+      "tier": "convenience"
+    },
+    {
+      "path": "templates/template.CLAUDE.md",
+      "tier": "essential"
+    },
+    {
+      "path": "templates/compact-instructions.md",
+      "tier": "essential"
+    },
+    {
+      "path": "templates/template.AGENTS.md",
+      "tier": "essential"
+    },
+    {
+      "path": "templates/template.warm-briefing.md",
+      "tier": "essential"
+    },
+    {
+      "path": "templates/config.json.example",
+      "tier": "essential"
+    },
+    {
+      "path": "templates/engram-surface-daemon.service.template",
+      "tier": "convenience"
+    },
+    {
+      "path": "templates/engram-surface-daemon.plist.template",
+      "tier": "convenience"
+    },
+    {
+      "path": "templates/engram-viz-user.service.template",
+      "tier": "convenience"
+    },
+    {
+      "path": "templates/template.CLAUDE.multi-agent.md",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "templates/agents.json.example",
+      "tier": "convenience",
+      "multi_agent": true
+    }
+  ],
+  "excluded": [
+    {
+      "path": "tools/selftest.py",
+      "reason": "developer pre-deploy test runner — wraps pytest for quick confidence checks; not shipped in any install tier"
+    },
+    {
+      "path": "hooks/claude/context_tracker_hook.py",
+      "reason": "superseded by hooks/claude/context_tracker.py (Issue #140 session-isolation rewrite); context_tracker_hook.py is the old hook wrapper, now replaced by the multi-session-safe hook embedded in engram-session-start-hook.py"
+    },
+    {
+      "path": "tools/_telegram_api.py",
+      "reason": "Telegram-specific transport helper; persona-specific integration (agent/operator channel), not part of generic ENGRAM install"
+    },
+    {
+      "path": "tools/telegram_bot.py",
+      "reason": "Telegram bot CLI; persona-specific integration (agent/operator channel), not part of generic ENGRAM install"
+    },
+    {
+      "path": "tools/agent-bootstrap",
+      "reason": "operator-level host administration script for multi-agent Linux host setup (uid/group/home perms); not part of ENGRAM plugin — lives at /usr/local/sbin/agent-bootstrap on production hosts, installed separately by the operator"
+    },
+    {
+      "path": "tools/agentctl",
+      "reason": "an operator's day-to-day admin CLI for co-located AI agents; operator tool that lives at ~/.local/bin/agentctl, not part of ENGRAM plugin"
+    },
+    {
+      "path": "tools/borges_session_eval.py",
+      "reason": "Borges-persona-specific session quality evaluator; references Borges-specific ENGRAM observation IDs and rubric scaffolding, not generic ENGRAM tooling"
+    },
+    {
+      "path": "tools/test_forum_cli.py",
+      "reason": "test file for tools/forum.py — CI tooling only, never ships"
+    },
+    {
+      "path": "tools/test_forum_backup.py",
+      "reason": "test file for tools/forum_backup.py — CI tooling only, never ships"
+    },
+    {
+      "path": "tools/test_pr_body_close_keyword_gate.py",
+      "reason": "test file for the .github close-keyword trap-gate workflow — CI tooling only, never ships"
+    },
+    {
+      "path": "tools/test_baton_ci_guard.py",
+      "reason": "test file for tools/baton.py CI-green flip guard (#685) — CI tooling only, never ships"
+    },
+    {
+      "path": "tools/test_baton_approval_guard.py",
+      "reason": "test file for tools/baton.py post-approval re-check flip guard (#1002) — CI tooling only, never ships"
+    },
+    {
+      "path": "tools/test_baton_merge_gate.py",
+      "reason": "test file for tools/baton.py merge verb (#999/#1000) — CI tooling only, never ships"
+    },
+    {
+      "path": "tools/test_pre_dispatch_check.py",
+      "reason": "test file for tools/pre-dispatch-check.sh (#1006) — CI tooling only, never ships"
+    },
+    {
+      "path": "tools/test_migrate_to_plugin.sh",
+      "reason": "test file for tools/migrate-to-plugin.sh — CI tooling only, never ships"
+    },
+    {
+      "path": "tools/name_leak_warn.py",
+      "reason": "repo-CI infrastructure consumed only by .github/workflows/name-leak-warn.yml (warn-only diff gate); runs in GitHub Actions, not shipped in any install tier"
+    },
+    {
+      "path": "src/forum/",
+      "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; ships via its own build path, not through build-plugin.sh (issue #868)"
+    },
+    {
+      "path": "tools/forum_backup.py",
+      "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; server-host maintenance script, run from the repo on the forum host, not from the plugin (issue #868)"
+    },
+    {
+      "path": "tools/forum_backfill_embeddings.py",
+      "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; server-host maintenance script, run from the repo on the forum host, not from the plugin (issue #868)"
+    },
+    {
+      "path": "tools/forum_regen_derived.py",
+      "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; server-host maintenance script, run from the repo on the forum host, not from the plugin (issue #868)"
+    },
+    {
+      "path": "src/forum/deploy/engram-forum-backup.service",
+      "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; systemd service unit for the forum host, not part of the plugin bundle (issue #868)"
+    },
+    {
+      "path": "src/forum/deploy/engram-forum-backup.timer",
+      "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; systemd timer unit for the forum host, not part of the plugin bundle (issue #868)"
+    }
+  ],
+  "repo_only": [
+    {
+      "path": "tests/",
+      "reason": "dev test suite — never shipped in any install tier; CI-only"
+    },
+    {
+      "path": ".github/",
+      "reason": "GitHub Actions CI configuration — runs in GitHub's cloud, never part of the plugin install"
+    },
+    {
+      "path": "docs/",
+      "reason": "documentation files — developer reference, not shipped in any install tier"
+    },
+    {
+      "path": "README.md",
+      "reason": "repository landing-page documentation — not shipped in the plugin bundle"
+    },
+    {
+      "path": "README-AGENT.md",
+      "reason": "agent-facing install/orientation documentation — repository landing doc, not shipped in the plugin bundle"
+    },
+    {
+      "path": "LICENSE",
+      "reason": "project license file — not shipped in the plugin bundle"
+    },
+    {
+      "path": "CLAUDE.md",
+      "reason": "developer-facing project conventions (project-level CLAUDE.md) — not shipped in the plugin bundle"
+    },
+    {
+      "path": "USER_GUIDE.md",
+      "reason": "user guide documentation — not shipped in the plugin bundle"
+    },
+    {
+      "path": "pytest.ini",
+      "reason": "pytest configuration — dev test config, never shipped"
+    },
+    {
+      "path": "requirements/",
+      "reason": "Python dependency pin files — installation tooling only, not shipped in the plugin bundle"
+    },
+    {
+      "path": ".gitignore",
+      "reason": "git ignore rules — repo configuration, not shipped in the plugin bundle"
+    },
+    {
+      "path": "packaging/README.md",
+      "reason": "README for the packaging directory — documentation, not shipped inside the plugin bundle"
+    },
+    {
+      "path": "upgrade-guides/",
+      "reason": "operator upgrade guides — developer/operator reference documentation, not shipped in the plugin bundle"
+    },
+    {
+      "path": "docs/inter-agent/",
+      "reason": "inter-agent protocol design documents — developer reference, not shipped in the plugin bundle (moved from root in Phase 4 of #1093)"
+    },
+    {
+      "path": ".claude/",
+      "reason": "per-developer local Claude Code agent definitions (developer-local working files for Ariadne/Borges) — not part of the shared plugin bundle"
+    },
+    {
+      "path": "agents/claude/README.md",
+      "reason": "README for the agents/claude directory — documentation only, not a shippable agent file (build-plugin.sh copies *.md files excluding README.md)"
+    },
+    {
+      "path": "docs/cycle/",
+      "reason": "epistemic research cycle design documents and artifacts (CHARTER, CHRONICLE, charter-inputs, mira-package, standpoint design) — in-development research material, not shipped in the plugin bundle (moved from root in Phase 4 of #1093)"
+    },
+    {
+      "path": "docs/archive/",
+      "reason": "historical one-time migration artifacts preserved for reference — ran during early development and are not shipped in any install tier (moved from root in Phase 4 of #1093)"
+    },
+    {
+      "path": "src/build/packaging/README.md",
+      "reason": "README for the src/build/packaging directory — documentation, not shipped inside the plugin bundle"
+    },
+    {
+      "path": "release-minus-set.txt",
+      "reason": "release-cutover exclude manifest — consumed by tools/release-cutover.py at cutover time; not shipped in any install tier"
+    }
+  ],
+  "build_inputs": [
+    {
+      "path": "plugin.json",
+      "reason": "Claude Code plugin manifest — copied into the bundle root by the build engine (tools/engine/build.py) as the bundle's own manifest; structural build input, not a depth-tier-gated mechanism"
+    },
+    {
+      "path": "hooks/hooks.json",
+      "reason": "Hooks registration — the build engine writes a tier/identity-filtered copy into the bundle (hooks/hooks.json); structural build input, not itself a depth-tier-gated mechanism"
+    },
+    {
+      "path": "src/build/packaging/mcp.json",
+      "reason": "MCP server registration source — the build engine transforms it into the bundle's .mcp.json (renamed at the plugin root); build input, not a depth-tier-gated mechanism"
+    },
+    {
+      "path": "src/build/packaging/platforms/",
+      "reason": "Per-platform profile sources (claude-code.json, codex.json) — baked by the build engine into the bundle's platform.json; build input, not a depth-tier-gated mechanism"
+    },
+    {
+      "path": "src/build/packaging/tiers.json",
+      "reason": "The tier manifest itself — consumed by the build engine to select shippable mechanisms; build configuration input, not a depth-tier-gated mechanism"
+    }
+  ]
+}

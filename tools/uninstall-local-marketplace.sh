@@ -1,0 +1,1 @@
+../src/engram/tools/uninstall-local-marketplace.sh

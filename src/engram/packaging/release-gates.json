@@ -1,0 +1,22 @@
+{
+  "expected_suite_residual": [],
+  "expected_tool_count": 49,
+  "forbidden_teachings": [
+    {
+      "surface_glob": "README.md",
+      "regex": "deploy\\.sh",
+      "reason": "retired upgrade path"
+    },
+    {
+      "surface_glob": "src/engram/templates/template.*.md",
+      "regex": "hooks in `settings\\.json`",
+      "reason": "plugin hooks.json is the location"
+    },
+    {
+      "surface_glob": "src/engram/templates/*.service.template",
+      "regex": "hooks in `settings\\.json`",
+      "reason": "plugin hooks.json is the location"
+    }
+  ],
+  "release_blocker_issues": [605, 643, 654, 689, 814, 863]
+}

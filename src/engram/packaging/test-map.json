@@ -1,0 +1,431 @@
+{
+  "schema_version": 1,
+  "description": "Convention map for non-imported surfaces \u2014 hooks, shells, skills, templates, packaging. Layer 2 of tools/run_touched_tests.py selection. All test_globs verified to exist at seeding time (2026-06-06). Aspirational or non-existent test targets must use full_suite_fallback=true rather than invented paths.",
+  "mappings": [
+    {
+      "path_prefix_or_glob": "hooks/claude/context_tracker.py",
+      "test_globs": [
+        "tests/test_drowsiness_display_levels.py",
+        "tests/test_per_session_marker.py"
+      ],
+      "note": "context_tracker.py is imported by the session-start hook and tested via direct subprocess calls"
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-baton-prompt-hook.py",
+      "test_globs": [
+        "tests/test_baton_hook.py",
+        "tests/test_baton_autopull.py",
+        "tests/test_build_plugin_hooks_consistency.py",
+        "tests/test_engine_phase3.py",
+        "tests/test_engine_unit.py",
+        "tests/test_tier_build_filter.py",
+        "tests/test_tiers_manifest.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-deference-detector-prompt.py",
+      "test_globs": [
+        "tests/test_deference_detector_scope_gate.py",
+        "tests/test_engine_unit.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-deference-detector-stop.py",
+      "test_globs": [
+        "tests/test_deference_detector_scope_gate.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-end-of-day-hook.py",
+      "test_globs": [
+        "tests/test_end_of_day_hook.py",
+        "tests/test_engine_phase3.py",
+        "tests/test_tiers_manifest.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-forum-prompt-hook.py",
+      "test_globs": [
+        "tests/test_forum_hook.py",
+        "tests/test_engine_phase3.py",
+        "tests/test_tiers_manifest.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-inter-agent-prompt-hook.py",
+      "test_globs": [
+        "tests/test_inter_agent_hook.py",
+        "tests/test_build_plugin_hooks_consistency.py",
+        "tests/test_engine_phase3.py",
+        "tests/test_engine_unit.py",
+        "tests/test_tier_build_filter.py",
+        "tests/test_tiers_manifest.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-postcompact-hook.py",
+      "test_globs": [
+        "tests/test_starred_block.py",
+        "tests/test_engine_phase3.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-session-start-hook.py",
+      "test_globs": [
+        "tests/test_session_start_hook_auto_sleep_cron.py",
+        "tests/test_session_start_hook_calibration.py",
+        "tests/test_session_start_hook_mcp_health.py",
+        "tests/test_per_session_marker_prune.py",
+        "tests/test_starred_block.py",
+        "tests/test_fairy_policy.py",
+        "tests/test_resolve_runtime_dir_plugin.py",
+        "tests/test_engine_phase3.py",
+        "tests/test_engine_unit.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-stop-hook.py",
+      "test_globs": [
+        "tests/test_stop_hook_idle_suppression.py",
+        "tests/test_stop_hook_maturity_gate.py",
+        "tests/test_stop_hook_prose_gate.py",
+        "tests/test_codex_hook_envelopes.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-surface-daemon.py",
+      "test_globs": [
+        "tests/test_resolve_runtime_dir_plugin.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-surface-hook.py",
+      "test_globs": [
+        "tests/test_engram_surface_hook_critical_warning.py",
+        "tests/test_engram_surface_hook_idf_gate.py",
+        "tests/test_auto_surface_prepending.py",
+        "tests/test_surface_hook_attached_packs.py",
+        "tests/test_recall_summary_substrate.py",
+        "tests/test_resolve_runtime_dir_plugin.py",
+        "tests/test_engine_unit.py",
+        "tests/test_tier_build_filter.py",
+        "tests/test_tiers_manifest.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-time-bar-hook.py",
+      "test_globs": [
+        "tests/test_time_bar_hook.py",
+        "tests/test_codex_hook_envelopes.py",
+        "tests/test_tier_build_filter.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-toolcall-repair.py",
+      "test_globs": [
+        "tests/test_add_observation_payload.py"
+      ],
+      "note": "toolcall-repair is exercised in test_add_observation_payload (antml repair path)"
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-user-identity-hook.py",
+      "test_globs": [
+        "tests/test_codex_hook_envelopes.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-utility-credit-mention-stop.py",
+      "test_globs": [
+        "tests/test_engram_utility_credit_mention_stop.py",
+        "tests/test_utility_use_action.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/start-engram-daemon.sh",
+      "full_suite_fallback": true,
+      "note": "No dedicated test file for start-engram-daemon.sh"
+    },
+    {
+      "path_prefix_or_glob": "tools/__init__.py",
+      "test_globs": [
+        "tests/test_plugin_manifest_import_sync.py"
+      ],
+      "note": "tools/__init__.py tested via plugin manifest import sync"
+    },
+    {
+      "path_prefix_or_glob": "tools/baton.py",
+      "test_globs": [
+        "tests/test_baton.py",
+        "tests/test_baton_autopull.py",
+        "tests/test_baton_hook.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "tools/check-claude-md-drift.py",
+      "test_globs": ["tests/test_check_claude_md_drift.py"],
+      "note": "standalone subprocess CLI (not import-reachable); dedicated CLI test covers arg handling + exit codes 0/1/2 + drift-diff output"
+    },
+    {
+      "path_prefix_or_glob": "tools/cohort_dispatch.py",
+      "test_globs": [
+        "tests/test_cohort_dispatch.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "tools/config_schema.py",
+      "test_globs": [
+        "tests/test_config_schema.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "tools/engram-regenerate-embeddings.py",
+      "test_globs": [
+        "tests/test_git_backup_embeddings.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "tools/forum.py",
+      "test_globs": [
+        "tests/test_tier_build_filter.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "tools/ia.py",
+      "test_globs": [
+        "tests/test_ia_cli.py",
+        "tests/test_inter_agent_hook.py",
+        "tests/test_codex_hook_envelopes.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "tools/recall_summary_payload.py",
+      "test_globs": [
+        "tests/test_recall_summary_writes.py"
+      ],
+      "note": "recall_summary_payload referenced in test_recall_summary_writes"
+    },
+    {
+      "path_prefix_or_glob": "tools/recall_summary_prompts.py",
+      "test_globs": [
+        "tests/test_recall_summary_writes.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "tools/recall_summary_validator.py",
+      "test_globs": [
+        "tests/test_recall_summary_writes.py",
+        "tests/test_plugin_manifest_import_sync.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "tools/run_touched_tests.py",
+      "test_globs": [
+        "tests/test_run_touched_tests.py"
+      ],
+      "note": "The runner itself is a fail-open trigger \u2014 changes to it always trigger full suite in production. This entry is for the completeness gate only."
+    },
+    {
+      "path_prefix_or_glob": "tools/scan-leaks.py",
+      "test_globs": [
+        "tests/test_tier_build_filter.py",
+        "tests/test_engine_unit.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "tools/release-cutover.py",
+      "test_globs": [
+        "tests/test_release_cutover.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "tools/worktree-gc.py",
+      "test_globs": [
+        "tests/test_worktree_gc.py"
+      ],
+      "note": "classify() decision-matrix unit tests; _is_clean and _pr_state monkeypatched so no real git/gh calls are made."
+    },
+    {
+      "path_prefix_or_glob": "tools/surgical.py",
+      "test_globs": [
+        "tests/test_engine_unit.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "tools/build-plugin.sh",
+      "test_globs": [
+        "tests/test_build_plugin_hooks_consistency.py",
+        "tests/test_plugin_manifest_import_sync.py",
+        "tests/test_tier_build_filter.py",
+        "tests/test_resolve_runtime_dir_plugin.py",
+        "tests/test_engine_unit.py",
+        "tests/test_tiers_manifest.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "tools/install-local-marketplace.sh",
+      "test_globs": [
+        "tests/test_install_local_marketplace.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "tools/operator-setup-viz.sh",
+      "test_globs": [
+        "tests/test_engine_phase3.py"
+      ]
+    },
+    {
+      "path_prefix_or_glob": "tools/engram-fix-git-backup.sh",
+      "full_suite_fallback": true,
+      "note": "No test file found for engram-fix-git-backup.sh"
+    },
+    {
+      "path_prefix_or_glob": "tools/collab-letter-monitor.sh",
+      "full_suite_fallback": true,
+      "note": "No test file found for collab-letter-monitor.sh"
+    },
+    {
+      "path_prefix_or_glob": "tools/forum-mention-monitor.sh",
+      "full_suite_fallback": true,
+      "note": "No test file found for forum-mention-monitor.sh"
+    },
+    {
+      "path_prefix_or_glob": "skills/claude/",
+      "test_globs": [
+        "tests/test_skill_frontmatter_lint.py",
+        "tests/test_skill_server_sync.py",
+        "tests/test_tiers_manifest.py"
+      ],
+      "note": "Any change to a skill directory triggers skill lint + tiers manifest"
+    },
+    {
+      "path_prefix_or_glob": "templates/",
+      "test_globs": [
+        "tests/test_tiers_manifest.py",
+        "tests/test_bootstrap_codex.py"
+      ],
+      "note": "Template changes trigger manifest gate and bootstrap codex tests"
+    },
+    {
+      "path_prefix_or_glob": "packaging/tiers.json",
+      "test_globs": [
+        "tests/test_tiers_manifest.py",
+        "tests/test_tier_build_filter.py",
+        "tests/test_build_plugin_hooks_consistency.py",
+        "tests/test_plugin_manifest_import_sync.py"
+      ],
+      "note": "tiers.json changes trigger all manifest and tier tests"
+    },
+    {
+      "path_prefix_or_glob": ".github/workflows/",
+      "test_globs": [],
+      "note": "No tests for GitHub Actions workflow YAML files. Workflow changes do not have a test surface; included as explicit empty entry to acknowledge the surface."
+    },
+    {
+      "path_prefix_or_glob": "agents/claude/",
+      "test_globs": [
+        "tests/test_tiers_manifest.py"
+      ],
+      "note": "Agent document changes trigger tiers manifest check only"
+    },
+    {
+      "path_prefix_or_glob": "tools/release_gates.py",
+      "test_globs": [
+        "tests/test_release_gates.py"
+      ],
+      "note": "scorecard tool; tests import via from tools.release_gates (L1-inert stem per the tools-package quirk) \u2014 explicit map entry"
+    },
+    {
+      "path_prefix_or_glob": "packaging/release-gates.json",
+      "test_globs": [
+        "tests/test_release_gates.py"
+      ],
+      "note": "scorecard config; consumed by release_gates tests"
+    }
+  ],
+  "unmapped": [
+    {
+      "path": "hooks/claude/context_tracker_hook.py",
+      "reason": "Superseded by context_tracker.py per tiers.json excluded list; no dedicated test"
+    },
+    {
+      "path": "tools/_channel.py",
+      "reason": "Internal multi-agent transport helper; no dedicated test file. Changes covered by ia.py test suite indirectly."
+    },
+    {
+      "path": "tools/_common.py",
+      "reason": "Internal helper with no dedicated test file; tested indirectly through tools that use it"
+    },
+    {
+      "path": "tools/_session_context.py",
+      "reason": "Internal session context helper with no dedicated test file"
+    },
+    {
+      "path": "tools/antml_repair_baseline.py",
+      "reason": "Dev-tier baseline tool; no dedicated test file"
+    },
+    {
+      "path": "tools/compute_task_time.py",
+      "reason": "No dedicated test file found"
+    },
+    {
+      "path": "tools/deference_baseline.py",
+      "reason": "Dev-tier baseline tool; no dedicated test file"
+    },
+    {
+      "path": "tools/dream_master_batch.py",
+      "reason": "No dedicated unit test file; tested as part of integration flows"
+    },
+    {
+      "path": "tools/dump_mcp_schema.py",
+      "reason": "Dev-tier diagnostic for the modularization wave gates (#872): dumps the MCP tool schema for byte-diff against a baseline. Exercised manually as a per-wave gate, not by a unit test."
+    },
+    {
+      "path": "tools/forum_backfill_embeddings.py",
+      "reason": "No dedicated test file found"
+    },
+    {
+      "path": "tools/forum_backup.py",
+      "reason": "No dedicated test file found (tools/test_forum_backup.py is excluded from shipping per tiers.json)"
+    },
+    {
+      "path": "tools/forum_regen_derived.py",
+      "reason": "No dedicated test file found"
+    },
+    {
+      "path": "tools/session.py",
+      "reason": "No dedicated test file found"
+    },
+    {
+      "path": "tools/verify_quote.py",
+      "reason": "No dedicated test file found (verify_quote is tested indirectly via server tests)"
+    },
+    {
+      "path": "tools/write_sleep_marker.py",
+      "reason": "No dedicated test file found"
+    },
+    {
+      "path": "tools/_status_derive.py",
+      "reason": "Internal helper for status derivation; no dedicated test file. Changes covered indirectly by callers."
+    },
+    {
+      "path": "tools/pre-dispatch-check.sh",
+      "reason": "Shell pre-dispatch guard; no dedicated test file. Tested manually as part of the dispatch workflow."
+    },
+    {
+      "path": "tools/uninstall-local-marketplace.sh",
+      "reason": "Uninstall script; no dedicated test file. Inverse of install-local-marketplace.sh; covered by manual verification."
+    },
+    {
+      "path": "tools/run-all-tests.sh",
+      "reason": "Unified test runner script; no dedicated test file. Verified manually by running it end-to-end against both suites."
+    },
+    {
+      "path": "tools/ghpr.sh",
+      "reason": "Local CI-cost simulator (git+gh wrapper bundling touched-test selection, cost logging, and gated PR push); no dedicated test file. Verified manually."
+    }
+  ],
+  "server_import_allowlist": [
+    "test_engram_core_seam.py",
+    "test_inductive_enumeration_and_timing.py"
+  ]
+}

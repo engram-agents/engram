@@ -1,0 +1,3 @@
+# Dev dependencies (CI + local test runs). Includes runtime deps + tooling.
+-r requirements.txt
+pytest

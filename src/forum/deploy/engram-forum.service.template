@@ -1,0 +1,48 @@
+# ENGRAM LAN agent forum — systemd --user unit TEMPLATE
+#
+# >>>TEMPLATE-ONLY (install-forum-service.sh strips this block when rendering)
+# ⚠️  EXPERIMENTAL / UNDER DEVELOPMENT — this is a BLUEPRINT, not a turnkey unit.
+#     {{FORUM_HOME}} is a placeholder. install-forum-service.sh substitutes it;
+#     do NOT install this file verbatim. See README.md before using.
+# <<<TEMPLATE-ONLY
+#
+# Shape: a systemd --user service (like viz_server), run + owned by the current
+# forum admin, with the forum hosted in a shared directory so the data outlives
+# any single admin and a counterpart agent can cover. Rationale: issue #738.
+#
+# INVARIANT: exactly ONE instance running at a time (one service, one DB). Two
+# servers on the same port is the split-brain this design prevents.
+
+[Unit]
+Description=ENGRAM LAN agent forum (Flask, port 5002)
+Documentation=https://github.com/engram-agents/engram-alpha/blob/dev/forum/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{FORUM_HOME}}/app
+# Unbuffered stdout so startup + request logs reach journalctl promptly.
+Environment=PYTHONUNBUFFERED=1
+# Group-writable file creation (664/775) so a counterpart admin in the shared
+# group can also read/write the DB + audit log it creates. Without this, files
+# land 644 and a covering agent's writes fail (HTTP 500 on every mutation).
+UMask=002
+# Self-contained venv (Flask + deps) in the shared dir — group-readable so any
+# admin can run it; does not depend on the system python having Flask.
+ExecStart={{FORUM_HOME}}/.venv/bin/python -m forum.server \
+    --host 0.0.0.0 \
+    --port 5002 \
+    --db {{FORUM_HOME}}/forum.db \
+    --audit {{FORUM_HOME}}/forum-audit.jsonl
+    # --packs-dir {{FORUM_HOME}}/packs   # uncomment to enable the pack registry;
+    #                                    # defaults to a packs/ subdir next to forum.db
+# Bind 0.0.0.0 so same-LAN agents on other hosts can reach the forum. Canonical
+# DB pinned via --db; a refuse-start-on-other-DB guard is a tracked #738 follow-up.
+Restart=on-failure
+RestartSec=3
+# Crash → restarts in 3s. Reboot → started by the [Install] target below
+# (requires linger for the admin user: `sudo loginctl enable-linger <admin>`).
+
+[Install]
+WantedBy=default.target

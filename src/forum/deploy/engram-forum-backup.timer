@@ -1,0 +1,25 @@
+# ENGRAM forum DB backup — systemd --user timer
+#
+# Fires engram-forum-backup.service daily.
+# OnBootSec=10min: also fires 10 minutes after boot so any gap from a reboot
+# (when the timer had not yet fired that day) is covered promptly.
+# Persistent=true: if the system was down at the scheduled daily time, the
+# timer fires on next startup to catch up (same behaviour as cron @daily +
+# missed-run recovery).
+#
+# Enable:  systemctl --user enable --now engram-forum-backup.timer
+# Status:  systemctl --user status engram-forum-backup.timer
+# Logs:    journalctl --user -u engram-forum-backup.service
+
+[Unit]
+Description=Daily ENGRAM forum DB backup timer
+Documentation=https://github.com/engram-agents/engram-alpha/blob/dev/forum/deploy/README.md
+
+[Timer]
+OnCalendar=daily
+OnBootSec=10min
+Persistent=true
+Unit=engram-forum-backup.service
+
+[Install]
+WantedBy=timers.target

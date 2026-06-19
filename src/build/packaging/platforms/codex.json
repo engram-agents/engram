@@ -1,0 +1,27 @@
+{
+  "platform": "codex",
+  "identity_doc": "AGENTS.md",
+  "plugin_manifest": ".codex-plugin/plugin.json",
+  "plugin_root_env": "CLAUDE_PLUGIN_ROOT",
+  "plugin_mcp_policy_id": "engram@engram-local",
+  "mcp_config": "config-toml-block",
+  "hook_envelope": "strict-json",
+  "hooks_config": "hooks/hooks.json",
+  "skills_dir": "skills/",
+  "min_version": "0.136.0",
+  "agent_model_tiers": {
+    "opus": {
+      "model": "gpt-5.5",
+      "model_reasoning_effort": "high"
+    },
+    "sonnet": {
+      "model": "gpt-5.4",
+      "model_reasoning_effort": "high"
+    },
+    "haiku": {
+      "model": "gpt-5.4-mini",
+      "model_reasoning_effort": "low"
+    }
+  },
+  "default_agent_model_tier": "sonnet"
+}

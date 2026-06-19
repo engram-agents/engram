@@ -1,0 +1,12 @@
+{
+  "patterns": [
+    {
+      "regex": "\\b(Alice|Bob|Carol)\\b",
+      "label": "personal name"
+    },
+    {
+      "regex": "/home/example-user/",
+      "label": "hardcoded user home"
+    }
+  ]
+}

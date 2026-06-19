@@ -1,0 +1,1490 @@
+#!/bin/bash
+# =============================================================================
+# agentctl — an operator's day-to-day admin tool for co-located AI agents
+#
+# DRAFT v0 — 2026-05-02. NOT YET INSTALLED.  Lives under active-work/ until
+# The operator reviews.  After review move to ~/.local/bin/agentctl.
+#
+# Scope of v0:
+#   health   session   bash
+# Added v0.1 (broker — share/unshare/share-status):
+#   share    unshare    share-status
+# Added v0.3 (spawn flow — multi-agent newborn lifecycle, v0.1 minimum):
+#   spawn    finalize-name
+#
+# Usage:
+#   agentctl health                      # health table for all agents
+#   agentctl session <agent> [--platform <claude|codex>] [--no-share] [--cd <dir>] [...]
+#                                        # interactive session as agent; executes
+#                                        # the platform binary (claude or codex)
+#                                        # directly. Platform auto-detected from
+#                                        # baked profile or binary heuristic.
+#                                        # --local is deprecated (no-op with notice).
+#                                        # tmux and other multiplexers are the
+#                                        # operator's own affair.
+#                                        # Single-dash flag grammar (alias namespace):
+#                                        #   -xyz  is a BUNDLE of single-char aliases,
+#                                        #         expanded in char order: -x -y -z.
+#                                        #   Any unrecognized char → loud error, exit 6.
+#                                        #   No single-dash arg ever passes through raw.
+#                                        #   Bare - (stdin) passes as a non-flag arg.
+#                                        # Recognized aliases:
+#                                        #   -c  claude:--continue  codex:subcommand transform
+#                                        #   -d  claude:--dangerously-skip-permissions
+#                                        #       codex:--dangerously-bypass-approvals-and-sandbox
+#                                        #   -r  claude:--remote-control <agent>
+#                                        #       codex: error (remote control unavailable)
+#                                        # Double-dash flags and non-flag args pass through verbatim.
+#   agentctl bash <agent>                # plain bash shell as agent (no CLI)
+#   sudo agentctl share <agent> <path> [--mode rw|ro] [--ttl <duration>]
+#                                        # grant agent ACL access to operator-side path;
+#                                        # parent dirs get --x traversal, target gets
+#                                        # rwX (or rX for --mode ro), default ACL on
+#                                        # dirs so new files inherit. Audited.
+#   sudo agentctl unshare <agent> <path> # revoke share (recursive ACL removal)
+#   agentctl share-status [<agent>]      # list active shares
+#   sudo agentctl spawn [--runtime claude]  (v0.1: claude only)
+#                       [--alpha-source PATH] [--bootstrap-path PATH]
+#                                        # birth a newborn-tagged agent
+#                                        # (agent-newborn-YYYYMMDDhhmmss)
+#                                        # via /usr/local/sbin/agent-bootstrap.
+#                                        # Prints next-step instructions.
+#                                        # Multi-runtime (gemini-cli, codex) is
+#                                        # forthcoming as a separate epic.
+#   sudo agentctl finalize-name <newborn-id> <chosen>
+#                                        # single-shot rename a newborn-tagged
+#                                        # agent to its chosen name. Refuses
+#                                        # anything not matching agent-newborn-*
+#                                        # (this is first-session-only, NOT a
+#                                        # general rename — names are immutable
+#                                        # post-finalize — names are immutable).
+# =============================================================================
+
+set -euo pipefail
+
+SHARED_ROOT="/home/agents-shared"
+SUBCMD="${1:-help}"
+[[ $# -gt 0 ]] && shift
+
+# ---------- helpers ----------
+list_agents() {
+    # Returns names (without "agent-" prefix) of all users in the agents group.
+    getent group agents 2>/dev/null \
+        | awk -F: '{print $4}' \
+        | tr ',' '\n' \
+        | grep -E '^agent-' \
+        | sed 's/^agent-//' \
+        | sort
+}
+
+resolve_user() {
+    local name="$1"
+    local user="agent-$name"
+    if ! id "$user" >/dev/null 2>&1; then
+        echo "ERROR: agent '$name' not found (no Linux user '$user')" >&2
+        exit 1
+    fi
+    echo "$user"
+}
+
+# ---------- subcommands ----------
+cmd_health() {
+    printf '%-12s %-7s %-22s %-10s\n' AGENT UID LAST_SLEEP HEALTHFILE
+    printf '%-12s %-7s %-22s %-10s\n' '-----' '---' '----------' '----------'
+    while read -r name; do
+        [[ -z "$name" ]] && continue
+        local user="agent-$name"
+        local uid
+        uid=$(id -u "$user" 2>/dev/null || echo "?")
+        local hf="$SHARED_ROOT/health/$name/last-sleep.json"
+        local last_sleep="(none)"
+        if [[ -r "$hf" ]]; then
+            last_sleep=$(python3 -c "
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    print(d.get('completed_at',d.get('timestamp','?')))
+except Exception as e:
+    print(f'(parse-err: {e})')
+" "$hf" 2>/dev/null) || last_sleep="(unreadable)"
+        fi
+        printf '%-12s %-7s %-22s %-10s\n' "$name" "$uid" "$last_sleep" "$([ -r "$hf" ] && echo OK || echo MISSING)"
+    done < <(list_agents)
+}
+
+# ---------- session helpers ----------
+
+# _session_platform: detect which platform binary to use for this agent.
+# Deterministic ladder, first hit wins:
+#   1. Explicit override (non-empty $1)
+#   2. Baked profile at ~/.engram/marketplace/plugins/engram/platform.json
+#   3. Binary heuristic: codex present + claude absent → codex
+#   4. Default: claude
+# No sudo inside this function — caller passes $user for the sudo cmds.
+_session_platform() {
+    local override="$1"
+    local user="$2"
+
+    # 1. Explicit override
+    if [[ -n "$override" ]]; then
+        case "$override" in
+            claude|codex) echo "$override"; return 0 ;;
+            *) echo "ERROR: --platform must be claude or codex (got '$override')" >&2; return 2 ;;
+        esac
+    fi
+
+    # 2. Baked profile (no jq dependency — grep+cut only)
+    local raw
+    raw=$(sudo -u "$user" -i bash -c \
+        'cat ~/.engram/marketplace/plugins/engram/platform.json' 2>/dev/null) || true
+    if [[ -n "$raw" ]] && echo "$raw" | grep -q '"platform"'; then
+        local val
+        val=$(echo "$raw" \
+            | grep -o '"platform"[[:space:]]*:[[:space:]]*"[^"]*"' \
+            | head -1 \
+            | sed 's/.*:[[:space:]]*"\([^"]*\)".*/\1/')
+        if [[ "$val" == "codex" ]]; then
+            echo "codex"; return 0
+        elif [[ -n "$val" ]]; then
+            echo "claude"; return 0
+        fi
+    fi
+
+    # 3. Binary heuristic: codex present AND claude absent → codex
+    local has_codex=0 has_claude=0
+    sudo -u "$user" -i bash -c 'command -v codex' >/dev/null 2>&1 && has_codex=1
+    sudo -u "$user" -i bash -c 'command -v claude' >/dev/null 2>&1 && has_claude=1
+    if [[ $has_codex -eq 1 && $has_claude -eq 0 ]]; then
+        echo "codex"; return 0
+    fi
+
+    # 4. Default
+    echo "claude"
+}
+
+# _expand_session_args: pure function (no sudo, no filesystem).
+# Expands short aliases to their full equivalents for the given platform.
+# Signature: _expand_session_args <platform> <agent_name> <args...>
+# Outputs one word per line (callers use `mapfile` to collect).
+# Returns exit 4 on unknown platform (this is the unit-test seam for
+# platform validation; cmd_session also validates via _session_platform).
+# Returns exit 5 if any arg is empty or contains a newline — the one-word-
+# per-line protocol cannot carry either (empty args are silently stripped by
+# command substitution; newline-args would split into multiple words on the
+# read side). Rejection is loud and early.
+# Returns exit 3 if codex -r is requested (remote control unavailable).
+#   Precedence: exit 3 takes priority over exit 6 when a bundle contains both
+#   an unrecognized char and -r on codex (codex -r is the more specific error).
+# Returns exit 6 if any single-dash arg contains an unrecognized alias char.
+#   Error names the offending char and the original arg on stderr.
+#
+# Flag namespace:
+#   Single-dash args (-xyz): the agentctl alias namespace — BUNDLE of single-
+#   char alias flags, expanded in char order.  Any constituent char that is not
+#   a recognized alias (c/d/r) causes loud failure (exit 6).  NO single-dash
+#   arg ever passes through raw, including chars that look like platform flags
+#   (e.g. -n, -e).  Bare - (the stdin convention) is treated as a non-flag arg
+#   and passes through verbatim.
+#   Double-dash args (--anything): platform pass-through verbatim.
+#   Non-flag args: pass through verbatim.
+#
+# Emission discipline: ALL words are emitted with `printf '%s\n'`, NEVER with
+# `echo`. bash's echo consumes flags like -n/-e/-E as its own options and emits
+# nothing or a bare newline — silent data corruption for args that happen to
+# look like echo flags. printf '%s\n' is flag-agnostic; the format string is
+# always literal. This is the same class of silent-corruption hazard as the
+# -d/--debug collision that motivated the alias layer in the first place.
+#
+# Expansion rules (single-char aliases):
+#   -c  claude → append --continue                         (deduped)
+#       codex  → base command becomes "codex resume --latest" (deduped)
+#   -d  claude → --dangerously-skip-permissions            (deduped)
+#       codex  → --dangerously-bypass-approvals-and-sandbox (deduped)
+#   -r  claude → --remote-control <agent_name>  (two words, deduped)
+#       codex  → error to stderr, return 3
+# Bundles are split first, then each char is expanded by the rules above.
+# Dedup across a bundle works identically to dedup across separate flags.
+#
+# NOTE: aliases MUST be expanded here and never passed through raw.
+# claude itself parses -d as --debug (silent behavior change); that is the
+# reason these aliases live in agentctl rather than the caller.
+_expand_session_args() {
+    local platform="$1"
+    local agent_name="$2"
+    shift 2
+
+    # Validate platform — unknown values are a caller error.
+    case "$platform" in
+        claude|codex) ;;
+        *) printf '%s\n' "ERROR: unknown platform '$platform' (expected claude or codex)" >&2; return 4 ;;
+    esac
+
+    # Reject empty args and newline-containing args before any expansion.
+    # The one-word-per-line protocol cannot carry them: command substitution
+    # strips trailing newlines (--resume "" becomes --resume silently), and a
+    # newline in an arg would split into multiple words on the mapfile side.
+    for arg in "$@"; do
+        if [[ -z "$arg" ]]; then
+            printf '%s\n' "session args may not be empty or contain newlines (got: <empty>)" >&2
+            return 5
+        fi
+        if [[ "$arg" == *$'\n'* ]]; then
+            # Represent the arg with \n visible for diagnostics.
+            local repr; repr="${arg//$'\n'/\\n}"
+            printf '%s\n' "session args may not be empty or contain newlines (got: $repr)" >&2
+            return 5
+        fi
+    done
+
+    local base_cmd="$platform"
+    local use_resume=0   # codex -c subcommand transform flag
+    local extra_args=()
+    local has_error=0     # set to 1 on codex -r (exit 3)
+    local has_bad_alias=0 # set to 1 on unrecognized single-char alias (exit 6)
+
+    # First pass: collect flags, detect -c (anywhere, including inside bundles)
+    # for codex subcommand transform.  We scan args once to determine if -c is
+    # present before emitting the base command words.  Bundle expansion applies
+    # here too: -rc, -cr, etc. all count as containing -c.
+    local saw_c=0
+    for arg in "$@"; do
+        # Bare - is not a bundle; skip.
+        [[ "$arg" == "-" ]] && continue
+        # Single-dash bundle: scan each char.
+        if [[ "$arg" =~ ^-[^-].* ]]; then
+            local chars="${arg#-}"
+            local i=0
+            while [[ $i -lt ${#chars} ]]; do
+                local ch="${chars:$i:1}"
+                [[ "$ch" == "c" ]] && saw_c=1
+                (( i++ )) || true
+            done
+        elif [[ "$arg" == "-c" ]]; then
+            # Legacy single-char form — already matched by the bundle branch above,
+            # but explicit for clarity (single char is a bundle of length 1).
+            saw_c=1
+        fi
+    done
+
+    if [[ "$platform" == "codex" && $saw_c -eq 1 ]]; then
+        use_resume=1
+    fi
+
+    # Second pass: expand aliases.
+    # Single-dash args are treated as BUNDLES: -xyz splits into -x -y -z, each
+    # expanded in char order.  Any char not in the recognized alias set (c/d/r)
+    # causes loud failure (exit 6) naming the char and the original arg.
+    # Bare - passes through as a non-flag arg.
+    # Double-dash and non-flag args pass through verbatim.
+    local skip_c_done=0   # dedupe -c for claude (emit --continue only once)
+    local seen_d=0         # dedupe -d across both platforms (emit flag once)
+    local seen_r=0         # dedupe -r on claude (emit --remote-control <agent> only once)
+
+    _expand_one_alias() {
+        # Expand a single alias char for the current platform/agent.
+        # Modifies outer-scope variables: extra_args, has_error, has_bad_alias,
+        # skip_c_done, seen_d, seen_r.  Takes: char, original_arg.
+        local ch="$1" orig_arg="$2"
+        case "$ch" in
+            c)
+                if [[ "$platform" == "claude" ]]; then
+                    if [[ $skip_c_done -eq 0 ]]; then
+                        extra_args+=("--continue")
+                        skip_c_done=1
+                    fi
+                elif [[ "$platform" == "codex" ]]; then
+                    : # absorbed into subcommand transform; no per-occurrence output
+                fi
+                ;;
+            d)
+                if [[ $seen_d -eq 0 ]]; then
+                    if [[ "$platform" == "claude" ]]; then
+                        extra_args+=("--dangerously-skip-permissions")
+                    else
+                        extra_args+=("--dangerously-bypass-approvals-and-sandbox")
+                    fi
+                    seen_d=1
+                fi
+                ;;
+            r)
+                if [[ "$platform" == "claude" ]]; then
+                    if [[ $seen_r -eq 0 ]]; then
+                        extra_args+=("--remote-control")
+                        extra_args+=("$agent_name")
+                        seen_r=1
+                    fi
+                else
+                    printf '%s\n' "remote control is not available for codex agents (drop -r)" >&2
+                    has_error=1
+                fi
+                ;;
+            *)
+                printf '%s\n' "ERROR: unrecognized alias '-$ch' in arg '$orig_arg' (recognized: c d r)" >&2
+                has_bad_alias=1
+                ;;
+        esac
+    }
+
+    for arg in "$@"; do
+        if [[ "$arg" == "-" ]]; then
+            # Bare - is the stdin convention: pass through as a non-flag arg.
+            extra_args+=("$arg")
+        elif [[ "$arg" =~ ^-[^-] ]]; then
+            # Single-dash bundle: split into chars and expand each in order.
+            local chars="${arg#-}"
+            local i=0
+            while [[ $i -lt ${#chars} ]]; do
+                local ch="${chars:$i:1}"
+                _expand_one_alias "$ch" "$arg"
+                (( i++ )) || true
+            done
+        else
+            # Double-dash flag or non-flag arg: pass through verbatim.
+            extra_args+=("$arg")
+        fi
+    done
+
+    # Exit code precedence: codex -r (exit 3) > unrecognized alias (exit 6).
+    if [[ $has_error -eq 1 ]]; then
+        return 3
+    fi
+    if [[ $has_bad_alias -eq 1 ]]; then
+        return 6
+    fi
+
+    # Emit base command words, then expanded args.
+    # printf '%s\n' is used throughout (not echo) — see emission discipline above.
+    if [[ "$platform" == "codex" && $use_resume -eq 1 ]]; then
+        printf '%s\n' "codex"
+        printf '%s\n' "resume"
+        printf '%s\n' "--latest"
+    else
+        printf '%s\n' "$base_cmd"
+    fi
+    for a in "${extra_args[@]}"; do
+        printf '%s\n' "$a"
+    done
+}
+
+cmd_session() {
+    local name="${1:-}"; shift || true
+    [[ -z "$name" ]] && {
+        echo "Usage: agentctl session <agent> [--platform <claude|codex>] [--no-share] [--cd <dir>] [...]" >&2
+        echo >&2
+        echo "  Executes the platform binary (claude or codex) directly as the agent." >&2
+        echo "  Platform auto-detected from baked profile, then binary heuristic." >&2
+        echo "  tmux and other multiplexers are the operator's own affair." >&2
+        echo >&2
+        echo "  --platform <claude|codex>  override auto-detected platform" >&2
+        echo "  --no-share                 skip auto-share of cwd (agent runs from its own home)" >&2
+        echo "  --cd <dir>                 use <dir> as project folder instead of caller's cwd" >&2
+        echo "  --local                    (deprecated — no-op; sessions are always direct now)" >&2
+        echo >&2
+        echo "  Flag grammar:" >&2
+        echo "    Single-dash: agentctl alias namespace.  -xyz is a bundle: -x -y -z" >&2
+        echo "      expanded in char order.  Any unrecognized char → loud error, exit 6." >&2
+        echo "      NO single-dash arg ever passes through (including -n, -e, etc.)." >&2
+        echo "      Bare - (stdin) is a non-flag arg and passes through verbatim." >&2
+        echo "    Double-dash: platform pass-through verbatim." >&2
+        echo "    Non-flag args: pass through verbatim." >&2
+        echo >&2
+        echo "  Recognized single-char aliases:" >&2
+        echo "    -c   claude: --continue" >&2
+        echo "         codex:  subcommand becomes 'codex resume --latest'" >&2
+        echo "    -d   claude: --dangerously-skip-permissions" >&2
+        echo "         codex:  --dangerously-bypass-approvals-and-sandbox" >&2
+        echo "    -r   claude: --remote-control <agent>" >&2
+        echo "         codex:  error — remote control is not available for codex agents" >&2
+        exit 2
+    }
+    local user; user=$(resolve_user "$name")
+    local platform_override=""
+    local no_share=0
+    local cd_override=""
+    local extra=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --platform)
+                [[ -z "${2:-}" ]] && { echo "ERROR: --platform requires an argument (claude|codex)" >&2; exit 2; }
+                platform_override="$2"; shift 2 ;;
+            --platform=*) platform_override="${1#--platform=}"; shift ;;
+            --local)
+                echo "(--local is deprecated: sessions are always direct now)" >&2
+                shift ;;
+            --no-share) no_share=1; shift ;;
+            --cd)
+                [[ -z "${2:-}" ]] && { echo "ERROR: --cd requires a directory argument" >&2; exit 2; }
+                cd_override="$2"; shift 2 ;;
+            --cd=*)     cd_override="${1#--cd=}"; shift ;;
+            *)          extra+=("$1"); shift ;;
+        esac
+    done
+
+    # Validate --platform early if provided (before any heavy lifting).
+    if [[ -n "$platform_override" ]]; then
+        case "$platform_override" in
+            claude|codex) ;;
+            *) echo "ERROR: --platform must be claude or codex (got '$platform_override')" >&2; exit 2 ;;
+        esac
+    fi
+
+    # Project-dir propagation + auto-share. Design rationale (2026-05-03): the directory
+    # where you type `agentctl session` becomes the agent's project folder by default.
+    # We auto-grant rwX ACL so the agent can write inside it, then pass cwd as the
+    # project dir to launchers. Claude organizes session JSONL by cwd
+    # (~/.claude/projects/<encoded-cwd>/), so this also keeps --continue/--resume
+    # scoped to the right project.
+    #
+    # Refused for: system paths, the operator home root, dotfile dirs (secrets), other
+    # agents' homes. The agent's own home gets cwd propagation but no share
+    # (already accessible). --no-share opts out entirely.
+    local orig_cwd
+    if [[ -n "$cd_override" ]]; then
+        # Resolve to absolute path; fail loudly if the dir doesn't exist.
+        orig_cwd=$(readlink -f "$cd_override" 2>/dev/null) || {
+            echo "ERROR: --cd target '$cd_override' does not resolve" >&2; exit 1
+        }
+        [[ -d "$orig_cwd" ]] || { echo "ERROR: --cd target '$cd_override' is not a directory" >&2; exit 1; }
+    else
+        orig_cwd="$(pwd)"
+    fi
+    local cwd_arg=()
+    if [[ $no_share -eq 1 ]]; then
+        echo "(--no-share: agent runs from \$HOME; --continue/--resume may not see expected sessions)" >&2
+    else
+        case "$orig_cwd" in
+            "/home/$user"|"/home/$user"/* )
+                cwd_arg=("$orig_cwd")
+                ;;
+            /home/agent-*)
+                echo "(cwd $orig_cwd is another agent's home; not auto-sharing — running from \$HOME)" >&2
+                ;;
+            "$HOME"|"$HOME"/.??*)
+                echo "(cwd $orig_cwd is your home root or a dotfile dir; not auto-sharing — cd into a project subdirectory or use --no-share)" >&2
+                ;;
+            /|/etc*|/usr*|/var*|/sys*|/proc*|/dev*|/boot*|/root*|/opt*)
+                echo "(refusing to auto-share system path $orig_cwd; running from \$HOME)" >&2
+                ;;
+            *)
+                # Passive ACL check: skip share if agent already has w-permission via
+                # the agents-group ACL. getfacl is readable by anyone with rX traversal,
+                # no sudo needed.
+                if getfacl -p -- "$orig_cwd" 2>/dev/null \
+                   | grep -qE "^group:$user:.*[wW]" 2>/dev/null; then
+                    cwd_arg=("$orig_cwd")
+                else
+                    echo "Granting $user rwX ACL on $orig_cwd (sudo may prompt for password)..."
+                    local self="${BASH_SOURCE[0]:-$0}"
+                    if sudo "$self" share "$name" "$orig_cwd" --mode rw; then
+                        cwd_arg=("$orig_cwd")
+                    else
+                        echo "Auto-share failed; running from \$HOME — --continue/--resume may not see expected sessions." >&2
+                    fi
+                fi
+                ;;
+        esac
+    fi
+
+    # Detect platform and expand aliases.
+    local platform
+    platform=$(_session_platform "$platform_override" "$user") || {
+        echo "ERROR: platform detection failed" >&2; exit 2
+    }
+
+    # Capture expansion via command substitution so the exit code propagates.
+    # NOTE: process-substitution (`mapfile < <(cmd)`) always exits 0 — the
+    # sub-shell's exit code is discarded, so error paths (e.g. codex -r) would
+    # print their message but continue into a bare session.  Command substitution
+    # (`var=$(cmd)`) DOES propagate the exit code; split into two steps to
+    # preserve the one-word-per-line contract.
+    local expanded_raw
+    expanded_raw=$(_expand_session_args "$platform" "$name" "${extra[@]}") || {
+        # _expand_session_args already printed the error to stderr.
+        exit 2
+    }
+    local expanded=()
+    [[ -n "$expanded_raw" ]] && mapfile -t expanded <<< "$expanded_raw"
+    [[ ${#expanded[@]} -eq 0 ]] && { echo "ERROR: empty expansion from _expand_session_args" >&2; exit 2; }
+
+    # expanded[0] is the binary (or "codex" for the resume subcommand transform);
+    # expanded[1..] are the args (including subcommand words for codex resume).
+    # Tail args = everything after the binary word.
+    local binary="${expanded[0]:-$platform}"
+    local tail_args=("${expanded[@]:1}")
+
+    # Launch: try direct binary exec first, then ~/.runtime/start.sh fallback.
+    if sudo -u "$user" -i bash -c "command -v \"$binary\"" >/dev/null 2>&1; then
+        if [[ ${#cwd_arg[@]} -gt 0 ]]; then
+            sudo -u "$user" -i bash -c \
+                "cd $(printf '%q' "${cwd_arg[0]}") && exec \"$binary\" \"\$@\"" \
+                -- "${tail_args[@]}"
+        else
+            sudo -u "$user" -i "$binary" "${tail_args[@]}"
+        fi
+    elif sudo -u "$user" -i bash -c 'test -x "$HOME/.runtime/start.sh"' 2>/dev/null; then
+        # Fallback: ~/.runtime/start.sh adapter. Pass tail args only (not the
+        # base binary word — the adapter knows what to launch).
+        if [[ ${#cwd_arg[@]} -gt 0 ]]; then
+            sudo -u "$user" -i bash -c \
+                "cd $(printf '%q' "${cwd_arg[0]}") && exec ~/.runtime/start.sh \"\$@\"" \
+                -- "${tail_args[@]}"
+        else
+            sudo -u "$user" -i bash -c '~/.runtime/start.sh "$@"' -- "${tail_args[@]}"
+        fi
+    else
+        echo "ERROR: no $binary on PATH for $user and no ~/.runtime/start.sh adapter" >&2
+        exit 1
+    fi
+}
+
+cmd_bash() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { echo "Usage: agentctl bash <agent>" >&2; exit 2; }
+    local user; user=$(resolve_user "$name")
+    sudo -u "$user" -i
+}
+
+
+# ---------- v0.3 spawn flow: spawn / finalize-name ----------
+#
+# Per active-work/spawn-implementation-2026-05-05.md (alpha repo) and
+# Newborn-tag pattern: every freshly-spawned agent gets a placeholder uid
+# agent-newborn-YYYYMMDDhhmmss until it picks its real name in first session.
+# finalize-name then does the substrate rename in one shot — no general-purpose
+# rename is provided (names are immutable post-finalize).
+
+cmd_spawn() {
+    require_root "spawn"
+
+    local runtime="claude"
+    local alpha_source=""
+    local bootstrap_path="/usr/local/sbin/agent-bootstrap"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --runtime)          runtime="$2"; shift 2 ;;
+            --runtime=*)        runtime="${1#--runtime=}"; shift ;;
+            --alpha-source)     alpha_source="$2"; shift 2 ;;
+            --alpha-source=*)   alpha_source="${1#--alpha-source=}"; shift ;;
+            --bootstrap-path)   bootstrap_path="$2"; shift 2 ;;
+            --bootstrap-path=*) bootstrap_path="${1#--bootstrap-path=}"; shift ;;
+            *) echo "ERROR: unknown flag '$1'" >&2; exit 2 ;;
+        esac
+    done
+
+    if [[ ! -x "$bootstrap_path" ]]; then
+        echo "ERROR: agent-bootstrap not found at $bootstrap_path" >&2
+        echo "       Install it from engram-alpha:" >&2
+        echo "         sudo cp <engram-alpha-checkout>/tools/agent-bootstrap \\" >&2
+        echo "             $bootstrap_path && sudo chmod 0755 $bootstrap_path" >&2
+        exit 1
+    fi
+
+    # v0.1: claude only. Multi-runtime support (gemini-cli, codex) is
+    # forthcoming as a separate epic with proper per-runtime test
+    # fixtures and end-to-end validation. Until then, agentctl spawn
+    # rejects non-claude runtime rather than half-supporting (the
+    # silent-corruption pattern that prompted this scope decision per
+    # the spawn-implementation PR review of 2026-05-05).
+    if [[ "$runtime" != "claude" ]]; then
+        echo "ERROR: agentctl spawn v0.1 supports --runtime=claude only." >&2
+        echo "       Multi-runtime (gemini-cli, codex) is forthcoming as a separate epic." >&2
+        echo "       See ask-lei.md for the v0.2 multi-runtime ticket; until then, --runtime=claude only." >&2
+        exit 2
+    fi
+
+    # Newborn placeholder name: agent-newborn-YYYYMMDDhhmmss (UTC).
+    # Fits in the 32-char Linux username limit (28 chars used).
+    local newborn_tag; newborn_tag="newborn-$(date -u +%Y%m%d%H%M%S)"
+    local user_name="agent-$newborn_tag"
+
+    if id "$user_name" >/dev/null 2>&1; then
+        echo "ERROR: user $user_name already exists (newborn-timestamp clash?)" >&2
+        echo "       This is extremely unlikely; verify with 'id $user_name' and retry." >&2
+        exit 1
+    fi
+
+    echo "== agentctl spawn =="
+    echo "  Newborn name:   $user_name"
+    echo "  Runtime:        $runtime"
+    echo "  Bootstrap:      $bootstrap_path"
+    if [[ -n "$alpha_source" ]]; then
+        echo "  Alpha source:   $alpha_source (overridden)"
+    else
+        echo "  Alpha source:   (auto-detected by agent-bootstrap)"
+    fi
+    echo
+
+    # Multi-tenant defaults: agentctl spawn always creates an agent
+    # destined for a multi-agent host (that's the whole point of agentctl).
+    # Override agent-bootstrap's solo-safe defaults:
+    #   --home-mode 0750: group-traversable so the operator + peer agents in
+    #                     `agents` can `cd` into the new home.
+    # The post-bootstrap chgrp below sets the home's group to `agents`
+    # so the 0750 group-bit actually grants traversal to multi-agent
+    # peers (otherwise the group is the per-user group, no peer access).
+    # Matches the historical pattern for agent-borges + agent-mneme.
+    local bootstrap_args=("$newborn_tag" "--runtime" "$runtime" "--home-mode" "0750")
+    [[ -n "$alpha_source" ]] && bootstrap_args+=("--alpha-source" "$alpha_source")
+
+    # Delegate substrate setup. agent-bootstrap prints its own next-steps
+    # block; we add a spawn-specific finalize-name reminder below.
+    "$bootstrap_path" "${bootstrap_args[@]}"
+
+    # Re-group the new home to `agents` so peers (and the operator) in the
+    # `agents` group can traverse via the 0750 group-bit above. The
+    # bootstrap's final chown sets the home's group to the per-user
+    # group; this undoes that for the top-level home only (inner
+    # files stay per-user-group as bootstrap configured).
+    chgrp agents "/home/agent-$newborn_tag" 2>/dev/null || \
+        echo "WARN: chgrp agents /home/agent-$newborn_tag failed; the operator may not be able to traverse the new home." >&2
+
+    audit "spawn" "$newborn_tag" "newborn" "runtime=$runtime"
+
+    cat <<NEXT
+
+== Spawn complete ==
+The newborn is at $user_name. To complete the birth:
+
+  1. Enter the newborn's bash login shell:
+       agentctl bash $newborn_tag
+
+  2. Inside that shell, materialize ENGRAM (runs alpha installer):
+       bash ~/.runtime/install.sh
+
+  3. Login to the LLM provider (interactive):
+       claude login           # or gemini login
+
+  4. Start the first session:
+       claude                 # SessionStart hook fires engram-first-session
+                              # → agent generates 3 candidate names → you pick
+
+  5. From the operator's shell (NOT inside the newborn shell), finalize the rename:
+       sudo agentctl finalize-name $newborn_tag <chosen-name>
+
+To abandon a newborn before finalize-name (simple cleanup):
+  sudo userdel -r $user_name
+NEXT
+}
+
+cmd_finalize_name() {
+    require_root "finalize-name"
+
+    local newborn_tag="${1:-}"; shift || true
+    local chosen="${1:-}"; shift || true
+    [[ -z "$newborn_tag" || -z "$chosen" ]] && {
+        echo "Usage: sudo agentctl finalize-name <newborn-id> <chosen-name>" >&2
+        echo "  Example: sudo agentctl finalize-name newborn-20260505083012 ada" >&2
+        exit 2
+    }
+
+    # Refuse anything that isn't the newborn-tag pattern. This command is
+    # first-session-only — names are immutable post-finalize.
+    if [[ ! "$newborn_tag" =~ ^newborn-[0-9]{14}$ ]]; then
+        echo "ERROR: '$newborn_tag' doesn't match the newborn-YYYYMMDDhhmmss pattern." >&2
+        echo "       finalize-name is for the spawn flow only — it refuses general renames." >&2
+        echo "       Names are immutable after first session." >&2
+        exit 1
+    fi
+
+    local newborn_user="agent-$newborn_tag"
+    local chosen_user="agent-$chosen"
+    local newborn_home="/home/$newborn_user"
+    local chosen_home="/home/$chosen_user"
+
+    # Validate identities
+    if ! id "$newborn_user" >/dev/null 2>&1; then
+        echo "ERROR: newborn $newborn_user does not exist" >&2
+        exit 1
+    fi
+    if id "$chosen_user" >/dev/null 2>&1; then
+        echo "ERROR: chosen name '$chosen_user' is already taken" >&2
+        exit 1
+    fi
+    if [[ ! "$chosen" =~ ^[a-z][a-z0-9_-]*$ ]]; then
+        echo "ERROR: chosen name '$chosen' is not a valid Linux username" >&2
+        echo "       Allowed: lowercase letters, digits, underscore, hyphen; must start with a letter." >&2
+        exit 1
+    fi
+
+    echo "== agentctl finalize-name =="
+    echo "  Newborn:  $newborn_user → $chosen_user"
+    echo "  Home:     $newborn_home → $chosen_home"
+    echo
+
+    # Terminate any user-level systemd sessions, lingering background
+    # processes, and ENGRAM daemons for the newborn. usermod -d -m
+    # refuses to rename a user that has any process running under
+    # that uid. The newborn's first claude session typically leaves
+    # behind a user-level systemd (pid table shows `systemd --user`
+    # + sd-pam) plus engram-surface-daemon — both must be cleared
+    # before the rename can proceed. Best-effort, non-fatal if none
+    # of these exist (fresh-from-spawn newborns may have nothing
+    # running yet).
+    echo "Step 1.5: terminating any running processes for $newborn_user..."
+    loginctl disable-linger "$newborn_user" 2>/dev/null || true
+    loginctl terminate-user "$newborn_user" 2>/dev/null || true
+    sleep 1
+    pkill -KILL -u "$newborn_user" 2>/dev/null || true
+    sleep 1
+    if pgrep -u "$newborn_user" >/dev/null 2>&1; then
+        echo "WARN: some processes still running for $newborn_user after kill attempt; usermod may fail." >&2
+        ps -fu "$newborn_user" >&2 || true
+    fi
+
+    # Substrate rename: usermod + groupmod + home dir move.
+    echo "Step 2: usermod -l + -d -m + groupmod -n..."
+    usermod -l "$chosen_user" -d "$chosen_home" -m "$newborn_user"
+    groupmod -n "$chosen_user" "$newborn_user" 2>/dev/null || true
+
+    # Claude Code project-dir rename. Claude stores session JSONLs at
+    # ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl where encoded-cwd
+    # replaces / with -. After usermod, the home dir moved but the project
+    # subfolder still encodes the OLD newborn path — so `claude --continue`
+    # from the chosen home would look for -home-<chosen> and not find the
+    # pre-finalize sessions. Rename subfolders that match the old prefix
+    # so first-session continuity survives the rename.
+    # JSONL contents themselves are left intact (historical record of the
+    # newborn-phase work — accurate as it happened).
+    echo "Step 2b: renaming ~/.claude/projects/ encoded-cwd subfolders..."
+    local claude_projects="$chosen_home/.claude/projects"
+    if [[ -d "$claude_projects" ]]; then
+        local old_encoded="-home-${newborn_user}"
+        local new_encoded="-home-${chosen_user}"
+        for d in "$claude_projects"/*; do
+            [[ -d "$d" ]] || continue
+            local base; base=$(basename "$d")
+            if [[ "$base" == "$old_encoded"* ]]; then
+                local suffix="${base#$old_encoded}"
+                local new_base="${new_encoded}${suffix}"
+                mv "$d" "$claude_projects/$new_base"
+                echo "  $base → $new_base"
+            fi
+        done
+    fi
+
+    # Post-rename path rewrite across all active-config files. After
+    # usermod -d -m, multiple files in $chosen_home still reference
+    # /home/<newborn>/... — they were written at install/first-session
+    # time with the (then-correct) newborn path. Each layer fails its
+    # own way:
+    #   - .claude.json projects key → `claude --continue` returns "no
+    #     sessions" (lookup by NEW cwd misses).
+    #   - .claude.json mcpServers paths → ENOENT spawning MCP server,
+    #     `/mcp` says "Failed to reconnect: ENOENT".
+    #   - .claude/settings.json hook commands → UserPromptSubmit and
+    #     other hooks print "/bin/sh: <newborn-path>: not found" on
+    #     every prompt.
+    #   - .claude/settings.local.json → additional settings.
+    #   - .claude/CLAUDE.md → agent identity file path refs.
+    #   - .codex/config.toml → ENOENT on codex startup (issue #825).
+    #   - .engram/seed-manifest.json, .codex/rules/default.rules, etc.
+    # History/record files (.jsonl, .log, .sql, graph_snapshot.md,
+    # *-complete.json) are INTENTIONALLY left untouched — they are a
+    # factual record of the newborn phase and must stay intact.
+    # Binary files (knowledge.db, .pyc, images) are skipped — rewriting
+    # binary content corrupts it.
+    # Fix: exhaustively walk $chosen_home and text-substitute old_prefix
+    # → new_prefix in every file that is NOT a record/binary, using an
+    # empirically-derived skip-set (inline below — agentctl is a single
+    # vendored file; the rewrite logic lives here, not in a sibling module).
+    echo "Step 2c: rewriting stale newborn paths in all config/runtime files (exhaustive walk)..."
+    # Substitute the user-name part (not just /home/<name>) so both
+    # absolute-path form (/home/agent-newborn-XXX) AND encoded-cwd form
+    # (-home-agent-newborn-XXX, inside .claude/projects/ encodings + bash
+    # allowlist entries in settings.local.json) get rewritten.
+    local old_path="$newborn_user"
+    local new_path="$chosen_user"
+    if sudo -u "$chosen_user" python3 - "$chosen_home" "$old_path" "$new_path" <<'PYTHON'
+# === BEGIN finalize_name_rewrite (single source; tests/test_finalize_name_rewrite.py extracts between these sentinels) ===
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+
+# Reconfigure stdout to replace unencodable characters instead of raising.
+# Covers the ✓ glyph in progress lines (and any future glyphs) when stdout
+# is bound to an ASCII codec (e.g. LC_ALL=C with PEP 538 coercion disabled).
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
+
+# ---------------------------------------------------------------------------
+# Skip-list constants  (empirically derived — do NOT loosen without a new sweep)
+# ---------------------------------------------------------------------------
+
+# Directory components: stop os.walk from descending into these.
+# Rationale: binaries, bytecache, VCS, package caches, historical transcripts,
+# periodic backup snapshots — descending is expensive and produces no rewrites
+# we actually want.
+_PRUNE_DIRS = frozenset({
+    "venv",
+    "__pycache__",
+    ".git",
+    "node_modules",
+    "file-history",
+    "sessions",
+    "cron-backups",
+})
+
+# File extensions to skip entirely.
+# .pyc       — compiled bytecode (binary, variable-length fields)
+# .jsonl     — session/history transcripts (factual record of the newborn phase)
+# .log       — log files (factual record)
+# .sql       — e.g. knowledge.sql; the ENGRAM graph DUMP.  It regenerates from
+#              knowledge.db on the next nap/checkpoint, AND may contain node
+#              text that legitimately references the newborn home as accurate
+#              history — must not be rewritten.
+# .bak       — existing backups (don't rewrite our own safety copies)
+_SKIP_EXTENSIONS = frozenset({
+    ".pyc",
+    ".jsonl",
+    ".log",
+    ".sql",
+    ".bak",
+})
+
+# Exact filenames to skip (base name only, no directory component).
+# graph_snapshot.md      — regenerable summary snapshot
+# history.jsonl          — handled by extension, but listed explicitly for clarity
+# knowledge.db           — SQLite binary
+# knowledge.db-wal       — WAL journal (binary)
+# knowledge.db-shm       — shared-memory file (binary)
+_SKIP_NAMES = frozenset({
+    "graph_snapshot.md",
+    "history.jsonl",
+    "knowledge.db",
+    "knowledge.db-wal",
+    "knowledge.db-shm",
+})
+
+# Suffix patterns for endswith checks.
+# *-complete.json — e.g. finalize-name-complete.json: the rename AUDIT record.
+#   Rewriting agent-newborn-<ts>→<chosen> inside it would make it falsely read
+#   "from=<chosen> to=<chosen>", corrupting the record of what the rename did.
+# *.bak-prefinalize — our own pre-write backup copies (never rewrite the safety
+#   copy). Note: Path.suffix on "foo.bak-prefinalize" is ".bak-prefinalize",
+#   not ".bak" — so these are caught by this endswith check, not the _SKIP_EXTENSIONS
+#   ".bak" entry (which catches plain ".bak" files only).
+_SKIP_SUFFIXES = (
+    "-complete.json",
+    ".bak-prefinalize",
+)
+
+_BINARY_PROBE_BYTES = 8192  # how many bytes to read for NUL-byte detection
+
+
+def _is_binary(path):
+    """Return True if the file appears to be binary (NUL byte in first 8KB)."""
+    try:
+        with path.open("rb") as fh:
+            chunk = fh.read(_BINARY_PROBE_BYTES)
+        return b"\x00" in chunk
+    except OSError:
+        return True  # unreadable → treat as binary, skip safely
+
+
+def _should_skip(path):
+    """Return (skip, reason) for a candidate file.
+
+    Reasons are human-readable labels for the skip-count report.
+    'record'  — a factual record/log/dump/audit file (must stay intact)
+    'binary'  — binary file (rewriting would corrupt it)
+    '(rewrite)' — not skipped; caller should rewrite
+    """
+    name = path.name
+    suffix = path.suffix.lower()
+
+    # Exact-name check first (fastest)
+    if name in _SKIP_NAMES:
+        return True, "record"
+
+    # Suffix-pattern check
+    for pat in _SKIP_SUFFIXES:
+        if name.endswith(pat):
+            return True, "record"
+
+    # Extension check
+    if suffix in _SKIP_EXTENSIONS:
+        return True, "record"
+
+    # Binary probe (belt-and-suspenders; catches knowledge.db, .pyc stragglers,
+    # images, etc. even if they somehow aren't under a pruned dir)
+    if _is_binary(path):
+        return True, "binary"
+
+    return False, "(rewrite)"
+
+
+def _try_toml_validate(text, path):
+    """Attempt TOML validation; return True if valid or tomllib unavailable."""
+    try:
+        import tomllib  # stdlib Python 3.11+
+    except ImportError:
+        return True  # graceful skip — no third-party dep added
+    try:
+        tomllib.loads(text)
+        return True
+    except tomllib.TOMLDecodeError as e:
+        print(
+            f"  ERROR: rewrite would invalidate TOML in {path}: {e}",
+            file=sys.stderr,
+        )
+        print(
+            f"         pre-write copy at {path}.bak-prefinalize left intact",
+            file=sys.stderr,
+        )
+        return False
+
+
+def rewrite_tree(home, old_prefix, new_prefix):
+    """Walk *home* and rewrite every text config file that contains *old_prefix*.
+
+    Parameters
+    ----------
+    home        Absolute path of the agent's home directory (string or Path).
+    old_prefix  The old newborn username token, e.g. ``agent-newborn-20260604123456``.
+                Matches BOTH ``/home/agent-newborn-<ts>`` (absolute-path form) and
+                ``-home-agent-newborn-<ts>`` (encoded-cwd form in
+                ``.claude/projects/``), because the substring covers both.
+    new_prefix  The chosen username token, e.g. ``agent-ada``.
+
+    Returns
+    -------
+    dict with keys ``touched`` (int), ``total`` (int), ``skipped_record`` (int).
+
+    Raises
+    ------
+    SystemExit(1)  if a JSON or TOML file fails to validate after rewrite
+                   (the ``.bak-prefinalize`` pre-write copy is left intact;
+                   the file itself is NOT overwritten on validation failure).
+    """
+    home_path = Path(home)
+    total = 0
+    touched = 0
+    skipped_record = 0
+    skipped_utf8 = 0
+
+    for dirpath, dirs, files in os.walk(home_path):
+        # Prune directories in-place so os.walk doesn't descend into them.
+        dirs[:] = [d for d in dirs if d not in _PRUNE_DIRS]
+
+        for fname in files:
+            p = Path(dirpath) / fname
+
+            skip, reason = _should_skip(p)
+            if skip:
+                if reason == "record":
+                    skipped_record += 1
+                # binary skips are not counted in skipped_record (different category)
+                continue
+
+            # Read as strict UTF-8; skip on decode error (invalid-UTF-8 file
+            # with no NUL bytes would pass _is_binary but silently corrupt on
+            # rewrite via U+FFFD substitution — skip it instead).
+            # Also skip on OSError (permissions, dangling symlink, etc.)
+            try:
+                text = p.read_text(encoding="utf-8", errors="strict")
+            except UnicodeDecodeError:
+                skipped_utf8 += 1
+                continue
+            except OSError:
+                continue
+
+            count = text.count(old_prefix)
+            if count == 0:
+                continue
+
+            # Backup before any write (pre-write copy; original stays in .bak-prefinalize)
+            bak = Path(str(p) + ".bak-prefinalize")
+            shutil.copy2(p, bak)
+
+            new_text = text.replace(old_prefix, new_prefix)
+
+            # Validate JSON files post-rewrite (before overwriting)
+            if p.suffix.lower() == ".json":
+                try:
+                    json.loads(new_text)
+                except json.JSONDecodeError as e:
+                    print(
+                        f"  ERROR: rewrite would invalidate JSON in {p}: {e}",
+                        file=sys.stderr,
+                    )
+                    print(
+                        f"         pre-write copy at {bak} left intact",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+
+            # Validate TOML files post-rewrite (best-effort; py3.11+ stdlib)
+            if p.suffix.lower() == ".toml":
+                if not _try_toml_validate(new_text, p):
+                    sys.exit(1)
+
+            p.write_text(new_text, encoding="utf-8")
+            total += count
+            touched += 1
+            print(f"  ✓ {p.name}: {count} occurrences rewritten")
+
+    return {"touched": touched, "total": total, "skipped_record": skipped_record, "skipped_utf8": skipped_utf8}
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 4:
+        print(
+            "Usage: agentctl-heredoc <home> <old_prefix> <new_prefix>",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    _home, _old, _new = sys.argv[1], sys.argv[2], sys.argv[3]
+    result = rewrite_tree(_home, _old, _new)
+
+    if result["total"] == 0:
+        print("  (no stale references found)")
+    else:
+        print(
+            f"  total: {result['total']} occurrences across {result['touched']} file(s)"
+        )
+    if result["skipped_record"] > 0:
+        print(
+            f"  skipped (record/log/dump): {result['skipped_record']} file(s) — factual record, left intact"
+        )
+    if result["skipped_utf8"] > 0:
+        print(
+            f"  skipped (invalid UTF-8): {result['skipped_utf8']} file(s) — not valid UTF-8, left intact"
+        )
+# === END finalize_name_rewrite ===
+PYTHON
+    then
+        :
+    else
+        echo "" >&2
+        echo "  ╔══════════════════════════════════════════════════════════════╗" >&2
+        echo "  ║  ERROR: Step 2c path-rewrite FAILED                         ║" >&2
+        echo "  ╚══════════════════════════════════════════════════════════════╝" >&2
+        echo "" >&2
+        echo "  The agent's config still references the old newborn path." >&2
+        echo "  codex/MCP/hooks will NOT work until this is fixed manually." >&2
+        echo "" >&2
+        echo "  Fix: replace all '$old_path' strings with '$new_path' in:" >&2
+        echo "    $chosen_home/.claude.json" >&2
+        echo "    $chosen_home/.claude/settings.json" >&2
+        echo "    $chosen_home/.claude/settings.local.json" >&2
+        echo "    $chosen_home/.claude/CLAUDE.md" >&2
+        echo "    $chosen_home/.codex/config.toml" >&2
+        echo "    (and any other config/runtime file under $chosen_home)" >&2
+        echo "" >&2
+        echo "  The rename (Step 2 usermod) already completed — the new" >&2
+        echo "  username '$chosen_user' is active but the config is stale." >&2
+        exit 1
+    fi
+
+    # Claude Code symlink repair. Claude Code's native installer creates
+    # ~/.local/bin/claude as an ABSOLUTE symlink to
+    # ~/.local/share/claude/versions/X.Y.Z. After usermod -d -m moves
+    # the home, the symlink TARGET still points at the old home path,
+    # leaving it dangling. Bash can't exec it → `agentctl session` fails
+    # immediately with "exec: no such file or directory" when the session
+    # command tries to exec the claude binary directly.
+    # Fix: re-create the symlink with a RELATIVE target so it survives
+    # any future home renames. Skip if no symlink exists (newborn that
+    # never installed claude) OR if it already resolves (no rename
+    # needed).
+    echo "Step 2d: repairing ~/.local/bin/claude symlink if dangling..."
+    local claude_symlink="$chosen_home/.local/bin/claude"
+    if [[ -L "$claude_symlink" ]]; then
+        if [[ ! -e "$claude_symlink" ]]; then
+            # Dangling. Find the new target by scanning versions/ for the
+            # latest install (alphabetical sort happens to be version-order
+            # for X.Y.Z semantic versions).
+            local versions_dir="$chosen_home/.local/share/claude/versions"
+            if [[ -d "$versions_dir" ]]; then
+                local latest_version
+                latest_version=$(ls "$versions_dir" 2>/dev/null | sort | tail -1)
+                if [[ -n "$latest_version" ]]; then
+                    sudo -u "$chosen_user" bash -c "
+                        cd '$chosen_home/.local/bin' && \
+                        rm -f claude && \
+                        ln -s '../share/claude/versions/$latest_version' claude
+                    "
+                    echo "  ✓ repaired: claude → ../share/claude/versions/$latest_version (relative)"
+                else
+                    echo "  WARN: ~/.local/share/claude/versions/ is empty; manual claude install required" >&2
+                fi
+            else
+                echo "  WARN: ~/.local/share/claude/versions/ doesn't exist; symlink stays dangling" >&2
+                echo "        Newborn likely never ran claude's native installer." >&2
+            fi
+        else
+            echo "  (claude symlink already resolves — no repair needed)"
+        fi
+    else
+        echo "  (no claude symlink at $claude_symlink — skipped)"
+    fi
+
+    # ACL sweep on shared dirs. For a fresh newborn, there typically aren't
+    # any g:agent-newborn-* ACL entries, but sweep defensively.
+    echo "Step 3: ACL sweep on $SHARED_ROOT (replacing g:$newborn_user → g:$chosen_user)..."
+    if command -v setfacl >/dev/null 2>&1 && command -v getfacl >/dev/null 2>&1; then
+        local found_acls
+        found_acls=$(getfacl -R -p "$SHARED_ROOT" 2>/dev/null | grep -B 2 "^group:$newborn_user:" || true)
+        if [[ -n "$found_acls" ]]; then
+            # Best-effort sweep — non-fatal if any entry resists.
+            getfacl -R -p "$SHARED_ROOT" 2>/dev/null \
+                | grep -B 1 "^group:$newborn_user:" \
+                | grep "^# file:" \
+                | sed 's/^# file: //' \
+                | while read -r path; do
+                    setfacl -m "g:$chosen_user:$(getfacl --tabular -- "$path" 2>/dev/null | awk -F: -v u="$newborn_user" '$2==u {print $3}')" "$path" 2>/dev/null || true
+                    setfacl -x "g:$newborn_user" "$path" 2>/dev/null || true
+                done
+        fi
+    fi
+
+    # Health dir rename in the community share.
+    if [[ -d "$SHARED_ROOT/health/$newborn_tag" ]]; then
+        mv "$SHARED_ROOT/health/$newborn_tag" "$SHARED_ROOT/health/$chosen"
+        chown "$chosen_user:agents" "$SHARED_ROOT/health/$chosen"
+    fi
+
+    # Snapshot the post-finalize ENGRAM state — this is the rebirth target
+    # if first session goes wrong (first-session lifecycle: rebirth case).
+    echo "Step 4: snapshot ~/.engram → ~/.engram.first-session-baseline.bak/..."
+    if [[ -d "$chosen_home/.engram" ]]; then
+        cp -a "$chosen_home/.engram" "$chosen_home/.engram.first-session-baseline.bak"
+        chown -R "$chosen_user:$chosen_user" "$chosen_home/.engram.first-session-baseline.bak"
+        echo "  ✓ baseline snapshot taken"
+    else
+        echo "  (no ~/.engram yet — skipped; agent will install ENGRAM after this finalize)"
+    fi
+
+    # Drop a marker file so the next session's SessionStart hook can pick
+    # up the rename + queue any post-finalize-name housekeeping (warm-
+    # briefing placeholder substitutions, optional first-day observation
+    # filing). The agent's first session already files the 3-candidate
+    # naming observation as part of engram-first-session — finalize-name
+    # doesn't need to duplicate that work.
+    cat > "$chosen_home/.engram/finalize-name-complete.json" 2>/dev/null <<JSON
+{
+  "newborn_uid": "$newborn_user",
+  "chosen_name": "$chosen",
+  "finalized_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+JSON
+    chown "$chosen_user:$chosen_user" "$chosen_home/.engram/finalize-name-complete.json" 2>/dev/null || true
+
+    # Restart the ENGRAM surface daemon (a.k.a. recall daemon) under
+    # the new uid. Step 1.5 killed it along with the newborn's other
+    # processes to clear usermod's "user is currently used" block;
+    # SessionStart hook would auto-start it on next claude session,
+    # but doing it explicitly here leaves the agent in a fully-alive
+    # state immediately post-finalize. The launcher is idempotent.
+    echo "Step 6: restarting ENGRAM surface daemon under $chosen_user..."
+    local daemon_launcher="$chosen_home/.engram/hooks/start-engram-daemon.sh"
+    if [[ -x "$daemon_launcher" ]]; then
+        if sudo -u "$chosen_user" \
+              ENGRAM_HOME="$chosen_home/.engram" \
+              bash "$daemon_launcher" >/dev/null 2>&1; then
+            sleep 1
+            if sudo -u "$chosen_user" test -f "$chosen_home/.engram/recall-daemon.pid"; then
+                echo "  ✓ surface daemon started (pid $(sudo -u "$chosen_user" cat "$chosen_home/.engram/recall-daemon.pid" 2>/dev/null || echo "?"))"
+            else
+                echo "  WARN: launcher returned 0 but no pidfile — check $chosen_home/.engram/surface-daemon.log" >&2
+            fi
+        else
+            echo "  WARN: daemon launcher returned non-zero — check $chosen_home/.engram/surface-daemon.log" >&2
+        fi
+    else
+        echo "  (no daemon launcher at $daemon_launcher — skipped; will auto-start on next claude session)"
+    fi
+
+    audit "finalize-name" "$chosen" "uid" "from=$newborn_user"
+
+    cat <<DONE
+
+== Finalize-name complete ==
+  ✓ uid:    $newborn_user → $chosen_user
+  ✓ home:   $newborn_home → $chosen_home
+  ✓ baseline backup: $chosen_home/.engram.first-session-baseline.bak/
+  ✓ marker: $chosen_home/.engram/finalize-name-complete.json
+  ✓ surface daemon: restarted under $chosen_user
+
+Smoke test:
+  agentctl session $chosen        # should drop you into a clean session
+
+The agent's identity is now permanent. To retire later, see
+active-work/spawn-implementation-2026-05-05.md (v0.2 retire ceremony).
+DONE
+}
+
+# ---------- v0.1 broker: share / unshare / share-status ----------
+#
+# Mechanism: POSIX ACLs (setfacl/getfacl). Multi-agent compatible (each agent
+# has its own ACL entry on the path), TTL-revocable, audit-logged. State lives
+# at $SHARED_ROOT/share-state/<agent>.json; audit at $SHARED_ROOT/audit/share-log.
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "ERROR: '$1' requires sudo (modifies ACLs)" >&2
+        echo "Try: sudo $0 $1 ..." >&2
+        exit 1
+    fi
+}
+
+audit() {
+    local action="$1"; local agent="$2"; local path="$3"; local extras="${4:-}"
+    local stamp; stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local audit_dir="$SHARED_ROOT/audit"
+    mkdir -p "$audit_dir"
+    echo "$stamp $action ${SUDO_USER:-$(id -un)}→$agent path=$path${extras:+ $extras}" >> "$audit_dir/share-log"
+    chgrp agents "$audit_dir/share-log" 2>/dev/null || true
+    chmod 0664 "$audit_dir/share-log" 2>/dev/null || true
+}
+
+cmd_share() {
+    local agent="${1:-}"; shift || true
+    local path="${1:-}"; shift || true
+    local mode="rw"
+    local ttl=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mode) mode="${2:-}"; shift 2 ;;
+            --ttl)  ttl="${2:-}"; shift 2 ;;
+            *) echo "ERROR: unknown flag '$1'" >&2; exit 2 ;;
+        esac
+    done
+    [[ -z "$agent" || -z "$path" ]] && {
+        echo "Usage: sudo agentctl share <agent> <path> [--mode rw|ro] [--ttl <duration>]" >&2; exit 2
+    }
+    require_root share
+    local user; user=$(resolve_user "$agent")
+    [[ -e "$path" ]] || { echo "ERROR: path '$path' does not exist" >&2; exit 1; }
+    path=$(readlink -f "$path")
+
+    case "$path" in
+        /etc/*|/usr/*|/var/*|/sys/*|/proc/*|/dev/*|/boot/*|/root/*|/etc|/usr|/var|/root|/)
+            echo "ERROR: refusing to share system path '$path'" >&2; exit 1 ;;
+    esac
+
+    local acl_perm
+    case "$mode" in
+        rw) acl_perm="rwX" ;;
+        ro) acl_perm="rX" ;;
+        *)  echo "ERROR: --mode must be rw or ro (got '$mode')" >&2; exit 2 ;;
+    esac
+
+    # Parent traversal: walk from path's parent up to /, add g:user:--x ACL.
+    # setfacl is idempotent — re-running is safe.
+    local parent
+    parent=$(dirname "$path")
+    while [[ "$parent" != "/" && -n "$parent" ]]; do
+        setfacl -m "g:$user:--x" "$parent" \
+            || { echo "ERROR: setfacl --x failed on '$parent'" >&2; exit 1; }
+        # Preserve the invoking human user's read+traverse on every ancestor
+        # we restrict via named-group --x. Without this, if the invoker is a
+        # member of the named group (e.g. the operator is in the agent groups for
+        # read access to agent home dirs at mode 0750), the named-group entry
+        # overrides their own access — they cannot ls the ancestor. Bug
+        # surfaced 2026-05-07 on /home; workaround was setfacl -m u:<operator>:rx.
+        # This makes the workaround structural (every share preserves invoker).
+        if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+            setfacl -m "u:$SUDO_USER:r-x" "$parent" \
+                || echo "WARNING: preserve u:$SUDO_USER:r-x failed on '$parent'" >&2
+        fi
+        parent=$(dirname "$parent")
+    done
+
+    # Target: recursive ACL
+    setfacl -R -m "g:$user:$acl_perm" "$path" \
+        || { echo "ERROR: setfacl $acl_perm failed on '$path'" >&2; exit 1; }
+
+    # Default ACL on directories so new files inherit
+    if [[ -d "$path" ]]; then
+        setfacl -R -d -m "g:$user:$acl_perm" "$path" \
+            || echo "WARNING: default ACL setfacl failed on '$path'" >&2
+    fi
+
+    # Git safe.directory exception: git 2.35.2+ refuses to operate on repos owned
+    # by a different uid (CVE-2022-24765). ACL access is necessary but not
+    # sufficient — the agent's gitconfig needs an explicit safe.directory entry
+    # at the repo root. Idempotent (git tolerates duplicate entries).
+    if command -v git >/dev/null 2>&1; then
+        local git_repo_root=""
+        if git_repo_root=$(sudo -u "$user" git -C "$path" rev-parse --show-toplevel 2>/dev/null); then
+            sudo -u "$user" git config --global --add safe.directory "$git_repo_root" \
+                && echo "  + git safe.directory: $git_repo_root (for $user)"
+        fi
+    fi
+
+    # TTL: schedule revoke via 'at' if specified and available
+    if [[ -n "$ttl" ]]; then
+        if command -v at >/dev/null 2>&1; then
+            echo "$0 unshare $agent $path" | at "now + $ttl" 2>/dev/null \
+                && echo "  scheduled auto-unshare at: now + $ttl"
+        else
+            echo "WARNING: 'at' not installed; --ttl requested but not enforced. Manual unshare needed." >&2
+        fi
+    fi
+
+    # State tracking
+    local state_dir="$SHARED_ROOT/share-state"
+    mkdir -p "$state_dir"
+    local state_file="$state_dir/$agent.json"
+    AGENT="$agent" SHARE_PATH="$path" SHARE_MODE="$mode" SHARE_TTL="$ttl" STATE_FILE="$state_file" \
+    python3 - <<'PYEOF'
+import json, os
+from datetime import datetime, timezone
+sf = os.environ['STATE_FILE']
+entry = {
+    "path": os.environ['SHARE_PATH'],
+    "mode": os.environ['SHARE_MODE'],
+    "ttl": os.environ['SHARE_TTL'] or None,
+    "granted_at": datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z'),
+}
+state = []
+if os.path.exists(sf):
+    try: state = json.load(open(sf))
+    except Exception: state = []
+state = [s for s in state if s.get("path") != entry["path"]]
+state.append(entry)
+json.dump(state, open(sf, "w"), indent=2)
+PYEOF
+    chgrp agents "$state_file" 2>/dev/null || true
+    chmod 0664 "$state_file" 2>/dev/null || true
+
+    audit share "$agent" "$path" "mode=$mode ttl=${ttl:-none}"
+    echo "✓ Shared $path with $agent (mode=$mode${ttl:+, ttl=$ttl})"
+}
+
+cmd_unshare() {
+    local agent="${1:-}"; shift || true
+    local path="${1:-}"; shift || true
+    [[ -z "$agent" || -z "$path" ]] && {
+        echo "Usage: sudo agentctl unshare <agent> <path>" >&2; exit 2
+    }
+    require_root unshare
+    local user; user=$(resolve_user "$agent")
+    path=$(readlink -f "$path" 2>/dev/null || echo "$path")
+
+    # Remove recursive + default ACL
+    if [[ -e "$path" ]]; then
+        setfacl -R -x "g:$user" "$path" 2>/dev/null || true
+        [[ -d "$path" ]] && setfacl -R -d -x "g:$user" "$path" 2>/dev/null || true
+    fi
+
+    # Update state file
+    local state_file="$SHARED_ROOT/share-state/$agent.json"
+    if [[ -f "$state_file" ]]; then
+        SHARE_PATH="$path" STATE_FILE="$state_file" python3 - <<'PYEOF'
+import json, os
+sf = os.environ['STATE_FILE']
+target = os.environ['SHARE_PATH']
+state = json.load(open(sf))
+state = [s for s in state if s.get("path") != target]
+json.dump(state, open(sf, "w"), indent=2)
+PYEOF
+        # GC parent --x ACLs: remove any parent ACL not needed by remaining shares
+        REMAINING=$(python3 -c "import json; print('\n'.join(s['path'] for s in json.load(open('$state_file'))))")
+        local parent
+        parent=$(dirname "$path")
+        while [[ "$parent" != "/" && -n "$parent" ]]; do
+            local still_needed=0
+            while IFS= read -r remp; do
+                [[ -z "$remp" ]] && continue
+                case "$remp" in
+                    "$parent"/*|"$parent") still_needed=1; break ;;
+                esac
+            done <<< "$REMAINING"
+            if [[ $still_needed -eq 0 ]]; then
+                setfacl -x "g:$user" "$parent" 2>/dev/null || true
+            fi
+            parent=$(dirname "$parent")
+        done
+
+        # GC git safe.directory: remove the agent's exception for this repo
+        # root only if no remaining share is inside the same repo. Path may be
+        # gone post-unshare, so try resolving repo root from path first; if that
+        # fails, skip (stale gitconfig entry is harmless).
+        if command -v git >/dev/null 2>&1; then
+            local unshared_repo_root=""
+            if unshared_repo_root=$(sudo -u "$user" git -C "$path" rev-parse --show-toplevel 2>/dev/null); then
+                local still_needed_git=0
+                while IFS= read -r remp; do
+                    [[ -z "$remp" ]] && continue
+                    local rem_root=""
+                    if rem_root=$(sudo -u "$user" git -C "$remp" rev-parse --show-toplevel 2>/dev/null); then
+                        if [[ "$rem_root" == "$unshared_repo_root" ]]; then
+                            still_needed_git=1; break
+                        fi
+                    fi
+                done <<< "$REMAINING"
+                if [[ $still_needed_git -eq 0 ]]; then
+                    sudo -u "$user" git config --global --unset-all safe.directory "$unshared_repo_root" 2>/dev/null \
+                        && echo "  - git safe.directory: $unshared_repo_root (removed for $user)"
+                fi
+            fi
+        fi
+    fi
+
+    audit unshare "$agent" "$path"
+    echo "✓ Unshared $path from $agent"
+}
+
+cmd_share_status() {
+    local agent="${1:-}"
+    local state_dir="$SHARED_ROOT/share-state"
+    if [[ ! -d "$state_dir" ]]; then
+        echo "(no shares — $state_dir not yet created)"
+        return 0
+    fi
+    if [[ -n "$agent" ]]; then
+        local _; _=$(resolve_user "$agent") # validate
+        local sf="$state_dir/$agent.json"
+        if [[ -r "$sf" ]]; then
+            echo "=== $agent ==="
+            cat "$sf"
+        else
+            echo "No active shares for $agent"
+        fi
+    else
+        local found=0
+        for sf in "$state_dir"/*.json; do
+            [[ -f "$sf" ]] || continue
+            found=1
+            local name; name=$(basename "$sf" .json)
+            echo "=== $name ==="
+            cat "$sf"
+            echo
+        done
+        [[ $found -eq 0 ]] && echo "No active shares for any agent"
+    fi
+}
+
+cmd_help() {
+    sed -n '3,33p' "$0"
+}
+
+# ---------- internal verb: __expand-session-args ----------
+# Not listed in user-facing help (internal verb, invoked programmatically).
+# Usage: agentctl __expand-session-args <platform> <agent_name> [args...]
+# Calls _expand_session_args and exits with its status. Used directly by the
+# test suite to exercise alias expansion without needing real agents or sudo.
+cmd__expand_session_args() {
+    local platform="${1:-}"; shift || true
+    local agent_name="${1:-}"; shift || true
+    _expand_session_args "$platform" "$agent_name" "$@"
+}
+
+case "$SUBCMD" in
+    health)        cmd_health        "$@" ;;
+    session)       cmd_session       "$@" ;;
+    bash)          cmd_bash          "$@" ;;
+    spawn)         cmd_spawn         "$@" ;;
+    finalize-name) cmd_finalize_name "$@" ;;
+    share)         cmd_share         "$@" ;;
+    unshare)       cmd_unshare       "$@" ;;
+    share-status)  cmd_share_status  "$@" ;;
+    help|--help|-h) cmd_help ;;
+    __expand-session-args) cmd__expand_session_args "$@" ;;
+    *) echo "Unknown subcommand: $SUBCMD"; cmd_help; exit 2 ;;
+esac

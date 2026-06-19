@@ -1,0 +1,19 @@
+[Unit]
+Description=ENGRAM Visualization Server (multi-agent, user session)
+
+[Service]
+Type=simple
+# Runs as the operator (no User=/Group=/SupplementaryGroups= — user-session
+# unit inherits the login user automatically).  The operator is expected to
+# belong to the `agents` group (or have direct DB read access) so it can
+# reach peer-agent knowledge.db files.
+WorkingDirectory={{PLUGIN_ENGRAM_DIR}}
+ExecStart={{PYTHON}} {{PLUGIN_ENGRAM_DIR}}/viz_server.py --bind 127.0.0.1 --port 5001 --config /etc/engram-viz/agents.json
+
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

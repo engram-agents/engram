@@ -1,0 +1,11 @@
+{
+  "platform": "claude-code",
+  "identity_doc": "CLAUDE.md",
+  "plugin_manifest": "plugin.json",
+  "plugin_root_env": "CLAUDE_PLUGIN_ROOT",
+  "mcp_config": ".mcp.json",
+  "hook_envelope": "text-ok",
+  "hooks_config": "hooks/hooks.json",
+  "skills_dir": "skills/",
+  "min_version": "1.0.0"
+}
