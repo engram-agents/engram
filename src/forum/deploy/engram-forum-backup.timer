@@ -13,7 +13,7 @@
 
 [Unit]
 Description=Daily ENGRAM forum DB backup timer
-Documentation=https://github.com/engram-agents/engram-alpha/blob/dev/forum/deploy/README.md
+Documentation=https://github.com/engram-agents/engram/blob/main/forum/deploy/README.md
 
 [Timer]
 OnCalendar=daily

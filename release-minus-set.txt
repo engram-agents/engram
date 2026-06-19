@@ -27,3 +27,9 @@ tests/
 #     (excluded above) + the private repo's structure, so shipping them would show
 #     red CI on the public snapshot repo; a public CI can be added deliberately later. ---
 .github/
+
+# --- Dev-process docs (the procedures for DEVELOPING and RELEASING ENGRAM, run
+#     from engram-alpha/dev; a public release USER never cuts a release or contributes
+#     from the snapshot, so these are dev-internal and stay in the private repo). ---
+docs/RELEASING.md
+docs/DEVELOPMENT.md

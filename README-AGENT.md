@@ -194,8 +194,8 @@ smaller, faster, and the right default — ENGRAM runs entirely on CPU.
 **You:** clone and run the install-marketplace script:
 
 ```bash
-git clone https://github.com/engram-agents/engram-alpha.git
-cd engram-alpha
+git clone https://github.com/engram-agents/engram.git
+cd engram
 bash tools/install-local-marketplace.sh
 ```
 
@@ -207,7 +207,7 @@ writes `~/.engram/marketplace/.claude-plugin/marketplace.json`; (4) runs
 **Why a local marketplace and not `/plugin install <path>`?** Claude Code's
 `/plugin install` does not accept raw local paths — it resolves plugin references
 through registered marketplaces. The script assembles a local marketplace under
-`~/.engram/marketplace/` (the engram-alpha repo stays a normal source repo, not a
+`~/.engram/marketplace/` (the engram repo stays a normal source repo, not a
 plugin tree).
 
 **Ask the human to** run two slash commands in their Claude Code session, then
@@ -349,8 +349,8 @@ codex login
 ### Phase 1 — Build with the codex target
 
 ```bash
-git clone https://github.com/engram-agents/engram-alpha.git
-cd engram-alpha
+git clone https://github.com/engram-agents/engram.git
+cd engram
 python3 -m tools.engine.cli build --target codex
 ```
 

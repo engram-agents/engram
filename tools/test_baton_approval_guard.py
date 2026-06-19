@@ -241,7 +241,7 @@ def test_red_ci_rejects_before_approval_guard(projects_dir, engram_home, monkeyp
 # Helpers below build mock side-effect sequences for the two-call shape.
 # ---------------------------------------------------------------------------
 
-_REPO_PAYLOAD = {"nameWithOwner": "engram-agents/engram-alpha"}
+_REPO_PAYLOAD = {"nameWithOwner": "engram-agents/engram"}
 
 
 def _gh_result(payload, returncode: int = 0, stderr: str = ""):

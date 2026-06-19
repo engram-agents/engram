@@ -4645,7 +4645,7 @@ CONFIG_HTML = r"""<!DOCTYPE html>
   <div class="config-footer">
     ENGRAM has additional configuration parameters for protocol-level
     tuning that aren&#39;t surfaced here. They live in ~/.engram/config.json
-    and are documented in the project <a href="https://github.com/engram-agents/engram-alpha/blob/dev/README.md" target="_blank">README</a>. Edit them only after
+    and are documented in the project <a href="https://github.com/engram-agents/engram/blob/main/README.md" target="_blank">README</a>. Edit them only after
     reading the calibration documentation.
   </div>
 

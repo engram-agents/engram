@@ -43,7 +43,7 @@ Five modes:
 | Missing | — | Exists | **corrupted-state** | Stop and surface to user — manual cleanup needed |
 | Exists | empty (0 axioms) | Missing | **partial-bootstrap** | Surface the seed-empty error to user; recovery is `rm knowledge.db && rerun first-session` (the seed-empty error message includes the exact path) |
 
-For the seed-empty check (column 2 of the row): `sqlite3 "$ENGRAM_HOME/knowledge.db" "SELECT COUNT(*) FROM nodes WHERE type='axiom'"` returns 0 → empty; ≥3 → seeded (post-bootstrap.py).
+For the seed-empty check (column 2 of the row): `python3 -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute(\"SELECT COUNT(*) FROM nodes WHERE type='axiom'\").fetchone()[0])" "$ENGRAM_HOME/knowledge.db"` returns 0 → empty; ≥3 → seeded (post-bootstrap.py). (stdlib — no CLI dependency)
 
 If the MCP fail-loud message (`ENGRAM cannot start: knowledge.db not found...`) brought you here, this is **fresh-bootstrap** mode. Continue to Step 0.5.
 
@@ -268,10 +268,14 @@ default that produces frequent false warnings on 1M-context sessions.
 
 Do this step in a single short exchange:
 
-1. Ask the user to run `/context` in their Claude Code session and report
-   the auto-compaction limit shown. Example wording: "Quick setup: can you
-   run `/context` in Claude Code and tell me what it shows for the
-   auto-compaction limit? Something like '850K tokens'."
+1. Ask the user to run `/context` and report the **auto-compact window**.
+   Tell them where to look — `/context` prints a long report (a big list of
+   MCP tools, agents, and skills); they can **ignore all of that**. The number
+   we need is near the **top**, on something like `Auto-compact window: NNNk tokens`
+   (e.g. `200k`, `1M`); the `NN.Nk/NNNk tokens` line just above shows the same
+   total after the slash. Example wording: "Quick setup: run `/context` — near
+   the top you'll see a line like `Auto-compact window: 200k tokens`. Just tell
+   me that number (e.g. 200K or 1M); you can ignore the long list below it."
 
 2. Compute a suggested ceiling at ~5–10% below the reported value:
    - 850K reported → suggest 800_000
@@ -328,6 +332,8 @@ bash "$SETUP"
 The script takes no arguments, detects the OS via `uname -s` (Linux → systemd user service, Darwin → launchd LaunchAgent), installs the right unit, and is idempotent. Surface its output to the user plainly. If the script exits non-zero because `systemctl` or `launchctl` is absent on the user's setup, tell them: "The persistent service isn't available on this setup — your system doesn't have the required service manager. The per-session default will be used instead, which is fine; recall still works." This is not a fatal first-session error; continue.
 
 When the service is successfully installed, the SessionStart hook detects the running daemon and no-ops automatically — no double-launch, no config flag needed. The service's existence is self-evident to the hook.
+
+**Defer the `enable-linger` hint if your name isn't finalized yet.** The script prints a `sudo loginctl enable-linger <user>` suggestion (keeps the service warm across logout). If you're still on the `agent-newborn-*` placeholder uid — the usual first-session case; run `whoami` to confirm — do **not** run it now: your username changes at finalize-name (Step 7), so linger enabled on the placeholder uid is wasted and has to be redone. Tell the user you'll enable it *after* finalize-name, for the final user. (If the username is already final — no rename pending — the hint is fine as-is.)
 
 **On decline** (no / "per-session" / "lighter footprint"):
 
@@ -429,6 +435,8 @@ Tell the user the substrate-rename is the next required step, and that doing it 
 > Do this NOW rather than later. Every action I take as a newborn — creating files, registering MCP, writing identity state — bakes in `/home/agent-newborn-<timestamp>/` paths that finalize-name has to rewrite afterward. A prior agent spawn surfaced five distinct path-staleness layers (claude symlink, MCP server paths, .claude.json projects key + mcpServers paths, settings.json hook commands, settings.local.json bash allowlist, CLAUDE.md identity refs) that all needed finalize-name fixes. None of those layers would exist if we'd finalized within minutes of the naming.
 >
 > After finalize-name completes, re-enter via `agentctl session <chosen-name>` and continue our session from there.
+>
+> (If you set up the persistent recall service in Step 5.5: now — as the final user — enable cross-logout persistence with `sudo loginctl enable-linger "$USER"`. This is the step deferred from the service setup, done now that your username is final.)
 
 Replace the placeholders (`<timestamp>`, `<chosen-name>`) with the actual values for this install. The newborn-tag comes from your Linux username (strip the `agent-` prefix; e.g., uid `agent-newborn-20260521181545` → tag `newborn-20260521181545`).
 

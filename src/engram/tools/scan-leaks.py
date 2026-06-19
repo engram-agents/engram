@@ -42,11 +42,12 @@ from pathlib import Path
 # Structural patterns with NO personal data — safe to commit.
 COMMITTED_PATTERNS = [
     (re.compile(r"kg_protocol_for_ai"), "main repo path"),
+    (re.compile(r"engram-agents/engram-alpha"), "private dev-repo URL — must be engram-agents/engram in public snapshot"),
 ]
 
 LOCAL_CONFIG_NAME = ".scan-leaks-local.json"
 
-SCAN_EXTENSIONS = {".py", ".md", ".sh", ".json", ".template", ".service"}
+SCAN_EXTENSIONS = {".py", ".md", ".sh", ".json", ".template", ".service", ".timer"}
 # LICENSE: copyright lines are intentional.
 # .scan-leaks-local.json: the local personal-name roster must be skipped —
 #   it contains the exact patterns the scanner is looking for (by design).

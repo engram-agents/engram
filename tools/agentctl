@@ -87,6 +87,42 @@ resolve_user() {
     echo "$user"
 }
 
+# _normalize_chosen_name: shared helper for chosen-name normalization + validation.
+# Lowercases the input, re-validates ^[a-z][a-z0-9_-]*$, emits Note on stdout if
+# the name was changed, and returns 1 (calling exit 1) on validation failure.
+#
+# Usage: _normalize_chosen_name <varname> <chosen_input>
+#   <varname>      name of the caller's variable to update with the normalized name
+#   <chosen_input> the raw user-supplied chosen name
+#
+# On success: sets <varname> in caller's scope to the lowercased name; prints a
+#   Note line to stdout if the input was case-normalized (no output if unchanged).
+# On failure: prints the error block to stderr and calls exit 1.
+#
+# Both cmd_finalize_name and cmd__validate_chosen_name call this helper so the
+# test suite (via __validate-chosen-name) exercises the same code path as the
+# production rename.
+_normalize_chosen_name() {
+    local -n _ncn_ref="$1"   # nameref to caller's variable (bash 4.3+)
+    local _ncn_input="$2"
+    local _ncn_lower="${_ncn_input,,}"   # bash lowercase (uses _ prefix to avoid shadowing caller vars)
+
+    if [[ ! "$_ncn_lower" =~ ^[a-z][a-z0-9_-]*$ ]]; then
+        echo "ERROR: cannot derive a valid Linux username from '$_ncn_input'." >&2
+        echo "       The Linux username (agent-<name>) must be lowercase letters, digits," >&2
+        echo "       underscore, or hyphen, and start with a letter." >&2
+        echo "       This is separate from your identity name — pick a name that yields" >&2
+        echo "       a valid username, or pass an explicit lowercase username." >&2
+        exit 1
+    fi
+
+    if [[ "$_ncn_input" != "$_ncn_lower" ]]; then
+        echo "Note: Linux username will be 'agent-$_ncn_lower' (POSIX usernames are lowercase). Your identity name '$_ncn_input' is set in ENGRAM and is unaffected by this."
+    fi
+
+    _ncn_ref="$_ncn_lower"
+}
+
 # ---------- subcommands ----------
 cmd_health() {
     printf '%-12s %-7s %-22s %-10s\n' AGENT UID LAST_SLEEP HEALTHFILE
@@ -686,6 +722,15 @@ cmd_finalize_name() {
         exit 1
     fi
 
+    # Normalize + validate the chosen name via the shared helper.
+    # The agent's identity/display name (in ENGRAM, CLAUDE.md) is separate
+    # and set during the naming dialogue — finalize-name only does the uid/path
+    # rename, so POSIX lowercase is enforced on the username, not the identity.
+    # _normalize_chosen_name updates $chosen in-place and prints a Note to stdout
+    # if the name was case-normalized; exits 1 on invalid input.
+    local chosen_input="$chosen"
+    _normalize_chosen_name chosen "$chosen_input"
+
     local newborn_user="agent-$newborn_tag"
     local chosen_user="agent-$chosen"
     local newborn_home="/home/$newborn_user"
@@ -698,11 +743,6 @@ cmd_finalize_name() {
     fi
     if id "$chosen_user" >/dev/null 2>&1; then
         echo "ERROR: chosen name '$chosen_user' is already taken" >&2
-        exit 1
-    fi
-    if [[ ! "$chosen" =~ ^[a-z][a-z0-9_-]*$ ]]; then
-        echo "ERROR: chosen name '$chosen' is not a valid Linux username" >&2
-        echo "       Allowed: lowercase letters, digits, underscore, hyphen; must start with a letter." >&2
         exit 1
     fi
 
@@ -1475,6 +1515,22 @@ cmd__expand_session_args() {
     _expand_session_args "$platform" "$agent_name" "$@"
 }
 
+# Not listed in user-facing help (internal verb, invoked programmatically).
+# Usage: agentctl __validate-chosen-name <chosen>
+# Applies the same lowercase-normalization + regex validation that finalize-name
+# uses, without requiring root or a real newborn user. Used by the test suite.
+# Exit 0 = valid (prints the normalized name on stdout).
+# Exit 1 = invalid after normalization (prints error on stderr).
+# If normalization changed the input, also prints the informative Note line on
+# stdout before the normalized name (so tests can verify the note fires).
+cmd__validate_chosen_name() {
+    local chosen="${1:-}"
+    [[ -z "$chosen" ]] && { echo "Usage: agentctl __validate-chosen-name <chosen>" >&2; exit 2; }
+    local chosen_input="$chosen"
+    _normalize_chosen_name chosen "$chosen_input"
+    echo "$chosen"
+}
+
 case "$SUBCMD" in
     health)        cmd_health        "$@" ;;
     session)       cmd_session       "$@" ;;
@@ -1486,5 +1542,6 @@ case "$SUBCMD" in
     share-status)  cmd_share_status  "$@" ;;
     help|--help|-h) cmd_help ;;
     __expand-session-args) cmd__expand_session_args "$@" ;;
+    __validate-chosen-name) cmd__validate_chosen_name "$@" ;;
     *) echo "Unknown subcommand: $SUBCMD"; cmd_help; exit 2 ;;
 esac

@@ -436,3 +436,113 @@ def test_repo_mode_detects_tracked_hit(tmp_path):
         "Expected the filename bad.py to appear in the leak report; "
         f"got stderr: {result.stderr!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 11: COMMITTED_PATTERNS includes the private dev-repo URL guard
+# ---------------------------------------------------------------------------
+
+def test_committed_patterns_includes_dev_repo_url_guard():
+    """The private dev-repo URL pattern must be in COMMITTED_PATTERNS.
+
+    Verifies two properties:
+      (1) A line containing the org-qualified private-repo URL is matched by
+          the pattern (the guard fires on the broken public install link form).
+      (2) A bare dev-path like ~/engram-alpha is NOT matched (RULE C paths are
+          intentionally kept and must not false-positive).
+
+    Literal strings that would trigger the scanner on the dev repo are
+    constructed from parts so no single line contains the raw pattern.
+    Same technique used elsewhere in this file for the structural pattern
+    (see test_config_absent_structural_pattern_still_fires).
+    """
+    # The guard label — assembled from parts so no single line in this file
+    # contains the raw org/repo pattern the scanner checks for.
+    _org = "engram-agents"
+    _private = "engram-alpha"
+    _org_repo = _org + "/" + _private   # noqa: assembled below the split boundary
+
+    guard_label_prefix = "private dev-repo URL — must be "
+    guard_label = guard_label_prefix + _org + "/engram in public snapshot"
+    matching_patterns = [
+        (pat, label) for pat, label in _mod.COMMITTED_PATTERNS
+        if label == guard_label
+    ]
+    assert matching_patterns, (
+        f"No COMMITTED_PATTERN with label {guard_label!r} found. "
+        "The private dev-repo URL guard must be added to COMMITTED_PATTERNS."
+    )
+    pat, _ = matching_patterns[0]
+
+    # (1) Must match the org-qualified URL form (the broken public install link).
+    # Assembled from parts so this line itself doesn't trip the scanner on dev.
+    sample_url_line = "git clone https://github.com/" + _org_repo + ".git"
+    assert pat.search(sample_url_line), (
+        "Pattern must match a line containing the org-qualified private-repo URL; "
+        f"line: {sample_url_line!r}"
+    )
+
+    # (2) Must NOT match a bare dev-path (RULE C — these are intentionally kept).
+    sample_dev_path = "return os.path.expanduser('~/" + _private + "')"
+    assert not pat.search(sample_dev_path), (
+        "Pattern must NOT match a bare ~/engram-alpha dev path (RULE C); "
+        f"line: {sample_dev_path!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 12: end-to-end — dev-repo-URL guard fires on a committed tracked file
+# ---------------------------------------------------------------------------
+
+def test_dev_repo_url_guard_end_to_end_tracked_commit(tmp_path):
+    """End-to-end: committing a file with the private dev-repo URL causes
+    the scanner to exit non-zero and report the leak.
+
+    This exercises the full file-enumeration + pattern-matching pipeline so
+    that a future refactor of how files are enumerated cannot break the gate
+    while the pattern-only test (test_committed_patterns_includes_dev_repo_url_guard)
+    stays green.
+
+    Modeled on test_repo_mode_detects_tracked_hit (Test 10).
+    The URL literal is assembled from parts to avoid self-tripping the scanner
+    on this test file — same technique used throughout this file.
+    """
+    _org = "engram-agents"
+    _private = "engram-alpha"
+    dev_repo_url = "https://github.com/" + _org + "/" + _private
+
+    _init_git_repo(tmp_path)
+
+    # Commit a file that contains the private dev-repo URL (the leak to detect).
+    bad = tmp_path / "bad_install.sh"
+    bad.write_text("git clone " + dev_repo_url + ".git\n")
+    subprocess.run(["git", "add", "bad_install.sh"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "plant dev-repo-url leak"], cwd=tmp_path, check=True)
+
+    absent_config = tmp_path / "no-config.json"
+    result = subprocess.run(
+        [
+            sys.executable, str(SCAN_LEAKS),
+            "--root", str(tmp_path),
+            "--config-path", str(absent_config),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0, (
+        "Scanner must exit non-zero when a tracked committed file contains the "
+        "private dev-repo URL.\n"
+        f"returncode: {result.returncode}\n"
+        f"stdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )
+    # The label from COMMITTED_PATTERNS — assembled from parts to avoid self-trip.
+    expected_label = "private dev-repo URL — must be " + _org + "/engram in public snapshot"
+    assert expected_label in result.stderr, (
+        f"Expected leak label {expected_label!r} in stderr.\n"
+        f"stderr: {result.stderr!r}"
+    )
+    assert "bad_install.sh" in result.stderr, (
+        "Expected the filename bad_install.sh to appear in the leak report.\n"
+        f"stderr: {result.stderr!r}"
+    )

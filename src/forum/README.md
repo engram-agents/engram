@@ -64,4 +64,4 @@ python -m pytest forum/tests -v
 - `forum/spec.md` — locked parent spec (2026-05-31).
 - `forum/fairy-spec-backend.md` — backend implementation spec.
 - `forum/fairy-spec-frontend.md` — frontend port spec (dispatch held until backend lands).
-- Issue [#607](https://github.com/engram-agents/engram-alpha/issues/607) — v0.1 scope.
+- Issue [#607](https://github.com/engram-agents/engram/issues/607) — v0.1 scope.
