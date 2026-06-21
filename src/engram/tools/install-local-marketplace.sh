@@ -165,9 +165,16 @@ else
     # proceeds flagless and drops configured surfaces (multi-agent / dev tier)
     # — the #704 class. Same contract as migrate-to-plugin.sh's require_jq.
     if ! command -v jq &>/dev/null; then
-      die "jq is required to read $_cfg for build flags (multi_agent/install_tier). Without jq the build would silently drop your configured surfaces (#704 class). Install jq and retry."
+      {
+        printf '[install-local-marketplace] ERROR: jq is required to read %s (multi_agent/install_tier).\n' "$_cfg"
+        printf '[install-local-marketplace]   Install jq:  brew install jq  (macOS)  |  sudo apt-get install jq  (Debian/Ubuntu)\n'
+        printf '[install-local-marketplace]   No-jq path:  bash tools/build-plugin.sh --tier <tier> --multi-agent\n'
+        printf '[install-local-marketplace]                bash tools/install-local-marketplace.sh --skip-build\n'
+        printf '[install-local-marketplace]   Without jq the build silently drops configured surfaces (#704 class).\n'
+      } >&2
+      exit 1
     fi
-    _ma="$(jq -r '.multi_agent // false' "$_cfg")"
+    _ma="$(jq -r 'if (.multi_agent == true) or (.mode == "multi") then "true" else "false" end' "$_cfg")"
     _tier="$(jq -r '.install_tier // empty' "$_cfg")"
     [[ "$_ma" == "true" ]] && build_flags+=("--multi-agent")
     [[ -n "$_tier" ]] && build_flags+=("--tier" "$_tier")

@@ -58,7 +58,9 @@ Bring the clone to the intended commit and verify:
 cd "$SOURCE_DIR"
 git fetch origin
 git status --short          # clean (or only changes you intend to ship)
-git checkout dev && git pull origin dev
+UPSTREAM_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+# If UPSTREAM_BRANCH is "HEAD" you are in detached state — checkout your branch first (e.g. git checkout main or git checkout dev).
+git pull origin "$UPSTREAM_BRANCH"
 git log --oneline -1        # confirm the commit the user wants
 ```
 
@@ -75,7 +77,8 @@ Read what you're about to apply BEFORE any mutation, so you can flag concerns an
 ```bash
 SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)
 DEPLOYED=$(grep '^alpha_sha=' ~/.engram/.deployed-version | cut -d= -f2-)
-git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/dev"
+UPSTREAM_BRANCH="$(git -C "$SOURCE_DIR" rev-parse --abbrev-ref HEAD)"
+git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH"
 ```
 
 - Empty output → nothing to upgrade; tell the user and exit the flow.
@@ -86,7 +89,8 @@ git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/dev"
 **Also note here** whether any CLAUDE.md render source appears in the change set — that pre-announces Step 6's gate. The rendered `~/.claude/CLAUDE.md` is assembled from **multiple** upstream sources: `templates/template.CLAUDE.md` + `templates/compact-instructions.md` (folded in by bootstrap at install-time). A change to either file produces rendered-CLAUDE.md drift. Check both:
 
 ```bash
-git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/dev" -- src/engram/templates/template.CLAUDE.md src/engram/templates/compact-instructions.md
+UPSTREAM_BRANCH="$(git -C "$SOURCE_DIR" rev-parse --abbrev-ref HEAD)"
+git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH" -- src/engram/templates/template.CLAUDE.md src/engram/templates/compact-instructions.md
 ```
 
 **Checkpoint**: change-set summary surfaced + user confirmed proceed (or concern resolved) + CLAUDE.md-template-changed noted yes/no.
@@ -167,11 +171,12 @@ Use the rendered-diff tool (catches changes to ALL render sources, not just the 
 ```bash
 SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)
 DEPLOYED=$(grep '^alpha_sha=' ~/.engram/.deployed-version | cut -d= -f2-)
-# Claude — compare rendered output between the deployed commit and current dev:
+UPSTREAM_BRANCH="$(git -C "$SOURCE_DIR" rev-parse --abbrev-ref HEAD)"
+# Claude — compare rendered output between the deployed commit and current upstream branch:
 python "$SOURCE_DIR/tools/check-claude-md-drift.py" \
     --repo "$SOURCE_DIR" \
     --base "$DEPLOYED" \
-    --head origin/dev
+    --head "origin/$UPSTREAM_BRANCH"
 # Exit 0 = no drift; exit 1 = diff printed to stdout; any other exit = tool/git error (investigate, do NOT read as drift).
 # Codex (template.AGENTS.md is single-source; raw diff is sufficient):
 diff "$SOURCE_DIR"/src/engram/templates/template.AGENTS.md /path/to/live/AGENTS.md
