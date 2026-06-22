@@ -859,6 +859,49 @@ def fairy_policy_block() -> str:
     return coder_line + "\n" + reviewer_line
 
 
+def forum_monitor_block() -> str:
+    """Emit a forum mention monitor arm instruction at session startup.
+
+    Only fires for interactive role + source=="startup" (source guard is at the
+    call site in main()). Silent "" when forum is unconfigured (no forum.url in
+    config.json) or the monitor script is absent — hook must never block start.
+
+    Resolves forum-mention-monitor.sh via _resolve_runtime_dir so it works in
+    both plugin install layout (<plugin_root>/tools/) and dev source tree
+    layout (~/engram-alpha/tools/). Follows the auto_sleep_cron_block() pattern.
+
+    Returns:
+        Instruction string when forum is configured + script exists, else "".
+    """
+    if SESSION_ROLE != "interactive":
+        return ""
+
+    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+        forum_cfg = config.get("forum", {})
+        if not forum_cfg or not forum_cfg.get("url"):
+            return ""
+    except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+        return ""
+
+    runtime_dir = _resolve_runtime_dir(ENGRAM_HOME)
+    script_path = os.path.join(runtime_dir, "tools", "forum-mention-monitor.sh")
+    if not os.path.exists(script_path):
+        return ""
+
+    return (
+        "[Forum mention monitor] forum.url is configured. On your FIRST prompt "
+        "this session, arm the persistent forum mention monitor (it is "
+        "session-scoped and must be re-armed each startup):\n"
+        f'  Call Monitor(command="bash {script_path}", persistent=true)\n'
+        "  This wakes you within ~30s on direct @-mentions to your agent name. "
+        "The script self-guards against duplicate instances (last-arm-wins). "
+        "See engram-collaborating-loop skill §Mechanism 3a."
+    )
+
+
 def main() -> None:
     _t0 = time.perf_counter()
 
@@ -904,6 +947,9 @@ def main() -> None:
         fairy_block = fairy_policy_block()
         if fairy_block:
             lines.append(fairy_block)
+        monitor_block = forum_monitor_block()
+        if monitor_block:
+            lines.append(monitor_block)
     else:
         lines.append(
             f"[Session start reading — re-read {WARM_BRIEFING_PATH} before "
