@@ -11,6 +11,7 @@ Per the viz_server.py:33 module-level comment, AGENTS structure is:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -119,7 +120,8 @@ class TestGetStatsDataEmptyStates(unittest.TestCase):
     """Verify graceful empty-state responses (the UI relies on the shape)."""
 
     def test_nonexistent_index_db_returns_empty(self):
-        result = viz_server.get_stats_data("/tmp/no-such-file.db")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = viz_server.get_stats_data(os.path.join(tmpdir, "index.db"))
         self.assertTrue(result.get("empty"))
         self.assertIn("reason", result)
 
@@ -275,6 +277,62 @@ class TestGetStatsDataPopulated(unittest.TestCase):
                 e["tool_name"], "engram_add_observation",
                 f"L2 error event leaked into Panel 5: {e}",
             )
+
+
+class TestGetStatsDataAutoRun(unittest.TestCase):
+    """Verify get_stats_data auto-runs the indexer when index.db is absent (issue #1048)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="engram_stats_autorun_")
+        self.logs_dir = Path(self.tmpdir)
+        (self.logs_dir / "sessions").mkdir()
+        self.index_db_path = str(self.logs_dir / "index.db")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_auto_run_creates_index_db_when_absent(self):
+        """Auto-run creates index.db even when no JSONL events are present."""
+        self.assertFalse(os.path.exists(self.index_db_path))
+        result = viz_server.get_stats_data(self.index_db_path)
+        self.assertTrue(os.path.exists(self.index_db_path))
+        # 0 events → empty state, but index.db was built (not the missing-db error)
+        self.assertTrue(result.get("empty"))
+        self.assertNotIn("No index.db at expected location", result.get("reason", ""))
+
+    def test_auto_run_indexes_existing_jsonl_events(self):
+        """With JSONL events present, auto-run populates index and stats return data."""
+        recent = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        event = {
+            "uuid": "test-uuid-autorun-001",
+            "sessionId": "test-session-autorun",
+            "turn": 1,
+            "ts": recent,
+            "event_type": "engram.surface.call",
+            "data": {},
+        }
+        (self.logs_dir / "sessions" / "test-session-autorun.l1.jsonl").write_text(
+            json.dumps(event) + "\n"
+        )
+        self.assertFalse(os.path.exists(self.index_db_path))
+        result = viz_server.get_stats_data(self.index_db_path)
+        self.assertTrue(os.path.exists(self.index_db_path))
+        self.assertFalse(result.get("empty"), f"Expected stats, got empty: {result}")
+        self.assertIn("total_events", result)
+        self.assertEqual(result["total_events"], 1)
+
+    def test_error_hint_uses_script_dir_not_tilde_engram(self):
+        """Fallback error hint must reference the script dir, not ~/.engram."""
+        saved = viz_server._INDEXER_AVAILABLE
+        try:
+            viz_server._INDEXER_AVAILABLE = False
+            result = viz_server.get_stats_data(self.index_db_path)
+            reason = result.get("reason", "")
+            self.assertIn("engram_log_indexer.py", reason)
+            self.assertNotIn("~/.engram/engram_log_indexer.py", reason)
+        finally:
+            viz_server._INDEXER_AVAILABLE = saved
 
 
 if __name__ == "__main__":
