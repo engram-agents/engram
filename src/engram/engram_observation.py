@@ -264,6 +264,41 @@ def _format_yellow_warning(match: dict) -> str:
     return msg
 
 
+def _normalize_for_equivalence(text: str) -> str:
+    """Normalize text for equivalence-class quote matching (#1287).
+
+    Applied SYMMETRICALLY to both the quote and the source, so it can only
+    forgive presentational differences — never let a paraphrase pass, since
+    differing words survive normalization. Folds: Unicode NFC; curly→straight
+    quotes; em/en/figure-dash→hyphen; non-breaking & thin unicode spaces→space;
+    zero-width space→removed; all whitespace runs (incl. newlines/tabs)→single
+    space; strips ends.
+
+    NOTE: deliberately does NOT support elision/ellipsis skipping — see #1287.
+    """
+    import unicodedata
+    import re
+    t = unicodedata.normalize("NFC", text)
+    # Curly / typographic quotes → ASCII
+    t = t.translate({
+        0x2018: 0x27, 0x2019: 0x27, 0x201A: 0x27, 0x201B: 0x27,  # ' ' ‚ ‛ -> '
+        0x2032: 0x27,                                              # prime ′ -> '
+        0x201C: 0x22, 0x201D: 0x22, 0x201E: 0x22, 0x201F: 0x22,  # " " „ ‟ -> "
+        0x2033: 0x22,                                              # double prime ″ -> "
+    })
+    # Dashes → hyphen-minus
+    t = t.translate({0x2012: 0x2D, 0x2013: 0x2D, 0x2014: 0x2D, 0x2015: 0x2D})
+    # Non-breaking / specialty spaces → regular space; zero-width → removed
+    t = (t.replace(" ", " ")   # NO-BREAK SPACE
+          .replace(" ", " ")   # NARROW NO-BREAK SPACE
+          .replace(" ", " ")   # THIN SPACE
+          .replace(" ", " ")   # FIGURE SPACE
+          .replace("​", ""))   # ZERO WIDTH SPACE
+    # Collapse all whitespace runs (incl. newlines, tabs) to a single space; strip
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 def _escape_for_source(text: str, file_path: str) -> str:
     """Escape text to match how it appears in a source file's raw content.
 
@@ -592,12 +627,12 @@ def _verify_quote_in_source(url: str, quoted_text: str) -> Optional[str]:
         if ascii_escaped != escaped and ascii_escaped in content:
             return None  # Found with ASCII escape
 
-    # Last resort: Unicode-normalized plain text comparison (handles NFC/NFD)
-    import unicodedata
-    norm_quote = unicodedata.normalize("NFC", quoted_text)
-    norm_content = unicodedata.normalize("NFC", content)
-    if norm_quote in norm_content:
-        return None  # Found via Unicode normalization
+    # Last resort: equivalence-normalized comparison (#1287). Subsumes NFC and
+    # additionally forgives presentational differences (whitespace runs, curly vs
+    # straight quotes, em/en-dashes, non-breaking spaces). Symmetric — forgives
+    # presentation only, cannot pass a paraphrase (differing words survive).
+    if _normalize_for_equivalence(quoted_text) in _normalize_for_equivalence(content):
+        return None  # Found via equivalence normalization
 
     # All strategies failed — try to find near matches for the agent
     near = _find_near_matches(content, escaped, file_path)
