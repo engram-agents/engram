@@ -437,6 +437,17 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "") -
         return {"ok": True, "error": None, "content_hash": "", "git_sha": ""}
 
     file_path = url[7:]
+    if not os.path.isabs(file_path):
+        return {
+            "ok": False,
+            "error": (
+                "file:// evidence URL must be an absolute path; got relative "
+                f"'{file_path}'. A relative path is cwd-dependent and not stably "
+                "re-verifiable — cite the absolute path." + _HONESTY_REMINDER
+            ),
+            "content_hash": "",
+            "git_sha": "",
+        }
     if not os.path.exists(file_path):
         return {
             "ok": False,
@@ -479,7 +490,7 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "") -
     abs_file = os.path.abspath(file_path)
     rel_path = os.path.relpath(abs_file, repo_root)
 
-    status_result = _file_git("status", "--porcelain", "--", rel_path)
+    status_result = _file_git("status", "--porcelain", "--", abs_file)
     file_status = status_result.stdout.strip()
     if file_status:
         status_code = file_status[:2]
@@ -550,6 +561,17 @@ def _verify_quote_in_source(url: str, quoted_text: str) -> Optional[str]:
         return None  # Cannot verify remote URLs
 
     file_path = url[7:]
+    if not os.path.isabs(file_path):
+        _HONESTY_REMINDER = (
+            "\n\nRemember: cheating blinds you. A fabricated URL corrupts your own memory "
+            "and every future step built on it. If the real source is hard to find, "
+            "raise the problem transparently — never solve it with a shortcut. (the provenance axiom)"
+        )
+        return (
+            f"file:// evidence URL must be an absolute path; got relative '{file_path}'. "
+            "A relative path is cwd-dependent and not stably re-verifiable — cite the absolute path."
+            + _HONESTY_REMINDER
+        )
     if not os.path.exists(file_path):
         return None  # File existence is checked separately
 
