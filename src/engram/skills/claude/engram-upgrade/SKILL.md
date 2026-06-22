@@ -77,6 +77,10 @@ Read what you're about to apply BEFORE any mutation, so you can flag concerns an
 ```bash
 SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)
 DEPLOYED=$(grep '^alpha_sha=' ~/.engram/.deployed-version | cut -d= -f2-)
+# Save the pre-upgrade SHA before Step 3 overwrites .deployed-version.
+# Step 3's install-local-marketplace.sh refreshes the marker to the new SHA,
+# so a fresh read in Step 6 yields base==head → false "no drift" (#1194).
+echo "$DEPLOYED" > ~/.engram/.upgrade-pre-sha
 UPSTREAM_BRANCH="$(git -C "$SOURCE_DIR" rev-parse --abbrev-ref HEAD)"
 git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH"
 ```
@@ -93,7 +97,7 @@ UPSTREAM_BRANCH="$(git -C "$SOURCE_DIR" rev-parse --abbrev-ref HEAD)"
 git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH" -- src/engram/templates/template.CLAUDE.md src/engram/templates/compact-instructions.md
 ```
 
-**Checkpoint**: change-set summary surfaced + user confirmed proceed (or concern resolved) + CLAUDE.md-template-changed noted yes/no.
+**Checkpoint**: change-set summary surfaced + user confirmed proceed (or concern resolved) + CLAUDE.md-template-changed noted yes/no + pre-upgrade SHA saved to `~/.engram/.upgrade-pre-sha`.
 
 ---
 
@@ -170,7 +174,13 @@ Use the rendered-diff tool (catches changes to ALL render sources, not just the 
 
 ```bash
 SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)
-DEPLOYED=$(grep '^alpha_sha=' ~/.engram/.deployed-version | cut -d= -f2-)
+# Read the pre-upgrade SHA saved in Step 2.  Do NOT re-read .deployed-version here —
+# Step 3 already overwrote it with the new SHA, so base==head → false "no drift" (#1194).
+DEPLOYED=$(cat ~/.engram/.upgrade-pre-sha 2>/dev/null) || {
+  echo "ERROR: ~/.engram/.upgrade-pre-sha not found — re-run Step 2 to save the pre-upgrade SHA before proceeding."
+  exit 1
+}
+[[ -z "$DEPLOYED" ]] && { echo "ERROR: ~/.engram/.upgrade-pre-sha is empty — re-run Step 2 (check that .deployed-version has a valid alpha_sha= line)."; exit 1; }
 UPSTREAM_BRANCH="$(git -C "$SOURCE_DIR" rev-parse --abbrev-ref HEAD)"
 # Claude — compare rendered output between the deployed commit and current upstream branch:
 python "$SOURCE_DIR/tools/check-claude-md-drift.py" \
@@ -196,11 +206,12 @@ diff "$SOURCE_DIR"/src/engram/templates/template.AGENTS.md /path/to/live/AGENTS.
 
 ```bash
 cat ~/.engram/.deployed-version          # marker SHA = the commit you built (forensics anchor)
+rm -f ~/.engram/.upgrade-pre-sha         # pre-upgrade SHA scratch file no longer needed
 ```
 
 Then through the **plugin MCP** (after Step 5's reconnect): call `engram_stats` and confirm it returns your real node count — this proves the new server is running against your untouched graph. On Codex, also verify installed-cache files match the marketplace if hooks are the upgrade target. If `engram_stats` errors or the node count is implausible, stop and investigate before declaring the upgrade done.
 
-**Checkpoint**: marker SHA matches the intended commit + `engram_stats` returns the expected graph through the new server.
+**Checkpoint**: marker SHA matches the intended commit + `engram_stats` returns the expected graph through the new server + `.upgrade-pre-sha` scratch file removed.
 
 ---
 
