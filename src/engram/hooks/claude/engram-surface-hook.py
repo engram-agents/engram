@@ -1017,17 +1017,37 @@ def main():
                 f"persists past the next prompt.]"
             )
         else:
-            parts.append(
-                f"[⚠️ ENGRAM CRITICAL — surface daemon offline; semantic recall "
-                f"DISABLED, ranking degraded to lexical-only. Notify {user_name} "
-                f"immediately — recall quality is severely impaired. "
-                f"Recovery: bash {daemon_script} — then re-check the socket. "
-                f"If this warning persists after re-launching, it is NOT a "
-                f"cold-start race: something on this machine is conflicting with "
-                f"the daemon (port already bound, permissions, or resource "
-                f"limits) — investigate the root cause before continuing, don't "
-                f"just re-launch.]"
-            )
+            # Check for idle-shutdown tombstone (#1260): daemon exited as intended
+            # after idle-timeout — self-recovering startup condition, not a crash.
+            _idle_tombstone = os.path.join(ENGRAM_HOME, "daemon-idle-shutdown")
+            _is_idle_shutdown = False
+            try:
+                with open(_idle_tombstone) as _tf:
+                    _shutdown_at = int(_tf.read().strip())
+                # Valid for up to 48h (2 idle-timeout cycles); stale after that.
+                if 0 <= (int(time.time()) - _shutdown_at) <= 172800:
+                    _is_idle_shutdown = True
+            except Exception:
+                pass
+            if _is_idle_shutdown:
+                parts.append(
+                    f"[ENGRAM: surface daemon was idle-shutdown (idle timeout) — "
+                    f"restarting automatically, semantic recall resumes in a few "
+                    f"seconds. No action needed unless this persists past the next "
+                    f"prompt. Recovery if it persists: bash {daemon_script}]"
+                )
+            else:
+                parts.append(
+                    f"[⚠️ ENGRAM CRITICAL — surface daemon offline; semantic recall "
+                    f"DISABLED, ranking degraded to lexical-only. Notify {user_name} "
+                    f"immediately — recall quality is severely impaired. "
+                    f"Recovery: bash {daemon_script} — then re-check the socket. "
+                    f"If this warning persists after re-launching, it is NOT a "
+                    f"cold-start race: something on this machine is conflicting with "
+                    f"the daemon (port already bound, permissions, or resource "
+                    f"limits) — investigate the root cause before continuing, don't "
+                    f"just re-launch.]"
+                )
 
     # MCP write-tool liveness check — deferred from SessionStart to avoid the
     # timing race (marker still has old PID when session starts). By the first

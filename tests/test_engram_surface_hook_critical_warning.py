@@ -274,5 +274,178 @@ class TestCriticalWhenLaunchAttemptStale(unittest.TestCase):
         )
 
 
+class TestIdleShutdownTombstone(unittest.TestCase):
+    """Tombstone present + recent → SOFT idle-shutdown message (#1260)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_idle_tombstone_test_")
+        config_path = os.path.join(self.tmp, "config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump({"primary_user": "Alex"}, f)
+        self.hook = _load_hook_module()
+        self.hook.ENGRAM_HOME = self.tmp
+        self.hook.SOCKET_PATH = os.path.join(self.tmp, "recall-daemon.sock")
+        self.hook.KNOWLEDGE_DB_PATH = os.path.join(self.tmp, "knowledge.db")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_idle_shutdown_tombstone_gives_soft_not_critical(self):
+        """Offline + recent tombstone → SOFT idle-shutdown message, NOT CRITICAL."""
+        import time
+        # Write a fresh idle-shutdown tombstone
+        tombstone_path = os.path.join(self.tmp, "daemon-idle-shutdown")
+        with open(tombstone_path, "w") as f:
+            f.write(str(int(time.time())))
+
+        raw_output = _run_main_capture(self.hook, _make_hook_input())
+        self.assertTrue(raw_output.strip(), "main() produced no stdout")
+        response = json.loads(raw_output.strip())
+        additional_context = (
+            response
+            .get("hookSpecificOutput", {})
+            .get("additionalContext", "")
+        )
+        self.assertIn(
+            "idle-shutdown",
+            additional_context,
+            "SOFT idle-shutdown message must appear when tombstone is present and recent",
+        )
+        self.assertNotIn(
+            "⚠️ ENGRAM CRITICAL",
+            additional_context,
+            "CRITICAL warning must NOT fire when idle-shutdown tombstone is present and recent",
+        )
+
+
+class TestCriticalWhenTombstoneAbsent(unittest.TestCase):
+    """Tombstone absent → CRITICAL fires (#1260)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_no_tombstone_test_")
+        config_path = os.path.join(self.tmp, "config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump({"primary_user": "Alex"}, f)
+        self.hook = _load_hook_module()
+        self.hook.ENGRAM_HOME = self.tmp
+        self.hook.SOCKET_PATH = os.path.join(self.tmp, "recall-daemon.sock")
+        self.hook.KNOWLEDGE_DB_PATH = os.path.join(self.tmp, "knowledge.db")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_critical_fires_when_tombstone_absent(self):
+        """Offline + no tombstone file → CRITICAL warning fires."""
+        # No tombstone written — clean temp dir
+        raw_output = _run_main_capture(self.hook, _make_hook_input())
+        self.assertTrue(raw_output.strip(), "main() produced no stdout")
+        response = json.loads(raw_output.strip())
+        additional_context = (
+            response
+            .get("hookSpecificOutput", {})
+            .get("additionalContext", "")
+        )
+        self.assertIn(
+            "⚠️ ENGRAM CRITICAL",
+            additional_context,
+            "CRITICAL warning must fire when no tombstone is present",
+        )
+        self.assertNotIn(
+            "idle-shutdown",
+            additional_context,
+            "SOFT idle-shutdown message must NOT appear when no tombstone is present",
+        )
+
+
+class TestStaleTombstone(unittest.TestCase):
+    """Tombstone present but older than 48h → CRITICAL fires (#1260)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_stale_tombstone_test_")
+        config_path = os.path.join(self.tmp, "config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump({"primary_user": "Alex"}, f)
+        self.hook = _load_hook_module()
+        self.hook.ENGRAM_HOME = self.tmp
+        self.hook.SOCKET_PATH = os.path.join(self.tmp, "recall-daemon.sock")
+        self.hook.KNOWLEDGE_DB_PATH = os.path.join(self.tmp, "knowledge.db")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_critical_fires_when_tombstone_stale(self):
+        """Offline + tombstone older than 48h → CRITICAL (stale tombstone ignored)."""
+        import time
+        tombstone_path = os.path.join(self.tmp, "daemon-idle-shutdown")
+        # 48h + 1s past the validity window
+        with open(tombstone_path, "w") as f:
+            f.write(str(int(time.time()) - 172801))
+
+        raw_output = _run_main_capture(self.hook, _make_hook_input())
+        self.assertTrue(raw_output.strip(), "main() produced no stdout")
+        response = json.loads(raw_output.strip())
+        additional_context = (
+            response
+            .get("hookSpecificOutput", {})
+            .get("additionalContext", "")
+        )
+        self.assertIn(
+            "⚠️ ENGRAM CRITICAL",
+            additional_context,
+            "CRITICAL must fire when tombstone is stale (> 48h)",
+        )
+        self.assertNotIn(
+            "idle-shutdown",
+            additional_context,
+            "SOFT idle-shutdown message must NOT appear for a stale tombstone",
+        )
+
+
+class TestCorruptTombstone(unittest.TestCase):
+    """Tombstone present but with non-integer content → CRITICAL fires (#1260)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_corrupt_tombstone_test_")
+        config_path = os.path.join(self.tmp, "config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump({"primary_user": "Alex"}, f)
+        self.hook = _load_hook_module()
+        self.hook.ENGRAM_HOME = self.tmp
+        self.hook.SOCKET_PATH = os.path.join(self.tmp, "recall-daemon.sock")
+        self.hook.KNOWLEDGE_DB_PATH = os.path.join(self.tmp, "knowledge.db")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_critical_fires_when_tombstone_corrupt(self):
+        """Offline + tombstone with non-integer content → CRITICAL (int() raises, falls through)."""
+        tombstone_path = os.path.join(self.tmp, "daemon-idle-shutdown")
+        with open(tombstone_path, "w") as f:
+            f.write("not-an-int")
+
+        raw_output = _run_main_capture(self.hook, _make_hook_input())
+        self.assertTrue(raw_output.strip(), "main() produced no stdout")
+        response = json.loads(raw_output.strip())
+        additional_context = (
+            response
+            .get("hookSpecificOutput", {})
+            .get("additionalContext", "")
+        )
+        self.assertIn(
+            "⚠️ ENGRAM CRITICAL",
+            additional_context,
+            "CRITICAL must fire when tombstone content is corrupt (non-integer)",
+        )
+        self.assertNotIn(
+            "idle-shutdown",
+            additional_context,
+            "SOFT idle-shutdown message must NOT appear for a corrupt tombstone",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
