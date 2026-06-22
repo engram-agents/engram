@@ -587,6 +587,13 @@ class TestSourceParsing:
             snap._parse_source("web:https://example.com")
         assert exc_info.value.code == snap.EXIT_VALIDATION
 
+    def test_parse_file_remote_authority_exits(self, tmp_path):
+        """file://host/path is rejected; file: is local-only."""
+        snap = _load_snapshot(tmp_path / "engram", tmp_path / "archive")
+        with pytest.raises(SystemExit) as exc_info:
+            snap._parse_source("file://host/etc/passwd")
+        assert exc_info.value.code == snap.EXIT_VALIDATION
+
 
 # ============================================================================
 # Tests: span parsing
@@ -616,6 +623,172 @@ class TestSpanParsing:
         with pytest.raises(SystemExit) as exc_info:
             snap._parse_span("a:b")
         assert exc_info.value.code == snap.EXIT_VALIDATION
+
+
+# ============================================================================
+# Tests: file: snapshot
+# ============================================================================
+
+class TestSnapshotFile:
+    """_snapshot_file archives a local file and returns correct JSON shape."""
+
+    def _load_snap(self, tmp_path):
+        return _load_snapshot(tmp_path / "engram", tmp_path / "archive")
+
+    def test_archives_a_real_file(self, tmp_path):
+        """Basic round-trip: write a .py file, snapshot it, check all fields."""
+        snap = self._load_snap(tmp_path)
+        evidence_archive = tmp_path / "archive"
+
+        src = tmp_path / "x.py"
+        src.write_bytes(b"# hello\nprint('world')\n")
+        content = src.read_bytes()
+        expected_sha = _sha256(content)
+
+        result = snap._snapshot_file(str(src), {})
+
+        assert result["source_type"] == "file"
+        assert result["content_hash"] == expected_sha
+        assert result["git_sha"] is None
+        assert result["archive_status"] == "archived"
+        assert result["block_reason"] is None
+        assert result["original_url"].startswith("file://")
+        assert result["original_url"].endswith(str(src.resolve()))
+
+        # Archive file exists at <root>/<sha[:2]>/<sha>.py
+        archive_file = evidence_archive / expected_sha[:2] / f"{expected_sha}.py"
+        assert archive_file.exists(), f"archive file missing: {archive_file}"
+        assert archive_file.read_bytes() == content
+
+    def test_content_addressing_is_idempotent(self, tmp_path):
+        """Snapshotting the same file twice produces identical hash and path."""
+        snap = self._load_snap(tmp_path)
+
+        src = tmp_path / "repeat.txt"
+        src.write_bytes(b"idempotent content\n")
+
+        result1 = snap._snapshot_file(str(src), {})
+        result2 = snap._snapshot_file(str(src), {})
+
+        assert result1["content_hash"] == result2["content_hash"]
+        assert result1["file_url"] == result2["file_url"]
+
+        # Only one file in the archive bucket
+        sha = result1["content_hash"]
+        evidence_archive = tmp_path / "archive"
+        bucket = evidence_archive / sha[:2]
+        files = list(bucket.glob(f"{sha}.*"))
+        assert len(files) == 1, f"expected 1 file, found {len(files)}: {files}"
+
+    def test_extension_fallback_for_extensionless_file(self, tmp_path):
+        """A file with no extension uses .bin in the archive."""
+        snap = self._load_snap(tmp_path)
+        evidence_archive = tmp_path / "archive"
+
+        src = tmp_path / "noext"
+        src.write_bytes(b"binary content\x00\x01\x02")
+
+        result = snap._snapshot_file(str(src), {})
+        archive_path = result["file_url"][len("file://"):]
+        assert archive_path.endswith(".bin"), f"expected .bin, got: {archive_path}"
+
+    def test_tilde_expansion(self, tmp_path, monkeypatch):
+        """A ~-prefixed path resolves correctly."""
+        snap = self._load_snap(tmp_path)
+
+        # Place a file in tmp_path and make ~ resolve to tmp_path
+        monkeypatch.setenv("HOME", str(tmp_path))
+        src = tmp_path / "myfile.md"
+        src.write_bytes(b"# A note\n")
+
+        result = snap._snapshot_file("~/myfile.md", {})
+        assert result["source_type"] == "file"
+        assert result["content_hash"] == _sha256(b"# A note\n")
+
+    def test_relative_path_resolves_against_cwd(self, tmp_path, monkeypatch):
+        """A relative path resolves against the current working directory."""
+        snap = self._load_snap(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        src = tmp_path / "relative.txt"
+        src.write_bytes(b"relative content\n")
+
+        result = snap._snapshot_file("relative.txt", {})
+        assert result["source_type"] == "file"
+        assert result["content_hash"] == _sha256(b"relative content\n")
+
+    def test_error_nonexistent_path(self, tmp_path, capsys):
+        """Nonexistent path exits with EXIT_STATE; stderr mentions 'regular file'."""
+        snap = self._load_snap(tmp_path)
+
+        nonexistent = str(tmp_path / "does_not_exist.py")
+        with pytest.raises(SystemExit) as exc_info:
+            snap._snapshot_file(nonexistent, {})
+        assert exc_info.value.code == snap.EXIT_STATE
+        assert "regular file" in capsys.readouterr().err
+
+    def test_error_directory(self, tmp_path):
+        """Passing a directory exits with EXIT_STATE."""
+        snap = self._load_snap(tmp_path)
+
+        with pytest.raises(SystemExit) as exc_info:
+            snap._snapshot_file(str(tmp_path), {})
+        assert exc_info.value.code == snap.EXIT_STATE
+
+    def test_error_bare_file_colon(self, tmp_path):
+        """Bare 'file:' (no path) exits with EXIT_VALIDATION."""
+        snap = self._load_snap(tmp_path)
+
+        with pytest.raises(SystemExit) as exc_info:
+            snap._parse_source("file:")
+        assert exc_info.value.code == snap.EXIT_VALIDATION
+
+    def test_file_uri_normalization(self, tmp_path):
+        """_parse_source('file:///etc/hostname') returns ('file', '/etc/hostname')."""
+        snap = self._load_snap(tmp_path)
+
+        source_type, path_str = snap._parse_source("file:///etc/hostname")
+        assert source_type == "file"
+        assert path_str == "/etc/hostname"
+
+    def test_dotfile_archives_as_bin(self, tmp_path):
+        """A dotfile (.bashrc) has an empty Path.suffix and archives with .bin extension."""
+        snap = self._load_snap(tmp_path)
+        evidence_archive = tmp_path / "archive"
+
+        src = tmp_path / ".bashrc"
+        src.write_bytes(b"export PATH=$PATH:/usr/local/bin\n")
+        content = src.read_bytes()
+        expected_sha = _sha256(content)
+
+        result = snap._snapshot_file(str(src), {})
+
+        archive_path = result["file_url"][len("file://"):]
+        assert archive_path.endswith(".bin"), f"dotfile should archive as .bin, got: {archive_path}"
+        # Traceability via original_url
+        assert result["original_url"].endswith(str(src.resolve()))
+        # Archive file exists
+        archive_file = evidence_archive / expected_sha[:2] / f"{expected_sha}.bin"
+        assert archive_file.exists(), f"archive file missing: {archive_file}"
+
+    def test_output_json_has_all_required_keys(self, tmp_path):
+        """The output dict has exactly the required 8 keys."""
+        snap = self._load_snap(tmp_path)
+
+        src = tmp_path / "schema_check.json"
+        src.write_bytes(b'{"key": "value"}\n')
+
+        result = snap._snapshot_file(str(src), {})
+
+        required_keys = {
+            "file_url", "content_hash", "captured_at",
+            "git_sha", "archive_status", "original_url",
+            "source_type", "block_reason",
+        }
+        assert required_keys == set(result.keys()), (
+            f"Missing: {required_keys - set(result.keys())}, "
+            f"Extra: {set(result.keys()) - required_keys}"
+        )
 
 
 def test_dual_copy_in_sync():

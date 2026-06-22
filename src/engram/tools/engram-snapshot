@@ -13,6 +13,8 @@ Sources (P1):
     forum:<id>           Archive a LAN forum thread (rendered text)
     jsonl:<session-id>   Archive a span from a session transcript
     jsonl:               Bare — current session transcript (most-recent marker)
+Sources (P1.5):
+    file:<path>          Archive an arbitrary local file (absolute, relative, or ~-prefixed)
 
 Output (JSON to stdout, designed to feed engram_add_observation):
     {
@@ -432,6 +434,52 @@ def _snapshot_jsonl(
 
 
 # ---------------------------------------------------------------------------
+# Source: file:<path>
+# ---------------------------------------------------------------------------
+
+def _snapshot_file(path_str: str, config: dict) -> dict:
+    """Archive an arbitrary local file and return the output JSON dict."""
+    path = Path(path_str).expanduser()
+    try:
+        resolved = path.resolve()
+    except OSError as exc:
+        print(f"engram-snapshot: cannot resolve path '{path_str}': {exc}", file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+    if not resolved.is_file():
+        print(
+            f"engram-snapshot: file: source must be an existing regular file, got '{path_str}' "
+            f"(resolved: {resolved}).",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_STATE)
+    try:
+        content_bytes = resolved.read_bytes()
+    except OSError as exc:
+        print(f"engram-snapshot: cannot read '{resolved}': {exc}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+
+    # Dotfiles (.bashrc, .gitignore) have an empty Path.suffix, so they archive
+    # as <sha>.bin; traceability is preserved via original_url.
+    ext = resolved.suffix.lstrip(".") or "bin"
+    try:
+        archive_path, sha = _archive_write(content_bytes, ext)
+    except OSError as exc:
+        print(f"engram-snapshot: archive write failed: {exc}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+
+    return {
+        "file_url": _file_url(archive_path),
+        "content_hash": sha,
+        "captured_at": _now_utc_iso(),
+        "git_sha": None,
+        "archive_status": "archived",
+        "original_url": "file://" + str(resolved),
+        "source_type": "file",
+        "block_reason": None,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Span argument parsing
 # ---------------------------------------------------------------------------
 
@@ -470,8 +518,9 @@ def _parse_source(source: str) -> tuple:
     """Parse the <source> positional argument.
 
     Returns (source_type, source_id) where:
-      source_type in {'forum', 'jsonl'}
-      source_id: thread id (int) for forum, session-id string (or '') for jsonl
+      source_type in {'forum', 'jsonl', 'file'}
+      source_id: thread id (int) for forum, session-id string (or '') for jsonl,
+                 path string for file
 
     Exits EXIT_VALIDATION on unrecognised source format.
     """
@@ -497,10 +546,35 @@ def _parse_source(source: str) -> tuple:
         session_id = source[len("jsonl:"):].strip() or None
         return "jsonl", session_id
 
+    if source.startswith("file:"):
+        raw = source[len("file:"):]
+        if not raw:
+            print(
+                "engram-snapshot: file: requires a path (e.g. 'file:/abs/path' or 'file:~/notes.md')",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        # Normalize a file URI form: file:///abs → /abs (drop empty authority).
+        if raw.startswith("//"):
+            rest = raw[2:]
+            # file:///abs/path → rest="/abs/path" (empty authority — the only local form).
+            # file://host/path → rest="host/path" (non-empty authority) → reject; file: is local-only.
+            if not rest.startswith("/"):
+                print(
+                    "engram-snapshot: file: is local-only; a remote authority "
+                    f"(file://host/...) is not supported, got '{source}'. "
+                    "Use file:///abs/path or file:/abs/path.",
+                    file=sys.stderr,
+                )
+                sys.exit(EXIT_VALIDATION)
+            raw = rest
+        return "file", raw
+
     # Bare 'jsonl:' is handled above (empty strip → None)
     print(
         f"engram-snapshot: unrecognised source '{source}'. "
-        "Use 'forum:<id>' or 'jsonl:<session-id>' (or bare 'jsonl:' for current session). "
+        "Use 'forum:<id>', 'jsonl:<session-id>' (or bare 'jsonl:' for current session), "
+        "or 'file:<path>'. "
         "P2 (web:, pdf:) not yet implemented.",
         file=sys.stderr,
     )
@@ -517,7 +591,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Archive an evidence source into the content-addressed evidence store "
             "and emit a JSON record designed to feed engram_add_observation.\n\n"
-            "P1 sources: forum:<id>  jsonl:<session-id>  jsonl: (bare = current session)"
+            "P1 sources: forum:<id>  jsonl:<session-id>  jsonl: (bare = current session)\n"
+            "P1.5 sources: file:<path>"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -532,7 +607,8 @@ def build_parser() -> argparse.ArgumentParser:
             "What to archive. P1 shorthands: "
             "'forum:<id>' (LAN forum thread), "
             "'jsonl:<session-id>' (session transcript span), "
-            "'jsonl:' (bare — current session transcript)."
+            "'jsonl:' (bare — current session transcript). "
+            "P1.5: 'file:<path>' (arbitrary local file; absolute, relative, or ~-prefixed)."
         ),
     )
 
@@ -565,7 +641,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="type_override",
         help=(
             "Override source-type auto-detection. "
-            "P1 supports 'forum' and 'jsonl' only."
+            "'forum', 'jsonl', and 'file' implemented."
         ),
     )
 
@@ -599,10 +675,10 @@ def main() -> None:
     # Apply --type override if given (validation only for P1 types)
     if args.type_override is not None:
         override = args.type_override
-        if override not in ("auto", "forum", "jsonl"):
+        if override not in ("auto", "forum", "jsonl", "file"):
             print(
                 f"engram-snapshot: --type {override!r} is not supported in P1. "
-                "Only 'forum' and 'jsonl' are implemented.",
+                "Only 'forum', 'jsonl', and 'file' are implemented.",
                 file=sys.stderr,
             )
             sys.exit(EXIT_STATE)
@@ -632,6 +708,8 @@ def main() -> None:
         result = _snapshot_forum(source_id, config, agent_name)
     elif source_type == "jsonl":
         result = _snapshot_jsonl(source_id, span_start, span_end, config)
+    elif source_type == "file":
+        result = _snapshot_file(source_id, config)
     else:
         # Should be unreachable given _parse_source validation
         print(
