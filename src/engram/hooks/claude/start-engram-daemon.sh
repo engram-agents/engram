@@ -3,6 +3,10 @@
 # If already running, this is a no-op.
 
 : "${ENGRAM_HOME:=$HOME/.engram}"
+# Guard against source: directory marketplace double-fire (#1066).
+if [[ "${CLAUDE_PLUGIN_ROOT:-}" == "${ENGRAM_HOME}/marketplace/"* ]]; then
+    exit 0  # empty stdout is valid no-op per #824/#832 contract
+fi
 SOCKET_PATH="$ENGRAM_HOME/recall-daemon.sock"
 PID_PATH="$ENGRAM_HOME/recall-daemon.pid"
 DAEMON_SCRIPT="$(dirname "$0")/engram-surface-daemon.py"
