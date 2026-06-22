@@ -4138,6 +4138,34 @@ def _validate_reasoning_structure(
                         # constantly = the per-derivation fatigue Lei's precision
                         # gate forbids (Borges #721). The ⚠⚠ composite carries the
                         # only actionable signal here (when zero-verified).
+
+                    # Layer-2 check (#1289): inductive_generalization requires
+                    # >= 2 INDEPENDENT cross-lineage instances — the hypothesis-
+                    # author's own lineage is the variance source and cannot
+                    # simultaneously serve as independent corroboration.
+                    # lineage_vals holds sha256[:12] hashes (from
+                    # _standpoint_cluster_key), so self_lin must be hashed
+                    # to the same form before the set-difference.
+                    # Only fires when the graph has >= 2 distinct lineages
+                    # (warning must point to an available action).
+                    if reasoning_type == "inductive_generalization":
+                        self_lin = _self_lineage()
+                        self_lin_hash = (
+                            hashlib.sha256(self_lin.encode()).hexdigest()[:12]
+                            if self_lin else None
+                        )
+                        independent = (
+                            lineage_vals - {self_lin_hash}
+                            if self_lin_hash else lineage_vals
+                        )
+                        if len(independent) < 2 and _graph_lineage_count(conn) >= 2:
+                            parts.append(
+                                f"⚠ inductive_generalization: independent "
+                                f"cross-lineage instances (excluding "
+                                f"hypothesis-author lineage '{self_lin}') = "
+                                f"{len(independent)} — consider inductive_analogy"
+                            )
+
                 # parts may be empty if all axes have partial coverage across
                 # premises — the guard is load-bearing in the mixed-axis case.
                 if parts:

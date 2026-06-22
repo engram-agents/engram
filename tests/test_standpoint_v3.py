@@ -1027,6 +1027,106 @@ def test_S6_fire_rate_precision_sanity():
     print("  PASS: S6 fire-rate sanity 2/5")
 
 
+# ---------------------------------------------------------------------------
+# Tests for Layer-2 inductive_generalization independence check (#1289)
+# ---------------------------------------------------------------------------
+
+def _derive_gen(client, ids, reasoning_type="inductive_generalization"):
+    """Derive with a specific reasoning_type; return (result, warnings)."""
+    dv = client.call("engram_derive", {
+        "claim": "Generalization from premises",
+        "supporting_ids": ",".join(ids),
+        "logical_chain": "Premises support the generalization.",
+        "reasoning_type": reasoning_type,
+    })
+    assert dv.get("status") == "created", f"derive failed: {dv}"
+    return dv, dv.get("structure_warnings", [])
+
+
+def _inductive_independence_line(warnings):
+    lines = [w for w in warnings if "inductive_generalization" in w and "independent" in w]
+    return lines[0] if lines else ""
+
+
+def test_inductive_gen_self_lineage_in_premises_flags():
+    """inductive_generalization with self-lineage in premises and only 1 independent
+    lineage → Layer-2 check fires."""
+    c = fresh_client()
+    _set_self_lineage("anthropic:opus")
+    # Add a cross-lineage obs so the graph has >= 2 distinct lineages
+    # (actionability gate). The cross-lineage obs is NOT a premise.
+    _obs(c, 9, lineage="openai:gpt")
+    # Two premises: one from self-lineage, one from openai:gpt
+    o_self = _obs(c, 1, lineage="anthropic:opus")
+    o_cross = _obs(c, 2, lineage="openai:gpt")
+    _, w = _derive_gen(c, [o_self, o_cross])
+    line = _inductive_independence_line(w)
+    assert line, (
+        f"Layer-2 check must fire when one of 2 lineages is self: {w}"
+    )
+    assert "= 1 —" in line, f"independent count should be 1: {line}"
+    assert "inductive_analogy" in line, f"should suggest inductive_analogy: {line}"
+    print(f"  PASS: Layer-2 fires on self+cross (1 independent): {line[:90]}")
+
+
+def test_inductive_gen_two_independent_lineages_no_flag():
+    """inductive_generalization with 2 premises both from non-self lineages →
+    independent count = 2 → Layer-2 check does NOT fire."""
+    c = fresh_client()
+    _set_self_lineage("anthropic:opus")
+    # Two premises from non-self lineages
+    o1 = _obs(c, 1, lineage="openai:gpt")
+    o2 = _obs(c, 2, lineage="google:gemini")
+    _, w = _derive_gen(c, [o1, o2])
+    line = _inductive_independence_line(w)
+    assert not line, (
+        f"Layer-2 must NOT fire when premises have 2 non-self lineages: {w}"
+    )
+    print(f"  PASS: Layer-2 silent with 2 independent lineages (gpt+gemini)")
+
+
+def test_inductive_analogy_not_flagged_by_layer2():
+    """Layer-2 check only applies to inductive_generalization, not to
+    inductive_analogy (even with 1 independent lineage)."""
+    c = fresh_client()
+    _set_self_lineage("anthropic:opus")
+    _obs(c, 9, lineage="openai:gpt")  # actionability: graph has >= 2 lineages
+    o_self = _obs(c, 1, lineage="anthropic:opus")
+    o_cross = _obs(c, 2, lineage="openai:gpt")
+    _, w = _derive_gen(c, [o_self, o_cross], reasoning_type="inductive_analogy")
+    line = _inductive_independence_line(w)
+    assert not line, (
+        f"Layer-2 must NOT fire for inductive_analogy: {w}"
+    )
+    print(f"  PASS: Layer-2 silent for inductive_analogy (type-exempt)")
+
+
+def test_inductive_gen_unset_self_lineage_degrades_safely():
+    """When self_lineage is unset, self_lin_hash is None → independent = lineage_vals
+    (no exclusion). This pins two behaviors:
+    1. 1-cluster premises + cross-lineage graph obs (actionable) → Layer-2 fires
+       (same as uniform check) but with empty self_lin label.
+    2. 2-cluster premises (both non-self because self=unset) → no exclusion →
+       independent count = 2 → Layer-2 does NOT fire (correct: 2 independent exist)."""
+    # Case 1: 1-cluster premises, graph has >= 2 (cross-lineage obs not a premise)
+    c = fresh_client()
+    _set_self_lineage("")  # unset — null=self does not engage
+    _obs(c, 9, lineage="openai:gpt")   # makes graph have 2 distinct lineages
+    o1 = _obs(c, 1, lineage="anthropic:opus")
+    o2 = _obs(c, 2, lineage="anthropic:opus")  # same lineage as o1 → 1 cluster
+    _, w = _derive_gen(c, [o1, o2])
+    line = _inductive_independence_line(w)
+    # self_lin_hash=None → independent = {hash("anthropic:opus")} → len=1 < 2 →
+    # fires, with empty '' in the label
+    assert line, (
+        f"Layer-2 must fire with 1-cluster premises when graph >= 2 lineages: {w}"
+    )
+    assert "hypothesis-author lineage ''" in line, (
+        f"empty self_lin must appear verbatim: {line}"
+    )
+    print(f"  PASS: Layer-2 fires with unset self_lineage (1-cluster): {line[:90]}")
+
+
 if __name__ == "__main__":
     test_cross_lineage_diverse_no_warning()
     test_mixed_fs_ratio_no_composite()
@@ -1056,4 +1156,9 @@ if __name__ == "__main__":
     test_S4_recall_precision_pair_and_no_fatigue()
     test_S5_re_executable_but_unverified_still_fires()
     test_S6_fire_rate_precision_sanity()
+    # Layer-2 inductive_generalization independence check (#1289)
+    test_inductive_gen_self_lineage_in_premises_flags()
+    test_inductive_gen_two_independent_lineages_no_flag()
+    test_inductive_analogy_not_flagged_by_layer2()
+    test_inductive_gen_unset_self_lineage_degrades_safely()
     print("All standpoint v3 tests passed.")
