@@ -421,46 +421,73 @@ def _warn_if_local_url(url: str) -> None:
     )
 
 
+def _load_json_payload(raw: str) -> dict:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.exit(f"ERROR: invalid JSON payload: {e}")
+
+
 def cmd_add_evidence(args):
-    _warn_if_local_url(args.url)
     client = get_client(resolve_pkg(args))
-    return report(client.call("engram_add_evidence", {
-        "url": args.url, "title": args.title,
-        "domain": args.domain or "", "source_date": args.source_date or "",
-    }))
+    if args.json_payload is not None:
+        raw = sys.stdin.read() if args.json_payload == "-" else args.json_payload
+        payload = _load_json_payload(raw)
+    else:
+        if not args.url or not args.title:
+            sys.exit("ERROR: --url and --title required (or pass a JSON payload as the first positional argument).")
+        _warn_if_local_url(args.url)
+        payload = {
+            "url": args.url, "title": args.title,
+            "domain": args.domain or "", "source_date": args.source_date or "",
+        }
+    return report(client.call("engram_add_evidence", payload))
 
 
 def cmd_add_observation(args):
     client = get_client(resolve_pkg(args))
-    payload = {
-        "quoted_text": args.quoted_text,
-        "interpretation": args.interpretation,
-        "claim": args.claim,
-        "quote_type": args.quote_type,
-    }
-    if args.evidence_id:
-        payload["evidence_id"] = args.evidence_id
-    elif args.url:
-        _warn_if_local_url(args.url)
-        payload["url"] = args.url
-        payload["title"] = args.title or ""
-        if args.source_date:
-            payload["source_date"] = args.source_date
+    if args.json_payload is not None:
+        raw = sys.stdin.read() if args.json_payload == "-" else args.json_payload
+        payload = _load_json_payload(raw)
     else:
-        sys.exit("ERROR: provide --evidence-id OR --url --title.")
-    if args.source_class:
-        payload["source_class"] = args.source_class
+        if not args.quoted_text or not args.interpretation or not args.claim or not args.quote_type:
+            sys.exit("ERROR: --quoted-text, --interpretation, --claim, --quote-type required (or pass a JSON payload as the first positional argument).")
+        payload = {
+            "quoted_text": args.quoted_text,
+            "interpretation": args.interpretation,
+            "claim": args.claim,
+            "quote_type": args.quote_type,
+        }
+        if args.evidence_id:
+            payload["evidence_id"] = args.evidence_id
+        elif args.url:
+            _warn_if_local_url(args.url)
+            payload["url"] = args.url
+            payload["title"] = args.title or ""
+            if args.source_date:
+                payload["source_date"] = args.source_date
+        else:
+            sys.exit("ERROR: provide --evidence-id OR --url --title.")
+        if args.source_class:
+            payload["source_class"] = args.source_class
     return report(client.call("engram_add_observation", payload))
 
 
 def cmd_derive(args):
     client = get_client(resolve_pkg(args))
-    return report(client.call("engram_derive", {
-        "claim": args.claim,
-        "supporting_ids": args.supporting_ids,
-        "logical_chain": args.logical_chain,
-        "reasoning_type": args.reasoning_type,
-    }))
+    if args.json_payload is not None:
+        raw = sys.stdin.read() if args.json_payload == "-" else args.json_payload
+        payload = _load_json_payload(raw)
+    else:
+        if not args.claim or not args.supporting_ids or not args.logical_chain or not args.reasoning_type:
+            sys.exit("ERROR: --claim, --supporting-ids, --logical-chain, --reasoning-type required (or pass a JSON payload as the first positional argument).")
+        payload = {
+            "claim": args.claim,
+            "supporting_ids": args.supporting_ids,
+            "logical_chain": args.logical_chain,
+            "reasoning_type": args.reasoning_type,
+        }
+    return report(client.call("engram_derive", payload))
 
 
 def cmd_supersede(args):
@@ -471,14 +498,21 @@ def cmd_supersede(args):
       1. Create the new node via add-observation / derive / etc.
       2. engram-pkg supersede --old-node-id <old> --new-node-id <new>
          [--reason <short rationale>]
+         OR: engram-pkg supersede '{"old_node_id":"<old>","new_node_id":"<new>"}'
     """
     client = get_client(resolve_pkg(args))
-    payload = {
-        "old_node_id": args.old_node_id,
-        "new_node_id": args.new_node_id,
-    }
-    if args.reason:
-        payload["supersede_reason"] = args.reason
+    if args.json_payload is not None:
+        raw = sys.stdin.read() if args.json_payload == "-" else args.json_payload
+        payload = _load_json_payload(raw)
+    else:
+        if not args.old_node_id or not args.new_node_id:
+            sys.exit("ERROR: --old-node-id and --new-node-id required (or pass a JSON payload as the first positional argument).")
+        payload = {
+            "old_node_id": args.old_node_id,
+            "new_node_id": args.new_node_id,
+        }
+        if args.reason:
+            payload["supersede_reason"] = args.reason
     return report(client.call("engram_supersede", payload))
 
 
@@ -1603,17 +1637,21 @@ def build_parser():
     i.set_defaults(func=cmd_init)
 
     e = sp.add_parser("add-evidence", help="Register a source document.")
-    e.add_argument("--url", required=True)
-    e.add_argument("--title", required=True)
+    e.add_argument("json_payload", nargs="?", default=None,
+                   help='JSON payload (same schema as MCP engram_add_evidence payload_json). Use "-" to read from stdin. If omitted, use named flags.')
+    e.add_argument("--url")
+    e.add_argument("--title")
     e.add_argument("--domain")
     e.add_argument("--source-date")
     e.set_defaults(func=cmd_add_evidence)
 
     o = sp.add_parser("add-observation", help="Extract a claim with provenance from a source.")
-    o.add_argument("--quoted-text", required=True)
-    o.add_argument("--interpretation", required=True)
-    o.add_argument("--claim", required=True)
-    o.add_argument("--quote-type", required=True,
+    o.add_argument("json_payload", nargs="?", default=None,
+                   help='JSON payload (same schema as MCP engram_add_observation payload_json). Use "-" to read from stdin. If omitted, use named flags.')
+    o.add_argument("--quoted-text")
+    o.add_argument("--interpretation")
+    o.add_argument("--claim")
+    o.add_argument("--quote-type",
                    choices=["hard_data", "official_statement", "attributed_analysis",
                             "unnamed_source", "editorial"])
     o.add_argument("--evidence-id", help="Use this OR --url+--title.")
@@ -1624,10 +1662,12 @@ def build_parser():
     o.set_defaults(func=cmd_add_observation)
 
     d = sp.add_parser("derive", help="Combine evidence into a derived claim.")
-    d.add_argument("--claim", required=True)
-    d.add_argument("--supporting-ids", required=True, help="Comma-separated node IDs.")
-    d.add_argument("--logical-chain", required=True)
-    d.add_argument("--reasoning-type", required=True,
+    d.add_argument("json_payload", nargs="?", default=None,
+                   help='JSON payload (same schema as MCP engram_derive payload_json). Use "-" to read from stdin. If omitted, use named flags.')
+    d.add_argument("--claim")
+    d.add_argument("--supporting-ids", help="Comma-separated node IDs.")
+    d.add_argument("--logical-chain")
+    d.add_argument("--reasoning-type",
                    help="One of the engram_derive reasoning types.")
     d.set_defaults(func=cmd_derive)
 
@@ -1635,10 +1675,11 @@ def build_parser():
         "supersede",
         help="Wire an existing replacement node as the successor of an old node (relational only).",
     )
-    s.add_argument("--old-node-id", required=True, help="ID of the node being superseded.")
+    s.add_argument("json_payload", nargs="?", default=None,
+                   help='JSON payload (same schema as MCP engram_supersede payload_json). Use "-" to read from stdin. If omitted, use named flags.')
+    s.add_argument("--old-node-id", help="ID of the node being superseded.")
     s.add_argument(
         "--new-node-id",
-        required=True,
         help="ID of the replacement node — must already exist (create via add-observation, derive, etc. first).",
     )
     s.add_argument("--reason", help="Optional short rationale for why this revision exists.")
