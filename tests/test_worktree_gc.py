@@ -211,3 +211,62 @@ def test_classify_no_pr(tmp_path):
         action, reason = _mod.classify(t, ROOT)
     assert action == "KEEP"
     assert "no PR" in reason
+
+
+# ---------------------------------------------------------------------------
+# 11. _prune_orphan_agent_refs — deletes orphans, keeps checked-out refs
+# ---------------------------------------------------------------------------
+
+
+def test_prune_orphan_agent_refs_deletes_orphans():
+    """Orphan worktree-agent-* refs (not checked out) are deleted."""
+    branch_list_out = "  worktree-agent-aaa\n  worktree-agent-bbb\n  worktree-agent-ccc\n"
+    calls = []
+
+    def fake_run(args, cwd=None):
+        calls.append(args)
+        if args[:3] == ["git", "branch", "--list"]:
+            return 0, branch_list_out, ""
+        if args[:3] == ["git", "branch", "-D"]:
+            return 0, "", ""
+        return 0, "", ""
+
+    with patch.object(_mod, "_run", side_effect=fake_run):
+        pruned, total = _mod._prune_orphan_agent_refs(ROOT, checked_out=set())
+
+    assert total == 3
+    assert pruned == 3
+    deleted = [c[3] for c in calls if c[:3] == ["git", "branch", "-D"]]
+    assert sorted(deleted) == ["worktree-agent-aaa", "worktree-agent-bbb", "worktree-agent-ccc"]
+
+
+def test_prune_orphan_agent_refs_keeps_checked_out():
+    """A worktree-agent-* ref still checked out in a worktree is not deleted."""
+    branch_list_out = "  worktree-agent-aaa\n* worktree-agent-bbb\n"
+    calls = []
+
+    def fake_run(args, cwd=None):
+        calls.append(args)
+        if args[:3] == ["git", "branch", "--list"]:
+            return 0, branch_list_out, ""
+        if args[:3] == ["git", "branch", "-D"]:
+            return 0, "", ""
+        return 0, "", ""
+
+    with patch.object(_mod, "_run", side_effect=fake_run):
+        pruned, total = _mod._prune_orphan_agent_refs(
+            ROOT, checked_out={"worktree-agent-bbb"}
+        )
+
+    assert total == 1  # only aaa is an orphan
+    assert pruned == 1
+    deleted = [c[3] for c in calls if c[:3] == ["git", "branch", "-D"]]
+    assert deleted == ["worktree-agent-aaa"]  # bbb was not deleted
+
+
+def test_prune_orphan_agent_refs_no_refs():
+    """Returns (0, 0) when no worktree-agent-* refs exist."""
+    with patch.object(_mod, "_run", return_value=(0, "", "")):
+        pruned, total = _mod._prune_orphan_agent_refs(ROOT, checked_out=set())
+    assert pruned == 0
+    assert total == 0

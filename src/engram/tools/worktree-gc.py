@@ -19,7 +19,7 @@ This tool classifies each worktree and removes the safely-finished ones:
 
 Default is DRY-RUN: it prints the plan and changes nothing. Pass --apply to
 execute (`git worktree remove` + delete the now-merged local branch, then
-`git worktree prune`).
+`git worktree prune` + delete orphan `worktree-agent-*` branch refs).
 
 Safety invariants:
   * The main checkout is never touched.
@@ -129,6 +129,23 @@ def classify(t: dict, root: str) -> tuple[str, str]:
     return "KEEP", f"no PR for '{branch}' — flagged for human review (pre-PR or abandoned)"
 
 
+def _prune_orphan_agent_refs(root: str, checked_out: set[str]) -> tuple[int, int]:
+    """Delete worktree-agent-* branch refs not checked out in any remaining worktree.
+
+    Returns (pruned, total).
+    """
+    rc, out, _ = _run(["git", "branch", "--list", "worktree-agent-*"], cwd=root)
+    if rc != 0 or not out.strip():
+        return 0, 0
+    refs = [b.strip().removeprefix("* ") for b in out.splitlines() if b.strip()]
+    orphans = [r for r in refs if r not in checked_out]
+    pruned = sum(
+        1 for ref in orphans
+        if _run(["git", "branch", "-D", ref], cwd=root)[0] == 0
+    )
+    return pruned, len(orphans)
+
+
 def remove_worktree(t: dict, root: str) -> tuple[bool, str]:
     path = t["path"]
     rc, _, err = _run(["git", "worktree", "remove", "--force", path], cwd=root)
@@ -196,7 +213,11 @@ def main() -> int:
         print(f"  {'✓' if ok else '✗'} {t['path']} — {msg}")
         removed += ok
     _run(["git", "worktree", "prune"], cwd=root)
-    print(f"\nworktree-gc: removed {removed}/{len(prune)}; ran git worktree prune.")
+    remaining = _list_worktrees(root)
+    checked_out = {t.get("branch") for t in remaining if t.get("branch")}
+    pruned_refs, total_refs = _prune_orphan_agent_refs(root, checked_out)
+    ref_note = f"; pruned {pruned_refs}/{total_refs} orphan worktree-agent-* refs" if total_refs else ""
+    print(f"\nworktree-gc: removed {removed}/{len(prune)}; ran git worktree prune{ref_note}.")
     return 0
 
 
