@@ -643,6 +643,7 @@ def _add_lesson_impl(
     logical_chain: str = "",
     reasoning_type: str = "inductive_generalization",
     context_ids: str = "",
+    situation_pattern: str = "",
 ) -> str:
     """Internal implementation — see engram_add_lesson MCP tool for the public
     payload schema. Kept callable with named kwargs for in-server callers.
@@ -757,6 +758,8 @@ def _add_lesson_impl(
             "reasoning_class": rclass,
             "scaffolding_nudge": scaffolding_nudge,
         }
+        if situation_pattern:
+            meta["situation_pattern"] = situation_pattern
 
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, logical_chain,

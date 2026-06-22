@@ -3681,7 +3681,7 @@ def engram_goal_tension(payload_json: str) -> str:
 
 _ADD_LESSON_FIELDS = frozenset({
     "claim", "incident_ids", "scaffolding_nudge", "logical_chain",
-    "reasoning_type", "context_ids",
+    "reasoning_type", "context_ids", "situation_pattern",
 })
 
 
@@ -3734,6 +3734,14 @@ def engram_add_lesson(payload_json: str) -> str:
             logical_chain (str, required): How the incidents lead to this lesson.
             reasoning_type (str, optional): Default 'inductive_generalization'.
             context_ids (str, optional): Comma-separated node IDs for context references.
+            situation_pattern (str, optional): Regex matched against the pending Bash
+                COMMAND at action-moment by the PreToolUse tripwire hook. When the
+                pattern fires, scaffolding_nudge is injected as additionalContext before
+                the command runs. Use for lessons whose retrieval cue is a command shape
+                (a specific CLI/tool invocation) — NOT lessons cued by the semantic
+                content of what you're about to say; those still rely on the prompt-time
+                recall hook and are uncovered by this one when the cue lands in pure prose.
+                Example: r'(?:forum\\s+reply|ia\\s+write)'
 
     Returns:
         JSON with lesson ID, confidence, linked incidents, and similar

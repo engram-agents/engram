@@ -397,6 +397,10 @@
       "tier": "convenience"
     },
     {
+      "path": "hooks/claude/engram-lesson-tripwire-hook.py",
+      "tier": "convenience"
+    },
+    {
       "path": "skills/claude/engram-first-session",
       "tier": "essential"
     },
