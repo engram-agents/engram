@@ -73,12 +73,11 @@ Working order — **batch-by-type pass** (PR-B):
    "Recall-summary failures (from final_payload.json)" below. The `failures`
    list already contains pre-validated truly-unfixable entries from the parent's
    retry loop; note them in the dream record (do NOT attempt inline fixes).
-6. Execute one bucket at a time (each MCP write is still individual for
-   correctness):
+6. Execute one bucket at a time in `ALL_BUCKET_NAMES` order
+   (`tools/dream_master_batch.py` is canonical — reference it, don't retype the
+   sequence; each MCP write is still individual for correctness):
    - First: **resolutions** — for each finding, `check_snapshot_divergence`
      then `engram_resolve`
-   - Then: **goal_tension_resolutions** — `check_snapshot_divergence` then
-     `engram_resolve` on gt_* nodes
    - Then: **supersedes** — `check_snapshot_divergence` then `engram_supersede`
    - Then: **retractions** — `check_snapshot_divergence` then `engram_retract`
    - Then: **new_derivations** — `check_snapshot_divergence` then `engram_derive`
@@ -86,6 +85,8 @@ Working order — **batch-by-type pass** (PR-B):
      `engram_lesson_register_incident`
    - Then: **cornerstone_moves** — `check_snapshot_divergence` then
      `engram_add_cornerstone` or `engram_outgrow_cornerstone`
+   - Then: **goal_tension_resolutions** — `check_snapshot_divergence` then
+     `engram_resolve` on gt_* nodes
    - Then: **edge_wiring** — `check_snapshot_divergence` on the source node,
      verify edge still absent, then `engram_add_edge` (Category 7 suggestions)
    - **unknown bucket**: log all items in the dream record for the morning
