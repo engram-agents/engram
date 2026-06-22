@@ -393,6 +393,10 @@
       "tier": "convenience"
     },
     {
+      "path": "hooks/claude/engram-bash-pipe-exit-warn.py",
+      "tier": "convenience"
+    },
+    {
       "path": "skills/claude/engram-first-session",
       "tier": "essential"
     },
