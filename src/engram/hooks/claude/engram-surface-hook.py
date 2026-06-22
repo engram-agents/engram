@@ -141,8 +141,22 @@ DEFAULT_IDF_GATE_ENABLED = True  # feature flag for safe rollout
 # Duration after a daemon launch attempt during which the per-turn surface hook
 # treats daemon-unreachable as a warmup state (SOFT message) rather than a genuine
 # outage (CRITICAL). The daemon writes its PID and binds its socket only after the
-# ~7s model load; this window covers that cold-start gap.
-_DAEMON_WARMUP_WINDOW_SECONDS = 20
+# model load; typical load is 7-15s, but slower hardware (first install, cold OS cache)
+# can take 30-60s. 120s covers all plausible cold-start scenarios without masking a
+# genuine crash (after 120s a daemon that never bound has clearly failed).
+# Configurable via ENGRAM_DAEMON_WARMUP_WINDOW_SECONDS for sites with unusually slow
+# hardware (set to 0 to disable the warmup window entirely).
+def _resolve_warmup_window() -> int:
+    raw = os.environ.get("ENGRAM_DAEMON_WARMUP_WINDOW_SECONDS", "")
+    if raw:
+        try:
+            val = int(raw)
+            return max(0, val)
+        except (ValueError, TypeError):
+            pass
+    return 120
+
+_DAEMON_WARMUP_WINDOW_SECONDS = _resolve_warmup_window()
 
 # Attached-pack surfacing quota — max results pulled across all packs combined.
 _PACK_SURFACE_QUOTA = 3

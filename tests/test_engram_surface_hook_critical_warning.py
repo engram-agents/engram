@@ -246,10 +246,10 @@ class TestCriticalWhenLaunchAttemptStale(unittest.TestCase):
     def test_critical_when_launch_attempt_stale(self):
         """CRITICAL fires (not SOFT) when daemon-launch-attempt is older than the warmup window."""
         import time
-        # Write a stale launch-attempt marker (100 seconds in the past, well outside window)
+        # Write a stale launch-attempt marker (200 seconds in the past, well outside the 120s window)
         marker_path = os.path.join(self.tmp, "daemon-launch-attempt")
         with open(marker_path, "w") as f:
-            f.write(str(int(time.time()) - 100))
+            f.write(str(int(time.time()) - 200))
 
         raw_output = _run_main_capture(self.hook, _make_hook_input())
         self.assertTrue(
