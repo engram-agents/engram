@@ -2674,10 +2674,12 @@ _ADD_CONJECTURE_FIELDS = frozenset({"claim", "basis", "initial_confidence", "con
 #
 # Lifecycle: open → investigated via observations + derivations → resolved
 # via engram_resolve with prediction_outcome=supported/refuted/inconclusive.
-# When a conjecture gets strong evidence + reaches conjecture confidence
-# ceiling (~0.85), the right move is engram_derive the same claim with
-# proper premises and supersede the conjecture; conjectures shouldn't lurk
-# as "facts in disguise."
+# When a conjecture gets strong evidence, promote via engram_resolve with
+# target_id=conjecture_id, resolving_node_id=<derivation>, and
+# prediction_outcome="supported". Optionally precede with engram_derive to
+# build the supporting derivation; but the derive step alone does NOT close
+# the lifecycle — only engram_resolve sets status="supported". Do NOT
+# supersede — _supersede_impl rejects cross-type promotion (cj → dv).
 #
 # basis field: why this conjecture is worth investigating. Distinguishes a
 # disciplined conjecture (specific gap, testable mechanism) from a free-floating
@@ -2703,8 +2705,12 @@ def engram_add_conjecture(payload_json: str) -> str:
 
     Speculative-by-definition (confidence [0.10, 0.60]). Lifecycle: open →
     investigated → resolved via engram_resolve. When evidence is strong, promote
-    via engram_derive + supersede. Pass all fields as one JSON object string in
-    payload_json.
+    via engram_resolve with target_id=conjecture_id, resolving_node_id=
+    <derivation_id>, and prediction_outcome="supported". Optionally first use
+    engram_derive to build the supporting derivation from evidence, but derive
+    alone does NOT close the lifecycle. Do NOT use
+    supersede — cross-type promotion is rejected. Pass all fields as one
+    JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
