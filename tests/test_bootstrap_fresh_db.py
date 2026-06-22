@@ -10,6 +10,7 @@ the initial commit (smoke-test only rendered error messages, didn't run
 the bootstrap end-to-end). This test is the regression guard.
 """
 
+import json
 import os
 import shutil
 import sqlite3
@@ -548,5 +549,92 @@ def test_bootstrap_force_reseed_empty_on_nonempty_db_refuses():
             f"Expected 'non-empty' in output, got:\n{combined}"
         )
 
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Tests for _set_cleanup_period_days (via subprocess — same pattern as above)
+# ---------------------------------------------------------------------------
+
+
+def _run_bootstrap_for_cleanup_test(workdir: Path, pre_settings: dict | None = None):
+    """Run bootstrap.py in a subprocess and return the resulting settings.json
+    content.  pre_settings, if given, is written to CLAUDE_HOME/settings.json
+    before bootstrap runs — used to test the no-override path."""
+    engram_home = workdir / ".engram"
+    claude_home = workdir / ".claude"
+    engram_home.mkdir(parents=True)
+    claude_home.mkdir(parents=True)
+    if pre_settings is not None:
+        (claude_home / "settings.json").write_text(json.dumps(pre_settings))
+    runtime_files = [
+        "server.py", "engram_client.py", "engram_confidence.py",
+        "engram_filter.py", "engram_idf.py", "engram_ids.py",
+        "engram_log_emitter.py", "engram_log_indexer.py",
+    ]
+    for fname in runtime_files:
+        src = REPO_ROOT / fname
+        if src.exists():
+            shutil.copy2(src, engram_home / fname)
+    env = os.environ.copy()
+    env.update({
+        "ALPHA_DIR": str(REPO_ROOT),
+        "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "src" / "engram" / "templates"),
+        "ENGRAM_HOME": str(engram_home),
+        "CLAUDE_HOME": str(claude_home),
+        "PYTHON_BIN": sys.executable,
+        "TARGET": "claude",
+    })
+    env.pop("ENGRAM_BOOTSTRAP", None)
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "src" / "engram" / "bootstrap.py")],
+        env=env, capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, (
+        f"bootstrap.py failed:\n  stdout: {result.stdout}\n  stderr: {result.stderr}"
+    )
+    settings_path = claude_home / "settings.json"
+    return json.loads(settings_path.read_text()) if settings_path.exists() else {}
+
+
+def test_bootstrap_sets_cleanup_period_days_when_settings_absent():
+    """bootstrap sets cleanupPeriodDays=36500 in settings.json when absent."""
+    workdir = Path(tempfile.mkdtemp(prefix="engram_cleanup_test_"))
+    try:
+        data = _run_bootstrap_for_cleanup_test(workdir)
+        assert data.get("cleanupPeriodDays") == 36500, (
+            f"expected 36500, got {data.get('cleanupPeriodDays')}"
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_bootstrap_sets_cleanup_period_days_merges_into_existing_settings():
+    """bootstrap sets cleanupPeriodDays, preserving existing keys."""
+    workdir = Path(tempfile.mkdtemp(prefix="engram_cleanup_test_"))
+    try:
+        data = _run_bootstrap_for_cleanup_test(
+            workdir, pre_settings={"model": "sonnet", "theme": "dark"}
+        )
+        assert data.get("cleanupPeriodDays") == 36500, (
+            f"expected 36500, got {data.get('cleanupPeriodDays')}"
+        )
+        assert data.get("model") == "sonnet", "existing model key should be preserved"
+        assert data.get("theme") == "dark", "existing theme key should be preserved"
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_bootstrap_does_not_override_existing_cleanup_period_days():
+    """bootstrap does not overwrite cleanupPeriodDays when already set."""
+    workdir = Path(tempfile.mkdtemp(prefix="engram_cleanup_test_"))
+    try:
+        data = _run_bootstrap_for_cleanup_test(
+            workdir, pre_settings={"cleanupPeriodDays": 90}
+        )
+        assert data.get("cleanupPeriodDays") == 90, (
+            f"user's value 90 should be preserved, got {data.get('cleanupPeriodDays')}"
+        )
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
