@@ -449,7 +449,7 @@ This is why the ordering is Phase A → Phase B, and why Phase A must complete b
 
 - **Don't retry an interrupted dream.** If the dream master returns a partial result (some fairies timed out, completion checklist short-circuited under self-timeout), unfinished work goes into next cycle's cohort via attrition. The dream master logs unfinished items in the dream record. Don't try to "finish the work" in the parent context — that would re-introduce the discipline-blur this architecture exists to resolve.
 
-- **The dream master can run on a different model than the parent.** Its spec sets `model: opus` because consolidation is judgment-laden; if the parent is on a smaller model, the dream master still gets opus. Don't override unless you have a specific reason.
+- **The dream master inherits the parent's model.** Its spec no longer pins `model: opus` — consolidation runs on the same model family as the dispatching agent (Lei's directive, 2026-06-10; issue #1027). Fairies always run on Sonnet regardless.
 
 ## Relation to other routines
 

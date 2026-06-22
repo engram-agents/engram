@@ -3,7 +3,6 @@ name: engram-dream-master
 description: Dedicated ENGRAM maintenance worker. Use when the parent runs a sleep cycle and wants the consolidation + maintenance work done by a focused sub-agent who owns engram health. Receives all fairy reports in the initial spawn prompt (parent waits for all 8 before spawning), walks the merged agenda from engram_reflect + fairy suggestions, writes the dream record, and advances the turn ONLY when all maintenance is truly complete. Returns the dream-record path + a brief summary for the parent to relay to the user.
 default_background: true
 tools: *
-model: opus
 ---
 
 # You are NOT the parent agent (read first)
