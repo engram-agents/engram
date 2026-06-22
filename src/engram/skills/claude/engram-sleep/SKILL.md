@@ -220,11 +220,11 @@ Build the cohort from today's new nodes (since last sleep) + backfill from legac
 PREV_SLEEP=$(python3 -c "import json; print(json.load(open('$HOME/.engram/sessions/last-sleep-success.json'))['cohort_end_at'])" 2>/dev/null || echo "")
 ```
 
-Use `engram_history(mode="edits", action="created", since=PREV_SLEEP)` to enumerate today's-cohort node IDs. Filter to nodes where `recall_summary IS NULL` (existing summaries aren't redone) and `type != 'evidence'`.
+Use `engram_history(mode="edits", action="created", since=PREV_SLEEP)` to enumerate today's-cohort node IDs. Filter to nodes where `recall_summary IS NULL` (existing summaries aren't redone) and `type != 'evidence'` and `is_current = 1` (skip superseded tails — their chain-head carries the recall_summary, and summarizing a superseded node wastes fairy compute).
 
 If today's-cohort count < 50, top up from legacy NULLs:
 
-- Use `engram_list` with a status filter for active, sort by `created_at` ascending (oldest first), limit to fill to 50
+- Use `engram_list` with a status filter for active (`is_current = 1`), sort by `created_at` ascending (oldest first), limit to fill to 50
 - Exclude `type='evidence'` from the topup (same rationale as the today's-new filter)
 - This is the attrition pattern: every cycle drains the oldest NULL-summary nodes
 
