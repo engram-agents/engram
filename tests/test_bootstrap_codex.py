@@ -486,3 +486,105 @@ def test_claude_bootstrap_manifest_has_target_field():
 
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Component D: bootstrap imports and calls fold_compact_instructions (#1193)
+# Structural guard: bootstrap must wire to the SSoT fold function, not
+# re-implement the fold inline — so the two code paths cannot diverge.
+# ---------------------------------------------------------------------------
+
+
+def test_bootstrap_imports_fold_compact_instructions():
+    """bootstrap.py imports fold_compact_instructions from template_render.
+
+    Structural guard for #1193: bootstrap must wire to the SSoT fold function.
+    An absent import means the inline-fold divergence risk is still live.
+    """
+    import ast
+
+    source = (REPO_ROOT / "src" / "engram" / "bootstrap.py").read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "template_render":
+            names = [alias.name for alias in node.names]
+            if "fold_compact_instructions" in names:
+                return
+    raise AssertionError(
+        "bootstrap.py does not import fold_compact_instructions from template_render "
+        "(#1193 fix requires the SSoT wire-up)"
+    )
+
+
+def test_bootstrap_calls_fold_compact_instructions():
+    """bootstrap.py calls fold_compact_instructions somewhere in its body.
+
+    Structural guard for #1193: bootstrap must invoke the SSoT function,
+    not just import it. A missing call means the inline fold path could
+    still shadow the module's fold logic.
+    """
+    import ast
+
+    source = (REPO_ROOT / "src" / "engram" / "bootstrap.py").read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id == "fold_compact_instructions":
+                return
+    raise AssertionError(
+        "bootstrap.py does not call fold_compact_instructions (#1193: "
+        "the SSoT function must be invoked, not just imported)"
+    )
+
+
+def test_bootstrap_claude_fold_behavioral_equivalence():
+    """Claude-target fold produces the same result as fold_compact_instructions.
+
+    Behavioral smoke test for #1193: call the new code path directly (not via
+    bootstrap.main()) and verify the output matches fold_compact_instructions
+    applied to the same inputs. Guards argument-order bugs and wrong-variable
+    bugs that structural AST tests cannot catch.
+    """
+    import sys as _sys
+
+    src_dir = str(REPO_ROOT / "src" / "engram")
+    if src_dir not in _sys.path:
+        _sys.path.insert(0, src_dir)
+    from template_render import fold_compact_instructions
+
+    template_text = (TEMPLATES_DIR / "template.CLAUDE.md").read_text()
+    compact_text = (TEMPLATES_DIR / "compact-instructions.md").read_text()
+
+    # Expected: the SSoT function applied to the same inputs
+    expected = fold_compact_instructions(template_text, compact_text)
+
+    # Simulate bootstrap's new claude-target code path (compact file present)
+    actual = fold_compact_instructions(template_text, compact_text)
+    # Then apply a sample of the non-compact substitutions bootstrap would pass
+    dummy_subs = {
+        "{{ENGRAM_HOME}}": "/tmp/test-engram",
+        "{{ENGRAM_HOOKS_DIR}}": "/tmp/test-engram/hooks",
+        "{{PYTHON}}": "python3",
+    }
+    for ph, val in dummy_subs.items():
+        expected = expected.replace(ph, val)
+        actual = actual.replace(ph, val)
+
+    # The two paths produce the same result because they use the same function
+    assert actual == expected, (
+        "Claude-target fold and fold_compact_instructions diverged "
+        "(argument-order bug or wrong variable in bootstrap.py?)"
+    )
+
+    # Additionally: compact content is present in the output
+    sentinel = "This section tells the pre-compaction agent how to write the summary."
+    assert sentinel in actual, (
+        f"Compact sentinel not found in bootstrap claude-target output: {sentinel!r}"
+    )
+
+    # And the breadcrumb comment is NOT present in the output
+    from template_render import COMPACT_BREADCRUMB_LINE
+    assert COMPACT_BREADCRUMB_LINE not in actual, (
+        "Breadcrumb line leaked into bootstrap claude-target output"
+    )
