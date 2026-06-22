@@ -64,6 +64,20 @@ def _mk_derivation(claim: str, support_ids: list, reasoning_type: str = "deducti
     return result["derivation_id"]
 
 
+def _mk_cornerstone(tag: str, title: str, supporting_ids: list = None) -> str:
+    """Create a cornerstone node via the impl and return its ID."""
+    result = json.loads(engram_cornerstone._add_cornerstone_impl(
+        tag=tag,
+        title=title,
+        new_frame=f"New frame for {title}",
+        prior_frame=f"Prior frame for {title}",
+        triggering_experience=f"Triggering experience for {title}",
+        supporting_ids=",".join(supporting_ids) if supporting_ids else "",
+    ))
+    assert "cornerstone_id" in result, f"cornerstone creation failed: {result}"
+    return result["cornerstone_id"]
+
+
 def _edges(conn, source=None, target=None, relation=None):
     q = "SELECT source_id, target_id, relation, metadata FROM edges WHERE 1=1"
     params = []
@@ -581,7 +595,108 @@ def test_supersede_person_transfers_self_anchor():
     assert failed == 0, f"{failed} sub-test(s) failed"
 
 
+def test_supersede_person_migrates_supported_by():
+    """Person supersede migrates incoming supported_by edges from cornerstones/lessons.
+
+    Verifies #1209: Aleph's remaining gap — cs/ls supported_by → old_person
+    edges are rerooted to the new person; non-cs/ls supported_by edges are NOT
+    migrated (they get stale-marked by the cascade instead).
+    """
+    passed = 0
+    failed = 0
+
+    with engram_core.engram_sandbox():
+
+        # ---- Test A: cornerstone with supported_by→old_person gets migrated ----
+        pn_old = _mk_person("Person Old")
+        ob_anchor = _mk_observation("Anchor observation about pn_old")
+        cs_id = _mk_cornerstone("test-anchor", "cornerstone anchored in pn_old",
+                                supporting_ids=[pn_old, ob_anchor])
+        pn_new = _mk_person("Person New")
+        sup_r = json.loads(engram_revision._supersede_impl(pn_old, pn_new,
+                                                           supersede_reason="alias correction"))
+        assert sup_r["status"] == "superseded", f"TA: supersede failed: {sup_r}"
+
+        conn = engram_core._get_db()
+        try:
+            # New supported_by edge: cs → pn_new
+            new_edge = conn.execute(
+                "SELECT 1 FROM edges WHERE source_id=? AND target_id=? AND relation='supported_by'",
+                (cs_id, pn_new),
+            ).fetchone()
+            assert new_edge is not None, f"TA: cs→pn_new supported_by edge missing after supersede"
+            # Old supported_by edge preserved (audit trail)
+            old_edge = conn.execute(
+                "SELECT 1 FROM edges WHERE source_id=? AND target_id=? AND relation='supported_by'",
+                (cs_id, pn_old),
+            ).fetchone()
+            assert old_edge is not None, f"TA: cs→pn_old supported_by edge should remain as audit trail"
+        finally:
+            conn.close()
+        print("  TA  PASS — person supersede migrates cs supported_by to new node; old preserved")
+        passed += 1
+
+        # ---- Test B: duplicate guard — pre-existing cs→pn_new edge not doubled ----
+        pn_x = _mk_person("Person X")
+        pn_y = _mk_person("Person Y")
+        cs2 = _mk_cornerstone("test-dup", "cornerstone supported by both persons",
+                               supporting_ids=[pn_x, pn_y])
+        sup_r2 = json.loads(engram_revision._supersede_impl(pn_x, pn_y))
+        assert sup_r2["status"] == "superseded", f"TB: supersede failed: {sup_r2}"
+
+        conn = engram_core._get_db()
+        try:
+            cnt = conn.execute(
+                "SELECT COUNT(*) AS c FROM edges WHERE source_id=? AND target_id=? AND relation='supported_by'",
+                (cs2, pn_y),
+            ).fetchone()["c"]
+            assert cnt == 1, f"TB: duplicate guard failed — {cnt} cs→pn_y edges (expected 1)"
+        finally:
+            conn.close()
+        print("  TB  PASS — duplicate guard: pre-existing cs→pn_y supported_by not doubled")
+        passed += 1
+
+        # ---- Test C: cornerstone is NOT in stale list (cascade already skips cs/ls) ----
+        pn_a = _mk_person("Person A")
+        cs3 = _mk_cornerstone("test-stale", "should not be stale after supersede",
+                               supporting_ids=[pn_a])
+        pn_b = _mk_person("Person B")
+        sup_r3 = json.loads(engram_revision._supersede_impl(pn_a, pn_b))
+        assert sup_r3["status"] == "superseded", f"TC: supersede failed: {sup_r3}"
+        stale_ids = [s["id"] for s in sup_r3.get("stale_downstream", [])]
+        assert cs3 not in stale_ids, f"TC: cornerstone {cs3} incorrectly appears in stale list"
+        print("  TC  PASS — cornerstone not in stale list (cs/ls cascade skip rule)")
+        passed += 1
+
+        # ---- Test D: non-person supersede does NOT migrate supported_by edges ----
+        ob_p = _mk_observation("Claim P — premise")
+        ob_q = _mk_observation("Claim Q — replacement")
+        cs4 = _mk_cornerstone("test-non-person", "cornerstone anchored in ob_p",
+                               supporting_ids=[ob_p])
+        sup_r4 = json.loads(engram_revision._supersede_impl(ob_p, ob_q))
+        assert sup_r4["status"] == "superseded", f"TD: supersede failed: {sup_r4}"
+
+        conn = engram_core._get_db()
+        try:
+            # No edge cs4 → ob_q should exist (ob_p is not a person; migration doesn't run)
+            migrated = conn.execute(
+                "SELECT 1 FROM edges WHERE source_id=? AND target_id=? AND relation='supported_by'",
+                (cs4, ob_q),
+            ).fetchone()
+            assert migrated is None, f"TD: non-person supersede spuriously migrated supported_by to {ob_q}"
+        finally:
+            conn.close()
+        print("  TD  PASS — non-person supersede does not migrate supported_by edges")
+        passed += 1
+
+    print(f"\n{'='*56}")
+    print(f"  {passed} passed, {failed} failed")
+    print('='*56)
+    assert failed == 0, f"{failed} sub-test(s) failed"
+
+
 if __name__ == "__main__":
     test_supersede_relational()
     test_supersede_person_migrates_about_edges()
     test_supersede_person_transfers_self_anchor()
+    test_supersede_person_migrates_supported_by()

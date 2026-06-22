@@ -708,6 +708,36 @@ def _supersede_impl(
                           {"transferred_from": old_node_id,
                            "trust_tier": old_self["trust_tier"]})
 
+            # Migrate incoming `supported_by` edges from cornerstones/lessons.
+            # The cascade walker already skips cs/ls nodes (§2.0 skip rule), so
+            # they are not stale-marked when a premise is superseded. But the edge
+            # still points at the now-non-current person, leaving the cs/ls
+            # anchored to a superseded node. Add a parallel edge to the new node.
+            # Old edges are preserved as audit trail (same as about migration).
+            # See #1209 (Aleph's remaining gap — cs/ls supported_by not rerooted).
+            cs_ls_sources = conn.execute(
+                "SELECT e.source_id FROM edges e "
+                "JOIN nodes n ON n.id = e.source_id "
+                "WHERE e.target_id = ? AND e.relation = 'supported_by' "
+                "AND n.type IN ('cornerstone', 'lesson') AND n.is_current = 1",
+                (old_node_id,),
+            ).fetchall()
+            for row in cs_ls_sources:
+                src = row["source_id"]
+                already = conn.execute(
+                    "SELECT 1 FROM edges "
+                    "WHERE source_id = ? AND target_id = ? AND relation = 'supported_by'",
+                    (src, new_node_id),
+                ).fetchone()
+                if not already:
+                    conn.execute(
+                        "INSERT INTO edges (source_id, target_id, relation, created_at)"
+                        " VALUES (?, ?, 'supported_by', ?)",
+                        (src, new_node_id, now),
+                    )
+                    core._log_edit(conn, "supported_by_migrated", new_node_id, new["type"],
+                              {"supported_by_source_id": src, "migrated_from": old_node_id})
+
         # Flag downstream dependents of the old node as stale.
         # Uses shared walker (_walk_cascade_downstream) — PR-AA SSoT refactor.
         visited = {old_node_id}  # seed superseded node so walker won't process it
