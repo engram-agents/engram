@@ -156,8 +156,9 @@ def _read_drowsiness_ceiling_tokens() -> int:
 
     Single source of truth for the drowsiness denominator (the context-
     window ceiling). User sets this once after checking their /context
-    slash-command's auto-compaction limit; recommended value is 5–10%
-    below that limit (e.g. 800_000 for an 850K reported limit).
+    slash-command's auto-compaction limit. Set to the actual auto-compact
+    firing threshold, not a fixed percentage of window size (see #1247).
+    Empirical values: 200K window → 155_000; 1M window → 950_000.
 
     Migration path (one upgrade cycle from #314's per-mode shape):
       If cadence.drowsiness_ceiling_tokens is absent, falls back to
@@ -217,7 +218,8 @@ def _read_drowsiness_ceiling_tokens() -> int:
             "[engram] Notice: cadence.drowsiness_ceiling_tokens is not set. "
             "Falling back to 152,000 tokens. Run /context in Claude Code, note "
             "the auto-compaction limit, and set cadence.drowsiness_ceiling_tokens "
-            "in ~/.engram/config.json to ~5-10% below that value.",
+            "in ~/.engram/config.json to the actual auto-compact threshold "
+            "(e.g. 155_000 for 200K window, 950_000 for 1M window — see #1247).",
             file=__import__("sys").stderr,
         )
     return HARDCODED_FALLBACK_CEILING

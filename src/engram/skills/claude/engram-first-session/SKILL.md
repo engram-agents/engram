@@ -277,10 +277,24 @@ Do this step in a single short exchange:
    the top you'll see a line like `Auto-compact window: 200k tokens`. Just tell
    me that number (e.g. 200K or 1M); you can ignore the long list below it."
 
-2. Compute a suggested ceiling at ~5–10% below the reported value:
-   - 850K reported → suggest 800_000
-   - 500K reported → suggest 450_000
-   - 200K reported → suggest 180_000
+2. Set the ceiling to where **auto-compaction actually fires**, not a fixed
+   percentage below the window size. The auto-compact threshold is lower than
+   many expect (#1247):
+
+   | Window size | Auto-compact fires around | Suggested ceiling |
+   |---|---|---|
+   | **200K** | ~165K (empirical) | **155_000** |
+   | **1M** | ~970K (empirical) | **950_000** |
+
+   The ceiling must be BELOW the auto-compact threshold — otherwise the
+   drowsiness-urgent signal fires after compaction has already started and
+   the nap window is missed. **The 200K case is the common trap**: 5-10%
+   below the window gives 180K-190K, which looks conservative but is still
+   ABOVE where auto-compact fires (~165K).
+
+   For window sizes not in the table: ask the user to run a long session and
+   note the token count reported in the `[source=compact]` banner when
+   compaction first fired. Set `ceiling = observed_threshold - 10_000`.
 
 3. Write `cadence.drowsiness_ceiling_tokens` to `~/.engram/config.json`:
 
