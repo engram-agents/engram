@@ -356,6 +356,52 @@ def _find_near_matches(
     return matches
 
 
+# Content-addressed evidence archive root (#1253). Mirrors the engram-snapshot
+# CLI's resolution exactly: $ENGRAM_EVIDENCE_ARCHIVE override, else
+# $ENGRAM_HOME/evidence-archive. Files here are named by their sha256 content
+# hash, which makes them immutable-by-construction.
+EVIDENCE_ARCHIVE_ROOT = (
+    os.environ.get("ENGRAM_EVIDENCE_ARCHIVE")
+    or str(core.DATA_DIR / "evidence-archive")
+)
+
+
+def _content_addressed_archive_hash(abs_file: str) -> str:
+    """If abs_file is a content-addressed evidence-archive file whose name
+    matches its actual content hash, return that hash; else return "".
+
+    Content-addressing provides the SAME immutability guarantee the
+    committed-before-cite guard exists for, by a different mechanism: the
+    filename IS the sha256 of the bytes, so the cited content can never change
+    without the path changing too. This lets the deferred-commit path
+    (#1253, Lei's ruling) cite an archive file at content_hash time — before
+    the git commit that backfills its git_sha at nap — WITHOUT losing the
+    immutability the guard protects. The check is scoped to the archive root,
+    so all OTHER file:// citations (working-tree files whose bytes can mutate)
+    keep the commit guard unchanged.
+    """
+    try:
+        # realpath (not abspath) resolves symlinks, so the scope check enforces
+        # the tighter invariant "the actual bytes live inside the archive root"
+        # — a symlink planted in the archive that points outside is rejected.
+        archive_root = os.path.realpath(EVIDENCE_ARCHIVE_ROOT)
+        af = os.path.realpath(abs_file)
+        # Must live under the archive root (reject path-traversal / symlink-out).
+        if os.path.commonpath([archive_root, af]) != archive_root:
+            return ""
+        # Basename stem must be a 64-char lowercase-hex sha256.
+        stem = os.path.basename(af).split(".", 1)[0]
+        if len(stem) != 64 or any(c not in "0123456789abcdef" for c in stem):
+            return ""
+        # And it must actually hash to its name (cheap re-verification; this is
+        # the integrity gate that replaces the commit-freeze for archive files).
+        with open(af, "rb") as fh:
+            actual = hashlib.sha256(fh.read()).hexdigest()
+        return actual if actual == stem else ""
+    except (OSError, ValueError):
+        return ""
+
+
 def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "") -> dict:
     """Validate a file:// URL is citable and capture its version state.
 
@@ -415,6 +461,18 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "") -
 
     if not file_in_git_repo:
         return {"ok": True, "error": None, "content_hash": "", "git_sha": ""}
+
+    # Deferred-commit relaxation (#1253): a content-addressed evidence-archive
+    # file is immutable by construction (its name IS the sha256 of its bytes),
+    # so it is safe to cite regardless of git commit state — the content can't
+    # change without the path changing. Accept it now at content_hash; its
+    # git_sha backfills at the next nap commit. Checked BEFORE the status/HEAD
+    # logic on purpose: an uncommitted archive file would otherwise be rejected
+    # by the cat-file HEAD check below. Scoped to the archive root, so every
+    # other file:// citation keeps the committed-before-cite guard unchanged.
+    ca_hash = _content_addressed_archive_hash(file_path)
+    if ca_hash:
+        return {"ok": True, "error": None, "content_hash": ca_hash, "git_sha": ""}
 
     repo_root_result = _file_git("rev-parse", "--show-toplevel")
     repo_root = repo_root_result.stdout.strip()

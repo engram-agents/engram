@@ -218,6 +218,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/engram-snapshot",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/collab-letter-monitor.sh",
       "tier": "convenience",
       "multi_agent": true
