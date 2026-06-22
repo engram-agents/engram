@@ -421,6 +421,115 @@ def test_file_evidence_per_observation_versioning():
     os.unlink(version_file)
 
 
+def test_quote_verified_https_false():
+    """https:// URL observations should have quote_verified: False and a warning."""
+    client = fresh_client()
+    r = client.call("engram_add_observation", {
+        "url": "https://example.com/paper",
+        "title": "Research Paper",
+        "quoted_text": "Memory is fundamental to cognition.",
+        "interpretation": "Core claim from paper.",
+        "claim": "Memory is fundamental to cognition",
+        "quote_type": "attributed_analysis",
+    })
+    assert r["status"] == "created", f"Unexpected: {r}"
+    assert r["quote_verified"] is False
+    assert "quote_provenance_warning" in r
+    assert "unverified" in r["quote_provenance_warning"]
+
+
+def test_quote_verified_file_true():
+    """file:// URL observations should have quote_verified: True and no warning."""
+    fd, tmpfile = tempfile.mkstemp(prefix="engram_test_qv_", suffix=".txt")
+    os.close(fd)
+    with open(tmpfile, "w") as f:
+        f.write("This is the verified quote text.\n")
+    try:
+        client = fresh_client()
+        r = client.call("engram_add_observation", {
+            "url": f"file://{tmpfile}",
+            "title": "Temp file",
+            "quoted_text": "This is the verified quote text.",
+            "interpretation": "Quote from local file.",
+            "claim": "Temp file contains verified quote",
+            "quote_type": "hard_data",
+        })
+        assert r["status"] == "created", f"Unexpected: {r}"
+        assert r["quote_verified"] is True
+        assert "quote_provenance_warning" not in r
+    finally:
+        os.unlink(tmpfile)
+
+
+def test_quote_verified_stored_in_metadata():
+    """quote_verified should be stored in node metadata."""
+    client = fresh_client()
+    r = client.call("engram_add_observation", {
+        "url": "https://example.com/article",
+        "title": "Web Article",
+        "quoted_text": "Some web claim.",
+        "interpretation": "From the web.",
+        "claim": "Quote verified stored in metadata",
+        "quote_type": "editorial",
+    })
+    assert r["status"] == "created"
+    insp = client.call("engram_inspect", {"node_id": r["observation_id"], "view": "deep"})
+    node = insp["node"]
+    meta = node.get("metadata", {})
+    if isinstance(meta, str):
+        meta = json.loads(meta)
+    assert "quote_verified" in meta
+    assert meta["quote_verified"] is False  # https:// → False
+
+
+def test_quote_verified_batch_propagates():
+    """Batch observations should carry quote_verified in each result dict."""
+    client = fresh_client()
+    obs = [
+        {
+            "quoted_text": "Batch claim one.",
+            "interpretation": "First.",
+            "claim": "Batch claim one verified",
+            "quote_type": "hard_data",
+        },
+        {
+            "quoted_text": "Batch claim two.",
+            "interpretation": "Second.",
+            "claim": "Batch claim two verified",
+            "quote_type": "editorial",
+        },
+    ]
+    r = client.call("engram_add_observation_batch", {
+        "url": "https://example.com/batch-source",
+        "title": "Batch Source",
+        "observations_json": json.dumps(obs),
+    })
+    assert r["status"] == "batch_complete"
+    assert r["created"] == 2
+    for result in r["results"]:
+        assert result["quote_verified"] is False
+        assert "quote_provenance_warning" in result
+
+
+def test_quote_verified_visible_in_recall_view():
+    """quote_verified should appear in engram_inspect recall view (not buried in metadata)."""
+    client = fresh_client()
+    r = client.call("engram_add_observation", {
+        "url": "https://example.com/recall-test",
+        "title": "Recall test article",
+        "quoted_text": "Claim for recall view test.",
+        "interpretation": "Testing recall view visibility.",
+        "claim": "Quote verified visible in recall view",
+        "quote_type": "editorial",
+    })
+    assert r["status"] == "created"
+    insp = client.call("engram_inspect", {"node_id": r["observation_id"], "view": "recall"})
+    node = insp["node"]
+    assert "quote_verified" in node, f"quote_verified missing from recall view; got keys: {list(node.keys())}"
+    assert node["quote_verified"] is False  # https:// → False
+    assert "metadata" not in node, "raw metadata should remain stripped from recall view"
+
+
 def _init_git_repo(git_dir):
     """Helper: create a fresh git repo with initial config."""
     import subprocess
@@ -595,6 +704,11 @@ if __name__ == "__main__":
         test_nonexistent_file_rejected,
         test_valid_file_url_accepted,
         test_https_url_accepted,
+        test_quote_verified_https_false,
+        test_quote_verified_file_true,
+        test_quote_verified_stored_in_metadata,
+        test_quote_verified_batch_propagates,
+        test_quote_verified_visible_in_recall_view,
         test_file_evidence_per_observation_versioning,
         test_git_enforcement_uncommitted_file_rejected,
         test_git_enforcement_modified_file_rejected,

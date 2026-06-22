@@ -828,6 +828,18 @@ def _build_inspect_recall_view(
     })
     node_recall = {k: v for k, v in node.items() if k not in _RECALL_OMIT}
 
+    # Promote quote_verified from metadata blob so provenance is visible at
+    # recall time without requiring view="deep". Only added for observation nodes
+    # that carry the field (set by #1204). See #1283.
+    _raw_meta = node.get("metadata")
+    if _raw_meta:
+        try:
+            _meta = json.loads(_raw_meta) if isinstance(_raw_meta, str) else _raw_meta
+            if "quote_verified" in _meta:
+                node_recall["quote_verified"] = _meta["quote_verified"]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     response: dict = {
         "node": node_recall,
         "view": "recall",

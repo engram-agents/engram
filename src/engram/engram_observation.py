@@ -965,7 +965,14 @@ def _add_observation_impl(
 
         node_id = core._next_id(conn, node_type)
         now = core._now()
-        obs_metadata = {"source_class": source_class}
+        # quote_verified: True when quoted_text was confirmed an exact substring of
+        # the file:// source; False for https://, http://, empty source_url
+        # (evidence_id-only path), or any other non-file:// scheme (no fetch occurs
+        # at creation time). Marks provenance quality on the node itself so
+        # inspect + recall surfaces distinguish verified from unverified quotes.
+        # See #1204.
+        quote_verified = ev_url.startswith("file://")
+        obs_metadata = {"source_class": source_class, "quote_verified": quote_verified}
         if captured_git_sha:
             obs_metadata["git_sha"] = captured_git_sha
         if captured_content_hash:
@@ -1017,7 +1024,15 @@ def _add_observation_impl(
             "type": node_type,
             "confidence": confidence,
             "source_class": source_class,
+            "quote_verified": quote_verified,
         }
+        if not quote_verified:
+            result["quote_provenance_warning"] = (
+                "Web-sourced quoted_text is unverified at encoding — no page fetch "
+                "occurs at observation creation time. The quote may not appear verbatim "
+                "at the cited URL (paraphrase, page-change, paywall). For high-stakes "
+                "citations, verify manually. See #1204."
+            )
 
         # Handle prediction decomposition
         prediction_id = None
