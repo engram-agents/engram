@@ -74,6 +74,33 @@ PROJECT_DIR = _resolve_runtime_dir(ENGRAM_HOME)
 os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
 
 
+def _check_db_liveness(db_path: str) -> tuple[bool, str]:
+    """Lightweight SQLite probe. Returns (True, 'ok') or (False, reason).
+
+    Opens the DB read-only (mode=ro URI) to avoid touching WAL or journal.
+    Catches SQLite I/O errors and DatabaseError (corrupt WAL, not-a-database).
+    Fail-open on unexpected exceptions so probe bugs never break the hook.
+    See #1218 (surface serves stale daemon cache under complete DB failure).
+    """
+    if not os.path.exists(db_path):
+        return False, "knowledge.db not found"
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        conn.execute("PRAGMA user_version")
+        return True, "ok"
+    except sqlite3.DatabaseError as e:
+        return False, str(e)
+    except Exception:
+        return True, "ok"  # fail-open: probe infrastructure bug ≠ DB failure
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
     """Check whether the MCP server wrote its initialization-complete marker.
 
@@ -1072,6 +1099,18 @@ def main():
             f"⚠️  ENGRAM substrate health:\n"
             f"  MCP write-tool liveness: UNCONFIRMED ({write_reason})\n"
             f"  → ENGRAM write calls will fail silently. Recovery: restart the MCP server."
+        )
+
+    # DB liveness check — detects when the surface daemon serves stale
+    # in-memory cache nodes while the SQLite file itself is inaccessible
+    # (WAL failure, disk I/O error, corruption). See #1218 / #786.
+    db_ok, db_reason = _check_db_liveness(KNOWLEDGE_DB_PATH)
+    if not db_ok:
+        parts.append(
+            f"⚠️  ENGRAM substrate health:\n"
+            f"  DB liveness: FAILED ({db_reason})\n"
+            f"  → MCP tool calls will fail. Surface nodes above may be stale pre-failure cache.\n"
+            f"  Recovery: check disk health / WAL integrity, then restart the MCP server."
         )
 
     # Attached-pack surfacing — queried AFTER own-graph result, guarded
