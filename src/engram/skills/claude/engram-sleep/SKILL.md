@@ -358,7 +358,7 @@ If validate exits 0 (no failures), `final_payload.json` is written automatically
 If validate exits 1 (failures present), run the mechanical retry loop. The loop alternates between shell steps and a Claude dispatch step:
 
 ```bash
-MAX_RETRIES=2  # configurable; 2 is the default
+MAX_RETRIES=1  # single fairy retry; awake agent handles any remaining failures
 ATTEMPT=0
 ```
 
@@ -403,6 +403,23 @@ Go back to shell step 1.
 # After loop: final_payload.json is ready (best-effort); unfixable.json holds structurally unrecoverable items.
 ```
 
+**After retry loop — awake agent handles any remaining failures (max 1 attempt):**
+
+If `retry_payload.json` still exists after the loop (failures survive the single fairy retry), the awake Opus agent writes recall summaries for the remaining items directly:
+
+1. Read `$COHORT_DIR/retry_payload.json` — this is the `{"items": [...]}` list of still-failing nodes (same schema as the batch-summary fairy's input).
+2. For each item in `retry_payload.json`: write a recall_summary (≤120 chars, hard cap 200) and recall_keywords list following the batch-summary spec. Prefer concision over completeness — these are the hard nodes the fairy couldn't compress; compress them yourself.
+3. Write your output to `$COHORT_DIR/agent_residual_output.json` as `{"items": [{node_id, recall_summary, recall_keywords}, ...]}`.
+4. Run incorporate:
+   ```bash
+   python3 -m tools.cohort_dispatch incorporate \
+     --retry-output "$COHORT_DIR/agent_residual_output.json" \
+     --out "$COHORT_DIR"
+   ```
+   This folds your summaries into `final_payload.json`. Any item that still fails validation (malformed output) goes into `unfixable.json` — don't retry further.
+
+After this step, `final_payload.json` is complete for this cycle. The awake agent then applies the summaries (Step 7.5 below) before spawning the dream master.
+
 **Cumulative-clean / bad-pool-only invariant (the loop's correctness contract — #1215):**
 Each retry round operates on **only the previous round's failures**, and the clean set is **cumulative and monotonic** — once a node validates clean it is never re-dispatched or re-validated, and `len(clean)` only ever goes up. The tool enforces this for you: `cmd_validate` writes the **round-0 baseline** (`clean_items.json` + `failures.json`); `incorporate` then **owns the per-round accumulation** — it rewrites `clean_items.json` to the grown clean set and `failures.json` to the shrunken pool of items still failing, so the next round's retry fairy is dispatched on `retry_payload.json` (= exactly that round's bad-only pool). **Do not hand-reset, merge, or re-incorporate a stale `clean_items.json` / `failures.json` between rounds** — that re-introduces the round-0-snapshot regression (round N silently dropping rounds 1…N-1's fixes; clean count going backwards). Just loop `incorporate` and trust the files it persists.
 
@@ -419,6 +436,32 @@ This is the **wait-then-spawn pattern** using filesystem-as-channel. Claude Code
 
 **Validation failures are retried by re-dispatching a fairy, NOT by mechanical script fixes.** Quality of recall_summary / recall_keywords is critical because they surface in recall_surface and many node-rendering tools. The retry sub-agent receives the same guidance plus a "previous attempt failed" block with verbatim validator errors. This is the load-bearing design decision (maintainer design); `cohort_dispatch.py` does not modify LLM output.
 
+### Step 7.5 — Apply the batch-summary payload directly (before spawning the dream master)
+
+**Skip this step if the recall-summary substrate is not deployed.** If batch-summary fairies were skipped in Step 5 (no `recall_summary` column or no `engram_set_recall_summaries` tool), `final_payload.json` will not exist — do not attempt to apply it; proceed directly to Step 8.
+
+```bash
+# Guard: substrate check (parallel to Step 5's substrate-absent skip)
+if [ ! -f "$COHORT_DIR/final_payload.json" ]; then
+    # Substrate not deployed or batch-summary step skipped — proceed to Step 8.
+fi
+```
+
+When `final_payload.json` exists, the parent applies recall summaries now — before spawning the dream master — so:
+- The summaries are persisted even if the dream master times out
+- The dream master's spawn prompt is leaner (no payload inline)
+- The dream master focuses purely on consolidation (reflect → buckets → resolve/supersede/retract/derive → turn-advance → dream record)
+
+Read `$COHORT_DIR/final_payload.json` and apply via the MCP tool:
+
+```python
+engram_set_recall_summaries(payload_json=open(f"{COHORT_DIR}/final_payload.json").read())
+```
+
+(This is a Claude tool call, not a shell command. The payload is the `{"summaries": [...], "failures": [...]}` JSON produced by `cohort_dispatch.py validate` / `incorporate`.)
+
+Log the result: X summaries applied, Y failures deferred to next cycle.
+
 ### Step 8 — Spawn the dream master with the full report bundle
 
 Once all fairy reports are collected (or marked timed-out) and the final payload is ready, spawn the master with everything in its initial prompt:
@@ -434,19 +477,15 @@ Agent(
     - ... (categories 3-7 similar) ...
     [Or "Category N (<NAME>) TIMED OUT — proceeding without" for any fairy that didn't return]
 
-    BATCH-SUMMARY FINAL PAYLOAD (apply via engram_set_recall_summaries):
-    ```json
-    <contents of $COHORT_DIR/final_payload.json inline>
-    ```
-
     COHORT METADATA:
     - Today's new nodes since prev sleep <PREV_SLEEP_TIMESTAMP>: <K> IDs
     - Backfill from legacy NULL-summary: <L> IDs
     - Total: <K+L> ≤ 50, split across <N> chunks of ≤15 each
     - Batch-summary cohort dir: <COHORT_DIR>
+    - Recall summaries already applied by parent in Step 7.5: X applied, Y failures deferred to next cycle
     - SSoT modules live at: <engram-alpha-repo-path>/tools/ (recall_summary_validator, recall_summary_payload)
 
-    Call engram_reflect first for your initial agenda. Read all 7 dream-fairy reports from disk. Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items. Apply the summary-fairy batch payload via engram_set_recall_summaries. Execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
+    Call engram_reflect first for your initial agenda. Read all 7 dream-fairy reports from disk. Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items. Execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
 
     FINAL RETURN: dream record path + top-line counts (resolved / superseded / promoted / refuted / recall-summaries applied) + health score delta + flagged-for-user count. The parent relays this to the user verbatim.""",
     run_in_background=true
