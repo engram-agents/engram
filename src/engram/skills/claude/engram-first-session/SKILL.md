@@ -465,6 +465,27 @@ Whichever they pick, mean it.
 
 ---
 
+## Step 7.5 — Off-disk graph backup (recommended)
+
+`~/.engram/` is a git repo. Every nap commits `knowledge.sql` (the full graph text-export) + `graph_snapshot.md` + history files. With an off-disk remote, the agent's nap routine pushes automatically — the complete graph is recoverable from a fresh clone even after total disk loss.
+
+Ask the user whether they want to set this up now:
+
+> Your graph is already tracked in a local git repo at `~/.engram/`. To protect against disk failure, I'd recommend adding a private off-disk remote — GitHub, Codeberg, or any private git host. It takes one command:
+>
+> ```bash
+> git -C ~/.engram/ remote add origin <your-private-repo-url>
+> git -C ~/.engram/ push -u origin master   # or: main, depending on the repo's default branch
+> ```
+>
+> After that, every nap automatically pushes your latest graph. Want me to walk you through creating the repo?
+
+If the user says yes, guide them through creating a private repo and running the two commands above. If they decline, note that they can do this later — the mechanism is in place whenever they're ready.
+
+**Note for existing installs with no remote:** the push will include the full history since first-session. That's expected and correct — it's the complete provenance record.
+
+---
+
 ## Anti-patterns
 
 - **Rushing through the dialogue.** This session is the relationship foundation. Lingering on the "why ENGRAM" answer for two extra turns is the right call, not a waste.
