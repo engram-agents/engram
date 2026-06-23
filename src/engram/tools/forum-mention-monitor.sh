@@ -65,6 +65,14 @@ EOF
     esac
 done
 
+# Validate purpose key: only [a-zA-Z0-9_-] safe in pgrep -f regex (#1307).
+case "$PURPOSE" in
+    *[!a-zA-Z0-9_-]*)
+        echo "forum-mention-monitor: --purpose key must contain only [a-zA-Z0-9_-]; got: '$PURPOSE'" >&2
+        exit 1
+        ;;
+esac
+
 # ---------------------------------------------------------------------------
 # resolve identity + forum URL
 # ---------------------------------------------------------------------------
