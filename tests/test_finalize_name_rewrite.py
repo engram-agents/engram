@@ -751,3 +751,94 @@ class TestGenericity:
         text = (home / "settings.json").read_text()
         assert OLD_TAG not in text
         assert NEW_NAME in text
+
+
+# ---------------------------------------------------------------------------
+# Step 7 viz-ACL counter regression tests
+# ---------------------------------------------------------------------------
+
+def _step7_acl_loop(tmp_path: Path, dirs: list, setfacl_exits: dict | None = None) -> subprocess.CompletedProcess:
+    """Run the Step 7 ACL-counter loop in a bash subshell.
+
+    Creates dirs under tmp_path, installs a mock setfacl that returns the
+    exit code in setfacl_exits (keyed by dir basename, default 0), then runs
+    the loop and returns the result.
+    """
+    if setfacl_exits is None:
+        setfacl_exits = {}
+
+    # Create dirs
+    for d in dirs:
+        (tmp_path / d).mkdir(exist_ok=True)
+
+    # Write a mock setfacl that reads its exit code from a per-dir file.
+    # The -R flag doesn't change the basename, so we key on the last path arg.
+    mock_setfacl = tmp_path / "setfacl"
+    mock_setfacl.write_text(
+        "#!/bin/bash\n"
+        "# Last arg is the target path; look up exit code by basename.\n"
+        "target=\"${@: -1}\"\n"
+        "base=$(basename \"$target\")\n"
+        f"declare -A exits=({' '.join(f'[{k}]={v}' for k, v in setfacl_exits.items())})\n"
+        "exit \"${exits[$base]:-0}\"\n"
+    )
+    mock_setfacl.chmod(0o755)
+
+    script = f"""
+_step7_test() {{
+    local chosen_home="{tmp_path}"
+    local VIZ_OPERATOR="testuser"
+    local _viz_ok=0 _viz_skipped=0 _viz_cfg_ok=0
+    for _engram_dir in "$chosen_home"/.engram "$chosen_home"/.engram-*; do
+        [[ -d "$_engram_dir" ]] || {{ (( _viz_skipped++ )) || true; continue; }}
+        local _setfacl_err
+        _setfacl_err=$(setfacl -R -m "u:${{VIZ_OPERATOR}}:rX" "$_engram_dir" 2>&1) \\
+            && setfacl -R -d -m "u:${{VIZ_OPERATOR}}:rX" "$_engram_dir" 2>/dev/null \\
+            && (( ++_viz_ok )) \\
+            || {{ echo "  WARN: setfacl rX failed on $_engram_dir: $_setfacl_err" >&2; continue; }}
+    done
+    echo "_viz_ok=$_viz_ok _viz_skipped=$_viz_skipped"
+}}
+export PATH="{tmp_path}:$PATH"
+_step7_test
+"""
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+
+class TestStep7VizAclCounter:
+    """Regression tests for the Step 7 ACL counter (Borges blocker, PR #1351).
+
+    Bug: (( _viz_ok++ )) post-increment evaluates to 0 (false) when _viz_ok=0,
+    so the || WARN branch fires on the FIRST dir even when setfacl succeeded.
+    Fix: (( ++_viz_ok )) pre-increment evaluates to 1 (true) on first success.
+    """
+
+    def test_single_engram_dir_no_spurious_warn(self, tmp_path):
+        """A single ~/.engram dir with a succeeding setfacl produces no WARN."""
+        result = _step7_acl_loop(tmp_path, [".engram"])
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        assert "WARN" not in result.stderr, f"Spurious WARN on first dir: {result.stderr}"
+        assert "_viz_ok=1" in result.stdout, f"Counter not incremented: {result.stdout}"
+
+    def test_two_engram_dirs_both_counted(self, tmp_path):
+        """Two engram dirs (.engram + .engram-gemini) both counted, no WARN."""
+        result = _step7_acl_loop(tmp_path, [".engram", ".engram-gemini"])
+        assert result.returncode == 0
+        assert "WARN" not in result.stderr, f"Spurious WARN: {result.stderr}"
+        assert "_viz_ok=2" in result.stdout, f"Expected 2 successes: {result.stdout}"
+
+    def test_no_engram_dirs_all_skipped(self, tmp_path):
+        """With no engram dirs, _viz_ok=0 and _viz_skipped>0, no WARN."""
+        result = _step7_acl_loop(tmp_path, [])
+        assert result.returncode == 0
+        assert "WARN" not in result.stderr
+        assert "_viz_ok=0" in result.stdout
+        assert "_viz_skipped=" in result.stdout
+
+    def test_setfacl_failure_emits_warn(self, tmp_path):
+        """When setfacl fails, WARN IS emitted (distinguishes real failure from false alarm)."""
+        result = _step7_acl_loop(
+            tmp_path, [".engram"], setfacl_exits={".engram": 1}
+        )
+        assert "WARN" in result.stderr, f"Expected WARN on setfacl failure: {result.stderr}"
+        assert "_viz_ok=0" in result.stdout
