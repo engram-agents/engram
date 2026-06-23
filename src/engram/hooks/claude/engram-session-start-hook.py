@@ -40,9 +40,11 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -347,6 +349,76 @@ def format_calibration_block(conf_all: dict, conf_7d: dict, current_turn: int) -
 INTER_AGENT_DIR = os.environ.get("INTER_AGENT_DIR", "/home/agents-shared/inter-agent")
 STARRED_CAP = 10
 STARRED_STALE_DAYS = 7  # soft TTL for staleness nudge (nudge only, never auto-drop)
+
+# Agent registration directory (parallel to inter-agent/ and projects/)
+AGENTS_SHARED_ROOT = os.environ.get("AGENTS_SHARED_DIR", "/home/agents-shared")
+AGENT_REGISTRY_DIR = os.path.join(AGENTS_SHARED_ROOT, "agents")
+# Asymmetry note: this hook exposes only AGENTS_SHARED_DIR as a test override
+# (deriving the registry subdir from it).  ia.py additionally accepts
+# AGENT_REGISTRY_DIR as a direct override for the registry path.  A test that
+# sets AGENT_REGISTRY_DIR without also setting AGENTS_SHARED_DIR (or vice
+# versa) will see different paths in the hook vs. ia.py.  The hook's path is
+# write-side (registration); ia.py's path is read-side (scan_peers).  Keeping
+# them in sync in tests requires overriding AGENTS_SHARED_DIR, not just
+# AGENT_REGISTRY_DIR (or passing --registry-dir directly to ia peers).
+
+
+def write_agent_registration(
+    agent_name: str,
+    registry_dir: str = AGENT_REGISTRY_DIR,
+) -> None:
+    """Write/refresh the agent's registration file in the shared registry.
+
+    Writes atomically via temp-file + os.replace so concurrent agents never
+    read a partial JSON. Creates the registry dir (group-writable, setgid) if
+    it does not exist. Fails silently if the shared filesystem is absent or
+    unwritable — this is a multi-agent-only convenience, not a blocker.
+
+    File path: <registry_dir>/<agent_name>.json
+    Content   : {"agent_name": ..., "hostname": ..., "pid": ..., "registered_at": <ISO UTC>}
+
+    Args:
+        agent_name   : The agent's own name (from config.json or env).
+        registry_dir : Override for the default /home/agents-shared/agents/.
+                       (Exposed for testing.)
+    """
+    if not agent_name:
+        return
+
+    # Gate: the shared-fs root must exist and be a directory. If absent (single-
+    # host install with no shared fs), skip silently — never break SessionStart.
+    shared_root = os.path.dirname(registry_dir)
+    if not os.path.isdir(shared_root):
+        return
+
+    try:
+        # Create the registry dir with group-writable, setgid permissions so
+        # co-tenant agents can each write their own file.
+        os.makedirs(registry_dir, mode=0o2775, exist_ok=True)
+
+        record = {
+            "agent_name": agent_name,
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+            "registered_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        dest = os.path.join(registry_dir, f"{agent_name}.json")
+
+        # Atomic write: temp file in same dir + os.replace (same-fs, no TOCTOU).
+        fd, tmp_path = tempfile.mkstemp(dir=registry_dir, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(record, f)
+            os.replace(tmp_path, dest)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception:
+        # Fail-soft: never raise from a multi-agent convenience side-effect.
+        pass
 
 
 def starred_block(engram_home: str) -> str:
@@ -912,6 +984,21 @@ def main() -> None:
 
     marker = write_marker(hook_input)
     write_baseline(use_compact_boundary=True)
+
+    # ── Agent registration (multi-agent only) ─────────────────────────────────
+    # Write/refresh the agent's registration file in the shared registry so
+    # peers can discover co-host vs cross-host topology. Fail-soft: the shared
+    # filesystem may not exist (single-host install), and write_agent_registration
+    # is wrapped in a broad try/except that swallows all errors silently.
+    try:
+        _config_path = os.path.join(ENGRAM_HOME, "config.json")
+        with open(_config_path) as _cf:
+            _cfg = json.load(_cf)
+        _agent_name = _cfg.get("agent_name", "").strip()
+        if _agent_name:
+            write_agent_registration(_agent_name)
+    except Exception:
+        pass  # fail-soft: never break SessionStart for registration
 
     if os.path.exists(CURRENT_USER_PATH):
         try:
