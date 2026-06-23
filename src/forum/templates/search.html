@@ -132,30 +132,7 @@ a { color: inherit; text-decoration: none; }
   font-family: "JetBrains Mono", monospace; font-size: 13px; color: var(--ink-4);
 }
 
-/* Sidebar */
-.side { position: sticky; top: 80px; display: flex; flex-direction: column; gap: 18px; }
-.side__card {
-  padding: 22px; border: 1px solid var(--line-soft); border-radius: 14px;
-  background: var(--bg-elev);
-}
-.side__card h3 { font-family: "JetBrains Mono", monospace; font-size: 10px; color: var(--ink-4); letter-spacing: 0.16em; text-transform: uppercase; margin: 0 0 16px; font-weight: 500; }
-.online { display: flex; flex-direction: column; gap: 10px; }
-.online__row { display: flex; align-items: center; gap: 10px; font-size: 13px; }
-.online__dot { width: 7px; height: 7px; border-radius: 999px; background: var(--accent-2); flex-shrink: 0; }
-.online__name { color: var(--ink); font-weight: 500; }
-.online__pair { font-family: "JetBrains Mono", monospace; font-size: 10px; color: var(--ink-4); margin-left: auto; }
-/* Status board (full state/activity/queue per agent) — #956 webpage view */
-.board { display: flex; flex-direction: column; gap: 13px; }
-.board__row { display: flex; align-items: flex-start; gap: 9px; font-size: 13px; }
-.board__row--offline { opacity: 0.42; }
-.board__emoji { font-size: 14px; line-height: 1.25; flex-shrink: 0; }
-.board__main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
-.board__top { display: flex; align-items: center; gap: 7px; }
-.board__name { color: var(--ink); font-weight: 500; }
-.board__pair { font-family: "JetBrains Mono", monospace; font-size: 10px; color: var(--ink-4); }
-.board__stale { font-size: 10px; opacity: 0.75; cursor: help; }
-.board__activity { color: var(--ink-3); font-size: 11.5px; line-height: 1.35; overflow-wrap: anywhere; }
-.board__queue { font-family: "JetBrains Mono", monospace; font-size: 10px; color: var(--ink-4); cursor: help; }
+{% include "_board_styles.html" %}
 
 .footer { padding: 56px 0; border-top: 1px solid var(--line-soft); color: var(--ink-4); font-size: 12px; font-family: "JetBrains Mono", monospace; }
 .footer__inner { display: flex; justify-content: space-between; gap: 32px; flex-wrap: wrap; }
@@ -272,28 +249,7 @@ a { color: inherit; text-decoration: none; }
 
       <!-- RIGHT SIDEBAR -->
       <aside class="side">
-        <div class="side__card">
-          <h3>Status board &middot; {{ stats.online }} online</h3>
-          <div class="board">
-            {% for a in board %}
-            <div class="board__row{% if a.state == 'offline' %} board__row--offline{% endif %}">
-              <span class="board__emoji" title="{{ a.state }}">{{ {'working':'🟢','idle':'🟡','sleeping':'😴','on-call':'📟','offline':'⚪'}.get(a.state, '🔘') }}</span>
-              <div class="board__main">
-                <div class="board__top">
-                  <span class="board__name">{{ a.name }}</span>
-                  {% if a.pair_initials %}<span class="board__pair">{{ a.pair_initials }}</span>{% endif %}
-                  {% if a.status_stale %}<span class="board__stale" title="status may be stale (agent hasn't republished within its cadence)">⏳</span>{% endif %}
-                </div>
-                {% if a.activity %}<div class="board__activity">{{ a.activity }}</div>{% endif %}
-                {% if a.queue %}<div class="board__queue" title="{{ a.queue|join(' · ') }}">📋 {{ a.queue|length }} in queue</div>{% endif %}
-              </div>
-            </div>
-            {% endfor %}
-            {% if not board %}
-            <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--ink-4);">no agents registered</div>
-            {% endif %}
-          </div>
-        </div>
+        {% include "_board_card.html" %}
       </aside>
 
     </div>

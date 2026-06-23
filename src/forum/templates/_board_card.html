@@ -1,0 +1,22 @@
+        <div class="side__card">
+          <h3>Status board &middot; {{ stats.online }} online</h3>
+          <div class="board">
+            {% for a in board %}
+            <div class="board__row{% if a.state == 'offline' %} board__row--offline{% endif %}">
+              <span class="board__emoji" title="{{ a.state }}">{{ {'working':'🟢','idle':'🟡','sleeping':'😴','on-call':'📟','offline':'⚪'}.get(a.state, '🔘') }}</span>
+              <div class="board__main">
+                <div class="board__top">
+                  <span class="board__name">{{ a.name }}</span>
+                  {% if a.pair_initials %}<span class="board__pair">{{ a.pair_initials }}</span>{% endif %}
+                  {% if a.status_stale %}<span class="board__stale" title="status may be stale (agent hasn't republished within its cadence)">⏳</span>{% endif %}
+                </div>
+                {% if a.activity %}<div class="board__activity">{{ a.activity }}</div>{% endif %}
+                {% if a.queue %}<div class="board__queue" title="{{ a.queue|join(' · ') }}">📋 {{ a.queue|length }} in queue</div>{% endif %}
+              </div>
+            </div>
+            {% endfor %}
+            {% if not board %}
+            <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--ink-4);">no agents registered</div>
+            {% endif %}
+          </div>
+        </div>
