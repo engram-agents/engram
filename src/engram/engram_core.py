@@ -1442,6 +1442,13 @@ def _get_db() -> sqlite3.Connection:
         # premises: N same-lineage agents provide ~one witness of independent
         # corroboration on substrate-prior bias, for any N.
         ("standpoint_lineage", "TEXT"),
+        # standpoint_architecture: cognitive architecture of the source's producer.
+        # Enum: transformer | vision-spatial | embodied-sensorimotor |
+        #       graph-neural | human | other.
+        # Tracks architectural (not just training) diversity — Class A calibration
+        # exposure: patterns orthogonal to transformer inductive bias are
+        # undetectable by all-transformer-family premise sets.
+        ("standpoint_architecture", "TEXT"),
         # fs_class: falsification-sensitivity native field (Phase 2).
         # NULL = Phase-1 proxy applies; "re-executable" | "frozen" = native.
         # No migration of existing rows — Phase-1 proxy covers all NULL cases.
@@ -3993,7 +4000,7 @@ def _standpoint_cluster_key(
     """Return per-axis cluster keys for a node's standpoint fields.
 
     Returns {"author": sha256(author)[:12] | None, "collection": sha256(collection)[:12] | None,
-    "lineage": sha256(lineage)[:12] | None}.
+    "lineage": sha256(lineage)[:12] | None, "architecture": sha256(architecture)[:12] | None}.
     Returns None if no standpoint field is set (can't distinguish from 'no data').
 
     Note: standpoint_override_tag is annotation-only — it is NOT included in
@@ -4001,9 +4008,14 @@ def _standpoint_cluster_key(
     an override_tag set returns None here (treated as no standpoint data).
     standpoint_override_tag will serve as the entry point for platform/env/locale
     data until v3 makes those axes first-class.
+
+    standpoint_architecture is an optional enum field tracking cognitive
+    architecture diversity (transformer, human, etc.). No null=self fallback —
+    an unset architecture is truly unknown, not synthesized.
     """
     row = conn.execute(
-        "SELECT standpoint_author_id, standpoint_collection_id, standpoint_lineage "
+        "SELECT standpoint_author_id, standpoint_collection_id, standpoint_lineage, "
+        "standpoint_architecture "
         "FROM nodes WHERE id = ?",
         (node_id,),
     ).fetchone()
@@ -4012,21 +4024,23 @@ def _standpoint_cluster_key(
     author = (row["standpoint_author_id"] or "").strip()
     collection = (row["standpoint_collection_id"] or "").strip()
     lineage = (row["standpoint_lineage"] or "").strip()
+    architecture = (row["standpoint_architecture"] or "").strip()
     # null=self at the lineage axis (D1 §2 — Borges #721): an unmarked
     # observation is the filer's OWN training lineage by convention. Fall back
     # to config self_lineage so own-unmarked premises make the gate fire.
-    # Lineage axis ONLY — do NOT synthesize author/collection (the agent
-    # asserted neither). DB column stays NULL (read-time synthesis), so
-    # _graph_lineage_count still counts only explicitly-marked lineages
+    # Lineage axis ONLY — do NOT synthesize author/collection/architecture (the
+    # agent asserted none of those). DB column stays NULL (read-time synthesis),
+    # so _graph_lineage_count still counts only explicitly-marked lineages
     # (Luria's #723 sign-off: actionability gate unaffected).
     if not lineage:
         lineage = _self_lineage()
-    if not author and not collection and not lineage:
+    if not author and not collection and not lineage and not architecture:
         return None
     return {
         "author": hashlib.sha256(author.encode()).hexdigest()[:12] if author else None,
         "collection": hashlib.sha256(collection.encode()).hexdigest()[:12] if collection else None,
         "lineage": hashlib.sha256(lineage.encode()).hexdigest()[:12] if lineage else None,
+        "architecture": hashlib.sha256(architecture.encode()).hexdigest()[:12] if architecture else None,
     }
 
 
@@ -4324,6 +4338,40 @@ def _validate_reasoning_structure(
                                 f"hypothesis-author lineage '{self_lin}') = "
                                 f"{len(independent)} — consider inductive_analogy"
                             )
+
+                # Architecture axis: collect raw enum values directly from DB
+                # so we can render the actual architecture name in warnings.
+                # Separate from axis_keys (which holds hashes) — raw values
+                # are needed to name the specific family in the Class A warning.
+                # No null=self — an unset architecture is genuinely unknown.
+                # All-or-omit: collect every leaf's value (None if unset), then
+                # emit only when every leaf has data (mirrors _axis_label guard).
+                arch_raw_list = []
+                for lid in obs_leaves:
+                    arch_row = conn.execute(
+                        "SELECT standpoint_architecture FROM nodes WHERE id = ?",
+                        (lid,),
+                    ).fetchone()
+                    val = (
+                        arch_row["standpoint_architecture"].strip().lower()
+                        if (arch_row and arch_row["standpoint_architecture"])
+                        else None
+                    )
+                    arch_raw_list.append(val)
+                if arch_raw_list and None not in arch_raw_list:
+                    arch_set = set(arch_raw_list)
+                    if len(arch_set) > 1:
+                        parts.append(
+                            f"architecture: {len(arch_set)} families (diverse)"
+                        )
+                    else:
+                        arch_name = next(iter(arch_set))
+                        parts.append(
+                            f"architecture: 1 family"
+                            f" (⚠ single-family (all {arch_name})"
+                            f" — Class A exposure elevated)"
+                        )
+                # Partial coverage or no data: emit nothing (all-or-omit).
 
                 # parts may be empty if all axes have partial coverage across
                 # premises — the guard is load-bearing in the mixed-axis case.

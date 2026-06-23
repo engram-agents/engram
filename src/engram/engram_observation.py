@@ -858,6 +858,7 @@ def _add_observation_impl(
     standpoint_collection_id: str = "",
     standpoint_override_tag: str = "",
     standpoint_lineage: str = "",
+    standpoint_architecture: str = "",
     fs_class=None,
 ) -> str:
     """Internal implementation — see engram_add_observation MCP tool for the
@@ -917,6 +918,23 @@ def _add_observation_impl(
                 "error": (
                     f"standpoint_lineage must match provider:family "
                     f'(e.g. "anthropic:opus"); got "{standpoint_lineage}"'
+                )
+            }
+        )
+
+    # standpoint_architecture enum gate: reject unknown values up-front so the
+    # DB only ever holds the declared enum members. Redirecting error names the
+    # accepted set so the caller knows what to fix.
+    _ARCH_ENUM = {
+        "transformer", "vision-spatial", "embodied-sensorimotor",
+        "graph-neural", "human", "other",
+    }
+    if standpoint_architecture and standpoint_architecture not in _ARCH_ENUM:
+        return json.dumps(
+            {
+                "error": (
+                    f"standpoint_architecture must be one of "
+                    f"{sorted(_ARCH_ENUM)}; got \"{standpoint_architecture}\""
                 )
             }
         )
@@ -1021,8 +1039,8 @@ def _add_observation_impl(
             """INSERT INTO nodes (id, type, claim, created_at, evidence_id, quoted_text,
                interpretation, quote_type, confidence, confidence_history, metadata,
                standpoint_author_id, standpoint_collection_id, standpoint_override_tag,
-               standpoint_lineage, fs_class)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               standpoint_lineage, standpoint_architecture, fs_class)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 node_id,
                 node_type,
@@ -1039,6 +1057,7 @@ def _add_observation_impl(
                 standpoint_collection_id or None,
                 standpoint_override_tag or None,
                 standpoint_lineage or None,
+                standpoint_architecture or None,
                 fs_class if fs_class in ("re-executable", "frozen") else None,
             ),
         )
@@ -1302,6 +1321,7 @@ def _add_observation_batch_impl(
             - standpoint_collection_id (optional): Corpus or work identity for this observation's source ("vantage" axis).
             - standpoint_override_tag (optional): Free-form standpoint label when the cluster key is insufficient.
             - standpoint_lineage (optional): Training lineage "provider:family" (e.g. "anthropic:opus") for the source claim's producer.
+            - standpoint_architecture (optional): Cognitive architecture of the source's producer. Enum: transformer | vision-spatial | embodied-sensorimotor | graph-neural | human | other. Tracks architectural (not just training) diversity — Class A calibration exposure.
         url: URL of the source document. The evidence node is auto-created or reused.
         title: Title of the source document (required if url is provided).
         domain: Source domain (auto-extracted from URL if omitted).
@@ -1368,6 +1388,7 @@ def _add_observation_batch_impl(
             standpoint_collection_id=obs.get("standpoint_collection_id", ""),
             standpoint_override_tag=obs.get("standpoint_override_tag", ""),
             standpoint_lineage=obs.get("standpoint_lineage", ""),
+            standpoint_architecture=obs.get("standpoint_architecture", ""),
             fs_class=obs.get("fs_class"),
         ))
         r["index"] = i

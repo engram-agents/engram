@@ -509,6 +509,209 @@ def test_mixed_axis_collection_omitted_when_partial():
 
 
 # ---------------------------------------------------------------------------
+# Test 10: standpoint_architecture stored and retrievable from DB
+# ---------------------------------------------------------------------------
+
+def test_standpoint_architecture_stored():
+    """standpoint_architecture is stored in the DB and retrievable."""
+    client = fresh_client()
+    r = client.call("engram_add_observation", {
+        "url": "https://example.com/arch-test",
+        "title": "Architecture test",
+        "quoted_text": "The model produced output A.",
+        "interpretation": "Transformer model output.",
+        "claim": "The model produced output A",
+        "quote_type": "hard_data",
+        "standpoint_architecture": "transformer",
+    })
+    assert r.get("status") == "created", f"Expected created, got: {r}"
+    node_id = r["observation_id"]
+
+    import server as _server
+    conn = sqlite3.connect(str(_server.core.DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT standpoint_architecture FROM nodes WHERE id = ?",
+            (node_id,),
+        ).fetchone()
+        assert row is not None, "Node not found in DB"
+        assert row["standpoint_architecture"] == "transformer", (
+            f"Expected 'transformer', got: {row['standpoint_architecture']}"
+        )
+    finally:
+        conn.close()
+    print("  PASS: standpoint_architecture stored in DB")
+
+
+# ---------------------------------------------------------------------------
+# Test 11: standpoint_architecture enum validation
+# ---------------------------------------------------------------------------
+
+def test_standpoint_architecture_enum_validation():
+    """Filing with an invalid standpoint_architecture returns a validation error."""
+    client = fresh_client()
+    r = client.call("engram_add_observation", {
+        "url": "https://example.com/arch-invalid",
+        "title": "Invalid arch test",
+        "quoted_text": "Some claim here.",
+        "interpretation": "Some interpretation.",
+        "claim": "Some claim",
+        "quote_type": "hard_data",
+        "standpoint_architecture": "invalid-architecture-name",
+    })
+    assert r.get("error") is not None, f"Expected error, got: {r}"
+    assert "standpoint_architecture" in r["error"], (
+        f"Error should mention standpoint_architecture: {r['error']}"
+    )
+    assert "invalid-architecture-name" in r["error"], (
+        f"Error should mention the bad value: {r['error']}"
+    )
+    print(f"  PASS: Invalid architecture → validation error: {r['error'][:80]}")
+
+
+# ---------------------------------------------------------------------------
+# Test 12: standpoint_architecture uniform → Class A exposure warning
+# ---------------------------------------------------------------------------
+
+def test_standpoint_architecture_uniform_warning():
+    """Derivation with all premises tagged same architecture → Class A exposure warning."""
+    client = fresh_client()
+
+    r1 = client.call("engram_add_observation", {
+        "url": "https://example.com/arch-uniform-1",
+        "title": "Arch uniform source 1",
+        "quoted_text": "Claim alpha from transformer model.",
+        "interpretation": "Output from transformer.",
+        "claim": "Claim alpha is valid",
+        "quote_type": "hard_data",
+        "standpoint_architecture": "transformer",
+    })
+    assert r1.get("status") == "created", f"r1 failed: {r1}"
+
+    r2 = client.call("engram_add_observation", {
+        "url": "https://example.com/arch-uniform-2",
+        "title": "Arch uniform source 2",
+        "quoted_text": "Claim beta from transformer model.",
+        "interpretation": "Output from another transformer.",
+        "claim": "Claim beta is valid",
+        "quote_type": "hard_data",
+        "standpoint_architecture": "transformer",
+    })
+    assert r2.get("status") == "created", f"r2 failed: {r2}"
+
+    dv = client.call("engram_derive", {
+        "claim": "Alpha and beta are jointly valid",
+        "supporting_ids": f"{r1['observation_id']},{r2['observation_id']}",
+        "logical_chain": "Both alpha and beta hold independently",
+        "reasoning_type": "inductive_causal",
+    })
+    assert dv.get("status") == "created", f"Derive failed: {dv}"
+    warnings = dv.get("structure_warnings", [])
+    standpoint_warns = [w for w in warnings if "STANDPOINT" in w]
+    assert len(standpoint_warns) >= 1, f"Expected STANDPOINT warning, got: {warnings}"
+    assert any("Class A exposure elevated" in w for w in standpoint_warns), (
+        f"Expected 'Class A exposure elevated' in warning, got: {standpoint_warns}"
+    )
+    assert any("all transformer" in w for w in standpoint_warns), (
+        f"Expected 'all transformer' in warning, got: {standpoint_warns}"
+    )
+    assert any("single-family" in w for w in standpoint_warns), (
+        f"Expected 'single-family' in warning, got: {standpoint_warns}"
+    )
+    print(f"  PASS: All-transformer premises → Class A exposure warning: {standpoint_warns[0][:100]}")
+
+
+# ---------------------------------------------------------------------------
+# Test 13: standpoint_architecture diverse → no Class A exposure warning
+# ---------------------------------------------------------------------------
+
+def test_standpoint_architecture_diverse_no_warning():
+    """Derivation with premises from different architectures → 'diverse', no Class A warning."""
+    client = fresh_client()
+
+    r1 = client.call("engram_add_observation", {
+        "url": "https://example.com/arch-diverse-1",
+        "title": "Arch diverse source 1 — transformer",
+        "quoted_text": "Observation from a transformer model.",
+        "interpretation": "Transformer output.",
+        "claim": "Observation A from transformer",
+        "quote_type": "hard_data",
+        "standpoint_architecture": "transformer",
+    })
+    assert r1.get("status") == "created", f"r1 failed: {r1}"
+
+    r2 = client.call("engram_add_observation", {
+        "url": "https://example.com/arch-diverse-2",
+        "title": "Arch diverse source 2 — human",
+        "quoted_text": "Observation from a human expert.",
+        "interpretation": "Human expert observation.",
+        "claim": "Observation B from human",
+        "quote_type": "personal_communication",
+        "standpoint_architecture": "human",
+    })
+    assert r2.get("status") == "created", f"r2 failed: {r2}"
+
+    dv = client.call("engram_derive", {
+        "claim": "Observations A and B jointly support the conclusion",
+        "supporting_ids": f"{r1['observation_id']},{r2['observation_id']}",
+        "logical_chain": "AI and human observations corroborate each other",
+        "reasoning_type": "inductive_causal",
+    })
+    assert dv.get("status") == "created", f"Derive failed: {dv}"
+    warnings = dv.get("structure_warnings", [])
+    standpoint_warns = [w for w in warnings if "STANDPOINT" in w]
+    assert len(standpoint_warns) >= 1, f"Expected STANDPOINT warning, got: {warnings}"
+    assert any("diverse" in w for w in standpoint_warns), (
+        f"Expected 'diverse' in STANDPOINT warning, got: {standpoint_warns}"
+    )
+    assert not any("Class A exposure elevated" in w for w in standpoint_warns), (
+        f"Expected NO 'Class A exposure elevated' for diverse architectures, got: {standpoint_warns}"
+    )
+    print(f"  PASS: Diverse architectures → 'diverse', no Class A warning: {standpoint_warns[0][:100]}")
+
+
+def test_standpoint_architecture_partial_data_omit():
+    """One premise tagged transformer + one untagged → architecture axis silently omitted (all-or-omit)."""
+    client = fresh_client()
+
+    r1 = client.call("engram_add_observation", {
+        "url": "https://example.com/arch-partial-1",
+        "title": "Arch partial source 1 — tagged transformer",
+        "quoted_text": "Observation from a transformer model.",
+        "interpretation": "Transformer output.",
+        "claim": "Observation A tagged transformer",
+        "quote_type": "hard_data",
+        "standpoint_architecture": "transformer",
+    })
+    assert r1.get("status") == "created", f"r1 failed: {r1}"
+
+    r2 = client.call("engram_add_observation", {
+        "url": "https://example.com/arch-partial-2",
+        "title": "Arch partial source 2 — untagged",
+        "quoted_text": "Observation with no architecture tag.",
+        "interpretation": "Untagged source.",
+        "claim": "Observation B untagged",
+        "quote_type": "hard_data",
+    })
+    assert r2.get("status") == "created", f"r2 failed: {r2}"
+
+    dv = client.call("engram_derive", {
+        "claim": "Observations A and B jointly support a conclusion",
+        "supporting_ids": f"{r1['observation_id']},{r2['observation_id']}",
+        "logical_chain": "Partial architecture data should suppress the architecture axis",
+        "reasoning_type": "inductive_causal",
+    })
+    assert dv.get("status") == "created", f"Derive failed: {dv}"
+    warnings = dv.get("structure_warnings", [])
+    arch_warns = [w for w in warnings if "architecture" in w.lower()]
+    assert not arch_warns, (
+        f"Expected no architecture warning when one premise is untagged (all-or-omit), got: {arch_warns}"
+    )
+    print(f"  PASS: Partial architecture data → axis omitted (all-or-omit). warnings={[w[:80] for w in warnings]}")
+
+
+# ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
 
@@ -524,6 +727,11 @@ if __name__ == "__main__":
         test_author_diverse_collection_uniform_warning,
         test_single_axis_author_only_warning,
         test_mixed_axis_collection_omitted_when_partial,
+        test_standpoint_architecture_stored,
+        test_standpoint_architecture_enum_validation,
+        test_standpoint_architecture_uniform_warning,
+        test_standpoint_architecture_diverse_no_warning,
+        test_standpoint_architecture_partial_data_omit,
     ]
 
     print(f"\nRunning {len(tests)} standpoint field tests...\n")

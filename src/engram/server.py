@@ -1329,7 +1329,7 @@ _ADD_OBSERVATION_FIELDS = frozenset({
     "is_predictive", "predicted_event", "resolution_timeframe",
     "source_class", "content_hash", "git_sha",
     "standpoint_author_id", "standpoint_collection_id", "standpoint_override_tag",
-    "standpoint_lineage",
+    "standpoint_lineage", "standpoint_architecture",
     "fs_class",
 })
 
@@ -1427,6 +1427,7 @@ def engram_add_observation(payload_json: str) -> str:
             standpoint_collection_id (str, optional): Corpus or work identity for the source ("vantage" axis). Independent axis in per-axis standpoint cluster key.
             standpoint_override_tag (str, optional): Free-form standpoint label for when the computed cluster key is insufficient (lab measurements, personal comms, introspective self-reports).
             standpoint_lineage (str, optional): Training lineage of the source claim's producer, format "provider:family" (e.g. "anthropic:opus"). The most load-bearing bias axis for AI-agent premises; format-validated, rejected with a redirecting error if malformed.
+            standpoint_architecture (str, optional): Cognitive architecture of the source's producer. Enum: transformer | vision-spatial | embodied-sensorimotor | graph-neural | human | other. Tracks architectural (not just training) diversity — Class A calibration exposure. Use "human" for human sources, "transformer" for other LLMs, omit for self-observations when explicit tracking is not desired.
             fs_class (str, optional): Falsification-sensitivity class — "re-executable" (Class 1: claim can be re-tested by re-running the measurement) or "frozen" (Class 2: claim records a past event that cannot be re-executed). Omit or pass null to let the Phase-1 proxy (derived from quote_type) apply. When provided, takes priority over the proxy and the FALSIFICATION line drops the "(proxy:quote_type)" label. When the class is ambiguous (e.g. a re-readable file that records past state), omit and let the proxy apply — hesitation is the correct signal to omit.
 
     Returns:
@@ -1508,7 +1509,7 @@ def engram_add_observation_batch(payload_json: str) -> str:
                 interpretation, claim, quote_type; optional is_predictive,
                 predicted_event, resolution_timeframe, source_class,
                 standpoint_author_id, standpoint_collection_id, standpoint_override_tag,
-                standpoint_lineage.
+                standpoint_lineage, standpoint_architecture.
             url (str, optional): Source URL. The evidence node is auto-created
                 or reused. Use this+title OR evidence_id, not both.
             title (str, optional): Source title (required when url given).
