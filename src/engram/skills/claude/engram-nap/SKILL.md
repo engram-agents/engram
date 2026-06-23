@@ -60,6 +60,18 @@ The `nap` mode:
 - Does NOT advance the turn counter — no forgetting triggered (turn advance is reserved for post-dream session checkpoints)
 - Arms the `nap_checkpoint` feeling-nudge marker (TTL=5 turns) — the return JSON includes `feeling_report_nudge` text asking whether any moment in this burst produced a distinct internal state worth marking
 
+**After calling `engram_nap()`, check the return value for backup health:**
+
+```python
+result = engram_nap(message="...")
+db_backup = result.get("db_backup", {})
+if db_backup.get("status") not in ("ok", "skipped"):
+    # Surface visibly — a silently-degrading backup is discovered only when needed
+    print(f"⚠ binary backup FAILED: {db_backup.get('error', db_backup)}")
+```
+
+Log `✓ binary backup ok` / `⚠ binary backup FAILED: <reason>` alongside the nap summary so a recurring outage is visible, not buried in the return dict. The mechanism is already there; this is the surfacing step.
+
 ## Step 4 — Handle the feeling-nudge (optional)
 
 Read the `feeling_report_nudge` text in the checkpoint return. Honest self-check:

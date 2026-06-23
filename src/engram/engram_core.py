@@ -8,6 +8,13 @@ Extracted from server.py in #872 wave 1. HOUSE RULES (spec D3):
 - This module must not import server.py or any family module (acyclic).
 - Helpers used by 3+ tool families get promoted here in the family wave that
   first needs them out of server.py (rolling promotion; spec D6 note).
+
+Checkpoint/backup layers (both written in _commit_snapshot on every nap):
+- knowledge.sql — embedding-stripped SQL text dump, committed to git (line-diff friendly).
+- db-backup/knowledge-YYYYMMDD.db — binary hot-copy for fast point-in-time restore
+  without re-running the full pipeline. 7-day rotating window (~84 MB). Best-effort;
+  never blocks the nap. db-backup/ should be listed in ~/.engram/.gitignore (binary,
+  large, not line-diff friendly).
 """
 
 import functools
@@ -23,7 +30,7 @@ import subprocess
 import textwrap
 import time
 import uuid as _uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Union
 from urllib.parse import urlparse
@@ -2706,6 +2713,80 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
     return "\n".join(lines)
 
 
+def _write_binary_backup(
+    src_db_path: str,
+    backup_dir: Path,
+    max_keep: int = 7,
+) -> dict:
+    """Write a timestamped binary hot-copy of knowledge.db to backup_dir.
+
+    Uses sqlite3.Connection.backup() — the same WAL-safe hot-copy approach as
+    engram_backup.dump_stripped — so the live database is never locked hard.
+
+    Naming: knowledge-YYYYMMDD.db (one file per calendar day). Idempotent: if a
+    file for today already exists, the write is skipped.
+
+    Rotation: after a successful write, all but the max_keep newest files (sorted
+    by mtime) are deleted.
+
+    Returns:
+        {"path": str, "bytes": int, "pruned": int}  — successful write
+        {"skipped": "same-day copy exists", "path": str}  — idempotent skip
+        {"error": str}  — any failure (best-effort: never raises, never blocks nap)
+
+    Note: backup_dir (DATA_DIR / "db-backup") should be listed in
+    ~/.engram/.gitignore so the binary files are never committed to the ENGRAM
+    git repo. The gitignore for the ENGRAM data dir lives at runtime
+    (~/.engram/.gitignore), not in the source tree.
+    """
+    dest_path: Path | None = None
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        today_str = date.today().strftime("%Y%m%d")
+        dest_path = backup_dir / f"knowledge-{today_str}.db"
+
+        if dest_path.exists():
+            return {"skipped": "same-day copy exists", "path": str(dest_path)}
+
+        src_conn = sqlite3.connect(src_db_path)
+        try:
+            dest_conn = sqlite3.connect(str(dest_path))
+            try:
+                src_conn.backup(dest_conn)
+            finally:
+                dest_conn.close()
+        finally:
+            src_conn.close()
+
+        backup_bytes = dest_path.stat().st_size
+
+        # Prune: keep only the max_keep newest files by mtime.
+        all_backups = sorted(
+            backup_dir.glob("knowledge-*.db"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        pruned = 0
+        for old_file in all_backups[max_keep:]:
+            try:
+                old_file.unlink()
+                pruned += 1
+            except OSError:
+                pass  # best-effort: skip files we can't remove
+
+        return {"path": str(dest_path), "bytes": backup_bytes, "pruned": pruned}
+
+    except Exception as e:
+        # Remove any partial/zero-byte dest_path so a same-day retry isn't
+        # blocked by the idempotency check pointing at a corrupt file.
+        if dest_path is not None:
+            try:
+                dest_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return {"error": str(e)}
+
+
 def _commit_snapshot(
     conn: sqlite3.Connection,
     message: str,
@@ -2867,6 +2948,13 @@ def _commit_snapshot(
             except Exception:
                 pass
 
+    # 2b. Binary backup: timestamped hot-copy of knowledge.db for fast point-in-time
+    #     restore without re-running the full pipeline.  Best-effort (#1142): never
+    #     raises, never blocks the nap.  7-day rotating window; one file per day.
+    #     Note: db-backup/ should be in ~/.engram/.gitignore — binary files, not
+    #     line-diff friendly.  The .gitignore lives at runtime, not in the source tree.
+    _db_backup_result = _write_binary_backup(str(DB_PATH), DATA_DIR / "db-backup")
+
     # 3 (was 2). Flush WAL into the main db file so the next nap starts clean.
     # Runs AFTER dump_stripped — see ordering note above (#786 Option A).
     # Skipped entirely when skip_checkpoint=True (degraded-marker override or
@@ -2890,11 +2978,14 @@ def _commit_snapshot(
     # not only the success path — otherwise a backup failure is visible on stderr
     # but invisible to the agent reading the nap/sleep response (the class-5
     # silent-failure mode this PR eliminates).
+    # Keys: sql_dump (stats from dump_stripped), sql_dump_error (if dump failed),
+    #       db_backup (result from _write_binary_backup — path/bytes/pruned or skipped/error).
     _dump_fields: dict = {}
     if _dump_stats is not None:
         _dump_fields["sql_dump"] = _dump_stats
     if _dump_error is not None:
         _dump_fields["sql_dump_error"] = _dump_error
+    _dump_fields["db_backup"] = _db_backup_result
 
     # 3. Stage explicit files only (never `git add .` — would pull in backups,
     #    daemon sockets, etc.)
