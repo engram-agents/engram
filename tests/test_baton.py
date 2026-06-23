@@ -1621,6 +1621,85 @@ class TestPoolSentinel:
             f"Expected turn=alice (lowercased sentinel) after release; got {turn_after!r}"
         )
 
+    def test_sentinel_accepts_short_form_first_token(
+        self, engram_home, projects_dir
+    ):
+        """Pool initialized with turn='lei' works when primary_user='Lei Shi'.
+
+        Regression test for issue #1309: _pool_sentinel() returns the full
+        lowercased name ('lei shi'), but pools are often initialized with just
+        the first token ('lei'). claim/flip must accept both forms.
+        """
+        _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
+
+        # Pool with short-form sentinel (turn='lei', not 'lei shi') — the bug trigger.
+        _write_project(
+            projects_dir, "pool-short-form-test",
+            title="short-form sentinel test",
+            turn="lei",
+            participants=["borges", "ariadne"],
+            status="in-progress",
+        )
+
+        # claim must succeed: 'lei' matches sentinel 'lei shi' via first-token rule.
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "claim", "pool-short-form-test",
+        )
+        assert rc == 0, (
+            f"claim failed for short-form sentinel 'lei' with primary_user='Lei Shi'; "
+            f"stderr: {stderr}"
+        )
+        turn = _read_project_field(projects_dir, "pool-short-form-test", "turn")
+        assert turn == "borges", f"Expected turn=borges after claim; got {turn!r}"
+
+        # release must put the baton back to the full sentinel ('lei shi').
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "release", "pool-short-form-test",
+        )
+        assert rc == 0, f"release failed; stderr: {stderr}"
+        turn_after = _read_project_field(projects_dir, "pool-short-form-test", "turn")
+        assert turn_after == "lei shi", (
+            f"Expected full sentinel 'lei shi' after release; got {turn_after!r}"
+        )
+
+    def test_merge_gate2_accepts_short_form_sentinel(
+        self, engram_home, projects_dir
+    ):
+        """baton merge Gate 2 accepts short-form sentinel 'lei' with primary_user='Lei Shi'.
+
+        Regression test for the missed comparison site in cmd_merge (issue #1309):
+        Gate 2 used raw != sentinel instead of _is_pool_sentinel, so a PR baton
+        with turn='lei' (short form, written by baton flip) would block merge
+        with "turn is with lei — not presented for merge."
+        """
+        _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
+
+        # Baton with short-form sentinel in turn (the bug trigger).
+        # No github: anchor → Gates 3/4 (CI + approval) are skipped automatically.
+        _write_project(
+            projects_dir, "PR-9999",
+            title="short-form merge gate test",
+            turn="lei",
+            participants=["borges", "ariadne"],
+            status="in-progress",
+        )
+
+        # --dry-run --force: skips CI (Gate 3) + approval (Gate 4); no real gh call.
+        # Should pass Gate 2 without "not presented for merge" error.
+        rc, stdout, stderr = _run_baton(
+            engram_home, projects_dir,
+            "merge", "PR-9999", "--dry-run", "--force",
+        )
+        assert rc == 0, (
+            f"merge --dry-run failed at Gate 2 for short-form sentinel 'lei'; "
+            f"stderr: {stderr}"
+        )
+        assert "gate 2 (turn=sentinel): PASS" in stdout, (
+            f"Expected Gate 2 PASS in dry-run output; got: {stdout!r}"
+        )
+
     def test_missing_config_no_env_fails_loud(self, engram_home, projects_dir):
         """Missing config.json + no BATON_POOL_SENTINEL → exit non-zero with message.
 

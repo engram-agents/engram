@@ -691,7 +691,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         initial_turn = participants[0]
 
     # Validate initial turn
-    if initial_turn != _pool_sentinel() and initial_turn not in participants:
+    if not _is_pool_sentinel(initial_turn) and initial_turn not in participants:
         print(
             f"baton init: turn '{initial_turn}' must be in participants "
             f"{participants} or the pool sentinel ({_pool_sentinel()!r}).",
@@ -835,7 +835,7 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     participants_str = fields.get("participants", "").strip()
     participants = _parse_participants(participants_str) if participants_str else []
 
-    if to_agent != _pool_sentinel() and to_agent not in participants:
+    if not _is_pool_sentinel(to_agent) and to_agent not in participants:
         print(
             f"baton flip: '{to_agent}' is not a participant in {project_id}. "
             f"Participants: {participants}. "
@@ -861,7 +861,7 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     github_anchor = fields.get("github", "").strip().lower()
     _flip_force = args.force
     _pr_anchor_match = re.match(r"^pr/(\d+)$", github_anchor)
-    if _pr_anchor_match and to_agent == _pool_sentinel():
+    if _pr_anchor_match and _is_pool_sentinel(to_agent):
         _pr_num = _pr_anchor_match.group(1)
         _ci_state, _ci_detail = _pr_ci_state(_pr_num)
         if _ci_state in ("red", "pending"):
@@ -1054,6 +1054,20 @@ def _pool_sentinel() -> str:
     sys.exit(EXIT_VALIDATION)
 
 
+def _is_pool_sentinel(name: str) -> bool:
+    """Return True if name (already stripped/lowercased) matches the pool sentinel.
+
+    Accepts both the full sentinel ("lei shi") and its first token ("lei") so
+    pools initialized with a short-form turn value work correctly (issue #1309).
+    """
+    sentinel = _pool_sentinel()  # e.g. "lei shi"
+    if name == sentinel:
+        return True
+    # Also accept the first whitespace-token of the sentinel ("lei" from "lei shi").
+    first_token = sentinel.split()[0] if sentinel else ""
+    return bool(first_token) and name == first_token
+
+
 def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     """Claim a Project-layer baton from the pool.
 
@@ -1097,7 +1111,7 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
     # Validate: current turn must be the pool sentinel
     current_turn = fields.get("turn", "").strip().lower()
-    if current_turn != _pool_sentinel():
+    if not _is_pool_sentinel(current_turn):
         print(
             f"baton claim: refusing to steal claim from {current_turn}; "
             "use 'baton flip <project-id> <self> <reason>' if you have an "
@@ -1767,7 +1781,7 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     # ---- Gate 2: turn == pool sentinel --------------------------------
     sentinel = _pool_sentinel()
     current_turn = fields.get("turn", "").strip().lower()
-    if current_turn != sentinel:
+    if not _is_pool_sentinel(current_turn):
         holder = current_turn or "(unknown)"
         print(
             f"baton merge: turn is with {holder} — not presented for merge. "
