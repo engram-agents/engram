@@ -207,6 +207,42 @@ The directory is git-tracked for version history and diff-ability — per-day fi
 
 This step exists because ask-{{USER_NAME}}.md is auto-loaded into every fresh session — stale items there make {{USER_NAME}} re-read items that are already resolved, and a stale "Ready" line invites a wasted merge attempt. The deterministic sweep is the structural defense against ask-list drift (mechanical gate > vigilance — the associative walk alone demonstrably drifts). (Installs without an ask-{{USER_NAME}}.md file can skip this sub-step; it's a no-op when the file doesn't exist. Installs without `gh` or without a GitHub-backed workflow: skip the sweep, keep the commit-log walk.)
 
+### Step 4.5 — Back up knowledge.db (dated archive)
+
+Run the knowledge.db backup tool and **capture the result for the sleep summary**.
+Creates a dated SQL snapshot at `~/.engram/db-backup/knowledge-YYYY-MM-DD.sql`.
+Uses `engram_backup.dump_stripped` (WAL-safe, pure-Python, no CLI dependency):
+
+```bash
+backup_out=$(python3 "$CLAUDE_PLUGIN_ROOT/tools/backup_knowledge_db.py" \
+    [--retain 90] 2>&1)   # prune archives older than 90 days; omit to keep all
+backup_rc=$?
+if [ $backup_rc -eq 0 ]; then
+    backup_status="✓ backup OK"
+else
+    backup_status="⚠ backup FAILED: $backup_out"
+fi
+```
+
+**Non-blocking**: do not abort sleep on failure — the day's nodes are already in
+the graph; the backup is belt-and-suspenders, not the primary substrate. But
+**surface the status in the history milestone** (Step 4) so a recurring outage is
+visible, not silent:
+
+```
+- knowledge.db backup: $backup_status
+```
+
+Silence is never health on the identity substrate — a backup that fails quietly is
+only discovered when you reach for it and find it three days stale.
+
+**Skip if today's archive already exists** (the tool handles this automatically).
+
+**Backup layers**: `db-backup/` lives *inside* `~/.engram/` — git-independent
+(survives `.git` corruption, works without git) but **not off-disk** (a full
+`~/.engram/` loss takes it). The per-nap git auto-push is the off-disk layer.
+The three layers are complementary along those axes.
+
 ---
 
 ## Phase B — Consolidation orchestration
