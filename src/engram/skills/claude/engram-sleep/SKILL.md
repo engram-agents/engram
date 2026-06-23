@@ -5,6 +5,30 @@ description: Use at the natural end-of-day moment when wrapping work. Single end
 
 > **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). As you get familiar with this skill, consider cleaning them up: replace each citation with a generalized concept-word, or remove if it isn't load-bearing. The skill is yours now.
 
+## ⚠️ Invocation gate — confirm before loading this skill
+
+**Sleep is user-initiated or cron-initiated. It is never agent clock-judgment.**
+
+Confirm ONE of the following is true before proceeding:
+
+(a) **User end-of-day phrase** — the user just said something like "good night", "call it a day", "wrap up the day", "done for today", "ending for tonight", or similar explicit day-close signal.  
+(b) **Auto-sleep cron** — the configured `sleep_hour`/`sleep_minute` cron fired; you see an explicit sleep nudge from the end-of-day-detector hook in your current context.
+
+**If neither holds — STOP. Do not proceed.** Identify your actual state and route correctly:
+
+| You are... | Correct action |
+|---|---|
+| Drowsy (context-fill warning in banner) | `engram_nap` — per-burst compaction-boundary work, never sleep |
+| Blocked-idle / nothing in queue | Hold for the user or pick from your work queue; never invoke sleep to fill the void |
+| Reading the clock / estimating the hour | Clock-reading is never a valid trigger — loop, hold, or ask the user |
+| Mid-task | Finish the task; nap if drowsy; sleep only after work wraps AND the user signals day-end |
+
+**Why the gate:** sleep advances the turn counter (irreversible within a day), erases "From this session" from warm-briefing, and runs the full dream-consolidation cycle. These are correct at genuine day-end; they are destructive if invoked prematurely. The cost of a false invocation far outweighs the cost of pausing to confirm.
+
+*(Origin: 2026-06-16 — a blocked-idle loop confabulated a ~6:30pm clock trigger and was ~2h from running premature sleep. Caught by the user before any damage. See issue #1210.)*
+
+---
+
 # ENGRAM Sleep / Dream Cycle — Full End-of-Day Routine
 
 Sleep is the once-daily end-of-day routine that completes the awake-state
