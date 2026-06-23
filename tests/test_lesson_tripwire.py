@@ -1,4 +1,4 @@
-"""Tests for the lesson-tripwire PreToolUse hook (issue #1203).
+"""Tests for the lesson-tripwire PreToolUse hook (issues #1203 + #1297).
 
 Coverage:
   1. test_matching_command_returns_nudge — pattern match returns the nudge string
@@ -8,6 +8,12 @@ Coverage:
   5. test_pattern_case_insensitive — FORUM REPLY matches (?:forum reply|ia write)
   6. test_situation_pattern_stored_via_mcp — engram_add_lesson stores situation_pattern
      in metadata and it is queryable by load_tripwires
+  7. test_mcp_tool_match — pattern matches mcp__engram__engram_add_observation in match target
+  8. test_mcp_tool_no_match — unrelated MCP tool does not trigger forum-reply lesson
+  9. test_bash_call_still_works — Bash call path unchanged after MCP extension
+ 10. test_build_match_target_bash — build_match_target extracts Bash command string
+ 11. test_build_match_target_mcp — build_match_target returns tool_name + args for MCP
+ 12. test_build_match_target_unknown — build_match_target returns "" for unknown tool_name
 """
 
 from __future__ import annotations
@@ -42,6 +48,7 @@ def _import_hook():
 _hook = _import_hook()
 load_tripwires = _hook.load_tripwires
 check_command = _hook.check_command
+build_match_target = _hook.build_match_target
 
 # ---------------------------------------------------------------------------
 # Helpers for tests 1–5: a minimal temp DB with just the nodes table
@@ -143,7 +150,75 @@ class TestLoadTripwires(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Test 6: integration — situation_pattern stored via engram_add_lesson MCP tool
+# Tests 7–9: MCP locus-2 — pattern matching against tool_name + args (issue #1297)
+# ---------------------------------------------------------------------------
+
+class TestMcpToolMatching(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="engram_tripwire_mcp_match_"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_mcp_tool_match(self):
+        """Pattern matching engram_add_observation fires on the MCP tool call."""
+        db = _make_db(self.tmp)
+        _insert_lesson(db, pattern=r"engram_add_observation", nudge="Run verify_quote.py first.")
+        tripwires = load_tripwires(db_path=db)
+        # Simulate the match target built for an MCP engram_add_observation call
+        match_target = 'mcp__plugin_engram_engram__engram_add_observation {"payload_json":"{}"}'
+        hits = check_command(match_target, tripwires)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("verify_quote", hits[0])
+
+    def test_mcp_tool_no_match(self):
+        """A forum-reply pattern does not fire on an unrelated MCP tool call."""
+        db = _make_db(self.tmp)
+        _insert_lesson(db, pattern=r"forum reply|ia write", nudge="Read body from stdin.")
+        tripwires = load_tripwires(db_path=db)
+        match_target = 'mcp__plugin_engram_engram__engram_add_observation {"payload_json":"{}"}'
+        hits = check_command(match_target, tripwires)
+        self.assertEqual(hits, [])
+
+    def test_bash_call_still_works(self):
+        """After the MCP extension, Bash command matching still works correctly."""
+        db = _make_db(self.tmp)
+        _insert_lesson(db, pattern=r"forum reply|ia write", nudge="Read body from stdin.")
+        tripwires = load_tripwires(db_path=db)
+        hits = check_command("forum reply 42", tripwires)
+        self.assertEqual(len(hits), 1)
+
+
+# ---------------------------------------------------------------------------
+# Tests 10–12: build_match_target unit tests
+# ---------------------------------------------------------------------------
+
+class TestBuildMatchTarget(unittest.TestCase):
+
+    def test_build_match_target_bash(self):
+        """Bash call → returns the command string."""
+        hook_input = {"tool_name": "Bash", "tool_input": {"command": "forum reply 42"}}
+        self.assertEqual(build_match_target(hook_input), "forum reply 42")
+
+    def test_build_match_target_mcp(self):
+        """MCP call → returns tool_name + compact JSON args."""
+        hook_input = {
+            "tool_name": "mcp__plugin_engram_engram__engram_add_observation",
+            "tool_input": {"payload_json": "{}"},
+        }
+        result = build_match_target(hook_input)
+        self.assertIn("mcp__plugin_engram_engram__engram_add_observation", result)
+        self.assertIn("payload_json", result)
+
+    def test_build_match_target_unknown(self):
+        """Unknown tool_name (not Bash, not mcp__*) → returns empty string."""
+        hook_input = {"tool_name": "SomeFutureTool", "tool_input": {}}
+        self.assertEqual(build_match_target(hook_input), "")
+
+
+# ---------------------------------------------------------------------------
+# Test 13: integration — situation_pattern stored via engram_add_lesson MCP tool
 # ---------------------------------------------------------------------------
 
 TEST_DIR = tempfile.mkdtemp(prefix="engram_tripwire_mcp_")

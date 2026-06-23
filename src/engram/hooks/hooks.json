@@ -97,6 +97,16 @@
             "timeout": 3
           }
         ]
+      },
+      {
+        "matcher": "mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-lesson-tripwire-hook.py\"",
+            "timeout": 3
+          }
+        ]
       }
     ],
     "PostCompact": [
