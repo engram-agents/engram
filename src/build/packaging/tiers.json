@@ -203,7 +203,8 @@
     },
     {
       "path": "tools/session.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "multi_agent": true
     },
     {
       "path": "tools/compute_task_time.py",
@@ -215,7 +216,8 @@
     },
     {
       "path": "tools/_session_context.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "multi_agent": true
     },
     {
       "path": "tools/engram-pkg",

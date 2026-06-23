@@ -602,3 +602,92 @@ def test_identity_coupled_hooks_are_known():
         "Expected identity_coupled=true on these hooks per spec #778, but it is missing:\n"
         + "\n".join(f"  {p}" for p in sorted(missing))
     )
+
+
+def test_import_dep_tier_consistency():
+    """If A ships at (tier, topology) T and imports B, B must also ship at T.
+
+    Prevents the #1087/#1088 class: an importer shipping in contexts where
+    the importee doesn't, causing ImportError at runtime.
+
+    Only checks top-level module-scope imports in Python mechanism files.
+    Resolves module names to mechanism paths by checking the same directory
+    as the importing file (the pattern used by the scripts in this repo).
+    Stdlib and external packages are automatically excluded (they won't
+    resolve to any mechanism entry).
+    """
+    import ast
+
+    manifest = _load_manifest()
+    mechanisms = manifest["mechanisms"]
+    src_root = os.path.join(REPO_ROOT, manifest.get("source_root", "."))
+
+    # Build path→entry lookup for Python files
+    path_to_entry = {e["path"]: e for e in mechanisms}
+
+    violations = []
+
+    for entry in mechanisms:
+        path = entry["path"]
+        if not path.endswith(".py"):
+            continue
+        full_path = os.path.join(src_root, path)
+        if not os.path.isfile(full_path):
+            continue
+
+        try:
+            with open(full_path, encoding="utf-8") as f:
+                source = f.read()
+            tree = ast.parse(source, filename=full_path)
+        except (SyntaxError, OSError):
+            continue
+
+        # Collect only top-level module-scope imports (direct Module children)
+        for node in ast.iter_child_nodes(tree):
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+
+            # Resolve the module name(s) to potential mechanism paths
+            module_names = []
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                # Only handle simple names (no dots) — same-dir resolution
+                if "." not in module and module:
+                    dir_part = os.path.dirname(path)
+                    candidate = f"{dir_part}/{module}.py" if dir_part else f"{module}.py"
+                    module_names.append(candidate)
+            else:  # ast.Import
+                for alias in node.names:
+                    name = alias.name.split(".")[0]  # top-level package only
+                    dir_part = os.path.dirname(path)
+                    candidate = f"{dir_part}/{name}.py" if dir_part else f"{name}.py"
+                    module_names.append(candidate)
+
+            for importee_path in module_names:
+                if importee_path not in path_to_entry:
+                    continue  # not a mechanism — skip (stdlib, external, or not tracked)
+
+                importee = path_to_entry[importee_path]
+                importer_rank = TIER_RANKS.get(entry.get("tier", "dev"), 2)
+                importee_rank = TIER_RANKS.get(importee.get("tier", "dev"), 2)
+
+                # Violation 1: importee has a HIGHER tier rank than importer
+                # (importee ships at a more restrictive threshold)
+                if importee_rank > importer_rank:
+                    violations.append(
+                        f"TIER: {path!r} (tier={entry.get('tier')}) imports "
+                        f"{importee_path!r} (tier={importee.get('tier')}) — "
+                        f"importee ships at a higher tier; importer will ship without it"
+                    )
+
+                # Violation 2: importee is multi_agent-only but importer ships single-agent
+                if importee.get("multi_agent") is True and entry.get("multi_agent") is not True:
+                    violations.append(
+                        f"MULTI_AGENT: {path!r} (multi_agent not set → ships single-agent) "
+                        f"imports {importee_path!r} (multi_agent=True → single-agent build drops it)"
+                    )
+
+    assert not violations, (
+        f"Import-dep tier/flag inconsistencies found ({len(violations)}):\n"
+        + "\n".join(f"  {v}" for v in violations)
+    )
