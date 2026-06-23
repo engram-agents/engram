@@ -72,6 +72,18 @@ if db_backup.get("status") not in ("ok", "skipped"):
 
 Log `✓ binary backup ok` / `⚠ binary backup FAILED: <reason>` alongside the nap summary so a recurring outage is visible, not buried in the return dict. The mechanism is already there; this is the surfacing step.
 
+## Step 3.5 — Prune finished fairy worktrees
+
+Run the worktree garbage-collector to remove orphaned coder/reviewer-fairy worktrees whose PRs have merged or closed:
+
+```bash
+python tools/worktree-gc.py --apply
+```
+
+Safe to run unconditionally: the tool skips dirty worktrees, skips worktrees with open PRs, skips worktrees with no PR (flags them for human review), and never touches the main checkout. Dry-run mode (`python tools/worktree-gc.py` without `--apply`) is available to preview the plan first. Idempotent — a second run on a clean state is a no-op.
+
+Run this step from the repo root. Skip if `tools/worktree-gc.py` is not present (pre-T2 install or worktree GC not yet shipped).
+
 ## Step 4 — Handle the feeling-nudge (optional)
 
 Read the `feeling_report_nudge` text in the checkpoint return. Honest self-check:
