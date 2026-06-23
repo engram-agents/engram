@@ -271,6 +271,116 @@ class TestMappingCompleteness:
             + "\n".join(f"  {p}" for p in uncovered)
         )
 
+    def test_synthetic_tiered_tool_without_test_map_entry_is_flagged(
+        self, tmp_path: Path
+    ):
+        """RED-detector: a tool tagged in tiers.json but absent from test-map.json fails.
+
+        Injects a synthetic tool path into tiers.json mechanisms[] and a
+        synthetic tiers.json+test-map.json pair into a temp directory, then
+        reproduces the gate's accounting logic to verify the gate would flag the
+        missing entry. This validates the tiered-tool completeness gate is
+        non-vacuous — it cannot be trivially satisfied by adding a tiers.json
+        entry and forgetting the test-map counterpart.
+
+        Mirrors test_whole_tree_synthetic_undeclared_path_is_flagged in
+        test_tiers_manifest.py.
+
+        Scan scope: this RED-detector iterates only ``*.py`` files (via
+        ``rglob("*.py")``).  The production gate
+        ``test_all_shipped_tools_are_covered`` also iterates ``*.sh`` via
+        ``glob("*.sh")``, so a ``.sh`` tool tiered without a test-map entry is
+        out of this test's scope — intentional; the test validates the ``.py``
+        case.
+
+        L1 check: the coverage check here is a single-step ``stem in
+        import_graph`` lookup.  The production gate also applies the
+        ``_package_root_stem(rel)`` fallback for sub-package files (e.g.
+        ``tools/engine/x.py``), which maps to the ``"tools"`` key in the import
+        graph.  For the direct ``tools/``-child synthetic tool used here that
+        fallback is a no-op, but a ``tools/<subpkg>/x.py`` file could read
+        differently between this test and production.
+
+        Pre-existing red note: the pre-existing red that the sibling test-map
+        entries fixed actually lived in ``test_all_hooks_are_covered`` — a
+        different scan surface (``hooks/claude/`` without tiers.json gating),
+        not this test's tools/tiers.json surface.
+        """
+        # Build a minimal synthetic tiers.json with one tiered tool that has
+        # no import-graph coverage and no test-map.json entry.
+        synthetic_tool_rel = "tools/synthetic_new_tool.py"
+        synthetic_tiers = {
+            "schema_version": 1,
+            "depth_tiers": ["essential", "convenience", "dev"],
+            "default_tier": "convenience",
+            "mechanisms": [
+                {
+                    "path": synthetic_tool_rel,
+                    "tier": "convenience",
+                    "description": "synthetic tool for RED-detector test",
+                }
+            ],
+        }
+        synthetic_test_map: dict = {
+            "schema_version": 1,
+            "mappings": [],
+            "unmapped": [],
+        }
+
+        # Write the synthetic fixtures to a temp location
+        tiers_file = tmp_path / "tiers.json"
+        test_map_file = tmp_path / "test-map.json"
+        tiers_file.write_text(json.dumps(synthetic_tiers), encoding="utf-8")
+        test_map_file.write_text(json.dumps(synthetic_test_map), encoding="utf-8")
+
+        # Reproduce the gate's accounting logic against the synthetic fixtures,
+        # using a synthetic tools/ dir that contains the tiered file.
+        tools_dir = tmp_path / "tools"
+        tools_dir.mkdir()
+        synthetic_py = tools_dir / "synthetic_new_tool.py"
+        synthetic_py.write_text("# synthetic tool\n", encoding="utf-8")
+
+        tiers = json.loads(tiers_file.read_text())
+        test_map = json.loads(test_map_file.read_text())
+
+        tiered_paths: set[str] = {
+            entry["path"] for entry in tiers.get("mechanisms", [])
+        }
+
+        def _is_tiered(rel: str) -> bool:
+            if rel in tiered_paths:
+                return True
+            for parent in Path(rel).parents:
+                if str(parent) in tiered_paths:
+                    return True
+            return False
+
+        map_covered: set[str] = set()
+        for entry in test_map.get("mappings", []):
+            map_covered.add(entry.get("path_prefix_or_glob", "").rstrip("/"))
+        for entry in test_map.get("unmapped", []):
+            map_covered.add(entry.get("path", "").rstrip("/"))
+
+        # Simulate a minimal import graph (no test imports synthetic_new_tool)
+        import_graph: dict[str, set[str]] = {}
+
+        uncovered: list[str] = []
+        for tool in sorted(tools_dir.rglob("*.py")):
+            rel = str(tool.relative_to(tmp_path))
+            if not _is_tiered(rel):
+                continue
+            stem = tool.stem
+            in_import_graph = stem in import_graph
+            in_map = rel in map_covered
+            if not in_import_graph and not in_map:
+                uncovered.append(rel)
+
+        assert synthetic_tool_rel in uncovered, (
+            "RED-detector failure: a tool tagged in tiers.json but absent from "
+            "test-map.json (mappings AND unmapped) was NOT flagged as uncovered. "
+            f"Gate did not fire; uncovered={uncovered!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # ═══════════════════════════════════════════════════════════════════════════

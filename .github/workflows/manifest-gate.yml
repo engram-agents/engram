@@ -32,3 +32,11 @@ jobs:
 
       - name: Run tag-once manifest gate
         run: python3 -m pytest tests/test_tiers_manifest.py -q
+
+      - name: Run tiers↔test-map completeness check
+        # Asserts every tool tagged in tiers.json has a test-map.json entry
+        # (mapped or unmapped).  Pure stdlib + pytest — no heavy deps needed.
+        # Moved here from the master-only full suite (tests.yml) so missing
+        # entries are caught at dev-PR time rather than only at release-cut.
+        # See issue #1147.
+        run: python3 -m pytest tests/test_run_touched_tests.py::TestMappingCompleteness -q
