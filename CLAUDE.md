@@ -154,7 +154,8 @@ is posted by a reviewer (fairy or colleague) when converged, never by the author
 ### Every PR carries a baton — merge-readiness is baton-tracked, not inferred
 
 Open a PR-baton **at PR creation**, for **every** PR — bunch-driven OR standalone:
-`baton init PR-N --title "<short>" --participants <self>,<counterpart> --turn <self> --status in-progress`.
+`baton init PR-N --title "<short>" --participants <self>,<counterpart>,<maintainer> --turn <self> --status in-progress --colleague <counterpart>`.
+Use `--colleague <name>` to identify the expected colleague reviewer — this adds them to participants (dedup) and enables the colleague gate: `baton flip PR-N <maintainer>` will be rejected if no non-author APPROVED review exists. Without `--colleague` (and without a third participant), the gate falls back to warn-only (single-agent mode).
 Then flip it as the turn actually passes along the review pipeline:
 
 - reviewer-fairy converged → `baton flip PR-N <counterpart> "fairy-converged; colleague please"`

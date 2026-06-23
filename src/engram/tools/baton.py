@@ -669,6 +669,19 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_VALIDATION)
 
+    # --colleague: add the named colleague to participants (dedup) (#1267 Fix B).
+    # The colleague argument makes the colleague-gate enforceable at flip time:
+    # if a colleague participant is present, `baton flip PR-N <sentinel>` with
+    # no APPROVED review will be rejected. Without it, the gate falls back to
+    # single-agent (warn-only) mode.
+    colleague_name = getattr(args, "colleague", None)
+    colleague_note = ""
+    if colleague_name:
+        colleague_name = colleague_name.strip().lower()
+        if colleague_name and colleague_name not in participants:
+            participants.append(colleague_name)
+        colleague_note = f"Colleague reviewer: {colleague_name}"
+
     # Default turn: the invoking agent (if in participants) else first participant
     if args.turn:
         initial_turn = args.turn.strip().lower()
@@ -731,6 +744,10 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         "",
         f"# {project_id} — {title}",
         "",
+    ]
+    if colleague_note:
+        content_lines.append(colleague_note)
+    content_lines += [
         "",
         "## Turn log",
         "",
@@ -748,6 +765,30 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     print(f"  status:       {status}")
     if github_anchor:
         print(f"  github:       {github_anchor}")
+    if colleague_name:
+        print(f"  colleague:    {colleague_name}")
+
+    # Colleague-gate enforceability warning for PR-named batons (#1267 Fix B).
+    # If this is a PR baton (PR-N id) and no colleague is resolvable from
+    # participants (participants ⊆ {author, sentinel}), warn at creation time
+    # so the gap surfaces here rather than silently at flip.
+    _is_pr_baton = re.match(r"^(?:PR-|pr-)(\d+)$", project_id)
+    if _is_pr_baton:
+        _sentinel = _pool_sentinel()
+        # Determine the author: the initial turn holder (proxy for the PR author)
+        _colleagues_at_init = [
+            p for p in participants
+            if p != initial_turn and p != _sentinel
+        ]
+        if not _colleagues_at_init:
+            print(
+                f"baton init: warning — no colleague participant for PR baton "
+                f"'{project_id}'. The colleague gate (flip-to-maintainer "
+                "approval check) will not be enforced — use "
+                "--colleague <name> or add a colleague to --participants to "
+                "enable it.",
+                file=sys.stderr,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -850,8 +891,9 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         # guard above. Even with CI green on the current tip, a commit
         # pushed AFTER the latest approval means the maintainer would merge
         # a tip nobody approved — reject the flip until re-review (or
-        # --force). no_approval passes through: approval-existence is the
-        # colleague-layer's gate, not this oid compare's.
+        # --force). no_approval is now handled by the colleague-gate below
+        # (#1267): it rejects when a colleague participant is present, and
+        # warns-only in single-agent mode (no colleague to perform the review).
         _ap_state, _ap_detail = _pr_approval_state(_pr_num)
         if _ap_state == "stale":
             if _flip_force:
@@ -869,13 +911,57 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
                     file=sys.stderr,
                 )
                 sys.exit(EXIT_VALIDATION)
+        elif _ap_state == "no_approval":
+            # Colleague-gate (#1267): determine whether a colleague participant
+            # exists.  A colleague is any participant who is neither the current
+            # baton holder (the PR author/driver flipping to the sentinel) nor
+            # the pool sentinel itself.  The current holder is the baton's
+            # turn: field — the same value used as from_agent below.
+            # GitHub blocks self-approval, so "an APPROVED review exists" ≡
+            # "a non-author approved."  If no approval exists and a colleague
+            # is expected, reject the flip (enforce).  If no colleague is in
+            # the participants list (single-agent mode / no counterpart), warn
+            # and proceed — per CLAUDE.md the colleague layer collapses when no
+            # counterpart exists ("don't block on a colleague review that has
+            # no one to perform it").
+            _current_holder = fields.get("turn", agent_name or "unknown").strip().lower()
+            _sentinel = _pool_sentinel()
+            _colleague_participants = [
+                p for p in participants
+                if p != _current_holder and p != _sentinel
+            ]
+            if _colleague_participants:
+                if _flip_force:
+                    print(
+                        f"warning: --force — flipping despite no colleague approval "
+                        f"on PR #{_pr_num} (no APPROVED review from a non-author "
+                        "colleague exists yet)",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"baton flip: no colleague approval on PR #{_pr_num}. "
+                        "A non-author colleague must review and approve this PR "
+                        "before it goes to the maintainer. "
+                        "Pass --force to override.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(EXIT_VALIDATION)
+            else:
+                # Single-agent mode: no counterpart to perform the review.
+                # Warn and proceed — don't block on a review with no one to do it.
+                print(
+                    f"warning: no colleague approval on PR #{_pr_num} "
+                    "(no colleague participant — single-agent mode; skipping colleague gate)",
+                    file=sys.stderr,
+                )
         elif _ap_state == "unknown":
             print(
                 f"warning: could not verify post-approval state for PR "
                 f"#{_pr_num} ({_ap_detail}) — proceeding anyway",
                 file=sys.stderr,
             )
-        # fresh / no_approval: proceed silently
+        # fresh: proceed silently
 
     now = _now_iso()
     from_agent = fields.get("turn", agent_name or "unknown").strip().lower()
@@ -1900,6 +1986,16 @@ def build_parser() -> argparse.ArgumentParser:
             "GitHub anchor for live status in the auto-pull hook. "
             "Format: pr/<N> or project/<N> (e.g. pr/490, project/4). "
             "Without this, only batons named PR-<N> resolve automatically."
+        ),
+    )
+    p_init.add_argument(
+        "--colleague", metavar="AGENT",
+        help=(
+            "Name the expected colleague reviewer. Added to participants (dedup) "
+            "and noted in the baton body. Enables the colleague-gate at flip time: "
+            "baton flip PR-N <sentinel> will be rejected if no non-author APPROVED "
+            "review exists. Without this, the gate falls back to single-agent "
+            "(warn-only) mode if no colleague appears in --participants."
         ),
     )
 

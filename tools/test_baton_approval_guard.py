@@ -3,11 +3,16 @@
 Companion to test_baton_ci_guard.py (#974/#685): that guard checks CI is
 green NOW; this one checks the green tip is the APPROVED tip.
 
+Note: test 4 was updated by #1267 (Phase 1) — no_approval used to pass through
+silently, but now triggers the colleague-gate: with a colleague participant it
+rejects (EXIT_VALIDATION); without one (single-agent mode) it warns and proceeds.
+The full colleague-gate coverage lives in test_baton_colleague_gate.py.
+
 Coverage — wiring (cmd_flip):
   1. fresh approval → flip proceeds (no stderr)
   2. stale approval (tip moved after approval) → refuses (EXIT_VALIDATION), no file mutation
   3. stale + --force → proceeds with warning
-  4. no_approval → passes through silently (colleague-layer's jurisdiction)
+  4. no_approval + colleague → refuses (EXIT_VALIDATION) [#1267 Fix A']
   5. unknown verdict → proceeds with advisory warning
   6. flip to NON-sentinel participant → guard not consulted
   7. red CI rejects BEFORE the approval guard runs (fail-fast ordering)
@@ -180,15 +185,24 @@ def test_flip_stale_with_force_proceeds(projects_dir, engram_home, monkeypatch):
     assert "post-approval" in err
 
 
-def test_flip_no_approval_passes_through(projects_dir, engram_home, monkeypatch):
+def test_flip_no_approval_with_colleague_rejected(projects_dir, engram_home, monkeypatch):
+    """#1267 Fix A': no_approval + colleague participant → REJECTED (EXIT_VALIDATION).
+
+    This test was 'no_approval passes through silently' before #1267; updated
+    to cover the new enforce-when-colleague behavior.  The single-agent (warn-only)
+    path is in test_baton_colleague_gate.py::test_no_approval_without_colleague_warns_and_proceeds.
+    """
+    # _make_baton_file creates [borges, ariadne] — ariadne is the colleague
     _make_baton_file(projects_dir, "PR-203", github="pr/203")
     monkeypatch.setattr(
         baton, "_pr_approval_state",
         lambda pr_num: ("no_approval", "no APPROVED review on the PR"),
     )
     code, out, err = _invoke_flip("PR-203", SENTINEL, "ready to merge")
-    assert code == 0, f"no_approval must pass through, got {code}; stderr={err!r}"
-    assert err == "", f"no_approval must be silent, got stderr={err!r}"
+    assert code == baton.EXIT_VALIDATION, (
+        f"no_approval with colleague must reject, got {code}; stderr={err!r}"
+    )
+    assert "no colleague approval" in err
 
 
 def test_flip_unknown_warns_and_proceeds(projects_dir, engram_home, monkeypatch):
