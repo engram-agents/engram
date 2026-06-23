@@ -878,6 +878,68 @@ def _backfill_vec_nodes(conn: sqlite3.Connection) -> int:
     return inserted
 
 
+def _best_resolver_for(conn: sqlite3.Connection, target_id: str):
+    """Return the argmax-confidence current, non-retracted resolver for target_id.
+
+    Queries the resolves edge set and returns a sqlite3.Row with columns
+    (id, confidence) for the highest-confidence qualifying resolver, or None
+    if no such resolver exists. Shared helper used by:
+      - _resolve_impl normal path (engram_revision.py)
+      - _resolve_impl no_op self-heal (engram_revision.py)
+      - _backfill_resolved_by (below)
+
+    Does NOT commit. Caller manages the transaction.
+    """
+    return conn.execute(
+        """SELECT n.id, n.confidence FROM edges e
+           JOIN nodes n ON e.source_id = n.id
+           WHERE e.target_id = ? AND e.relation = 'resolves'
+           AND n.is_current = 1 AND n.status != 'retracted'
+           ORDER BY n.confidence DESC LIMIT 1""",
+        (target_id,),
+    ).fetchone()
+
+
+def _backfill_resolved_by(conn: sqlite3.Connection) -> int:
+    """One-time pass: write resolved_by for resolved nodes that are missing it.
+
+    Targets nodes with resolved_by IS NULL and a resolution status — the
+    pre-#759 state for contradictions and other resolvable types. For each,
+    runs the argmax-confidence resolver lookup via _best_resolver_for and
+    writes resolved_by. Idempotent: only touches rows with NULL resolved_by.
+
+    Applies to all resolvable-status nodes (not just contradictions) for
+    thoroughness. The named defect class is contradictions (pre-#759 gap).
+
+    Returns the count of rows updated. Commits only if rows were updated.
+    """
+    RESOLVED_STATUSES = ("resolved", "partially_resolved", "confirmed",
+                         "partially_confirmed", "refuted", "partially_refuted",
+                         "supported", "inconclusive")
+    placeholders = ",".join("?" * len(RESOLVED_STATUSES))
+    rows = conn.execute(
+        f"SELECT id FROM nodes "
+        f"WHERE resolved_by IS NULL AND status IN ({placeholders})",
+        RESOLVED_STATUSES,
+    ).fetchall()
+    if not rows:
+        return 0
+    updated = 0
+    for r in rows:
+        node_id = r["id"]
+        best = _best_resolver_for(conn, node_id)
+        if best is None:
+            continue  # no qualifying resolver in edges — skip
+        conn.execute(
+            "UPDATE nodes SET resolved_by = ? WHERE id = ?",
+            (best["id"], node_id),
+        )
+        updated += 1
+    if updated:
+        conn.commit()
+    return updated
+
+
 def _load_vec_extension(conn: sqlite3.Connection) -> bool:
     """Load the sqlite-vec extension on a connection. Returns True on success.
 
@@ -1607,6 +1669,12 @@ def _get_db() -> sqlite3.Connection:
 
     # One-time backfill: populate edit_history from existing nodes if empty.
     _backfill_edit_history(conn)
+
+    # One-time backfill: write resolved_by for resolved nodes where it is NULL.
+    # Affects pre-#759 contradictions and any other resolvable nodes that were
+    # resolved before the resolved_by column was written. Idempotent — guarded
+    # by the NULL check inside _backfill_resolved_by (skips immediately if 0 rows).
+    _backfill_resolved_by(conn)
 
     # Backfill focus_state singleton row if missing. active_set_name stays
     # NULL until the first engram_focus_load / engram_focus_save call.

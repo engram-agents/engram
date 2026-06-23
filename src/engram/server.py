@@ -281,6 +281,12 @@ def _backfill_source_type(*args, **kwargs):
 def _backfill_edit_history(*args, **kwargs):
     return core._backfill_edit_history(*args, **kwargs)
 
+def _backfill_resolved_by(*args, **kwargs):
+    return core._backfill_resolved_by(*args, **kwargs)
+
+def _best_resolver_for(*args, **kwargs):
+    return core._best_resolver_for(*args, **kwargs)
+
 def _walguard_startup_clear(*args, **kwargs):
     return core._walguard_startup_clear(*args, **kwargs)
 

@@ -368,6 +368,21 @@ def _resolve_impl(
             (resolving_node_id, target_id),
         ).fetchone()
         if existing_edge:
+            # Self-heal: if resolved_by is NULL (pre-#759 state or any prior
+            # gap), compute and write it now. This makes re-calling engram_resolve
+            # on an already-resolved contradiction idempotent AND corrective.
+            # Only run if NULL — skip recomputation when already set.
+            current_resolved_by = conn.execute(
+                "SELECT resolved_by FROM nodes WHERE id = ?", (target_id,)
+            ).fetchone()
+            if current_resolved_by and current_resolved_by["resolved_by"] is None:
+                best = core._best_resolver_for(conn, target_id)
+                if best is not None:
+                    conn.execute(
+                        "UPDATE nodes SET resolved_by = ? WHERE id = ?",
+                        (best["id"], target_id),
+                    )
+                    conn.commit()
             return json.dumps({
                 "status": "no_op",
                 "message": (
@@ -404,15 +419,9 @@ def _resolve_impl(
         else:
             # Fetch the argmax-confidence current resolver (ORDER BY desc, LIMIT 1) so
             # that resolved_by always points at the strongest resolver, not the latest-wired
-            # one. Same query that drove MAX(confidence) before, now returning the id too.
-            best_row = conn.execute(
-                """SELECT n.id, n.confidence FROM edges e
-                   JOIN nodes n ON e.source_id = n.id
-                   WHERE e.target_id = ? AND e.relation = 'resolves'
-                   AND n.is_current = 1 AND n.status != 'retracted'
-                   ORDER BY n.confidence DESC LIMIT 1""",
-                (target_id,),
-            ).fetchone()
+            # one. Uses the shared core._best_resolver_for helper (same query as the no_op
+            # self-heal and _backfill_resolved_by paths).
+            best_row = core._best_resolver_for(conn, target_id)
             max_conf = best_row["confidence"] if best_row and best_row["confidence"] is not None else confidence
             best_resolver_id = best_row["id"] if best_row else resolving_node_id
             if max_conf >= threshold:
