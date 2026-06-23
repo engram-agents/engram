@@ -2,19 +2,15 @@
 """Post-compact: write the last-compact-at marker so the context tracker can
 correctly compute drowsiness against the post-compact byte-offset.
 
-Background. Earlier Claude Code versions wrote a `compact_boundary` JSONL
-entry at /compact time, and context_tracker scanned the JSONL for that
-marker to determine where the post-compact window begins. As of ~2026-05-07
-that marker is no longer written (or no longer present in the surfaces we
-read). Without it, read_current_tokens iterates back to the latest pre-
-compact usage record and reports the pre-compact token count — the meter
-shows ~100% drowsy on a freshly-compacted session.
-
-Fix (2026-05-07, ob_NNNN): the PostCompact hook records the JSONL byte
-offset AT POST-COMPACT TIME into ~/.engram/last-compact-at.json. The
-tracker then reads only the post-offset portion of the JSONL to compute
-current_tokens, and falls back to the legacy compact_boundary scan if the
-marker file is missing or stale.
+Background. Claude Code writes a `compact_boundary` JSONL entry (with full
+compactMetadata: preTokens, postTokens, durationMs) at /compact time; the
+context_tracker scans the JSONL for that marker to locate the post-compact
+window. The marker was transiently absent ~2026-05-07 but is confirmed back
+in live sessions (live-verified 2026-06-09). The PostCompact hook writes the
+JSONL byte offset at compact time into ~/.engram/last-compact-at.json as a
+correctness backstop — for sessions where compact_boundary is absent or
+stale the tracker falls back to the marker; for normal sessions it is a
+belt-and-suspenders efficiency hedge (avoids rescanning from the top)."""
 
 Also surfaces starred inter-agent letters as concise pointers in
 additionalContext so load-bearing cross-session agreements survive the
