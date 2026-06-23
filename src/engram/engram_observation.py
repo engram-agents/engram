@@ -1291,7 +1291,7 @@ def _add_observation_batch_impl(
             - quoted_text (required): Verbatim quote from the source
             - interpretation (required): Your reasoning about what this means
             - claim (required): Atomic, falsifiable claim
-            - quote_type (required): hard_data, official_statement, attributed_analysis, unnamed_source, personal_communication, or editorial
+            - quote_type (required): hard_data, official_statement, attributed_analysis, counterfactual_inference, unnamed_source, personal_communication, or editorial
             - is_predictive (optional): boolean, default false
             - predicted_event (optional): if predictive, the event predicted
             - resolution_timeframe (optional): if predictive, ISO date for resolution

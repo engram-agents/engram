@@ -1411,7 +1411,7 @@ def engram_add_observation(payload_json: str) -> str:
             quoted_text (str, required): Exact quote from the source document.
             interpretation (str, required): Agent's reasoning about what this quote means.
             claim (str, required): The atomic, falsifiable claim this observation supports.
-            quote_type (str, required): One of: hard_data, official_statement, attributed_analysis, unnamed_source, personal_communication, editorial.
+            quote_type (str, required): One of: hard_data, official_statement, attributed_analysis, counterfactual_inference, unnamed_source, personal_communication, editorial.
             url (str, optional): URL of the source document. The evidence node is auto-created or reused.
             title (str, optional): Title of the source document (required if url is provided).
             domain (str, optional): Source domain (auto-extracted from URL if omitted).

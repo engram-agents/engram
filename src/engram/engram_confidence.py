@@ -18,6 +18,10 @@ CONFIDENCE_MAP = {
     "hard_data": 0.95,
     "official_statement": 0.85,
     "attributed_analysis": 0.70,
+    # Causal-inference-derived counterfactual: like attributed_analysis but
+    # carries irreducible approximation residual (unmeasured confounders,
+    # selection effects, partial compliance). Class C epistemic horizon (#1160).
+    "counterfactual_inference": 0.65,
     "unnamed_source": 0.50,
     "personal_communication": 0.40,
     "editorial": 0.35,
