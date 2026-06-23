@@ -3703,10 +3703,8 @@ def _validate_config_value(key: str, raw_value) -> tuple:
     if expected_type == "string" and "pattern" in row:
         import re
         if not re.fullmatch(row["pattern"], v):
-            return None, (
-                f"Key {key!r}: value {v!r} does not match expected format "
-                f"(expected HH:MM 24h format, e.g. '03:00')"
-            )
+            hint = row.get("pattern_error", f"expected format matching {row['pattern']!r}")
+            return None, f"Key {key!r}: value {v!r} does not match expected format ({hint})"
 
     return v, None
 

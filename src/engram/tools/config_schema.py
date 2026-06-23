@@ -42,6 +42,7 @@ SCHEMA: list[dict] = [
     {"key": "self_lineage", "section": "identity", "tier": TIER_A, "type": "string",
      "control": "text", "label": "Self lineage",
      "pattern": "^(|[a-z0-9_-]+:[a-z0-9._-]+)$",
+     "pattern_error": "expected provider:family format (e.g. 'anthropic:opus') or empty",
      "tooltip": "This install's own training lineage as provider:family (e.g. "
                 "'anthropic:opus'). Powers standpoint v3 null=self: an unmarked "
                 "observation counts as your own lineage so the standpoint/F-S "
@@ -102,6 +103,7 @@ SCHEMA: list[dict] = [
     {"key": "cadence.auto_sleep_time", "section": "auto_sleep", "tier": TIER_A,
      "type": "string", "control": "time_hm",
      "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$",
+     "pattern_error": "expected HH:MM 24h format (00:00–23:59), e.g. '03:00'",
      "label": "Auto-sleep time (HH:MM)",
      "tooltip": "Local-time 24-hour clock when the nightly sleep cycle fires (e.g. '03:00'). Format: HH:MM, 00:00–23:59. Takes effect next session.",
      "editable": True, "restart_required": True,

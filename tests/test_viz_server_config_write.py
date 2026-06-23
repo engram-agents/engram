@@ -698,5 +698,29 @@ class TestAutoSleepTimePatternValidation(ConfigWriteBase):
         self.assertEqual(cfg["cadence"]["auto_sleep_time"], "22:30")
 
 
+class TestSelfLineagePatternValidation(ConfigWriteBase):
+    """self_lineage pattern-mismatch error must NOT say 'HH:MM' (issue #990)."""
+
+    def test_valid_lineage_accepted(self):
+        """'anthropic:opus' is a valid provider:family value."""
+        result = viz_server.write_config_key("test", "self_lineage", "anthropic:opus")
+        self.assertTrue(result["ok"], result)
+
+    def test_empty_lineage_accepted(self):
+        """Empty string is valid (disables the feature)."""
+        result = viz_server.write_config_key("test", "self_lineage", "")
+        self.assertTrue(result["ok"], result)
+
+    def test_invalid_lineage_rejected(self):
+        """An invalid value must be rejected and the error must not mention 'HH:MM'."""
+        result = viz_server.write_config_key("test", "self_lineage", "invalid!value")
+        self.assertFalse(result["ok"], "Expected ok=False for 'invalid!value'")
+        error = result.get("error", "")
+        self.assertNotIn("HH:MM", error,
+                         f"Error must not reference HH:MM for self_lineage; got: {error!r}")
+        self.assertIn("provider", error.lower(),
+                      f"Error should describe lineage format; got: {error!r}")
+
+
 if __name__ == "__main__":
     unittest.main()
