@@ -188,3 +188,99 @@ def test_prune_deletes_old_meta_json_files(tmp_path):
 
     assert not old_meta.exists(),       ".meta.json sidecars older than 7 days should be pruned"
     assert not old_hex_jsonl.exists(),  "hex-id .json older than 7 days should be pruned"
+
+
+# ---------------------------------------------------------------------------
+# Round-3: fairy transcript deletion.
+# ---------------------------------------------------------------------------
+
+def test_prune_deletes_fairy_transcript_with_marker(tmp_path):
+    sessions_dir = tmp_path / "engram" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    transcript_file = tmp_path / "fairy-transcript.jsonl"
+    transcript_file.write_text("[]")
+
+    marker_path = sessions_dir / "aaaa1111-bbbb-cccc-dddd-eeeeffffbbbb.json"
+    import json
+    marker_path.write_text(json.dumps({
+        "session_id": "aaaa1111-bbbb-cccc-dddd-eeeeffffbbbb",
+        "transcript_path": str(transcript_file),
+        "role": "fairy",
+        "cwd": "/home/user/.claude/worktrees/agent-xyz/repo",
+    }))
+    _set_mtime(marker_path, 8 * 86400)
+    _set_mtime(transcript_file, 8 * 86400)
+
+    mod = _load_hook(tmp_path / "engram")
+    mod.prune_stale_session_markers(None)
+
+    assert not marker_path.exists(), "marker should be deleted"
+    assert not transcript_file.exists(), "fairy transcript should be deleted"
+
+
+def test_prune_keeps_interactive_transcript(tmp_path):
+    sessions_dir = tmp_path / "engram" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    transcript_file = tmp_path / "interactive-transcript.jsonl"
+    transcript_file.write_text("[]")
+
+    marker_path = sessions_dir / "bbbb2222-cccc-dddd-eeee-ffffffff1234.json"
+    import json
+    marker_path.write_text(json.dumps({
+        "session_id": "bbbb2222-cccc-dddd-eeee-ffffffff1234",
+        "transcript_path": str(transcript_file),
+        "role": "interactive",
+        "cwd": "/home/user/project",
+    }))
+    _set_mtime(marker_path, 8 * 86400)
+    _set_mtime(transcript_file, 8 * 86400)
+
+    mod = _load_hook(tmp_path / "engram")
+    mod.prune_stale_session_markers(None)
+
+    assert not marker_path.exists(), "marker should be deleted"
+    assert transcript_file.exists(), "interactive transcript must NOT be deleted"
+
+
+def test_prune_fairy_missing_transcript_no_error(tmp_path):
+    sessions_dir = tmp_path / "engram" / "sessions"
+    sessions_dir.mkdir(parents=True)
+
+    marker_path = sessions_dir / "cccc3333-dddd-eeee-ffff-aaaa11112222.json"
+    import json
+    marker_path.write_text(json.dumps({
+        "session_id": "cccc3333-dddd-eeee-ffff-aaaa11112222",
+        "transcript_path": str(tmp_path / "nonexistent.jsonl"),
+        "role": "fairy",
+    }))
+    _set_mtime(marker_path, 8 * 86400)
+
+    mod = _load_hook(tmp_path / "engram")
+    mod.prune_stale_session_markers(None)  # must not raise
+
+    assert not marker_path.exists(), "marker should be deleted"
+
+
+def test_write_marker_fairy_cwd_detection(tmp_path):
+    import json, os
+    sessions_dir = tmp_path / "engram" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    # Ensure env var does not override
+    os.environ.pop("ENGRAM_SESSION_ROLE", None)
+    mod = _load_hook(tmp_path / "engram")
+
+    hook_input = {
+        "session_id": "dddd4444-eeee-ffff-aaaa-bbbbcccc5678",
+        "transcript_path": "/tmp/fairy-session.jsonl",
+        "cwd": "/home/user/.claude/worktrees/agent-abc123/engram-alpha",
+        "source": "startup",
+    }
+    marker = mod.write_marker(hook_input)
+    assert marker is not None
+    assert marker["role"] == "fairy", f"expected fairy, got {marker['role']!r}"
+
+    # Also verify the written file
+    written = sessions_dir / "dddd4444-eeee-ffff-aaaa-bbbbcccc5678.json"
+    with open(written) as f:
+        data = json.load(f)
+    assert data["role"] == "fairy"

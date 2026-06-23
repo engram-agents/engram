@@ -546,6 +546,11 @@ _MARKER_RE = re.compile(
     r'|^[0-9a-f]{8,}(\.meta)?\.json$'
 )
 
+# CWD pattern for Agent-spawned worktree fairies.  Detects the .claude/worktrees/agent-*
+# path that worktree-isolated fairies run inside, as a fallback when ENGRAM_SESSION_ROLE
+# is not set by the spawner.
+_FAIRY_CWD_RE = re.compile(r'(^|[/\\])\.claude[/\\]worktrees[/\\]agent-')
+
 
 def prune_stale_session_markers(current_session_id: str | None) -> None:
     """Delete session marker files older than 7 days from SESSIONS_DIR.
@@ -571,6 +576,23 @@ def prune_stale_session_markers(current_session_id: str | None) -> None:
         path = os.path.join(SESSIONS_DIR, name)
         try:
             if os.path.getmtime(path) < cutoff:
+                # For fairy sessions, also delete the JSONL transcript — fairies are
+                # disposable workers; interactive transcripts are kept indefinitely.
+                transcript_to_delete = None
+                try:
+                    with open(path) as _mf:
+                        _md = json.load(_mf)
+                    if _md.get("role") == "fairy":
+                        _tp = _md.get("transcript_path") or ""
+                        if _tp and os.path.isfile(_tp):
+                            transcript_to_delete = _tp
+                except (OSError, ValueError):
+                    pass  # unreadable marker — skip transcript cleanup, still prune marker
+                if transcript_to_delete:
+                    try:
+                        os.remove(transcript_to_delete)
+                    except OSError as exc:
+                        print(f"[engram-session-start] prune: could not remove transcript {transcript_to_delete}: {exc}", file=sys.stderr)
                 os.remove(path)
         except OSError as exc:
             print(f"[engram-session-start] prune: could not remove {path}: {exc}", file=sys.stderr)
@@ -581,14 +603,21 @@ def write_marker(hook_input: dict) -> dict | None:
     transcript_path = hook_input.get("transcript_path")
     if not session_id or not transcript_path:
         return None
+    # CWD-based fairy auto-detection: if the spawner didn't set ENGRAM_SESSION_ROLE,
+    # check whether we're running inside a Claude Code worktree (a reliable proxy for
+    # a fairy session). Env-var override always wins.
+    _effective_role = SESSION_ROLE
+    _cwd_val = hook_input.get("cwd") or ""
+    if _effective_role == "interactive" and _FAIRY_CWD_RE.search(_cwd_val):
+        _effective_role = "fairy"
     marker = {
         "session_id": session_id,
         "transcript_path": transcript_path,
         "source": hook_input.get("source"),
         "cwd": hook_input.get("cwd"),
         "started_at": datetime.now(timezone.utc).isoformat(),
-        "role": SESSION_ROLE,
-        "purpose": SESSION_PURPOSE or DEFAULT_PURPOSES.get(SESSION_ROLE, SESSION_ROLE),
+        "role": _effective_role,
+        "purpose": SESSION_PURPOSE or DEFAULT_PURPOSES.get(_effective_role, _effective_role),
     }
     try:
         # Per-session marker keyed by session_id. Concurrent sessions own
