@@ -959,6 +959,16 @@ def _retract_impl(
 
         now = core._now()
 
+        # Self-anchor guard: retracting a person self-anchor leaves zero current
+        # self-anchors — silently breaking link_about default-targeting,
+        # focus='self' emergence-scan, and trust_tier='self' assignment.
+        # Detect now (before the retract flips is_current=0) so we can warn.
+        _retract_node_meta = json.loads(node["metadata"] or "{}")
+        _self_anchor_retracted = (
+            node["type"] == "person"
+            and bool(_retract_node_meta.get("is_self"))
+        )
+
         # 1. Mark the node as retracted
         retract_meta = json.loads(node["metadata"] or "{}")
         retract_meta["retracted"] = True
@@ -1211,6 +1221,14 @@ def _retract_impl(
             result["replacement_id"] = replacement_id
         if result_replacement_skipped:
             result["replacement_skipped"] = True
+        if _self_anchor_retracted:
+            result["warning"] = (
+                "Retracted node was the agent's self-anchor (is_self=True). "
+                "The graph now has zero current self-anchors. "
+                "engram_link_about default-targeting, focus='self' emergence-scan, "
+                "and trust_tier='self' assignment are broken until a new person node "
+                "is created with is_self=True (or an existing one is promoted)."
+            )
 
         # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
         emit_if_initialized(

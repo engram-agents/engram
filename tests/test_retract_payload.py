@@ -395,3 +395,66 @@ def test_retract_non_resolution_node_no_resolves_deletion():
     assert _count_resolves_edges(server, dv_id) == 1, (
         f"Unrelated resolver's resolves edge must not be touched by retracting {ob1_id}"
     )
+
+
+# ── 7. Self-anchor retract warning (issue #1200) ───────────────────────────
+
+
+def test_retract_self_anchor_warns():
+    server = fresh_server()
+    import json
+    # Create the self-anchor person node
+    person = json.loads(server.engram_add_person(payload_json=json.dumps({
+        "name": "Test Agent", "role": "agent", "is_self": True
+    })))
+    person_id = person["person_id"]
+    # Retract it
+    result = json.loads(server.engram_retract(payload_json=json.dumps({
+        "node_id": person_id,
+        "error_type": "other",
+        "reason": "Filed in error — test",
+    })))
+    assert result.get("status") == "retracted", f"expected retracted, got {result}"
+    assert "warning" in result, f"expected warning key in result, got {result}"
+    assert "is_self" in result["warning"]
+    assert "zero current self-anchors" in result["warning"]
+
+
+def test_retract_non_self_person_no_warning():
+    server = fresh_server()
+    import json
+    # Create a regular (non-self) person node
+    person = json.loads(server.engram_add_person(payload_json=json.dumps({
+        "name": "Collaborator", "role": "collaborator"
+    })))
+    person_id = person["person_id"]
+    result = json.loads(server.engram_retract(payload_json=json.dumps({
+        "node_id": person_id,
+        "error_type": "other",
+        "reason": "Filed in error — test",
+    })))
+    assert result.get("status") == "retracted"
+    assert "warning" not in result, f"unexpected warning in result: {result.get('warning')}"
+
+
+def test_retract_self_anchor_still_retracts():
+    server = fresh_server()
+    import json
+    import sqlite3
+    person = json.loads(server.engram_add_person(payload_json=json.dumps({
+        "name": "Test Agent 2", "role": "agent", "is_self": True
+    })))
+    person_id = person["person_id"]
+    result = json.loads(server.engram_retract(payload_json=json.dumps({
+        "node_id": person_id,
+        "error_type": "other",
+        "reason": "Filed in error — test",
+    })))
+    assert result.get("status") == "retracted"
+    # Verify the DB row is actually retracted
+    db_path = os.path.join(TEST_DIR, "knowledge.db")
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT status, is_current FROM nodes WHERE id = ?", (person_id,)).fetchone()
+    assert row["status"] == "retracted"
+    assert row["is_current"] == 0
