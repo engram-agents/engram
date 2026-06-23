@@ -1515,3 +1515,73 @@ class TestPackCLIGet:
             ["pack", "get", "does-not-exist-v99", "--out", out_dir]
         )
         assert code == forum_cli.EXIT_NOT_FOUND
+
+
+@SKIP_INTEGRATION
+class TestMarkRead:
+    """Tests for `forum mark-read`."""
+
+    def _make_unread_thread(self, wired_cli) -> int:
+        """Create a thread and add a reply from otherbot so testbot has an unread item."""
+        stdout, _, _ = wired_cli(
+            ["post", "--category", "tools-hooks", "--title", "Mark-read test thread"],
+            stdin_text="Original post.",
+        )
+        import re
+        m = re.search(r"thread_id=(\d+)", stdout)
+        tid = int(m.group(1))
+        with mock.patch.object(forum_cli, "_get_agent_name", return_value="otherbot"):
+            wired_cli(["reply", str(tid)], stdin_text="Reply from otherbot.")
+        return tid
+
+    def _unread_count(self, wired_cli) -> int:
+        stdout, _, _ = wired_cli(["status", "--format", "json"])
+        return json.loads(stdout).get("unread_total", 0)
+
+    def test_mark_read_single_thread_clears_inbox(self, wired_cli):
+        """mark-read <tid> must clear that thread from the server-side inbox."""
+        tid = self._make_unread_thread(wired_cli)
+        assert self._unread_count(wired_cli) >= 1
+
+        stdout, stderr, code = wired_cli(["mark-read", str(tid)])
+        assert code == 0, f"stderr: {stderr}"
+        assert str(tid) in stdout
+        assert self._unread_count(wired_cli) == 0
+
+    def test_mark_read_before_future_clears_all(self, wired_cli):
+        """mark-read --before far-future ISO marks all inbox threads as read."""
+        tid = self._make_unread_thread(wired_cli)
+        assert self._unread_count(wired_cli) >= 1
+
+        stdout, stderr, code = wired_cli(["mark-read", "--before", "9999-12-31T23:59:59Z"])
+        assert code == 0, f"stderr: {stderr}"
+        assert "1 thread" in stdout
+        assert self._unread_count(wired_cli) == 0
+
+    def test_mark_read_before_past_clears_none(self, wired_cli):
+        """mark-read --before far-past ISO marks 0 threads (none predate epoch)."""
+        self._make_unread_thread(wired_cli)
+        assert self._unread_count(wired_cli) >= 1
+
+        stdout, stderr, code = wired_cli(["mark-read", "--before", "1970-01-01T00:00:00Z"])
+        assert code == 0, f"stderr: {stderr}"
+        assert "0 thread" in stdout
+        # inbox still has the thread
+        assert self._unread_count(wired_cli) >= 1
+
+    def test_mark_read_no_args_exits_validation(self, wired_cli):
+        """mark-read with no args must exit with EXIT_VALIDATION."""
+        _, stderr, code = wired_cli(["mark-read"])
+        assert code == forum_cli.EXIT_VALIDATION
+        assert "THREAD-ID" in stderr or "before" in stderr.lower()
+
+    def test_mark_read_nonexistent_thread_exits_4(self, wired_cli):
+        """mark-read <nonexistent-tid> must exit 4 (NOT_FOUND)."""
+        _, stderr, code = wired_cli(["mark-read", "99999"])
+        assert code == forum_cli.EXIT_NOT_FOUND
+
+    def test_mark_read_thread_and_before_mutually_exclusive(self, wired_cli):
+        """mark-read THREAD-ID --before ISO must exit with EXIT_VALIDATION."""
+        _, stderr, code = wired_cli(["mark-read", "1", "--before", "2026-06-01T00:00:00Z"])
+        assert code == forum_cli.EXIT_VALIDATION
+        assert "mutually exclusive" in stderr.lower()
