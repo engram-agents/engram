@@ -336,14 +336,7 @@ def engram_sandbox(data_dir: str | Path | None = None, keep: bool = False):
             if not CONFIG_PATH.exists():
                 CONFIG_PATH.write_text(json.dumps({
                     "trust_pool": [],
-                    "confidence_map": {
-                        "hard_data": 0.95,
-                        "official_statement": 0.85,
-                        "attributed_analysis": 0.70,
-                        "unnamed_source": 0.50,
-                        "personal_communication": 0.40,
-                        "editorial": 0.35,
-                    },
+                    "confidence_map": CONFIDENCE_MAP,
                     "memory": {
                         "decay_base": 1.014,
                         "current_turn": 0,

@@ -1653,7 +1653,7 @@ def build_parser():
     o.add_argument("--claim")
     o.add_argument("--quote-type",
                    choices=["hard_data", "official_statement", "attributed_analysis",
-                            "counterfactual_inference", "unnamed_source", "editorial"])
+                            "counterfactual_inference", "unnamed_source", "personal_communication", "editorial"])
     o.add_argument("--evidence-id", help="Use this OR --url+--title.")
     o.add_argument("--url")
     o.add_argument("--title")
