@@ -540,6 +540,12 @@ def _update_task_impl(*args, **kwargs):
 def _report_feeling_impl(*args, **kwargs):
     return _tasks_mod._report_feeling_impl(*args, **kwargs)
 
+def _deactivate_goal_impl(*args, **kwargs):
+    return _tasks_mod._deactivate_goal_impl(*args, **kwargs)
+
+def _activate_goal_impl(*args, **kwargs):
+    return _tasks_mod._activate_goal_impl(*args, **kwargs)
+
 def _create_derivation(*args, **kwargs):
     return core._create_derivation(*args, **kwargs)
 
@@ -2839,6 +2845,139 @@ def engram_add_goal(payload_json: str) -> str:
 
     return _add_goal_impl(**params)
 
+
+# Set of legitimate field names for the engram_deactivate_goal payload.
+_DEACTIVATE_GOAL_FIELDS = frozenset({"goal_id", "reason"})
+
+
+# DESIGN INTENT — engram_deactivate_goal
+# ---------------------------------------
+# Reversible dormancy for goals that are set aside but not abandoned.
+# The goal was VALID when filed; we are NOT retracting it (no is_current=0,
+# no status change). We are simply marking it as paused so that
+# _reflect_impl's active_goals scan skips it — eliminating dream / reflect
+# noise from a goal that is no longer actively pursued.
+#
+# The lifecycle_state field lives in metadata JSON (no schema migration).
+# Absent / "active" = active; "paused" = deactivated.
+#
+# Pair with engram_activate_goal to restore it. Use engram_supersede instead
+# if the goal has been genuinely replaced by a better framing.
+#
+# Single-payload signature (mandatory per CLAUDE.md MCP tool parameter style).
+@mcp.tool(
+    name="engram_deactivate_goal",
+    annotations={
+        "title": "Deactivate Goal",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_deactivate_goal(payload_json: str) -> str:
+    """Mark a goal as paused (dormant) without retracting it.
+
+    Use when a goal is set aside but not abandoned — it was VALID when filed
+    and may be picked up again. This is NOT retraction (which marks an error).
+
+    A deactivated goal is hidden from engram_reflect's active_goals scan to
+    eliminate dream noise. It remains queryable and citable.
+
+    Use engram_activate_goal to restore it. Use engram_supersede if the goal
+    has been replaced by a better framing.
+
+    Pass all fields as one JSON object string in payload_json.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            goal_id (str, required): The gl_NNNN node ID to deactivate.
+            reason (str, optional): Why the goal is being set aside.
+
+    Returns:
+        JSON with {"status": "deactivated", "node_id": ..., "lifecycle_state": "paused"}.
+        On error, returns {"error": "..."}.
+
+    See _deactivate_goal_impl for full semantics.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _DEACTIVATE_GOAL_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_DEACTIVATE_GOAL_FIELDS)}"
+        })
+
+    return _deactivate_goal_impl(**params)
+
+
+# Set of legitimate field names for the engram_activate_goal payload.
+_ACTIVATE_GOAL_FIELDS = frozenset({"goal_id", "reason"})
+
+
+# DESIGN INTENT — engram_activate_goal
+# -------------------------------------
+# Restores a previously paused goal to active status. The goal re-enters
+# _reflect_impl's active_goals scan and dream processing.
+#
+# Only valid for goals that were deactivated via engram_deactivate_goal
+# (lifecycle_state == "paused"). Attempting to activate a goal that is
+# already active returns an error.
+#
+# Single-payload signature (mandatory per CLAUDE.md MCP tool parameter style).
+@mcp.tool(
+    name="engram_activate_goal",
+    annotations={
+        "title": "Activate Goal",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_activate_goal(payload_json: str) -> str:
+    """Reactivate a previously paused goal.
+
+    Restores a goal deactivated by engram_deactivate_goal. The goal returns
+    to engram_reflect's active_goals scan and dream processing.
+
+    Only valid for goals currently in the "paused" lifecycle state. Attempting
+    to activate an already-active goal returns an error.
+
+    Pass all fields as one JSON object string in payload_json.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            goal_id (str, required): The gl_NNNN node ID to reactivate.
+            reason (str, optional): Why the goal is being reactivated.
+
+    Returns:
+        JSON with {"status": "activated", "node_id": ..., "lifecycle_state": "active"}.
+        On error, returns {"error": "..."}.
+
+    See _activate_goal_impl for full semantics.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _ACTIVATE_GOAL_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ACTIVATE_GOAL_FIELDS)}"
+        })
+
+    return _activate_goal_impl(**params)
 
 
 _ADD_PERSON_FIELDS = frozenset({
