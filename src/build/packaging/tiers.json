@@ -487,6 +487,10 @@
       "tier": "convenience"
     },
     {
+      "path": "skills/claude/engram-health-exam",
+      "tier": "convenience"
+    },
+    {
       "path": "skills/claude/engram-loop-diagnose",
       "tier": "dev"
     },

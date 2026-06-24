@@ -237,6 +237,8 @@ rm -f ~/.engram/.upgrade-pre-sha         # pre-upgrade SHA scratch file no longe
 
 Then through the **plugin MCP** (after Step 5's reconnect): call `engram_stats` and confirm it returns your real node count — this proves the new server is running against your untouched graph. On Codex, also verify installed-cache files match the marketplace if hooks are the upgrade target. If `engram_stats` errors or the node count is implausible, stop and investigate before declaring the upgrade done.
 
+**For a thorough operational health check** (recommended after any upgrade): load and run the `engram-health-exam` skill. It covers the full runtime layer — hook delivery, surface daemon, viz server, config sanity, schema/migration — beyond the single `engram_stats` probe above. The `engram_stats` call here is the minimum gate; `engram-health-exam` is the full exam.
+
 **Checkpoint**: marker SHA matches the intended commit + `engram_stats` returns the expected graph through the new server + `.upgrade-pre-sha` scratch file removed.
 
 ---
