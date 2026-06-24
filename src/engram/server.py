@@ -2343,8 +2343,8 @@ def engram_stats(payload_json: str = "{}") -> str:
             sections (list of str, optional): Subset of sections to return.
                 Valid names: structure, edges, confidence, open_questions,
                 open_predictions, reasoning_breakdown, weakest_nodes,
-                health_score, memory. Default (omitted or null): all sections.
-                Unknown names are ignored with a logged warning.
+                health_score, memory, version. Default (omitted or null): all
+                sections. Unknown names are ignored with a logged warning.
 
     Returns:
         JSON with comprehensive graph statistics. Top-level keys (all sections):
@@ -2357,6 +2357,11 @@ def engram_stats(payload_json: str = "{}") -> str:
             memory: current_turn + tier thresholds.
             confidence: distribution stats per type, quote_type, reasoning_type,
                 source_class.
+            version: live build identity — alpha_sha, alpha_branch, alpha_dirty,
+                deployed_at, deployed_from (from .deployed-version); tier,
+                multi_agent, shipped_at (from .engram-build-manifest.json if
+                present); agent_name (from config.json, only if absent above).
+                Empty dict when no identity files are present.
             window (conditional): present only when mode != "all".
     """
     # ── Parse + validate payload ───────────────────────────────────────────

@@ -11,6 +11,8 @@ Coverage:
   9. Confidence by_source_class — matches observation metadata aggregation.
   10. sections selector — sections=["confidence"] returns only confidence + window.
   11. sections selector with unknown name — graceful, known sections returned.
+  12. version section — present by default; reads .deployed-version + config; absent when
+      not requested; graceful when identity files are missing.
 
   Wrapper-contract coverage (JSON-parse / non-dict / invalid-mode / non-string
   sections rejection) lives in tests/test_stats_payload.py — those test the
@@ -135,8 +137,9 @@ def test_no_arg_call_returns_all_sections():
     assert "open_predictions_recent" in r, r
     assert "weakest_nodes" in r, r
     assert "memory" in r, r
-    # New section present
+    # New sections present
     assert "confidence" in r, r
+    assert "version" in r, r
     # No window key when mode=all (default)
     assert "window" not in r, r
 
@@ -511,6 +514,55 @@ def test_percentile_helper_edge_cases():
     assert engram_stats._percentile(vals, 100) == 0.9
 
 
+# ── Section 12: version ──────────────────────────────────────────────────────
+
+
+def test_version_section_present_by_default():
+    """Default no-arg call includes a version key."""
+    stats, _, _, _, _ = _make_fresh_mods()
+    r = json.loads(stats._stats_impl())
+    assert "version" in r, r
+
+
+def test_version_section_reads_deployed_version_file():
+    """version section parses .deployed-version key=value file."""
+    stats, _, _, _, core_mod = _make_fresh_mods()
+    _deployed = core_mod.DATA_DIR / ".deployed-version"
+    _deployed.write_text(
+        "alpha_sha=abc1234\nalpha_branch=dev\ndeployed_at=2026-01-01T00:00:00Z\n"
+    )
+    r = json.loads(stats._stats_impl(sections=["version"]))
+    ver = r["version"]
+    assert ver.get("alpha_sha") == "abc1234"
+    assert ver.get("alpha_branch") == "dev"
+    assert ver.get("deployed_at") == "2026-01-01T00:00:00Z"
+
+
+def test_version_section_absent_when_not_requested():
+    """Requesting only 'structure' excludes version from the result."""
+    stats, _, _, _, _ = _make_fresh_mods()
+    r = json.loads(stats._stats_impl(sections=["structure"]))
+    assert "version" not in r, r
+
+
+def test_version_section_graceful_when_no_identity_files():
+    """version section returns an empty dict when identity files are absent."""
+    stats, _, _, _, _ = _make_fresh_mods()
+    # TEST_DIR has no .deployed-version or .engram-build-manifest.json
+    r = json.loads(stats._stats_impl(sections=["version"]))
+    assert "version" in r
+    assert isinstance(r["version"], dict)
+    assert "deployed_version_error" not in r["version"]
+
+
+def test_version_section_reads_config_agent_name():
+    """version section includes agent_name from config.json."""
+    stats, _, _, _, core_mod = _make_fresh_mods()
+    core_mod.CONFIG_PATH.write_text(json.dumps({"agent_name": "test-luria", "memory": {}}))
+    r = json.loads(stats._stats_impl(sections=["version"]))
+    assert r["version"].get("agent_name") == "test-luria"
+
+
 if __name__ == "__main__":
     tests = [
         test_no_arg_call_returns_all_sections,
@@ -535,6 +587,11 @@ if __name__ == "__main__":
         test_sections_unknown_name_graceful,
         test_sections_all_unknown_graceful,
         test_percentile_helper_edge_cases,
+        test_version_section_present_by_default,
+        test_version_section_reads_deployed_version_file,
+        test_version_section_absent_when_not_requested,
+        test_version_section_graceful_when_no_identity_files,
+        test_version_section_reads_config_agent_name,
     ]
 
     passed = 0
