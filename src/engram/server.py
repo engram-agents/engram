@@ -5472,6 +5472,159 @@ def engram_query_pattern(payload_json: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# engram_embedding_cluster
+# ---------------------------------------------------------------------------
+# Exposes pairwise embedding similarity as a dream-fairy-callable primitive
+# for semantic clustering (issue #1154 — cat-10 v2 scan). Read-only; uses
+# stored embedding column (computed over claim text at filing time).
+# ---------------------------------------------------------------------------
+
+_EMBEDDING_CLUSTER_FIELDS = frozenset({
+    "node_ids", "threshold", "min_cluster_size",
+})
+
+
+@mcp.tool(
+    name="engram_embedding_cluster",
+    annotations={
+        "title": "Cluster Nodes by Embedding Similarity",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_embedding_cluster(payload_json: str) -> str:
+    """Cluster a set of nodes by their stored embedding similarity.
+
+    Computes pairwise cosine similarity over the stored embedding vectors
+    (computed at filing time over each node's claim text) and returns
+    transitive-closure clusters where every pair within a cluster has
+    similarity >= threshold. Uses existing sqlite-vec infrastructure with
+    no on-the-fly model calls. Intended as a dream-fairy-callable primitive
+    for semantic gap-keyed lesson-candidate scans (cat-10 v2, issue #1154).
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            node_ids (list[str], required): Node IDs to cluster (e.g.
+                ["ob_XXXX", "ob_YYYY", "dv_ZZZZ"]). At most 500 nodes.
+            threshold (float, optional): Cosine similarity threshold for
+                grouping two nodes together. Default 0.55. Range [0.0, 1.0].
+            min_cluster_size (int, optional): Minimum cluster size to include
+                in the "clusters" list. Singletons below this size go into
+                "singletons". Default 2.
+
+    Returns:
+        JSON with:
+            clusters: list of lists — each inner list is a group of node IDs
+                whose pairwise similarity is >= threshold (transitive closure).
+                Sorted by cluster size descending. Only clusters of size >=
+                min_cluster_size are included.
+            singletons: node IDs with embeddings but no cluster partner above
+                threshold.
+            unembedded: node IDs with no stored embedding (cold-start or
+                embedding not yet computed).
+            pair_count: total pairwise comparisons performed.
+            embedding_model: model used for stored embeddings (informational).
+        On error: {"error": "..."}.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _EMBEDDING_CLUSTER_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_EMBEDDING_CLUSTER_FIELDS)}"
+        })
+    if "node_ids" not in params:
+        return json.dumps({"error": "payload_json must include required field 'node_ids'"})
+    node_ids = params["node_ids"]
+    if not isinstance(node_ids, list) or not all(isinstance(x, str) for x in node_ids):
+        return json.dumps({"error": "'node_ids' must be a list of strings"})
+    if len(node_ids) > 500:
+        return json.dumps({"error": f"Too many node_ids ({len(node_ids)}); max 500"})
+
+    threshold = float(params.get("threshold", 0.55))
+    if not (0.0 <= threshold <= 1.0):
+        return json.dumps({"error": f"'threshold' must be in [0.0, 1.0]; got {threshold}"})
+    min_cluster_size = int(params.get("min_cluster_size", 2))
+    if min_cluster_size < 1:
+        return json.dumps({"error": f"'min_cluster_size' must be >= 1; got {min_cluster_size}"})
+
+    try:
+        conn = _get_db()
+    except Exception as e:
+        return json.dumps({"error": f"DB unavailable: {e}"})
+
+    # Fetch stored embeddings.
+    placeholders = ",".join("?" * len(node_ids)) if node_ids else "NULL"
+    rows = conn.execute(
+        f"SELECT id, embedding FROM nodes WHERE id IN ({placeholders})",
+        node_ids,
+    ).fetchall() if node_ids else []
+
+    id_to_vec: dict[str, list[float]] = {}
+    for row in rows:
+        vec = _decode_embedding(row["embedding"])
+        if vec is not None:
+            id_to_vec[row["id"]] = vec
+
+    unembedded = [nid for nid in node_ids if nid not in id_to_vec]
+    embedded_ids = list(id_to_vec.keys())
+
+    # Union-find clustering (transitive closure).
+    parent: dict[str, str] = {nid: nid for nid in embedded_ids}
+
+    def _find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(x: str, y: str) -> None:
+        px, py = _find(x), _find(y)
+        if px != py:
+            parent[py] = px
+
+    pair_count = 0
+    n = len(embedded_ids)
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = embedded_ids[i], embedded_ids[j]
+            sim = core.EmbeddingManager.cosine_similarity(id_to_vec[a], id_to_vec[b])
+            pair_count += 1
+            if sim >= threshold:
+                _union(a, b)
+
+    # Collect groups.
+    groups: dict[str, list[str]] = {}
+    for nid in embedded_ids:
+        root = _find(nid)
+        groups.setdefault(root, []).append(nid)
+
+    clusters = sorted(
+        [g for g in groups.values() if len(g) >= min_cluster_size],
+        key=lambda g: -len(g),
+    )
+    singletons = [
+        nid for nid in embedded_ids
+        if len(groups[_find(nid)]) < min_cluster_size
+    ]
+
+    return json.dumps({
+        "clusters": clusters,
+        "singletons": singletons,
+        "unembedded": unembedded,
+        "pair_count": pair_count,
+        "embedding_model": core.DEFAULT_EMBEDDING_MODEL,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
