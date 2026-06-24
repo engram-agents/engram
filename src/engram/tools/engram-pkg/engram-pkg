@@ -195,11 +195,62 @@ if [[ ! -f "$DB_FILE" ]]; then
     exit 1
 fi
 
-# WAL flush so .dump captures all committed writes from the live engram.
-sqlite3 "$DB_FILE" "PRAGMA wal_checkpoint(TRUNCATE);" > /dev/null
-sqlite3 "$DB_FILE" .dump > "$SQL_FILE"
+# WAL flush + virtual-table-safe SQL dump — pure-Python, no sqlite3 CLI needed (#799).
+# Rebuilds an in-memory copy from only the real (non-virtual) tables so iterdump()
+# never encounters FTS5/vec0 virtual tables that require unloaded extensions (#799).
+python3 - "$DB_FILE" "$SQL_FILE" <<'ENGRAM_DUMP'
+import sys, sqlite3
+db_file, sql_file = sys.argv[1], sys.argv[2]
+src = sqlite3.connect(db_file)
+src.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+src.commit()
+# Collect schema — ORDER BY rowid preserves creation order (tables before indexes).
+schema = src.execute(
+    "SELECT type, name, sql FROM sqlite_master ORDER BY rowid"
+).fetchall()
+# Virtual tables: sql starts with CREATE VIRTUAL TABLE (case-insensitive).
+virtual = {name for t, name, sql in schema
+           if t == "table" and sql is not None
+           and sql.upper().lstrip().startswith("CREATE VIRTUAL TABLE")}
+# Shadow tables: name starts with "<virtual_name>_" for any virtual table.
+pfxs = tuple(v + "_" for v in virtual)
+shadow = {name for t, name, sql in schema
+          if t == "table" and any(name.startswith(p) for p in pfxs)}
+# sqlite_* system tables are auto-managed by SQLite; skip them in CREATE.
+skip_tables = virtual | shadow | {name for t, name, sql in schema if name.startswith("sqlite_")}
+# Triggers referencing any virtual table.
+skip_trg = {name for t, name, sql in schema
+            if t == "trigger" and sql is not None
+            and any(v in sql for v in virtual)}
+# Rebuild in-memory DB with only the real tables + indexes + safe triggers.
+bk = sqlite3.connect(":memory:")
+for t, name, sql in schema:
+    if sql is None:
+        continue
+    if t in ("table", "shadow") and name in skip_tables:
+        continue
+    if t == "trigger" and name in skip_trg:
+        continue
+    bk.execute(sql)
+bk.commit()
+# Copy data row-by-row for each included real table.
+for t, name, sql in schema:
+    if t != "table" or name in skip_tables or sql is None:
+        continue
+    rows = src.execute(f"SELECT * FROM [{name}]").fetchall()
+    if rows:
+        bk.executemany(
+            f"INSERT INTO [{name}] VALUES ({','.join('?' * len(rows[0]))})", rows
+        )
+bk.commit()
+src.close()
+with open(sql_file, "w") as f:
+    for line in bk.iterdump():
+        print(line, file=f)
+bk.close()
+ENGRAM_DUMP
 
-NODE_COUNT=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM nodes;")
+NODE_COUNT=$(python3 -c "import sys,sqlite3; c=sqlite3.connect(sys.argv[1]); print(c.execute('SELECT COUNT(*) FROM nodes').fetchone()[0]); c.close()" "$DB_FILE")
 SQL_LINES=$(wc -l < "$SQL_FILE")
 echo "Dumped $DB_FILE -> $SQL_FILE  ($NODE_COUNT nodes, $SQL_LINES lines)"
 echo "Review diff with: git diff knowledge.sql"
@@ -209,7 +260,8 @@ _BUILD_SH_TEMPLATE = '''#!/usr/bin/env bash
 # Build the local knowledge.db from knowledge.sql.
 # Run this once after `git clone` (and again whenever you `git pull` and the .sql changed).
 #
-# This is the consumer-side build — minimal, no toolkit dependency, just sqlite3.
+# Consumer-side build — requires only python3 (stdlib sqlite3 module); no
+# other toolkit dependency. (#799: ported from sqlite3 CLI to pure-Python.)
 # (Authoring uses the engram-pkg CLI from engram-alpha/tools/engram-pkg/.)
 
 set -euo pipefail
@@ -225,11 +277,12 @@ fi
 
 # Replace any existing local .db. The .sql is the source of truth; local .db
 # is a build artifact and may be regenerated freely.
+# Pure-Python — no sqlite3 CLI needed (#799).
 rm -f "$DB_FILE" "$DB_FILE-shm" "$DB_FILE-wal"
-sqlite3 "$DB_FILE" < "$SQL_FILE"
+python3 -c "import sys,sqlite3; c=sqlite3.connect(sys.argv[1]); c.executescript(open(sys.argv[2]).read()); c.close()" "$DB_FILE" "$SQL_FILE"
 
-NODE_COUNT=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM nodes;")
-EDGE_COUNT=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM edges;")
+NODE_COUNT=$(python3 -c "import sys,sqlite3; c=sqlite3.connect(sys.argv[1]); print(c.execute('SELECT COUNT(*) FROM nodes').fetchone()[0]); c.close()" "$DB_FILE")
+EDGE_COUNT=$(python3 -c "import sys,sqlite3; c=sqlite3.connect(sys.argv[1]); print(c.execute('SELECT COUNT(*) FROM edges').fetchone()[0]); c.close()" "$DB_FILE")
 echo "Built $DB_FILE  ($NODE_COUNT nodes, $EDGE_COUNT edges)"
 '''
 
