@@ -4382,12 +4382,17 @@ def _validate_reasoning_structure(
                         f"STANDPOINT: {'; '.join(parts)}; others unchecked."
                         " (load skill `engram-standpoint` for the calibration theory)"
                     )
-
-            # If any key is None: some leaves lack standpoint data — skip the
-            # STANDPOINT report (can't distinguish no-data from same-cluster).
-            # The FALSIFICATION block below is NOT gated on this — it runs as a
-            # sibling so F-S (which needs no standpoint) is never suppressed by
-            # missing standpoint marks.
+            else:
+                # Some leaves lack standpoint data — can't distinguish no-data
+                # from same-cluster, so emit a low-noise unchecked notice (#761).
+                n_missing = sum(1 for k in axis_keys if k is None)
+                warnings.append(
+                    f"STANDPOINT: unchecked ({n_missing}/{n_leaves} premises"
+                    f" lack standpoint data)."
+                )
+            # The FALSIFICATION block below is NOT gated on standpoint — it runs
+            # as a sibling so F-S (which needs no standpoint) is never suppressed
+            # by missing standpoint marks.
 
         # --- FALSIFICATION block (UN-NESTED — sibling of STANDPOINT) ---
         # F-S is a property of the EVIDENCE, derived from quote_type/fs_class via

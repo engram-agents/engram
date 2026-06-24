@@ -5,7 +5,7 @@ Tests cover:
 1. standpoint columns written and retrievable from DB
 2. _validate_reasoning_structure: same standpoint → per-axis "⚠ uniform" warnings
 3. _validate_reasoning_structure: different standpoints → per-axis "diverse" warnings
-4. _validate_reasoning_structure: no standpoint data → no standpoint warning
+4. _validate_reasoning_structure: no standpoint data → STANDPOINT: unchecked (#761)
 5. Batch observations support per-observation standpoint fields
 6. standpoint_override_tag written to DB
 7. author-diverse/collection-uniform → ⚠ uniform caught on collection axis (v2 key test)
@@ -56,6 +56,15 @@ def _read_node_standpoint(client, node_id):
         return dict(row)
     finally:
         conn.close()
+
+
+def _set_self_lineage(value):
+    """Write self_lineage into the live test config so _self_lineage() reads it."""
+    import server as _server
+    cp = _server.core.CONFIG_PATH
+    cfg = json.loads(cp.read_text())
+    cfg["self_lineage"] = value
+    cp.write_text(json.dumps(cfg))
 
 
 # ---------------------------------------------------------------------------
@@ -204,8 +213,11 @@ def test_different_standpoints_two_cluster_warning():
 # ---------------------------------------------------------------------------
 
 def test_no_standpoint_data_no_warning():
-    """Two observations with no standpoint fields produce no standpoint warning."""
+    """Two observations with no standpoint fields produce STANDPOINT: unchecked (#761).
+    Previously this silently skipped; now a low-noise unchecked notice fires
+    while the ⚠⚠ composite stays closed (safe degradation preserved)."""
     client = fresh_client()
+    _set_self_lineage("")  # disable null=self so cluster_key returns None for all-unmarked
 
     r1 = client.call("engram_add_observation", {
         "url": "https://reuters.com/article1",
@@ -236,10 +248,17 @@ def test_no_standpoint_data_no_warning():
     assert dv.get("status") == "created", f"Derive failed: {dv}"
     warnings = dv.get("structure_warnings", [])
     standpoint_warns = [w for w in warnings if "STANDPOINT" in w]
-    assert len(standpoint_warns) == 0, (
-        f"Expected no standpoint warning when no standpoint data, got: {standpoint_warns}"
+    composite_warns = [w for w in warnings if w.startswith("⚠⚠")]
+    assert len(standpoint_warns) == 1 and "unchecked" in standpoint_warns[0], (
+        f"Expected exactly one STANDPOINT: unchecked warning, got: {standpoint_warns}"
     )
-    print("  PASS: No standpoint data → no standpoint warning")
+    assert "2/2" in standpoint_warns[0], (
+        f"Expected 2/2 proportion in unchecked line: {standpoint_warns[0]}"
+    )
+    assert len(composite_warns) == 0, (
+        f"⚠⚠ composite must stay closed with no standpoint data: {composite_warns}"
+    )
+    print(f"  PASS: No standpoint data → STANDPOINT: unchecked (2/2 ...), no ⚠⚠")
 
 
 # ---------------------------------------------------------------------------

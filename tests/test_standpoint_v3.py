@@ -867,20 +867,22 @@ def test_null_self_lineage_makes_gate_fire():
     )
 
     # Direction 2: self_lineage unset → null=self does NOT engage → cluster_key
-    # returns None for all-unmarked premises → gate stays closed (safe
-    # degradation, same as pre-feature).
+    # returns None for all-unmarked premises → ⚠⚠ composite stays closed (safe
+    # degradation), but STANDPOINT: unchecked fires (#761 — explicit over silent).
     client2 = fresh_client()
     _set_self_lineage("")
     u1 = _obs(client2, 1, quote_type="editorial")
     u2 = _obs(client2, 2, quote_type="editorial")
     _dv2, warnings2 = _derive(client2, [u1, u2], claim="Own-unmarked, self_lineage unset")
     assert _composite_line(warnings2) == "", (
-        f"unset self_lineage must safe-degrade to a closed gate: {warnings2}"
+        f"unset self_lineage must safe-degrade to a closed ⚠⚠ gate: {warnings2}"
     )
-    assert _standpoint_line(warnings2) == "", (
-        f"all-unmarked + no self_lineage → no STANDPOINT line: {warnings2}"
+    line2 = _standpoint_line(warnings2)
+    assert "unchecked" in line2, (
+        f"all-unmarked + no self_lineage → STANDPOINT: unchecked must fire (#761): {warnings2}"
     )
-    print("  PASS: null=self both directions (configured fires; unset safe-degrades)")
+    assert "2/2" in line2, f"expected 2/2 in unchecked line: {line2}"
+    print("  PASS: null=self both directions (configured fires ⚠⚠; unset emits unchecked)")
 
 
 def test_malformed_self_lineage_fails_closed():
@@ -1128,6 +1130,47 @@ def test_inductive_gen_unset_self_lineage_degrades_safely():
     print(f"  PASS: Layer-2 fires with unset self_lineage (1-cluster): {line[:90]}")
 
 
+# ---------------------------------------------------------------------------
+# Issue #761: explicit STANDPOINT: unchecked emission when premises lack
+# standpoint data (instead of silent skip).
+# Precondition: _self_lineage() must return "" so null=self doesn't kick in
+# and synthesize a lineage for all-unmarked observations.
+# ---------------------------------------------------------------------------
+
+def test_standpoint_unchecked_all_premises_missing():
+    """All premises lack standpoint data → emit STANDPOINT: unchecked (N/N ...)."""
+    c = fresh_client()
+    _set_self_lineage("")  # disable null=self synthesis so cluster_key returns None
+    o1 = _obs(c, 1)   # no standpoint fields, no lineage → cluster_key = None
+    o2 = _obs(c, 2)
+    _, w = _derive(c, [o1, o2])
+    line = _standpoint_line(w)
+    assert "unchecked" in line, (
+        f"Expected 'unchecked' in STANDPOINT line when all premises lack standpoint: {w}"
+    )
+    assert "2/2" in line, (
+        f"Expected '2/2' proportion in unchecked line: {line}"
+    )
+    print(f"  PASS: unchecked (all): {line}")
+
+
+def test_standpoint_unchecked_partial_premises_missing():
+    """One of two premises lacks standpoint data → emit STANDPOINT: unchecked (1/2 ...)."""
+    c = fresh_client()
+    _set_self_lineage("")  # disable null=self synthesis
+    o_with = _obs(c, 1, lineage="anthropic:opus")  # has standpoint data
+    o_without = _obs(c, 2)                          # no standpoint fields → None
+    _, w = _derive(c, [o_with, o_without])
+    line = _standpoint_line(w)
+    assert "unchecked" in line, (
+        f"Expected 'unchecked' in STANDPOINT line for partial standpoint: {w}"
+    )
+    assert "1/2" in line, (
+        f"Expected '1/2' proportion in unchecked line: {line}"
+    )
+    print(f"  PASS: unchecked (partial): {line}")
+
+
 if __name__ == "__main__":
     test_cross_lineage_diverse_no_warning()
     test_mixed_fs_ratio_no_composite()
@@ -1162,4 +1205,7 @@ if __name__ == "__main__":
     test_inductive_gen_two_independent_lineages_no_flag()
     test_inductive_analogy_not_flagged_by_layer2()
     test_inductive_gen_unset_self_lineage_degrades_safely()
+    # Issue #761 — explicit unchecked emission
+    test_standpoint_unchecked_all_premises_missing()
+    test_standpoint_unchecked_partial_premises_missing()
     print("All standpoint v3 tests passed.")
