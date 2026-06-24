@@ -1,0 +1,56 @@
+name: affected-tests
+
+# Import-graph selective pytest on every dev PR.
+# Runs only the tests affected by the PR's changed files via
+# src/engram/tools/run_touched_tests.py (Layer 1: static import graph;
+# Layer 2: packaging/test-map.json convention map).
+#
+# Fail-open: any changed file unresolved by both layers triggers the full
+# suite so a new surface can never silently escape coverage.
+#
+# This gate intentionally does NOT replace the full suite (tests.yml,
+# master-only). Its output — "SUBSET green" or "Full suite green (fallback)"
+# — is an iteration signal, not a convergence claim. The full suite gates
+# merge-readiness at master-merge time.
+#
+# Decision (Lei 2026-06-23, issue #1358): mechanical gate > vigilance for
+# dev-PR coverage. A SyntaxError in a hook (#1347 → #1356) merged to dev
+# green because no tests ran on dev PRs. This workflow closes that gap.
+on:
+  pull_request:
+    branches: [dev]
+
+jobs:
+  affected-tests:
+    runs-on: ubuntu-latest
+    env:
+      # Skip optional sentence-transformers embedding code path (avoids ~500MB
+      # model download per run). Tests pass either way.
+      ENGRAM_NO_EMBEDDINGS: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Fetch enough history for the base-branch diff.
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements/requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements/requirements-dev.txt
+          # src/forum/tests/ imports forum.server (Flask + bleach + markdown-it-py
+          # + beautifulsoup4 + html5lib); those deps live in src/forum/requirements.txt.
+          # Without this, forum-touching PRs select forum tests but fail on import.
+          pip install -r src/forum/requirements.txt
+
+      - name: Run affected tests
+        run: |
+          python src/engram/tools/run_touched_tests.py \
+            --base origin/${{ github.base_ref }} \
+            -- -v --tb=short
