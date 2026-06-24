@@ -494,6 +494,9 @@ def starred_block(engram_home: str) -> str:
 
 
 SESSION_ROLE = os.environ.get("ENGRAM_SESSION_ROLE", "interactive").strip().lower()
+# Effective session role — updated by main() after write_marker() resolves CWD.
+# Starts equal to SESSION_ROLE (env-var), may be promoted to "fairy" by CWD detection.
+_EFFECTIVE_SESSION_ROLE = SESSION_ROLE
 SESSION_PURPOSE = os.environ.get("ENGRAM_SESSION_PURPOSE", "").strip()
 SESSIONS_DIR = os.path.join(ENGRAM_HOME, "sessions")
 CURRENT_USER_PATH = os.path.join(ENGRAM_HOME, "current_user.json")
@@ -699,7 +702,7 @@ def sleep_status_block() -> str:
         banner asking the user to run /engram-sleep to establish a baseline.
         Genuine first-ever boot (DB below threshold) stays silent.
     """
-    if SESSION_ROLE != "interactive":
+    if _EFFECTIVE_SESSION_ROLE != "interactive":
         return ""
 
     marker: dict | None = None
@@ -783,7 +786,7 @@ def auto_sleep_cron_block() -> str:
     Returns:
         Multi-line nudge string when enabled + interactive, otherwise "".
     """
-    if SESSION_ROLE != "interactive":
+    if _EFFECTIVE_SESSION_ROLE != "interactive":
         return ""
 
     config_path = os.path.join(ENGRAM_HOME, "config.json")
@@ -889,7 +892,7 @@ def fairy_policy_block() -> str:
     Returns:
         Two-line string when interactive+startup, "" otherwise.
     """
-    if SESSION_ROLE != "interactive":
+    if _EFFECTIVE_SESSION_ROLE != "interactive":
         return ""
 
     config_path = os.path.join(ENGRAM_HOME, "config.json")
@@ -974,7 +977,7 @@ def forum_monitor_block() -> str:
     Returns:
         Instruction string when forum is configured + script exists, else "".
     """
-    if SESSION_ROLE != "interactive":
+    if _EFFECTIVE_SESSION_ROLE != "interactive":
         return ""
 
     config_path = os.path.join(ENGRAM_HOME, "config.json")
@@ -1012,6 +1015,8 @@ def main() -> None:
         hook_input = {}
 
     marker = write_marker(hook_input)
+    global _EFFECTIVE_SESSION_ROLE
+    _EFFECTIVE_SESSION_ROLE = marker.get("role", SESSION_ROLE) if marker else SESSION_ROLE
     write_baseline(use_compact_boundary=True)
 
     # ── Agent registration (multi-agent only) ─────────────────────────────────
