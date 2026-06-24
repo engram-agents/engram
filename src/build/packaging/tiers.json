@@ -505,6 +505,10 @@
       "tier": "convenience"
     },
     {
+      "path": "skills/claude/engram-standpoint",
+      "tier": "convenience"
+    },
+    {
       "path": "skills/claude/engram-collaborating-loop",
       "tier": "convenience",
       "multi_agent": true

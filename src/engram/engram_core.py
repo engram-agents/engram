@@ -4371,6 +4371,7 @@ def _validate_reasoning_structure(
                 if parts:
                     warnings.append(
                         f"STANDPOINT: {'; '.join(parts)}; others unchecked."
+                        " (load skill `engram-standpoint` for the calibration theory)"
                     )
 
             # If any key is None: some leaves lack standpoint data — skip the
