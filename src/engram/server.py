@@ -1331,6 +1331,8 @@ _ADD_OBSERVATION_FIELDS = frozenset({
     "standpoint_author_id", "standpoint_collection_id", "standpoint_override_tag",
     "standpoint_lineage", "standpoint_architecture",
     "fs_class",
+    "source_repo",
+    "repo_path",
 })
 
 
@@ -1429,6 +1431,8 @@ def engram_add_observation(payload_json: str) -> str:
             standpoint_lineage (str, optional): Training lineage of the source claim's producer, format "provider:family" (e.g. "anthropic:opus"). The most load-bearing bias axis for AI-agent premises; format-validated, rejected with a redirecting error if malformed.
             standpoint_architecture (str, optional): Cognitive architecture of the source's producer. Enum: transformer | vision-spatial | embodied-sensorimotor | graph-neural | human | other. Tracks architectural (not just training) diversity — Class A calibration exposure. Use "human" for human sources, "transformer" for other LLMs, omit for self-observations when explicit tracking is not desired.
             fs_class (str, optional): Falsification-sensitivity class — "re-executable" (Class 1: claim can be re-tested by re-running the measurement) or "frozen" (Class 2: claim records a past event that cannot be re-executed). Omit or pass null to let the Phase-1 proxy (derived from quote_type) apply. When provided, takes priority over the proxy and the FALSIFICATION line drops the "(proxy:quote_type)" label. When the class is ambiguous (e.g. a re-readable file that records past state), omit and let the proxy apply — hesitation is the correct signal to omit.
+            source_repo (str, optional): Absolute path to an alternative git repository to use for git operations. When omitted, the git repo is auto-detected from the file:// URL's directory. Use this for cross-repo citations where the cited file lives outside the target repo (e.g. a plugin file deployed to ~/.engram/ that is committed in the plugin source tree ~/engram-alpha/).
+            repo_path (str, optional): Relative path within source_repo where the committed copy of the cited file lives (e.g. "src/engram/server.py"). Required when source_repo is provided and the cited file:// URL path is outside source_repo — used for git status and cat-file checks instead of the auto-derived path. Without repo_path, the path is derived from the file URL relative to the source_repo root, which fails when the file lives outside source_repo. Example: cite file:///home/user/.engram/marketplace/plugins/engram/server.py with source_repo="/home/user/engram-alpha" and repo_path="src/engram/server.py".
 
     Returns:
         JSON with the new observation ID, confidence, evidence ID, and any prediction node created.
@@ -1462,6 +1466,7 @@ def engram_add_observation(payload_json: str) -> str:
 _ADD_OBSERVATION_BATCH_FIELDS = frozenset({
     "observations_json", "url", "title", "domain", "source_date",
     "evidence_id", "content_hash", "git_sha",
+    "source_repo", "repo_path",
 })
 
 

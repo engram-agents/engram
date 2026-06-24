@@ -217,3 +217,48 @@ def test_client_call_explicit_payload_json_passthrough():
         }),
     })
     assert r.get("status") == "created", f"Explicit payload_json should pass through: {r}"
+
+
+# ── 7. source_repo field ───────────────────────────────────────────────────
+
+
+def test_source_repo_accepted_as_known_field():
+    """source_repo and repo_path are in _ADD_OBSERVATION_FIELDS — must not be rejected as unknown."""
+    server = fresh_server()
+    r = json.loads(server.engram_add_observation(payload_json=json.dumps({
+        "quoted_text": "q", "interpretation": "i", "claim": "c",
+        "quote_type": "hard_data",
+        "url": "https://example.com/doc",
+        "title": "T",
+        "source_repo": "",
+        "repo_path": "",
+    })))
+    assert "Unknown fields" not in r.get("error", ""), (
+        f"source_repo/repo_path should be known fields, not rejected as unknown: {r}"
+    )
+
+
+def test_source_repo_nonexistent_dir_rejected():
+    """source_repo pointing to a non-existent path returns a 'not a directory' error."""
+    server = fresh_server()
+    content = "The rate of Y is 42%."
+    f = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+    try:
+        f.write(content)
+        f.close()
+        tmp_path = f.name
+        r = json.loads(server.engram_add_observation(payload_json=json.dumps({
+            "quoted_text": content,
+            "interpretation": "Known rate.",
+            "claim": "Rate of Y is 42%",
+            "quote_type": "hard_data",
+            "url": f"file://{tmp_path}",
+            "title": "Test temp file",
+            "source_repo": "/nonexistent/no/such/dir",
+        })))
+        assert "error" in r, f"Expected error for bad source_repo, got: {r}"
+        assert "not a directory" in r["error"], (
+            f"Expected 'not a directory' in error message: {r['error']}"
+        )
+    finally:
+        os.unlink(f.name)
