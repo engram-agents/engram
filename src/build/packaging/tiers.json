@@ -688,6 +688,10 @@
       "reason": "repository landing-page documentation — not shipped in the plugin bundle"
     },
     {
+      "path": "README.zh.md",
+      "reason": "Simplified Chinese translation of the repository landing page — rendered by the website's /zh/readme page; not shipped in the plugin bundle"
+    },
+    {
       "path": "README-AGENT.md",
       "reason": "agent-facing install/orientation documentation — repository landing doc, not shipped in the plugin bundle"
     },
@@ -702,6 +706,10 @@
     {
       "path": "USER_GUIDE.md",
       "reason": "user guide documentation — not shipped in the plugin bundle"
+    },
+    {
+      "path": "USER_GUIDE.zh.md",
+      "reason": "Simplified Chinese translation of the user guide — rendered by the website's /zh/user-guide page; not shipped in the plugin bundle"
     },
     {
       "path": "pytest.ini",

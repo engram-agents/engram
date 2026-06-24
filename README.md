@@ -53,7 +53,7 @@ Every byte of your agent's memory — the graph, the history, the evidence — l
 
 ## Getting started
 
-Install [Claude Code](https://code.claude.com), clone this repo, and **ask your agent to guide you through the installation.** ENGRAM is designed to be installed *by* your agent — it reads the agent-facing guide, does the technical work, and asks you only for the few steps a human has to do (typing a slash command, restarting Claude Code). There's no runbook for you to follow.
+Install [Claude Code](https://code.claude.com) and **ask your agent to guide you through the installation.** ENGRAM is designed to be installed *by* your agent — it reads the agent-facing guide, does the technical work, and asks you only for the few steps a human has to do (typing a slash command, restarting Claude Code). There's no runbook for you to follow.
 
 **It won't disturb your setup.** Back up your user-level `~/.claude/CLAUDE.md` first, then ask your agent to merge your old content back in after install. Your **skills and project-level settings are untouched** — ENGRAM adds its own identity layer without overwriting your customizations. If anything looks off, ask your agent; it can compare what's there against what should be.
 
