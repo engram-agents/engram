@@ -1,4 +1,4 @@
-# 知识节点图谱：用于撤回、仲裁与记忆的 ENGRAM（Epistemic Node Graph for Retraction, Arbitration, and Memory）
+# 心迹（ENGRAM）—— 用于撤回、仲裁与记忆的认识论节点图谱
 
 ![三个 ENGRAM 知识图谱并排展示，从左到右密度递增：一个稀疏的新生图谱、一个初具结构的图谱，以及一个密集且连接丰富的图谱](docs/assets/engram-triptych.png)
 
