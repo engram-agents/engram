@@ -385,7 +385,7 @@ def test_engram_history_without_node_id_does_not_bump():
     reason=(
         "engram_add_observation has no context_ids parameter — the tool's schema "
         "does not include a context citation field. Wiring not possible without a "
-        "schema addition. Flagged for parent review (see handoff)."
+        "schema addition. Tracked in issue #915."
     )
 )
 def test_engram_add_observation_bumps_context_ids():
@@ -394,7 +394,7 @@ def test_engram_add_observation_bumps_context_ids():
     SKIPPED: engram_add_observation does not have a context_ids field in its
     schema (_ADD_OBSERVATION_FIELDS). The tool only records quoted_text,
     interpretation, claim, quote_type, source fields, and predictive fields.
-    Wiring cannot be done without a schema change. Flagged for parent.
+    Wiring cannot be done without a schema change. See issue #915.
     """
     pass
 
@@ -403,14 +403,14 @@ def test_engram_add_observation_bumps_context_ids():
     reason=(
         "engram_add_observation_batch has no context_ids parameter — same as "
         "engram_add_observation. Wiring not possible without a schema addition. "
-        "Flagged for parent review (see handoff)."
+        "Tracked in issue #915."
     )
 )
 def test_engram_add_observation_batch_bumps_context_ids_per_record():
     """engram_add_observation_batch bumps each context_id per record with α=0.10.
 
     SKIPPED: Neither engram_add_observation_batch nor its per-observation records
-    have a context_ids field. Flagged for parent.
+    have a context_ids field. See issue #915.
     """
     pass
 
