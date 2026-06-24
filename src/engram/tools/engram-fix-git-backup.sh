@@ -20,10 +20,10 @@
 #
 # Steps:
 #   0. Refuse unless knowledge.db exists (safety gate)
-#   1. Create out-of-tree safety snapshot of knowledge.db (sqlite3 .backup)
+#   1. Create out-of-tree safety snapshot of knowledge.db (Python sqlite3.backup API)
 #      and verify node count matches live DB
 #   2. Write / refresh .gitignore with canonical patterns
-#   3. Regenerate knowledge.sql embedding-stripped (backup→null→dump method)
+#   3. Regenerate knowledge.sql embedding-stripped (pure-Python: backup→null→dump)
 #   4. Verify stripped dump rebuilds losslessly (node/edge/edit_history counts)
 #      BEFORE touching git
 #   5. Drop old git history + fresh git init + add (respecting .gitignore)

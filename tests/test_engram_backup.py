@@ -421,6 +421,52 @@ def test_verify_roundtrip_fts_no_probe_term(tmp_path):
     assert rep["nodes"] == 1
 
 
+def test_verify_roundtrip_zero_fts_hits(tmp_path):
+    """Zero-hit FTS path: verify_roundtrip returns ok=True and fts_hits==0 when no
+    node in the DB contains the probe term ('migration').
+
+    This confirms the guard introduced for the #723 nit is load-bearing: a graph
+    that genuinely has no 'migration' content passes cleanly, and the returned
+    fts_hits value is 0 (not None, not missing).
+    """
+    db_path = str(tmp_path / "knowledge.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE nodes (
+            id   TEXT PRIMARY KEY,
+            claim TEXT,
+            quoted_text TEXT,
+            interpretation TEXT,
+            embedding TEXT
+        );
+        CREATE TABLE edges (src TEXT, dst TEXT, relation TEXT);
+        CREATE VIRTUAL TABLE nodes_fts USING fts5(
+            claim, quoted_text, interpretation,
+            content='nodes', content_rowid='rowid'
+        );
+        CREATE TRIGGER nodes_fts_insert AFTER INSERT ON nodes BEGIN
+            INSERT INTO nodes_fts(rowid, claim, quoted_text, interpretation)
+            VALUES (new.rowid, new.claim, new.quoted_text, new.interpretation);
+        END;
+        """
+    )
+    # Nodes exist but none contain 'migration'.
+    conn.execute(
+        "INSERT INTO nodes VALUES ('ob_1', 'epistemic humility cornerstone', 'axiom', 'introspective', '[0.1]')"
+    )
+    conn.execute(
+        "INSERT INTO nodes VALUES ('ob_2', 'provenance chain for observations', 'evidence', 'sourced', '[0.2]')"
+    )
+    conn.commit()
+    conn.close()
+
+    rep = engram_backup.verify_roundtrip(db_path)
+    assert rep["ok"] is True
+    assert rep["nodes"] == 2
+    assert rep["fts_hits"] == 0
+
+
 @pytest.mark.skipif(not _SQLITE_VEC_LOADABLE, reason="sqlite_vec not importable or not loadable")
 def test_dump_stripped_with_real_vec_nodes(tmp_path):
     """Regression test for #724: dump_stripped must not raise when the DB contains

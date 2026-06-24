@@ -3000,6 +3000,8 @@ def _commit_snapshot(
             if f.is_file() and f.name != ".key" and "__pycache__" not in str(f):
                 files_to_stage.append(f"diary/{f.name}")
 
+    # Dead branch under normal operation — step above always writes graph_snapshot.md.
+    # Can only fire if snapshot generation itself failed (class-5 signal).
     if not files_to_stage:
         return {"git_committed": False, "reason": "no tracked files exist", **_dump_fields}
 
