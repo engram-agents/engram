@@ -4225,17 +4225,18 @@ def _validate_reasoning_structure(
             "CHECKED (mechanical): same-evidence-root cluster across premises."
         )
 
-    # Standpoint uniformity check — advisory for ALL derivations with 2+ premises.
-    # Extends the multi_source check: maps each evidence root to its standpoint
-    # cluster and emits a positive-liveness probe (per the class-5 two-layer
-    # lesson: surface must ALWAYS name what axes were checked, even on clean).
+    # Standpoint uniformity check — advisory for ALL derivations with 1+ premises.
+    # Extended from n >= 2 to n >= 1 (#958): chains of single-premise derivations
+    # (dv←dv←dv←ob) previously escaped the F-S and ⚠⚠ checks at every level.
+    # STANDPOINT axis reports for n_leaves=1 are trivially uniform but technically
+    # correct; F-S and ⚠⚠ are the primary signals for the single-premise case.
     #
     # Implementation note: standpoint_author_id / standpoint_collection_id are
     # filed on observation (premise) nodes, not on evidence nodes. We trace
     # evidence roots to determine whether premises share the same source for the
     # multi_source check above, but the standpoint cluster key is derived from
     # the premise nodes themselves (where the standpoint data actually lives).
-    if n >= 2:
+    if n >= 1:
         # Closure-walk to OBSERVATION leaves: standpoint (author/collection/
         # lineage) + quote_type/fs_class live on observation nodes — NOT on the
         # direct premises (which may themselves be derivations) and NOT on the
@@ -4463,20 +4464,20 @@ def _validate_reasoning_structure(
                         f"{remedy}{proxy_suffix}."
                     )
 
-        # Role-axis prompt (issue #933): the one premise-quality axis the
-        # substrate structurally CANNOT check — which premise carries the
-        # entailment. A contextual weak premise can floor a deduction
-        # (under-confidence) or pad a corroboration (over-confidence) with all
-        # evidence roots distinct, and every mechanical check above stays
-        # silent. Always a question on multi-premise derivations, never a
-        # pass/fail, never an auto-discount — an auto-discount would need to
-        # know which premise is load-bearing, and it can't (forum #19
-        # consensus, three graphs).
-        warnings.append(
-            "NOT CHECKED (agent judgment): premise role — is the load-bearing "
-            "premise the one driving the confidence? Context premises belong "
-            "in context_ids."
-        )
+        # Role-axis prompt (issue #933): only meaningful for multi-premise
+        # derivations — which premise carries the entailment. Gated on n >= 2
+        # even though the outer block is now n >= 1 (#958). A contextual weak
+        # premise can floor a deduction (under-confidence) or pad a
+        # corroboration (over-confidence) with all evidence roots distinct, and
+        # every mechanical check above stays silent. Never a pass/fail, never
+        # an auto-discount — an auto-discount would need to know which premise
+        # is load-bearing, and it can't (forum #19 consensus, three graphs).
+        if n >= 2:
+            warnings.append(
+                "NOT CHECKED (agent judgment): premise role — is the load-bearing "
+                "premise the one driving the confidence? Context premises belong "
+                "in context_ids."
+            )
 
     return warnings
 

@@ -11,6 +11,8 @@ Tests cover:
 7. author-diverse/collection-uniform → ⚠ uniform caught on collection axis (v2 key test)
 8. Single-axis premises: author-only reports author axis, omits collection
 9. Mixed-axis premises: partial axis omitted (all-or-omit rule)
+10. Single-premise derivation triggers STANDPOINT + FALSIFICATION (n >= 1 gate, #958)
+11. Single-premise chain: ⚠⚠ fires when lineage-uniform and zero verified leaves
 """
 
 import atexit
@@ -292,11 +294,17 @@ def test_batch_with_standpoint_fields():
 
 
 # ---------------------------------------------------------------------------
-# Test 6: Single-premise derivation — no standpoint check fires (n < 2)
+# Test 6: Single-premise derivation — STANDPOINT + FALSIFICATION fire (#958)
 # ---------------------------------------------------------------------------
 
-def test_single_premise_no_standpoint_check():
-    """A derivation with only 1 premise does not trigger the standpoint check."""
+def test_single_premise_triggers_standpoint_and_fs():
+    """A derivation with only 1 premise now triggers STANDPOINT and FALSIFICATION.
+
+    Before #958 the gate was `if n >= 2`, silently skipping single-premise
+    derivations. After the fix the gate is `if n >= 1`, so even a single-premise
+    derivation whose observation leaf has standpoint data gets STANDPOINT (trivially
+    uniform but technically correct) and FALSIFICATION advisory.
+    """
     client = fresh_client()
 
     r1 = client.call("engram_add_observation", {
@@ -320,14 +328,63 @@ def test_single_premise_no_standpoint_check():
     assert dv.get("status") == "created", f"Derive failed: {dv}"
     warnings = dv.get("structure_warnings", [])
     standpoint_warns = [w for w in warnings if "STANDPOINT" in w]
-    assert len(standpoint_warns) == 0, (
-        f"Expected no standpoint warning for single-premise derivation, got: {standpoint_warns}"
+    fs_warns = [w for w in warnings if "FALSIFICATION" in w]
+    assert len(standpoint_warns) >= 1, (
+        f"Expected STANDPOINT warning for single-premise derivation (n >= 1 gate), "
+        f"got none. All warnings: {warnings}"
     )
-    print("  PASS: Single-premise derivation → no standpoint check")
+    assert len(fs_warns) >= 1, (
+        f"Expected FALSIFICATION warning for single-premise derivation, "
+        f"got none. All warnings: {warnings}"
+    )
+    print(f"  PASS: Single-premise derivation → STANDPOINT + FALSIFICATION fire. "
+          f"standpoint={standpoint_warns[0][:60]!r}")
 
 
 # ---------------------------------------------------------------------------
-# Test 7: author-diverse / collection-uniform → ⚠ uniform caught on collection
+# Test 7 (new): Single-premise chain ⚠⚠ escalation fires (#958)
+# ---------------------------------------------------------------------------
+
+def test_single_premise_chain_ww_fires():
+    """⚠⚠ escalation fires for a single-premise derivation with uniform lineage and zero
+    verified leaves.
+
+    Covers the chain case from #958: dv←ob with lineage-uniform + unverified obs
+    must escalate to ⚠⚠ now that the n >= 1 gate is in place. Without the #958
+    fix, this derivation would have emitted NO advisory; with the fix the ⚠⚠
+    composite fires.
+    """
+    client = fresh_client()
+
+    r1 = client.call("engram_add_observation", {
+        "url": "https://example.com/chain-base",
+        "title": "Chain base observation",
+        "quoted_text": "A foundational claim derived from conversation.",
+        "interpretation": "Conversational prior — frozen, unverified.",
+        "claim": "Foundational claim A",
+        "quote_type": "personal_communication",
+        "standpoint_lineage": "anthropic:claude",
+    })
+    assert r1.get("status") == "created", f"r1 failed: {r1}"
+
+    dv = client.call("engram_derive", {
+        "claim": "Derived claim from chain base",
+        "supporting_ids": r1["observation_id"],
+        "logical_chain": "The foundational claim implies this derived claim.",
+        "reasoning_type": "authority_expert",
+    })
+    assert dv.get("status") == "created", f"Derive failed: {dv}"
+    warnings = dv.get("structure_warnings", [])
+    ww_warns = [w for w in warnings if w.startswith("⚠⚠")]
+    assert len(ww_warns) >= 1, (
+        f"Expected ⚠⚠ escalation for single-premise derivation with lineage-uniform "
+        f"unverified leaves, got none. All warnings: {warnings}"
+    )
+    print(f"  PASS: Single-premise chain ⚠⚠ escalation fires. ww={ww_warns[0][:80]!r}")
+
+
+# ---------------------------------------------------------------------------
+# Test 8 (prev. 7): author-diverse / collection-uniform → ⚠ uniform caught on collection
 # ---------------------------------------------------------------------------
 
 def test_author_diverse_collection_uniform_warning():
@@ -723,7 +780,8 @@ if __name__ == "__main__":
         test_different_standpoints_two_cluster_warning,
         test_no_standpoint_data_no_warning,
         test_batch_with_standpoint_fields,
-        test_single_premise_no_standpoint_check,
+        test_single_premise_triggers_standpoint_and_fs,
+        test_single_premise_chain_ww_fires,
         test_author_diverse_collection_uniform_warning,
         test_single_axis_author_only_warning,
         test_mixed_axis_collection_omitted_when_partial,
