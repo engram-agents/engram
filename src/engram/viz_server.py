@@ -4132,9 +4132,9 @@ def get_stats_data(index_db_path: str) -> dict:
                 ),
             }
     try:
-        # mode=ro defensively; engram_log_indexer.py uses DELETE journal mode
-        # today so no WAL-staleness risk exists, but if it ever switches to WAL,
-        # mode=ro is correct AND we still need to NOT carry immutable=1 (#184).
+        # mode=ro (no immutable=1): index.db uses WAL journal mode (#879) so
+        # mode=ro needs -shm/-wal access; immutable=1 would skip those files
+        # and produce stale reads.
         conn = sqlite3.connect(f"file:{index_db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
     except sqlite3.Error as exc:

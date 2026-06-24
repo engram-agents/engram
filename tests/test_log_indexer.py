@@ -144,6 +144,14 @@ class TestEmptyLogsDir(IndexerTestBase):
         Indexer.run_once(logs_dir=self.logs_dir)
         self.assertTrue(_table_exists(self.db_path, "events"))
 
+    def test_wal_journal_mode(self):
+        """index.db must use WAL journal mode to avoid write contention (#879)."""
+        Indexer.run_once(logs_dir=self.logs_dir)
+        conn = sqlite3.connect(str(self.db_path))
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        conn.close()
+        self.assertEqual(mode, "wal", "index.db must use WAL journal mode")
+
     def test_all_7_indexes_created(self):
         Indexer.run_once(logs_dir=self.logs_dir)
         idx = _get_index_names(self.db_path)
