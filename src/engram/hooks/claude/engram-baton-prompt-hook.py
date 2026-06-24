@@ -462,13 +462,19 @@ def _scan_my_batons(agent_name: str) -> list:
 # ---------------------------------------------------------------------------
 
 def _auto_archive_merged_pr_batons(cache: dict) -> None:
-    """Scan ALL open PR-batons and close any whose live GitHub status is MERGED.
+    """Scan ALL open PR-batons and close any whose live GitHub status is terminal.
+
+    Handles two terminal GitHub PR states:
+    - MERGED → baton closed with status ``merged``
+    - CLOSED (without merge) → baton closed with status ``cancelled``
 
     This pass is independent of the in-court rendering loop — it runs over
     every baton file regardless of which agent holds the turn.  Merged PRs
     always have turn==<maintainer> (the merge-ready signal), so they are
     never in any agent's court and would never be reached by the rendering
-    loop scan.
+    loop scan.  Closed-without-merge PRs can have any turn value (the PR may
+    have been closed mid-review from any turn), so the second-scan model is
+    the only reliable detection path for those too.
 
     Instrumentation: every outcome (success, failure, skip) is written to
     stderr (the hook log channel).  Stdout is reserved for prompt context.
@@ -520,14 +526,22 @@ def _auto_archive_merged_pr_batons(cache: dict) -> None:
 
         # Fetch live status via the existing cache mechanism (30s TTL)
         live_status = _get_live_status(anchor, cache)
-        if not (live_status == "MERGED" or live_status.startswith("MERGED")):
+
+        # Map live GitHub terminal states to baton close statuses.
+        if live_status == "MERGED" or live_status.startswith("MERGED"):
+            close_status = "merged"
+            log_reason = "PR merged"
+        elif live_status == "CLOSED":
+            close_status = "cancelled"
+            log_reason = "PR closed without merge"
+        else:
             continue
 
-        # Live status is MERGED — close the baton
+        # Live PR is terminal — close the baton
         pid = project_id
         try:
             result = subprocess.run(
-                [baton_bin, "close", pid, "--status", "merged"],
+                [baton_bin, "close", pid, "--status", close_status],
                 capture_output=True,
                 text=True,
                 timeout=_GH_TIMEOUT,
@@ -541,7 +555,7 @@ def _auto_archive_merged_pr_batons(cache: dict) -> None:
                 )
             else:
                 print(
-                    f"baton auto-archive: closed {pid} (PR merged)",
+                    f"baton auto-archive: closed {pid} ({log_reason})",
                     file=sys.stderr,
                 )
         except Exception as e:
@@ -648,9 +662,10 @@ def main() -> None:
         print(json.dumps(response))
 
     # ── Auto-archive pass: runs even when my_batons is empty ─────────────────
-    # Merged PR-batons always have turn==<maintainer>, so they are never in any
-    # agent's in-court list.  This second scan covers ALL open PR-batons
-    # regardless of turn, closing any whose live GitHub status is MERGED.
+    # Terminal PR-batons (MERGED or CLOSED) may have any turn value, so they
+    # are not reliably caught by the in-court scan above.  This second scan
+    # covers ALL open PR-batons regardless of turn, closing any whose live
+    # GitHub status is a terminal state (MERGED → "merged"; CLOSED → "cancelled").
     # Guard: skip when gh is unavailable (no live status reachable anyway).
     if gh_ok:
         _auto_archive_merged_pr_batons(cache)

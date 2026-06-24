@@ -1016,3 +1016,98 @@ class TestAutoArchiveSecondPass:
         assert stdout_lines == [], (
             f"stdout must be empty when no batons in court; got: {stdout_lines}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests 25–26: Auto-archive on CLOSED (without merge) detection — issue #881
+# ---------------------------------------------------------------------------
+
+class TestAutoArchiveClosedWithoutMerge:
+    """Auto-archive PR-batons when live GitHub status is CLOSED (not merged)."""
+
+    @staticmethod
+    def _which(name: str):
+        """Fake shutil.which: returns the name itself for known tools."""
+        if name in ("baton", "gh"):
+            return name
+        return None
+
+    # ------------------------------------------------------------------
+    # Test 25: CLOSED PR → baton close with --status cancelled
+    # ------------------------------------------------------------------
+
+    def test_closed_pr_baton_archived_as_cancelled(self, engram_home, projects_dir):
+        """baton close --status cancelled is called when a PR-baton's live status is CLOSED.
+
+        This is the 'closed-without-merge' residual class (issue #881): a PR
+        that was closed without merging leaves its baton open under the
+        MERGED-only auto-archive.  The fix extends the scan to also handle
+        CLOSED → cancelled.
+        """
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-2800",
+            turn="borges",
+            status="in-review",
+            turn_reason="colleague review in progress — PR closed without merge mid-review",
+        )
+
+        mod = _load_hook_module(engram_home, projects_dir)
+
+        with patch.dict(os.environ, {
+            "ENGRAM_HOME": str(engram_home),
+            "BATON_PROJECTS_DIR": str(projects_dir),
+        }):
+            with patch.object(mod.shutil, "which", side_effect=self._which):
+                with patch.object(mod, "_fetch_pr_status", return_value="CLOSED"):
+                    with patch.object(mod, "subprocess") as mock_subproc:
+                        mock_subproc.run.return_value = type(
+                            "CompletedProcess", (), {"returncode": 0}
+                        )()
+                        mod.main()
+
+        mock_subproc.run.assert_called_once_with(
+            ["baton", "close", "PR-2800", "--status", "cancelled"],
+            capture_output=True,
+            text=True,
+            timeout=mod._GH_TIMEOUT,
+        )
+
+    # ------------------------------------------------------------------
+    # Test 26: already-cancelled baton is NOT archived again (idempotency)
+    # ------------------------------------------------------------------
+
+    def test_already_cancelled_baton_not_archived_again(
+        self, engram_home, projects_dir
+    ):
+        """baton close is NOT called for a baton already status=cancelled."""
+        _write_config(engram_home, "borges")
+        _write_project(
+            projects_dir, "PR-2900",
+            turn="borges",
+            status="cancelled",          # already closed
+            turn_reason="PR was closed without merge",
+        )
+
+        mod = _load_hook_module(engram_home, projects_dir)
+
+        baton_close_calls = []
+
+        def _fake_run(args, **kwargs):
+            if args[:2] == ["baton", "close"]:
+                baton_close_calls.append(args)
+            return type("CompletedProcess", (), {"returncode": 0})()
+
+        with patch.dict(os.environ, {
+            "ENGRAM_HOME": str(engram_home),
+            "BATON_PROJECTS_DIR": str(projects_dir),
+        }):
+            with patch.object(mod.shutil, "which", side_effect=self._which):
+                with patch.object(mod, "_fetch_pr_status", return_value="CLOSED"):
+                    with patch.object(mod, "subprocess") as mock_subproc:
+                        mock_subproc.run.side_effect = _fake_run
+                        mod.main()
+
+        assert baton_close_calls == [], (
+            "baton close must not be called for a baton already status=cancelled"
+        )
