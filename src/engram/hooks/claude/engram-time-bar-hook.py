@@ -8,7 +8,8 @@ Closes the Welcome-Back failure mode and the FROZEN-NOW-IN-
 COMPACTION-SUMMARY risk (the CLOCK-DRIFT-hygiene derivation) by re-rendering every turn against wall-clock.
 
 Output (one line, prepended to the injected context):
-  [Time: <weekday> <local_date> <local_12h> <tz_abbr> (<utc_hhmmZ>) | session started <hms> ago | last user msg <hms> ago]
+  Configured tz:   [Time: <weekday> <local_date> <local_12h> <tz_abbr> (<utc_hhmmZ>) | session started <hms> ago | last user msg <hms> ago]
+  Unconfigured tz: [Time: <weekday> <utc_date> <utc_HHMM> UTC (tz not configured) | session started <hms> ago | last user msg <hms> ago]
 
 User-local time is PROMINENT — weekday, date, 12-hour clock, and tz abbr are all
 derived from the user's timezone (not UTC), so the agent reads the human's actual
@@ -23,7 +24,9 @@ Signal sources:
     (SessionStart hook writes per-session marker; session_id read from this
     hook's stdin payload per issue #140)
   - Last user msg: ~/.engram/last-user-msg.json (self-maintained by this hook)
-  - User-local tz: ~/.engram/config.json 'user.timezone' (fallback 'America/Los_Angeles')
+  - User-local tz: ~/.engram/config.json 'user.timezone' (None when absent →
+    UTC shown with '(tz not configured)' label rather than a silently-wrong
+    default coast; set user.timezone to an IANA name, e.g. 'America/New_York')
 
 Additive-only: if any signal fails to read, the bar renders with a best-effort
 label ('unknown', 'parse-error', etc) rather than crashing. The hook writes to
@@ -51,7 +54,6 @@ SESSIONS_DIR = ENGRAM_DIR / "sessions"
 LAST_USER_MSG = ENGRAM_DIR / "last-user-msg.json"
 LAST_USER_ACTIVITY = ENGRAM_DIR / "last-user-activity"
 CONFIG = ENGRAM_DIR / "config.json"
-DEFAULT_TZ = "America/Los_Angeles"
 
 # Prompt-body prefixes that identify non-human events (loop self-wakes and
 # monitor notifications). Used as the fallback discriminator when promptSource
@@ -97,22 +99,37 @@ def _hms_ago(now_utc: datetime, then_iso):
     return f"{days}d{hrs}h" if hrs else f"{days}d"
 
 
-def _get_lei_tz():
+def _get_user_tz():
+    """Return the user's IANA timezone name, or None if not configured."""
     cfg = _read_json(CONFIG) or {}
     user = cfg.get("user") or {}
-    return user.get("timezone") or DEFAULT_TZ
+    tz = user.get("timezone")
+    return tz if isinstance(tz, str) and tz.strip() else None
 
 
-def _format_time_field(now_utc: datetime, tz_name: str) -> str:
+def _format_time_field(now_utc: datetime, tz_name) -> str:
     """Render the time field with USER-LOCAL prominent and UTC parenthetical.
 
     weekday / date / 12-hour clock / tz abbr are all derived from the user's
     timezone (so the agent reads the human's real time-of-day, including the
     correct local date — which can differ from the UTC date near midnight).
-    UTC is reduced to a small ``(HH:MMZ)`` tail. If the timezone can't be
-    resolved (no zoneinfo module, bad tz name), fall back to a clearly-labelled
-    UTC so the failure is visible rather than silently mis-rendered as local.
+    UTC is reduced to a small ``(HH:MMZ)`` tail.
+
+    When tz_name is None (user.timezone absent from config.json), the bar
+    shows UTC with a visible '(tz not configured)' label — an actionable
+    signal, never a silently-wrong local time defaulting to the wrong coast.
+    Set user.timezone in config.json to an IANA name (e.g. 'America/New_York').
+
+    If the timezone can't be resolved (no zoneinfo module, bad tz name), fall
+    back to a clearly-labelled UTC so the failure is visible rather than
+    silently mis-rendered as local.
     """
+    if tz_name is None:
+        # Not configured — show UTC with an actionable label.
+        return (
+            f"{now_utc.strftime('%a')} {now_utc.strftime('%Y-%m-%d')} "
+            f"{now_utc.strftime('%H:%M')} UTC (tz not configured)"
+        )
     if ZoneInfo is not None:
         try:
             local = now_utc.astimezone(ZoneInfo(tz_name))
@@ -217,7 +234,7 @@ def main():
     except Exception:
         pass
 
-    time_field = _format_time_field(now_utc, _get_lei_tz())
+    time_field = _format_time_field(now_utc, _get_user_tz())
     bar = (
         f"[Time: {time_field} | "
         f"session started {session_ago} ago | "

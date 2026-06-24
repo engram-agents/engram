@@ -95,6 +95,52 @@ def test_fallback_when_zoneinfo_module_absent(monkeypatch):
     assert "2026-06-03T02:55" in field
 
 
+def test_tz_none_shows_utc_with_not_configured_label():
+    """tz_name=None (unconfigured) → UTC shown with actionable label, never a silent wrong coast."""
+    now = datetime(2026, 6, 3, 2, 55, tzinfo=timezone.utc)
+    field = tbh._format_time_field(now, None)
+    assert "UTC (tz not configured)" in field
+    # Weekday and date come from UTC when unconfigured (NOT from local EDT).
+    assert "Wed" in field  # 2026-06-03 UTC is Wednesday
+    assert "2026-06-03" in field
+    # Does NOT silently show a wrong-coast timezone.
+    assert "PDT" not in field
+    assert "EDT" not in field
+
+
+def test_get_user_tz_returns_none_when_no_config(tmp_path, monkeypatch):
+    """No config.json → returns None (not a hardcoded LA default)."""
+    monkeypatch.setattr(tbh, "CONFIG", tmp_path / "config.json")
+    assert tbh._get_user_tz() is None
+
+
+def test_get_user_tz_returns_none_when_user_block_absent(tmp_path, monkeypatch):
+    """config.json present but no 'user' block → returns None."""
+    import json as _json
+    cfg = tmp_path / "config.json"
+    cfg.write_text(_json.dumps({"agent_name": "test"}))
+    monkeypatch.setattr(tbh, "CONFIG", cfg)
+    assert tbh._get_user_tz() is None
+
+
+def test_get_user_tz_returns_none_when_timezone_empty(tmp_path, monkeypatch):
+    """config.json has user.timezone='' (empty) → returns None."""
+    import json as _json
+    cfg = tmp_path / "config.json"
+    cfg.write_text(_json.dumps({"user": {"timezone": ""}}))
+    monkeypatch.setattr(tbh, "CONFIG", cfg)
+    assert tbh._get_user_tz() is None
+
+
+def test_get_user_tz_returns_value_when_set(tmp_path, monkeypatch):
+    """config.json has user.timezone set → returns it."""
+    import json as _json
+    cfg = tmp_path / "config.json"
+    cfg.write_text(_json.dumps({"user": {"timezone": "America/New_York"}}))
+    monkeypatch.setattr(tbh, "CONFIG", cfg)
+    assert tbh._get_user_tz() == "America/New_York"
+
+
 # ---------------------------------------------------------------------------
 # Spec case 7 — last-user-activity stamp discriminator
 # ---------------------------------------------------------------------------
