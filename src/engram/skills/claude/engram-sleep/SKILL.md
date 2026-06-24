@@ -270,6 +270,41 @@ only discovered when you reach for it and find it three days stale.
 `~/.engram/` loss takes it). The per-nap git auto-push is the off-disk layer.
 The three layers are complementary along those axes.
 
+### Step 4.6 — Back up main session logs (skip subagents/)
+
+Run the session-log backup tool and **capture the result for the sleep summary**.
+Copies top-level `.jsonl` logs from `~/.claude/projects/` to
+`~/.engram/session-logs-archive/`, skipping any path containing `/subagents/`.
+Top-level logs are cited as `source_url` evidence in ENGRAM nodes; subagent logs
+are ephemeral fairy transcripts that are never cited.
+
+```bash
+session_backup_out=$($HOME/.engram/venv/bin/python3 \
+    "$CLAUDE_PLUGIN_ROOT/tools/backup_session_logs.py" \
+    [--retain 365] 2>&1)   # prune archive entries older than 365 days; omit to keep all
+session_backup_rc=$?
+if [ $session_backup_rc -eq 0 ]; then
+    session_backup_status="✓ session-log backup OK: $session_backup_out"
+else
+    session_backup_status="⚠ session-log backup FAILED: $session_backup_out"
+fi
+```
+
+**Non-blocking**: do not abort sleep on failure — the session logs already exist in
+`~/.claude/projects/`; the archive is belt-and-suspenders for retention-policy
+independence. But **surface the status in the history milestone** (Step 4) so a
+recurring failure is visible, not silent:
+
+```
+- session-log backup: $session_backup_status
+```
+
+**Skip if source directory is absent** (the tool handles this automatically — it
+exits 0 with a 0-backed-up summary when `~/.claude/projects/` does not exist).
+
+**Deduplication**: the tool skips files already in the archive that match by size;
+re-copies if size differs (resumed session may have grown the file).
+
 ---
 
 ## Phase B — Consolidation orchestration
