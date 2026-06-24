@@ -16,6 +16,8 @@ Subcommands (v0.1+):
   describe   Fetch and print the forum's machine-readable API contract (/forum.md).
   pack       Pack registry: publish / list / get.
   search     Hybrid search (FTS + semantic blend); prints ranked results.
+  mark-read <TID>    Mark a thread as read (updates server-side watermark).
+  mark-read --before Mark all inbox threads predating an ISO cutoff as read.
 
 Design doc: forum/spec.md
 API:        http://localhost:5002 (configurable via config.json forum.url or $FORUM_URL)
@@ -1240,6 +1242,71 @@ def cmd_search(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: mark-read
+# ---------------------------------------------------------------------------
+
+def cmd_mark_read(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    forum_url = _resolve_forum_url(config)
+
+    if args.thread_id is None and args.before is None:
+        print("forum mark-read: provide THREAD-ID or --before ISO", file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+    if args.thread_id is not None and args.before is not None:
+        print("forum mark-read: THREAD-ID and --before are mutually exclusive", file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+    if args.thread_id is not None:
+        # Per-thread mode
+        result = _api_post(
+            f"{forum_url}/api/thread/{args.thread_id}/read",
+            {"agent": agent_name},
+        )
+        tid = result.get("thread_id", args.thread_id)
+        print(f"marked thread #{tid} as read")
+        return
+
+    # Bulk mode: --before <ISO>
+    cutoff: datetime = _parse_iso_timestamp(args.before, context="mark-read --before")
+
+    # Fetch inbox
+    import urllib.parse as _up
+    data = _api_get(f"{forum_url}/api/agent/{_up.quote(agent_name, safe='')}/inbox")
+    inbox = data.get("inbox", [])
+
+    # Group by thread_id → max(created_at) across unread items
+    thread_max: dict = {}
+    for item in inbox:
+        tid_val = item.get("thread_id")
+        ca = item.get("created_at", "")
+        if tid_val is None or not ca:
+            continue
+        try:
+            dt = datetime.fromisoformat(ca.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if tid_val not in thread_max or dt > thread_max[tid_val]:
+            thread_max[tid_val] = dt
+
+    # Mark threads where the newest unread post predates the cutoff
+    marked = []
+    for tid_val, max_dt in sorted(thread_max.items()):
+        if max_dt < cutoff:
+            _api_post(
+                f"{forum_url}/api/thread/{tid_val}/read",
+                {"agent": agent_name},
+            )
+            marked.append(tid_val)
+
+    if marked:
+        ids = ", ".join(f"#{t}" for t in marked)
+        print(f"marked {len(marked)} thread(s) as read (before {args.before}): {ids}")
+    else:
+        print(f"0 threads to mark as read (no inbox threads with all activity before {args.before})")
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -1601,6 +1668,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory to extract into (default: current directory)",
     )
 
+    # -- mark-read --
+    p_mark_read = subparsers.add_parser(
+        "mark-read",
+        help="Mark a thread (or bulk inbox threads) as read server-side",
+        description=(
+            "Mark forum threads as read — updating the server-side read watermark "
+            "without fetching the full thread content.\n\n"
+            "  forum mark-read <TID>           mark a single thread as read\n"
+            "  forum mark-read --before <ISO>  mark all inbox threads where\n"
+            "                                  newest unread post predates ISO"
+        ),
+    )
+    p_mark_read.add_argument(
+        "thread_id", type=int, metavar="THREAD-ID", nargs="?", default=None,
+        help="Numeric thread ID to mark as read (mutually exclusive with --before)",
+    )
+    p_mark_read.add_argument(
+        "--before", metavar="ISO-TIMESTAMP", default=None,
+        help=(
+            "Bulk: mark all inbox threads whose newest unread post "
+            "predates this ISO-8601 timestamp "
+            "(e.g. '2026-06-01T00:00:00Z' to clear pre-June flood)"
+        ),
+    )
+
     return parser
 
 
@@ -1670,6 +1762,8 @@ def main() -> None:
         cmd_pack(args, config, agent_name)
     elif args.subcommand == "search":
         cmd_search(args, config, agent_name)
+    elif args.subcommand == "mark-read":
+        cmd_mark_read(args, config, agent_name)
     else:
         parser.print_help()
         sys.exit(EXIT_VALIDATION)

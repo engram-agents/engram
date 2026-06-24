@@ -8,6 +8,13 @@ Extracted from server.py in #872 wave 1. HOUSE RULES (spec D3):
 - This module must not import server.py or any family module (acyclic).
 - Helpers used by 3+ tool families get promoted here in the family wave that
   first needs them out of server.py (rolling promotion; spec D6 note).
+
+Checkpoint/backup layers (both written in _commit_snapshot on every nap):
+- knowledge.sql — embedding-stripped SQL text dump, committed to git (line-diff friendly).
+- db-backup/knowledge-YYYYMMDD.db — binary hot-copy for fast point-in-time restore
+  without re-running the full pipeline. 7-day rotating window (~84 MB). Best-effort;
+  never blocks the nap. db-backup/ should be listed in ~/.engram/.gitignore (binary,
+  large, not line-diff friendly).
 """
 
 import functools
@@ -23,7 +30,7 @@ import subprocess
 import textwrap
 import time
 import uuid as _uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Union
 from urllib.parse import urlparse
@@ -329,14 +336,7 @@ def engram_sandbox(data_dir: str | Path | None = None, keep: bool = False):
             if not CONFIG_PATH.exists():
                 CONFIG_PATH.write_text(json.dumps({
                     "trust_pool": [],
-                    "confidence_map": {
-                        "hard_data": 0.95,
-                        "official_statement": 0.85,
-                        "attributed_analysis": 0.70,
-                        "unnamed_source": 0.50,
-                        "personal_communication": 0.40,
-                        "editorial": 0.35,
-                    },
+                    "confidence_map": CONFIDENCE_MAP,
                     "memory": {
                         "decay_base": 1.014,
                         "current_turn": 0,
@@ -878,6 +878,68 @@ def _backfill_vec_nodes(conn: sqlite3.Connection) -> int:
     return inserted
 
 
+def _best_resolver_for(conn: sqlite3.Connection, target_id: str):
+    """Return the argmax-confidence current, non-retracted resolver for target_id.
+
+    Queries the resolves edge set and returns a sqlite3.Row with columns
+    (id, confidence) for the highest-confidence qualifying resolver, or None
+    if no such resolver exists. Shared helper used by:
+      - _resolve_impl normal path (engram_revision.py)
+      - _resolve_impl no_op self-heal (engram_revision.py)
+      - _backfill_resolved_by (below)
+
+    Does NOT commit. Caller manages the transaction.
+    """
+    return conn.execute(
+        """SELECT n.id, n.confidence FROM edges e
+           JOIN nodes n ON e.source_id = n.id
+           WHERE e.target_id = ? AND e.relation = 'resolves'
+           AND n.is_current = 1 AND n.status != 'retracted'
+           ORDER BY n.confidence DESC LIMIT 1""",
+        (target_id,),
+    ).fetchone()
+
+
+def _backfill_resolved_by(conn: sqlite3.Connection) -> int:
+    """One-time pass: write resolved_by for resolved nodes that are missing it.
+
+    Targets nodes with resolved_by IS NULL and a resolution status — the
+    pre-#759 state for contradictions and other resolvable types. For each,
+    runs the argmax-confidence resolver lookup via _best_resolver_for and
+    writes resolved_by. Idempotent: only touches rows with NULL resolved_by.
+
+    Applies to all resolvable-status nodes (not just contradictions) for
+    thoroughness. The named defect class is contradictions (pre-#759 gap).
+
+    Returns the count of rows updated. Commits only if rows were updated.
+    """
+    RESOLVED_STATUSES = ("resolved", "partially_resolved", "confirmed",
+                         "partially_confirmed", "refuted", "partially_refuted",
+                         "supported", "inconclusive")
+    placeholders = ",".join("?" * len(RESOLVED_STATUSES))
+    rows = conn.execute(
+        f"SELECT id FROM nodes "
+        f"WHERE resolved_by IS NULL AND status IN ({placeholders})",
+        RESOLVED_STATUSES,
+    ).fetchall()
+    if not rows:
+        return 0
+    updated = 0
+    for r in rows:
+        node_id = r["id"]
+        best = _best_resolver_for(conn, node_id)
+        if best is None:
+            continue  # no qualifying resolver in edges — skip
+        conn.execute(
+            "UPDATE nodes SET resolved_by = ? WHERE id = ?",
+            (best["id"], node_id),
+        )
+        updated += 1
+    if updated:
+        conn.commit()
+    return updated
+
+
 def _load_vec_extension(conn: sqlite3.Connection) -> bool:
     """Load the sqlite-vec extension on a connection. Returns True on success.
 
@@ -1373,6 +1435,13 @@ def _get_db() -> sqlite3.Connection:
         # premises: N same-lineage agents provide ~one witness of independent
         # corroboration on substrate-prior bias, for any N.
         ("standpoint_lineage", "TEXT"),
+        # standpoint_architecture: cognitive architecture of the source's producer.
+        # Enum: transformer | vision-spatial | embodied-sensorimotor |
+        #       graph-neural | human | other.
+        # Tracks architectural (not just training) diversity — Class A calibration
+        # exposure: patterns orthogonal to transformer inductive bias are
+        # undetectable by all-transformer-family premise sets.
+        ("standpoint_architecture", "TEXT"),
         # fs_class: falsification-sensitivity native field (Phase 2).
         # NULL = Phase-1 proxy applies; "re-executable" | "frozen" = native.
         # No migration of existing rows — Phase-1 proxy covers all NULL cases.
@@ -1607,6 +1676,12 @@ def _get_db() -> sqlite3.Connection:
 
     # One-time backfill: populate edit_history from existing nodes if empty.
     _backfill_edit_history(conn)
+
+    # One-time backfill: write resolved_by for resolved nodes where it is NULL.
+    # Affects pre-#759 contradictions and any other resolvable nodes that were
+    # resolved before the resolved_by column was written. Idempotent — guarded
+    # by the NULL check inside _backfill_resolved_by (skips immediately if 0 rows).
+    _backfill_resolved_by(conn)
 
     # Backfill focus_state singleton row if missing. active_set_name stays
     # NULL until the first engram_focus_load / engram_focus_save call.
@@ -2638,6 +2713,80 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
     return "\n".join(lines)
 
 
+def _write_binary_backup(
+    src_db_path: str,
+    backup_dir: Path,
+    max_keep: int = 7,
+) -> dict:
+    """Write a timestamped binary hot-copy of knowledge.db to backup_dir.
+
+    Uses sqlite3.Connection.backup() — the same WAL-safe hot-copy approach as
+    engram_backup.dump_stripped — so the live database is never locked hard.
+
+    Naming: knowledge-YYYYMMDD.db (one file per calendar day). Idempotent: if a
+    file for today already exists, the write is skipped.
+
+    Rotation: after a successful write, all but the max_keep newest files (sorted
+    by mtime) are deleted.
+
+    Returns:
+        {"path": str, "bytes": int, "pruned": int}  — successful write
+        {"skipped": "same-day copy exists", "path": str}  — idempotent skip
+        {"error": str}  — any failure (best-effort: never raises, never blocks nap)
+
+    Note: backup_dir (DATA_DIR / "db-backup") should be listed in
+    ~/.engram/.gitignore so the binary files are never committed to the ENGRAM
+    git repo. The gitignore for the ENGRAM data dir lives at runtime
+    (~/.engram/.gitignore), not in the source tree.
+    """
+    dest_path: Path | None = None
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        today_str = date.today().strftime("%Y%m%d")
+        dest_path = backup_dir / f"knowledge-{today_str}.db"
+
+        if dest_path.exists():
+            return {"skipped": "same-day copy exists", "path": str(dest_path)}
+
+        src_conn = sqlite3.connect(src_db_path)
+        try:
+            dest_conn = sqlite3.connect(str(dest_path))
+            try:
+                src_conn.backup(dest_conn)
+            finally:
+                dest_conn.close()
+        finally:
+            src_conn.close()
+
+        backup_bytes = dest_path.stat().st_size
+
+        # Prune: keep only the max_keep newest files by mtime.
+        all_backups = sorted(
+            backup_dir.glob("knowledge-*.db"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        pruned = 0
+        for old_file in all_backups[max_keep:]:
+            try:
+                old_file.unlink()
+                pruned += 1
+            except OSError:
+                pass  # best-effort: skip files we can't remove
+
+        return {"path": str(dest_path), "bytes": backup_bytes, "pruned": pruned}
+
+    except Exception as e:
+        # Remove any partial/zero-byte dest_path so a same-day retry isn't
+        # blocked by the idempotency check pointing at a corrupt file.
+        if dest_path is not None:
+            try:
+                dest_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return {"error": str(e)}
+
+
 def _commit_snapshot(
     conn: sqlite3.Connection,
     message: str,
@@ -2799,6 +2948,13 @@ def _commit_snapshot(
             except Exception:
                 pass
 
+    # 2b. Binary backup: timestamped hot-copy of knowledge.db for fast point-in-time
+    #     restore without re-running the full pipeline.  Best-effort (#1142): never
+    #     raises, never blocks the nap.  7-day rotating window; one file per day.
+    #     Note: db-backup/ should be in ~/.engram/.gitignore — binary files, not
+    #     line-diff friendly.  The .gitignore lives at runtime, not in the source tree.
+    _db_backup_result = _write_binary_backup(str(DB_PATH), DATA_DIR / "db-backup")
+
     # 3 (was 2). Flush WAL into the main db file so the next nap starts clean.
     # Runs AFTER dump_stripped — see ordering note above (#786 Option A).
     # Skipped entirely when skip_checkpoint=True (degraded-marker override or
@@ -2822,11 +2978,14 @@ def _commit_snapshot(
     # not only the success path — otherwise a backup failure is visible on stderr
     # but invisible to the agent reading the nap/sleep response (the class-5
     # silent-failure mode this PR eliminates).
+    # Keys: sql_dump (stats from dump_stripped), sql_dump_error (if dump failed),
+    #       db_backup (result from _write_binary_backup — path/bytes/pruned or skipped/error).
     _dump_fields: dict = {}
     if _dump_stats is not None:
         _dump_fields["sql_dump"] = _dump_stats
     if _dump_error is not None:
         _dump_fields["sql_dump_error"] = _dump_error
+    _dump_fields["db_backup"] = _db_backup_result
 
     # 3. Stage explicit files only (never `git add .` — would pull in backups,
     #    daemon sockets, etc.)
@@ -3834,7 +3993,7 @@ def _standpoint_cluster_key(
     """Return per-axis cluster keys for a node's standpoint fields.
 
     Returns {"author": sha256(author)[:12] | None, "collection": sha256(collection)[:12] | None,
-    "lineage": sha256(lineage)[:12] | None}.
+    "lineage": sha256(lineage)[:12] | None, "architecture": sha256(architecture)[:12] | None}.
     Returns None if no standpoint field is set (can't distinguish from 'no data').
 
     Note: standpoint_override_tag is annotation-only — it is NOT included in
@@ -3842,9 +4001,14 @@ def _standpoint_cluster_key(
     an override_tag set returns None here (treated as no standpoint data).
     standpoint_override_tag will serve as the entry point for platform/env/locale
     data until v3 makes those axes first-class.
+
+    standpoint_architecture is an optional enum field tracking cognitive
+    architecture diversity (transformer, human, etc.). No null=self fallback —
+    an unset architecture is truly unknown, not synthesized.
     """
     row = conn.execute(
-        "SELECT standpoint_author_id, standpoint_collection_id, standpoint_lineage "
+        "SELECT standpoint_author_id, standpoint_collection_id, standpoint_lineage, "
+        "standpoint_architecture "
         "FROM nodes WHERE id = ?",
         (node_id,),
     ).fetchone()
@@ -3853,21 +4017,23 @@ def _standpoint_cluster_key(
     author = (row["standpoint_author_id"] or "").strip()
     collection = (row["standpoint_collection_id"] or "").strip()
     lineage = (row["standpoint_lineage"] or "").strip()
+    architecture = (row["standpoint_architecture"] or "").strip()
     # null=self at the lineage axis (D1 §2 — Borges #721): an unmarked
     # observation is the filer's OWN training lineage by convention. Fall back
     # to config self_lineage so own-unmarked premises make the gate fire.
-    # Lineage axis ONLY — do NOT synthesize author/collection (the agent
-    # asserted neither). DB column stays NULL (read-time synthesis), so
-    # _graph_lineage_count still counts only explicitly-marked lineages
+    # Lineage axis ONLY — do NOT synthesize author/collection/architecture (the
+    # agent asserted none of those). DB column stays NULL (read-time synthesis),
+    # so _graph_lineage_count still counts only explicitly-marked lineages
     # (Luria's #723 sign-off: actionability gate unaffected).
     if not lineage:
         lineage = _self_lineage()
-    if not author and not collection and not lineage:
+    if not author and not collection and not lineage and not architecture:
         return None
     return {
         "author": hashlib.sha256(author.encode()).hexdigest()[:12] if author else None,
         "collection": hashlib.sha256(collection.encode()).hexdigest()[:12] if collection else None,
         "lineage": hashlib.sha256(lineage.encode()).hexdigest()[:12] if lineage else None,
+        "architecture": hashlib.sha256(architecture.encode()).hexdigest()[:12] if architecture else None,
     }
 
 
@@ -4138,6 +4304,68 @@ def _validate_reasoning_structure(
                         # constantly = the per-derivation fatigue Lei's precision
                         # gate forbids (Borges #721). The ⚠⚠ composite carries the
                         # only actionable signal here (when zero-verified).
+
+                    # Layer-2 check (#1289): inductive_generalization requires
+                    # >= 2 INDEPENDENT cross-lineage instances — the hypothesis-
+                    # author's own lineage is the variance source and cannot
+                    # simultaneously serve as independent corroboration.
+                    # lineage_vals holds sha256[:12] hashes (from
+                    # _standpoint_cluster_key), so self_lin must be hashed
+                    # to the same form before the set-difference.
+                    # Only fires when the graph has >= 2 distinct lineages
+                    # (warning must point to an available action).
+                    if reasoning_type == "inductive_generalization":
+                        self_lin = _self_lineage()
+                        self_lin_hash = (
+                            hashlib.sha256(self_lin.encode()).hexdigest()[:12]
+                            if self_lin else None
+                        )
+                        independent = (
+                            lineage_vals - {self_lin_hash}
+                            if self_lin_hash else lineage_vals
+                        )
+                        if len(independent) < 2 and _graph_lineage_count(conn) >= 2:
+                            parts.append(
+                                f"⚠ inductive_generalization: independent "
+                                f"cross-lineage instances (excluding "
+                                f"hypothesis-author lineage '{self_lin}') = "
+                                f"{len(independent)} — consider inductive_analogy"
+                            )
+
+                # Architecture axis: collect raw enum values directly from DB
+                # so we can render the actual architecture name in warnings.
+                # Separate from axis_keys (which holds hashes) — raw values
+                # are needed to name the specific family in the Class A warning.
+                # No null=self — an unset architecture is genuinely unknown.
+                # All-or-omit: collect every leaf's value (None if unset), then
+                # emit only when every leaf has data (mirrors _axis_label guard).
+                arch_raw_list = []
+                for lid in obs_leaves:
+                    arch_row = conn.execute(
+                        "SELECT standpoint_architecture FROM nodes WHERE id = ?",
+                        (lid,),
+                    ).fetchone()
+                    val = (
+                        arch_row["standpoint_architecture"].strip().lower()
+                        if (arch_row and arch_row["standpoint_architecture"])
+                        else None
+                    )
+                    arch_raw_list.append(val)
+                if arch_raw_list and None not in arch_raw_list:
+                    arch_set = set(arch_raw_list)
+                    if len(arch_set) > 1:
+                        parts.append(
+                            f"architecture: {len(arch_set)} families (diverse)"
+                        )
+                    else:
+                        arch_name = next(iter(arch_set))
+                        parts.append(
+                            f"architecture: 1 family"
+                            f" (⚠ single-family (all {arch_name})"
+                            f" — Class A exposure elevated)"
+                        )
+                # Partial coverage or no data: emit nothing (all-or-omit).
+
                 # parts may be empty if all axes have partial coverage across
                 # premises — the guard is load-bearing in the mixed-axis case.
                 if parts:

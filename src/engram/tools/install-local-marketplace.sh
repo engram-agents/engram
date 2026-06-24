@@ -165,9 +165,16 @@ else
     # proceeds flagless and drops configured surfaces (multi-agent / dev tier)
     # — the #704 class. Same contract as migrate-to-plugin.sh's require_jq.
     if ! command -v jq &>/dev/null; then
-      die "jq is required to read $_cfg for build flags (multi_agent/install_tier). Without jq the build would silently drop your configured surfaces (#704 class). Install jq and retry."
+      {
+        printf '[install-local-marketplace] ERROR: jq is required to read %s (multi_agent/install_tier).\n' "$_cfg"
+        printf '[install-local-marketplace]   Install jq:  brew install jq  (macOS)  |  sudo apt-get install jq  (Debian/Ubuntu)\n'
+        printf '[install-local-marketplace]   No-jq path:  bash tools/build-plugin.sh --tier <tier> --multi-agent\n'
+        printf '[install-local-marketplace]                bash tools/install-local-marketplace.sh --skip-build\n'
+        printf '[install-local-marketplace]   Without jq the build silently drops configured surfaces (#704 class).\n'
+      } >&2
+      exit 1
     fi
-    _ma="$(jq -r '.multi_agent // false' "$_cfg")"
+    _ma="$(jq -r 'if (.multi_agent == true) or (.mode == "multi") then "true" else "false" end' "$_cfg")"
     _tier="$(jq -r '.install_tier // empty' "$_cfg")"
     [[ "$_ma" == "true" ]] && build_flags+=("--multi-agent")
     [[ -n "$_tier" ]] && build_flags+=("--tier" "$_tier")
@@ -260,6 +267,36 @@ deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 deployed_from=$REPO_ROOT
 MARKER
 log "Version marker refreshed: $ENGRAM_HOME/.deployed-version (alpha_sha=$ALPHA_SHA)"
+
+# ── Persist install choices to config.json (bug 4, #1244) ────────────────────
+# Write install_tier and multi_agent back to config.json so the next upgrade
+# can read them without the user needing to re-specify explicit flags.
+# Only runs in the non-skip-build path: --skip-build callers managed their own
+# flags and their choices are not visible here.
+if [[ $SKIP_BUILD -eq 0 ]] && [[ -n "${_cfg:-}" ]] && [[ -f "${_cfg}" ]] && command -v python3 &>/dev/null; then
+  python3 - "${_cfg}" "${_tier:-}" "${_ma:-false}" <<'PY'
+import json, sys
+path, tier, ma = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(path) as f:
+        d = json.load(f)
+except (OSError, json.JSONDecodeError):
+    sys.exit(0)
+changed = False
+if tier and d.get('install_tier') != tier:
+    d['install_tier'] = tier
+    changed = True
+new_ma = ma == 'true'
+if d.get('multi_agent') is not new_ma:
+    d['multi_agent'] = new_ma
+    changed = True
+if changed:
+    with open(path, 'w') as f:
+        json.dump(d, f, indent=2)
+        f.write('\n')
+    print(f"[install-local-marketplace] config.json updated: install_tier={tier or 'unset'} multi_agent={ma}")
+PY
+fi
 
 # ── Hook-registration-change detection ────────────────────────────────────────
 # Claude Code only reloads the hook set on a FULL restart — /mcp reconnect

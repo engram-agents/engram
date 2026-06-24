@@ -232,6 +232,14 @@ def idle_watchdog(idle_timeout: int):
                 f"[engram-daemon] Idle for {idle_timeout}s, shutting down.",
                 file=sys.stderr,
             )
+            # Write idle-shutdown tombstone so the surface hook can give a softer
+            # alarm on next startup rather than a generic CRITICAL (#1260).
+            tombstone_path = os.path.join(ENGRAM_HOME, "daemon-idle-shutdown")
+            try:
+                with open(tombstone_path, "w") as f:
+                    f.write(str(int(time.time())))
+            except OSError:
+                pass
             _shutdown.set()
             break
         _shutdown.wait(timeout=60)  # check every minute
@@ -301,6 +309,12 @@ def main():
     # Create Unix socket server
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(SOCKET_PATH)
+    # Remove any idle-shutdown tombstone — daemon is healthy and running (#1260).
+    tombstone_path = os.path.join(ENGRAM_HOME, "daemon-idle-shutdown")
+    try:
+        os.unlink(tombstone_path)
+    except FileNotFoundError:
+        pass
     server.listen(5)
     server.settimeout(5.0)  # allow periodic shutdown checks
 

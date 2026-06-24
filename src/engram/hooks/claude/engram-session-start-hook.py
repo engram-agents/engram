@@ -30,13 +30,21 @@ access≠presence gap. Sourced from engram_stats(sections=
 ["confidence"]) + engram_stats(mode="7-turn", sections=["confidence"]).
 Silent skip on any stats failure: hook never blocks session start.
 """
+import os as _os, sys as _sys
+# Guard against source: directory marketplace double-fire (#1066).
+_plugin_root = _os.environ.get("CLAUDE_PLUGIN_ROOT", "")
+_engram_home = _os.environ.get("ENGRAM_HOME") or _os.path.expanduser("~/.engram")
+if _plugin_root.startswith(_os.path.join(_engram_home, "marketplace") + _os.sep):
+    _sys.exit(0)  # empty stdout is valid no-op per #824/#832 contract
 import hashlib
 import json
 import os
 import re
+import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -342,6 +350,76 @@ INTER_AGENT_DIR = os.environ.get("INTER_AGENT_DIR", "/home/agents-shared/inter-a
 STARRED_CAP = 10
 STARRED_STALE_DAYS = 7  # soft TTL for staleness nudge (nudge only, never auto-drop)
 
+# Agent registration directory (parallel to inter-agent/ and projects/)
+AGENTS_SHARED_ROOT = os.environ.get("AGENTS_SHARED_DIR", "/home/agents-shared")
+AGENT_REGISTRY_DIR = os.path.join(AGENTS_SHARED_ROOT, "agents")
+# Asymmetry note: this hook exposes only AGENTS_SHARED_DIR as a test override
+# (deriving the registry subdir from it).  ia.py additionally accepts
+# AGENT_REGISTRY_DIR as a direct override for the registry path.  A test that
+# sets AGENT_REGISTRY_DIR without also setting AGENTS_SHARED_DIR (or vice
+# versa) will see different paths in the hook vs. ia.py.  The hook's path is
+# write-side (registration); ia.py's path is read-side (scan_peers).  Keeping
+# them in sync in tests requires overriding AGENTS_SHARED_DIR, not just
+# AGENT_REGISTRY_DIR (or passing --registry-dir directly to ia peers).
+
+
+def write_agent_registration(
+    agent_name: str,
+    registry_dir: str = AGENT_REGISTRY_DIR,
+) -> None:
+    """Write/refresh the agent's registration file in the shared registry.
+
+    Writes atomically via temp-file + os.replace so concurrent agents never
+    read a partial JSON. Creates the registry dir (group-writable, setgid) if
+    it does not exist. Fails silently if the shared filesystem is absent or
+    unwritable — this is a multi-agent-only convenience, not a blocker.
+
+    File path: <registry_dir>/<agent_name>.json
+    Content   : {"agent_name": ..., "hostname": ..., "pid": ..., "registered_at": <ISO UTC>}
+
+    Args:
+        agent_name   : The agent's own name (from config.json or env).
+        registry_dir : Override for the default /home/agents-shared/agents/.
+                       (Exposed for testing.)
+    """
+    if not agent_name:
+        return
+
+    # Gate: the shared-fs root must exist and be a directory. If absent (single-
+    # host install with no shared fs), skip silently — never break SessionStart.
+    shared_root = os.path.dirname(registry_dir)
+    if not os.path.isdir(shared_root):
+        return
+
+    try:
+        # Create the registry dir with group-writable, setgid permissions so
+        # co-tenant agents can each write their own file.
+        os.makedirs(registry_dir, mode=0o2775, exist_ok=True)
+
+        record = {
+            "agent_name": agent_name,
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+            "registered_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        dest = os.path.join(registry_dir, f"{agent_name}.json")
+
+        # Atomic write: temp file in same dir + os.replace (same-fs, no TOCTOU).
+        fd, tmp_path = tempfile.mkstemp(dir=registry_dir, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(record, f)
+            os.replace(tmp_path, dest)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception:
+        # Fail-soft: never raise from a multi-agent convenience side-effect.
+        pass
+
 
 def starred_block(engram_home: str) -> str:
     """Render starred inter-agent letters as concise pointers.
@@ -416,6 +494,9 @@ def starred_block(engram_home: str) -> str:
 
 
 SESSION_ROLE = os.environ.get("ENGRAM_SESSION_ROLE", "interactive").strip().lower()
+# Effective session role — updated by main() after write_marker() resolves CWD.
+# Starts equal to SESSION_ROLE (env-var), may be promoted to "fairy" by CWD detection.
+_EFFECTIVE_SESSION_ROLE = SESSION_ROLE
 SESSION_PURPOSE = os.environ.get("ENGRAM_SESSION_PURPOSE", "").strip()
 SESSIONS_DIR = os.path.join(ENGRAM_HOME, "sessions")
 CURRENT_USER_PATH = os.path.join(ENGRAM_HOME, "current_user.json")
@@ -468,6 +549,11 @@ _MARKER_RE = re.compile(
     r'|^[0-9a-f]{8,}(\.meta)?\.json$'
 )
 
+# CWD pattern for Agent-spawned worktree fairies.  Detects the .claude/worktrees/agent-*
+# path that worktree-isolated fairies run inside, as a fallback when ENGRAM_SESSION_ROLE
+# is not set by the spawner.
+_FAIRY_CWD_RE = re.compile(r'(^|[/\\])\.claude[/\\]worktrees[/\\]agent-')
+
 
 def prune_stale_session_markers(current_session_id: str | None) -> None:
     """Delete session marker files older than 7 days from SESSIONS_DIR.
@@ -493,6 +579,23 @@ def prune_stale_session_markers(current_session_id: str | None) -> None:
         path = os.path.join(SESSIONS_DIR, name)
         try:
             if os.path.getmtime(path) < cutoff:
+                # For fairy sessions, also delete the JSONL transcript — fairies are
+                # disposable workers; interactive transcripts are kept indefinitely.
+                transcript_to_delete = None
+                try:
+                    with open(path) as _mf:
+                        _md = json.load(_mf)
+                    if _md.get("role") == "fairy":
+                        _tp = _md.get("transcript_path") or ""
+                        if _tp and os.path.isfile(_tp):
+                            transcript_to_delete = _tp
+                except (OSError, ValueError):
+                    pass  # unreadable marker — skip transcript cleanup, still prune marker
+                if transcript_to_delete:
+                    try:
+                        os.remove(transcript_to_delete)
+                    except OSError as exc:
+                        print(f"[engram-session-start] prune: could not remove transcript {transcript_to_delete}: {exc}", file=sys.stderr)
                 os.remove(path)
         except OSError as exc:
             print(f"[engram-session-start] prune: could not remove {path}: {exc}", file=sys.stderr)
@@ -503,14 +606,21 @@ def write_marker(hook_input: dict) -> dict | None:
     transcript_path = hook_input.get("transcript_path")
     if not session_id or not transcript_path:
         return None
+    # CWD-based fairy auto-detection: if the spawner didn't set ENGRAM_SESSION_ROLE,
+    # check whether we're running inside a Claude Code worktree (a reliable proxy for
+    # a fairy session). Env-var override always wins.
+    _effective_role = SESSION_ROLE
+    _cwd_val = hook_input.get("cwd") or ""
+    if _effective_role == "interactive" and _FAIRY_CWD_RE.search(_cwd_val):
+        _effective_role = "fairy"
     marker = {
         "session_id": session_id,
         "transcript_path": transcript_path,
         "source": hook_input.get("source"),
         "cwd": hook_input.get("cwd"),
         "started_at": datetime.now(timezone.utc).isoformat(),
-        "role": SESSION_ROLE,
-        "purpose": SESSION_PURPOSE or DEFAULT_PURPOSES.get(SESSION_ROLE, SESSION_ROLE),
+        "role": _effective_role,
+        "purpose": SESSION_PURPOSE or DEFAULT_PURPOSES.get(_effective_role, _effective_role),
     }
     try:
         # Per-session marker keyed by session_id. Concurrent sessions own
@@ -592,7 +702,7 @@ def sleep_status_block() -> str:
         banner asking the user to run /engram-sleep to establish a baseline.
         Genuine first-ever boot (DB below threshold) stays silent.
     """
-    if SESSION_ROLE != "interactive":
+    if _EFFECTIVE_SESSION_ROLE != "interactive":
         return ""
 
     marker: dict | None = None
@@ -676,7 +786,7 @@ def auto_sleep_cron_block() -> str:
     Returns:
         Multi-line nudge string when enabled + interactive, otherwise "".
     """
-    if SESSION_ROLE != "interactive":
+    if _EFFECTIVE_SESSION_ROLE != "interactive":
         return ""
 
     config_path = os.path.join(ENGRAM_HOME, "config.json")
@@ -782,7 +892,7 @@ def fairy_policy_block() -> str:
     Returns:
         Two-line string when interactive+startup, "" otherwise.
     """
-    if SESSION_ROLE != "interactive":
+    if _EFFECTIVE_SESSION_ROLE != "interactive":
         return ""
 
     config_path = os.path.join(ENGRAM_HOME, "config.json")
@@ -853,6 +963,49 @@ def fairy_policy_block() -> str:
     return coder_line + "\n" + reviewer_line
 
 
+def forum_monitor_block() -> str:
+    """Emit a forum mention monitor arm instruction at session startup.
+
+    Only fires for interactive role + source=="startup" (source guard is at the
+    call site in main()). Silent "" when forum is unconfigured (no forum.url in
+    config.json) or the monitor script is absent — hook must never block start.
+
+    Resolves forum-mention-monitor.sh via _resolve_runtime_dir so it works in
+    both plugin install layout (<plugin_root>/tools/) and dev source tree
+    layout (~/engram-alpha/tools/). Follows the auto_sleep_cron_block() pattern.
+
+    Returns:
+        Instruction string when forum is configured + script exists, else "".
+    """
+    if _EFFECTIVE_SESSION_ROLE != "interactive":
+        return ""
+
+    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+        forum_cfg = config.get("forum", {})
+        if not forum_cfg or not forum_cfg.get("url"):
+            return ""
+    except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+        return ""
+
+    runtime_dir = _resolve_runtime_dir(ENGRAM_HOME)
+    script_path = os.path.join(runtime_dir, "tools", "forum-mention-monitor.sh")
+    if not os.path.exists(script_path):
+        return ""
+
+    return (
+        "[Forum mention monitor] forum.url is configured. On your FIRST prompt "
+        "this session, arm the persistent forum mention monitor (it is "
+        "session-scoped and must be re-armed each startup):\n"
+        f'  Call Monitor(command="bash {script_path}", persistent=true)\n'
+        "  This wakes you within ~30s on direct @-mentions to your agent name. "
+        "The script self-guards against duplicate instances (last-arm-wins). "
+        "See engram-collaborating-loop skill §Mechanism 3a."
+    )
+
+
 def main() -> None:
     _t0 = time.perf_counter()
 
@@ -862,7 +1015,24 @@ def main() -> None:
         hook_input = {}
 
     marker = write_marker(hook_input)
+    global _EFFECTIVE_SESSION_ROLE
+    _EFFECTIVE_SESSION_ROLE = marker.get("role", SESSION_ROLE) if marker else SESSION_ROLE
     write_baseline(use_compact_boundary=True)
+
+    # ── Agent registration (multi-agent only) ─────────────────────────────────
+    # Write/refresh the agent's registration file in the shared registry so
+    # peers can discover co-host vs cross-host topology. Fail-soft: the shared
+    # filesystem may not exist (single-host install), and write_agent_registration
+    # is wrapped in a broad try/except that swallows all errors silently.
+    try:
+        _config_path = os.path.join(ENGRAM_HOME, "config.json")
+        with open(_config_path) as _cf:
+            _cfg = json.load(_cf)
+        _agent_name = _cfg.get("agent_name", "").strip()
+        if _agent_name:
+            write_agent_registration(_agent_name)
+    except Exception:
+        pass  # fail-soft: never break SessionStart for registration
 
     if os.path.exists(CURRENT_USER_PATH):
         try:
@@ -898,6 +1068,9 @@ def main() -> None:
         fairy_block = fairy_policy_block()
         if fairy_block:
             lines.append(fairy_block)
+        monitor_block = forum_monitor_block()
+        if monitor_block:
+            lines.append(monitor_block)
     else:
         lines.append(
             f"[Session start reading — re-read {WARM_BRIEFING_PATH} before "

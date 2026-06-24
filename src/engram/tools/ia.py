@@ -5,7 +5,7 @@ A thin CLI wrapping the inter-agent file protocol at
 /home/agents-shared/inter-agent/. Provides validated letter creation,
 cursor-tracked reading, and quick status checks.
 
-Nine subcommands:
+Ten subcommands:
   list        Show letters addressed to me (default: unread only)
   read        Display a letter; advance read cursor to its timestamp
   write       Create a new letter via $EDITOR with validated frontmatter
@@ -15,6 +15,7 @@ Nine subcommands:
   star        Star a letter to re-surface it at continuity-reset points
   unstar      Remove a letter from the starred list
   starred     List all starred letters
+  peers       Show known peers (co-host vs cross-host) from the agent registry
 
 Design doc: ariadne-desk/projects/inter-agent-cli/DESIGN.md (v2, 2026-05-23)
 Protocol:   inter-agent/README.md
@@ -27,10 +28,11 @@ import os
 import pwd
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -44,15 +46,150 @@ ENGRAM_HOME = (
 )
 INTER_AGENT_DIR = os.environ.get("INTER_AGENT_DIR", "/home/agents-shared/inter-agent")
 
+# Agent registration directory (parallel to inter-agent/ and projects/).
+# Override via AGENTS_SHARED_DIR for testing.
+_AGENTS_SHARED_ROOT = os.environ.get("AGENTS_SHARED_DIR", "/home/agents-shared")
+AGENT_REGISTRY_DIR = os.environ.get("AGENT_REGISTRY_DIR", os.path.join(_AGENTS_SHARED_ROOT, "agents"))
+
 READ_CURSOR_PATH = os.path.join(ENGRAM_HOME, "inter-agent-read-cursor.txt")
 SURFACED_CURSOR_PATH = os.path.join(ENGRAM_HOME, "inter-agent-surfaced-cursor.txt")
 STARRED_LIST_PATH = os.path.join(ENGRAM_HOME, "inter-agent-starred.json")
+
+# Staleness threshold for agent registration files (24 hours)
+PEER_STALE_HOURS = 24
 
 # Exit codes per DESIGN §7
 EXIT_OK = 0
 EXIT_VALIDATION = 1
 EXIT_IO = 2
 EXIT_STATE = 3
+
+# ---------------------------------------------------------------------------
+# Peer registry helpers
+# ---------------------------------------------------------------------------
+
+
+def scan_peers(
+    own_name: str,
+    registry_dir: str = AGENT_REGISTRY_DIR,
+    stale_hours: int = PEER_STALE_HOURS,
+    _now: Optional[datetime] = None,
+) -> list:
+    """Scan the agent registry and classify peers relative to this agent.
+
+    Reads every *.json file in registry_dir (excluding own_name.json), parses
+    the registration record, and classifies each peer as co-host (same
+    hostname) or cross-host (different hostname). Marks entries older than
+    stale_hours as stale. Robust to malformed or missing files — skips and
+    continues rather than raising.
+
+    Args:
+        own_name     : This agent's name (used to exclude self).
+        registry_dir : Path to the directory containing *.json registration
+                       files. (Override in tests.)
+        stale_hours  : Age threshold in hours above which a peer entry is
+                       marked stale. Default 24h.
+        _now         : Override the current time (for testing).
+
+    Returns:
+        A list of dicts, one per peer, sorted by agent_name:
+          {
+            "agent_name" : str,
+            "hostname"   : str,
+            "pid"        : int | None,
+            "registered_at": str | None,   # ISO-8601 UTC string or None
+            "topology"   : "co-host" | "cross-host",
+            "age_seconds": float | None,   # None if registered_at missing/invalid
+            "stale"      : bool,
+          }
+        Malformed entries (missing/invalid agent_name or hostname) are skipped.
+    """
+    registry_path = Path(registry_dir)
+    if not registry_path.is_dir():
+        return []
+
+    own_hostname = socket.gethostname()
+    now = _now if _now is not None else datetime.now(timezone.utc)
+    stale_delta = timedelta(hours=stale_hours)
+
+    results = []
+    for json_file in sorted(registry_path.glob("*.json")):
+        try:
+            text = json_file.read_text(encoding="utf-8")
+            record = json.loads(text)
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue  # skip malformed/unreadable files
+
+        if not isinstance(record, dict):
+            continue
+
+        agent_name = record.get("agent_name", "").strip()
+        hostname = record.get("hostname", "").strip()
+
+        # Must have both agent_name and hostname to be useful
+        if not agent_name or not hostname:
+            continue
+
+        # Exclude self
+        if agent_name.lower() == own_name.lower():
+            continue
+
+        try:
+            pid_raw = record.get("pid")
+            pid = int(pid_raw) if pid_raw is not None else None
+        except (ValueError, TypeError):
+            pid = None  # non-numeric pid field — skip coercion, continue
+
+        registered_at_str = record.get("registered_at")
+        age_seconds: Optional[float] = None
+        stale = False
+        if registered_at_str:
+            try:
+                registered_dt = datetime.fromisoformat(
+                    registered_at_str.replace("Z", "+00:00")
+                )
+                if registered_dt.tzinfo is None:
+                    registered_dt = registered_dt.replace(tzinfo=timezone.utc)
+                age_td = now - registered_dt
+                age_seconds = age_td.total_seconds()
+                stale = age_td > stale_delta
+            except (ValueError, TypeError):
+                pass  # leave age_seconds=None, stale=False
+
+        topology = "co-host" if hostname == own_hostname else "cross-host"
+
+        results.append({
+            "agent_name": agent_name,
+            "hostname": hostname,
+            "pid": pid,
+            "registered_at": registered_at_str,
+            "topology": topology,
+            "age_seconds": age_seconds,
+            "stale": stale,
+        })
+
+    results.sort(key=lambda p: p["agent_name"].lower())
+    return results
+
+
+def _format_age(age_seconds: Optional[float]) -> str:
+    """Format an age in seconds as a human-readable string."""
+    if age_seconds is None:
+        return "unknown"
+    total = int(age_seconds)
+    if total < 60:
+        return f"{total}s"
+    elif total < 3600:
+        return f"{total // 60}m"
+    elif total < 86400:
+        h = total // 3600
+        m = (total % 3600) // 60
+        return f"{h}h{m:02d}m"
+    else:
+        d = total // 86400
+        h = (total % 86400) // 3600
+        return f"{d}d{h:02d}h"
+
 
 # ---------------------------------------------------------------------------
 # Config helpers  (mirrors hook conventions, does NOT import from hook)
@@ -1337,6 +1474,50 @@ def cmd_starred(args: argparse.Namespace, config: dict, agent_name: str) -> None
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: peers
+# ---------------------------------------------------------------------------
+
+
+def cmd_peers(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    """Scan the agent registry and display co-host vs cross-host peers."""
+    registry_dir = getattr(args, "registry_dir", None) or AGENT_REGISTRY_DIR
+    peers = scan_peers(agent_name, registry_dir=registry_dir)
+
+    if args.format == "json":
+        print(json.dumps(peers, indent=2))
+        return
+
+    if not peers:
+        print("peers (0): no peer registration files found.")
+        reg_path = Path(registry_dir)
+        if not reg_path.is_dir():
+            print(
+                f"  (registry dir does not exist: {registry_dir})",
+                file=sys.stderr,
+            )
+        return
+
+    cohost = [p for p in peers if p["topology"] == "co-host"]
+    crosshost = [p for p in peers if p["topology"] == "cross-host"]
+
+    def _render_peer(p: dict) -> str:
+        stale_marker = "  (stale)" if p["stale"] else ""
+        return (
+            f"  {p['agent_name']:<14}  {p['hostname']:<20}  "
+            f"{p['topology']:<12}  {_format_age(p['age_seconds'])}"
+            f"{stale_marker}"
+        )
+
+    header = f"{'agent':<14}  {'hostname':<20}  {'topology':<12}  age"
+    print(header)
+    print("-" * len(header))
+    for p in cohost + crosshost:
+        print(_render_peer(p))
+    print(f"\n{len(cohost)} co-host, {len(crosshost)} cross-host "
+          f"({len([p for p in peers if p['stale']])} stale)")
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -1601,6 +1782,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format: human (default) or json",
     )
 
+    # -- peers --
+    p_peers = subparsers.add_parser(
+        "peers",
+        help="Show known peers from the agent registry, classified co-host vs cross-host",
+        description=(
+            "Scan /home/agents-shared/agents/ for peer registration files and "
+            "classify each peer as co-host (same hostname — ia/baton reachable) "
+            "or cross-host (different hostname — forum only). "
+            "Entries older than 24h are marked stale."
+        ),
+    )
+    p_peers.add_argument(
+        "--format", choices=["human", "json"], default="human",
+        help="Output format: human (default) or json",
+    )
+    p_peers.add_argument(
+        "--registry-dir", dest="registry_dir", metavar="PATH", default=None,
+        help=argparse.SUPPRESS,  # internal / testing override
+    )
+
     return parser
 
 
@@ -1614,9 +1815,12 @@ def main() -> None:
 
     config = _load_config()
 
-    # Mode gate for all subcommands except status
-    # (status shows single-mode state to help diagnose misconfiguration)
-    if args.subcommand != "status":
+    # Mode gate for all subcommands except status and peers.
+    # status: shows single-mode state to help diagnose misconfiguration.
+    # peers: read-only registry query, useful precisely to diagnose topology
+    #        before committing to multi-agent mode; mirrors the status rationale.
+    _MODE_GATE_EXEMPT = {"status", "peers"}
+    if args.subcommand not in _MODE_GATE_EXEMPT:
         _check_multi_agent_mode(config)
 
     agent_name = _get_agent_name(config)
@@ -1640,6 +1844,8 @@ def main() -> None:
         cmd_unstar(args, config, agent_name)
     elif args.subcommand == "starred":
         cmd_starred(args, config, agent_name)
+    elif args.subcommand == "peers":
+        cmd_peers(args, config, agent_name)
     else:
         parser.print_help()
         sys.exit(EXIT_VALIDATION)

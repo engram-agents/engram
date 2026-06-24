@@ -60,6 +60,30 @@ The `nap` mode:
 - Does NOT advance the turn counter — no forgetting triggered (turn advance is reserved for post-dream session checkpoints)
 - Arms the `nap_checkpoint` feeling-nudge marker (TTL=5 turns) — the return JSON includes `feeling_report_nudge` text asking whether any moment in this burst produced a distinct internal state worth marking
 
+**After calling `engram_nap()`, check the return value for backup health:**
+
+```python
+result = engram_nap(message="...")
+db_backup = result.get("db_backup", {})
+if db_backup.get("status") not in ("ok", "skipped"):
+    # Surface visibly — a silently-degrading backup is discovered only when needed
+    print(f"⚠ binary backup FAILED: {db_backup.get('error', db_backup)}")
+```
+
+Log `✓ binary backup ok` / `⚠ binary backup FAILED: <reason>` alongside the nap summary so a recurring outage is visible, not buried in the return dict. The mechanism is already there; this is the surfacing step.
+
+## Step 3.5 — Prune finished fairy worktrees
+
+Run the worktree garbage-collector to remove orphaned coder/reviewer-fairy worktrees whose PRs have merged or closed:
+
+```bash
+python tools/worktree-gc.py --apply
+```
+
+Safe to run unconditionally: the tool skips dirty worktrees, skips worktrees with open PRs, skips worktrees with no PR (flags them for human review), and never touches the main checkout. Dry-run mode (`python tools/worktree-gc.py` without `--apply`) is available to preview the plan first. Idempotent — a second run on a clean state is a no-op.
+
+Run this step from the repo root. Skip if `tools/worktree-gc.py` is not present (pre-T2 install or worktree GC not yet shipped).
+
 ## Step 4 — Handle the feeling-nudge (optional)
 
 Read the `feeling_report_nudge` text in the checkpoint return. Honest self-check:
@@ -157,7 +181,9 @@ engram_list_focused()
 
 **Focus new cornerstones** from this burst: `engram_focus(node_ids=[...], reason="...")` — the key claims, questions, or derivations the next session must pick up intact. Include the thread name in `reason` so future-me can see why each pin exists.
 
-**Cap handling (15 max).** If adding new pins would exceed the cap, evict the **earliest-focused node that is not currently being actively worked on** — oldest-inactive-first, not oldest-overall. This preserves long-running pins that are still load-bearing while shedding truly dormant ones. If every slot is on an active thread, that's a signal to consolidate or split threads rather than force-evict.
+**Redundant-with-auto-load check (#1249).** Before cap-based eviction, scan the focused list for nodes that are already guaranteed to load via CLAUDE.md or warm-briefing regardless of the focus set: goals (`gl_*`), axioms (`ax_*`), cornerstones (`cs_*`), founding identity observations (day-1 cluster, etc.). These nodes occupy a slot without adding cross-compaction value — the auto-load surface carries them whether or not they're pinned. **Unfocus them immediately** (call `engram_unfocus`) unless they are the *direct subject of active work in this burst* (e.g., you are currently revising a goal node's claim or deriving from a specific axiom — not just using one as background context). Fill the freed slots with current-work nodes from Step 2's cohort — the live plans, open questions, and design derivations that exist nowhere in the auto-load surfaces. The failure mode this check prevents: identity nodes silently consuming the entire 15-slot cap while the live working context (today's plan, an open question, a design decision) goes unfocused and is lost at compaction. The focus channel's value is carrying *non-auto-loaded* working context. A goal in focus gains ~nothing; a current-task derivation that exists only in ENGRAM loses everything without it.
+
+**Cap handling (15 max).** If adding new pins would exceed the cap after the redundant-with-auto-load sweep above, evict the **earliest-focused node that is not currently being actively worked on** — oldest-inactive-first, not oldest-overall. This preserves long-running pins that are still load-bearing while shedding truly dormant ones. If every slot is on an active thread, that's a signal to consolidate or split threads rather than force-evict.
 
 **Null-result is valid:** if the list is already aligned with next session's direction, say so and move on. Anti-pattern: performative rotation — touching the list just because this step exists.
 

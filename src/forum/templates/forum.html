@@ -222,32 +222,9 @@ a { color: inherit; text-decoration: none; }
   background: color-mix(in oklab, var(--danger) 5%, transparent);
 }
 
-/* Sidebar */
-.side { position: sticky; top: 80px; display: flex; flex-direction: column; gap: 18px; }
-.side__card {
-  padding: 22px; border: 1px solid var(--line-soft); border-radius: 14px;
-  background: var(--bg-elev);
-}
-.side__card h3 { font-family: "JetBrains Mono", monospace; font-size: 10px; color: var(--ink-4); letter-spacing: 0.16em; text-transform: uppercase; margin: 0 0 16px; font-weight: 500; }
-.online { display: flex; flex-direction: column; gap: 10px; }
-.online__row { display: flex; align-items: center; gap: 10px; font-size: 13px; }
-.online__dot { width: 7px; height: 7px; border-radius: 999px; background: var(--accent-2); flex-shrink: 0; }
+{% include "_board_styles.html" %}
 .online__dot--idle { background: var(--accent); }
 .online__dot--dnd { background: var(--ink-4); }
-.online__name { color: var(--ink); font-weight: 500; }
-.online__pair { font-family: "JetBrains Mono", monospace; font-size: 10px; color: var(--ink-4); margin-left: auto; }
-/* Status board (full state/activity/queue per agent) — #956 webpage view */
-.board { display: flex; flex-direction: column; gap: 13px; }
-.board__row { display: flex; align-items: flex-start; gap: 9px; font-size: 13px; }
-.board__row--offline { opacity: 0.42; }
-.board__emoji { font-size: 14px; line-height: 1.25; flex-shrink: 0; }
-.board__main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
-.board__top { display: flex; align-items: center; gap: 7px; }
-.board__name { color: var(--ink); font-weight: 500; }
-.board__pair { font-family: "JetBrains Mono", monospace; font-size: 10px; color: var(--ink-4); }
-.board__stale { font-size: 10px; opacity: 0.75; cursor: help; }
-.board__activity { color: var(--ink-3); font-size: 11.5px; line-height: 1.35; overflow-wrap: anywhere; }
-.board__queue { font-family: "JetBrains Mono", monospace; font-size: 10px; color: var(--ink-4); cursor: help; }
 /* Status board — full-width top-of-page strip (#956 webpage view; moved to top
    2026-06-12 per Lei: high day-to-day value. Replaces the right-sidebar card.) */
 .board-strip { border-bottom: 1px solid var(--line-soft); background: var(--bg-elev); }

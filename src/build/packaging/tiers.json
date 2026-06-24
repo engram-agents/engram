@@ -156,6 +156,10 @@
       "tier": "essential"
     },
     {
+      "path": "tools/backup_knowledge_db.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/build-plugin.sh",
       "tier": "convenience",
       "source": "src/build/build-plugin.sh"
@@ -199,7 +203,8 @@
     },
     {
       "path": "tools/session.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "multi_agent": true
     },
     {
       "path": "tools/compute_task_time.py",
@@ -211,10 +216,15 @@
     },
     {
       "path": "tools/_session_context.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "multi_agent": true
     },
     {
       "path": "tools/engram-pkg",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/engram-snapshot",
       "tier": "convenience"
     },
     {
@@ -386,6 +396,14 @@
     },
     {
       "path": "hooks/claude/engram-utility-credit-mention-stop.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "hooks/claude/engram-bash-pipe-exit-warn.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "hooks/claude/engram-lesson-tripwire-hook.py",
       "tier": "convenience"
     },
     {
@@ -608,6 +626,10 @@
       "reason": "test file for tools/baton.py post-approval re-check flip guard (#1002) — CI tooling only, never ships"
     },
     {
+      "path": "tools/test_baton_colleague_gate.py",
+      "reason": "test file for tools/baton.py colleague-gate enforcement (#1267) — CI tooling only, never ships"
+    },
+    {
       "path": "tools/test_baton_merge_gate.py",
       "reason": "test file for tools/baton.py merge verb (#999/#1000) — CI tooling only, never ships"
     },
@@ -666,6 +688,10 @@
       "reason": "repository landing-page documentation — not shipped in the plugin bundle"
     },
     {
+      "path": "README.zh.md",
+      "reason": "Simplified Chinese translation of the repository landing page — rendered by the website's /zh/readme page; not shipped in the plugin bundle"
+    },
+    {
       "path": "README-AGENT.md",
       "reason": "agent-facing install/orientation documentation — repository landing doc, not shipped in the plugin bundle"
     },
@@ -680,6 +706,10 @@
     {
       "path": "USER_GUIDE.md",
       "reason": "user guide documentation — not shipped in the plugin bundle"
+    },
+    {
+      "path": "USER_GUIDE.zh.md",
+      "reason": "Simplified Chinese translation of the user guide — rendered by the website's /zh/user-guide page; not shipped in the plugin bundle"
     },
     {
       "path": "pytest.ini",

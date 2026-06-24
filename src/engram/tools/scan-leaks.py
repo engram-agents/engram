@@ -54,7 +54,11 @@ SCAN_EXTENSIONS = {".py", ".md", ".sh", ".json", ".template", ".service", ".time
 # scan-leaks.py: STRUCTURAL self-skip — the scanner's own source always
 #   contains the literal patterns it checks (docstring + COMMITTED_PATTERNS
 #   definition).  This is inherent to the tool's design, not personal-data.
-SKIP_FILES = {"LICENSE", LOCAL_CONFIG_NAME, "scan-leaks.py"}
+# test_release_cutover.py: deliberately plants the structural pattern as test
+#   fixtures (e.g. "kg_protocol_for_ai" in _commit_file calls) to verify the
+#   release-cutover scanner picks them up.  Same structural rationale as the
+#   scan-leaks.py self-skip: patterns present by design, not as actual leaks.
+SKIP_FILES = {"LICENSE", LOCAL_CONFIG_NAME, "scan-leaks.py", "test_release_cutover.py"}
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".claude"}
 # .claude: harness-internal (agent worktrees + transcripts) — stale fairy
 # worktrees carry pre-fix file copies that read as false-positive leaks.

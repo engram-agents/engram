@@ -828,6 +828,18 @@ def _build_inspect_recall_view(
     })
     node_recall = {k: v for k, v in node.items() if k not in _RECALL_OMIT}
 
+    # Promote quote_verified from metadata blob so provenance is visible at
+    # recall time without requiring view="deep". Only added for observation nodes
+    # that carry the field (set by #1204). See #1283.
+    _raw_meta = node.get("metadata")
+    if _raw_meta:
+        try:
+            _meta = json.loads(_raw_meta) if isinstance(_raw_meta, str) else _raw_meta
+            if "quote_verified" in _meta:
+                node_recall["quote_verified"] = _meta["quote_verified"]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     response: dict = {
         "node": node_recall,
         "view": "recall",
@@ -1264,24 +1276,24 @@ def _search_nodes(
     # --- Tier-size derivation (Lei 2026-05-19 architecture discussion) ---
     # Tier 1: large raw pool per source.  Tier 2: composite-shrink target.
     # Tier 3 returns top_k (the caller's requested count).
-    tier1_size = top_k * core.TIER1_MULTIPLIER   # e.g. 300 for top_k=10
-    tier2_size = top_k * core.TIER2_MULTIPLIER   # e.g.  40 for top_k=10
+    pool_size = top_k * core.TIER1_MULTIPLIER            # e.g. 300 for top_k=10
+    secondary_pool_size = top_k * core.TIER2_MULTIPLIER  # e.g.  40 for top_k=10
 
     # ══ TIER 1: Raw retrieval (FTS + semantic) ══════════════════════════
     # Retrieve a large raw pool per source (TIER1_MULTIPLIER × top_k per path).
-    # Output: ≤ tier1_size candidates with _relevance + optional _embedding;
+    # Output: ≤ pool_size candidates with _relevance + optional _embedding;
     # order is interleaved (FTS-first then semantic-only), NOT sorted.
 
     # --- FTS keyword search ---
     fts_ids: set[str] = set()
     fts_results: list[sqlite3.Row] = []
     fts_query = core._sanitize_fts_query(query, conn)
-    fts_cap = max(1, tier1_size // 2)  # reservation cap for FTS (half of tier-1 pool)
+    fts_cap = max(1, pool_size // 2)  # reservation cap for FTS (half of retrieval pool)
     try:
         if not fts_query:
             raise sqlite3.OperationalError("empty FTS query")
-        # LIMIT is tier1_size * 3 (= top_k * TIER1_MULTIPLIER * 3) so the
-        # SQL fetch always supplies enough rows for fts_cap (= tier1_size // 2)
+        # LIMIT is pool_size * 3 (= top_k * TIER1_MULTIPLIER * 3) so the
+        # SQL fetch always supplies enough rows for fts_cap (= pool_size // 2)
         # to be the binding constraint, regardless of TIER1_MULTIPLIER's
         # value. Previously hardcoded as top_k * 3 — became the binding
         # constraint at the old MMR_POOL_MULTIPLIER ≥ 3.
@@ -1292,7 +1304,7 @@ def _search_nodes(
                WHERE nodes_fts MATCH ?
                ORDER BY fts.rank
                LIMIT ?""",
-            (fts_query, tier1_size * 3),
+            (fts_query, pool_size * 3),
         ).fetchall()
 
         if return_debug:
@@ -1316,7 +1328,7 @@ def _search_nodes(
                 continue
             fts_results.append(r)
             fts_ids.add(r["id"])
-            # Cap FTS at half of tier1_size so semantic results retain real estate
+            # Cap FTS at half of pool_size so semantic results retain real estate
             # in the merged output. With the new IDF-driven OR-match,
             # _sanitize_fts_query can return 40-100+ hits for a single query;
             # without this cap, FTS would fill every slot and crowd out the
@@ -1421,9 +1433,9 @@ def _search_nodes(
             }
         output.append(node)
 
-    # Fill remaining tier-1 slots with semantic-only hits (up to tier1_size total).
-    # Large tier-1 pool ensures tier-2 composite shrink has enough candidates.
-    remaining = tier1_size - len(output)
+    # Fill remaining retrieval-pool slots with semantic-only hits (up to pool_size total).
+    # Large retrieval pool ensures secondary-pool composite shrink has enough candidates.
+    remaining = pool_size - len(output)
     for s in semantic_only[:remaining]:
         if s["id"] in seen:
             continue
@@ -1541,13 +1553,13 @@ def _search_nodes(
     # MMR also re-sorts internally as a safety net, but enforcing the sort
     # here makes the boundary explicit and inspectable in debugging.
     output.sort(key=lambda x: x.get("_composite", 0), reverse=True)
-    # Tier-2 shrink: cut to top_k × TIER2_MULTIPLIER best-composite candidates.
-    # This is the tier-boundary cut — tier-1 retrieved broadly, tier-2 shrinks
+    # Secondary-pool shrink: cut to top_k × TIER2_MULTIPLIER best-composite candidates.
+    # This is the pool-boundary cut — retrieval pool fetched broadly, secondary pool shrinks
     # before handing off to MMR.  The sort above ensures we keep the top.
-    output = output[:tier2_size]
+    output = output[:secondary_pool_size]
 
     # ── TIER 3: MMR diversity reranker (alpha #178 area 2) ───────────────
-    # Input: tier2_size candidates (top_k × TIER2_MULTIPLIER, composite-sorted).
+    # Input: secondary_pool_size candidates (top_k × TIER2_MULTIPLIER, composite-sorted).
     # Output: top_k nodes, MMR-ordered for diversity.
     # When MMR_LAMBDA=1 the output is identical to the composite-sorted order.
     # When embedder is disabled (ENGRAM_NO_EMBEDDINGS=1) all nodes have

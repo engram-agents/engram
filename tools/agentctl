@@ -63,6 +63,10 @@
 set -euo pipefail
 
 SHARED_ROOT="/home/agents-shared"
+# Viz/operator account that needs read access to agent ~/.engram dirs for the
+# viz dashboard (knowledge.db dropdown) and write access to config.json for
+# the viz config tab. Override via env var; empty string disables the ACL step.
+VIZ_OPERATOR="${VIZ_OPERATOR:-spt}"
 SUBCMD="${1:-help}"
 [[ $# -gt 0 ]] && shift
 
@@ -1238,6 +1242,46 @@ JSON
         echo "  (no daemon launcher at $daemon_launcher — skipped; will auto-start on next claude session)"
     fi
 
+    # Step 7: grant viz/operator (spt) ACLs on ~/.engram* so the agent is
+    # viz-visible by default without a manual setfacl step (#1108).
+    # Grants: rX (read+traverse) on all ~/.engram* dirs so the viz dashboard
+    # can read knowledge.db; rw on config.json so the viz config tab can edit
+    # it. Uses the per-config-ACL model: config-write via POSIX ACL.
+    # Handles ~/.engram-<lineage> variants (e.g. .engram-gemini).
+    # Non-fatal: skipped gracefully when VIZ_OPERATOR is empty, setfacl is
+    # absent, or no engram dir exists yet (agent installs ENGRAM post-finalize).
+    local _viz_acl_result
+    if [[ -z "${VIZ_OPERATOR:-}" ]]; then
+        _viz_acl_result="skipped (VIZ_OPERATOR not set)"
+    elif ! command -v setfacl >/dev/null 2>&1; then
+        _viz_acl_result="skipped (setfacl not available)"
+    else
+        echo "Step 7: granting viz/operator ACLs for '${VIZ_OPERATOR}' on ~/.engram* ..."
+        local _viz_ok=0 _viz_skipped=0 _viz_cfg_ok=0
+        for _engram_dir in "$chosen_home"/.engram "$chosen_home"/.engram-*; do
+            [[ -d "$_engram_dir" ]] || { (( _viz_skipped++ )) || true; continue; }
+            # Read+traverse on the whole dir tree (new files inherit via default ACL).
+            local _setfacl_err
+            _setfacl_err=$(setfacl -R -m "u:${VIZ_OPERATOR}:rX" "$_engram_dir" 2>&1) \
+                && setfacl -R -d -m "u:${VIZ_OPERATOR}:rX" "$_engram_dir" 2>/dev/null \
+                && (( ++_viz_ok )) \
+                || { echo "  WARN: setfacl rX failed on $_engram_dir: $_setfacl_err" >&2; continue; }
+            # Write on config.json (only when rX succeeded — traversal is prerequisite).
+            local _cfg="$_engram_dir/config.json"
+            [[ -f "$_cfg" ]] && setfacl -m "u:${VIZ_OPERATOR}:rw" "$_cfg" 2>/dev/null \
+                && (( _viz_cfg_ok++ )) || true
+        done
+        if (( _viz_ok > 0 )); then
+            _viz_acl_result="${VIZ_OPERATOR}: rX on ${_viz_ok} engram dir(s)"
+            (( _viz_cfg_ok > 0 )) && _viz_acl_result+=" + rw on ${_viz_cfg_ok} config.json"
+        elif (( _viz_skipped > 0 )); then
+            _viz_acl_result="no ~/.engram* dir found yet — run 'sudo agentctl share ${chosen} ~/.engram --mode ro' after first session installs ENGRAM"
+        else
+            _viz_acl_result="WARN: setfacl failed on all dirs — check stderr above"
+        fi
+        echo "  ✓ viz ACL: $_viz_acl_result"
+    fi
+
     audit "finalize-name" "$chosen" "uid" "from=$newborn_user"
 
     cat <<DONE
@@ -1248,6 +1292,7 @@ JSON
   ✓ baseline backup: $chosen_home/.engram.first-session-baseline.bak/
   ✓ marker: $chosen_home/.engram/finalize-name-complete.json
   ✓ surface daemon: restarted under $chosen_user
+  ✓ viz ACL: $_viz_acl_result
 
 Smoke test:
   agentctl session $chosen        # should drop you into a clean session

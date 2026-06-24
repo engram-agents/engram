@@ -317,6 +317,34 @@ _CI_PENDING_STATUSES = frozenset({
 })
 
 
+def _dedupe_checks_by_latest(checks: list) -> list:
+    """Keep only the latest run per check name.
+
+    GitHub's statusCheckRollup contains ALL runs for a PR, including
+    superseded ones from earlier commits.  When a check is re-run after a
+    new push, both the old FAILURE and the new SUCCESS appear in the list.
+    Iterating naively finds the stale FAILURE and false-blocks the gate.
+
+    ISO-8601 completedAt strings compare correctly as plain strings
+    (lexicographic == chronological).  A null/missing completedAt (check
+    still in progress) sorts before any finished timestamp, so an in-progress
+    re-run correctly loses to the completed previous run of the same name —
+    the pending state is then caught by the pending-pass below.
+
+    Edge case: if two runs for the same name both have completedAt=None
+    (both in-progress), the first one seen is kept.  In practice both would
+    be in-progress and the pending-pass catches them regardless of which wins.
+    """
+    latest: dict = {}
+    for check in checks:
+        name = check.get("name") or check.get("context") or ""
+        completed_at = check.get("completedAt") or ""
+        existing = latest.get(name)
+        if existing is None or completed_at > (existing.get("completedAt") or ""):
+            latest[name] = check
+    return list(latest.values())
+
+
 def _pr_ci_state(pr_number: str) -> tuple:
     """Query GitHub CI state for a pull request via `gh`.
 
@@ -357,6 +385,12 @@ def _pr_ci_state(pr_number: str) -> tuple:
     except (json.JSONDecodeError, ValueError):
         return ("unknown", "gh returned unparseable JSON")
 
+    # mergeStateStatus=CLEAN is GitHub's authoritative "latest run per check
+    # all passed" verdict — trust it directly and skip per-check analysis.
+    merge_state = (data.get("mergeStateStatus") or "").upper()
+    if merge_state == "CLEAN":
+        return ("green", "mergeStateStatus=CLEAN")
+
     checks = data.get("statusCheckRollup")
     if not isinstance(checks, list):
         return ("unknown", "statusCheckRollup missing or not a list")
@@ -364,6 +398,10 @@ def _pr_ci_state(pr_number: str) -> tuple:
     if not checks:
         # No checks registered — treat as green
         return ("green", "no checks registered")
+
+    # Dedupe: keep only the latest run per check name so stale superseded
+    # runs (e.g. FAILURE from a pre-push commit) don't false-block (#1366).
+    checks = _dedupe_checks_by_latest(checks)
 
     for check in checks:
         # Handle both check-run shape (conclusion) and status-context shape (state/status)
@@ -669,6 +707,19 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_VALIDATION)
 
+    # --colleague: add the named colleague to participants (dedup) (#1267 Fix B).
+    # The colleague argument makes the colleague-gate enforceable at flip time:
+    # if a colleague participant is present, `baton flip PR-N <sentinel>` with
+    # no APPROVED review will be rejected. Without it, the gate falls back to
+    # single-agent (warn-only) mode.
+    colleague_name = getattr(args, "colleague", None)
+    colleague_note = ""
+    if colleague_name:
+        colleague_name = colleague_name.strip().lower()
+        if colleague_name and colleague_name not in participants:
+            participants.append(colleague_name)
+        colleague_note = f"Colleague reviewer: {colleague_name}"
+
     # Default turn: the invoking agent (if in participants) else first participant
     if args.turn:
         initial_turn = args.turn.strip().lower()
@@ -678,7 +729,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         initial_turn = participants[0]
 
     # Validate initial turn
-    if initial_turn != _pool_sentinel() and initial_turn not in participants:
+    if not _is_pool_sentinel(initial_turn) and initial_turn not in participants:
         print(
             f"baton init: turn '{initial_turn}' must be in participants "
             f"{participants} or the pool sentinel ({_pool_sentinel()!r}).",
@@ -731,6 +782,10 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         "",
         f"# {project_id} — {title}",
         "",
+    ]
+    if colleague_note:
+        content_lines.append(colleague_note)
+    content_lines += [
         "",
         "## Turn log",
         "",
@@ -748,6 +803,30 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     print(f"  status:       {status}")
     if github_anchor:
         print(f"  github:       {github_anchor}")
+    if colleague_name:
+        print(f"  colleague:    {colleague_name}")
+
+    # Colleague-gate enforceability warning for PR-named batons (#1267 Fix B).
+    # If this is a PR baton (PR-N id) and no colleague is resolvable from
+    # participants (participants ⊆ {author, sentinel}), warn at creation time
+    # so the gap surfaces here rather than silently at flip.
+    _is_pr_baton = re.match(r"^(?:PR-|pr-)(\d+)$", project_id)
+    if _is_pr_baton:
+        _sentinel = _pool_sentinel()
+        # Determine the author: the initial turn holder (proxy for the PR author)
+        _colleagues_at_init = [
+            p for p in participants
+            if p != initial_turn and p != _sentinel
+        ]
+        if not _colleagues_at_init:
+            print(
+                f"baton init: warning — no colleague participant for PR baton "
+                f"'{project_id}'. The colleague gate (flip-to-maintainer "
+                "approval check) will not be enforced — use "
+                "--colleague <name> or add a colleague to --participants to "
+                "enable it.",
+                file=sys.stderr,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -794,7 +873,7 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     participants_str = fields.get("participants", "").strip()
     participants = _parse_participants(participants_str) if participants_str else []
 
-    if to_agent != _pool_sentinel() and to_agent not in participants:
+    if not _is_pool_sentinel(to_agent) and to_agent not in participants:
         print(
             f"baton flip: '{to_agent}' is not a participant in {project_id}. "
             f"Participants: {participants}. "
@@ -820,7 +899,7 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     github_anchor = fields.get("github", "").strip().lower()
     _flip_force = args.force
     _pr_anchor_match = re.match(r"^pr/(\d+)$", github_anchor)
-    if _pr_anchor_match and to_agent == _pool_sentinel():
+    if _pr_anchor_match and _is_pool_sentinel(to_agent):
         _pr_num = _pr_anchor_match.group(1)
         _ci_state, _ci_detail = _pr_ci_state(_pr_num)
         if _ci_state in ("red", "pending"):
@@ -850,8 +929,9 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         # guard above. Even with CI green on the current tip, a commit
         # pushed AFTER the latest approval means the maintainer would merge
         # a tip nobody approved — reject the flip until re-review (or
-        # --force). no_approval passes through: approval-existence is the
-        # colleague-layer's gate, not this oid compare's.
+        # --force). no_approval is now handled by the colleague-gate below
+        # (#1267): it rejects when a colleague participant is present, and
+        # warns-only in single-agent mode (no colleague to perform the review).
         _ap_state, _ap_detail = _pr_approval_state(_pr_num)
         if _ap_state == "stale":
             if _flip_force:
@@ -869,13 +949,57 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
                     file=sys.stderr,
                 )
                 sys.exit(EXIT_VALIDATION)
+        elif _ap_state == "no_approval":
+            # Colleague-gate (#1267): determine whether a colleague participant
+            # exists.  A colleague is any participant who is neither the current
+            # baton holder (the PR author/driver flipping to the sentinel) nor
+            # the pool sentinel itself.  The current holder is the baton's
+            # turn: field — the same value used as from_agent below.
+            # GitHub blocks self-approval, so "an APPROVED review exists" ≡
+            # "a non-author approved."  If no approval exists and a colleague
+            # is expected, reject the flip (enforce).  If no colleague is in
+            # the participants list (single-agent mode / no counterpart), warn
+            # and proceed — per CLAUDE.md the colleague layer collapses when no
+            # counterpart exists ("don't block on a colleague review that has
+            # no one to perform it").
+            _current_holder = fields.get("turn", agent_name or "unknown").strip().lower()
+            _sentinel = _pool_sentinel()
+            _colleague_participants = [
+                p for p in participants
+                if p != _current_holder and p != _sentinel
+            ]
+            if _colleague_participants:
+                if _flip_force:
+                    print(
+                        f"warning: --force — flipping despite no colleague approval "
+                        f"on PR #{_pr_num} (no APPROVED review from a non-author "
+                        "colleague exists yet)",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"baton flip: no colleague approval on PR #{_pr_num}. "
+                        "A non-author colleague must review and approve this PR "
+                        "before it goes to the maintainer. "
+                        "Pass --force to override.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(EXIT_VALIDATION)
+            else:
+                # Single-agent mode: no counterpart to perform the review.
+                # Warn and proceed — don't block on a review with no one to do it.
+                print(
+                    f"warning: no colleague approval on PR #{_pr_num} "
+                    "(no colleague participant — single-agent mode; skipping colleague gate)",
+                    file=sys.stderr,
+                )
         elif _ap_state == "unknown":
             print(
                 f"warning: could not verify post-approval state for PR "
                 f"#{_pr_num} ({_ap_detail}) — proceeding anyway",
                 file=sys.stderr,
             )
-        # fresh / no_approval: proceed silently
+        # fresh: proceed silently
 
     now = _now_iso()
     from_agent = fields.get("turn", agent_name or "unknown").strip().lower()
@@ -968,6 +1092,20 @@ def _pool_sentinel() -> str:
     sys.exit(EXIT_VALIDATION)
 
 
+def _is_pool_sentinel(name: str) -> bool:
+    """Return True if name (already stripped/lowercased) matches the pool sentinel.
+
+    Accepts both the full sentinel ("lei shi") and its first token ("lei") so
+    pools initialized with a short-form turn value work correctly (issue #1309).
+    """
+    sentinel = _pool_sentinel()  # e.g. "lei shi"
+    if name == sentinel:
+        return True
+    # Also accept the first whitespace-token of the sentinel ("lei" from "lei shi").
+    first_token = sentinel.split()[0] if sentinel else ""
+    return bool(first_token) and name == first_token
+
+
 def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     """Claim a Project-layer baton from the pool.
 
@@ -1011,7 +1149,7 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
     # Validate: current turn must be the pool sentinel
     current_turn = fields.get("turn", "").strip().lower()
-    if current_turn != _pool_sentinel():
+    if not _is_pool_sentinel(current_turn):
         print(
             f"baton claim: refusing to steal claim from {current_turn}; "
             "use 'baton flip <project-id> <self> <reason>' if you have an "
@@ -1681,7 +1819,7 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     # ---- Gate 2: turn == pool sentinel --------------------------------
     sentinel = _pool_sentinel()
     current_turn = fields.get("turn", "").strip().lower()
-    if current_turn != sentinel:
+    if not _is_pool_sentinel(current_turn):
         holder = current_turn or "(unknown)"
         print(
             f"baton merge: turn is with {holder} — not presented for merge. "
@@ -1900,6 +2038,16 @@ def build_parser() -> argparse.ArgumentParser:
             "GitHub anchor for live status in the auto-pull hook. "
             "Format: pr/<N> or project/<N> (e.g. pr/490, project/4). "
             "Without this, only batons named PR-<N> resolve automatically."
+        ),
+    )
+    p_init.add_argument(
+        "--colleague", metavar="AGENT",
+        help=(
+            "Name the expected colleague reviewer. Added to participants (dedup) "
+            "and noted in the baton body. Enables the colleague-gate at flip time: "
+            "baton flip PR-N <sentinel> will be rejected if no non-author APPROVED "
+            "review exists. Without this, the gate falls back to single-agent "
+            "(warn-only) mode if no colleague appears in --participants."
         ),
     )
 

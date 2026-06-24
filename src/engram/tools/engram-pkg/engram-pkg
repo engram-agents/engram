@@ -25,6 +25,8 @@ Common subcommands:
     build              Run scripts/build.sh — build knowledge.db from .sql.
     call               Generic escape hatch — invoke any engram_* tool by name with JSON args.
     scope-export       Export a provenance closure of cited nodes as a scoped engram-package.
+    render             Assemble a human-readable derived view (markdown + fidelity sheet) from
+                       a paper-manifest + prose-blocks JSON. Deterministic — no LLM call.
 
 Why a CLI rather than MCP-tool duplication: parallel personal vs package
 MCP tools share shape and selection signal; mid-flow it's easy to fire the
@@ -38,6 +40,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -418,46 +421,73 @@ def _warn_if_local_url(url: str) -> None:
     )
 
 
+def _load_json_payload(raw: str) -> dict:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.exit(f"ERROR: invalid JSON payload: {e}")
+
+
 def cmd_add_evidence(args):
-    _warn_if_local_url(args.url)
     client = get_client(resolve_pkg(args))
-    return report(client.call("engram_add_evidence", {
-        "url": args.url, "title": args.title,
-        "domain": args.domain or "", "source_date": args.source_date or "",
-    }))
+    if args.json_payload is not None:
+        raw = sys.stdin.read() if args.json_payload == "-" else args.json_payload
+        payload = _load_json_payload(raw)
+    else:
+        if not args.url or not args.title:
+            sys.exit("ERROR: --url and --title required (or pass a JSON payload as the first positional argument).")
+        _warn_if_local_url(args.url)
+        payload = {
+            "url": args.url, "title": args.title,
+            "domain": args.domain or "", "source_date": args.source_date or "",
+        }
+    return report(client.call("engram_add_evidence", payload))
 
 
 def cmd_add_observation(args):
     client = get_client(resolve_pkg(args))
-    payload = {
-        "quoted_text": args.quoted_text,
-        "interpretation": args.interpretation,
-        "claim": args.claim,
-        "quote_type": args.quote_type,
-    }
-    if args.evidence_id:
-        payload["evidence_id"] = args.evidence_id
-    elif args.url:
-        _warn_if_local_url(args.url)
-        payload["url"] = args.url
-        payload["title"] = args.title or ""
-        if args.source_date:
-            payload["source_date"] = args.source_date
+    if args.json_payload is not None:
+        raw = sys.stdin.read() if args.json_payload == "-" else args.json_payload
+        payload = _load_json_payload(raw)
     else:
-        sys.exit("ERROR: provide --evidence-id OR --url --title.")
-    if args.source_class:
-        payload["source_class"] = args.source_class
+        if not args.quoted_text or not args.interpretation or not args.claim or not args.quote_type:
+            sys.exit("ERROR: --quoted-text, --interpretation, --claim, --quote-type required (or pass a JSON payload as the first positional argument).")
+        payload = {
+            "quoted_text": args.quoted_text,
+            "interpretation": args.interpretation,
+            "claim": args.claim,
+            "quote_type": args.quote_type,
+        }
+        if args.evidence_id:
+            payload["evidence_id"] = args.evidence_id
+        elif args.url:
+            _warn_if_local_url(args.url)
+            payload["url"] = args.url
+            payload["title"] = args.title or ""
+            if args.source_date:
+                payload["source_date"] = args.source_date
+        else:
+            sys.exit("ERROR: provide --evidence-id OR --url --title.")
+        if args.source_class:
+            payload["source_class"] = args.source_class
     return report(client.call("engram_add_observation", payload))
 
 
 def cmd_derive(args):
     client = get_client(resolve_pkg(args))
-    return report(client.call("engram_derive", {
-        "claim": args.claim,
-        "supporting_ids": args.supporting_ids,
-        "logical_chain": args.logical_chain,
-        "reasoning_type": args.reasoning_type,
-    }))
+    if args.json_payload is not None:
+        raw = sys.stdin.read() if args.json_payload == "-" else args.json_payload
+        payload = _load_json_payload(raw)
+    else:
+        if not args.claim or not args.supporting_ids or not args.logical_chain or not args.reasoning_type:
+            sys.exit("ERROR: --claim, --supporting-ids, --logical-chain, --reasoning-type required (or pass a JSON payload as the first positional argument).")
+        payload = {
+            "claim": args.claim,
+            "supporting_ids": args.supporting_ids,
+            "logical_chain": args.logical_chain,
+            "reasoning_type": args.reasoning_type,
+        }
+    return report(client.call("engram_derive", payload))
 
 
 def cmd_supersede(args):
@@ -468,14 +498,21 @@ def cmd_supersede(args):
       1. Create the new node via add-observation / derive / etc.
       2. engram-pkg supersede --old-node-id <old> --new-node-id <new>
          [--reason <short rationale>]
+         OR: engram-pkg supersede '{"old_node_id":"<old>","new_node_id":"<new>"}'
     """
     client = get_client(resolve_pkg(args))
-    payload = {
-        "old_node_id": args.old_node_id,
-        "new_node_id": args.new_node_id,
-    }
-    if args.reason:
-        payload["supersede_reason"] = args.reason
+    if args.json_payload is not None:
+        raw = sys.stdin.read() if args.json_payload == "-" else args.json_payload
+        payload = _load_json_payload(raw)
+    else:
+        if not args.old_node_id or not args.new_node_id:
+            sys.exit("ERROR: --old-node-id and --new-node-id required (or pass a JSON payload as the first positional argument).")
+        payload = {
+            "old_node_id": args.old_node_id,
+            "new_node_id": args.new_node_id,
+        }
+        if args.reason:
+            payload["supersede_reason"] = args.reason
     return report(client.call("engram_supersede", payload))
 
 
@@ -1106,6 +1143,479 @@ def cmd_call(args):
 
 
 # ---------------------------------------------------------------------------
+# render helpers
+# ---------------------------------------------------------------------------
+
+def _render_read_pkg_node(pkg_db_path: Path, node_id: str):
+    """Return a row dict for node_id from the package DB, or None if missing.
+
+    Reads directly from SQLite (same underlying mechanism as cmd_inspect but
+    without the full server round-trip, keeping render deterministic + offline).
+    Opens the DB read-only (mode=ro) — render must never mutate the package.
+    """
+    conn = sqlite3.connect(f"file:{pkg_db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _render_pkg_name(pkg_path: Path) -> str:
+    """Return the package name from config.json, or the directory basename."""
+    cfg = pkg_path / "config.json"
+    if cfg.exists():
+        try:
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+            name = data.get("pkg_name") or data.get("name") or ""
+            if name:
+                return name
+        except (json.JSONDecodeError, OSError):
+            pass
+    return pkg_path.name
+
+
+def _render_origin(node_row: dict) -> dict:
+    """Extract the 'origin' sub-dict from a node's metadata JSON.
+
+    Returns an empty dict if the node has no metadata or no origin sub-key.
+    Never raises — graceful degrade is required by spec.
+    """
+    raw_meta = node_row.get("metadata") or "{}"
+    try:
+        meta = json.loads(raw_meta)
+    except (json.JSONDecodeError, TypeError):
+        meta = {}
+    return meta.get("origin") or {}
+
+
+# Regex for an inline node-id parenthetical embedded in prose text.
+# Matches "(prefix_NNNN optional words)" where prefix is any node-type abbreviation.
+# Used in Item 1 to strip agent-navigation anchors before rendering human prose.
+_NODE_ID_PAREN_RE = re.compile(
+    r"\(\b(?:ob|dv|cs|ax|gl|ls|cj|df|pn|qu|ct|ev|fl|tk)_[0-9A-Za-z]+\b[^)]*\)"
+)
+
+
+def _strip_node_id_parentheticals(text: str) -> str:
+    """Remove inline node-id parentheticals from prose text.
+
+    Strips groups like "(dv_NNNN Feature 1)" or "(ob_NNNN)" that are
+    agent-navigation anchors clutter for human readers.  The renderer's own
+    trailing "(node_id)" provenance tag is appended AFTER this strip, so it
+    is never affected.
+
+    Also collapses double-spaces and removes space-before-punctuation that
+    may result from the removal.
+    """
+    stripped = _NODE_ID_PAREN_RE.sub("", text)
+    # Collapse multiple spaces into one.
+    stripped = re.sub(r"  +", " ", stripped)
+    # Remove a space immediately before certain punctuation characters.
+    stripped = re.sub(r" ([.,;:!?])", r"\1", stripped)
+    return stripped.strip()
+
+
+def cmd_render(args):
+    """Assemble a human-readable derived view from a prose-blocks JSON + manifest.
+
+    Deterministic assembler+validator — NO LLM/network call.
+
+    Outputs:
+      --output  : rendered markdown (R1 header + body + R2 appendix)
+      --fidelity: per-author fidelity sheet JSON (R3)
+
+    Strict validation fires FIRST; if validation fails the command exits
+    non-zero and writes nothing.
+    """
+    pkg_path = resolve_pkg(args)
+    _check_stale_build(pkg_path)
+
+    # ------------------------------------------------------------------ #
+    # 1. Load and parse input files                                        #
+    # ------------------------------------------------------------------ #
+    if args.format != "markdown":
+        sys.exit(f"ERROR: render: --format '{args.format}' is not supported in v1. Only 'markdown' is accepted.")
+
+    manifest_path = Path(args.manifest).expanduser().resolve()
+    prose_path = Path(args.prose).expanduser().resolve()
+
+    try:
+        manifest_raw = manifest_path.read_text(encoding="utf-8")
+    except OSError as e:
+        sys.exit(f"ERROR: render: cannot read --manifest {manifest_path}: {e}")
+    try:
+        manifest = json.loads(manifest_raw)
+    except json.JSONDecodeError as e:
+        sys.exit(f"ERROR: render: --manifest {manifest_path} contains malformed JSON: {e}")
+
+    try:
+        prose_raw = prose_path.read_text(encoding="utf-8")
+    except OSError as e:
+        sys.exit(f"ERROR: render: cannot read --prose {prose_path}: {e}")
+    try:
+        prose_blocks = json.loads(prose_raw)
+    except json.JSONDecodeError as e:
+        sys.exit(f"ERROR: render: --prose {prose_path} contains malformed JSON: {e}")
+
+    if not isinstance(manifest, dict):
+        sys.exit(f"ERROR: render: --manifest must be a JSON object, got {type(manifest).__name__}.")
+    if not isinstance(prose_blocks, list):
+        sys.exit(f"ERROR: render: --prose must be a JSON array of blocks, got {type(prose_blocks).__name__}.")
+
+    # ------------------------------------------------------------------ #
+    # 2. Extract manifest fields                                           #
+    # ------------------------------------------------------------------ #
+    title = manifest.get("title") or "(untitled)"
+    authors = manifest.get("authors") or []
+    abstract_node_id = manifest.get("abstract_node_id")
+    sections = manifest.get("sections") or []
+
+    # Collect ALL node_ids declared in the manifest (sections + abstract).
+    manifest_node_ids: set[str] = set()
+    if abstract_node_id:
+        manifest_node_ids.add(abstract_node_id)
+    section_node_set: dict[str, set[str]] = {}  # section_title → set of node_ids
+    for sec in sections:
+        sec_title = sec.get("title") or ""
+        sec_ids = sec.get("node_ids_in_order") or []
+        section_node_set[sec_title] = set(sec_ids)
+        for nid in sec_ids:
+            manifest_node_ids.add(nid)
+
+    # ------------------------------------------------------------------ #
+    # 3. Extract prose block index                                         #
+    # ------------------------------------------------------------------ #
+    # sourced_by_node: node_id → list of block indices (for coverage check)
+    sourced_by_node: dict[str, list[int]] = {}
+    for i, blk in enumerate(prose_blocks):
+        if not isinstance(blk, dict):
+            sys.exit(f"ERROR: render: prose block at index {i} is not a JSON object.")
+        btype = blk.get("type")
+        if btype not in ("sourced", "connective"):
+            sys.exit(f"ERROR: render: prose block at index {i} has unknown type '{btype}'. Must be 'sourced' or 'connective'.")
+        if btype == "sourced":
+            nid = blk.get("node_id")
+            if not nid:
+                sys.exit(f"ERROR: render: sourced block at index {i} missing 'node_id'.")
+            sourced_by_node.setdefault(nid, []).append(i)
+
+    # ------------------------------------------------------------------ #
+    # 4. Strict validation                                                 #
+    # ------------------------------------------------------------------ #
+    pkg_db = pkg_path / "knowledge.db"
+    if not pkg_db.exists():
+        sys.exit(f"ERROR: render: package DB not found at {pkg_db}. Run `engram-pkg build` first.")
+
+    # Single read pass — open one connection and read every manifest node once.
+    # The result is reused for both validation (4c) and the render cache (step 6),
+    # halving the connection/read overhead compared to two separate passes.
+    pkg_node_cache: dict[str, dict] = {}
+    _db_conn = sqlite3.connect(f"file:{pkg_db}?mode=ro", uri=True)
+    _db_conn.row_factory = sqlite3.Row
+    try:
+        for nid in manifest_node_ids:
+            row = _db_conn.execute(
+                "SELECT * FROM nodes WHERE id = ?", (nid,)
+            ).fetchone()
+            if row is not None:
+                pkg_node_cache[nid] = dict(row)
+    finally:
+        _db_conn.close()
+
+    errors: list[str] = []
+
+    # (a) Every manifest node_id must appear in at least one sourced block.
+    for nid in sorted(manifest_node_ids):
+        if nid not in sourced_by_node:
+            errors.append(f"manifest node '{nid}' has no sourced block in --prose")
+
+    # (b) Every sourced block's node_id must appear in the manifest.
+    for nid in sorted(sourced_by_node.keys()):
+        if nid not in manifest_node_ids:
+            errors.append(f"sourced block node_id '{nid}' does not appear in --manifest")
+
+    # (c) Every manifest node_id must resolve to a real node in the package.
+    # Uses pkg_node_cache populated by the single read pass above.
+    for nid in sorted(manifest_node_ids):
+        if nid not in pkg_node_cache:
+            errors.append(f"node '{nid}' declared in manifest not found in package DB")
+
+    if errors:
+        sys.stderr.write("ERROR: render: validation failed — nothing written.\n")
+        for err in errors:
+            sys.stderr.write(f"  - {err}\n")
+        sys.exit(1)
+
+    # ------------------------------------------------------------------ #
+    # 5. Build section membership map: which block indices belong to each  #
+    #    section (plus abstract)?                                          #
+    # ------------------------------------------------------------------ #
+    # Strategy: walk prose_blocks in order; a block is in a section if it's
+    # a sourced block whose node_id is in that section's node_ids_in_order.
+    # Connective blocks are assigned to the same section as the previous
+    # sourced block (or to the abstract if we haven't seen a sourced block yet).
+    #
+    # We assign each block to at most one section. The assignment is a flat
+    # pass; the first matching section wins (sections are walked in manifest
+    # order). Blocks that don't match any section are skipped (only possible
+    # if validation passed — shouldn't occur post-validation).
+
+    # Build a node_id → section_index map for O(1) lookup.
+    node_to_section: dict[str, int] = {}
+    if abstract_node_id:
+        node_to_section[abstract_node_id] = -1  # -1 = abstract sentinel
+    for sec_idx, sec in enumerate(sections):
+        for nid in (sec.get("node_ids_in_order") or []):
+            node_to_section[nid] = sec_idx
+
+    # Block assignment: assign each block to its section (-1 = abstract, ≥0 = section).
+    block_assignments: list[int | None] = [None] * len(prose_blocks)
+    # Item 4: track connective blocks that were dropped (appeared before first sourced block).
+    dropped_connectives: list[dict] = []
+    last_section: int | None = None
+    for i, blk in enumerate(prose_blocks):
+        if blk["type"] == "sourced":
+            sec_idx = node_to_section.get(blk["node_id"])
+            block_assignments[i] = sec_idx
+            last_section = sec_idx
+        else:
+            # connective: inherit previous sourced block's section.
+            # If no sourced block has been seen yet, last_section is None —
+            # the block cannot be assigned to any section and will be dropped.
+            # Emit a loud warning so the author knows content was not rendered.
+            if last_section is None:
+                snippet = (blk.get("text") or "")[:60]
+                sys.stderr.write(
+                    f"WARNING: render: connective block before any sourced block "
+                    f"has no section and was not rendered: \"{snippet}\"\n"
+                )
+                # Item 4: record the dropped connective for the fidelity sheet.
+                dropped_connectives.append({
+                    "text": blk.get("text") or "",
+                    "reason": "no section — appeared before first sourced block",
+                })
+            block_assignments[i] = last_section
+
+    # ------------------------------------------------------------------ #
+    # 6. pkg_node_cache already populated by the single read pass in §4.  #
+    # ------------------------------------------------------------------ #
+    # (No second DB read needed — pkg_node_cache was built above and is
+    # reused here unchanged. Kept as a section marker so step numbering
+    # in the surrounding sections stays consistent.)
+
+    # ------------------------------------------------------------------ #
+    # 6b. Build sec_idx → section title map for Item 3 (fidelity section  #
+    #     field). Abstract (-1) maps to "Abstract".                        #
+    # ------------------------------------------------------------------ #
+    sec_idx_to_title: dict[int, str] = {-1: "Abstract"}
+    for sec_idx, sec in enumerate(sections):
+        sec_idx_to_title[sec_idx] = sec.get("title") or f"Section {sec_idx + 1}"
+
+    # ------------------------------------------------------------------ #
+    # 7. Build the rendered markdown                                       #
+    # ------------------------------------------------------------------ #
+    pkg_name = _render_pkg_name(pkg_path)
+    lines: list[str] = []
+
+    # R1 header (non-negotiable)
+    lines.append(f"> **Derived view** of package `{pkg_name}` — NOT the source of truth. The package is.")
+    regen_cmd = f"engram-pkg --pkg <pkg> render --manifest {manifest_path.name} --prose {prose_path.name}"
+    lines.append(f"> Regenerate: `{regen_cmd}`")
+    lines.append("")
+    lines.append(f"# {title}")
+    if authors:
+        lines.append(f"**Authors:** {', '.join(str(a) for a in authors)}")
+    lines.append("")
+
+    def _render_blocks_for_section(sec_idx: int | None) -> None:
+        """Append block text for the given section index to `lines`."""
+        for i, blk in enumerate(prose_blocks):
+            if block_assignments[i] != sec_idx:
+                continue
+            text = blk.get("text") or ""
+            if blk["type"] == "sourced":
+                # Item 1: strip inline node-id parentheticals from prose FIRST,
+                # then append the canonical trailing provenance cite.
+                clean_text = _strip_node_id_parentheticals(text)
+                lines.append(f"{clean_text} ({blk['node_id']})")
+            else:
+                # Item 1: strip inline node-id parentheticals from connective text too.
+                lines.append(_strip_node_id_parentheticals(text))
+            lines.append("")
+
+    # Abstract section (if present)
+    if abstract_node_id:
+        lines.append("## Abstract")
+        lines.append("")
+        _render_blocks_for_section(-1)
+
+    # Body sections
+    for sec_idx, sec in enumerate(sections):
+        sec_title = sec.get("title") or f"Section {sec_idx + 1}"
+        lines.append(f"## {sec_title}")
+        lines.append("")
+        _render_blocks_for_section(sec_idx)
+
+    # R2 appendix: provenance / authorship table
+    lines.append("## Provenance / authorship")
+    lines.append("")
+    lines.append("| package id | originating agent | source-graph node | lineage |")
+    lines.append("| --- | --- | --- | --- |")
+
+    # Collect all sourced node_ids in order (first appearance in prose list)
+    seen_in_table: set[str] = set()
+    sourced_in_order: list[str] = []
+    for blk in prose_blocks:
+        if blk["type"] == "sourced":
+            nid = blk["node_id"]
+            if nid not in seen_in_table:
+                sourced_in_order.append(nid)
+                seen_in_table.add(nid)
+
+    # Sort by originating agent for the table (per spec: "sorted by originating agent")
+    def _agent_key(nid: str) -> str:
+        row = pkg_node_cache.get(nid, {})
+        origin = _render_origin(row)
+        return origin.get("agent_id") or ""
+
+    sourced_sorted = sorted(sourced_in_order, key=_agent_key)
+
+    for nid in sourced_sorted:
+        row = pkg_node_cache.get(nid, {})
+        origin = _render_origin(row)
+        if origin:
+            agent_id = origin.get("agent_id") or "(origin unset)"
+            src_node = origin.get("source_graph_node_id") or ""
+            lineage = origin.get("lineage") or ""
+        else:
+            agent_id = "(origin unset)"
+            src_node = ""
+            lineage = ""
+        lines.append(f"| {nid} | {agent_id} | {src_node} | {lineage} |")
+
+    lines.append("")
+
+    markdown_text = "\n".join(lines)
+
+    # ------------------------------------------------------------------ #
+    # 8. Build the fidelity JSON (R3)                                      #
+    # ------------------------------------------------------------------ #
+    per_author: dict[str, list[dict]] = {}
+    connective_prose: list[dict] = []
+
+    for i, blk in enumerate(prose_blocks):
+        if blk["type"] == "sourced":
+            nid = blk["node_id"]
+            row = pkg_node_cache.get(nid, {})
+            origin = _render_origin(row)
+            agent_id = origin.get("agent_id") or "(origin unset)"
+            # node_claim: read FROM the package, not from the prose JSON
+            node_claim = row.get("claim") or ""
+            # Item 3: include the section title so certifiers can navigate.
+            assigned_sec_idx = block_assignments[i]
+            section_title = sec_idx_to_title.get(assigned_sec_idx, "") if assigned_sec_idx is not None else ""
+            per_author.setdefault(agent_id, []).append({
+                "node_id": nid,
+                "node_claim": node_claim,
+                "rendered_text": blk.get("text") or "",
+                "section": section_title,
+                "status": "pending",
+            })
+        else:
+            connective_prose.append({
+                "text": blk.get("text") or "",
+                "status": "pending",
+            })
+
+    fidelity = {
+        "package": pkg_name,
+        "manifest": str(manifest_path),
+        "generated_for_proofread": True,
+        "per_author_sourced": per_author,
+        "connective_prose": connective_prose,
+        # Item 4: dropped connective blocks recorded for lead-certifier visibility.
+        "dropped_connective": dropped_connectives,
+    }
+    fidelity_text = json.dumps(fidelity, indent=2, ensure_ascii=False)
+
+    # ------------------------------------------------------------------ #
+    # 9. Determine output paths                                            #
+    # ------------------------------------------------------------------ #
+    if args.output:
+        output_path = Path(args.output).expanduser().resolve()
+        if args.fidelity:
+            fidelity_path = Path(args.fidelity).expanduser().resolve()
+        else:
+            stem = output_path.stem
+            fidelity_path = output_path.parent / f"{stem}-fidelity.json"
+    else:
+        output_path = None  # stdout
+        if args.fidelity:
+            fidelity_path = Path(args.fidelity).expanduser().resolve()
+        else:
+            fidelity_path = Path("fidelity.json").resolve()
+
+    # ------------------------------------------------------------------ #
+    # 10. Write outputs (post-validation; per-file atomic via temp+rename) #
+    #                                                                       #
+    # Validation already passed — we only reach here when both outputs are  #
+    # ready to write. Each file is written to a temp sibling first, then    #
+    # os.replace()-ed to the final path, so a failure between the two        #
+    # writes cannot leave a half-written final file. Markdown is written     #
+    # before fidelity so that on any error the markdown is absent rather     #
+    # than present without its companion fidelity sheet.                     #
+    # ------------------------------------------------------------------ #
+    import tempfile as _tempfile
+
+    if output_path:
+        _parent = output_path.parent
+        _parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_md = _tempfile.mkstemp(dir=_parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(markdown_text)
+            # Item 2: mkstemp creates mode 600; set 644 so the output is
+            # human-readable without requiring elevated permissions.
+            os.chmod(tmp_md, 0o644)
+            os.replace(tmp_md, output_path)
+        except Exception:
+            try:
+                os.unlink(tmp_md)
+            except OSError:
+                pass
+            raise
+        print(f"render: wrote {output_path}", file=sys.stderr)
+    else:
+        print(markdown_text)
+
+    _fid_parent = fidelity_path.parent
+    _fid_parent.mkdir(parents=True, exist_ok=True)
+    fd2, tmp_fid = _tempfile.mkstemp(dir=_fid_parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd2, "w", encoding="utf-8") as fh:
+            fh.write(fidelity_text)
+        # Item 2: mkstemp creates mode 600; set 644 so the fidelity JSON is
+        # human-readable without requiring elevated permissions.
+        os.chmod(tmp_fid, 0o644)
+        os.replace(tmp_fid, fidelity_path)
+    except Exception:
+        try:
+            os.unlink(tmp_fid)
+        except OSError:
+            pass
+        raise
+
+    if output_path:
+        print(f"render: wrote {fidelity_path}", file=sys.stderr)
+    else:
+        print(f"render: wrote fidelity → {fidelity_path}", file=sys.stderr)
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -1127,19 +1637,23 @@ def build_parser():
     i.set_defaults(func=cmd_init)
 
     e = sp.add_parser("add-evidence", help="Register a source document.")
-    e.add_argument("--url", required=True)
-    e.add_argument("--title", required=True)
+    e.add_argument("json_payload", nargs="?", default=None,
+                   help='JSON payload (same schema as MCP engram_add_evidence payload_json). Use "-" to read from stdin. If omitted, use named flags.')
+    e.add_argument("--url")
+    e.add_argument("--title")
     e.add_argument("--domain")
     e.add_argument("--source-date")
     e.set_defaults(func=cmd_add_evidence)
 
     o = sp.add_parser("add-observation", help="Extract a claim with provenance from a source.")
-    o.add_argument("--quoted-text", required=True)
-    o.add_argument("--interpretation", required=True)
-    o.add_argument("--claim", required=True)
-    o.add_argument("--quote-type", required=True,
+    o.add_argument("json_payload", nargs="?", default=None,
+                   help='JSON payload (same schema as MCP engram_add_observation payload_json). Use "-" to read from stdin. If omitted, use named flags.')
+    o.add_argument("--quoted-text")
+    o.add_argument("--interpretation")
+    o.add_argument("--claim")
+    o.add_argument("--quote-type",
                    choices=["hard_data", "official_statement", "attributed_analysis",
-                            "unnamed_source", "editorial"])
+                            "counterfactual_inference", "unnamed_source", "personal_communication", "editorial"])
     o.add_argument("--evidence-id", help="Use this OR --url+--title.")
     o.add_argument("--url")
     o.add_argument("--title")
@@ -1148,10 +1662,12 @@ def build_parser():
     o.set_defaults(func=cmd_add_observation)
 
     d = sp.add_parser("derive", help="Combine evidence into a derived claim.")
-    d.add_argument("--claim", required=True)
-    d.add_argument("--supporting-ids", required=True, help="Comma-separated node IDs.")
-    d.add_argument("--logical-chain", required=True)
-    d.add_argument("--reasoning-type", required=True,
+    d.add_argument("json_payload", nargs="?", default=None,
+                   help='JSON payload (same schema as MCP engram_derive payload_json). Use "-" to read from stdin. If omitted, use named flags.')
+    d.add_argument("--claim")
+    d.add_argument("--supporting-ids", help="Comma-separated node IDs.")
+    d.add_argument("--logical-chain")
+    d.add_argument("--reasoning-type",
                    help="One of the engram_derive reasoning types.")
     d.set_defaults(func=cmd_derive)
 
@@ -1159,10 +1675,11 @@ def build_parser():
         "supersede",
         help="Wire an existing replacement node as the successor of an old node (relational only).",
     )
-    s.add_argument("--old-node-id", required=True, help="ID of the node being superseded.")
+    s.add_argument("json_payload", nargs="?", default=None,
+                   help='JSON payload (same schema as MCP engram_supersede payload_json). Use "-" to read from stdin. If omitted, use named flags.')
+    s.add_argument("--old-node-id", help="ID of the node being superseded.")
     s.add_argument(
         "--new-node-id",
-        required=True,
         help="ID of the replacement node — must already exist (create via add-observation, derive, etc. first).",
     )
     s.add_argument("--reason", help="Optional short rationale for why this revision exists.")
@@ -1236,6 +1753,56 @@ def build_parser():
         ),
     )
     se.set_defaults(func=cmd_scope_export)
+
+    rd = sp.add_parser(
+        "render",
+        help=(
+            "Assemble a human-readable derived view (markdown + fidelity sheet) "
+            "from a paper-manifest + prose-blocks JSON. Deterministic — no LLM call."
+        ),
+    )
+    rd.add_argument(
+        "--manifest",
+        required=True,
+        help=(
+            "Path to the paper-manifest JSON "
+            "({manifest_version, title, authors:[agent_ids], abstract_node_id, "
+            "sections:[{title, node_ids_in_order}]})."
+        ),
+    )
+    rd.add_argument(
+        "--prose",
+        required=True,
+        help=(
+            "Path to the prose-blocks JSON — a flat ordered list of blocks, each "
+            '{"type":"sourced","node_id":"<id>","text":"..."} or '
+            '{"type":"connective","text":"..."}.'
+        ),
+    )
+    rd.add_argument(
+        "--format",
+        default="markdown",
+        help="Output format. Only 'markdown' is supported in v1 (default: markdown).",
+    )
+    rd.add_argument(
+        "--output",
+        default=None,
+        help=(
+            "Path for the rendered markdown output. "
+            "Default: stdout. The fidelity sheet is written to "
+            "<output-stem>-fidelity.json alongside it."
+        ),
+    )
+    rd.add_argument(
+        "--fidelity",
+        default=None,
+        help=(
+            "Path for the fidelity JSON (R3). "
+            "Default: <output-stem>-fidelity.json when --output is given, "
+            "otherwise ./fidelity.json."
+        ),
+    )
+    rd.set_defaults(func=cmd_render)
 
     c = sp.add_parser("call", help="Generic escape hatch — invoke any engram_* tool by JSON.")
     c.add_argument("tool_name", help="Full tool name (e.g. engram_reflect).")

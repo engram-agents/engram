@@ -368,6 +368,21 @@ def _resolve_impl(
             (resolving_node_id, target_id),
         ).fetchone()
         if existing_edge:
+            # Self-heal: if resolved_by is NULL (pre-#759 state or any prior
+            # gap), compute and write it now. This makes re-calling engram_resolve
+            # on an already-resolved contradiction idempotent AND corrective.
+            # Only run if NULL — skip recomputation when already set.
+            current_resolved_by = conn.execute(
+                "SELECT resolved_by FROM nodes WHERE id = ?", (target_id,)
+            ).fetchone()
+            if current_resolved_by and current_resolved_by["resolved_by"] is None:
+                best = core._best_resolver_for(conn, target_id)
+                if best is not None:
+                    conn.execute(
+                        "UPDATE nodes SET resolved_by = ? WHERE id = ?",
+                        (best["id"], target_id),
+                    )
+                    conn.commit()
             return json.dumps({
                 "status": "no_op",
                 "message": (
@@ -404,15 +419,9 @@ def _resolve_impl(
         else:
             # Fetch the argmax-confidence current resolver (ORDER BY desc, LIMIT 1) so
             # that resolved_by always points at the strongest resolver, not the latest-wired
-            # one. Same query that drove MAX(confidence) before, now returning the id too.
-            best_row = conn.execute(
-                """SELECT n.id, n.confidence FROM edges e
-                   JOIN nodes n ON e.source_id = n.id
-                   WHERE e.target_id = ? AND e.relation = 'resolves'
-                   AND n.is_current = 1 AND n.status != 'retracted'
-                   ORDER BY n.confidence DESC LIMIT 1""",
-                (target_id,),
-            ).fetchone()
+            # one. Uses the shared core._best_resolver_for helper (same query as the no_op
+            # self-heal and _backfill_resolved_by paths).
+            best_row = core._best_resolver_for(conn, target_id)
             max_conf = best_row["confidence"] if best_row and best_row["confidence"] is not None else confidence
             best_resolver_id = best_row["id"] if best_row else resolving_node_id
             if max_conf >= threshold:
@@ -708,6 +717,36 @@ def _supersede_impl(
                           {"transferred_from": old_node_id,
                            "trust_tier": old_self["trust_tier"]})
 
+            # Migrate incoming `supported_by` edges from cornerstones/lessons.
+            # The cascade walker already skips cs/ls nodes (§2.0 skip rule), so
+            # they are not stale-marked when a premise is superseded. But the edge
+            # still points at the now-non-current person, leaving the cs/ls
+            # anchored to a superseded node. Add a parallel edge to the new node.
+            # Old edges are preserved as audit trail (same as about migration).
+            # See #1209 (Aleph's remaining gap — cs/ls supported_by not rerooted).
+            cs_ls_sources = conn.execute(
+                "SELECT e.source_id FROM edges e "
+                "JOIN nodes n ON n.id = e.source_id "
+                "WHERE e.target_id = ? AND e.relation = 'supported_by' "
+                "AND n.type IN ('cornerstone', 'lesson') AND n.is_current = 1",
+                (old_node_id,),
+            ).fetchall()
+            for row in cs_ls_sources:
+                src = row["source_id"]
+                already = conn.execute(
+                    "SELECT 1 FROM edges "
+                    "WHERE source_id = ? AND target_id = ? AND relation = 'supported_by'",
+                    (src, new_node_id),
+                ).fetchone()
+                if not already:
+                    conn.execute(
+                        "INSERT INTO edges (source_id, target_id, relation, created_at)"
+                        " VALUES (?, ?, 'supported_by', ?)",
+                        (src, new_node_id, now),
+                    )
+                    core._log_edit(conn, "supported_by_migrated", new_node_id, new["type"],
+                              {"supported_by_source_id": src, "migrated_from": old_node_id})
+
         # Flag downstream dependents of the old node as stale.
         # Uses shared walker (_walk_cascade_downstream) — PR-AA SSoT refactor.
         visited = {old_node_id}  # seed superseded node so walker won't process it
@@ -919,6 +958,16 @@ def _retract_impl(
             return json.dumps({"error": f"Node '{node_id}' not found."})
 
         now = core._now()
+
+        # Self-anchor guard: retracting a person self-anchor leaves zero current
+        # self-anchors — silently breaking link_about default-targeting,
+        # focus='self' emergence-scan, and trust_tier='self' assignment.
+        # Detect now (before the retract flips is_current=0) so we can warn.
+        _retract_node_meta = json.loads(node["metadata"] or "{}")
+        _self_anchor_retracted = (
+            node["type"] == "person"
+            and bool(_retract_node_meta.get("is_self"))
+        )
 
         # 1. Mark the node as retracted
         retract_meta = json.loads(node["metadata"] or "{}")
@@ -1172,6 +1221,14 @@ def _retract_impl(
             result["replacement_id"] = replacement_id
         if result_replacement_skipped:
             result["replacement_skipped"] = True
+        if _self_anchor_retracted:
+            result["warning"] = (
+                "Retracted node was the agent's self-anchor (is_self=True). "
+                "The graph now has zero current self-anchors. "
+                "engram_link_about default-targeting, focus='self' emergence-scan, "
+                "and trust_tier='self' assignment are broken until a new person node "
+                "is created with is_self=True (or an existing one is promoted)."
+            )
 
         # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
         emit_if_initialized(

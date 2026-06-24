@@ -42,6 +42,10 @@
   },
   "primary_user": "you",
 
+  "_comment_install": "Install tier and topology recorded by install-local-marketplace.sh after each build+install. install_tier: the depth tier used (essential | convenience | dev). multi_agent: true if the --multi-agent flag was used. These fields are written automatically — edit only if you need to override the next upgrade's defaults.",
+  "install_tier": "convenience",
+  "multi_agent": false,
+
   "_comment_fairy_policy": "Fairy delegation policies — how the agent decides whether to spawn a fairy vs. do the work directly. Both default to 'auto'. Values: 'explicit' (spawn only when user asks), 'auto' (agent judges per-task using the named skill), 'always' (unconditionally delegate). In 'auto' mode the agent loads the skill engram-auto-coder-fairy-judgement or engram-auto-reviewer-fairy-judgement to decide; edit those skill files to tune the heuristic.",
   "coder_fairy_policy": "auto",
   "reviewer_fairy_policy": "auto",

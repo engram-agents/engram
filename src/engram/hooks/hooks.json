@@ -82,6 +82,31 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-bash-pipe-exit-warn.py\"",
+            "timeout": 3
+          },
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-lesson-tripwire-hook.py\"",
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-lesson-tripwire-hook.py\"",
+            "timeout": 3
+          }
+        ]
       }
     ],
     "PostCompact": [

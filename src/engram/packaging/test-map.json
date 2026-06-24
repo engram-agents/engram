@@ -23,6 +23,13 @@
       ]
     },
     {
+      "path_prefix_or_glob": "hooks/claude/engram-bash-pipe-exit-warn.py",
+      "test_globs": [
+        "tests/test_engram_bash_pipe_exit_warn.py"
+      ],
+      "note": "PreToolUse hook that warns on pipe-exit-masking patterns (issue #1085)"
+    },
+    {
       "path_prefix_or_glob": "hooks/claude/engram-deference-detector-prompt.py",
       "test_globs": [
         "tests/test_deference_detector_scope_gate.py",
@@ -61,6 +68,13 @@
         "tests/test_tier_build_filter.py",
         "tests/test_tiers_manifest.py"
       ]
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-lesson-tripwire-hook.py",
+      "test_globs": [
+        "tests/test_lesson_tripwire.py"
+      ],
+      "note": "PreToolUse hook that surfaces lesson tripwires on Bash and MCP tool calls (issues #1203 + #1297)"
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-postcompact-hook.py",

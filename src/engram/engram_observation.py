@@ -264,6 +264,41 @@ def _format_yellow_warning(match: dict) -> str:
     return msg
 
 
+def _normalize_for_equivalence(text: str) -> str:
+    """Normalize text for equivalence-class quote matching (#1287).
+
+    Applied SYMMETRICALLY to both the quote and the source, so it can only
+    forgive presentational differences — never let a paraphrase pass, since
+    differing words survive normalization. Folds: Unicode NFC; curly→straight
+    quotes; em/en/figure-dash→hyphen; non-breaking & thin unicode spaces→space;
+    zero-width space→removed; all whitespace runs (incl. newlines/tabs)→single
+    space; strips ends.
+
+    NOTE: deliberately does NOT support elision/ellipsis skipping — see #1287.
+    """
+    import unicodedata
+    import re
+    t = unicodedata.normalize("NFC", text)
+    # Curly / typographic quotes → ASCII
+    t = t.translate({
+        0x2018: 0x27, 0x2019: 0x27, 0x201A: 0x27, 0x201B: 0x27,  # ' ' ‚ ‛ -> '
+        0x2032: 0x27,                                              # prime ′ -> '
+        0x201C: 0x22, 0x201D: 0x22, 0x201E: 0x22, 0x201F: 0x22,  # " " „ ‟ -> "
+        0x2033: 0x22,                                              # double prime ″ -> "
+    })
+    # Dashes → hyphen-minus
+    t = t.translate({0x2012: 0x2D, 0x2013: 0x2D, 0x2014: 0x2D, 0x2015: 0x2D})
+    # Non-breaking / specialty spaces → regular space; zero-width → removed
+    t = (t.replace(" ", " ")   # NO-BREAK SPACE
+          .replace(" ", " ")   # NARROW NO-BREAK SPACE
+          .replace(" ", " ")   # THIN SPACE
+          .replace(" ", " ")   # FIGURE SPACE
+          .replace("​", ""))   # ZERO WIDTH SPACE
+    # Collapse all whitespace runs (incl. newlines, tabs) to a single space; strip
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 def _escape_for_source(text: str, file_path: str) -> str:
     """Escape text to match how it appears in a source file's raw content.
 
@@ -356,6 +391,52 @@ def _find_near_matches(
     return matches
 
 
+# Content-addressed evidence archive root (#1253). Mirrors the engram-snapshot
+# CLI's resolution exactly: $ENGRAM_EVIDENCE_ARCHIVE override, else
+# $ENGRAM_HOME/evidence-archive. Files here are named by their sha256 content
+# hash, which makes them immutable-by-construction.
+EVIDENCE_ARCHIVE_ROOT = (
+    os.environ.get("ENGRAM_EVIDENCE_ARCHIVE")
+    or str(core.DATA_DIR / "evidence-archive")
+)
+
+
+def _content_addressed_archive_hash(abs_file: str) -> str:
+    """If abs_file is a content-addressed evidence-archive file whose name
+    matches its actual content hash, return that hash; else return "".
+
+    Content-addressing provides the SAME immutability guarantee the
+    committed-before-cite guard exists for, by a different mechanism: the
+    filename IS the sha256 of the bytes, so the cited content can never change
+    without the path changing too. This lets the deferred-commit path
+    (#1253, Lei's ruling) cite an archive file at content_hash time — before
+    the git commit that backfills its git_sha at nap — WITHOUT losing the
+    immutability the guard protects. The check is scoped to the archive root,
+    so all OTHER file:// citations (working-tree files whose bytes can mutate)
+    keep the commit guard unchanged.
+    """
+    try:
+        # realpath (not abspath) resolves symlinks, so the scope check enforces
+        # the tighter invariant "the actual bytes live inside the archive root"
+        # — a symlink planted in the archive that points outside is rejected.
+        archive_root = os.path.realpath(EVIDENCE_ARCHIVE_ROOT)
+        af = os.path.realpath(abs_file)
+        # Must live under the archive root (reject path-traversal / symlink-out).
+        if os.path.commonpath([archive_root, af]) != archive_root:
+            return ""
+        # Basename stem must be a 64-char lowercase-hex sha256.
+        stem = os.path.basename(af).split(".", 1)[0]
+        if len(stem) != 64 or any(c not in "0123456789abcdef" for c in stem):
+            return ""
+        # And it must actually hash to its name (cheap re-verification; this is
+        # the integrity gate that replaces the commit-freeze for archive files).
+        with open(af, "rb") as fh:
+            actual = hashlib.sha256(fh.read()).hexdigest()
+        return actual if actual == stem else ""
+    except (OSError, ValueError):
+        return ""
+
+
 def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "") -> dict:
     """Validate a file:// URL is citable and capture its version state.
 
@@ -391,6 +472,17 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "") -
         return {"ok": True, "error": None, "content_hash": "", "git_sha": ""}
 
     file_path = url[7:]
+    if not os.path.isabs(file_path):
+        return {
+            "ok": False,
+            "error": (
+                "file:// evidence URL must be an absolute path; got relative "
+                f"'{file_path}'. A relative path is cwd-dependent and not stably "
+                "re-verifiable — cite the absolute path." + _HONESTY_REMINDER
+            ),
+            "content_hash": "",
+            "git_sha": "",
+        }
     if not os.path.exists(file_path):
         return {
             "ok": False,
@@ -416,12 +508,24 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "") -
     if not file_in_git_repo:
         return {"ok": True, "error": None, "content_hash": "", "git_sha": ""}
 
+    # Deferred-commit relaxation (#1253): a content-addressed evidence-archive
+    # file is immutable by construction (its name IS the sha256 of its bytes),
+    # so it is safe to cite regardless of git commit state — the content can't
+    # change without the path changing. Accept it now at content_hash; its
+    # git_sha backfills at the next nap commit. Checked BEFORE the status/HEAD
+    # logic on purpose: an uncommitted archive file would otherwise be rejected
+    # by the cat-file HEAD check below. Scoped to the archive root, so every
+    # other file:// citation keeps the committed-before-cite guard unchanged.
+    ca_hash = _content_addressed_archive_hash(file_path)
+    if ca_hash:
+        return {"ok": True, "error": None, "content_hash": ca_hash, "git_sha": ""}
+
     repo_root_result = _file_git("rev-parse", "--show-toplevel")
     repo_root = repo_root_result.stdout.strip()
     abs_file = os.path.abspath(file_path)
     rel_path = os.path.relpath(abs_file, repo_root)
 
-    status_result = _file_git("status", "--porcelain", "--", rel_path)
+    status_result = _file_git("status", "--porcelain", "--", abs_file)
     file_status = status_result.stdout.strip()
     if file_status:
         status_code = file_status[:2]
@@ -492,6 +596,17 @@ def _verify_quote_in_source(url: str, quoted_text: str) -> Optional[str]:
         return None  # Cannot verify remote URLs
 
     file_path = url[7:]
+    if not os.path.isabs(file_path):
+        _HONESTY_REMINDER = (
+            "\n\nRemember: cheating blinds you. A fabricated URL corrupts your own memory "
+            "and every future step built on it. If the real source is hard to find, "
+            "raise the problem transparently — never solve it with a shortcut. (the provenance axiom)"
+        )
+        return (
+            f"file:// evidence URL must be an absolute path; got relative '{file_path}'. "
+            "A relative path is cwd-dependent and not stably re-verifiable — cite the absolute path."
+            + _HONESTY_REMINDER
+        )
     if not os.path.exists(file_path):
         return None  # File existence is checked separately
 
@@ -512,12 +627,12 @@ def _verify_quote_in_source(url: str, quoted_text: str) -> Optional[str]:
         if ascii_escaped != escaped and ascii_escaped in content:
             return None  # Found with ASCII escape
 
-    # Last resort: Unicode-normalized plain text comparison (handles NFC/NFD)
-    import unicodedata
-    norm_quote = unicodedata.normalize("NFC", quoted_text)
-    norm_content = unicodedata.normalize("NFC", content)
-    if norm_quote in norm_content:
-        return None  # Found via Unicode normalization
+    # Last resort: equivalence-normalized comparison (#1287). Subsumes NFC and
+    # additionally forgives presentational differences (whitespace runs, curly vs
+    # straight quotes, em/en-dashes, non-breaking spaces). Symmetric — forgives
+    # presentation only, cannot pass a paraphrase (differing words survive).
+    if _normalize_for_equivalence(quoted_text) in _normalize_for_equivalence(content):
+        return None  # Found via equivalence normalization
 
     # All strategies failed — try to find near matches for the agent
     near = _find_near_matches(content, escaped, file_path)
@@ -743,6 +858,7 @@ def _add_observation_impl(
     standpoint_collection_id: str = "",
     standpoint_override_tag: str = "",
     standpoint_lineage: str = "",
+    standpoint_architecture: str = "",
     fs_class=None,
 ) -> str:
     """Internal implementation — see engram_add_observation MCP tool for the
@@ -802,6 +918,23 @@ def _add_observation_impl(
                 "error": (
                     f"standpoint_lineage must match provider:family "
                     f'(e.g. "anthropic:opus"); got "{standpoint_lineage}"'
+                )
+            }
+        )
+
+    # standpoint_architecture enum gate: reject unknown values up-front so the
+    # DB only ever holds the declared enum members. Redirecting error names the
+    # accepted set so the caller knows what to fix.
+    _ARCH_ENUM = {
+        "transformer", "vision-spatial", "embodied-sensorimotor",
+        "graph-neural", "human", "other",
+    }
+    if standpoint_architecture and standpoint_architecture not in _ARCH_ENUM:
+        return json.dumps(
+            {
+                "error": (
+                    f"standpoint_architecture must be one of "
+                    f"{sorted(_ARCH_ENUM)}; got \"{standpoint_architecture}\""
                 )
             }
         )
@@ -885,7 +1018,14 @@ def _add_observation_impl(
 
         node_id = core._next_id(conn, node_type)
         now = core._now()
-        obs_metadata = {"source_class": source_class}
+        # quote_verified: True when quoted_text was confirmed an exact substring of
+        # the file:// source; False for https://, http://, empty source_url
+        # (evidence_id-only path), or any other non-file:// scheme (no fetch occurs
+        # at creation time). Marks provenance quality on the node itself so
+        # inspect + recall surfaces distinguish verified from unverified quotes.
+        # See #1204.
+        quote_verified = ev_url.startswith("file://")
+        obs_metadata = {"source_class": source_class, "quote_verified": quote_verified}
         if captured_git_sha:
             obs_metadata["git_sha"] = captured_git_sha
         if captured_content_hash:
@@ -899,8 +1039,8 @@ def _add_observation_impl(
             """INSERT INTO nodes (id, type, claim, created_at, evidence_id, quoted_text,
                interpretation, quote_type, confidence, confidence_history, metadata,
                standpoint_author_id, standpoint_collection_id, standpoint_override_tag,
-               standpoint_lineage, fs_class)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               standpoint_lineage, standpoint_architecture, fs_class)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 node_id,
                 node_type,
@@ -917,6 +1057,7 @@ def _add_observation_impl(
                 standpoint_collection_id or None,
                 standpoint_override_tag or None,
                 standpoint_lineage or None,
+                standpoint_architecture or None,
                 fs_class if fs_class in ("re-executable", "frozen") else None,
             ),
         )
@@ -937,7 +1078,15 @@ def _add_observation_impl(
             "type": node_type,
             "confidence": confidence,
             "source_class": source_class,
+            "quote_verified": quote_verified,
         }
+        if not quote_verified:
+            result["quote_provenance_warning"] = (
+                "Web-sourced quoted_text is unverified at encoding — no page fetch "
+                "occurs at observation creation time. The quote may not appear verbatim "
+                "at the cited URL (paraphrase, page-change, paywall). For high-stakes "
+                "citations, verify manually. See #1204."
+            )
 
         # Handle prediction decomposition
         prediction_id = None
@@ -1161,7 +1310,7 @@ def _add_observation_batch_impl(
             - quoted_text (required): Verbatim quote from the source
             - interpretation (required): Your reasoning about what this means
             - claim (required): Atomic, falsifiable claim
-            - quote_type (required): hard_data, official_statement, attributed_analysis, unnamed_source, personal_communication, or editorial
+            - quote_type (required): hard_data, official_statement, attributed_analysis, counterfactual_inference, unnamed_source, personal_communication, or editorial
             - is_predictive (optional): boolean, default false
             - predicted_event (optional): if predictive, the event predicted
             - resolution_timeframe (optional): if predictive, ISO date for resolution
@@ -1172,6 +1321,7 @@ def _add_observation_batch_impl(
             - standpoint_collection_id (optional): Corpus or work identity for this observation's source ("vantage" axis).
             - standpoint_override_tag (optional): Free-form standpoint label when the cluster key is insufficient.
             - standpoint_lineage (optional): Training lineage "provider:family" (e.g. "anthropic:opus") for the source claim's producer.
+            - standpoint_architecture (optional): Cognitive architecture of the source's producer. Enum: transformer | vision-spatial | embodied-sensorimotor | graph-neural | human | other. Tracks architectural (not just training) diversity — Class A calibration exposure.
         url: URL of the source document. The evidence node is auto-created or reused.
         title: Title of the source document (required if url is provided).
         domain: Source domain (auto-extracted from URL if omitted).
@@ -1238,6 +1388,7 @@ def _add_observation_batch_impl(
             standpoint_collection_id=obs.get("standpoint_collection_id", ""),
             standpoint_override_tag=obs.get("standpoint_override_tag", ""),
             standpoint_lineage=obs.get("standpoint_lineage", ""),
+            standpoint_architecture=obs.get("standpoint_architecture", ""),
             fs_class=obs.get("fs_class"),
         ))
         r["index"] = i

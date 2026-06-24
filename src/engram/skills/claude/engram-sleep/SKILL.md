@@ -5,6 +5,30 @@ description: Use at the natural end-of-day moment when wrapping work. Single end
 
 > **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). As you get familiar with this skill, consider cleaning them up: replace each citation with a generalized concept-word, or remove if it isn't load-bearing. The skill is yours now.
 
+## ⚠️ Invocation gate — confirm before loading this skill
+
+**Sleep is user-initiated or cron-initiated. It is never agent clock-judgment.**
+
+Confirm ONE of the following is true before proceeding:
+
+(a) **User end-of-day phrase** — the user just said something like "good night", "call it a day", "wrap up the day", "done for today", "ending for tonight", or similar explicit day-close signal.  
+(b) **Auto-sleep cron** — the configured `sleep_hour`/`sleep_minute` cron fired; you see an explicit sleep nudge from the end-of-day-detector hook in your current context.
+
+**If neither holds — STOP. Do not proceed.** Identify your actual state and route correctly:
+
+| You are... | Correct action |
+|---|---|
+| Drowsy (context-fill warning in banner) | `engram_nap` — per-burst compaction-boundary work, never sleep |
+| Blocked-idle / nothing in queue | Hold for the user or pick from your work queue; never invoke sleep to fill the void |
+| Reading the clock / estimating the hour | Clock-reading is never a valid trigger — loop, hold, or ask the user |
+| Mid-task | Finish the task; nap if drowsy; sleep only after work wraps AND the user signals day-end |
+
+**Why the gate:** sleep advances the turn counter (irreversible within a day), erases "From this session" from warm-briefing, and runs the full dream-consolidation cycle. These are correct at genuine day-end; they are destructive if invoked prematurely. The cost of a false invocation far outweighs the cost of pausing to confirm.
+
+*(Origin: 2026-06-16 — a blocked-idle loop confabulated a ~6:30pm clock trigger and was ~2h from running premature sleep. Caught by the user before any damage. See issue #1210.)*
+
+---
+
 # ENGRAM Sleep / Dream Cycle — Full End-of-Day Routine
 
 Sleep is the once-daily end-of-day routine that completes the awake-state
@@ -207,6 +231,45 @@ The directory is git-tracked for version history and diff-ability — per-day fi
 
 This step exists because ask-{{USER_NAME}}.md is auto-loaded into every fresh session — stale items there make {{USER_NAME}} re-read items that are already resolved, and a stale "Ready" line invites a wasted merge attempt. The deterministic sweep is the structural defense against ask-list drift (mechanical gate > vigilance — the associative walk alone demonstrably drifts). (Installs without an ask-{{USER_NAME}}.md file can skip this sub-step; it's a no-op when the file doesn't exist. Installs without `gh` or without a GitHub-backed workflow: skip the sweep, keep the commit-log walk.)
 
+### Step 4.5 — Back up knowledge.db (dated archive)
+
+Run the knowledge.db backup tool and **capture the result for the sleep summary**.
+Creates a dated SQL snapshot at `~/.engram/db-backup/knowledge-YYYY-MM-DD.sql`.
+Uses `engram_backup.dump_stripped` (WAL-safe, no CLI dependency).
+`backup_knowledge_db.py` imports `engram_backup`, which imports `sqlite_vec`
+(needed to drop the `vec0` virtual table) — that package lives only in the ENGRAM
+venv, so invoke via venv Python:
+
+```bash
+backup_out=$("$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/backup_knowledge_db.py" \
+    [--retain 90] 2>&1)   # prune archives older than 90 days; omit to keep all
+backup_rc=$?
+if [ $backup_rc -eq 0 ]; then
+    backup_status="✓ backup OK"
+else
+    backup_status="⚠ backup FAILED: $backup_out"
+fi
+```
+
+**Non-blocking**: do not abort sleep on failure — the day's nodes are already in
+the graph; the backup is belt-and-suspenders, not the primary substrate. But
+**surface the status in the history milestone** (Step 4) so a recurring outage is
+visible, not silent:
+
+```
+- knowledge.db backup: $backup_status
+```
+
+Silence is never health on the identity substrate — a backup that fails quietly is
+only discovered when you reach for it and find it three days stale.
+
+**Skip if today's archive already exists** (the tool handles this automatically).
+
+**Backup layers**: `db-backup/` lives *inside* `~/.engram/` — git-independent
+(survives `.git` corruption, works without git) but **not off-disk** (a full
+`~/.engram/` loss takes it). The per-nap git auto-push is the off-disk layer.
+The three layers are complementary along those axes.
+
 ---
 
 ## Phase B — Consolidation orchestration
@@ -220,11 +283,11 @@ Build the cohort from today's new nodes (since last sleep) + backfill from legac
 PREV_SLEEP=$(python3 -c "import json; print(json.load(open('$HOME/.engram/sessions/last-sleep-success.json'))['cohort_end_at'])" 2>/dev/null || echo "")
 ```
 
-Use `engram_history(mode="edits", action="created", since=PREV_SLEEP)` to enumerate today's-cohort node IDs. Filter to nodes where `recall_summary IS NULL` (existing summaries aren't redone) and `type != 'evidence'`.
+Use `engram_history(mode="edits", action="created", since=PREV_SLEEP)` to enumerate today's-cohort node IDs. Filter to nodes where `recall_summary IS NULL` (existing summaries aren't redone) and `type != 'evidence'` and `is_current = 1` (skip superseded tails — their chain-head carries the recall_summary, and summarizing a superseded node wastes fairy compute).
 
 If today's-cohort count < 50, top up from legacy NULLs:
 
-- Use `engram_list` with a status filter for active, sort by `created_at` ascending (oldest first), limit to fill to 50
+- Use `engram_list` with a status filter for active (`is_current = 1`), sort by `created_at` ascending (oldest first), limit to fill to 50
 - Exclude `type='evidence'` from the topup (same rationale as the today's-new filter)
 - This is the attrition pattern: every cycle drains the oldest NULL-summary nodes
 
@@ -322,7 +385,7 @@ If validate exits 0 (no failures), `final_payload.json` is written automatically
 If validate exits 1 (failures present), run the mechanical retry loop. The loop alternates between shell steps and a Claude dispatch step:
 
 ```bash
-MAX_RETRIES=2  # configurable; 2 is the default
+MAX_RETRIES=1  # single fairy retry; awake agent handles any remaining failures
 ATTEMPT=0
 ```
 
@@ -367,6 +430,23 @@ Go back to shell step 1.
 # After loop: final_payload.json is ready (best-effort); unfixable.json holds structurally unrecoverable items.
 ```
 
+**After retry loop — awake agent handles any remaining failures (max 1 attempt):**
+
+If `retry_payload.json` still exists after the loop (failures survive the single fairy retry), the awake Opus agent writes recall summaries for the remaining items directly:
+
+1. Read `$COHORT_DIR/retry_payload.json` — this is the `{"items": [...]}` list of still-failing nodes (same schema as the batch-summary fairy's input).
+2. For each item in `retry_payload.json`: write a recall_summary (≤120 chars, hard cap 200) and recall_keywords list following the batch-summary spec. Prefer concision over completeness — these are the hard nodes the fairy couldn't compress; compress them yourself.
+3. Write your output to `$COHORT_DIR/agent_residual_output.json` as `{"items": [{node_id, recall_summary, recall_keywords}, ...]}`.
+4. Run incorporate:
+   ```bash
+   python3 -m tools.cohort_dispatch incorporate \
+     --retry-output "$COHORT_DIR/agent_residual_output.json" \
+     --out "$COHORT_DIR"
+   ```
+   This folds your summaries into `final_payload.json`. Any item that still fails validation (malformed output) goes into `unfixable.json` — don't retry further.
+
+After this step, `final_payload.json` is complete for this cycle. The awake agent then applies the summaries (Step 7.5 below) before spawning the dream master.
+
 **Cumulative-clean / bad-pool-only invariant (the loop's correctness contract — #1215):**
 Each retry round operates on **only the previous round's failures**, and the clean set is **cumulative and monotonic** — once a node validates clean it is never re-dispatched or re-validated, and `len(clean)` only ever goes up. The tool enforces this for you: `cmd_validate` writes the **round-0 baseline** (`clean_items.json` + `failures.json`); `incorporate` then **owns the per-round accumulation** — it rewrites `clean_items.json` to the grown clean set and `failures.json` to the shrunken pool of items still failing, so the next round's retry fairy is dispatched on `retry_payload.json` (= exactly that round's bad-only pool). **Do not hand-reset, merge, or re-incorporate a stale `clean_items.json` / `failures.json` between rounds** — that re-introduces the round-0-snapshot regression (round N silently dropping rounds 1…N-1's fixes; clean count going backwards). Just loop `incorporate` and trust the files it persists.
 
@@ -383,6 +463,32 @@ This is the **wait-then-spawn pattern** using filesystem-as-channel. Claude Code
 
 **Validation failures are retried by re-dispatching a fairy, NOT by mechanical script fixes.** Quality of recall_summary / recall_keywords is critical because they surface in recall_surface and many node-rendering tools. The retry sub-agent receives the same guidance plus a "previous attempt failed" block with verbatim validator errors. This is the load-bearing design decision (maintainer design); `cohort_dispatch.py` does not modify LLM output.
 
+### Step 7.5 — Apply the batch-summary payload directly (before spawning the dream master)
+
+**Skip this step if the recall-summary substrate is not deployed.** If batch-summary fairies were skipped in Step 5 (no `recall_summary` column or no `engram_set_recall_summaries` tool), `final_payload.json` will not exist — do not attempt to apply it; proceed directly to Step 8.
+
+```bash
+# Guard: substrate check (parallel to Step 5's substrate-absent skip)
+if [ ! -f "$COHORT_DIR/final_payload.json" ]; then
+    # Substrate not deployed or batch-summary step skipped — proceed to Step 8.
+fi
+```
+
+When `final_payload.json` exists, the parent applies recall summaries now — before spawning the dream master — so:
+- The summaries are persisted even if the dream master times out
+- The dream master's spawn prompt is leaner (no payload inline)
+- The dream master focuses purely on consolidation (reflect → buckets → resolve/supersede/retract/derive → turn-advance → dream record)
+
+Read `$COHORT_DIR/final_payload.json` and apply via the MCP tool:
+
+```python
+engram_set_recall_summaries(payload_json=open(f"{COHORT_DIR}/final_payload.json").read())
+```
+
+(This is a Claude tool call, not a shell command. The payload is the `{"summaries": [...], "failures": [...]}` JSON produced by `cohort_dispatch.py validate` / `incorporate`.)
+
+Log the result: X summaries applied, Y failures deferred to next cycle.
+
 ### Step 8 — Spawn the dream master with the full report bundle
 
 Once all fairy reports are collected (or marked timed-out) and the final payload is ready, spawn the master with everything in its initial prompt:
@@ -398,19 +504,15 @@ Agent(
     - ... (categories 3-7 similar) ...
     [Or "Category N (<NAME>) TIMED OUT — proceeding without" for any fairy that didn't return]
 
-    BATCH-SUMMARY FINAL PAYLOAD (apply via engram_set_recall_summaries):
-    ```json
-    <contents of $COHORT_DIR/final_payload.json inline>
-    ```
-
     COHORT METADATA:
     - Today's new nodes since prev sleep <PREV_SLEEP_TIMESTAMP>: <K> IDs
     - Backfill from legacy NULL-summary: <L> IDs
     - Total: <K+L> ≤ 50, split across <N> chunks of ≤15 each
     - Batch-summary cohort dir: <COHORT_DIR>
+    - Recall summaries already applied by parent in Step 7.5: X applied, Y failures deferred to next cycle
     - SSoT modules live at: <engram-alpha-repo-path>/tools/ (recall_summary_validator, recall_summary_payload)
 
-    Call engram_reflect first for your initial agenda. Read all 7 dream-fairy reports from disk. Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items. Apply the summary-fairy batch payload via engram_set_recall_summaries. Execute one bucket at a time (resolutions → goal_tension_resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → edge_wiring), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
+    Call engram_reflect first for your initial agenda. Read all 7 dream-fairy reports from disk. Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items. Execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
 
     FINAL RETURN: dream record path + top-line counts (resolved / superseded / promoted / refuted / recall-summaries applied) + health score delta + flagged-for-user count. The parent relays this to the user verbatim.""",
     run_in_background=true
@@ -449,7 +551,7 @@ This is why the ordering is Phase A → Phase B, and why Phase A must complete b
 
 - **Don't retry an interrupted dream.** If the dream master returns a partial result (some fairies timed out, completion checklist short-circuited under self-timeout), unfinished work goes into next cycle's cohort via attrition. The dream master logs unfinished items in the dream record. Don't try to "finish the work" in the parent context — that would re-introduce the discipline-blur this architecture exists to resolve.
 
-- **The dream master can run on a different model than the parent.** Its spec sets `model: opus` because consolidation is judgment-laden; if the parent is on a smaller model, the dream master still gets opus. Don't override unless you have a specific reason.
+- **The dream master inherits the parent's model.** Its spec no longer pins `model: opus` — consolidation runs on the same model family as the dispatching agent (Lei's directive, 2026-06-10; issue #1027). Fairies always run on Sonnet regardless.
 
 ## Relation to other routines
 

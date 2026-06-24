@@ -10,6 +10,12 @@ Exit codes:
   0 — success, JSON with additionalContext on stdout
   1 — non-blocking error (logged, prompt proceeds without nudge)
 """
+import os as _os, sys as _sys
+# Guard against source: directory marketplace double-fire (#1066).
+_plugin_root = _os.environ.get("CLAUDE_PLUGIN_ROOT", "")
+_engram_home = _os.environ.get("ENGRAM_HOME") or _os.path.expanduser("~/.engram")
+if _plugin_root.startswith(_os.path.join(_engram_home, "marketplace") + _os.sep):
+    _sys.exit(0)  # empty stdout is valid no-op per #824/#832 contract
 
 import json
 import os
@@ -66,6 +72,33 @@ PROJECT_DIR = _resolve_runtime_dir(ENGRAM_HOME)
 
 # Bridge for downstream callers: ensure ENGRAM_HOME is set so any sibling process inherits it.
 os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
+
+
+def _check_db_liveness(db_path: str) -> tuple[bool, str]:
+    """Lightweight SQLite probe. Returns (True, 'ok') or (False, reason).
+
+    Opens the DB read-only (mode=ro URI) to avoid touching WAL or journal.
+    Catches SQLite I/O errors and DatabaseError (corrupt WAL, not-a-database).
+    Fail-open on unexpected exceptions so probe bugs never break the hook.
+    See #1218 (surface serves stale daemon cache under complete DB failure).
+    """
+    if not os.path.exists(db_path):
+        return False, "knowledge.db not found"
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        conn.execute("PRAGMA user_version")
+        return True, "ok"
+    except sqlite3.DatabaseError as e:
+        return False, str(e)
+    except Exception:
+        return True, "ok"  # fail-open: probe infrastructure bug ≠ DB failure
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
@@ -135,8 +168,22 @@ DEFAULT_IDF_GATE_ENABLED = True  # feature flag for safe rollout
 # Duration after a daemon launch attempt during which the per-turn surface hook
 # treats daemon-unreachable as a warmup state (SOFT message) rather than a genuine
 # outage (CRITICAL). The daemon writes its PID and binds its socket only after the
-# ~7s model load; this window covers that cold-start gap.
-_DAEMON_WARMUP_WINDOW_SECONDS = 20
+# model load; typical load is 7-15s, but slower hardware (first install, cold OS cache)
+# can take 30-60s. 120s covers all plausible cold-start scenarios without masking a
+# genuine crash (after 120s a daemon that never bound has clearly failed).
+# Configurable via ENGRAM_DAEMON_WARMUP_WINDOW_SECONDS for sites with unusually slow
+# hardware (set to 0 to disable the warmup window entirely).
+def _resolve_warmup_window() -> int:
+    raw = os.environ.get("ENGRAM_DAEMON_WARMUP_WINDOW_SECONDS", "")
+    if raw:
+        try:
+            val = int(raw)
+            return max(0, val)
+        except (ValueError, TypeError):
+            pass
+    return 120
+
+_DAEMON_WARMUP_WINDOW_SECONDS = _resolve_warmup_window()
 
 # Attached-pack surfacing quota — max results pulled across all packs combined.
 _PACK_SURFACE_QUOTA = 3
@@ -1011,17 +1058,37 @@ def main():
                 f"persists past the next prompt.]"
             )
         else:
-            parts.append(
-                f"[⚠️ ENGRAM CRITICAL — surface daemon offline; semantic recall "
-                f"DISABLED, ranking degraded to lexical-only. Notify {user_name} "
-                f"immediately — recall quality is severely impaired. "
-                f"Recovery: bash {daemon_script} — then re-check the socket. "
-                f"If this warning persists after re-launching, it is NOT a "
-                f"cold-start race: something on this machine is conflicting with "
-                f"the daemon (port already bound, permissions, or resource "
-                f"limits) — investigate the root cause before continuing, don't "
-                f"just re-launch.]"
-            )
+            # Check for idle-shutdown tombstone (#1260): daemon exited as intended
+            # after idle-timeout — self-recovering startup condition, not a crash.
+            _idle_tombstone = os.path.join(ENGRAM_HOME, "daemon-idle-shutdown")
+            _is_idle_shutdown = False
+            try:
+                with open(_idle_tombstone) as _tf:
+                    _shutdown_at = int(_tf.read().strip())
+                # Valid for up to 48h (2 idle-timeout cycles); stale after that.
+                if 0 <= (int(time.time()) - _shutdown_at) <= 172800:
+                    _is_idle_shutdown = True
+            except Exception:
+                pass
+            if _is_idle_shutdown:
+                parts.append(
+                    f"[ENGRAM: surface daemon was idle-shutdown (idle timeout) — "
+                    f"restarting automatically, semantic recall resumes in a few "
+                    f"seconds. No action needed unless this persists past the next "
+                    f"prompt. Recovery if it persists: bash {daemon_script}]"
+                )
+            else:
+                parts.append(
+                    f"[⚠️ ENGRAM CRITICAL — surface daemon offline; semantic recall "
+                    f"DISABLED, ranking degraded to lexical-only. Notify {user_name} "
+                    f"immediately — recall quality is severely impaired. "
+                    f"Recovery: bash {daemon_script} — then re-check the socket. "
+                    f"If this warning persists after re-launching, it is NOT a "
+                    f"cold-start race: something on this machine is conflicting with "
+                    f"the daemon (port already bound, permissions, or resource "
+                    f"limits) — investigate the root cause before continuing, don't "
+                    f"just re-launch.]"
+                )
 
     # MCP write-tool liveness check — deferred from SessionStart to avoid the
     # timing race (marker still has old PID when session starts). By the first
@@ -1032,6 +1099,18 @@ def main():
             f"⚠️  ENGRAM substrate health:\n"
             f"  MCP write-tool liveness: UNCONFIRMED ({write_reason})\n"
             f"  → ENGRAM write calls will fail silently. Recovery: restart the MCP server."
+        )
+
+    # DB liveness check — detects when the surface daemon serves stale
+    # in-memory cache nodes while the SQLite file itself is inaccessible
+    # (WAL failure, disk I/O error, corruption). See #1218 / #786.
+    db_ok, db_reason = _check_db_liveness(KNOWLEDGE_DB_PATH)
+    if not db_ok:
+        parts.append(
+            f"⚠️  ENGRAM substrate health:\n"
+            f"  DB liveness: FAILED ({db_reason})\n"
+            f"  → MCP tool calls will fail. Surface nodes above may be stale pre-failure cache.\n"
+            f"  Recovery: check disk health / WAL integrity, then restart the MCP server."
         )
 
     # Attached-pack surfacing — queried AFTER own-graph result, guarded

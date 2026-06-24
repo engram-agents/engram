@@ -1,0 +1,726 @@
+#!/usr/bin/env python3
+"""engram-snapshot — Content-addressed evidence archiver
+
+A stdlib CLI in the ia.py/forum.py/baton.py family.  Archives evidence sources
+(forum threads, JSONL session spans) into a content-addressed flat-file store at
+~/.engram/evidence-archive/ and emits a JSON record designed to feed
+engram_add_observation directly.
+
+Usage:
+    engram-snapshot <source> [--span L_START:L_END] [--commit-mode sync|deferred]
+
+Sources (P1):
+    forum:<id>           Archive a LAN forum thread (rendered text)
+    jsonl:<session-id>   Archive a span from a session transcript
+    jsonl:               Bare — current session transcript (most-recent marker)
+Sources (P1.5):
+    file:<path>          Archive an arbitrary local file (absolute, relative, or ~-prefixed)
+
+Output (JSON to stdout, designed to feed engram_add_observation):
+    {
+      "file_url":       "file:///home/<agent>/.engram/evidence-archive/ab/ab3f…d2.txt",
+      "content_hash":   "ab3f…d2",
+      "captured_at":    "2026-06-21T14:31:07Z",
+      "git_sha":        null,               // always null in deferred mode (P1 only)
+      "archive_status": "archived",         // archived | blocked | unreachable
+      "original_url":   "http://localhost:5002/threads/119",
+      "source_type":    "forum",
+      "block_reason":   null
+    }
+
+Design / full spec: engram-alpha issue #1253 (universal archive-at-filing).
+"""
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import pwd
+import subprocess
+import sys
+import tempfile
+from contextlib import redirect_stdout
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Path to the sibling forum.py so we can import it without it being on
+# sys.path by default.  Same pattern used by forum.py importing _status_derive.
+# ---------------------------------------------------------------------------
+
+_TOOLS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_TOOLS_DIR))
+
+# ---------------------------------------------------------------------------
+# Environment + paths
+# ---------------------------------------------------------------------------
+
+ENGRAM_HOME = (
+    os.environ.get("ENGRAM_HOME")
+    or str(Path.home() / ".engram")
+)
+
+EVIDENCE_ARCHIVE_ROOT = (
+    os.environ.get("ENGRAM_EVIDENCE_ARCHIVE")
+    or str(Path(ENGRAM_HOME) / "evidence-archive")
+)
+
+# Exit codes (mirrors ia.py/baton.py pattern)
+EXIT_OK = 0
+EXIT_VALIDATION = 1
+EXIT_IO = 2
+EXIT_STATE = 3
+
+
+# ---------------------------------------------------------------------------
+# Config helpers (mirrors ia.py / forum.py conventions)
+# ---------------------------------------------------------------------------
+
+def _load_config() -> dict:
+    """Load $ENGRAM_HOME/config.json. Returns {} on any failure."""
+    config_path = Path(ENGRAM_HOME) / "config.json"
+    if config_path.exists():
+        try:
+            return json.loads(config_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _get_agent_name(config: Optional[dict] = None) -> str:
+    """Resolve this agent's own name (same priority chain as ia.py/forum.py)."""
+    if config is None:
+        config = _load_config()
+    name = config.get("agent_name", "").strip()
+    if name:
+        return name
+
+    def _strip_agent_prefix(username: str) -> str:
+        if username.startswith("agent-"):
+            return username[len("agent-"):]
+        return username
+
+    for envvar in ("USER", "LOGNAME"):
+        username = os.environ.get(envvar, "").strip()
+        if username:
+            return _strip_agent_prefix(username)
+
+    try:
+        username = pwd.getpwuid(os.getuid()).pw_name
+        if username:
+            return _strip_agent_prefix(username)
+    except KeyError:
+        pass
+
+    return ""
+
+
+def _resolve_forum_url(config: Optional[dict] = None) -> str:
+    """Resolve forum server URL (same priority chain as forum.py)."""
+    if config is None:
+        config = _load_config()
+    forum_cfg = config.get("forum", {})
+    if isinstance(forum_cfg, dict):
+        url = forum_cfg.get("url", "").strip()
+        if url:
+            return url.rstrip("/")
+    env_url = os.environ.get("FORUM_URL", "").strip()
+    if env_url:
+        return env_url.rstrip("/")
+    return "http://localhost:5002"
+
+
+# ---------------------------------------------------------------------------
+# Content-addressed archive write
+# ---------------------------------------------------------------------------
+
+def _sha256_hex(content_bytes: bytes) -> str:
+    """Compute hex SHA-256 of content_bytes."""
+    return hashlib.sha256(content_bytes).hexdigest()
+
+
+def _archive_write(content_bytes: bytes, ext: str) -> tuple:
+    """Write content_bytes to the content-addressed archive.
+
+    Layout: <archive_root>/<sha[:2]>/<sha>.<ext>
+
+    Write strategy: temp-file + atomic os.rename (lock-free).
+    Identical-hash re-writes are idempotent (same bytes → same path).
+
+    Returns (archive_path: Path, sha256_hex: str).
+    """
+    sha = _sha256_hex(content_bytes)
+    bucket = sha[:2]
+    archive_root = Path(EVIDENCE_ARCHIVE_ROOT)
+    bucket_dir = archive_root / bucket
+    dest = bucket_dir / f"{sha}.{ext}"
+
+    # Fast path: already archived (idempotent)
+    if dest.exists():
+        return dest, sha
+
+    # Ensure directory exists
+    bucket_dir.mkdir(parents=True, exist_ok=True)
+
+    # Atomic write: write to tmp in the same directory, then os.rename.
+    # Same-filesystem rename is atomic on POSIX; both tmp and dest are under
+    # bucket_dir so they're on the same fs.
+    fd, tmp_path = tempfile.mkstemp(dir=str(bucket_dir), prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content_bytes)
+        os.rename(tmp_path, str(dest))
+    except Exception:
+        # Clean up tmp on failure; re-raise so caller can report
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+    return dest, sha
+
+
+def _file_url(path: Path) -> str:
+    """Convert an absolute path to a file:// URL."""
+    return "file://" + str(path.resolve())
+
+
+def _now_utc_iso() -> str:
+    """Current UTC time as ISO 8601 with Z suffix."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------------------
+# Source: forum:<id>
+# ---------------------------------------------------------------------------
+
+def _forum_read_rendered(thread_id: int, config: dict, agent_name: str) -> str:
+    """Fetch and render a forum thread as text.
+
+    Imports forum.py from the sibling tools/ directory and calls its
+    HTTP-fetch + render path directly (avoids shelling out; same output
+    as `forum read <id>` in --format human mode).
+
+    Returns the rendered text string.
+    Exits with EXIT_IO/EXIT_STATE on forum server errors.
+    """
+    # Import forum module (available on sys.path from module-level insert)
+    try:
+        import forum as _forum_mod
+    except ImportError as exc:
+        print(
+            f"engram-snapshot: cannot import forum.py from {_TOOLS_DIR}: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_STATE)
+
+    # Resolve forum URL (reuse forum.py's cache-aware resolver via module global,
+    # but since we're calling the function directly we replicate the resolution)
+    forum_url = _resolve_forum_url(config)
+
+    # Override the module-level cache so _do_request uses the right URL
+    _forum_mod._FORUM_URL_CACHE = forum_url
+
+    agent = agent_name or ""
+    params = {"agent": agent} if agent else {}
+
+    data = _forum_mod._api_get(
+        f"{forum_url}/api/thread/{thread_id}",
+        params=params or None,
+    )
+
+    thread = data.get("thread", {})
+    posts = data.get("posts", [])
+
+    # Capture _render_thread_human's stdout into a string. We call _api_get +
+    # _render_thread_human directly rather than forum.py's cmd_read ON PURPOSE:
+    # cmd_read posts a read-watermark (advances the forum read cursor), and a
+    # snapshotter must NOT mutate read state. If forum.py is ever refactored so
+    # the watermark moves into the render path, this invariant breaks — keep the
+    # two calls split.
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        _forum_mod._render_thread_human(thread, posts)
+
+    rendered = buf.getvalue()
+
+    # Prepend a timestamp header (mirrors the spec's "rendered text + the
+    # existing timestamp header" note in §3)
+    captured_at = _now_utc_iso()
+    header = (
+        f"# Forum Thread #{thread_id} — archived {captured_at}\n"
+        f"# original_url: {forum_url}/threads/{thread_id}\n"
+        f"#\n"
+    )
+    return header + rendered
+
+
+def _snapshot_forum(
+    thread_id: int,
+    config: dict,
+    agent_name: str,
+) -> dict:
+    """Archive a forum thread and return the output JSON dict."""
+    forum_url = _resolve_forum_url(config)
+    original_url = f"{forum_url}/threads/{thread_id}"
+
+    rendered = _forum_read_rendered(thread_id, config, agent_name)
+    content_bytes = rendered.encode("utf-8")
+
+    try:
+        archive_path, sha = _archive_write(content_bytes, "txt")
+    except OSError as exc:
+        print(
+            f"engram-snapshot: archive write failed: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_IO)
+
+    return {
+        "file_url": _file_url(archive_path),
+        "content_hash": sha,
+        "captured_at": _now_utc_iso(),
+        "git_sha": None,
+        "archive_status": "archived",
+        "original_url": original_url,
+        "source_type": "forum",
+        "block_reason": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Source: jsonl:<session-id>
+# ---------------------------------------------------------------------------
+
+def _find_session_transcript(session_id: Optional[str]) -> Optional[str]:
+    """Resolve the JSONL transcript path for a session.
+
+    Uses the per-session marker at ~/.engram/sessions/<session_id>.json
+    (written by the SessionStart hook).  When session_id is None or empty,
+    searches for the most recently modified .json marker file.
+
+    Returns the transcript_path string, or None if not resolvable.
+    """
+    sessions_dir = Path(ENGRAM_HOME) / "sessions"
+    if not sessions_dir.is_dir():
+        return None
+
+    if session_id:
+        marker_path = sessions_dir / f"{session_id}.json"
+        if not marker_path.exists():
+            return None
+        try:
+            marker = json.loads(marker_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+        transcript = marker.get("transcript_path", "")
+        if transcript and Path(transcript).exists():
+            return transcript
+        return None
+    else:
+        # Bare jsonl: — pick the most recently modified .json marker
+        markers = sorted(
+            sessions_dir.glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for m in markers:
+            try:
+                marker = json.loads(m.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            transcript = marker.get("transcript_path", "")
+            if transcript and Path(transcript).exists():
+                return transcript
+        return None
+
+
+def _extract_jsonl_span(
+    transcript_path: str,
+    span_start: Optional[int],
+    span_end: Optional[int],
+) -> bytes:
+    """Extract a line span from a JSONL transcript.
+
+    Lines are 1-indexed and inclusive (spec §3: 'JSONL is line-delimited,
+    so the span unit is lines').  When span_start/span_end are None, copies
+    the entire file.
+
+    Returns the span as bytes (JSONL lines joined with newlines, trailing
+    newline included).  Raises ValueError on invalid span bounds.
+    """
+    with open(transcript_path, "r", encoding="utf-8", errors="replace") as fh:
+        all_lines = fh.readlines()
+
+    total = len(all_lines)
+
+    if span_start is None and span_end is None:
+        return "".join(all_lines).encode("utf-8")
+
+    # Validate bounds
+    if span_start is None:
+        span_start = 1
+    if span_end is None:
+        span_end = total
+
+    if span_start < 1:
+        raise ValueError(f"--span start {span_start} is less than 1 (lines are 1-indexed)")
+    if span_end < span_start:
+        raise ValueError(
+            f"--span end {span_end} is before start {span_start}"
+        )
+    if span_start > total:
+        raise ValueError(
+            f"--span start {span_start} exceeds file length {total}"
+        )
+
+    # Clamp end to file length
+    effective_end = min(span_end, total)
+
+    # 1-indexed inclusive → 0-indexed slice: lines[span_start-1 : span_end]
+    selected = all_lines[span_start - 1 : effective_end]
+    content = "".join(selected)
+    if not content.endswith("\n"):
+        content += "\n"
+    return content.encode("utf-8")
+
+
+def _snapshot_jsonl(
+    session_id: Optional[str],
+    span_start: Optional[int],
+    span_end: Optional[int],
+    config: dict,
+) -> dict:
+    """Archive a JSONL session span and return the output JSON dict."""
+    transcript_path = _find_session_transcript(session_id)
+    if transcript_path is None:
+        desc = f"session '{session_id}'" if session_id else "current session"
+        print(
+            f"engram-snapshot: cannot resolve JSONL transcript for {desc}. "
+            f"Ensure the session marker exists at "
+            f"{Path(ENGRAM_HOME) / 'sessions' / (session_id + '.json' if session_id else '<session-id>.json')}.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_STATE)
+
+    try:
+        content_bytes = _extract_jsonl_span(transcript_path, span_start, span_end)
+    except (OSError, ValueError) as exc:
+        print(f"engram-snapshot: JSONL span error: {exc}", file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+    try:
+        archive_path, sha = _archive_write(content_bytes, "jsonl")
+    except OSError as exc:
+        print(f"engram-snapshot: archive write failed: {exc}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+
+    # original_url: file:// URL to the source transcript
+    original_url = "file://" + str(Path(transcript_path).resolve())
+
+    return {
+        "file_url": _file_url(archive_path),
+        "content_hash": sha,
+        "captured_at": _now_utc_iso(),
+        "git_sha": None,
+        "archive_status": "archived",
+        "original_url": original_url,
+        "source_type": "jsonl",
+        "block_reason": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Source: file:<path>
+# ---------------------------------------------------------------------------
+
+def _snapshot_file(path_str: str, config: dict) -> dict:
+    """Archive an arbitrary local file and return the output JSON dict."""
+    path = Path(path_str).expanduser()
+    try:
+        resolved = path.resolve()
+    except OSError as exc:
+        print(f"engram-snapshot: cannot resolve path '{path_str}': {exc}", file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+    if not resolved.is_file():
+        print(
+            f"engram-snapshot: file: source must be an existing regular file, got '{path_str}' "
+            f"(resolved: {resolved}).",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_STATE)
+    try:
+        content_bytes = resolved.read_bytes()
+    except OSError as exc:
+        print(f"engram-snapshot: cannot read '{resolved}': {exc}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+
+    # Dotfiles (.bashrc, .gitignore) have an empty Path.suffix, so they archive
+    # as <sha>.bin; traceability is preserved via original_url.
+    ext = resolved.suffix.lstrip(".") or "bin"
+    try:
+        archive_path, sha = _archive_write(content_bytes, ext)
+    except OSError as exc:
+        print(f"engram-snapshot: archive write failed: {exc}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+
+    return {
+        "file_url": _file_url(archive_path),
+        "content_hash": sha,
+        "captured_at": _now_utc_iso(),
+        "git_sha": None,
+        "archive_status": "archived",
+        "original_url": "file://" + str(resolved),
+        "source_type": "file",
+        "block_reason": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Span argument parsing
+# ---------------------------------------------------------------------------
+
+def _parse_span(span_str: str) -> tuple:
+    """Parse --span L_START:L_END into (start, end) integers (1-indexed, inclusive).
+
+    Returns (None, None) when span_str is empty/None.
+    Exits EXIT_VALIDATION on malformed input.
+    """
+    if not span_str:
+        return None, None
+    parts = span_str.split(":")
+    if len(parts) != 2:
+        print(
+            f"engram-snapshot: --span must be L_START:L_END (e.g. '10:20'), got '{span_str}'",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+    try:
+        start = int(parts[0])
+        end = int(parts[1])
+    except ValueError:
+        print(
+            f"engram-snapshot: --span values must be integers, got '{span_str}'",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+    return start, end
+
+
+# ---------------------------------------------------------------------------
+# Source parsing
+# ---------------------------------------------------------------------------
+
+def _parse_source(source: str) -> tuple:
+    """Parse the <source> positional argument.
+
+    Returns (source_type, source_id) where:
+      source_type in {'forum', 'jsonl', 'file'}
+      source_id: thread id (int) for forum, session-id string (or '') for jsonl,
+                 path string for file
+
+    Exits EXIT_VALIDATION on unrecognised source format.
+    """
+    if source.startswith("forum:"):
+        raw_id = source[len("forum:"):]
+        if not raw_id:
+            print(
+                "engram-snapshot: forum: requires a thread id (e.g. 'forum:119')",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        try:
+            thread_id = int(raw_id)
+        except ValueError:
+            print(
+                f"engram-snapshot: forum: thread id must be an integer, got '{raw_id}'",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        return "forum", thread_id
+
+    if source.startswith("jsonl:"):
+        session_id = source[len("jsonl:"):].strip() or None
+        return "jsonl", session_id
+
+    if source.startswith("file:"):
+        raw = source[len("file:"):]
+        if not raw:
+            print(
+                "engram-snapshot: file: requires a path (e.g. 'file:/abs/path' or 'file:~/notes.md')",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        # Normalize a file URI form: file:///abs → /abs (drop empty authority).
+        if raw.startswith("//"):
+            rest = raw[2:]
+            # file:///abs/path → rest="/abs/path" (empty authority — the only local form).
+            # file://host/path → rest="host/path" (non-empty authority) → reject; file: is local-only.
+            if not rest.startswith("/"):
+                print(
+                    "engram-snapshot: file: is local-only; a remote authority "
+                    f"(file://host/...) is not supported, got '{source}'. "
+                    "Use file:///abs/path or file:/abs/path.",
+                    file=sys.stderr,
+                )
+                sys.exit(EXIT_VALIDATION)
+            raw = rest
+        return "file", raw
+
+    # Bare 'jsonl:' is handled above (empty strip → None)
+    print(
+        f"engram-snapshot: unrecognised source '{source}'. "
+        "Use 'forum:<id>', 'jsonl:<session-id>' (or bare 'jsonl:' for current session), "
+        "or 'file:<path>'. "
+        "P2 (web:, pdf:) not yet implemented.",
+        file=sys.stderr,
+    )
+    sys.exit(EXIT_VALIDATION)
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="engram-snapshot",
+        description=(
+            "Archive an evidence source into the content-addressed evidence store "
+            "and emit a JSON record designed to feed engram_add_observation.\n\n"
+            "P1 sources: forum:<id>  jsonl:<session-id>  jsonl: (bare = current session)\n"
+            "P1.5 sources: file:<path>"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Design / spec: engram-alpha issue #1253\n"
+        ),
+    )
+
+    parser.add_argument(
+        "source",
+        metavar="SOURCE",
+        help=(
+            "What to archive. P1 shorthands: "
+            "'forum:<id>' (LAN forum thread), "
+            "'jsonl:<session-id>' (session transcript span), "
+            "'jsonl:' (bare — current session transcript). "
+            "P1.5: 'file:<path>' (arbitrary local file; absolute, relative, or ~-prefixed)."
+        ),
+    )
+
+    parser.add_argument(
+        "--span",
+        metavar="L_START:L_END",
+        default=None,
+        help=(
+            "For jsonl: sources — 1-indexed inclusive line range to extract "
+            "(e.g. '--span 10:20'). Omit to copy the entire transcript."
+        ),
+    )
+
+    parser.add_argument(
+        "--commit-mode",
+        choices=["sync", "deferred"],
+        default="deferred",
+        dest="commit_mode",
+        help=(
+            "When to git-commit the archive. "
+            "'deferred' (default): write only — commit happens at nap time. "
+            "'sync': not yet implemented in P1 (exits with an error if specified)."
+        ),
+    )
+
+    parser.add_argument(
+        "--type",
+        choices=["auto", "web", "pdf", "forum", "jsonl", "file"],
+        default=None,
+        dest="type_override",
+        help=(
+            "Override source-type auto-detection. "
+            "'forum', 'jsonl', and 'file' implemented."
+        ),
+    )
+
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    # P1: sync commit-mode is not implemented (no git operations in hot path)
+    if args.commit_mode == "sync":
+        print(
+            "engram-snapshot: --commit-mode sync is not yet implemented (P3). "
+            "Use --commit-mode deferred (the default). "
+            "The nap hook backfills git_sha at nap time.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_STATE)
+
+    config = _load_config()
+    agent_name = _get_agent_name(config)
+
+    # Parse source
+    source_type, source_id = _parse_source(args.source)
+
+    # Apply --type override if given (validation only for P1 types)
+    if args.type_override is not None:
+        override = args.type_override
+        if override not in ("auto", "forum", "jsonl", "file"):
+            print(
+                f"engram-snapshot: --type {override!r} is not supported in P1. "
+                "Only 'forum', 'jsonl', and 'file' are implemented.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_STATE)
+        if override not in ("auto",) and override != source_type:
+            print(
+                f"engram-snapshot: --type {override!r} conflicts with "
+                f"source shorthand '{args.source}' (type={source_type}). "
+                "Remove --type or ensure it matches the source prefix.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+
+    # --span is only valid for jsonl
+    span_start, span_end = None, None
+    if args.span:
+        if source_type != "jsonl":
+            print(
+                f"engram-snapshot: --span is only valid for jsonl: sources, "
+                f"but source type is '{source_type}'.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        span_start, span_end = _parse_span(args.span)
+
+    # Dispatch
+    if source_type == "forum":
+        result = _snapshot_forum(source_id, config, agent_name)
+    elif source_type == "jsonl":
+        result = _snapshot_jsonl(source_id, span_start, span_end, config)
+    elif source_type == "file":
+        result = _snapshot_file(source_id, config)
+    else:
+        # Should be unreachable given _parse_source validation
+        print(
+            f"engram-snapshot: internal error — unhandled source_type '{source_type}'",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_STATE)
+
+    # Emit JSON to stdout (designed to feed engram_add_observation)
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()

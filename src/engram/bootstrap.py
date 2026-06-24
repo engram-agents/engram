@@ -70,7 +70,7 @@ CODEX_HOME = Path(os.environ["CODEX_HOME"]) if TARGET == "codex" else None
 # resolve DATA_DIR — that's a separate concern from where server.py lives.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import server  # noqa: E402
-from template_render import COMPACT_BREADCRUMB_LINE  # noqa: E402
+from template_render import COMPACT_BREADCRUMB_LINE, fold_compact_instructions  # noqa: E402
 
 
 def _add(fn, **kwargs) -> str:
@@ -359,6 +359,32 @@ def _render_codex_target(substitutions: dict[str, str]) -> None:
     print(f"  AGENTS.md → {CODEX_HOME}/AGENTS.md", flush=True)
 
 
+def _set_cleanup_period_days(claude_home: Path, days: int = 36500) -> None:
+    """Merge cleanupPeriodDays into ~/.claude/settings.json if not already set.
+
+    Claude Code's default ~30-day rolling trim silently deletes chat transcripts.
+    For ENGRAM agents, transcripts are identity history and ENGRAM evidence anchors
+    — losing them means losing re-auditability for any observation cited by jsonl
+    path. Setting a large value (36500 = 100 years) at install time preserves them
+    without the user needing to know the trim exists.
+
+    Only sets the key when absent — never overrides a value the user already chose.
+    """
+    settings_path = claude_home / "settings.json"
+    try:
+        settings: dict = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        settings = {}
+    if "cleanupPeriodDays" not in settings:
+        settings["cleanupPeriodDays"] = days
+        settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+        print(
+            f"  settings.json → cleanupPeriodDays={days} "
+            f"(preserves transcript history; override anytime in {settings_path})",
+            flush=True,
+        )
+
+
 def _db_node_count(db_path: Path) -> int:
     """Return the number of rows in the nodes table, or 0 if the table
     doesn't exist yet (e.g. file exists but schema hasn't been created).
@@ -578,8 +604,9 @@ def main() -> None:
     # template.CLAUDE.md. It's a guide for whoever edits the template (the real
     # Compact Instructions live in compact-instructions.md), not for the rendered
     # install — so it must not leak into the agent's ~/.claude/CLAUDE.md or the
-    # Codex prompt. Both render paths iterate `substitutions` and .replace(), so
-    # one empty-value entry removes the whole comment line in every target.
+    # Codex prompt. The codex target iterates substitutions and .replace(), so
+    # one empty-value entry removes the whole comment line there. The Claude
+    # target handles the breadcrumb via fold_compact_instructions() (see below).
     # COMPACT_BREADCRUMB_LINE is the canonical string from template_render.py
     # (SSoT); tests/test_bootstrap_codex.py asserts it matches the template.
     substitutions[COMPACT_BREADCRUMB_LINE] = ""
@@ -614,12 +641,29 @@ def main() -> None:
 
     # Target-specific identity doc + hook config
     if TARGET == "claude":
-        substitute_template(
-            TEMPLATES_DIR / "template.CLAUDE.md",
-            CLAUDE_HOME / "CLAUDE.md",
-            substitutions,
-        )
+        # Use the SSoT fold function for the compact-instructions fold (#1193) so
+        # bootstrap stays wired to template_render.fold_compact_instructions() and
+        # cannot diverge from the canonical fold logic via inline substitution drift.
+        _template_text = (TEMPLATES_DIR / "template.CLAUDE.md").read_text()
+        _compact_text = substitutions.get("{{COMPACT_INSTRUCTIONS}}")
+        if _compact_text is not None:
+            _claude_text = fold_compact_instructions(_template_text, _compact_text)
+        else:
+            # Compact file absent (fallback from above): strip breadcrumb only,
+            # leave {{COMPACT_INSTRUCTIONS}} unresolved so the gap is visible.
+            _claude_text = _template_text.replace(COMPACT_BREADCRUMB_LINE, "")
+        # Apply remaining (non-compact) substitutions. Exclude the two compact-fold
+        # keys — both are already handled above (by fold_compact_instructions or the
+        # fallback .replace call); re-applying them would be a harmless no-op but
+        # exclusion makes the intent explicit.
+        for _ph, _val in substitutions.items():
+            if _ph not in (COMPACT_BREADCRUMB_LINE, "{{COMPACT_INSTRUCTIONS}}"):
+                _claude_text = _claude_text.replace(_ph, _val)
+        CLAUDE_HOME.mkdir(parents=True, exist_ok=True)
+        (CLAUDE_HOME / "CLAUDE.md").write_text(_claude_text)
         print(f"  CLAUDE.md → {CLAUDE_HOME}/CLAUDE.md", flush=True)
+
+        _set_cleanup_period_days(CLAUDE_HOME)
 
     elif TARGET == "codex":
         _render_codex_target(substitutions)

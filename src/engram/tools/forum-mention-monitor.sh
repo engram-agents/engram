@@ -6,7 +6,7 @@
 # Stop with TaskStop when the loop ends.
 #
 # Usage:
-#   forum-mention-monitor.sh
+#   forum-mention-monitor.sh [--purpose <key>]
 #
 # Multi-agent hosts may symlink this into /home/agents-shared/bin/ alongside
 # ia/baton/forum (same convention; no install step creates the symlink — it is
@@ -27,13 +27,20 @@ set -u
 # NOT -e: a transient failure must not kill a session-length watch.
 
 # ---------------------------------------------------------------------------
-# --help
+# argument parsing: --help, --purpose <key>
 # ---------------------------------------------------------------------------
-if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-    cat <<'EOF'
+PURPOSE="default"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h)
+            cat <<'EOF'
 forum-mention-monitor.sh — watch the LAN forum for new direct @-mentions of me
 
-Usage: forum-mention-monitor.sh
+Usage: forum-mention-monitor.sh [--purpose <key>]
+
+  --purpose <key>  Purpose key for this instance (default: "default").
+                   Self-reap is scoped to same-purpose instances only, so two
+                   instances launched for different purposes do not cross-kill.
 
 Resolves SELF (URL-encoded) and forum BASE URL from ~/.engram/config.json.
 URL resolution order: config.json forum.url > $FORUM_URL > http://localhost:5002
@@ -45,8 +52,26 @@ transient forum-down cycles.
 Emits one line per new direct @-mention (post_id + thread title).
 Polls every 30s. Arm via Monitor tool with persistent: true; stop with TaskStop.
 EOF
-    exit 0
-fi
+            exit 0
+            ;;
+        --purpose)
+            PURPOSE="${2:?--purpose requires a value}"
+            shift 2
+            ;;
+        *)
+            echo "forum-mention-monitor.sh: unrecognised argument: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Validate purpose key: only [a-zA-Z0-9_-] safe in pgrep -f regex (#1307).
+case "$PURPOSE" in
+    *[!a-zA-Z0-9_-]*)
+        echo "forum-mention-monitor: --purpose key must contain only [a-zA-Z0-9_-]; got: '$PURPOSE'" >&2
+        exit 1
+        ;;
+esac
 
 # ---------------------------------------------------------------------------
 # resolve identity + forum URL
@@ -72,7 +97,18 @@ URL="$BASE/api/agent/$SELF/mentions?kind=at_mention"   # #1040: at_mention only 
 # recoverable). Set $FORUM_MENTION_NO_REAP to any non-empty value to disable.
 # ---------------------------------------------------------------------------
 if [ -z "${FORUM_MENTION_NO_REAP:-}" ] && command -v pgrep >/dev/null 2>&1; then
-    for _pid in $(pgrep -u "$(id -u)" -f 'forum-mention-monitor\.sh' 2>/dev/null); do
+    # Purpose-scoped reap: only kill prior instances running with the SAME
+    # --purpose key. For the "default" purpose (no --purpose arg passed), match
+    # by script name only — identical to the pre-#1183 behaviour, ensuring
+    # last-arm-wins for default instances. For an explicit non-default purpose
+    # key, match by script name AND purpose so default instances (and instances
+    # of a different non-default purpose) are never cross-killed (#1183).
+    if [ "$PURPOSE" = "default" ]; then
+        _pgrep_pattern='forum-mention-monitor\.sh'
+    else
+        _pgrep_pattern="forum-mention-monitor\.sh.*--purpose ${PURPOSE}"
+    fi
+    for _pid in $(pgrep -u "$(id -u)" -f "$_pgrep_pattern" 2>/dev/null); do
         [ "$_pid" = "$$" ] && continue
         [ "$_pid" = "${PPID:-0}" ] && continue
         kill "$_pid" 2>/dev/null || true

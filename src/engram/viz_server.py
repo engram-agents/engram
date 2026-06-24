@@ -59,6 +59,13 @@ except ImportError:
     _HEALTH_SCORE_AVAILABLE = False
     _compute_health_score = None  # type: ignore[assignment]
 
+try:
+    from engram_log_indexer import Indexer as _Indexer  # noqa: E402
+    _INDEXER_AVAILABLE = True
+except ImportError:
+    _INDEXER_AVAILABLE = False
+    _Indexer = None  # type: ignore[assignment]
+
 # _CONFIDENCE_BEARING_TYPES — calibration SSoT, imported from engram_stats
 # (promoted to a module-level constant in #1225) so /api/schema and its CI drift
 # gate track the real source rather than a replica. On import failure the empty
@@ -3696,10 +3703,8 @@ def _validate_config_value(key: str, raw_value) -> tuple:
     if expected_type == "string" and "pattern" in row:
         import re
         if not re.fullmatch(row["pattern"], v):
-            return None, (
-                f"Key {key!r}: value {v!r} does not match expected format "
-                f"(expected HH:MM 24h format, e.g. '03:00')"
-            )
+            hint = row.get("pattern_error", f"expected format matching {row['pattern']!r}")
+            return None, f"Key {key!r}: value {v!r} does not match expected format ({hint})"
 
     return v, None
 
@@ -4108,7 +4113,24 @@ def get_stats_data(index_db_path: str) -> dict:
     render a 'No events yet' placeholder rather than a blank card.
     """
     if not index_db_path or not os.path.exists(index_db_path):
-        return {"empty": True, "reason": "No index.db at expected location yet — has the indexer run? Try: python3 ~/.engram/engram_log_indexer.py"}
+        # Auto-bootstrap: run the indexer on-demand when index.db is absent.
+        # Blocks the single-threaded HTTPServer for the indexing pass, but this
+        # is a one-time cost per server lifecycle — once index.db exists, this
+        # branch is never re-entered for the lifetime of the process.
+        if _INDEXER_AVAILABLE and index_db_path:
+            try:
+                _Indexer.run_once(logs_dir=Path(index_db_path).parent)
+            except Exception as exc:
+                logging.warning("stats auto-run failed: %s", exc)
+        if not index_db_path or not os.path.exists(index_db_path):
+            indexer_path = os.path.join(_THIS_DIR, "engram_log_indexer.py")
+            return {
+                "empty": True,
+                "reason": (
+                    "No index.db at expected location yet — has the indexer run? "
+                    f"Try: python3 {indexer_path}"
+                ),
+            }
     try:
         # mode=ro defensively; engram_log_indexer.py uses DELETE journal mode
         # today so no WAL-staleness risk exists, but if it ever switches to WAL,

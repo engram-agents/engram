@@ -281,6 +281,12 @@ def _backfill_source_type(*args, **kwargs):
 def _backfill_edit_history(*args, **kwargs):
     return core._backfill_edit_history(*args, **kwargs)
 
+def _backfill_resolved_by(*args, **kwargs):
+    return core._backfill_resolved_by(*args, **kwargs)
+
+def _best_resolver_for(*args, **kwargs):
+    return core._best_resolver_for(*args, **kwargs)
+
 def _walguard_startup_clear(*args, **kwargs):
     return core._walguard_startup_clear(*args, **kwargs)
 
@@ -1323,7 +1329,7 @@ _ADD_OBSERVATION_FIELDS = frozenset({
     "is_predictive", "predicted_event", "resolution_timeframe",
     "source_class", "content_hash", "git_sha",
     "standpoint_author_id", "standpoint_collection_id", "standpoint_override_tag",
-    "standpoint_lineage",
+    "standpoint_lineage", "standpoint_architecture",
     "fs_class",
 })
 
@@ -1405,7 +1411,7 @@ def engram_add_observation(payload_json: str) -> str:
             quoted_text (str, required): Exact quote from the source document.
             interpretation (str, required): Agent's reasoning about what this quote means.
             claim (str, required): The atomic, falsifiable claim this observation supports.
-            quote_type (str, required): One of: hard_data, official_statement, attributed_analysis, unnamed_source, personal_communication, editorial.
+            quote_type (str, required): One of: hard_data, official_statement, attributed_analysis, counterfactual_inference, unnamed_source, personal_communication, editorial.
             url (str, optional): URL of the source document. The evidence node is auto-created or reused.
             title (str, optional): Title of the source document (required if url is provided).
             domain (str, optional): Source domain (auto-extracted from URL if omitted).
@@ -1421,6 +1427,7 @@ def engram_add_observation(payload_json: str) -> str:
             standpoint_collection_id (str, optional): Corpus or work identity for the source ("vantage" axis). Independent axis in per-axis standpoint cluster key.
             standpoint_override_tag (str, optional): Free-form standpoint label for when the computed cluster key is insufficient (lab measurements, personal comms, introspective self-reports).
             standpoint_lineage (str, optional): Training lineage of the source claim's producer, format "provider:family" (e.g. "anthropic:opus"). The most load-bearing bias axis for AI-agent premises; format-validated, rejected with a redirecting error if malformed.
+            standpoint_architecture (str, optional): Cognitive architecture of the source's producer. Enum: transformer | vision-spatial | embodied-sensorimotor | graph-neural | human | other. Tracks architectural (not just training) diversity — Class A calibration exposure. Use "human" for human sources, "transformer" for other LLMs, omit for self-observations when explicit tracking is not desired.
             fs_class (str, optional): Falsification-sensitivity class — "re-executable" (Class 1: claim can be re-tested by re-running the measurement) or "frozen" (Class 2: claim records a past event that cannot be re-executed). Omit or pass null to let the Phase-1 proxy (derived from quote_type) apply. When provided, takes priority over the proxy and the FALSIFICATION line drops the "(proxy:quote_type)" label. When the class is ambiguous (e.g. a re-readable file that records past state), omit and let the proxy apply — hesitation is the correct signal to omit.
 
     Returns:
@@ -1502,7 +1509,7 @@ def engram_add_observation_batch(payload_json: str) -> str:
                 interpretation, claim, quote_type; optional is_predictive,
                 predicted_event, resolution_timeframe, source_class,
                 standpoint_author_id, standpoint_collection_id, standpoint_override_tag,
-                standpoint_lineage.
+                standpoint_lineage, standpoint_architecture.
             url (str, optional): Source URL. The evidence node is auto-created
                 or reused. Use this+title OR evidence_id, not both.
             title (str, optional): Source title (required when url given).
@@ -2674,10 +2681,12 @@ _ADD_CONJECTURE_FIELDS = frozenset({"claim", "basis", "initial_confidence", "con
 #
 # Lifecycle: open → investigated via observations + derivations → resolved
 # via engram_resolve with prediction_outcome=supported/refuted/inconclusive.
-# When a conjecture gets strong evidence + reaches conjecture confidence
-# ceiling (~0.85), the right move is engram_derive the same claim with
-# proper premises and supersede the conjecture; conjectures shouldn't lurk
-# as "facts in disguise."
+# When a conjecture gets strong evidence, promote via engram_resolve with
+# target_id=conjecture_id, resolving_node_id=<derivation>, and
+# prediction_outcome="supported". Optionally precede with engram_derive to
+# build the supporting derivation; but the derive step alone does NOT close
+# the lifecycle — only engram_resolve sets status="supported". Do NOT
+# supersede — _supersede_impl rejects cross-type promotion (cj → dv).
 #
 # basis field: why this conjecture is worth investigating. Distinguishes a
 # disciplined conjecture (specific gap, testable mechanism) from a free-floating
@@ -2703,8 +2712,12 @@ def engram_add_conjecture(payload_json: str) -> str:
 
     Speculative-by-definition (confidence [0.10, 0.60]). Lifecycle: open →
     investigated → resolved via engram_resolve. When evidence is strong, promote
-    via engram_derive + supersede. Pass all fields as one JSON object string in
-    payload_json.
+    via engram_resolve with target_id=conjecture_id, resolving_node_id=
+    <derivation_id>, and prediction_outcome="supported". Optionally first use
+    engram_derive to build the supporting derivation from evidence, but derive
+    alone does NOT close the lifecycle. Do NOT use
+    supersede — cross-type promotion is rejected. Pass all fields as one
+    JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -3675,7 +3688,7 @@ def engram_goal_tension(payload_json: str) -> str:
 
 _ADD_LESSON_FIELDS = frozenset({
     "claim", "incident_ids", "scaffolding_nudge", "logical_chain",
-    "reasoning_type", "context_ids",
+    "reasoning_type", "context_ids", "situation_pattern",
 })
 
 
@@ -3728,6 +3741,14 @@ def engram_add_lesson(payload_json: str) -> str:
             logical_chain (str, required): How the incidents lead to this lesson.
             reasoning_type (str, optional): Default 'inductive_generalization'.
             context_ids (str, optional): Comma-separated node IDs for context references.
+            situation_pattern (str, optional): Regex matched against the pending Bash
+                COMMAND at action-moment by the PreToolUse tripwire hook. When the
+                pattern fires, scaffolding_nudge is injected as additionalContext before
+                the command runs. Use for lessons whose retrieval cue is a command shape
+                (a specific CLI/tool invocation) — NOT lessons cued by the semantic
+                content of what you're about to say; those still rely on the prompt-time
+                recall hook and are uncovered by this one when the cue lands in pure prose.
+                Example: r'(?:forum\\s+reply|ia\\s+write)'
 
     Returns:
         JSON with lesson ID, confidence, linked incidents, and similar

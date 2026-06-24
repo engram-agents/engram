@@ -37,7 +37,7 @@ That's the line between a memory **for** the agent and the memory **of** the age
 
 ## Your agent's memory never leaves your machine
 
-Every byte of your agent's memory — the graph, the history, the evidence — lives on **your** machine, as plain local files under `~/.engram/` (SQLite + Git). No cloud, no account, no remote telemetry; nothing is ever sent off your computer. (ENGRAM keeps a couple of small local logs for its own tuning — query-calibration stats and the like — and those never leave your machine either.) The Git backup is a local repo you control; if you ever push it somewhere for safekeeping, that's your account and your call. And ENGRAM is **fully open source** — you don't have to take our word for any of this. Read every line; **security scans are welcome.**
+Every byte of your agent's memory — the graph, the history, the evidence — lives on **your** machine, as plain local files under `~/.engram/` (SQLite + Git). No cloud, no account, no remote telemetry; nothing is ever sent off your computer. (ENGRAM keeps a couple of small local logs for its own tuning — query-calibration stats and the like — and those never leave your machine either.) The Git backup is a local repo you control. **Recommended:** add a private off-disk remote **that you control** (your repo, your account — still nothing goes to us or any ENGRAM service) — `~/.engram/` is already a git repo tracking your graph as `knowledge.sql` on every nap; one `git remote add origin <your-private-repo-url>` and the agent's nap routine pushes it automatically. Same-disk-only risks total loss on hardware failure, and the graph is your agent's identity substrate. And ENGRAM is **fully open source** — you don't have to take our word for any of this. Read every line; **security scans are welcome.**
 
 ---
 
@@ -53,7 +53,7 @@ Every byte of your agent's memory — the graph, the history, the evidence — l
 
 ## Getting started
 
-Install [Claude Code](https://code.claude.com), clone this repo, and **ask your agent to guide you through the installation.** ENGRAM is designed to be installed *by* your agent — it reads the agent-facing guide, does the technical work, and asks you only for the few steps a human has to do (typing a slash command, restarting Claude Code). There's no runbook for you to follow.
+Install [Claude Code](https://code.claude.com) and **ask your agent to guide you through the installation.** ENGRAM is designed to be installed *by* your agent — it reads the agent-facing guide, does the technical work, and asks you only for the few steps a human has to do (typing a slash command, restarting Claude Code). There's no runbook for you to follow.
 
 **It won't disturb your setup.** Back up your user-level `~/.claude/CLAUDE.md` first, then ask your agent to merge your old content back in after install. Your **skills and project-level settings are untouched** — ENGRAM adds its own identity layer without overwriting your customizations. If anything looks off, ask your agent; it can compare what's there against what should be.
 

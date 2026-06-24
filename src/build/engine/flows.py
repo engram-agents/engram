@@ -564,7 +564,7 @@ def _apply_marketplace_rebuilt(ctx: dict[str, Any]) -> None:
             "install_tier unset in config.json — set it (essential|convenience|dev) "
             "before upgrading; see #707"
         )
-    multi_agent = bool(config.get("multi_agent", False))
+    multi_agent = bool(config.get("multi_agent")) or config.get("mode") == "multi"
 
     # Determine plugin output path
     plugin_root = os.path.join(source_dir, "build", "plugin")
@@ -606,7 +606,7 @@ def _check_flags_match_config(ctx: dict[str, Any]) -> bool:
 
     config = _load_engram_config(ctx)
     expected_tier = config.get("install_tier") or "convenience"
-    expected_ma = bool(config.get("multi_agent", False))
+    expected_ma = bool(config.get("multi_agent")) or config.get("mode") == "multi"
 
     built_tier = bm.get("tier")
     built_ma = bool(bm.get("multi_agent"))

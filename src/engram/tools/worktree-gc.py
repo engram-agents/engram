@@ -16,14 +16,16 @@ This tool classifies each worktree and removes the safely-finished ones:
   KEEP    branch worktree whose PR is OPEN (active work)
   KEEP    branch worktree with NO PR (pre-PR or abandoned — flagged for a human)
   SKIP    any worktree that is DIRTY (uncommitted changes) — never destroy work
+  SKIP    any worktree that has a live process with CWD inside it (in-use guard)
 
 Default is DRY-RUN: it prints the plan and changes nothing. Pass --apply to
 execute (`git worktree remove` + delete the now-merged local branch, then
-`git worktree prune`).
+`git worktree prune` + delete orphan `worktree-agent-*` branch refs).
 
 Safety invariants:
   * The main checkout is never touched.
   * A dirty worktree is never removed (clean-status gate), even if its PR merged.
+  * An in-use worktree is never removed (in-use guard: /proc/*/cwd scan).
   * An OPEN-PR worktree is never removed.
   * A no-PR branch is never auto-removed (could be unpushed/abandoned work) —
     only reported, so a human decides.
@@ -38,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -94,6 +97,30 @@ def _is_clean(path: str) -> bool:
     return rc == 0 and out.strip() == ""
 
 
+def _is_in_use(path: str) -> bool:
+    """Return True if any live process has its CWD inside this worktree directory.
+
+    Scans /proc/*/cwd symlinks (Linux only). Falls back to False on non-Linux
+    or permission errors — safe to call unconditionally; the worst case is we
+    fail to detect an in-use worktree and proceed to the PR-state check.
+    """
+    proc = Path("/proc")
+    if not proc.exists():
+        return False
+    resolved = Path(path).resolve()
+    for pid_dir in proc.iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        cwd_link = pid_dir / "cwd"
+        try:
+            cwd = Path(os.readlink(str(cwd_link))).resolve()
+            if cwd == resolved or str(cwd).startswith(str(resolved) + "/"):
+                return True
+        except (OSError, PermissionError):
+            continue
+    return False
+
+
 def _pr_state(branch: str, root: str) -> str | None:
     """Return 'MERGED'/'CLOSED'/'OPEN' for the branch's PR, or None if no PR / gh unavailable."""
     rc, out, _ = _run(
@@ -117,9 +144,13 @@ def classify(t: dict, root: str) -> tuple[str, str]:
     if not _is_clean(path):
         return "SKIP", "DIRTY — uncommitted changes; not removing"
     branch = t.get("branch")
-    if branch is None:  # detached HEAD — reviewer-fairy leftover
+    if branch is None:  # detached HEAD — reviewer-fairy leftover (unless still running)
+        if _is_in_use(path):
+            return "SKIP", "detached HEAD but process active (reviewer-fairy still running)"
         return "PRUNE", "detached HEAD, clean (reviewer-fairy leftover)"
     if branch.startswith("worktree-agent-") or branch.startswith("review-"):
+        if _is_in_use(path):
+            return "SKIP", f"tmp branch '{branch}' but process active (fairy still running)"
         return "PRUNE", f"tmp review branch '{branch}', clean"
     state = _pr_state(branch, root)
     if state in ("MERGED", "CLOSED"):
@@ -127,6 +158,23 @@ def classify(t: dict, root: str) -> tuple[str, str]:
     if state == "OPEN":
         return "KEEP", f"PR OPEN ({branch}) — active work"
     return "KEEP", f"no PR for '{branch}' — flagged for human review (pre-PR or abandoned)"
+
+
+def _prune_orphan_agent_refs(root: str, checked_out: set[str]) -> tuple[int, int]:
+    """Delete worktree-agent-* branch refs not checked out in any remaining worktree.
+
+    Returns (pruned, total).
+    """
+    rc, out, _ = _run(["git", "branch", "--list", "worktree-agent-*"], cwd=root)
+    if rc != 0 or not out.strip():
+        return 0, 0
+    refs = [b.strip().removeprefix("* ") for b in out.splitlines() if b.strip()]
+    orphans = [r for r in refs if r not in checked_out]
+    pruned = sum(
+        1 for ref in orphans
+        if _run(["git", "branch", "-D", ref], cwd=root)[0] == 0
+    )
+    return pruned, len(orphans)
 
 
 def remove_worktree(t: dict, root: str) -> tuple[bool, str]:
@@ -196,7 +244,11 @@ def main() -> int:
         print(f"  {'✓' if ok else '✗'} {t['path']} — {msg}")
         removed += ok
     _run(["git", "worktree", "prune"], cwd=root)
-    print(f"\nworktree-gc: removed {removed}/{len(prune)}; ran git worktree prune.")
+    remaining = _list_worktrees(root)
+    checked_out = {t.get("branch") for t in remaining if t.get("branch")}
+    pruned_refs, total_refs = _prune_orphan_agent_refs(root, checked_out)
+    ref_note = f"; pruned {pruned_refs}/{total_refs} orphan worktree-agent-* refs" if total_refs else ""
+    print(f"\nworktree-gc: removed {removed}/{len(prune)}; ran git worktree prune{ref_note}.")
     return 0
 
 
