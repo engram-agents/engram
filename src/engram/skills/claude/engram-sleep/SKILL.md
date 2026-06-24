@@ -235,10 +235,13 @@ This step exists because ask-{{USER_NAME}}.md is auto-loaded into every fresh se
 
 Run the knowledge.db backup tool and **capture the result for the sleep summary**.
 Creates a dated SQL snapshot at `~/.engram/db-backup/knowledge-YYYY-MM-DD.sql`.
-Uses `engram_backup.dump_stripped` (WAL-safe, pure-Python, no CLI dependency):
+Uses `engram_backup.dump_stripped` (WAL-safe, no CLI dependency).
+`backup_knowledge_db.py` imports `engram_backup`, which imports `sqlite_vec`
+(needed to drop the `vec0` virtual table) — that package lives only in the ENGRAM
+venv, so invoke via venv Python:
 
 ```bash
-backup_out=$(python3 "$CLAUDE_PLUGIN_ROOT/tools/backup_knowledge_db.py" \
+backup_out=$("$HOME/.engram/venv/bin/python3" "$CLAUDE_PLUGIN_ROOT/tools/backup_knowledge_db.py" \
     [--retain 90] 2>&1)   # prune archives older than 90 days; omit to keep all
 backup_rc=$?
 if [ $backup_rc -eq 0 ]; then
