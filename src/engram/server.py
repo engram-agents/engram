@@ -1514,7 +1514,14 @@ def engram_add_observation_batch(payload_json: str) -> str:
                 interpretation, claim, quote_type; optional is_predictive,
                 predicted_event, resolution_timeframe, source_class,
                 standpoint_author_id, standpoint_collection_id, standpoint_override_tag,
-                standpoint_lineage, standpoint_architecture.
+                standpoint_lineage (format "provider:family", e.g. "anthropic:opus" —
+                the most load-bearing bias axis for AI-agent premises; format-validated),
+                standpoint_architecture (transformer | vision-spatial | embodied-sensorimotor
+                | graph-neural | human | other),
+                fs_class ("re-executable" for Class 1 claims that can be re-tested by
+                re-running the measurement, or "frozen" for Class 2 claims recording a
+                past event that cannot be re-executed; omit to let the Phase-1 proxy from
+                quote_type apply — hesitation is the correct signal to omit).
             url (str, optional): Source URL. The evidence node is auto-created
                 or reused. Use this+title OR evidence_id, not both.
             title (str, optional): Source title (required when url given).
