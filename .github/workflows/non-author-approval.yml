@@ -1,0 +1,151 @@
+name: non-author-approval
+
+# Issue #1267 Fix C (Phase 2, v2) — CI backstop that enforces ALL non-author
+# reviewers must have APPROVED as their latest review state before merge.
+#
+# Motivation (2026-06-22 incident): 6 PRs reached lei's merge queue without
+# colleague review, caught only by manual observation.
+# Phase 1 (baton flip-to-maintainer guard, PR #1302): catches the gap at
+# workflow time. Phase 2 (this file): CI hard backstop — a secondary check
+# that survives baton bypass.
+#
+# Gate logic (Lei's 2026-06-24 spec):
+#   PASS when: (1) ≥1 non-author reviewer has submitted a review AND
+#              (2) ALL reviewers' latest non-dismissed review is APPROVED.
+#   FAIL when: any reviewer's latest state is CHANGES_REQUESTED or COMMENTED
+#              (not fully approved) — even if a different reviewer has APPROVED.
+#
+# What this catches:
+#   ✓ Reviewed-but-not-all-approved: one reviewer CHANGES_REQUESTED, another
+#     APPROVED → old gate passed (≥1 APPROVED); new gate fails (not all APPROVED).
+#   ✓ Approved-then-re-requested: reviewer approved then later requested changes
+#     → latest state is CHANGES_REQUESTED → gate fails.
+#   ✓ Comment-only reviewers: latest state COMMENTED → gate fails (not APPROVED).
+#
+# What this does NOT catch (same limitation as v1):
+#   ✗ Never-reviewed: PR with zero reviews on push events → gate passes (exit 0).
+#     Never-reviewed enforcement is owned by Phase-1 baton (#1302).
+#
+# Two-event design (unchanged from v1):
+#   pull_request (push/open/sync): always exit 0 ("pending").
+#   pull_request_review (submitted): enforce the gate.
+#
+#   Why: a push-event FAILURE + later review-event SUCCESS on the same SHA
+#   creates UNSTABLE in the statusCheckRollup, blocking merge even after approval.
+#   Empirically verified — exit 0 on push events is the fix. On review events
+#   only one run fires per review submission, so FAILURE → SUCCESS resolves cleanly
+#   (latest run by check-name supersedes prior failures).
+#
+# Latest-per-reviewer semantics:
+#   For each reviewer, only their most recent non-DISMISSED review counts.
+#   DISMISSED = an admin/author explicitly dismissed a stale review; treated as
+#   "cleared" (reviewer has not voted since). Bot accounts ([bot] suffix) excluded.
+
+on:
+  pull_request:
+    branches: [dev, master]
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted]
+    # Note: `branches` is not supported for pull_request_review events
+    # (GitHub silently ignores it). Gate logic is correct regardless of base branch.
+
+permissions:
+  pull-requests: read
+
+jobs:
+  non-author-approval:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all non-author reviews are APPROVED (latest per reviewer)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "PR #${PR_NUMBER} by ${PR_AUTHOR}"
+
+          # pull_request events: exit 0 (pending) — avoid lingering-red UNSTABLE.
+          # See file header for rationale. Never-reviewed blocked by baton (#1302).
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "⏳ Colleague-gate: pending (enforces on review submission, not on push)."
+            echo "Gate: (1) ≥1 non-author reviewer submitted, (2) all latest reviews APPROVED."
+            exit 0
+          fi
+
+          # pull_request_review event: enforce the full gate.
+          # per_page=100 is GitHub's max; no PR will have >100 reviews in practice.
+          # (--paginate without --slurp emits one JSON array per page, which breaks
+          # downstream bash integer comparisons on multi-line output.)
+          ALL_REVIEWS=$(gh api \
+            "repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100")
+
+          # Compute latest-per-reviewer stats.
+          # Excludes: PR author, [bot]-suffix accounts, DISMISSED reviews.
+          # For each remaining reviewer: latest non-dismissed review state.
+          STATS=$(echo "$ALL_REVIEWS" | jq \
+            --arg author "$PR_AUTHOR" \
+            '{
+              reviewer_count: (
+                [group_by(.user.login)[] |
+                 select(.[0].user.login != $author) |
+                 select(.[0].user.login | test("\\[bot\\]$") | not) |
+                 [.[] | select(.state != "DISMISSED")] |
+                 select(length > 0)] | length
+              ),
+              non_approved: (
+                [group_by(.user.login)[] |
+                 select(.[0].user.login != $author) |
+                 select(.[0].user.login | test("\\[bot\\]$") | not) |
+                 [.[] | select(.state != "DISMISSED")] |
+                 select(length > 0) |
+                 sort_by(.submitted_at) | last |
+                 select(.state != "APPROVED") |
+                 "\(.user.login): \(.state)"]
+              ),
+              all_states: (
+                [group_by(.user.login)[] |
+                 select(.[0].user.login != $author) |
+                 select(.[0].user.login | test("\\[bot\\]$") | not) |
+                 [.[] | select(.state != "DISMISSED")] |
+                 select(length > 0) |
+                 sort_by(.submitted_at) | last |
+                 "\(.user.login): \(.state)"]
+              )
+            }')
+
+          REVIEWER_COUNT=$(echo "$STATS" | jq -r '.reviewer_count')
+          NON_APPROVED_COUNT=$(echo "$STATS" | jq -r '.non_approved | length')
+
+          echo "Non-author reviewers with active reviews: ${REVIEWER_COUNT}"
+          echo "Latest review states:"
+          STATES=$(echo "$STATS" | jq -r '.all_states[]')
+          if [ -n "$STATES" ]; then
+            echo "$STATES" | sed 's/^/  /'
+          else
+            echo "  (none)"
+          fi
+
+          # Gate evaluation.
+          if [ "${REVIEWER_COUNT}" -ge 1 ] && [ "${NON_APPROVED_COUNT}" -eq 0 ]; then
+            echo ""
+            echo "✓ Colleague-gate satisfied: ≥1 non-author reviewer, all latest reviews APPROVED."
+            exit 0
+          fi
+
+          echo ""
+          echo "✗ Colleague-gate not satisfied."
+          if [ "${REVIEWER_COUNT}" -eq 0 ]; then
+            echo "  No non-author reviews submitted yet."
+            echo "  (Never-reviewed enforcement: Phase-1 baton gate, PR #1302.)"
+          else
+            echo "  ${NON_APPROVED_COUNT} reviewer(s) have not fully approved:"
+            echo "$STATS" | jq -r '.non_approved[]' | sed 's/^/    /'
+            echo "  → CHANGES_REQUESTED: reviewer must re-approve after the fix."
+            echo "  → COMMENTED: reviewer must upgrade to an explicit APPROVED review."
+          fi
+          echo ""
+          echo "All non-author reviewers must have APPROVED as their latest review."
+          echo "Review hierarchy (CLAUDE.md): reviewer-fairy → counterpart-colleague → maintainer."
+          exit 1
