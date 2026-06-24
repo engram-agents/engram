@@ -22,6 +22,7 @@ Bucket names match the dream-master's action categories:
   cornerstone_moves   — engram_add_cornerstone / engram_outgrow_cornerstone
   goal_tension_resolutions — engram_resolve on gt_* nodes
   edge_wiring         — engram_add_edge calls (Category 7 missing-edge suggestions)
+  task_closures       — engram_update_task calls (Category 8 stale-task-ref closures)
 
 Suggestion-string → bucket routing uses the SUGGESTION_ROUTING table below;
 add new entries when the dream-fairy spec adds new suggestion types.
@@ -44,6 +45,7 @@ BUCKET_LESSONS = "lessons"
 BUCKET_CORNERSTONE_MOVES = "cornerstone_moves"
 BUCKET_GOAL_TENSION_RESOLUTIONS = "goal_tension_resolutions"
 BUCKET_EDGE_WIRING = "edge_wiring"
+BUCKET_TASK_CLOSURES = "task_closures"
 BUCKET_UNKNOWN = "unknown"
 
 ALL_BUCKET_NAMES = (
@@ -55,6 +57,7 @@ ALL_BUCKET_NAMES = (
     BUCKET_CORNERSTONE_MOVES,
     BUCKET_GOAL_TENSION_RESOLUTIONS,
     BUCKET_EDGE_WIRING,
+    BUCKET_TASK_CLOSURES,
     BUCKET_UNKNOWN,
 )
 
@@ -104,6 +107,11 @@ SUGGESTION_ROUTING: list[tuple[str, str]] = [
     (r"\banchors?\b", BUCKET_CORNERSTONE_MOVES),
     (r"\bengram_add_cornerstone\b", BUCKET_CORNERSTONE_MOVES),
     (r"\bengram_outgrow_cornerstone\b", BUCKET_CORNERSTONE_MOVES),
+    # Task-closure patterns (Category 8 stale-task-ref suggestions).
+    # Canonical form: "close task and mark done — external reference #N <state>".
+    # "close task" anchors on task; "mark.*task.*done" requires both words to
+    # prevent false-positives like "mark contradiction done after resolution".
+    (r"\b(close task|mark.*task.*done|update.*task|task.*done|stale.*task)\b", BUCKET_TASK_CLOSURES),
 ]
 
 # Pre-compiled patterns for performance.

@@ -3,7 +3,7 @@
 PR-B: self-sufficient fairy reports + dream-master batch-by-type orchestration.
 
 Coverage:
-  1. bucket_findings() — routing correctness for all seven action buckets.
+  1. bucket_findings() — routing correctness for all eight action buckets.
   2. bucket_findings() — unknown suggestions land in BUCKET_UNKNOWN.
   3. bucket_findings() — multi-fairy input is merged; _source_fairy is set.
   4. bucket_findings() — empty / malformed input is handled safely.
@@ -38,6 +38,7 @@ from tools.dream_master_batch import (
     BUCKET_CORNERSTONE_MOVES,
     BUCKET_GOAL_TENSION_RESOLUTIONS,
     BUCKET_EDGE_WIRING,
+    BUCKET_TASK_CLOSURES,
     BUCKET_UNKNOWN,
     ALL_BUCKET_NAMES,
     BatchResult,
@@ -865,6 +866,61 @@ class TestEdgeWiringBucket:
 
 
 # ---------------------------------------------------------------------------
+# 22. Task-closures bucket routing (Category 8)
+# ---------------------------------------------------------------------------
+
+
+class TestTaskClosuresBucket:
+    """Routing correctness and containment for the task_closures bucket."""
+
+    def _route(self, suggestion: str) -> str:
+        finding = _make_finding("tk_0001", suggestion)
+        report = _make_report([finding])
+        buckets = bucket_findings([report])
+        for name, items in buckets.items():
+            for item in items:
+                if item["node_id"] == "tk_0001":
+                    return name
+        return BUCKET_UNKNOWN
+
+    def test_canonical_suggestion_routes_to_task_closures(self):
+        assert (
+            self._route("close task and mark done — external reference #1251 MERGED")
+            == BUCKET_TASK_CLOSURES
+        )
+
+    def test_mark_done_variant_routes_to_task_closures(self):
+        assert self._route("mark task done — external reference closed PR") == BUCKET_TASK_CLOSURES
+
+    def test_stale_task_variant_routes_to_task_closures(self):
+        assert self._route("stale task — reference #999 CLOSED") == BUCKET_TASK_CLOSURES
+
+    def test_does_not_shadow_resolutions(self):
+        assert self._route("resolve question via engram_resolve") == BUCKET_RESOLUTIONS
+
+    def test_close_task_not_bare_close(self):
+        """Bare 'close' without 'task' should not route to task_closures."""
+        result = self._route("close as resolved — no longer relevant")
+        assert result != BUCKET_TASK_CLOSURES
+
+    def test_mark_done_without_task_does_not_route_to_task_closures(self):
+        """'mark contradiction done' must not shadow resolutions bucket."""
+        result = self._route("mark contradiction done after resolution")
+        assert result != BUCKET_TASK_CLOSURES
+
+    def test_task_closures_in_all_bucket_names(self):
+        assert BUCKET_TASK_CLOSURES in ALL_BUCKET_NAMES
+
+    def test_task_closures_before_unknown_in_all_bucket_names(self):
+        names = list(ALL_BUCKET_NAMES)
+        assert names.index(BUCKET_TASK_CLOSURES) < names.index(BUCKET_UNKNOWN)
+
+    def test_task_closures_after_edge_wiring_in_all_bucket_names(self):
+        names = list(ALL_BUCKET_NAMES)
+        assert names.index(BUCKET_EDGE_WIRING) < names.index(BUCKET_TASK_CLOSURES)
+
+
+# ---------------------------------------------------------------------------
 # 21. Regression table — all existing buckets still route unchanged
 # ---------------------------------------------------------------------------
 
@@ -905,6 +961,9 @@ class TestRoutingRegressionTable:
 
     def test_goal_tension_resolutions_still_routes(self):
         assert self._single("resolve goal-tension gt_0003 via synthesis") == BUCKET_GOAL_TENSION_RESOLUTIONS
+
+    def test_task_closures_still_routes(self):
+        assert self._single("close task and mark done — external reference #1251 MERGED") == BUCKET_TASK_CLOSURES
 
     def test_unknown_still_falls_through(self):
         assert self._single("a completely novel action type no pattern knows") == BUCKET_UNKNOWN

@@ -37,7 +37,7 @@ This converts "resolve at the spot" from an exhortation into an economic argumen
 - Runs `cohort_dispatch.py validate` after batch-summary fairies return; dispatches a retry fairy if needed; runs `incorporate-retry` to produce `final_payload.json`
 - **Waits** for all fairy completion notifications, collecting reports from disk (dream-fairies) + the `final_payload.json` from the batch-summary validate/retry loop
 - **Applies recall summaries** directly via `engram_set_recall_summaries` in Step 7.5 (before spawning you), so the summaries are persisted even if you time out
-- **Then spawns you** with all fairy reports in your initial prompt — file paths for the 7 dream-fairy reports (full content on disk; you read it) + cohort metadata including recall-summary counts
+- **Then spawns you** with all fairy reports in your initial prompt — file paths for the 8 dream-fairy reports (full content on disk; you read it) + cohort metadata including recall-summary counts
 - Holds the broader session context (today's work, focus state, user-facing surface)
 
 **You handle maintenance:**
@@ -55,14 +55,14 @@ All fairy reports arrive **in your initial spawn prompt** — the parent collect
 
 What you receive in the spawn prompt:
 
-1. **7 dream-fairy reports** as `(category, disk path, TL;DR bullets)` triples. Read the full report from disk via the cited path before integrating each one's findings.
+1. **8 dream-fairy reports** as `(category, disk path, TL;DR bullets)` triples. Read the full report from disk via the cited path before integrating each one's findings.
 2. **Cohort metadata** (today's-new + backfill counts, chunk count, cohort dir path, recall-summary counts already applied by the parent in Step 7.5).
 3. **Timeout markers** for any fairy that didn't return — proceed without that fairy, note it in the dream record.
 
 Working order — **batch-by-type pass** (PR-B):
 
 1. Call `engram_reflect` first for your structured initial agenda.
-2. Read ALL 7 dream-fairy reports from disk in one pass.
+2. Read ALL 8 dream-fairy reports from disk in one pass.
 3. Call `bucket_findings(fairy_reports)` from `tools/dream_master_batch.py` to
    partition all findings into action-type buckets (single operation, no MCP
    calls needed — snapshots are pre-packed in each finding).
@@ -83,6 +83,16 @@ Working order — **batch-by-type pass** (PR-B):
      `engram_resolve` on gt_* nodes
    - Then: **edge_wiring** — `check_snapshot_divergence` on the source node,
      verify edge still absent, then `engram_add_edge` (Category 7 suggestions)
+   - Then: **task_closures** — for each finding, call `check_snapshot_divergence`
+     on the task node, then verify the external reference is still MERGED/CLOSED
+     via a fresh `gh pr view` or `gh issue view` call (the snapshot was taken
+     earlier; re-verify before writing). If confirmed: call
+     `engram_update_task(task_id=..., new_status='done',
+     note='externally resolved: #N <state> confirmed <ISO date>')`. Note:
+     `engram_resolve` is NOT applicable to task nodes (protocol violation —
+     `task` is not in `RESOLVABLE_TYPES`); skip it. If the fresh `gh` check
+     returns OPEN or UNKNOWN: skip and log in the dream record as
+     "stale-but-still-open: task_id #N".
    - **unknown bucket**: log all items in the dream record for the morning
      review; do not execute them.
 6. Write the dream record + call `engram_advance_turn` when completion checklist
@@ -189,6 +199,7 @@ Bias-toward-action on:
 - **Lesson candidates** — when three or more incidents share a structural pattern and no lesson names it, file the lesson via `engram_add_lesson`. **This is a load-bearing addition** — lessons fire as tripwires across all future sessions. When you file one, emphasize it in the dream record's Lessons-filed section so the user reads it carefully in the morning review.
 - **Contradictions you uncover** — when consolidating reveals two existing nodes in genuine conflict (no contradiction node yet exists between them), file the contradiction via `engram_contradict`. Distinguish from `engram_resolve`, which closes an existing contradiction node — you may need both in sequence: `engram_contradict` to name the conflict, then `engram_derive` to compose the synthesis derivation, then `engram_resolve(target_id=ct_NEW, resolving_node_id=dv_NEW)` to wire the close.
 - **Category 7 missing-principle-edge suggestions** — for each suggestion from the Category 7 fairy report: call `check_snapshot_divergence` on the source node, then verify the edge still doesn't exist via `fetch_safety_row`, then wire accepted suggestions via `engram_add_edge(source_id=<src>, target_id=<dst>, relation=<instantiates|serves>)` — the tool takes exactly those three fields (no note parameter); carry the evidence snippet into the dream record next to the wired-edge line instead. Gate each one: review the similarity score and evidence snippet before committing. Skip any suggestion whose source node has diverged or whose edge now already exists. Log wired and skipped counts in the dream record.
+- **Category 8 stale-task-ref closures** — for each suggestion from the Category 8 fairy report: call `check_snapshot_divergence` on the task node, then re-verify the external reference state via a fresh `gh pr view N --json state` or `gh issue view N --json state` call (the fairy's snapshot was taken earlier). If MERGED/CLOSED confirmed: call `engram_update_task(task_id=<tk_id>, new_status='done', note='externally resolved: #N <state> confirmed <ISO date>')`. Note: `engram_resolve` is NOT applicable to task nodes (`task` is not in `RESOLVABLE_TYPES`). If the fresh check returns OPEN or UNKNOWN: skip and log as "stale-but-still-open: <tk_id> #N" in the dream record.
 
 # What's outside your domain (flag for the parent in the dream record)
 
