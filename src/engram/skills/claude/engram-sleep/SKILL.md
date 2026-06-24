@@ -70,24 +70,52 @@ The parent's role is purely orchestration.
 
 ---
 
+## Pre-flight: context guard (fires before Phase A)
+
+Before any step, check the parent session's context size. **A large parent context taxes the entire sleep run** — not just Phase A, but also Phase B, because every orchestration turn (fairy dispatch, notification processing, recall-summary application, dream-master spawn, relay) runs in the parent's full context. Measured cost with an unchecked large context: **6.39M tokens in 25 minutes**, exceeding a full 5h billing budget (21-hour session, Aleph incident 2026-06-06, issue #878).
+
+Locate the `[Drowsiness: …]` banner injected by the context-tracker hook.
+
+### Auto-sleep / cron-initiated (invocation gate path b — user NOT present)
+
+- **`[Drowsiness: refreshed]`** — below 50% of ceiling → proceed to Phase A.
+- **Any other level** (`energetic`, `a little drowsy`, `needs a nap: N%`) — at or above 50% → **HARD ABORT**:
+
+  > "Auto-sleep aborted: context is at [level] — too large for safe consolidation. A large session context multiplies the token cost of every Phase A step and every Phase B orchestration turn. When you next have an attended session with the user, run `engram-nap` + `/compact` to compact the context; the next scheduled cron fire will then retry in a compact context."
+
+  **Stop.** Do NOT attempt nap or compact autonomously — those require user oversight. Do NOT re-arm sleep; the next cron fire handles it.
+
+  **Why hard abort (not a soft proposal) for auto-sleep:** no user is present to override the decision, the cost is invisible until it hits the billing statement, and the measured incidents exhausted an entire 5h budget in under 30 minutes. Aborting here is always cheaper than explaining the overage.
+
+- **No banner** (hook not configured or hook output not visible) → proceed to Phase A (can't detect, can't guard).
+
+### User-initiated (invocation gate path a — user present)
+
+- **`[Drowsiness: refreshed]`** — below 50% → proceed to Phase A.
+- **`[Drowsiness: needs a nap: N%]`** (urgent, typically ≥85%) → surface a strong recommendation and wait for explicit confirmation before proceeding:
+
+  > "Context is at urgent level ([N]%). Sleeping now will burn significant tokens across Phase A review steps and Phase B orchestration turns. Strongly recommend `engram-nap` + compact first — takes ~2 min and reduces per-turn cost ~20×. Proceed anyway? (Say 'yes, proceed' to override.)"
+
+- **`[Drowsiness: energetic]` or `[Drowsiness: a little drowsy]`** (50–85%) → surface the soft proposal and proceed if the user agrees (see Phase A pre-flight below).
+- **No banner** → proceed to Phase A.
+
+---
+
 ## Phase A — Cohort completion
 
-### Phase A pre-flight: context check (user still present)
+### Phase A pre-flight: context check (user-present, moderate levels)
 
-Phase A runs while you're still at the desk. Before starting the bedtime review, check whether the current context is large enough to make a nap worthwhile.
+This check covers the 50–85% user-present case not handled by the hard guard above. Before starting the bedtime review, surface the nap option:
 
-Locate the drowsiness banner in this prompt's context, injected by the context-tracker hook (`[Drowsiness: …]`):
+- **`[Drowsiness: energetic]` or `[Drowsiness: a little drowsy]`** — surface this to the user now, before Phase A begins:
 
-- **`[Drowsiness: refreshed]`** — below 50% of ceiling → proceed to Step 1.
-- **Any other level** (`energetic`, `a little drowsy`, `needs a nap: N%`) — at or above 50% → surface this to the user now, before Phase A begins:
+  > "Your context is at [level] — Phase A's bedtime review will burn additional tokens in this window since each step runs in the current large context, and Phase B's orchestration turns will too. While you're still here, a quick nap first would reduce that cost. Want to run `engram-nap` before we start? (You can also proceed directly.)"
 
-  > "Your context is at [level] — Phase A's bedtime review will burn additional tokens in this window since each step runs in the current large context. While you're still here, a quick nap first would reduce that cost. Want to run `engram-nap` before we start? (You can also proceed directly — Phase B fairies start fresh and aren't affected.)"
+  **This is a proposal, not a block.** If the user says "just proceed", proceed.
 
-  **This is a proposal, not a block.** Phase B orchestration (fairies + dream master) starts fresh regardless of parent context size — they don't inherit it. The only real cost of skipping the nap is the Phase A steps themselves running in a larger window. If the user says "just proceed", proceed.
+- **`[Drowsiness: refreshed]`** or **no banner** → proceed directly to Step 1.
 
-- **No banner in context** (hook not configured or hook output not visible) → proceed directly to Step 1.
-
-> **Why Phase A, not Phase B.** Dream fairies and the dream master start afresh — they don't re-cache the parent session context, so a large parent window has no multiplier effect on Phase B cost. Phase A is where the awake agent does work (node filing, warm-briefing erase, history reconcile) — those steps run inside the current context window and do compound with size. The check belongs where the user can still act on it.
+> **Why the guard covers both Phase A and Phase B.** Dream fairies and the dream master run in their own fresh contexts, so their individual turns are unaffected. But the **parent's orchestration turns in Phase B** — dispatching fairies, processing their task-notifications (7+ turns), applying recall summaries, spawning the dream master, relaying results — all run in the parent's full session context. A large parent context re-caches on each of those turns, compounding the cost just as Phase A does. The guard belongs before the entire sleep run, not just before Phase A. *(Origin: the unchecked Phase B orchestration was the measured source of the 6.39M-token overage in the Aleph incident — the prior framing "Phase B isn't affected" was incorrect and is now corrected.)*
 
 ### Step 1 — Walk the day's full cohort
 
