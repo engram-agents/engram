@@ -160,7 +160,33 @@ The plugin tree/cache now has the new `server.py`, but the running MCP server ma
 
 ## Step 5a — Shared-bin CLI refresh (multi-agent only)
 
-**If multi-agent:** After the plugin rebuild, check shared-bin CLI drift — the next prompt will surface a `⚠️ shared-bin drift` banner if drift is detected. To refresh proactively: for each of `{ia,baton,forum}`, compare `/home/agents-shared/bin/<cli>` with `$CLAUDE_PLUGIN_ROOT/tools/<src>.py` (use `diff` or `md5sum`) and `sudo cp` to refresh any that differ before other agents resume. This prevents the silent-degradation class where agents run a stale shared CLI against a newly-upgraded hook.
+**If multi-agent:** After the plugin rebuild, check shared-bin CLI drift — the next prompt will surface a `⚠️ shared-bin drift` banner if drift is detected. The shared-bin CLIs (`ia`, `baton`, `forum`) are owned by whichever agent created them (typically the main agent on the host). Refresh policy is **permission-driven, not sudo-by-default**:
+
+- **If the target is writable by you** — refresh with a plain `cp`, no sudo needed.
+- **If the target is not writable** — skip; the owning agent should refresh. Do NOT `sudo cp` another agent's files.
+
+```bash
+for pair in "ia.py:ia" "baton.py:baton" "forum.py:forum"; do
+  src="${pair%%:*}"; cli="${pair##*:}"
+  target="/home/agents-shared/bin/$cli"
+  [ ! -e "$target" ] && echo "$cli: not in shared-bin — skip" && continue
+  if [ -w "$target" ]; then
+    diff -q "$CLAUDE_PLUGIN_ROOT/tools/$src" "$target" >/dev/null 2>&1
+    diff_rc=$?
+    if [ $diff_rc -eq 0 ]; then
+      echo "$cli: up to date"
+    elif [ $diff_rc -eq 1 ]; then
+      cp "$CLAUDE_PLUGIN_ROOT/tools/$src" "$target" && echo "$cli: refreshed" || echo "$cli: cp failed"
+    else
+      echo "$cli: diff error — check $CLAUDE_PLUGIN_ROOT/tools/$src"
+    fi
+  else
+    echo "$cli: owned by $(stat -c%U "$target" 2>/dev/null || stat -f%Su "$target") — skip (owning agent refreshes)"
+  fi
+done
+```
+
+This prevents the silent-degradation class where agents run a stale shared CLI against a newly-upgraded hook, while respecting each agent's file ownership.
 
 ---
 
