@@ -430,6 +430,10 @@ def _set_trust_tier_impl(*args, **kwargs):
 
 def _add_trust_signal_impl(*args, **kwargs):
     return _trust_mod._add_trust_signal_impl(*args, **kwargs)
+
+def _set_person_lineage_impl(*args, **kwargs):
+    return _trust_mod._set_person_lineage_impl(*args, **kwargs)
+
 # ---- end #872 wave-3 compat forwarders --------------------------------
 
 # ---- #872 wave-4 family imports --------------------------------------
@@ -3148,6 +3152,72 @@ def engram_set_trust_tier(payload_json: str) -> str:
         tier=tier,
         justification_obs_id=justification_obs_id,
         primary_user_approval_obtained=approval_flag,
+    )
+
+
+_SET_PERSON_LINEAGE_FIELDS = frozenset({"target_pn", "model_id"})
+
+
+# DESIGN INTENT — engram_set_person_lineage
+# ------------------------------------------
+# Records the agent's model training lineage (provider / family / version) on
+# a person node — typically the agent's own self-anchor (pn_self) — by patching
+# its metadata in-place.
+#
+# Motivation (standpoint v3 / issue #820): standpoint auto-stamping at filing
+# time needs the filer's lineage to be retrievable from the person node so the
+# system can derive "provider:family" without trusting the agent to supply it
+# on every call. Calling this once at session-start makes lineage systematic.
+#
+# Parsed: "claude-sonnet-4-6" → model_provider=anthropic, model_family=claude-sonnet,
+# model_version=4.6. Unrecognised formats: provider="", family=model_id, version="".
+#
+# target_pn defaults to the self-anchor when omitted.
+# Single-payload signature.
+@mcp.tool(
+    name="engram_set_person_lineage",
+    annotations={
+        "title": "Record Model Lineage on a Person Node",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_set_person_lineage(payload_json: str) -> str:
+    """Record model training lineage (provider/family/version) on a person node.
+
+    Parses the given model_id and patches the person node's metadata with
+    model_provider, model_family, and model_version fields.  Call once at
+    session start to record lineage without boilerplate on every observation.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            model_id (str, required): Model identifier, e.g. "claude-sonnet-4-6".
+                Parsed into: model_provider ("anthropic"), model_family
+                ("claude-sonnet"), model_version ("4.6").
+            target_pn (str, optional): Person node ID (pn_NNNN) to update.
+                Omit to use the graph's self-anchor.
+
+    Returns:
+        JSON with status ("ok"), person_id, model_provider, model_family,
+        model_version.  On error: {"error": "..."}.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _SET_PERSON_LINEAGE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_SET_PERSON_LINEAGE_FIELDS)}"
+        })
+    return _trust_mod._set_person_lineage_impl(
+        target_pn=params.get("target_pn", ""),
+        model_id=params.get("model_id", ""),
     )
 
 
