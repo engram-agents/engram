@@ -10,7 +10,7 @@ in live sessions (live-verified 2026-06-09). The PostCompact hook writes the
 JSONL byte offset at compact time into ~/.engram/last-compact-at.json as a
 correctness backstop — for sessions where compact_boundary is absent or
 stale the tracker falls back to the marker; for normal sessions it is a
-belt-and-suspenders efficiency hedge (avoids rescanning from the top)."""
+belt-and-suspenders efficiency hedge (avoids rescanning from the top).
 
 Also surfaces starred inter-agent letters as concise pointers in
 additionalContext so load-bearing cross-session agreements survive the
