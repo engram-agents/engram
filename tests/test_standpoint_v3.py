@@ -121,7 +121,7 @@ def test_cross_lineage_diverse_no_warning():
 
     _dv, warnings = _derive(client, [o1, o2])
     sp = _standpoint_line(warnings)
-    assert "lineage: 2 clusters (diverse)" in sp, f"expected diverse lineage, got: {sp}"
+    assert "lineage: 2 clusters / 2 leaves (diverse)" in sp, f"expected diverse lineage, got: {sp}"
     assert "⚠ uniform — shared training lineage" not in sp
     assert _composite_line(warnings) == "", f"no ⚠⚠ expected: {warnings}"
     print(f"  PASS: cross-lineage diverse: {sp[:100]}")
@@ -162,7 +162,7 @@ def test_uniform_lineage_warning_fires_when_actionable():
 
     _dv, warnings = _derive(client, [o1, o2])
     sp = _standpoint_line(warnings)
-    assert "lineage: 1 cluster (⚠ uniform — shared training lineage" in sp, (
+    assert "lineage: 1 cluster / 2 leaves (⚠ uniform — shared training lineage" in sp, (
         f"expected strengthened uniform warning, got: {sp}"
     )
     assert "zero independent corroboration on substrate-prior bias" in sp
@@ -201,8 +201,8 @@ def test_author_diverse_lineage_uniform_caught():
 
     _dv, warnings = _derive(client, [o1, o2, o3])
     sp = _standpoint_line(warnings)
-    assert "author: 3 clusters (diverse)" in sp, f"author should be diverse: {sp}"
-    assert "lineage: 1 cluster (⚠ uniform" in sp, (
+    assert "author: 3 clusters / 3 leaves (diverse)" in sp, f"author should be diverse: {sp}"
+    assert "lineage: 1 cluster / 3 leaves (⚠ uniform" in sp, (
         f"lineage uniformity must be caught despite author diversity: {sp}"
     )
     print(f"  PASS: v2 blindness pinned: {sp[:140]}")
@@ -381,7 +381,7 @@ def test_single_lineage_gate_informational_then_live():
     _obs(client, 9, lineage="openai:gpt")
     _dv2, warnings2 = _derive(client, [o1, o2], claim="Re-derived after cross-lineage filing")
     sp2 = _standpoint_line(warnings2)
-    assert "lineage: 1 cluster (⚠ uniform — shared training lineage" in sp2, (
+    assert "lineage: 1 cluster / 2 leaves (⚠ uniform — shared training lineage" in sp2, (
         f"⚠ must go live after the first cross-lineage filing: {sp2}"
     )
     print("  PASS: actionability gate both directions (graph state, not config)")
@@ -1064,7 +1064,8 @@ def test_inductive_gen_self_lineage_in_premises_flags():
     assert line, (
         f"Layer-2 check must fire when one of 2 lineages is self: {w}"
     )
-    assert "= 1 —" in line, f"independent count should be 1: {line}"
+    assert "= 1;" in line, f"independent count should be 1: {line}"
+    assert "1 of 2 leaves cross-lineage" in line, f"per-leaf proportion missing: {line}"
     assert "inductive_analogy" in line, f"should suggest inductive_analogy: {line}"
     print(f"  PASS: Layer-2 fires on self+cross (1 independent): {line[:90]}")
 

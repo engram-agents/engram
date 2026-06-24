@@ -4273,7 +4273,7 @@ def _validate_reasoning_structure(
                     n_clusters = len(vals)
                     unit = "cluster" if n_clusters == 1 else "clusters"
                     verdict = "diverse" if n_clusters > 1 else "⚠ uniform"
-                    return f"{n_clusters} {unit} ({verdict})"
+                    return f"{n_clusters} {unit} / {n_leaves} leaves ({verdict})"
 
                 parts = []
                 author_lbl = _axis_label({k["author"] for k in axis_keys})
@@ -4292,14 +4292,14 @@ def _validate_reasoning_structure(
                 lineage_vals = {k["lineage"] for k in axis_keys}
                 if None not in lineage_vals:
                     if len(lineage_vals) > 1:
-                        parts.append(f"lineage: {len(lineage_vals)} clusters (diverse)")
+                        parts.append(f"lineage: {len(lineage_vals)} clusters / {n_leaves} leaves (diverse)")
                     else:
                         lineage_uniform = True
                         if _graph_lineage_count(conn) >= 2:
                             parts.append(
-                                "lineage: 1 cluster (⚠ uniform — shared training "
-                                "lineage; zero independent corroboration on "
-                                "substrate-prior bias)"
+                                f"lineage: 1 cluster / {n_leaves} leaves (⚠ uniform — shared training "
+                                f"lineage; zero independent corroboration on "
+                                f"substrate-prior bias)"
                             )
                         # else: single-lineage graph — emit NO standalone line.
                         # null=self (Component A) makes lineage uniform on EVERY
@@ -4327,12 +4327,18 @@ def _validate_reasoning_structure(
                             lineage_vals - {self_lin_hash}
                             if self_lin_hash else lineage_vals
                         )
+                        # Count observation leaves with a cross-lineage (non-author) lineage hash.
+                        cross_lin_set = {self_lin_hash} if self_lin_hash else set()
+                        n_cross_leaves = sum(
+                            1 for k in axis_keys
+                            if k.get("lineage") is not None
+                            and k.get("lineage") not in cross_lin_set
+                        )
                         if len(independent) < 2 and _graph_lineage_count(conn) >= 2:
                             parts.append(
-                                f"⚠ inductive_generalization: independent "
-                                f"cross-lineage instances (excluding "
-                                f"hypothesis-author lineage '{self_lin}') = "
-                                f"{len(independent)} — consider inductive_analogy"
+                                f"⚠ inductive_generalization: independent cross-lineage instances "
+                                f"(excluding hypothesis-author lineage '{self_lin}') = {len(independent)}; "
+                                f"{n_cross_leaves} of {n_leaves} leaves cross-lineage — consider inductive_analogy"
                             )
 
                 # Architecture axis: collect raw enum values directly from DB
