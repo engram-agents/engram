@@ -879,5 +879,121 @@ class TestStandaloneMiniNudgeFooter(unittest.TestCase):
                       "Combined-nudge footer must still reference engram_inspect(node_id)")
 
 
+# ---------------------------------------------------------------------------
+# Golden byte-identity test — zero-packs surfacing invariant (issue #860)
+#
+# Pins the EXACT output of format_nudge() when no packs are attached at
+# byte level, not just section-absence.  Any change to the zero-packs code
+# path that alters the rendering must be reflected here deliberately rather
+# than slipping through as a silent regression.
+#
+# Fixture: fixed result dict with deterministic content (created_ago=None →
+# age tag "?", no DB-dependent or timestamp-dependent fields).
+# Golden: the literal output format_nudge() must produce for this fixture
+# when pack_results is None OR [].
+# ---------------------------------------------------------------------------
+
+_ZERO_PACKS_FIXTURE = {
+    "match_count": 2,
+    "top_claims": [
+        {
+            "id": "ob_0001",
+            "type": "observation",
+            "claim": "Test claim for zero-packs golden baseline",
+            "confidence": 0.85,
+            "recall_summary": "A test observation node",
+            "recall_keywords": ["test", "golden"],
+            "created_ago": None,   # explicit None → _compact_age returns "?" deterministically
+        }
+    ],
+    "special_nodes": [],
+    "matched_meta": [
+        {
+            "id": "ob_0002",
+            "recall_keywords": ["baseline", "packs"],
+        }
+    ],
+    "matched_ids": ["ob_0001", "ob_0002"],
+    "age": {},
+    "issues": {},
+}
+
+# The expected literal output of format_nudge(_ZERO_PACKS_FIXTURE, pack_results=None).
+# Update only when the rendering format intentionally changes — never because a
+# pack accidentally crept in.
+_ZERO_PACKS_GOLDEN = (
+    "[ENGRAM Recall: 2 nodes match your query]\n"
+    "  Top claims:\n"
+    "    - [ob_0001] (conf 0.85) · ?  `test` · `golden` — A test observation node\n"
+    "  Others:\n"
+    "    - [ob_0002] `baseline` · `packs`\n"
+    "  Use engram_inspect(node_id) for details, engram_get_subgraph for full chains."
+)
+
+
+class TestZeroPacksGoldenInvariant(unittest.TestCase):
+    """Golden byte-identity test for zero-packs surfacing invariant (issue #860).
+
+    Pins format_nudge() output byte-for-byte when no packs are attached,
+    stronger than the section-absence check in TestFormatNudgePackSection.
+    """
+
+    def setUp(self):
+        self.hook = _load_hook_module()
+
+    def test_none_pack_results_byte_identical_to_golden(self):
+        """format_nudge with pack_results=None produces byte-identical golden output."""
+        actual = self.hook.format_nudge(_ZERO_PACKS_FIXTURE, pack_results=None)
+        self.assertEqual(actual, _ZERO_PACKS_GOLDEN,
+                         "Zero-packs output (pack_results=None) diverged from golden — "
+                         "update _ZERO_PACKS_GOLDEN if the format change is intentional.")
+
+    def test_empty_list_pack_results_byte_identical_to_golden(self):
+        """format_nudge with pack_results=[] produces byte-identical golden output."""
+        actual = self.hook.format_nudge(_ZERO_PACKS_FIXTURE, pack_results=[])
+        self.assertEqual(actual, _ZERO_PACKS_GOLDEN,
+                         "Zero-packs output (pack_results=[]) diverged from golden — "
+                         "update _ZERO_PACKS_GOLDEN if the format change is intentional.")
+
+    def test_none_and_empty_list_are_identical(self):
+        """pack_results=None and pack_results=[] produce the same output."""
+        out_none = self.hook.format_nudge(_ZERO_PACKS_FIXTURE, pack_results=None)
+        out_empty = self.hook.format_nudge(_ZERO_PACKS_FIXTURE, pack_results=[])
+        self.assertEqual(out_none, out_empty,
+                         "None and [] pack_results must produce identical output.")
+
+    def test_golden_excludes_attached_libraries_section(self):
+        """The golden output itself must not contain the attached-libraries marker."""
+        self.assertNotIn("From attached libraries", _ZERO_PACKS_GOLDEN,
+                         "_ZERO_PACKS_GOLDEN must not include the pack section marker — "
+                         "fix the golden constant if it does.")
+
+    def test_with_pack_results_differs_from_golden(self):
+        """Adding pack results produces output that differs from the golden (contrast test).
+
+        Confirms the golden constant is meaningfully discriminating, not a trivially-
+        satisfied invariant.  The assertIn("From attached libraries", ...) here is a
+        contrast-sanity check — not a duplicate of TestFormatNudgePackSection::
+        test_pack_results_section_appears; that test covers section presence in
+        isolation, while this one validates the golden's ability to detect the delta.
+        """
+        pack_result = [
+            {
+                "id": "xx_0001",
+                "type": "observation",
+                "claim": "A pack claim that must not appear in zero-packs output",
+                "confidence": 0.70,
+                "recall_summary": None,
+                "recall_keywords": None,
+                "pack_id": "testlib",
+            }
+        ]
+        out_with_pack = self.hook.format_nudge(_ZERO_PACKS_FIXTURE, pack_results=pack_result)
+        self.assertNotEqual(out_with_pack, _ZERO_PACKS_GOLDEN,
+                            "Output with pack results must differ from the zero-packs golden.")
+        self.assertIn("From attached libraries", out_with_pack,
+                      "Pack section must appear when pack_results is non-empty.")
+
+
 if __name__ == "__main__":
     unittest.main()
