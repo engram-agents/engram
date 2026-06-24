@@ -317,6 +317,34 @@ _CI_PENDING_STATUSES = frozenset({
 })
 
 
+def _dedupe_checks_by_latest(checks: list) -> list:
+    """Keep only the latest run per check name.
+
+    GitHub's statusCheckRollup contains ALL runs for a PR, including
+    superseded ones from earlier commits.  When a check is re-run after a
+    new push, both the old FAILURE and the new SUCCESS appear in the list.
+    Iterating naively finds the stale FAILURE and false-blocks the gate.
+
+    ISO-8601 completedAt strings compare correctly as plain strings
+    (lexicographic == chronological).  A null/missing completedAt (check
+    still in progress) sorts before any finished timestamp, so an in-progress
+    re-run correctly loses to the completed previous run of the same name —
+    the pending state is then caught by the pending-pass below.
+
+    Edge case: if two runs for the same name both have completedAt=None
+    (both in-progress), the first one seen is kept.  In practice both would
+    be in-progress and the pending-pass catches them regardless of which wins.
+    """
+    latest: dict = {}
+    for check in checks:
+        name = check.get("name") or check.get("context") or ""
+        completed_at = check.get("completedAt") or ""
+        existing = latest.get(name)
+        if existing is None or completed_at > (existing.get("completedAt") or ""):
+            latest[name] = check
+    return list(latest.values())
+
+
 def _pr_ci_state(pr_number: str) -> tuple:
     """Query GitHub CI state for a pull request via `gh`.
 
@@ -357,6 +385,12 @@ def _pr_ci_state(pr_number: str) -> tuple:
     except (json.JSONDecodeError, ValueError):
         return ("unknown", "gh returned unparseable JSON")
 
+    # mergeStateStatus=CLEAN is GitHub's authoritative "latest run per check
+    # all passed" verdict — trust it directly and skip per-check analysis.
+    merge_state = (data.get("mergeStateStatus") or "").upper()
+    if merge_state == "CLEAN":
+        return ("green", "mergeStateStatus=CLEAN")
+
     checks = data.get("statusCheckRollup")
     if not isinstance(checks, list):
         return ("unknown", "statusCheckRollup missing or not a list")
@@ -364,6 +398,10 @@ def _pr_ci_state(pr_number: str) -> tuple:
     if not checks:
         # No checks registered — treat as green
         return ("green", "no checks registered")
+
+    # Dedupe: keep only the latest run per check name so stale superseded
+    # runs (e.g. FAILURE from a pre-push commit) don't false-block (#1366).
+    checks = _dedupe_checks_by_latest(checks)
 
     for check in checks:
         # Handle both check-run shape (conclusion) and status-context shape (state/status)

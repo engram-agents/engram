@@ -1727,3 +1727,113 @@ class TestPoolSentinel:
         assert "sentinel" in stderr.lower() or "primary_user" in stderr.lower(), (
             f"Expected error message mentioning sentinel/primary_user; got: {stderr!r}"
         )
+
+
+# ===========================================================================
+# CATEGORY 12: CI-state dedup helper + mergeStateStatus=CLEAN short-circuit (#1366)
+# ===========================================================================
+
+import importlib.util as _ilu
+import unittest.mock as _mock
+
+def _load_baton_module():
+    spec = _ilu.spec_from_file_location("baton", CLI_PATH)
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestCiStateDedup:
+    """Unit tests for _dedupe_checks_by_latest and the _pr_ci_state fix (#1366).
+
+    Root cause: statusCheckRollup contains ALL runs including superseded ones.
+    A stale FAILURE from a pre-push commit falsely blocked baton flip even when
+    the latest run of the same check was SUCCESS.
+    """
+
+    @pytest.fixture
+    def baton(self):
+        return _load_baton_module()
+
+    def test_dedupe_keeps_latest_by_completed_at(self, baton):
+        checks = [
+            {"name": "trap-check", "conclusion": "FAILURE", "completedAt": "2026-06-24T10:00:00Z"},
+            {"name": "trap-check", "conclusion": "SUCCESS", "completedAt": "2026-06-24T12:00:00Z"},
+        ]
+        result = baton._dedupe_checks_by_latest(checks)
+        assert len(result) == 1
+        assert result[0]["conclusion"] == "SUCCESS"
+
+    def test_dedupe_null_completed_at_loses_to_finished(self, baton):
+        # In-progress re-run (null completedAt) should not displace a finished run,
+        # regardless of which ordering they appear in the list.
+        checks_finished_first = [
+            {"name": "ci", "conclusion": "SUCCESS", "completedAt": "2026-06-24T12:00:00Z"},
+            {"name": "ci", "conclusion": None, "completedAt": None},
+        ]
+        result = baton._dedupe_checks_by_latest(checks_finished_first)
+        assert len(result) == 1
+        assert result[0]["conclusion"] == "SUCCESS"
+
+        checks_null_first = [
+            {"name": "ci", "conclusion": None, "completedAt": None},
+            {"name": "ci", "conclusion": "SUCCESS", "completedAt": "2026-06-24T12:00:00Z"},
+        ]
+        result = baton._dedupe_checks_by_latest(checks_null_first)
+        assert len(result) == 1
+        assert result[0]["conclusion"] == "SUCCESS"
+
+    def test_dedupe_preserves_distinct_names(self, baton):
+        checks = [
+            {"name": "manifest-gate", "conclusion": "SUCCESS", "completedAt": "2026-06-24T12:00:00Z"},
+            {"name": "trap-check",    "conclusion": "SUCCESS", "completedAt": "2026-06-24T12:01:00Z"},
+        ]
+        result = baton._dedupe_checks_by_latest(checks)
+        assert len(result) == 2
+
+    def test_pr_ci_state_clean_short_circuits(self, baton):
+        # mergeStateStatus=CLEAN should return green immediately, even if the
+        # rollup contains a stale FAILURE entry.
+        payload = json.dumps({
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": [
+                {"name": "trap-check", "conclusion": "FAILURE",
+                 "completedAt": "2026-06-24T10:00:00Z", "state": "COMPLETED"},
+            ],
+        })
+        mock_result = _mock.MagicMock(returncode=0, stdout=payload, stderr="")
+        with _mock.patch("subprocess.run", return_value=mock_result):
+            state, detail = baton._pr_ci_state("123")
+        assert state == "green"
+        assert "CLEAN" in detail
+
+    def test_pr_ci_state_stale_failure_with_latest_success_is_green(self, baton):
+        # Two runs of the same check: old FAILURE, new SUCCESS.
+        # Without dedup the old code returned red; with dedup it's green.
+        payload = json.dumps({
+            "mergeStateStatus": "UNKNOWN",
+            "statusCheckRollup": [
+                {"name": "trap-check", "conclusion": "FAILURE",
+                 "completedAt": "2026-06-24T10:00:00Z", "state": "COMPLETED"},
+                {"name": "trap-check", "conclusion": "SUCCESS",
+                 "completedAt": "2026-06-24T12:00:00Z", "state": "COMPLETED"},
+            ],
+        })
+        mock_result = _mock.MagicMock(returncode=0, stdout=payload, stderr="")
+        with _mock.patch("subprocess.run", return_value=mock_result):
+            state, detail = baton._pr_ci_state("123")
+        assert state == "green", f"expected green, got {state!r}: {detail}"
+
+    def test_pr_ci_state_genuine_failure_is_red(self, baton):
+        payload = json.dumps({
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [
+                {"name": "trap-check", "conclusion": "FAILURE",
+                 "completedAt": "2026-06-24T12:00:00Z", "state": "COMPLETED"},
+            ],
+        })
+        mock_result = _mock.MagicMock(returncode=0, stdout=payload, stderr="")
+        with _mock.patch("subprocess.run", return_value=mock_result):
+            state, detail = baton._pr_ci_state("123")
+        assert state == "red"
+        assert "trap-check" in detail
