@@ -340,7 +340,7 @@ class TestCodexAgentEmission:
         master = self._read_agent(codex_convenience_bundle, "engram-dream-master")
         assert coder["model"] == "gpt-5.4"
         assert coder["model_reasoning_effort"] == "high"
-        assert master["model"] == "gpt-5.5"
+        assert master["model"] == "gpt-5.4"
         assert master["model_reasoning_effort"] == "high"
 
     def test_codex_agent_no_claude_frontmatter_leaks(self, codex_convenience_bundle):

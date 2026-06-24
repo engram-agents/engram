@@ -296,7 +296,7 @@ def test_supersede_json_payload(pkg_dir):
 
 def test_add_evidence_stdin_payload(pkg_dir):
     """Passing "-" as json_payload reads the JSON from stdin."""
-    payload = json.dumps({"url": "https://stdin-test.example.com", "title": "Stdin Source"})
+    payload = json.dumps({"url": "https://example.com", "title": "Stdin Source"})
     result = _run(["add-evidence", "-"], pkg_dir, input_text=payload)
     assert result.returncode == 0, (
         f"add-evidence stdin path failed (rc={result.returncode}):\n"
