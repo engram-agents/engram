@@ -54,6 +54,8 @@ VALID_ERROR_TYPES = {
     "other",              # anything else
 }
 
+VALID_INITIATION_TYPES = frozenset({"user_prompted", "gate_prompted", "unprompted"})
+
 # Discipline hint returned when the threshold gate fires on engram_resolve.
 # Surfaces in the result JSON as "discipline_hint" alongside "note" to guide
 # callers away from chain-dilution and toward legitimate paths forward.
@@ -883,6 +885,9 @@ def _retract_impl(
     error_type: str = "",
     reason: str = "",
     replacement_json: str = "",
+    initiation: str = "",
+    initiation_gate: str = "",
+    initiation_ref: str = "",
     _obs_creator=None,
 ) -> str:
     """Internal implementation — see engram_retract MCP tool for the public
@@ -927,6 +932,17 @@ def _retract_impl(
         replacement_json: Optional JSON object with fields for creating a correct
             replacement observation: {"quoted_text", "interpretation", "claim",
             "quote_type", "source_class"}. The replacement cites the same evidence.
+        initiation (str, optional): Who initiated this retraction. One of:
+            user_prompted — triggered by explicit user request;
+            gate_prompted — triggered by an internal gate (see initiation_gate);
+            unprompted — self-initiated without external prompt.
+        initiation_gate (str, optional): Which gate triggered the retraction
+            (e.g. 'honesty_axiom', 'deference_detector'). Meaningful only
+            when initiation='gate_prompted'.
+        initiation_ref (str, optional): Session ID at retract-time (auto-
+            captured by the server wrapper; not a user-supplied field).
+            Allows contingent-verification of the initiation tier while the
+            session transcript lives.
         _obs_creator: Optional callable matching the _add_observation_impl
             signature — injected by the server.py wrapper so this module
             does not need to import server.py (acyclic dependency rule).
@@ -946,6 +962,17 @@ def _retract_impl(
     if error_type not in VALID_ERROR_TYPES:
         return json.dumps({
             "error": f"Invalid error_type '{error_type}'. Must be one of: {', '.join(sorted(VALID_ERROR_TYPES))}"
+        })
+
+    if initiation and initiation not in VALID_INITIATION_TYPES:
+        return json.dumps({
+            "error": f"Invalid initiation '{initiation}'. Must be one of: {', '.join(sorted(VALID_INITIATION_TYPES))}"
+        })
+
+    if initiation_gate and initiation != "gate_prompted":
+        return json.dumps({
+            "error": "initiation_gate is only valid when initiation='gate_prompted'. "
+                     f"Got initiation='{initiation or '(unset)'}' with initiation_gate='{initiation_gate}'."
         })
 
     conn = core._get_db()
@@ -975,6 +1002,12 @@ def _retract_impl(
         retract_meta["error_type"] = error_type
         retract_meta["retraction_reason"] = reason
         retract_meta["retracted_at"] = now
+        if initiation:
+            retract_meta["initiation"] = initiation
+        if initiation_gate:
+            retract_meta["initiation_gate"] = initiation_gate
+        if initiation_ref:
+            retract_meta["initiation_ref"] = initiation_ref
 
         conn.execute(
             "UPDATE nodes SET status = 'retracted', is_current = 0, metadata = ? WHERE id = ?",
@@ -1211,6 +1244,12 @@ def _retract_impl(
             "tainted_contradictions": tainted_contradictions,
             "tainted_contradiction_count": len(tainted_contradictions),
         }
+        if initiation:
+            result["initiation"] = initiation
+        if initiation_gate:
+            result["initiation_gate"] = initiation_gate
+        if initiation_ref:
+            result["initiation_ref"] = initiation_ref
         if support_lost_cs_ls:
             result["support_lost"] = support_lost_cs_ls
             result["support_lost_count"] = len(support_lost_cs_ls)

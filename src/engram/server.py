@@ -4672,7 +4672,10 @@ def engram_supersede(payload_json: str) -> str:
 # _detect_zero_support body moved to engram_revision.py (family E) in #872 wave 6.
 # Compat forwarder above in wave-6 compat block.
 # Set of legitimate field names for the engram_retract payload.
-_RETRACT_FIELDS = frozenset({"node_id", "error_type", "reason", "replacement_json"})
+_RETRACT_FIELDS = frozenset({
+    "node_id", "error_type", "reason", "replacement_json",
+    "initiation", "initiation_gate",
+})
 
 
 # DESIGN INTENT — engram_retract
@@ -4734,6 +4737,11 @@ def engram_retract(payload_json: str) -> str:
                 observation fields {quoted_text, interpretation, claim,
                 quote_type, source_class}. The replacement cites the same
                 evidence.
+            initiation (str, optional): Who initiated the retraction. One of:
+                user_prompted, gate_prompted, unprompted.
+            initiation_gate (str, optional): Which gate triggered the
+                retraction (e.g. 'honesty_axiom'). Meaningful only when
+                initiation='gate_prompted'.
 
     Returns:
         JSON with retraction details, tainted downstream nodes, and optional
@@ -4755,7 +4763,12 @@ def engram_retract(payload_json: str) -> str:
                      f"Allowed: {sorted(_RETRACT_FIELDS)}"
         })
 
-    return _retract_impl(**params)
+    _initiation_ref = (
+        os.environ.get("CLAUDE_SESSION_ID")
+        or os.environ.get("ANTHROPIC_SESSION_ID")
+        or ""
+    )
+    return _retract_impl(**params, initiation_ref=_initiation_ref)
 
 
 # _retract_impl body moved to engram_revision.py (family E) in #872 wave 6.

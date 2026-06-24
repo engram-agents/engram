@@ -6,6 +6,9 @@ Coverage:
   3. Required-field validation — missing node_id / error_type / reason rejected.
   4. error_type validation — invalid error_type rejected.
   5. Internal helper — _retract_impl works with named kwargs.
+  6. Retract deletes resolves edges (issue #211, Option A).
+  7. Self-anchor retract warning (issue #1200).
+  8. Initiation provenance fields (issue #1099 C1).
 
 Note on terminology: the OUTER param is `payload_json` (wave 2 wrapper);
 there is also an INNER `replacement_json` field inside the payload (the
@@ -458,3 +461,226 @@ def test_retract_self_anchor_still_retracts():
         row = conn.execute("SELECT status, is_current FROM nodes WHERE id = ?", (person_id,)).fetchone()
     assert row["status"] == "retracted"
     assert row["is_current"] == 0
+
+
+# ── 8. Initiation provenance fields ───────────────────────────────────────
+
+
+def test_initiation_user_prompted_stored():
+    """initiation='user_prompted' is stored in metadata and echoed in result."""
+    server = fresh_server()
+    ob_id = _seed_observation(server)
+    payload = {
+        "node_id": ob_id,
+        "error_type": "other",
+        "reason": "Test initiation field.",
+        "initiation": "user_prompted",
+    }
+    r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    assert r.get("initiation") == "user_prompted", r
+    # Verify it's in DB metadata
+    import sqlite3
+    db_path = os.path.join(TEST_DIR, "knowledge.db")
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (ob_id,)).fetchone()
+    meta = json.loads(row["metadata"])
+    assert meta.get("initiation") == "user_prompted", meta
+
+
+def test_initiation_gate_prompted_with_gate():
+    """initiation='gate_prompted' + initiation_gate stored and echoed."""
+    server = fresh_server()
+    ob_id = _seed_observation(server)
+    payload = {
+        "node_id": ob_id,
+        "error_type": "hallucinated_claim",
+        "reason": "Gate flagged this as unsupported.",
+        "initiation": "gate_prompted",
+        "initiation_gate": "honesty_axiom",
+    }
+    r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    assert r.get("initiation") == "gate_prompted", r
+    assert r.get("initiation_gate") == "honesty_axiom", r
+    import sqlite3
+    db_path = os.path.join(TEST_DIR, "knowledge.db")
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (ob_id,)).fetchone()
+    meta = json.loads(row["metadata"])
+    assert meta.get("initiation") == "gate_prompted", meta
+    assert meta.get("initiation_gate") == "honesty_axiom", meta
+
+
+def test_initiation_unprompted_stored():
+    """initiation='unprompted' is stored and echoed."""
+    server = fresh_server()
+    ob_id = _seed_observation(server)
+    payload = {
+        "node_id": ob_id,
+        "error_type": "duplicate",
+        "reason": "Self-identified as duplicate during routine scan.",
+        "initiation": "unprompted",
+    }
+    r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    assert r.get("initiation") == "unprompted", r
+
+
+def test_initiation_omitted_leaves_no_key():
+    """When initiation is omitted, result has no 'initiation' key."""
+    server = fresh_server()
+    ob_id = _seed_observation(server)
+    payload = {
+        "node_id": ob_id,
+        "error_type": "other",
+        "reason": "No initiation supplied.",
+    }
+    r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    assert "initiation" not in r, f"expected no initiation key, got: {r}"
+
+
+def test_initiation_invalid_value_rejected():
+    """An invalid initiation value is rejected before the retraction executes."""
+    server = fresh_server()
+    ob_id = _seed_observation(server)
+    payload = {
+        "node_id": ob_id,
+        "error_type": "other",
+        "reason": "x",
+        "initiation": "self_initiated",  # invalid — not in VALID_INITIATION_TYPES
+    }
+    r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert "Invalid initiation" in r["error"], r
+
+
+def test_initiation_ref_auto_captured_in_metadata():
+    """initiation_ref is auto-captured by the server wrapper and stored in metadata."""
+    import sqlite3
+    server = fresh_server()
+    ob_id = _seed_observation(server)
+    # Set an env var so we can verify the capture path
+    os.environ["CLAUDE_SESSION_ID"] = "test-session-abc123"
+    try:
+        payload = {
+            "node_id": ob_id,
+            "error_type": "other",
+            "reason": "Test session capture.",
+            "initiation": "unprompted",
+        }
+        r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+        assert "error" not in r, r
+        # initiation_ref echoed in result
+        assert r.get("initiation_ref") == "test-session-abc123", r
+        # and stored in DB metadata
+        db_path = os.path.join(TEST_DIR, "knowledge.db")
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (ob_id,)).fetchone()
+        meta = json.loads(row["metadata"])
+        assert meta.get("initiation_ref") == "test-session-abc123", meta
+    finally:
+        os.environ.pop("CLAUDE_SESSION_ID", None)
+
+
+def test_initiation_ref_not_user_supplied():
+    """initiation_ref is NOT accepted as a user-supplied field (unknown-field rejection)."""
+    server = fresh_server()
+    ob_id = _seed_observation(server)
+    payload = {
+        "node_id": ob_id,
+        "error_type": "other",
+        "reason": "x",
+        "initiation_ref": "user-tried-to-supply-this",
+    }
+    r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+    assert "error" in r and "Unknown fields" in r["error"], r
+    assert "initiation_ref" in r["error"], r
+
+
+def test_initiation_gate_without_gate_prompted_rejected():
+    """initiation_gate supplied with initiation != 'gate_prompted' is rejected."""
+    server = fresh_server()
+    ob_id = _seed_observation(server)
+    # gate with user_prompted — contradictory combination
+    payload = {
+        "node_id": ob_id,
+        "error_type": "other",
+        "reason": "x",
+        "initiation": "user_prompted",
+        "initiation_gate": "honesty_axiom",
+    }
+    r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert "initiation_gate" in r["error"] and "gate_prompted" in r["error"], r
+
+
+def test_initiation_gate_without_initiation_rejected():
+    """initiation_gate with no initiation field is also rejected (not gate_prompted)."""
+    server = fresh_server()
+    ob_id = _seed_observation(server)
+    payload = {
+        "node_id": ob_id,
+        "error_type": "other",
+        "reason": "x",
+        "initiation_gate": "honesty_axiom",
+    }
+    r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert "initiation_gate" in r["error"] and "gate_prompted" in r["error"], r
+
+
+def test_initiation_ref_captured_without_initiation_field():
+    """initiation_ref is captured from env even when no initiation label is supplied."""
+    import sqlite3
+    server = fresh_server()
+    ob_id = _seed_observation(server)
+    os.environ["CLAUDE_SESSION_ID"] = "session-no-initiation"
+    try:
+        payload = {
+            "node_id": ob_id,
+            "error_type": "other",
+            "reason": "No initiation label, but session should still be captured.",
+        }
+        r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+        assert "error" not in r, r
+        assert r.get("initiation_ref") == "session-no-initiation", r
+        db_path = os.path.join(TEST_DIR, "knowledge.db")
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (ob_id,)).fetchone()
+        meta = json.loads(row["metadata"])
+        assert meta.get("initiation_ref") == "session-no-initiation", meta
+    finally:
+        os.environ.pop("CLAUDE_SESSION_ID", None)
+
+
+def test_initiation_ref_anthropic_session_id_fallback():
+    """ANTHROPIC_SESSION_ID is used as fallback when CLAUDE_SESSION_ID is absent."""
+    import sqlite3
+    server = fresh_server()
+    ob_id = _seed_observation(server)
+    os.environ.pop("CLAUDE_SESSION_ID", None)
+    os.environ["ANTHROPIC_SESSION_ID"] = "anthropic-fallback-xyz"
+    try:
+        payload = {
+            "node_id": ob_id,
+            "error_type": "other",
+            "reason": "Test ANTHROPIC_SESSION_ID fallback path.",
+            "initiation": "unprompted",
+        }
+        r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+        assert "error" not in r, r
+        assert r.get("initiation_ref") == "anthropic-fallback-xyz", r
+        db_path = os.path.join(TEST_DIR, "knowledge.db")
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (ob_id,)).fetchone()
+        meta = json.loads(row["metadata"])
+        assert meta.get("initiation_ref") == "anthropic-fallback-xyz", meta
+    finally:
+        os.environ.pop("ANTHROPIC_SESSION_ID", None)
