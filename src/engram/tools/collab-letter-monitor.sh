@@ -30,6 +30,10 @@
 #     dir) can never overwrite a live monitor's baseline and flood it.
 #   - own-write exclusion kept as belt-and-suspenders: a self-addressed letter
 #     is the only case it changes, and skipping it is correct there too.
+#   - engaged-suppression (#1077 part 2): while last-user-activity is within
+#     the engaged window (default 360s = 6 min), skip the emit cycle entirely —
+#     letters accumulate as unseen and are emitted after the window expires.
+#     The 'engaged' status is published by the forum prompt hook independently.
 
 set -u
 # NOT -e: a transient failure must not kill a session-length watch.
@@ -143,10 +147,29 @@ SEEN="${COLLAB_MONITOR_SEEN_FILE:-$HOME/.engram/.collab-monitor-seen.$(printf '%
 # Seed the seen-set with everything already present, so we emit only NEW arrivals.
 ls "$DIR"/*.md 2>/dev/null | sort > "$SEEN"
 
+# Path to the last-user-activity stamp (written by the time-bar hook on each
+# genuine human-typed prompt). Used to detect the 'engaged' / talking-to-user
+# state — same source as _status_derive._recently_engaged() in Python.
+LAST_USER_ACTIVITY="$HOME/.engram/last-user-activity"
+# Engaged-window in seconds: matches _status_derive._DEFAULT_ENGAGED_WINDOW (360).
+# If cadence.engaged_window_seconds is customised in config.json, update this too.
+_ENGAGED_WINDOW=360
+
 # ---------------------------------------------------------------------------
 # poll loop
 # ---------------------------------------------------------------------------
 while true; do
+    # Suppress events during interactive (talking-to-user / 'engaged') sessions
+    # (#1077 part 2). When the user is actively conversing, waking the agent
+    # mid-turn adds noise. Letters accumulate as unseen; the monitor emits
+    # them once the engaged window expires (default 6 min of user inactivity).
+    if [ -f "$LAST_USER_ACTIVITY" ]; then
+        _stamp="$(cat "$LAST_USER_ACTIVITY" 2>/dev/null || echo 0)"
+        _age=$(( $(date +%s) - ${_stamp:-0} )) || _age=999999
+        if [ "$_age" -ge 0 ] && [ "$_age" -le "$_ENGAGED_WINDOW" ]; then
+            sleep 2; continue
+        fi
+    fi
     ls "$DIR"/*.md 2>/dev/null | sort > "$SEEN.now"
     # Only diff+update on a non-empty listing — a transient empty `ls` must not
     # clobber $SEEN (the seed-clobber flood, #743). A genuinely empty dir simply

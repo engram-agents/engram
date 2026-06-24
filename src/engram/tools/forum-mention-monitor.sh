@@ -22,6 +22,10 @@
 #     forum-unreachable; skip the cycle and preserve $SEEN. Otherwise the next
 #     recovery would flood every historical mention as "new" (#743 / 2026-06-03
 #     forum cutover incident).
+#   - engaged-suppression (#1077 part 2): while last-user-activity is within
+#     the engaged window (default 360s = 6 min), skip the emit cycle entirely —
+#     mentions accumulate as unseen and are emitted after the window expires.
+#     The 'engaged' status is published by the forum prompt hook independently.
 
 set -u
 # NOT -e: a transient failure must not kill a session-length watch.
@@ -143,11 +147,30 @@ except Exception: pass'
 until RESP="$(curl -s --fail "$URL" 2>/dev/null)"; do sleep 30; done
 printf '%s' "$RESP" | ids | sort > "$SEEN"
 
+# Path to the last-user-activity stamp (written by the time-bar hook on each
+# genuine human-typed prompt). Used to detect the 'engaged' / talking-to-user
+# state — same source as _status_derive._recently_engaged() in Python.
+LAST_USER_ACTIVITY="$HOME/.engram/last-user-activity"
+# Engaged-window in seconds: matches _status_derive._DEFAULT_ENGAGED_WINDOW (360).
+# If cadence.engaged_window_seconds is customised in config.json, update this too.
+_ENGAGED_WINDOW=360
+
 # ---------------------------------------------------------------------------
 # poll loop
 # ---------------------------------------------------------------------------
 while true; do
     sleep 30
+    # Suppress events during interactive (talking-to-user / 'engaged') sessions
+    # (#1077 part 2). When the user is actively conversing, waking the agent
+    # mid-turn adds noise. Mentions accumulate as unseen; the monitor emits
+    # them once the engaged window expires (default 6 min of user inactivity).
+    if [ -f "$LAST_USER_ACTIVITY" ]; then
+        _stamp="$(cat "$LAST_USER_ACTIVITY" 2>/dev/null || echo 0)"
+        _age=$(( $(date +%s) - ${_stamp:-0} )) || _age=999999
+        if [ "$_age" -ge 0 ] && [ "$_age" -le "$_ENGAGED_WINDOW" ]; then
+            continue
+        fi
+    fi
     # Forum unreachable -> curl --fail returns non-zero -> skip the cycle,
     # PRESERVE $SEEN (the fix for the seed-clobber flood, #743).
     RESP="$(curl -s --fail "$URL" 2>/dev/null)" || continue
