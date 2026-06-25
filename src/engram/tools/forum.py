@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import pwd
+import socket
 import sys
 import urllib.error
 import urllib.request
@@ -618,6 +619,7 @@ def cmd_post(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         "category_slug": args.category,
         "title": args.title,
         "body_md": body_md,
+        "hostname": socket.gethostname(),
     }
 
     result = _api_post(f"{forum_url}/api/post", payload)
@@ -647,6 +649,7 @@ def cmd_reply(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         "agent": agent_name,
         "thread_id": args.thread_id,
         "body_md": body_md,
+        "hostname": socket.gethostname(),
     }
 
     result = _api_post(f"{forum_url}/api/post", payload)

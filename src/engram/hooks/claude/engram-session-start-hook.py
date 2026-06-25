@@ -488,6 +488,122 @@ def write_agent_registration(
         pass
 
 
+def update_counterparts_from_registry(
+    agent_name: str,
+    config_path: str,
+    registry_dir: str = AGENT_REGISTRY_DIR,
+) -> None:
+    """Update config.json's counterparts list from the live agent registry.
+
+    Replaces the manually-maintained counterparts list with ground truth derived
+    from the shared registry.  Co-host peers (same hostname as the current agent)
+    are the ones reachable via ia/baton and therefore the meaningful counterpart
+    set.  Cross-host peers are excluded.
+
+    Stale entries (older than PEER_STALE_HOURS from ia.py, mirrored here as 24h)
+    are excluded — same policy as ia.py's scan_peers().
+
+    Fail-soft: any exception is silently caught, identical to
+    write_agent_registration.  Never raises.  The gate:
+    - shared-fs root must exist (same as write_agent_registration).
+    - config.json must be readable and writable.
+    - registry_dir must be a directory.
+    If any of those fail, silently returns.
+
+    Write is atomic: temp file in same directory as config.json + os.replace.
+
+    Args:
+        agent_name   : This agent's own name (used to exclude self from peers).
+        config_path  : Absolute path to config.json.
+        registry_dir : Path to the agent registry directory.
+                       Override in tests via AGENTS_SHARED_DIR env.
+    """
+    try:
+        registry_path = Path(registry_dir)
+        if not registry_path.is_dir():
+            return
+
+        own_hostname = socket.gethostname()
+        now = datetime.now(timezone.utc)
+        stale_delta_seconds = 24 * 3600  # PEER_STALE_HOURS = 24
+
+        co_host_names: list[str] = []
+        for json_file in sorted(registry_path.glob("*.json")):
+            try:
+                text = json_file.read_text(encoding="utf-8")
+                record = json.loads(text)
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue  # skip malformed/unreadable files
+
+            if not isinstance(record, dict):
+                continue
+
+            peer_name = record.get("agent_name", "").strip()
+            peer_hostname = record.get("hostname", "").strip()
+
+            # Must have both name and hostname
+            if not peer_name or not peer_hostname:
+                continue
+
+            # Exclude self
+            if peer_name.lower() == agent_name.lower():
+                continue
+
+            # Skip stale entries
+            registered_at_str = record.get("registered_at")
+            if registered_at_str:
+                try:
+                    registered_dt = datetime.fromisoformat(
+                        registered_at_str.replace("Z", "+00:00")
+                    )
+                    if registered_dt.tzinfo is None:
+                        registered_dt = registered_dt.replace(tzinfo=timezone.utc)
+                    age_seconds = (now - registered_dt).total_seconds()
+                    if age_seconds > stale_delta_seconds:
+                        continue  # stale — skip
+                except (ValueError, TypeError):
+                    pass  # can't parse age — include conservatively
+
+            # Co-host only: same hostname as this agent
+            if peer_hostname != own_hostname:
+                continue
+
+            co_host_names.append(peer_name)
+
+        co_host_names.sort()
+
+        # If the registry has entries but we found zero co-host peers, the registry
+        # is likely in a transient state (simultaneous restarts filtering all entries
+        # as stale).  Skip the write to avoid blanking the counterparts list spuriously.
+        # If the registry is genuinely empty (no .json files), fall through and clear.
+        if not co_host_names and any(registry_path.glob("*.json")):
+            return
+
+        # Read current config.json
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+
+        config["counterparts"] = co_host_names
+
+        # Atomic write: temp in same dir as config.json, then os.replace
+        config_dir = os.path.dirname(config_path)
+        fd, tmp_path = tempfile.mkstemp(dir=config_dir, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
+                f.write("\n")
+            os.replace(tmp_path, config_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception:
+        # Fail-soft: never raise from a multi-agent convenience side-effect.
+        pass
+
+
 def starred_block(engram_home: str) -> str:
     """Render starred inter-agent letters as concise pointers.
 
@@ -1098,6 +1214,7 @@ def main() -> None:
         _agent_name = _cfg.get("agent_name", "").strip()
         if _agent_name:
             write_agent_registration(_agent_name)
+            update_counterparts_from_registry(_agent_name, _config_path, AGENT_REGISTRY_DIR)
     except Exception:
         pass  # fail-soft: never break SessionStart for registration
 

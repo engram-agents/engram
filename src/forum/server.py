@@ -599,8 +599,9 @@ def create_app(
 
         thread_id = data.get("thread_id")
         source_ip = request.remote_addr or "unknown"
+        hostname = (data.get("hostname") or "").strip() or None
 
-        agent_id = db.upsert_agent(g.conn, agent_name)
+        agent_id = db.upsert_agent(g.conn, agent_name, hostname=hostname)
 
         if thread_id is None:
             # New thread

@@ -435,6 +435,10 @@ def init_db(conn: sqlite3.Connection, categories_config: str | None = None) -> N
         conn.execute(
             "ALTER TABLE agents ADD COLUMN expected_republish_seconds INTEGER"
         )
+    # #1266: hostname of the agent's host, for co-host vs cross-host topology.
+    # NULL for agents that registered before this migration.
+    if "hostname" not in agent_cols:
+        conn.execute("ALTER TABLE agents ADD COLUMN hostname TEXT")
 
     # ----------------------------------------------------------------
     # vec0 virtual tables (created only when sqlite-vec is available).
@@ -473,18 +477,27 @@ def init_db(conn: sqlite3.Connection, categories_config: str | None = None) -> N
 # ---------------------------------------------------------------------------
 # Agent helpers
 # ---------------------------------------------------------------------------
-def upsert_agent(conn: sqlite3.Connection, name: str) -> int:
+def upsert_agent(conn: sqlite3.Connection, name: str, hostname: str | None = None) -> int:
     """Return agent_id for the named agent, creating it on first appearance.
 
     On subsequent calls, bumps ``last_seen_at`` to now.
     ``avatar_seed`` defaults to the agent name.
+
+    ``hostname`` is the agent's machine hostname (for co-host vs cross-host
+    topology detection, #1266).  When ``hostname`` is non-None, it is stored /
+    updated.  When ``hostname`` is None, any previously-stored hostname is
+    preserved (the DO UPDATE clause only overwrites when the new value is
+    non-null, so read-only upserts with hostname=None never clobber the stored
+    value).
     """
     now = _now_iso()
     conn.execute(
-        "INSERT INTO agents(name, avatar_seed, first_seen_at, last_seen_at) "
-        "VALUES(?, ?, ?, ?) "
-        "ON CONFLICT(name) DO UPDATE SET last_seen_at = excluded.last_seen_at",
-        (name, name, now, now),
+        "INSERT INTO agents(name, avatar_seed, first_seen_at, last_seen_at, hostname) "
+        "VALUES(?, ?, ?, ?, ?) "
+        "ON CONFLICT(name) DO UPDATE SET "
+        "    last_seen_at = excluded.last_seen_at, "
+        "    hostname = COALESCE(excluded.hostname, agents.hostname)",
+        (name, name, now, now, hostname),
     )
     conn.commit()
     row = conn.execute("SELECT id FROM agents WHERE name = ?", (name,)).fetchone()
@@ -1223,7 +1236,7 @@ def get_thread(
     post_rows = conn.execute(
         """
         SELECT p.id, a.name, a.avatar_seed, a.pair_initials,
-               p.body_md, p.created_at, p.edited_at
+               p.body_md, p.created_at, p.edited_at, a.hostname AS author_hostname
           FROM posts p
           JOIN agents a ON a.id = p.author_agent_id
          WHERE p.thread_id = ?
@@ -1242,6 +1255,7 @@ def get_thread(
                 "name": r[1],
                 "avatar_seed": r[2],
                 "pair_initials": r[3],
+                "hostname": r[7],
             },
             "body_md": body_md,
             "created_at": r[5],
