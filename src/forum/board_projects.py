@@ -378,9 +378,18 @@ def read_project_board(projects_dir: Optional[Path] = None) -> list[dict[str, An
         except OSError:
             file_mtime = None
 
+        # Display time: prefer turn_since ("whose turn, since when").
         updated_at = turn_since or file_mtime
         updated_at_str = (
             updated_at.strftime("%Y-%m-%dT%H:%M:%SZ") if updated_at else ""
+        )
+        # Cursor key for the /updates feed: the file's SERVER-OBSERVED mtime —
+        # set atomically by baton's temp+rename at the instant the file becomes
+        # visible — NOT the writer-stamped turn_since (which precedes visibility
+        # and causes silent missed wakes, #1445). Falls back to display time only
+        # if the mtime is unreadable.
+        cursor_ts_str = (
+            file_mtime.strftime("%Y-%m-%dT%H:%M:%SZ") if file_mtime else updated_at_str
         )
 
         kind = _infer_kind(project_id, github_ref)
@@ -406,6 +415,7 @@ def read_project_board(projects_dir: Optional[Path] = None) -> list[dict[str, An
             "github": github_ref,
             "updated_at": updated_at_str,
             "updated_at_dt": updated_at,
+            "cursor_ts": cursor_ts_str,
             "_pr_num": pr_m.group(1) if pr_m else None,
         })
 
@@ -451,6 +461,7 @@ def read_project_board(projects_dir: Optional[Path] = None) -> list[dict[str, An
             "gh_state": gh_state,
             "gh_unknown": gh_unknown,
             "updated_at": raw["updated_at"],
+            "cursor_ts": raw["cursor_ts"],
             "age_str": age,
         }
         items.append(item)
@@ -490,16 +501,21 @@ def filter_updates(
 
     Args:
         items:  Full board item list from read_project_board().
-        since:  ISO-8601 cursor string (exclusive: items with updated_at > since).
+        since:  ISO-8601 cursor string (exclusive: items with cursor_ts > since).
                 None returns all items.
         agent:  If provided, only items whose turn == agent.
 
     Returns:
         Filtered list preserving original order.
 
-    Since-cursor correctness: we use `turn_since` as the change-time when
-    available, falling back to updated_at (which itself falls back to file
-    mtime). This matches the spec: "change-time (turn_since, else file mtime)".
+    Since-cursor correctness (#1445 fix): the cursor keys on `cursor_ts` — the
+    file's SERVER-OBSERVED mtime, which baton's atomic temp+rename sets at the
+    instant the file becomes visible — NOT the writer-stamped `turn_since`.
+    Because the cursor key is set by the same atomic op that makes the file
+    readable, no poll's `as_of` can advance past an item before it is visible,
+    so a court-change is never silently missed. (`turn_since` precedes visibility
+    by the write duration and caused the silent-miss; it stays the display value
+    only.)
     """
     since_dt: Optional[datetime] = None
     if since:
@@ -511,9 +527,9 @@ def filter_updates(
         if agent is not None and item["turn"] != agent.lower().strip():
             continue
 
-        # Since filter: compare updated_at (already the turn_since or mtime).
+        # Since filter keyed on the visibility-monotonic mtime cursor (#1445).
         if since_dt is not None:
-            item_dt = _parse_iso(item["updated_at"])
+            item_dt = _parse_iso(item["cursor_ts"])
             if item_dt is None or item_dt <= since_dt:
                 continue
 

@@ -132,6 +132,7 @@ class TestReadModel:
         required = {
             "project", "title", "kind", "status", "effective_status",
             "turn", "turn_since", "participants", "github", "gh_state", "updated_at",
+            "cursor_ts",  # the /updates cursor key — guard against its removal
         }
         for item in items:
             missing = required - set(item.keys())
@@ -260,12 +261,12 @@ class TestFilterUpdates:
     def _get_items(self):
         return _board_with_gh_mock({"100": "open", "101": "open", "102": "merged"})
 
-    def test_since_epoch_returns_all_with_updated_at(self):
-        """since=epoch (1970-01-01T00:00:00Z) returns all items that have updated_at."""
+    def test_since_epoch_returns_all_with_cursor_ts(self):
+        """since=epoch (1970-01-01T00:00:00Z) returns all items with a cursor_ts."""
         items = self._get_items()
         updates = filter_updates(items, "1970-01-01T00:00:00Z", None)
-        # All fixture items have turn_since set → all have updated_at
-        assert len(updates) == len([i for i in items if i["updated_at"]])
+        # All fixture files have a readable mtime → all have cursor_ts
+        assert len(updates) == len([i for i in items if i["cursor_ts"]])
 
     def test_since_future_returns_empty(self):
         """since=future timestamp returns no items."""
@@ -273,15 +274,24 @@ class TestFilterUpdates:
         updates = filter_updates(items, "2099-12-31T23:59:59Z", None)
         assert updates == []
 
-    def test_since_between_dates_filters_correctly(self):
-        """since=2026-06-19T00:00:00Z: only items with turn_since > that date."""
-        items = self._get_items()
-        # PR-100 turn_since is 2026-06-20T10:00:00Z → should appear
-        # PR-101 turn_since is 2026-06-18T14:30:00Z → should NOT appear
-        updates = filter_updates(items, "2026-06-19T00:00:00Z", None)
-        update_ids = {u["project"] for u in updates}
-        assert "PR-100" in update_ids
-        assert "PR-101" not in update_ids
+    def test_since_keys_on_cursor_ts_not_turn_since(self):
+        """#1445 fix: the cursor keys on cursor_ts (file mtime = visibility), NOT
+        turn_since. A backdated turn_since must not hide a recently-written item
+        (that backdating is exactly what caused the silent missed wake)."""
+        items = [
+            # turn_since (display) BEFORE `since`, but mtime (cursor) AFTER it:
+            # the old turn_since-keying would silently DROP this → the bug.
+            {"project": "backdated", "turn": "ariadne",
+             "updated_at": "2026-06-18T00:00:00Z",
+             "cursor_ts":  "2026-06-20T00:00:00Z"},
+            # mtime before `since` → genuinely not changed since → excluded.
+            {"project": "old", "turn": "ariadne",
+             "updated_at": "2026-06-20T00:00:00Z",
+             "cursor_ts":  "2026-06-18T00:00:00Z"},
+        ]
+        ids = {u["project"] for u in filter_updates(items, "2026-06-19T00:00:00Z", None)}
+        assert "backdated" in ids   # mtime > since → included (was dropped under the bug)
+        assert "old" not in ids     # mtime < since → correctly excluded
 
     def test_since_none_returns_all(self):
         """since=None returns all items (no time filtering)."""
@@ -358,6 +368,7 @@ class TestApiBoardProjects:
         required = {
             "project", "title", "kind", "status", "effective_status",
             "turn", "turn_since", "participants", "github", "gh_state", "updated_at",
+            "cursor_ts",  # the /updates cursor key — guard against its removal
         }
         for item in data["board"]:
             missing = required - set(item.keys())

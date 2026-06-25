@@ -1130,8 +1130,8 @@ def create_app(
     # ------------------------------------------------------------------
     # GET /api/board/updates?since=<iso8601>[&agent=<name>]
     #
-    # Returns only items whose change-time (turn_since, else file mtime)
-    # is strictly newer than `since`. Designed for Monitor polling at ~2s.
+    # Returns only items whose cursor key (`cursor_ts` = file server-observed
+    # mtime) is strictly newer than `since`. Designed for Monitor polling at ~2s.
     # Response: {updates: [...], as_of: <iso>}
     #
     # Cursor contract (loop-agents depend on this): the client echoes the
@@ -1154,12 +1154,14 @@ def create_app(
 
         Response: {updates: [...], as_of: <iso8601>, now: <iso8601 alias>}
 
-        Cursor correctness: `as_of` is captured BEFORE reading the board, so the
-        client's next poll (since=as_of, exclusive) never misses an item written
-        during this read — it re-fires it instead (safe duplicate > silent miss).
-        The since-filter uses turn_since as change-time when available, else file
-        mtime; items with updated_at <= since (or none, when since is set) are
-        excluded.
+        Cursor correctness: two complementary properties. (1) `as_of` is captured
+        BEFORE reading the board, so the client's next poll (since=as_of,
+        exclusive) never misses an item written during this read — it re-fires it
+        instead (safe duplicate > silent miss). (2) The since-filter keys on
+        `cursor_ts` — the file's SERVER-OBSERVED mtime, set atomically by baton's
+        temp+rename at the visibility instant — NOT the writer-stamped turn_since
+        (which precedes visibility and caused the #1445 silent miss). Items with
+        cursor_ts <= since (or none, when since is set) are excluded.
         """
         since = request.args.get("since", "").strip() or None
         agent = request.args.get("agent", "").strip() or None
