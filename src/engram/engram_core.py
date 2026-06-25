@@ -1533,7 +1533,7 @@ def _get_db() -> sqlite3.Connection:
         conn.execute(
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
-                claim, quoted_text, interpretation,
+                claim, quoted_text, interpretation, reported_state, trigger_text,
                 content='nodes', content_rowid='rowid'
             )
         """
@@ -1573,14 +1573,14 @@ def _get_db() -> sqlite3.Connection:
     for trigger_sql in [
         """
         CREATE TRIGGER IF NOT EXISTS nodes_fts_insert AFTER INSERT ON nodes BEGIN
-            INSERT INTO nodes_fts(rowid, claim, quoted_text, interpretation)
-            VALUES (new.rowid, new.claim, new.quoted_text, new.interpretation);
+            INSERT INTO nodes_fts(rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
+            VALUES (new.rowid, new.claim, new.quoted_text, new.interpretation, new.reported_state, new.trigger_text);
         END
         """,
         """
         CREATE TRIGGER IF NOT EXISTS nodes_fts_delete AFTER DELETE ON nodes BEGIN
-            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation)
-            VALUES ('delete', old.rowid, old.claim, old.quoted_text, old.interpretation);
+            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
+            VALUES ('delete', old.rowid, old.claim, old.quoted_text, old.interpretation, old.reported_state, old.trigger_text);
         END
         """,
         # Retract trigger (#274, round-2 #280): remove retracted nodes from FTS.
@@ -1604,11 +1604,13 @@ def _get_db() -> sqlite3.Connection:
         AFTER UPDATE OF status ON nodes
         WHEN NEW.status = 'retracted' AND COALESCE(OLD.status, '') != 'retracted'
         BEGIN
-            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation)
+            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
             VALUES ('delete', OLD.rowid,
                     COALESCE(OLD.claim, ''),
                     COALESCE(OLD.quoted_text, ''),
-                    COALESCE(OLD.interpretation, ''));
+                    COALESCE(OLD.interpretation, ''),
+                    COALESCE(OLD.reported_state, ''),
+                    COALESCE(OLD.trigger_text, ''));
         END
         """,
     ]:
@@ -1659,6 +1661,88 @@ def _get_db() -> sqlite3.Connection:
             # empty index on a restore-from-dump path — #781).
             # OperationalError is a subclass of DatabaseError so the single
             # except handles both cases with unchanged retry-gate semantics.
+            pass
+
+    # Migration version 2 (#403): expand nodes_fts to cover reported_state
+    # and trigger_text — feeling_report nodes were invisible to engram_query
+    # because these fields weren't in the FTS index.
+    #
+    # Strategy: drop vocab↔fts dependency chain, rebuild both, backfill all
+    # non-retracted nodes into the new 5-column schema, recreate triggers.
+    # Gated by user_version so it runs exactly once.
+    if current_user_version < 2:
+        try:
+            # Drop in dependency order: vocab depends on FTS, FTS is the target.
+            conn.execute("DROP TABLE IF EXISTS nodes_fts_vocab")
+            conn.execute("DROP TABLE IF EXISTS nodes_fts")
+            # Drop old triggers so they can be recreated with new column list.
+            conn.execute("DROP TRIGGER IF EXISTS nodes_fts_insert")
+            conn.execute("DROP TRIGGER IF EXISTS nodes_fts_delete")
+            conn.execute("DROP TRIGGER IF EXISTS nodes_retract_remove_from_fts")
+            # Recreate FTS table with 5-column schema.
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE nodes_fts USING fts5(
+                    claim, quoted_text, interpretation, reported_state, trigger_text,
+                    content='nodes', content_rowid='rowid'
+                )
+                """
+            )
+            # Recreate the three triggers with updated column lists.
+            conn.execute(
+                """
+                CREATE TRIGGER nodes_fts_insert AFTER INSERT ON nodes BEGIN
+                    INSERT INTO nodes_fts(rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
+                    VALUES (new.rowid, new.claim, new.quoted_text, new.interpretation, new.reported_state, new.trigger_text);
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER nodes_fts_delete AFTER DELETE ON nodes BEGIN
+                    INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
+                    VALUES ('delete', old.rowid, old.claim, old.quoted_text, old.interpretation, old.reported_state, old.trigger_text);
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER nodes_retract_remove_from_fts
+                AFTER UPDATE OF status ON nodes
+                WHEN NEW.status = 'retracted' AND COALESCE(OLD.status, '') != 'retracted'
+                BEGIN
+                    INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
+                    VALUES ('delete', OLD.rowid,
+                            COALESCE(OLD.claim, ''),
+                            COALESCE(OLD.quoted_text, ''),
+                            COALESCE(OLD.interpretation, ''),
+                            COALESCE(OLD.reported_state, ''),
+                            COALESCE(OLD.trigger_text, ''));
+                END
+                """
+            )
+            # Backfill all non-retracted nodes into the new 5-column schema.
+            conn.execute(
+                """
+                INSERT INTO nodes_fts(rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
+                SELECT rowid,
+                       COALESCE(claim, ''),
+                       COALESCE(quoted_text, ''),
+                       COALESCE(interpretation, ''),
+                       COALESCE(reported_state, ''),
+                       COALESCE(trigger_text, '')
+                FROM nodes
+                WHERE status != 'retracted'
+                """
+            )
+            # Recreate vocab table (depends on nodes_fts; must come after FTS rebuild).
+            try:
+                from engram_idf import ensure_vocab_table
+                ensure_vocab_table(conn)
+            except Exception:
+                pass
+            conn.execute("PRAGMA user_version = 2")
+        except sqlite3.DatabaseError:
             pass
 
     # ── Diagnostic suite tables (append-only logs) ──────────────────────────
