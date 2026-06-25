@@ -1,0 +1,50 @@
+{# _project_card.html — partial for a single project board item.
+   Mirrors _board_card.html visual pattern (sidebar agent cards).
+   Variables expected in scope: item (dict from read_project_board).
+#}
+{%- set eff = item.effective_status -%}
+{%- set kind_emoji = {'pr': '⎄', 'issue': '◎', 'project': '⬡'}.get(item.kind, '·') -%}
+{%- set status_colors = {
+    'planning':   'var(--ink-3)',
+    'in-progress':'var(--accent-2)',
+    'in-review':  'var(--accent)',
+    'done':       'var(--ink-4)',
+} -%}
+{%- set badge_color = status_colors.get(eff, 'var(--ink-4)') -%}
+
+<div class="pcard{% if eff == 'done' %} pcard--done{% endif %}">
+  <div class="pcard__top">
+    <span class="pcard__kind" title="{{ item.kind }}">{{ kind_emoji }}</span>
+    <span class="pcard__id mono">{{ item.project }}</span>
+    <span class="pcard__badge" style="color: {{ badge_color }}; border-color: color-mix(in oklab, {{ badge_color }} 30%, var(--line));">
+      {%- if item.gh_unknown %}<span title="gh state unavailable">?</span> {% endif -%}
+      {{ eff }}
+      {%- if item.gh_state and item.gh_state != '' %} <span class="pcard__ghstate">(gh: {{ item.gh_state }})</span>{% endif -%}
+    </span>
+    {% if item.github %}
+    <a class="pcard__ghlink mono" href="https://github.com/engram-agents/engram-alpha/pull/{{ item.github | replace('pr/', '') }}" target="_blank" rel="noopener" title="GitHub: {{ item.github }}">↗</a>
+    {% endif %}
+  </div>
+
+  <div class="pcard__title">{{ item.title }}</div>
+
+  <div class="pcard__court">
+    <span class="pcard__court-label">court</span>
+    <span class="pcard__turn">{{ item.turn or '—' }}</span>
+    {% if item.age_str %}
+    <span class="pcard__age mono">{{ item.age_str }}</span>
+    {% endif %}
+  </div>
+
+  {% if item.turn_reason %}
+  <div class="pcard__reason">{{ item.turn_reason }}</div>
+  {% endif %}
+
+  {% if item.participants %}
+  <div class="pcard__participants">
+    {% for p in item.participants %}
+    <span class="pcard__participant{% if p == item.turn %} pcard__participant--active{% endif %}" title="{{ p }}">{{ p }}</span>{% if not loop.last %}<span class="pcard__sep">·</span>{% endif %}
+    {% endfor %}
+  </div>
+  {% endif %}
+</div>

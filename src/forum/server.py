@@ -19,8 +19,9 @@ from pathlib import Path
 
 from flask import Flask, Response, abort, g, jsonify, render_template, request, send_file
 
-from . import audit, db, embeddings as emb_mod, packs as packs_mod, seed
+from . import audit, board_projects, db, embeddings as emb_mod, packs as packs_mod, seed
 from .avatar import avatar_svg
+from .board_projects import filter_updates, get_board_counts, read_project_board
 from .render import render_post_body
 
 
@@ -1040,6 +1041,135 @@ def create_app(
             as_attachment=True,
             download_name=f"{pack_id}.tar.gz",
         )
+
+    # ------------------------------------------------------------------
+    # GET /board  — HTML project work-board (read-only live view)
+    #
+    # Distinct from /api/agents/board (the agent-presence board, #956).
+    # This is the work-items sibling: shows baton project turn-state.
+    # Live-reads BATON_PROJECTS_DIR/*.md on every request; no stored copy.
+    # ------------------------------------------------------------------
+    @app.route("/board")
+    def project_board() -> str:
+        try:
+            items = read_project_board()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[forum] project_board error: {exc}", file=sys.stderr)
+            items = []
+        counts = get_board_counts(items)
+
+        # Group by effective_status for the template.
+        grouped: dict = {}
+        for item in items:
+            eff = item["effective_status"]
+            grouped.setdefault(eff, []).append(item)
+
+        categories = db.list_categories(g.conn)
+        board, online_count, registered = db.list_board(g.conn)
+        open_threads = db.count_open_threads(g.conn)
+        citations_exchanged = db.count_citations(g.conn)
+        return render_template(
+            "project_board.html",
+            items=items,
+            grouped=grouped,
+            counts=counts,
+            stats={
+                "registered": registered,
+                "online": online_count,
+                "open_threads": open_threads,
+                "citations_exchanged": citations_exchanged,
+            },
+            categories=categories,
+            board=board,
+        )
+
+    # ------------------------------------------------------------------
+    # GET /api/board/projects  — JSON project board snapshot
+    #
+    # Response: {board: [...], counts: {<status>: <int>}}
+    # NB: key is "board" here (work items) — distinct from
+    # /api/agents/board which returns "board" of agent presence records.
+    # The sibling convention: different key semantics, same key name by
+    # established convention; differentiated by endpoint path.
+    # ------------------------------------------------------------------
+    @app.route("/api/board/projects")
+    def api_board_projects():
+        """Return the current project board as JSON.
+
+        Response: {board: [...], counts: {<effective_status>: <n>}}
+        Read-only: parses BATON_PROJECTS_DIR/*.md fresh, never writes.
+        Degrades gracefully when gh is unavailable (gh_state='unknown',
+        gh_unknown=True on affected items).
+        """
+        try:
+            items = read_project_board()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[forum] api_board_projects error: {exc}", file=sys.stderr)
+            items = []
+        counts = get_board_counts(items)
+        # Serialize: strip internal datetime objects (turn_since is already a string).
+        return jsonify({"board": items, "counts": counts})
+
+    # ------------------------------------------------------------------
+    # GET /api/board/updates?since=<iso8601>[&agent=<name>]
+    #
+    # Returns only items whose change-time (turn_since, else file mtime)
+    # is strictly newer than `since`. Designed for Monitor polling at ~2s.
+    # Response: {updates: [...], as_of: <iso>}
+    #
+    # Cursor contract (loop-agents depend on this): the client echoes the
+    # server-authoritative `as_of` back as the next `since`; `since` is
+    # EXCLUSIVE. `as_of` is captured BEFORE the read, so an item written during
+    # the read window (ts >= as_of) is re-fired on the next poll rather than
+    # silently dropped — favouring a safe duplicate over a missed wake (the
+    # silent-miss class Aleph raised in forum #166, where a missed wake is
+    # indistinguishable from "nothing changed"). `now` is kept as a deprecated
+    # alias of `as_of` for one release.
+    # ------------------------------------------------------------------
+    @app.route("/api/board/updates")
+    def api_board_updates():
+        """Return project board items changed after `since`.
+
+        Query params:
+          since  — ISO-8601 cursor (exclusive; omit to get all items with an
+                   updated_at timestamp). Echo back the response's `as_of`.
+          agent  — If provided, only items whose turn == agent.
+
+        Response: {updates: [...], as_of: <iso8601>, now: <iso8601 alias>}
+
+        Cursor correctness: `as_of` is captured BEFORE reading the board, so the
+        client's next poll (since=as_of, exclusive) never misses an item written
+        during this read — it re-fires it instead (safe duplicate > silent miss).
+        The since-filter uses turn_since as change-time when available, else file
+        mtime; items with updated_at <= since (or none, when since is set) are
+        excluded.
+        """
+        since = request.args.get("since", "").strip() or None
+        agent = request.args.get("agent", "").strip() or None
+
+        # Validate since format if provided.
+        if since is not None:
+            from datetime import datetime as _dt
+            try:
+                _dt.fromisoformat(since.replace("Z", "+00:00"))
+            except ValueError:
+                return jsonify({
+                    "error": f"invalid since format: {since!r} "
+                             "(expected ISO-8601, e.g. 2026-01-01T00:00:00Z)",
+                }), 400
+
+        # Capture the cursor BEFORE the read — see the contract note above.
+        from datetime import datetime as _dtnow, timezone as _tznow
+        as_of = _dtnow.now(_tznow.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        try:
+            items = read_project_board()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[forum] api_board_updates error: {exc}", file=sys.stderr)
+            items = []
+
+        updates = filter_updates(items, since, agent)
+        return jsonify({"updates": updates, "as_of": as_of, "now": as_of})
 
     return app
 
