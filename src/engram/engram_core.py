@@ -4432,11 +4432,39 @@ def _validate_reasoning_structure(
 
                 # parts may be empty if all axes have partial coverage across
                 # premises — the guard is load-bearing in the mixed-axis case.
+                # Detect genuine mixed-axis partial coverage: at least one leaf
+                # has data AND at least one leaf lacks data for the same axis.
+                # Lineage excluded — null=self means it is never partially tracked;
+                # suppression by the actionability gate (uniform, single-lineage
+                # graph) is intentional and should produce silence, not a notice.
+                has_partial_author = (
+                    any(k["author"] is not None for k in axis_keys)
+                    and any(k["author"] is None for k in axis_keys)
+                )
+                has_partial_collection = (
+                    any(k["collection"] is not None for k in axis_keys)
+                    and any(k["collection"] is None for k in axis_keys)
+                )
+                has_partial_arch = (
+                    any(r is not None for r in arch_raw_list)
+                    and any(r is None for r in arch_raw_list)
+                )
                 if parts:
                     warnings.append(
                         f"STANDPOINT: {'; '.join(parts)}; others unchecked."
                         " (load skill `engram-standpoint` for the calibration theory)"
                     )
+                elif has_partial_author or has_partial_collection or has_partial_arch:
+                    # All leaves have standpoint keys (none are None) but every
+                    # axis has at least one leaf missing that specific axis value
+                    # — mixed-axis partial coverage, nothing emitted above.
+                    warnings.append(
+                        "STANDPOINT: partially unchecked"
+                        " (mixed-axis coverage — no axis has data on all premises)."
+                    )
+                # else: all axes absent or actionability-gated (e.g. uniform
+                # single-lineage graph) — emit nothing by design.
+
             else:
                 # Some leaves lack standpoint data — can't distinguish no-data
                 # from same-cluster, so emit a low-noise unchecked notice (#761).
