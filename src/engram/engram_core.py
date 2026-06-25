@@ -550,6 +550,61 @@ EDGE_CLASSIFICATIONS = {
 }
 
 
+# ── Edge tier taxonomy ───────────────────────────────────────────────────────
+#
+# Three-tier classification of edge relations per the agent's edge taxonomy
+# (the three-tier edge taxonomy: dependency / relational / classification).
+# Maintained as a SEPARATE dict from
+# EDGE_CLASSIFICATIONS so that existing consumers of that dict (which iterate
+# its schema of {cascade, dag_check, removable, addable_after_creation,
+# provenance}) are not affected.
+#
+# Tier→dag_check expectation:
+#   dependency     ⇒ dag_check=True   (causal / provenance chain; temporal order matters)
+#   relational     ⇒ dag_check=False  (symmetric or cross-temporal; no causal direction)
+#   classification ⇒ dag_check=False  (realization / membership; no temporal constraint)
+#
+# NOTE on subtask_of: tiered "dependency" (dag_check=True) deliberately.
+# A subtask generally post-dates its parent goal/task, making the DAG check
+# correct in the common case. The rare task-reorg inversion (old task becomes
+# subtask of a newer umbrella) has 0 current violations, so it stays checked.
+# This is a watch item, not a divergence requiring acknowledgment.
+#
+# AUDIT SURFACE (not enforcement): test_edge_tier_audit.py uses this map to
+# warn on unintended drift between dag_check flags and tier expectations.
+# Divergence emits a warnings.warn for human review — never a hard failure.
+# A relation MAY intentionally diverge (see EDGE_TIER_DIVERGENCE_ACK below).
+EDGE_TIERS: dict[str, str] = {
+    # dependency tier: causal / provenance edges; dag_check=True expected
+    "cites":        "dependency",
+    "derives_from": "dependency",
+    "retracts":     "dependency",
+    "supersedes":   "dependency",
+    "supported_by": "dependency",
+    "subtask_of":   "dependency",
+    # relational tier: symmetric / cross-temporal; dag_check=False expected
+    "contradicts":  "relational",
+    "tensions":     "relational",
+    "about":        "relational",
+    "resolves":     "relational",   # epistemic-stance edge: a resolution closes a question/contradiction (pairs with contradicts), not a realization/membership
+    # classification tier: realization / membership; dag_check=False expected
+    "instantiates": "classification",
+    "serves":       "classification",
+    "exemplifies":  "classification",
+}
+
+# Intentional-divergence acknowledgment table.
+# If a relation's dag_check flag intentionally diverges from its tier's
+# expectation, add it here with a short reason string. The audit test
+# (test_edge_tier_audit.py) skips emitting a warning for acknowledged entries,
+# preserving the ability to intentionally diverge without noisy CI output.
+# Currently empty — there are no intentional divergences.
+EDGE_TIER_DIVERGENCE_ACK: dict[str, str] = {
+    # "<relation>": "<reason for intentional divergence>"
+    # Example (hypothetical):
+    #   "about": "temporarily dag_check=True pending refactor #NNNN"
+}
+
 DAG_EXEMPT_RELATIONS = frozenset(
     r for r, c in EDGE_CLASSIFICATIONS.items() if not c["dag_check"]
 )
