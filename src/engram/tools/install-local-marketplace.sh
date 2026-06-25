@@ -361,6 +361,28 @@ if candidates:
 PY
 )"
   fi
+  # Create compatibility symlinks from stale ENGRAM cache dirs to the new one.
+  # An in-session Codex upgrade can leave hook registrations pointing at the
+  # old path, blocking shell commands until the session restarts.  Symlinking
+  # old → new keeps current sessions alive while the new hook code runs.
+  if [[ -n "$CODEX_PLUGIN_CACHE_DIR" ]]; then
+    CACHE_PARENT="$(dirname "$CODEX_PLUGIN_CACHE_DIR")"
+    NEW_BASE="$(basename "$CODEX_PLUGIN_CACHE_DIR")"
+    if [[ -z "$NEW_BASE" ]]; then
+      log "WARN: could not derive new cache basename — skipping compat symlink step"
+    else
+      shopt -s nullglob
+      for old_dir in "$CACHE_PARENT"/0.1.0-dev.*; do
+        [[ -e "$old_dir" || -L "$old_dir" ]] || continue
+        [[ "$(basename "$old_dir")" == "$NEW_BASE" ]] && continue
+        log "Symlinking stale cache dir for in-session compat: $(basename "$old_dir") -> $NEW_BASE"
+        rm -rf "$old_dir"
+        ln -s "$CODEX_PLUGIN_CACHE_DIR" "$old_dir"
+      done
+      shopt -u nullglob
+    fi
+  fi
+
   if [[ -n "$CODEX_PLUGIN_CACHE_DIR" && -f "$CODEX_PLUGIN_CACHE_DIR/.mcp.json" ]]; then
     log "Patching Codex plugin MCP command -> $CODEX_PLUGIN_CACHE_DIR/launch-engram-server.sh"
     python3 - "$CODEX_PLUGIN_CACHE_DIR/.mcp.json" "$CODEX_PLUGIN_CACHE_DIR/launch-engram-server.sh" <<'PY'
