@@ -462,7 +462,7 @@ def _scan_my_batons(agent_name: str) -> list:
 # ---------------------------------------------------------------------------
 
 def _auto_archive_merged_pr_batons(cache: dict) -> None:
-    """Scan ALL open PR-batons and close any whose live GitHub status is terminal.
+    """Scan ALL open PR-batons and close any whose cached GitHub status is terminal.
 
     Handles two terminal GitHub PR states:
     - MERGED → baton closed with status ``merged``
@@ -479,8 +479,12 @@ def _auto_archive_merged_pr_batons(cache: dict) -> None:
     Instrumentation: every outcome (success, failure, skip) is written to
     stderr (the hook log channel).  Stdout is reserved for prompt context.
 
-    Cost discipline: reuses the existing 30s-TTL cache passed in from main();
-    adds zero gh calls for cache-fresh anchors.
+    Cache-only mode: this function skips any PR-baton whose anchor is not
+    already present in the 30s-TTL cache.  With 430+ baton files, making a
+    fresh gh API call (~0.4s each) per uncached anchor would far exceed the
+    hook's 5s timeout before completing the scan.  Use ``baton gc`` for an
+    explicit full offline sweep that queries live GitHub state for every
+    uncached PR-baton.
     """
     # Resolve the baton binary once; reuse the result for the guard check.
     _baton_which = shutil.which("baton")
@@ -524,8 +528,13 @@ def _auto_archive_merged_pr_batons(cache: dict) -> None:
         if not anchor:
             continue
 
-        # Fetch live status via the existing cache mechanism (30s TTL)
-        live_status = _get_live_status(anchor, cache)
+        # Cache-only: skip uncached anchors to stay within the hook's 5s timeout.
+        # With 430+ baton files, uncached gh calls (~0.4s each) would exceed the
+        # timeout before completing the scan. Use 'baton gc' for full offline sweep.
+        cached = _cache_get(cache, anchor)
+        if cached is None:
+            continue
+        live_status = cached
 
         # Map live GitHub terminal states to baton close statuses.
         if live_status == "MERGED" or live_status.startswith("MERGED"):

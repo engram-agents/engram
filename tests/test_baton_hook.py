@@ -406,6 +406,18 @@ def _load_hook_module(engram_home: Path, projects_dir: Path):
     return mod
 
 
+def _write_baton_cache(engram_home: Path, entries: dict) -> None:
+    """Write baton-status-cache.json pre-populated with given anchor→status entries.
+
+    The auto-archive pass is cache-only; populate the cache so tests don't need
+    to mock _fetch_pr_status (which is no longer called by that path).
+    """
+    import time
+    cache = {anchor: {"fetched_at": time.time(), "render": status}
+             for anchor, status in entries.items()}
+    (engram_home / "baton-status-cache.json").write_text(json.dumps(cache))
+
+
 # ---------------------------------------------------------------------------
 # Tests 13–17: Auto-archive on MERGED detection
 # ---------------------------------------------------------------------------
@@ -692,18 +704,18 @@ class TestAutoArchiveSecondPass:
         )
 
         mod = _load_hook_module(engram_home, projects_dir)
+        _write_baton_cache(engram_home, {"pr/2100": "MERGED"})
 
         with patch.dict(os.environ, {
             "ENGRAM_HOME": str(engram_home),
             "BATON_PROJECTS_DIR": str(projects_dir),
         }):
             with patch.object(mod.shutil, "which", side_effect=self._which):
-                with patch.object(mod, "_fetch_pr_status", return_value="MERGED"):
-                    with patch.object(mod, "subprocess") as mock_subproc:
-                        mock_subproc.run.return_value = type(
-                            "CompletedProcess", (), {"returncode": 0}
-                        )()
-                        mod.main()
+                with patch.object(mod, "subprocess") as mock_subproc:
+                    mock_subproc.run.return_value = type(
+                        "CompletedProcess", (), {"returncode": 0}
+                    )()
+                    mod.main()
 
         mock_subproc.run.assert_called_once_with(
             ["baton", "close", "PR-2100", "--status", "merged"],
@@ -855,6 +867,7 @@ class TestAutoArchiveSecondPass:
         )
 
         mod = _load_hook_module(engram_home, projects_dir)
+        _write_baton_cache(engram_home, {"pr/2500": "MERGED"})
 
         stderr_lines = []
         stdout_lines = []
@@ -883,11 +896,10 @@ class TestAutoArchiveSecondPass:
             "BATON_PROJECTS_DIR": str(projects_dir),
         }):
             with patch.object(mod.shutil, "which", side_effect=self._which):
-                with patch.object(mod, "_fetch_pr_status", return_value="MERGED"):
-                    with patch.object(mod, "subprocess") as mock_subproc:
-                        mock_subproc.run.side_effect = _failing_run
-                        with patch("builtins.print", side_effect=_fake_print):
-                            mod.main()
+                with patch.object(mod, "subprocess") as mock_subproc:
+                    mock_subproc.run.side_effect = _failing_run
+                    with patch("builtins.print", side_effect=_fake_print):
+                        mod.main()
 
         # stdout must be empty (no in-court batons)
         assert stdout_lines == [], (
@@ -977,6 +989,7 @@ class TestAutoArchiveSecondPass:
         )
 
         mod = _load_hook_module(engram_home, projects_dir)
+        _write_baton_cache(engram_home, {"pr/2700": "MERGED"})
 
         baton_close_calls = []
         stdout_lines = []
@@ -999,11 +1012,10 @@ class TestAutoArchiveSecondPass:
             "BATON_PROJECTS_DIR": str(projects_dir),
         }):
             with patch.object(mod.shutil, "which", side_effect=self._which):
-                with patch.object(mod, "_fetch_pr_status", return_value="MERGED"):
-                    with patch.object(mod, "subprocess") as mock_subproc:
-                        mock_subproc.run.side_effect = _fake_run
-                        with patch("builtins.print", side_effect=_fake_print):
-                            mod.main()
+                with patch.object(mod, "subprocess") as mock_subproc:
+                    mock_subproc.run.side_effect = _fake_run
+                    with patch("builtins.print", side_effect=_fake_print):
+                        mod.main()
 
         # Auto-archive must have fired (the merged PR-baton was archived)
         assert len(baton_close_calls) == 1, (

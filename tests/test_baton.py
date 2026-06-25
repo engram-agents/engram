@@ -660,6 +660,19 @@ class TestIntegration:
         status = _read_project_field(projects_dir, "PR-504", "status")
         assert status == "merged"
 
+    def test_close_appends_turn_log_entry(self, engram_home, projects_dir):
+        """baton close appends a turn-log entry so gc-close == cmd-close audit trail."""
+        _write_config(engram_home, "borges")
+        _write_project(projects_dir, "PR-505", status="in-review")
+        _run_baton(
+            engram_home, projects_dir,
+            "close", "PR-505", "--status", "merged",
+        )
+        content = (projects_dir / "PR-505.md").read_text()
+        assert "## Turn log" in content
+        log_section = content.split("## Turn log")[-1]
+        assert "close: merged" in log_section
+
     def test_mine_filters_by_turn(self, engram_home, projects_dir):
         """mine only shows projects where turn == invoking agent."""
         _write_config(engram_home, "borges")

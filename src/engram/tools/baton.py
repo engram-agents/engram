@@ -6,7 +6,7 @@ A thin CLI wrapping the baton file protocol at
 shared projects (PRs, designs, etc.) so agents always know whose move it
 is next.
 
-Twelve subcommands:
+Thirteen subcommands:
   init        Create a new project baton file
   flip        Pass the baton to another participant (PR layer)
   claim       Take a Project-layer baton from the pool (pool → self)
@@ -16,6 +16,7 @@ Twelve subcommands:
   show        Display a project file
   close       Mark a project merged or cancelled
   reopen      Flip a closed baton back to an active status (inverse of close)
+  gc          Batch-close PR-batons whose GitHub PR is merged or closed
   rename      Update the human-readable project title
   anchor      Set or update the github: anchor on an existing baton
   merge       Gate-checked squash merge: baton-turn + CI-green + approval-fresh
@@ -32,6 +33,7 @@ import json
 import os
 import pwd
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -597,6 +599,26 @@ def _append_turn_log(body: str, entry: str) -> str:
         # Create the section
         separator = "\n\n" if body.strip() else ""
         return body.rstrip() + separator + f"\n{section_header}\n\n" + entry + "\n"
+
+
+def _close_baton(dest: Path, text: str, new_status: str, reason: str) -> None:
+    """Set a baton's status to a closed state and append a turn-log entry.
+
+    Shared by cmd_close and cmd_gc so gc-closed batons have the same audit
+    trail format as cmd-closed ones.
+    """
+    now = _now_iso()
+    updated_text = _update_frontmatter(text, {"status": new_status})
+    _updated_fields, updated_body = _parse_frontmatter(updated_text)
+    log_entry = f"- {now} close: {new_status} — {reason}"
+    final_body = _append_turn_log(updated_body, log_entry)
+    fm_m = _FRONTMATTER_RE.match(updated_text)
+    if fm_m:
+        fm_section = updated_text[:fm_m.end()]
+        final_content = fm_section.rstrip("\n") + "\n" + final_body
+    else:
+        final_content = updated_text
+    _atomic_write(dest, final_content)
 
 
 # ---------------------------------------------------------------------------
@@ -1466,8 +1488,7 @@ def cmd_close(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_VALIDATION)
 
-    updated_text = _update_frontmatter(text, {"status": new_status})
-    _atomic_write(dest, updated_text)
+    _close_baton(dest, text, new_status, f"closed by {agent_name or 'agent'}")
     print(f"baton close: {project_id} → {new_status}")
 
 
@@ -1557,6 +1578,108 @@ def cmd_reopen(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
     _atomic_write(dest, final_content)
     print(f"baton reopen: {project_id} → {new_status}")
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: gc
+# ---------------------------------------------------------------------------
+
+def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    """Batch-close PR-batons whose GitHub PR is MERGED or CLOSED.
+
+    Scans all open PR-batons and queries the live GitHub state for each.
+    PRs in MERGED state are closed with status ``merged``; PRs in CLOSED
+    state (without merge) are closed with status ``cancelled``.
+
+    Use ``--dry-run`` to preview changes without applying them.
+    Use ``--limit N`` to cap the number of PR-batons processed per run
+    (default: 30) and bound wall-clock runtime.
+
+    This is the explicit full-sweep complement to the prompt hook's
+    cache-only auto-archive pass.  Agents should run ``baton gc`` at
+    loop-start to drain the backlog of merged/closed PR-batons that the
+    hook cannot reach (uncached anchors).
+    """
+    if not shutil.which("gh"):
+        print("baton gc: gh CLI not found — cannot query live PR state", file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+    projects_dir = Path(BATON_PROJECTS_DIR)
+    if not projects_dir.is_dir():
+        print("baton gc: projects directory not found", file=sys.stderr)
+        sys.exit(EXIT_IO)
+
+    pr_re = re.compile(r"^PR-(\d+)$")
+    dry_run = args.dry_run
+    limit = args.limit
+
+    closed = skipped = failed = 0
+    processed = 0
+
+    for md_file in sorted(projects_dir.glob("*.md")):
+        if processed >= limit:
+            break
+        try:
+            text = md_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            skipped += 1
+            continue
+
+        fields, _body = _parse_frontmatter(text)
+        if not fields:
+            skipped += 1
+            continue
+
+        status = fields.get("status", "").strip().lower()
+        if status in CLOSED_STATUSES:
+            continue  # already closed — don't count as skipped
+
+        project_id = fields.get("project", "").strip() or md_file.stem
+        m = pr_re.match(project_id)
+        if not m:
+            continue  # not a PR-baton
+
+        pr_num = m.group(1)
+        processed += 1
+
+        try:
+            result = subprocess.run(
+                ["gh", "pr", "view", pr_num, "--json", "state", "-q", ".state"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                print(f"baton gc: gh query failed for {project_id} (pr #{pr_num})", file=sys.stderr)
+                skipped += 1
+                continue
+            state = result.stdout.strip().upper()
+        except Exception as e:
+            print(f"baton gc: error querying {project_id}: {e!r}", file=sys.stderr)
+            skipped += 1
+            continue
+
+        if state == "MERGED":
+            new_status = "merged"
+        elif state == "CLOSED":
+            new_status = "cancelled"
+        else:
+            skipped += 1
+            continue
+
+        if dry_run:
+            print(f"baton gc: would close {project_id} → {new_status} (PR #{pr_num} is {state})")
+            closed += 1
+            continue
+
+        try:
+            _close_baton(md_file, text, new_status, f"gc: PR #{pr_num} is {state}")
+            print(f"baton gc: closed {project_id} → {new_status} (PR #{pr_num})")
+            closed += 1
+        except (Exception, SystemExit) as e:
+            print(f"baton gc: write failed for {project_id}: {e!r}", file=sys.stderr)
+            failed += 1
+
+    action = "would close" if dry_run else "closed"
+    print(f"baton gc: {action} {closed}, skipped {skipped}, failed {failed}")
 
 
 # ---------------------------------------------------------------------------
@@ -2206,6 +2329,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Active status to set (default: in-progress)",
     )
 
+    # -- gc --
+    p_gc = subparsers.add_parser(
+        "gc",
+        help="batch-close PR-batons whose GitHub PR is merged/closed",
+        description=(
+            "Scan all open PR-batons and close any whose live GitHub PR state\n"
+            "is terminal (MERGED → status:merged; CLOSED → status:cancelled).\n\n"
+            "Use --dry-run to preview without applying changes.\n"
+            "Use --limit N to cap the number of PR-batons processed per run\n"
+            "(default: 30) to bound wall-clock runtime.\n\n"
+            "This is the explicit full-sweep complement to the prompt hook's\n"
+            "cache-only auto-archive pass.  Run at loop-start to drain the\n"
+            "backlog of merged/closed PR-batons the hook cannot reach."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_gc.add_argument(
+        "--dry-run", action="store_true", default=False,
+        dest="dry_run",
+        help="list changes without applying them",
+    )
+    p_gc.add_argument(
+        "--limit", type=int, default=30,
+        help="max PR-batons to process per run (default: 30)",
+    )
+    p_gc.set_defaults(func=cmd_gc)
+
     # -- rename --
     p_rename = subparsers.add_parser(
         "rename",
@@ -2320,6 +2470,8 @@ def main() -> None:
         cmd_close(args, config, agent_name)
     elif args.subcommand == "reopen":
         cmd_reopen(args, config, agent_name)
+    elif args.subcommand == "gc":
+        cmd_gc(args, config, agent_name)
     elif args.subcommand == "rename":
         cmd_rename(args, config, agent_name)
     elif args.subcommand == "anchor":
