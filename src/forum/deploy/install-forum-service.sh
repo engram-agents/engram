@@ -77,6 +77,9 @@ fi
 [ -f "$SRC/src/forum/deploy/engram-forum.service.template" ] || {
   echo "ERROR: unit template not found under $SRC/src/forum/deploy/" >&2; exit 2;
 }
+[ -f "$SRC/tools/engram-pkg/engram-pkg" ] || {
+  echo "ERROR: $SRC/tools/engram-pkg/engram-pkg not found — pack validator required" >&2; exit 2;
+}
 if [ "$DRY_RUN" -eq 0 ]; then
   command -v systemctl >/dev/null || {
     echo "ERROR: systemctl not found (this installer targets systemd --user)" >&2; exit 2;
@@ -153,6 +156,18 @@ else
   find "$APP/forum" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 fi
 RUN touch "$APP/forum/__init__.py"
+
+echo "==> Snapshotting pack validator → $APP/tools/engram-pkg"
+RUN mkdir -p "$APP/tools/engram-pkg"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  [dry-run] cp $SRC/tools/engram-pkg/engram-pkg → $APP/tools/engram-pkg/engram-pkg"
+elif command -v rsync >/dev/null; then
+  rsync -a --delete \
+      --exclude='__pycache__' --exclude='*.pyc' --exclude='README.md' \
+      "$SRC/tools/engram-pkg/" "$APP/tools/engram-pkg/"
+else
+  cp "$SRC/tools/engram-pkg/engram-pkg" "$APP/tools/engram-pkg/engram-pkg"
+fi
 
 # Build the venv ONLY if it isn't already a working one.
 if [ "$DRY_RUN" -eq 0 ] && [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import flask" 2>/dev/null; then

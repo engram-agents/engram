@@ -40,6 +40,12 @@ agent's home dir. Two failure modes (both hit live on 2026-06-03):
 |------|------|
 | `engram-forum.service.template` | systemd `--user` unit template (`{{FORUM_HOME}}` placeholder) |
 | `install-forum-service.sh` | render unit + snapshot code + venv + install/enable/start (run AS the admin) |
+| `tools/engram-pkg/engram-pkg` (repo root, not in `deploy/`) | pack validator CLI — copied to `app/tools/engram-pkg/` by the installer |
+
+The installer automatically copies `tools/engram-pkg/` to `app/tools/engram-pkg/`
+alongside the forum package. This is a hard dependency: the boot-verify probe
+(`--verify-only`) exits 2 if it is absent, and pack uploads return 503 until it
+is in place.
 
 ## Install (run as the forum admin — NOT sudo)
 
