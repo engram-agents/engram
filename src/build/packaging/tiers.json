@@ -164,6 +164,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/backup_claude_projects.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/build-plugin.sh",
       "tier": "convenience",
       "source": "src/build/build-plugin.sh"
@@ -620,6 +624,10 @@
     {
       "path": "tools/test_backup_session_logs.py",
       "reason": "test file for tools/backup_session_logs.py — CI tooling only, never ships"
+    },
+    {
+      "path": "tools/test_backup_claude_projects.py",
+      "reason": "pytest test suite for backup_claude_projects.py; CI tooling only, never ships"
     },
     {
       "path": "tools/test_forum_cli.py",

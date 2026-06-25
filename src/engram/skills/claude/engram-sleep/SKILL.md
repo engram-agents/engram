@@ -352,6 +352,42 @@ re-copies if size differs (resumed session may have grown the file).
 
 ---
 
+### Step 4.7 — Back up full `~/.claude/projects/` directory
+
+Run the full-directory backup tool and **capture the result for the sleep summary**.
+Mirrors the complete `~/.claude/projects/` tree (all file types) to
+`~/.engram/claude-projects-archive/`, preserving directory structure.
+Complements Step 4.6 (which archives `.jsonl` logs to a separate retention-independent
+location); this step captures configs, subagent transcripts, and any other artifacts for
+disaster-recovery and migration-safety.
+
+**Scope:** `~/.claude/projects/` only — does not touch `~/.engram/knowledge.db`
+(already handled by the Step 4.5 SQL dump).
+
+```bash
+claude_backup_out=$($HOME/.engram/venv/bin/python3 \
+    "$CLAUDE_PLUGIN_ROOT/tools/backup_claude_projects.py" \
+    2>&1)
+claude_backup_rc=$?
+if [ $claude_backup_rc -eq 0 ]; then
+    claude_backup_status="✓ claude-projects backup OK: $claude_backup_out"
+else
+    claude_backup_status="⚠ claude-projects backup FAILED: $claude_backup_out"
+fi
+```
+
+**Non-blocking**: do not abort sleep on failure. Surface the status in the history milestone:
+
+```
+- claude-projects backup: $claude_backup_status
+```
+
+**Skip if source directory is absent** (tool exits 0 with "0 copied" automatically).
+
+**Deduplication**: uncompressed — skips if size AND mtime match (within 1s); compressed (`--compress`) — skips if mtime matches (within 1s, size not compared since .gz wraps vary). Re-copies if the relevant check fails.
+
+---
+
 ## Phase B — Consolidation orchestration
 
 > **Phase B is MANDATORY whenever you reach it** (see the all-or-nothing invariant in
