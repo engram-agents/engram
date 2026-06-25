@@ -117,8 +117,9 @@ Eight well-supported categories you scan for, plus two heuristic categories you 
    2. For each open task, extract GitHub references from the claim text using this pattern: `(?:(?:PR|pull request|issue|closes?)\s*#(\d+)|(?<!\w)#(\d+)(?!\w))`. Extract all candidate numbers.
    3. For each reference number, run:
       ```bash
-      gh pr view N --json state,mergedAt --repo engram-agents/engram-alpha 2>/dev/null
-      gh issue view N --json state,closedAt --repo engram-agents/engram-alpha 2>/dev/null
+      # Run from your project-repo checkout (cwd's gh default), or add --repo OWNER/REPO:
+      gh pr view N --json state,mergedAt 2>/dev/null
+      gh issue view N --json state,closedAt 2>/dev/null
       ```
       A PR returning `"state":"MERGED"` or an issue returning `"state":"CLOSED"` is an externally-resolved reference. If `gh` returns an error (non-existent number), treat as `UNKNOWN` — do not flag.
    4. Flag any task whose claim references ≥1 MERGED/CLOSED artifact AND whose task status is not `done`/`abandoned`.

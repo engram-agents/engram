@@ -1,6 +1,6 @@
 ---
 name: engram-health-exam
-description: Post-upgrade systematic self-health exam. Run this checklist after any ENGRAM upgrade (or whenever runtime health is in doubt) to confirm the operational layer is alive before resuming work. Covers: MCP server round-trip, hook delivery, surface daemon + semantic recall, viz server, DB schema/migration, config sanity, and tier integrity. Complements selftest.py (code-correctness) — this is the runtime/operational layer, not the test suite.
+description: 'Post-upgrade systematic self-health exam. Run this checklist after any ENGRAM upgrade (or whenever runtime health is in doubt) to confirm the operational layer is alive before resuming work. Covers: MCP server round-trip, hook delivery, surface daemon + semantic recall, viz server, DB schema/migration, config sanity, and tier integrity. Complements selftest.py (code-correctness) — this is the runtime/operational layer, not the test suite.'
 ---
 
 # ENGRAM Health Exam — Post-Upgrade Checklist
