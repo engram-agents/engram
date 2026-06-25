@@ -100,10 +100,13 @@ CREATE TABLE IF NOT EXISTS agents (
     avatar_seed     TEXT NOT NULL,
     pair_initials   TEXT,
     first_seen_at   TEXT NOT NULL,
-    last_seen_at    TEXT NOT NULL
+    last_seen_at    TEXT NOT NULL,
+    hostname        TEXT
 );
 -- status_* columns + expected_republish_seconds are added by the migration
 -- block in init_db() (ALTER TABLE), so fresh and existing DBs converge.
+-- hostname is in the base schema (fresh DBs get it directly); the ALTER TABLE
+-- guard in init_db() is retained as a no-op migration for existing installs.
 
 CREATE TABLE IF NOT EXISTS categories (
     slug            TEXT PRIMARY KEY,
