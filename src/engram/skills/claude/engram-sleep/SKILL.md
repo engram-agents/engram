@@ -68,6 +68,21 @@ The parent's role is purely orchestration.
 - The day produced no work worth reviewing (skip sleep or proceed directly to Phase B if Phase A produces nothing)
 - Right after a sleep with no new work happening since (nothing to consolidate)
 
+> **⚠️ ALL-OR-NOTHING INVARIANT — never skip *part* of a sleep.** Once you commit to a
+> sleep, **Phase B's fairy dispatch is MANDATORY**, not optional. If a day is genuinely
+> too light to consolidate, skip the **whole** sleep — but NEVER run Phase A + advance
+> the turn while dropping the fairies. `engram_advance_turn` marks today's cohort
+> "previous-turn handled"; several fairy categories scope to the **fresh cohort = nodes
+> created since the last sleep** (most explicitly **Category 7 — missing principle-edges**),
+> so after the turn advances a later sleep's window no longer includes today's nodes and
+> they are **skipped forever** — they never get their one-shot fresh-cohort pass.
+> **Parent context is NEVER a valid reason to drop the fairies** — the dispatch is one
+> background `Agent` message and the fairies run in fresh contexts that don't inherit the
+> parent's. If your context is too large to orchestrate Phase B, **nap first to clear,
+> then run the FULL Phase B** — do not trim it. (Incident: 2026-06-24 — fairies skipped
+> "for context economy"; an explicit-cohort backfill later recovered 3 lost principle-edges
+> + 1 misleading-because-obsoleted node. engram-alpha #1426.)
+
 ---
 
 ## Pre-flight: context guard (fires before Phase A)
@@ -338,6 +353,14 @@ re-copies if size differs (resumed session may have grown the file).
 ---
 
 ## Phase B — Consolidation orchestration
+
+> **Phase B is MANDATORY whenever you reach it** (see the all-or-nothing invariant in
+> "When NOT to sleep"). The dream-fairy dispatch (Step 6) is the load-bearing part: the
+> fairies are the ONLY pass that scans the fresh cohort while it is still the current
+> turn. Skipping them and running the dream master on `engram_reflect` alone permanently
+> loses every window-scoped finding on today's nodes (missing principle-edges,
+> fresh-cohort contradictions). Do NOT skip the fairies for context economy — they run in
+> fresh contexts; if the parent is too full, nap, then dispatch.
 
 ### Step 5 — Compute the recall-summary cohort and run cohort_dispatch prepare
 
