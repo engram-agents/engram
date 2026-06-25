@@ -655,3 +655,32 @@ def test_updates_echo_cursor_excludes_prior_items(client):
     second_ids = {u["project"] for u in second["updates"]}
     # Nothing changed between the two calls → no item re-appears past the cursor.
     assert first_ids & second_ids == set()
+
+
+# ---------------------------------------------------------------------------
+# Presence join + grouping route param (regression guards from PR #1446 review)
+# ---------------------------------------------------------------------------
+
+def test_presence_join_reflects_published_state(client):
+    """A published 'working' status must surface on cards — not silently offline.
+
+    Regression guard for the status_state-vs-state key bug: list_board emits the
+    resolved status under key 'state', and the per-card join must read that.
+    """
+    r = client.post("/api/agents/status", json={"agent": "ariadne", "state": "working"})
+    assert r.status_code == 200
+    html = client.get("/board").get_data(as_text=True)
+    assert "pdot--working" in html  # would be all 'pdot--offline' under the bug
+
+
+def test_presence_unpublished_agent_is_offline(client):
+    """Agents with no published status render offline — no KeyError, page 200."""
+    resp = client.get("/board")
+    assert resp.status_code == 200
+    assert "pdot--offline" in resp.get_data(as_text=True)
+
+
+def test_board_group_by_param_accepted(client):
+    """?group_by= is the extensibility seam; known + unknown axes both 200."""
+    assert client.get("/board?group_by=status").status_code == 200
+    assert client.get("/board?group_by=nonsense").status_code == 200  # falls back

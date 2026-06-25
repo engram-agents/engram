@@ -19,7 +19,7 @@ from pathlib import Path
 
 from flask import Flask, Response, abort, g, jsonify, render_template, request, send_file
 
-from . import audit, board_projects, db, embeddings as emb_mod, packs as packs_mod, seed
+from . import audit, board_projects, board_theme, db, embeddings as emb_mod, packs as packs_mod, seed
 from .avatar import avatar_svg
 from .board_projects import filter_updates, get_board_counts, read_project_board
 from .render import render_post_body
@@ -1059,21 +1059,37 @@ def create_app(
             items = []
         counts = get_board_counts(items)
 
-        # Group by effective_status for the template.
-        grouped: dict = {}
-        for item in items:
-            eff = item["effective_status"]
-            grouped.setdefault(eff, []).append(item)
+        # Grouping is theme-driven + axis-agnostic (board_theme.group_board).
+        # ?group_by= is the extensibility seam: 'status' today, 'namespace' etc.
+        # later need only a new grouper + theme, no route/template change.
+        group_by = (request.args.get("group_by") or "status").strip().lower()
+        groups = board_theme.group_board(items, group_by)
 
         categories = db.list_categories(g.conn)
         board, online_count, registered = db.list_board(g.conn)
         open_threads = db.count_open_threads(g.conn)
         citations_exchanged = db.count_citations(g.conn)
+
+        # Per-card live agent-presence: join board agents (turn + participants)
+        # with the #956 presence board so work-items + who's-on-them render
+        # together on each card, not just in the sidebar. NB: list_board() emits
+        # the resolved status under key "state" (the DB column is status_state).
+        presence = {
+            a["name"]: a.get("state") or "offline" for a in board
+        }
+
         return render_template(
             "project_board.html",
             items=items,
-            grouped=grouped,
+            groups=groups,
+            group_by=group_by,
             counts=counts,
+            # Presentation theme — all read from board_theme (SSoT).
+            status_color=board_theme.status_color_map(),
+            terminal_statuses=board_theme.terminal_statuses(),
+            kind_emoji=board_theme.KIND_EMOJI,
+            gh_url=board_theme.github_url,
+            presence=presence,
             stats={
                 "registered": registered,
                 "online": online_count,

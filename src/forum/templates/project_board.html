@@ -23,6 +23,16 @@
   --accent-3:  oklch(0.74 0.13 245);
   --accent-4:  oklch(0.78 0.14 305);
   --danger:    oklch(0.68 0.18 25);
+
+  /* Status palette — the slots board_theme's --st-* names resolve to.
+     Intuitive hues: amber=active work, blue=needs review, violet=not-started,
+     red=blocked, green=done. Recolor a status here or remap in board_theme.py. */
+  --st-progress: var(--accent);     /* in-progress — amber */
+  --st-review:   var(--accent-3);   /* in-review   — blue  */
+  --st-planning: var(--accent-4);   /* planning    — violet */
+  --st-blocked:  var(--danger);     /* blocked     — red   */
+  --st-done:     var(--accent-2);   /* done        — green */
+  --st-default:  var(--ink-3);      /* unknown statuses */
 }
 
 * { box-sizing: border-box; }
@@ -100,15 +110,44 @@ a { color: inherit; text-decoration: none; }
 .pboard__cards { display: flex; flex-direction: column; gap: 12px; }
 .pboard__empty { font-size: 13px; color: var(--ink-4); font-style: italic; }
 
-/* Project card */
+/* Group header colour-coding (driven by --group-color from the theme) */
+.pboard__section-dot {
+  width: 8px; height: 8px; border-radius: 999px;
+  background: var(--group-color, var(--ink-4));
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--group-color, var(--ink-4)) 20%, transparent);
+  flex-shrink: 0;
+}
+.pboard__section-emoji { font-size: 11px; line-height: 1; opacity: 0.9; }
+
+/* Project card — status-striped + colour-coded (--status-color set per card) */
 .pcard {
+  position: relative;
   padding: 18px 20px;
   border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--status-color, var(--line));
   border-radius: 12px;
   background: var(--bg-elev);
   display: flex; flex-direction: column; gap: 8px;
+  transition: border-color 0.15s ease, background 0.15s ease;
 }
-.pcard--done { opacity: 0.52; }
+.pcard:hover {
+  background: var(--bg-card);
+  border-color: color-mix(in oklab, var(--status-color, var(--line)) 40%, var(--line));
+}
+.pcard--done { opacity: 0.5; }
+
+/* Live agent-presence dot (synced with the #956 presence board) */
+.pcard__pdot {
+  display: inline-block; width: 6px; height: 6px; border-radius: 999px;
+  background: var(--pdot, var(--ink-4)); margin-right: 3px; flex-shrink: 0;
+  vertical-align: middle;
+}
+.pdot--working { --pdot: var(--accent-2); }
+.pdot--engaged { --pdot: var(--accent-2); box-shadow: 0 0 0 2px color-mix(in oklab, var(--accent-2) 28%, transparent); }
+.pdot--idle    { --pdot: var(--accent); }
+.pdot--sleeping{ --pdot: var(--accent-4); opacity: 0.7; }
+.pdot--on-call { --pdot: var(--accent-3); }
+.pdot--offline { --pdot: var(--ink-4); opacity: 0.4; }
 .pcard__top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .pcard__kind { font-size: 14px; line-height: 1; }
 .pcard__id { font-size: 11px; color: var(--ink-3); }
@@ -220,46 +259,23 @@ a { color: inherit; text-decoration: none; }
     <div class="pboard__grid">
       <div class="pboard__main">
 
-        {# Render active statuses first, then done #}
-        {% set status_order = ['in-review', 'in-progress', 'planning', 'done'] %}
-        {% set status_labels = {
-            'in-review':   'In review',
-            'in-progress': 'In progress',
-            'planning':    'Planning',
-            'done':        'Done',
-        } %}
-
-        {% for status_key in status_order %}
-          {% if status_key in grouped and grouped[status_key] %}
-          <div class="pboard__section">
-            <div class="pboard__section-hd">
-              {{ status_labels.get(status_key, status_key) }}
-              <span class="pboard__section-count">{{ grouped[status_key]|length }}</span>
-            </div>
-            <div class="pboard__cards">
-              {% for item in grouped[status_key] %}
-                {% include "_project_card.html" %}
-              {% endfor %}
-            </div>
+        {# Generic group rendering — `groups` comes from board_theme.group_board
+           (axis-agnostic). Adding a grouping axis (namespace, owner, …) needs no
+           change here; the route passes a different `groups` and this renders it. #}
+        {% for grp in groups %}
+        <section class="pboard__section" style="--group-color: {{ grp.color }};">
+          <div class="pboard__section-hd">
+            <span class="pboard__section-dot"></span>
+            <span class="pboard__section-emoji">{{ grp.emoji }}</span>
+            {{ grp.label }}
+            <span class="pboard__section-count">{{ grp.count }}</span>
           </div>
-          {% endif %}
-        {% endfor %}
-
-        {# Any other status keys not in our preset order #}
-        {% for status_key, group_items in grouped.items() %}
-          {% if status_key not in status_order %}
-          <div class="pboard__section">
-            <div class="pboard__section-hd">
-              {{ status_key }}
-              <span class="pboard__section-count">{{ group_items|length }}</span>
-            </div>
-            <div class="pboard__cards">
-              {% for item in group_items %}
-                {% include "_project_card.html" %}
-              {% endfor %}
-            </div>
+          <div class="pboard__cards">
+            {% for item in grp.cards %}
+              {% include "_project_card.html" %}
+            {% endfor %}
           </div>
-          {% endif %}
+        </section>
         {% endfor %}
 
         {% if not items %}
