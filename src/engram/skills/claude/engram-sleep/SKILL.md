@@ -355,12 +355,17 @@ re-copies if size differs (resumed session may have grown the file).
 ## Phase B — Consolidation orchestration
 
 > **Phase B is MANDATORY whenever you reach it** (see the all-or-nothing invariant in
-> "When NOT to sleep"). The dream-fairy dispatch (Step 6) is the load-bearing part: the
-> fairies are the ONLY pass that scans the fresh cohort while it is still the current
-> turn. Skipping them and running the dream master on `engram_reflect` alone permanently
-> loses every window-scoped finding on today's nodes (missing principle-edges,
-> fresh-cohort contradictions). Do NOT skip the fairies for context economy — they run in
-> fresh contexts; if the parent is too full, nap, then dispatch.
+> "When NOT to sleep"). The rule is: **skip the whole sleep, or none of it — never skip *part* of it.** The dream-fairy dispatch (Step 6) is the load-bearing part — the fairies are the ONLY pass that scans the fresh cohort while it is still the current turn.
+>
+> The 8 fairies divide into two groups with different risk profiles:
+>
+> - **Truly window-scoped (Category 7; partially Category 6):** Category 7 (missing principle-edges) operates on the *fresh cohort* using an explicit `created_at >= prev-sleep-timestamp` filter. That window closes when `engram_advance_turn` fires — a missed Cat 7 pass is *permanent*, no backfill path. Category 6 (recent-resolution echoes) uses an implementation-defined recency window that also narrows post-advance; its miss is partially recoverable but degrades over cycles.
+>
+> - **All-time scoped but never deferrable (Categories 1/2/3/4/5/8):** open questions, contradictions, stale nodes, cornerstone candidates, tainted derivations, and stale task refs query across the full graph — they *can* be caught next cycle. But "catchable next cycle" is the rationalization that lets partial skipping compound silently: skip Cat 1 tonight, skip Cat 3 tomorrow, and consolidation debt accumulates past the capacity of any single pass.
+>
+> **Context pressure is never a valid reason to skip fairies.** They run in fresh contexts; the parent's context size is irrelevant to fairy execution. If the parent context is too full, **nap first, then dispatch the full set** — do not drop fairies.
+>
+> *(Origin: 2026-06-24 incident — a parent skipped 7 fairies "for parent-context economy"; the dream master advanced the turn. Backfill found 3 permanently-missing principle-edges (a derivation → its axiom, and two observations → their goal nodes). Initial fix #1427 (Ariadne) added the all-or-nothing MANDATORY framing; #1429 (Sol) adds the per-category taxonomy to close the "all-time-scoped fairies are catchable next cycle, can I skip them?" loophole.)*
 
 ### Step 5 — Compute the recall-summary cohort and run cohort_dispatch prepare
 
@@ -636,7 +641,7 @@ This is why the ordering is Phase A → Phase B, and why Phase A must complete b
 
 - **Parent does NOT call `engram_reflect`, `engram_advance_turn`, or write the dream record.** Those are dream-master responsibilities. The parent's job is orchestration + relay.
 
-- **Parent's context is light by design.** Dispatch + routing messages costs little context. If your context fills up during the routing phase, nap first to clear, then resume routing — the dream master's context is separate and unaffected by parent compaction.
+- **Parent's context is light by design.** Dispatch + routing messages costs little context. If your context fills up during the routing phase, **nap first to clear it, then return and dispatch the full fairy set** — do not reduce or drop fairies. The dream master's context is separate and unaffected by parent compaction. (See the Phase B mandatory invariant above: context pressure is never a reason to skip fairies.)
 
 - **Don't retry an interrupted dream.** If the dream master returns a partial result (some fairies timed out, completion checklist short-circuited under self-timeout), unfinished work goes into next cycle's cohort via attrition. The dream master logs unfinished items in the dream record. Don't try to "finish the work" in the parent context — that would re-introduce the discipline-blur this architecture exists to resolve.
 
