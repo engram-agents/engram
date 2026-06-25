@@ -46,7 +46,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -488,6 +488,9 @@ def write_agent_registration(
         pass
 
 
+PEER_STALE_HOURS = 24  # mirror ia.py's default
+
+
 def update_counterparts_from_registry(
     agent_name: str,
     config_path: str,
@@ -525,7 +528,7 @@ def update_counterparts_from_registry(
 
         own_hostname = socket.gethostname()
         now = datetime.now(timezone.utc)
-        stale_delta_seconds = 24 * 3600  # PEER_STALE_HOURS = 24
+        stale_delta_seconds = PEER_STALE_HOURS * 3600
 
         co_host_names: list[str] = []
         for json_file in sorted(registry_path.glob("*.json")):
@@ -602,6 +605,69 @@ def update_counterparts_from_registry(
     except Exception:
         # Fail-soft: never raise from a multi-agent convenience side-effect.
         pass
+
+
+def peer_topology_block(agent_name: str) -> str:
+    """Return a one-line co-host / cross-host peer summary for startup context.
+
+    Reads the shared agent registry (same dir as write_agent_registration writes
+    to) and classifies each live peer by hostname. Injected only on fresh-startup
+    so agents walk in knowing which peers are ia/baton-reachable vs forum-only.
+    Returns "" when the registry is absent (single-agent install), empty, or on
+    any error — never blocks session start.
+    """
+    if not agent_name:
+        return ""  # can't exclude self reliably without knowing our own name
+    try:
+        registry_path = Path(AGENT_REGISTRY_DIR)
+        if not registry_path.is_dir():
+            return ""
+
+        own_hostname = socket.gethostname()
+        now = datetime.now(timezone.utc)
+        stale_delta = timedelta(hours=PEER_STALE_HOURS)
+
+        cohost: list[str] = []
+        crosshost: list[str] = []
+
+        for json_file in sorted(registry_path.glob("*.json")):
+            try:
+                record = json.loads(json_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+
+            peer_name = record.get("agent_name", "").strip()
+            hostname = record.get("hostname", "").strip()
+            if not peer_name or not hostname or peer_name.lower() == agent_name.lower():
+                continue
+
+            # Skip stale entries (peer not active).
+            reg_at = record.get("registered_at")
+            if reg_at:  # no registered_at → treat as live (fail-open: missing timestamp ≠ stale)
+                try:
+                    reg_dt = datetime.fromisoformat(reg_at.replace("Z", "+00:00"))
+                    if (now - reg_dt) > stale_delta:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            if hostname == own_hostname:
+                cohost.append(peer_name)
+            else:
+                crosshost.append(peer_name)
+
+        if not cohost and not crosshost:
+            return ""
+
+        parts: list[str] = []
+        if cohost:
+            parts.append(f"co-host (ia/baton): {', '.join(cohost)}")
+        if crosshost:
+            parts.append(f"cross-host (forum): {', '.join(crosshost)}")
+
+        return f"[Peer topology — {'; '.join(parts)}]"
+    except Exception:
+        return ""
 
 
 def starred_block(engram_home: str) -> str:
@@ -1207,6 +1273,7 @@ def main() -> None:
     # peers can discover co-host vs cross-host topology. Fail-soft: the shared
     # filesystem may not exist (single-host install), and write_agent_registration
     # is wrapped in a broad try/except that swallows all errors silently.
+    _agent_name = ""
     try:
         _config_path = os.path.join(ENGRAM_HOME, "config.json")
         with open(_config_path) as _cf:
@@ -1255,6 +1322,9 @@ def main() -> None:
         monitor_block = forum_monitor_block()
         if monitor_block:
             lines.append(monitor_block)
+        peer_block = peer_topology_block(_agent_name)
+        if peer_block:
+            lines.append(peer_block)
     else:
         lines.append(
             f"[Session start reading — re-read {WARM_BRIEFING_PATH} before "
