@@ -1,0 +1,99 @@
+name: anti-dup-check
+
+# Issue #1433 — mechanical gate against duplicate-effort PRs.
+# Problem: discipline-only pre-checks failed under high-parallelism async
+# work (5+ duplicate-PR collisions on 2026-06-25 despite the convention
+# adopted the previous day). Two cases this gate catches:
+#
+#   1. Target issue already CLOSED (sequential dup — opened after the
+#      first PR merged and auto-closed the issue). → FAIL hard.
+#   2. Another open PR already references the same issue with a closing
+#      keyword (parallel dup — two PRs racing on the same fix). → WARN.
+#
+# Scopes to closing keywords only (close/closes/closed, fix/fixes/fixed,
+# resolve/resolves/resolved) — EPIC/umbrella multi-PR flows that reference
+# an issue without a closing keyword are not flagged.
+#
+# Uses body-text grep (same as trap-check): GitHub's closingIssuesReferences
+# GraphQL field is dormant on stacked/non-default-base PRs.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: [dev, master]
+
+jobs:
+  anti-dup:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: read
+      pull-requests: read
+    steps:
+      - name: Check target issues for already-closed or competing open PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Strip inline-code spans before grepping — GitHub's auto-close parser
+          # ignores keywords inside backticks (verified #1191), and CLAUDE.md
+          # recommends backticking close-keyword examples to avoid parser trips.
+          # Without stripping, a backtick-wrapped example (e.g. `closes #N`)
+          # would false-hard-fail this gate even though GitHub won't act on it.
+          BODY_STRIPPED=$(printf '%s' "$PR_BODY" | sed 's/`[^`]*`//g')
+
+          # Extract issue numbers referenced with a closing keyword in the body.
+          CLOSING_NS=$(printf '%s' "$BODY_STRIPPED" \
+            | grep -ioE '(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]+#[0-9]+' \
+            | grep -oE '[0-9]+' | sort -u)
+
+          if [ -z "$CLOSING_NS" ]; then
+            echo "No closing-keyword issue references in the PR body. ✓"
+            exit 0
+          fi
+
+          HARD_FAIL=0
+
+          for N in $CLOSING_NS; do
+            # ── Check 1: Is the target issue already CLOSED? ──────────────────
+            STATE=$(gh issue view "$N" --repo "$REPO" --json state \
+              --jq '.state' 2>/dev/null || echo "unknown")
+            if [ "$STATE" = "CLOSED" ]; then
+              echo "::error::Issue #$N is already CLOSED. This PR appears to be a duplicate — the issue was resolved by an earlier PR. Verify before continuing; if this PR supersedes the prior fix, reopen the issue first."
+              HARD_FAIL=1
+            elif [ "$STATE" = "unknown" ]; then
+              echo "::warning::Could not fetch state for issue #$N (API error or issue not found). Manual check recommended."
+            else
+              echo "Issue #$N is open (state=$STATE). ✓"
+            fi
+
+            # ── Check 2: Another open PR already targets the same issue ───────
+            # List open PRs, exclude this PR, grep body for a closing-keyword
+            # reference to #N. (GraphQL closingIssuesReferences is dormant on
+            # stacked PRs, so body-grep is the reliable signal.)
+            # Note: we grep raw bodies here (not stripped) — over-flagging a
+            # competing PR that backticks its keyword is a harmless warning;
+            # the important accuracy is on the hard-fail Check-1 above.
+            # Both $PR_NUMBER and $N are digit-only (extracted via grep [0-9]+),
+            # so direct interpolation into the jq filter is safe (no injection risk).
+            COMPETING=$(gh pr list --repo "$REPO" --state open \
+              --json number,body \
+              --jq '.[] | select(.number != '"$PR_NUMBER"') | select(.body != null) |
+               select(.body | test("(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]+#'"$N"'\\b"; "i")) |
+               .number' 2>/dev/null | tr '\n' ' ' | xargs)
+            if [ -n "$COMPETING" ]; then
+              echo "::warning::Issue #$N already has open PR(s) with a closing keyword: $(printf '#%s ' $COMPETING). Check for duplicate effort. If this PR supersedes those, note it in the PR description."
+            fi
+          done
+
+          if [ "$HARD_FAIL" = "1" ]; then
+            echo ""
+            echo "One or more target issues are already CLOSED. To proceed:"
+            echo "  • If this PR genuinely differs from the merged fix, reopen the"
+            echo "    issue and update the PR body to explain the distinction."
+            echo "  • If this PR duplicates the merged fix, close it."
+            exit 1
+          fi
+
+          echo "All closing-keyword targets are open. ✓"
