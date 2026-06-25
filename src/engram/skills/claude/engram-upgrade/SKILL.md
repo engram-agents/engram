@@ -190,6 +190,36 @@ This prevents the silent-degradation class where agents run a stale shared CLI a
 
 ---
 
+## Step 5b — Restart viz server (if installed as systemd service)
+
+Skip if you don't use the viz dashboard (T2 feature, may not be installed).
+
+The plugin rebuild (Step 4) replaced `viz_server.py` in the plugin cache, but any running viz service still executes the **old code**. Without a restart the health dashboard silently serves stale content — it appears healthy but reports on the pre-upgrade version.
+
+**macOS note:** systemd is Linux-only. On macOS, skip to the manual-start path below. launchd integration is a known gap (see #402); it is not handled here.
+
+```bash
+# Check if a systemd service is registered (Linux only):
+systemctl --user status engram-viz 2>/dev/null || echo "no systemd service"
+
+# If registered, restart it:
+systemctl --user restart engram-viz && echo "viz restarted" || echo "viz restart failed — check journalctl --user -u engram-viz"
+```
+
+**If not a systemd service** (manual-start install, or macOS): the old process is still running. Tell the user:
+> The viz server is serving pre-upgrade code. Kill the old process and restart:
+> `pkill -f viz_server.py; python3 ${CLAUDE_PLUGIN_ROOT:-~/.engram/marketplace/plugins/engram}/viz_server.py &`
+
+Verify the server is live with new code after the restart:
+```bash
+curl -s http://localhost:5001/api/health | python3 -m json.tool
+```
+A `health_score` field in the response confirms the viz server is up. Step 7 also checks this.
+
+**Checkpoint**: viz responds to `http://localhost:5001/api/health` (or the service is confirmed not installed).
+
+---
+
 ## Step 6 — CLAUDE.md template inverse-merge (HARD GATE, the residual)
 
 If Step 2 found any CLAUDE.md render source changed in the range, **do not skip this**. The rendered `~/.claude/CLAUDE.md` is assembled from multiple upstream sources — `templates/template.CLAUDE.md` AND `templates/compact-instructions.md` — so a `compact-instructions.md`-only change is just as drift-producing as a template change. On Codex, also check `templates/template.AGENTS.md` and any local first-person instructions in `~/.codex/config.toml`/project `AGENTS.md`. The plugin upgrade did not touch these user-scope identity surfaces, so source-side additions may NOT have reached the running agent.
