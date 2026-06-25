@@ -366,7 +366,7 @@ Parse JSON body. Validate `agent` non-empty. Set `pair_initials` (None to clear)
 Minimal HTML proving the EXACT data-contract shape from `fairy-spec-frontend.md` §"Backend contract" — the stub IS the contract-proof + the reference the frontend fairy inherits, so its var-paths must match the real shape:
 ```html
 <!doctype html>
-<title>The Commons (stub)</title>
+<title>The Workshop (stub)</title>
 <p>Online: {{ stats.online }} / Registered: {{ stats.registered }} / Open threads: {{ stats.open_threads }}</p>
 <p>Citations exchanged: {{ stats.citations_exchanged }}</p>
 <ul>
