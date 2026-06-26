@@ -33,12 +33,17 @@ import socket
 import subprocess
 import sys
 import tempfile
-import urllib.error
 import urllib.parse
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+
+# UCS Slice E — thin-client scaffold (ships alongside ia.py as tools/forum_api.py).
+# Explicit path insert ensures this import works when ia.py is loaded via importlib
+# (e.g. in direct-import tests) — Python's automatic script-dir addition only fires
+# when ia.py is the __main__ entry point, not when loaded via spec_from_file_location.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from forum_api import ForumClient, ForumHttpError, ForumNetworkError, forum_url_from_config
 
 # ---------------------------------------------------------------------------
 # Environment + paths
@@ -1522,36 +1527,22 @@ def cmd_peers(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Forum DM channel  (UCS Slice D)
+# Forum DM channel  (UCS Slice D + E)
 # ---------------------------------------------------------------------------
-
-def _get_forum_url(config: dict) -> str:
-    """Resolve the forum base URL from config (mirrors forum.py's _resolve_forum_url)."""
-    return (
-        (config.get("forum") or {}).get("url")
-        or os.environ.get("FORUM_URL")
-        or "http://localhost:5002"
-    )
 
 
 def cmd_dm(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    """DM send/read/list via the forum /api/dm endpoint."""
-    forum_url = getattr(args, "forum_url", None) or _get_forum_url(config)
+    """DM send/read/list via the forum /api/dm endpoint (thin-client via ForumClient)."""
+    forum_url = getattr(args, "forum_url", None) or forum_url_from_config(config)
+    client = ForumClient(forum_url)
 
     if not args.counterpart:
         # List mode: show all my DM threads
-        url = f"{forum_url}/api/dm"
-        req = urllib.request.Request(
-            f"{url}?agent={urllib.parse.quote(agent_name)}",
-            headers={"Accept": "application/json"},
-        )
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-        except urllib.error.URLError as e:
-            print(f"ia dm: forum unreachable — {e}", file=sys.stderr)
+            data = client.get("/api/dm", params={"agent": agent_name})
+        except ForumNetworkError as e:
+            print(f"ia dm: {e}", file=sys.stderr)
             sys.exit(EXIT_IO)
-
         threads = data.get("threads", [])
         if not threads:
             print("(no DM threads)")
@@ -1570,52 +1561,35 @@ def cmd_dm(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         if not body:
             print("ia dm: body is empty (nothing to send)", file=sys.stderr)
             sys.exit(EXIT_VALIDATION)
-
-        url = f"{forum_url}/api/dm/{urllib.parse.quote(counterpart)}"
-        payload = json.dumps({"agent": agent_name, "body": body}).encode()
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-            method="POST",
-        )
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                result = json.loads(resp.read().decode())
-        except urllib.error.HTTPError as e:
-            err = e.read().decode("utf-8", errors="replace")
-            print(f"ia dm: send failed ({e.code}): {err}", file=sys.stderr)
+            result = client.post(
+                f"/api/dm/{urllib.parse.quote(counterpart)}",
+                {"agent": agent_name, "body": body},
+            )
+        except ForumHttpError as e:
+            print(f"ia dm: send failed ({e.status}): {e.body}", file=sys.stderr)
             sys.exit(EXIT_VALIDATION)
-        except urllib.error.URLError as e:
-            print(f"ia dm: forum unreachable — {e}", file=sys.stderr)
+        except ForumNetworkError as e:
+            print(f"ia dm: {e}", file=sys.stderr)
             sys.exit(EXIT_IO)
-
-        print(
-            f"ia dm: sent to {counterpart} "
-            f"(seq={result.get('seq')}, ts={result.get('ts')})"
-        )
+        print(f"ia dm: sent to {counterpart} (seq={result.get('seq')}, ts={result.get('ts')})")
         return
 
     # Read mode: fetch and display thread
     since_seq = getattr(args, "since_seq", 0) or 0
-    url = f"{forum_url}/api/dm/{urllib.parse.quote(counterpart)}"
-    params = f"?agent={urllib.parse.quote(agent_name)}&since_seq={since_seq}"
-    req = urllib.request.Request(
-        url + params,
-        headers={"Accept": "application/json"},
-    )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
+        data = client.get(
+            f"/api/dm/{urllib.parse.quote(counterpart)}",
+            params={"agent": agent_name, "since_seq": str(since_seq)},
+        )
+    except ForumHttpError as e:
+        if e.status == 404:
             print(f"(no DM thread with {counterpart})")
             return
-        err = e.read().decode("utf-8", errors="replace")
-        print(f"ia dm: error ({e.code}): {err}", file=sys.stderr)
+        print(f"ia dm: error ({e.status}): {e.body}", file=sys.stderr)
         sys.exit(EXIT_VALIDATION)
-    except urllib.error.URLError as e:
-        print(f"ia dm: forum unreachable — {e}", file=sys.stderr)
+    except ForumNetworkError as e:
+        print(f"ia dm: {e}", file=sys.stderr)
         sys.exit(EXIT_IO)
 
     messages = data.get("messages", [])
