@@ -21,5 +21,17 @@ path; a write that bypasses the module is invisible to the real-time feed.
 from __future__ import annotations
 
 from .seq import SeqAllocator
+from .store import (
+    CoordinationStore,
+    DmMessage,
+    ProjectRecord,
+    dm_thread_key,
+)
 
-__all__ = ["SeqAllocator"]
+__all__ = [
+    "SeqAllocator",
+    "CoordinationStore",
+    "DmMessage",
+    "ProjectRecord",
+    "dm_thread_key",
+]
