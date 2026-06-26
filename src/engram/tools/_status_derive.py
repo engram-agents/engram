@@ -250,12 +250,32 @@ def derive_own_status(
     # state
     if override_state is not None:
         state = override_state
-    elif _recently_engaged():
-        state = "engaged"
-    elif loop is not None or batons:
-        state = "working"
     else:
-        state = "idle"
+        # Consult presence mode. The import is lazy + try/except-guarded because
+        # presence is an OPTIONAL surface — it's stdlib-only and self-contained
+        # (it does NOT import _status_derive, so there is no circular import to
+        # avoid). Lazy + guarded means that if presence is absent or errors, we
+        # fail-open to the existing engaged/working/idle logic below. Fail-open to
+        # "auto" on any error — a broken presence layer must not suppress the loop
+        # by silently staying in "user".
+        _presence_mode = "auto"
+        try:
+            import presence as _presence_mod  # noqa: PLC0415
+            _presence_mode, _ = _presence_mod.get_mode()
+        except Exception:
+            _presence_mode = "auto"
+
+        # Both presence mode=user (cooldown window) and _recently_engaged
+        # (engaged_window) map to the "engaged" display state, so the effective
+        # engaged-display threshold is max(cooldown_seconds, engaged_window_seconds).
+        if _presence_mode == "user":
+            state = "engaged"
+        elif _recently_engaged():
+            state = "engaged"
+        elif loop is not None or batons:
+            state = "working"
+        else:
+            state = "idle"
 
     # cadence
     if on_call:

@@ -287,6 +287,14 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/presence.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/engram-mode.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/worktree-gc.py",
       "tier": "convenience"
     },
