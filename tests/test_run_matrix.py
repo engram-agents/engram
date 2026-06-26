@@ -119,8 +119,8 @@ def test_compute_image_hash_deterministic_and_input_sensitive(tmp_path):
     (tmp_path / "docker").mkdir()
     df = tmp_path / "docker" / "Dockerfile.full-default"
     df.write_text("FROM python:3.12\n")
-    (tmp_path / "packaging").mkdir()
-    (tmp_path / "packaging" / "tiers.json").write_text("{}")
+    (tmp_path / "src" / "build" / "packaging").mkdir(parents=True)
+    (tmp_path / "src" / "build" / "packaging" / "tiers.json").write_text("{}")
     (tmp_path / "requirements.txt").write_text("pytest\n")
     env = rm.P0_ENVS[0]
     h1 = rm.compute_image_hash(env, str(tmp_path))
@@ -129,6 +129,9 @@ def test_compute_image_hash_deterministic_and_input_sensitive(tmp_path):
     df.write_text("FROM python:3.12\nRUN echo changed\n")
     h3 = rm.compute_image_hash(env, str(tmp_path))
     assert h3 != h1  # input change invalidates
+    (tmp_path / "src" / "build" / "packaging" / "tiers.json").write_text('{"changed": true}')
+    h4 = rm.compute_image_hash(env, str(tmp_path))
+    assert h4 != h3  # tiers.json change also invalidates
 
 
 def test_parse_pytest_counts():

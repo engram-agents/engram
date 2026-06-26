@@ -157,7 +157,7 @@ def pytest_targets(selection: dict) -> list[str]:
 def _freshness_inputs(env: EnvSpec, repo_root: str) -> list[str]:
     """Files whose change should invalidate a prebuilt image, in stable order."""
     root = Path(repo_root)
-    inputs = [env.dockerfile, "packaging/tiers.json"]
+    inputs = [env.dockerfile, "src/build/packaging/tiers.json"]
     inputs += sorted(str(p.relative_to(root)) for p in root.glob("requirements*.txt"))
     return inputs
 
