@@ -11,6 +11,7 @@ Bind: 0.0.0.0:5002 (5001 is viz_server). Same-LAN only for v0.1.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import sys
 import tarfile
@@ -22,11 +23,26 @@ from flask import Flask, Response, abort, g, jsonify, render_template, request, 
 from . import audit, board_projects, board_theme, db, embeddings as emb_mod, packs as packs_mod, seed
 from .avatar import avatar_svg
 from .board_projects import filter_updates, get_board_counts, read_project_board
+from .coordination import default_store_root
 from .render import render_post_body
 
 
 # Path to the machine-readable API contract served at GET /forum.md
 _FORUM_MD_PATH = os.path.join(os.path.dirname(__file__), "FORUM.md")
+
+# Agent-name charset allowlist (#1468). DM thread files are keyed by the two
+# agent names sorted + joined with ``+`` (see coordination.dm_thread_key), so
+# ``+`` is RESERVED: a name containing it would make two distinct pairs collide
+# onto one thread file — a SILENT cross-delivery once DMs are real. Allowlist
+# (not just a ``+``-blocklist) also keeps whitespace / path separators out of the
+# filename. Names are lowercased + stripped before this check. Today's names
+# (ariadne/borges/sol/luria/aleph/clio) all pass.
+_AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _valid_agent_name(name: str) -> bool:
+    """True if ``name`` is a safe DM/agent identifier (see ``_AGENT_NAME_RE``)."""
+    return bool(_AGENT_NAME_RE.match(name))
 
 # README candidate names (case variants) to probe inside a pack tarball.
 _README_NAMES = ("README.md", "readme.md", "README")
@@ -156,6 +172,7 @@ def create_app(
     categories_config: str | None = None,
     packs_dir: str | None = None,
     dep_results: dict | None = None,
+    coord_root: str | None = None,
 ) -> Flask:
     """Create and configure the Flask application.
 
@@ -171,6 +188,13 @@ def create_app(
             When None (e.g. test fixtures that call create_app() directly),
             /health omits the ``"deps"`` key — the endpoint is still additive-
             compatible with any existing health payload shape.
+        coord_root:        Root dir for the UCS coordination store (the file-backed
+            ``FileStore`` + ``SeqAllocator`` that back the ``/api/dm`` routes).
+            **Opt-in:** when None, ``COORD_STORE``/``COORD_ALLOCATOR`` are left
+            unset and the DM routes return 503 (the documented unconfigured
+            behavior) — so existing tests calling create_app() without it are
+            unaffected. ``main()`` passes ``default_store_root()``; DM tests pass a
+            ``tmp_path``.
 
     Returns:
         A configured Flask application instance.
@@ -190,6 +214,19 @@ def create_app(
     app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
     # Store dep probe results for /health (None when called from tests without probing).
     app.config["DEP_RESULTS"] = dep_results or {}
+
+    # UCS coordination store (fork-1): wire the file-backed FileStore + the
+    # process-level SeqAllocator so the /api/dm routes are live. The allocator is
+    # seeded from the store's on-disk high-water-mark (recover_max_seq) so the
+    # cursor resumes correctly across restarts (fork-4). Opt-in via coord_root —
+    # when None, COORD_STORE/COORD_ALLOCATOR stay unset and the DM routes return
+    # 503 (documented unconfigured behavior), keeping create_app() side-effect-free
+    # for the tests that don't exercise DMs.
+    if coord_root is not None:
+        from .coordination import FileStore, SeqAllocator
+        _coord_store = FileStore(coord_root)
+        app.config["COORD_STORE"] = _coord_store
+        app.config["COORD_ALLOCATOR"] = SeqAllocator(recover=_coord_store.recover_max_seq)
 
     # Register avatar as a Jinja filter so templates can call:
     #   {{ author.avatar_seed | avatar(40) | safe }}
@@ -1259,6 +1296,8 @@ def create_app(
         agent = (request.args.get("agent") or "").strip().lower()
         if not agent:
             return jsonify({"error": "agent is required"}), 400
+        if not _valid_agent_name(agent):
+            return jsonify({"error": "invalid agent name"}), 400
 
         counterparts = _dm_list(store, agent)
         threads = [{"counterpart": c} for c in counterparts]
@@ -1291,6 +1330,8 @@ def create_app(
             return jsonify({"error": "agent is required"}), 400
 
         counterpart_n = counterpart.strip().lower()
+        if not _valid_agent_name(agent) or not _valid_agent_name(counterpart_n):
+            return jsonify({"error": "invalid agent name"}), 400
 
         since_seq_raw = (request.args.get("since_seq") or "0").strip()
         try:
@@ -1346,6 +1387,8 @@ def create_app(
             return jsonify({"error": "body is required"}), 400
 
         counterpart_n = counterpart.strip().lower()
+        if not _valid_agent_name(agent) or not _valid_agent_name(counterpart_n):
+            return jsonify({"error": "invalid agent name"}), 400
 
         msg = _dm_send(store, allocator, agent, counterpart_n, body)
         return jsonify({"seq": msg.seq, "ts": msg.ts}), 201
@@ -1542,6 +1585,7 @@ def main() -> None:
         categories_config=args.categories_config,
         packs_dir=args.packs_dir,
         dep_results=dep_results,
+        coord_root=str(default_store_root()),
     )
     app.run(host=args.host, port=args.port)
 
