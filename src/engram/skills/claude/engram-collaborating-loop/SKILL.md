@@ -30,9 +30,14 @@ up**.
 
 This skill is a **specialization of `engram-loop`**. Everything about the loop
 *formality* — the `~/.engram/loop-mode.json` marker (entry-guard / write-on-
-start / remove-on-end), the start-vs-continuation decision, the loop-aware
-drowsiness banner — lives in `engram-loop` and is NOT restated here. Read that
-first; this skill adds only the coordination layer on top.
+start / remove-on-end), the start-vs-continuation decision, the **engaged-gate**
+(run `engram-loop-gate` on a heartbeat wake; `defer <N>` → re-arm + stop, the
+#1456 defer-to-a-present-user step), the loop-aware drowsiness banner — lives in
+`engram-loop` and is NOT restated here. Read that first; this skill adds only the
+coordination layer on top. (The engaged-gate applies to the `ScheduleWakeup`
+heartbeat wake; the Monitor wakes already self-suppress during the engaged
+window, so the two mechanisms cover the same "user is here" signal from both
+sides.)
 
 ---
 

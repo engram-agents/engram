@@ -278,6 +278,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/engram-loop-gate.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/worktree-gc.py",
       "tier": "convenience"
     },

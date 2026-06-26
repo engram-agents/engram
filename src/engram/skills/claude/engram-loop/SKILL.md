@@ -57,10 +57,34 @@ decides whether you write the marker or check it:
   cat ~/.engram/loop-mode.json 2>/dev/null
   ```
 
-  - **present** → the loop is live → continue the iteration via Step 1.5 (staleness sanity check) then Step 2 (loop body).
+  - **present** → the loop is live → run the **engaged-gate** (below) first, then continue the iteration via Step 1.5 (staleness sanity check) then Step 2 (loop body).
   - **absent** → the loop already ended (the marker is removed at loop-end); this
     re-fire is a **MISFIRE** (stale-marker misfire failure mode). Do NOT run the loop body, and do NOT
     re-arm. Note "stale loop — marker absent, stopping" and stop.
+
+  **Engaged-gate — defer to a present user before doing autonomous work (#1456).**
+  On a CONTINUATION wake with the marker present, run the loop self-gate *before*
+  the loop body:
+
+  ```bash
+  "$CLAUDE_PLUGIN_ROOT/tools/engram-loop-gate.py"   # prints "defer <N>" or "proceed"
+  ```
+
+  - **`proceed`** → the user is not currently engaged → continue to Step 1.5 → Step 2 as normal.
+  - **`defer <N>`** → a genuine human prompt landed within the engaged window: the
+    user is *here*. **Do NOT run the loop body.** Re-arm `ScheduleWakeup` for `<N>`
+    seconds with the same loop prompt, and stop. This is **defer-not-drop** — the
+    marker stays, no work is lost, the wake just slides past the engaged window
+    (sliding: each user message resets it, so the loop stays quiet while the user
+    is active, then wakes once they go quiet).
+
+  Why: the monitors already suppress real-time events during the engaged window
+  (#1077 part 2), but the `ScheduleWakeup` heartbeat did not — so an autonomous
+  loop-wake could fire mid-conversation and talk over the user (the gap that
+  motivated #1456). The gate closes that asymmetry using the *same*
+  `last-user-activity` signal the monitors use. It is **fail-open**: a missing
+  stamp or any gate error prints `proceed`, so a broken gate never deadlocks the
+  loop — it only ever lets it run.
 
   **Why warm-briefing on post-compaction wakes — two live incidents:**
   - *Post-compaction*: when a compaction fires mid-loop, the stub is the entire

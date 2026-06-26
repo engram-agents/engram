@@ -198,6 +198,12 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/engram-loop-gate.py",
+      "test_globs": [
+        "tests/test_loop_gate.py"
+      ]
+    },
+    {
       "path_prefix_or_glob": "tools/forum.py",
       "test_globs": [
         "tests/test_tier_build_filter.py"

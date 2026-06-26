@@ -71,6 +71,10 @@ _UNSET = object()
 # cadence.engaged_window_seconds in config.json.
 _DEFAULT_ENGAGED_WINDOW: int = 360
 
+# Loop-gate constants (loop_gate_decision).
+_LOOP_GATE_MIN_DEFER: int = 60   # never re-arm shorter than this on a defer
+_LOOP_GATE_MARGIN: int = 30      # seconds added to remaining for next-wake timing
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -161,6 +165,53 @@ def _recently_engaged() -> bool:
         return age <= window
     except Exception:
         return False
+
+
+def loop_gate_decision() -> tuple:
+    """Decide whether an autonomous loop-wake should run now or re-defer.
+
+    Returns (decision, defer_seconds, reason):
+      - ("defer", N, "user-engaged") when a recent human prompt is within the
+        engaged window. N = time remaining until the window would expire from the
+        last activity stamp, + a small margin, clamped to [_LOOP_GATE_MIN_DEFER,
+        window]. Sliding by construction: if the user types again the stamp moves
+        and the next wake re-defers.
+      - ("proceed", 0, <reason>) otherwise (not engaged, OR any error).
+
+    FAIL-OPEN to proceed: the loop's liveness must NEVER depend on this gate. A
+    missing/unparseable stamp, a future-dated stamp, a config read error — every
+    failure path returns ("proceed", 0, ...). A broken gate lets the loop run
+    (strictly no worse than today's no-gate behavior); it must never deadlock it.
+    """
+    try:
+        if not _recently_engaged():
+            return ("proceed", 0, "not-engaged")
+
+        # Engaged — compute how long to re-defer.
+        try:
+            with open(LAST_USER_ACTIVITY_PATH, encoding="utf-8") as fh:
+                raw = fh.read().strip()
+            stamp = float(raw)
+            now = time.time()
+            window = _read_engaged_window()
+            remaining = (stamp + window) - now
+            if remaining <= 0:
+                # Window just lapsed between the two reads — proceed.
+                return ("proceed", 0, "not-engaged")
+            defer_raw = remaining + _LOOP_GATE_MARGIN
+            defer = int(max(_LOOP_GATE_MIN_DEFER, min(defer_raw, window)))
+            return ("defer", defer, "user-engaged")
+        except Exception:
+            # Race or read failure after _recently_engaged() was True.
+            # Full-window defer is the safe conservative choice.
+            # Use the module constant directly — calling _read_engaged_window()
+            # here could itself raise, escaping to the outer except and returning
+            # ("proceed", 0, "gate-error"), which defeats the engaged→defer
+            # guarantee this branch exists to enforce.
+            window = _DEFAULT_ENGAGED_WINDOW
+            return ("defer", window, "user-engaged-fallback")
+    except Exception:
+        return ("proceed", 0, "gate-error")
 
 
 # ---------------------------------------------------------------------------
