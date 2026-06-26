@@ -1,4 +1,4 @@
-"""Tests for coordination.projects — the relocated baton write-fns (flip, claim, release).
+"""Tests for coordination.projects — the relocated baton write-fns (flip, claim, release, set_status).
 
 Exercises the full write body against a real FileStore + SeqAllocator: read →
 transform → atomic-write under the allocator lock (fork-4), seq embedded + returned.
@@ -13,6 +13,7 @@ from forum.coordination import (
     claim,
     flip,
     release,
+    set_status,
 )
 from forum.coordination import markdown as md
 
@@ -244,5 +245,78 @@ def test_release_missing_project_raises(store, allocator):
         release(
             store, allocator, "PR-nope",
             holder="ariadne", pool_sentinel="lei",
+            reason="done",
+        )
+
+
+# ---------------------------------------------------------------------------
+# set_status() tests
+# ---------------------------------------------------------------------------
+
+
+def test_set_status_updates_status_and_appends_log(store, allocator):
+    seq = set_status(
+        store, allocator, "PR-1",
+        new_status="in-review",
+        reason="submitted for review",
+        caller="close",
+        ts="2026-06-26T12:00:00Z",
+    )
+    assert seq == 1
+
+    raw = store.read_project("PR-1")
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["status"] == "in-review"
+    assert fields["seq"] == "1"
+    assert "- 2026-06-26T12:00:00Z close: in-review — submitted for review" in raw
+
+
+def test_set_status_byte_exact_golden(store, allocator):
+    """Byte-exact: log line uses caller label, em-dash separator, and reason verbatim."""
+    set_status(
+        store, allocator, "PR-1",
+        new_status="merged",
+        reason="CI green, colleague approved",
+        caller="close",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = store.read_project("PR-1")
+    assert "status: merged" in raw
+    assert "- 2026-06-26T12:00:00Z close: merged — CI green, colleague approved" in raw
+
+
+def test_set_status_default_caller(store, allocator):
+    """When caller is omitted, the log entry uses 'set_status' as the verb."""
+    set_status(
+        store, allocator, "PR-1",
+        new_status="planning",
+        reason="reset",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = store.read_project("PR-1")
+    assert "- 2026-06-26T12:00:00Z set_status: planning — reset" in raw
+
+
+def test_set_status_does_not_touch_turn_fields(store, allocator):
+    """set_status only mutates the status field; turn / turn_since / turn_reason are unchanged."""
+    set_status(
+        store, allocator, "PR-1",
+        new_status="merged",
+        reason="done",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = store.read_project("PR-1")
+    fields, _ = md.parse_frontmatter(raw)
+    # turn fields from the seed baton must survive unchanged
+    assert fields["turn"] == "ariadne"
+    assert fields["turn_since"] == "2026-06-26T00:00:00Z"
+    assert fields["turn_reason"] == '"start"'
+
+
+def test_set_status_missing_project_raises(store, allocator):
+    with pytest.raises(ProjectNotFound):
+        set_status(
+            store, allocator, "PR-nope",
+            new_status="merged",
             reason="done",
         )

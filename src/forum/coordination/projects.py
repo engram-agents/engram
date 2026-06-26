@@ -9,9 +9,9 @@ later the HTTP route layer) — only the write body lives here, so every front-e
 (CLI, web, the ``/api/updates`` feed) goes through the one writer (fork-4: no write
 path bypasses the module).
 
-This slice lands ``flip`` (the most-used op) and the shared pattern; ``claim`` and
-``release`` follow the same shape. close / gc / init / reopen / rename / anchor /
-merge follow in further slices.
+This slice lands ``flip`` (the most-used op) and the shared pattern; ``claim``,
+``release``, and ``set_status`` follow the same shape. close / gc / init / reopen /
+rename / anchor / merge follow in further slices.
 """
 
 from __future__ import annotations
@@ -196,6 +196,53 @@ def release(
     if title_renamed:
         log_entry += f"\n- {now} title marked (done)"
     body = md.append_turn_log(body, log_entry)
+    final = md.reattach_frontmatter(updated, body)
+
+    with allocator.allocate() as seq:
+        store.write_project(project_id, final, seq=seq)
+    return seq
+
+
+def set_status(
+    store: CoordinationStore,
+    allocator: SeqAllocator,
+    project_id: str,
+    *,
+    new_status: str,
+    reason: str,
+    caller: str = "set_status",
+    ts: Optional[str] = None,
+) -> int:
+    """Set a project baton's ``status`` field; return the assigned seq.
+
+    The pure write body of any status-transition operation (close, reopen, gc,
+    merge): updates ``status`` in frontmatter, appends a turn-log entry, and
+    writes atomically under the allocator lock (fork-4).  CLI-layer validation
+    (is ``new_status`` a valid value? is the transition permitted?) is the
+    caller's job — only the write body lives here.
+
+    Args:
+        new_status: the target status string (e.g. ``"merged"``, ``"in-review"``).
+        reason: human-readable explanation logged in the turn-log entry.
+        caller: operation label used in the log entry (e.g. ``"close"``,
+            ``"reopen"``).  Defaults to ``"set_status"`` for bare calls.
+        ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
+
+    Returns:
+        The seq assigned to this mutation.
+
+    Raises:
+        ProjectNotFound: if ``project_id`` has no existing baton file.
+    """
+    content = store.read_project(project_id)
+    if content is None:
+        raise ProjectNotFound(project_id)
+
+    now = ts or md.now_iso()
+
+    updated = md.update_frontmatter(content, {"status": new_status})
+    _, body = md.parse_frontmatter(updated)
+    body = md.append_turn_log(body, f"- {now} {caller}: {new_status} — {reason}")
     final = md.reattach_frontmatter(updated, body)
 
     with allocator.allocate() as seq:
