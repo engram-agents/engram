@@ -274,6 +274,11 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/forum_api.py",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
       "path": "tools/_status_derive.py",
       "tier": "convenience"
     },

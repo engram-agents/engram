@@ -210,6 +210,12 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/forum_api.py",
+      "test_globs": [
+        "tests/test_forum_api.py"
+      ]
+    },
+    {
       "path_prefix_or_glob": "tools/ia.py",
       "test_globs": [
         "tests/test_ia_cli.py",
