@@ -62,29 +62,59 @@ decides whether you write the marker or check it:
     re-fire is a **MISFIRE** (stale-marker misfire failure mode). Do NOT run the loop body, and do NOT
     re-arm. Note "stale loop — marker absent, stopping" and stop.
 
-  **Engaged-gate — defer to a present user before doing autonomous work (#1456).**
+  **Presence gate — defer to a present/focused user before autonomous work (#1456).**
   On a CONTINUATION wake with the marker present, run the loop self-gate *before*
   the loop body:
 
   ```bash
-  "$CLAUDE_PLUGIN_ROOT/tools/engram-loop-gate.py"   # prints "defer <N>" or "proceed"
+  "$CLAUDE_PLUGIN_ROOT/tools/engram-loop-gate.py"          # prints "defer <N>" or "proceed"
+  "$CLAUDE_PLUGIN_ROOT/tools/engram-loop-gate.py" --json   # adds the reason — read it when deferred
   ```
 
-  - **`proceed`** → the user is not currently engaged → continue to Step 1.5 → Step 2 as normal.
-  - **`defer <N>`** → a genuine human prompt landed within the engaged window: the
-    user is *here*. **Do NOT run the loop body.** Re-arm `ScheduleWakeup` for `<N>`
-    seconds with the same loop prompt, and stop. This is **defer-not-drop** — the
-    marker stays, no work is lost, the wake just slides past the engaged window
-    (sliding: each user message resets it, so the loop stays quiet while the user
-    is active, then wakes once they go quiet).
+  - **`proceed`** → no present/focused user → continue to Step 1.5 → Step 2 as normal.
+  - **`defer <N>`** → the user is *here* (or has asked to be left focused). **Do NOT
+    run the loop body.** Re-arm `ScheduleWakeup` for `<N>` seconds with the same loop
+    prompt, and stop. This is **defer-not-drop** — the marker stays, no work is lost,
+    the wake just slides past the suppression window.
+
+  **Surface *why* you deferred (suspended ≠ dead).** Read the `--json` `reason` and
+  put it in your stop line, so a presence-suspended loop never reads as a stuck/dead
+  one:
+  - `user-engaged` — a genuine human prompt within the *engaged window*
+    (`cadence.engaged_window_seconds`, default 360s). Sliding: each user message
+    resets it; the loop wakes once they go quiet.
+  - `presence-derived-user` — presence mode resolved to `user` from recent activity
+    within the *cooldown window* (`cadence.cooldown_seconds`, default 600s ⊇ the
+    engaged window). The presence-aware gate (#1489) is the higher control; the raw
+    engaged-defer is its fallback.
+  - `presence-override-user` — an **explicit** `engram-mode user` override is active
+    (Lei or I deliberately suspended the loop). Defers until the override's TTL
+    expires, or indefinitely until `engram-mode clear`.
+
+  **Controlling it — `engram-mode` (the mode SSoT the gate reads):**
+  - `engram-mode user [--ttl <seconds>]` → suspend the loop deliberately ("I'm
+    focused with the user — hold autonomous wakes"). Without `--ttl` it holds until
+    cleared — a quiet footgun: it suspends *every* cooldown indefinitely until
+    `engram-mode clear`, so prefer a TTL unless you mean "until I say otherwise".
+  - `engram-mode auto [--ttl <seconds>]` → resume / "go on your own": an explicit
+    auto override even **beats** a recent-activity engaged-defer (the deliberate "I'm
+    autonomous now" signal). With `--ttl` it's time-boxed (revert to derived after N
+    seconds); without, it holds until `engram-mode clear`. `engram-mode clear` reverts
+    to the derived (activity-based) mode.
+  - `engram-mode show [--json]` → inspect the current mode + resolved bundle without
+    changing anything (use it to check whether the loop is presence-suspended).
 
   Why: the monitors already suppress real-time events during the engaged window
   (#1077 part 2), but the `ScheduleWakeup` heartbeat did not — so an autonomous
   loop-wake could fire mid-conversation and talk over the user (the gap that
-  motivated #1456). The gate closes that asymmetry using the *same*
-  `last-user-activity` signal the monitors use. It is **fail-open**: a missing
-  stamp or any gate error prints `proceed`, so a broken gate never deadlocks the
-  loop — it only ever lets it run.
+  motivated #1456). #1469 closed that with the engaged-defer; #1489 made the gate
+  **presence-aware**, so an explicit `engram-mode user` (or the wider cooldown
+  window) also suspends it, with the raw `last-user-activity` engaged-defer as the
+  fallback. It is **fail-open**: a missing stamp or any gate error prints `proceed`,
+  and an absent presence layer degrades to the raw engaged-defer (itself fail-open on
+  a missing stamp) — so a broken gate never deadlocks the loop. On error it errs
+  toward `proceed` (the loop runs), never toward a stuck defer: the accepted cost is
+  it may run while the user is present, never that it freezes waiting on a dead gate.
 
   **Why warm-briefing on post-compaction wakes — two live incidents:**
   - *Post-compaction*: when a compaction fires mid-loop, the stub is the entire
