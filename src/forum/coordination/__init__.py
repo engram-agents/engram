@@ -28,6 +28,7 @@ from .store import (
     dm_thread_key,
 )
 from .store_file import FileStore, default_store_root
+from .dm import dm_send, dm_read, dm_list
 
 __all__ = [
     "SeqAllocator",
@@ -37,4 +38,7 @@ __all__ = [
     "dm_thread_key",
     "FileStore",
     "default_store_root",
+    "dm_send",
+    "dm_read",
+    "dm_list",
 ]

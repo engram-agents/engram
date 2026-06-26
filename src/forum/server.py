@@ -1226,6 +1226,130 @@ def create_app(
         updates = filter_updates(items, since, agent)
         return jsonify({"updates": updates, "as_of": as_of, "now": as_of})
 
+    # ------------------------------------------------------------------
+    # DM private channel  (UCS Slice D)
+    #
+    # Three endpoints:
+    #   GET  /api/dm                       — list threads for ?agent=
+    #   GET  /api/dm/<counterpart>         — read thread with ?agent=
+    #   POST /api/dm/<counterpart>         — send DM (JSON body)
+    #
+    # Both store (COORD_STORE) and allocator (COORD_ALLOCATOR) are
+    # injected via app.config by the caller (or the concrete FileStore
+    # wiring — Slice E). When neither is configured, all three endpoints
+    # return 503 so the server stays healthy without the coordination store.
+    # ------------------------------------------------------------------
+
+    @app.route("/api/dm", methods=["GET"])
+    def api_dm_list():
+        """List DM threads for the requesting agent.
+
+        Query params:
+            agent  — required; the requesting agent name.
+
+        Response: {threads: [{counterpart}], agent: <name>}
+        ACL: returns only threads where agent is one of the pair.
+        """
+        from forum.coordination import dm_list as _dm_list
+
+        store = app.config.get("COORD_STORE")
+        if store is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        agent = (request.args.get("agent") or "").strip().lower()
+        if not agent:
+            return jsonify({"error": "agent is required"}), 400
+
+        counterparts = _dm_list(store, agent)
+        threads = [{"counterpart": c} for c in counterparts]
+        return jsonify({"threads": threads, "agent": agent})
+
+    @app.route("/api/dm/<counterpart>", methods=["GET"])
+    def api_dm_read(counterpart: str):
+        """Read the DM thread between agent and counterpart.
+
+        Query params:
+            agent      — required; must be one of the pair.
+            since_seq  — optional int cursor (exclusive). Defaults to 0 (all messages).
+
+        Response: {messages: [{seq, sender, recipient, body, ts}], as_of_seq: <int>}
+        ``as_of_seq`` is the per-thread high-water mark (last returned message seq,
+        or ``since_seq`` when no messages match) — use it as the next ``since_seq``
+        for incremental reads. It is NOT the global feed cursor (``allocator.current()``)
+        and must not be wired into the unified ``/api/updates`` monitor.
+        ACL: agent must be one of {agent, counterpart} — enforced at the store layer
+             (read_dm_thread is order-independent; only the pair's messages are returned).
+        """
+        from forum.coordination import dm_read as _dm_read
+
+        store = app.config.get("COORD_STORE")
+        if store is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        agent = (request.args.get("agent") or "").strip().lower()
+        if not agent:
+            return jsonify({"error": "agent is required"}), 400
+
+        counterpart_n = counterpart.strip().lower()
+
+        since_seq_raw = (request.args.get("since_seq") or "0").strip()
+        try:
+            since_seq = int(since_seq_raw)
+        except ValueError:
+            return jsonify({"error": "since_seq must be an integer"}), 400
+
+        messages = _dm_read(store, agent, counterpart_n, since_seq=since_seq)
+        as_of_seq = messages[-1].seq if messages else since_seq
+        return jsonify({
+            "messages": [
+                {
+                    "seq": m.seq,
+                    "sender": m.sender,
+                    "recipient": m.recipient,
+                    "body": m.body,
+                    "ts": m.ts,
+                }
+                for m in messages
+            ],
+            "as_of_seq": as_of_seq,
+        })
+
+    @app.route("/api/dm/<counterpart>", methods=["POST"])
+    def api_dm_send(counterpart: str):
+        """Send a DM from agent to counterpart.
+
+        JSON body: {"agent": "<sender>", "body": "<message text>"}
+        Trust model: ``agent`` is client-supplied and not cryptographically
+        verified — the same honor-system trust as the rest of the forum
+        (``/api/post`` uses the same pattern). DM privacy is LAN-scoped;
+        hardenable when forum-wide auth lands (issue #1459).
+
+        Response: {seq: <int>, ts: <str>}
+        """
+        from forum.coordination import dm_send as _dm_send
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent:
+            return jsonify({"error": "agent is required"}), 400
+
+        body = (data.get("body") or "").strip()
+        if not body:
+            return jsonify({"error": "body is required"}), 400
+
+        counterpart_n = counterpart.strip().lower()
+
+        msg = _dm_send(store, allocator, agent, counterpart_n, body)
+        return jsonify({"seq": msg.seq, "ts": msg.ts}), 201
+
     return app
 
 

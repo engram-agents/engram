@@ -5,7 +5,7 @@ A thin CLI wrapping the inter-agent file protocol at
 /home/agents-shared/inter-agent/. Provides validated letter creation,
 cursor-tracked reading, and quick status checks.
 
-Ten subcommands:
+Eleven subcommands:
   list        Show letters addressed to me (default: unread only)
   read        Display a letter; advance read cursor to its timestamp
   write       Create a new letter via $EDITOR with validated frontmatter
@@ -16,6 +16,7 @@ Ten subcommands:
   unstar      Remove a letter from the starred list
   starred     List all starred letters
   peers       Show known peers (co-host vs cross-host) from the agent registry
+  dm          Send or read a direct message via the forum DM channel
 
 Design doc: ariadne-desk/projects/inter-agent-cli/DESIGN.md (v2, 2026-05-23)
 Protocol:   inter-agent/README.md
@@ -32,6 +33,9 @@ import socket
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -1518,6 +1522,113 @@ def cmd_peers(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Forum DM channel  (UCS Slice D)
+# ---------------------------------------------------------------------------
+
+def _get_forum_url(config: dict) -> str:
+    """Resolve the forum base URL from config (mirrors forum.py's _resolve_forum_url)."""
+    return (
+        (config.get("forum") or {}).get("url")
+        or os.environ.get("FORUM_URL")
+        or "http://localhost:5002"
+    )
+
+
+def cmd_dm(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+    """DM send/read/list via the forum /api/dm endpoint."""
+    forum_url = getattr(args, "forum_url", None) or _get_forum_url(config)
+
+    if not args.counterpart:
+        # List mode: show all my DM threads
+        url = f"{forum_url}/api/dm"
+        req = urllib.request.Request(
+            f"{url}?agent={urllib.parse.quote(agent_name)}",
+            headers={"Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+        except urllib.error.URLError as e:
+            print(f"ia dm: forum unreachable — {e}", file=sys.stderr)
+            sys.exit(EXIT_IO)
+
+        threads = data.get("threads", [])
+        if not threads:
+            print("(no DM threads)")
+            return
+        print(f"DM threads for {agent_name}:")
+        for t in threads:
+            print(f"  ↔ {t['counterpart']}")
+        return
+
+    counterpart = args.counterpart.strip().lower()
+
+    # Send mode: stdin piped or --send flag
+    sending = args.send or (not sys.stdin.isatty())
+    if sending:
+        body = sys.stdin.read().strip()
+        if not body:
+            print("ia dm: body is empty (nothing to send)", file=sys.stderr)
+            sys.exit(EXIT_VALIDATION)
+
+        url = f"{forum_url}/api/dm/{urllib.parse.quote(counterpart)}"
+        payload = json.dumps({"agent": agent_name, "body": body}).encode()
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            err = e.read().decode("utf-8", errors="replace")
+            print(f"ia dm: send failed ({e.code}): {err}", file=sys.stderr)
+            sys.exit(EXIT_VALIDATION)
+        except urllib.error.URLError as e:
+            print(f"ia dm: forum unreachable — {e}", file=sys.stderr)
+            sys.exit(EXIT_IO)
+
+        print(
+            f"ia dm: sent to {counterpart} "
+            f"(seq={result.get('seq')}, ts={result.get('ts')})"
+        )
+        return
+
+    # Read mode: fetch and display thread
+    since_seq = getattr(args, "since_seq", 0) or 0
+    url = f"{forum_url}/api/dm/{urllib.parse.quote(counterpart)}"
+    params = f"?agent={urllib.parse.quote(agent_name)}&since_seq={since_seq}"
+    req = urllib.request.Request(
+        url + params,
+        headers={"Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print(f"(no DM thread with {counterpart})")
+            return
+        err = e.read().decode("utf-8", errors="replace")
+        print(f"ia dm: error ({e.code}): {err}", file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+    except urllib.error.URLError as e:
+        print(f"ia dm: forum unreachable — {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+
+    messages = data.get("messages", [])
+    if not messages:
+        print(f"(no messages with {counterpart})")
+        return
+
+    for msg in messages:
+        print(f"\n--- seq={msg['seq']} from={msg['sender']} at={msg['ts']} ---")
+        print(msg["body"])
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -1807,6 +1918,40 @@ def build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,  # internal / testing override
     )
 
+    # -- dm --
+    p_dm = subparsers.add_parser(
+        "dm",
+        help="Send or read a direct message via the forum DM channel",
+        description=(
+            "Three modes:\n"
+            "  ia dm                     — list my DM threads\n"
+            "  ia dm <counterpart>       — read thread with counterpart\n"
+            "  ia dm <counterpart> < body.md  — send a DM (body from stdin)\n"
+            "  ia dm <counterpart> --send     — same as piping stdin\n"
+            "\n"
+            "Trust model: DMs are per-pair and LAN-scoped; agent identity is\n"
+            "honor-system (same as the rest of the forum). Not cryptographically\n"
+            "private — hardenable when forum-wide auth lands (issue #1459)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_dm.add_argument(
+        "counterpart", nargs="?", default=None,
+        help="The other agent in the thread. Omit to list all threads.",
+    )
+    p_dm.add_argument(
+        "--send", action="store_true",
+        help="Force send mode (read body from stdin even if stdin is a tty)",
+    )
+    p_dm.add_argument(
+        "--since-seq", dest="since_seq", type=int, default=0, metavar="N",
+        help="Return messages with seq > N (default 0 = all)",
+    )
+    p_dm.add_argument(
+        "--forum-url", dest="forum_url", default=None,
+        help=argparse.SUPPRESS,  # internal / testing override
+    )
+
     return parser
 
 
@@ -1820,11 +1965,13 @@ def main() -> None:
 
     config = _load_config()
 
-    # Mode gate for all subcommands except status and peers.
+    # Mode gate for all subcommands except status, peers, and dm.
     # status: shows single-mode state to help diagnose misconfiguration.
     # peers: read-only registry query, useful precisely to diagnose topology
     #        before committing to multi-agent mode; mirrors the status rationale.
-    _MODE_GATE_EXEMPT = {"status", "peers"}
+    # dm: goes through the forum server (not the filesystem protocol), so it
+    #     is mode-independent; fails gracefully if the forum is unreachable.
+    _MODE_GATE_EXEMPT = {"status", "peers", "dm"}
     if args.subcommand not in _MODE_GATE_EXEMPT:
         _check_multi_agent_mode(config)
 
@@ -1851,6 +1998,8 @@ def main() -> None:
         cmd_starred(args, config, agent_name)
     elif args.subcommand == "peers":
         cmd_peers(args, config, agent_name)
+    elif args.subcommand == "dm":
+        cmd_dm(args, config, agent_name)
     else:
         parser.print_help()
         sys.exit(EXIT_VALIDATION)
