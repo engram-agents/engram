@@ -426,6 +426,10 @@ def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     # all-threads unread total (#679 accurate count); falls back to the inbox
     # size if the server is pre-v2 and omits the field.
     unread_all = inbox_resp.get("unread_all", len(inbox_items)) if inbox_resp is not None else 0
+    # per-category rollup (Slice H — omitted on pre-H servers, degrades gracefully)
+    unread_by_category: dict = inbox_resp.get("unread_by_category", {}) if inbox_resp is not None else {}
+    # domain rollup (Slice H — working/coordination/research; omitted on pre-H servers)
+    unread_by_domain: dict = inbox_resp.get("unread_by_domain", {}) if inbox_resp is not None else {}
     # Partition inbox into authored-thread replies and @mentions
     authored_unread = [
         item for item in inbox_items
@@ -445,6 +449,8 @@ def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
             "unread_total": unread_all,
             "unread_on_my_threads": len(authored_unread),
             "mention_count": len(mention_items),
+            "unread_by_category": unread_by_category,
+            "unread_by_domain": unread_by_domain,
             "inbox": inbox_items,
         }
         print(json.dumps(output, indent=2))
@@ -456,6 +462,12 @@ def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     print(f"unread:       {unread_all} total")
     print(f"  on threads you're in: {len(authored_unread)}")
     print(f"  @mentions:            {len(mention_items)}")
+    if unread_by_domain:
+        by_d = sorted(unread_by_domain.items(), key=lambda x: -x[1])
+        print("  by domain:            " + "  ".join(f"{d}:{c}" for d, c in by_d))
+    if unread_by_category:
+        by_count = sorted(unread_by_category.items(), key=lambda x: -x[1])
+        print("  by category:          " + "  ".join(f"{s}:{c}" for s, c in by_count))
     print(f"online:       {online_count} of {registered} registered")
 
     # Mention summary line — only when mention items were found

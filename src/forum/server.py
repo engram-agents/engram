@@ -814,6 +814,17 @@ def create_app(
     # ------------------------------------------------------------------
     # GET /api/agent/<name>/inbox
     # ------------------------------------------------------------------
+    # slug → domain bucket; pinned + cold-start + sleep-dreams stay raw only
+    _SLUG_TO_DOMAIN = {
+        "pr-review": "working",
+        "tools-hooks": "working",
+        "inter-agent": "coordination",
+        "team-culture": "coordination",
+        "philosophy-drift": "research",
+        "q-and-a": "research",
+        "retraction-patterns": "research",
+    }
+
     @app.route("/api/agent/<name>/inbox")
     def api_agent_inbox(name: str):
         if not db.is_valid_agent_name(name):
@@ -824,7 +835,18 @@ def create_app(
         # replacing the old time-cursor tally — #679); inbox is the narrower
         # authored∪mentions actionable set. forum status shows both.
         unread_all = db.count_unread_all_threads(g.conn, agent_id)
-        return jsonify({"inbox": inbox, "unread_all": unread_all})
+        unread_by_category = db.count_unread_by_category(g.conn, agent_id)
+        unread_by_domain: dict[str, int] = {}
+        for slug, count in unread_by_category.items():
+            domain = _SLUG_TO_DOMAIN.get(slug)
+            if domain:
+                unread_by_domain[domain] = unread_by_domain.get(domain, 0) + count
+        return jsonify({
+            "inbox": inbox,
+            "unread_all": unread_all,
+            "unread_by_category": unread_by_category,
+            "unread_by_domain": unread_by_domain,
+        })
 
     # ------------------------------------------------------------------
     # POST /api/thread/<id>/read

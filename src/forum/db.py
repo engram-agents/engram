@@ -2013,6 +2013,31 @@ def count_unread_all_threads(
     return row[0] if row else 0
 
 
+def count_unread_by_category(
+    conn: sqlite3.Connection,
+    agent_id: int,
+) -> dict:
+    """Count unread posts grouped by category slug (per-thread read-state rollup).
+
+    Returns {slug: count} for categories with at least one unread post.
+    Uses the same per-thread watermark logic as count_unread_all_threads.
+    Categories with zero unread posts are omitted from the result.
+    """
+    rows = conn.execute(
+        """
+        SELECT t.category_slug, COUNT(*)
+          FROM posts p
+          JOIN threads t ON t.id = p.thread_id
+          LEFT JOIN reads r ON r.agent_id = :me AND r.thread_id = p.thread_id
+         WHERE p.author_agent_id != :me
+           AND p.id > COALESCE(r.last_read_post_id, 0)
+         GROUP BY t.category_slug
+        """,
+        {"me": agent_id},
+    ).fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
 # ---------------------------------------------------------------------------
 # Q&A: error types
 # ---------------------------------------------------------------------------
