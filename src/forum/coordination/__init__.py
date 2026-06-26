@@ -31,7 +31,7 @@ from .store import (
 )
 from .store_file import FileStore, default_store_root
 from .dm import dm_send, dm_read, dm_list
-from .projects import ProjectNotFound, flip, claim, release, set_status
+from .projects import ProjectNotFound, flip, claim, release, set_status, close, reopen
 from .updates import build_updates
 
 __all__ = [
@@ -50,5 +50,7 @@ __all__ = [
     "claim",
     "release",
     "set_status",
+    "close",
+    "reopen",
     "build_updates",
 ]

@@ -248,3 +248,92 @@ def set_status(
     with allocator.allocate() as seq:
         store.write_project(project_id, final, seq=seq)
     return seq
+
+
+def close(
+    store: CoordinationStore,
+    allocator: SeqAllocator,
+    project_id: str,
+    *,
+    new_status: str,
+    reason: str,
+    ts: Optional[str] = None,
+) -> int:
+    """Pure write body of baton cmd_close / gc. Validation (new_status ∈ CLOSED_STATUSES, not already closed) is the caller's job.
+
+    Updates ``status`` in frontmatter (turn fields are NOT touched), appends a
+    close turn-log entry, and writes atomically under the allocator lock (fork-4).
+
+    Args:
+        new_status: the target closed-status string (e.g. ``"merged"``, ``"abandoned"``).
+        reason: human-readable explanation logged in the turn-log entry.
+        ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
+
+    Returns:
+        The seq assigned to this mutation.
+
+    Raises:
+        ProjectNotFound: if ``project_id`` has no existing baton file.
+    """
+    content = store.read_project(project_id)
+    if content is None:
+        raise ProjectNotFound(project_id)
+
+    now = ts or md.now_iso()
+
+    updated = md.update_frontmatter(content, {"status": new_status})
+    _, body = md.parse_frontmatter(updated)
+    body = md.append_turn_log(body, f"- {now} close: {new_status} — {reason}")
+    final = md.reattach_frontmatter(updated, body)
+
+    with allocator.allocate() as seq:
+        store.write_project(project_id, final, seq=seq)
+    return seq
+
+
+def reopen(
+    store: CoordinationStore,
+    allocator: SeqAllocator,
+    project_id: str,
+    *,
+    invoker: str,
+    new_status: str,
+    ts: Optional[str] = None,
+) -> int:
+    """Pure write body of baton cmd_reopen. Validation (new_status ∈ ACTIVE_STATUSES, current_status ∈ CLOSED_STATUSES) is the caller's job. Reads current status internally for the log entry.
+
+    Updates ``status`` in frontmatter (turn fields are NOT touched), appends a
+    reopened turn-log entry recording the prior status, and writes atomically
+    under the allocator lock (fork-4).
+
+    Args:
+        invoker: agent performing the reopen (normalised to lowercase).
+        new_status: the target active-status string (e.g. ``"in-progress"``).
+        ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
+
+    Returns:
+        The seq assigned to this mutation.
+
+    Raises:
+        ProjectNotFound: if ``project_id`` has no existing baton file.
+    """
+    content = store.read_project(project_id)
+    if content is None:
+        raise ProjectNotFound(project_id)
+
+    now = ts or md.now_iso()
+    invoker_name = invoker.strip().lower()
+    fields, _ = md.parse_frontmatter(content)
+    current_status = fields.get("status", "")
+
+    updated = md.update_frontmatter(content, {"status": new_status})
+    _, body = md.parse_frontmatter(updated)
+    body = md.append_turn_log(
+        body,
+        f"- {now} reopened → {invoker_name}: status was {current_status} → {new_status}",
+    )
+    final = md.reattach_frontmatter(updated, body)
+
+    with allocator.allocate() as seq:
+        store.write_project(project_id, final, seq=seq)
+    return seq

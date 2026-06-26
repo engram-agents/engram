@@ -1,4 +1,4 @@
-"""Tests for coordination.projects — the relocated baton write-fns (flip, claim, release, set_status).
+"""Tests for coordination.projects — the relocated baton write-fns (flip, claim, release, set_status, close, reopen).
 
 Exercises the full write body against a real FileStore + SeqAllocator: read →
 transform → atomic-write under the allocator lock (fork-4), seq embedded + returned.
@@ -11,8 +11,10 @@ from forum.coordination import (
     ProjectNotFound,
     SeqAllocator,
     claim,
+    close,
     flip,
     release,
+    reopen,
     set_status,
 )
 from forum.coordination import markdown as md
@@ -320,3 +322,154 @@ def test_set_status_missing_project_raises(store, allocator):
             new_status="merged",
             reason="done",
         )
+
+
+# ---------------------------------------------------------------------------
+# close() tests
+# ---------------------------------------------------------------------------
+
+
+def test_close_updates_status_and_appends_log(store, allocator):
+    seq = close(
+        store, allocator, "PR-1",
+        new_status="merged",
+        reason="scope complete",
+        ts="2026-06-26T12:00:00Z",
+    )
+    assert seq == 1  # first allocation above the seeded seq 0
+
+    raw = store.read_project("PR-1")
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["status"] == "merged"
+    assert fields["seq"] == "1"
+    assert "close: merged — " in raw
+
+
+def test_close_byte_exact_golden(store, allocator):
+    """Byte-exact: log line format is '- {ts} close: {status} — {reason}'."""
+    close(
+        store, allocator, "PR-1",
+        new_status="merged",
+        reason="scope complete",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = store.read_project("PR-1")
+    assert "- 2026-06-26T12:00:00Z close: merged — scope complete" in raw
+
+
+def test_close_does_not_touch_turn_fields(store, allocator):
+    """close() only mutates the status field; turn / turn_since / turn_reason are unchanged."""
+    close(
+        store, allocator, "PR-1",
+        new_status="merged",
+        reason="done",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = store.read_project("PR-1")
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["turn"] == "ariadne"
+    assert fields["turn_since"] == "2026-06-26T00:00:00Z"
+    assert fields["turn_reason"] == '"start"'
+
+
+def test_close_returns_monotonic_seq(store, allocator):
+    seq1 = close(store, allocator, "PR-1", new_status="abandoned", reason="first")
+    seq2 = close(store, allocator, "PR-1", new_status="merged", reason="second")
+    assert seq2 > seq1
+
+
+def test_close_missing_project_raises(store, allocator):
+    with pytest.raises(ProjectNotFound):
+        close(store, allocator, "PR-nope", new_status="merged", reason="done")
+
+
+# ---------------------------------------------------------------------------
+# reopen() tests
+# ---------------------------------------------------------------------------
+
+
+def _closed_baton():
+    return (
+        "---\n"
+        "project_id: PR-2\n"
+        "title: a title\n"
+        "status: merged\n"
+        "turn: ariadne\n"
+        "turn_since: 2026-06-26T00:00:00Z\n"
+        'turn_reason: "start"\n'
+        "participants: [ariadne, borges]\n"
+        "---\n"
+        "# PR-2\n\nsome body\n"
+    )
+
+
+@pytest.fixture
+def closed_store(tmp_path):
+    s = FileStore(tmp_path)
+    s.write_project("PR-2", _closed_baton(), seq=0)
+    return s
+
+
+@pytest.fixture
+def closed_allocator(closed_store):
+    return SeqAllocator(recover=closed_store.recover_max_seq)
+
+
+def test_reopen_updates_status_and_appends_log(closed_store, closed_allocator):
+    seq = reopen(
+        closed_store, closed_allocator, "PR-2",
+        invoker="luria",
+        new_status="in-progress",
+        ts="2026-06-26T12:00:00Z",
+    )
+    assert seq == 1  # first allocation above the seeded seq 0
+
+    raw = closed_store.read_project("PR-2")
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["status"] == "in-progress"
+    assert fields["seq"] == "1"
+    assert "reopened →" in raw
+
+
+def test_reopen_byte_exact_golden(closed_store, closed_allocator):
+    """Byte-exact: log line format is '- {ts} reopened → {invoker}: status was {old} → {new}'."""
+    reopen(
+        closed_store, closed_allocator, "PR-2",
+        invoker="luria",
+        new_status="in-progress",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = closed_store.read_project("PR-2")
+    assert "- 2026-06-26T12:00:00Z reopened → luria: status was merged → in-progress" in raw
+
+
+def test_reopen_reads_current_status_for_log(closed_store, closed_allocator):
+    """The 'status was X' fragment must reflect the pre-reopen status read from the file, not a caller arg."""
+    reopen(
+        closed_store, closed_allocator, "PR-2",
+        invoker="luria",
+        new_status="in-progress",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = closed_store.read_project("PR-2")
+    assert "status was merged" in raw
+
+
+def test_reopen_does_not_touch_turn_fields(closed_store, closed_allocator):
+    """reopen() only mutates the status field; turn / turn_since / turn_reason are unchanged."""
+    reopen(
+        closed_store, closed_allocator, "PR-2",
+        invoker="luria",
+        new_status="in-progress",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = closed_store.read_project("PR-2")
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["turn"] == "ariadne"
+    assert fields["turn_since"] == "2026-06-26T00:00:00Z"
+    assert fields["turn_reason"] == '"start"'
+
+
+def test_reopen_missing_project_raises(store, allocator):
+    with pytest.raises(ProjectNotFound):
+        reopen(store, allocator, "PR-nope", invoker="luria", new_status="in-progress")
