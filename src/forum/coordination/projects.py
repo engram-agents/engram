@@ -9,9 +9,9 @@ later the HTTP route layer) — only the write body lives here, so every front-e
 (CLI, web, the ``/api/updates`` feed) goes through the one writer (fork-4: no write
 path bypasses the module).
 
-This slice lands ``flip`` (the most-used op) and the shared pattern; claim / release /
-close / gc / init / reopen / rename / anchor / merge follow the same shape in
-follow-up slices.
+This slice lands ``flip`` (the most-used op) and the shared pattern; ``claim`` and
+``release`` follow the same shape. close / gc / init / reopen / rename / anchor /
+merge follow in further slices.
 """
 
 from __future__ import annotations
@@ -79,6 +79,123 @@ def flip(
     )
     _, body = md.parse_frontmatter(updated)
     body = md.append_turn_log(body, f"- {now} {from_agent} → {to}: {reason}")
+    final = md.reattach_frontmatter(updated, body)
+
+    with allocator.allocate() as seq:
+        store.write_project(project_id, final, seq=seq)
+    return seq
+
+
+def claim(
+    store: CoordinationStore,
+    allocator: SeqAllocator,
+    project_id: str,
+    *,
+    claimer: str,
+    pool_sentinel: str,
+    ts: Optional[str] = None,
+) -> int:
+    """Claim a project baton from the pool; return the assigned seq.
+
+    The pure write body of ``baton cmd_claim``: sets ``turn`` to the claimer,
+    updates ``turn_since`` / ``turn_reason``, appends a pool-sentinel→claimer
+    log entry.  CLI-layer validation (pool-sentinel check, participant check,
+    closed-status check) is the caller's job — only the write body lives here.
+
+    Args:
+        claimer: agent claiming the baton (normalised to lowercase).
+        pool_sentinel: the install's pool-sentinel name (resolved by the caller
+            from ``config.json``'s ``primary_user`` field).
+        ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
+
+    Returns:
+        The seq assigned to this mutation.
+
+    Raises:
+        ProjectNotFound: if ``project_id`` has no existing baton file.
+    """
+    content = store.read_project(project_id)
+    if content is None:
+        raise ProjectNotFound(project_id)
+
+    now = ts or md.now_iso()
+    self_name = claimer.strip().lower()
+    sentinel = pool_sentinel.strip().lower()
+
+    updated = md.update_frontmatter(
+        content,
+        {"turn": self_name, "turn_since": now, "turn_reason": '"claimed"'},
+    )
+    _, body = md.parse_frontmatter(updated)
+    body = md.append_turn_log(body, f"- {now} {sentinel} → {self_name}: claimed")
+    final = md.reattach_frontmatter(updated, body)
+
+    with allocator.allocate() as seq:
+        store.write_project(project_id, final, seq=seq)
+    return seq
+
+
+def release(
+    store: CoordinationStore,
+    allocator: SeqAllocator,
+    project_id: str,
+    *,
+    holder: str,
+    pool_sentinel: str,
+    reason: str,
+    done: bool = False,
+    ts: Optional[str] = None,
+) -> int:
+    """Release a project baton back to the pool; return the assigned seq.
+
+    The pure write body of ``baton cmd_release``: sets ``turn`` to the pool
+    sentinel, updates ``turn_since`` / ``turn_reason``, appends a holder→sentinel
+    log entry.  With ``done=True`` appends ``" (done)"`` to the title (idempotent).
+    CLI-layer validation (holder-must-be-current-turn, closed-status check) is
+    the caller's job.
+
+    Args:
+        holder: the current turn holder (the one releasing).
+        pool_sentinel: the install's pool-sentinel name (resolved by the caller).
+        reason: the release reason / message.
+        done: if True, mark the project title with ``" (done)"`` (idempotent).
+        ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
+
+    Returns:
+        The seq assigned to this mutation.
+
+    Raises:
+        ProjectNotFound: if ``project_id`` has no existing baton file.
+    """
+    content = store.read_project(project_id)
+    if content is None:
+        raise ProjectNotFound(project_id)
+
+    now = ts or md.now_iso()
+    self_name = holder.strip().lower()
+    sentinel = pool_sentinel.strip().lower()
+
+    updates: dict = {
+        "turn": sentinel,
+        "turn_since": now,
+        "turn_reason": f'"{reason}"',
+    }
+
+    title_renamed = False
+    if done:
+        fields, _ = md.parse_frontmatter(content)
+        current_title = fields.get("title", "").strip()
+        if not current_title.endswith("(done)"):
+            updates["title"] = current_title + " (done)"
+            title_renamed = True
+
+    updated = md.update_frontmatter(content, updates)
+    _, body = md.parse_frontmatter(updated)
+
+    log_entry = f"- {now} {self_name} → {sentinel}: {reason}"
+    if title_renamed:
+        log_entry += f"\n- {now} title marked (done)"
+    body = md.append_turn_log(body, log_entry)
     final = md.reattach_frontmatter(updated, body)
 
     with allocator.allocate() as seq:

@@ -1,4 +1,4 @@
-"""Tests for coordination.projects — the relocated baton write-fns (flip).
+"""Tests for coordination.projects — the relocated baton write-fns (flip, claim, release).
 
 Exercises the full write body against a real FileStore + SeqAllocator: read →
 transform → atomic-write under the allocator lock (fork-4), seq embedded + returned.
@@ -10,7 +10,9 @@ from forum.coordination import (
     FileStore,
     ProjectNotFound,
     SeqAllocator,
+    claim,
     flip,
+    release,
 )
 from forum.coordination import markdown as md
 
@@ -101,3 +103,146 @@ def test_flip_does_not_double_append_turn_log_section(store, allocator):
     raw = store.read_project("PR-1")
     assert raw.count(md.TURN_LOG_HEADER) == 1
     assert "one" in raw and "two" in raw
+
+
+# ---------------------------------------------------------------------------
+# claim() tests
+# ---------------------------------------------------------------------------
+
+
+def test_claim_updates_turn_and_appends_log(store, allocator):
+    seq = claim(
+        store, allocator, "PR-1",
+        claimer="luria", pool_sentinel="lei",
+        ts="2026-06-26T12:00:00Z",
+    )
+    assert seq == 1  # first allocation above the seeded seq 0
+
+    raw = store.read_project("PR-1")
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["turn"] == "luria"
+    assert fields["turn_since"] == "2026-06-26T12:00:00Z"
+    assert fields["turn_reason"] == '"claimed"'
+    assert "- 2026-06-26T12:00:00Z lei → luria: claimed" in raw
+    assert fields["seq"] == "1"
+
+
+def test_claim_byte_exact_golden(store, allocator):
+    """Byte-exact: turn_reason is the literal string '"claimed"' in the frontmatter,
+    and the log line uses the right-arrow character → (not ASCII ->)."""
+    claim(
+        store, allocator, "PR-1",
+        claimer="ariadne", pool_sentinel="lei",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = store.read_project("PR-1")
+    # frontmatter field appears verbatim
+    assert 'turn_reason: "claimed"' in raw
+    # log line with unicode arrow
+    assert "- 2026-06-26T12:00:00Z lei → ariadne: claimed" in raw
+
+
+def test_claim_normalizes_claimer_case(store, allocator):
+    claim(
+        store, allocator, "PR-1",
+        claimer="  LURIA  ", pool_sentinel="lei",
+    )
+    fields, _ = md.parse_frontmatter(store.read_project("PR-1"))
+    assert fields["turn"] == "luria"
+
+
+def test_claim_missing_project_raises(store, allocator):
+    with pytest.raises(ProjectNotFound):
+        claim(store, allocator, "PR-nope", claimer="luria", pool_sentinel="lei")
+
+
+# ---------------------------------------------------------------------------
+# release() tests
+# ---------------------------------------------------------------------------
+
+
+def test_release_updates_turn_and_appends_log(store, allocator):
+    seq = release(
+        store, allocator, "PR-1",
+        holder="ariadne", pool_sentinel="lei",
+        reason="all done",
+        ts="2026-06-26T12:00:00Z",
+    )
+    assert seq == 1  # first allocation above the seeded seq 0
+
+    raw = store.read_project("PR-1")
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["turn"] == "lei"
+    assert fields["turn_since"] == "2026-06-26T12:00:00Z"
+    assert fields["turn_reason"] == '"all done"'
+    assert "- 2026-06-26T12:00:00Z ariadne → lei: all done" in raw
+    assert fields["seq"] == "1"
+
+
+def test_release_with_done_marks_title_and_logs(store, allocator):
+    release(
+        store, allocator, "PR-1",
+        holder="ariadne", pool_sentinel="lei",
+        reason="finished", done=True,
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = store.read_project("PR-1")
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["title"] == "a title (done)"
+    assert "- 2026-06-26T12:00:00Z ariadne → lei: finished" in raw
+    assert "- 2026-06-26T12:00:00Z title marked (done)" in raw
+
+
+def test_release_done_flag_idempotent_if_already_done(tmp_path):
+    # seed a baton whose title already ends with "(done)"
+    already_done = (
+        "---\n"
+        "project_id: PR-2\n"
+        "title: a title (done)\n"
+        "status: in-progress\n"
+        "turn: ariadne\n"
+        "turn_since: 2026-06-26T00:00:00Z\n"
+        'turn_reason: "start"\n'
+        "participants: [ariadne, borges]\n"
+        "---\n"
+        "# PR-2\n\nsome body\n"
+    )
+    s = FileStore(tmp_path)
+    s.write_project("PR-2", already_done, seq=0)
+    a = SeqAllocator(recover=s.recover_max_seq)
+
+    release(
+        s, a, "PR-2",
+        holder="ariadne", pool_sentinel="lei",
+        reason="re-release", done=True,
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = s.read_project("PR-2")
+    fields, _ = md.parse_frontmatter(raw)
+    # title must NOT gain a second "(done)" suffix
+    assert fields["title"] == "a title (done)"
+    # the "title marked (done)" extra log line must NOT appear
+    assert "title marked (done)" not in raw
+
+
+def test_release_byte_exact_golden(store, allocator):
+    """Byte-exact: turn_reason is the verbatim reason in double-quotes,
+    and the log line uses the unicode right-arrow →."""
+    release(
+        store, allocator, "PR-1",
+        holder="ariadne", pool_sentinel="lei",
+        reason="scope complete",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = store.read_project("PR-1")
+    assert 'turn_reason: "scope complete"' in raw
+    assert "- 2026-06-26T12:00:00Z ariadne → lei: scope complete" in raw
+
+
+def test_release_missing_project_raises(store, allocator):
+    with pytest.raises(ProjectNotFound):
+        release(
+            store, allocator, "PR-nope",
+            holder="ariadne", pool_sentinel="lei",
+            reason="done",
+        )

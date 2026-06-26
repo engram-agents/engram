@@ -31,7 +31,7 @@ from .store import (
 )
 from .store_file import FileStore, default_store_root
 from .dm import dm_send, dm_read, dm_list
-from .projects import ProjectNotFound, flip
+from .projects import ProjectNotFound, flip, claim, release
 
 __all__ = [
     "SeqAllocator",
@@ -46,4 +46,6 @@ __all__ = [
     "dm_list",
     "ProjectNotFound",
     "flip",
+    "claim",
+    "release",
 ]
