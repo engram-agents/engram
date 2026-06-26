@@ -11,10 +11,11 @@ Design goals:
   live thin-client proof, shipped in UCS Slice D).
 
 Exit-code mapping (callers use these constants):
-    EXIT_OK         = 0  — success
-    EXIT_VALIDATION = 1  — bad input / HTTP 4xx
-    EXIT_IO         = 2  — network unreachable / timeout
-    EXIT_STATE      = 3  — state conflict
+    EXIT_OK          = 0  — success
+    EXIT_VALIDATION  = 2  — bad input / HTTP 4xx (mirrors forum.py)
+    EXIT_UNREACHABLE = 3  — network unreachable / timeout (mirrors forum.py)
+    EXIT_NOT_FOUND   = 4  — HTTP 404 (mirrors forum.py)
+    EXIT_STATE       = 5  — state conflict (e.g. ColleagueGateError) [forum_api extension; not in forum.py]
 """
 from __future__ import annotations
 
@@ -25,11 +26,12 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, Optional
 
-# Standard exit codes — mirror ia.py and baton.py so callers don't need to import both.
-EXIT_OK = 0
-EXIT_VALIDATION = 1
-EXIT_IO = 2
-EXIT_STATE = 3
+# Exit codes 0/2/3/4 mirror forum.py; EXIT_STATE=5 is a forum_api extension (ColleagueGateError).
+EXIT_OK          = 0
+EXIT_VALIDATION  = 2
+EXIT_UNREACHABLE = 3
+EXIT_NOT_FOUND   = 4
+EXIT_STATE       = 5
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +42,7 @@ EXIT_STATE = 3
 class ForumApiError(Exception):
     """Base class for forum API errors; carries exit_code for caller mapping."""
 
-    def __init__(self, msg: str, exit_code: int = EXIT_IO) -> None:
+    def __init__(self, msg: str, exit_code: int = EXIT_UNREACHABLE) -> None:
         super().__init__(msg)
         self.exit_code = exit_code
 
@@ -49,7 +51,7 @@ class ForumNetworkError(ForumApiError):
     """Forum server unreachable — connection refused, timeout, DNS failure."""
 
     def __init__(self, cause: str) -> None:
-        super().__init__(f"forum unreachable — {cause}", EXIT_IO)
+        super().__init__(f"forum unreachable — {cause}", EXIT_UNREACHABLE)
 
 
 class ForumHttpError(ForumApiError):
@@ -61,7 +63,8 @@ class ForumHttpError(ForumApiError):
     """
 
     def __init__(self, status: int, body: str) -> None:
-        super().__init__(f"HTTP {status}: {body}", EXIT_VALIDATION)
+        exit_code = EXIT_NOT_FOUND if status == 404 else EXIT_VALIDATION
+        super().__init__(f"HTTP {status}: {body}", exit_code)
         self.status = status
         self.body = body
 
@@ -112,9 +115,9 @@ class ForumClient:
         try:
             result = client.post(...)
         except ForumNetworkError as e:
-            print(f"baton flip: {e}", file=sys.stderr); sys.exit(EXIT_IO)
+            print(f"baton flip: {e}", file=sys.stderr); sys.exit(e.exit_code)
         except ForumHttpError as e:
-            print(f"baton flip: {e.status}: {e.body}", file=sys.stderr); sys.exit(EXIT_VALIDATION)
+            print(f"baton flip: {e.status}: {e.body}", file=sys.stderr); sys.exit(e.exit_code)
     """
 
     def __init__(self, base_url: str, timeout: int = 10) -> None:

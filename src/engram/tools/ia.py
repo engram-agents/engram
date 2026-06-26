@@ -1542,7 +1542,7 @@ def cmd_dm(args: argparse.Namespace, config: dict, agent_name: str) -> None:
             data = client.get("/api/dm", params={"agent": agent_name})
         except ForumNetworkError as e:
             print(f"ia dm: {e}", file=sys.stderr)
-            sys.exit(EXIT_IO)
+            sys.exit(e.exit_code)
         threads = data.get("threads", [])
         if not threads:
             print("(no DM threads)")
@@ -1568,10 +1568,10 @@ def cmd_dm(args: argparse.Namespace, config: dict, agent_name: str) -> None:
             )
         except ForumHttpError as e:
             print(f"ia dm: send failed ({e.status}): {e.body}", file=sys.stderr)
-            sys.exit(EXIT_VALIDATION)
+            sys.exit(e.exit_code)
         except ForumNetworkError as e:
             print(f"ia dm: {e}", file=sys.stderr)
-            sys.exit(EXIT_IO)
+            sys.exit(e.exit_code)
         print(f"ia dm: sent to {counterpart} (seq={result.get('seq')}, ts={result.get('ts')})")
         return
 
@@ -1587,10 +1587,10 @@ def cmd_dm(args: argparse.Namespace, config: dict, agent_name: str) -> None:
             print(f"(no DM thread with {counterpart})")
             return
         print(f"ia dm: error ({e.status}): {e.body}", file=sys.stderr)
-        sys.exit(EXIT_VALIDATION)
+        sys.exit(e.exit_code)
     except ForumNetworkError as e:
         print(f"ia dm: {e}", file=sys.stderr)
-        sys.exit(EXIT_IO)
+        sys.exit(e.exit_code)
 
     messages = data.get("messages", [])
     if not messages:

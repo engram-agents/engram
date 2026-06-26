@@ -17,8 +17,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tools.forum_api import (
-    EXIT_IO,
+    EXIT_NOT_FOUND,
     EXIT_OK,
+    EXIT_UNREACHABLE,
     EXIT_VALIDATION,
     ForumApiError,
     ForumClient,
@@ -110,7 +111,7 @@ def test_get_network_error_raises_forum_network_error():
     with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("refused")):
         with pytest.raises(ForumNetworkError) as exc_info:
             client.get("/api/dm")
-    assert exc_info.value.exit_code == EXIT_IO
+    assert exc_info.value.exit_code == EXIT_UNREACHABLE
     assert "unreachable" in str(exc_info.value)
 
 
@@ -121,7 +122,7 @@ def test_get_http_error_raises_forum_http_error():
         with pytest.raises(ForumHttpError) as exc_info:
             client.get("/api/dm")
     assert exc_info.value.status == 404
-    assert exc_info.value.exit_code == EXIT_VALIDATION
+    assert exc_info.value.exit_code == EXIT_NOT_FOUND
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +170,7 @@ def test_post_http_400_raises_forum_http_error():
 
 def test_forum_network_error_exit_code():
     e = ForumNetworkError("connection refused")
-    assert e.exit_code == EXIT_IO
+    assert e.exit_code == EXIT_UNREACHABLE
     assert isinstance(e, ForumApiError)
 
 
