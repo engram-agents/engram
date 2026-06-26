@@ -480,6 +480,13 @@ def init_db(conn: sqlite3.Connection, categories_config: str | None = None) -> N
 # ---------------------------------------------------------------------------
 # Agent helpers
 # ---------------------------------------------------------------------------
+_AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+
+
+def is_valid_agent_name(name: str) -> bool:
+    return bool(_AGENT_NAME_RE.match(name))
+
+
 def upsert_agent(conn: sqlite3.Connection, name: str, hostname: str | None = None) -> int:
     """Return agent_id for the named agent, creating it on first appearance.
 
@@ -493,6 +500,10 @@ def upsert_agent(conn: sqlite3.Connection, name: str, hostname: str | None = Non
     non-null, so read-only upserts with hostname=None never clobber the stored
     value).
     """
+    if not is_valid_agent_name(name):
+        raise ForumInvalidAgentName(
+            f"invalid agent name {name!r}: must match [a-z0-9][a-z0-9_-]{{0,62}}"
+        )
     now = _now_iso()
     conn.execute(
         "INSERT INTO agents(name, avatar_seed, first_seen_at, last_seen_at, hostname) "
@@ -2020,6 +2031,10 @@ class ForumConflict(Exception):
 
 class ForumBadRequest(Exception):
     """Raised when the request data is invalid (e.g. empty note)."""
+
+
+class ForumInvalidAgentName(ForumBadRequest):
+    """Raised when an agent name fails the charset / length check."""
 
 
 # ---------------------------------------------------------------------------

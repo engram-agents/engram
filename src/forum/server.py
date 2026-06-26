@@ -315,7 +315,7 @@ def create_app(
     def thread_view(tid: int) -> str:
         # Optional ?agent= bump for polling clients to stay online.
         agent_name = request.args.get("agent")
-        if agent_name:
+        if agent_name and db.is_valid_agent_name(agent_name):
             db.upsert_agent(g.conn, agent_name)
 
         thread_dict, posts = db.get_thread(g.conn, tid)
@@ -467,7 +467,7 @@ def create_app(
 
         # Optional ?agent= bump for polling clients to stay online.
         agent_name = request.args.get("agent")
-        if agent_name:
+        if agent_name and db.is_valid_agent_name(agent_name):
             db.upsert_agent(g.conn, agent_name)
 
         threads = db.list_threads(g.conn, since=since, category=category, sort=sort)
@@ -479,7 +479,7 @@ def create_app(
     @app.route("/api/thread/<int:tid>")
     def api_thread(tid: int):
         agent_name = request.args.get("agent")
-        if agent_name:
+        if agent_name and db.is_valid_agent_name(agent_name):
             db.upsert_agent(g.conn, agent_name)
 
         thread_dict, posts = db.get_thread(g.conn, tid)
@@ -518,6 +518,8 @@ def create_app(
         except (ValueError, TypeError):
             return jsonify({"error": "post_id must be an integer"}), 400
 
+        if not db.is_valid_agent_name(agent_name):
+            return jsonify({"error": f"invalid agent name {agent_name!r}"}), 400
         agent_id = db.upsert_agent(g.conn, agent_name)
 
         try:
@@ -557,6 +559,8 @@ def create_app(
 
         note = data.get("note") or ""
 
+        if not db.is_valid_agent_name(agent_name):
+            return jsonify({"error": f"invalid agent name {agent_name!r}"}), 400
         agent_id = db.upsert_agent(g.conn, agent_name)
 
         try:
@@ -601,6 +605,8 @@ def create_app(
         source_ip = request.remote_addr or "unknown"
         hostname = (data.get("hostname") or "").strip() or None
 
+        if not db.is_valid_agent_name(agent_name):
+            return jsonify({"error": f"invalid agent name {agent_name!r}"}), 400
         agent_id = db.upsert_agent(g.conn, agent_name, hostname=hostname)
 
         if thread_id is None:
@@ -691,7 +697,7 @@ def create_app(
     @app.route("/api/agents/online")
     def api_agents_online():
         agent_name = request.args.get("agent")
-        if agent_name:
+        if agent_name and db.is_valid_agent_name(agent_name):
             db.upsert_agent(g.conn, agent_name)
 
         online_agents, count, registered = db.list_online(g.conn)
@@ -720,6 +726,8 @@ def create_app(
         agent_name = (data.get("agent") or "").strip()
         if not agent_name:
             return jsonify({"error": "agent is required"}), 400
+        if not db.is_valid_agent_name(agent_name):
+            return jsonify({"error": f"invalid agent name {agent_name!r}"}), 400
 
         state = data.get("state")
         if state is None:
@@ -769,7 +777,7 @@ def create_app(
         reuse the same key name for different types.
         """
         agent_name = request.args.get("agent")
-        if agent_name:
+        if agent_name and db.is_valid_agent_name(agent_name):
             db.upsert_agent(g.conn, agent_name)
 
         board, online_count, registered = db.list_board(g.conn)
@@ -808,6 +816,8 @@ def create_app(
     # ------------------------------------------------------------------
     @app.route("/api/agent/<name>/inbox")
     def api_agent_inbox(name: str):
+        if not db.is_valid_agent_name(name):
+            return jsonify({"error": f"invalid agent name {name!r}"}), 400
         agent_id = db.upsert_agent(g.conn, name)
         inbox = db.get_inbox(g.conn, agent_id)
         # unread_all is the wider all-threads count (the accurate "N total"
@@ -829,6 +839,8 @@ def create_app(
         if not agent_name:
             return jsonify({"error": "agent is required"}), 400
 
+        if not db.is_valid_agent_name(agent_name):
+            return jsonify({"error": f"invalid agent name {agent_name!r}"}), 400
         agent_id = db.upsert_agent(g.conn, agent_name)
 
         # Validate thread exists
@@ -881,6 +893,8 @@ def create_app(
         if pair_initials is not None:
             pair_initials = str(pair_initials).strip() or None
 
+        if not db.is_valid_agent_name(agent_name):
+            return jsonify({"error": f"invalid agent name {agent_name!r}"}), 400
         source_ip = request.remote_addr or "unknown"
         agent_id = db.upsert_agent(g.conn, agent_name)
         db.set_pair_initials(g.conn, agent_id, pair_initials)
