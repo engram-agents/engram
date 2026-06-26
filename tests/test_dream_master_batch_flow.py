@@ -3,7 +3,7 @@
 PR-B: self-sufficient fairy reports + dream-master batch-by-type orchestration.
 
 Coverage:
-  1. bucket_findings() — routing correctness for all eight action buckets.
+  1. bucket_findings() — routing correctness for all nine action buckets.
   2. bucket_findings() — unknown suggestions land in BUCKET_UNKNOWN.
   3. bucket_findings() — multi-fairy input is merged; _source_fairy is set.
   4. bucket_findings() — empty / malformed input is handled safely.
@@ -39,6 +39,7 @@ from tools.dream_master_batch import (
     BUCKET_GOAL_TENSION_RESOLUTIONS,
     BUCKET_EDGE_WIRING,
     BUCKET_TASK_CLOSURES,
+    BUCKET_COVERAGE_GAPS,
     BUCKET_UNKNOWN,
     ALL_BUCKET_NAMES,
     BatchResult,
@@ -139,6 +140,22 @@ class TestBucketFindingsRouting:
 
     def test_lesson_suggestion(self):
         assert self._single("register incident for lesson ls_0014") == BUCKET_LESSONS
+
+    def test_coverage_gap_auto_load_surface(self):
+        assert self._single(
+            "Add warm-briefing anchor entry for cs_0042 — no auto-load surface coverage found"
+        ) == BUCKET_COVERAGE_GAPS
+
+    def test_coverage_gap_warm_briefing(self):
+        assert self._single(
+            "Add warm-briefing anchor for cs_0011 (handle: cheap-verify) — no auto-load surface anchor found"
+        ) == BUCKET_COVERAGE_GAPS
+
+    def test_coverage_gap_routes_before_cornerstone(self):
+        # coverage-gap suggestions contain "cornerstone" but must NOT fall through to BUCKET_CORNERSTONE_MOVES
+        assert self._single(
+            "cs_0050 cornerstone has no auto-load surface anchor — add warm-briefing anchor entry"
+        ) == BUCKET_COVERAGE_GAPS
 
     def test_cornerstone_suggestion(self):
         assert self._single("anchor as cornerstone via engram_add_cornerstone") == BUCKET_CORNERSTONE_MOVES
@@ -964,6 +981,9 @@ class TestRoutingRegressionTable:
 
     def test_task_closures_still_routes(self):
         assert self._single("close task and mark done — external reference #1251 MERGED") == BUCKET_TASK_CLOSURES
+
+    def test_coverage_gaps_still_routes(self):
+        assert self._single("Add warm-briefing anchor entry for cs_0042 (handle: soma-scope) — no auto-load surface coverage found.") == BUCKET_COVERAGE_GAPS
 
     def test_unknown_still_falls_through(self):
         assert self._single("a completely novel action type no pattern knows") == BUCKET_UNKNOWN

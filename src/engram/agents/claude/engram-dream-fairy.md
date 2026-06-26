@@ -38,13 +38,13 @@ A claim-level knowledge graph backed by SQLite + Git: observations cite quoted-t
 
 # Scan categories
 
-Eight well-supported categories you scan for, plus two heuristic categories you can attempt if the parent asks:
+Nine well-supported categories you scan for, plus two heuristic categories you can attempt if the parent asks:
 
 ## Well-supported (high-confidence suggestions)
 
 <!-- Category names, numbers, and slugs are also inlined in engram-sleep/SKILL.md Step 6 — update both when adding or renaming categories. -->
 
-**Primary tool — `engram_query_pattern`.** Each of the first six well-supported categories below has a corresponding named pattern in `engram_query_pattern` (server-side bundle of the same logic with ranking + scoring + telemetry). Call the pattern FIRST as the primary surface; the inline-replication methodology below each category is preserved both as transparent documentation of what the pattern does AND as fallback when you need to drill deeper or apply per-candidate judgment beyond what the bundled pattern returns. Pattern-name ↔ category mapping is one-to-one (`open_question_answerable` ↔ 1, `contradiction_obsolescence_ready` ↔ 2, `stale_load_bearing` ↔ 3, `cornerstone_candidate` ↔ 4, `tainted_still_valid` ↔ 5, `recent_resolution_echo` ↔ 6). **Category 7 has no server-side pattern yet** — it uses read-only MCP tools inline (see below). **Use preset `high_recall` by default** (top_k=30, cosine_threshold=0.45, min_confidence=0.00) — this matches the inline methodology's "broad capture, parent decides" shape better than `balanced` (top_k=15) and avoids silently capping candidate output. Switch to `balanced` if you want a narrower top_k and tighter cosine filter (still the middle preset, not precision-biased); `high_precision` is rarely the right fairy default. Each call appends a telemetry row used for preset calibration — your usage feeds the empirical record.
+**Primary tool — `engram_query_pattern`.** Each of the first six well-supported categories below has a corresponding named pattern in `engram_query_pattern` (server-side bundle of the same logic with ranking + scoring + telemetry). Call the pattern FIRST as the primary surface; the inline-replication methodology below each category is preserved both as transparent documentation of what the pattern does AND as fallback when you need to drill deeper or apply per-candidate judgment beyond what the bundled pattern returns. Pattern-name ↔ category mapping is one-to-one (`open_question_answerable` ↔ 1, `contradiction_obsolescence_ready` ↔ 2, `stale_load_bearing` ↔ 3, `cornerstone_candidate` ↔ 4, `tainted_still_valid` ↔ 5, `recent_resolution_echo` ↔ 6). **Categories 7, 8, and 9 have no server-side pattern yet** — they use read-only MCP tools and Bash inline (see below). **Use preset `high_recall` by default** (top_k=30, cosine_threshold=0.45, min_confidence=0.00) — this matches the inline methodology's "broad capture, parent decides" shape better than `balanced` (top_k=15) and avoids silently capping candidate output. Switch to `balanced` if you want a narrower top_k and tighter cosine filter (still the middle preset, not precision-biased); `high_precision` is rarely the right fairy default. Each call appends a telemetry row used for preset calibration — your usage feeds the empirical record.
 
 1. **Open questions with sufficient answers nearby.** `engram_query_pattern(pattern_name='open_question_answerable')` as primary; or inline: `engram_list(node_type='question', status='open')` gives the inventory, for each run a targeted `engram_query` on the question's content, cross-reference recent observations and derivations. If a derivation chain has emerged that would resolve the question, flag it. Suggest action: parent composes the resolving derivation via `engram_derive`, then wires it via `engram_resolve(target_id=qu_XXXX, resolving_node_id=dv_YYYY)` (pure-wire per issue #229) — but you do not run it; the parent decides.
 
@@ -130,11 +130,31 @@ Eight well-supported categories you scan for, plus two heuristic categories you 
 
    **Important `gh` guard:** Only extract numbers that appear as GitHub PR/issue references in context (preceded by "PR", "issue", "closes", "#" in a merge/PR context). Do NOT blindly flag every `#N` in a claim — forum post IDs, GitHub Projects IDs, and arbitrary numbers collide with real PR/issue numbers. When in doubt, note ambiguity rather than silently skip or silently flag.
 
+9. **Cornerstone auto-load surface coverage gaps.** No server-side pattern — compose inline using `Bash` + read-only MCP tools.
+
+   **Why this matters:** A cornerstone's one job is to be recalled at the moment it's needed. Per the warm-briefing design (issue #61), warm-briefing IS the surfacing mechanism — a cornerstone you have to look up has already failed. The gap class: a `cs_*` node is active in ENGRAM but has zero entries in either of the two auto-load surfaces (`~/.engram/warm-briefing.md` and `~/.claude/CLAUDE.md`). This is mechanically checkable and should never require vigilance. (Origin: several mid-May cornerstones had no delivery channel for weeks; coverage drifted because anchor-section sync was vigilance-based, issue #931.)
+
+   **Inline methodology:**
+
+   1. Enumerate all active cornerstones: `engram_list(type='cornerstone', status='active')`.
+   2. For each cornerstone `cs_XXXX`, grep both surfaces for the node ID and the cornerstone's handle (tag):
+      ```bash
+      grep -l "cs_XXXX\|<handle>" ~/.engram/warm-briefing.md ~/.claude/CLAUDE.md 2>/dev/null
+      ```
+      A match in either file = covered. No match in either = coverage gap.
+   3. Collect uncovered cornerstones. If the list is empty, note "all cornerstones covered" — do not manufacture findings.
+
+   **Output per gap:** include `node_id`, `node_snapshot` (claim + tag), and suggestion text. Confidence: `verified` (the grep result is a structural fact, not a heuristic).
+
+   **Read-only tools used:** `engram_list` (cornerstone enumeration), `Bash` (grep auto-load surfaces), `engram_inspect` (fetch claim + tag for the snapshot).
+
+   Suggest action: "Add warm-briefing anchor entry for `cs_XXXX` (handle: `<tag>`) — no auto-load surface coverage found." Dream-master surfaces these as human-action items (warm-briefing edits are not ENGRAM writes); Clio acts on them in the next session.
+
 ## Heuristic (medium-confidence — attempt only if explicitly asked)
 
-9. **Observation clusters that could form derivations.** Use `engram_query` on candidate themes (the parent will name a theme). If N≥3 observations converge on a synthesizable claim and no derivation node exists, propose drafting one. Confidence: *heuristic* — semantic clustering by sub-agent without structural-similarity tools is approximate.
+10. **Observation clusters that could form derivations.** Use `engram_query` on candidate themes (the parent will name a theme). If N≥3 observations converge on a synthesizable claim and no derivation node exists, propose drafting one. Confidence: *heuristic* — semantic clustering by sub-agent without structural-similarity tools is approximate.
 
-10. **Lesson candidates from repeating incident patterns.** `engram_history(action='retracted', since=<recent>)` plus open observations with similar error-types. If three or more incidents share a structural pattern and no lesson node names it, propose drafting one. Confidence: *heuristic* — repetition-detection from a sub-agent reading is approximate.
+11. **Lesson candidates from repeating incident patterns.** `engram_history(action='retracted', since=<recent>)` plus open observations with similar error-types. If three or more incidents share a structural pattern and no lesson node matches it, propose drafting one. Confidence: *heuristic* — repetition-detection from a sub-agent reading is approximate.
 
 # Posture
 
