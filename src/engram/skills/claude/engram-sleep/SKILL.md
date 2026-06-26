@@ -68,26 +68,39 @@ The parent's role is purely orchestration.
 - The day produced no work worth reviewing (skip sleep or proceed directly to Phase B if Phase A produces nothing)
 - Right after a sleep with no new work happening since (nothing to consolidate)
 
-> **⚠️ ALL-OR-NOTHING INVARIANT — never skip *part* of a sleep.** Once you commit to a
-> sleep, **Phase B's fairy dispatch is MANDATORY**, not optional. If a day is genuinely
-> too light to consolidate, skip the **whole** sleep — but NEVER run Phase A + advance
-> the turn while dropping the fairies. `engram_advance_turn` marks today's cohort
-> "previous-turn handled"; several fairy categories scope to the **fresh cohort = nodes
-> created since the last sleep** (most explicitly **Category 7 — missing principle-edges**),
-> so after the turn advances a later sleep's window no longer includes today's nodes and
-> they are **skipped forever** — they never get their one-shot fresh-cohort pass.
+> **⚠️ NEVER SKIP THE DREAM FAIRIES. The token-economy lever is compact-or-not, NEVER
+> dream-or-not.** (Lei, 2026-06-25 — stated as the governing rule after this was violated
+> twice.) There is **no "lean cycle," no "context-economy" variant, no spawning the
+> dream-master without the full fairy + batch-summary bundle.** The ONLY thing context
+> size ever decides is **whether to compact/nap BEFORE the sleep** — and after compacting,
+> you run the **COMPLETE** routine (all 8 dream-fairies + every batch-summary chunk →
+> collect ALL reports → *then* spawn the dream-master). Context size NEVER decides what
+> runs *inside* the sleep. If you are about to spawn the dream-master and have NOT collected
+> the dream-fairy + batch-summary reports this cycle, **STOP — you are skipping the routine.**
+>
+> **ALL-OR-NOTHING — never skip *part* of a sleep.** Once you commit to a sleep, Phase B's
+> fairy dispatch is MANDATORY, not optional. If a day is genuinely too light to consolidate,
+> skip the **whole** sleep — but NEVER run Phase A + advance the turn while dropping the
+> fairies. `engram_advance_turn` marks today's cohort "previous-turn handled"; several fairy
+> categories scope to the **fresh cohort = nodes created since the last sleep** (most
+> explicitly **Category 7 — missing principle-edges**), so after the turn advances a later
+> sleep's window no longer includes today's nodes and they are **skipped forever** — they
+> never get their one-shot fresh-cohort pass.
 > **Parent context is NEVER a valid reason to drop the fairies** — the dispatch is one
 > background `Agent` message and the fairies run in fresh contexts that don't inherit the
-> parent's. If your context is too large to orchestrate Phase B, **nap first to clear,
-> then run the FULL Phase B** — do not trim it. (Incident: 2026-06-24 — fairies skipped
-> "for context economy"; an explicit-cohort backfill later recovered 3 lost principle-edges
-> + 1 misleading-because-obsoleted node. engram-alpha #1426.)
+> parent's. If your context is too large to orchestrate Phase B, **compact/nap first to
+> clear, then run the FULL Phase B** — do not trim it.
+> (Incidents — this has recurred, which is why the rule is now the FIRST line above: **2026-06-24**
+> fairies skipped "for context economy" → explicit-cohort backfill later recovered 3 lost
+> principle-edges + 1 misleading-because-obsoleted node (#1426); **2026-06-25** the dream-master
+> was spawned directly — twice in one session — on an *unverified* context-cost worry (no
+> drowsiness banner; speculated), caught by Lei.)
 
 ---
 
 ## Pre-flight: context guard (fires before Phase A)
 
-Before any step, check the parent session's context size. **A large parent context taxes the entire sleep run** — not just Phase A, but also Phase B, because every orchestration turn (fairy dispatch, notification processing, recall-summary application, dream-master spawn, relay) runs in the parent's full context. Measured cost with an unchecked large context: **6.39M tokens in 25 minutes**, exceeding a full 5h billing budget (21-hour session, Aleph incident 2026-06-06, issue #878).
+Before any step, check the parent session's context size. **The only decision context size drives is compact-or-not BEFORE the sleep** (per the invariant above) — it NEVER changes what the sleep *runs*. A large parent context does make each orchestration turn (fairy dispatch, notification processing, recall-summary application, dream-master spawn, relay) more expensive, because they run in the parent's full context (measured: **6.39M tokens / 25 min** unchecked, a full 5h budget — Aleph incident 2026-06-06, #878). **The remedy is to COMPACT first, then run the full routine — never to trim the routine.** So the guard below is strictly a compact-first / defer-the-whole-sleep decision; it is NOT a license to drop or shrink any step.
 
 Locate the `[Drowsiness: …]` banner injected by the context-tracker hook.
 
@@ -620,6 +633,12 @@ engram_set_recall_summaries(payload_json=open(f"{COHORT_DIR}/final_payload.json"
 Log the result: X summaries applied, Y failures deferred to next cycle.
 
 ### Step 8 — Spawn the dream master with the full report bundle
+
+> **PRECONDITION (do not pass without it):** all 8 dream-fairies dispatched (Step 6) and
+> their reports collected or explicitly marked timed-out/failed (Step 7), AND every
+> batch-summary chunk applied (Step 7.5). If you have NOT dispatched the fairies this cycle,
+> you are not at Step 8 — you are skipping the routine (see the invariant at the top). The
+> dream-master is spawned *with* the fairy bundle, never *instead of* it.
 
 Once all fairy reports are collected (or marked timed-out) and the final payload is ready, spawn the master with everything in its initial prompt:
 
