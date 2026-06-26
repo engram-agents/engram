@@ -9,9 +9,11 @@ Design contract: ``specs/unified-coordination-surface-write-contract.md``
 (forum #170). Build plan: ``specs/unified-coordination-surface-BUILD-PLAN.md``.
 
 Slice A (this package) is the foundation:
-  - ``seq``  — the process-level monotonic cursor allocator (§3 cursor contract)
-  - ``store`` (later) — the file-first store abstraction (fork-1)
-  - module writer fns (later) — relocate the ``baton`` ``cmd_*`` write bodies here
+  - ``seq``   — the process-level monotonic cursor allocator (§3 cursor contract)
+  - ``store`` — the file-first store abstraction (fork-1; ``CoordinationStore`` +
+    the ``FileStore`` impl)
+  - ``projects`` — the ``baton`` ``cmd_*`` write bodies, relocated server-side
+    (``flip`` lands first; the rest follow the same read→transform→write shape)
 
 Load-bearing invariant (fork-4): every coordination mutation goes through this
 module → atomic-write → cursor-bump, under one lock. There is NO other write
@@ -29,6 +31,7 @@ from .store import (
 )
 from .store_file import FileStore, default_store_root
 from .dm import dm_send, dm_read, dm_list
+from .projects import ProjectNotFound, flip
 
 __all__ = [
     "SeqAllocator",
@@ -41,4 +44,6 @@ __all__ = [
     "dm_send",
     "dm_read",
     "dm_list",
+    "ProjectNotFound",
+    "flip",
 ]
