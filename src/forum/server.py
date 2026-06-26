@@ -1384,6 +1384,54 @@ def create_app(
         msg = _dm_send(store, allocator, agent, counterpart_n, body)
         return jsonify({"seq": msg.seq, "ts": msg.ts}), 201
 
+    # ------------------------------------------------------------------
+    # Unified updates feed (UCS Slice B) — GET /api/updates
+    # ------------------------------------------------------------------
+    @app.route("/api/updates", methods=["GET"])
+    def api_updates():
+        """Unified wake-cursor feed — the relevance-filtered update union for an agent.
+
+        Query params:
+            agent  — required; the recipient. Validated against the charset guard.
+            since  — optional int cursor (EXCLUSIVE). Defaults to 0 (all);
+                     negative clamps to 0.
+            kinds  — optional comma-separated narrowing (Phase-1 kinds: dm, baton).
+
+        Response: ``{"updates": [{kind, seq, wake, …}], "as_of": <int>, "ts": <str>}``.
+        ``as_of`` = the served watermark (``allocator.current()``; may LEGITIMATELY
+        freeze when there are no new commits — a frozen ``as_of`` is not a dead feed).
+        ``ts`` = the server clock for this request, the LIVENESS signal: the consumer
+        keys dead-feed detection on ``ts``-advance / staleness (plus non-200), NOT on
+        ``as_of``-advance. ``since`` exclusive → re-polling the same cursor is
+        idempotent (no duplicate replay). See spec §3 + ``coordination/updates.py``.
+        """
+        from forum.coordination import build_updates
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        agent = (request.args.get("agent") or "").strip().lower()
+        if not agent:
+            return jsonify({"error": "agent is required"}), 400
+        if not db.is_valid_agent_name(agent):
+            return jsonify({"error": "invalid agent name"}), 400
+
+        try:
+            since = int(request.args.get("since", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "since must be an integer"}), 400
+        if since < 0:
+            since = 0
+
+        kinds_arg = request.args.get("kinds")
+        kinds = None
+        if kinds_arg:
+            kinds = [k.strip().lower() for k in kinds_arg.split(",") if k.strip()]
+
+        return jsonify(build_updates(store, allocator, agent, since=since, kinds=kinds))
+
     return app
 
 
