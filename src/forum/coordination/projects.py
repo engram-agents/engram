@@ -10,8 +10,7 @@ later the HTTP route layer) — only the write body lives here, so every front-e
 path bypasses the module).
 
 This slice lands ``flip`` (the most-used op) and the shared pattern; ``claim``,
-``release``, and ``set_status`` follow the same shape. close / gc / init / reopen /
-rename / anchor / merge follow in further slices.
+``release``, and ``set_status`` follow the same shape. gc / merge follow in further slices.
 """
 
 from __future__ import annotations
@@ -28,6 +27,14 @@ class ProjectNotFound(Exception):
 
     The CLI/route layer maps this to its own not-found error + exit code; the
     write-fn does not assume how the caller reports it.
+    """
+
+
+class ProjectAlreadyExists(Exception):
+    """Raised by ``init`` when the target ``project_id`` already has a baton file.
+
+    The CLI/route layer maps this to its own already-exists error + exit code;
+    the write-fn does not assume how the caller reports it.
     """
 
 
@@ -336,4 +343,182 @@ def reopen(
 
     with allocator.allocate() as seq:
         store.write_project(project_id, final, seq=seq)
+    return seq
+
+
+def rename(
+    store: CoordinationStore,
+    allocator: SeqAllocator,
+    project_id: str,
+    *,
+    new_title: str,
+    ts: Optional[str] = None,
+) -> int:
+    """Rename a project baton's title field; return the assigned seq.
+
+    Pure write body of ``baton cmd_rename``: reads old title, updates ``title``
+    in frontmatter, appends a turn-log entry recording the rename, and writes
+    atomically under the allocator lock (fork-4). Validation (non-empty title,
+    length limit, no newlines) is the caller's job.
+
+    Log format: ``- {ts} renamed: title from "{old}" to "{new}"``
+
+    Args:
+        new_title: the new title string (caller should strip whitespace).
+        ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
+
+    Returns:
+        The seq assigned to this mutation.
+
+    Raises:
+        ProjectNotFound: if ``project_id`` has no existing baton file.
+    """
+    content = store.read_project(project_id)
+    if content is None:
+        raise ProjectNotFound(project_id)
+
+    now = ts or md.now_iso()
+    fields, _ = md.parse_frontmatter(content)
+    old_title = fields.get("title", "").strip()
+
+    updated = md.update_frontmatter(content, {"title": new_title})
+    _, body = md.parse_frontmatter(updated)
+    body = md.append_turn_log(body, f'- {now} renamed: title from "{old_title}" to "{new_title}"')
+    final = md.reattach_frontmatter(updated, body)
+
+    with allocator.allocate() as seq:
+        store.write_project(project_id, final, seq=seq)
+    return seq
+
+
+def anchor(
+    store: CoordinationStore,
+    allocator: SeqAllocator,
+    project_id: str,
+    *,
+    github_anchor: str,
+    ts: Optional[str] = None,
+) -> int:
+    """Set or update the ``github:`` anchor on a project baton; return the assigned seq.
+
+    Pure write body of ``baton cmd_anchor``: reads the current ``github:`` field
+    (may be absent), updates (or adds) it in frontmatter, appends a turn-log
+    entry that distinguishes new-set from update, and writes atomically under
+    the allocator lock (fork-4). Anchor format validation (``pr/<N>`` or
+    ``project/<N>``) is the caller's job.
+
+    Log formats:
+      - First set: ``- {ts} anchor set: github → {anchor}``
+      - Update:    ``- {ts} anchor updated: github from "{old}" to "{new}"``
+
+    Args:
+        github_anchor: the anchor string (e.g. ``"pr/490"``).
+        ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
+
+    Returns:
+        The seq assigned to this mutation.
+
+    Raises:
+        ProjectNotFound: if ``project_id`` has no existing baton file.
+    """
+    content = store.read_project(project_id)
+    if content is None:
+        raise ProjectNotFound(project_id)
+
+    now = ts or md.now_iso()
+    fields, _ = md.parse_frontmatter(content)
+    old_anchor = fields.get("github", "").strip()
+
+    updated = md.update_frontmatter(content, {"github": github_anchor})
+    _, body = md.parse_frontmatter(updated)
+    if old_anchor:
+        log_entry = f'- {now} anchor updated: github from "{old_anchor}" to "{github_anchor}"'
+    else:
+        log_entry = f"- {now} anchor set: github → {github_anchor}"
+    body = md.append_turn_log(body, log_entry)
+    final = md.reattach_frontmatter(updated, body)
+
+    with allocator.allocate() as seq:
+        store.write_project(project_id, final, seq=seq)
+    return seq
+
+
+def init(
+    store: CoordinationStore,
+    allocator: SeqAllocator,
+    project_id: str,
+    *,
+    title: str,
+    status: str,
+    turn: str,
+    participants: list,
+    turn_reason: str,
+    github: Optional[str] = None,
+    ts: Optional[str] = None,
+) -> int:
+    """Create a new project baton from scratch; return the assigned seq.
+
+    Pure write body of ``baton cmd_init``: builds the initial baton content
+    (YAML frontmatter + markdown body with a turn-log section) and writes it
+    atomically under the allocator lock (fork-4). Raises ``ProjectAlreadyExists``
+    if the project already exists — callers must check before calling.
+    All validation (project_id format, status validity, turn in participants,
+    title constraints) is the caller's job.
+
+    Frontmatter field order mirrors ``baton cmd_init``:
+      project / title / status / turn / turn_since / turn_reason / participants / github (optional)
+
+    Log format: ``- {ts} initialized → {turn}: {turn_reason}``
+
+    Args:
+        title: project title.
+        status: initial status (e.g. ``"in-progress"``, ``"planning"``).
+        turn: initial turn holder (lowercase, already validated by caller).
+        participants: list of participant names (lowercase, already validated).
+        turn_reason: human-readable reason for initial turn assignment.
+        github: optional GitHub anchor (e.g. ``"pr/490"`` or ``"project/4"``).
+        ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
+
+    Returns:
+        The seq assigned to this mutation.
+
+    Raises:
+        ProjectAlreadyExists: if ``project_id`` already has a baton file.
+    """
+    existing = store.read_project(project_id)
+    if existing is not None:
+        raise ProjectAlreadyExists(project_id)
+
+    now = ts or md.now_iso()
+    participants_str = "[" + ", ".join(participants) + "]"
+
+    fm_lines = [
+        "---",
+        f"project: {project_id}",
+        f"title: {title}",
+        f"status: {status}",
+        f"turn: {turn}",
+        f"turn_since: {now}",
+        f'turn_reason: "{turn_reason}"',
+        f"participants: {participants_str}",
+    ]
+    if github:
+        fm_lines.append(f"github: {github}")
+    fm_lines.append("---")
+    fm_lines.append("")
+
+    body_lines = [
+        "",
+        f"# {project_id} — {title}",
+        "",
+        "## Turn log",
+        "",
+        f"- {now} initialized → {turn}: {turn_reason}",
+        "",
+    ]
+
+    content = "\n".join(fm_lines) + "\n".join(body_lines)
+
+    with allocator.allocate() as seq:
+        store.write_project(project_id, content, seq=seq)
     return seq

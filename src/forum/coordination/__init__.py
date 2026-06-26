@@ -31,7 +31,19 @@ from .store import (
 )
 from .store_file import FileStore, default_store_root
 from .dm import dm_send, dm_read, dm_list
-from .projects import ProjectNotFound, flip, claim, release, set_status, close, reopen
+from .projects import (
+    ProjectAlreadyExists,
+    ProjectNotFound,
+    flip,
+    claim,
+    release,
+    set_status,
+    close,
+    reopen,
+    rename,
+    anchor,
+    init,
+)
 from .updates import build_updates
 
 __all__ = [
@@ -45,6 +57,7 @@ __all__ = [
     "dm_send",
     "dm_read",
     "dm_list",
+    "ProjectAlreadyExists",
     "ProjectNotFound",
     "flip",
     "claim",
@@ -52,5 +65,8 @@ __all__ = [
     "set_status",
     "close",
     "reopen",
+    "rename",
+    "anchor",
+    "init",
     "build_updates",
 ]

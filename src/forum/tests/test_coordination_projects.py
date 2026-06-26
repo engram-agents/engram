@@ -1,4 +1,4 @@
-"""Tests for coordination.projects — the relocated baton write-fns (flip, claim, release, set_status, close, reopen).
+"""Tests for coordination.projects — the relocated baton write-fns (flip, claim, release, set_status, close, reopen, rename, anchor, init).
 
 Exercises the full write body against a real FileStore + SeqAllocator: read →
 transform → atomic-write under the allocator lock (fork-4), seq embedded + returned.
@@ -8,12 +8,16 @@ import pytest
 
 from forum.coordination import (
     FileStore,
+    ProjectAlreadyExists,
     ProjectNotFound,
     SeqAllocator,
+    anchor,
     claim,
     close,
     flip,
+    init,
     release,
+    rename,
     reopen,
     set_status,
 )
@@ -473,3 +477,231 @@ def test_reopen_does_not_touch_turn_fields(closed_store, closed_allocator):
 def test_reopen_missing_project_raises(store, allocator):
     with pytest.raises(ProjectNotFound):
         reopen(store, allocator, "PR-nope", invoker="luria", new_status="in-progress")
+
+
+# ---------------------------------------------------------------------------
+# rename() tests
+# ---------------------------------------------------------------------------
+
+
+def test_rename_updates_title_and_appends_log(store, allocator):
+    seq = rename(store, allocator, "PR-1", new_title="New Title", ts="2026-06-26T12:00:00Z")
+    assert seq == 1
+    raw = store.read_project("PR-1")
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["title"] == "New Title"
+    assert fields["seq"] == "1"
+    assert 'renamed: title from "a title" to "New Title"' in raw
+
+
+def test_rename_byte_exact_golden(store, allocator):
+    rename(store, allocator, "PR-1", new_title="New Title", ts="2026-06-26T12:00:00Z")
+    raw = store.read_project("PR-1")
+    assert '- 2026-06-26T12:00:00Z renamed: title from "a title" to "New Title"' in raw
+
+
+def test_rename_does_not_touch_turn_fields(store, allocator):
+    rename(store, allocator, "PR-1", new_title="New Title", ts="2026-06-26T12:00:00Z")
+    fields, _ = md.parse_frontmatter(store.read_project("PR-1"))
+    assert fields["turn"] == "ariadne"
+    assert fields["turn_since"] == "2026-06-26T00:00:00Z"
+    assert fields["turn_reason"] == '"start"'
+
+
+def test_rename_returns_monotonic_seq(store, allocator):
+    s1 = rename(store, allocator, "PR-1", new_title="Title A")
+    s2 = rename(store, allocator, "PR-1", new_title="Title B")
+    assert s2 > s1
+
+
+def test_rename_missing_project_raises(store, allocator):
+    with pytest.raises(ProjectNotFound):
+        rename(store, allocator, "PR-nope", new_title="X")
+
+
+# ---------------------------------------------------------------------------
+# anchor() tests
+# ---------------------------------------------------------------------------
+
+
+def _baton_with_github(turn="ariadne"):
+    return (
+        "---\n"
+        "project_id: PR-3\n"
+        "title: a title\n"
+        "status: in-progress\n"
+        f"turn: {turn}\n"
+        "turn_since: 2026-06-26T00:00:00Z\n"
+        'turn_reason: "start"\n'
+        "participants: [ariadne, borges]\n"
+        "github: pr/490\n"
+        "---\n"
+        "# PR-3\n\nsome body\n"
+    )
+
+
+@pytest.fixture
+def anchored_store(tmp_path):
+    s = FileStore(tmp_path)
+    s.write_project("PR-3", _baton_with_github(), seq=0)
+    return s
+
+
+@pytest.fixture
+def anchored_allocator(anchored_store):
+    return SeqAllocator(recover=anchored_store.recover_max_seq)
+
+
+def test_anchor_set_new_anchor(store, allocator):
+    """anchor() with no prior github: field creates the field and logs 'anchor set'."""
+    seq = anchor(store, allocator, "PR-1", github_anchor="pr/490", ts="2026-06-26T12:00:00Z")
+    assert seq == 1
+    raw = store.read_project("PR-1")
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["github"] == "pr/490"
+    assert "anchor set: github → pr/490" in raw
+
+
+def test_anchor_set_byte_exact_golden(store, allocator):
+    anchor(store, allocator, "PR-1", github_anchor="pr/490", ts="2026-06-26T12:00:00Z")
+    raw = store.read_project("PR-1")
+    assert "- 2026-06-26T12:00:00Z anchor set: github → pr/490" in raw
+
+
+def test_anchor_update_existing_anchor(anchored_store, anchored_allocator):
+    """anchor() with an existing github: field updates it and logs 'anchor updated from X to Y'."""
+    anchor(anchored_store, anchored_allocator, "PR-3", github_anchor="pr/999", ts="2026-06-26T12:00:00Z")
+    raw = anchored_store.read_project("PR-3")
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["github"] == "pr/999"
+    assert 'anchor updated: github from "pr/490" to "pr/999"' in raw
+
+
+def test_anchor_update_byte_exact_golden(anchored_store, anchored_allocator):
+    anchor(anchored_store, anchored_allocator, "PR-3", github_anchor="pr/999", ts="2026-06-26T12:00:00Z")
+    raw = anchored_store.read_project("PR-3")
+    assert '- 2026-06-26T12:00:00Z anchor updated: github from "pr/490" to "pr/999"' in raw
+
+
+def test_anchor_does_not_touch_turn_fields(store, allocator):
+    anchor(store, allocator, "PR-1", github_anchor="pr/490", ts="2026-06-26T12:00:00Z")
+    fields, _ = md.parse_frontmatter(store.read_project("PR-1"))
+    assert fields["turn"] == "ariadne"
+    assert fields["turn_since"] == "2026-06-26T00:00:00Z"
+    assert fields["turn_reason"] == '"start"'
+
+
+def test_anchor_missing_project_raises(store, allocator):
+    with pytest.raises(ProjectNotFound):
+        anchor(store, allocator, "PR-nope", github_anchor="pr/490")
+
+
+# ---------------------------------------------------------------------------
+# init() tests
+# ---------------------------------------------------------------------------
+
+
+def test_init_creates_project_with_correct_content(tmp_path):
+    """init() creates the baton file with correct frontmatter and turn log."""
+    s = FileStore(tmp_path)
+    alloc = SeqAllocator(recover=s.recover_max_seq)
+    seq = init(
+        s, alloc, "PR-42",
+        title="Test Baton",
+        status="planning",
+        turn="borges",
+        participants=["borges", "ariadne"],
+        turn_reason="project initialized by luria",
+        ts="2026-06-26T12:00:00Z",
+    )
+    assert seq == 1
+    raw = s.read_project("PR-42")
+    assert raw is not None
+    fields, body = md.parse_frontmatter(raw)
+    assert fields["title"] == "Test Baton"
+    assert fields["status"] == "planning"
+    assert fields["turn"] == "borges"
+    assert fields["turn_since"] == "2026-06-26T12:00:00Z"
+    assert "initialized → borges" in raw
+
+
+def test_init_byte_exact_turn_log(tmp_path):
+    """Byte-exact: turn log line matches baton.cmd_init format."""
+    s = FileStore(tmp_path)
+    alloc = SeqAllocator(recover=s.recover_max_seq)
+    init(
+        s, alloc, "PR-42",
+        title="Test Baton",
+        status="in-progress",
+        turn="borges",
+        participants=["borges", "ariadne"],
+        turn_reason="project initialized by luria",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = s.read_project("PR-42")
+    assert "- 2026-06-26T12:00:00Z initialized → borges: project initialized by luria" in raw
+
+
+def test_init_with_github_anchor(tmp_path):
+    """init() with github= includes the github: field in frontmatter."""
+    s = FileStore(tmp_path)
+    alloc = SeqAllocator(recover=s.recover_max_seq)
+    init(
+        s, alloc, "PR-42",
+        title="T",
+        status="in-progress",
+        turn="borges",
+        participants=["borges"],
+        turn_reason="init",
+        github="pr/42",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = s.read_project("PR-42")
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["github"] == "pr/42"
+
+
+def test_init_without_github_anchor(tmp_path):
+    """init() without github= omits the github: field."""
+    s = FileStore(tmp_path)
+    alloc = SeqAllocator(recover=s.recover_max_seq)
+    init(
+        s, alloc, "PR-42",
+        title="T",
+        status="in-progress",
+        turn="borges",
+        participants=["borges"],
+        turn_reason="init",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = s.read_project("PR-42")
+    fields, _ = md.parse_frontmatter(raw)
+    assert "github" not in fields
+
+
+def test_init_raises_if_project_already_exists(store, allocator):
+    """init() raises ProjectAlreadyExists if the project_id already has a baton file."""
+    with pytest.raises(ProjectAlreadyExists):
+        init(
+            store, allocator, "PR-1",
+            title="T",
+            status="in-progress",
+            turn="ariadne",
+            participants=["ariadne"],
+            turn_reason="init",
+        )
+
+
+def test_init_returns_seq_1_for_fresh_store(tmp_path):
+    """init() into an empty store returns seq 1 (allocator starts at 0)."""
+    s = FileStore(tmp_path)
+    alloc = SeqAllocator(recover=s.recover_max_seq)
+    seq = init(
+        s, alloc, "PR-42",
+        title="T",
+        status="planning",
+        turn="luria",
+        participants=["luria", "borges"],
+        turn_reason="init",
+    )
+    assert seq == 1
