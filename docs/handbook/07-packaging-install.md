@@ -13,7 +13,7 @@
 >    files**. Composition: forum app ~31 (modules, templates, seeds, spec,
 >    requirements, deploy scripts beyond the 2 tiered backup units) · gemini lane
 >    ~29 (**RETIRED by #865** — resolved) · build-infrastructure meta-files
->    (~10: plugin.json, hooks/hooks.json, packaging/*.json incl. tiers.json itself,
+>    (~10: plugin.json, hooks/hooks.json, src/build/packaging/*.json incl. tiers.json itself,
 >    platform profiles — consumed BY the engine; need an explicit "infrastructure"
 >    manifest category or exclusion-with-reason) · misc (~11: fairy-spec strays,
 >    selftest.py, forum util scripts, inter-agent design docs, repo meta).
@@ -23,7 +23,7 @@
 
 # ENGRAM Packaging + Install Layer
 
-## Manifest (packaging/tiers.json, schema v1)
+## Manifest (src/build/packaging/tiers.json, schema v1)
 
 125 tiered mechanisms (62 essential / 50 convenience / 13 dev; cumulative ⊂-model) + 12 multi_agent-flagged + 4 identity-coupled (dropped for `--identity foreign`) + 17 excluded-with-reason (persona tools, operator tools, superseded hook, CI test files). Plus the two whole-tree buckets #991 added: `repo_only[]` (23 — tracked non-shippables: tests/CI/docs/root) + `build_inputs[]` (5 — build/install inputs). **Zero dangling entries** (all tiered paths exist). Coverage: now whole-tree default-deny — every git-tracked file must carry exactly one declared role (see §CI gates).
 
@@ -31,7 +31,7 @@
 
 Phase 1 (manifest load → tier+flag filter → copy to build/plugin/) · Phase 2 (hooks.json generation, reference resolution) · Phase 3 (platform profiles, --target claude-code|codex, --identity self|foreign with leak-scan). Files: manifest.py (load/validate/resolve: ships(m) := rank(tier) ≤ rank(chosen) AND (¬multi_agent OR chosen)) · build.py (transforms + codex emitters) · steps.py (convergent step-DAG for flows) · cli.py (build/plan/run/doctor). PROD-VERIFIED: graduated via golden-equivalence (#793), legacy bash retired. Codex target: implemented, **untested** (no codex-target test — L4 finding).
 
-## Platform profiles (packaging/platforms/)
+## Platform profiles (src/build/packaging/platforms/)
 
 claude-code.json (identity_doc CLAUDE.md, .mcp.json, hook envelope text-ok) · codex.json (AGENTS.md, config-toml-block, strict-json envelopes, min 0.136.0). Loaded at Phase 3, baked into bundle as platform.json. No gemini profile (the lane was RETIRED by #865; Claude/Codex are the two active targets).
 

@@ -71,7 +71,7 @@ template.
    tool used without its discipline is worse than not having it.)
 
 2. **Every shippable is tagged exactly once in the manifest.** The tier map *will
-   be* the single source of truth at `packaging/tiers.json`; `build-plugin.sh
+   be* the single source of truth at `src/build/packaging/tiers.json`; `build-plugin.sh
    --tier` *will* filter through it at **build time** (the
    agent-led install reads the README, prompts the user for tier + multi-agent, and
    builds accordingly — no post-install pruning). **CI must fail the build if any
@@ -79,7 +79,7 @@ template.
    skill, forgot to tier it" cannot drift past review. This is a mechanical gate,
    not vigilance.
 
-*(The `packaging/tiers.json` manifest + the CI tag-once test land with the tiering
+*(The `src/build/packaging/tiers.json` manifest + the CI tag-once test land with the tiering
 rollout. Until they do, the tier of any new artifact is still a required design
 decision — record it in the audit so the manifest is a transcription, not a
 re-derivation.)*

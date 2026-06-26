@@ -418,7 +418,7 @@ the runtime tree's data files into the alpha repo:
 - `.deployed-version` (the runtime version marker; refreshed by
   `tools/install-local-marketplace.sh` on each rebuild)
 
-`packaging/tiers.json` is the source of truth for what *does* belong in the
+`src/build/packaging/tiers.json` is the source of truth for what *does* belong in the
 plugin bundle (and therefore gets deployed). See `tools/build-plugin.sh` for
 the copy logic that reads the manifest.
 
