@@ -1,4 +1,4 @@
-# Epistemic Node Graph for Retraction, Arbitration, and Memory (ENGRAM)
+# Epistemic Node Graph for Retraction, Arbitration, and Memory (ENGRAM · 心迹)
 
 ![Three ENGRAM knowledge graphs side by side, growing denser left to right: a sparse newborn graph, a graph with emerging structure, and a dense richly-connected one](docs/assets/engram-triptych.png)
 

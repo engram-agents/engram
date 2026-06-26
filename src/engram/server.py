@@ -430,6 +430,10 @@ def _set_trust_tier_impl(*args, **kwargs):
 
 def _add_trust_signal_impl(*args, **kwargs):
     return _trust_mod._add_trust_signal_impl(*args, **kwargs)
+
+def _set_person_lineage_impl(*args, **kwargs):
+    return _trust_mod._set_person_lineage_impl(*args, **kwargs)
+
 # ---- end #872 wave-3 compat forwarders --------------------------------
 
 # ---- #872 wave-4 family imports --------------------------------------
@@ -539,6 +543,12 @@ def _update_task_impl(*args, **kwargs):
 
 def _report_feeling_impl(*args, **kwargs):
     return _tasks_mod._report_feeling_impl(*args, **kwargs)
+
+def _deactivate_goal_impl(*args, **kwargs):
+    return _tasks_mod._deactivate_goal_impl(*args, **kwargs)
+
+def _activate_goal_impl(*args, **kwargs):
+    return _tasks_mod._activate_goal_impl(*args, **kwargs)
 
 def _create_derivation(*args, **kwargs):
     return core._create_derivation(*args, **kwargs)
@@ -1331,6 +1341,8 @@ _ADD_OBSERVATION_FIELDS = frozenset({
     "standpoint_author_id", "standpoint_collection_id", "standpoint_override_tag",
     "standpoint_lineage", "standpoint_architecture",
     "fs_class",
+    "source_repo",
+    "repo_path",
 })
 
 
@@ -1429,6 +1441,8 @@ def engram_add_observation(payload_json: str) -> str:
             standpoint_lineage (str, optional): Training lineage of the source claim's producer, format "provider:family" (e.g. "anthropic:opus"). The most load-bearing bias axis for AI-agent premises; format-validated, rejected with a redirecting error if malformed.
             standpoint_architecture (str, optional): Cognitive architecture of the source's producer. Enum: transformer | vision-spatial | embodied-sensorimotor | graph-neural | human | other. Tracks architectural (not just training) diversity — Class A calibration exposure. Use "human" for human sources, "transformer" for other LLMs, omit for self-observations when explicit tracking is not desired.
             fs_class (str, optional): Falsification-sensitivity class — "re-executable" (Class 1: claim can be re-tested by re-running the measurement) or "frozen" (Class 2: claim records a past event that cannot be re-executed). Omit or pass null to let the Phase-1 proxy (derived from quote_type) apply. When provided, takes priority over the proxy and the FALSIFICATION line drops the "(proxy:quote_type)" label. When the class is ambiguous (e.g. a re-readable file that records past state), omit and let the proxy apply — hesitation is the correct signal to omit.
+            source_repo (str, optional): Absolute path to an alternative git repository to use for git operations. When omitted, the git repo is auto-detected from the file:// URL's directory. Use this for cross-repo citations where the cited file lives outside the target repo (e.g. a plugin file deployed to ~/.engram/ that is committed in the plugin source tree ~/engram-alpha/).
+            repo_path (str, optional): Relative path within source_repo where the committed copy of the cited file lives (e.g. "src/engram/server.py"). Required when source_repo is provided and the cited file:// URL path is outside source_repo — used for git status and cat-file checks instead of the auto-derived path. Without repo_path, the path is derived from the file URL relative to the source_repo root, which fails when the file lives outside source_repo. Example: cite file:///home/user/.engram/marketplace/plugins/engram/server.py with source_repo="/home/user/engram-alpha" and repo_path="src/engram/server.py".
 
     Returns:
         JSON with the new observation ID, confidence, evidence ID, and any prediction node created.
@@ -1462,6 +1476,7 @@ def engram_add_observation(payload_json: str) -> str:
 _ADD_OBSERVATION_BATCH_FIELDS = frozenset({
     "observations_json", "url", "title", "domain", "source_date",
     "evidence_id", "content_hash", "git_sha",
+    "source_repo", "repo_path",
 })
 
 
@@ -1509,7 +1524,14 @@ def engram_add_observation_batch(payload_json: str) -> str:
                 interpretation, claim, quote_type; optional is_predictive,
                 predicted_event, resolution_timeframe, source_class,
                 standpoint_author_id, standpoint_collection_id, standpoint_override_tag,
-                standpoint_lineage, standpoint_architecture.
+                standpoint_lineage (format "provider:family", e.g. "anthropic:opus" —
+                the most load-bearing bias axis for AI-agent premises; format-validated),
+                standpoint_architecture (transformer | vision-spatial | embodied-sensorimotor
+                | graph-neural | human | other),
+                fs_class ("re-executable" for Class 1 claims that can be re-tested by
+                re-running the measurement, or "frozen" for Class 2 claims recording a
+                past event that cannot be re-executed; omit to let the Phase-1 proxy from
+                quote_type apply — hesitation is the correct signal to omit).
             url (str, optional): Source URL. The evidence node is auto-created
                 or reused. Use this+title OR evidence_id, not both.
             title (str, optional): Source title (required when url given).
@@ -2331,8 +2353,8 @@ def engram_stats(payload_json: str = "{}") -> str:
             sections (list of str, optional): Subset of sections to return.
                 Valid names: structure, edges, confidence, open_questions,
                 open_predictions, reasoning_breakdown, weakest_nodes,
-                health_score, memory. Default (omitted or null): all sections.
-                Unknown names are ignored with a logged warning.
+                health_score, memory, version. Default (omitted or null): all
+                sections. Unknown names are ignored with a logged warning.
 
     Returns:
         JSON with comprehensive graph statistics. Top-level keys (all sections):
@@ -2345,6 +2367,11 @@ def engram_stats(payload_json: str = "{}") -> str:
             memory: current_turn + tier thresholds.
             confidence: distribution stats per type, quote_type, reasoning_type,
                 source_class.
+            version: live build identity — alpha_sha, alpha_branch, alpha_dirty,
+                deployed_at, deployed_from (from .deployed-version); tier,
+                multi_agent, shipped_at (from .engram-build-manifest.json if
+                present); agent_name (from config.json, only if absent above).
+                Empty dict when no identity files are present.
             window (conditional): present only when mode != "all".
     """
     # ── Parse + validate payload ───────────────────────────────────────────
@@ -2823,6 +2850,139 @@ def engram_add_goal(payload_json: str) -> str:
     return _add_goal_impl(**params)
 
 
+# Set of legitimate field names for the engram_deactivate_goal payload.
+_DEACTIVATE_GOAL_FIELDS = frozenset({"goal_id", "reason"})
+
+
+# DESIGN INTENT — engram_deactivate_goal
+# ---------------------------------------
+# Reversible dormancy for goals that are set aside but not abandoned.
+# The goal was VALID when filed; we are NOT retracting it (no is_current=0,
+# no status change). We are simply marking it as paused so that
+# _reflect_impl's active_goals scan skips it — eliminating dream / reflect
+# noise from a goal that is no longer actively pursued.
+#
+# The lifecycle_state field lives in metadata JSON (no schema migration).
+# Absent / "active" = active; "paused" = deactivated.
+#
+# Pair with engram_activate_goal to restore it. Use engram_supersede instead
+# if the goal has been genuinely replaced by a better framing.
+#
+# Single-payload signature (mandatory per CLAUDE.md MCP tool parameter style).
+@mcp.tool(
+    name="engram_deactivate_goal",
+    annotations={
+        "title": "Deactivate Goal",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_deactivate_goal(payload_json: str) -> str:
+    """Mark a goal as paused (dormant) without retracting it.
+
+    Use when a goal is set aside but not abandoned — it was VALID when filed
+    and may be picked up again. This is NOT retraction (which marks an error).
+
+    A deactivated goal is hidden from engram_reflect's active_goals scan to
+    eliminate dream noise. It remains queryable and citable.
+
+    Use engram_activate_goal to restore it. Use engram_supersede if the goal
+    has been replaced by a better framing.
+
+    Pass all fields as one JSON object string in payload_json.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            goal_id (str, required): The gl_NNNN node ID to deactivate.
+            reason (str, optional): Why the goal is being set aside.
+
+    Returns:
+        JSON with {"status": "deactivated", "node_id": ..., "lifecycle_state": "paused"}.
+        On error, returns {"error": "..."}.
+
+    See _deactivate_goal_impl for full semantics.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _DEACTIVATE_GOAL_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_DEACTIVATE_GOAL_FIELDS)}"
+        })
+
+    return _deactivate_goal_impl(**params)
+
+
+# Set of legitimate field names for the engram_activate_goal payload.
+_ACTIVATE_GOAL_FIELDS = frozenset({"goal_id", "reason"})
+
+
+# DESIGN INTENT — engram_activate_goal
+# -------------------------------------
+# Restores a previously paused goal to active status. The goal re-enters
+# _reflect_impl's active_goals scan and dream processing.
+#
+# Only valid for goals that were deactivated via engram_deactivate_goal
+# (lifecycle_state == "paused"). Attempting to activate a goal that is
+# already active returns an error.
+#
+# Single-payload signature (mandatory per CLAUDE.md MCP tool parameter style).
+@mcp.tool(
+    name="engram_activate_goal",
+    annotations={
+        "title": "Activate Goal",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_activate_goal(payload_json: str) -> str:
+    """Reactivate a previously paused goal.
+
+    Restores a goal deactivated by engram_deactivate_goal. The goal returns
+    to engram_reflect's active_goals scan and dream processing.
+
+    Only valid for goals currently in the "paused" lifecycle state. Attempting
+    to activate an already-active goal returns an error.
+
+    Pass all fields as one JSON object string in payload_json.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            goal_id (str, required): The gl_NNNN node ID to reactivate.
+            reason (str, optional): Why the goal is being reactivated.
+
+    Returns:
+        JSON with {"status": "activated", "node_id": ..., "lifecycle_state": "active"}.
+        On error, returns {"error": "..."}.
+
+    See _activate_goal_impl for full semantics.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _ACTIVATE_GOAL_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ACTIVATE_GOAL_FIELDS)}"
+        })
+
+    return _activate_goal_impl(**params)
+
 
 _ADD_PERSON_FIELDS = frozenset({
     "name", "role", "description", "aliases", "context_ids", "is_self",
@@ -2992,6 +3152,72 @@ def engram_set_trust_tier(payload_json: str) -> str:
         tier=tier,
         justification_obs_id=justification_obs_id,
         primary_user_approval_obtained=approval_flag,
+    )
+
+
+_SET_PERSON_LINEAGE_FIELDS = frozenset({"target_pn", "model_id"})
+
+
+# DESIGN INTENT — engram_set_person_lineage
+# ------------------------------------------
+# Records the agent's model training lineage (provider / family / version) on
+# a person node — typically the agent's own self-anchor (pn_self) — by patching
+# its metadata in-place.
+#
+# Motivation (standpoint v3 / issue #820): standpoint auto-stamping at filing
+# time needs the filer's lineage to be retrievable from the person node so the
+# system can derive "provider:family" without trusting the agent to supply it
+# on every call. Calling this once at session-start makes lineage systematic.
+#
+# Parsed: "claude-sonnet-4-6" → model_provider=anthropic, model_family=claude-sonnet,
+# model_version=4.6. Unrecognised formats: provider="", family=model_id, version="".
+#
+# target_pn defaults to the self-anchor when omitted.
+# Single-payload signature.
+@mcp.tool(
+    name="engram_set_person_lineage",
+    annotations={
+        "title": "Record Model Lineage on a Person Node",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_set_person_lineage(payload_json: str) -> str:
+    """Record model training lineage (provider/family/version) on a person node.
+
+    Parses the given model_id and patches the person node's metadata with
+    model_provider, model_family, and model_version fields.  Call once at
+    session start to record lineage without boilerplate on every observation.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            model_id (str, required): Model identifier, e.g. "claude-sonnet-4-6".
+                Parsed into: model_provider ("anthropic"), model_family
+                ("claude-sonnet"), model_version ("4.6").
+            target_pn (str, optional): Person node ID (pn_NNNN) to update.
+                Omit to use the graph's self-anchor.
+
+    Returns:
+        JSON with status ("ok"), person_id, model_provider, model_family,
+        model_version.  On error: {"error": "..."}.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _SET_PERSON_LINEAGE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_SET_PERSON_LINEAGE_FIELDS)}"
+        })
+    return _trust_mod._set_person_lineage_impl(
+        target_pn=params.get("target_pn", ""),
+        model_id=params.get("model_id", ""),
     )
 
 
@@ -4660,7 +4886,10 @@ def engram_supersede(payload_json: str) -> str:
 # _detect_zero_support body moved to engram_revision.py (family E) in #872 wave 6.
 # Compat forwarder above in wave-6 compat block.
 # Set of legitimate field names for the engram_retract payload.
-_RETRACT_FIELDS = frozenset({"node_id", "error_type", "reason", "replacement_json"})
+_RETRACT_FIELDS = frozenset({
+    "node_id", "error_type", "reason", "replacement_json",
+    "initiation", "initiation_gate",
+})
 
 
 # DESIGN INTENT — engram_retract
@@ -4722,6 +4951,11 @@ def engram_retract(payload_json: str) -> str:
                 observation fields {quoted_text, interpretation, claim,
                 quote_type, source_class}. The replacement cites the same
                 evidence.
+            initiation (str, optional): Who initiated the retraction. One of:
+                user_prompted, gate_prompted, unprompted.
+            initiation_gate (str, optional): Which gate triggered the
+                retraction (e.g. 'honesty_axiom'). Meaningful only when
+                initiation='gate_prompted'.
 
     Returns:
         JSON with retraction details, tainted downstream nodes, and optional
@@ -4743,7 +4977,12 @@ def engram_retract(payload_json: str) -> str:
                      f"Allowed: {sorted(_RETRACT_FIELDS)}"
         })
 
-    return _retract_impl(**params)
+    _initiation_ref = (
+        os.environ.get("CLAUDE_SESSION_ID")
+        or os.environ.get("ANTHROPIC_SESSION_ID")
+        or ""
+    )
+    return _retract_impl(**params, initiation_ref=_initiation_ref)
 
 
 # _retract_impl body moved to engram_revision.py (family E) in #872 wave 6.
@@ -5439,6 +5678,159 @@ def engram_query_pattern(payload_json: str) -> str:
     if "pattern_name" not in params:
         return json.dumps({"error": "payload_json must include required field 'pattern_name'"})
     return _query_pattern_impl(**params)
+
+
+# ---------------------------------------------------------------------------
+# engram_embedding_cluster
+# ---------------------------------------------------------------------------
+# Exposes pairwise embedding similarity as a dream-fairy-callable primitive
+# for semantic clustering (issue #1154 — cat-10 v2 scan). Read-only; uses
+# stored embedding column (computed over claim text at filing time).
+# ---------------------------------------------------------------------------
+
+_EMBEDDING_CLUSTER_FIELDS = frozenset({
+    "node_ids", "threshold", "min_cluster_size",
+})
+
+
+@mcp.tool(
+    name="engram_embedding_cluster",
+    annotations={
+        "title": "Cluster Nodes by Embedding Similarity",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_embedding_cluster(payload_json: str) -> str:
+    """Cluster a set of nodes by their stored embedding similarity.
+
+    Computes pairwise cosine similarity over the stored embedding vectors
+    (computed at filing time over each node's claim text) and returns
+    transitive-closure clusters where every pair within a cluster has
+    similarity >= threshold. Uses existing sqlite-vec infrastructure with
+    no on-the-fly model calls. Intended as a dream-fairy-callable primitive
+    for semantic gap-keyed lesson-candidate scans (cat-10 v2, issue #1154).
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            node_ids (list[str], required): Node IDs to cluster (e.g.
+                ["ob_XXXX", "ob_YYYY", "dv_ZZZZ"]). At most 500 nodes.
+            threshold (float, optional): Cosine similarity threshold for
+                grouping two nodes together. Default 0.55. Range [0.0, 1.0].
+            min_cluster_size (int, optional): Minimum cluster size to include
+                in the "clusters" list. Singletons below this size go into
+                "singletons". Default 2.
+
+    Returns:
+        JSON with:
+            clusters: list of lists — each inner list is a group of node IDs
+                whose pairwise similarity is >= threshold (transitive closure).
+                Sorted by cluster size descending. Only clusters of size >=
+                min_cluster_size are included.
+            singletons: node IDs with embeddings but no cluster partner above
+                threshold.
+            unembedded: node IDs with no stored embedding (cold-start or
+                embedding not yet computed).
+            pair_count: total pairwise comparisons performed.
+            embedding_model: model used for stored embeddings (informational).
+        On error: {"error": "..."}.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+    unknown = set(params.keys()) - _EMBEDDING_CLUSTER_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_EMBEDDING_CLUSTER_FIELDS)}"
+        })
+    if "node_ids" not in params:
+        return json.dumps({"error": "payload_json must include required field 'node_ids'"})
+    node_ids = params["node_ids"]
+    if not isinstance(node_ids, list) or not all(isinstance(x, str) for x in node_ids):
+        return json.dumps({"error": "'node_ids' must be a list of strings"})
+    if len(node_ids) > 500:
+        return json.dumps({"error": f"Too many node_ids ({len(node_ids)}); max 500"})
+
+    threshold = float(params.get("threshold", 0.55))
+    if not (0.0 <= threshold <= 1.0):
+        return json.dumps({"error": f"'threshold' must be in [0.0, 1.0]; got {threshold}"})
+    min_cluster_size = int(params.get("min_cluster_size", 2))
+    if min_cluster_size < 1:
+        return json.dumps({"error": f"'min_cluster_size' must be >= 1; got {min_cluster_size}"})
+
+    try:
+        conn = _get_db()
+    except Exception as e:
+        return json.dumps({"error": f"DB unavailable: {e}"})
+
+    # Fetch stored embeddings.
+    placeholders = ",".join("?" * len(node_ids)) if node_ids else "NULL"
+    rows = conn.execute(
+        f"SELECT id, embedding FROM nodes WHERE id IN ({placeholders})",
+        node_ids,
+    ).fetchall() if node_ids else []
+
+    id_to_vec: dict[str, list[float]] = {}
+    for row in rows:
+        vec = _decode_embedding(row["embedding"])
+        if vec is not None:
+            id_to_vec[row["id"]] = vec
+
+    unembedded = [nid for nid in node_ids if nid not in id_to_vec]
+    embedded_ids = list(id_to_vec.keys())
+
+    # Union-find clustering (transitive closure).
+    parent: dict[str, str] = {nid: nid for nid in embedded_ids}
+
+    def _find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(x: str, y: str) -> None:
+        px, py = _find(x), _find(y)
+        if px != py:
+            parent[py] = px
+
+    pair_count = 0
+    n = len(embedded_ids)
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = embedded_ids[i], embedded_ids[j]
+            sim = core.EmbeddingManager.cosine_similarity(id_to_vec[a], id_to_vec[b])
+            pair_count += 1
+            if sim >= threshold:
+                _union(a, b)
+
+    # Collect groups.
+    groups: dict[str, list[str]] = {}
+    for nid in embedded_ids:
+        root = _find(nid)
+        groups.setdefault(root, []).append(nid)
+
+    clusters = sorted(
+        [g for g in groups.values() if len(g) >= min_cluster_size],
+        key=lambda g: -len(g),
+    )
+    singletons = [
+        nid for nid in embedded_ids
+        if len(groups[_find(nid)]) < min_cluster_size
+    ]
+
+    return json.dumps({
+        "clusters": clusters,
+        "singletons": singletons,
+        "unembedded": unembedded,
+        "pair_count": pair_count,
+        "embedding_model": core.DEFAULT_EMBEDDING_MODEL,
+    })
 
 
 # ---------------------------------------------------------------------------

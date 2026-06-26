@@ -437,7 +437,7 @@ def _content_addressed_archive_hash(abs_file: str) -> str:
         return ""
 
 
-def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "") -> dict:
+def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "", source_repo: str = "", repo_path: str = "") -> dict:
     """Validate a file:// URL is citable and capture its version state.
 
     Used by both evidence creation (for the "must be committed before cite"
@@ -496,8 +496,24 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "") -
         }
 
     file_dir = os.path.dirname(os.path.abspath(file_path))
+    # When source_repo is provided, run git operations from that repo root
+    # instead of the directory inferred from the file path. This lets the
+    # caller verify a file against a secondary repo (e.g. the plugin source
+    # tree) when the file's containing directory resolves to a different repo
+    # (e.g. the ~/.engram data repo where plugin files are untracked).
+    if source_repo:
+        git_cwd = os.path.abspath(source_repo)
+        if not os.path.isdir(git_cwd):
+            return {
+                "ok": False,
+                "error": f"source_repo '{source_repo}' is not a directory." + _HONESTY_REMINDER,
+                "content_hash": "",
+                "git_sha": "",
+            }
+    else:
+        git_cwd = file_dir
     _file_git = lambda *args: subprocess.run(
-        [core.GIT_EXE, *args], cwd=file_dir, capture_output=True, text=True, timeout=core.GIT_TIMEOUT
+        [core.GIT_EXE, *args], cwd=git_cwd, capture_output=True, text=True, timeout=core.GIT_TIMEOUT
     )
     try:
         repo_check = _file_git("rev-parse", "--is-inside-work-tree")
@@ -523,9 +539,18 @@ def _capture_file_version(url: str, content_hash: str = "", git_sha: str = "") -
     repo_root_result = _file_git("rev-parse", "--show-toplevel")
     repo_root = repo_root_result.stdout.strip()
     abs_file = os.path.abspath(file_path)
-    rel_path = os.path.relpath(abs_file, repo_root)
 
-    status_result = _file_git("status", "--porcelain", "--", abs_file)
+    if source_repo and repo_path:
+        # Cross-repo citation: the cited file lives outside source_repo at abs_file,
+        # but the canonical committed copy is at repo_path within source_repo.
+        # Use repo_path for all git tree operations; abs_file only for content_hash.
+        rel_path = repo_path
+        git_status_path = repo_path
+    else:
+        rel_path = os.path.relpath(abs_file, repo_root)
+        git_status_path = abs_file  # absolute path works in same-repo context
+
+    status_result = _file_git("status", "--porcelain", "--", git_status_path)
     file_status = status_result.stdout.strip()
     if file_status:
         status_code = file_status[:2]
@@ -670,6 +695,8 @@ def _add_evidence_impl(
     domain: str = "",
     source_date: str = "",
     content_snippet: str = "",
+    source_repo: str = "",
+    repo_path: str = "",
 ) -> str:
     """Internal implementation — see engram_add_evidence for the public
     payload schema. Kept callable with named kwargs for in-server callers.
@@ -739,7 +766,7 @@ def _add_evidence_impl(
             # File:// URLs: enforce the committed-before-cite guard. Do NOT
             # store the version state on the evidence — that lives on each
             # citing observation now.
-            ver = _capture_file_version(url)
+            ver = _capture_file_version(url, source_repo=source_repo, repo_path=repo_path)
             if not ver["ok"]:
                 return json.dumps({"error": ver["error"]})
         elif url.startswith("http://") or url.startswith("https://"):
@@ -860,6 +887,8 @@ def _add_observation_impl(
     standpoint_lineage: str = "",
     standpoint_architecture: str = "",
     fs_class=None,
+    source_repo: str = "",
+    repo_path: str = "",
 ) -> str:
     """Internal implementation — see engram_add_observation MCP tool for the
     public payload schema. Kept callable with named kwargs for in-server
@@ -966,6 +995,7 @@ def _add_observation_impl(
         # Auto-create or reuse evidence node
         ev_result = json.loads(_add_evidence_impl(
             url=url, title=title, domain=domain, source_date=source_date,
+            source_repo=source_repo, repo_path=repo_path,
         ))
         if ev_result.get("error"):
             return json.dumps({"error": f"Failed to create evidence node: {ev_result['error']}"})
@@ -993,7 +1023,7 @@ def _add_observation_impl(
         # Capture per-observation file version (the evidence-block refactor derivation). For file:// URLs
         # in a git repo: enforce committed-before-cite + record the specific
         # revision read on this observation. For other URLs: no-op.
-        ver = _capture_file_version(ev_url, content_hash=content_hash, git_sha=git_sha)
+        ver = _capture_file_version(ev_url, content_hash=content_hash, git_sha=git_sha, source_repo=source_repo, repo_path=repo_path)
         if not ver["ok"]:
             return json.dumps({"error": ver["error"]})
         captured_content_hash = ver["content_hash"]
@@ -1291,6 +1321,8 @@ def _add_observation_batch_impl(
     evidence_id: str = "",
     content_hash: str = "",
     git_sha: str = "",
+    source_repo: str = "",
+    repo_path: str = "",
 ) -> str:
     """Internal implementation — see engram_add_observation_batch MCP tool for
     the public payload schema. Kept callable with named kwargs for in-server
@@ -1351,6 +1383,7 @@ def _add_observation_batch_impl(
             return json.dumps({"error": "'title' is required when providing 'url'."})
         ev_result = json.loads(_add_evidence_impl(
             url=url, title=title, domain=domain, source_date=source_date,
+            source_repo=source_repo, repo_path=repo_path,
         ))
         if ev_result.get("error"):
             return json.dumps({"error": f"Failed to create evidence node: {ev_result['error']}"})
@@ -1390,6 +1423,8 @@ def _add_observation_batch_impl(
             standpoint_lineage=obs.get("standpoint_lineage", ""),
             standpoint_architecture=obs.get("standpoint_architecture", ""),
             fs_class=obs.get("fs_class"),
+            source_repo=source_repo,
+            repo_path=repo_path,
         ))
         r["index"] = i
         results.append(r)

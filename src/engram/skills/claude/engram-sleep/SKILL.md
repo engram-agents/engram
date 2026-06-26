@@ -68,26 +68,82 @@ The parent's role is purely orchestration.
 - The day produced no work worth reviewing (skip sleep or proceed directly to Phase B if Phase A produces nothing)
 - Right after a sleep with no new work happening since (nothing to consolidate)
 
+> **⚠️ NEVER SKIP THE DREAM FAIRIES. The token-economy lever is compact-or-not, NEVER
+> dream-or-not.** (Lei, 2026-06-25 — stated as the governing rule after this was violated
+> twice.) There is **no "lean cycle," no "context-economy" variant, no spawning the
+> dream-master without the full fairy + batch-summary bundle.** The ONLY thing context
+> size ever decides is **whether to compact/nap BEFORE the sleep** — and after compacting,
+> you run the **COMPLETE** routine (all 8 dream-fairies + every batch-summary chunk →
+> collect ALL reports → *then* spawn the dream-master). Context size NEVER decides what
+> runs *inside* the sleep. If you are about to spawn the dream-master and have NOT collected
+> the dream-fairy + batch-summary reports this cycle, **STOP — you are skipping the routine.**
+>
+> **ALL-OR-NOTHING — never skip *part* of a sleep.** Once you commit to a sleep, Phase B's
+> fairy dispatch is MANDATORY, not optional. If a day is genuinely too light to consolidate,
+> skip the **whole** sleep — but NEVER run Phase A + advance the turn while dropping the
+> fairies. `engram_advance_turn` marks today's cohort "previous-turn handled"; several fairy
+> categories scope to the **fresh cohort = nodes created since the last sleep** (most
+> explicitly **Category 7 — missing principle-edges**), so after the turn advances a later
+> sleep's window no longer includes today's nodes and they are **skipped forever** — they
+> never get their one-shot fresh-cohort pass.
+> **Parent context is NEVER a valid reason to drop the fairies** — the dispatch is one
+> background `Agent` message and the fairies run in fresh contexts that don't inherit the
+> parent's. If your context is too large to orchestrate Phase B, **compact/nap first to
+> clear, then run the FULL Phase B** — do not trim it.
+> (Incidents — this has recurred, which is why the rule is now the FIRST line above: **2026-06-24**
+> fairies skipped "for context economy" → explicit-cohort backfill later recovered 3 lost
+> principle-edges + 1 misleading-because-obsoleted node (#1426); **2026-06-25** the dream-master
+> was spawned directly — twice in one session — on an *unverified* context-cost worry (no
+> drowsiness banner; speculated), caught by Lei.)
+
+---
+
+## Pre-flight: context guard (fires before Phase A)
+
+Before any step, check the parent session's context size. **The only decision context size drives is compact-or-not BEFORE the sleep** (per the invariant above) — it NEVER changes what the sleep *runs*. A large parent context does make each orchestration turn (fairy dispatch, notification processing, recall-summary application, dream-master spawn, relay) more expensive, because they run in the parent's full context (measured: **6.39M tokens / 25 min** unchecked, a full 5h budget — Aleph incident 2026-06-06, #878). **The remedy is to COMPACT first, then run the full routine — never to trim the routine.** So the guard below is strictly a compact-first / defer-the-whole-sleep decision; it is NOT a license to drop or shrink any step.
+
+Locate the `[Drowsiness: …]` banner injected by the context-tracker hook.
+
+### Auto-sleep / cron-initiated (invocation gate path b — user NOT present)
+
+- **`[Drowsiness: refreshed]`** — below 50% of ceiling → proceed to Phase A.
+- **Any other level** (`energetic`, `a little drowsy`, `needs a nap: N%`) — at or above 50% → **HARD ABORT**:
+
+  > "Auto-sleep aborted: context is at [level] — too large for safe consolidation. A large session context multiplies the token cost of every Phase A step and every Phase B orchestration turn. When you next have an attended session with the user, run `engram-nap` + `/compact` to compact the context; the next scheduled cron fire will then retry in a compact context."
+
+  **Stop.** Do NOT attempt nap or compact autonomously — those require user oversight. Do NOT re-arm sleep; the next cron fire handles it.
+
+  **Why hard abort (not a soft proposal) for auto-sleep:** no user is present to override the decision, the cost is invisible until it hits the billing statement, and the measured incidents exhausted an entire 5h budget in under 30 minutes. Aborting here is always cheaper than explaining the overage.
+
+- **No banner** (hook not configured or hook output not visible) → proceed to Phase A (can't detect, can't guard).
+
+### User-initiated (invocation gate path a — user present)
+
+- **`[Drowsiness: refreshed]`** — below 50% → proceed to Phase A.
+- **`[Drowsiness: needs a nap: N%]`** (urgent, typically ≥85%) → surface a strong recommendation and wait for explicit confirmation before proceeding:
+
+  > "Context is at urgent level ([N]%). Sleeping now will burn significant tokens across Phase A review steps and Phase B orchestration turns. Strongly recommend `engram-nap` + compact first — takes ~2 min and reduces per-turn cost ~20×. Proceed anyway? (Say 'yes, proceed' to override.)"
+
+- **`[Drowsiness: energetic]` or `[Drowsiness: a little drowsy]`** (50–85%) → surface the soft proposal and proceed if the user agrees (see Phase A pre-flight below).
+- **No banner** → proceed to Phase A.
+
 ---
 
 ## Phase A — Cohort completion
 
-### Phase A pre-flight: context check (user still present)
+### Phase A pre-flight: context check (user-present, moderate levels)
 
-Phase A runs while you're still at the desk. Before starting the bedtime review, check whether the current context is large enough to make a nap worthwhile.
+This check covers the 50–85% user-present case not handled by the hard guard above. Before starting the bedtime review, surface the nap option:
 
-Locate the drowsiness banner in this prompt's context, injected by the context-tracker hook (`[Drowsiness: …]`):
+- **`[Drowsiness: energetic]` or `[Drowsiness: a little drowsy]`** — surface this to the user now, before Phase A begins:
 
-- **`[Drowsiness: refreshed]`** — below 50% of ceiling → proceed to Step 1.
-- **Any other level** (`energetic`, `a little drowsy`, `needs a nap: N%`) — at or above 50% → surface this to the user now, before Phase A begins:
+  > "Your context is at [level] — Phase A's bedtime review will burn additional tokens in this window since each step runs in the current large context, and Phase B's orchestration turns will too. While you're still here, a quick nap first would reduce that cost. Want to run `engram-nap` before we start? (You can also proceed directly.)"
 
-  > "Your context is at [level] — Phase A's bedtime review will burn additional tokens in this window since each step runs in the current large context. While you're still here, a quick nap first would reduce that cost. Want to run `engram-nap` before we start? (You can also proceed directly — Phase B fairies start fresh and aren't affected.)"
+  **This is a proposal, not a block.** If the user says "just proceed", proceed.
 
-  **This is a proposal, not a block.** Phase B orchestration (fairies + dream master) starts fresh regardless of parent context size — they don't inherit it. The only real cost of skipping the nap is the Phase A steps themselves running in a larger window. If the user says "just proceed", proceed.
+- **`[Drowsiness: refreshed]`** or **no banner** → proceed directly to Step 1.
 
-- **No banner in context** (hook not configured or hook output not visible) → proceed directly to Step 1.
-
-> **Why Phase A, not Phase B.** Dream fairies and the dream master start afresh — they don't re-cache the parent session context, so a large parent window has no multiplier effect on Phase B cost. Phase A is where the awake agent does work (node filing, warm-briefing erase, history reconcile) — those steps run inside the current context window and do compound with size. The check belongs where the user can still act on it.
+> **Why the guard covers both Phase A and Phase B.** Dream fairies and the dream master run in their own fresh contexts, so their individual turns are unaffected. But the **parent's orchestration turns in Phase B** — dispatching fairies, processing their task-notifications (7+ turns), applying recall summaries, spawning the dream master, relaying results — all run in the parent's full session context. A large parent context re-caches on each of those turns, compounding the cost just as Phase A does. The guard belongs before the entire sleep run, not just before Phase A. *(Origin: the unchecked Phase B orchestration was the measured source of the 6.39M-token overage in the Aleph incident — the prior framing "Phase B isn't affected" was incorrect and is now corrected.)*
 
 ### Step 1 — Walk the day's full cohort
 
@@ -231,6 +287,8 @@ The directory is git-tracked for version history and diff-ability — per-day fi
 
 This step exists because ask-{{USER_NAME}}.md is auto-loaded into every fresh session — stale items there make {{USER_NAME}} re-read items that are already resolved, and a stale "Ready" line invites a wasted merge attempt. The deterministic sweep is the structural defense against ask-list drift (mechanical gate > vigilance — the associative walk alone demonstrably drifts). (Installs without an ask-{{USER_NAME}}.md file can skip this sub-step; it's a no-op when the file doesn't exist. Installs without `gh` or without a GitHub-backed workflow: skip the sweep, keep the commit-log walk.)
 
+**Prefer `tk_` nodes for tracked items (layer 2a, #1251):** New deferred or tracked items — things you intend to follow up on across sessions — are better filed as `engram_add_task(...)` than as free prose in ask-{{USER_NAME}}.md or history. A `tk_` node gets the dream-cycle's Category 8 reconcile pass: when the referenced PR/issue closes, the fairy flags it and the dream-master marks it done automatically. Free-prose entries require the Step 4 ask-{{USER_NAME}} sweep (which only covers text surfaces) and are invisible to the dream cycle.
+
 ### Step 4.5 — Back up knowledge.db (dated archive)
 
 Run the knowledge.db backup tool and **capture the result for the sleep summary**.
@@ -270,9 +328,57 @@ only discovered when you reach for it and find it three days stale.
 `~/.engram/` loss takes it). The per-nap git auto-push is the off-disk layer.
 The three layers are complementary along those axes.
 
+### Step 4.6 — Back up main session logs (skip subagents/)
+
+Run the session-log backup tool and **capture the result for the sleep summary**.
+Copies top-level `.jsonl` logs from `~/.claude/projects/` to
+`~/.engram/session-logs-archive/`, skipping any path containing `/subagents/`.
+Top-level logs are cited as `source_url` evidence in ENGRAM nodes; subagent logs
+are ephemeral fairy transcripts that are never cited.
+
+```bash
+session_backup_out=$($HOME/.engram/venv/bin/python3 \
+    "$CLAUDE_PLUGIN_ROOT/tools/backup_session_logs.py" \
+    [--retain 365] 2>&1)   # prune archive entries older than 365 days; omit to keep all
+session_backup_rc=$?
+if [ $session_backup_rc -eq 0 ]; then
+    session_backup_status="✓ session-log backup OK: $session_backup_out"
+else
+    session_backup_status="⚠ session-log backup FAILED: $session_backup_out"
+fi
+```
+
+**Non-blocking**: do not abort sleep on failure — the session logs already exist in
+`~/.claude/projects/`; the archive is belt-and-suspenders for retention-policy
+independence. But **surface the status in the history milestone** (Step 4) so a
+recurring failure is visible, not silent:
+
+```
+- session-log backup: $session_backup_status
+```
+
+**Skip if source directory is absent** (the tool handles this automatically — it
+exits 0 with a 0-backed-up summary when `~/.claude/projects/` does not exist).
+
+**Deduplication**: the tool skips files already in the archive that match by size;
+re-copies if size differs (resumed session may have grown the file).
+
 ---
 
 ## Phase B — Consolidation orchestration
+
+> **Phase B is MANDATORY whenever you reach it** (see the all-or-nothing invariant in
+> "When NOT to sleep"). The rule is: **skip the whole sleep, or none of it — never skip *part* of it.** The dream-fairy dispatch (Step 6) is the load-bearing part — the fairies are the ONLY pass that scans the fresh cohort while it is still the current turn.
+>
+> The 8 fairies divide into two groups with different risk profiles:
+>
+> - **Truly window-scoped (Category 7; partially Category 6):** Category 7 (missing principle-edges) operates on the *fresh cohort* using an explicit `created_at >= prev-sleep-timestamp` filter. That window closes when `engram_advance_turn` fires — a missed Cat 7 pass is *permanent*, no backfill path. Category 6 (recent-resolution echoes) uses an implementation-defined recency window that also narrows post-advance; its miss is partially recoverable but degrades over cycles.
+>
+> - **All-time scoped but never deferrable (Categories 1/2/3/4/5/8):** open questions, contradictions, stale nodes, cornerstone candidates, tainted derivations, and stale task refs query across the full graph — they *can* be caught next cycle. But "catchable next cycle" is the rationalization that lets partial skipping compound silently: skip Cat 1 tonight, skip Cat 3 tomorrow, and consolidation debt accumulates past the capacity of any single pass.
+>
+> **Context pressure is never a valid reason to skip fairies.** They run in fresh contexts; the parent's context size is irrelevant to fairy execution. If the parent context is too full, **nap first, then dispatch the full set** — do not drop fairies.
+>
+> *(Origin: 2026-06-24 incident — a parent skipped 7 fairies "for parent-context economy"; the dream master advanced the turn. Backfill found 3 permanently-missing principle-edges (a derivation → its axiom, and two observations → their goal nodes). Initial fix #1427 (Ariadne) added the all-or-nothing MANDATORY framing; #1429 (Sol) adds the per-category taxonomy to close the "all-time-scoped fairies are catchable next cycle, can I skip them?" loophole.)*
 
 ### Step 5 — Compute the recall-summary cohort and run cohort_dispatch prepare
 
@@ -295,7 +401,7 @@ If today's-cohort count < 50, top up from legacy NULLs:
 
 Cap at 50 protects the cycle's fairy compute budget. The backfill naturally drains the legacy NULL pool over many cycles.
 
-**If your install's recall-summary substrate isn't deployed yet** (no `recall_summary` column on `nodes`, or no `engram_set_recall_summaries` MCP tool registered): skip the batch summary step entirely — dispatch only the 7 dream-fairies, spawn the dream master with a manifest of 7 fairies, and proceed. The architecture is forward-compat: the dream master handles 7-fairy cycles cleanly.
+**If your install's recall-summary substrate isn't deployed yet** (no `recall_summary` column on `nodes`, or no `engram_set_recall_summaries` MCP tool registered): skip the batch summary step entirely — dispatch only the 8 dream-fairies, spawn the dream master with a manifest of 8 fairies, and proceed. The architecture is forward-compat: the dream master handles 8-fairy cycles cleanly.
 
 **Run cohort_dispatch prepare** to chunk the cohort and write per-chunk payload files:
 
@@ -329,11 +435,11 @@ python3 -m tools.cohort_dispatch verify-in \
 
 Verify-in checks: (1) valid JSON per chunk, (2) required fields present (id, type, claim), (3) every id resolves in the DB with matching claim (race-window guard against retracted nodes), (4) no duplicate IDs within or across chunks, (5) chunk size ≤ 15. On non-zero exit, do not proceed to dispatch — the cohort has a structural problem to fix first.
 
-### Step 6 — Dispatch all fairies in parallel (7 dream-fairies + N batch-summary-fairies)
+### Step 6 — Dispatch all fairies in parallel (8 dream-fairies + N batch-summary-fairies)
 
 Single `Agent`-tool message with all calls, each `run_in_background=true`.
 
-**Fairies 1-7** — `subagent_type="engram-dream-fairy"`, one per well-supported category. **Use these exact substitution values** (canonical from `engram-dream-fairy.md`; do NOT derive from memory or prior-session context — the category numbering changes across versions and must be read here each dispatch):
+**Fairies 1-8** — `subagent_type="engram-dream-fairy"`, one per well-supported category. **Use these exact substitution values** (canonical from `engram-dream-fairy.md`; do NOT derive from memory or prior-session context — the category numbering changes across versions and must be read here each dispatch):
 
 | `{N}` | `{CATEGORY_NAME}` | `{SLUG}` |
 |-------|-------------------|----------|
@@ -344,10 +450,11 @@ Single `Agent`-tool message with all calls, each `run_in_background=true`.
 | 5 | Tainted-but-still-valid derivations | tainted-valid |
 | 6 | Recent-resolution echoes | resolution-echoes |
 | 7 | Missing principle-edges (instantiates/serves) | missing-edges |
+| 8 | Open tasks with stale external references | stale-task-refs |
 
 Prompt template (substitute `{N}`, `{CATEGORY_NAME}`, `{SLUG}` from the table above):
 
-> Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md`. Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only file path + 5-bullet TL;DR for this category. Do NOT run other categories or the heuristic categories (8, 9).
+> Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md`. Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only file path + 5-bullet TL;DR for this category. Do NOT run other categories or the heuristic categories (9, 10).
 
 **Batch-summary fairies** — one `subagent_type="engram-batch-summary-fairy"` per chunk from the manifest (typically 1–4 fairies for a 50-node cohort at chunk-size=15). For each chunk, construct a short dispatch prompt inline using the paths from the manifest. Example:
 
@@ -367,7 +474,7 @@ All fairies fire in parallel with `run_in_background=true`; the harness fires a 
 
 Receive each fairy's task-notification as it arrives. Collect from the completion result:
 
-- **Fairies 1-7**: file path (`~/.engram/dream/<TODAY>-fairy-<N>-<SLUG>.md`) + 5-bullet TL;DR. Full report content lives on disk at the cited path.
+- **Fairies 1-8**: file path (`~/.engram/dream/<TODAY>-fairy-<N>-<SLUG>.md`) + 5-bullet TL;DR. Full report content lives on disk at the cited path.
 - **Batch-summary fairies**: write each fairy's returned JSON to `<cohort-dir>/chunk-N/agent_output.json`.
 
 **Fairy timeout**: if any fairy doesn't return within 15 minutes of dispatch, mark it as timed-out. For dream-fairies, note the timeout in the master's spawn prompt. For batch-summary fairies, mark the affected chunk as missing.
@@ -491,6 +598,12 @@ Log the result: X summaries applied, Y failures deferred to next cycle.
 
 ### Step 8 — Spawn the dream master with the full report bundle
 
+> **PRECONDITION (do not pass without it):** all 8 dream-fairies dispatched (Step 6) and
+> their reports collected or explicitly marked timed-out/failed (Step 7), AND every
+> batch-summary chunk applied (Step 7.5). If you have NOT dispatched the fairies this cycle,
+> you are not at Step 8 — you are skipping the routine (see the invariant at the top). The
+> dream-master is spawned *with* the fairy bundle, never *instead of* it.
+
 Once all fairy reports are collected (or marked timed-out) and the final payload is ready, spawn the master with everything in its initial prompt:
 
 ```
@@ -512,7 +625,7 @@ Agent(
     - Recall summaries already applied by parent in Step 7.5: X applied, Y failures deferred to next cycle
     - SSoT modules live at: <engram-alpha-repo-path>/tools/ (recall_summary_validator, recall_summary_payload)
 
-    Call engram_reflect first for your initial agenda. Read all 7 dream-fairy reports from disk. Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items. Execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
+    Call engram_reflect first for your initial agenda. Read all 8 dream-fairy reports from disk. Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items. Execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring → task_closures; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
 
     FINAL RETURN: dream record path + top-line counts (resolved / superseded / promoted / refuted / recall-summaries applied) + health score delta + flagged-for-user count. The parent relays this to the user verbatim.""",
     run_in_background=true
@@ -547,7 +660,7 @@ This is why the ordering is Phase A → Phase B, and why Phase A must complete b
 
 - **Parent does NOT call `engram_reflect`, `engram_advance_turn`, or write the dream record.** Those are dream-master responsibilities. The parent's job is orchestration + relay.
 
-- **Parent's context is light by design.** Dispatch + routing messages costs little context. If your context fills up during the routing phase, nap first to clear, then resume routing — the dream master's context is separate and unaffected by parent compaction.
+- **Parent's context is light by design.** Dispatch + routing messages costs little context. If your context fills up during the routing phase, **nap first to clear it, then return and dispatch the full fairy set** — do not reduce or drop fairies. The dream master's context is separate and unaffected by parent compaction. (See the Phase B mandatory invariant above: context pressure is never a reason to skip fairies.)
 
 - **Don't retry an interrupted dream.** If the dream master returns a partial result (some fairies timed out, completion checklist short-circuited under self-timeout), unfinished work goes into next cycle's cohort via attrition. The dream master logs unfinished items in the dream record. Don't try to "finish the work" in the parent context — that would re-introduce the discipline-blur this architecture exists to resolve.
 
@@ -559,7 +672,7 @@ This is why the ordering is Phase A → Phase B, and why Phase A must complete b
 - **Dream master** (`engram-dream-master`) — owns the consolidation this skill orchestrates. Spec at `~/.claude/agents/engram-dream-master.md`.
 - **Batch-summary fairies** (`engram-batch-summary-fairy`) — one-shot batch generators dispatched by the parent after `cohort_dispatch.py prepare`. Each fairy receives a short dispatch prompt naming its input payload path and output path; it Reads the payload file (≤15 nodes), generates recall_summary + recall_keywords, and Writes the output JSON. Tool list: `[Read, Write]`. No inline payload embedding in the dispatch prompt. Sole dispatch path for recall_summary generation in the sleep cycle. Spec at `~/.claude/agents/engram-batch-summary-fairy.md`.
 - **cohort_dispatch.py** — orchestration script in `tools/cohort_dispatch.py`. Five subcommands: `prepare` (chunk cohort → per-chunk payload.json), `verify-in` (pre-flight integrity checks), `validate` (split clean vs failures, auto-write retry_payload.json), `incorporate` / `incorporate-retry` (merge retry output → final_payload.json + retry_payload.json + unfixable.json + attempt_count).
-- **Dream fairies 1-7** (`engram-dream-fairy`) — read-only consolidation-suggestion scanners. Spec at `~/.claude/agents/engram-dream-fairy.md`.
+- **Dream fairies 1-8** (`engram-dream-fairy`) — read-only consolidation-suggestion scanners. Spec at `~/.claude/agents/engram-dream-fairy.md`.
 - **End-of-day-detector hook** — surfaces engram-sleep on wrap-up phrases; user "Yes" triggers this skill.
 
 ## macOS auto-sleep timing

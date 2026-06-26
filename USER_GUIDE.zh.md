@@ -1,4 +1,4 @@
-# ENGRAM 用户指南
+# 心迹（ENGRAM）用户指南
 
 *写给正在使用已安装 ENGRAM 的 Claude Code 智能体的用户。还没安装？请参阅 `README.md`。*
 

@@ -160,6 +160,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/backup_session_logs.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/build-plugin.sh",
       "tier": "convenience",
       "source": "src/build/build-plugin.sh"
@@ -483,6 +487,10 @@
       "tier": "convenience"
     },
     {
+      "path": "skills/claude/engram-health-exam",
+      "tier": "convenience"
+    },
+    {
       "path": "skills/claude/engram-loop-diagnose",
       "tier": "dev"
     },
@@ -498,6 +506,10 @@
     },
     {
       "path": "skills/claude/engram-forum",
+      "tier": "convenience"
+    },
+    {
+      "path": "skills/claude/engram-standpoint",
       "tier": "convenience"
     },
     {
@@ -604,6 +616,10 @@
     {
       "path": "tools/borges_session_eval.py",
       "reason": "Borges-persona-specific session quality evaluator; references Borges-specific ENGRAM observation IDs and rubric scaffolding, not generic ENGRAM tooling"
+    },
+    {
+      "path": "tools/test_backup_session_logs.py",
+      "reason": "test file for tools/backup_session_logs.py — CI tooling only, never ships"
     },
     {
       "path": "tools/test_forum_cli.py",

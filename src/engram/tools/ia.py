@@ -1635,7 +1635,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_write.add_argument(
         "--from-stdin", action="store_true",
         help=(
-            "Read full letter content from stdin instead of opening $EDITOR. "
+            "Read the FULL letter from stdin — frontmatter block (--- / from: / to: / "
+            "timestamp: / ---) PLUS body. Fails with 'could not parse frontmatter' if "
+            "body-only content is passed. Use --body-file instead when you only have "
+            "the body and want frontmatter auto-assembled. "
             "(filename timestamp is always send-time; if your stdin frontmatter "
             "specifies a different timestamp, they will diverge by design — "
             "frontmatter ts is authoritative for readers.)"
@@ -1644,10 +1647,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_write.add_argument(
         "--body-file", metavar="PATH",
         help=(
-            "Path to a file containing ONLY the letter body; "
-            "frontmatter (from/to/timestamp) is auto-assembled. "
+            "Path to a file containing ONLY the letter body (no frontmatter); "
+            "frontmatter (from/to/timestamp) is auto-assembled from flags. "
             "Body is read verbatim (no shell processing) — the safe path "
             "for content with backticks/$vars/angle-brackets. "
+            "If the file accidentally includes a '---' frontmatter block, a warning "
+            "is emitted but the letter is still sent as-is. "
             "Mutually exclusive with --from-stdin."
         ),
     )

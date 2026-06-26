@@ -389,7 +389,9 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         # LOW-VOLUME: source-swap goal → recall_summary with claim fallback.
         goals = conn.execute(
             """SELECT id, claim, recall_summary, created_at FROM nodes
-               WHERE type = 'goal' AND status = 'open' AND is_current = 1"""
+               WHERE type = 'goal' AND status = 'open' AND is_current = 1
+               AND (json_extract(metadata, '$.lifecycle_state') IS NULL
+                    OR json_extract(metadata, '$.lifecycle_state') = 'active')"""
         ).fetchall()
         report["active_goals"] = [
             {"id": g["id"], "goal": core._reflect_rs_or_claim(g, "claim"), "since": g["created_at"]}

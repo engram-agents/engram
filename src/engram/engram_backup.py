@@ -361,9 +361,13 @@ def verify_roundtrip(src_db_path: str) -> dict:
             # fts_hits: recon probe count (definitionally clean post rebuild_fts_index).
             # The delta between the two surfaces any pollution in the source index —
             # diagnostic signal that exposed the whole #727 mechanism.
-            fts_ok = rc.execute(
-                "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'migration'"
-            ).fetchone()[0]
+            # Skip diagnostic probe when source returned 0 hits — trivially uninformative.
+            if fts_hits_orig:
+                fts_ok = rc.execute(
+                    "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'migration'"
+                ).fetchone()[0]
+            else:
+                fts_ok = 0
         rc.close()
         return {
             **stats,

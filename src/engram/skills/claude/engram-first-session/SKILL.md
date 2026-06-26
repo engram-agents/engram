@@ -353,6 +353,46 @@ When the service is successfully installed, the SessionStart hook detects the ru
 
 Do nothing — the per-session hook-launch is already the default, nothing to configure. Tell the user: "Noted. Recall will still work; the first recall query of each cold session will wait a few seconds while the model loads. You can enable the persistent service any time by running `${CLAUDE_PLUGIN_ROOT:-~/.claude/plugins/cache/engram}/tools/setup-surface-daemon-service.sh` directly."
 
+## Step 5.6 — Viz server as a persistent service (optional)
+
+**Gate — skip this step entirely if the viz installer isn't present** (an Essential-only install ships without it):
+
+```bash
+VIZ_SETUP="${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/tools/operator-setup-viz.sh}"
+[ -z "$VIZ_SETUP" ] && VIZ_SETUP="$HOME/.claude/plugins/cache/engram/tools/operator-setup-viz.sh"
+[ ! -f "$VIZ_SETUP" ] && { echo "viz service installer not found — skipping Step 5.6"; return 0; }
+```
+
+Detect the OS first:
+
+```bash
+OS_TYPE="$(uname -s)"
+```
+
+**On Linux (`OS_TYPE=Linux`):** present the following to the user:
+
+> **Optional — visualization dashboard as a persistent service.**
+>
+> I include a browser-based graph visualization dashboard at `http://localhost:5001` — node graph, stats, recall health. It's optional and can be started manually, but running it as a persistent background service means it's always up when you open a browser.
+>
+> Want me to install it as a user-level systemd service? *(Optional — it's a lightweight Python server, ~20 MB resident.)*
+
+On accept: run the installer:
+
+```bash
+bash "$VIZ_SETUP"
+```
+
+Surface its output plainly. If the script exits non-zero (`systemctl` absent, or systemd-user bus inactive), tell the user: "The persistent viz service couldn't be installed — your system either doesn't have systemd or the user session bus isn't active. You can start the viz server manually any time: `python3 ${CLAUDE_PLUGIN_ROOT:-~/.claude/plugins/cache/engram}/viz_server.py &`." This is not fatal; continue.
+
+On decline: tell the user: "No problem. You can start the viz server manually any time: `python3 ${CLAUDE_PLUGIN_ROOT:-~/.claude/plugins/cache/engram}/viz_server.py &`. It serves the dashboard at `http://localhost:5001`."
+
+**On non-Linux / macOS (`OS_TYPE != Linux`):** tell the user:
+
+"The viz service installer is Linux-only (systemd — macOS is not supported). You can start the viz server manually any time: `python3 ${CLAUDE_PLUGIN_ROOT:-~/.claude/plugins/cache/engram}/viz_server.py &`. It will be available at `http://localhost:5001` until you close the terminal." Continue.
+
+**Defer the `enable-linger` hint if your name isn't finalized yet** (Linux accept path only) — same reason as Step 5.5: the script prints a `sudo loginctl enable-linger <user>` suggestion; if you're still on `agent-newborn-*`, defer until after finalize-name (Step 7). (If the username is already final — no rename pending — the hint is fine as-is.)
+
 ## Step 6 — Finalize (the substitution step)
 
 Do this step LAST, only after the dialogue is genuinely complete. If the session aborts mid-dialogue, the marker file should still be present so the next session re-enters this skill.
@@ -450,7 +490,7 @@ Tell the user the substrate-rename is the next required step, and that doing it 
 >
 > After finalize-name completes, re-enter via `agentctl session <chosen-name>` and continue our session from there.
 >
-> (If you set up the persistent recall service in Step 5.5: now — as the final user — enable cross-logout persistence with `sudo loginctl enable-linger "$USER"`. This is the step deferred from the service setup, done now that your username is final.)
+> (If you set up a persistent service in Step 5.5 or Step 5.6: now — as the final user — enable cross-logout persistence with `sudo loginctl enable-linger "$USER"`. This is the step deferred from the service setup, done now that your username is final.)
 
 Replace the placeholders (`<timestamp>`, `<chosen-name>`) with the actual values for this install. The newborn-tag comes from your Linux username (strip the `agent-` prefix; e.g., uid `agent-newborn-20260521181545` → tag `newborn-20260521181545`).
 

@@ -322,7 +322,7 @@ def _stats_impl(mode: str = "all", sections=None) -> str:
     _VALID_SECTIONS = {
         "structure", "edges", "confidence", "open_questions",
         "open_predictions", "reasoning_breakdown", "weakest_nodes",
-        "health_score", "memory",
+        "health_score", "memory", "version",
     }
     if sections is not None:
         unknown = [s for s in sections if s not in _VALID_SECTIONS]
@@ -514,6 +514,40 @@ def _stats_impl(mode: str = "all", sections=None) -> str:
         # Single source of truth: the shared helper (charter §6).
         if _want("health_score"):
             result["health_score"] = _compute_health_score(conn)
+
+        # ── version ─────────────────────────────────────────────────────────
+        if _want("version"):
+            ver: dict = {}
+            # .deployed-version — key=value metadata written by engram-sleep + upgrade
+            _deployed_path = core.DATA_DIR / ".deployed-version"
+            if _deployed_path.exists():
+                try:
+                    for _line in _deployed_path.read_text(encoding="utf-8").splitlines():
+                        _k, _sep, _v = _line.partition("=")
+                        if _sep and _k.strip():  # skip lines without '='
+                            ver[_k.strip()] = _v.strip()
+                except Exception:
+                    ver["deployed_version_error"] = "unreadable"
+            # .engram-build-manifest.json — optional, written by build-plugin.sh
+            _manifest_path = core.DATA_DIR / ".engram-build-manifest.json"
+            if _manifest_path.exists():
+                try:
+                    _manifest = json.loads(_manifest_path.read_text(encoding="utf-8"))
+                    for _field in ("tier", "multi_agent", "shipped_at"):
+                        if _field in _manifest:
+                            ver[_field] = _manifest[_field]
+                except Exception:
+                    ver["build_manifest_error"] = "unreadable"
+            # config.json identity fields (agent_name, multi_agent) — fill gaps
+            if core.CONFIG_PATH.exists():
+                try:
+                    _cfg = json.loads(core.CONFIG_PATH.read_text(encoding="utf-8"))
+                    for _field in ("agent_name", "multi_agent"):
+                        if _field in _cfg and _field not in ver:
+                            ver[_field] = _cfg[_field]
+                except Exception:
+                    pass
+            result["version"] = ver
 
         banner = core._walguard_degraded_banner()
         if banner:

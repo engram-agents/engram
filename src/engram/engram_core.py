@@ -3000,6 +3000,8 @@ def _commit_snapshot(
             if f.is_file() and f.name != ".key" and "__pycache__" not in str(f):
                 files_to_stage.append(f"diary/{f.name}")
 
+    # Dead branch under normal operation — step above always writes graph_snapshot.md.
+    # Can only fire if snapshot generation itself failed (class-5 signal).
     if not files_to_stage:
         return {"git_committed": False, "reason": "no tracked files exist", **_dump_fields}
 
@@ -4223,17 +4225,18 @@ def _validate_reasoning_structure(
             "CHECKED (mechanical): same-evidence-root cluster across premises."
         )
 
-    # Standpoint uniformity check — advisory for ALL derivations with 2+ premises.
-    # Extends the multi_source check: maps each evidence root to its standpoint
-    # cluster and emits a positive-liveness probe (per the class-5 two-layer
-    # lesson: surface must ALWAYS name what axes were checked, even on clean).
+    # Standpoint uniformity check — advisory for ALL derivations with 1+ premises.
+    # Extended from n >= 2 to n >= 1 (#958): chains of single-premise derivations
+    # (dv←dv←dv←ob) previously escaped the F-S and ⚠⚠ checks at every level.
+    # STANDPOINT axis reports for n_leaves=1 are trivially uniform but technically
+    # correct; F-S and ⚠⚠ are the primary signals for the single-premise case.
     #
     # Implementation note: standpoint_author_id / standpoint_collection_id are
     # filed on observation (premise) nodes, not on evidence nodes. We trace
     # evidence roots to determine whether premises share the same source for the
     # multi_source check above, but the standpoint cluster key is derived from
     # the premise nodes themselves (where the standpoint data actually lives).
-    if n >= 2:
+    if n >= 1:
         # Closure-walk to OBSERVATION leaves: standpoint (author/collection/
         # lineage) + quote_type/fs_class live on observation nodes — NOT on the
         # direct premises (which may themselves be derivations) and NOT on the
@@ -4270,7 +4273,7 @@ def _validate_reasoning_structure(
                     n_clusters = len(vals)
                     unit = "cluster" if n_clusters == 1 else "clusters"
                     verdict = "diverse" if n_clusters > 1 else "⚠ uniform"
-                    return f"{n_clusters} {unit} ({verdict})"
+                    return f"{n_clusters} {unit} / {n_leaves} leaves ({verdict})"
 
                 parts = []
                 author_lbl = _axis_label({k["author"] for k in axis_keys})
@@ -4289,14 +4292,14 @@ def _validate_reasoning_structure(
                 lineage_vals = {k["lineage"] for k in axis_keys}
                 if None not in lineage_vals:
                     if len(lineage_vals) > 1:
-                        parts.append(f"lineage: {len(lineage_vals)} clusters (diverse)")
+                        parts.append(f"lineage: {len(lineage_vals)} clusters / {n_leaves} leaves (diverse)")
                     else:
                         lineage_uniform = True
                         if _graph_lineage_count(conn) >= 2:
                             parts.append(
-                                "lineage: 1 cluster (⚠ uniform — shared training "
-                                "lineage; zero independent corroboration on "
-                                "substrate-prior bias)"
+                                f"lineage: 1 cluster / {n_leaves} leaves (⚠ uniform — shared training "
+                                f"lineage; zero independent corroboration on "
+                                f"substrate-prior bias)"
                             )
                         # else: single-lineage graph — emit NO standalone line.
                         # null=self (Component A) makes lineage uniform on EVERY
@@ -4324,12 +4327,18 @@ def _validate_reasoning_structure(
                             lineage_vals - {self_lin_hash}
                             if self_lin_hash else lineage_vals
                         )
+                        # Count observation leaves with a cross-lineage (non-author) lineage hash.
+                        cross_lin_set = {self_lin_hash} if self_lin_hash else set()
+                        n_cross_leaves = sum(
+                            1 for k in axis_keys
+                            if k.get("lineage") is not None
+                            and k.get("lineage") not in cross_lin_set
+                        )
                         if len(independent) < 2 and _graph_lineage_count(conn) >= 2:
                             parts.append(
-                                f"⚠ inductive_generalization: independent "
-                                f"cross-lineage instances (excluding "
-                                f"hypothesis-author lineage '{self_lin}') = "
-                                f"{len(independent)} — consider inductive_analogy"
+                                f"⚠ inductive_generalization: independent cross-lineage instances "
+                                f"(excluding hypothesis-author lineage '{self_lin}') = {len(independent)}; "
+                                f"{n_cross_leaves} of {n_leaves} leaves cross-lineage — consider inductive_analogy"
                             )
 
                 # Architecture axis: collect raw enum values directly from DB
@@ -4371,13 +4380,19 @@ def _validate_reasoning_structure(
                 if parts:
                     warnings.append(
                         f"STANDPOINT: {'; '.join(parts)}; others unchecked."
+                        " (load skill `engram-standpoint` for the calibration theory)"
                     )
-
-            # If any key is None: some leaves lack standpoint data — skip the
-            # STANDPOINT report (can't distinguish no-data from same-cluster).
-            # The FALSIFICATION block below is NOT gated on this — it runs as a
-            # sibling so F-S (which needs no standpoint) is never suppressed by
-            # missing standpoint marks.
+            else:
+                # Some leaves lack standpoint data — can't distinguish no-data
+                # from same-cluster, so emit a low-noise unchecked notice (#761).
+                n_missing = sum(1 for k in axis_keys if k is None)
+                warnings.append(
+                    f"STANDPOINT: unchecked ({n_missing}/{n_leaves} premises"
+                    f" lack standpoint data)."
+                )
+            # The FALSIFICATION block below is NOT gated on standpoint — it runs
+            # as a sibling so F-S (which needs no standpoint) is never suppressed
+            # by missing standpoint marks.
 
         # --- FALSIFICATION block (UN-NESTED — sibling of STANDPOINT) ---
         # F-S is a property of the EVIDENCE, derived from quote_type/fs_class via
@@ -4460,20 +4475,20 @@ def _validate_reasoning_structure(
                         f"{remedy}{proxy_suffix}."
                     )
 
-        # Role-axis prompt (issue #933): the one premise-quality axis the
-        # substrate structurally CANNOT check — which premise carries the
-        # entailment. A contextual weak premise can floor a deduction
-        # (under-confidence) or pad a corroboration (over-confidence) with all
-        # evidence roots distinct, and every mechanical check above stays
-        # silent. Always a question on multi-premise derivations, never a
-        # pass/fail, never an auto-discount — an auto-discount would need to
-        # know which premise is load-bearing, and it can't (forum #19
-        # consensus, three graphs).
-        warnings.append(
-            "NOT CHECKED (agent judgment): premise role — is the load-bearing "
-            "premise the one driving the confidence? Context premises belong "
-            "in context_ids."
-        )
+        # Role-axis prompt (issue #933): only meaningful for multi-premise
+        # derivations — which premise carries the entailment. Gated on n >= 2
+        # even though the outer block is now n >= 1 (#958). A contextual weak
+        # premise can floor a deduction (under-confidence) or pad a
+        # corroboration (over-confidence) with all evidence roots distinct, and
+        # every mechanical check above stays silent. Never a pass/fail, never
+        # an auto-discount — an auto-discount would need to know which premise
+        # is load-bearing, and it can't (forum #19 consensus, three graphs).
+        if n >= 2:
+            warnings.append(
+                "NOT CHECKED (agent judgment): premise role — is the load-bearing "
+                "premise the one driving the confidence? Context premises belong "
+                "in context_ids."
+            )
 
     return warnings
 

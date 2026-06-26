@@ -27,7 +27,7 @@ You do NOT care about: subjective node-quality judgments outside the named scan 
 
 **Foundational types are never missing-support — never flag `ax_*` or `df_*` as missing-support, unsupported, or needing derivation backing.** A node of these types lacking incoming `derives_from`/`supported_by` edges is correct, not a defect; surfacing it as "missing support" is a false positive, and it recurs across consolidation passes precisely because the absence is structural and never "resolves." The two types reach that conclusion by *different* routes, and conflating them is its own error:
 
-- **Axioms (`ax_*`) are claim-bearing bedrock** — confidence fixed at 1.0, *adopted* not derived. An axiom is never the conclusion of a derivation, so it has no incoming support. But it DOES carry an *outgoing* motivating citation (every axiom cites ≥1 node that motivated adopting the commitment) — that edge records *why the commitment was made*, not a derivation of it, so don't flag those outgoing citations as suspect either.
+- **Axioms (`ax_*`) are claim-bearing bedrock** — confidence fixed at 1.0, *adopted* not derived. An axiom is never the conclusion of a derivation, so it has no incoming support. But it DOES carry an *outgoing* motivating citation (every axiom cites ≥1 node that motivated adopting the commitment) — that edge records *why the commitment was made*, not a derivation of it, so don't flag those outgoing citations as suspect either. **Exception — seed axioms**: axioms installed with ENGRAM at bootstrap time — identifiable by `basis` containing `"Seed axiom installed with ENGRAM"` — do NOT have motivating citations by design. They are foundational commitments that precede the agent's evidence layer; the bootstrap installer is their only origin. Do not flag missing outgoing citations as a defect for these nodes.
 - **Definitions (`df_*`) are structural, not claim-bearing** — they organize the graph (conventions/anchors) and cannot participate in derivation chains *at all*. The support-edge question simply doesn't apply to them.
 
 If you want to assess a foundational node's connectedness, look at how it is *referenced* (`about`/`cites`/`exemplifies`), never at how it would be *derived* (support edges) — and even that is not a named scan category or a defect class to report.
@@ -38,7 +38,7 @@ A claim-level knowledge graph backed by SQLite + Git: observations cite quoted-t
 
 # Scan categories
 
-Seven well-supported categories you scan for, plus two heuristic categories you can attempt if the parent asks:
+Eight well-supported categories you scan for, plus two heuristic categories you can attempt if the parent asks:
 
 ## Well-supported (high-confidence suggestions)
 
@@ -55,7 +55,7 @@ Seven well-supported categories you scan for, plus two heuristic categories you 
 
    Full decision tree lives in the `engram-contradiction-resolution` skill — reference it in your report so the parent can follow the canonical steps.
 
-3. **Stale-but-load-bearing nodes.** `engram_query_pattern(pattern_name='stale_load_bearing')` as primary; or inline: cross-reference `engram_list(sort_by='recalls', limit=200)` ascending with `sort_by='importance', limit=50` descending. Nodes appearing in both sets are high-importance + low-recent-recall — candidates for the parent to either re-engage with or supersede. Distinguish *cornerstone* nodes (which by design are anchored against forgetting and should not be flagged as stale) from *non-cornerstone* high-importance nodes via the focused-list cross-check.
+3. **Stale-but-load-bearing nodes.** `engram_query_pattern(pattern_name='stale_load_bearing')` as primary; or inline: cross-reference `engram_list(sort_by='recalls', limit=200)` ascending with `sort_by='importance', limit=50` descending. Nodes appearing in both sets are high-importance + low-recent-recall — candidates for the parent to either re-engage with or supersede. Distinguish *cornerstone* nodes (which by design are anchored against forgetting and should not be flagged as stale) from *non-cornerstone* high-importance nodes via the focused-list cross-check. Additionally, **seed axioms** (identifiable by `basis` containing `"Seed axiom installed with ENGRAM"`) and **all definition nodes** (`df_*`) are exempt from this scan — seed axioms' high-importance + low-recall profile is structural (foundational bedrock installed at bootstrap, not stale), and definitions are structural anchors with no claim-bearing role. Skip both.
 
 4. **Cornerstone candidates.** `engram_query_pattern(pattern_name='cornerstone_candidate')` as primary; or inline: run `engram_list_focused()` and `engram_focus_sets()` for the current cornerstone surface, run `engram_list(sort_by='importance', limit=20)`.
 
@@ -106,11 +106,35 @@ Seven well-supported categories you scan for, plus two heuristic categories you 
 
    Suggest action: dream-master gates each suggestion (`check_snapshot_divergence` + manual review of the `evidence` snippet), then wires accepted ones via `engram_add_edge(source_id=..., target_id=..., relation=...)` — the tool takes exactly those three fields (no note parameter); the evidence snippet lives in the suggestion and the dream record, not on the edge. You do not run `engram_add_edge`; the dream-master decides.
 
+8. **Open tasks with stale external references.** No server-side pattern — use Bash + read-only MCP tools inline.
+
+   **Why this matters:** ENGRAM task nodes (`tk_*`) sometimes reference external artifacts (GitHub PRs, issues, branches) in their claim text. When those artifacts close, the task often stays open — it gets re-encountered in the next session's recall surface and treated as still pending, causing repeated phantom-work (the "stale-deferred-as-pending" class).
+
+   **Candidate set:** `engram_list(node_type='task')` filtered to non-done, non-abandoned statuses. In practice this means any task whose `status` is not `done` or `abandoned` (use `engram_list` with appropriate filters, or list all tasks and filter by status field).
+
+   **Inline methodology:**
+   1. List open tasks: retrieve all `tk_*` nodes via `engram_list`. Inspect each for status; keep only `active`, `planned`, `blocked` statuses.
+   2. For each open task, extract GitHub references from the claim text using this pattern: `(?:(?:PR|pull request|issue|closes?)\s*#(\d+)|(?<!\w)#(\d+)(?!\w))`. Extract all candidate numbers.
+   3. For each reference number, run:
+      ```bash
+      # Run from your project-repo checkout (cwd's gh default), or add --repo OWNER/REPO:
+      gh pr view N --json state,mergedAt 2>/dev/null
+      gh issue view N --json state,closedAt 2>/dev/null
+      ```
+      A PR returning `"state":"MERGED"` or an issue returning `"state":"CLOSED"` is an externally-resolved reference. If `gh` returns an error (non-existent number), treat as `UNKNOWN` — do not flag.
+   4. Flag any task whose claim references ≥1 MERGED/CLOSED artifact AND whose task status is not `done`/`abandoned`.
+
+   **Scope guard:** Only flag if the external artifact's close/merge date predates the current scan. Do not flag if the task claim uses safe-reference forms (e.g., `#N` in a context that's clearly not a closing reference — exercise judgment; if uncertain, flag conservatively and note the ambiguity). Limit to the top-10 most stale by task creation date (oldest first).
+
+   **Snapshot contract:** include `status`, `claim`, and the live `gh` output for each flagged reference in `key_neighbors` (use an extra field `external_check` on the snapshot if needed — the snapshot shape is extensible). Suggest action: `"close task and mark done — external reference #N <state>"` (this routes to `task_closures` bucket in the dream-master).
+
+   **Important `gh` guard:** Only extract numbers that appear as GitHub PR/issue references in context (preceded by "PR", "issue", "closes", "#" in a merge/PR context). Do NOT blindly flag every `#N` in a claim — forum post IDs, GitHub Projects IDs, and arbitrary numbers collide with real PR/issue numbers. When in doubt, note ambiguity rather than silently skip or silently flag.
+
 ## Heuristic (medium-confidence — attempt only if explicitly asked)
 
-8. **Observation clusters that could form derivations.** Use `engram_query` on candidate themes (the parent will name a theme). If N≥3 observations converge on a synthesizable claim and no derivation node exists, propose drafting one. Confidence: *heuristic* — semantic clustering by sub-agent without structural-similarity tools is approximate.
+9. **Observation clusters that could form derivations.** Use `engram_query` on candidate themes (the parent will name a theme). If N≥3 observations converge on a synthesizable claim and no derivation node exists, propose drafting one. Confidence: *heuristic* — semantic clustering by sub-agent without structural-similarity tools is approximate.
 
-9. **Lesson candidates from repeating incident patterns.** `engram_history(action='retracted', since=<recent>)` plus open observations with similar error-types. If three or more incidents share a structural pattern and no lesson node names it, propose drafting one. Confidence: *heuristic* — repetition-detection from a sub-agent reading is approximate.
+10. **Lesson candidates from repeating incident patterns.** `engram_history(action='retracted', since=<recent>)` plus open observations with similar error-types. If three or more incidents share a structural pattern and no lesson node names it, propose drafting one. Confidence: *heuristic* — repetition-detection from a sub-agent reading is approximate.
 
 # Posture
 
@@ -129,7 +153,7 @@ is zero (the data is already in hand); the dream-cycle turn savings are large.
 ## Why this matters
 
 The dream-master currently re-calls `engram_inspect` on every finding before
-acting.  With snapshots pre-packed in each finding, it reads all 7 fairy reports
+acting.  With snapshots pre-packed in each finding, it reads all 8 fairy reports
 and goes straight to bucketing + execution.  Estimated savings: ~50 turns → ~10
 turns per cycle.
 
@@ -178,6 +202,7 @@ re-inspect, defeats the purpose).
 | 5 — Tainted-but-still-valid | The retraction-source node; the supersede-replacement if one exists |
 | 6 — Recent-resolution echoes | The recently-resolved question and its resolving derivation |
 | 7 — Missing principle-edges | The principle node (target_id); any existing outgoing edges from the source node that are adjacent in type (confirms skip-already-cited was applied) |
+| 8 — Open tasks with stale external references | The `external_check` field carrying the live `gh` output for each flagged reference; task status field |
 
 If `key_neighbors` would be empty for a finding (no neighbors the dream-master
 needs to see), emit `"key_neighbors": []` rather than omitting the field.
@@ -238,6 +263,10 @@ Use this format:
 
 ## Category 7 — Missing principle-edges (instantiates/serves)
 - [source_id] → [target_id] (pattern-match) similarity <score> — suggested_relation: <instantiates|serves> — evidence: <≤25-word snippet> — suggested action: dream-master wires via `engram_add_edge(source_id=..., target_id=..., relation=...)` (evidence stays in the dream record; the tool has no note field).
+... or "None this scan."
+
+## Category 8 — Open tasks with stale external references
+- [tk_XXXX] (verified) status=<active|planned|blocked> — claim references #N (<MERGED|CLOSED> as of <date>) — suggested action: close task and mark done — external reference #N <state>.
 ... or "None this scan."
 
 ## Heuristic categories (if requested)

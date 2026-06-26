@@ -242,6 +242,73 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
         return True, None  # advisory — never block session start
 
 
+def _check_backup_staleness(engram_home: str) -> tuple[bool, str | None]:
+    """Check whether knowledge.sql is reasonably current relative to knowledge.db.
+
+    Compares mtime of knowledge.db against mtime of knowledge.sql.  When the
+    DB has been written more recently than the SQL dump by more than the
+    configured threshold, the git backup is stale and the agent should be
+    nudged to run engram-nap or engram-sleep.
+
+    Returns:
+        (True, None) if the backup is current, knowledge.db is absent (nothing
+                     to back up yet), or any OSError is encountered (fail-open
+                     — advisory probe, must never block session start).
+        (False, reason) if knowledge.sql is absent or the gap exceeds the
+                        configured threshold.
+    """
+    try:
+        db_path = os.path.join(engram_home, "knowledge.db")
+        sql_path = os.path.join(engram_home, "knowledge.sql")
+
+        if not os.path.exists(db_path) or os.path.getsize(db_path) == 0:
+            # No DB yet (or an empty shell left by sqlite3.connect) — nothing to back up.
+            return True, None
+
+        if not os.path.exists(sql_path):
+            # sql absent — only meaningful if the DB has actual nodes to back up.
+            # A freshly bootstrapped empty schema (no nodes) doesn't need a backup yet.
+            try:
+                _conn = sqlite3.connect(db_path, timeout=1.0)
+                try:
+                    _count = _conn.execute("SELECT count(*) FROM nodes").fetchone()[0]
+                finally:
+                    _conn.close()
+            except Exception:
+                _count = 0
+            if _count == 0:
+                return True, None
+            return False, "knowledge.sql not found — git backup not initialized"
+
+        db_mtime = os.path.getmtime(db_path)
+        sql_mtime = os.path.getmtime(sql_path)
+        stale_seconds = db_mtime - sql_mtime
+
+        # Read threshold from config; default 2 hours.
+        threshold_hours = 2.0
+        try:
+            config_path = os.path.join(engram_home, "config.json")
+            with open(config_path) as _f:
+                _cfg = json.load(_f)
+            threshold_hours = float(
+                _cfg.get("backup", {}).get("stale_threshold_hours", 2.0)
+            )
+        except Exception:
+            pass  # use default
+
+        if stale_seconds > threshold_hours * 3600:
+            stale_hours = stale_seconds / 3600
+            return (
+                False,
+                f"knowledge.sql is {stale_hours:.0f}h stale "
+                f"(knowledge.db newer than last backup)",
+            )
+
+        return True, None
+    except OSError:
+        return True, None  # advisory — never block session start
+
+
 def format_calibration_block(conf_all: dict, conf_7d: dict, current_turn: int) -> str:
     """Render a 6-10 line calibration anchor for session start.
 
@@ -1148,12 +1215,17 @@ def main() -> None:
     # start probe retired in #1157. Check deferred to UserPromptSubmit (surface
     # hook) where the race window is long past.
     mcp_ok, mcp_reason = _check_mcp_health(ENGRAM_HOME)
+    stale_ok, stale_reason = _check_backup_staleness(ENGRAM_HOME)
 
-    if not mcp_ok:
+    if not mcp_ok or not stale_ok:
         lines.append("")
         lines.append("⚠️  ENGRAM substrate health:")
-        lines.append(f"  MCP server: OFFLINE ({mcp_reason})")
-        lines.append("  → Tell the user immediately. ENGRAM tool calls will fail.")
+        if not mcp_ok:
+            lines.append(f"  MCP server: OFFLINE ({mcp_reason})")
+            lines.append("  → Tell the user immediately. ENGRAM tool calls will fail.")
+        if not stale_ok:
+            lines.append(f"  Git backup: {stale_reason}")
+            lines.append("  → Run engram-nap or engram-sleep to update the git backup.")
 
     output_obj = {
         "hookSpecificOutput": {

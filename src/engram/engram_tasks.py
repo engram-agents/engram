@@ -2,7 +2,8 @@
 
 Extracted from server.py as part of #872 wave 5.
 
-Family J covers: add_goal, add_task, update_task, report_feeling — the
+Family J covers: add_goal, add_task, update_task, report_feeling,
+deactivate_goal, activate_goal — the
 task-management and feeling-report impls, plus the J-local helpers and
 constants they depend on (_capture_feeling_context, TASK_IMPORTANCE).
 
@@ -685,6 +686,140 @@ def _report_feeling_impl(
             "intensity_hint": intensity_value,
             "context_nodes": cited_ids,
             "context_fingerprint": fingerprint,
+        })
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Goal lifecycle — deactivate / activate
+# ---------------------------------------------------------------------------
+
+def _deactivate_goal_impl(
+    goal_id: str = "",
+    reason: str = "",
+) -> str:
+    """Internal implementation — see engram_deactivate_goal MCP tool for the
+    public payload schema.
+
+    Mark a goal as paused (dormant) without retracting it.  The goal was valid
+    when filed and remains valid; it is simply no longer actively pursued.
+
+    A deactivated goal is hidden from ``_reflect_impl``'s active_goals scan so
+    it no longer generates dream / reflect noise.  It is NOT retracted (no
+    is_current=0, no status change) — it stays queryable and citable.
+
+    Lifecycle state is stored in ``metadata.lifecycle_state``.  Absent or
+    ``"active"`` means active; ``"paused"`` means deactivated.
+
+    Args:
+        goal_id: The gl_NNNN node ID to deactivate.
+        reason: Optional human-readable reason for setting aside.
+
+    Returns:
+        JSON with ``{"status": "deactivated", "node_id": goal_id,
+        "lifecycle_state": "paused"}`` on success, or ``{"error": "..."}``
+        on failure.
+    """
+    if not goal_id or not goal_id.strip():
+        return json.dumps({"error": "goal_id is required and cannot be empty."})
+
+    conn = core._get_db()
+    try:
+        row = conn.execute(
+            "SELECT id, type, is_current, metadata FROM nodes WHERE id = ?",
+            (goal_id,),
+        ).fetchone()
+        if not row:
+            return json.dumps({"error": f"Node '{goal_id}' not found."})
+        if row["type"] != "goal":
+            return json.dumps({"error": f"Node '{goal_id}' is type '{row['type']}', not 'goal'."})
+        if not row["is_current"]:
+            return json.dumps({"error": f"Node '{goal_id}' is not current (already retracted or superseded)."})
+
+        meta = json.loads(row["metadata"]) if row["metadata"] else {}
+        current_state = meta.get("lifecycle_state")
+        if current_state == "paused":
+            return json.dumps({"error": "goal already deactivated"})
+
+        meta["lifecycle_state"] = "paused"
+        meta["deactivated_at"] = core._now()
+        if reason:
+            meta["deactivation_reason"] = reason
+        else:
+            meta.pop("deactivation_reason", None)
+
+        conn.execute(
+            "UPDATE nodes SET metadata = ? WHERE id = ?",
+            (json.dumps(meta), goal_id),
+        )
+        conn.commit()
+        return json.dumps({
+            "status": "deactivated",
+            "node_id": goal_id,
+            "lifecycle_state": "paused",
+        })
+    finally:
+        conn.close()
+
+
+def _activate_goal_impl(
+    goal_id: str = "",
+    reason: str = "",
+) -> str:
+    """Internal implementation — see engram_activate_goal MCP tool for the
+    public payload schema.
+
+    Reactivate a previously paused goal.  The goal returns to the active scan
+    in ``_reflect_impl`` and dream processing.
+
+    Args:
+        goal_id: The gl_NNNN node ID to reactivate.
+        reason: Optional human-readable reason for reactivation.
+
+    Returns:
+        JSON with ``{"status": "activated", "node_id": goal_id,
+        "lifecycle_state": "active"}`` on success, or ``{"error": "..."}``
+        on failure.
+    """
+    if not goal_id or not goal_id.strip():
+        return json.dumps({"error": "goal_id is required and cannot be empty."})
+
+    conn = core._get_db()
+    try:
+        row = conn.execute(
+            "SELECT id, type, is_current, metadata FROM nodes WHERE id = ?",
+            (goal_id,),
+        ).fetchone()
+        if not row:
+            return json.dumps({"error": f"Node '{goal_id}' not found."})
+        if row["type"] != "goal":
+            return json.dumps({"error": f"Node '{goal_id}' is type '{row['type']}', not 'goal'."})
+        if not row["is_current"]:
+            return json.dumps({"error": f"Node '{goal_id}' is not current (already retracted or superseded)."})
+
+        meta = json.loads(row["metadata"]) if row["metadata"] else {}
+        current_state = meta.get("lifecycle_state")
+        if current_state != "paused":
+            return json.dumps({"error": "goal is not deactivated"})
+
+        meta["lifecycle_state"] = "active"
+        meta["reactivated_at"] = core._now()
+        if reason:
+            meta["reactivation_reason"] = reason
+        else:
+            meta.pop("reactivation_reason", None)
+        meta.pop("deactivation_reason", None)
+
+        conn.execute(
+            "UPDATE nodes SET metadata = ? WHERE id = ?",
+            (json.dumps(meta), goal_id),
+        )
+        conn.commit()
+        return json.dumps({
+            "status": "activated",
+            "node_id": goal_id,
+            "lifecycle_state": "active",
         })
     finally:
         conn.close()

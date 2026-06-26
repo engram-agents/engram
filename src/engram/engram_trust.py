@@ -162,6 +162,113 @@ def _add_person_impl(
 
 
 # ---------------------------------------------------------------------------
+# Person lineage impl
+# ---------------------------------------------------------------------------
+
+def _parse_model_id(model_id: str) -> dict:
+    """Parse a model ID string into provider, family, and version.
+
+    Handles Claude model IDs ("claude-{family}-{major}-{minor}[{date}]"):
+      "claude-sonnet-4-6"      → provider=anthropic, family=claude-sonnet, version=4.6
+      "claude-opus-4-8"        → provider=anthropic, family=claude-opus,   version=4.8
+      "claude-haiku-4-5-20251001" → provider=anthropic, family=claude-haiku, version=4.5
+
+    For unrecognised formats, provider and version are empty; family=model_id.
+
+    NOTE: This parser targets the claude-{name}-{major}-{minor}[{date}] scheme.
+    Anthropic also issues IDs of the form claude-3-5-sonnet-20241022, where digits
+    appear inside the family name — those would produce wrong field assignments here.
+    Only pass IDs that match the {family}-{major}-{minor} scheme.
+    """
+    mid = model_id.strip()
+    if not mid.startswith("claude-"):
+        return {"provider": "", "family": mid, "version": ""}
+
+    provider = "anthropic"
+    parts = mid.split("-")
+    family_parts = []
+    version_digits = []
+    for part in parts:
+        if part.isdigit():
+            if len(part) <= 2:  # major/minor digit; skip date-style suffixes like "20251001"
+                version_digits.append(part)
+        else:
+            family_parts.append(part)
+    family = "-".join(family_parts)
+    version = ".".join(version_digits)
+    return {"provider": provider, "family": family, "version": version}
+
+
+def _set_person_lineage_impl(target_pn: str = "", model_id: str = "") -> str:
+    """Record model training lineage (provider/family/version) on a person node.
+
+    Updates the person node's metadata to add model_provider, model_family,
+    and model_version fields derived from the supplied model_id string.
+
+    Args:
+        target_pn: Person node ID (pn_NNNN) to update. Defaults to the
+                   graph's self-anchor when empty.
+        model_id:  Model identifier string, e.g. "claude-sonnet-4-6".
+                   Parsed into provider + family + version.
+
+    Returns:
+        JSON with status, person_id, and the parsed lineage fields.
+    """
+    if not model_id or not model_id.strip():
+        return json.dumps({"error": "model_id is required (e.g. 'claude-sonnet-4-6')."})
+
+    parsed = _parse_model_id(model_id.strip())
+
+    conn = core._get_db()
+    try:
+        if not target_pn or not target_pn.strip():
+            row = conn.execute(
+                "SELECT id, metadata FROM nodes "
+                "WHERE type='person' AND json_extract(metadata,'$.is_self')=1 AND is_current=1"
+            ).fetchone()
+            if not row:
+                return json.dumps({
+                    "error": (
+                        "No self-anchor person node found. "
+                        "Create one with engram_add_person(is_self=True) first."
+                    )
+                })
+        else:
+            row = conn.execute(
+                "SELECT id, metadata FROM nodes WHERE id=? AND type='person' AND is_current=1",
+                (target_pn.strip(),),
+            ).fetchone()
+            if not row:
+                return json.dumps({
+                    "error": (
+                        f"Person node '{target_pn}' not found or not type 'person'. "
+                        "Use engram_add_person to create it first."
+                    )
+                })
+
+        meta = json.loads(row["metadata"] or "{}")
+        meta["model_provider"] = parsed["provider"]
+        meta["model_family"] = parsed["family"]
+        meta["model_version"] = parsed["version"]
+
+        conn.execute(
+            "UPDATE nodes SET metadata=? WHERE id=?",
+            (json.dumps(meta), row["id"]),
+        )
+        conn.commit()
+
+        return json.dumps({
+            "status": "ok",
+            "person_id": row["id"],
+            "model_provider": parsed["provider"],
+            "model_family": parsed["family"],
+            "model_version": parsed["version"],
+        })
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Trust-tier impl
 # ---------------------------------------------------------------------------
 

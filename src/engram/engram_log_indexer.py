@@ -68,6 +68,7 @@ _CREATE_INDEXES = [
 
 def _init_schema(conn: sqlite3.Connection) -> None:
     """Create events table and all indexes if they don't already exist."""
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(_CREATE_EVENTS_TABLE)
     for stmt in _CREATE_INDEXES:
         conn.execute(stmt)
