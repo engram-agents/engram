@@ -27,6 +27,7 @@ from .store import (
     ProjectRecord,
     dm_thread_key,
 )
+from .store_file import FileStore, default_store_root
 
 __all__ = [
     "SeqAllocator",
@@ -34,4 +35,6 @@ __all__ = [
     "DmMessage",
     "ProjectRecord",
     "dm_thread_key",
+    "FileStore",
+    "default_store_root",
 ]
