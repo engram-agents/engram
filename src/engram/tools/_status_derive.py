@@ -171,18 +171,60 @@ def loop_gate_decision() -> tuple:
     """Decide whether an autonomous loop-wake should run now or re-defer.
 
     Returns (decision, defer_seconds, reason):
-      - ("defer", N, "user-engaged") when a recent human prompt is within the
-        engaged window. N = time remaining until the window would expire from the
-        last activity stamp, + a small margin, clamped to [_LOOP_GATE_MIN_DEFER,
-        window]. Sliding by construction: if the user types again the stamp moves
-        and the next wake re-defers.
+      - ("defer", N, "presence-override-user") when an explicit user-mode override
+        is active (highest priority; suspends loop by deliberate user choice).
+      - ("defer", N, "presence-derived-user") when derived presence mode is user
+        (Lei active within the cooldown window).
+      - ("proceed", 0, "presence-override-auto") when an explicit auto-mode override
+        is active — this beats the engaged-defer, letting the loop proceed even when
+        a recent stamp would otherwise trigger engaged-defer.
+      - ("defer", N, "user-engaged") when no presence signal and a recent human
+        prompt is within the engaged window (the original #1469 path, unchanged).
       - ("proceed", 0, <reason>) otherwise (not engaged, OR any error).
 
-    FAIL-OPEN to proceed: the loop's liveness must NEVER depend on this gate. A
-    missing/unparseable stamp, a future-dated stamp, a config read error — every
-    failure path returns ("proceed", 0, ...). A broken gate lets the loop run
+    Resolution order: presence override-user → presence derived-user →
+    presence override-auto → derived-auto / no presence → #1469 engaged-defer.
+
+    FAIL-OPEN to proceed: the loop's liveness must NEVER depend on this gate. Any
+    failure in the presence layer falls through to the existing engaged-defer path;
+    any failure there returns ("proceed", 0, ...). A broken gate lets the loop run
     (strictly no worse than today's no-gate behavior); it must never deadlock it.
     """
+    # Presence consultation — must be inside the outer try/except so any presence
+    # bug falls through to the existing #1469 engaged-defer path unchanged.
+    # Lazy + guarded import: presence is stdlib-only and does NOT import
+    # _status_derive, so there is no circular import.  Absent or erroring presence
+    # → fall through to the existing engaged-defer logic below (fail-open).
+    try:
+        import presence  # noqa: PLC0415
+        override = presence.active_override()       # None | {"mode","expires_at",...}
+        _mode, bundle = presence.get_mode(override=override)
+        if bundle.get("loop_suspended"):            # loop_suspended is True only for the user bundle (2-state spine)
+            cooldown = presence.cooldown_seconds()
+            if override and override.get("mode") == "user":
+                exp = override.get("expires_at")
+                if exp:
+                    remaining = presence.parse_iso(exp) - time.time()
+                    defer = int(max(_LOOP_GATE_MIN_DEFER, min(remaining + _LOOP_GATE_MARGIN, cooldown)))
+                else:
+                    defer = cooldown                # no-expiry override → bounded re-check
+                return ("defer", defer, "presence-override-user")
+            # derived user (recent activity within cooldown)
+            try:
+                with open(LAST_USER_ACTIVITY_PATH, encoding="utf-8") as fh:
+                    stamp = float(fh.read().strip())
+                remaining = (stamp + cooldown) - time.time()
+                defer = int(max(_LOOP_GATE_MIN_DEFER, min(remaining + _LOOP_GATE_MARGIN, cooldown)))
+            except Exception:
+                defer = cooldown
+            return ("defer", defer, "presence-derived-user")
+        if override and override.get("mode") == "auto":
+            return ("proceed", 0, "presence-override-auto")  # explicit auto beats engaged-defer
+        # derived-auto → fall through to the existing #1469 engaged-defer below
+    except Exception:
+        pass  # presence unavailable / any error → existing engaged-defer path
+
+    # --- existing #1469 engaged-defer logic UNCHANGED below this line ---
     try:
         if not _recently_engaged():
             return ("proceed", 0, "not-engaged")

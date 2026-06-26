@@ -504,3 +504,259 @@ class TestCLI:
         assert os.access(str(CLI_PATH), os.X_OK), (
             f"{CLI_PATH} is not executable; chmod +x was not applied"
         )
+
+
+# ---------------------------------------------------------------------------
+# active_override — new helper (loop-suspend-enactment)
+# ---------------------------------------------------------------------------
+
+class TestActiveOverride:
+    """Tests for presence.active_override() -> Optional[dict]."""
+
+    def test_returns_dict_for_live_permanent_override(self, tmp_path, monkeypatch):
+        """set_mode('user') with no TTL → active_override() returns the dict."""
+        mod = _load_presence()
+        _setup_presence(mod, tmp_path, monkeypatch)
+        mod.set_mode("user")
+        result = mod.active_override()
+        assert result is not None
+        assert isinstance(result, dict)
+        assert result["mode"] == "user"
+        assert result["expires_at"] is None
+
+    def test_returns_dict_for_live_ttl_override(self, tmp_path, monkeypatch):
+        """set_mode('user', ttl_seconds=60) → active_override() returns dict while fresh."""
+        mod = _load_presence()
+        _setup_presence(mod, tmp_path, monkeypatch)
+        mod.set_mode("user", ttl_seconds=60)
+        result = mod.active_override()
+        assert result is not None
+        assert result["mode"] == "user"
+        assert result["expires_at"] is not None
+
+    def test_returns_none_when_no_file(self, tmp_path, monkeypatch):
+        """No override file → active_override() returns None."""
+        mod = _load_presence()
+        _setup_presence(mod, tmp_path, monkeypatch)
+        # No file written.
+        assert mod.active_override() is None
+
+    def test_returns_none_for_expired_override(self, tmp_path, monkeypatch):
+        """set_mode('user', ttl_seconds=1) → after expiry active_override() returns None."""
+        mod = _load_presence()
+        _setup_presence(mod, tmp_path, monkeypatch)
+        mod.set_mode("user", ttl_seconds=1)
+        # Confirm active while fresh.
+        assert mod.active_override() is not None
+        time.sleep(1.1)
+        assert mod.active_override() is None
+
+    def test_returns_none_for_corrupt_file(self, tmp_path, monkeypatch):
+        """Corrupt JSON in override file → active_override() returns None (fail-open)."""
+        mod = _load_presence()
+        _setup_presence(mod, tmp_path, monkeypatch)
+        (tmp_path / "presence-mode.json").write_text("not valid json {{{")
+        assert mod.active_override() is None
+
+    def test_returns_none_for_unknown_mode(self, tmp_path, monkeypatch):
+        """Override with unknown mode name → active_override() returns None."""
+        mod = _load_presence()
+        _setup_presence(mod, tmp_path, monkeypatch)
+        _write_override(tmp_path, "bogus-mode")
+        assert mod.active_override() is None
+
+    def test_auto_override_returns_dict(self, tmp_path, monkeypatch):
+        """set_mode('auto') → active_override() returns dict with mode='auto'."""
+        mod = _load_presence()
+        _setup_presence(mod, tmp_path, monkeypatch)
+        mod.set_mode("auto")
+        result = mod.active_override()
+        assert result is not None
+        assert result["mode"] == "auto"
+
+    def test_returns_none_after_clear(self, tmp_path, monkeypatch):
+        """After clear_mode(), active_override() returns None."""
+        mod = _load_presence()
+        _setup_presence(mod, tmp_path, monkeypatch)
+        mod.set_mode("user")
+        assert mod.active_override() is not None
+        mod.clear_mode()
+        assert mod.active_override() is None
+
+
+# ---------------------------------------------------------------------------
+# cooldown_seconds — new public wrapper (loop-suspend-enactment)
+# ---------------------------------------------------------------------------
+
+class TestCooldownSeconds:
+    """Tests for presence.cooldown_seconds() -> int (public wrapper)."""
+
+    def test_returns_default_when_no_config(self, tmp_path, monkeypatch):
+        """No config.json → cooldown_seconds() == _DEFAULT_COOLDOWN_SECONDS."""
+        mod = _load_presence()
+        monkeypatch.setattr(mod, "ENGRAM_HOME", str(tmp_path))
+        assert mod.cooldown_seconds() == mod._DEFAULT_COOLDOWN_SECONDS
+
+    def test_returns_configured_value(self, tmp_path, monkeypatch):
+        """config.json with cooldown_seconds=120 → cooldown_seconds() == 120."""
+        mod = _load_presence()
+        monkeypatch.setattr(mod, "ENGRAM_HOME", str(tmp_path))
+        (tmp_path / "config.json").write_text(json.dumps({"cadence": {"cooldown_seconds": 120}}))
+        assert mod.cooldown_seconds() == 120
+
+    def test_returns_default_on_bad_config(self, tmp_path, monkeypatch):
+        """Malformed config.json → cooldown_seconds() falls back to default."""
+        mod = _load_presence()
+        monkeypatch.setattr(mod, "ENGRAM_HOME", str(tmp_path))
+        (tmp_path / "config.json").write_text("not json {{{")
+        assert mod.cooldown_seconds() == mod._DEFAULT_COOLDOWN_SECONDS
+
+    def test_equals_read_cooldown_seconds(self, tmp_path, monkeypatch):
+        """cooldown_seconds() == _read_cooldown_seconds() (thin wrapper contract)."""
+        mod = _load_presence()
+        monkeypatch.setattr(mod, "ENGRAM_HOME", str(tmp_path))
+        # With a config value set.
+        (tmp_path / "config.json").write_text(json.dumps({"cadence": {"cooldown_seconds": 300}}))
+        assert mod.cooldown_seconds() == mod._read_cooldown_seconds()
+
+
+# ---------------------------------------------------------------------------
+# get_mode regression guard post-refactor (loop-suspend-enactment)
+# ---------------------------------------------------------------------------
+
+class TestGetModeRegressionAfterRefactor:
+    """Regression guard: get_mode() behavior must be unchanged after the
+    active_override() refactor.  These cases mirror TestGetModeDerived and
+    TestGetModeOverride; running them in the same session verifies the
+    refactored code path produces identical results.
+    """
+
+    def test_derived_user_still_works(self, tmp_path, monkeypatch):
+        """Derived path: recent stamp → mode 'user'."""
+        mod = _load_presence()
+        _setup_presence(mod, tmp_path, monkeypatch)
+        _write_stamp(tmp_path, 10)
+        mode, bundle = mod.get_mode()
+        assert mode == "user"
+        assert bundle is mod.MODE_BUNDLES["user"]
+
+    def test_derived_auto_still_works(self, tmp_path, monkeypatch):
+        """Derived path: stale stamp → mode 'auto'."""
+        mod = _load_presence()
+        _setup_presence(mod, tmp_path, monkeypatch)
+        _write_stamp(tmp_path, 9999)
+        mode, bundle = mod.get_mode()
+        assert mode == "auto"
+        assert bundle is mod.MODE_BUNDLES["auto"]
+
+    def test_override_user_still_wins_over_stale_stamp(self, tmp_path, monkeypatch):
+        """Override path: explicit 'user' wins over stale stamp."""
+        mod = _load_presence()
+        _setup_presence(mod, tmp_path, monkeypatch)
+        _write_stamp(tmp_path, 9999)
+        mod.set_mode("user")
+        mode, bundle = mod.get_mode()
+        assert mode == "user"
+        assert bundle is mod.MODE_BUNDLES["user"]
+
+    def test_expired_override_reverts_to_derived(self, tmp_path, monkeypatch):
+        """Expired override → reverts to derived (stale stamp → 'auto')."""
+        mod = _load_presence()
+        _setup_presence(mod, tmp_path, monkeypatch)
+        _write_stamp(tmp_path, 9999)
+        mod.set_mode("user", ttl_seconds=1)
+        time.sleep(1.1)
+        mode, _ = mod.get_mode()
+        assert mode == "auto"
+
+    def test_fail_open_on_corrupt_file(self, tmp_path, monkeypatch):
+        """Corrupt override → fail-open → derived → missing stamp → 'auto'."""
+        mod = _load_presence()
+        _setup_presence(mod, tmp_path, monkeypatch)
+        (tmp_path / "presence-mode.json").write_text("not valid json {{{")
+        mode, bundle = mod.get_mode()
+        assert mode == "auto"
+        assert bundle is mod.MODE_BUNDLES["auto"]
+
+
+# ---------------------------------------------------------------------------
+# get_mode(override=...) — explicit-override param (round-2, reviewer suggestion)
+# ---------------------------------------------------------------------------
+
+class TestGetModeOverrideParam:
+    """Verify that passing override= to get_mode() avoids re-reading active_override().
+
+    The sentinel (_UNSET) path (no arg) must call active_override() as before;
+    the explicit-override path (dict or None) must NOT call active_override().
+    """
+
+    def test_get_mode_with_override_dict_uses_dict_mode(self, tmp_path, monkeypatch):
+        """get_mode(override=<dict>) uses the dict's mode without reading the file."""
+        mod = _load_presence()
+        _setup_presence(mod, tmp_path, monkeypatch)
+        # Track whether active_override was called.
+        call_log = []
+
+        def _spy_active_override():
+            call_log.append("called")
+            return None
+
+        monkeypatch.setattr(mod, "active_override", _spy_active_override)
+
+        override_dict = {"mode": "user", "since": "2026-06-26T00:00:00+00:00", "expires_at": None}
+        mode, bundle = mod.get_mode(override=override_dict)
+
+        assert mode == "user"
+        assert bundle is mod.MODE_BUNDLES["user"]
+        assert call_log == [], "active_override() must NOT be called when override is passed"
+
+    def test_get_mode_with_override_none_goes_to_derived(self, tmp_path, monkeypatch):
+        """get_mode(override=None) goes straight to derived path without active_override()."""
+        mod = _load_presence()
+        _setup_presence(mod, tmp_path, monkeypatch)
+        call_log = []
+
+        def _spy_active_override():
+            call_log.append("called")
+            return {"mode": "user", "since": "2026-06-26T00:00:00+00:00", "expires_at": None}
+
+        monkeypatch.setattr(mod, "active_override", _spy_active_override)
+
+        # Stale stamp → derived would be 'auto'.
+        _write_stamp(tmp_path, 9999)
+        mode, bundle = mod.get_mode(override=None)
+
+        assert mode == "auto"
+        assert bundle is mod.MODE_BUNDLES["auto"]
+        assert call_log == [], "active_override() must NOT be called when override=None is passed"
+
+    def test_get_mode_default_still_calls_active_override(self, tmp_path, monkeypatch):
+        """get_mode() with no arg still calls active_override() (unchanged default behavior)."""
+        mod = _load_presence()
+        _setup_presence(mod, tmp_path, monkeypatch)
+        call_log = []
+
+        def _spy_active_override():
+            call_log.append("called")
+            return None  # no override → falls through to derived
+
+        monkeypatch.setattr(mod, "active_override", _spy_active_override)
+        _write_stamp(tmp_path, 9999)  # derived → 'auto'
+        mode, _ = mod.get_mode()
+
+        assert mode == "auto"
+        assert len(call_log) == 1, "active_override() must be called exactly once for the default path"
+
+    def test_get_mode_with_auto_override_dict(self, tmp_path, monkeypatch):
+        """get_mode(override=<auto-dict>) returns ('auto', ...) without file read."""
+        mod = _load_presence()
+        _setup_presence(mod, tmp_path, monkeypatch)
+        call_log = []
+        monkeypatch.setattr(mod, "active_override", lambda: call_log.append("called") or None)
+
+        override_dict = {"mode": "auto", "since": "2026-06-26T00:00:00+00:00", "expires_at": None}
+        mode, bundle = mod.get_mode(override=override_dict)
+
+        assert mode == "auto"
+        assert bundle is mod.MODE_BUNDLES["auto"]
+        assert call_log == []

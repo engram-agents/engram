@@ -64,11 +64,14 @@ LAST_USER_ACTIVITY_PATH: str = os.path.join(ENGRAM_HOME, "last-user-activity")
 PRESENCE_MODE_PATH: str = os.path.join(ENGRAM_HOME, "presence-mode.json")
 
 
+# Distinguishes "no override given" from an explicit None passed to get_mode().
+_UNSET = object()
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _parse_iso(iso_str: str) -> float:
+def parse_iso(iso_str: str) -> float:
     """Parse an ISO 8601 string to a POSIX float. Raises on error."""
     dt = datetime.fromisoformat(iso_str)
     if dt.tzinfo is None:
@@ -125,33 +128,69 @@ def _derive_mode() -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
-def get_mode() -> tuple:
+def active_override() -> Optional[dict]:
+    """Return the parsed override dict if a non-expired explicit override is active.
+
+    Returns the full dict (``{"mode", "since", "expires_at", ...}``) when
+    ``~/.engram/presence-mode.json`` exists, has a known mode, and is not
+    expired.  ``expires_at=None`` means permanent (no expiry) → valid.
+    Any error (missing file, corrupt JSON, unknown mode, parse failure,
+    expired TTL) → ``None``.  Fail-open to None — same spirit as get_mode's
+    fail-open-to-auto: a broken presence layer must never deadlock a caller.
+    """
+    try:
+        with open(PRESENCE_MODE_PATH, encoding="utf-8") as fh:
+            override = json.load(fh)
+        if not isinstance(override, dict):
+            return None
+        if override.get("mode") not in MODE_BUNDLES:
+            return None
+        expires_at = override.get("expires_at")
+        if expires_at is None:
+            return override  # permanent override — valid indefinitely
+        if time.time() < parse_iso(expires_at):
+            return override  # not yet expired — valid
+        return None  # expired
+    except Exception:
+        return None
+
+
+def cooldown_seconds() -> int:
+    """Return the configured cooldown_seconds (public wrapper of _read_cooldown_seconds).
+
+    Lets callers (e.g. ``_status_derive.loop_gate_decision``) read the cooldown
+    without reaching into a private name.
+    """
+    return _read_cooldown_seconds()
+
+
+def get_mode(override=_UNSET) -> tuple:
     """Return ``(mode_name, resolved_bundle)``.
 
+    Parameters
+    ----------
+    override:
+        If not supplied (default ``_UNSET``), ``active_override()`` is called
+        to read the current explicit override — the normal path for callers that
+        have not already fetched it.  If supplied, that value is used directly
+        (dict → override path; ``None`` → derived path), avoiding a second
+        ``active_override()`` read per call.  This is the only reason to pass
+        the argument; existing callers that pass nothing are unaffected.
+
     Resolution order:
-    1. Explicit override in ``~/.engram/presence-mode.json`` (if not expired).
+    1. Explicit override (``override`` arg or ``active_override()`` result) if a
+       non-``None`` dict with a known mode is provided.
     2. Derived from ``last-user-activity`` stamp vs cooldown window.
     3. Fail-open to ``("auto", MODE_BUNDLES["auto"])`` on any error.
 
     The returned bundle is always ``MODE_BUNDLES[mode_name]`` — one table,
     consistent-by-construction.
     """
-    try:
-        with open(PRESENCE_MODE_PATH, encoding="utf-8") as fh:
-            override = json.load(fh)
-        if isinstance(override, dict) and override.get("mode") in MODE_BUNDLES:
-            mode = override["mode"]
-            expires_at = override.get("expires_at")
-            if expires_at is None:
-                # No expiry — override is permanent until cleared.
-                return (mode, MODE_BUNDLES[mode])
-            if time.time() < _parse_iso(expires_at):
-                return (mode, MODE_BUNDLES[mode])
-            # Expired — fall through to derived.
-    except FileNotFoundError:
-        pass  # No override file — expected in the derived path.
-    except Exception:
-        pass  # Corrupt / unreadable override — fail-open to derived.
+    if override is _UNSET:
+        override = active_override()
+    if override is not None:
+        mode = override["mode"]
+        return (mode, MODE_BUNDLES[mode])
 
     # Derived path.
     mode = _derive_mode()

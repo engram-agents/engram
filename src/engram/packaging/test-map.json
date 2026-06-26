@@ -204,6 +204,14 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/_status_derive.py",
+      "test_globs": [
+        "tests/test_loop_gate.py",
+        "tests/test_status_derive.py"
+      ],
+      "note": "loop_gate_decision and derive_own_status tested here; loop-suspend-enactment added dedicated coverage in test_loop_gate.py"
+    },
+    {
       "path_prefix_or_glob": "tools/presence.py",
       "test_globs": [
         "tests/test_presence.py"
@@ -449,7 +457,7 @@
     },
     {
       "path": "tools/_status_derive.py",
-      "reason": "Internal helper for status derivation; no dedicated test file. Changes covered indirectly by callers."
+      "reason": "Moved to mappings (loop-suspend-enactment): dedicated test files now exist — see mappings entry for tools/_status_derive.py."
     },
     {
       "path": "tools/pre-dispatch-check.sh",
