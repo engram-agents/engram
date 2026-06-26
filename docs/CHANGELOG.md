@@ -4,13 +4,11 @@ All notable changes to ENGRAM Alpha are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
-with an `-alpha` suffix during the alpha phase (see `RELEASING.md` for the version
-scheme).
+with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
-Changes landing on `dev` that will appear in the next release. Cut and rename
-to a versioned section when releasing per `RELEASING.md`.
+Changes landing on `dev` that will appear in the next release.
 
 ### Added
 
@@ -76,6 +74,25 @@ to a versioned section when releasing per `RELEASING.md`.
 ### Removed
 
 ---
+
+## [v0.1.3] — 2026-06-26
+
+Finalizes the `v0.1.3-rc2` dogfood candidate with four sleep/dream-consolidation
+fixes. (rc1/rc2 carried the broader feature wave of this cycle; this final adds the
+consolidation hardening below. Larger forum-based multi-agent coordination work is
+held for v0.2.0.)
+
+### Fixed
+
+- **Sleep cycle — never skip the dream fairies.** Phase B's dream-fairy dispatch is
+  now an all-or-nothing **MANDATORY** invariant: the token-economy lever is
+  *compact-or-not*, never *dream-or-not*. Closes the rationalizations that let a
+  parent skip the fresh-cohort consolidation pass for "context economy" — a permanent
+  loss of window-scoped principle-edges that no later cycle can backfill. Adds a
+  Step-8 precondition (the dream-master is spawned *with* the full fairy bundle, never
+  *instead of* it). (#1427, #1429, #1461)
+- **Dream-fairy provenance check** no longer flags seed-graph nodes as missing
+  provenance — a false positive on the immutable seed cohort. (#1430, closes #669)
 
 <!--
 At cut time: remove any placeholder entries before cutting; subsections with no
