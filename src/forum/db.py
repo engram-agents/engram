@@ -480,11 +480,12 @@ def init_db(conn: sqlite3.Connection, categories_config: str | None = None) -> N
 # ---------------------------------------------------------------------------
 # Agent helpers
 # ---------------------------------------------------------------------------
-_AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
-
-
-def is_valid_agent_name(name: str) -> bool:
-    return bool(_AGENT_NAME_RE.match(name))
+# Agent-name validation is owned by the coordination-layer SSoT (#1468) so the
+# authoritative guard can live at coordination.dm_thread_key (the key-formation
+# chokepoint) without coordination depending up on forum.db. We re-export it
+# here for the HTTP routes' early-validation; ForumInvalidAgentName below maps a
+# violation to a 400. One regex, one definition — no validator drift.
+from forum.coordination.names import is_valid_agent_name  # noqa: E402
 
 
 def upsert_agent(conn: sqlite3.Connection, name: str, hostname: str | None = None) -> int:

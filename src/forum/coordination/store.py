@@ -57,6 +57,8 @@ import abc
 from dataclasses import dataclass
 from typing import Optional
 
+from .names import InvalidAgentName, is_valid_agent_name
+
 
 # ---------------------------------------------------------------------------
 # Record types (transport-neutral; the same shapes back the file + DB impls)
@@ -94,13 +96,24 @@ def dm_thread_key(a: str, b: str) -> str:
     ``dm_thread_key("sol", "ariadne")`` resolve to the SAME thread file.
     Names are lowercased + stripped for stability.
 
-    Note: ``+`` is RESERVED in agent names (it is the pair-key separator).
+    ``+`` is RESERVED in agent names (it is the pair-key separator):
     ``dm_thread_key("a+b", "c")`` and ``dm_thread_key("a", "b+c")`` would both
-    key to ``a+b+c`` — a silent collision of two distinct pairs. Agent-name
-    registration must reject ``+``; today's names (ariadne/borges/sol/luria/
-    aleph/clio) are all safe.
+    key to ``a+b+c`` — a silent collision of two distinct pairs. So this function
+    is the **authoritative guard** (#1468): it RAISES :class:`InvalidAgentName` if
+    either name fails the allowlist, at the chokepoint every caller passes through
+    (HTTP routes, the ``ia dm`` thin-client, reads and writes) — no caller can
+    route around it. HTTP routes still pre-validate via ``is_valid_agent_name``
+    for a clean 400; this raise is the backstop that makes the invariant
+    un-bypassable.
+
+    Raises:
+        InvalidAgentName: if ``a`` or ``b`` (after strip+lowercase) fails the
+            charset allowlist.
     """
     x, y = sorted((a.strip().lower(), b.strip().lower()))
+    for _n in (x, y):
+        if not is_valid_agent_name(_n):
+            raise InvalidAgentName(f"invalid agent name: {_n!r}")
     return f"{x}+{y}"
 
 

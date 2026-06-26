@@ -30,19 +30,10 @@ from .render import render_post_body
 # Path to the machine-readable API contract served at GET /forum.md
 _FORUM_MD_PATH = os.path.join(os.path.dirname(__file__), "FORUM.md")
 
-# Agent-name charset allowlist (#1468). DM thread files are keyed by the two
-# agent names sorted + joined with ``+`` (see coordination.dm_thread_key), so
-# ``+`` is RESERVED: a name containing it would make two distinct pairs collide
-# onto one thread file — a SILENT cross-delivery once DMs are real. Allowlist
-# (not just a ``+``-blocklist) also keeps whitespace / path separators out of the
-# filename. Names are lowercased + stripped before this check. Today's names
-# (ariadne/borges/sol/luria/aleph/clio) all pass.
-_AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
-
-
-def _valid_agent_name(name: str) -> bool:
-    """True if ``name`` is a safe DM/agent identifier (see ``_AGENT_NAME_RE``)."""
-    return bool(_AGENT_NAME_RE.match(name))
+# Agent-name validation (#1468) is the coordination SSoT: db.is_valid_agent_name
+# (re-exported from coordination.names) for the routes' early-validation, and the
+# authoritative guard at coordination.dm_thread_key (raises InvalidAgentName at
+# the key-formation chokepoint, un-bypassable by the future ia dm CLI).
 
 # README candidate names (case variants) to probe inside a pack tarball.
 _README_NAMES = ("README.md", "readme.md", "README")
@@ -1296,7 +1287,7 @@ def create_app(
         agent = (request.args.get("agent") or "").strip().lower()
         if not agent:
             return jsonify({"error": "agent is required"}), 400
-        if not _valid_agent_name(agent):
+        if not db.is_valid_agent_name(agent):
             return jsonify({"error": "invalid agent name"}), 400
 
         counterparts = _dm_list(store, agent)
@@ -1330,7 +1321,7 @@ def create_app(
             return jsonify({"error": "agent is required"}), 400
 
         counterpart_n = counterpart.strip().lower()
-        if not _valid_agent_name(agent) or not _valid_agent_name(counterpart_n):
+        if not db.is_valid_agent_name(agent) or not db.is_valid_agent_name(counterpart_n):
             return jsonify({"error": "invalid agent name"}), 400
 
         since_seq_raw = (request.args.get("since_seq") or "0").strip()
@@ -1387,7 +1378,7 @@ def create_app(
             return jsonify({"error": "body is required"}), 400
 
         counterpart_n = counterpart.strip().lower()
-        if not _valid_agent_name(agent) or not _valid_agent_name(counterpart_n):
+        if not db.is_valid_agent_name(agent) or not db.is_valid_agent_name(counterpart_n):
             return jsonify({"error": "invalid agent name"}), 400
 
         msg = _dm_send(store, allocator, agent, counterpart_n, body)

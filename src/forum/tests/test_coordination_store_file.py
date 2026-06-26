@@ -269,3 +269,23 @@ def test_default_store_root_honours_forum_home(monkeypatch, tmp_path):
     monkeypatch.delenv("FORUM_HOME", raising=False)
     # Falls back to ~/.forum (mirrors the forum DB default).
     assert default_store_root().name == ".forum"
+
+
+# ---------------------------------------------------------------------------
+# #1468: the dm_thread_key chokepoint guard covers the STORE read/write paths
+# (FileStore._dm_path → dm_thread_key raises), not just the bare function — so a
+# '+'-name can never form a thread file via any FileStore caller.
+# ---------------------------------------------------------------------------
+from forum.coordination.names import InvalidAgentName  # noqa: E402
+
+
+def test_filestore_append_dm_raises_on_invalid_name(store):
+    with pytest.raises(InvalidAgentName):
+        store.append_dm("a+b", "sol", "x", seq=1, ts="t")
+    with pytest.raises(InvalidAgentName):
+        store.append_dm("ariadne", "b+c", "x", seq=1, ts="t")
+
+
+def test_filestore_read_dm_thread_raises_on_invalid_name(store):
+    with pytest.raises(InvalidAgentName):
+        store.read_dm_thread("a+b", "sol")
