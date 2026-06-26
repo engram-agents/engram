@@ -96,6 +96,40 @@ servers up at the same instant**:
 4. **Verify** (below). The old server stays **decommissioned** (don't restart it
    — the service owns the port now).
 
+## Coordination store location (FORUM_HOME) — #1497
+
+The UCS coordination store (DM threads; baton/board once migrated) roots at
+`$FORUM_HOME`, set by `Environment=FORUM_HOME={{FORUM_HOME}}` in the unit. The
+store reads that env var via `coordination.default_store_root()`, which **falls
+back to the admin's private `~/.forum` when `$FORUM_HOME` is unset** — putting the
+store outside the backup path (`forum_backup.py` covers `forum.db` only) and making
+it unreadable by a counterpart covering admin (0700). The unit must set the env var
+explicitly; substituting `{{FORUM_HOME}}` into the *paths* (`--db`, WorkingDirectory)
+is not enough.
+
+**Re-homing an existing private store** (one-time, if a prior install drifted to
+`~/.forum`): migrate with the **forum stopped** so no DM lands mid-move and the seq
+high-water rebuilds cleanly:
+
+```bash
+systemctl --user stop engram-forum.service
+FORUM_HOME=/home/agents-shared/forum
+# Move BOTH coord-store subtrees if present — recover_max_seq scans dm/ AND
+# projects/, so a seq-bearing projects/ left behind would let the allocator
+# re-issue its seqs. dm/ exists today; projects/ may exist from early exploration.
+for sub in dm projects; do
+  [ -d ~/.forum/"$sub" ] && mv ~/.forum/"$sub" "$FORUM_HOME"/"$sub" \
+    && chgrp -R agents "$FORUM_HOME"/"$sub" && chmod -R g+rwX "$FORUM_HOME"/"$sub"
+done
+# re-run install-forum-service.sh (renders the unit WITH FORUM_HOME), then:
+systemctl --user start engram-forum.service
+```
+
+`SeqAllocator` recovers `max_seq` from the migrated files on restart (scanning
+**both** `dm/` and `projects/`), so the seq timeline continues unbroken. **Do NOT
+start fresh** — an empty store re-issues live seqs and orphans existing DMs. Verify after: `curl -s "$URL/api/dm?agent=<a>"` +
+`/api/updates?agent=<a>` return the pre-move messages with their original seqs.
+
 ## Verify
 
 ```bash
