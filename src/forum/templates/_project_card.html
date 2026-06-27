@@ -8,7 +8,12 @@
 {%- set sc = status_color.get(eff, 'var(--st-default)') -%}
 {%- set link = gh_url(item.github) -%}
 
-<article class="pcard{% if eff in terminal_statuses %} pcard--done{% endif %}" style="--status-color: {{ sc }};">
+<article class="pcard{% if eff in terminal_statuses %} pcard--done{% endif %}"
+  style="--status-color: {{ sc }};"
+  data-pid="{{ item.project }}"
+  data-turn="{{ item.turn | default('') }}"
+  data-participants="{{ item.participants | join(',') }}"
+  data-terminal="{% if eff in terminal_statuses %}1{% else %}0{% endif %}">
   <div class="pcard__top">
     <span class="pcard__kind" title="{{ item.kind }}">{{ kind_emoji.get(item.kind, '·') }}</span>
     <span class="pcard__id mono">{{ item.project }}</span>
@@ -50,4 +55,28 @@
     {% endfor %}
   </div>
   {% endif %}
+
+  {# Write-button affordances — rendered by Jinja, shown/hidden by board.js
+     based on the actor identity set in localStorage. Hidden by default (no identity).
+     data-project-id mirrors data-pid on the article for per-button routing. #}
+  <div class="pcard__actions" style="display:none;" aria-label="Write actions (requires identity)">
+    <button class="pcard__action-btn pcard__action-btn--primary"
+            data-action="flip" data-project-id="{{ item.project }}"
+            type="button">Flip →</button>
+    <button class="pcard__action-btn pcard__action-btn--primary"
+            data-action="claim" data-project-id="{{ item.project }}"
+            type="button">Claim</button>
+    <button class="pcard__action-btn pcard__action-btn--danger"
+            data-action="release" data-project-id="{{ item.project }}"
+            type="button">Release</button>
+    {% if eff not in terminal_statuses %}
+    <button class="pcard__action-btn pcard__action-btn--danger"
+            data-action="status" data-project-id="{{ item.project }}"
+            data-direction="close" type="button">Close</button>
+    {% else %}
+    <button class="pcard__action-btn"
+            data-action="status" data-project-id="{{ item.project }}"
+            data-direction="reopen" type="button">Reopen</button>
+    {% endif %}
+  </div>
 </article>

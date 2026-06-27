@@ -201,6 +201,79 @@ a { color: inherit; text-decoration: none; }
 }
 .pcard__sep { color: var(--ink-4); font-size: 10px; }
 
+/* --------------------------------------------------------------------------
+   Identity bar (write-button affordance — Model B honor-system selector)
+   ----------------------------------------------------------------------- */
+.actor-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 12px 0 16px;
+  border-bottom: 1px solid var(--line-soft);
+  margin-bottom: 28px;
+  font-size: 13px; color: var(--ink-3);
+}
+.actor-bar label { white-space: nowrap; }
+.actor-bar input {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11px; padding: 4px 10px;
+  border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg-card); color: var(--ink);
+  width: 130px;
+}
+.actor-bar input:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--accent) 18%, transparent);
+}
+.actor-set-btn {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 10px; padding: 4px 13px;
+  border: 1px solid var(--accent); border-radius: 999px;
+  background: transparent; color: var(--accent);
+  cursor: pointer; letter-spacing: 0.06em;
+  transition: background 0.12s;
+}
+.actor-set-btn:hover { background: color-mix(in oklab, var(--accent) 12%, transparent); }
+.actor-indicator {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 10px; color: var(--accent-2); letter-spacing: 0.05em;
+}
+.actor-error {
+  font-size: 11px; color: var(--danger); padding: 2px 8px;
+  border: 1px solid color-mix(in oklab, var(--danger) 40%, transparent);
+  border-radius: 6px; background: color-mix(in oklab, var(--danger) 8%, transparent);
+}
+
+/* --------------------------------------------------------------------------
+   Per-card write buttons (rendered by Jinja, shown by JS when identity set)
+   ----------------------------------------------------------------------- */
+.pcard__actions {
+  display: flex; gap: 6px; flex-wrap: wrap;
+  margin-top: 6px; padding-top: 8px;
+  border-top: 1px solid var(--line-soft);
+}
+.pcard__action-btn {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 10px; padding: 3px 11px;
+  border: 1px solid var(--line); border-radius: 999px;
+  background: var(--bg-card); color: var(--ink-3);
+  cursor: pointer; letter-spacing: 0.04em;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.pcard__action-btn:hover { background: var(--bg-elev); color: var(--ink); }
+.pcard__action-btn--primary {
+  border-color: color-mix(in oklab, var(--accent) 45%, var(--line));
+  color: var(--accent);
+}
+.pcard__action-btn--primary:hover {
+  background: color-mix(in oklab, var(--accent) 10%, transparent);
+}
+.pcard__action-btn--danger {
+  border-color: color-mix(in oklab, var(--danger) 45%, var(--line));
+  color: var(--danger);
+}
+.pcard__action-btn--danger:hover {
+  background: color-mix(in oklab, var(--danger) 10%, transparent);
+}
+
 /* Sidebar */
 {% include "_board_styles.html" %}
 
@@ -257,6 +330,23 @@ a { color: inherit; text-decoration: none; }
   </div>
 
   <div class="pboard__body">
+
+    {# Identity bar — Model B honor-system selector (no auth; matches /api/post,
+       baton CLI, and all /api/projects/* routes which take agent as a field).
+       Actor + pool-sentinel persisted to localStorage; write-buttons enabled only
+       when actor is set. #}
+    <div id="actor-bar" class="actor-bar">
+      <label for="actor-input">I am:</label>
+      <input id="actor-input" type="text" placeholder="agent name"
+             autocomplete="off" spellcheck="false" maxlength="64" />
+      <label for="sentinel-input">Pool sentinel:</label>
+      <input id="sentinel-input" type="text" placeholder="e.g. lei"
+             autocomplete="off" spellcheck="false" maxlength="64" />
+      <button id="actor-save" class="actor-set-btn" type="button">Set</button>
+      <span id="actor-indicator" class="actor-indicator" style="display:none;"></span>
+      <span id="actor-error" class="actor-error" style="display:none;"></span>
+    </div>
+
     <div class="pboard__grid">
       <div class="pboard__main">
 
@@ -303,5 +393,262 @@ a { color: inherit; text-decoration: none; }
   </div><!-- .pboard__body -->
 </div><!-- .shell -->
 
+
+<script>
+/* -------------------------------------------------------------------------
+   Board write-buttons — vanilla JS, no framework.
+   Model B honor-system identity: actor name stored in localStorage.
+   Buttons rendered by Jinja (always present in DOM); JS shows/hides them
+   based on identity + card state. All state-changes require confirm().
+   POST routes: /api/projects/<pid>/{flip,claim,release,status}
+   Reconcile after success: location.reload() (simplest; GET /api/board/projects
+   is implicitly re-fetched via the page route — mutation response is {seq} only).
+   -------------------------------------------------------------------- */
+(function () {
+  'use strict';
+
+  var STORAGE_ACTOR    = 'board_actor';
+  var STORAGE_SENTINEL = 'board_sentinel';
+
+  /* -- localStorage helpers -- */
+  function getActor()    { return (localStorage.getItem(STORAGE_ACTOR)    || '').trim(); }
+  function getSentinel() { return (localStorage.getItem(STORAGE_SENTINEL) || '').trim(); }
+
+  /* -- Error display -- */
+  var _errTimer;
+  function showError(msg) {
+    var el = document.getElementById('actor-error');
+    if (!el) return;
+    el.textContent = msg;
+    el.style.display = '';
+    clearTimeout(_errTimer);
+    _errTimer = setTimeout(function () { el.style.display = 'none'; }, 6000);
+  }
+
+  /* -- Button visibility per card -- */
+  function updateCardButtons(card, actor, sentinel) {
+    var div = card.querySelector('.pcard__actions');
+    if (!div) return;
+
+    if (!actor) { div.style.display = 'none'; return; }
+
+    var turn     = (card.dataset.turn     || '').toLowerCase().trim();
+    var terminal = card.dataset.terminal === '1';
+    var holdsIt  = actor === turn;
+
+    /* Individual button visibility */
+    div.querySelectorAll('[data-action]').forEach(function (btn) {
+      var action    = btn.dataset.action;
+      var direction = btn.dataset.direction;
+      var visible   = false;
+
+      if (action === 'flip')    { visible = holdsIt && !terminal; }
+      if (action === 'claim')   { visible = !!(sentinel && turn === sentinel && !terminal); }
+      if (action === 'release') { visible = !!(holdsIt && sentinel && !terminal); }
+      if (action === 'status')  {
+        if (direction === 'close')  { visible = !terminal; }
+        if (direction === 'reopen') { visible =  terminal; }
+      }
+
+      btn.style.display = visible ? '' : 'none';
+    });
+
+    /* Show container iff at least one button is visible */
+    var anyVisible = [].some.call(div.querySelectorAll('[data-action]'), function (b) {
+      return b.style.display !== 'none';
+    });
+    div.style.display = anyVisible ? 'flex' : 'none';
+  }
+
+  function renderAllButtons() {
+    var actor    = getActor();
+    var sentinel = getSentinel();
+    document.querySelectorAll('.pcard[data-pid]').forEach(function (card) {
+      updateCardButtons(card, actor, sentinel);
+    });
+  }
+
+  /* -- Identity bar -- */
+  function initIdentityBar() {
+    var inputActor    = document.getElementById('actor-input');
+    var inputSentinel = document.getElementById('sentinel-input');
+    var btn           = document.getElementById('actor-save');
+    var indicator     = document.getElementById('actor-indicator');
+    if (!inputActor || !btn) return;
+
+    /* Restore saved values */
+    var savedActor    = getActor();
+    var savedSentinel = getSentinel();
+    if (savedActor)    { inputActor.value    = savedActor; }
+    if (savedSentinel) { inputSentinel.value = savedSentinel; }
+    refreshIndicator(indicator, savedActor);
+
+    btn.addEventListener('click', function () {
+      var actor    = inputActor.value.trim().toLowerCase();
+      var sentinel = inputSentinel ? inputSentinel.value.trim().toLowerCase() : '';
+      if (actor) {
+        localStorage.setItem(STORAGE_ACTOR, actor);
+        if (sentinel) { localStorage.setItem(STORAGE_SENTINEL, sentinel); }
+        else          { localStorage.removeItem(STORAGE_SENTINEL); }
+      } else {
+        localStorage.removeItem(STORAGE_ACTOR);
+        localStorage.removeItem(STORAGE_SENTINEL);
+      }
+      refreshIndicator(indicator, actor);
+      renderAllButtons();
+    });
+
+    /* Allow Enter key in inputs to trigger Set */
+    [inputActor, inputSentinel].forEach(function (inp) {
+      if (inp) { inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') btn.click(); }); }
+    });
+  }
+
+  function refreshIndicator(el, actor) {
+    if (!el) return;
+    el.textContent = actor ? ('Active as: ' + actor) : '';
+    el.style.display = actor ? '' : 'none';
+  }
+
+  /* -- POST + reconcile -- */
+  function doPost(url, body) {
+    fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    .then(function (resp) {
+      if (!resp.ok) {
+        return resp.json()
+          .then(function (data) { showError(data.error || ('HTTP ' + resp.status)); })
+          .catch(function ()    { showError('HTTP ' + resp.status); });
+      }
+      /* Success: reload re-renders the board from projects/*.md (the page route
+         re-reads the files on every GET — no separate fetch needed). */
+      location.reload();
+    })
+    .catch(function (err) { showError('Network error: ' + err.message); });
+  }
+
+  /* -- Action handlers -- */
+
+  function handleFlip(pid, card, actor) {
+    /* data-participants is comma-joined server-side; agent names are validated
+       comma-free (is_valid_agent_name), so a bare split(',') is unambiguous. */
+    var participants = (card.dataset.participants || '').split(',').filter(Boolean);
+    var others = participants.filter(function (p) { return p.toLowerCase() !== actor; });
+
+    var to;
+    if (others.length === 0) {
+      showError('No other participants to flip to.');
+      return;
+    } else if (others.length === 1) {
+      to = others[0];
+    } else {
+      to = prompt('Flip ' + pid + ' to which agent?\nParticipants: ' + others.join(', '));
+      if (to === null) return;
+      to = to.trim().toLowerCase();
+      if (!to) return;
+    }
+
+    var reason = prompt('Reason for flip?');
+    if (reason === null) return;
+    reason = reason.trim();
+    if (!reason) return;  /* /flip rejects an empty reason (400) */
+
+    if (!confirm('Act as ' + actor + ' — flip ' + pid + "'s turn to " + to + '?')) return;
+    doPost('/api/projects/' + pid + '/flip', { agent: actor, to_agent: to, reason: reason });
+  }
+
+  function handleClaim(pid, card, actor) {
+    /* pool_sentinel is the card's current turn (we only show Claim when turn===sentinel) */
+    var sentinel = (card.dataset.turn || '').toLowerCase().trim();
+    if (!sentinel) { showError('Cannot determine pool sentinel from card state.'); return; }
+    if (!confirm('Act as ' + actor + ' — claim ' + pid + ' from pool?')) return;
+    doPost('/api/projects/' + pid + '/claim', { agent: actor, pool_sentinel: sentinel });
+  }
+
+  function handleRelease(pid, actor, sentinel) {
+    var reason = prompt('Release reason?');
+    if (reason === null) return;
+    reason = reason.trim();
+    if (!reason) return;
+
+    var done = confirm('Mark as done?\n(OK = done, Cancel = return to pool without done-flag)');
+
+    if (!confirm('Act as ' + actor + ' — release ' + pid + '?\nReason: "' + reason + '"')) return;
+    doPost('/api/projects/' + pid + '/release',
+           { agent: actor, pool_sentinel: sentinel, reason: reason, done: done });
+  }
+
+  /* Mirrors the server's _ACTIVE_STATUSES dispatch in /api/projects/<pid>/status:
+     an active status reopens, anything else closes. */
+  var ACTIVE_STATUSES = ['planning', 'in-progress', 'in-review'];
+
+  function handleStatus(pid, direction, actor) {
+    var newStatus, defaultVal;
+    if (direction === 'close') {
+      defaultVal = 'cancelled';
+      newStatus = prompt('New status?\n(cancelled / done / merged)', defaultVal);
+    } else {
+      defaultVal = 'in-progress';
+      newStatus = prompt('Reopen as?\n(in-progress / planning / in-review)', defaultVal);
+    }
+    if (newStatus === null) return;  /* cancelled */
+    newStatus = newStatus.trim().toLowerCase();
+    if (!newStatus) return;  /* empty / whitespace-only — trim before the check (matches handleFlip/handleRelease) */
+
+    /* Guard the active-set boundary so a mistyped status can't silently flip the
+       server's close↔reopen dispatch (e.g. typing "in-progress" into Close). */
+    var isActive = ACTIVE_STATUSES.indexOf(newStatus) !== -1;
+    if (direction === 'close' && isActive) {
+      showError('"' + newStatus + '" is an active status — use Reopen, not Close.');
+      return;
+    }
+    if (direction === 'reopen' && !isActive) {
+      showError('Reopen needs an active status (' + ACTIVE_STATUSES.join(' / ') + ').');
+      return;
+    }
+
+    var reason = prompt('Reason?');
+    if (reason === null) return;
+    reason = reason.trim();
+    if (!reason) return;  /* /status rejects an empty reason (400) */
+
+    if (!confirm('Act as ' + actor + ' — set ' + pid + ' status to "' + newStatus + '"?')) return;
+    doPost('/api/projects/' + pid + '/status',
+           { agent: actor, new_status: newStatus, reason: reason });
+  }
+
+  /* -- Event delegation (single listener covers all cards) -- */
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    var card = btn.closest('.pcard[data-pid]');
+    if (!card) return;
+
+    var action    = btn.dataset.action;
+    var pid       = btn.dataset.projectId || card.dataset.pid;
+    var actor     = getActor();
+    var sentinel  = getSentinel();
+
+    if (!actor) { showError('Set your identity first.'); return; }
+
+    /* REQUIRED confirm affordance lives inside each handler (Borges security condition) */
+    switch (action) {
+      case 'flip':    handleFlip(pid, card, actor);                      break;
+      case 'claim':   handleClaim(pid, card, actor);                     break;
+      case 'release': handleRelease(pid, actor, sentinel);               break;
+      case 'status':  handleStatus(pid, btn.dataset.direction, actor);   break;
+    }
+  });
+
+  /* -- Boot -- */
+  document.addEventListener('DOMContentLoaded', function () {
+    initIdentityBar();
+    renderAllButtons();
+  });
+}());
+</script>
 </body>
 </html>
