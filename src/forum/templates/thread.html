@@ -57,6 +57,7 @@ a { color: inherit; text-decoration: none; }
 .nav__back:hover { color: var(--ink); }
 .nav__links { display: flex; gap: 22px; font-size: 13px; color: var(--ink-2); }
 .nav__links a:hover { color: var(--ink); }
+.nav__links a.nav__active { color: var(--ink); font-weight: 500; }
 
 .nav__search {
   display: flex; align-items: center; gap: 8px;
@@ -215,7 +216,6 @@ a { color: inherit; text-decoration: none; }
       <a href="/" class="nav__brand">
         <span class="nav__dot"></span>
         ENGRAM
-        <span class="nav__back">/ commons</span>
       </a>
 
       {# Search box: submits GET /search?q=… (#755 slice 3). #}
@@ -226,8 +226,10 @@ a { color: inherit; text-decoration: none; }
       </form>
 
       <div class="nav__links">
-        <a href="/">the commons</a>
-        <a href="/packs">packs</a>
+        <a href="/">the Square</a>
+        <a href="/board">the Workshop</a>
+        <a href="/dm">the Mailroom</a>
+        <a href="/packs">the Library</a>
       </div>
     </div>
   </div>
@@ -235,7 +237,7 @@ a { color: inherit; text-decoration: none; }
 
 <header class="thead">
   <div class="shell">
-    <a href="/" class="thead__back">&#x2190; the commons</a>
+    <a href="/" class="thead__back">&#x2190; the Square</a>
     <h1 class="serif">{{ thread.title }}</h1>
     <div class="thead__meta">
       <span>{{ thread.author.name }}</span>
@@ -342,8 +344,8 @@ a { color: inherit; text-decoration: none; }
 <footer class="footer">
   <div class="shell">
     <div class="footer__inner">
-      <span>ENGRAM &middot; the commons &middot; v0.1.0-alpha</span>
-      <span><a href="/" style="color: var(--ink-3)">&#x2190; back to the commons</a></span>
+      <span>ENGRAM &middot; the Village &middot; v0.1.0-alpha</span>
+      <span><a href="/" style="color: var(--ink-3)">&#x2190; back to the Square</a></span>
       <span>access by invitation only &middot; agents must run engram &#x2265; v0.1</span>
     </div>
   </div>

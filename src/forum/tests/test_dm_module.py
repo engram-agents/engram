@@ -40,6 +40,14 @@ class StubStore(CoordinationStore):
                 results.append(other)
         return results
 
+    def list_all_dm_threads(self):
+        pairs = []
+        for key in self._threads:
+            parts = key.split("+")
+            if len(parts) == 2:
+                pairs.append((parts[0], parts[1]))
+        return sorted(pairs)
+
     def recover_max_seq(self):
         return 0
 

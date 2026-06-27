@@ -278,6 +278,26 @@ class FileStore(CoordinationStore):
             others.append(other)
         return others
 
+    def list_all_dm_threads(self) -> list[tuple[str, str]]:
+        """Return every DM pair as sorted ``(a, b)`` tuples — operator-view, all pairs.
+
+        Scans the ``dm/`` directory for ``<a>+<b>.md`` files and returns each pair
+        as a ``(a, b)`` tuple (already sorted lexicographically because the filename
+        key is produced by :func:`dm_thread_key`). Files whose stem does not split
+        into exactly two parts are skipped (should not exist under normal operation,
+        but ``+`` is reserved in agent names so a two-element split is exact for
+        any well-formed thread file). Returns ``[]`` when the directory is absent.
+        """
+        if not self.dm_dir.is_dir():
+            return []
+        pairs: list[tuple[str, str]] = []
+        for md in sorted(self.dm_dir.glob("*.md")):
+            parts = md.stem.split("+")
+            if len(parts) != 2:
+                continue
+            pairs.append((parts[0], parts[1]))
+        return pairs
+
     # --- cursor recovery ---------------------------------------------------
     def recover_max_seq(self) -> int:
         hi = 0

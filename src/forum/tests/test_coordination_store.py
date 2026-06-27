@@ -77,6 +77,9 @@ def test_full_impl_is_concrete():
         def list_dm_threads(self, agent):
             return []
 
+        def list_all_dm_threads(self):
+            return []
+
         def recover_max_seq(self):
             return 0
 

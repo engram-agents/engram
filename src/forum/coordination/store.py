@@ -194,6 +194,21 @@ class CoordinationStore(abc.ABC):
         Backs ``ia read`` with no counterparty (the unread-across-threads view).
         """
 
+    @abc.abstractmethod
+    def list_all_dm_threads(self) -> list[tuple[str, str]]:
+        """Return every DM pair as sorted ``(a, b)`` tuples — operator-view, all pairs.
+
+        Unlike :meth:`list_dm_threads` (agent-scoped), this returns ALL pairs in the
+        store regardless of which agent is requesting. Each tuple is the canonical
+        sorted pair produced by :func:`dm_thread_key` — ``a < b`` lexicographically.
+        Returns ``[]`` if the dm directory does not exist or is empty.
+
+        Backs the operator oversight view (``GET /dm``) where the human operator
+        needs full visibility across all agent conversations for debugging and
+        transparency. This method MUST NOT be exposed to agent-facing API routes
+        (those remain 1:1-ACL-scoped via :meth:`list_dm_threads`).
+        """
+
     # --- cursor recovery ---------------------------------------------------
     @abc.abstractmethod
     def recover_max_seq(self) -> int:

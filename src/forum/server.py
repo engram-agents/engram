@@ -1165,6 +1165,75 @@ def create_app(
         )
 
     # ------------------------------------------------------------------
+    # GET /dm          — operator DM overview (all pairs)
+    # GET /dm/<a>/<b>  — operator DM thread view (one pair, chronological)
+    #
+    # Operator oversight view — sees all pairs by design; for release this
+    # must be gated to the operator/admin once forum auth lands (#1459),
+    # else it would leak the 1:1 DM privacy.
+    #
+    # READ-ONLY — no POST / no send from this UI. The agent-facing /api/dm
+    # routes (1:1 ACL, agent-scoped) are distinct and untouched.
+    # 503 when COORD_STORE is unconfigured (same guard as the API routes).
+    # ------------------------------------------------------------------
+    @app.route("/dm")
+    def dm_viewer_overview():
+        """Operator DM overview — list every pair across the store.
+
+        Operator oversight view — sees all pairs by design; for release this
+        must be gated to the operator/admin once forum auth lands (#1459),
+        else it would leak the 1:1 DM privacy.
+        """
+        store = app.config.get("COORD_STORE")
+        if store is None:
+            abort(503)
+
+        pairs = store.list_all_dm_threads()
+        threads = []
+        for a, b in pairs:
+            messages = store.read_dm_thread(a, b)
+            last_msg = messages[-1] if messages else None
+            threads.append({
+                "a": a,
+                "b": b,
+                "count": len(messages),
+                "last_ts": last_msg.ts if last_msg else None,
+                "last_preview": (last_msg.body[:120] if last_msg else None),
+                "last_truncated": (last_msg is not None and len(last_msg.body) > 120),
+                "last_sender": last_msg.sender if last_msg else None,
+            })
+        return render_template("dm.html", threads=threads)
+
+    @app.route("/dm/<a>/<b>")
+    def dm_viewer_thread(a: str, b: str):
+        """Operator DM thread view — render a single pair's full thread.
+
+        Operator oversight view — sees all pairs by design; for release this
+        must be gated to the operator/admin once forum auth lands (#1459),
+        else it would leak the 1:1 DM privacy.
+
+        Missing pairs (no messages yet) are rendered as an empty thread,
+        not a 500 or hard 404.  Invalid agent names (charset violation)
+        return 400.
+        """
+        store = app.config.get("COORD_STORE")
+        if store is None:
+            abort(503)
+
+        a_norm = a.strip().lower()
+        b_norm = b.strip().lower()
+        if not db.is_valid_agent_name(a_norm) or not db.is_valid_agent_name(b_norm):
+            abort(400)
+
+        messages = store.read_dm_thread(a_norm, b_norm)
+        return render_template(
+            "dm_thread.html",
+            a=a_norm,
+            b=b_norm,
+            messages=messages,
+        )
+
+    # ------------------------------------------------------------------
     # GET /api/board/projects  — JSON project board snapshot
     #
     # Response: {board: [...], counts: {<status>: <int>}}
