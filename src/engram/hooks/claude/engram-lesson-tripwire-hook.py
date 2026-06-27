@@ -32,13 +32,6 @@ Complements (does not replace) the prompt-time recall hook.
 TIER: T2 (Convenience) — degrades gracefully on DB unavailability; never blocks.
 Issues: #1203 (Bash/locus-1) + #1297 (MCP/locus-2) — lesson-tripwire encoding-specificity gap.
 """
-import os as _os, sys as _sys
-# Guard against source: directory marketplace double-fire (#1066).
-_plugin_root = _os.environ.get("CLAUDE_PLUGIN_ROOT", "")
-_engram_home = _os.environ.get("ENGRAM_HOME") or _os.path.expanduser("~/.engram")
-if _plugin_root.startswith(_os.path.join(_engram_home, "marketplace") + _os.sep):
-    _sys.exit(0)
-
 import json
 import os
 import re

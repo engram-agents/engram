@@ -30,12 +30,6 @@ access≠presence gap. Sourced from engram_stats(sections=
 ["confidence"]) + engram_stats(mode="7-turn", sections=["confidence"]).
 Silent skip on any stats failure: hook never blocks session start.
 """
-import os as _os, sys as _sys
-# Guard against source: directory marketplace double-fire (#1066).
-_plugin_root = _os.environ.get("CLAUDE_PLUGIN_ROOT", "")
-_engram_home = _os.environ.get("ENGRAM_HOME") or _os.path.expanduser("~/.engram")
-if _plugin_root.startswith(_os.path.join(_engram_home, "marketplace") + _os.sep):
-    _sys.exit(0)  # empty stdout is valid no-op per #824/#832 contract
 import hashlib
 import json
 import os
