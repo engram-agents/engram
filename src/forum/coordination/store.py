@@ -148,6 +148,21 @@ class CoordinationStore(abc.ABC):
         it after a restart.
         """
 
+    @abc.abstractmethod
+    def archive_project(self, project_id: str) -> None:
+        """Move a merged baton from ``projects/<pid>.md`` to ``archive/<pid>.md``.
+
+        Called by the ``merge`` writer-fn after the seq-bearing write to keep the
+        active board clean. Idempotent: no-op if the project file is not found
+        (already archived or never written). Must not raise on missing project.
+
+        The ``archive/`` directory is under the same root as ``projects/`` so the
+        rename is cross-dir but same-filesystem — ``Path.rename`` is atomic on POSIX.
+        The archived file retains its ``seq:`` embedding so ``recover_max_seq`` can
+        count it (``FileStore.recover_max_seq`` MUST scan both ``projects/`` and
+        ``archive/``).
+        """
+
     # --- DM ----------------------------------------------------------------
     @abc.abstractmethod
     def read_dm_thread(

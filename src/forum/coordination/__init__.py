@@ -43,6 +43,7 @@ from .projects import (
     rename,
     anchor,
     init,
+    merge,
 )
 from .updates import build_updates
 
@@ -68,5 +69,6 @@ __all__ = [
     "rename",
     "anchor",
     "init",
+    "merge",
     "build_updates",
 ]

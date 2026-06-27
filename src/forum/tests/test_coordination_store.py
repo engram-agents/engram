@@ -65,6 +65,9 @@ def test_full_impl_is_concrete():
         def write_project(self, project_id, content, *, seq):
             pass
 
+        def archive_project(self, project_id):
+            pass
+
         def read_dm_thread(self, a, b, *, since_seq=0):
             return []
 

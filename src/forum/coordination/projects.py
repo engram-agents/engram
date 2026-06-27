@@ -298,6 +298,73 @@ def close(
     return seq
 
 
+def merge(
+    store: CoordinationStore,
+    allocator: SeqAllocator,
+    project_id: str,
+    *,
+    merged_by: str,
+    forced: bool = False,
+    ts: Optional[str] = None,
+) -> int:
+    """Mark a project baton as merged and archive it; return the assigned seq.
+
+    Pure write body of baton cmd_merge (the post-gh-merge FS-write only). The
+    gh-orchestration (PR-state queries, CI/approval gates, the gh pr merge call)
+    stays client-side in baton.py — only this post-merge write lives here.
+
+    Log formats:
+      - Normal: ``- {ts} merged via baton merge by {merged_by}``
+      - Forced:  ``- {ts} merged via baton merge by {merged_by} (FORCED past gates 3-4)``
+
+    OQ-4 archive relocation: after the seq-bearing write, calls
+    ``store.archive_project(project_id)`` to move the baton from
+    ``projects/<pid>.md`` to ``archive/<pid>.md``, keeping the active board clean.
+    The archive move happens OUTSIDE the allocator lock (the lock covers only the
+    seq-bearing write, per fork-4). If the process crashes between write and
+    archive, the baton is in projects/ with status=merged — correct data, just
+    not archived; the next run will see a closed project in the active dir (benign;
+    ``read_projects(active_only=True)`` already filters by CLOSED_STATUSES).
+
+    Args:
+        merged_by: agent performing the merge (normalised to lowercase).
+        forced: if True, append ``(FORCED past gates 3-4)`` to the log entry.
+        ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
+
+    Returns:
+        The seq assigned to this mutation.
+
+    Raises:
+        ProjectNotFound: if ``project_id`` has no existing baton file.
+    """
+    content = store.read_project(project_id)
+    if content is None:
+        raise ProjectNotFound(project_id)
+
+    now = ts or md.now_iso()
+    merged_by_n = merged_by.strip().lower()
+
+    if forced:
+        log_line = (
+            f"- {now} merged via baton merge by {merged_by_n} "
+            "(FORCED past gates 3-4)"
+        )
+    else:
+        log_line = f"- {now} merged via baton merge by {merged_by_n}"
+
+    updated = md.update_frontmatter(content, {"status": "merged"})
+    _, body = md.parse_frontmatter(updated)
+    body = md.append_turn_log(body, log_line)
+    final = md.reattach_frontmatter(updated, body)
+
+    with allocator.allocate() as seq:
+        store.write_project(project_id, final, seq=seq)
+
+    # OQ-4 archive relocation (outside lock — seq-bearing write is complete)
+    store.archive_project(project_id)
+    return seq
+
+
 def reopen(
     store: CoordinationStore,
     allocator: SeqAllocator,

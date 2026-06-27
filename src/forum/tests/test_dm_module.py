@@ -18,6 +18,9 @@ class StubStore(CoordinationStore):
     def write_project(self, pid, content, *, seq):
         pass
 
+    def archive_project(self, project_id):
+        pass
+
     def read_dm_thread(self, a, b, *, since_seq=0):
         key = dm_thread_key(a, b)
         return [m for m in self._threads.get(key, []) if m.seq > since_seq]

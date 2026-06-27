@@ -1432,6 +1432,415 @@ def create_app(
 
         return jsonify(build_updates(store, allocator, agent, since=since, kinds=kinds))
 
+    # ------------------------------------------------------------------
+    # Project / board coordination routes (UCS #1494 Phase 1c+2)
+    #   GET  /api/projects                     — list all project records
+    #   GET  /api/projects/<pid>               — single project record
+    #   POST /api/projects                     — init (create) a new baton
+    #   POST /api/projects/<pid>/flip          — flip turn
+    #   POST /api/projects/<pid>/claim         — claim from pool
+    #   POST /api/projects/<pid>/release       — release back to pool
+    #   POST /api/projects/<pid>/status        — close or reopen
+    #   POST /api/projects/<pid>/rename        — rename title
+    #   POST /api/projects/<pid>/anchor        — set/update github anchor
+    #   POST /api/projects/<pid>/gc            — gc-close (client calls after gh query)
+    #   POST /api/projects/<pid>/merge         — post-merge closure + archive
+    #
+    # All mutation routes require COORD_STORE + COORD_ALLOCATOR; return 503 when
+    # not configured. Read routes only need COORD_STORE.
+    # ------------------------------------------------------------------
+
+    @app.route("/api/projects", methods=["GET"])
+    def api_projects_list():
+        """List project records.
+
+        Query params:
+            agent       — optional; filter to projects where agent is a participant.
+            active_only — optional bool string (true/false/1/0); default true.
+
+        Response: {projects: [{project_id, title, status, turn, turn_since, turn_reason,
+                               participants, seq}]}
+        """
+        from forum.coordination import projects as _proj
+
+        store = app.config.get("COORD_STORE")
+        if store is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        active_raw = (request.args.get("active_only") or "true").strip().lower()
+        active_only = active_raw not in ("false", "0", "no")
+        agent = (request.args.get("agent") or "").strip().lower()
+
+        records = store.read_projects(active_only=active_only)
+        if agent:
+            records = [r for r in records if agent in r.participants]
+
+        return jsonify({
+            "projects": [
+                {
+                    "project_id": r.project_id,
+                    "title": r.title,
+                    "status": r.status,
+                    "turn": r.turn,
+                    "turn_since": r.turn_since,
+                    "turn_reason": r.turn_reason,
+                    "participants": list(r.participants),
+                    "seq": r.seq,
+                }
+                for r in records
+            ]
+        })
+
+    @app.route("/api/projects/<pid>", methods=["GET"])
+    def api_project_show(pid: str):
+        """Return a single project's raw markdown + parsed fields.
+
+        Response: {project_id, raw} where raw is the full markdown content.
+        Returns 404 when not found.
+        """
+        store = app.config.get("COORD_STORE")
+        if store is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        raw = store.read_project(pid)
+        if raw is None:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+
+        return jsonify({"project_id": pid, "raw": raw})
+
+    @app.route("/api/projects", methods=["POST"])
+    def api_project_init():
+        """Create a new project baton.
+
+        JSON body: {agent, project_id, title, status, turn, participants, turn_reason, github?}
+        ``participants`` may be a list of strings OR a comma-separated string.
+        Response: {seq, project_id}, 201.
+        Errors: 400 (missing/invalid fields), 409 (already exists), 503 (store not configured).
+        """
+        from forum.coordination import init as _init, ProjectAlreadyExists
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        project_id = (data.get("project_id") or "").strip()
+        title = (data.get("title") or "").strip()
+        status = (data.get("status") or "").strip()
+        turn = (data.get("turn") or "").strip().lower()
+        turn_reason = (data.get("turn_reason") or "").strip()
+        github = (data.get("github") or "").strip() or None
+
+        raw_parts = data.get("participants") or []
+        if isinstance(raw_parts, str):
+            participants = [p.strip().lower() for p in raw_parts.split(",") if p.strip()]
+        else:
+            participants = [p.strip().lower() for p in raw_parts if p]
+
+        if not project_id or not title or not status or not turn or not turn_reason or not participants:
+            return jsonify({"error": "project_id, title, status, turn, turn_reason, and participants are required"}), 400
+
+        try:
+            seq = _init(
+                store, allocator, project_id,
+                title=title, status=status, turn=turn,
+                participants=participants, turn_reason=turn_reason,
+                github=github,
+            )
+        except ProjectAlreadyExists:
+            return jsonify({"error": f"project already exists: {project_id}"}), 409
+
+        return jsonify({"seq": seq, "project_id": project_id}), 201
+
+    @app.route("/api/projects/<pid>/flip", methods=["POST"])
+    def api_project_flip(pid: str):
+        """Flip a baton's turn.
+
+        JSON body: {agent, to_agent, reason}
+        Response: {seq}, 201.
+        """
+        from forum.coordination import flip as _flip, ProjectNotFound
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        to_agent = (data.get("to_agent") or "").strip().lower()
+        reason = (data.get("reason") or "").strip()
+        if not to_agent or not reason:
+            return jsonify({"error": "to_agent and reason are required"}), 400
+
+        try:
+            seq = _flip(store, allocator, pid, to_agent=to_agent, reason=reason)
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+
+        return jsonify({"seq": seq}), 201
+
+    @app.route("/api/projects/<pid>/claim", methods=["POST"])
+    def api_project_claim(pid: str):
+        """Claim a project baton from the pool.
+
+        JSON body: {agent, pool_sentinel}
+        Response: {seq}, 201.
+        """
+        from forum.coordination import claim as _claim, ProjectNotFound
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        pool_sentinel = (data.get("pool_sentinel") or "").strip().lower()
+        if not pool_sentinel:
+            return jsonify({"error": "pool_sentinel is required"}), 400
+
+        try:
+            seq = _claim(store, allocator, pid, claimer=agent, pool_sentinel=pool_sentinel)
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+
+        return jsonify({"seq": seq}), 201
+
+    @app.route("/api/projects/<pid>/release", methods=["POST"])
+    def api_project_release(pid: str):
+        """Release a project baton back to the pool.
+
+        JSON body: {agent, pool_sentinel, reason, done?}
+        ``done`` (bool, default false) appends "(done)" to the project title.
+        Response: {seq}, 201.
+        """
+        from forum.coordination import release as _release, ProjectNotFound
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        pool_sentinel = (data.get("pool_sentinel") or "").strip().lower()
+        reason = (data.get("reason") or "").strip()
+        if not pool_sentinel or not reason:
+            return jsonify({"error": "pool_sentinel and reason are required"}), 400
+
+        done = bool(data.get("done", False))
+
+        try:
+            seq = _release(store, allocator, pid, holder=agent, pool_sentinel=pool_sentinel, reason=reason, done=done)
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+
+        return jsonify({"seq": seq}), 201
+
+    @app.route("/api/projects/<pid>/status", methods=["POST"])
+    def api_project_status(pid: str):
+        """Close or reopen a project baton (dispatches on new_status).
+
+        JSON body: {agent, new_status, reason}
+        Dispatch: if new_status in (planning, in-progress, in-review) → reopen;
+                  otherwise → close.
+        Response: {seq}, 201.
+        """
+        from forum.coordination import close as _close, reopen as _reopen, ProjectNotFound
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        new_status = (data.get("new_status") or "").strip().lower()
+        reason = (data.get("reason") or "").strip()
+        if not new_status or not reason:
+            return jsonify({"error": "new_status and reason are required"}), 400
+
+        _ACTIVE_STATUSES = frozenset({"planning", "in-progress", "in-review"})
+
+        try:
+            if new_status in _ACTIVE_STATUSES:
+                seq = _reopen(store, allocator, pid, invoker=agent, new_status=new_status)
+            else:
+                seq = _close(store, allocator, pid, new_status=new_status, reason=reason)
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+
+        return jsonify({"seq": seq}), 201
+
+    @app.route("/api/projects/<pid>/rename", methods=["POST"])
+    def api_project_rename(pid: str):
+        """Rename a project baton's title.
+
+        JSON body: {agent, new_title}
+        Response: {seq}, 201.
+        """
+        from forum.coordination import rename as _rename, ProjectNotFound
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        new_title = (data.get("new_title") or "").strip()
+        if not new_title:
+            return jsonify({"error": "new_title is required"}), 400
+
+        try:
+            seq = _rename(store, allocator, pid, new_title=new_title)
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+
+        return jsonify({"seq": seq}), 201
+
+    @app.route("/api/projects/<pid>/anchor", methods=["POST"])
+    def api_project_anchor(pid: str):
+        """Set or update the github anchor on a project baton.
+
+        JSON body: {agent, github}
+        Response: {seq}, 201.
+        """
+        from forum.coordination import anchor as _anchor, ProjectNotFound
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        github_anchor = (data.get("github") or "").strip()
+        if not github_anchor:
+            return jsonify({"error": "github is required"}), 400
+
+        try:
+            seq = _anchor(store, allocator, pid, github_anchor=github_anchor)
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+
+        return jsonify({"seq": seq}), 201
+
+    @app.route("/api/projects/<pid>/gc", methods=["POST"])
+    def api_project_gc(pid: str):
+        """GC-close a project baton (client has already queried gh state).
+
+        JSON body: {agent, new_status, reason}
+        ``new_status`` must be a closed status (merged or cancelled).
+        Response: {seq}, 201.
+        """
+        from forum.coordination import close as _close, ProjectNotFound
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        new_status = (data.get("new_status") or "").strip().lower()
+        reason = (data.get("reason") or "").strip()
+        if not new_status or not reason:
+            return jsonify({"error": "new_status and reason are required"}), 400
+
+        try:
+            seq = _close(store, allocator, pid, new_status=new_status, reason=reason)
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+
+        return jsonify({"seq": seq}), 201
+
+    @app.route("/api/projects/<pid>/merge", methods=["POST"])
+    def api_project_merge(pid: str):
+        """Post-merge baton closure + OQ-4 archive relocation.
+
+        Called AFTER gh pr merge succeeds client-side. Sets status→merged with the
+        correct log format and moves the baton to archive/.
+
+        JSON body: {agent, forced?}
+        ``forced`` (bool, default false) adds "(FORCED past gates 3-4)" to the log.
+        Response: {seq}, 201.
+        """
+        from forum.coordination import merge as _merge, ProjectNotFound
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        forced = bool(data.get("forced", False))
+
+        try:
+            seq = _merge(store, allocator, pid, merged_by=agent, forced=forced)
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+
+        return jsonify({"seq": seq}), 201
+
     return app
 
 

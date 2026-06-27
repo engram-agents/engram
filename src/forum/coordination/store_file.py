@@ -209,6 +209,14 @@ class FileStore(CoordinationStore):
         path = self.projects_dir / f"{project_id}.md"
         _atomic_write(path, _embed_seq(content, seq))
 
+    def archive_project(self, project_id: str) -> None:
+        src = self.projects_dir / f"{project_id}.md"
+        if not src.exists():
+            return  # idempotent: already archived or never written
+        dst_dir = self.root / "archive"
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        src.rename(dst_dir / f"{project_id}.md")  # atomic POSIX rename (same fs)
+
     # --- DM ----------------------------------------------------------------
     def _dm_path(self, a: str, b: str) -> Path:
         return self.dm_dir / f"{dm_thread_key(a, b)}.md"
@@ -275,6 +283,14 @@ class FileStore(CoordinationStore):
         hi = 0
         if self.projects_dir.is_dir():
             for md in self.projects_dir.glob("*.md"):
+                try:
+                    fields, _ = _parse_frontmatter(md.read_text(encoding="utf-8"))
+                except OSError:
+                    continue
+                hi = max(hi, _coerce_seq(fields.get("seq", "")))
+        archive_dir = self.root / "archive"
+        if archive_dir.is_dir():
+            for md in archive_dir.glob("*.md"):
                 try:
                     fields, _ = _parse_frontmatter(md.read_text(encoding="utf-8"))
                 except OSError:
