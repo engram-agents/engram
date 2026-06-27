@@ -75,6 +75,24 @@ Changes landing on `dev` that will appear in the next release.
 
 ---
 
+## [v0.1.4] — 2026-06-26
+
+Emergency hotfix. No feature changes — v0.1.3 plus a single critical fix.
+
+### Fixed
+
+- **Restored the ENGRAM hook layer on marketplace-path installs.** The `#1066`
+  "marketplace double-fire guard" (added in v0.1.2) exited every hook with
+  `sys.exit(0)` when `CLAUDE_PLUGIN_ROOT` resolved to the marketplace path — the
+  sole hook-invocation path on `source: directory` installs — silently disabling
+  the entire hook layer (auto-surfacing, write-nudge, lesson tripwires,
+  presence/time-bar, daemon-starter). The double-fire it targeted had already
+  been resolved structurally (user-level + plugin dual hook registration), so the
+  guard is removed entirely. Affects v0.1.2 and v0.1.3; v0.1.1 and earlier are
+  unaffected.
+
+---
+
 ## [v0.1.3] — 2026-06-26
 
 Finalizes the `v0.1.3-rc2` dogfood candidate with four sleep/dream-consolidation
