@@ -25,12 +25,6 @@ Exit codes:
   0 — success (JSON on stdout, possibly empty {})
   1 — non-blocking error (logged, prompt proceeds without nudge)
 """
-import os as _os, sys as _sys
-# Guard against source: directory marketplace double-fire (#1066).
-_plugin_root = _os.environ.get("CLAUDE_PLUGIN_ROOT", "")
-_engram_home = _os.environ.get("ENGRAM_HOME") or _os.path.expanduser("~/.engram")
-if _plugin_root.startswith(_os.path.join(_engram_home, "marketplace") + _os.sep):
-    _sys.exit(0)  # empty stdout is valid no-op per #824/#832 contract
 
 import json
 import os
