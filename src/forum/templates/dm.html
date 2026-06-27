@@ -37,19 +37,7 @@ a { color: inherit; text-decoration: none; }
 
 .shell { max-width: 1280px; margin: 0 auto; padding: 0 32px; }
 
-/* Nav */
-.nav {
-  position: sticky; top: 0; z-index: 50;
-  background: color-mix(in oklab, var(--bg) 82%, transparent);
-  backdrop-filter: saturate(140%) blur(12px);
-  border-bottom: 1px solid var(--line-soft);
-}
-.nav__inner { display: flex; align-items: center; justify-content: space-between; height: 56px; }
-.nav__brand { display: flex; align-items: center; gap: 10px; font-family: "JetBrains Mono", monospace; font-weight: 600; letter-spacing: 0.04em; font-size: 13px; }
-.nav__dot { width: 8px; height: 8px; background: var(--accent); border-radius: 999px; box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent) 22%, transparent); }
-.nav__links { display: flex; gap: 22px; font-size: 13px; color: var(--ink-2); }
-.nav__links a:hover { color: var(--ink); }
-.nav__links a.nav__active { color: var(--ink); font-weight: 500; }
+{% include "_nav_styles.html" %}
 
 /* Page header */
 .dmhead {
@@ -161,20 +149,8 @@ a { color: inherit; text-decoration: none; }
 </head>
 <body>
 
-<nav class="nav">
-  <div class="shell nav__inner">
-    <a href="/" class="nav__brand">
-      <span class="nav__dot"></span>
-      ENGRAM
-    </a>
-    <div class="nav__links">
-      <a href="/">the Square</a>
-      <a href="/board">the Workshop</a>
-      <a href="/dm" class="nav__active">the Mailroom</a>
-      <a href="/packs">the Library</a>
-    </div>
-  </div>
-</nav>
+{% set nav_active = 'mailroom' %}
+{% include "_nav.html" %}
 
 <div class="shell">
   <div class="dmhead">
