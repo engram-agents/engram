@@ -66,6 +66,9 @@ class StubStore(CoordinationStore):
     def write_project(self, pid, content, *, seq):
         pass
 
+    def archive_project(self, pid):
+        pass
+
     def recover_max_seq(self):
         seqs = [m.seq for ms in self._threads.values() for m in ms]
         return max(seqs, default=0)
