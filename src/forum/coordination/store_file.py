@@ -121,6 +121,7 @@ def _atomic_write(path: Path, content: str) -> None:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)  # world-readable before rename; mkstemp defaults to 0600
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)

@@ -714,6 +714,10 @@
     {
       "path": "src/forum/deploy/engram-forum-backup.timer",
       "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; systemd timer unit for the forum host, not part of the plugin bundle (issue #868)"
+    },
+    {
+      "path": "src/engram/tools/baton-migrate-to-coord-store.py",
+      "reason": "one-shot state migration helper: reads existing baton files from the old agents-shared path and POSTs to the new /api/projects/* routes (Phase 3 UCS migration); not a recurring shipped mechanism"
     }
   ],
   "repo_only": [

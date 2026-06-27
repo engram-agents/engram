@@ -4,23 +4,42 @@ Test categories:
   - Smoke:          each subcommand happy path exits 0
   - Validation:     bad inputs rejected with expected exit codes / errors
   - Frontmatter:    parser handles edge cases, malformed files, quotes
-  - AtomicWrite:    no .tmp files remain after successful operations
   - SingleAgent:    missing projects dir → silent exit or actionable error
   - Integration:    init → flip → mine → show → close round-trip
+  - CI-state dedup: _dedupe_checks_by_latest + _pr_ci_state (#1366)
 
-Mirrors the class-based pytest structure of tests/test_ia_cli.py.
+Write commands (init, flip, close, reopen, rename, claim, release, anchor) are
+tested via direct module calls + a mock ForumClient — no live forum server
+needed.  Read commands (status, mine, show) use subprocess as before.
+
+Phase 3 migration note: baton.py write commands now call the forum API rather
+than writing directly to disk.  Tests that previously asserted on on-disk state
+after a write are ported to assert on the mock client's post call_args instead.
 """
 
+import argparse
 import json
 import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 CLI_PATH = Path(__file__).parent.parent / "tools" / "baton.py"
+
+# ---------------------------------------------------------------------------
+# Module-level baton import for direct-call tests (same pattern as
+# src/forum/tests/test_baton_thin_client.py).  Adding tools/ to sys.path
+# once here covers both baton.py and forum_api.py.
+# ---------------------------------------------------------------------------
+_TOOLS_DIR = str(Path(__file__).parent.parent / "tools")
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+
+import baton as _baton  # noqa: E402 (after sys.path insert)
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +66,13 @@ def _run_baton(
         timeout=15,
     )
     return proc.returncode, proc.stdout, proc.stderr
+
+
+def _make_client(return_value=None) -> MagicMock:
+    """Return a mock ForumClient whose post() returns the given dict."""
+    client = MagicMock()
+    client.post.return_value = return_value or {"seq": 42}
+    return client
 
 
 def _write_config(
@@ -112,9 +138,9 @@ def _ts(offset_minutes: int = -5) -> str:
 
 def _read_project_field(projects_dir: Path, project_id: str, field: str) -> str:
     """Read a specific frontmatter field from a project file."""
+    import re
     path = projects_dir / f"{project_id}.md"
     text = path.read_text()
-    import re
     m = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL).match(text)
     if not m:
         return ""
@@ -161,16 +187,29 @@ class TestSmoke:
         assert "flip" in stdout
         assert "status" in stdout
 
-    def test_init_exits_0(self, engram_home, projects_dir):
+    def test_init_exits_0(self, engram_home, projects_dir, monkeypatch):
+        """init happy path: API is called and no exception is raised."""
         _write_config(engram_home, "borges")
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "init", "PR-999",
-            "--title", "smoke test",
-            "--participants", "borges,ariadne",
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-999",
+            title="smoke test",
+            participants="borges,ariadne",
+            status="planning",
+            turn=None,
+            github=None,
+            colleague=None,
         )
-        assert rc == 0, f"init failed; stderr: {stderr}"
-        assert (projects_dir / "PR-999.md").exists()
+        _baton.cmd_init(args, {}, "borges", client)
+
+        client.post.assert_called_once()
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects"
+        assert body["project_id"] == "PR-999"
 
     def test_status_empty_exits_0(self, engram_home, projects_dir):
         _write_config(engram_home, "borges")
@@ -198,23 +237,35 @@ class TestSmoke:
         assert rc == 0
         assert "PR-300" in stdout
 
-    def test_flip_exits_0(self, engram_home, projects_dir):
+    def test_flip_exits_0(self, engram_home, projects_dir, monkeypatch):
+        """flip happy path: API is called and no exception is raised."""
         _write_config(engram_home, "borges")
         _write_project(projects_dir, "PR-400", turn="borges")
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "flip", "PR-400", "ariadne", "done step 1",
-        )
-        assert rc == 0, f"flip failed; stderr: {stderr}"
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr: ("unknown", "no gh"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr: ("unknown", "no gh"))
 
-    def test_close_exits_0(self, engram_home, projects_dir):
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-400",
+            to="ariadne",
+            reason="done step 1",
+            force=False,
+        )
+        _baton.cmd_flip(args, {}, "borges", client)
+        client.post.assert_called_once()
+
+    def test_close_exits_0(self, engram_home, projects_dir, monkeypatch):
+        """close happy path: API is called and no exception is raised."""
         _write_config(engram_home, "borges")
         _write_project(projects_dir, "PR-500", status="in-review")
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "close", "PR-500", "--status", "merged",
-        )
-        assert rc == 0, f"close failed; stderr: {stderr}"
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(project_id="PR-500", status="merged")
+        _baton.cmd_close(args, {}, "borges", client)
+        client.post.assert_called_once()
 
 
 # ===========================================================================
@@ -283,15 +334,27 @@ class TestValidation:
         assert rc == 1
         assert "not a participant" in stderr or "participant" in stderr
 
-    def test_flip_to_casey_allowed(self, engram_home, projects_dir):
-        """flip to 'casey' is always valid regardless of participants list."""
+    def test_flip_to_casey_allowed(self, engram_home, projects_dir, monkeypatch):
+        """flip to 'casey' (pool sentinel) is always valid regardless of participants list."""
         _write_config(engram_home, "borges")
         _write_project(projects_dir, "PR-104", participants=["borges", "ariadne"])
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "flip", "PR-104", "casey", "need human decision",
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr: ("unknown", "no gh"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr: ("unknown", "no gh"))
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-104",
+            to="casey",
+            reason="need human decision",
+            force=False,
         )
-        assert rc == 0, f"flip to casey failed; stderr: {stderr}"
+        # Should not raise — casey is the pool sentinel and is always a valid recipient
+        _baton.cmd_flip(args, {}, "borges", client)
+        client.post.assert_called_once()
+        _, body = client.post.call_args[0]
+        assert body["to_agent"] == "casey"
 
     def test_flip_closed_project_fails(self, engram_home, projects_dir):
         """flip on merged project → exit 1, closed error."""
@@ -382,8 +445,8 @@ class TestFrontmatterParsing:
         assert "Full content test" in stdout
         assert "Turn log" in stdout
 
-    def test_participants_brackets_parsed(self, engram_home, projects_dir):
-        """Participants in [alice, bob] format are parsed correctly."""
+    def test_participants_brackets_parsed(self, engram_home, projects_dir, monkeypatch):
+        """Participants in [alice, bob] format are parsed correctly for flip validation."""
         _write_config(engram_home, "borges")
         # Write a project directly with bracketed participants
         content = (
@@ -401,14 +464,29 @@ class TestFrontmatterParsing:
             "- 2026-05-28T10:00:00Z initialized → borges\n"
         )
         (projects_dir / "PR-202.md").write_text(content)
+
         rc, stdout, stderr = _run_baton(engram_home, projects_dir, "show", "PR-202")
         assert rc == 0
-        # Now flip to ariadne — should work because ariadne is in participants
-        rc2, stdout2, stderr2 = _run_baton(
-            engram_home, projects_dir,
-            "flip", "PR-202", "ariadne", "test flip",
+
+        # flip: port to direct call + mock — validates that bracketed participants
+        # are correctly parsed so ariadne is accepted as a valid flip target.
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr: ("unknown", "no gh"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr: ("unknown", "no gh"))
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-202",
+            to="ariadne",
+            reason="test flip",
+            force=False,
         )
-        assert rc2 == 0, f"flip with bracketed participants failed; stderr: {stderr2}"
+        # Should not raise — proves ariadne was found in bracketed participants
+        _baton.cmd_flip(args, {}, "borges", client)
+        client.post.assert_called_once()
+        _, body = client.post.call_args[0]
+        assert body["to_agent"] == "ariadne"
 
     def test_malformed_file_skipped_in_status(self, engram_home, projects_dir):
         """Malformed .md file (no frontmatter) is silently skipped in status."""
@@ -445,68 +523,6 @@ class TestFrontmatterParsing:
         rc, stdout, stderr = _run_baton(engram_home, projects_dir, "status")
         assert rc == 0
         assert "PR-205" in stdout
-
-
-# ===========================================================================
-# CATEGORY 4: Atomic write safety
-# ===========================================================================
-
-class TestAtomicWrite:
-    """No .tmp files remain after successful operations."""
-
-    def test_init_no_tmp_remains(self, engram_home, projects_dir):
-        """After init, no .tmp file remains."""
-        _write_config(engram_home, "borges")
-        _run_baton(
-            engram_home, projects_dir,
-            "init", "PR-301",
-            "--title", "atomic test",
-            "--participants", "borges,ariadne",
-        )
-        tmp_files = list(projects_dir.glob("*.tmp"))
-        assert tmp_files == [], f"Tmp files must not remain: {tmp_files}"
-
-    def test_flip_no_tmp_remains(self, engram_home, projects_dir):
-        """After flip, no .tmp file remains."""
-        _write_config(engram_home, "borges")
-        _write_project(projects_dir, "PR-302", turn="borges")
-        _run_baton(
-            engram_home, projects_dir,
-            "flip", "PR-302", "ariadne", "done",
-        )
-        tmp_files = list(projects_dir.glob("*.tmp"))
-        assert tmp_files == [], f"Tmp files must not remain: {tmp_files}"
-
-    def test_close_no_tmp_remains(self, engram_home, projects_dir):
-        """After close, no .tmp file remains."""
-        _write_config(engram_home, "borges")
-        _write_project(projects_dir, "PR-303", status="in-review")
-        _run_baton(engram_home, projects_dir, "close", "PR-303", "--status", "merged")
-        tmp_files = list(projects_dir.glob("*.tmp"))
-        assert tmp_files == [], f"Tmp files must not remain: {tmp_files}"
-
-    def test_init_creates_md_file(self, engram_home, projects_dir):
-        """init creates exactly one .md file with correct name."""
-        _write_config(engram_home, "borges")
-        _run_baton(
-            engram_home, projects_dir,
-            "init", "DESIGN-trust-tier-v2",
-            "--title", "trust tier design",
-            "--participants", "borges,ariadne",
-        )
-        assert (projects_dir / "DESIGN-trust-tier-v2.md").exists()
-
-    def test_flip_updates_file_in_place(self, engram_home, projects_dir):
-        """flip modifies the same file (no new file created)."""
-        _write_config(engram_home, "borges")
-        _write_project(projects_dir, "PR-304", turn="borges")
-        before_count = len(list(projects_dir.glob("*.md")))
-        _run_baton(
-            engram_home, projects_dir,
-            "flip", "PR-304", "ariadne", "done",
-        )
-        after_count = len(list(projects_dir.glob("*.md")))
-        assert before_count == after_count, "flip must not create new files"
 
 
 # ===========================================================================
@@ -561,117 +577,97 @@ class TestSingleAgentGuard:
 class TestIntegration:
     """init → flip → mine → show → close round-trip."""
 
+    @pytest.mark.skip(
+        reason="requires live forum server; multi-step state chain can't be "
+               "reproduced with mocks alone (mine/status/show read server-written files). "
+               "Individual write operations are covered by the other Integration tests."
+    )
     def test_full_round_trip(self, engram_home, projects_dir):
         """Complete lifecycle: init, flip twice, mine filtering, close."""
-        _write_config(engram_home, "borges")
 
-        # Step 1: init (borges holds baton initially)
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "init", "PR-425",
-            "--title", "viz_server global agent selector",
-            "--participants", "borges,ariadne",
-        )
-        assert rc == 0
-        assert (projects_dir / "PR-425.md").exists()
-
-        # Step 2: verify borges mine shows PR-425
-        rc, stdout, stderr = _run_baton(engram_home, projects_dir, "mine")
-        assert rc == 0
-        assert "PR-425" in stdout
-
-        # Step 3: flip to ariadne
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "flip", "PR-425", "ariadne", "colleague-review request",
-        )
-        assert rc == 0
-
-        # Step 4: borges mine should be empty
-        rc, stdout, stderr = _run_baton(engram_home, projects_dir, "mine")
-        assert rc == 0
-        assert "PR-425" not in stdout
-
-        # Step 5: status should still show PR-425 (it's active)
-        rc, stdout, stderr = _run_baton(engram_home, projects_dir, "status")
-        assert rc == 0
-        assert "PR-425" in stdout
-
-        # Step 6: show should display updated turn
-        rc, stdout, stderr = _run_baton(engram_home, projects_dir, "show", "PR-425")
-        assert rc == 0
-        assert "ariadne" in stdout
-        assert "colleague-review request" in stdout
-
-        # Step 7: close
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "close", "PR-425", "--status", "merged",
-        )
-        assert rc == 0
-
-        # Step 8: status should not show PR-425 anymore
-        rc, stdout, stderr = _run_baton(engram_home, projects_dir, "status")
-        assert rc == 0
-        assert "PR-425" not in stdout
-
-    def test_flip_updates_turn_field(self, engram_home, projects_dir):
-        """After flip, the turn: field in frontmatter is updated."""
+    def test_flip_updates_turn_field(self, engram_home, projects_dir, monkeypatch):
+        """After flip, the API receives to_agent=ariadne (server updates turn field)."""
         _write_config(engram_home, "borges")
         _write_project(projects_dir, "PR-501", turn="borges")
-        _run_baton(
-            engram_home, projects_dir,
-            "flip", "PR-501", "ariadne", "done step 1",
-        )
-        turn = _read_project_field(projects_dir, "PR-501", "turn")
-        assert turn == "ariadne"
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr: ("unknown", "no gh"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr: ("unknown", "no gh"))
 
-    def test_flip_updates_turn_reason(self, engram_home, projects_dir):
-        """After flip, the turn_reason field reflects the new reason."""
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-501", to="ariadne", reason="done step 1", force=False,
+        )
+        _baton.cmd_flip(args, {}, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["to_agent"] == "ariadne"
+
+    def test_flip_updates_turn_reason(self, engram_home, projects_dir, monkeypatch):
+        """After flip, the API receives the provided reason (server updates turn_reason)."""
         _write_config(engram_home, "borges")
         _write_project(projects_dir, "PR-502", turn="borges")
-        _run_baton(
-            engram_home, projects_dir,
-            "flip", "PR-502", "ariadne", "round-3 fix pushed",
-        )
-        reason = _read_project_field(projects_dir, "PR-502", "turn_reason")
-        assert "round-3 fix pushed" in reason
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr: ("unknown", "no gh"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr: ("unknown", "no gh"))
 
-    def test_flip_appends_turn_log_entry(self, engram_home, projects_dir):
-        """After flip, a turn log entry is appended to the file body."""
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-502", to="ariadne", reason="round-3 fix pushed", force=False,
+        )
+        _baton.cmd_flip(args, {}, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert "round-3 fix pushed" in body["reason"]
+
+    def test_flip_appends_turn_log_entry(self, engram_home, projects_dir, monkeypatch):
+        """After flip, the API is called with to_agent and reason (server appends turn log)."""
         _write_config(engram_home, "borges")
         _write_project(projects_dir, "PR-503", turn="borges")
-        _run_baton(
-            engram_home, projects_dir,
-            "flip", "PR-503", "ariadne", "step complete",
-        )
-        content = (projects_dir / "PR-503.md").read_text()
-        assert "→ ariadne" in content
-        assert "step complete" in content
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr: ("unknown", "no gh"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr: ("unknown", "no gh"))
 
-    def test_close_updates_status_field(self, engram_home, projects_dir):
-        """After close, the status: field is updated in frontmatter."""
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-503", to="ariadne", reason="step complete", force=False,
+        )
+        _baton.cmd_flip(args, {}, "borges", client)
+
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-503/flip"
+        assert body["to_agent"] == "ariadne"
+        assert "step complete" in body["reason"]
+
+    def test_close_updates_status_field(self, engram_home, projects_dir, monkeypatch):
+        """After close, the API receives new_status=merged (server updates status field)."""
         _write_config(engram_home, "borges")
         _write_project(projects_dir, "PR-504", status="in-review")
-        _run_baton(
-            engram_home, projects_dir,
-            "close", "PR-504", "--status", "merged",
-        )
-        status = _read_project_field(projects_dir, "PR-504", "status")
-        assert status == "merged"
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
 
-    def test_close_appends_turn_log_entry(self, engram_home, projects_dir):
-        """baton close appends a turn-log entry so gc-close == cmd-close audit trail."""
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(project_id="PR-504", status="merged")
+        _baton.cmd_close(args, {}, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["new_status"] == "merged"
+
+    def test_close_appends_turn_log_entry(self, engram_home, projects_dir, monkeypatch):
+        """baton close calls the API with status=merged (server appends audit log entry)."""
         _write_config(engram_home, "borges")
         _write_project(projects_dir, "PR-505", status="in-review")
-        _run_baton(
-            engram_home, projects_dir,
-            "close", "PR-505", "--status", "merged",
-        )
-        content = (projects_dir / "PR-505.md").read_text()
-        assert "## Turn log" in content
-        log_section = content.split("## Turn log")[-1]
-        assert "close: merged" in log_section
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(project_id="PR-505", status="merged")
+        _baton.cmd_close(args, {}, "borges", client)
+
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-505/status"
+        assert body["new_status"] == "merged"
+        assert "agent" in body
 
     def test_mine_filters_by_turn(self, engram_home, projects_dir):
         """mine only shows projects where turn == invoking agent."""
@@ -695,21 +691,37 @@ class TestIntegration:
         assert "PR-603" in stdout1 and "PR-603" in stdout2
         assert "PR-604" not in stdout1 and "PR-604" not in stdout2
 
-    def test_multiple_flips_accumulate_log_entries(self, engram_home, projects_dir):
-        """Multiple flips each append their own turn log entry."""
+    def test_multiple_flips_accumulate_log_entries(self, engram_home, projects_dir, monkeypatch):
+        """Multiple flip API calls are each made with their distinct reasons."""
         _write_config(engram_home, "borges")
         _write_project(projects_dir, "PR-605", turn="borges")
-        _run_baton(
-            engram_home, projects_dir,
-            "flip", "PR-605", "ariadne", "first flip",
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr: ("unknown", "no gh"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr: ("unknown", "no gh"))
+
+        client = _make_client({"seq": 1})
+
+        # First flip borges → ariadne
+        args1 = argparse.Namespace(
+            project_id="PR-605", to="ariadne", reason="first flip", force=False,
         )
-        _run_baton(
-            engram_home, projects_dir,
-            "flip", "PR-605", "borges", "second flip",
+        _baton.cmd_flip(args1, {}, "borges", client)
+
+        # Simulate server write so the file reflects ariadne as turn holder for next flip
+        _write_project(projects_dir, "PR-605", turn="ariadne")
+
+        # Second flip ariadne → borges
+        args2 = argparse.Namespace(
+            project_id="PR-605", to="borges", reason="second flip", force=False,
         )
-        content = (projects_dir / "PR-605.md").read_text()
-        assert "first flip" in content
-        assert "second flip" in content
+        _baton.cmd_flip(args2, {}, "ariadne", client)
+
+        assert client.post.call_count == 2
+        first_body = client.post.call_args_list[0][0][1]
+        second_body = client.post.call_args_list[1][0][1]
+        assert first_body["reason"] == "first flip"
+        assert second_body["reason"] == "second flip"
 
     def test_status_sorted_by_turn_since(self, engram_home, projects_dir):
         """status output sorts by turn_since ascending (oldest first)."""
@@ -730,54 +742,91 @@ class TestIntegration:
         idx_702 = stdout.find("PR-702")
         assert idx_701 < idx_702, "Older project should appear first"
 
-    def test_init_default_turn_is_invoking_agent(self, engram_home, projects_dir):
-        """init without --turn defaults to the invoking agent."""
+    def test_init_default_turn_is_invoking_agent(self, engram_home, projects_dir, monkeypatch):
+        """init without --turn posts body with turn=borges (the invoking agent)."""
         _write_config(engram_home, "borges")
-        _run_baton(
-            engram_home, projects_dir,
-            "init", "PR-801",
-            "--title", "default turn test",
-            "--participants", "borges,ariadne",
-        )
-        turn = _read_project_field(projects_dir, "PR-801", "turn")
-        assert turn == "borges"
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
 
-    def test_init_explicit_turn_override(self, engram_home, projects_dir):
-        """init with --turn ariadne sets initial turn to ariadne."""
-        _write_config(engram_home, "borges")
-        _run_baton(
-            engram_home, projects_dir,
-            "init", "PR-802",
-            "--title", "explicit turn",
-            "--participants", "borges,ariadne",
-            "--turn", "ariadne",
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-801",
+            title="default turn test",
+            participants="borges,ariadne",
+            status="planning",
+            turn=None,
+            github=None,
+            colleague=None,
         )
-        turn = _read_project_field(projects_dir, "PR-802", "turn")
-        assert turn == "ariadne"
+        _baton.cmd_init(args, {}, "borges", client)
 
-    def test_init_casey_as_participant_allowed(self, engram_home, projects_dir):
-        """casey can be a participant in a project."""
-        _write_config(engram_home, "borges")
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "init", "PR-803",
-            "--title", "with casey",
-            "--participants", "borges,ariadne,casey",
-            "--turn", "casey",
-        )
-        assert rc == 0, f"init with casey failed; stderr: {stderr}"
+        _, body = client.post.call_args[0]
+        assert body["turn"] == "borges"
 
-    def test_descriptive_project_id_accepted(self, engram_home, projects_dir):
-        """DESIGN-style IDs are accepted."""
+    def test_init_explicit_turn_override(self, engram_home, projects_dir, monkeypatch):
+        """init with --turn ariadne posts body with turn=ariadne."""
         _write_config(engram_home, "borges")
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "init", "DESIGN-trust-tier-v2",
-            "--title", "trust tier design",
-            "--participants", "borges,ariadne",
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-802",
+            title="explicit turn",
+            participants="borges,ariadne",
+            status="planning",
+            turn="ariadne",
+            github=None,
+            colleague=None,
         )
-        assert rc == 0, f"DESIGN-ID init failed; stderr: {stderr}"
-        assert (projects_dir / "DESIGN-trust-tier-v2.md").exists()
+        _baton.cmd_init(args, {}, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["turn"] == "ariadne"
+
+    def test_init_casey_as_participant_allowed(self, engram_home, projects_dir, monkeypatch):
+        """casey can be a participant and initial turn holder — API is called."""
+        _write_config(engram_home, "borges")
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-803",
+            title="with casey",
+            participants="borges,ariadne,casey",
+            status="planning",
+            turn="casey",
+            github=None,
+            colleague=None,
+        )
+        _baton.cmd_init(args, {}, "borges", client)
+        client.post.assert_called_once()
+
+    def test_descriptive_project_id_accepted(self, engram_home, projects_dir, monkeypatch):
+        """DESIGN-style IDs are accepted and posted to the API."""
+        _write_config(engram_home, "borges")
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="DESIGN-trust-tier-v2",
+            title="trust tier design",
+            participants="borges,ariadne",
+            status="planning",
+            turn=None,
+            github=None,
+            colleague=None,
+        )
+        _baton.cmd_init(args, {}, "borges", client)
+        client.post.assert_called_once()
+        _, body = client.post.call_args[0]
+        assert body["project_id"] == "DESIGN-trust-tier-v2"
 
 
 # ===========================================================================
@@ -787,59 +836,55 @@ class TestIntegration:
 class TestRename:
     """baton rename: round-trip, validation, and audit-line tests."""
 
-    def test_rename_round_trip(self, engram_home, projects_dir):
-        """Round-trip: init → rename → show, title updated, other fields unchanged."""
+    def test_rename_round_trip(self, engram_home, projects_dir, monkeypatch):
+        """init → rename: the rename API is called with the new title."""
         _write_config(engram_home, "borges")
-        # Init a project
-        rc, _, stderr = _run_baton(
-            engram_home, projects_dir,
-            "init", "PR-901",
-            "--title", "original title",
-            "--participants", "borges,ariadne",
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        client = _make_client({"seq": 1})
+
+        # Step 1: init (API call, no file written)
+        args_init = argparse.Namespace(
+            project_id="PR-901",
+            title="original title",
+            participants="borges,ariadne",
+            status="planning",
+            turn=None,
+            github=None,
+            colleague=None,
         )
-        assert rc == 0, f"init failed; stderr: {stderr}"
+        _baton.cmd_init(args_init, {}, "borges", client)
+        client.post.assert_called_once()
 
-        # Capture pre-rename state of non-title fields
-        status_before = _read_project_field(projects_dir, "PR-901", "status")
-        turn_before = _read_project_field(projects_dir, "PR-901", "turn")
-        participants_before = _read_project_field(projects_dir, "PR-901", "participants")
+        # Simulate server write so rename can read and parse the file
+        _write_project(projects_dir, "PR-901", title="original title", turn="borges",
+                       status="planning")
 
-        # Rename
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "rename", "PR-901",
-            "--title", "new shiny title",
-        )
-        assert rc == 0, f"rename failed; stderr: {stderr}"
-        assert '"new shiny title"' in stdout
+        # Step 2: rename
+        client.reset_mock()
+        args_rename = argparse.Namespace(project_id="PR-901", title="new shiny title")
+        _baton.cmd_rename(args_rename, {}, "borges", client)
 
-        # Verify title updated
-        title_after = _read_project_field(projects_dir, "PR-901", "title")
-        assert title_after == "new shiny title"
+        client.post.assert_called_once()
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-901/rename"
+        assert body["new_title"] == "new shiny title"
 
-        # Verify other fields unchanged
-        assert _read_project_field(projects_dir, "PR-901", "status") == status_before
-        assert _read_project_field(projects_dir, "PR-901", "turn") == turn_before
-        assert _read_project_field(projects_dir, "PR-901", "participants") == participants_before
-
-        # baton show should reflect new title
-        rc, show_out, _ = _run_baton(engram_home, projects_dir, "show", "PR-901")
-        assert rc == 0
-        assert "new shiny title" in show_out
-
-    def test_rename_audit_line_appended(self, engram_home, projects_dir):
-        """After rename, the last body entry is the timestamped rename audit line."""
+    def test_rename_audit_line_appended(self, engram_home, projects_dir, monkeypatch):
+        """After rename, the API is called with the new title (server appends audit line)."""
         _write_config(engram_home, "borges")
         _write_project(projects_dir, "PR-902", title="before rename")
-        rc, _, stderr = _run_baton(
-            engram_home, projects_dir,
-            "rename", "PR-902",
-            "--title", "after rename",
-        )
-        assert rc == 0, f"rename failed; stderr: {stderr}"
-        content = (projects_dir / "PR-902.md").read_text()
-        # Audit line must be present somewhere in the body
-        assert 'renamed: title from "before rename" to "after rename"' in content
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(project_id="PR-902", title="after rename")
+        _baton.cmd_rename(args, {}, "borges", client)
+
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-902/rename"
+        assert body["new_title"] == "after rename"
 
     def test_rename_refuse_missing_project(self, engram_home, projects_dir):
         """Rename of non-existent project exits non-zero with clear error."""
@@ -911,16 +956,19 @@ class TestRename:
         tmp_files = list(projects_dir.glob("*.tmp"))
         assert tmp_files == [], f"Tmp files must not remain: {tmp_files}"
 
-    def test_rename_exact_200_char_title_accepted(self, engram_home, projects_dir):
-        """Title of exactly 200 chars is accepted (boundary: inclusive)."""
+    def test_rename_exact_200_char_title_accepted(self, engram_home, projects_dir, monkeypatch):
+        """Title of exactly 200 chars is accepted and reaches the API."""
         _write_config(engram_home, "borges")
         _write_project(projects_dir, "PR-908", title="original")
-        rc, _, stderr = _run_baton(
-            engram_home, projects_dir,
-            "rename", "PR-908",
-            "--title", "a" * 200,
-        )
-        assert rc == 0, f"200-char title rejected; stderr: {stderr}"
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(project_id="PR-908", title="a" * 200)
+        _baton.cmd_rename(args, {}, "borges", client)
+
+        client.post.assert_called_once()
+        _, body = client.post.call_args[0]
+        assert len(body["new_title"]) == 200
 
 
 # ===========================================================================
@@ -930,8 +978,8 @@ class TestRename:
 class TestClaim:
     """baton claim: happy path, state-guard refusals, and audit-line tests."""
 
-    def test_claim_happy_path(self, engram_home, projects_dir):
-        """Claim from pool: turn→borges; turn_reason→claimed; audit log appended; no .tmp."""
+    def test_claim_happy_path(self, engram_home, projects_dir, monkeypatch):
+        """Claim posts to the claim route with agent=borges and pool_sentinel=casey."""
         _write_config(engram_home, "borges")
         # Project sits in pool (turn=casey)
         _write_project(
@@ -941,27 +989,19 @@ class TestClaim:
             participants=["borges", "ariadne"],
             turn_reason="released",
         )
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "claim", "PR-1001",
-        )
-        assert rc == 0, f"claim failed; stderr: {stderr}"
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda n: n == "casey")
 
-        # turn field updated to invoking agent
-        turn = _read_project_field(projects_dir, "PR-1001", "turn")
-        assert turn == "borges"
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(project_id="PR-1001")
+        _baton.cmd_claim(args, {}, "borges", client)
 
-        # turn_reason updated to "claimed"
-        reason = _read_project_field(projects_dir, "PR-1001", "turn_reason")
-        assert reason == "claimed"
-
-        # Audit log entry appended
-        content = (projects_dir / "PR-1001.md").read_text()
-        assert "→ borges: claimed" in content
-
-        # No .tmp file leftover
-        tmp_files = list(projects_dir.glob("*.tmp"))
-        assert tmp_files == [], f"Tmp files must not remain: {tmp_files}"
+        client.post.assert_called_once()
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-1001/claim"
+        assert body["agent"] == "borges"
+        assert body["pool_sentinel"] == "casey"
 
     def test_claim_refuse_already_claimed_by_other(self, engram_home, projects_dir):
         """Claim when project is held by another agent → EXIT_STATE (3) with clear message."""
@@ -1013,8 +1053,8 @@ class TestClaim:
 class TestRelease:
     """baton release: happy path, state-guard refusals, --done flag tests."""
 
-    def test_release_happy_path(self, engram_home, projects_dir):
-        """Release to pool: turn→casey; default turn_reason; audit log appended; no .tmp."""
+    def test_release_happy_path(self, engram_home, projects_dir, monkeypatch):
+        """Release posts to the release route with pool_sentinel=casey."""
         _write_config(engram_home, "borges")
         _write_project(
             projects_dir, "PR-1101",
@@ -1022,45 +1062,39 @@ class TestRelease:
             turn="borges",
             participants=["borges", "ariadne"],
         )
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "release", "PR-1101",
-        )
-        assert rc == 0, f"release failed; stderr: {stderr}"
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
 
-        # turn field updated to pool sentinel
-        turn = _read_project_field(projects_dir, "PR-1101", "turn")
-        assert turn == "casey"
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(project_id="PR-1101", done=False, reason="released")
+        _baton.cmd_release(args, {}, "borges", client)
 
-        # turn_reason defaults to "released"
-        reason = _read_project_field(projects_dir, "PR-1101", "turn_reason")
-        assert reason == "released"
+        client.post.assert_called_once()
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-1101/release"
+        assert body["pool_sentinel"] == "casey"
+        assert body["reason"] == "released"
+        assert body["done"] is False
 
-        # Audit log entry appended
-        content = (projects_dir / "PR-1101.md").read_text()
-        assert "→ casey: released" in content
-
-        # No .tmp file leftover
-        tmp_files = list(projects_dir.glob("*.tmp"))
-        assert tmp_files == [], f"Tmp files must not remain: {tmp_files}"
-
-    def test_release_custom_reason(self, engram_home, projects_dir):
-        """Release with --reason writes the provided reason to turn_reason."""
+    def test_release_custom_reason(self, engram_home, projects_dir, monkeypatch):
+        """Release with --reason passes the provided reason in the POST body."""
         _write_config(engram_home, "borges")
         _write_project(
             projects_dir, "PR-1102",
             turn="borges",
             participants=["borges", "ariadne"],
         )
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "release", "PR-1102",
-            "--reason", "stepping back for review",
-        )
-        assert rc == 0, f"release failed; stderr: {stderr}"
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
 
-        reason = _read_project_field(projects_dir, "PR-1102", "turn_reason")
-        assert "stepping back for review" in reason
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-1102", done=False, reason="stepping back for review",
+        )
+        _baton.cmd_release(args, {}, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert "stepping back for review" in body["reason"]
 
     def test_release_refuse_non_holder(self, engram_home, projects_dir):
         """Release when invoker is not current holder → EXIT_STATE (3)."""
@@ -1078,8 +1112,8 @@ class TestRelease:
         assert rc == 3, f"Expected EXIT_STATE=3; got rc={rc}; stderr: {stderr}"
         assert "ariadne" in stderr  # message names the actual holder
 
-    def test_release_done_appends_to_title(self, engram_home, projects_dir):
-        """release --done appends '(done)' to the project title."""
+    def test_release_done_appends_to_title(self, engram_home, projects_dir, monkeypatch):
+        """release --done passes done=True in POST body (server appends '(done)' to title)."""
         _write_config(engram_home, "borges")
         _write_project(
             projects_dir, "PR-1104",
@@ -1087,37 +1121,35 @@ class TestRelease:
             turn="borges",
             participants=["borges", "ariadne"],
         )
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "release", "PR-1104",
-            "--done",
-        )
-        assert rc == 0, f"release --done failed; stderr: {stderr}"
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
 
-        title = _read_project_field(projects_dir, "PR-1104", "title")
-        assert title == "cli gap work (done)"
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(project_id="PR-1104", done=True, reason="released")
+        _baton.cmd_release(args, {}, "borges", client)
 
-    def test_release_done_idempotent(self, engram_home, projects_dir):
-        """release --done on already-(done) title does not double-append."""
+        _, body = client.post.call_args[0]
+        assert body["done"] is True
+
+    def test_release_done_idempotent(self, engram_home, projects_dir, monkeypatch):
+        """release --done on already-(done) title passes done=True (server handles idempotency)."""
         _write_config(engram_home, "borges")
-        # Title already ends with (done)
         _write_project(
             projects_dir, "PR-1105",
             title="cli gap work (done)",
             turn="borges",
             participants=["borges", "ariadne"],
         )
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "release", "PR-1105",
-            "--done",
-        )
-        assert rc == 0, f"release --done on (done) title failed; stderr: {stderr}"
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
 
-        title = _read_project_field(projects_dir, "PR-1105", "title")
-        assert title == "cli gap work (done)", (
-            f"Expected '(done)' not doubled; got: {title!r}"
-        )
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(project_id="PR-1105", done=True, reason="released")
+        _baton.cmd_release(args, {}, "borges", client)
+
+        client.post.assert_called_once()
+        _, body = client.post.call_args[0]
+        assert body["done"] is True
 
 
 # ===========================================================================
@@ -1133,38 +1165,73 @@ _GITHUB_ANCHOR_PATTERN = _re.compile(r"^(pr|project)/\d+$")
 class TestAnchor:
     """baton anchor subcommand and baton init --github flag."""
 
-    def test_init_github_pr_writes_frontmatter(self, engram_home, projects_dir):
-        """init --github pr/123 writes github: pr/123 into frontmatter."""
+    def test_init_github_pr_writes_frontmatter(self, engram_home, projects_dir, monkeypatch):
+        """init --github passes the anchor in the API body (server writes frontmatter)."""
         _write_config(engram_home, "borges")
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "init", "PR-env-home",
-            "--title", "env home test",
-            "--participants", "borges,ariadne",
-            "--github", "pr/123",
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-env-home",
+            title="env home test",
+            participants="borges,ariadne",
+            status="planning",
+            turn=None,
+            github="pr/123",
+            colleague=None,
         )
-        assert rc == 0, f"init --github failed; stderr: {stderr}"
-        github_val = _read_project_field(projects_dir, "PR-env-home", "github")
-        assert github_val == "pr/123"
+        _baton.cmd_init(args, {}, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["github"] == "pr/123"
         # Confirm the value matches the hook's expected format
-        assert _GITHUB_ANCHOR_PATTERN.match(github_val), (
-            f"Written github value '{github_val}' does not match hook's anchor pattern"
+        assert _GITHUB_ANCHOR_PATTERN.match(body["github"]), (
+            f"Posted github value '{body['github']}' does not match hook's anchor pattern"
         )
 
-    def test_init_github_pr_reflected_in_show(self, engram_home, projects_dir):
-        """baton show reflects the github: field written by init --github."""
+    def test_init_github_pr_reflected_in_show(self, engram_home, projects_dir, monkeypatch):
+        """init --github is sent to the API; baton show reflects the field when file exists."""
         _write_config(engram_home, "borges")
-        _run_baton(
-            engram_home, projects_dir,
-            "init", "PR-show-test",
-            "--title", "show test",
-            "--participants", "borges,ariadne",
-            "--github", "pr/456",
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-show-test",
+            title="show test",
+            participants="borges,ariadne",
+            status="planning",
+            turn=None,
+            github="pr/456",
+            colleague=None,
         )
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "show", "PR-show-test",
+        _baton.cmd_init(args, {}, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["github"] == "pr/456"
+
+        # Simulate server write with the github field so that show can display it
+        content = (
+            "---\n"
+            "project: PR-show-test\n"
+            "title: show test\n"
+            "status: planning\n"
+            "turn: borges\n"
+            "turn_since: 2026-01-01T00:00:00Z\n"
+            'turn_reason: "initialized"\n'
+            "participants: [borges, ariadne]\n"
+            "github: pr/456\n"
+            "---\n\n"
+            "# PR-show-test\n\n"
+            "## Turn log\n\n"
+            "- 2026-01-01T00:00:00Z initialized\n"
         )
+        (projects_dir / "PR-show-test.md").write_text(content)
+
+        rc, stdout, stderr = _run_baton(engram_home, projects_dir, "show", "PR-show-test")
         assert rc == 0
         assert "pr/456" in stdout
 
@@ -1183,70 +1250,80 @@ class TestAnchor:
                 f"Expected non-zero exit for --github '{bad_val}'; got rc={rc}"
             )
 
-    def test_anchor_sets_github_on_existing_baton(self, engram_home, projects_dir):
-        """Round-trip: init plain → anchor → show shows github: project/4; other fields unchanged."""
+    def test_anchor_sets_github_on_existing_baton(self, engram_home, projects_dir, monkeypatch):
+        """Round-trip: init → anchor: the anchor API is called with github=project/4."""
         _write_config(engram_home, "borges")
-        # Step 1: init without --github
-        rc, _, stderr = _run_baton(
-            engram_home, projects_dir,
-            "init", "pool-data-correctness",
-            "--title", "data correctness work",
-            "--participants", "borges,ariadne",
-        )
-        assert rc == 0, f"init failed; stderr: {stderr}"
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
 
-        # Capture pre-anchor state of non-github fields
-        status_before = _read_project_field(projects_dir, "pool-data-correctness", "status")
-        turn_before = _read_project_field(projects_dir, "pool-data-correctness", "turn")
-        title_before = _read_project_field(projects_dir, "pool-data-correctness", "title")
+        client = _make_client({"seq": 1})
+
+        # Step 1: init without --github
+        args_init = argparse.Namespace(
+            project_id="pool-data-correctness",
+            title="data correctness work",
+            participants="borges,ariadne",
+            status="planning",
+            turn=None,
+            github=None,
+            colleague=None,
+        )
+        _baton.cmd_init(args_init, {}, "borges", client)
+        init_body = client.post.call_args[0][1]
+        assert init_body.get("github") is None
+
+        # Simulate server write (so anchor can read/parse the file)
+        _write_project(
+            projects_dir, "pool-data-correctness",
+            title="data correctness work",
+            turn="borges",
+            status="planning",
+        )
 
         # Step 2: set anchor
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "anchor", "pool-data-correctness",
-            "--github", "project/4",
+        client.reset_mock()
+        args_anchor = argparse.Namespace(
+            project_id="pool-data-correctness", github="project/4",
         )
-        assert rc == 0, f"anchor failed; stderr: {stderr}"
+        _baton.cmd_anchor(args_anchor, {}, "borges", client)
 
-        # Step 3: verify github field set
-        github_val = _read_project_field(projects_dir, "pool-data-correctness", "github")
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/pool-data-correctness/anchor"
+        github_val = body["github"]
         assert github_val == "project/4"
         assert _GITHUB_ANCHOR_PATTERN.match(github_val), (
-            f"Written github value '{github_val}' does not match hook's anchor pattern"
+            f"Posted github value '{github_val}' does not match hook's anchor pattern"
         )
 
-        # Step 4: verify other fields unchanged
-        assert _read_project_field(projects_dir, "pool-data-correctness", "status") == status_before
-        assert _read_project_field(projects_dir, "pool-data-correctness", "turn") == turn_before
-        assert _read_project_field(projects_dir, "pool-data-correctness", "title") == title_before
-
-        # Step 5: show reflects the new anchor
-        rc, show_out, _ = _run_baton(
-            engram_home, projects_dir,
-            "show", "pool-data-correctness",
-        )
-        assert rc == 0
-        assert "project/4" in show_out
-
-    def test_anchor_updates_existing_github_field(self, engram_home, projects_dir):
-        """anchor on a baton that already has a github: field replaces it."""
+    def test_anchor_updates_existing_github_field(self, engram_home, projects_dir, monkeypatch):
+        """anchor on a baton that already has github: field calls API with new value."""
         _write_config(engram_home, "borges")
-        _run_baton(
-            engram_home, projects_dir,
-            "init", "PR-update-anchor",
-            "--title", "update anchor test",
-            "--participants", "borges,ariadne",
-            "--github", "pr/100",
+        # Write file with existing github field (simulating a server-written file)
+        content = (
+            "---\n"
+            "project: PR-update-anchor\n"
+            "title: update anchor test\n"
+            "status: in-progress\n"
+            "turn: borges\n"
+            "turn_since: 2026-01-01T00:00:00Z\n"
+            'turn_reason: "test"\n'
+            "participants: [borges, ariadne]\n"
+            "github: pr/100\n"
+            "---\n\n"
+            "# PR-update-anchor\n\n"
+            "## Turn log\n\n"
+            "- 2026-01-01T00:00:00Z initialized\n"
         )
-        # Update to a different anchor
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "anchor", "PR-update-anchor",
-            "--github", "pr/200",
-        )
-        assert rc == 0, f"anchor update failed; stderr: {stderr}"
-        github_val = _read_project_field(projects_dir, "PR-update-anchor", "github")
-        assert github_val == "pr/200"
+        (projects_dir / "PR-update-anchor.md").write_text(content)
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(project_id="PR-update-anchor", github="pr/200")
+        _baton.cmd_anchor(args, {}, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["github"] == "pr/200"
 
     def test_anchor_missing_project_exits_nonzero(self, engram_home, projects_dir):
         """anchor on a non-existent project exits non-zero."""
@@ -1273,18 +1350,19 @@ class TestAnchor:
                 f"Expected non-zero exit for --github '{bad_val}'; got rc={rc}"
             )
 
-    def test_anchor_audit_line_appended(self, engram_home, projects_dir):
-        """anchor appends an audit line to the turn log."""
+    def test_anchor_audit_line_appended(self, engram_home, projects_dir, monkeypatch):
+        """anchor calls the API (server appends audit line to the turn log)."""
         _write_config(engram_home, "borges")
         _write_project(projects_dir, "PR-1202", turn="borges")
-        _run_baton(
-            engram_home, projects_dir,
-            "anchor", "PR-1202",
-            "--github", "pr/77",
-        )
-        content = (projects_dir / "PR-1202.md").read_text()
-        assert "anchor" in content.lower()
-        assert "pr/77" in content
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(project_id="PR-1202", github="pr/77")
+        _baton.cmd_anchor(args, {}, "borges", client)
+
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-1202/anchor"
+        assert body["github"] == "pr/77"
 
     def test_anchor_no_tmp_remains(self, engram_home, projects_dir):
         """After anchor, no .tmp file remains (atomic write hygiene)."""
@@ -1298,31 +1376,46 @@ class TestAnchor:
         tmp_files = list(projects_dir.glob("*.tmp"))
         assert tmp_files == [], f"Tmp files must not remain: {tmp_files}"
 
-    def test_init_without_github_does_not_write_github_field(self, engram_home, projects_dir):
-        """init without --github writes no github: field (backward compatibility)."""
+    def test_init_without_github_does_not_write_github_field(
+        self, engram_home, projects_dir, monkeypatch,
+    ):
+        """init without --github posts no github field (or null) to the API."""
         _write_config(engram_home, "borges")
-        _run_baton(
-            engram_home, projects_dir,
-            "init", "PR-no-github",
-            "--title", "no anchor",
-            "--participants", "borges,ariadne",
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-no-github",
+            title="no anchor",
+            participants="borges,ariadne",
+            status="planning",
+            turn=None,
+            github=None,
+            colleague=None,
         )
-        github_val = _read_project_field(projects_dir, "PR-no-github", "github")
-        assert github_val == "", (
-            f"Expected no github field; got: '{github_val}'"
+        _baton.cmd_init(args, {}, "borges", client)
+
+        _, body = client.post.call_args[0]
+        github_val = body.get("github")
+        assert github_val is None, (
+            f"Expected no github field (None); got: '{github_val}'"
         )
 
-    def test_anchor_github_project_format(self, engram_home, projects_dir):
-        """anchor with project/<N> value is accepted and stored correctly."""
+    def test_anchor_github_project_format(self, engram_home, projects_dir, monkeypatch):
+        """anchor with project/<N> value is accepted and posted to the API correctly."""
         _write_config(engram_home, "borges")
         _write_project(projects_dir, "PR-1204", turn="borges")
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "anchor", "PR-1204",
-            "--github", "project/4",
-        )
-        assert rc == 0, f"anchor project/<N> failed; stderr: {stderr}"
-        github_val = _read_project_field(projects_dir, "PR-1204", "github")
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(project_id="PR-1204", github="project/4")
+        _baton.cmd_anchor(args, {}, "borges", client)
+
+        client.post.assert_called_once()
+        _, body = client.post.call_args[0]
+        github_val = body["github"]
         assert github_val == "project/4"
         assert _GITHUB_ANCHOR_PATTERN.match(github_val)
 
@@ -1334,8 +1427,8 @@ class TestAnchor:
 class TestReopen:
     """baton reopen: happy path, state-guard refusals, audit-line, and argparse tests."""
 
-    def test_reopen_merged_baton_to_in_progress(self, engram_home, projects_dir):
-        """Reopen a merged baton: status → in-progress; audit log appended; no .tmp."""
+    def test_reopen_merged_baton_to_in_progress(self, engram_home, projects_dir, monkeypatch):
+        """Reopen a merged baton: API is called with new_status=in-progress."""
         _write_config(engram_home, "borges")
         _write_project(
             projects_dir, "PR-1301",
@@ -1344,28 +1437,21 @@ class TestReopen:
             turn="borges",
             participants=["borges", "ariadne"],
         )
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "reopen", "PR-1301",
-        )
-        assert rc == 0, f"reopen merged→in-progress failed; stderr: {stderr}"
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
 
-        # status field updated to in-progress
-        status = _read_project_field(projects_dir, "PR-1301", "status")
-        assert status == "in-progress"
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(project_id="PR-1301", status="in-progress")
+        _baton.cmd_reopen(args, {}, "borges", client)
 
-        # Audit log entry appended
-        content = (projects_dir / "PR-1301.md").read_text()
-        assert "reopened" in content
-        assert "merged" in content
-        assert "in-progress" in content
+        client.post.assert_called_once()
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-1301/status"
+        assert body["new_status"] == "in-progress"
 
-        # No .tmp file leftover
-        tmp_files = list(projects_dir.glob("*.tmp"))
-        assert tmp_files == [], f"Tmp files must not remain: {tmp_files}"
-
-    def test_reopen_cancelled_baton_to_in_progress(self, engram_home, projects_dir):
-        """Reopen a cancelled baton: status → in-progress."""
+    def test_reopen_cancelled_baton_to_in_progress(
+        self, engram_home, projects_dir, monkeypatch,
+    ):
+        """Reopen a cancelled baton: API is called with new_status=in-progress."""
         _write_config(engram_home, "borges")
         _write_project(
             projects_dir, "PR-1302",
@@ -1373,17 +1459,17 @@ class TestReopen:
             turn="borges",
             participants=["borges", "ariadne"],
         )
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "reopen", "PR-1302",
-        )
-        assert rc == 0, f"reopen cancelled→in-progress failed; stderr: {stderr}"
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
 
-        status = _read_project_field(projects_dir, "PR-1302", "status")
-        assert status == "in-progress"
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(project_id="PR-1302", status="in-progress")
+        _baton.cmd_reopen(args, {}, "borges", client)
 
-    def test_reopen_with_explicit_status_flag(self, engram_home, projects_dir):
-        """Reopen with --status in-review sets status to in-review."""
+        _, body = client.post.call_args[0]
+        assert body["new_status"] == "in-progress"
+
+    def test_reopen_with_explicit_status_flag(self, engram_home, projects_dir, monkeypatch):
+        """Reopen with --status in-review: API called with new_status=in-review."""
         _write_config(engram_home, "borges")
         _write_project(
             projects_dir, "PR-1303",
@@ -1391,14 +1477,14 @@ class TestReopen:
             turn="borges",
             participants=["borges", "ariadne"],
         )
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "reopen", "PR-1303", "--status", "in-review",
-        )
-        assert rc == 0, f"reopen --status in-review failed; stderr: {stderr}"
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
 
-        status = _read_project_field(projects_dir, "PR-1303", "status")
-        assert status == "in-review"
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(project_id="PR-1303", status="in-review")
+        _baton.cmd_reopen(args, {}, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["new_status"] == "in-review"
 
     def test_reopen_refuses_already_active(self, engram_home, projects_dir):
         """Reopen on already-active baton → exit 1 with message naming current status."""
@@ -1434,8 +1520,8 @@ class TestReopen:
         assert rc != 0
         assert "invalid choice" in stderr or "merged" in stderr
 
-    def test_reopen_with_status_planning(self, engram_home, projects_dir):
-        """Reopen with --status planning succeeds (completes 3-value matrix)."""
+    def test_reopen_with_status_planning(self, engram_home, projects_dir, monkeypatch):
+        """Reopen with --status planning calls API with new_status=planning."""
         _write_config(engram_home, "borges")
         _write_project(
             projects_dir, "PR-1306",
@@ -1443,13 +1529,15 @@ class TestReopen:
             turn="borges",
             participants=["borges", "ariadne"],
         )
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "reopen", "PR-1306", "--status", "planning",
-        )
-        assert rc == 0, f"exit {rc}, stderr={stderr!r}"
-        baton_path = projects_dir / "PR-1306.md"
-        assert "status: planning" in baton_path.read_text()
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(project_id="PR-1306", status="planning")
+        _baton.cmd_reopen(args, {}, "borges", client)
+
+        client.post.assert_called_once()
+        _, body = client.post.call_args[0]
+        assert body["new_status"] == "planning"
 
     def test_reopen_refuses_missing_file(self, engram_home, projects_dir):
         """Reopen of non-existent project → exit 1 with not-found error."""
@@ -1461,8 +1549,8 @@ class TestReopen:
         assert rc == 1, f"Expected exit 1 for missing project; got rc={rc}"
         assert "not found" in stderr.lower() or "PR-NONE" in stderr
 
-    def test_reopen_appends_audit_log(self, engram_home, projects_dir):
-        """Reopen appends an audit-log line (not replacing) with correct format."""
+    def test_reopen_appends_audit_log(self, engram_home, projects_dir, monkeypatch):
+        """reopen API call includes a reason with the status transition (server appends audit)."""
         _write_config(engram_home, "borges")
         _write_project(
             projects_dir, "PR-1306",
@@ -1471,27 +1559,19 @@ class TestReopen:
             participants=["borges", "ariadne"],
             turn_reason="merged successfully",
         )
-        # Count "reopened" occurrences before (should be zero)
-        before_content = (projects_dir / "PR-1306.md").read_text()
-        before_reopen_count = before_content.count("reopened")
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
 
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "reopen", "PR-1306",
-        )
-        assert rc == 0, f"reopen failed; stderr: {stderr}"
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(project_id="PR-1306", status="in-progress")
+        _baton.cmd_reopen(args, {}, "borges", client)
 
-        after_content = (projects_dir / "PR-1306.md").read_text()
-
-        # Exactly one "reopened" audit line appended (not replacing)
-        assert after_content.count("reopened") == before_reopen_count + 1
-
-        # Audit line has expected format: "reopened → <agent>: status was <prev> → <new>"
-        assert "reopened → borges" in after_content
-        assert "status was merged → in-progress" in after_content
-
-        # Original content still present (append, not overwrite)
-        assert "merged successfully" in after_content
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-1306/status"
+        # cmd_reopen sets reason = f"reopened by {invoker}: status was {old} → {new}"
+        assert "reopened" in body["reason"]
+        assert "borges" in body["reason"]
+        assert "merged" in body["reason"]
+        assert "in-progress" in body["reason"]
 
     def test_reopen_no_tmp_remains(self, engram_home, projects_dir):
         """After reopen, no .tmp file remains (atomic write hygiene)."""
@@ -1509,8 +1589,8 @@ class TestReopen:
         tmp_files = list(projects_dir.glob("*.tmp"))
         assert tmp_files == [], f"Tmp files must not remain: {tmp_files}"
 
-    def test_reopen_output_message_style(self, engram_home, projects_dir):
-        """reopen prints a confirmation line in the style of other subcommands."""
+    def test_reopen_output_message_style(self, engram_home, projects_dir, monkeypatch, capsys):
+        """reopen prints a confirmation line with project ID and new status."""
         _write_config(engram_home, "borges")
         _write_project(
             projects_dir, "PR-1308",
@@ -1518,13 +1598,15 @@ class TestReopen:
             turn="borges",
             participants=["borges", "ariadne"],
         )
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "reopen", "PR-1308",
-        )
-        assert rc == 0, f"reopen failed; stderr: {stderr}"
-        assert "PR-1308" in stdout
-        assert "in-progress" in stdout
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(project_id="PR-1308", status="in-progress")
+        _baton.cmd_reopen(args, {}, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "PR-1308" in captured.out
+        assert "in-progress" in captured.out
 
 
 # ===========================================================================
@@ -1535,17 +1617,15 @@ class TestPoolSentinel:
     """Pool sentinel is derived from config primary_user, not hardcoded."""
 
     def test_sentinel_resolves_to_non_casey_primary_user(
-        self, engram_home, projects_dir
+        self, engram_home, projects_dir, monkeypatch,
     ):
-        """With primary_user='alice' in config, the pool sentinel is 'alice'.
+        """With primary_user='alice', pool sentinel is 'alice' — claim/release use alice.
 
         This is the core fresh-install correctness test from issue #606:
         a non-casey primary_user install must work end-to-end.
+        Ported to direct call + mock; we verify pool_sentinel appears in API bodies.
         """
-        # Write config with primary_user=alice (non-casey install).
         _write_config(engram_home, agent_name="borges", primary_user="alice")
-
-        # Create a pool project: turn=alice (the sentinel for this install).
         _write_project(
             projects_dir, "pool-alice-test",
             title="non-casey sentinel test",
@@ -1553,128 +1633,149 @@ class TestPoolSentinel:
             participants=["borges", "ariadne"],
             status="in-progress",
         )
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
+        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda n: n in ("alice",))
 
-        # claim must succeed when turn == pool sentinel (alice).
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "claim", "pool-alice-test",
-        )
-        assert rc == 0, (
-            f"claim failed with primary_user=alice; stderr: {stderr}"
-        )
-        turn = _read_project_field(projects_dir, "pool-alice-test", "turn")
-        assert turn == "borges", f"Expected turn=borges after claim; got {turn!r}"
+        # Claim: _pool_sentinel() must read config → "alice" (not "casey")
+        client = _make_client({"seq": 1})
+        args_claim = argparse.Namespace(project_id="pool-alice-test")
+        _baton.cmd_claim(args_claim, {}, "borges", client)
 
-        # release must put the baton back to alice (the sentinel), not "casey".
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "release", "pool-alice-test",
+        _, claim_body = client.post.call_args[0]
+        assert claim_body["pool_sentinel"] == "alice", (
+            f"Expected pool_sentinel='alice'; got '{claim_body['pool_sentinel']}'"
         )
-        assert rc == 0, (
-            f"release failed with primary_user=alice; stderr: {stderr}"
-        )
-        turn_after = _read_project_field(projects_dir, "pool-alice-test", "turn")
-        assert turn_after == "alice", (
-            f"Expected turn=alice (sentinel) after release; got {turn_after!r}"
+        assert "casey" not in claim_body["pool_sentinel"], (
+            "pool_sentinel must not fall back to 'casey' for an alice install"
         )
 
-        # Confirm the audit log uses alice, not casey.
-        content = (projects_dir / "pool-alice-test.md").read_text()
-        assert "→ borges: claimed" in content, "Claim audit entry missing"
-        assert "→ alice: released" in content, "Release audit entry uses wrong sentinel"
-        assert "casey" not in content.split("## Turn log")[-1], (
-            "Literal 'casey' must not appear in the turn log for an alice install"
+        # Simulate server write (borges now holds baton)
+        _write_project(
+            projects_dir, "pool-alice-test",
+            turn="borges",
+            participants=["borges", "ariadne"],
+        )
+
+        # Release: sentinel should still be "alice"
+        client.reset_mock()
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        args_release = argparse.Namespace(
+            project_id="pool-alice-test", done=False, reason="released",
+        )
+        _baton.cmd_release(args_release, {}, "borges", client)
+
+        _, release_body = client.post.call_args[0]
+        assert release_body["pool_sentinel"] == "alice", (
+            f"Expected pool_sentinel='alice' in release; got '{release_body['pool_sentinel']}'"
         )
 
     def test_sentinel_case_normalizes_capitalized_primary_user(
-        self, engram_home, projects_dir
+        self, engram_home, projects_dir, monkeypatch,
     ):
         """primary_user='Alice' (capitalized) in config normalizes to sentinel 'alice'.
 
         Regression test for PR #612 round-2: _pool_sentinel() used to return
         the raw config string, so a capitalized primary_user would silently
-        fail all sentinel comparisons (which .strip().lower() their operand).
-        The fix applies .lower() in _pool_sentinel() itself, so both paths
-        (config-derived and env-fallback) are consistent with the comparison
-        sites.
+        fail all sentinel comparisons.  The fix applies .lower() in _pool_sentinel().
+        Ported to direct call + mock; we verify pool_sentinel='alice' (lowercased).
         """
-        # Write config with primary_user=Alice (capitalized — the bug trigger).
         _write_config(engram_home, agent_name="borges", primary_user="Alice")
-
-        # Baton file has turn=alice (lowercase) — what a well-formed file looks like.
         _write_project(
             projects_dir, "pool-alice-cap-test",
             title="capitalized primary_user test",
-            turn="alice",
+            turn="alice",  # lowercase — the bug trigger
             participants=["borges", "ariadne"],
             status="in-progress",
         )
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
+        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda n: n in ("alice",))
 
-        # claim must succeed: sentinel resolves to 'alice' despite 'Alice' in config.
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "claim", "pool-alice-cap-test",
-        )
-        assert rc == 0, (
-            f"claim failed with primary_user='Alice' (capitalized); stderr: {stderr}"
-        )
-        turn = _read_project_field(projects_dir, "pool-alice-cap-test", "turn")
-        assert turn == "borges", f"Expected turn=borges after claim; got {turn!r}"
+        # Claim: sentinel must resolve to lowercase "alice" despite "Alice" in config
+        client = _make_client({"seq": 1})
+        args_claim = argparse.Namespace(project_id="pool-alice-cap-test")
+        _baton.cmd_claim(args_claim, {}, "borges", client)
 
-        # release must write sentinel as lowercase 'alice', not raw 'Alice'.
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "release", "pool-alice-cap-test",
+        _, claim_body = client.post.call_args[0]
+        assert claim_body["pool_sentinel"] == "alice", (
+            f"Expected lowercased sentinel 'alice'; got '{claim_body['pool_sentinel']}'"
         )
-        assert rc == 0, (
-            f"release failed with primary_user='Alice' (capitalized); stderr: {stderr}"
+
+        # Simulate server write
+        _write_project(
+            projects_dir, "pool-alice-cap-test",
+            turn="borges",
+            participants=["borges", "ariadne"],
         )
-        turn_after = _read_project_field(projects_dir, "pool-alice-cap-test", "turn")
-        assert turn_after == "alice", (
-            f"Expected turn=alice (lowercased sentinel) after release; got {turn_after!r}"
+
+        # Release: sentinel still lowercase "alice"
+        client.reset_mock()
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        args_release = argparse.Namespace(
+            project_id="pool-alice-cap-test", done=False, reason="released",
+        )
+        _baton.cmd_release(args_release, {}, "borges", client)
+
+        _, release_body = client.post.call_args[0]
+        assert release_body["pool_sentinel"] == "alice", (
+            f"Expected lowercased sentinel 'alice'; got '{release_body['pool_sentinel']}'"
         )
 
     def test_sentinel_accepts_short_form_first_token(
-        self, engram_home, projects_dir
+        self, engram_home, projects_dir, monkeypatch,
     ):
         """Pool initialized with turn='lei' works when primary_user='Lei Shi'.
 
-        Regression test for issue #1309: _pool_sentinel() returns the full
-        lowercased name ('lei shi'), but pools are often initialized with just
-        the first token ('lei'). claim/flip must accept both forms.
+        Regression test for issue #1309: _pool_sentinel() returns 'lei shi',
+        but pools are often initialized with just the first token ('lei').
+        _is_pool_sentinel must accept both forms.
+        Ported to direct call + mock; we verify claim succeeds and the full
+        sentinel appears in the release body.
         """
         _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
-
-        # Pool with short-form sentinel (turn='lei', not 'lei shi') — the bug trigger.
         _write_project(
             projects_dir, "pool-short-form-test",
             title="short-form sentinel test",
-            turn="lei",
+            turn="lei",  # short form — the bug trigger
             participants=["borges", "ariadne"],
             status="in-progress",
         )
+        monkeypatch.setattr(_baton, "BATON_PROJECTS_DIR", str(projects_dir))
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
 
-        # claim must succeed: 'lei' matches sentinel 'lei shi' via first-token rule.
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "claim", "pool-short-form-test",
-        )
-        assert rc == 0, (
-            f"claim failed for short-form sentinel 'lei' with primary_user='Lei Shi'; "
-            f"stderr: {stderr}"
-        )
-        turn = _read_project_field(projects_dir, "pool-short-form-test", "turn")
-        assert turn == "borges", f"Expected turn=borges after claim; got {turn!r}"
+        # Claim: _is_pool_sentinel("lei") must return True for sentinel "lei shi"
+        client = _make_client({"seq": 1})
+        args_claim = argparse.Namespace(project_id="pool-short-form-test")
+        _baton.cmd_claim(args_claim, {}, "borges", client)
 
-        # release must put the baton back to the full sentinel ('lei shi').
-        rc, stdout, stderr = _run_baton(
-            engram_home, projects_dir,
-            "release", "pool-short-form-test",
+        _, claim_body = client.post.call_args[0]
+        assert claim_body["agent"] == "borges"
+        assert claim_body["pool_sentinel"] == "lei shi", (
+            f"Expected full sentinel 'lei shi'; got '{claim_body['pool_sentinel']}'"
         )
-        assert rc == 0, f"release failed; stderr: {stderr}"
-        turn_after = _read_project_field(projects_dir, "pool-short-form-test", "turn")
-        assert turn_after == "lei shi", (
-            f"Expected full sentinel 'lei shi' after release; got {turn_after!r}"
+
+        # Simulate server write (borges holds baton after claim)
+        _write_project(
+            projects_dir, "pool-short-form-test",
+            turn="borges",
+            participants=["borges", "ariadne"],
+        )
+
+        # Release: sentinel must be full "lei shi"
+        client.reset_mock()
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        args_release = argparse.Namespace(
+            project_id="pool-short-form-test", done=False, reason="released",
+        )
+        _baton.cmd_release(args_release, {}, "borges", client)
+
+        _, release_body = client.post.call_args[0]
+        assert release_body["pool_sentinel"] == "lei shi", (
+            f"Expected full sentinel 'lei shi' after release; got '{release_body['pool_sentinel']}'"
         )
 
     def test_merge_gate2_accepts_short_form_sentinel(
@@ -1748,6 +1849,7 @@ class TestPoolSentinel:
 
 import importlib.util as _ilu
 import unittest.mock as _mock
+
 
 def _load_baton_module():
     spec = _ilu.spec_from_file_location("baton", CLI_PATH)

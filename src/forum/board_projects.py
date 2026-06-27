@@ -29,7 +29,12 @@ from typing import Any, Optional
 # ---------------------------------------------------------------------------
 
 # Default projects directory — override via BATON_PROJECTS_DIR env var in tests.
-_DEFAULT_PROJECTS_DIR = "/home/agents-shared/projects"
+# Post-Phase-3 the coord store lives at $FORUM_HOME/projects; fall back to
+# ~/.forum/projects (mirrors store_file.default_store_root semantics).
+def _default_projects_dir() -> Path:
+    forum_home = os.environ.get("FORUM_HOME", "").strip()
+    root = Path(forum_home) if forum_home else (Path.home() / ".forum")
+    return root / "projects"
 
 # Valid status values from baton protocol.
 VALID_STATUSES = {"planning", "in-progress", "in-review", "merged", "cancelled"}
@@ -294,7 +299,7 @@ def _effective_status(
 def _projects_dir() -> Path:
     """Return the baton projects directory path."""
     env = os.environ.get("BATON_PROJECTS_DIR", "").strip()
-    return Path(env) if env else Path(_DEFAULT_PROJECTS_DIR)
+    return Path(env) if env else _default_projects_dir()
 
 
 def read_project_board(projects_dir: Optional[Path] = None) -> list[dict[str, Any]]:
@@ -305,7 +310,7 @@ def read_project_board(projects_dir: Optional[Path] = None) -> list[dict[str, An
 
     Args:
         projects_dir: Override directory (for tests). Defaults to
-            $BATON_PROJECTS_DIR or /home/agents-shared/projects.
+            $BATON_PROJECTS_DIR or $FORUM_HOME/projects (fallback: ~/.forum/projects).
 
     Returns:
         List of dicts with keys:

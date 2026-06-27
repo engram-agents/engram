@@ -36,10 +36,21 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+# Phase 3: thin-client imports — same pattern as tools/ia.py.
+# Explicit path insert ensures this import works when baton.py is loaded via
+# importlib (e.g. in direct-import tests) — Python's automatic script-dir
+# addition only fires when baton.py is the __main__ entry point.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from forum_api import (
+    ForumClient,
+    ForumHttpError,
+    ForumNetworkError,
+    forum_url_from_config,
+)
 
 # ---------------------------------------------------------------------------
 # Environment + paths
@@ -49,7 +60,12 @@ ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
     or str(Path.home() / ".engram")
 )
-BATON_PROJECTS_DIR = os.environ.get("BATON_PROJECTS_DIR", "/home/agents-shared/projects")
+_forum_home_env = os.environ.get("FORUM_HOME", "").strip()
+_FORUM_HOME = _forum_home_env if _forum_home_env else str(Path.home() / ".forum")
+BATON_PROJECTS_DIR = os.environ.get(
+    "BATON_PROJECTS_DIR",
+    str(Path(_FORUM_HOME) / "projects"),
+)
 
 # Exit codes
 EXIT_OK = 0
@@ -175,11 +191,6 @@ def _format_participants(participants: list) -> str:
     return "[" + ", ".join(participants) + "]"
 
 
-def _now_iso() -> str:
-    """Return current UTC time as ISO-8601 with Z suffix."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def _parse_iso(ts_str: str) -> Optional[datetime]:
     """Parse an ISO-8601 UTC timestamp; return None on failure."""
     if not ts_str:
@@ -238,69 +249,6 @@ def _project_path(project_id: str, projects_dir: Optional[Path] = None) -> Path:
     return projects_dir / f"{project_id}.md"
 
 
-# ---------------------------------------------------------------------------
-# Atomic write helper
-# ---------------------------------------------------------------------------
-
-def _atomic_write(dest: Path, content: str) -> None:
-    """Write content to dest atomically via tmp + os.rename.
-
-    Writes to <dest>.tmp first, then renames to dest. On POSIX systems
-    os.rename is atomic within the same filesystem — a concurrent reader
-    cannot see a partial file.
-    """
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
-    try:
-        tmp.write_text(content, encoding="utf-8")
-        os.rename(str(tmp), str(dest))
-    except OSError as e:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        print(f"baton: write failed: {e}", file=sys.stderr)
-        sys.exit(EXIT_IO)
-
-
-# ---------------------------------------------------------------------------
-# Frontmatter replacement helper
-# ---------------------------------------------------------------------------
-
-def _update_frontmatter(text: str, updates: dict) -> str:
-    """Apply updates dict to frontmatter fields; return full updated text.
-
-    Replaces individual frontmatter values in-place (preserving order of
-    other fields and the body). If a key from updates doesn't exist in the
-    frontmatter, it is appended before the closing ---.
-    """
-    m = _FRONTMATTER_RE.match(text)
-    if not m:
-        # No frontmatter — can't update; caller must handle
-        return text
-
-    fm_block = m.group(1)
-    body = text[m.end():]
-    fm_lines = fm_block.split("\n")
-    found_keys = set()
-
-    new_lines = []
-    for line in fm_lines:
-        fm = _FRONTMATTER_FIELD_RE.match(line)
-        if fm:
-            key = fm.group(1).strip().lower()
-            if key in updates:
-                new_lines.append(f"{key}: {updates[key]}")
-                found_keys.add(key)
-                continue
-        new_lines.append(line)
-
-    # Append any keys that weren't already present
-    for key, val in updates.items():
-        if key not in found_keys:
-            new_lines.append(f"{key}: {val}")
-
-    new_fm_block = "\n".join(new_lines)
-    return f"---\n{new_fm_block}\n---\n{body}"
 
 
 # ---------------------------------------------------------------------------
@@ -581,44 +529,6 @@ def _pr_approval_state(pr_number: str) -> tuple:
     )
 
 
-# ---------------------------------------------------------------------------
-# Turn log helpers
-# ---------------------------------------------------------------------------
-
-def _append_turn_log(body: str, entry: str) -> str:
-    """Append a new turn log entry to the body.
-
-    Finds the '## Turn log' section and appends. Creates the section if
-    absent.
-    """
-    section_header = "## Turn log"
-    if section_header in body:
-        # Append at end of the turn log section
-        return body.rstrip() + "\n" + entry + "\n"
-    else:
-        # Create the section
-        separator = "\n\n" if body.strip() else ""
-        return body.rstrip() + separator + f"\n{section_header}\n\n" + entry + "\n"
-
-
-def _close_baton(dest: Path, text: str, new_status: str, reason: str) -> None:
-    """Set a baton's status to a closed state and append a turn-log entry.
-
-    Shared by cmd_close and cmd_gc so gc-closed batons have the same audit
-    trail format as cmd-closed ones.
-    """
-    now = _now_iso()
-    updated_text = _update_frontmatter(text, {"status": new_status})
-    _updated_fields, updated_body = _parse_frontmatter(updated_text)
-    log_entry = f"- {now} close: {new_status} — {reason}"
-    final_body = _append_turn_log(updated_body, log_entry)
-    fm_m = _FRONTMATTER_RE.match(updated_text)
-    if fm_m:
-        fm_section = updated_text[:fm_m.end()]
-        final_content = fm_section.rstrip("\n") + "\n" + final_body
-    else:
-        final_content = updated_text
-    _atomic_write(dest, final_content)
 
 
 # ---------------------------------------------------------------------------
@@ -691,7 +601,7 @@ def _scan_projects(
 # Subcommand: init
 # ---------------------------------------------------------------------------
 
-def cmd_init(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     projects_dir = Path(BATON_PROJECTS_DIR)
 
     if not projects_dir.is_dir():
@@ -780,44 +690,30 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str) -> None:
             )
             sys.exit(EXIT_VALIDATION)
 
-    now = _now_iso()
-    participants_str = _format_participants(participants)
     title = args.title or project_id
-
-    # Build the initial reason
     init_reason = f"project initialized by {agent_name or 'unknown'}"
 
-    content_lines = [
-        "---",
-        f"project: {project_id}",
-        f"title: {title}",
-        f"status: {status}",
-        f"turn: {initial_turn}",
-        f"turn_since: {now}",
-        f'turn_reason: "{init_reason}"',
-        f"participants: {participants_str}",
-    ]
-    if github_anchor:
-        content_lines.append(f"github: {github_anchor}")
-    content_lines += [
-        "---",
-        "",
-        f"# {project_id} — {title}",
-        "",
-    ]
-    if colleague_note:
-        content_lines.append(colleague_note)
-    content_lines += [
-        "",
-        "## Turn log",
-        "",
-        f"- {now} initialized → {initial_turn}: {init_reason}",
-        "",
-    ]
-    content = "\n".join(content_lines)
-
-    _atomic_write(dest, content)
-    print(f"baton init: created {dest}")
+    try:
+        client.post("/api/projects", {
+            "agent": agent_name or "baton",
+            "project_id": project_id,
+            "title": title,
+            "status": status,
+            "turn": initial_turn,
+            "turn_reason": init_reason,
+            "github": github_anchor,
+            "participants": participants,
+        })
+    except ForumNetworkError as e:
+        print(f"baton init: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 409:
+            print(f"baton init: project already exists: {project_id}", file=sys.stderr)
+        else:
+            print(f"baton init: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
+    print(f"baton init: created {project_id} (via forum API)")
     print(f"  project:      {project_id}")
     print(f"  title:        {title}")
     print(f"  participants: {', '.join(participants)}")
@@ -855,7 +751,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 # Subcommand: flip
 # ---------------------------------------------------------------------------
 
-def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     projects_dir = Path(BATON_PROJECTS_DIR)
     project_id = args.project_id
     to_agent = args.to.strip().lower()
@@ -1023,37 +919,26 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
             )
         # fresh: proceed silently
 
-    now = _now_iso()
     from_agent = fields.get("turn", agent_name or "unknown").strip().lower()
 
-    # Update frontmatter
-    updates = {
-        "turn": to_agent,
-        "turn_since": now,
-        "turn_reason": f'"{reason}"',
-    }
-    updated_text = _update_frontmatter(text, updates)
-
-    # Re-parse to get body after frontmatter update
-    _updated_fields, updated_body = _parse_frontmatter(updated_text)
-
-    # Append turn log entry
-    log_entry = f"- {now} {from_agent} → {to_agent}: {reason}"
-    final_body = _append_turn_log(updated_body, log_entry)
-
-    # Reconstruct final content: frontmatter + updated body
-    fm_m = _FRONTMATTER_RE.match(updated_text)
-    if fm_m:
-        fm_section = updated_text[:fm_m.end()]
-        final_content = fm_section.rstrip("\n") + "\n" + final_body
-    else:
-        final_content = updated_text
-
-    _atomic_write(dest, final_content)
+    try:
+        client.post(f"/api/projects/{project_id}/flip", {
+            "agent": agent_name or from_agent,
+            "to_agent": to_agent,
+            "reason": reason,
+        })
+    except ForumNetworkError as e:
+        print(f"baton flip: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton flip: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        print(f"baton flip: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
     print(f"baton flip: {project_id} → {to_agent}")
     print(f"  from:   {from_agent}")
     print(f"  reason: {reason}")
-    print(f"  at:     {now}")
 
 
 # ---------------------------------------------------------------------------
@@ -1128,7 +1013,7 @@ def _is_pool_sentinel(name: str) -> bool:
     return bool(first_token) and name == first_token
 
 
-def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     """Claim a Project-layer baton from the pool.
 
     Equivalent to 'baton flip <project-id> <self> "claimed"' but makes the
@@ -1209,33 +1094,21 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_VALIDATION)
 
-    now = _now_iso()
     self_name = agent_name.lower()
-
-    # Atomic write: turn → self, turn_since → now, turn_reason → "claimed"
-    updates = {
-        "turn": self_name,
-        "turn_since": now,
-        "turn_reason": '"claimed"',
-    }
-    updated_text = _update_frontmatter(text, updates)
-
-    # Re-parse to get body after frontmatter update
-    _updated_fields, updated_body = _parse_frontmatter(updated_text)
-
-    # Append turn log entry
-    log_entry = f"- {now} {_pool_sentinel()} → {self_name}: claimed"
-    final_body = _append_turn_log(updated_body, log_entry)
-
-    # Reconstruct final content: frontmatter + updated body
-    fm_m = _FRONTMATTER_RE.match(updated_text)
-    if fm_m:
-        fm_section = updated_text[:fm_m.end()]
-        final_content = fm_section.rstrip("\n") + "\n" + final_body
-    else:
-        final_content = updated_text
-
-    _atomic_write(dest, final_content)
+    try:
+        client.post(f"/api/projects/{project_id}/claim", {
+            "agent": self_name,
+            "pool_sentinel": _pool_sentinel(),
+        })
+    except ForumNetworkError as e:
+        print(f"baton claim: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton claim: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        print(f"baton claim: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
     print(f"baton claim: {project_id} → {self_name}")
 
 
@@ -1243,7 +1116,7 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 # Subcommand: release  (Project layer — self → pool sentinel)
 # ---------------------------------------------------------------------------
 
-def cmd_release(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+def cmd_release(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     """Release a Project-layer baton back to the pool.
 
     Equivalent to 'baton flip <project-id> <pool-sentinel> <reason>' but
@@ -1313,45 +1186,24 @@ def cmd_release(args: argparse.Namespace, config: dict, agent_name: str) -> None
         )
         sys.exit(EXIT_VALIDATION)
 
-    now = _now_iso()
-
-    # Build frontmatter updates: turn → pool sentinel, turn_since → now, turn_reason → reason
-    updates: dict = {
-        "turn": _pool_sentinel(),
-        "turn_since": now,
-        "turn_reason": f'"{reason}"',
-    }
-
-    # --done: append "(done)" to title (idempotent)
-    title_renamed = False
-    if mark_done:
-        current_title = fields.get("title", "").strip()
-        if not current_title.endswith("(done)"):
-            new_title = current_title + " (done)"
-            updates["title"] = new_title
-            title_renamed = True
-
-    updated_text = _update_frontmatter(text, updates)
-
-    # Re-parse to get body after frontmatter update
-    _updated_fields, updated_body = _parse_frontmatter(updated_text)
-
-    # Append turn log entry (and a second line if title was renamed)
-    log_entry = f"- {now} {self_name} → {_pool_sentinel()}: {reason}"
-    if title_renamed:
-        log_entry += f"\n- {now} title marked (done)"
-    final_body = _append_turn_log(updated_body, log_entry)
-
-    # Reconstruct final content: frontmatter + updated body
-    fm_m = _FRONTMATTER_RE.match(updated_text)
-    if fm_m:
-        fm_section = updated_text[:fm_m.end()]
-        final_content = fm_section.rstrip("\n") + "\n" + final_body
-    else:
-        final_content = updated_text
-
-    _atomic_write(dest, final_content)
-    print(f"baton release: {project_id} → {_pool_sentinel()}")
+    sentinel = _pool_sentinel()
+    try:
+        client.post(f"/api/projects/{project_id}/release", {
+            "agent": self_name,
+            "pool_sentinel": sentinel,
+            "reason": reason,
+            "done": mark_done,
+        })
+    except ForumNetworkError as e:
+        print(f"baton release: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton release: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        print(f"baton release: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
+    print(f"baton release: {project_id} → {sentinel}")
     if mark_done:
         print("  marked (done)")
 
@@ -1439,7 +1291,7 @@ def cmd_show(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 # Subcommand: close
 # ---------------------------------------------------------------------------
 
-def cmd_close(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+def cmd_close(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     projects_dir = Path(BATON_PROJECTS_DIR)
     project_id = args.project_id
     new_status = args.status.strip().lower()
@@ -1488,7 +1340,22 @@ def cmd_close(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_VALIDATION)
 
-    _close_baton(dest, text, new_status, f"closed by {agent_name or 'agent'}")
+    close_reason = f"closed by {agent_name or 'agent'}"
+    try:
+        client.post(f"/api/projects/{project_id}/status", {
+            "agent": agent_name or "baton",
+            "new_status": new_status,
+            "reason": close_reason,
+        })
+    except ForumNetworkError as e:
+        print(f"baton close: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton close: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        print(f"baton close: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
     print(f"baton close: {project_id} → {new_status}")
 
 
@@ -1500,7 +1367,7 @@ def cmd_close(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 ACTIVE_STATUSES = {"planning", "in-progress", "in-review"}
 
 
-def cmd_reopen(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+def cmd_reopen(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     """Flip a closed baton back to an active status.
 
     Inverse of cmd_close. Only operates on batons with status: merged or
@@ -1555,28 +1422,23 @@ def cmd_reopen(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_VALIDATION)
 
-    now = _now_iso()
     invoker = agent_name or "unknown"
-
-    # Update status in frontmatter
-    updated_text = _update_frontmatter(text, {"status": new_status})
-
-    # Re-parse to get body after frontmatter update
-    _updated_fields, updated_body = _parse_frontmatter(updated_text)
-
-    # Append audit-log entry
-    log_entry = f"- {now} reopened → {invoker}: status was {current_status} → {new_status}"
-    final_body = _append_turn_log(updated_body, log_entry)
-
-    # Reconstruct final content: frontmatter + updated body
-    fm_m = _FRONTMATTER_RE.match(updated_text)
-    if fm_m:
-        fm_section = updated_text[:fm_m.end()]
-        final_content = fm_section.rstrip("\n") + "\n" + final_body
-    else:
-        final_content = updated_text
-
-    _atomic_write(dest, final_content)
+    reopen_reason = f"reopened by {invoker}: status was {current_status} → {new_status}"
+    try:
+        client.post(f"/api/projects/{project_id}/status", {
+            "agent": invoker,
+            "new_status": new_status,
+            "reason": reopen_reason,
+        })
+    except ForumNetworkError as e:
+        print(f"baton reopen: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton reopen: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        print(f"baton reopen: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
     print(f"baton reopen: {project_id} → {new_status}")
 
 
@@ -1584,7 +1446,7 @@ def cmd_reopen(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 # Subcommand: gc
 # ---------------------------------------------------------------------------
 
-def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     """Batch-close PR-batons whose GitHub PR is MERGED or CLOSED.
 
     Scans all open PR-batons and queries the live GitHub state for each.
@@ -1670,12 +1532,20 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str) -> None:
             closed += 1
             continue
 
+        gc_reason = f"gc: PR #{pr_num} is {state}"
         try:
-            _close_baton(md_file, text, new_status, f"gc: PR #{pr_num} is {state}")
+            client.post(f"/api/projects/{project_id}/gc", {
+                "agent": agent_name or "baton",
+                "new_status": new_status,
+                "reason": gc_reason,
+            })
             print(f"baton gc: closed {project_id} → {new_status} (PR #{pr_num})")
             closed += 1
-        except (Exception, SystemExit) as e:
+        except (ForumNetworkError, ForumHttpError) as e:
             print(f"baton gc: write failed for {project_id}: {e!r}", file=sys.stderr)
+            failed += 1
+        except Exception as e:
+            print(f"baton gc: unexpected error for {project_id}: {e!r}", file=sys.stderr)
             failed += 1
 
     action = "would close" if dry_run else "closed"
@@ -1686,7 +1556,7 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 # Subcommand: rename
 # ---------------------------------------------------------------------------
 
-def cmd_rename(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+def cmd_rename(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     projects_dir = Path(BATON_PROJECTS_DIR)
     project_id = args.project_id
     new_title = args.title
@@ -1751,30 +1621,20 @@ def cmd_rename(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_VALIDATION)
 
-    old_title = fields["title"]
-
-    # Update frontmatter (preserves field order via _update_frontmatter)
-    updated_text = _update_frontmatter(text, {"title": stripped_title})
-
-    # Re-parse to get body after frontmatter update
-    _updated_fields, updated_body = _parse_frontmatter(updated_text)
-
-    # Append audit line to turn log
-    now = _now_iso()
-    log_entry = (
-        f'- {now} renamed: title from "{old_title}" to "{stripped_title}"'
-    )
-    final_body = _append_turn_log(updated_body, log_entry)
-
-    # Reconstruct final content: frontmatter + updated body
-    fm_m = _FRONTMATTER_RE.match(updated_text)
-    if fm_m:
-        fm_section = updated_text[:fm_m.end()]
-        final_content = fm_section.rstrip("\n") + "\n" + final_body
-    else:
-        final_content = updated_text
-
-    _atomic_write(dest, final_content)
+    try:
+        client.post(f"/api/projects/{project_id}/rename", {
+            "agent": agent_name or "baton",
+            "new_title": stripped_title,
+        })
+    except ForumNetworkError as e:
+        print(f"baton rename: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton rename: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        print(f"baton rename: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
     print(f'baton rename: {project_id} title → "{stripped_title}"')
 
 
@@ -1782,11 +1642,11 @@ def cmd_rename(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 # Subcommand: anchor
 # ---------------------------------------------------------------------------
 
-def cmd_anchor(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+def cmd_anchor(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     """Set or update the github: anchor on an existing baton.
 
-    Mirrors cmd_rename's atomic frontmatter-update pattern:
-    read → validate → _update_frontmatter → atomic write → audit line.
+    Reads the local file for pre-flight validation (project exists, parseable
+    frontmatter), then delegates the write to the forum API via client.post.
     """
     projects_dir = Path(BATON_PROJECTS_DIR)
     project_id = args.project_id
@@ -1831,33 +1691,20 @@ def cmd_anchor(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_VALIDATION)
 
-    old_anchor = fields.get("github", "").strip()
-
-    # Update (or add) the github: field in frontmatter
-    updated_text = _update_frontmatter(text, {"github": github_anchor})
-
-    # Re-parse to get body after frontmatter update
-    _updated_fields, updated_body = _parse_frontmatter(updated_text)
-
-    # Append audit line to turn log
-    now = _now_iso()
-    if old_anchor:
-        log_entry = (
-            f'- {now} anchor updated: github from "{old_anchor}" to "{github_anchor}"'
-        )
-    else:
-        log_entry = f'- {now} anchor set: github → {github_anchor}'
-    final_body = _append_turn_log(updated_body, log_entry)
-
-    # Reconstruct final content: frontmatter + updated body
-    fm_m = _FRONTMATTER_RE.match(updated_text)
-    if fm_m:
-        fm_section = updated_text[:fm_m.end()]
-        final_content = fm_section.rstrip("\n") + "\n" + final_body
-    else:
-        final_content = updated_text
-
-    _atomic_write(dest, final_content)
+    try:
+        client.post(f"/api/projects/{project_id}/anchor", {
+            "agent": agent_name or "baton",
+            "github": github_anchor,
+        })
+    except ForumNetworkError as e:
+        print(f"baton anchor: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton anchor: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        print(f"baton anchor: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
     print(f"baton anchor: {project_id} github → {github_anchor}")
 
 
@@ -1865,7 +1712,7 @@ def cmd_anchor(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 # Subcommand: merge  (gate-checked merge verb — #999 + #1000)
 # ---------------------------------------------------------------------------
 
-def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     """Squash-merge a PR through the baton gate ladder.
 
     Gate ladder (all must pass in order):
@@ -2066,40 +1913,31 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_IO)
 
-    # ---- Gate 6: post-merge baton closure ----------------------------
-    now = _now_iso()
+    # ---- Gate 6: post-merge baton closure via API ----------------------------
     merge_by = agent_name or "unknown"
-    if force:
-        log_entry = (
-            f"- {now} merged via baton merge by {merge_by} "
-            "(FORCED past gates 3-4)"
-        )
-    else:
-        log_entry = f"- {now} merged via baton merge by {merge_by}"
 
-    # Update frontmatter: set status → merged
-    updated_text = _update_frontmatter(text, {"status": "merged"})
-
-    # Re-parse to get the body after frontmatter update, then append log entry
-    _uf, updated_body = _parse_frontmatter(updated_text)
-    final_body = _append_turn_log(updated_body, log_entry)
-
-    # Reconstruct: frontmatter section + updated body
-    fm_m = _FRONTMATTER_RE.match(updated_text)
-    if fm_m:
-        fm_section = updated_text[:fm_m.end()]
-        final_content = fm_section.rstrip("\n") + "\n" + final_body
-    else:
-        final_content = updated_text
-
-    # The GitHub merge above is irreversible; say so BEFORE the local write so
-    # an _atomic_write failure is diagnosable as merged-on-GitHub/baton-stale.
+    # The GitHub merge above is irreversible; say so BEFORE the API write so
+    # a failure is diagnosable as merged-on-GitHub/baton-stale.
     print(f"baton merge: PR #{pr_number} merged on GitHub; writing baton closure...")
-    _atomic_write(dest, final_content)
+    try:
+        client.post(f"/api/projects/{project_id}/merge", {
+            "agent": merge_by,
+            "forced": force,
+        })
+    except ForumNetworkError as e:
+        print(f"baton merge: server unreachable writing closure: {e}", file=sys.stderr)
+        print(
+            f"  (GitHub merge succeeded; close baton manually: "
+            f"baton close {project_id} --status merged)",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        print(f"baton merge: baton closure failed ({e.status}): {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO)
 
     print(f"baton merge: PR #{pr_number} merged (squash)")
     print(f"  baton: {project_id} → merged")
-    print(f"  at:    {now}")
 
 
 # ---------------------------------------------------------------------------
@@ -2450,16 +2288,18 @@ def main() -> None:
 
     config = _load_config()
     agent_name = _get_agent_name(config)
+    client = ForumClient.from_config(config)
 
-    # Dispatch
+    # Dispatch — read-only commands (status, mine, show) don't need client;
+    # write commands receive it as the 4th positional parameter.
     if args.subcommand == "init":
-        cmd_init(args, config, agent_name)
+        cmd_init(args, config, agent_name, client)
     elif args.subcommand == "flip":
-        cmd_flip(args, config, agent_name)
+        cmd_flip(args, config, agent_name, client)
     elif args.subcommand == "claim":
-        cmd_claim(args, config, agent_name)
+        cmd_claim(args, config, agent_name, client)
     elif args.subcommand == "release":
-        cmd_release(args, config, agent_name)
+        cmd_release(args, config, agent_name, client)
     elif args.subcommand == "status":
         cmd_status(args, config, agent_name)
     elif args.subcommand == "mine":
@@ -2467,17 +2307,17 @@ def main() -> None:
     elif args.subcommand == "show":
         cmd_show(args, config, agent_name)
     elif args.subcommand == "close":
-        cmd_close(args, config, agent_name)
+        cmd_close(args, config, agent_name, client)
     elif args.subcommand == "reopen":
-        cmd_reopen(args, config, agent_name)
+        cmd_reopen(args, config, agent_name, client)
     elif args.subcommand == "gc":
-        cmd_gc(args, config, agent_name)
+        cmd_gc(args, config, agent_name, client)
     elif args.subcommand == "rename":
-        cmd_rename(args, config, agent_name)
+        cmd_rename(args, config, agent_name, client)
     elif args.subcommand == "anchor":
-        cmd_anchor(args, config, agent_name)
+        cmd_anchor(args, config, agent_name, client)
     elif args.subcommand == "merge":
-        cmd_merge(args, config, agent_name)
+        cmd_merge(args, config, agent_name, client)
     else:
         parser.print_help()
         sys.exit(EXIT_VALIDATION)
