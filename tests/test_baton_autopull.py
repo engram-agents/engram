@@ -603,3 +603,60 @@ class TestLiveClauseInOutput:
         assert "pool work" in ctx
         # _fetch_pr_status must NOT have been called — no anchor resolves for pool-abc
         mock_fetch.assert_not_called()
+
+
+def test_tools_resolution_in_flattened_deployed_topology(tmp_path):
+    """Regression — a deploy-break the source-tree CI/reviews could not see.
+
+    The plugin build FLATTENS hooks/claude/ -> hooks/, so the DEPLOYED hook sits
+    one level shallower than source. A fixed ``parents[2]/tools`` resolved
+    forum_api in the source tree but OVERSHOT in the deployed tree -> the import
+    failed -> _FORUM_API_OK=False -> the hook silently no-op'd (rendered nothing).
+
+    Recreate the deployed layout (hooks/<name>.py with a SIBLING tools/) with
+    CLAUDE_PLUGIN_ROOT unset (forcing the walk-parents fallback) and assert the
+    hook still resolves forum_api: with mode=='multi' and a forum stub that
+    errors, a resolved import produces the loud "UCS unreachable" banner; a
+    broken import silently exits with empty stdout.
+    """
+    root = tmp_path / "engram"
+    (root / "hooks").mkdir(parents=True)
+    (root / "tools").mkdir()
+    hook_src = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "engram" / "hooks" / "claude" / "engram-baton-prompt-hook.py"
+    )
+    (root / "hooks" / "engram-baton-prompt-hook.py").write_text(hook_src.read_text())
+    # Stub forum_api whose ForumClient.get raises ForumNetworkError, so a
+    # resolved import + passed mode-gate yields the banner (not a silent exit).
+    (root / "tools" / "forum_api.py").write_text(
+        "class ForumNetworkError(Exception):\n"
+        "    def __init__(self, cause=''):\n"
+        "        super().__init__('forum unreachable — ' + cause)\n"
+        "class ForumHttpError(Exception):\n"
+        "    def __init__(self, status=0, body=''):\n"
+        "        self.status = status\n"
+        "        super().__init__(body)\n"
+        "def forum_url_from_config(config):\n"
+        "    return 'http://127.0.0.1:1'\n"
+        "class ForumClient:\n"
+        "    def __init__(self, url, timeout=10):\n"
+        "        pass\n"
+        "    def get(self, path, params=None):\n"
+        "        raise ForumNetworkError('stub')\n"
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.json").write_text(
+        json.dumps({"mode": "multi", "agent_name": "ariadne"})
+    )
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_ROOT"}
+    env["ENGRAM_HOME"] = str(home)
+    r = subprocess.run(
+        [sys.executable, str(root / "hooks" / "engram-baton-prompt-hook.py")],
+        input="{}", capture_output=True, text=True, env=env,
+    )
+    assert "UCS unreachable" in r.stdout, (
+        "deployed-topology hook silently no-op'd — forum_api not resolved "
+        f"(stdout={r.stdout!r} stderr={r.stderr!r})"
+    )

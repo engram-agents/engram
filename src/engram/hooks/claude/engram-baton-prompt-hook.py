@@ -46,13 +46,26 @@ from pathlib import Path
 from typing import Optional
 
 # Pure-API (UCS invariant): this hook reads coordination state ONLY via the
-# forum HTTP API — no local-filesystem fallback. forum_api ships alongside this
-# hook in the plugin tree (tools/ is a sibling of hooks/ under the plugin root,
-# and under src/engram/ in the source tree — parents[2] resolves both). The
-# import is best-effort: a failure degrades the hook to a no-op rather than
-# crashing the prompt.
-_TOOLS_DIR = Path(__file__).resolve().parents[2] / "tools"
-if str(_TOOLS_DIR) not in sys.path:
+# forum HTTP API — no local-filesystem fallback. forum_api ships in tools/.
+#
+# Resolve tools/ in BOTH topologies (mirrors engram-forum-prompt-hook.py) — a
+# fixed parents[N] is WRONG because the two trees differ in depth: the build
+# FLATTENS hooks/claude/ -> hooks/, so the deployed hook sits one level
+# shallower than the source. Source: src/engram/hooks/claude/<name>.py ->
+# src/engram/tools/. Plugin: <root>/hooks/<name>.py -> <root>/tools/. Prefer
+# $CLAUDE_PLUGIN_ROOT/tools when set, else walk parents and take the first dir
+# that actually contains forum_api.py. Import is best-effort: a failure
+# degrades the hook to a silent no-op rather than crashing the prompt.
+_tools_candidates = []
+_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
+if _plugin_root:
+    _tools_candidates.append(Path(_plugin_root) / "tools")
+for _parent in Path(__file__).resolve().parents:
+    _tools_candidates.append(_parent / "tools")
+_TOOLS_DIR = next(
+    (c for c in _tools_candidates if (c / "forum_api.py").exists()), None
+)
+if _TOOLS_DIR is not None and str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 try:
     from forum_api import (
