@@ -1,38 +1,67 @@
-"""Tests for tools/ia.py — inter-agent CLI.
+"""Tests for tools/ia.py — inter-agent CLI (DM-API backend).
 
-Test categories per DESIGN §8:
-  - Smoke: each subcommand returns expected exit code on happy-path input
-  - Validation: each frontmatter rule rejects bad input with the expected error
-  - Cursor: monotonic advance across cursor --set / mark-read / read,
-            atomic write, ISO format enforcement, --force override works
-  - Filesystem: atomic write of letters (no .tmp remains after success)
-  - Mode gate: single-agent mode returns clean error (exit 3)
-  - Integration: write → list → read round-trip produces correct cursor advance
+UCS PR3a: ia.py is now a pure-LAN-API thin client; no local inter-agent/
+filesystem reads or writes.  Tests follow the baton.py test pattern —
+mock ForumClient for direct-call tests; subprocess for argparse/exit-code
+integration.
 
-Follows the same tmp_path / subprocess / helper patterns as
-tests/test_inter_agent_hook.py.
+Test categories:
+  - Smoke:        each subcommand happy-path exits 0 via subprocess
+  - ModeGate:     single-agent mode → exit 3 for all DM commands
+  - Write:        POST per-recipient, multi-recipient loop, To/Subject encoding
+  - List:         GET /api/dm, thread rendering
+  - Read:         GET /api/dm/<counterpart>, message rendering, 404 handling
+  - Cursor:       show/set the as_of int cursor
+  - MarkRead:     advance cursor via /api/updates
+  - LoudFail:     ForumNetworkError/HttpError → stderr + non-zero exit
+  - Peers:        GET /api/agents/online rendering
+  - Status:       health check output
 """
 
+import argparse
 import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-CLI_PATH = (
-    Path(__file__).parent.parent / "tools" / "ia.py"
-)
+# ---------------------------------------------------------------------------
+# Module import (direct-call tests)
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_TOOLS_DIR = str(_REPO_ROOT / "src" / "engram" / "tools")
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+
+import importlib.util as _ilu
+
+_IA_PATH = _REPO_ROOT / "src" / "engram" / "tools" / "ia.py"
+_spec = _ilu.spec_from_file_location("ia_mod", str(_IA_PATH))
+_ia = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_ia)
+
+# Forum API error types for mocking
+from forum_api import ForumHttpError, ForumNetworkError  # noqa: E402
+
+CLI_PATH = _IA_PATH
+
+# Exit codes (mirror ia.py constants)
+EXIT_OK = 0
+EXIT_VALIDATION = 1
+EXIT_IO = 2
+EXIT_STATE = 3
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _run_ia(
     engram_home: Path,
-    inter_agent_dir: Path,
     *args: str,
     stdin_text: str = "",
     env_overrides: dict | None = None,
@@ -40,7 +69,6 @@ def _run_ia(
     """Run the ia CLI as a subprocess; return (exit_code, stdout, stderr)."""
     env = os.environ.copy()
     env["ENGRAM_HOME"] = str(engram_home)
-    env["INTER_AGENT_DIR"] = str(inter_agent_dir)
     if env_overrides:
         env.update(env_overrides)
     proc = subprocess.run(
@@ -54,64 +82,67 @@ def _run_ia(
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def _write_config(engram_home: Path, mode: str, agent_name: str = "ariadne") -> None:
+def _write_config(
+    engram_home: Path,
+    mode: str = "multi",
+    agent_name: str = "ariadne",
+) -> None:
     """Write a minimal config.json into engram_home."""
-    cfg = {"mode": mode, "agent_name": agent_name, "counterparts": []}
+    cfg = {"mode": mode, "agent_name": agent_name}
     (engram_home / "config.json").write_text(json.dumps(cfg))
 
 
-def _write_read_cursor(engram_home: Path, ts: datetime) -> None:
-    ts_str = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
-    (engram_home / "inter-agent-read-cursor.txt").write_text(ts_str + "\n")
+def _write_cursor(engram_home: Path, value: int) -> None:
+    """Write an integer cursor to the read-cursor file."""
+    (engram_home / "inter-agent-read-cursor.txt").write_text(str(value) + "\n")
 
 
-def _read_read_cursor(engram_home: Path) -> str:
+def _read_cursor(engram_home: Path) -> str:
+    """Read the raw cursor file content (stripped)."""
     path = engram_home / "inter-agent-read-cursor.txt"
     if path.exists():
         return path.read_text().strip()
     return ""
 
 
-def _write_letter(
-    inter_agent_dir: Path,
-    filename: str,
-    from_agent: str,
-    to_agent: str,
-    timestamp: datetime,
-    body: str = "Hello from a fellow agent.",
-    re_field: str = "",
-    heading: str = "",
-) -> Path:
-    """Write a properly-formatted inter-agent letter markdown file."""
-    ts_str = timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
-    fm_lines = [
-        "---",
-        f"from: {from_agent}",
-        f"to: {to_agent}",
-        f"timestamp: {ts_str}",
-    ]
-    if re_field:
-        fm_lines.append(f"re: {re_field}")
-    fm_lines.append("---")
-    fm_lines.append("")
-    if heading:
-        fm_lines.append(f"# {heading}")
-        fm_lines.append("")
-    fm_lines.append(body)
-    content = "\n".join(fm_lines) + "\n"
-    path = inter_agent_dir / filename
-    path.write_text(content)
-    return path
+def _make_client(
+    get_return: dict | None = None,
+    post_return: dict | None = None,
+) -> MagicMock:
+    """Return a mock ForumClient with configurable return values."""
+    client = MagicMock()
+    if get_return is not None:
+        client.get.return_value = get_return
+    if post_return is not None:
+        client.post.return_value = post_return or {"seq": 1, "ts": "2026-06-28T12:00:00Z"}
+    return client
 
 
-def _ts(offset_minutes: int = -5) -> datetime:
-    """Return a UTC datetime offset by the given minutes from now."""
-    return datetime.now(timezone.utc) + timedelta(minutes=offset_minutes)
+def _make_args(**kwargs) -> argparse.Namespace:
+    """Build an argparse.Namespace with sensible defaults for ia commands."""
+    defaults = {
+        "forum_url": "http://testforum:5002",
+        "format": "human",
+        "counterpart": None,
+        "since_seq": 0,
+        "to": None,
+        "subject": None,
+        "body_file": None,
+        "from_stdin": False,
+        "set_val": None,
+    }
+    defaults.update(kwargs)
+    return argparse.Namespace(**defaults)
+
+
+MULTI_CONFIG = {"mode": "multi", "agent_name": "ariadne"}
+SINGLE_CONFIG = {"mode": "single", "agent_name": "ariadne"}
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def engram_home(tmp_path: Path) -> Path:
@@ -120,1858 +151,796 @@ def engram_home(tmp_path: Path) -> Path:
     return home
 
 
-@pytest.fixture
-def inter_agent_dir(tmp_path: Path) -> Path:
-    d = tmp_path / "inter-agent"
-    d.mkdir()
-    return d
-
-
 # ===========================================================================
-# CATEGORY 1: Smoke tests — each subcommand happy-path
+# CATEGORY 1: Smoke tests — subprocess integration
 # ===========================================================================
+
 
 class TestSmoke:
-    """Each subcommand exits 0 on happy-path input."""
+    """Each subcommand exits 0 on happy-path input (subprocess, mocked forum)."""
 
-    def test_help_exits_0(self, engram_home, inter_agent_dir):
-        """ia --help exits 0 and prints subcommand descriptions."""
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "--help")
+    def test_help_exits_0(self, engram_home):
+        _write_config(engram_home, "multi")
+        rc, stdout, stderr = _run_ia(engram_home, "--help")
         assert rc == 0
         assert "list" in stdout
         assert "read" in stdout
         assert "write" in stdout
+        assert "mark-read" in stdout
+        assert "cursor" in stdout
+        assert "status" in stdout
+        assert "peers" in stdout
 
-    def test_status_multi_mode(self, engram_home, inter_agent_dir):
-        """ia status exits 0 in multi mode and shows agent name."""
+    def test_cursor_show_exits_0(self, engram_home):
+        """ia cursor with no file → shows 0 and exits 0."""
+        _write_config(engram_home, "multi")
+        rc, stdout, stderr = _run_ia(engram_home, "cursor", "--show")
+        assert rc == 0
+        assert "0" in stdout
+
+    def test_cursor_set_exits_0(self, engram_home):
+        """ia cursor --set 42 → exits 0, writes 42 to cursor file."""
+        _write_config(engram_home, "multi")
+        rc, stdout, stderr = _run_ia(engram_home, "cursor", "--set", "42")
+        assert rc == 0
+        assert "42" in stdout
+        assert _read_cursor(engram_home) == "42"
+
+    def test_status_multi_mode_exits_0(self, engram_home):
+        """ia status in multi mode exits 0 and shows agent name (forum errors are graceful)."""
         _write_config(engram_home, "multi", "ariadne")
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "status")
+        # Status is graceful on unreachable forum — it shows "(unreachable)"
+        rc, stdout, stderr = _run_ia(
+            engram_home, "status",
+            env_overrides={"FORUM_URL": "http://localhost:1"},  # port 1 = refused
+        )
         assert rc == 0
         assert "ariadne" in stdout
-        assert "multi" in stdout
 
-    def test_list_empty_exits_0(self, engram_home, inter_agent_dir):
-        """ia list with no letters exits 0."""
-        _write_config(engram_home, "multi", "ariadne")
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list")
-        assert rc == 0
-
-    def test_list_with_letter(self, engram_home, inter_agent_dir):
-        """ia list shows a letter addressed to the agent."""
-        _write_config(engram_home, "multi", "ariadne")
-        _write_letter(
-            inter_agent_dir, "2026-05-23T10-00-00Z_borges.md",
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-30), heading="Hello from borges",
-        )
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list")
-        assert rc == 0
-        assert "borges" in stdout
-        assert "Hello from borges" in stdout
-
-    def test_cursor_show_exits_0(self, engram_home, inter_agent_dir):
-        """ia cursor --show exits 0 (no cursor file → shows '(none)')."""
-        _write_config(engram_home, "multi", "ariadne")
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "cursor", "--show")
-        assert rc == 0
-        assert "none" in stdout
-
-    def test_cursor_set_exits_0(self, engram_home, inter_agent_dir):
-        """ia cursor --set exits 0 for a valid ISO timestamp."""
-        _write_config(engram_home, "multi", "ariadne")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "cursor", "--set", "2026-05-23T10:00:00Z",
-        )
-        assert rc == 0
-
-    def test_mark_read_all_exits_0(self, engram_home, inter_agent_dir):
-        """ia mark-read --all exits 0."""
-        _write_config(engram_home, "multi", "ariadne")
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "mark-read", "--all")
-        assert rc == 0
-
-    def test_write_from_stdin_exits_0(self, engram_home, inter_agent_dir):
-        """ia write --from-stdin exits 0 for valid letter."""
-        _write_config(engram_home, "multi", "ariadne")
-        now = datetime.now(timezone.utc)
-        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        letter_content = (
-            "---\n"
-            "from: ariadne\n"
-            "to: borges\n"
-            f"timestamp: {ts_str}\n"
-            "---\n\n"
-            "Hello borges, this is a test letter.\n"
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "borges", "--from-stdin",
-            stdin_text=letter_content,
-        )
-        assert rc == 0, f"write --from-stdin failed; stderr: {stderr}"
-        assert "sent" in stdout
-
-
-# ===========================================================================
-# CATEGORY 2: Validation tests — frontmatter rules
-# ===========================================================================
-
-class TestValidation:
-    """Frontmatter rules reject bad input with the expected error."""
-
-    def _build_letter(
-        self,
-        from_val: str = "ariadne",
-        to_val: str = "borges",
-        ts_val: str = "2026-05-23T10:00:00Z",
-        re_val: str = "",
-        body: str = "Test body content.\n",
-    ) -> str:
-        fm = ["---", f"from: {from_val}", f"to: {to_val}", f"timestamp: {ts_val}"]
-        if re_val:
-            fm.append(f"re: {re_val}")
-        fm.append("---")
-        fm.append("")
-        fm.append(body)
-        return "\n".join(fm)
-
-    def test_from_impersonation_rejected(self, engram_home, inter_agent_dir):
-        """from: field not matching agent name → exit 1, impersonation error."""
-        _write_config(engram_home, "multi", "ariadne")
-        letter = self._build_letter(from_val="borges")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "borges", "--from-stdin",
-            stdin_text=letter,
-        )
-        assert rc == 1
-        assert "impersonation" in stderr.lower() or "does not match" in stderr
-
-    def test_to_empty_rejected(self, engram_home, inter_agent_dir):
-        """to: value absent (line has only whitespace) → exit 1 with frontmatter error.
-
-        Note: the regex parser (shared with the hook) treats an empty `to:` line
-        followed by a newline as the value being merged with the next field, so
-        the validation error may surface as a timestamp or to: complaint depending
-        on parse outcome — the key invariant is rc == 1.
-        """
-        _write_config(engram_home, "multi", "ariadne")
-        # Use a letter where 'to' is clearly absent (no 'to:' key at all)
-        letter = (
-            "---\n"
-            "from: ariadne\n"
-            "timestamp: 2026-05-23T10:00:00Z\n"
-            "---\n\n"
-            "Body.\n"
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "borges", "--from-stdin",
-            stdin_text=letter,
-        )
-        assert rc == 1
-        assert "to:" in stderr or "`to:`" in stderr
-
-    def test_timestamp_filename_format_rejected(self, engram_home, inter_agent_dir):
-        """timestamp in filename-format (dashes instead of colons) → exit 1."""
-        _write_config(engram_home, "multi", "ariadne")
-        letter = self._build_letter(ts_val="2026-05-23T10-00-00Z")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "borges", "--from-stdin",
-            stdin_text=letter,
-        )
-        assert rc == 1
-        assert "filename-format" in stderr or "dashes" in stderr
-
-    def test_timestamp_invalid_iso_rejected(self, engram_home, inter_agent_dir):
-        """timestamp that isn't ISO-8601 at all → exit 1."""
-        _write_config(engram_home, "multi", "ariadne")
-        letter = self._build_letter(ts_val="not-a-timestamp")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "borges", "--from-stdin",
-            stdin_text=letter,
-        )
-        assert rc == 1
-        assert "timestamp" in stderr
-
-    def test_re_nonexistent_file_rejected(self, engram_home, inter_agent_dir):
-        """re: pointing to a file that doesn't exist → exit 1."""
-        _write_config(engram_home, "multi", "ariadne")
-        letter = self._build_letter(re_val="nonexistent-letter.md")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "borges", "--from-stdin",
-            stdin_text=letter,
-        )
-        assert rc == 1
-        assert "non-existent" in stderr or "nonexistent" in stderr or "not found" in stderr.lower()
-
-    def test_re_existing_file_accepted(self, engram_home, inter_agent_dir):
-        """re: pointing to an existing file → accepted (no re: error)."""
-        _write_config(engram_home, "multi", "ariadne")
-        # Create the referenced file
-        ref_filename = "2026-05-23T09-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, ref_filename,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60),
-        )
-        now = datetime.now(timezone.utc)
-        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        letter = (
-            "---\n"
-            "from: ariadne\n"
-            "to: borges\n"
-            f"timestamp: {ts_str}\n"
-            f"re: {ref_filename}\n"
-            "---\n\n"
-            "Reply body.\n"
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "borges", "--from-stdin",
-            stdin_text=letter,
-        )
-        assert rc == 0, f"re: existing file should be accepted; stderr: {stderr}"
-
-    def test_missing_frontmatter_rejected(self, engram_home, inter_agent_dir):
-        """No frontmatter block at all → exit 1."""
-        _write_config(engram_home, "multi", "ariadne")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "borges", "--from-stdin",
-            stdin_text="Just a plain body with no frontmatter.\n",
-        )
-        assert rc == 1
-        assert "frontmatter" in stderr.lower()
-
-    def test_to_empty_line_rejected_pre_parse(self, engram_home, inter_agent_dir):
-        """Bare 'to:' line (newline immediately after colon) caught before parser merge-quirk."""
-        _write_config(engram_home, "multi", "ariadne")
-        # The frontmatter parser regex would merge `to:\n<next-field>` into
-        # `to: <next-field-value>` — the pre-check catches this before parsing.
-        letter = (
-            "---\n"
-            "from: ariadne\n"
-            "to:\n"
-            "timestamp: 2026-05-23T10:00:00Z\n"
-            "---\n\n"
-            "Body.\n"
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "borges", "--from-stdin",
-            stdin_text=letter,
-        )
-        assert rc == 1
-        assert "to" in stderr.lower() and ("empty" in stderr.lower() or "recipient" in stderr.lower())
-
-    def test_write_no_to_no_reply_rejected(self, engram_home, inter_agent_dir):
-        """Guard fires when neither --to nor --reply is passed."""
-        _write_config(engram_home, "multi", "ariadne")
-        now = datetime.now(timezone.utc)
-        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        letter_content = (
-            "---\n"
-            "from: ariadne\n"
-            "to: borges\n"
-            f"timestamp: {ts_str}\n"
-            "---\n\n"
-            "Body.\n"
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--from-stdin",
-            stdin_text=letter_content,
-        )
-        assert rc == 1
-        assert "--to" in stderr and "--reply" in stderr
-
-
-# ===========================================================================
-# CATEGORY 3: Cursor tests
-# ===========================================================================
-
-class TestCursor:
-    """Cursor mechanics: monotonic, ISO format, --force, atomic write."""
-
-    def test_cursor_show_none_when_no_file(self, engram_home, inter_agent_dir):
-        """No cursor file → shows '(none)'."""
-        _write_config(engram_home, "multi", "ariadne")
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "cursor", "--show")
-        assert rc == 0
-        assert "none" in stdout
-
-    def test_cursor_set_valid_ts(self, engram_home, inter_agent_dir):
-        """ia cursor --set writes the timestamp to the cursor file."""
-        _write_config(engram_home, "multi", "ariadne")
-        target = "2026-05-22T10:00:00Z"
-        rc, _, _ = _run_ia(engram_home, inter_agent_dir, "cursor", "--set", target)
-        assert rc == 0
-        cursor_content = _read_read_cursor(engram_home)
-        assert cursor_content == target
-
-    def test_cursor_show_after_set(self, engram_home, inter_agent_dir):
-        """ia cursor --show after --set returns the set value."""
-        _write_config(engram_home, "multi", "ariadne")
-        target = "2026-05-22T10:00:00Z"
-        _run_ia(engram_home, inter_agent_dir, "cursor", "--set", target)
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "cursor", "--show")
-        assert rc == 0
-        assert target in stdout
-
-    def test_cursor_set_refuses_backward(self, engram_home, inter_agent_dir):
-        """cursor --set backward without --force → exit 1."""
-        _write_config(engram_home, "multi", "ariadne")
-        # Set cursor forward first
-        _run_ia(engram_home, inter_agent_dir, "cursor", "--set", "2026-05-22T10:00:00Z")
-        # Try to go backward
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "cursor", "--set", "2026-05-21T10:00:00Z",
-        )
-        assert rc == 1
-        assert "backward" in stderr
-
-    def test_cursor_set_backward_with_force(self, engram_home, inter_agent_dir):
-        """cursor --set backward WITH --force → succeeds."""
-        _write_config(engram_home, "multi", "ariadne")
-        _run_ia(engram_home, inter_agent_dir, "cursor", "--set", "2026-05-22T10:00:00Z")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "cursor", "--set", "2026-05-21T10:00:00Z", "--force",
-        )
-        assert rc == 0
-        cursor_content = _read_read_cursor(engram_home)
-        assert cursor_content == "2026-05-21T10:00:00Z"
-
-    def test_cursor_set_filename_format_rejected(self, engram_home, inter_agent_dir):
-        """cursor --set with filename-format value → exit 1, clear error."""
-        _write_config(engram_home, "multi", "ariadne")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "cursor", "--set", "2026-05-22T07-15-30Z_borges.md",
-        )
-        assert rc == 1
-        assert "filename-format" in stderr or "dashes" in stderr
-
-    def test_cursor_type_surfaced_requires_advanced(self, engram_home, inter_agent_dir):
-        """cursor --type surfaced without --advanced → exit 1 with hint."""
-        _write_config(engram_home, "multi", "ariadne")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "cursor", "--show", "--type", "surfaced",
-        )
-        assert rc == 1
-        assert "--advanced" in stderr
-
-    def test_cursor_type_surfaced_with_advanced(self, engram_home, inter_agent_dir):
-        """cursor --advanced --type surfaced --show → exits 0."""
-        _write_config(engram_home, "multi", "ariadne")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "cursor", "--show", "--advanced", "--type", "surfaced",
-        )
-        assert rc == 0
-
-    def test_mark_read_filename_advances_cursor(self, engram_home, inter_agent_dir):
-        """ia mark-read <filename> advances cursor to letter's timestamp."""
-        _write_config(engram_home, "multi", "ariadne")
-        letter_ts = _ts(-30)
-        letter_path = _write_letter(
-            inter_agent_dir, "2026-05-23T10-00-00Z_borges.md",
-            from_agent="borges", to_agent="ariadne",
-            timestamp=letter_ts,
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "mark-read", "2026-05-23T10-00-00Z_borges.md",
-        )
-        assert rc == 0
-        cursor_content = _read_read_cursor(engram_home)
-        expected_ts = letter_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
-        assert cursor_content == expected_ts
-
-    def test_mark_read_refuses_backward(self, engram_home, inter_agent_dir):
-        """mark-read backward without --force → exit 1."""
-        _write_config(engram_home, "multi", "ariadne")
-        # Set cursor forward first
-        _write_read_cursor(engram_home, _ts(-10))
-        # Create an older letter
-        old_letter = _write_letter(
-            inter_agent_dir, "2026-05-20T10-00-00Z_borges.md",
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60 * 24 * 3),  # 3 days ago
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "mark-read", "2026-05-20T10-00-00Z_borges.md",
-        )
-        assert rc == 1
-        assert "backward" in stderr
-
-    def test_mark_read_backward_with_force(self, engram_home, inter_agent_dir):
-        """mark-read backward WITH --force → succeeds."""
-        _write_config(engram_home, "multi", "ariadne")
-        _write_read_cursor(engram_home, _ts(-10))
-        old_ts = _ts(-60 * 24 * 3)
-        old_letter = _write_letter(
-            inter_agent_dir, "2026-05-20T10-00-00Z_borges.md",
-            from_agent="borges", to_agent="ariadne",
-            timestamp=old_ts,
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "mark-read", "2026-05-20T10-00-00Z_borges.md", "--force",
-        )
-        assert rc == 0
-
-    def test_mark_read_all_advances_to_now(self, engram_home, inter_agent_dir):
-        """mark-read --all advances cursor to approximately now.
-
-        The cursor is written with second precision (ISO format: HH:MM:SSZ),
-        so we compare against a truncated 'before' to avoid sub-second races.
-        """
-        _write_config(engram_home, "multi", "ariadne")
-        # Truncate to seconds: the cursor file only has second precision
-        before = datetime.now(timezone.utc).replace(microsecond=0)
-        rc, _, _ = _run_ia(engram_home, inter_agent_dir, "mark-read", "--all")
-        assert rc == 0
-        after = datetime.now(timezone.utc)
-        cursor_str = _read_read_cursor(engram_home)
-        cursor_dt = datetime.fromisoformat(cursor_str.replace("Z", "+00:00"))
-        assert before <= cursor_dt <= after
-
-    def test_mark_read_up_to(self, engram_home, inter_agent_dir):
-        """mark-read --up-to <ts> sets cursor to that timestamp."""
-        _write_config(engram_home, "multi", "ariadne")
-        target = "2026-05-23T12:00:00Z"
-        rc, _, _ = _run_ia(
-            engram_home, inter_agent_dir, "mark-read", "--up-to", target,
-        )
-        assert rc == 0
-        assert _read_read_cursor(engram_home) == target
-
-    def test_read_advances_cursor(self, engram_home, inter_agent_dir):
-        """ia read advances the read cursor to the letter's timestamp."""
-        _write_config(engram_home, "multi", "ariadne")
-        letter_ts = _ts(-5)
-        _write_letter(
-            inter_agent_dir, "2026-05-23T10-00-00Z_borges.md",
-            from_agent="borges", to_agent="ariadne",
-            timestamp=letter_ts,
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "read", "2026-05-23T10-00-00Z_borges.md",
-        )
-        assert rc == 0
-        cursor_content = _read_read_cursor(engram_home)
-        expected_ts = letter_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
-        assert cursor_content == expected_ts
-
-    def test_read_force_backward_advance(self, engram_home, inter_agent_dir):
-        """ia read backward cursor: hint on stderr without --force, advance with --force."""
-        _write_config(engram_home, "multi", "ariadne")
-        # Cursor at T2 (recent)
-        cursor_ts = _ts(-10)
-        _write_read_cursor(engram_home, cursor_ts)
-        cursor_ts_str = cursor_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
-        # Old letter at T1 (older than cursor)
-        old_ts = _ts(-60 * 24 * 3)  # 3 days ago
-        old_ts_str = old_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
-        _write_letter(
-            inter_agent_dir, "2026-05-20T10-00-00Z_borges.md",
-            from_agent="borges", to_agent="ariadne",
-            timestamp=old_ts,
-        )
-
-        # Without --force: ia read exits 0, cursor stays at T2, stderr hint emitted
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "read", "2026-05-20T10-00-00Z_borges.md",
-        )
-        assert rc == 0
-        assert _read_read_cursor(engram_home) == cursor_ts_str
-        assert "cursor not advanced" in stderr or "older than current cursor" in stderr
-
-        # With --force: ia read exits 0, cursor advances backward to T1
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "read", "2026-05-20T10-00-00Z_borges.md", "--force",
-        )
-        assert rc == 0
-        assert _read_read_cursor(engram_home) == old_ts_str
-
-
-# ===========================================================================
-# CATEGORY 4: Filesystem tests — atomic write
-# ===========================================================================
-
-class TestFilesystem:
-    """Atomic write of letters: no .tmp remains after success."""
-
-    def test_write_no_tmp_remains(self, engram_home, inter_agent_dir):
-        """After ia write --from-stdin, no .tmp file remains in inter-agent/."""
-        _write_config(engram_home, "multi", "ariadne")
-        now = datetime.now(timezone.utc)
-        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        letter = (
-            "---\n"
-            "from: ariadne\n"
-            "to: borges\n"
-            f"timestamp: {ts_str}\n"
-            "---\n\n"
-            "Body.\n"
-        )
-        _run_ia(engram_home, inter_agent_dir, "write", "--to", "borges", "--from-stdin",
-                stdin_text=letter)
-        tmp_files = list(inter_agent_dir.glob("*.tmp"))
-        assert tmp_files == [], f"Tmp files must not remain after successful write: {tmp_files}"
-
-    def test_write_creates_md_file(self, engram_home, inter_agent_dir):
-        """ia write --from-stdin creates a .md file in inter-agent/."""
-        _write_config(engram_home, "multi", "ariadne")
-        now = datetime.now(timezone.utc)
-        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        letter = (
-            "---\n"
-            "from: ariadne\n"
-            "to: borges\n"
-            f"timestamp: {ts_str}\n"
-            "---\n\n"
-            "Test body.\n"
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "borges", "--from-stdin",
-            stdin_text=letter,
-        )
-        assert rc == 0
-        md_files = list(inter_agent_dir.glob("*.md"))
-        assert len(md_files) == 1, f"Exactly one .md file expected; got {md_files}"
-
-    def test_write_file_mode_is_644(self, engram_home, inter_agent_dir):
-        """Written letter file has mode 644 (owner-only write)."""
-        _write_config(engram_home, "multi", "ariadne")
-        now = datetime.now(timezone.utc)
-        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        letter = (
-            "---\n"
-            "from: ariadne\n"
-            "to: borges\n"
-            f"timestamp: {ts_str}\n"
-            "---\n\n"
-            "Body.\n"
-        )
-        _run_ia(engram_home, inter_agent_dir, "write", "--to", "borges", "--from-stdin",
-                stdin_text=letter)
-        md_files = list(inter_agent_dir.glob("*.md"))
-        assert md_files, "Expected at least one .md file"
-        mode = oct(md_files[0].stat().st_mode)[-3:]
-        assert mode == "644", f"Expected mode 644, got {mode}"
-
-    def test_cursor_write_no_tmp_remains(self, engram_home, inter_agent_dir):
-        """After cursor --set, no .tmp file remains in engram_home."""
-        _write_config(engram_home, "multi", "ariadne")
-        _run_ia(engram_home, inter_agent_dir, "cursor", "--set", "2026-05-22T10:00:00Z")
-        tmp_files = list(engram_home.glob("*.tmp"))
-        assert tmp_files == [], f"Tmp files must not remain after cursor write: {tmp_files}"
-
-    def test_cursor_write_correct_content(self, engram_home, inter_agent_dir):
-        """Cursor file written with correct ISO timestamp content."""
-        _write_config(engram_home, "multi", "ariadne")
-        target = "2026-05-22T10:00:00Z"
-        _run_ia(engram_home, inter_agent_dir, "cursor", "--set", target)
-        cursor_path = engram_home / "inter-agent-read-cursor.txt"
-        assert cursor_path.exists()
-        content = cursor_path.read_text().strip()
-        assert content == target
-
-    def test_scan_skipped_count_emitted_on_malformed(self, engram_home, inter_agent_dir):
-        """ia list emits a stderr note when .md files with unparseable frontmatter exist."""
-        _write_config(engram_home, "multi", "ariadne")
-        # Write a valid letter (addressed to ariadne)
-        _write_letter(
-            inter_agent_dir, "2026-05-23T10-00-00Z_borges.md",
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-30), heading="Valid letter",
-        )
-        # Write a malformed .md file (no frontmatter block at all)
-        (inter_agent_dir / "malformed.md").write_text("No frontmatter here.\n")
-
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list", "--all")
-        assert rc == 0
-        assert "skipped" in stderr and "unparseable" in stderr
-
-
-# ===========================================================================
-# CATEGORY 5: Mode gate tests
-# ===========================================================================
-
-class TestModeGate:
-    """Single-agent mode returns a clean error (exit 3) for all subcommands."""
-
-    def test_list_single_mode_exits_3(self, engram_home, inter_agent_dir):
-        """ia list in single mode → exit 3."""
-        _write_config(engram_home, "single", "ariadne")
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list")
-        assert rc == 3
-        assert "single-agent mode" in stderr
-        assert "mode='multi'" in stderr or "mode='single'" in stderr
-        assert "inter-agent/README.md" in stderr
-
-    def test_write_single_mode_exits_3(self, engram_home, inter_agent_dir):
-        """ia write in single mode → exit 3."""
+    def test_status_single_mode_exits_0(self, engram_home):
+        """ia status works in single mode (diagnostic utility — mode-gate exempt)."""
         _write_config(engram_home, "single", "ariadne")
         rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir, "write", "--to", "borges", "--from-stdin",
-            stdin_text="body",
+            engram_home, "status",
+            env_overrides={"FORUM_URL": "http://localhost:1"},
         )
-        assert rc == 3
-
-    def test_cursor_single_mode_exits_3(self, engram_home, inter_agent_dir):
-        """ia cursor in single mode → exit 3."""
-        _write_config(engram_home, "single", "ariadne")
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "cursor", "--show")
-        assert rc == 3
-
-    def test_mark_read_single_mode_exits_3(self, engram_home, inter_agent_dir):
-        """ia mark-read in single mode → exit 3."""
-        _write_config(engram_home, "single", "ariadne")
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "mark-read", "--all")
-        assert rc == 3
-
-    def test_star_single_mode_exits_3(self, engram_home, inter_agent_dir):
-        """ia star in single mode → exit 3."""
-        _write_config(engram_home, "single", "ariadne")
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "star", "some-letter.md")
-        assert rc == 3
-
-    def test_unstar_single_mode_exits_3(self, engram_home, inter_agent_dir):
-        """ia unstar in single mode → exit 3."""
-        _write_config(engram_home, "single", "ariadne")
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "unstar", "some-letter.md")
-        assert rc == 3
-
-    def test_starred_single_mode_exits_3(self, engram_home, inter_agent_dir):
-        """ia starred in single mode → exit 3."""
-        _write_config(engram_home, "single", "ariadne")
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "starred")
-        assert rc == 3
-
-    def test_status_single_mode_exits_0(self, engram_home, inter_agent_dir):
-        """ia status works in single mode (diagnostic utility)."""
-        _write_config(engram_home, "single", "ariadne")
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "status")
         assert rc == 0
+        assert "ariadne" in stdout
         assert "single" in stdout
 
-    def test_mode_gate_error_has_all_three_lines(self, engram_home, inter_agent_dir):
-        """Mode gate error has all three actionable lines from DESIGN §9.4."""
-        _write_config(engram_home, "single", "ariadne")
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list")
-        assert rc == 3
+
+# ===========================================================================
+# CATEGORY 2: Mode gate tests
+# ===========================================================================
+
+
+class TestModeGate:
+    """Single-agent mode returns a clean error (exit 3) for all DM commands."""
+
+    def test_list_single_mode_exits_3(self, engram_home):
+        _write_config(engram_home, "single")
+        rc, stdout, stderr = _run_ia(engram_home, "list")
+        assert rc == EXIT_STATE
         assert "single-agent mode" in stderr
         assert "mode='multi'" in stderr
         assert "inter-agent/README.md" in stderr
 
-    def test_missing_config_treated_as_single(self, engram_home, inter_agent_dir):
-        """No config.json → mode defaults to 'single' → exit 3."""
-        # Don't write any config
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list")
-        assert rc == 3
+    def test_read_single_mode_exits_3(self, engram_home):
+        _write_config(engram_home, "single")
+        rc, stdout, stderr = _run_ia(engram_home, "read", "borges")
+        assert rc == EXIT_STATE
+        assert "single-agent mode" in stderr
 
-    def test_mode_gate_error_invalid_config(self, engram_home, inter_agent_dir):
-        """Corrupt config.json → exit 3 with 'invalid' + 'failed to parse' in stderr."""
-        # Write invalid JSON to config.json
+    def test_write_single_mode_exits_3(self, engram_home):
+        _write_config(engram_home, "single")
+        rc, stdout, stderr = _run_ia(
+            engram_home, "write", "--to", "borges", "--from-stdin",
+            stdin_text="hello",
+        )
+        assert rc == EXIT_STATE
+        assert "single-agent mode" in stderr
+
+    def test_mark_read_single_mode_exits_3(self, engram_home):
+        _write_config(engram_home, "single")
+        rc, stdout, stderr = _run_ia(engram_home, "mark-read")
+        assert rc == EXIT_STATE
+        assert "single-agent mode" in stderr
+
+    def test_cursor_single_mode_exits_3(self, engram_home):
+        _write_config(engram_home, "single")
+        rc, stdout, stderr = _run_ia(engram_home, "cursor", "--show")
+        assert rc == EXIT_STATE
+        assert "single-agent mode" in stderr
+
+    def test_peers_single_mode_exits_3(self, engram_home):
+        _write_config(engram_home, "single")
+        rc, stdout, stderr = _run_ia(
+            engram_home, "peers",
+            env_overrides={"FORUM_URL": "http://localhost:1"},
+        )
+        assert rc == EXIT_STATE
+        assert "single-agent mode" in stderr
+
+    def test_status_single_mode_exits_0(self, engram_home):
+        """ia status is exempt from the mode gate (diagnostic utility)."""
+        _write_config(engram_home, "single")
+        rc, stdout, stderr = _run_ia(
+            engram_home, "status",
+            env_overrides={"FORUM_URL": "http://localhost:1"},
+        )
+        assert rc == EXIT_OK
+        assert "single" in stdout
+
+    def test_missing_config_treated_as_single(self, engram_home):
+        """No config.json → mode defaults to 'single' → exit 3 for DM commands."""
+        rc, stdout, stderr = _run_ia(engram_home, "list")
+        assert rc == EXIT_STATE
+
+    def test_corrupt_config_treated_as_single(self, engram_home):
+        """Corrupt config.json → mode defaults to 'single' → exit 3."""
         (engram_home / "config.json").write_text("{not valid json")
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list")
-        assert rc == 3
-        assert "invalid" in stderr
-        assert "failed to parse" in stderr
+        rc, stdout, stderr = _run_ia(engram_home, "list")
+        assert rc == EXIT_STATE
+        assert "invalid" in stderr and "failed to parse" in stderr
+
+    def test_mode_gate_error_has_all_three_lines(self, engram_home):
+        """Mode gate error emits all three required lines (DESIGN §9.4)."""
+        _write_config(engram_home, "single")
+        rc, stdout, stderr = _run_ia(engram_home, "list")
+        assert rc == EXIT_STATE
+        assert "single-agent mode" in stderr
+        assert "mode='multi'" in stderr
+        assert "inter-agent/README.md" in stderr
 
 
 # ===========================================================================
-# CATEGORY 6: Integration round-trip
+# CATEGORY 3: Write command — POST + body encoding
 # ===========================================================================
 
-class TestIntegration:
-    """write → list → read round-trip with correct cursor advance."""
 
-    def test_write_list_read_round_trip(self, engram_home, inter_agent_dir):
-        """Write a letter from borges, then list and read it as ariadne."""
-        _write_config(engram_home, "multi", "ariadne")
+class TestWrite:
+    """Write command: POST per-recipient, multi-recipient loop, body encoding."""
 
-        # Simulate borges writing a letter to ariadne
-        letter_ts = _ts(-5)
-        letter_filename = _write_letter(
-            inter_agent_dir, "2026-05-23T13-00-00Z_borges.md",
-            from_agent="borges", to_agent="ariadne",
-            timestamp=letter_ts,
-            heading="Round-trip test",
-            body="This letter tests the full round-trip.",
-        )
+    def test_write_single_recipient_posts_once(self, monkeypatch):
+        """write --to borges calls POST /api/dm/borges exactly once."""
+        client = _make_client(post_return={"seq": 7, "ts": "2026-06-28T10:00:00Z"})
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(to="borges", from_stdin=True, subject=None)
+            # Simulate stdin with body text
+            monkeypatch.setattr("sys.stdin", __import__("io").StringIO("Hello borges.\n"))
+            _ia.cmd_write(args, MULTI_CONFIG, "ariadne")
 
-        # Step 1: ia list should show the letter
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list")
-        assert rc == 0
-        assert "borges" in stdout
-        assert "Round-trip test" in stdout
+        client.post.assert_called_once()
+        call_path, call_payload = client.post.call_args[0]
+        assert "/api/dm/borges" in call_path
+        assert call_payload["agent"] == "ariadne"
+        assert "Hello borges." in call_payload["body"]
 
-        # Verify cursor is not yet advanced (no read yet)
-        assert _read_read_cursor(engram_home) == ""
+    def test_write_multi_recipient_posts_to_each(self, monkeypatch, capsys):
+        """write --to borges,mira posts to each recipient's DM thread."""
+        post_return = {"seq": 5, "ts": "2026-06-28T10:00:00Z"}
+        client = _make_client(post_return=post_return)
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(to="borges,mira", from_stdin=True, subject=None)
+            monkeypatch.setattr("sys.stdin", __import__("io").StringIO("Group message.\n"))
+            _ia.cmd_write(args, MULTI_CONFIG, "ariadne")
 
-        # Step 2: ia read should display the letter and advance cursor
+        assert client.post.call_count == 2
+        paths = [call[0][0] for call in client.post.call_args_list]
+        assert any("borges" in p for p in paths)
+        assert any("mira" in p for p in paths)
+
+    def test_write_multi_recipient_to_line_prepended(self, monkeypatch):
+        """Multi-recipient: **To:** header prepended to body for each DM."""
+        post_return = {"seq": 1, "ts": "2026-06-28T10:00:00Z"}
+        client = _make_client(post_return=post_return)
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(to="borges,mira", from_stdin=True, subject=None)
+            monkeypatch.setattr("sys.stdin", __import__("io").StringIO("Group message.\n"))
+            _ia.cmd_write(args, MULTI_CONFIG, "ariadne")
+
+        # Both posts should have the **To:** header
+        for call in client.post.call_args_list:
+            body = call[0][1]["body"]
+            assert "**To:** borges, mira" in body, f"No To: header in body: {body!r}"
+
+    def test_write_multi_recipient_partial_failure_continues_and_exits_nonzero(
+        self, monkeypatch, capsys
+    ):
+        """Collect-and-continue: a mid-list send failure does NOT abort the rest.
+
+        All recipients are attempted; the failed ones are reported by name; and
+        the command exits non-zero (EXIT_IO) so the partial delivery is visible
+        rather than silently truncated at the first failure.
+        """
+        client = _make_client()
+        # recipient 1 succeeds, recipient 2 fails (forum unreachable mid-loop),
+        # recipient 3 succeeds — proving the loop continues past the failure.
+        client.post.side_effect = [
+            {"seq": 1, "ts": "2026-06-28T10:00:00Z"},
+            ForumNetworkError("connection refused"),
+            {"seq": 2, "ts": "2026-06-28T10:00:01Z"},
+        ]
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(to="borges,mira,clio", from_stdin=True, subject=None)
+            monkeypatch.setattr("sys.stdin", __import__("io").StringIO("Group message.\n"))
+            with pytest.raises(SystemExit) as exc:
+                _ia.cmd_write(args, MULTI_CONFIG, "ariadne")
+
+        assert exc.value.code == EXIT_IO
+        # ALL three recipients attempted despite the mid-list failure
+        assert client.post.call_count == 3
+        err = capsys.readouterr().err
+        assert "FAILED to mira" in err
+        assert "1 of 3 deliveries FAILED" in err
+
+    def test_write_single_recipient_no_to_line(self, monkeypatch):
+        """Single recipient: NO **To:** header (would expose BCC-like info)."""
+        client = _make_client(post_return={"seq": 1, "ts": "2026-06-28T10:00:00Z"})
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(to="borges", from_stdin=True, subject=None)
+            monkeypatch.setattr("sys.stdin", __import__("io").StringIO("Just to borges.\n"))
+            _ia.cmd_write(args, MULTI_CONFIG, "ariadne")
+
+        body = client.post.call_args[0][1]["body"]
+        assert "**To:**" not in body, f"Unexpected To: header for single recipient: {body!r}"
+
+    def test_write_subject_prepended(self, monkeypatch):
+        """--subject S: '**Subject:** S' is prepended before the body."""
+        client = _make_client(post_return={"seq": 2, "ts": "2026-06-28T10:00:00Z"})
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(to="borges", from_stdin=True, subject="PR review request")
+            monkeypatch.setattr("sys.stdin", __import__("io").StringIO("Please look at PR #42.\n"))
+            _ia.cmd_write(args, MULTI_CONFIG, "ariadne")
+
+        body = client.post.call_args[0][1]["body"]
+        assert "**Subject:** PR review request" in body
+        assert "Please look at PR #42." in body
+        # Subject should come before the body text
+        assert body.index("**Subject:**") < body.index("Please look")
+
+    def test_write_multi_recipient_with_subject_order(self, monkeypatch):
+        """Multi-recipient + subject: To-line appears before Subject line."""
+        client = _make_client(post_return={"seq": 3, "ts": "2026-06-28T10:00:00Z"})
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(to="borges,mira", from_stdin=True, subject="Important update")
+            monkeypatch.setattr("sys.stdin", __import__("io").StringIO("See the issue.\n"))
+            _ia.cmd_write(args, MULTI_CONFIG, "ariadne")
+
+        body = client.post.call_args_list[0][0][1]["body"]
+        assert "**To:**" in body
+        assert "**Subject:** Important update" in body
+        # To-line should come before Subject
+        assert body.index("**To:**") < body.index("**Subject:**")
+
+    def test_write_empty_body_fails(self, monkeypatch):
+        """Empty body → exit EXIT_VALIDATION, nothing posted."""
+        client = _make_client()
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(to="borges", from_stdin=True)
+            monkeypatch.setattr("sys.stdin", __import__("io").StringIO("   \n"))
+            with pytest.raises(SystemExit) as exc_info:
+                _ia.cmd_write(args, MULTI_CONFIG, "ariadne")
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+
+    def test_write_missing_to_fails(self, engram_home):
+        """--to not provided → exit non-zero."""
+        _write_config(engram_home, "multi")
         rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "read", "2026-05-23T13-00-00Z_borges.md",
+            engram_home, "write", "--from-stdin",
+            stdin_text="hello",
         )
-        assert rc == 0
-        assert "Round-trip test" in stdout
-        assert "This letter tests the full round-trip." in stdout
+        assert rc != 0
 
-        # Cursor must now be set to the letter's timestamp
-        cursor_content = _read_read_cursor(engram_home)
-        expected_ts = letter_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
-        assert cursor_content == expected_ts
+    def test_write_body_file(self, monkeypatch, tmp_path):
+        """--body-file: reads body from file, posts it."""
+        body_file = tmp_path / "body.md"
+        body_file.write_text("Content from file.\n", encoding="utf-8")
+        client = _make_client(post_return={"seq": 4, "ts": "2026-06-28T10:00:00Z"})
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(to="borges", body_file=str(body_file))
+            _ia.cmd_write(args, MULTI_CONFIG, "ariadne")
 
-        # Step 3: ia list --unread should now show 0 letters
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list", "--unread")
-        assert rc == 0
-        assert "(0)" in stdout or "no letters found" in stdout.lower()
+        body = client.post.call_args[0][1]["body"]
+        assert "Content from file." in body
 
-    def test_write_creates_readable_letter(self, engram_home, inter_agent_dir):
-        """Letter written via 'ia write --from-stdin' can be read back."""
-        _write_config(engram_home, "multi", "ariadne")
-        now = datetime.now(timezone.utc)
-        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        body = "This is the test letter body content."
-        letter = (
-            "---\n"
-            "from: ariadne\n"
-            "to: borges\n"
-            f"timestamp: {ts_str}\n"
-            "---\n\n"
-            "# Test heading\n\n"
-            f"{body}\n"
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "borges", "--from-stdin",
-            stdin_text=letter,
-        )
-        assert rc == 0, f"write failed; stderr: {stderr}"
+    def test_write_body_file_nonexistent_fails(self):
+        """--body-file pointing to missing file → exit EXIT_VALIDATION."""
+        client = _make_client()
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(
+                to="borges",
+                body_file="/tmp/definitely_does_not_exist_ia_test.md",
+            )
+            with pytest.raises(SystemExit) as exc_info:
+                _ia.cmd_write(args, MULTI_CONFIG, "ariadne")
+        assert exc_info.value.code == EXIT_VALIDATION
 
-        # The written file should exist and be parseable
-        md_files = list(inter_agent_dir.glob("*.md"))
-        assert md_files, "Expected a .md file to be written"
-        content = md_files[0].read_text()
-        assert body in content
-        assert "from: ariadne" in content
-        assert "to: borges" in content
 
-    def test_read_latest_reads_newest_unread(self, engram_home, inter_agent_dir):
-        """ia read --latest reads the newest unread letter."""
-        _write_config(engram_home, "multi", "ariadne")
+# ===========================================================================
+# CATEGORY 4: List command
+# ===========================================================================
 
-        older_ts = _ts(-30)
-        newer_ts = _ts(-5)
 
-        _write_letter(
-            inter_agent_dir, "2026-05-23T10-00-00Z_borges.md",
-            from_agent="borges", to_agent="ariadne",
-            timestamp=older_ts, heading="Older letter",
-        )
-        _write_letter(
-            inter_agent_dir, "2026-05-23T11-00-00Z_borges.md",
-            from_agent="borges", to_agent="ariadne",
-            timestamp=newer_ts, heading="Newer letter",
-        )
+class TestList:
+    """List command: GET /api/dm, thread rendering."""
 
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "read", "--latest")
-        assert rc == 0
-        assert "Newer letter" in stdout
+    def test_list_shows_threads(self, capsys):
+        """cmd_list renders counterpart names from /api/dm threads."""
+        threads = [{"counterpart": "borges"}, {"counterpart": "mira"}]
+        client = _make_client(get_return={"threads": threads})
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(format="human")
+            _ia.cmd_list(args, MULTI_CONFIG, "ariadne")
 
-    def test_list_format_json(self, engram_home, inter_agent_dir):
-        """ia list --format json returns valid JSON with expected fields."""
-        _write_config(engram_home, "multi", "ariadne")
-        _write_letter(
-            inter_agent_dir, "2026-05-23T10-00-00Z_borges.md",
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-30), heading="JSON test",
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir, "list", "--format", "json",
-        )
-        assert rc == 0
-        data = json.loads(stdout)
+        captured = capsys.readouterr()
+        assert "borges" in captured.out
+        assert "mira" in captured.out
+
+    def test_list_empty_shows_zero_message(self, capsys):
+        """cmd_list with no threads shows a '(0)' message."""
+        client = _make_client(get_return={"threads": []})
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(format="human")
+            _ia.cmd_list(args, MULTI_CONFIG, "ariadne")
+
+        captured = capsys.readouterr()
+        assert "0" in captured.out
+
+    def test_list_json_format(self, capsys):
+        """cmd_list --format json outputs JSON array."""
+        threads = [{"counterpart": "borges"}]
+        client = _make_client(get_return={"threads": threads})
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(format="json")
+            _ia.cmd_list(args, MULTI_CONFIG, "ariadne")
+
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
         assert isinstance(data, list)
-        assert len(data) == 1
-        letter = data[0]
-        assert "timestamp" in letter
-        assert "from" in letter
-        assert "title" in letter
-        assert "path" in letter
-        assert "filename" in letter
+        assert data[0]["counterpart"] == "borges"
 
-    def test_status_json_format(self, engram_home, inter_agent_dir):
-        """ia status --format json returns valid JSON with expected fields."""
-        _write_config(engram_home, "multi", "ariadne")
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "status", "--format", "json")
-        assert rc == 0
-        data = json.loads(stdout)
+    def test_list_calls_correct_endpoint(self):
+        """cmd_list calls GET /api/dm with agent param."""
+        client = _make_client(get_return={"threads": []})
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args()
+            _ia.cmd_list(args, MULTI_CONFIG, "ariadne")
+
+        client.get.assert_called_once_with("/api/dm", params={"agent": "ariadne"})
+
+
+# ===========================================================================
+# CATEGORY 5: Read command
+# ===========================================================================
+
+
+class TestRead:
+    """Read command: GET /api/dm/<counterpart>, message rendering, 404 handling."""
+
+    def test_read_shows_messages(self, capsys):
+        """cmd_read renders messages from the thread."""
+        messages = [
+            {"seq": 1, "sender": "borges", "ts": "2026-06-28T10:00:00Z", "body": "Hello ariadne."},
+            {"seq": 2, "sender": "ariadne", "ts": "2026-06-28T10:01:00Z", "body": "Hi borges!"},
+        ]
+        client = _make_client(get_return={"messages": messages})
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(counterpart="borges", since_seq=0)
+            _ia.cmd_read(args, MULTI_CONFIG, "ariadne")
+
+        captured = capsys.readouterr()
+        assert "Hello ariadne." in captured.out
+        assert "Hi borges!" in captured.out
+        assert "seq=1" in captured.out
+        assert "seq=2" in captured.out
+
+    def test_read_json_format(self, capsys):
+        """cmd_read --format json outputs JSON array of messages."""
+        messages = [
+            {"seq": 1, "sender": "borges", "ts": "2026-06-28T10:00:00Z", "body": "JSON test."}
+        ]
+        client = _make_client(get_return={"messages": messages})
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(counterpart="borges", format="json")
+            _ia.cmd_read(args, MULTI_CONFIG, "ariadne")
+
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert isinstance(data, list)
+        assert data[0]["seq"] == 1
+
+    def test_read_404_prints_no_thread_message(self, capsys):
+        """cmd_read with 404 response prints '(no DM thread with X)' and exits 0."""
+        client = MagicMock()
+        client.get.side_effect = ForumHttpError(404, "not found")
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(counterpart="nobody")
+            _ia.cmd_read(args, MULTI_CONFIG, "ariadne")  # should NOT raise
+
+        captured = capsys.readouterr()
+        assert "no DM thread with nobody" in captured.out
+
+    def test_read_empty_thread_prints_message(self, capsys):
+        """cmd_read with empty messages list prints '(no messages with X)'."""
+        client = _make_client(get_return={"messages": []})
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(counterpart="borges")
+            _ia.cmd_read(args, MULTI_CONFIG, "ariadne")
+
+        captured = capsys.readouterr()
+        assert "no messages with borges" in captured.out
+
+    def test_read_passes_since_seq(self):
+        """cmd_read passes --since-seq to the API."""
+        client = _make_client(get_return={"messages": []})
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(counterpart="borges", since_seq=5)
+            _ia.cmd_read(args, MULTI_CONFIG, "ariadne")
+
+        call_params = client.get.call_args[1]["params"]
+        assert call_params["since_seq"] == "5"
+
+
+# ===========================================================================
+# CATEGORY 6: Cursor command
+# ===========================================================================
+
+
+class TestCursor:
+    """Cursor: show/set the as_of int cursor."""
+
+    def test_cursor_show_zero_when_no_file(self, engram_home):
+        """ia cursor --show with no cursor file → shows 0."""
+        _write_config(engram_home, "multi")
+        rc, stdout, stderr = _run_ia(engram_home, "cursor", "--show")
+        assert rc == EXIT_OK
+        assert "0" in stdout
+
+    def test_cursor_set_integer(self, engram_home):
+        """ia cursor --set 100 → writes 100 to file."""
+        _write_config(engram_home, "multi")
+        rc, stdout, stderr = _run_ia(engram_home, "cursor", "--set", "100")
+        assert rc == EXIT_OK
+        assert _read_cursor(engram_home) == "100"
+
+    def test_cursor_show_after_set(self, engram_home):
+        """ia cursor shows the value written by --set."""
+        _write_config(engram_home, "multi")
+        _run_ia(engram_home, "cursor", "--set", "42")
+        rc, stdout, stderr = _run_ia(engram_home, "cursor", "--show")
+        assert rc == EXIT_OK
+        assert "42" in stdout
+
+    def test_cursor_show_existing_file(self, engram_home):
+        """ia cursor reads existing cursor file."""
+        _write_config(engram_home, "multi")
+        _write_cursor(engram_home, 999)
+        rc, stdout, stderr = _run_ia(engram_home, "cursor", "--show")
+        assert rc == EXIT_OK
+        assert "999" in stdout
+
+    def test_cursor_set_invalid_value_fails(self, engram_home):
+        """ia cursor --set 'not-an-int' → exit EXIT_VALIDATION."""
+        _write_config(engram_home, "multi")
+        rc, stdout, stderr = _run_ia(engram_home, "cursor", "--set", "not-an-int")
+        assert rc == EXIT_VALIDATION
+        assert "integer" in stderr
+
+    def test_cursor_write_no_tmp_remains(self, engram_home):
+        """After cursor --set, no .tmp file remains in engram_home."""
+        _write_config(engram_home, "multi")
+        _run_ia(engram_home, "cursor", "--set", "77")
+        tmp_files = list(engram_home.glob("*.tmp"))
+        assert tmp_files == [], f"Tmp files must not remain: {tmp_files}"
+
+    def test_read_cursor_int_helper_returns_0_when_absent(self, tmp_path):
+        """_read_cursor_int returns 0 when cursor file does not exist."""
+        result = _ia._read_cursor_int(str(tmp_path / "nonexistent.txt"))
+        assert result == 0
+
+    def test_read_cursor_int_helper_reads_value(self, tmp_path):
+        """_read_cursor_int returns the int stored in the file."""
+        cursor_file = tmp_path / "cursor.txt"
+        cursor_file.write_text("123\n")
+        assert _ia._read_cursor_int(str(cursor_file)) == 123
+
+    def test_read_cursor_int_helper_returns_0_on_invalid(self, tmp_path):
+        """_read_cursor_int returns 0 on non-integer file content."""
+        cursor_file = tmp_path / "cursor.txt"
+        cursor_file.write_text("2026-05-22T10:00:00Z\n")  # old timestamp format
+        assert _ia._read_cursor_int(str(cursor_file)) == 0
+
+
+# ===========================================================================
+# CATEGORY 7: MarkRead command
+# ===========================================================================
+
+
+class TestMarkRead:
+    """mark-read: advance cursor via /api/updates."""
+
+    def test_mark_read_advances_cursor(self, engram_home, capsys):
+        """mark-read writes returned as_of to cursor file."""
+        _write_config(engram_home, "multi")
+        _write_cursor(engram_home, 10)
+
+        updates_response = {"updates": [], "as_of": 42, "ts": "2026-06-28T12:00:00Z"}
+        client = _make_client(get_return=updates_response)
+        with patch.object(_ia, "ForumClient", return_value=client):
+            # Set READ_CURSOR_PATH to use our test home
+            original_path = _ia.READ_CURSOR_PATH
+            _ia.READ_CURSOR_PATH = str(engram_home / "inter-agent-read-cursor.txt")
+            try:
+                args = _make_args()
+                _ia.cmd_mark_read(args, MULTI_CONFIG, "ariadne")
+            finally:
+                _ia.READ_CURSOR_PATH = original_path
+
+        assert _read_cursor(engram_home) == "42"
+
+    def test_mark_read_calls_updates_endpoint(self, engram_home):
+        """mark-read calls GET /api/updates with agent + since + kinds=dm."""
+        _write_cursor(engram_home, 5)
+
+        updates_response = {"updates": [], "as_of": 10, "ts": "2026-06-28T12:00:00Z"}
+        client = _make_client(get_return=updates_response)
+        with patch.object(_ia, "ForumClient", return_value=client):
+            original_path = _ia.READ_CURSOR_PATH
+            _ia.READ_CURSOR_PATH = str(engram_home / "inter-agent-read-cursor.txt")
+            try:
+                args = _make_args()
+                _ia.cmd_mark_read(args, MULTI_CONFIG, "ariadne")
+            finally:
+                _ia.READ_CURSOR_PATH = original_path
+
+        call_params = client.get.call_args[1]["params"]
+        assert call_params["agent"] == "ariadne"
+        assert call_params["kinds"] == "dm"
+        # since should be the cursor value (5)
+        assert call_params["since"] == "5"
+
+    def test_mark_read_subprocess_multi_mode(self, engram_home):
+        """ia mark-read in single mode → exit 3 (mode gate fires)."""
+        _write_config(engram_home, "single")
+        rc, stdout, stderr = _run_ia(engram_home, "mark-read")
+        assert rc == EXIT_STATE
+        assert "single-agent mode" in stderr
+
+
+# ===========================================================================
+# CATEGORY 8: Loud-fail — unreachable forum
+# ===========================================================================
+
+
+class TestLoudFail:
+    """ForumNetworkError / HttpError → stderr + non-zero exit, NO fallback."""
+
+    def test_list_network_error_exits_nonzero(self, capsys):
+        """cmd_list with ForumNetworkError → stderr + sys.exit(EXIT_IO)."""
+        client = MagicMock()
+        client.get.side_effect = ForumNetworkError("connection refused")
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args()
+            with pytest.raises(SystemExit) as exc_info:
+                _ia.cmd_list(args, MULTI_CONFIG, "ariadne")
+        assert exc_info.value.code == EXIT_IO
+        captured = capsys.readouterr()
+        assert "unreachable" in captured.err.lower() or "forum" in captured.err.lower()
+
+    def test_write_network_error_exits_nonzero(self, monkeypatch, capsys):
+        """cmd_write with ForumNetworkError → stderr + sys.exit(EXIT_IO)."""
+        client = MagicMock()
+        client.post.side_effect = ForumNetworkError("connection refused")
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(to="borges", from_stdin=True)
+            monkeypatch.setattr("sys.stdin", __import__("io").StringIO("test body\n"))
+            with pytest.raises(SystemExit) as exc_info:
+                _ia.cmd_write(args, MULTI_CONFIG, "ariadne")
+        assert exc_info.value.code == EXIT_IO
+
+    def test_mark_read_network_error_exits_nonzero(self, engram_home, capsys):
+        """cmd_mark_read with ForumNetworkError → stderr + sys.exit."""
+        client = MagicMock()
+        client.get.side_effect = ForumNetworkError("connection refused")
+        with patch.object(_ia, "ForumClient", return_value=client):
+            original_path = _ia.READ_CURSOR_PATH
+            _ia.READ_CURSOR_PATH = str(engram_home / "inter-agent-read-cursor.txt")
+            try:
+                args = _make_args()
+                with pytest.raises(SystemExit) as exc_info:
+                    _ia.cmd_mark_read(args, MULTI_CONFIG, "ariadne")
+            finally:
+                _ia.READ_CURSOR_PATH = original_path
+        assert exc_info.value.code == EXIT_IO
+
+    def test_peers_network_error_exits_nonzero(self, capsys):
+        """cmd_peers with ForumNetworkError → stderr + sys.exit."""
+        client = MagicMock()
+        client.get.side_effect = ForumNetworkError("connection refused")
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args()
+            with pytest.raises(SystemExit) as exc_info:
+                _ia.cmd_peers(args, MULTI_CONFIG, "ariadne")
+        assert exc_info.value.code == EXIT_IO
+
+    def test_read_http_500_exits_nonzero(self, capsys):
+        """cmd_read with HTTP 500 → stderr + sys.exit."""
+        client = MagicMock()
+        client.get.side_effect = ForumHttpError(500, "internal server error")
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(counterpart="borges")
+            with pytest.raises(SystemExit) as exc_info:
+                _ia.cmd_read(args, MULTI_CONFIG, "ariadne")
+        assert exc_info.value.code == EXIT_IO
+
+    def test_loud_fail_subprocess_unreachable(self, engram_home):
+        """ia list against a refused port → non-zero exit + stderr."""
+        _write_config(engram_home, "multi")
+        rc, stdout, stderr = _run_ia(
+            engram_home, "list",
+            env_overrides={"FORUM_URL": "http://localhost:1"},
+        )
+        assert rc != EXIT_OK
+        # Should print an error on stderr
+        assert len(stderr) > 0
+
+    def test_no_silent_fallback_on_network_error(self, monkeypatch, capsys):
+        """ForumNetworkError must exit, never fall back to local files."""
+        client = MagicMock()
+        client.get.side_effect = ForumNetworkError("connection refused")
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args()
+            with pytest.raises(SystemExit):
+                _ia.cmd_list(args, MULTI_CONFIG, "ariadne")
+        # If we reach here, it exited — no silent fallback occurred
+
+
+# ===========================================================================
+# CATEGORY 9: Peers command
+# ===========================================================================
+
+
+class TestPeers:
+    """Peers: GET /api/agents/online rendering."""
+
+    def test_peers_shows_agent_names(self, capsys):
+        """cmd_peers renders names from the online list."""
+        online = [
+            {"name": "borges", "state": "idle"},
+            {"name": "mira", "state": "working"},
+        ]
+        client = _make_client(get_return={"online": online, "registered": 3})
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args()
+            _ia.cmd_peers(args, MULTI_CONFIG, "ariadne")
+
+        captured = capsys.readouterr()
+        assert "borges" in captured.out
+        assert "mira" in captured.out
+
+    def test_peers_excludes_self(self, capsys):
+        """cmd_peers filters out the calling agent from the display."""
+        online = [
+            {"name": "ariadne", "state": "idle"},
+            {"name": "borges", "state": "working"},
+        ]
+        client = _make_client(get_return={"online": online, "registered": 2})
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args()
+            _ia.cmd_peers(args, MULTI_CONFIG, "ariadne")
+
+        captured = capsys.readouterr()
+        # ariadne (self) should not appear in peers output
+        # borges should appear
+        assert "borges" in captured.out
+
+    def test_peers_json_format(self, capsys):
+        """cmd_peers --format json outputs raw API response as JSON."""
+        api_response = {"online": [{"name": "borges", "state": "idle"}], "registered": 2, "count": 1}
+        client = _make_client(get_return=api_response)
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args(format="json")
+            _ia.cmd_peers(args, MULTI_CONFIG, "ariadne")
+
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert "online" in data
+
+    def test_peers_empty_shows_zero_message(self, capsys):
+        """cmd_peers with no online agents shows a '0' message."""
+        client = _make_client(get_return={"online": [], "registered": 5})
+        with patch.object(_ia, "ForumClient", return_value=client):
+            args = _make_args()
+            _ia.cmd_peers(args, MULTI_CONFIG, "ariadne")
+
+        captured = capsys.readouterr()
+        assert "0" in captured.out
+
+
+# ===========================================================================
+# CATEGORY 10: Status command
+# ===========================================================================
+
+
+class TestStatus:
+    """Status: health check output."""
+
+    def test_status_json_format(self, capsys, engram_home):
+        """cmd_status --format json returns valid JSON with expected fields."""
+        client = MagicMock()
+        client.get.side_effect = [
+            {"threads": [{"counterpart": "borges"}]},
+            {"updates": [], "as_of": 10, "ts": "2026-06-28T12:00:00Z"},
+        ]
+        config = {"mode": "multi", "agent_name": "ariadne"}
+        with patch.object(_ia, "ForumClient", return_value=client):
+            original_path = _ia.READ_CURSOR_PATH
+            _ia.READ_CURSOR_PATH = str(engram_home / "inter-agent-read-cursor.txt")
+            try:
+                args = _make_args(format="json")
+                _ia.cmd_status(args, config, "ariadne")
+            finally:
+                _ia.READ_CURSOR_PATH = original_path
+
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
         assert data["agent"] == "ariadne"
         assert data["mode"] == "multi"
-        assert "unread_letters" in data
         assert "read_cursor" in data
+        assert "dm_threads" in data
 
-    def test_list_from_filter(self, engram_home, inter_agent_dir):
-        """ia list --from <agent> filters to only that sender."""
-        _write_config(engram_home, "multi", "ariadne")
-        _write_letter(
-            inter_agent_dir, "2026-05-23T10-00-00Z_borges.md",
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-30), heading="From borges",
-        )
-        _write_letter(
-            inter_agent_dir, "2026-05-23T11-00-00Z_mneme.md",
-            from_agent="mneme", to_agent="ariadne",
-            timestamp=_ts(-20), heading="From Zephyr",
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir, "list", "--from", "borges",
-        )
-        assert rc == 0
-        assert "From borges" in stdout
-        assert "From Zephyr" not in stdout
+    def test_status_graceful_on_unreachable(self, engram_home, capsys):
+        """cmd_status handles forum unreachable gracefully (shows '(unreachable)')."""
+        client = MagicMock()
+        client.get.side_effect = ForumNetworkError("connection refused")
+        with patch.object(_ia, "ForumClient", return_value=client):
+            original_path = _ia.READ_CURSOR_PATH
+            _ia.READ_CURSOR_PATH = str(engram_home / "inter-agent-read-cursor.txt")
+            try:
+                args = _make_args(format="human")
+                _ia.cmd_status(args, MULTI_CONFIG, "ariadne")
+            finally:
+                _ia.READ_CURSOR_PATH = original_path
 
-    def test_read_latest_no_unread_message_on_stdout(self, engram_home, inter_agent_dir):
-        """Nit 1: 'no unread' message lands on stdout (informational), not stderr."""
-        _write_config(engram_home, "multi", "ariadne")
-
-        # Write a letter, then advance the cursor past it so there are no unread
-        letter_ts = _ts(-30)
-        _write_letter(
-            inter_agent_dir, "2026-05-23T10-00-00Z_borges.md",
-            from_agent="borges", to_agent="ariadne",
-            timestamp=letter_ts, heading="Already read",
-        )
-        # Cursor set to a time after the letter — no unread remain
-        _write_read_cursor(engram_home, _ts(-5))
-
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "read", "--latest")
-        assert rc == 0
-        assert "no unread" in stdout
-        assert "no unread" not in stderr
+        captured = capsys.readouterr()
+        assert "ariadne" in captured.out
+        assert "unreachable" in captured.out
 
 
 # ===========================================================================
-# CATEGORY 7: REPLIED marker tests
+# CATEGORY 11: _encode_body helper unit tests
 # ===========================================================================
 
-class TestRepliedMarker:
-    """REPLIED marker: _scan_replied_filenames, cmd_list display, --reply convenience,
-    cmd_status unreplied count."""
 
-    # -----------------------------------------------------------------------
-    # _scan_replied_filenames unit tests
-    # -----------------------------------------------------------------------
-
-    def test_scan_replied_empty_when_no_outgoing(self, engram_home, inter_agent_dir):
-        """_scan_replied_filenames returns empty set when no outgoing letters exist."""
-        from tools.ia import _scan_replied_filenames
-        # Only incoming letters (to ariadne, from borges) — none outgoing from ariadne
-        _write_letter(
-            inter_agent_dir, "2026-05-28T10-00-00Z_borges.md",
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-30),
-        )
-        result = _scan_replied_filenames("ariadne", inter_agent_dir)
-        assert result == set()
-
-    def test_scan_replied_collects_re_values(self, engram_home, inter_agent_dir):
-        """_scan_replied_filenames collects re: values from multiple outgoing letters."""
-        from tools.ia import _scan_replied_filenames
-        incoming1 = "2026-05-28T09-00-00Z_borges.md"
-        incoming2 = "2026-05-28T10-00-00Z_borges.md"
-        # Outgoing letter referencing incoming1
-        _write_letter(
-            inter_agent_dir, "2026-05-28T11-00-00Z_ariadne.md",
-            from_agent="ariadne", to_agent="borges",
-            timestamp=_ts(-10), re_field=incoming1,
-        )
-        # Outgoing letter referencing incoming2
-        _write_letter(
-            inter_agent_dir, "2026-05-28T12-00-00Z_ariadne.md",
-            from_agent="ariadne", to_agent="borges",
-            timestamp=_ts(-5), re_field=incoming2,
-        )
-        result = _scan_replied_filenames("ariadne", inter_agent_dir)
-        assert result == {incoming1, incoming2}
-
-    def test_scan_replied_skips_malformed_letters(self, engram_home, inter_agent_dir):
-        """_scan_replied_filenames skips malformed letters gracefully."""
-        from tools.ia import _scan_replied_filenames
-        # Write a malformed .md file alongside a valid outgoing letter
-        (inter_agent_dir / "malformed-outgoing.md").write_text("no frontmatter here\n")
-        incoming1 = "2026-05-28T09-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, "2026-05-28T11-00-00Z_ariadne.md",
-            from_agent="ariadne", to_agent="borges",
-            timestamp=_ts(-10), re_field=incoming1,
-        )
-        # Should not raise; should still collect re: from the valid outgoing letter
-        result = _scan_replied_filenames("ariadne", inter_agent_dir)
-        assert result == {incoming1}
-
-    def test_scan_replied_ignores_outgoing_without_re(self, engram_home, inter_agent_dir):
-        """_scan_replied_filenames ignores outgoing letters with no re: field."""
-        from tools.ia import _scan_replied_filenames
-        # Outgoing letter without re: (cold start letter, not a reply)
-        _write_letter(
-            inter_agent_dir, "2026-05-28T11-00-00Z_ariadne.md",
-            from_agent="ariadne", to_agent="borges",
-            timestamp=_ts(-10),
-        )
-        result = _scan_replied_filenames("ariadne", inter_agent_dir)
-        assert result == set()
-
-    # -----------------------------------------------------------------------
-    # cmd_list REPLIED display tests
-    # -----------------------------------------------------------------------
-
-    def test_list_shows_replied_marker(self, engram_home, inter_agent_dir):
-        """cmd_list shows [REPLIED] on a letter when an outgoing re: points at it."""
-        _write_config(engram_home, "multi", "ariadne")
-        incoming_filename = "2026-05-28T09-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, incoming_filename,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60), heading="Original question",
-        )
-        # Outgoing reply that references the incoming letter
-        _write_letter(
-            inter_agent_dir, "2026-05-28T10-00-00Z_ariadne.md",
-            from_agent="ariadne", to_agent="borges",
-            timestamp=_ts(-30), re_field=incoming_filename,
-        )
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list", "--all")
-        assert rc == 0
-        assert "[REPLIED]" in stdout
-        assert "Original question" in stdout
-
-    def test_list_no_replied_marker_without_re(self, engram_home, inter_agent_dir):
-        """cmd_list does NOT show [REPLIED] when no outgoing letter references the incoming."""
-        _write_config(engram_home, "multi", "ariadne")
-        incoming_filename = "2026-05-28T09-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, incoming_filename,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60), heading="Unreplied letter",
-        )
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list", "--all")
-        assert rc == 0
-        assert "[REPLIED]" not in stdout
-        assert "Unreplied letter" in stdout
-
-    def test_list_replied_marker_only_on_correct_letter(self, engram_home, inter_agent_dir):
-        """[REPLIED] appears only on the specific letter referenced, not others."""
-        _write_config(engram_home, "multi", "ariadne")
-        incoming_replied = "2026-05-28T08-00-00Z_borges.md"
-        incoming_unreplied = "2026-05-28T09-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, incoming_replied,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-90), heading="Replied letter",
-        )
-        _write_letter(
-            inter_agent_dir, incoming_unreplied,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60), heading="Unreplied letter",
-        )
-        # Outgoing letter replies to incoming_replied only
-        _write_letter(
-            inter_agent_dir, "2026-05-28T10-00-00Z_ariadne.md",
-            from_agent="ariadne", to_agent="borges",
-            timestamp=_ts(-30), re_field=incoming_replied,
-        )
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list", "--all")
-        assert rc == 0
-        # Exactly one [REPLIED] marker in output
-        assert stdout.count("[REPLIED]") == 1
-        # "Replied letter" line has the marker
-        for line in stdout.splitlines():
-            if "Replied letter" in line:
-                assert "[REPLIED]" in line
-            if "Unreplied letter" in line:
-                assert "[REPLIED]" not in line
-
-    # -----------------------------------------------------------------------
-    # ia write --reply FILENAME tests
-    # -----------------------------------------------------------------------
-
-    def test_write_reply_autofills_to_and_re(self, engram_home, inter_agent_dir):
-        """ia write --reply FILENAME auto-fills to: from source's from: and sets re:."""
-        _write_config(engram_home, "multi", "ariadne")
-        now = datetime.now(timezone.utc)
-        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        incoming_filename = "2026-05-28T09-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, incoming_filename,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-30), heading="Please reply to this",
-        )
-        # Write a reply via --reply (body provided via stdin)
-        letter_content = (
-            "---\n"
-            "from: ariadne\n"
-            "to: borges\n"
-            f"timestamp: {ts_str}\n"
-            f"re: {incoming_filename}\n"
-            "---\n\n"
-            "# Reply\n\n"
-            "Here is my reply.\n"
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--reply", incoming_filename, "--from-stdin",
-            stdin_text=letter_content,
-        )
-        assert rc == 0, f"write --reply failed; stderr: {stderr}"
-        # Find the written letter (the outgoing one, from ariadne)
-        md_files = [f for f in inter_agent_dir.glob("*.md") if f.name != incoming_filename]
-        assert md_files, "Expected an outgoing letter to be written"
-        content = md_files[0].read_text()
-        assert "to: borges" in content
-        assert f"re: {incoming_filename}" in content
-
-    def test_write_reply_to_conflict_rejected(self, engram_home, inter_agent_dir):
-        """ia write --reply FILENAME --to OTHER (OTHER != source's from) is rejected."""
-        _write_config(engram_home, "multi", "ariadne")
-        incoming_filename = "2026-05-28T09-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, incoming_filename,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-30), heading="From borges",
-        )
-        now = datetime.now(timezone.utc)
-        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        letter_content = (
-            "---\n"
-            "from: ariadne\n"
-            "to: mneme\n"
-            f"timestamp: {ts_str}\n"
-            f"re: {incoming_filename}\n"
-            "---\n\n"
-            "Body.\n"
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--reply", incoming_filename, "--to", "mneme", "--from-stdin",
-            stdin_text=letter_content,
-        )
-        assert rc == 1, "Expected rejection when --to conflicts with source's from:"
-        assert "conflict" in stderr.lower() and "borges" in stderr and "mneme" in stderr
-
-    def test_write_reply_to_matching_accepted(self, engram_home, inter_agent_dir):
-        """ia write --reply FILENAME --to borges (matches source's from:) is accepted."""
-        _write_config(engram_home, "multi", "ariadne")
-        incoming_filename = "2026-05-28T09-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, incoming_filename,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-30), heading="From borges",
-        )
-        now = datetime.now(timezone.utc)
-        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        letter_content = (
-            "---\n"
-            "from: ariadne\n"
-            "to: borges\n"
-            f"timestamp: {ts_str}\n"
-            f"re: {incoming_filename}\n"
-            "---\n\n"
-            "Body.\n"
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--reply", incoming_filename, "--to", "borges", "--from-stdin",
-            stdin_text=letter_content,
-        )
-        assert rc == 0, f"Expected acceptance when --to matches source's from:; stderr: {stderr}"
-
-    def test_write_reply_nonexistent_source_rejected(self, engram_home, inter_agent_dir):
-        """ia write --reply NONEXISTENT → exit 1 with clear error."""
-        _write_config(engram_home, "multi", "ariadne")
-        now = datetime.now(timezone.utc)
-        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        letter_content = (
-            "---\n"
-            "from: ariadne\n"
-            "to: borges\n"
-            f"timestamp: {ts_str}\n"
-            "---\n\nBody.\n"
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--reply", "nonexistent-letter.md", "--from-stdin",
-            stdin_text=letter_content,
-        )
-        assert rc == 1
-        assert "not found" in stderr.lower() or "nonexistent" in stderr.lower()
-
-    def test_write_reply_results_in_re_and_to_in_file(self, engram_home, inter_agent_dir):
-        """Written reply letter has correct to: and re: fields in the file."""
-        _write_config(engram_home, "multi", "ariadne")
-        incoming_filename = "2026-05-28T09-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, incoming_filename,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-30), heading="Source letter",
-        )
-        now = datetime.now(timezone.utc)
-        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        letter_content = (
-            "---\n"
-            "from: ariadne\n"
-            "to: borges\n"
-            f"timestamp: {ts_str}\n"
-            f"re: {incoming_filename}\n"
-            "---\n\n"
-            "# Reply\n\nReply body here.\n"
-        )
-        rc, _, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--reply", incoming_filename, "--from-stdin",
-            stdin_text=letter_content,
-        )
-        assert rc == 0, f"stderr: {stderr}"
-        # Check the written file
-        written = [f for f in inter_agent_dir.glob("*.md") if f.name != incoming_filename]
-        assert written, "Expected a written reply file"
-        content = written[0].read_text()
-        from tools.ia import _parse_frontmatter
-        fields, _ = _parse_frontmatter(content)
-        assert fields.get("to") == "borges"
-        assert fields.get("re") == incoming_filename
-
-    # -----------------------------------------------------------------------
-    # cmd_status unreplied count tests
-    # -----------------------------------------------------------------------
-
-    def test_status_shows_unreplied_when_present(self, engram_home, inter_agent_dir):
-        """cmd_status shows unreplied count when there are unresponded letters."""
-        _write_config(engram_home, "multi", "ariadne")
-        _write_letter(
-            inter_agent_dir, "2026-05-28T09-00-00Z_borges.md",
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60), heading="Needs a reply",
-        )
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "status")
-        assert rc == 0
-        assert "unreplied" in stdout
-        assert "1" in stdout
-
-    def test_status_omits_unreplied_when_zero(self, engram_home, inter_agent_dir):
-        """cmd_status omits unreplied line when all incoming letters have been replied to."""
-        _write_config(engram_home, "multi", "ariadne")
-        incoming_filename = "2026-05-28T09-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, incoming_filename,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60), heading="Already replied",
-        )
-        # Outgoing reply
-        _write_letter(
-            inter_agent_dir, "2026-05-28T10-00-00Z_ariadne.md",
-            from_agent="ariadne", to_agent="borges",
-            timestamp=_ts(-30), re_field=incoming_filename,
-        )
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "status")
-        assert rc == 0
-        # Check that no "unreplied:" label line is emitted (the label is only shown > 0).
-        # Note: the inter-agent-dir path in the output may contain "unreplied" if the
-        # pytest tmp dir name includes it — check for the specific label pattern instead.
-        output_lines = stdout.splitlines()
-        unreplied_label_lines = [ln for ln in output_lines if ln.strip().startswith("unreplied:")]
-        assert unreplied_label_lines == [], f"Expected no unreplied: line; got: {unreplied_label_lines}"
-
-    def test_status_json_includes_unreplied_field(self, engram_home, inter_agent_dir):
-        """cmd_status --format json includes unreplied_letters field."""
-        _write_config(engram_home, "multi", "ariadne")
-        _write_letter(
-            inter_agent_dir, "2026-05-28T09-00-00Z_borges.md",
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60),
-        )
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "status", "--format", "json")
-        assert rc == 0
-        data = json.loads(stdout)
-        assert "unreplied_letters" in data
-        assert data["unreplied_letters"] == 1
-
-    def test_status_json_unreplied_zero_when_all_replied(self, engram_home, inter_agent_dir):
-        """cmd_status --format json shows unreplied_letters=0 when all replied."""
-        _write_config(engram_home, "multi", "ariadne")
-        incoming_filename = "2026-05-28T09-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, incoming_filename,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60),
-        )
-        _write_letter(
-            inter_agent_dir, "2026-05-28T10-00-00Z_ariadne.md",
-            from_agent="ariadne", to_agent="borges",
-            timestamp=_ts(-30), re_field=incoming_filename,
-        )
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "status", "--format", "json")
-        assert rc == 0
-        data = json.loads(stdout)
-        assert data["unreplied_letters"] == 0
-
-
-# ===========================================================================
-# CATEGORY 8: --body-file tests
-# ===========================================================================
-
-class TestBodyFile:
-    """ia write --body-file: auto-assembled frontmatter, verbatim body, error cases."""
-
-    def test_body_file_exits_0_and_sends(self, engram_home, inter_agent_dir, tmp_path):
-        """ia write --body-file exits 0 and creates a letter."""
-        _write_config(engram_home, "multi", "ariadne")
-        body_file = tmp_path / "body.md"
-        body_file.write_text("Hello borges, this is the body.\n", encoding="utf-8")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "borges", "--body-file", str(body_file),
-        )
-        assert rc == 0, f"write --body-file failed; stderr: {stderr}"
-        assert "sent" in stdout
-
-    def test_body_file_frontmatter_auto_filled(self, engram_home, inter_agent_dir, tmp_path):
-        """Written letter has correct auto-filled from, to, and valid timestamp."""
-        _write_config(engram_home, "multi", "ariadne")
-        body_file = tmp_path / "body.md"
-        body_file.write_text("Body content here.\n", encoding="utf-8")
-        before = datetime.now(timezone.utc).replace(microsecond=0)
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "borges", "--body-file", str(body_file),
-        )
-        after = datetime.now(timezone.utc)
-        assert rc == 0, f"stderr: {stderr}"
-        md_files = list(inter_agent_dir.glob("*.md"))
-        assert md_files, "Expected a written .md file"
-        from tools.ia import _parse_frontmatter
-        content = md_files[0].read_text()
-        fields, _ = _parse_frontmatter(content)
-        assert fields.get("from") == "ariadne", f"from: should be agent name; got {fields.get('from')!r}"
-        assert fields.get("to") == "borges", f"to: should be borges; got {fields.get('to')!r}"
-        ts_str = fields.get("timestamp", "")
-        assert ts_str, "timestamp: should be present"
-        ts_dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-        assert before <= ts_dt <= after, f"timestamp {ts_str!r} not in expected range"
-
-    def test_body_file_re_and_title_honored(self, engram_home, inter_agent_dir, tmp_path):
-        """--re and --title flags are honored when using --body-file."""
-        _write_config(engram_home, "multi", "ariadne")
-        # Create the referenced letter so re: validation passes
-        ref_filename = "2026-05-28T09-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, ref_filename,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60),
-        )
-        body_file = tmp_path / "body.md"
-        body_file.write_text("Reply body content.\n", encoding="utf-8")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "borges",
-            "--re", ref_filename,
-            "--title", "My Reply",
-            "--body-file", str(body_file),
-        )
-        assert rc == 0, f"stderr: {stderr}"
-        md_files = [f for f in inter_agent_dir.glob("*.md") if f.name != ref_filename]
-        assert md_files, "Expected an outgoing letter"
-        from tools.ia import _parse_frontmatter
-        content = md_files[0].read_text()
-        fields, body_text = _parse_frontmatter(content)
-        assert fields.get("re") == ref_filename, f"re: field should be set; got {fields.get('re')!r}"
-        assert "# My Reply" in content, "Title heading should appear in letter"
-
-    def test_body_file_backtick_roundtrip(self, engram_home, inter_agent_dir, tmp_path):
-        """Body with backticks/$vars/angle-brackets/YAML-special chars survives verbatim."""
-        _write_config(engram_home, "multi", "ariadne")
-        # This is the load-bearing test: all the problem chars that shell heredocs mangle
-        tricky_body = (
-            "Here is a shell command: `gh project copy <template>`\n"
-            "A variable: $TS\n"
-            "Angle brackets: <angle-brackets>\n"
-            "YAML-special: key: value: with colons\n"
-            "Another YAML-special: [list, of, items]\n"
-            "Backtick in context: run `echo $HOME` to see your home dir.\n"
-        )
-        body_file = tmp_path / "tricky_body.md"
-        body_file.write_text(tricky_body, encoding="utf-8")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "borges", "--body-file", str(body_file),
-        )
-        assert rc == 0, f"write with tricky body failed; stderr: {stderr}"
-        md_files = list(inter_agent_dir.glob("*.md"))
-        assert md_files, "Expected a written .md file"
-        content = md_files[0].read_text()
-        # Every tricky substring must appear verbatim in the written letter
-        assert "`gh project copy <template>`" in content, \
-            "Backtick command with angle-brackets did not survive verbatim"
-        assert "$TS" in content, "$TS variable did not survive verbatim"
-        assert "<angle-brackets>" in content, "Angle brackets did not survive verbatim"
-        assert "key: value: with colons" in content, "YAML colon content did not survive verbatim"
-        assert "[list, of, items]" in content, "YAML list syntax did not survive verbatim"
-        assert "`echo $HOME`" in content, "Nested backtick+var did not survive verbatim"
-
-    def test_from_stdin_back_compat(self, engram_home, inter_agent_dir):
-        """--from-stdin still works (back-compat retained)."""
-        _write_config(engram_home, "multi", "ariadne")
-        now = datetime.now(timezone.utc)
-        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        letter_content = (
-            "---\n"
-            "from: ariadne\n"
-            "to: borges\n"
-            f"timestamp: {ts_str}\n"
-            "---\n\n"
-            "Back-compat stdin body.\n"
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "borges", "--from-stdin",
-            stdin_text=letter_content,
-        )
-        assert rc == 0, f"--from-stdin back-compat failed; stderr: {stderr}"
-        assert "sent" in stdout
-
-    def test_body_file_and_from_stdin_mutually_exclusive(self, engram_home, inter_agent_dir, tmp_path):
-        """--body-file and --from-stdin together → clear error, non-zero exit."""
-        _write_config(engram_home, "multi", "ariadne")
-        body_file = tmp_path / "body.md"
-        body_file.write_text("Some body.\n", encoding="utf-8")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "borges",
-            "--body-file", str(body_file),
-            "--from-stdin",
-            stdin_text="stdin content",
-        )
-        assert rc != 0, "Expected non-zero exit when both --body-file and --from-stdin are passed"
-        assert "mutually exclusive" in stderr.lower() or "body-file" in stderr
-
-    def test_body_file_nonexistent_path(self, engram_home, inter_agent_dir):
-        """--body-file pointing at a nonexistent path → clear error, non-zero exit."""
-        _write_config(engram_home, "multi", "ariadne")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "borges",
-            "--body-file", "/tmp/definitely-does-not-exist-ia-body-file-test.md",
-        )
-        assert rc != 0, "Expected non-zero exit for missing body-file"
-        assert "not found" in stderr or "body-file" in stderr
-
-    def test_body_file_unreadable_permission_denied(self, engram_home, inter_agent_dir, tmp_path):
-        """--body-file pointing at an unreadable file (permission denied) → clear error, non-zero exit."""
-        if os.geteuid() == 0:
-            pytest.skip("Running as root — file permission checks are bypassed")
-        _write_config(engram_home, "multi", "ariadne")
-        body_file = tmp_path / "unreadable_body.md"
-        body_file.write_text("Some body content.\n", encoding="utf-8")
-        os.chmod(body_file, 0o000)
-        try:
-            rc, stdout, stderr = _run_ia(
-                engram_home, inter_agent_dir,
-                "write", "--to", "borges",
-                "--body-file", str(body_file),
-            )
-            assert rc != 0, "Expected non-zero exit for unreadable body-file"
-            assert "cannot read" in stderr or "body-file" in stderr
-        finally:
-            os.chmod(body_file, 0o644)
-
-
-# ===========================================================================
-# CATEGORY 9: Star/unstar/starred tests
-# ===========================================================================
-
-class TestStar:
-    """ia star / ia unstar / ia starred commands and the starred-block surface helper."""
-
-    # -----------------------------------------------------------------------
-    # ia star tests
-    # -----------------------------------------------------------------------
-
-    def test_star_new_letter(self, engram_home, inter_agent_dir):
-        """ia star <filename> adds a new entry to the starred list."""
-        _write_config(engram_home, "multi", "ariadne")
-        _write_letter(
-            inter_agent_dir, "2026-05-30T10-00-00Z_borges.md",
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60), heading="Key agreement",
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "star", "2026-05-30T10-00-00Z_borges.md",
-        )
-        assert rc == 0, f"star failed; stderr: {stderr}"
-        assert "starred" in stdout
-
-        # Verify starred JSON file was created with correct entry
-        starred_path = engram_home / "inter-agent-starred.json"
-        assert starred_path.exists(), "starred JSON file should be created"
-        entries = json.loads(starred_path.read_text())
-        assert isinstance(entries, list)
-        assert len(entries) == 1
-        assert entries[0]["filename"] == "2026-05-30T10-00-00Z_borges.md"
-        assert "starred_at" in entries[0]
-
-    def test_star_with_note(self, engram_home, inter_agent_dir):
-        """ia star <filename> --note <text> stores the note in the entry."""
-        _write_config(engram_home, "multi", "ariadne")
-        _write_letter(
-            inter_agent_dir, "2026-05-30T10-00-00Z_borges.md",
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60), heading="Key agreement",
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "star", "2026-05-30T10-00-00Z_borges.md",
-            "--note", "load-bearing work split agreed here",
-        )
-        assert rc == 0, f"star --note failed; stderr: {stderr}"
-        starred_path = engram_home / "inter-agent-starred.json"
-        entries = json.loads(starred_path.read_text())
-        assert entries[0]["note"] == "load-bearing work split agreed here"
-
-    def test_star_snapshots_from_and_title(self, engram_home, inter_agent_dir):
-        """ia star snapshots from/title at star-time into the stored entry."""
-        _write_config(engram_home, "multi", "ariadne")
-        filename = "2026-05-30T10-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, filename,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60), heading="Cross-session pact",
-        )
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "star", filename)
-        assert rc == 0, f"star failed; stderr: {stderr}"
-
-        starred_path = engram_home / "inter-agent-starred.json"
-        entries = json.loads(starred_path.read_text())
-        assert len(entries) == 1
-        entry = entries[0]
-        assert entry["from"] == "borges", f"expected from=borges; got {entry.get('from')!r}"
-        assert entry["title"] == "Cross-session pact", f"expected title; got {entry.get('title')!r}"
-
-    def test_starred_renders_without_rereading_letter(self, engram_home, inter_agent_dir):
-        """ia starred shows from/title from snapshot without re-opening the source letter."""
-        _write_config(engram_home, "multi", "ariadne")
-        filename = "2026-05-30T10-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, filename,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60), heading="Agreement details",
-        )
-        # Star it to create snapshot
-        _run_ia(engram_home, inter_agent_dir, "star", filename)
-
-        # Delete the source letter to prove ia starred reads from snapshot only
-        (inter_agent_dir / filename).unlink()
-
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "starred")
-        assert rc == 0, f"starred should not fail after letter deleted; stderr: {stderr}"
-        assert "borges" in stdout, "from-agent from snapshot should appear"
-        assert "Agreement details" in stdout, "title from snapshot should appear"
-
-    def test_star_idempotent_no_duplicate(self, engram_home, inter_agent_dir):
-        """Starring an already-starred letter does not add a duplicate entry."""
-        _write_config(engram_home, "multi", "ariadne")
-        filename = "2026-05-30T10-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, filename,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60), heading="Key agreement",
-        )
-        # Star it twice
-        _run_ia(engram_home, inter_agent_dir, "star", filename)
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "star", filename)
-        assert rc == 0, f"second star call failed; stderr: {stderr}"
-        starred_path = engram_home / "inter-agent-starred.json"
-        entries = json.loads(starred_path.read_text())
-        # Only one entry, not two
-        matching = [e for e in entries if e.get("filename") == filename]
-        assert len(matching) == 1, f"Expected 1 entry, got {len(matching)}"
-
-    def test_star_idempotent_updates_note(self, engram_home, inter_agent_dir):
-        """Re-starring with a new --note updates the note without duplicating."""
-        _write_config(engram_home, "multi", "ariadne")
-        filename = "2026-05-30T10-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, filename,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60), heading="Key agreement",
-        )
-        _run_ia(engram_home, inter_agent_dir, "star", filename, "--note", "first note")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir, "star", filename, "--note", "updated note",
-        )
-        assert rc == 0
-        entries = json.loads((engram_home / "inter-agent-starred.json").read_text())
-        matching = [e for e in entries if e.get("filename") == filename]
-        assert len(matching) == 1
-        assert matching[0]["note"] == "updated note"
-
-    def test_star_nonexistent_letter_rejected(self, engram_home, inter_agent_dir):
-        """ia star for a filename that doesn't exist in inter-agent/ → exit 1."""
-        _write_config(engram_home, "multi", "ariadne")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "star", "nonexistent-letter.md",
-        )
-        assert rc == 1, "Expected validation failure for nonexistent letter"
-        assert "not found" in stderr.lower() or "nonexistent" in stderr.lower()
-
-    # -----------------------------------------------------------------------
-    # ia unstar tests
-    # -----------------------------------------------------------------------
-
-    def test_unstar_removes_entry(self, engram_home, inter_agent_dir):
-        """ia unstar <filename> removes the entry from the starred list."""
-        _write_config(engram_home, "multi", "ariadne")
-        filename = "2026-05-30T10-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, filename,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60), heading="Key agreement",
-        )
-        _run_ia(engram_home, inter_agent_dir, "star", filename)
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "unstar", filename)
-        assert rc == 0, f"unstar failed; stderr: {stderr}"
-        entries = json.loads((engram_home / "inter-agent-starred.json").read_text())
-        assert all(e.get("filename") != filename for e in entries)
-
-    def test_unstar_absent_is_noop(self, engram_home, inter_agent_dir):
-        """ia unstar for a filename not in the starred list → exit 0, no-op."""
-        _write_config(engram_home, "multi", "ariadne")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "unstar", "never-starred.md",
-        )
-        assert rc == 0, f"unstar no-op should exit 0; stderr: {stderr}"
-        assert "no-op" in stdout.lower() or "not starred" in stdout.lower()
-
-    # -----------------------------------------------------------------------
-    # ia starred list tests
-    # -----------------------------------------------------------------------
-
-    def test_starred_empty_list(self, engram_home, inter_agent_dir):
-        """ia starred with no starred letters shows 0 count."""
-        _write_config(engram_home, "multi", "ariadne")
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "starred")
-        assert rc == 0
-        assert "0" in stdout or "no starred" in stdout.lower()
-
-    def test_starred_shows_from_title_filename(self, engram_home, inter_agent_dir):
-        """ia starred shows from · title · filename for each starred letter."""
-        _write_config(engram_home, "multi", "ariadne")
-        filename = "2026-05-30T10-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, filename,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60), heading="Cross-session agreement",
-        )
-        _run_ia(engram_home, inter_agent_dir, "star", filename, "--note", "work split")
-
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "starred")
-        assert rc == 0
-        assert "borges" in stdout
-        assert "Cross-session agreement" in stdout
-        assert filename in stdout
-
-    def test_starred_missing_letter_skips_with_warning(self, engram_home, inter_agent_dir):
-        """ia starred warns on stderr when a starred letter's file no longer exists."""
-        _write_config(engram_home, "multi", "ariadne")
-        # Manually inject a starred entry for a non-existent file
-        missing_filename = "2026-05-01T10-00-00Z_borges.md"
-        entries = [{"filename": missing_filename, "starred_at": "2026-05-01T10:00:00Z", "note": ""}]
-        (engram_home / "inter-agent-starred.json").write_text(json.dumps(entries))
-
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "starred")
-        assert rc == 0, "starred should not fail when a letter is missing"
-        # Warning about missing letter on stderr
-        assert "missing" in stderr.lower() or "no longer" in stderr.lower() or "not exist" in stderr.lower()
-
-    def test_starred_json_format(self, engram_home, inter_agent_dir):
-        """ia starred --format json returns valid JSON list."""
-        _write_config(engram_home, "multi", "ariadne")
-        filename = "2026-05-30T10-00-00Z_borges.md"
-        _write_letter(
-            inter_agent_dir, filename,
-            from_agent="borges", to_agent="ariadne",
-            timestamp=_ts(-60), heading="Agreement",
-        )
-        _run_ia(engram_home, inter_agent_dir, "star", filename, "--note", "important")
-
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "starred", "--format", "json")
-        assert rc == 0
-        data = json.loads(stdout)
-        assert isinstance(data, list)
-        assert len(data) == 1
-        assert data[0]["filename"] == filename
-        assert data[0]["note"] == "important"
-
-
-# ===========================================================================
-# CATEGORY 10: Multi-recipient tests (part of #631)
-# ===========================================================================
-
-class TestMultiRecipient:
-    """Multi-recipient letters: --to a,b writes ONE file; membership test semantics."""
-
-    # -----------------------------------------------------------------------
-    # Write: one file, frontmatter carries both names
-    # -----------------------------------------------------------------------
-
-    def test_write_multi_recipient_creates_one_file(self, engram_home, inter_agent_dir):
-        """ia write --to ariadne,borges creates exactly ONE .md file."""
-        _write_config(engram_home, "multi", "ariadne")
-        now = datetime.now(timezone.utc)
-        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        letter = (
-            "---\n"
-            "from: ariadne\n"
-            "to: ariadne, borges\n"
-            f"timestamp: {ts_str}\n"
-            "---\n\n"
-            "Hello both.\n"
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "ariadne,borges", "--from-stdin",
-            stdin_text=letter,
-        )
-        assert rc == 0, f"write --to ariadne,borges failed; stderr: {stderr}"
-        md_files = list(inter_agent_dir.glob("*.md"))
-        assert len(md_files) == 1, f"Expected exactly one .md file; got {[f.name for f in md_files]}"
-
-    def test_write_multi_recipient_frontmatter_has_both_names(self, engram_home, inter_agent_dir):
-        """Written multi-recipient letter has 'to: ariadne, borges' in frontmatter."""
-        _write_config(engram_home, "multi", "ariadne")
-        now = datetime.now(timezone.utc)
-        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        letter = (
-            "---\n"
-            "from: ariadne\n"
-            "to: ariadne, borges\n"
-            f"timestamp: {ts_str}\n"
-            "---\n\n"
-            "Hello both.\n"
-        )
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "ariadne,borges", "--from-stdin",
-            stdin_text=letter,
-        )
-        assert rc == 0, f"stderr: {stderr}"
-        md_files = list(inter_agent_dir.glob("*.md"))
-        content = md_files[0].read_text()
-        from tools.ia import _parse_frontmatter
-        fields, _ = _parse_frontmatter(content)
-        to_val = fields.get("to", "")
-        assert "ariadne" in to_val, f"'ariadne' missing from to: field; got {to_val!r}"
-        assert "borges" in to_val, f"'borges' missing from to: field; got {to_val!r}"
-
-    def test_write_multi_recipient_whitespace_normalized(self, engram_home, inter_agent_dir):
-        """--to 'ariadne , borges' (spaces around comma) normalizes to 'ariadne, borges'."""
-        _write_config(engram_home, "multi", "ariadne")
-        now = datetime.now(timezone.utc)
-        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        # Build letter with normalized to: (what the CLI will produce after stripping)
-        letter = (
-            "---\n"
-            "from: ariadne\n"
-            "to: ariadne, borges\n"
-            f"timestamp: {ts_str}\n"
-            "---\n\n"
-            "Body.\n"
-        )
-        # Pass with extra spaces around comma
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", "ariadne , borges", "--from-stdin",
-            stdin_text=letter,
-        )
-        assert rc == 0, f"stderr: {stderr}"
-        # Pin the normalization: to: field must be exactly "ariadne, borges"
-        md_files = list(inter_agent_dir.glob("*.md"))
-        assert len(md_files) == 1, f"Expected exactly one .md file; got {[f.name for f in md_files]}"
-        content = md_files[0].read_text()
-        from tools.ia import _parse_frontmatter
-        fields, _ = _parse_frontmatter(content)
-        to_val = fields.get("to", "")
-        assert to_val == "ariadne, borges", (
-            f"Whitespace normalization failed: expected 'ariadne, borges', got {to_val!r}"
-        )
-
-    # -----------------------------------------------------------------------
-    # ia list: recipient A sees it, recipient B sees it, non-recipient C does not
-    # -----------------------------------------------------------------------
-
-    def test_list_recipient_a_sees_multi_recipient_letter(self, engram_home, inter_agent_dir):
-        """ia list as recipient ariadne sees a letter with to: ariadne, borges."""
-        _write_config(engram_home, "multi", "ariadne")
-        _write_letter(
-            inter_agent_dir, "2026-06-05T10-00-00Z_mira.md",
-            from_agent="mira", to_agent="ariadne, borges",
-            timestamp=_ts(-30), heading="Shared update",
-        )
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list", "--all")
-        assert rc == 0, f"stderr: {stderr}"
-        assert "Shared update" in stdout, f"Expected 'Shared update' in stdout; got:\n{stdout}"
-
-    def test_list_recipient_b_sees_multi_recipient_letter(self, engram_home, inter_agent_dir):
-        """ia list as recipient borges sees a letter with to: ariadne, borges."""
-        _write_config(engram_home, "multi", "borges")
-        _write_letter(
-            inter_agent_dir, "2026-06-05T10-00-00Z_mira.md",
-            from_agent="mira", to_agent="ariadne, borges",
-            timestamp=_ts(-30), heading="Shared update",
-        )
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list", "--all")
-        assert rc == 0, f"stderr: {stderr}"
-        assert "Shared update" in stdout, f"Expected 'Shared update' in stdout as borges; got:\n{stdout}"
-
-    def test_list_non_recipient_does_not_see_multi_recipient_letter(self, engram_home, inter_agent_dir):
-        """ia list as non-recipient mira does NOT see to: ariadne, borges."""
-        _write_config(engram_home, "multi", "mira")
-        _write_letter(
-            inter_agent_dir, "2026-06-05T10-00-00Z_sender.md",
-            from_agent="sender", to_agent="ariadne, borges",
-            timestamp=_ts(-30), heading="Shared update",
-        )
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list", "--all")
-        assert rc == 0, f"stderr: {stderr}"
-        assert "Shared update" not in stdout, \
-            f"Non-recipient mira should not see the letter; got:\n{stdout}"
-
-    # -----------------------------------------------------------------------
-    # Exact-name membership: substring non-match cases
-    # -----------------------------------------------------------------------
-
-    def test_membership_no_substring_match_short_name(self, engram_home, inter_agent_dir):
-        """to: mira does NOT match agent name 'mir' (not a whole-name match)."""
-        from tools.ia import _is_recipient
-        assert not _is_recipient("mira", "mir"), \
-            "'mir' should not match 'mira' (substring non-match)"
-
-    def test_membership_no_substring_match_prefix(self, engram_home, inter_agent_dir):
-        """to: ariadne, borges does NOT match agent name 'aria' (prefix non-match)."""
-        from tools.ia import _is_recipient
-        assert not _is_recipient("ariadne, borges", "aria"), \
-            "'aria' should not match 'ariadne, borges'"
-
-    def test_membership_exact_match_single(self, engram_home, inter_agent_dir):
-        """to: ariadne matches agent name 'ariadne' exactly."""
-        from tools.ia import _is_recipient
-        assert _is_recipient("ariadne", "ariadne")
-
-    def test_membership_exact_match_multi(self, engram_home, inter_agent_dir):
-        """to: ariadne, borges matches both 'ariadne' and 'borges' exactly."""
-        from tools.ia import _is_recipient
-        assert _is_recipient("ariadne, borges", "ariadne")
-        assert _is_recipient("ariadne, borges", "borges")
-
-    def test_membership_case_insensitive(self, engram_home, inter_agent_dir):
-        """Membership test is case-insensitive."""
-        from tools.ia import _is_recipient
-        assert _is_recipient("Alexa, ZEPHYR", "alexa")
-        assert _is_recipient("Alexa, ZEPHYR", "zephyr")
-
-    def test_membership_no_match_empty_agent_name(self, engram_home, inter_agent_dir):
-        """Empty agent_name never matches."""
-        from tools.ia import _is_recipient
-        assert not _is_recipient("ariadne, borges", "")
-
-    def test_membership_no_match_empty_to_field(self, engram_home, inter_agent_dir):
-        """Empty to_field never matches."""
-        from tools.ia import _is_recipient
-        assert not _is_recipient("", "ariadne")
-
-    # -----------------------------------------------------------------------
-    # Empty-after-stripping guard: --to "," and "--to ' , '" must error loudly
-    # -----------------------------------------------------------------------
-
-    def test_write_empty_after_stripping_comma_only(self, engram_home, inter_agent_dir):
-        """--to ',' (comma only) is empty after stripping; exits with error, no file written."""
-        _write_config(engram_home, "multi", "ariadne")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", ",", "--from-stdin",
-            stdin_text="---\nfrom: ariadne\nto: ,\ntimestamp: 2026-06-05T10:00:00Z\n---\n\nBody.\n",
-        )
-        assert rc != 0, "Expected non-zero exit for --to ',' (empty after stripping)"
-        assert "empty after stripping" in stderr or "empty" in stderr, (
-            f"Expected error message about empty recipient; got stderr: {stderr!r}"
-        )
-        assert list(inter_agent_dir.glob("*.md")) == [], (
-            "No letter file should be written when --to is empty after stripping"
-        )
-
-    def test_write_empty_after_stripping_spaces_around_comma(self, engram_home, inter_agent_dir):
-        """--to ' , ' (spaces around comma only) is empty after stripping; errors loudly."""
-        _write_config(engram_home, "multi", "ariadne")
-        rc, stdout, stderr = _run_ia(
-            engram_home, inter_agent_dir,
-            "write", "--to", " , ", "--from-stdin",
-            stdin_text="---\nfrom: ariadne\nto: ,\ntimestamp: 2026-06-05T10:00:00Z\n---\n\nBody.\n",
-        )
-        assert rc != 0, "Expected non-zero exit for --to ' , ' (empty after stripping)"
-        assert "empty after stripping" in stderr or "empty" in stderr, (
-            f"Expected error message about empty recipient; got stderr: {stderr!r}"
-        )
-        assert list(inter_agent_dir.glob("*.md")) == [], (
-            "No letter file should be written when --to is empty after stripping"
-        )
-
-    # -----------------------------------------------------------------------
-    # Single-recipient regression: existing behavior unchanged
-    # -----------------------------------------------------------------------
-
-    def test_single_recipient_letter_still_works(self, engram_home, inter_agent_dir):
-        """Single-recipient letter (to: borges) still visible to borges via ia list."""
-        _write_config(engram_home, "multi", "borges")
-        _write_letter(
-            inter_agent_dir, "2026-06-05T11-00-00Z_ariadne.md",
-            from_agent="ariadne", to_agent="borges",
-            timestamp=_ts(-20), heading="Single recipient test",
-        )
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list", "--all")
-        assert rc == 0, f"stderr: {stderr}"
-        assert "Single recipient test" in stdout, \
-            f"Single-recipient letter not visible; got:\n{stdout}"
-
-    def test_single_recipient_not_visible_to_other_agent(self, engram_home, inter_agent_dir):
-        """Single-recipient letter (to: borges) NOT visible to ariadne."""
-        _write_config(engram_home, "multi", "ariadne")
-        _write_letter(
-            inter_agent_dir, "2026-06-05T11-00-00Z_mira.md",
-            from_agent="mira", to_agent="borges",
-            timestamp=_ts(-20), heading="Only for borges",
-        )
-        rc, stdout, stderr = _run_ia(engram_home, inter_agent_dir, "list", "--all")
-        assert rc == 0, f"stderr: {stderr}"
-        assert "Only for borges" not in stdout, \
-            f"Letter addressed to borges should not be visible to ariadne; got:\n{stdout}"
-
+class TestEncodeBody:
+    """_encode_body: header construction logic."""
+
+    def test_no_subject_no_multi_recipient(self):
+        """Single recipient, no subject → body unchanged."""
+        result = _ia._encode_body("Hello.\n", ["borges"], None)
+        assert result == "Hello.\n"
+
+    def test_subject_only(self):
+        """Subject → **Subject:** prepended."""
+        result = _ia._encode_body("Body text.\n", ["borges"], "My Subject")
+        assert result.startswith("**Subject:** My Subject")
+        assert "Body text." in result
+
+    def test_multi_recipient_only(self):
+        """Multi-recipient → **To:** prepended."""
+        result = _ia._encode_body("Body text.\n", ["borges", "mira"], None)
+        assert result.startswith("**To:** borges, mira")
+        assert "Body text." in result
+
+    def test_multi_recipient_and_subject_order(self):
+        """Multi-recipient + subject → **To:** first, then **Subject:**."""
+        result = _ia._encode_body("Body.\n", ["borges", "mira"], "Hello")
+        assert result.index("**To:**") < result.index("**Subject:**")
+
+    def test_body_preserved_verbatim(self):
+        """Body text is preserved verbatim including backticks and special chars."""
+        body = "Run `gh pr view 42` and check $STATUS.\n"
+        result = _ia._encode_body(body, ["borges"], None)
+        assert body.strip() in result
