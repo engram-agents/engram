@@ -1217,6 +1217,23 @@ PYTHON
 JSON
     chown "$chosen_user:$chosen_user" "$chosen_home/.engram/finalize-name-complete.json" 2>/dev/null || true
 
+    # Deferred viz-ACL marker: Step 7's setfacl is gated on [[ -d "$_engram_dir" ]]
+    # but the agent installs ENGRAM AFTER finalize-name runs, so Step 7 silently
+    # no-ops for newly-born agents. Write a marker at HOME root (always writable
+    # at finalize time) so the post-install SessionStart hook can apply the ACL
+    # on first session after ENGRAM is installed. Only written when VIZ_OPERATOR
+    # is set (mirrors Step 7's guard). Closes #1525.
+    if [[ -n "${VIZ_OPERATOR:-}" ]]; then
+        cat > "$chosen_home/.engram-finalize-pending.json" <<JSON
+{
+  "viz_operator": "${VIZ_OPERATOR}",
+  "chosen_name": "${chosen}",
+  "finalized_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+JSON
+        chown "$chosen_user:$chosen_user" "$chosen_home/.engram-finalize-pending.json" 2>/dev/null || true
+    fi
+
     # Restart the ENGRAM surface daemon (a.k.a. recall daemon) under
     # the new uid. Step 1.5 killed it along with the newborn's other
     # processes to clear usermod's "user is currently used" block;

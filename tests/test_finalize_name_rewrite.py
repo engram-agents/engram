@@ -842,3 +842,122 @@ class TestStep7VizAclCounter:
         )
         assert "WARN" in result.stderr, f"Expected WARN on setfacl failure: {result.stderr}"
         assert "_viz_ok=0" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Deferred viz-ACL pending-marker tests (issue #1525)
+# ---------------------------------------------------------------------------
+#
+# finalize-name now writes ~/.engram-finalize-pending.json (HOME root) so the
+# post-install SessionStart hook can apply the ACL after ENGRAM is installed.
+# These tests exercise the bash snippet that writes the marker by running it
+# inline in a subshell, matching the _step7_acl_loop approach above.
+
+def _run_pending_marker_step(
+    chosen_home: Path,
+    viz_operator: str,
+    chosen: str = "testagent",
+) -> subprocess.CompletedProcess:
+    """Run the deferred viz-ACL marker bash snippet in isolation.
+
+    Sets VIZ_OPERATOR and chosen_home, runs the snippet, and returns the
+    CompletedProcess. Does NOT run as root, so the chown silently no-ops —
+    this is expected and tested by asserting the file exists (not its owner).
+    """
+    script = f"""
+set -euo pipefail
+chosen_home="{chosen_home}"
+chosen="{chosen}"
+chosen_user="agent-{chosen}"
+VIZ_OPERATOR="{viz_operator}"
+if [[ -n "${{VIZ_OPERATOR:-}}" ]]; then
+    cat > "$chosen_home/.engram-finalize-pending.json" <<JSON
+{{
+  "viz_operator": "${{VIZ_OPERATOR}}",
+  "chosen_name": "${{chosen}}",
+  "finalized_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}}
+JSON
+    chown "$chosen_user:$chosen_user" "$chosen_home/.engram-finalize-pending.json" 2>/dev/null || true
+fi
+"""
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+
+class TestPendingVizAclMarker:
+    """Deferred viz-ACL marker written by finalize-name's new step (#1525).
+
+    finalize-name writes ~/.engram-finalize-pending.json so SessionStart can
+    apply ACLs after ENGRAM is installed (Step 7 no-ops when ~/.engram is absent
+    at finalize time). Tests cover marker content, non-creation when
+    VIZ_OPERATOR is empty, and finalized_at ISO 8601 format.
+    """
+
+    def test_marker_created_when_viz_operator_set(self, tmp_path):
+        """Marker file is created at HOME root when VIZ_OPERATOR is non-empty."""
+        chosen_home = tmp_path / "agent-testagent"
+        chosen_home.mkdir()
+        result = _run_pending_marker_step(chosen_home, viz_operator="spt")
+        assert result.returncode == 0, f"Script failed: {result.stderr}"
+        marker = chosen_home / ".engram-finalize-pending.json"
+        assert marker.exists(), "Pending marker must be created when VIZ_OPERATOR is set"
+
+    def test_marker_contains_viz_operator(self, tmp_path):
+        """Marker JSON contains the correct viz_operator field."""
+        chosen_home = tmp_path / "agent-testagent"
+        chosen_home.mkdir()
+        _run_pending_marker_step(chosen_home, viz_operator="spt")
+        data = json.loads((chosen_home / ".engram-finalize-pending.json").read_text())
+        assert data["viz_operator"] == "spt", f"Wrong viz_operator: {data}"
+
+    def test_marker_contains_chosen_name(self, tmp_path):
+        """Marker JSON contains the chosen_name matching the finalized agent."""
+        chosen_home = tmp_path / "agent-testagent"
+        chosen_home.mkdir()
+        _run_pending_marker_step(chosen_home, viz_operator="spt", chosen="testagent")
+        data = json.loads((chosen_home / ".engram-finalize-pending.json").read_text())
+        assert data["chosen_name"] == "testagent", f"Wrong chosen_name: {data}"
+
+    def test_marker_contains_iso8601_finalized_at(self, tmp_path):
+        """Marker JSON contains a finalized_at field in ISO 8601 UTC format."""
+        chosen_home = tmp_path / "agent-testagent"
+        chosen_home.mkdir()
+        _run_pending_marker_step(chosen_home, viz_operator="spt")
+        data = json.loads((chosen_home / ".engram-finalize-pending.json").read_text())
+        ts = data.get("finalized_at", "")
+        # Must match YYYY-MM-DDTHH:MM:SSZ (UTC ISO 8601)
+        import re as _re
+        assert _re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", ts), (
+            f"finalized_at must be ISO 8601 UTC, got: {ts!r}"
+        )
+
+    def test_marker_is_valid_json(self, tmp_path):
+        """Marker file is valid JSON (parseable without error)."""
+        chosen_home = tmp_path / "agent-testagent"
+        chosen_home.mkdir()
+        _run_pending_marker_step(chosen_home, viz_operator="spt")
+        content = (chosen_home / ".engram-finalize-pending.json").read_text()
+        parsed = json.loads(content)
+        assert isinstance(parsed, dict), "Marker must be a JSON object"
+
+    def test_marker_not_created_when_viz_operator_empty(self, tmp_path):
+        """Marker is NOT created when VIZ_OPERATOR is empty (mirrors Step 7 guard)."""
+        chosen_home = tmp_path / "agent-testagent"
+        chosen_home.mkdir()
+        result = _run_pending_marker_step(chosen_home, viz_operator="")
+        assert result.returncode == 0, f"Script failed: {result.stderr}"
+        marker = chosen_home / ".engram-finalize-pending.json"
+        assert not marker.exists(), (
+            "Pending marker must NOT be created when VIZ_OPERATOR is empty"
+        )
+
+    def test_marker_at_home_root_not_inside_engram(self, tmp_path):
+        """Marker is placed at HOME root, not inside ~/.engram (which may not exist yet)."""
+        chosen_home = tmp_path / "agent-testagent"
+        chosen_home.mkdir()
+        # Do NOT create .engram dir — simulating pre-install state
+        _run_pending_marker_step(chosen_home, viz_operator="spt")
+        marker = chosen_home / ".engram-finalize-pending.json"
+        inside_engram = chosen_home / ".engram" / ".engram-finalize-pending.json"
+        assert marker.exists(), "Marker must exist at HOME root"
+        assert not inside_engram.exists(), "Marker must NOT be placed inside ~/.engram"

@@ -1249,6 +1249,137 @@ def forum_monitor_block() -> str:
     )
 
 
+def _apply_pending_viz_acl(engram_home: str) -> None:
+    """Apply deferred viz/operator ACL when finalize-name ran before ENGRAM install.
+
+    finalize-name's Step 7 setfacl is gated on [[ -d "$_engram_dir" ]], but new
+    agents install ENGRAM post-finalize, so Step 7 silently no-ops for them.
+    finalize-name now writes a deferred marker at ~/.engram-finalize-pending.json
+    (HOME root, always writable at finalize time). This helper picks up that
+    marker on the first SessionStart after ENGRAM is installed and applies the
+    ACL so the viz dashboard can see the agent.
+
+    Scope note: finalize-name's Step 7 globs ~/.engram* (covers lineage variants
+    like .engram-gemini); this deferred helper only operates on the single
+    ENGRAM_HOME dir, which is correct here — lineage dirs don't exist at first
+    session, and Step 7 still covers them when finalize runs post-install.
+
+    Fail-safe: the entire body is wrapped in try/except Exception so this
+    helper NEVER raises or blocks session start — same advisory posture as the
+    _check_* helpers in this file. All subprocess calls use list args (never
+    shell=True). viz_operator is validated against POSIX username chars before
+    being interpolated into any command arg (injection-safe).
+
+    Removal policy:
+      - Marker removed:  viz_operator missing/empty, invalid charset, ACL already
+                         present, setfacl succeeded.
+      - Marker retained: setfacl/getfacl unavailable (retry in richer env),
+                         engram_home dir absent (ENGRAM not yet installed), any
+                         subprocess failure (retry next session).
+    """
+    try:
+        import shutil as _shutil
+
+        marker_path = os.path.join(os.path.expanduser("~"), ".engram-finalize-pending.json")
+        if not os.path.exists(marker_path):
+            return  # common case: no pending marker; must be cheap
+
+        # Parse marker JSON. A corrupt/unreadable marker is unrecoverable — we
+        # can't extract viz_operator — so DELETE it rather than retry forever.
+        # Unlike the tool-absent / .engram-absent cases (which self-resolve when
+        # the environment changes), a malformed file never would; leaving it
+        # would zombie every future session. Re-run finalize-name to regenerate.
+        try:
+            with open(marker_path) as _f:
+                _data = json.load(_f)
+        except Exception:
+            try:
+                os.remove(marker_path)
+            except Exception:
+                pass
+            return
+
+        viz_operator = (_data.get("viz_operator") or "").strip()
+        if not viz_operator:
+            try:
+                os.remove(marker_path)
+            except Exception:
+                pass
+            return
+
+        # Injection-safe charset validation: POSIX username chars only
+        if not re.match(r"^[a-z_][a-z0-9_-]*$", viz_operator):
+            try:
+                os.remove(marker_path)
+            except Exception:
+                pass
+            return
+
+        # setfacl/getfacl must be available; leave marker if not (retry later)
+        if not _shutil.which("setfacl") or not _shutil.which("getfacl"):
+            return
+
+        # engram_home must exist; if not, ENGRAM not yet installed — leave marker
+        if not os.path.isdir(engram_home):
+            return
+
+        # Idempotency: if ACL already present, just remove the marker
+        try:
+            _gf = subprocess.run(
+                ["getfacl", "--", engram_home],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if f"user:{viz_operator}:" in _gf.stdout:
+                try:
+                    os.remove(marker_path)
+                except Exception:
+                    pass
+                return
+        except Exception:
+            return  # leave marker on getfacl failure; retry next session
+
+        # Apply ACL — the agent owns ~/.engram, so no sudo required
+        try:
+            _r1 = subprocess.run(
+                ["setfacl", "-R", "-m", f"u:{viz_operator}:rX", engram_home],
+                capture_output=True,
+                timeout=30,
+            )
+            if _r1.returncode != 0:
+                return  # leave marker; retry next session
+
+            _r2 = subprocess.run(
+                ["setfacl", "-R", "-d", "-m", f"u:{viz_operator}:rX", engram_home],
+                capture_output=True,
+                timeout=30,
+            )
+            if _r2.returncode != 0:
+                return  # leave marker
+
+            # config.json rw (viz config-edit tab). Best-effort: its return code
+            # is intentionally not checked — marker removal is tied to the rX
+            # grant above (the load-bearing read access), not the rw upgrade.
+            _config_json = os.path.join(engram_home, "config.json")
+            if os.path.isfile(_config_json):
+                subprocess.run(
+                    ["setfacl", "-m", f"u:{viz_operator}:rw", _config_json],
+                    capture_output=True,
+                    timeout=10,
+                )
+        except Exception:
+            return  # leave marker; never raise
+
+        # Success: remove the pending marker
+        try:
+            os.remove(marker_path)
+        except Exception:
+            pass  # idempotent on next session via getfacl check
+    except Exception:
+        return  # outer guard: NEVER block or break session start
+
+
 def main() -> None:
     _t0 = time.perf_counter()
 
@@ -1372,6 +1503,17 @@ def main() -> None:
         _starred = starred_block(ENGRAM_HOME)
         if _starred:
             lines.append(_starred)
+    except Exception:
+        pass
+
+    # ── Deferred viz-ACL application ──────────────────────────────────────
+    # Pick up the pending marker written by agentctl finalize-name when
+    # ~/.engram didn't exist yet (agent installs ENGRAM post-finalize). Applies
+    # the ACL now that ~/.engram is present. Entirely advisory: _apply_pending_viz_acl
+    # is internally wrapped in try/except and never raises; this outer guard is
+    # belt-and-suspenders. Closes #1525.
+    try:
+        _apply_pending_viz_acl(ENGRAM_HOME)
     except Exception:
         pass
 
