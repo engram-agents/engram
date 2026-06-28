@@ -218,30 +218,6 @@ def _api_post(client: ForumClient, path: str, payload: dict) -> dict:
         sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
 
 
-def _is_recipient(to_field: str, agent_name: str) -> bool:
-    """Return True iff agent_name is a whole-name match in the to: field.
-
-    Membership test: split on commas, strip whitespace, exact match — NOT
-    substring. "mira" does not match "miranda". Case-insensitive.
-
-    NOTE (UCS PR3a): this helper is no longer used by the DM-based CLI — the
-    new `write` parses recipients inline. It is RETAINED solely as the canonical
-    half of the `test_is_recipient_hook_and_ia_parity` guard, which pins the
-    inter-agent prompt-hook's still-live `_is_recipient` against this copy. The
-    hook moves to the DM API in PR3b; the trio (this copy + the hook copy + the
-    parity test) is retired together there. Removing it here while the hook
-    still uses its half would yank a live guard (the slice-boundary gap Borges
-    caught on #1546).
-    """
-    if not agent_name or not to_field:
-        return False
-    agent_lower = agent_name.strip().lower()
-    for name in to_field.split(","):
-        if name.strip().lower() == agent_lower:
-            return True
-    return False
-
-
 # ---------------------------------------------------------------------------
 # Editor helper
 # ---------------------------------------------------------------------------
