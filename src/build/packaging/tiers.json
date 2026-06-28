@@ -251,6 +251,11 @@
       "multi_agent": true
     },
     {
+      "path": "tools/forum-updates-monitor.sh",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
       "path": "tools/ia.py",
       "tier": "convenience",
       "multi_agent": true
