@@ -157,6 +157,13 @@ add a stderr/file sentinel to the top of each candidate hook copy, fire a REAL
 prompt (a self-wake counts), and read which copy logged — that, plus
 `CLAUDE_PLUGIN_ROOT` read from *inside* a live hook, are the only ground truth.
 
+*Full system model — why directory-source loads in-place, the per-component scope
+(verified vs inferred), the complete edit-takes-effect table, and the
+verify-the-live-artifact method — lives in
+[`docs/claude-code-plugin-system.md`](docs/claude-code-plugin-system.md) (read
+on-demand; not loaded every session). This behavior is **undocumented upstream** —
+re-verify after any Claude Code version bump.*
+
 ## PR merge-readiness — CI-green gate (both modes)
 
 Merge-readiness has **two** gates, not one: a PR is merge-ready only when it is
