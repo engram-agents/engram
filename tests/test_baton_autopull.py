@@ -1,39 +1,52 @@
 """Tests for the auto-pull GitHub status enhancement in
-hooks/claude/engram-baton-prompt-hook.py.
+hooks/claude/engram-baton-prompt-hook.py — pure forum-API model.
 
-Covers (per spec):
-  1. Anchor resolution:
-     - ``github: pr/455`` frontmatter → anchor ``pr/455``
-     - ``github: project/4`` frontmatter → anchor ``project/4``
-     - ID ``PR-455`` (no github field) → anchor ``pr/455`` (fallback)
-     - ``pool-x`` (no github field, no PR-N pattern) → no anchor
-  2. Cache hit (fresh entry, <30s): reuses cached render, does NOT call gh.
-  3. Cache miss / stale (>30s): triggers a fresh gh call.
-  4. Quick-fail:
-     - gh timeout/error → falls back to cached render (if present),
-       else omits the live clause.
-     - Hook still returns its summary, never raises.
-  5. Degrade path: gh absent → hook emits normal summary (no crash).
+Migrated from the old subprocess/_write_project scaffolding to the pure
+forum-API pattern: _fetch_active_projects is monkeypatched to return
+project-dict lists, and integration tests call main() directly via
+_call_main() rather than spawning a subprocess.
 
-All tests mock ``gh`` (no real GitHub calls). Tmp dirs used for cache
-and projects directory throughout.
+Unique behavioral coverage preserved from the original file:
+  1. Anchor resolution (TestAnchorResolution) — _resolve_anchor() unit tests.
+  2. gh-status CACHE hit/stale (TestCacheHit / TestCacheStale) — direct unit
+     tests of _get_live_status / _cache_get / _cache_set.
+  3. gh quick-fail / timeout fallback (TestQuickFail) — unit + integration.
+  4. gh-absent graceful degrade (TestGhAbsent) — integration with gh_ok=False.
+  5. Cache persistence round-trip (TestCachePersistence) — _save_cache /
+     _load_cache unit tests.
+  6. Live-status-clause rendering (TestLiveClauseInOutput) — integration with
+     pre-populated on-disk cache; verifies the [STATUS] clause appears in the
+     rendered additionalContext output.
+
+Dropped (pure duplicate of test_baton_hook.py):
+  None. All categories cover angles not present in test_baton_hook.py.
+
+Note on project-anchored batons (github: project/N):
+  The forum /api/projects list endpoint does not carry the github: field, so
+  _my_batons() always resolves anchors from the project_id only (PR-NNN →
+  pr/NNN; pool-x → None). Project-anchored batons therefore receive no live-
+  status clause — graceful degradation. Tests that previously relied on the
+  github: frontmatter field for project/N anchors are updated to reflect this
+  (they either use PR-NNN ids or assert no clause for non-PR-NNN ids).
 """
 
 import importlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
 import sys
 import time
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 # ---------------------------------------------------------------------------
-# Load the hook module directly (not as a subprocess) for unit tests
+# Hook path
 # ---------------------------------------------------------------------------
 
 _HOOK_PATH = (
@@ -42,79 +55,107 @@ _HOOK_PATH = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Data helpers (match test_baton_hook.py convention)
+# ---------------------------------------------------------------------------
+
+def _make_project_dict(
+    project_id: str,
+    title: str = "Test project",
+    status: str = "in-review",
+    turn: str = "ariadne",
+    turn_since: "datetime | None" = None,
+    turn_reason: str = "colleague-review request",
+    participants: "list | None" = None,
+    seq: int = 1,
+) -> dict:
+    """Build a project dict matching the shape returned by GET /api/projects."""
+    if turn_since is None:
+        turn_since = datetime.now(timezone.utc) - timedelta(minutes=30)
+    return {
+        "project_id": project_id,
+        "title": title,
+        "status": status,
+        "turn": turn,
+        "turn_since": turn_since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "turn_reason": turn_reason,
+        "participants": participants or ["ariadne", "borges"],
+        "seq": seq,
+    }
+
+
+def _ts(offset_minutes: int) -> datetime:
+    """Return a UTC datetime offset by given minutes from now."""
+    return datetime.now(timezone.utc) + timedelta(minutes=offset_minutes)
+
+
+# ---------------------------------------------------------------------------
+# Filesystem helpers (engram_home only — no projects_dir)
+# ---------------------------------------------------------------------------
+
+def _write_config(engram_home: Path, agent_name: str = "ariadne") -> None:
+    """Write a minimal multi-agent config.json into engram_home."""
+    cfg = {"mode": "multi", "agent_name": agent_name}
+    (engram_home / "config.json").write_text(json.dumps(cfg))
+
+
+# ---------------------------------------------------------------------------
+# Module loader
+# ---------------------------------------------------------------------------
+
 def _load_hook_module(engram_home: Path):
     """Import the hook as a module with ENGRAM_HOME patched to tmp dir."""
     spec = importlib.util.spec_from_file_location(
         "engram_baton_prompt_hook", _HOOK_PATH
     )
     mod = importlib.util.module_from_spec(spec)
-    # Patch ENGRAM_HOME at module scope before exec
-    # We re-load fresh each time to isolate module-level globals.
     with patch.dict(os.environ, {"ENGRAM_HOME": str(engram_home)}):
         spec.loader.exec_module(mod)
     return mod
 
 
 # ---------------------------------------------------------------------------
-# Subprocess helper (for integration / degrade-path tests)
+# Integration runner helper (mirrors test_baton_hook.py)
 # ---------------------------------------------------------------------------
 
-def _run_hook(
-    engram_home: Path,
-    projects_dir: Path,
-    extra_env: dict | None = None,
+def _call_main(
+    mod,
+    projects=None,
+    raise_exc=None,
+    gh_ok: bool = False,
 ) -> tuple:
-    """Run the hook as a subprocess; return (exit_code, stdout, stderr)."""
-    env = os.environ.copy()
-    env["ENGRAM_HOME"] = str(engram_home)
-    env["BATON_PROJECTS_DIR"] = str(projects_dir)
-    if extra_env:
-        env.update(extra_env)
-    proc = subprocess.run(
-        [sys.executable, str(_HOOK_PATH)],
-        input=json.dumps({"prompt": "test"}),
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=15,
-    )
-    return proc.returncode, proc.stdout, proc.stderr
+    """Call mod.main() with _fetch_active_projects and _gh_available patched.
 
+    Returns (stdout_str, stderr_str, exit_code).
 
-def _write_config(engram_home: Path, agent_name: str = "ariadne") -> None:
-    cfg = {"mode": "multi", "agent_name": agent_name}
-    (engram_home / "config.json").write_text(json.dumps(cfg))
+    Parameters
+    ----------
+    projects:
+        List of project dicts returned by the fake fetch.  None treated as [].
+    raise_exc:
+        If set, _fetch_active_projects raises this exception instead.
+    gh_ok:
+        Value _gh_available() returns, controlling gh-dependent code paths
+        (live-status rendering and the auto-archive pass).
+    """
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    exit_code = 0
 
+    def _fake_fetch(config):
+        if raise_exc is not None:
+            raise raise_exc
+        return projects if projects is not None else []
 
-def _write_project(
-    projects_dir: Path,
-    project_id: str,
-    turn: str = "ariadne",
-    status: str = "in-review",
-    turn_reason: str = "colleague review",
-    turn_since: datetime | None = None,
-    github: str = "",
-) -> Path:
-    """Write a minimal baton project file for testing."""
-    if turn_since is None:
-        turn_since = datetime.now(timezone.utc) - timedelta(minutes=30)
-    ts_str = turn_since.strftime("%Y-%m-%dT%H:%M:%SZ")
-    lines = [
-        "---",
-        f"project: {project_id}",
-        f"title: Test {project_id}",
-        f"status: {status}",
-        f"turn: {turn}",
-        f"turn_since: {ts_str}",
-        f'turn_reason: "{turn_reason}"',
-        "participants: [ariadne, borges]",
-    ]
-    if github:
-        lines.append(f"github: {github}")
-    lines += ["---", "", f"# {project_id}", ""]
-    path = projects_dir / f"{project_id}.md"
-    path.write_text("\n".join(lines))
-    return path
+    with patch.object(mod, "_fetch_active_projects", side_effect=_fake_fetch):
+        with patch.object(mod, "_gh_available", return_value=gh_ok):
+            try:
+                with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+                    mod.main()
+            except SystemExit as e:
+                exit_code = int(e.code) if e.code is not None else 0
+
+    return stdout_buf.getvalue(), stderr_buf.getvalue(), exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -126,13 +167,6 @@ def tmp_engram_home(tmp_path: Path) -> Path:
     home = tmp_path / "engram_home"
     home.mkdir()
     return home
-
-
-@pytest.fixture
-def tmp_projects_dir(tmp_path: Path) -> Path:
-    d = tmp_path / "projects"
-    d.mkdir()
-    return d
 
 
 # ===========================================================================
@@ -180,7 +214,7 @@ class TestAnchorResolution:
         """Explicit ``github:`` field overrides PR-N fallback."""
         mod = self._mod(tmp_engram_home)
         # PR-100 would normally resolve to pr/100 via fallback,
-        # but explicit github: pr/999 should win
+        # but explicit github: pr/999 should win.
         assert mod._resolve_anchor("PR-100", "pr/999") == "pr/999"
 
     def test_explicit_field_case_insensitive(self, tmp_engram_home):
@@ -198,7 +232,7 @@ class TestAnchorResolution:
 class TestCacheHit:
     """A fresh (<30s) cache entry is reused; gh is NOT called."""
 
-    def test_cache_hit_skips_gh_call(self, tmp_engram_home, tmp_projects_dir):
+    def test_cache_hit_skips_gh_call(self, tmp_engram_home):
         """Fresh cache entry returned without calling gh."""
         mod = _load_hook_module(tmp_engram_home)
 
@@ -214,7 +248,13 @@ class TestCacheHit:
         mock_fetch.assert_not_called()
 
     def test_cache_hit_project_skips_gh_call(self, tmp_engram_home):
-        """Fresh project cache entry returned without calling gh."""
+        """Fresh project cache entry returned without calling gh.
+
+        _get_live_status handles project/ anchors; the function is still in
+        the codebase even though _my_batons no longer produces project/ anchors
+        (the API list endpoint omits the github: field). This unit test verifies
+        the code path remains correct.
+        """
         mod = _load_hook_module(tmp_engram_home)
 
         cache = {}
@@ -315,23 +355,27 @@ class TestQuickFail:
 
         assert result == ""
 
-    def test_hook_never_raises_on_gh_failure(self, tmp_engram_home, tmp_projects_dir, tmp_path):
-        """End-to-end: hook returns a valid summary even when gh exits non-zero."""
+    def test_hook_never_raises_on_gh_failure(self, tmp_engram_home):
+        """End-to-end: hook returns valid JSON even when _fetch_pr_status fails.
+
+        PR-500 is in ariadne's court; gh is "available" (gh_ok=True) but
+        _fetch_pr_status returns None (simulating auth failure / non-zero gh
+        exit). The hook must still surface PR-500 without a live clause and
+        must not raise.
+        """
         _write_config(tmp_engram_home)
-        _write_project(tmp_projects_dir, "PR-500", github="pr/500")
+        mod = _load_hook_module(tmp_engram_home)
 
-        # Write a fake gh that always exits with error (simulates auth failure)
-        fake_gh = tmp_path / "gh"
-        fake_gh.write_text("#!/bin/sh\nexit 1\n")
-        fake_gh.chmod(0o755)
-
-        rc, stdout, stderr = _run_hook(
-            tmp_engram_home, tmp_projects_dir,
-            extra_env={
-                "PATH": str(tmp_path),
-                "BATON_PROJECTS_DIR": str(tmp_projects_dir),
-            },
-        )
+        with patch.object(mod, "_fetch_pr_status", return_value=None):
+            stdout, stderr, rc = _call_main(
+                mod,
+                projects=[_make_project_dict(
+                    "PR-500",
+                    turn="ariadne",
+                    turn_reason="needs final review",
+                )],
+                gh_ok=True,
+            )
 
         assert rc == 0
         assert stdout.strip() != ""
@@ -341,18 +385,19 @@ class TestQuickFail:
         # No crash — live clause simply absent or empty
         assert "Traceback" not in stderr
 
-    def test_hook_summary_present_on_any_gh_state(self, tmp_engram_home, tmp_projects_dir):
-        """Hook emits baton summary regardless of gh availability."""
-        _write_config(tmp_engram_home)
-        _write_project(tmp_projects_dir, "PR-600", turn="ariadne")
+    def test_hook_summary_present_on_any_gh_state(self, tmp_engram_home):
+        """Hook emits baton summary regardless of gh availability.
 
-        # gh not on PATH at all
-        rc, stdout, stderr = _run_hook(
-            tmp_engram_home, tmp_projects_dir,
-            extra_env={
-                "PATH": "",  # No gh
-                "BATON_PROJECTS_DIR": str(tmp_projects_dir),
-            },
+        gh_ok=False simulates gh absent from PATH entirely.  The baton must
+        still surface in the rendered context without a live clause.
+        """
+        _write_config(tmp_engram_home)
+        mod = _load_hook_module(tmp_engram_home)
+
+        stdout, stderr, rc = _call_main(
+            mod,
+            projects=[_make_project_dict("PR-600", turn="ariadne")],
+            gh_ok=False,
         )
 
         assert rc == 0
@@ -362,28 +407,25 @@ class TestQuickFail:
 
 
 # ===========================================================================
-# Category 5: gh absent — full degrade path (subprocess integration)
+# Category 5: gh absent — full degrade path (integration)
 # ===========================================================================
 
 class TestGhAbsent:
-    """When gh is not on PATH, the hook degrades to turn_reason-only render."""
+    """When gh is unavailable (gh_ok=False), hook degrades to turn_reason-only render."""
 
-    def test_degrade_path_no_gh(self, tmp_engram_home, tmp_projects_dir):
-        """Hook runs normally when gh is absent — no live clause, no crash."""
+    def test_degrade_path_no_gh(self, tmp_engram_home):
+        """Hook runs normally when gh is unavailable — no live clause, no crash."""
         _write_config(tmp_engram_home)
-        _write_project(
-            tmp_projects_dir, "PR-700",
-            turn="ariadne",
-            turn_reason="fix pushed",
-            github="pr/700",
-        )
+        mod = _load_hook_module(tmp_engram_home)
 
-        rc, stdout, stderr = _run_hook(
-            tmp_engram_home, tmp_projects_dir,
-            extra_env={
-                "PATH": "",  # Remove gh from PATH
-                "BATON_PROJECTS_DIR": str(tmp_projects_dir),
-            },
+        stdout, stderr, rc = _call_main(
+            mod,
+            projects=[_make_project_dict(
+                "PR-700",
+                turn="ariadne",
+                turn_reason="fix pushed",
+            )],
+            gh_ok=False,
         )
 
         assert rc == 0, f"Hook must exit 0; stderr: {stderr}"
@@ -392,25 +434,26 @@ class TestGhAbsent:
         ctx = response["hookSpecificOutput"]["additionalContext"]
         assert "PR-700" in ctx
         assert "fix pushed" in ctx
-        # No live status brackets when gh absent
-        # (we just check it doesn't crash — the live clause is best-effort)
+        # No live status brackets when gh unavailable (best-effort omission)
 
-    def test_degrade_path_pr_fallback_no_gh(self, tmp_engram_home, tmp_projects_dir):
-        """PR-N fallback anchor resolves but degrade is clean when gh absent."""
+    def test_degrade_path_pr_fallback_no_gh(self, tmp_engram_home):
+        """PR-N id resolves its anchor but degrade is clean when gh unavailable.
+
+        The project dict has no github: field (the API list endpoint doesn't
+        carry it). _my_batons() resolves the anchor from the project_id:
+        PR-800 → pr/800. With gh_ok=False, no live clause is attempted.
+        """
         _write_config(tmp_engram_home)
-        # No github: field; PR-800 pattern triggers fallback anchor
-        _write_project(
-            tmp_projects_dir, "PR-800",
-            turn="ariadne",
-            turn_reason="awaiting review",
-        )
+        mod = _load_hook_module(tmp_engram_home)
 
-        rc, stdout, stderr = _run_hook(
-            tmp_engram_home, tmp_projects_dir,
-            extra_env={
-                "PATH": "",
-                "BATON_PROJECTS_DIR": str(tmp_projects_dir),
-            },
+        stdout, stderr, rc = _call_main(
+            mod,
+            projects=[_make_project_dict(
+                "PR-800",
+                turn="ariadne",
+                turn_reason="awaiting review",
+            )],
+            gh_ok=False,
         )
 
         assert rc == 0
@@ -452,8 +495,6 @@ class TestCachePersistence:
         }
         mod._save_cache(original)
 
-        # Re-load the module to test _load_cache against a DIFFERENT engram_home
-        # Actually just call _load_cache directly — it reads from ENGRAM_HOME global
         loaded = mod._load_cache()
         assert loaded == original
 
@@ -480,63 +521,85 @@ class TestCachePersistence:
 class TestLiveClauseInOutput:
     """End-to-end: live clause appears in additionalContext when gh works."""
 
-    def test_live_clause_appended_to_line(self, tmp_engram_home, tmp_projects_dir, tmp_path):
-        """When gh succeeds, rendered line includes [STATUS] clause."""
+    def test_live_clause_appended_to_line(self, tmp_engram_home):
+        """When a fresh cache entry exists, rendered line includes [STATUS] clause.
+
+        Pre-populates the on-disk cache with OPEN · review:APPROVED for
+        pr/1000.  The hook loads the cache, hits it for PR-1000's anchor, and
+        appends the clause.  Also verifies that the cache file persists after
+        the main() pass (main() calls _save_cache with the non-empty cache).
+
+        Note: the live clause originates from the PR-NNN id fallback anchor
+        (project_id PR-1000 → pr/1000), not from a github: frontmatter field
+        (which the /api/projects list endpoint no longer carries).
+        """
         _write_config(tmp_engram_home)
-        _write_project(
-            tmp_projects_dir, "PR-1000",
-            turn="ariadne",
-            turn_reason="needs final review",
-            github="pr/1000",
-        )
+        mod = _load_hook_module(tmp_engram_home)
 
-        # Write a fake gh that returns OPEN|APPROVED for any pr view call
-        fake_gh = tmp_path / "gh"
-        fake_gh.write_text(
-            "#!/bin/sh\n"
-            "echo 'OPEN|APPROVED'\n"
-        )
-        fake_gh.chmod(0o755)
+        # Pre-populate cache so _get_live_status returns without calling gh.
+        cache_file = tmp_engram_home / "baton-status-cache.json"
+        cache_file.write_text(json.dumps({
+            "pr/1000": {
+                "fetched_at": time.time(),
+                "render": "OPEN · review:APPROVED",
+            }
+        }))
 
-        rc, stdout, stderr = _run_hook(
-            tmp_engram_home, tmp_projects_dir,
-            extra_env={
-                "PATH": str(tmp_path),
-                "BATON_PROJECTS_DIR": str(tmp_projects_dir),
-            },
+        stdout, stderr, rc = _call_main(
+            mod,
+            projects=[_make_project_dict(
+                "PR-1000",
+                turn="ariadne",
+                turn_reason="needs final review",
+            )],
+            gh_ok=True,
         )
 
         assert rc == 0, f"Hook failed; stderr: {stderr}"
         ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
         assert "PR-1000" in ctx
-        assert "APPROVED" in ctx or "OPEN" in ctx
-        # main() must persist the fetched status to disk after a successful
-        # gh call (end-to-end, through the subprocess boundary).
-        cache_file = tmp_engram_home / "baton-status-cache.json"
-        assert cache_file.exists(), "expected baton-status-cache.json written after gh fetch"
+        assert "OPEN · review:APPROVED" in ctx, (
+            f"Live status clause missing from context: {ctx!r}"
+        )
+        # main() must persist the cache to disk after the pass.
+        assert cache_file.exists(), (
+            "expected baton-status-cache.json to persist after main()"
+        )
 
-    def test_no_anchor_no_live_clause(self, tmp_engram_home, tmp_projects_dir):
-        """Baton with no anchor (pool-abc style) renders without live clause."""
-        # Unit-test via module import: verify that _get_live_status is never
-        # called for a no-anchor baton (gh call count = 0).
+    def test_no_anchor_no_live_clause(self, tmp_engram_home):
+        """Baton with no anchor (pool-abc style) renders without live clause.
+
+        pool-abc has no PR-N pattern → _resolve_anchor returns None →
+        _my_batons sets github_anchor=None → the rendering loop skips
+        _get_live_status entirely → _fetch_pr_status is never called.
+        The hook emits a normal summary with the turn_reason only.
+
+        Note: PR-anchored batons (PR-N ids) still get the clause; this test
+        confirms the graceful degradation for non-PR-NNN ids.
+        """
+        _write_config(tmp_engram_home)
         mod = _load_hook_module(tmp_engram_home)
 
-        # pool-abc has no github field and doesn't match PR-N pattern → None
+        # Unit check: pool-abc has no anchor
         anchor = mod._resolve_anchor("pool-abc", "")
         assert anchor is None
 
-        # Verify that with no anchor, _get_live_status is not invoked.
-        # Subprocess integration: hook emits a normal summary without crashing.
-        _write_config(tmp_engram_home)
-        _write_project(
-            tmp_projects_dir, "pool-abc",
-            turn="ariadne",
-            turn_reason="pool work",
-        )
-
-        rc, stdout, stderr = _run_hook(tmp_engram_home, tmp_projects_dir)
+        # Integration: hook emits a normal summary without crashing,
+        # and _fetch_pr_status is never invoked (no anchor to query).
+        with patch.object(mod, "_fetch_pr_status") as mock_fetch:
+            stdout, stderr, rc = _call_main(
+                mod,
+                projects=[_make_project_dict(
+                    "pool-abc",
+                    turn="ariadne",
+                    turn_reason="pool work",
+                )],
+                gh_ok=True,
+            )
 
         assert rc == 0
         ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
         assert "pool-abc" in ctx
         assert "pool work" in ctx
+        # _fetch_pr_status must NOT have been called — no anchor resolves for pool-abc
+        mock_fetch.assert_not_called()

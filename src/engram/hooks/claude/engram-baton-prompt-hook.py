@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """UserPromptSubmit hook: surface baton-in-court projects to the agent.
 
-On every prompt, if the baton projects directory exists, scans
-/home/agents-shared/projects/ for project files where turn == this agent
-and status is active (not merged or cancelled). Injects a summary into
-the session context reminding the agent of pending batons.
+On every prompt, in multi-agent mode, queries the forum coordination API
+(GET /api/projects) for project records where turn == this agent and status
+is active (not merged or cancelled). Injects a summary into the session
+context reminding the agent of pending batons. Reads are 100% via the LAN
+forum API — no local-filesystem path (UCS pure-API invariant). If the API is
+unreachable, the hook surfaces a loud "⚠️ UCS unreachable" banner rather than
+silently rendering nothing.
 
 Unlike the inter-agent hook, baton has no cursor — turn state is the
 explicit current-state field in the file, read fresh each prompt. No
 surfaced/read cursor mechanism needed; the baton file IS the state.
 
 Anti-patterns guarded:
-  - Single-agent guard: if projects directory doesn't exist, exits silently.
+  - Single-agent guard: if config.json mode != 'multi', exits silently.
     Single-agent users see zero behavior change.
-  - No LLM calls, no DB — file-system reads and optional gh calls only.
+  - No LLM calls, no DB — one forum API call (+ optional gh calls) only.
     Per-gh-call timeout 4s; worst case one gh call per in-court baton on a
     full cache miss (N_batons calls). The 30s-TTL status cache makes the
     steady-state cost ~0 — most prompts hit cache and call gh zero times.
@@ -42,11 +45,30 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+# Pure-API (UCS invariant): this hook reads coordination state ONLY via the
+# forum HTTP API — no local-filesystem fallback. forum_api ships alongside this
+# hook in the plugin tree (tools/ is a sibling of hooks/ under the plugin root,
+# and under src/engram/ in the source tree — parents[2] resolves both). The
+# import is best-effort: a failure degrades the hook to a no-op rather than
+# crashing the prompt.
+_TOOLS_DIR = Path(__file__).resolve().parents[2] / "tools"
+if str(_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TOOLS_DIR))
+try:
+    from forum_api import (
+        ForumClient,
+        ForumNetworkError,
+        ForumHttpError,
+        forum_url_from_config,
+    )
+    _FORUM_API_OK = True
+except Exception:
+    _FORUM_API_OK = False
+
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
     or str(Path.home() / ".engram")
 )
-BATON_PROJECTS_DIR = os.environ.get("BATON_PROJECTS_DIR", "/home/agents-shared/projects")
 
 # Statuses that mean "closed" — these projects don't surface
 CLOSED_STATUSES = {"merged", "cancelled"}
@@ -385,67 +407,68 @@ def _get_live_status(anchor: str, cache: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Project scanning
+# Forum API (pure-API coordination reads — UCS invariant)
 # ---------------------------------------------------------------------------
 
-def _scan_my_batons(agent_name: str) -> list:
-    """Scan BATON_PROJECTS_DIR for projects where turn == agent_name.
+def _is_multi_agent_mode(config: dict) -> bool:
+    """True if config.json mode == 'multi' (mirrors ia.py / baton.py)."""
+    return config.get("mode", "single") == "multi"
+
+
+def _fetch_active_projects(config: dict) -> list:
+    """GET active project records via the forum API.
+
+    Returns the list of project dicts. Raises ForumNetworkError /
+    ForumHttpError on failure — the caller (main) decides whether to surface
+    the loud UCS-unreachable banner. There is NO local-filesystem fallback:
+    coordination state lives only in the LAN forum service.
+
+    Short timeout (3s, vs the CLI's 10s default): this runs SYNCHRONOUSLY on
+    every prompt, so a half-dead forum (accepts the socket, never responds)
+    must not stall the prompt up to 10s. Connection-refused already fails fast;
+    this bounds the slow-loris case to stay within the hook's time budget.
+    """
+    client = ForumClient(forum_url_from_config(config), timeout=3)
+    resp = client.get("/api/projects", params={"active_only": "true"})
+    return resp.get("projects", [])
+
+
+# ---------------------------------------------------------------------------
+# Project filtering
+# ---------------------------------------------------------------------------
+
+def _my_batons(projects: list, agent_name: str) -> list:
+    """Filter fetched project records to those where turn == agent_name.
 
     Returns list of dicts:
         {project_id, title, status, turn_since, turn_reason, github_anchor}.
-    Files that don't parse cleanly are silently skipped.
     Sorted by turn_since ascending (oldest baton first = most overdue first).
+
+    ``projects`` is the list from GET /api/projects (already active_only).
+    The list endpoint does not carry the github: field, so github_anchor is
+    resolved from the project_id (PR-NNN → pr/NNN). Project-anchored batons
+    (github: project/N) therefore get no live-status clause — graceful
+    degradation, identical to the gh-unavailable path.
     """
-    projects_dir = Path(BATON_PROJECTS_DIR)
-    if not projects_dir.is_dir():
+    if not agent_name:
         return []
-
+    me = agent_name.lower()
     my_batons = []
-    for md_file in projects_dir.glob("*.md"):
-        try:
-            text = md_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-
-        fields, _body = _parse_frontmatter(text)
-        if not fields:
-            continue
-
-        # Check status — skip closed projects
-        status = fields.get("status", "").strip().lower()
+    for p in projects:
+        status = (p.get("status") or "").strip().lower()
         if status in CLOSED_STATUSES:
             continue
-
-        # Check turn — must match our agent
-        turn = fields.get("turn", "").strip().lower()
-        if not agent_name or turn != agent_name.lower():
+        if (p.get("turn") or "").strip().lower() != me:
             continue
-
-        project_id = fields.get("project", "").strip()
-        if not project_id:
-            project_id = md_file.stem
-
-        title = fields.get("title", "").strip()
-        turn_since_str = fields.get("turn_since", "").strip()
-        turn_reason = fields.get("turn_reason", "").strip()
-        # Strip surrounding quotes from turn_reason if present
-        if turn_reason.startswith('"') and turn_reason.endswith('"'):
-            turn_reason = turn_reason[1:-1]
-        turn_since = _parse_iso(turn_since_str)
-
-        # Resolve GitHub anchor (may be None)
-        github_field = fields.get("github", "").strip()
-        github_anchor = _resolve_anchor(project_id, github_field)
-
+        project_id = (p.get("project_id") or "").strip()
         my_batons.append({
             "project_id": project_id,
-            "title": title,
+            "title": (p.get("title") or "").strip(),
             "status": status,
-            "turn_since": turn_since,
-            "turn_reason": turn_reason,
-            "github_anchor": github_anchor,
+            "turn_since": _parse_iso((p.get("turn_since") or "").strip()),
+            "turn_reason": (p.get("turn_reason") or "").strip(),
+            "github_anchor": _resolve_anchor(project_id, ""),
         })
-
     # Oldest baton first (most overdue = highest urgency)
     my_batons.sort(key=lambda b: b["turn_since"] or datetime.min.replace(tzinfo=timezone.utc))
     return my_batons
@@ -455,7 +478,7 @@ def _scan_my_batons(agent_name: str) -> list:
 # Auto-archive pass
 # ---------------------------------------------------------------------------
 
-def _auto_archive_merged_pr_batons(cache: dict) -> None:
+def _auto_archive_merged_pr_batons(projects: list, cache: dict) -> None:
     """Scan ALL open PR-batons and close any whose cached GitHub status is terminal.
 
     Handles two terminal GitHub PR states:
@@ -490,35 +513,21 @@ def _auto_archive_merged_pr_batons(cache: dict) -> None:
         )
         return
 
-    projects_dir = Path(BATON_PROJECTS_DIR)
-    if not projects_dir.is_dir():
-        return
-
-    for md_file in projects_dir.glob("*.md"):
-        try:
-            text = md_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-
-        fields, _body = _parse_frontmatter(text)
-        if not fields:
-            continue
-
-        # Skip already-closed batons (idempotency gate)
-        status = fields.get("status", "").strip().lower()
+    for p in projects:
+        # Skip already-closed batons (idempotency gate). The fetched list is
+        # already active_only, so this is belt-and-suspenders.
+        status = (p.get("status") or "").strip().lower()
         if status in CLOSED_STATUSES:
             continue
 
         # Only PR-batons (project_id matches ^PR-\d+$)
-        project_id = fields.get("project", "").strip()
-        if not project_id:
-            project_id = md_file.stem
+        project_id = (p.get("project_id") or "").strip()
         if not _PR_ID_RE.match(project_id):
             continue
 
-        # Resolve GitHub anchor — fallback to PR-NNN pattern
-        github_field = fields.get("github", "").strip()
-        anchor = _resolve_anchor(project_id, github_field)
+        # Resolve GitHub anchor from the PR-NNN id (the list endpoint does not
+        # carry the github: field; PR-batons need only the id).
+        anchor = _resolve_anchor(project_id, "")
         if not anchor:
             continue
 
@@ -572,18 +581,44 @@ def _auto_archive_merged_pr_batons(cache: dict) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    # ── Single-agent guard ────────────────────────────────────────────────────
-    # If the projects directory doesn't exist, baton is not deployed.
-    # Exit silently — single-agent installs must see zero behavior change.
-    projects_dir = Path(BATON_PROJECTS_DIR)
-    if not projects_dir.is_dir():
-        sys.exit(0)
+def _emit_context(text: str) -> None:
+    """Emit an additionalContext block on stdout (the UserPromptSubmit channel)."""
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": text,
+        }
+    }))
 
+
+def main() -> None:
     # ── Config + agent name ───────────────────────────────────────────────────
     config = _load_config()
     agent_name = _get_agent_name(config)
-    # Even if agent_name is empty, scanning returns nothing (no turn match).
+    # Even if agent_name is empty, filtering returns nothing (no turn match).
+
+    # ── Multi-agent gate ──────────────────────────────────────────────────────
+    # Pure-API: single-agent installs (mode != 'multi'), or a missing forum_api
+    # import, exit silently — zero behavior change, and no local-FS fallback.
+    if not _FORUM_API_OK or not _is_multi_agent_mode(config):
+        sys.exit(0)
+
+    # ── Fetch coordination state via the LAN forum API (loud on failure) ──────
+    try:
+        projects = _fetch_active_projects(config)
+    except (ForumNetworkError, ForumHttpError) as e:
+        # UCS invariant: fail LOUD — surface a banner rather than silently
+        # rendering nothing. The forum being down IS a problem the agent should
+        # see (even on the 5090 server host); it is never masked by a local read.
+        _emit_context(
+            "⚠️ UCS unreachable — baton/coordination state is "
+            f"unavailable (forum API error: {e}). Coordination reads/writes will "
+            "fail until the forum service is back."
+        )
+        return
+    except Exception:
+        # Belt-and-suspenders: an unexpected error must never crash the prompt.
+        return
 
     # ── Detect gh availability once (don't retry per baton) ──────────────────
     gh_ok = _gh_available()
@@ -596,8 +631,8 @@ def main() -> None:
         except Exception:
             cache = {}
 
-    # ── Scan for my batons ────────────────────────────────────────────────────
-    my_batons = _scan_my_batons(agent_name)
+    # ── Filter to my batons ───────────────────────────────────────────────────
+    my_batons = _my_batons(projects, agent_name)
 
     # ── Build injection block (only when there are in-court batons) ───────────
     if my_batons:
@@ -654,15 +689,7 @@ def main() -> None:
         )
 
         context = "\n".join(lines)
-
-        response = {
-            "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit",
-                "additionalContext": context,
-            }
-        }
-
-        print(json.dumps(response))
+        _emit_context(context)
 
     # ── Auto-archive pass: runs even when my_batons is empty ─────────────────
     # Terminal PR-batons (MERGED or CLOSED) may have any turn value, so they
@@ -671,7 +698,7 @@ def main() -> None:
     # GitHub status is a terminal state (MERGED → "merged"; CLOSED → "cancelled").
     # Guard: skip when gh is unavailable (no live status reachable anyway).
     if gh_ok:
-        _auto_archive_merged_pr_batons(cache)
+        _auto_archive_merged_pr_batons(projects, cache)
 
     # ── Persist cache after auto-archive pass ────────────────────────────────
     # Single save here, after both the in-court rendering pass and the
