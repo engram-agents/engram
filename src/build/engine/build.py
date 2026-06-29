@@ -519,18 +519,28 @@ def _toml_array(values: list[str]) -> str:
 def _engram_mcp_tool_names(tools: list[str] | str) -> list[str]:
     """Extract raw ENGRAM MCP tool names from Claude-style tool identifiers.
 
-    Claude agent specs name MCP tools as ``mcp__engram__engram_query``.
-    Codex MCP policy allowlists use the server-local tool name
-    (``engram_query``) under the installed plugin MCP policy table.
+    Claude agent specs name MCP tools as ``mcp__engram__engram_query`` (direct
+    install) or ``mcp__plugin_engram_engram__engram_query`` (plugin install).
+    Codex MCP policy allowlists use the server-local tool name (``engram_query``)
+    under the installed plugin MCP policy table. Both prefixes strip to the same
+    local name; deduplicate so a spec listing both forms emits each name once.
     """
     if tools == "*":
         return []
-    prefix = "mcp__engram__"
-    return [
-        tool[len(prefix) :]
-        for tool in tools
-        if isinstance(tool, str) and tool.startswith(prefix)
-    ]
+    _PREFIXES = ("mcp__engram__", "mcp__plugin_engram_engram__")
+    seen: set[str] = set()
+    result: list[str] = []
+    for tool in tools:
+        if not isinstance(tool, str):
+            continue
+        for prefix in _PREFIXES:
+            if tool.startswith(prefix):
+                name = tool[len(prefix):]
+                if name not in seen:
+                    seen.add(name)
+                    result.append(name)
+                break
+    return result
 
 
 def _emit_codex_agent_toml(
