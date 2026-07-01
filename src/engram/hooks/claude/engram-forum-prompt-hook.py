@@ -88,15 +88,15 @@ _DEFAULT_FORUM_URL = "http://localhost:5002"
 # publish silently no-ops — the existing thread/mention surfacing is unaffected.
 # ---------------------------------------------------------------------------
 
-_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
+_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
 _candidates = []
 if _plugin_root:
     _candidates.append(Path(_plugin_root) / "tools")          # plugin: hooks/ -> tools/
-_candidates.append(Path(__file__).resolve().parents[2] / "tools")  # repo: hooks/claude/ -> tools/
-for _c in _candidates:
-    if (_c / "_status_derive.py").exists():
-        sys.path.insert(0, str(_c))
-        break
+for _parent in Path(__file__).resolve().parents:              # walk-all-parents fallback
+    _candidates.append(_parent / "tools")
+_tools_dir = next((c for c in _candidates if (c / "_status_derive.py").exists()), None)
+if _tools_dir is not None and str(_tools_dir) not in sys.path:
+    sys.path.insert(0, str(_tools_dir))
 try:
     from _status_derive import derive_own_status, _read_loop_mode
 except Exception:
