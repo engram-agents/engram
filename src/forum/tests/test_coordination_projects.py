@@ -796,3 +796,34 @@ def test_recover_max_seq_counts_archived(store, allocator):
     seq = merge(store, allocator, "PR-1", merged_by="luria")
     hi = store.recover_max_seq()
     assert hi >= seq
+
+
+def test_read_projects_github_field_parsed(tmp_path):
+    """read_projects populates ProjectRecord.github from the frontmatter github: field."""
+    s = FileStore(tmp_path)
+    # Baton with explicit project-anchor
+    baton_with_github = (
+        "---\n"
+        "project_id: pool-ux\n"
+        "title: UX work pool\n"
+        "status: in-progress\n"
+        "turn: luria\n"
+        "turn_since: 2026-06-29T00:00:00Z\n"
+        "participants: [luria, sol]\n"
+        "github: project/7\n"
+        "---\n"
+        "# pool-ux\n\nbody\n"
+    )
+    s.write_project("pool-ux", baton_with_github, seq=1)
+    records = s.read_projects()
+    assert len(records) == 1
+    assert records[0].github == "project/7"
+
+
+def test_read_projects_github_field_absent(tmp_path):
+    """read_projects defaults ProjectRecord.github to empty string when field is absent."""
+    s = FileStore(tmp_path)
+    s.write_project("PR-1", _baton(turn="ariadne"), seq=1)
+    records = s.read_projects()
+    assert len(records) == 1
+    assert records[0].github == ""

@@ -58,7 +58,7 @@ class TestProjectsList:
     def test_project_fields_present(self, client):
         data = client.get("/api/projects").get_json()
         proj = next(p for p in data["projects"] if p["project_id"] == "PR-42")
-        for field in ("project_id", "title", "status", "turn", "turn_since", "turn_reason", "participants", "seq"):
+        for field in ("project_id", "title", "status", "turn", "turn_since", "turn_reason", "participants", "seq", "github"):
             assert field in proj, f"missing field: {field}"
 
     def test_agent_filter(self, client):

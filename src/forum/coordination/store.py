@@ -87,6 +87,7 @@ class ProjectRecord:
     participants: tuple[str, ...]
     seq: int  # the seq of this item's last mutation (0 if pre-migration / unseen)
     raw: str  # the full markdown, for callers that re-write it
+    github: str = ""  # optional anchor: "project/N" or "pr/N" (from frontmatter github: field)
 
 
 def dm_thread_key(a: str, b: str) -> str:

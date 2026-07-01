@@ -192,6 +192,7 @@ class FileStore(CoordinationStore):
                     participants=_parse_participants(fields.get("participants", "")),
                     seq=_coerce_seq(fields.get("seq", "")),
                     raw=raw,
+                    github=fields.get("github", "").strip(),
                 )
             )
         # ISO-8601 turn_since sorts lexicographically == chronologically; empty

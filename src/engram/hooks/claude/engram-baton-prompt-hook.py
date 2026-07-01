@@ -458,10 +458,9 @@ def _my_batons(projects: list, agent_name: str) -> list:
     Sorted by turn_since ascending (oldest baton first = most overdue first).
 
     ``projects`` is the list from GET /api/projects (already active_only).
-    The list endpoint does not carry the github: field, so github_anchor is
-    resolved from the project_id (PR-NNN → pr/NNN). Project-anchored batons
-    (github: project/N) therefore get no live-status clause — graceful
-    degradation, identical to the gh-unavailable path.
+    The list endpoint now carries the ``github`` field, so both PR-anchored
+    (pr/N) and project-anchored (project/N) batons resolve to a live-status
+    clause via _resolve_anchor.
     """
     if not agent_name:
         return []
@@ -480,7 +479,7 @@ def _my_batons(projects: list, agent_name: str) -> list:
             "status": status,
             "turn_since": _parse_iso((p.get("turn_since") or "").strip()),
             "turn_reason": (p.get("turn_reason") or "").strip(),
-            "github_anchor": _resolve_anchor(project_id, ""),
+            "github_anchor": _resolve_anchor(project_id, p.get("github", "")),
         })
     # Oldest baton first (most overdue = highest urgency)
     my_batons.sort(key=lambda b: b["turn_since"] or datetime.min.replace(tzinfo=timezone.utc))
@@ -538,9 +537,9 @@ def _auto_archive_merged_pr_batons(projects: list, cache: dict) -> None:
         if not _PR_ID_RE.match(project_id):
             continue
 
-        # Resolve GitHub anchor from the PR-NNN id (the list endpoint does not
-        # carry the github: field; PR-batons need only the id).
-        anchor = _resolve_anchor(project_id, "")
+        # Resolve GitHub anchor. The auto-archive pass only runs on PR-N
+        # batons so the id-fallback suffices; the github: field is a bonus.
+        anchor = _resolve_anchor(project_id, p.get("github", ""))
         if not anchor:
             continue
 

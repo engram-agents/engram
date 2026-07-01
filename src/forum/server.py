@@ -1551,7 +1551,7 @@ def create_app(
             active_only — optional bool string (true/false/1/0); default true.
 
         Response: {projects: [{project_id, title, status, turn, turn_since, turn_reason,
-                               participants, seq}]}
+                               participants, seq, github}]}
         """
         from forum.coordination import projects as _proj
 
@@ -1578,6 +1578,7 @@ def create_app(
                     "turn_reason": r.turn_reason,
                     "participants": list(r.participants),
                     "seq": r.seq,
+                    "github": r.github,
                 }
                 for r in records
             ]
