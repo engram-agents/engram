@@ -231,11 +231,18 @@ if [ "$START" -eq 1 ]; then
     # Gate 1: HTTP health check — hard gate, exits 2 on failure.
     # Gate 2: --verify-only (confirms all runtime deps present) — hard gate, exits 2 on failure.
     # ----------------------------------------------------------------
-    echo "==> Post-install gate 1: HTTP health check"
-    if curl --fail --silent --max-time 5 "http://127.0.0.1:${PORT}/health" >/dev/null; then
-      echo "    OK: forum /health responding on :${PORT}"
-    else
-      echo "ERROR: /health not responding — service may have failed to start." >&2
+    echo "==> Post-install gate 1: HTTP health check (up to 20s — model load grace)"
+    _health_ok=0
+    for _attempt in $(seq 1 20); do
+      if curl --fail --silent --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+        echo "    OK: forum /health responding on :${PORT} (attempt ${_attempt})"
+        _health_ok=1
+        break
+      fi
+      sleep 1
+    done
+    if [ "$_health_ok" -eq 0 ]; then
+      echo "ERROR: /health not responding after 20s — service failed to start." >&2
       echo "       Check: journalctl --user -u $UNIT -n 30" >&2
       exit 2
     fi
