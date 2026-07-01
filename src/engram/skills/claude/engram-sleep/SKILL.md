@@ -514,7 +514,16 @@ Receive each fairy's task-notification as it arrives. Collect from the completio
 - **Fairies 1-9**: file path (`~/.engram/dream/<TODAY>-fairy-<N>-<SLUG>.md`) + 5-bullet TL;DR. Full report content lives on disk at the cited path.
 - **Batch-summary fairies**: write each fairy's returned JSON to `<cohort-dir>/chunk-N/agent_output.json`.
 
-**Fairy timeout**: if any fairy doesn't return within 15 minutes of dispatch, mark it as timed-out. For dream-fairies, note the timeout in the master's spawn prompt. For batch-summary fairies, mark the affected chunk as missing.
+**Fairy timeout**: if any fairy doesn't return within the model-appropriate window, mark it as timed-out.
+
+| Model family | Expected completion | Timeout (mark timed-out) |
+|---|---|---|
+| Claude / Anthropic | 3–5 min per fairy | **15 min** |
+| Ollama / GLM (local) | 15–25 min per fairy | **30 min** |
+
+Use the model family of the fairy's assigned runtime. If the fairy's model family is not explicitly set in the dispatch, apply the parent's timeout row. If unsure, default to 30 min to avoid premature abort. For dream-fairies, note the timeout in the master's spawn prompt. For batch-summary fairies, mark the affected chunk as missing.
+
+*(Origin: Zephyr's first GLM-5 sleep cycle, 2026-06-28 — dream master was dispatched prematurely while GLM-5 fairies were still running at 15 min; batch-summary chunks 2-3 never completed. See #1533.)*
 
 **After all batch-summary fairy outputs are written, run validate:**
 
