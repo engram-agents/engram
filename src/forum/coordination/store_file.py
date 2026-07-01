@@ -216,7 +216,14 @@ class FileStore(CoordinationStore):
             return  # idempotent: already archived or never written
         dst_dir = self.root / "archive"
         dst_dir.mkdir(parents=True, exist_ok=True)
-        src.rename(dst_dir / f"{project_id}.md")  # atomic POSIX rename (same fs)
+        dst = dst_dir / f"{project_id}.md"
+        if dst.exists():
+            # Guard against silent clobber on pid reuse (#1512): suffix with seq.
+            seq = 1
+            while (dst_dir / f"{project_id}.{seq}.md").exists():
+                seq += 1
+            dst = dst_dir / f"{project_id}.{seq}.md"
+        src.rename(dst)  # atomic POSIX rename (same fs)
 
     # --- DM ----------------------------------------------------------------
     def _dm_path(self, a: str, b: str) -> Path:

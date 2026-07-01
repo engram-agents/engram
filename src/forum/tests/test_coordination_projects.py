@@ -756,6 +756,41 @@ def test_archive_project_idempotent(store):
     store.archive_project("PR-1")
 
 
+def test_archive_project_no_clobber_on_pid_reuse(store, tmp_path):
+    """Archiving a new pid that matches an existing archive entry must not clobber (#1512)."""
+    # Archive PR-1 once
+    store.archive_project("PR-1")
+    archive_path = store.root / "archive" / "PR-1.md"
+    assert archive_path.exists()
+    original_content = archive_path.read_text()
+
+    # Re-create PR-1 in the active dir (simulates pid reuse after earlier archive)
+    new_content = "---\nproject: PR-1\nturn: luria\n---\nnew baton content\n"
+    (store.projects_dir / "PR-1.md").write_text(new_content)
+
+    # Archive the new PR-1 — must NOT overwrite the existing archive entry
+    store.archive_project("PR-1")
+
+    # Original archive still intact
+    assert archive_path.read_text() == original_content, "original archive was clobbered"
+    # New baton landed in a suffixed file
+    suffixed = store.root / "archive" / "PR-1.1.md"
+    assert suffixed.exists(), "new baton missing from archive (expected PR-1.1.md)"
+    assert "new baton content" in suffixed.read_text()
+
+
+def test_archive_project_seq_suffix_increments(store):
+    """Second clobber produces .2.md, not another .1.md (#1512)."""
+    store.archive_project("PR-1")
+    (store.projects_dir / "PR-1.md").write_text("second\n")
+    store.archive_project("PR-1")
+    (store.projects_dir / "PR-1.md").write_text("third\n")
+    store.archive_project("PR-1")
+    assert (store.root / "archive" / "PR-1.md").exists()
+    assert (store.root / "archive" / "PR-1.1.md").exists()
+    assert (store.root / "archive" / "PR-1.2.md").exists()
+
+
 def test_recover_max_seq_counts_archived(store, allocator):
     # merge archives the file; seq must survive in recover_max_seq
     seq = merge(store, allocator, "PR-1", merged_by="luria")
