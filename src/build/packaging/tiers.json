@@ -279,6 +279,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/tripwire.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/forum_api.py",
       "tier": "convenience",
       "multi_agent": true
@@ -663,6 +667,10 @@
     {
       "path": "tools/test_forum_cli.py",
       "reason": "test file for tools/forum.py — CI tooling only, never ships"
+    },
+    {
+      "path": "tools/test_tripwire.py",
+      "reason": "test file for tools/tripwire.py — CI tooling only, never ships"
     },
     {
       "path": "tools/test_forum_backup.py",
