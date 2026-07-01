@@ -723,6 +723,7 @@ def build_parser() -> argparse.ArgumentParser:
     # -- mark-read --
     p_mr = subparsers.add_parser(
         "mark-read",
+        aliases=["mr"],
         help="Advance read cursor to current as_of from /api/updates",
         description=(
             "Poll GET /api/updates?kinds=dm and advance the local read cursor "
