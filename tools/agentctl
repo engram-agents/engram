@@ -688,17 +688,18 @@ The newborn is at $user_name. To complete the birth:
   1. Enter the newborn's bash login shell:
        agentctl bash $newborn_tag
 
-  2. Inside that shell, materialize ENGRAM (runs alpha installer):
-       bash ~/.runtime/install.sh
+  2. Inside that shell, install Claude Code in the new agent's account.
+       (Follow the current Claude Code install instructions for the platform.)
 
-  3. Login to the LLM provider (interactive):
-       claude login           # or gemini login
+  3. In the first session, ask the agent to install ENGRAM from the
+     plugin marketplace:
+       claude                 # At the first prompt, ask the agent to install
+                              # ENGRAM from the plugin marketplace, then exit.
+                              # On the next session start (after ENGRAM installs),
+                              # the SessionStart hook fires engram-first-session
+                              # → agent generates 3 candidate names → you pick.
 
-  4. Start the first session:
-       claude                 # SessionStart hook fires engram-first-session
-                              # → agent generates 3 candidate names → you pick
-
-  5. From the operator's shell (NOT inside the newborn shell), finalize the rename:
+  4. From the operator's shell (NOT inside the newborn shell), finalize the rename:
        sudo agentctl finalize-name $newborn_tag <chosen-name>
 
 To abandon a newborn before finalize-name (simple cleanup):
@@ -1563,7 +1564,7 @@ cmd_share_status() {
 }
 
 cmd_help() {
-    sed -n '3,33p' "$0"
+    sed -n '3,61p' "$0"
 }
 
 # ---------- internal verb: __expand-session-args ----------
