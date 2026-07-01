@@ -25,7 +25,16 @@ the unified payload_json signature as of 2026-05-27.
 - **`dev`** is the default branch and the merge target for ALL feature/fix PRs.
   Always open PRs against `dev` unless an explicit release-cut is happening.
 - **`master`** is the stable-release branch. It moves only on explicit release
-  cuts; routine PRs do NOT target master.
+  cuts; routine PRs do NOT target master. **A release cut = opening a formal
+  PR from `dev` → `master`** — this fires the full CI gate (`tests.yml` full
+  suite + `pr-checks` + `non-author-approval`), the thorough pre-release
+  validation. See `docs/RELEASING.md`.
+- **CI cost model (#1597):** dev PRs run only the cheap combined `pr-checks`
+  (static scrubs) + `non-author-approval`. The **full pytest suite does NOT run
+  on dev PRs** — at agent-PR velocity it's too expensive; run **affected-tests
+  locally** and paste the result in your review. The full suite runs once, on
+  the dev→master release PR (above). `affected-tests.yml` is `workflow_dispatch`
+  only.
 - Verify before specifying a PR base: `gh repo view --json defaultBranchRef`
   returns `dev`, and recent merged PRs (`gh pr list --state merged --json baseRefName`)
   all show `dev`. If your session-start banner shows a branch other than `dev`
