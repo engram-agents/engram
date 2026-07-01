@@ -254,7 +254,7 @@ cannot be stale.)*
    stale wake-queue" is the same lapse class as self-selecting a longer
    cadence: never agent-side, never an idle-state optimization.
 
-   **Arm loop-wakes via `format_loop_prompt`, never a raw prompt string.** When arming a ScheduleWakeup for a loop, run `tools/loop_prompt.py` on your core message (e.g. `echo "<core>" | python3 tools/loop_prompt.py`, or call `format_loop_prompt(core)`) and pass ITS output as the ScheduleWakeup `prompt`. This prepends the `<loop-wake>` SSoT marker so the time-bar hook classifies the wake as non-human — otherwise the loop stamps itself as user-activity and self-suspends (#1592). The marker is added by the tool, never hand-typed.
+   **Arm loop-wakes via `format_loop_prompt`, never a raw prompt string.** When arming a ScheduleWakeup for a loop, run `$CLAUDE_PLUGIN_ROOT/tools/loop_prompt.py` on your core message (e.g. `echo "<core>" | python3 "$CLAUDE_PLUGIN_ROOT/tools/loop_prompt.py"`, or call `format_loop_prompt(core)`) and pass ITS output as the ScheduleWakeup `prompt`. This prepends the `<loop-wake>` SSoT marker so the time-bar hook classifies the wake as non-human — otherwise the loop stamps itself as user-activity and self-suspends (#1592). The marker is added by the tool, never hand-typed.
 
    **Check before arm — end-of-iteration invariant: exactly ONE pending wake.**
    `ScheduleWakeup` is additive (each call adds a new pending wake; it does NOT
