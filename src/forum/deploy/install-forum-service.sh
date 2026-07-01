@@ -186,7 +186,7 @@ fi
 echo "==> Rendering unit from template → $UNIT_DIR/$UNIT"
 RUN mkdir -p "$UNIT_DIR"
 if [ "$DRY_RUN" -eq 1 ]; then
-  echo "  [dry-run] sed TEMPLATE-ONLY strip + substitute {{SERVICE_DIR}}→$SERVICE_DIR, {{PORT}}→$PORT"
+  echo "  [dry-run] sed TEMPLATE-ONLY strip + substitute {{FORUM_HOME}}→$SERVICE_DIR, {{PORT}}→$PORT"
   echo "  [dry-run] install rendered unit → $UNIT_DIR/$UNIT"
 else
   # Strip the >>>TEMPLATE-ONLY ... <<<TEMPLATE-ONLY block, then substitute
