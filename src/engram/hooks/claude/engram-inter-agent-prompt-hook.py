@@ -35,7 +35,6 @@ Part of the UCS PR3b migration (hooks/claude → forum DM API).
 Stacked on PR3a (ia.py DM CLI). Pattern reference: engram-baton-prompt-hook.py.
 """
 
-import hashlib
 import json
 import os
 import pwd
@@ -273,65 +272,6 @@ def _fetch_dm_updates(config: dict, agent_name: str, since: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Shared-bin drift detection
-# ---------------------------------------------------------------------------
-
-def _shared_bin_drift_lines(engram_home: Path, session_id: str) -> list:
-    """Return banner lines for drifted shared-bin CLIs, or [] if clean/skip."""
-    shared_bin = Path("/home/agents-shared/bin")
-    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
-    if not shared_bin.exists() or not plugin_root:
-        return []
-
-    FAMILY = [("ia", "ia.py"), ("baton", "baton.py"), ("forum", "forum.py")]
-
-    def _md5(p: Path) -> str:
-        return hashlib.md5(p.read_bytes()).hexdigest()
-
-    drifted = []
-    for cli_name, src_name in FAMILY:
-        shared = shared_bin / cli_name
-        src = Path(plugin_root) / "tools" / src_name
-        if not shared.exists() or not src.exists():
-            continue
-        if _md5(shared) != _md5(src):
-            drifted.append((cli_name, src_name))
-
-    if not drifted:
-        return []
-
-    # Compute fingerprint of the drift set
-    fingerprint = hashlib.md5(str(sorted(drifted)).encode()).hexdigest()
-
-    # Once-per-session throttle: skip if same fingerprint + session already warned
-    state_file = engram_home / "shared-bin-drift.state"
-    try:
-        state = json.loads(state_file.read_text())
-        if state.get("fingerprint") == fingerprint and state.get("session_id") == session_id:
-            return []  # throttled — already warned this session
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
-
-    # Write state (update fingerprint + session)
-    try:
-        state_file.write_text(json.dumps({"fingerprint": fingerprint, "session_id": session_id}))
-    except OSError:
-        pass  # non-fatal: if we can't write state, we'll warn again next prompt
-
-    lines = ["⚠️ shared-bin CLI drift detected (multi-agent):"]
-    for cli_name, src_name in drifted:
-        lines.append(
-            f"  - {cli_name}: sudo cp \"$CLAUDE_PLUGIN_ROOT/tools/{src_name}\""
-            f" /home/agents-shared/bin/{cli_name}"
-        )
-    lines.append(
-        "Refresh before agents resume to avoid silent divergence. "
-        "Use `engram_diagnose` for the on-demand check."
-    )
-    return lines
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -428,20 +368,12 @@ def main() -> None:
     if live_fetch:
         _write_cursor_int(SURFACED_CURSOR_PATH, new_as_of)
 
-    # ── Shared-bin drift check (inside mode gate; prepend when present) ───────
-    # Fail-open: drift check is advisory; DM channel is primary.
-    try:
-        drift_lines = _shared_bin_drift_lines(Path(ENGRAM_HOME), session_id)
-    except Exception:
-        drift_lines = []
-
     # ── Exit silently if nothing to report ────────────────────────────────────
-    if not new_dms and not unread_dms and not drift_lines:
+    if not new_dms and not unread_dms:
         sys.exit(0)
 
     # ── Build injection block ─────────────────────────────────────────────────
-    # Drift warning comes first — more operationally urgent than the DM list.
-    lines = list(drift_lines)
+    lines: list = []
 
     n_new = len(new_dms)
     if n_new > 0:

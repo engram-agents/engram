@@ -102,10 +102,6 @@ _FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):\s*(.*)$", re.MULTILINE)
 # PR-ID fallback pattern: "PR-NNN"
 _PR_ID_RE = re.compile(r"^PR-(\d+)$")
 
-# Fallback path for the baton CLI when shutil.which("baton") returns None.
-# Defined at module level so tests can patch it.
-_BATON_FALLBACK = "/home/agents-shared/bin/baton"
-
 
 # ---------------------------------------------------------------------------
 # Config helpers  (mirrors engram-inter-agent-prompt-hook.py exactly)
@@ -515,12 +511,11 @@ def _auto_archive_merged_pr_batons(projects: list, cache: dict) -> None:
     explicit full offline sweep that queries live GitHub state for every
     uncached PR-baton.
     """
-    # Resolve the baton binary once; reuse the result for the guard check.
+    # Resolve the baton binary; skip if not in PATH.
     _baton_which = shutil.which("baton")
-    baton_bin = _baton_which or _BATON_FALLBACK
-    if not _baton_which and not Path(_BATON_FALLBACK).exists():
+    if not _baton_which:
         print(
-            "baton auto-archive: baton CLI not found; skipping",
+            "baton auto-archive: baton CLI not found in PATH; skipping",
             file=sys.stderr,
         )
         return
@@ -565,7 +560,7 @@ def _auto_archive_merged_pr_batons(projects: list, cache: dict) -> None:
         pid = project_id
         try:
             result = subprocess.run(
-                [baton_bin, "close", pid, "--status", close_status],
+                [_baton_which, "close", pid, "--status", close_status],
                 capture_output=True,
                 text=True,
                 timeout=_GH_TIMEOUT,

@@ -683,12 +683,11 @@ class TestAutoArchivePure:
         )
 
     # 33. Baton binary missing
-    def test_baton_binary_missing_emits_skip_stderr(self, engram_home, tmp_path):
+    def test_baton_binary_missing_emits_skip_stderr(self, engram_home):
         """baton binary absent -> stderr skip line, no exception raised."""
         mod = self._mod(engram_home)
         projects = [_make_project_dict("PR-2600", turn="maintainer", status="in-progress")]
         cache: dict = {}
-        fake_fallback = str(tmp_path / "bin" / "baton")  # nonexistent path
 
         stderr_lines: list = []
 
@@ -697,9 +696,8 @@ class TestAutoArchivePure:
                 stderr_lines.append(str(args[0]) if args else "")
 
         with patch.object(mod.shutil, "which", return_value=None):
-            with patch.object(mod, "_BATON_FALLBACK", fake_fallback):
-                with patch("builtins.print", side_effect=_fake_print):
-                    mod._auto_archive_merged_pr_batons(projects, cache)  # must not raise
+            with patch("builtins.print", side_effect=_fake_print):
+                mod._auto_archive_merged_pr_batons(projects, cache)  # must not raise
 
         assert any("baton CLI not found" in line for line in stderr_lines), (
             f"Expected 'baton CLI not found' in stderr; got: {stderr_lines}"

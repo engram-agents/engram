@@ -9,7 +9,7 @@ Upgrading a plugin-mode ENGRAM install is mechanically simple but keeps one well
 
 **The architecture that makes plugin upgrades simple:** your *data* (`~/.engram/knowledge.db`, history, diary, sessions) and your *identity surfaces* (`~/.claude/CLAUDE.md`, warm-briefing) are **never touched** by a plugin upgrade. The *code* (server, hooks, tools, skills, agents) lives in the plugin tree at `~/.engram/marketplace/plugins/engram/`. **For a Claude `directory`-source local marketplace — the standard plugin install — that source tree IS the live code**: `CLAUDE_PLUGIN_ROOT` resolves to it and Claude Code invokes hooks/skills/tools directly from it (verified 2026-06-28 by live hook-fire instrumentation). So once Step 3's `install-local-marketplace.sh` rebuilds the source tree, **new hook / tool / skill code is already live** (re-read per invocation) — there is no separate "pull into cache" step for them. The host plugin *cache* (`~/.claude/plugins/cache/...`) + `installed_plugins.json` are version **bookkeeping, NOT the live load path** for a directory source. Only two code kinds need an explicit post-rebuild action (Step 5): a changed **`server.py`** (the running MCP process is from session start → `/mcp` reconnect) and a changed **`hooks.json` registration** (read at session start → full restart). **Codex differs:** `codex plugin add` copies the build into Codex's own cache (`~/.codex/plugins/cache/...`) — so the Codex flow is cache-refresh-based, and you use the installed cache for helper paths (e.g. `~/.codex/plugins/cache/.../tools/verify_quote.py`). **NB:** that Codex's *cache* is its live load path is **inferred** from the explicit copy step (the copy makes the cache the install location, unlike Claude's in-place source) — it has **not** been live-fire-verified the way Claude's directory-source model was. Re-verify on Codex, especially after a Codex version bump (same instrument-and-fire method). Note: `~/.engram/hooks` and `~/.engram/tools` are independent data directories with separate inodes — NOT symlinks into the plugin tree, NOT touched by the upgrade.
 
-**The one residual hard gate:** the host identity surface is user-scope identity and is *not* plugin-owned. On Claude this is usually `~/.claude/CLAUDE.md` rendered from `templates/template.CLAUDE.md`; on Codex it may be `~/.codex/config.toml` instructions plus project `AGENTS.md` from `templates/template.AGENTS.md`. If the relevant upstream template changed, the live surface needs an inverse-merge (Step 6). That's the load-bearing judgment step of this skill.
+**The one residual hard gate:** the host identity surface is user-scope identity and is *not* plugin-owned. On Claude this is usually `~/.claude/CLAUDE.md` rendered from `templates/template.CLAUDE.md`; on Codex it may be `~/.codex/config.toml` instructions plus project `AGENTS.md` from `templates/template.AGENTS.md`. If the relevant upstream template changed, the live surface needs an inverse-merge (Step 7). That's the load-bearing judgment step of this skill.
 
 **When to use:**
 - The install is plugin-mode (`~/.engram/marketplace/plugins/engram/plugin.json` exists) and the user wants newer alpha code without losing data
@@ -79,7 +79,7 @@ SOURCE_DIR=$(grep '^deployed_from=' ~/.engram/.deployed-version | cut -d= -f2-)
 DEPLOYED=$(grep '^alpha_sha=' ~/.engram/.deployed-version | cut -d= -f2-)
 # Save the pre-upgrade SHA before Step 3 overwrites .deployed-version.
 # Step 3's install-local-marketplace.sh refreshes the marker to the new SHA,
-# so a fresh read in Step 6 yields base==head → false "no drift" (#1194).
+# so a fresh read in Step 7 yields base==head → false "no drift" (#1194).
 echo "$DEPLOYED" > ~/.engram/.upgrade-pre-sha
 UPSTREAM_BRANCH="$(git -C "$SOURCE_DIR" rev-parse --abbrev-ref HEAD)"
 git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH"
@@ -90,7 +90,7 @@ git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH"
 - You may `gh pr view <N>` on at most ONE PR for depth. Do NOT loop over all PRs fetching bodies (token budget).
 - Write a ≤4-bullet summary: what surfaces are touched, anything deploy-fragile (`server.py` / hooks / migrations), anything user-facing. Surface it; pause on anything concerning.
 
-**Also note here** whether any CLAUDE.md render source appears in the change set — that pre-announces Step 6's gate. The rendered `~/.claude/CLAUDE.md` is assembled from **multiple** upstream sources: `templates/template.CLAUDE.md` + `templates/compact-instructions.md` (folded in by bootstrap at install-time). A change to either file produces rendered-CLAUDE.md drift. Check both:
+**Also note here** whether any CLAUDE.md render source appears in the change set — that pre-announces Step 7's gate. The rendered `~/.claude/CLAUDE.md` is assembled from **multiple** upstream sources: `templates/template.CLAUDE.md` + `templates/compact-instructions.md` (folded in by bootstrap at install-time). A change to either file produces rendered-CLAUDE.md drift. Check both:
 
 ```bash
 UPSTREAM_BRANCH="$(git -C "$SOURCE_DIR" rev-parse --abbrev-ref HEAD)"
@@ -160,39 +160,7 @@ The plugin tree/cache now has the new `server.py`, but the running MCP server ma
 
 ---
 
-## Step 5a — Shared-bin CLI refresh (multi-agent only)
-
-**If multi-agent:** After the plugin rebuild, check shared-bin CLI drift — the next prompt will surface a `⚠️ shared-bin drift` banner if drift is detected. The shared-bin CLIs (`ia`, `baton`, `forum`) are owned by whichever agent created them (typically the main agent on the host). Refresh policy is **permission-driven, not sudo-by-default**:
-
-- **If the target is writable by you** — refresh with a plain `cp`, no sudo needed.
-- **If the target is not writable** — skip; the owning agent should refresh. Do NOT `sudo cp` another agent's files.
-
-```bash
-for pair in "ia.py:ia" "baton.py:baton" "forum.py:forum"; do
-  src="${pair%%:*}"; cli="${pair##*:}"
-  target="/home/agents-shared/bin/$cli"
-  [ ! -e "$target" ] && echo "$cli: not in shared-bin — skip" && continue
-  if [ -w "$target" ]; then
-    diff -q "$CLAUDE_PLUGIN_ROOT/tools/$src" "$target" >/dev/null 2>&1
-    diff_rc=$?
-    if [ $diff_rc -eq 0 ]; then
-      echo "$cli: up to date"
-    elif [ $diff_rc -eq 1 ]; then
-      cp "$CLAUDE_PLUGIN_ROOT/tools/$src" "$target" && echo "$cli: refreshed" || echo "$cli: cp failed"
-    else
-      echo "$cli: diff error — check $CLAUDE_PLUGIN_ROOT/tools/$src"
-    fi
-  else
-    echo "$cli: owned by $(stat -c%U "$target" 2>/dev/null || stat -f%Su "$target") — skip (owning agent refreshes)"
-  fi
-done
-```
-
-This prevents the silent-degradation class where agents run a stale shared CLI against a newly-upgraded hook, while respecting each agent's file ownership.
-
----
-
-## Step 5b — Restart viz server (if installed as systemd service)
+## Step 6 — Restart viz server (if installed as systemd service)
 
 Skip if you don't use the viz dashboard (T2 feature, may not be installed).
 
@@ -216,13 +184,13 @@ Verify the server is live with new code after the restart:
 ```bash
 curl -s http://localhost:5001/api/health | python3 -m json.tool
 ```
-A `health_score` field in the response confirms the viz server is up. Step 7 also checks this.
+A `health_score` field in the response confirms the viz server is up. Step 8 also checks this.
 
 **Checkpoint**: viz responds to `http://localhost:5001/api/health` (or the service is confirmed not installed).
 
 ---
 
-## Step 6 — CLAUDE.md template inverse-merge (HARD GATE, the residual)
+## Step 7 — CLAUDE.md template inverse-merge (HARD GATE, the residual)
 
 If Step 2 found any CLAUDE.md render source changed in the range, **do not skip this**. The rendered `~/.claude/CLAUDE.md` is assembled from multiple upstream sources — `templates/template.CLAUDE.md` AND `templates/compact-instructions.md` — so a `compact-instructions.md`-only change is just as drift-producing as a template change. On Codex, also check `templates/template.AGENTS.md` and any local first-person instructions in `~/.codex/config.toml`/project `AGENTS.md`. The plugin upgrade did not touch these user-scope identity surfaces, so source-side additions may NOT have reached the running agent.
 
@@ -260,7 +228,7 @@ diff "$SOURCE_DIR"/src/engram/templates/template.AGENTS.md /path/to/live/AGENTS.
 
 ---
 
-## Step 7 — Verify
+## Step 8 — Verify
 
 ```bash
 cat ~/.engram/.deployed-version          # marker SHA = the commit you built (forensics anchor)
@@ -275,7 +243,7 @@ Then through the **plugin MCP** (after Step 5's reconnect): call `engram_stats` 
 
 ---
 
-## Step 8 — Record the upgrade in ENGRAM
+## Step 9 — Record the upgrade in ENGRAM
 
 ```python
 engram_add_observation(payload_json=json.dumps({
@@ -292,7 +260,7 @@ engram_add_observation(payload_json=json.dumps({
 
 Do **not** cite `file://~/.engram/.deployed-version` directly unless it is committed/tracked evidence. ENGRAM's provenance guard may reject untracked files; use a verified transcript/log quote instead.
 
-**Checkpoint**: obs filed; its SHA/target/cache claim matches Step 7's verified evidence.
+**Checkpoint**: obs filed; its SHA/target/cache claim matches Step 8's verified evidence.
 
 ---
 
@@ -300,7 +268,7 @@ Do **not** cite `file://~/.engram/.deployed-version` directly unless it is commi
 
 - **Context-impression that a step is done.** Every step has a checkpoint command — verify explicitly, not from "I think I did that." This is the failure mode the skill exists to close.
 - **Running Claude slash-commands yourself.** `/plugin …` and `/mcp` are Claude user actions. Codex is different: `codex plugin add engram@engram-local` is an ordinary CLI command and can be run by the agent.
-- **Skipping Step 6 because the template diff "looked fine."** The identity-surface inverse-merge is the one place a plugin upgrade still needs judgment. If deferring, write it to the ask-user queue immediately.
+- **Skipping Step 7 because the template diff "looked fine."** The identity-surface inverse-merge is the one place a plugin upgrade still needs judgment. If deferring, write it to the ask-user queue immediately.
 - **Building without checking the feature-set flags.** A wrong-flag build *succeeds* and silently drops surfaces (#704/#707 class). The Step 3 checkpoint exists for this.
 - **Re-bootstrapping (`FORCE=1`) to "refresh" anything.** `FORCE=1` (and `FORCE_RESEED_EMPTY=1`) now **refuse on a non-empty DB** — they are not bypass paths for live graphs. Never the upgrade path; a true fresh start requires manually deleting `knowledge.db` first.
 - **Killing the MCP subprocess to "restart" it.** User-restart only.
@@ -313,4 +281,4 @@ Do **not** cite `file://~/.engram/.deployed-version` directly unless it is commi
 - **`tools/migrate-to-plugin.sh`** — the one-time scatter→plugin migration for any install still on the retired scatter layout. Different procedure; needs the human for the `/plugin install` + `/mcp` pauses. This skill takes over for all upgrades *after* that migration.
 - **engram-self-improve** — a self-improvement code change ships through this skill once merged to the alpha source.
 - **engram-surgical** — data-corruption recovery, NOT routine upgrades.
-- **engram-nap / engram-sleep** — an upgrade is a meaningful state-change worth a nap checkpoint if context permits (Step 8's obs is the minimum record; a nap captures the wider session context).
+- **engram-nap / engram-sleep** — an upgrade is a meaningful state-change worth a nap checkpoint if context permits (Step 9's obs is the minimum record; a nap captures the wider session context).
