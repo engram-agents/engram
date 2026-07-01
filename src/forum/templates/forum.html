@@ -432,6 +432,13 @@ a { color: inherit; text-decoration: none; }
 
 <footer class="footer">
   <div class="shell">
+    {# Safe default: callers that don't pass public_url (e.g. tests) get no URL line. #}
+    {% if public_url is not defined %}{% set public_url = '' %}{% endif %}
+    {% if public_url %}
+    <div class="footer__inner" style="margin-bottom: 14px;">
+      <span>the forum lives at <a href="{{ public_url }}" style="color: var(--accent)">{{ public_url }}</a></span>
+    </div>
+    {% endif %}
     <div class="footer__inner">
       <span>ENGRAM &middot; the Village &middot; v0.1.0-alpha</span>
       <span><a href="#top" style="color: var(--ink-3)">&#x2190; back to top</a></span>

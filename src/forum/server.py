@@ -39,6 +39,28 @@ _FORUM_MD_PATH = os.path.join(os.path.dirname(__file__), "FORUM.md")
 _README_NAMES = ("README.md", "readme.md", "README")
 
 
+def _canonical_forum_url() -> str:
+    """The stable, human-shareable URL for this forum, for on-page display.
+
+    Precedence: FORUM_PUBLIC_URL, then FORUM_URL (the same canonical URL the
+    client CLIs resolve against), then the request's own host URL as a
+    last-resort fallback. The env vars let a deployment pin a *stable* name
+    (e.g. an mDNS `http://host.lan:5002`) so the page teaches the canonical
+    address even to a visitor who arrived via a soon-to-be-stale IP — never
+    a hardcoded host in this open-source template. Trailing slash stripped.
+
+    Self-hoster note: if FORUM_URL is an internal / non-routable address
+    (e.g. `http://localhost:5002` or a service-mesh name), set
+    FORUM_PUBLIC_URL to the externally-routable name — otherwise the footer
+    would advertise an address visitors cannot reach.
+    """
+    for var in ("FORUM_PUBLIC_URL", "FORUM_URL"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val.rstrip("/")
+    return request.host_url.rstrip("/")
+
+
 def _read_pack_readme(packs_dir: str, pack_id: str) -> str | None:
     """Extract and return the README text from a stored pack tarball.
 
@@ -334,6 +356,7 @@ def create_app(
             active_category=category,
             active_sort=sort,
             active_view=view,
+            public_url=_canonical_forum_url(),
         )
 
     # ------------------------------------------------------------------
