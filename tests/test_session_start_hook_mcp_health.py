@@ -213,13 +213,15 @@ def test_marker_with_running_pid_returns_ok(tmp_path, monkeypatch):
     assert write_reason is None
 
 
-def test_marker_with_dead_pid_returns_false(tmp_path, monkeypatch):
-    """When marker PID is no longer running → write-tool liveness is False."""
+def test_marker_with_dead_pid_and_no_server_returns_false(tmp_path, monkeypatch):
+    """When marker PID is dead AND no server.py is running → liveness is False."""
     engram_home = tmp_path / "engram"
     engram_home.mkdir()
     mod = _load_hook_module(monkeypatch, engram_home)
     _set_runtime_platform(monkeypatch, mod, tmp_path, "claude-code")
     monkeypatch.delenv("CODEX_PLUGIN_ROOT", raising=False)
+    # Suppress the secondary pgrep check — no server running in test env.
+    monkeypatch.setattr(mod, "_is_any_server_py_running", lambda: False)
     # PID 9999999 almost certainly does not exist on any Linux system.
     marker = {"pid": 9999999, "registered_at": "2026-06-13T00:00:00Z"}
     (engram_home / "mcp-tools-ready.json").write_text(json.dumps(marker))
@@ -227,6 +229,23 @@ def test_marker_with_dead_pid_returns_false(tmp_path, monkeypatch):
     write_ok, write_reason = mod._check_mcp_write_tool_marker(str(engram_home))
     assert write_ok is False
     assert "stale" in write_reason
+
+
+def test_marker_with_dead_pid_but_server_alive_returns_true(tmp_path, monkeypatch):
+    """Stale marker PID + live server.py (post-restart race) → liveness is True."""
+    engram_home = tmp_path / "engram"
+    engram_home.mkdir()
+    mod = _load_hook_module(monkeypatch, engram_home)
+    _set_runtime_platform(monkeypatch, mod, tmp_path, "claude-code")
+    monkeypatch.delenv("CODEX_PLUGIN_ROOT", raising=False)
+    # Simulate: dead marker PID, but a live server.py is running.
+    monkeypatch.setattr(mod, "_is_any_server_py_running", lambda: True)
+    marker = {"pid": 9999999, "registered_at": "2026-06-13T00:00:00Z"}
+    (engram_home / "mcp-tools-ready.json").write_text(json.dumps(marker))
+
+    write_ok, write_reason = mod._check_mcp_write_tool_marker(str(engram_home))
+    assert write_ok is True  # server alive, marker just stale from restart race
+    assert write_reason is None
 
 
 def test_codex_platform_defers_write_tool_marker_check(tmp_path, monkeypatch):

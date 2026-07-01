@@ -193,6 +193,22 @@ def _check_mcp_health(engram_home: str) -> tuple[bool, str | None]:
         return True, None
 
 
+def _is_any_server_py_running() -> bool:
+    """Return True if any server.py process is running (pgrep secondary check).
+
+    Used by _check_mcp_write_tool_marker to distinguish a truly dead server
+    from a post-restart race where the marker PID is stale but the server is
+    alive.  Best-effort: returns False on any error so the caller degrades to
+    the conservative (unhealthy) path rather than a false positive.
+    """
+    import subprocess as _sp
+    try:
+        r = _sp.run(["pgrep", "-f", "server.py"], capture_output=True, timeout=2)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
     """Check whether the MCP server wrote its initialization-complete marker.
 
@@ -231,6 +247,14 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
         except OSError as e:
             if e.errno == _errno.EPERM:
                 return True, None  # exists, no permission to signal — still running
+            # Marker PID is dead — server may have restarted and not yet refreshed
+            # the marker (race between restart and this hook). Secondary check: is
+            # any server.py actually running right now?
+            if _is_any_server_py_running():
+                # A live server.py found — stale marker, not a dead server.
+                # Return healthy; server will refresh the marker on its next
+                # startup write (or already has — hook just caught the window).
+                return True, None
             return False, f"mcp-tools-ready.json stale (server PID {pid} no longer running)"
     except Exception:
         return True, None  # advisory — never block session start
