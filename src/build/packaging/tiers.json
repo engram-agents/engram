@@ -296,6 +296,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/loop_prompt.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/engram-mode.py",
       "tier": "convenience"
     },

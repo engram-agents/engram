@@ -77,6 +77,8 @@ The heartbeat is your **liveness guarantee** — the periodic re-check that catc
 a dead Monitor and ensures you wake even when nothing else fires. Its cadence is
 a **per-state decision**, not a standing license to relax:
 
+> **Arm via `format_loop_prompt`** (see `engram-loop`) — the loop-wake marker prevents self-suspend (#1592).
+
 > **Self-sufficient-wake invariant: never leave yourself in a state where only
 > others can wake you.** A Monitor event still requires the counterpart to act
 > first, and the Monitor can die silently. If both agents simultaneously rely on

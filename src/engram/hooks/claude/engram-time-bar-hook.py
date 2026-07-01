@@ -49,6 +49,42 @@ LAST_USER_MSG = ENGRAM_DIR / "last-user-msg.json"
 LAST_USER_ACTIVITY = ENGRAM_DIR / "last-user-activity"
 CONFIG = ENGRAM_DIR / "config.json"
 
+# ---------------------------------------------------------------------------
+# loop_prompt import — SSoT for the loop-wake marker.
+#
+# Resolve tools/ in BOTH deploy topologies (same pattern as
+# engram-baton-prompt-hook.py / engram-forum-prompt-hook.py):
+#   Source:  src/engram/hooks/claude/<name>.py → src/engram/tools/
+#   Plugin:  <root>/hooks/<name>.py             → <root>/tools/
+# A fixed parents[N] overshoots in the deployed (flattened) tree.
+# Prefer $CLAUDE_PLUGIN_ROOT/tools when set; else walk parents and take the
+# first dir that actually contains loop_prompt.py.
+#
+# FAIL-SAFE: if the import fails for any reason the hook must NOT crash.
+# Fall back to the locally-defined _LOOP_WAKE_MARKER_FALLBACK constant so
+# prefix-based classification still works.  A regression test asserts this
+# fallback equals loop_prompt.LOOP_WAKE_MARKER so the two can't silently
+# diverge (#1592).
+# ---------------------------------------------------------------------------
+
+_LOOP_WAKE_MARKER_FALLBACK: str = "<loop-wake>"
+
+_lp_candidates = []
+_lp_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
+if _lp_plugin_root:
+    _lp_candidates.append(Path(_lp_plugin_root) / "tools")
+for _lp_parent in Path(__file__).resolve().parents:
+    _lp_candidates.append(_lp_parent / "tools")
+_LP_TOOLS_DIR = next(
+    (c for c in _lp_candidates if (c / "loop_prompt.py").exists()), None
+)
+if _LP_TOOLS_DIR is not None and str(_LP_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(_LP_TOOLS_DIR))
+try:
+    from loop_prompt import LOOP_WAKE_MARKER as _LOOP_WAKE_MARKER
+except Exception:
+    _LOOP_WAKE_MARKER = _LOOP_WAKE_MARKER_FALLBACK
+
 # Prompt-body prefixes that identify non-human events (loop self-wakes and
 # monitor notifications). Used as the fallback discriminator when promptSource
 # is absent from the hook payload.
@@ -57,6 +93,7 @@ _NON_HUMAN_PREFIXES = (
     "<command-message",
     "<command-name",
     "<local-command",
+    _LOOP_WAKE_MARKER,
 )
 
 
@@ -223,10 +260,14 @@ def main():
 
     prev = _read_json(LAST_USER_MSG) or {}
     last_msg_ago = _hms_ago(now_utc, prev.get("ts")) if prev.get("ts") else "(this msg)"
-    try:
-        LAST_USER_MSG.write_text(json.dumps({"ts": utc_iso}))
-    except Exception:
-        pass
+    # Gate the write on genuine human prompts — loop-wakes and monitor events
+    # must NOT advance the "last user msg" display (fixes the secondary display
+    # bug where loop-wakes reset the clock, making it always show 'this msg').
+    if _is_human_prompt(payload):
+        try:
+            LAST_USER_MSG.write_text(json.dumps({"ts": utc_iso}))
+        except Exception:
+            pass
 
     time_field = _format_time_field(now_utc, _get_user_tz())
     bar = (

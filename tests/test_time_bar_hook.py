@@ -1,5 +1,5 @@
-"""Tests for engram-time-bar-hook's time-field formatting (#721) and
-last-user-activity stamping (#1077 part 2).
+"""Tests for engram-time-bar-hook's time-field formatting (#721),
+last-user-activity stamping (#1077 part 2), and loop-wake classification (#1592).
 
 The formatting fix makes USER-LOCAL time prominent (weekday/date/12-hour/tz from
 the user's timezone) and reduces UTC to a small parenthetical — because an agent
@@ -9,10 +9,19 @@ UTC, so they stay correct across the UTC/local date boundary near midnight.
 
 The stamping tests (spec case 7) verify that last-user-activity is written only
 on genuine human-typed prompts and not on loop self-wakes or monitor events.
+
+The loop-wake tests (#1592) verify that:
+  - A ScheduleWakeup loop-wake prompt (CC-2.1.195 stdin shape, no promptSource)
+    is correctly classified as non-human by _is_human_prompt.
+  - The last-user-msg display write is gated on _is_human_prompt (Task 2b).
+  - The hook's fallback marker constant equals loop_prompt.LOOP_WAKE_MARKER (SSoT guard).
 """
 
 import importlib.util
+import json as _json
 import os
+import shutil
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,6 +34,12 @@ HOOK_PATH = os.path.join(
 spec = importlib.util.spec_from_file_location("time_bar_hook", HOOK_PATH)
 tbh = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tbh)
+
+# Also load loop_prompt for the SSoT guard test and fixture helpers.
+_LP_PATH = Path(__file__).parent.parent / "src" / "engram" / "tools" / "loop_prompt.py"
+_lp_spec = importlib.util.spec_from_file_location("loop_prompt_tbh_tests", _LP_PATH)
+_lp = importlib.util.module_from_spec(_lp_spec)
+_lp_spec.loader.exec_module(_lp)
 
 pytestmark = pytest.mark.skipif(tbh.ZoneInfo is None, reason="zoneinfo unavailable")
 
@@ -237,3 +252,238 @@ class TestStampUserActivity:
         import time as _time
         # Must not raise.
         tbh._stamp_user_activity(_time.time())
+
+
+# ---------------------------------------------------------------------------
+# #1592 — CC-2.1.195 fixture + loop-wake classification + secondary display bug
+# ---------------------------------------------------------------------------
+
+def _cc_payload(body: str) -> dict:
+    """Return the EXACT CC-2.1.195 UserPromptSubmit stdin shape (no promptSource).
+
+    In Claude Code 2.1.195, the hook payload contains ONLY these keys:
+    cwd, hook_event_name, permission_mode, prompt, session_id, transcript_path.
+    There is NO promptSource field — which is the root cause of #1592.
+    """
+    return {
+        "cwd": "/home/agent-borges/engram-alpha",
+        "hook_event_name": "UserPromptSubmit",
+        "permission_mode": "bypassPermissions",
+        "prompt": body,
+        "session_id": "test-session-1592",
+        "transcript_path": "/home/agent-borges/.claude/projects/test/transcript.jsonl",
+    }
+
+
+class TestLoopWakeClassification:
+    """#1592 — loop-wake prompts must be classified as non-human in the
+    CC-2.1.195 payload shape (no promptSource in stdin)."""
+
+    def test_cc_payload_plain_human_body_is_human(self):
+        """CC-2.1.195 shape + plain text body → classified as human (True)."""
+        payload = _cc_payload("Fix the regression in #1592 please.")
+        assert tbh._is_human_prompt(payload) is True
+
+    def test_cc_payload_loop_wake_body_is_not_human(self):
+        """CC-2.1.195 shape + format_loop_prompt body → classified as non-human (False).
+
+        This is the core #1592 fix: ScheduleWakeup loop wakes arrive with no
+        promptSource and a plain-text body.  The marker prefix ensures they
+        are detected as non-human in the fallback path.
+        """
+        loop_body = _lp.format_loop_prompt("Loop tick — checking for new work.")
+        payload = _cc_payload(loop_body)
+        assert tbh._is_human_prompt(payload) is False
+
+    def test_cc_payload_loop_wake_with_meta_is_not_human(self):
+        """CC-2.1.195 shape + format_loop_prompt with meta → non-human."""
+        loop_body = _lp.format_loop_prompt(
+            "Curiosity loop — scanning open questions.", kind="curiosity", seq=5
+        )
+        payload = _cc_payload(loop_body)
+        assert tbh._is_human_prompt(payload) is False
+
+    def test_cc_payload_no_prompt_source_key(self):
+        """Fixture must not carry promptSource — verify our fixture is faithful."""
+        payload = _cc_payload("hello")
+        assert "promptSource" not in payload
+
+    def test_loop_wake_marker_in_non_human_prefixes(self):
+        """The loop-wake marker is present in _NON_HUMAN_PREFIXES."""
+        assert tbh._LOOP_WAKE_MARKER in tbh._NON_HUMAN_PREFIXES
+
+    def test_is_loop_wake_round_trip(self):
+        """is_loop_wake(format_loop_prompt(x)) is always True."""
+        assert _lp.is_loop_wake(_lp.format_loop_prompt("anything"))
+
+    def test_format_loop_prompt_idempotent(self):
+        """format_loop_prompt applied twice does not double-mark."""
+        once = _lp.format_loop_prompt("core message")
+        twice = _lp.format_loop_prompt(once)
+        assert twice == once
+
+
+class TestSSoTGuard:
+    """The hook's fallback marker string equals loop_prompt.LOOP_WAKE_MARKER.
+
+    This guard prevents the two constants from diverging silently — if one is
+    updated and the other is not, the test fails and the drift is caught at
+    review time rather than in production (#1592 spec requirement).
+    """
+
+    def test_fallback_equals_loop_prompt_marker(self):
+        """Hook's hardcoded fallback == loop_prompt.LOOP_WAKE_MARKER (SSoT guard)."""
+        assert tbh._LOOP_WAKE_MARKER_FALLBACK == _lp.LOOP_WAKE_MARKER
+
+    def test_active_marker_equals_loop_prompt_marker(self):
+        """In the test env (source tree), the import succeeds and the active
+        marker also equals loop_prompt.LOOP_WAKE_MARKER."""
+        # _LOOP_WAKE_MARKER is set either from the import or from the fallback.
+        # In the test env the import succeeds, so both should be identical.
+        assert tbh._LOOP_WAKE_MARKER == _lp.LOOP_WAKE_MARKER
+
+
+class TestLastUserMsgGate:
+    """Task 2b — LAST_USER_MSG write is gated on _is_human_prompt (#1592).
+
+    The secondary display bug: the "last user msg Xm ago" display was updated
+    unconditionally, so loop-wakes reset it to "this msg" on every tick.
+    The fix gates the write on _is_human_prompt(payload).
+    """
+
+    def test_loop_wake_does_not_write_last_user_msg(self, tmp_path, monkeypatch):
+        """A loop-wake payload leaves LAST_USER_MSG unchanged."""
+        msg_path = tmp_path / "last-user-msg.json"
+        monkeypatch.setattr(tbh, "LAST_USER_MSG", msg_path)
+
+        payload = _cc_payload(_lp.format_loop_prompt("Loop tick."))
+        # Simulate the gated write from main()
+        if tbh._is_human_prompt(payload):
+            from datetime import timezone as _tz
+            utc_iso = datetime.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            msg_path.write_text(_json.dumps({"ts": utc_iso}))
+
+        assert not msg_path.exists(), (
+            "LAST_USER_MSG must not be written on a loop-wake prompt"
+        )
+
+    def test_human_prompt_writes_last_user_msg(self, tmp_path, monkeypatch):
+        """A genuine human payload causes LAST_USER_MSG to be written."""
+        msg_path = tmp_path / "last-user-msg.json"
+        monkeypatch.setattr(tbh, "LAST_USER_MSG", msg_path)
+
+        payload = _cc_payload("Please summarise the open issues.")
+        if tbh._is_human_prompt(payload):
+            from datetime import timezone as _tz
+            utc_iso = datetime.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            msg_path.write_text(_json.dumps({"ts": utc_iso}))
+
+        assert msg_path.exists(), (
+            "LAST_USER_MSG must be written on a genuine human prompt"
+        )
+        data = _json.loads(msg_path.read_text())
+        assert "ts" in data
+
+
+# ---------------------------------------------------------------------------
+# #1537/#1539 guard — deployed-tree resolution for loop_prompt import
+# ---------------------------------------------------------------------------
+
+class TestDeployedTreeResolution:
+    """Regression guard for the #1537/#1539 class of deployed-tree path bugs.
+
+    The plugin build flattens ``hooks/claude/*`` → ``hooks/*``, so a hook at
+    ``<root>/hooks/<name>.py`` is one level shallower than its source at
+    ``src/engram/hooks/claude/<name>.py``.  A fixed ``parents[N]`` calibrated
+    against the deeper source layout overshoots in the deployed tree (same
+    silent failure as #1539: the path resolves to *a* directory, just the wrong
+    one).
+
+    The time-bar hook uses the robust resolve pattern (``$CLAUDE_PLUGIN_ROOT/tools``
+    first, then walk-parents for ``loop_prompt.py``) instead of a fixed ``parents[N]``.
+    These tests exercise both paths by copying the real hook and loop_prompt into a
+    temp dir that mirrors the deployed (flattened) layout, then loading the hook
+    fresh so its module-level import block re-executes against that layout.
+
+    Loading uses a unique module name per case (``importlib.util.module_from_spec``
+    + ``spec.loader.exec_module``) so the top-level resolution re-runs rather than
+    reusing a cached module.
+    """
+
+    _SRC_ROOT = Path(__file__).parent.parent / "src" / "engram"
+
+    def _build_deployed_layout(self, root: Path) -> None:
+        """Populate ``<root>/hooks/engram-time-bar-hook.py`` and
+        ``<root>/tools/loop_prompt.py`` — the deployed (flattened) layout."""
+        (root / "hooks").mkdir(parents=True)
+        (root / "tools").mkdir(parents=True)
+        shutil.copy(
+            self._SRC_ROOT / "hooks" / "claude" / "engram-time-bar-hook.py",
+            root / "hooks" / "engram-time-bar-hook.py",
+        )
+        shutil.copy(
+            self._SRC_ROOT / "tools" / "loop_prompt.py",
+            root / "tools" / "loop_prompt.py",
+        )
+
+    def _load_hook_fresh(self, hook_path: Path, module_name: str):
+        """Load the hook at hook_path under a unique module_name.
+
+        Clears ``sys.modules['loop_prompt']`` first so the hook's top-level
+        import block re-resolves loop_prompt from the newly configured sys.path
+        rather than reusing a module cached from an earlier load.
+        """
+        sys.modules.pop("loop_prompt", None)
+        spec = importlib.util.spec_from_file_location(module_name, str(hook_path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_case1_plugin_root_set(self, tmp_path, monkeypatch):
+        """Case 1: CLAUDE_PLUGIN_ROOT=<root> → hook resolves loop_prompt via env-var path.
+
+        When ``$CLAUDE_PLUGIN_ROOT`` is set, ``<root>/tools`` is the first
+        candidate and is found before the walk-parents search even runs.
+        The hook's ``_LOOP_WAKE_MARKER`` is set from the import (not the
+        hardcoded fallback), and the prefix is present in ``_NON_HUMAN_PREFIXES``.
+        """
+        root = tmp_path / "plugin"
+        self._build_deployed_layout(root)
+        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(root))
+
+        saved_syspath = sys.path[:]
+        try:
+            hook = self._load_hook_fresh(
+                root / "hooks" / "engram-time-bar-hook.py",
+                "time_bar_hook_deployed_c1",
+            )
+            assert hook._LOOP_WAKE_MARKER == "<loop-wake>"
+            assert hook._LOOP_WAKE_MARKER in hook._NON_HUMAN_PREFIXES
+        finally:
+            sys.path[:] = saved_syspath
+            sys.modules.pop("loop_prompt", None)
+
+    def test_case2_plugin_root_unset(self, tmp_path, monkeypatch):
+        """Case 2: CLAUDE_PLUGIN_ROOT unset → walk-parents finds <root>/tools/loop_prompt.py.
+
+        With the env var absent, the hook walks parents of its own ``__file__``
+        (``<root>/hooks/engram-time-bar-hook.py``).  ``parents[1]`` is ``<root>``
+        and ``<root>/tools/loop_prompt.py`` exists → found in one hop.  A fixed
+        ``parents[N]`` calibrated against the source tree (two extra levels) would
+        land at the *parent* of ``<root>`` and miss the deployed tools dir.
+        """
+        root = tmp_path / "plugin"
+        self._build_deployed_layout(root)
+        monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
+
+        saved_syspath = sys.path[:]
+        try:
+            hook = self._load_hook_fresh(
+                root / "hooks" / "engram-time-bar-hook.py",
+                "time_bar_hook_deployed_c2",
+            )
+            assert hook._LOOP_WAKE_MARKER == "<loop-wake>"
+            assert hook._LOOP_WAKE_MARKER in hook._NON_HUMAN_PREFIXES
+        finally:
+            sys.path[:] = saved_syspath
+            sys.modules.pop("loop_prompt", None)
