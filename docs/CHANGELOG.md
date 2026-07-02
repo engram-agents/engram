@@ -4,8 +4,7 @@ All notable changes to ENGRAM Alpha are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
-with an `-alpha` suffix during the alpha phase (see `RELEASING.md` for the version
-scheme).
+with an `-alpha` suffix during the alpha phase.
 
 
 ## [Unreleased]
@@ -85,6 +84,43 @@ through one live service instead of racing on shared files.
 - **Misc** — agent-name charset enforced at registration; `agentctl` help + spawn
   instructions; `baton gc` + merged-baton cleanup; `forum_api.py` exit codes aligned
   with `forum.py`; `hostname` column added to the agents schema.
+
+## [v0.1.4] — 2026-06-26
+
+Emergency hotfix. No feature changes — v0.1.3 plus a single critical fix.
+
+### Fixed
+
+- **Restored the ENGRAM hook layer on marketplace-path installs.** The `#1066`
+  "marketplace double-fire guard" (added in v0.1.2) exited every hook with
+  `sys.exit(0)` when `CLAUDE_PLUGIN_ROOT` resolved to the marketplace path — the
+  sole hook-invocation path on `source: directory` installs — silently disabling
+  the entire hook layer (auto-surfacing, write-nudge, lesson tripwires,
+  presence/time-bar, daemon-starter). The double-fire it targeted had already
+  been resolved structurally (user-level + plugin dual hook registration), so the
+  guard is removed entirely. Affects v0.1.2 and v0.1.3; v0.1.1 and earlier are
+  unaffected.
+
+---
+
+## [v0.1.3] — 2026-06-26
+
+Finalizes the `v0.1.3-rc2` dogfood candidate with four sleep/dream-consolidation
+fixes. (rc1/rc2 carried the broader feature wave of this cycle; this final adds the
+consolidation hardening below. Larger forum-based multi-agent coordination work is
+held for v0.2.0.)
+
+### Fixed
+
+- **Sleep cycle — never skip the dream fairies.** Phase B's dream-fairy dispatch is
+  now an all-or-nothing **MANDATORY** invariant: the token-economy lever is
+  *compact-or-not*, never *dream-or-not*. Closes the rationalizations that let a
+  parent skip the fresh-cohort consolidation pass for "context economy" — a permanent
+  loss of window-scoped principle-edges that no later cycle can backfill. Adds a
+  Step-8 precondition (the dream-master is spawned *with* the full fairy bundle, never
+  *instead of* it). (#1427, #1429, #1461)
+- **Dream-fairy provenance check** no longer flags seed-graph nodes as missing
+  provenance — a false positive on the immutable seed cohort. (#1430, closes #669)
 
 <!--
 At cut time: remove any placeholder entries before cutting; subsections with no
