@@ -15,36 +15,49 @@ What we verify here:
   5. Key JS strings are present in the page (localStorage key, API endpoints).
 """
 
-import os
 import sqlite3
-from pathlib import Path
 
 import pytest
 
+from forum.coordination import FileStore, SeqAllocator, init as _init
 from forum.db import init_db
 from forum.server import create_app
 
 
 # ---------------------------------------------------------------------------
-# Fixtures — same pattern as test_project_board.py (fixture projects dir)
+# Fixtures — #1608: board cards are now seeded into a real FileStore (the
+# live coordination store), not read from a BATON_PROJECTS_DIR fixture dir
+# (that glob is dead since the 2026-06-27 UCS cutover — see
+# board_projects.py's module docstring). Same project ids/fields the retired
+# fixtures/projects/*.md set used, so every DOM assertion below still holds.
 # ---------------------------------------------------------------------------
-
-FIXTURES_DIR = Path(__file__).parent / "fixtures" / "projects"
-
 
 @pytest.fixture
 def app(tmp_path):
-    """Flask app backed by a temp DB + fixture projects dir (for board cards)."""
+    """Flask app backed by a temp DB + a seeded coordination store (for board cards)."""
     db_path = str(tmp_path / "forum.db")
     audit_path = str(tmp_path / "audit.jsonl")
     conn = sqlite3.connect(db_path)
     init_db(conn)
     conn.close()
+
+    store = FileStore(tmp_path / "coord")
+    allocator = SeqAllocator(recover=store.recover_max_seq)
+    _init(store, allocator, "PR-100",
+          title="Add project board feature", status="in-review", turn="ariadne",
+          participants=["borges", "ariadne", "lei"],
+          turn_reason="reviewer-fairy converged; colleague fresh-eye requested",
+          github="pr/100", ts="2026-06-20T10:00:00Z")
+    _init(store, allocator, "ISSUE-200",
+          title="Forum search indexing latency", status="planning", turn="lei",
+          participants=["borges", "ariadne", "lei"],
+          turn_reason="design discussion needed", ts="2026-06-21T12:00:00Z")
+
     application = create_app(db_path, audit_path)
     application.config["TESTING"] = True
-    os.environ["BATON_PROJECTS_DIR"] = str(FIXTURES_DIR)
-    yield application
-    os.environ.pop("BATON_PROJECTS_DIR", None)
+    application.config["COORD_STORE"] = store
+    application.config["COORD_ALLOCATOR"] = allocator
+    return application
 
 
 @pytest.fixture

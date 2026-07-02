@@ -372,7 +372,14 @@ class TestDeriveOwnStatusPresenceIntegration:
     """Integration tests for the presence check in _status_derive.derive_own_status."""
 
     def _setup_sd(self, mod, tmp_path: Path, monkeypatch) -> None:
-        """Configure _status_derive module paths at tmp_path."""
+        """Configure _status_derive module paths at tmp_path.
+
+        #1608: _held_baton_turns/_fetch_held_batons now hit the live forum HTTP
+        API rather than PROJECTS_DIR — mock urlopen to an empty project list so
+        these presence-integration tests stay hermetic (no real network call,
+        no dependency on a forum server happening to be reachable) and so
+        "no baton held" continues to mean what these tests assert.
+        """
         lm_path = tmp_path / "loop-mode.json"
         projects_dir = tmp_path / "projects"
         projects_dir.mkdir(exist_ok=True)
@@ -381,6 +388,22 @@ class TestDeriveOwnStatusPresenceIntegration:
         monkeypatch.setattr(mod, "PROJECTS_DIR", str(projects_dir))
         monkeypatch.setattr(mod, "ENGRAM_HOME", str(tmp_path))
         monkeypatch.setattr(mod, "LAST_USER_ACTIVITY_PATH", str(activity_path))
+        monkeypatch.delenv("FORUM_URL", raising=False)
+
+        class _EmptyProjectsResponse:
+            def read(self):
+                return json.dumps({"projects": []}).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+        monkeypatch.setattr(
+            mod.urllib.request, "urlopen",
+            lambda req, timeout=None: _EmptyProjectsResponse(),
+        )
 
     def _inject_presence_mock(self, mode: str, monkeypatch) -> None:
         """Inject a presence mock into sys.modules so the lazy import finds it."""

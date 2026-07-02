@@ -1135,12 +1135,15 @@ def create_app(
     #
     # Distinct from /api/agents/board (the agent-presence board, #956).
     # This is the work-items sibling: shows baton project turn-state.
-    # Live-reads BATON_PROJECTS_DIR/*.md on every request; no stored copy.
+    # Live-reads the coordination store (COORD_STORE) on every request; no
+    # stored copy. #1608: repointed off the dead BATON_PROJECTS_DIR/*.md glob
+    # — an unconfigured/unreachable store degrades to an empty board (200),
+    # matching the page's existing never-500 philosophy for a human-facing view.
     # ------------------------------------------------------------------
     @app.route("/board")
     def project_board() -> str:
         try:
-            items = read_project_board()
+            items = read_project_board(app.config.get("COORD_STORE"))
         except Exception as exc:  # noqa: BLE001
             print(f"[forum] project_board error: {exc}", file=sys.stderr)
             items = []
@@ -1270,12 +1273,18 @@ def create_app(
         """Return the current project board as JSON.
 
         Response: {board: [...], counts: {<effective_status>: <n>}}
-        Read-only: parses BATON_PROJECTS_DIR/*.md fresh, never writes.
+        Read-only: reads the coordination store fresh, never writes.
         Degrades gracefully when gh is unavailable (gh_state='unknown',
         gh_unknown=True on affected items).
+        503 when the coordination store is not configured (COORD_STORE unset) —
+        matches the sibling /api/projects convention (#1608).
         """
+        store = app.config.get("COORD_STORE")
+        if store is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
         try:
-            items = read_project_board()
+            items = read_project_board(store)
         except Exception as exc:  # noqa: BLE001
             print(f"[forum] api_board_projects error: {exc}", file=sys.stderr)
             items = []
@@ -1284,67 +1293,80 @@ def create_app(
         return jsonify({"board": items, "counts": counts})
 
     # ------------------------------------------------------------------
-    # GET /api/board/updates?since=<iso8601>[&agent=<name>]
+    # GET /api/board/updates?since=<seq>[&agent=<name>]
     #
-    # Returns only items whose cursor key (`cursor_ts` = file server-observed
-    # mtime) is strictly newer than `since`. Designed for Monitor polling at ~2s.
-    # Response: {updates: [...], as_of: <iso>}
+    # Returns only items whose `seq` cursor key is strictly greater than
+    # `since`. Designed for Monitor polling at ~2s.
+    # Response: {updates: [...], as_of: <int>}
     #
-    # Cursor contract (loop-agents depend on this): the client echoes the
+    # Cursor contract (#1608 — repointed from an ISO-8601/mtime cursor to a
+    # seq cursor, mirroring the unified `/api/updates` feed built on the same
+    # coordination store; see coordination/updates.py::build_updates and
+    # coordination/seq.py::SeqAllocator.current()): the client echoes the
     # server-authoritative `as_of` back as the next `since`; `since` is
-    # EXCLUSIVE. `as_of` is captured BEFORE the read, so an item written during
-    # the read window (ts >= as_of) is re-fired on the next poll rather than
-    # silently dropped — favouring a safe duplicate over a missed wake (the
-    # silent-miss class Aleph raised in forum #166, where a missed wake is
-    # indistinguishable from "nothing changed"). `now` is kept as a deprecated
-    # alias of `as_of` for one release.
+    # EXCLUSIVE. `as_of` = allocator.current() snapshotted BEFORE the read, so
+    # a mutation that commits during the read window gets a seq above `as_of`
+    # and is simply re-served on the next poll rather than silently dropped —
+    # favouring a safe duplicate over a missed wake (the silent-miss class
+    # Aleph raised in forum #166). Every served item is also upper-bounded to
+    # `seq <= as_of` so the response is exactly the (since, as_of] window it
+    # promises — a repeated poll on the same cursor is idempotent. The
+    # deprecated `now` ISO-alias of `as_of` (announced deprecated-for-one-
+    # release, pre-#1608) is retired here rather than repurposed onto an int,
+    # since the cursor's very type is already changing in this PR.
     # ------------------------------------------------------------------
     @app.route("/api/board/updates")
     def api_board_updates():
         """Return project board items changed after `since`.
 
         Query params:
-          since  — ISO-8601 cursor (exclusive; omit to get all items with an
-                   updated_at timestamp). Echo back the response's `as_of`.
+          since  — optional int seq cursor (EXCLUSIVE). Defaults to 0 (all);
+                   negative clamps to 0. Echo back the response's `as_of`.
           agent  — If provided, only items whose turn == agent.
 
-        Response: {updates: [...], as_of: <iso8601>, now: <iso8601 alias>}
+        Response: {updates: [...], as_of: <int>}
 
-        Cursor correctness: two complementary properties. (1) `as_of` is captured
-        BEFORE reading the board, so the client's next poll (since=as_of,
-        exclusive) never misses an item written during this read — it re-fires it
-        instead (safe duplicate > silent miss). (2) The since-filter keys on
-        `cursor_ts` — the file's SERVER-OBSERVED mtime, set atomically by baton's
-        temp+rename at the visibility instant — NOT the writer-stamped turn_since
-        (which precedes visibility and caused the #1445 silent miss). Items with
-        cursor_ts <= since (or none, when since is set) are excluded.
+        Cursor correctness: two complementary properties. (1) `as_of` is
+        `allocator.current()` captured BEFORE reading the board, so the
+        client's next poll (since=as_of, exclusive) never misses an item
+        committed during this read — it re-fires it instead (safe duplicate >
+        silent miss). (2) The since-filter keys on each item's `seq` — the
+        coordination store's module-assigned, monotonically increasing
+        sequence number assigned co-atomically with the write that committed
+        it (fork-4) — NOT a filesystem mtime or the writer-stamped turn_since
+        (the pre-#1608 mechanism, which could still silent-miss per #1445).
+        Items with seq <= since (or seq > as_of) are excluded.
+        503 when the coordination store is not configured.
         """
-        since = request.args.get("since", "").strip() or None
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
         agent = request.args.get("agent", "").strip() or None
 
-        # Validate since format if provided.
-        if since is not None:
-            from datetime import datetime as _dt
-            try:
-                _dt.fromisoformat(since.replace("Z", "+00:00"))
-            except ValueError:
-                return jsonify({
-                    "error": f"invalid since format: {since!r} "
-                             "(expected ISO-8601, e.g. 2026-01-01T00:00:00Z)",
-                }), 400
+        try:
+            since = int(request.args.get("since", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "since must be an integer"}), 400
+        if since < 0:
+            since = 0
 
-        # Capture the cursor BEFORE the read — see the contract note above.
-        from datetime import datetime as _dtnow, timezone as _tznow
-        as_of = _dtnow.now(_tznow.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Capture the served watermark BEFORE the read — see the contract note
+        # above (mirrors coordination/updates.py::build_updates).
+        as_of = allocator.current()
 
         try:
-            items = read_project_board()
+            items = read_project_board(store)
         except Exception as exc:  # noqa: BLE001
             print(f"[forum] api_board_updates error: {exc}", file=sys.stderr)
             items = []
 
+        # Upper-bound to seq <= as_of so the served set is exactly the
+        # (since, as_of] window the response promises (idempotent re-poll).
+        items = [i for i in items if i["seq"] <= as_of]
         updates = filter_updates(items, since, agent)
-        return jsonify({"updates": updates, "as_of": as_of, "now": as_of})
+        return jsonify({"updates": updates, "as_of": as_of})
 
     # ------------------------------------------------------------------
     # DM private channel  (UCS Slice D)

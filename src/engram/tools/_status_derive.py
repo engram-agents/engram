@@ -7,6 +7,14 @@ This module is intentionally stdlib-only — no third-party deps, no forum.py
 import-back. The hook is critical-path on every user prompt; a heavy dependency
 tree here would add startup latency and failure surface.
 
+#1608: ``_held_baton_turns`` (via the private ``_fetch_held_batons`` helper)
+reads the live forum coordination API (``GET /api/projects``) instead of
+globbing the local ``PROJECTS_DIR`` — the local ``projects/*.md`` files went
+dead at the 2026-06-27 UCS cutover, when ``baton.py`` moved to writing
+exclusively through the forum API. The HTTP call is ``urllib``-only (stdlib,
+no ``forum.py`` import-back) and fails soft (empty queue) on any error, per
+this module's existing never-break-a-wake contract.
+
 Exported surface
 ----------------
 derive_own_status(agent_name, ...)
@@ -30,11 +38,10 @@ LOOP_MODE_PATH, PROJECTS_DIR, ON_CALL_SENTINEL, _UNSET, ENGRAM_HOME,
 LAST_USER_ACTIVITY_PATH
 """
 
-import glob
 import json
 import os
-import re
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any, Optional
 
@@ -55,9 +62,18 @@ LOOP_MODE_PATH: str = os.path.join(ENGRAM_HOME, "loop-mode.json")
 LAST_USER_ACTIVITY_PATH: str = os.path.join(ENGRAM_HOME, "last-user-activity")
 
 # Shared baton/project dir — turn-state files (one .md per project/PR).
+# #1608: no longer read by _held_baton_turns (dead since the 2026-06-27 UCS
+# cutover — see the module docstring). Kept as a constant only for back-compat:
+# tools/forum.py still imports it, and existing tests monkeypatch it.
 PROJECTS_DIR: str = (
     os.environ.get("ENGRAM_PROJECTS_DIR") or "/home/agents-shared/projects"
 )
+
+# Default forum server URL — mirrors tools/forum.py::_DEFAULT_FORUM_URL.
+_DEFAULT_FORUM_URL: str = "http://localhost:5002"
+
+# Short timeout so an unreachable forum never stalls the critical-path hook.
+_FORUM_REQUEST_TIMEOUT_SECONDS: float = 2.0
 
 # Sentinel for "event-driven / monitor-only" cadence (no heartbeat).
 # Matches forum.db.ON_CALL_SENTINEL — the server renders such an agent
@@ -95,32 +111,121 @@ def _read_loop_mode() -> Optional[dict]:
         return None
 
 
-def _held_baton_turns(agent_name: str) -> list:
-    """Return short ids of batons in PROJECTS_DIR whose ``turn:`` is this agent.
+def _load_config() -> dict:
+    """Load $ENGRAM_HOME/config.json. Returns {} on any failure.
 
-    A baton in your court = active work you own → it both reinforces 'working'
-    and lands on your published queue so peers see your load. Frontmatter is the
-    simple ``key: value`` block the baton CLI writes; parsed with a minimal regex
-    (stdlib-only — no yaml dependency).
+    Re-implemented here (not imported from tools/forum.py) to keep this module
+    stdlib-only / import-back-free — see the module docstring. Mirrors
+    tools/forum.py::_load_config exactly.
+    """
+    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    try:
+        with open(config_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+
+
+def _resolve_forum_url() -> str:
+    """Resolve the forum server base URL.
+
+    Priority mirrors tools/forum.py::_resolve_forum_url (re-implemented here,
+    not imported — see the module docstring):
+      1. config.json["forum"]["url"]
+      2. $FORUM_URL env var
+      3. default http://localhost:5002
+
+    Not process-cached (unlike forum.py's version): this module's callers are
+    hooks/CLIs that invoke it at most a couple of times per short-lived
+    process, so the simplicity of a fresh resolve outweighs the marginal
+    saved file read, and it sidesteps any shared-mutable-state test surface.
+    """
+    config = _load_config()
+    forum_cfg = config.get("forum")
+    if isinstance(forum_cfg, dict):
+        url = (forum_cfg.get("url") or "").strip()
+        if url:
+            return url.rstrip("/")
+
+    env_url = os.environ.get("FORUM_URL", "").strip()
+    if env_url:
+        return env_url.rstrip("/")
+
+    return _DEFAULT_FORUM_URL
+
+
+def _fetch_held_batons(agent_name: str) -> list:
+    """Return live coordination-store project records whose ``turn:`` is this agent.
+
+    #1608: the single network call backing both ``_held_baton_turns`` (the
+    published queue, ids only) and ``derive_own_status``'s activity fallback
+    (F2) — both derive from this ONE fetch so a single ``derive_own_status()``
+    call never issues more than one HTTP request. Hits the same live source
+    ``GET /api/projects`` already serves (``active_only=true`` — terminal/closed
+    batons are excluded server-side, so a merged PR can never linger on the
+    queue the way the pre-#1608 dead local files did).
+
+    Returns a list of raw dicts (``project_id``, ``title``, ``turn_reason``,
+    ``turn_since``, ``status``, ``seq``, ...) in the API's response order
+    (server-sorted oldest-turn_since-first — see
+    ``forum.coordination.store_file.FileStore.read_projects``), filtered to
+    ``turn == agent_name`` (case-insensitive).
+
+    Fail-soft, MANDATORY: any failure (forum unreachable, non-200, malformed
+    JSON, unexpected shape) returns ``[]`` rather than raising. This function
+    is on the critical path of every user-prompt hook (via
+    ``derive_own_status``) and must never break a wake over a forum hiccup —
+    mirrors the module's existing fail-soft house style (see
+    ``_read_loop_mode``, ``_recently_engaged``).
     """
     if not agent_name:
         return []
-    held: list = []
-    for path in sorted(glob.glob(os.path.join(PROJECTS_DIR, "*.md"))):
-        try:
-            with open(path, encoding="utf-8") as fh:
-                # Frontmatter is the leading block; cap the read so a huge body
-                # (turn log) isn't slurped.
-                head = fh.read(4096)
-        except OSError:
-            continue
-        fm = head.split("\n---", 1)[0] if head.startswith("---") else head
-        turn_m = re.search(r"^turn:\s*(\S+)", fm, re.MULTILINE)
-        if not turn_m or turn_m.group(1).strip() != agent_name:
-            continue
-        id_m = re.search(r"^project:\s*(\S+)", fm, re.MULTILINE)
-        held.append(id_m.group(1).strip() if id_m else Path(path).stem)
-    return held
+    agent_name = agent_name.strip().lower()
+    if not agent_name:
+        return []
+
+    try:
+        base_url = _resolve_forum_url()
+        url = f"{base_url}/api/projects?active_only=true"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=_FORUM_REQUEST_TIMEOUT_SECONDS) as resp:
+            raw = resp.read()
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return []
+        projects = data.get("projects")
+        if not isinstance(projects, list):
+            return []
+
+        held: list = []
+        for item in projects:
+            if not isinstance(item, dict):
+                continue
+            turn = str(item.get("turn") or "").strip().lower()
+            if turn != agent_name:
+                continue
+            held.append(item)
+        return held
+    except Exception:
+        return []
+
+
+def _held_baton_turns(agent_name: str) -> list:
+    """Return project ids of live coordination-store batons whose ``turn:`` is
+    this agent.
+
+    A baton in your court = active work you own → it both reinforces 'working'
+    and lands on your published queue so peers see your load. #1608: sourced
+    from the live forum API (``_fetch_held_batons``) rather than a local-file
+    glob — see the module docstring. Same return shape as before
+    (``list[str]``), so callers are unaffected by the source change.
+    """
+    return [
+        str(b["project_id"])
+        for b in _fetch_held_batons(agent_name)
+        if b.get("project_id")
+    ]
 
 
 def _read_engaged_window() -> int:
@@ -283,11 +388,17 @@ def derive_own_status(
       (``pacer == 'monitor'`` or ``cadence_seconds == 0`` → sentinel; a positive
       ``cadence_seconds`` → that; otherwise None = server's global window).
     - **activity**: ``override_activity`` wins; else the loop marker's ``topic``
-      (truncated); else None.
+      (truncated); else (#1608, F2) the top held baton's ``title``/``turn_reason``
+      when there's no loop marker (a real signal even when idle-but-holding-a-
+      baton); else None.
     - **queue**: the held baton ids.
     """
     loop = _read_loop_mode()
-    batons = _held_baton_turns(agent_name)
+    # #1608: ONE fetch backs both `batons` (the queue) and the activity fallback
+    # below — _fetch_held_batons is the single HTTP call; _held_baton_turns is
+    # not used here so a derive_own_status() call never issues a second request.
+    held_records = _fetch_held_batons(agent_name)
+    batons = [str(b["project_id"]) for b in held_records if b.get("project_id")]
 
     # state
     if override_state is not None:
@@ -341,6 +452,17 @@ def derive_own_status(
         activity: Optional[str] = override_activity
     elif loop is not None and loop.get("topic"):
         activity = str(loop["topic"])[:120]
+    elif held_records:
+        # (#1608, F2) No loop marker, but a baton is in your court — surface it
+        # as the activity signal rather than falling through to None. "Top" =
+        # held_records[0], the API's own ordering (oldest turn_since first —
+        # the baton you've been sitting on turn longest). Prefer title (the
+        # work item's stable identity) over turn_reason (the last flip's
+        # rationale, which may be terse/stale); fall back to turn_reason only
+        # when title is blank.
+        _top = held_records[0]
+        _source = str(_top.get("title") or "").strip() or str(_top.get("turn_reason") or "").strip()
+        activity = _source[:120] if _source else None
     else:
         activity = None
 

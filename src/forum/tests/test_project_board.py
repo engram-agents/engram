@@ -1,23 +1,26 @@
-"""Tests for the project board read model and routes (Slice 1).
+"""Tests for the project board read model and routes.
+
+#1608: repointed off the pre-cutover BATON_PROJECTS_DIR/*.md glob (dead since
+the 2026-06-27 UCS cutover — see board_projects.py's module docstring) onto
+the live coordination store (the same `CoordinationStore.read_projects()`
+`GET /api/projects` already serves). Fixtures are now seeded into a real
+`FileStore` via the `forum.coordination` writer-fns instead of static .md
+fixture files.
 
 Covers:
-1. Read model parses fixture baton files correctly.
-2. Malformed file is skipped; other items still render.
+1. Read model reads store-backed ProjectRecords correctly.
+2. A record with no parseable frontmatter is skipped; other items still render.
 3. gh-reconcile: a fixture with a PR ref flips merged→done when gh mock says merged.
 4. gh-reconcile degrades gracefully when gh is unavailable (gh_unknown=True, page loads).
-5. /api/board/updates?since= correctness (since-cursor filtering).
+5. /api/board/updates?since=<seq> correctness (seq-cursor filtering, #1608).
 6. /api/board/updates?agent= filters to that agent's court.
-7. /api/board/projects returns 200 with board/counts keys.
-8. /board returns 200.
-9. No code path writes to any project .md file (verified by fixture mtime check).
+7. /api/board/projects returns 200 with board/counts keys; 503 without a store.
+8. /board returns 200; degrades to an empty board (200, never 500/503) without a store.
+9. No code path writes to the coordination store.
 """
 
 import json
-import os
 import sqlite3
-import time
-from pathlib import Path
-from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -30,23 +33,71 @@ from forum.board_projects import (
     get_board_counts,
     read_project_board,
 )
+from forum.coordination import FileStore, SeqAllocator, init as _init
 from forum.db import init_db
 from forum.server import create_app
 
 
 # ---------------------------------------------------------------------------
-# Path to fixture projects dir
+# Store fixture — seeds a FileStore with the same scenarios the retired
+# fixtures/projects/*.md set covered (same project ids, statuses, github refs).
 # ---------------------------------------------------------------------------
-FIXTURES_DIR = Path(__file__).parent / "fixtures" / "projects"
+
+def _seed_store(store: FileStore, allocator: SeqAllocator) -> None:
+    _init(store, allocator, "PR-100",
+          title="Add project board feature", status="in-review", turn="ariadne",
+          participants=["borges", "ariadne", "lei"],
+          turn_reason="reviewer-fairy converged; colleague fresh-eye requested",
+          github="pr/100", ts="2026-06-20T10:00:00Z")
+    _init(store, allocator, "PR-101",
+          title="Fix baton flip guard", status="in-progress", turn="borges",
+          participants=["borges", "ariadne"], turn_reason="claimed from pool",
+          github="pr/101", ts="2026-06-18T14:30:00Z")
+    _init(store, allocator, "PR-102",
+          title="Already merged PR that baton file still says in-progress",
+          status="in-progress", turn="lei",
+          participants=["kepler", "borges", "lei"], turn_reason="presented for merge",
+          github="pr/102", ts="2026-06-15T08:00:00Z")
+    _init(store, allocator, "PR-103",
+          title="Merged PR with file status already merged", status="merged",
+          turn="lei", participants=["ariadne", "lei"], turn_reason="merged",
+          github="pr/103", ts="2026-06-10T08:00:00Z")
+    _init(store, allocator, "ISSUE-200",
+          title="Forum search indexing latency", status="planning", turn="lei",
+          participants=["borges", "ariadne", "lei"],
+          turn_reason="design discussion needed", ts="2026-06-21T12:00:00Z")
+    # Malformed: no frontmatter at all — written directly (bypassing init(), which
+    # always emits well-formed frontmatter), the store-backed equivalent of the
+    # retired MALFORMED.md fixture.
+    (store.projects_dir / "MALFORMED.md").write_text(
+        "# This is a plain markdown file with no frontmatter\n\n"
+        "It should be skipped gracefully by the board parser without causing errors.\n"
+    )
+
+
+@pytest.fixture
+def store(tmp_path) -> FileStore:
+    s = FileStore(tmp_path / "coord")
+    alloc = SeqAllocator(recover=s.recover_max_seq)
+    _seed_store(s, alloc)
+    return s
+
+
+@pytest.fixture
+def allocator(store) -> SeqAllocator:
+    # Recovers from the seeded on-disk high-water-mark, mirroring what a
+    # freshly-started server process's allocator would see (matches the
+    # store/allocator pairing convention in test_projects_api.py).
+    return SeqAllocator(recover=store.recover_max_seq)
 
 
 # ---------------------------------------------------------------------------
-# Flask app fixture (backed by in-memory DB + fixture projects dir)
+# Flask app fixture (backed by an in-memory DB + the seeded FileStore)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def app(tmp_path):
-    """Flask app backed by a temp DB, using fixture projects dir."""
+def app(tmp_path, store, allocator):
+    """Flask app backed by a temp DB, wired to the seeded coordination store."""
     db_path = str(tmp_path / "forum.db")
     audit_path = str(tmp_path / "audit.jsonl")
     conn = sqlite3.connect(db_path)
@@ -54,11 +105,9 @@ def app(tmp_path):
     conn.close()
     application = create_app(db_path, audit_path)
     application.config["TESTING"] = True
-    # Point the board reader at our fixture directory via env var.
-    os.environ["BATON_PROJECTS_DIR"] = str(FIXTURES_DIR)
-    yield application
-    # Clean up env override after test.
-    os.environ.pop("BATON_PROJECTS_DIR", None)
+    application.config["COORD_STORE"] = store
+    application.config["COORD_ALLOCATOR"] = allocator
+    return application
 
 
 @pytest.fixture
@@ -67,36 +116,40 @@ def client(app):
 
 
 # ---------------------------------------------------------------------------
-# Helper: read_project_board from fixtures, mocking gh calls
+# Helper: read_project_board from the seeded store, mocking gh calls
 # ---------------------------------------------------------------------------
 
-def _board_with_gh_mock(gh_mock: dict[str, str]) -> list[dict]:
-    """Call read_project_board() from FIXTURES_DIR with gh state mocked.
+def _board_with_gh_mock(store, gh_mock: dict) -> list:
+    """Call read_project_board(store) with gh state mocked.
 
     Args:
         gh_mock: dict mapping pr_number string → state string.
             Any PR number not in the dict returns 'unknown'.
     """
-    def _fake_batch(pr_numbers: list[str]) -> dict[str, str]:
+    def _fake_batch(pr_numbers):
         return {pr: gh_mock.get(pr, "unknown") for pr in pr_numbers}
 
     with patch("forum.board_projects._batch_gh_reconcile", side_effect=_fake_batch):
-        return read_project_board(FIXTURES_DIR)
+        return read_project_board(store)
 
 
 # ---------------------------------------------------------------------------
-# 1. Read model: parses fixture files
+# 1. Read model: reads store-backed records
 # ---------------------------------------------------------------------------
 
 class TestReadModel:
-    def test_returns_list(self):
+    def test_returns_list(self, store):
         """read_project_board returns a list."""
-        items = _board_with_gh_mock({})
+        items = _board_with_gh_mock(store, {})
         assert isinstance(items, list)
 
-    def test_parses_pr_100(self):
+    def test_returns_empty_list_when_store_is_none(self):
+        """A None store (COORD_STORE not configured) degrades to []."""
+        assert read_project_board(None) == []
+
+    def test_parses_pr_100(self, store):
         """PR-100 fixture is parsed with correct fields."""
-        items = _board_with_gh_mock({"100": "open"})
+        items = _board_with_gh_mock(store, {"100": "open"})
         pr100 = next((i for i in items if i["project"] == "PR-100"), None)
         assert pr100 is not None, "PR-100 should be in the board"
         assert pr100["title"] == "Add project board feature"
@@ -106,61 +159,60 @@ class TestReadModel:
         assert pr100["github"] == "pr/100"
         assert "ariadne" in pr100["participants"]
         assert "lei" in pr100["participants"]
+        assert isinstance(pr100["seq"], int) and pr100["seq"] > 0
 
-    def test_parses_issue_200(self):
+    def test_parses_issue_200(self, store):
         """ISSUE-200 fixture is parsed as kind='issue'."""
-        items = _board_with_gh_mock({})
+        items = _board_with_gh_mock(store, {})
         iss = next((i for i in items if i["project"] == "ISSUE-200"), None)
         assert iss is not None
         assert iss["kind"] == "issue"
         assert iss["github"] == ""  # no github field
 
-    def test_all_projects_parsed(self):
-        """All valid fixture files are parsed (malformed is skipped)."""
-        items = _board_with_gh_mock({"100": "open", "101": "open", "102": "merged", "103": "merged"})
+    def test_all_projects_parsed(self, store):
+        """All valid fixture records are parsed (malformed is skipped)."""
+        items = _board_with_gh_mock(store, {"100": "open", "101": "open", "102": "merged", "103": "merged"})
         project_ids = {i["project"] for i in items}
-        # Valid baton files present in fixtures
         assert "PR-100" in project_ids
         assert "PR-101" in project_ids
         assert "PR-102" in project_ids
         assert "PR-103" in project_ids
         assert "ISSUE-200" in project_ids
 
-    def test_required_fields_present(self):
+    def test_required_fields_present(self, store):
         """Every item has all required fields."""
-        items = _board_with_gh_mock({"100": "open"})
+        items = _board_with_gh_mock(store, {"100": "open"})
         required = {
             "project", "title", "kind", "status", "effective_status",
             "turn", "turn_since", "participants", "github", "gh_state", "updated_at",
-            "cursor_ts",  # the /updates cursor key — guard against its removal
+            "seq",  # the /updates cursor key post-#1608 — guard against its removal
         }
         for item in items:
             missing = required - set(item.keys())
             assert not missing, f"Item {item['project']} missing fields: {missing}"
 
-    def test_age_str_present(self):
+    def test_age_str_present(self, store):
         """age_str is present (may be empty string for items with no turn_since)."""
-        items = _board_with_gh_mock({"100": "open"})
+        items = _board_with_gh_mock(store, {"100": "open"})
         for item in items:
             assert "age_str" in item
 
 
 # ---------------------------------------------------------------------------
-# 2. Malformed file is skipped; others render
+# 2. Malformed record is skipped; others render
 # ---------------------------------------------------------------------------
 
 class TestMalformedSkipped:
-    def test_malformed_not_in_board(self):
-        """MALFORMED.md (no frontmatter) is skipped; it never appears in board."""
-        items = _board_with_gh_mock({})
+    def test_malformed_not_in_board(self, store):
+        """A record with no frontmatter is skipped; it never appears in board."""
+        items = _board_with_gh_mock(store, {})
         project_ids = {i["project"] for i in items}
         assert "MALFORMED" not in project_ids
 
-    def test_other_items_still_rendered(self):
+    def test_other_items_still_rendered(self, store):
         """After skipping malformed, other items still render."""
-        items = _board_with_gh_mock({"100": "open"})
+        items = _board_with_gh_mock(store, {"100": "open"})
         project_ids = {i["project"] for i in items}
-        # At minimum PR-100 and ISSUE-200 should be present
         assert "PR-100" in project_ids
         assert "ISSUE-200" in project_ids
 
@@ -170,32 +222,32 @@ class TestMalformedSkipped:
 # ---------------------------------------------------------------------------
 
 class TestGhReconcile:
-    def test_pr102_reconciled_to_done(self):
+    def test_pr102_reconciled_to_done(self, store):
         """PR-102 file says in-progress but gh says merged → effective_status=done."""
-        items = _board_with_gh_mock({"102": "merged", "100": "open", "101": "open"})
+        items = _board_with_gh_mock(store, {"102": "merged", "100": "open", "101": "open"})
         pr102 = next((i for i in items if i["project"] == "PR-102"), None)
         assert pr102 is not None
         assert pr102["status"] == "in-progress"  # file status unchanged
         assert pr102["effective_status"] == "done"  # reconciled
         assert pr102["gh_state"] == "merged"
 
-    def test_pr103_file_merged_also_done(self):
+    def test_pr103_file_merged_also_done(self, store):
         """PR-103 file already says merged → effective_status=done regardless of gh."""
-        items = _board_with_gh_mock({"103": "open"})  # gh says open but file says merged
+        items = _board_with_gh_mock(store, {"103": "open"})  # gh says open but file says merged
         pr103 = next((i for i in items if i["project"] == "PR-103"), None)
         assert pr103 is not None
         assert pr103["effective_status"] == "done"  # file status is enough
 
-    def test_pr100_open_stays_active(self):
+    def test_pr100_open_stays_active(self, store):
         """PR-100 open on gh → effective_status=in-review (no reconciliation)."""
-        items = _board_with_gh_mock({"100": "open"})
+        items = _board_with_gh_mock(store, {"100": "open"})
         pr100 = next((i for i in items if i["project"] == "PR-100"), None)
         assert pr100 is not None
         assert pr100["effective_status"] == "in-review"
 
-    def test_closed_pr_also_done(self):
+    def test_closed_pr_also_done(self, store):
         """A PR that is closed (not merged) also flips to done."""
-        items = _board_with_gh_mock({"101": "closed"})
+        items = _board_with_gh_mock(store, {"101": "closed"})
         pr101 = next((i for i in items if i["project"] == "PR-101"), None)
         assert pr101 is not None
         assert pr101["effective_status"] == "done"
@@ -207,95 +259,99 @@ class TestGhReconcile:
 # ---------------------------------------------------------------------------
 
 class TestGhDegrade:
-    def test_gh_unknown_does_not_crash(self):
+    def test_gh_unknown_does_not_crash(self, store):
         """When gh returns unknown, board still renders (no exception)."""
         def _always_unknown(pr_numbers):
             return {pr: "unknown" for pr in pr_numbers}
 
         with patch("forum.board_projects._batch_gh_reconcile", side_effect=_always_unknown):
-            items = read_project_board(FIXTURES_DIR)
+            items = read_project_board(store)
 
         assert isinstance(items, list)
         assert len(items) > 0
 
-    def test_gh_unknown_sets_flag(self):
+    def test_gh_unknown_sets_flag(self, store):
         """Items with PR refs and unknown gh state have gh_unknown=True."""
         def _always_unknown(pr_numbers):
             return {pr: "unknown" for pr in pr_numbers}
 
         with patch("forum.board_projects._batch_gh_reconcile", side_effect=_always_unknown):
-            items = read_project_board(FIXTURES_DIR)
+            items = read_project_board(store)
 
-        # PR-100 has a github ref → should have gh_unknown=True
         pr100 = next((i for i in items if i["project"] == "PR-100"), None)
         assert pr100 is not None
         assert pr100["gh_unknown"] is True
 
-    def test_no_gh_ref_has_no_flag(self):
+    def test_no_gh_ref_has_no_flag(self, store):
         """ISSUE-200 has no github ref → gh_unknown=False."""
-        items = _board_with_gh_mock({})
+        items = _board_with_gh_mock(store, {})
         iss = next((i for i in items if i["project"] == "ISSUE-200"), None)
         assert iss is not None
         assert iss["gh_unknown"] is False
 
-    def test_batch_exception_degrades(self):
+    def test_batch_exception_degrades(self, store):
         """If _batch_gh_reconcile raises, board still returns (no 500)."""
         def _raise(*args, **kwargs):
             raise RuntimeError("gh not available")
 
         with patch("forum.board_projects._batch_gh_reconcile", side_effect=_raise):
-            items = read_project_board(FIXTURES_DIR)
+            items = read_project_board(store)
 
         assert isinstance(items, list)
-        # Items are returned but with unknown gh state
         for item in items:
             if item["github"]:
                 assert item["gh_state"] == "unknown" or item["gh_state"] == ""
 
 
 # ---------------------------------------------------------------------------
-# 5. filter_updates: since-cursor correctness
+# 5. filter_updates: seq-cursor correctness (#1608)
 # ---------------------------------------------------------------------------
 
 class TestFilterUpdates:
-    def _get_items(self):
-        return _board_with_gh_mock({"100": "open", "101": "open", "102": "merged"})
+    def _get_items(self, store):
+        return _board_with_gh_mock(store, {"100": "open", "101": "open", "102": "merged"})
 
-    def test_since_epoch_returns_all_with_cursor_ts(self):
-        """since=epoch (1970-01-01T00:00:00Z) returns all items with a cursor_ts."""
-        items = self._get_items()
-        updates = filter_updates(items, "1970-01-01T00:00:00Z", None)
-        # All fixture files have a readable mtime → all have cursor_ts
-        assert len(updates) == len([i for i in items if i["cursor_ts"]])
+    def test_since_zero_returns_all(self, store):
+        """since=0 (below every real seq) returns all items."""
+        items = self._get_items(store)
+        updates = filter_updates(items, 0, None)
+        assert len(updates) == len(items)
 
-    def test_since_future_returns_empty(self):
-        """since=future timestamp returns no items."""
-        items = self._get_items()
-        updates = filter_updates(items, "2099-12-31T23:59:59Z", None)
+    def test_since_far_future_seq_returns_empty(self, store):
+        """since beyond every item's seq returns no items."""
+        items = self._get_items(store)
+        updates = filter_updates(items, 999999, None)
         assert updates == []
 
-    def test_since_keys_on_cursor_ts_not_turn_since(self):
-        """#1445 fix: the cursor keys on cursor_ts (file mtime = visibility), NOT
-        turn_since. A backdated turn_since must not hide a recently-written item
-        (that backdating is exactly what caused the silent missed wake)."""
-        items = [
-            # turn_since (display) BEFORE `since`, but mtime (cursor) AFTER it:
-            # the old turn_since-keying would silently DROP this → the bug.
-            {"project": "backdated", "turn": "ariadne",
-             "updated_at": "2026-06-18T00:00:00Z",
-             "cursor_ts":  "2026-06-20T00:00:00Z"},
-            # mtime before `since` → genuinely not changed since → excluded.
-            {"project": "old", "turn": "ariadne",
-             "updated_at": "2026-06-20T00:00:00Z",
-             "cursor_ts":  "2026-06-18T00:00:00Z"},
-        ]
-        ids = {u["project"] for u in filter_updates(items, "2026-06-19T00:00:00Z", None)}
-        assert "backdated" in ids   # mtime > since → included (was dropped under the bug)
-        assert "old" not in ids     # mtime < since → correctly excluded
+    def test_since_excludes_at_or_below_only(self, store):
+        """since is EXCLUSIVE: an item at exactly `since` is excluded, one above is included."""
+        items = self._get_items(store)
+        seqs = sorted(i["seq"] for i in items)
+        mid = seqs[len(seqs) // 2]
+        updates = filter_updates(items, mid, None)
+        assert all(u["seq"] > mid for u in updates)
+        assert not any(i["seq"] == mid and i in updates for i in items)
 
-    def test_since_none_returns_all(self):
-        """since=None returns all items (no time filtering)."""
-        items = self._get_items()
+    def test_since_keys_on_seq_not_turn_since(self):
+        """#1608: the cursor keys on `seq` — the store's monotonic, co-atomically
+        assigned mutation counter — NOT turn_since (a writer-stamped display value
+        that can be backdated). A backdated turn_since must not hide a later-committed
+        item (mirrors the #1445 regression this replaces the mtime-cursor version of)."""
+        items = [
+            # turn_since (display) BEFORE the other item's, but seq (cursor) AFTER it:
+            # a turn_since-keyed cursor would silently drop this — the #1445-class bug.
+            {"project": "backdated", "turn": "ariadne",
+             "turn_since": "2026-06-18T00:00:00Z", "seq": 5},
+            {"project": "old", "turn": "ariadne",
+             "turn_since": "2026-06-20T00:00:00Z", "seq": 2},
+        ]
+        ids = {u["project"] for u in filter_updates(items, 3, None)}
+        assert "backdated" in ids   # seq 5 > since 3 → included
+        assert "old" not in ids     # seq 2 <= since 3 → correctly excluded
+
+    def test_since_none_returns_all(self, store):
+        """since=None returns all items (no since-filtering)."""
+        items = self._get_items(store)
         updates = filter_updates(items, None, None)
         assert len(updates) == len(items)
 
@@ -305,35 +361,33 @@ class TestFilterUpdates:
 # ---------------------------------------------------------------------------
 
 class TestFilterUpdatesAgent:
-    def _get_items(self):
-        return _board_with_gh_mock({"100": "open", "101": "open"})
+    def _get_items(self, store):
+        return _board_with_gh_mock(store, {"100": "open", "101": "open"})
 
-    def test_agent_filter_returns_only_that_courts_items(self):
+    def test_agent_filter_returns_only_that_courts_items(self, store):
         """?agent=ariadne returns only items where turn=ariadne."""
-        items = self._get_items()
+        items = self._get_items(store)
         updates = filter_updates(items, None, "ariadne")
         for u in updates:
             assert u["turn"] == "ariadne", f"{u['project']} has turn={u['turn']}, expected ariadne"
 
-    def test_agent_filter_excludes_other_courts(self):
+    def test_agent_filter_excludes_other_courts(self, store):
         """?agent=ariadne excludes items in borges's court."""
-        items = self._get_items()
+        items = self._get_items(store)
         updates = filter_updates(items, None, "ariadne")
         assert not any(u["turn"] == "borges" for u in updates)
 
-    def test_agent_filter_plus_since(self):
+    def test_agent_filter_plus_since(self, store):
         """Combined agent + since: filter both dimensions."""
-        items = self._get_items()
-        # Only ariadne's items after 2026-06-19
-        updates = filter_updates(items, "2026-06-19T00:00:00Z", "ariadne")
+        items = self._get_items(store)
+        updates = filter_updates(items, 0, "ariadne")
         for u in updates:
             assert u["turn"] == "ariadne"
-        pr101 = next((u for u in updates if u["project"] == "PR-101"), None)
-        assert pr101 is None  # PR-101 is borges's, not ariadne's
+        assert not any(u["project"] == "PR-101" for u in updates)  # PR-101 is borges's
 
-    def test_agent_not_in_court_returns_empty(self):
+    def test_agent_not_in_court_returns_empty(self, store):
         """?agent=nobody returns empty when nobody holds the baton."""
-        items = self._get_items()
+        items = self._get_items(store)
         updates = filter_updates(items, None, "nobody-holds-anything")
         assert updates == []
 
@@ -368,7 +422,7 @@ class TestApiBoardProjects:
         required = {
             "project", "title", "kind", "status", "effective_status",
             "turn", "turn_since", "participants", "github", "gh_state", "updated_at",
-            "cursor_ts",  # the /updates cursor key — guard against its removal
+            "seq",  # the /updates cursor key post-#1608 — guard against its removal
         }
         for item in data["board"]:
             missing = required - set(item.keys())
@@ -378,38 +432,54 @@ class TestApiBoardProjects:
         resp = client.get("/api/board/projects")
         assert "application/json" in resp.content_type
 
+    def test_503_without_store(self, tmp_path):
+        db_path = str(tmp_path / "f.db")
+        audit = str(tmp_path / "a.jsonl")
+        conn = sqlite3.connect(db_path)
+        init_db(conn)
+        conn.close()
+        app = create_app(db_path, audit)
+        app.config["TESTING"] = True
+        c = app.test_client()
+        assert c.get("/api/board/projects").status_code == 503
+
 
 # ---------------------------------------------------------------------------
-# 8. GET /api/board/updates — updates feed
+# 8. GET /api/board/updates — updates feed (seq cursor, #1608)
 # ---------------------------------------------------------------------------
 
 class TestApiBoardUpdates:
     def test_returns_200(self, client):
-        resp = client.get("/api/board/updates?since=1970-01-01T00:00:00Z")
+        resp = client.get("/api/board/updates?since=0")
         assert resp.status_code == 200
 
     def test_response_has_updates_key(self, client):
-        data = json.loads(client.get("/api/board/updates?since=1970-01-01T00:00:00Z").data)
+        data = json.loads(client.get("/api/board/updates?since=0").data)
         assert "updates" in data
 
-    def test_response_has_now_key(self, client):
-        data = json.loads(client.get("/api/board/updates?since=1970-01-01T00:00:00Z").data)
-        assert "now" in data
-        # now should be a valid ISO-8601 string
-        from datetime import datetime
-        datetime.fromisoformat(data["now"].replace("Z", "+00:00"))
+    def test_response_has_as_of_int_key(self, client):
+        data = json.loads(client.get("/api/board/updates?since=0").data)
+        assert "as_of" in data
+        assert isinstance(data["as_of"], int)
 
-    def test_since_epoch_returns_all_items(self, client):
-        data = json.loads(client.get("/api/board/updates?since=1970-01-01T00:00:00Z").data)
-        assert len(data["updates"]) >= 4  # at least 4 fixture files
+    def test_now_alias_retired(self, client):
+        """The deprecated `now` ISO-alias is retired (#1608) — the cursor's type
+        itself changed in this PR, so completing the announced deprecation here
+        avoids a second breaking change later."""
+        data = json.loads(client.get("/api/board/updates?since=0").data)
+        assert "now" not in data
 
-    def test_since_future_returns_empty(self, client):
-        data = json.loads(client.get("/api/board/updates?since=2099-01-01T00:00:00Z").data)
+    def test_since_zero_returns_all_items(self, client):
+        data = json.loads(client.get("/api/board/updates?since=0").data)
+        assert len(data["updates"]) >= 4  # at least 4 fixture records
+
+    def test_since_far_future_seq_returns_empty(self, client):
+        data = json.loads(client.get("/api/board/updates?since=999999").data)
         assert data["updates"] == []
 
     def test_agent_filter(self, client):
         data = json.loads(
-            client.get("/api/board/updates?since=1970-01-01T00:00:00Z&agent=ariadne").data
+            client.get("/api/board/updates?since=0&agent=ariadne").data
         )
         for item in data["updates"]:
             assert item["turn"] == "ariadne"
@@ -420,11 +490,30 @@ class TestApiBoardUpdates:
         data = json.loads(resp.data)
         assert "error" in data
 
+    def test_negative_since_clamps_to_zero(self, client):
+        """Negative since is clamped to 0 (mirrors /api/updates), not rejected."""
+        resp = client.get("/api/board/updates?since=-5")
+        assert resp.status_code == 200
+        data = json.loads(resp.data)
+        assert len(data["updates"]) >= 4
+
     def test_no_since_returns_all(self, client):
-        """Omitting since should return all items (no filtering)."""
+        """Omitting since defaults to 0 (no filtering)."""
         data = json.loads(client.get("/api/board/updates").data)
         assert "updates" in data
         assert isinstance(data["updates"], list)
+        assert len(data["updates"]) >= 4
+
+    def test_503_without_store(self, tmp_path):
+        db_path = str(tmp_path / "f.db")
+        audit = str(tmp_path / "a.jsonl")
+        conn = sqlite3.connect(db_path)
+        init_db(conn)
+        conn.close()
+        app = create_app(db_path, audit)
+        app.config["TESTING"] = True
+        c = app.test_client()
+        assert c.get("/api/board/updates").status_code == 503
 
 
 # ---------------------------------------------------------------------------
@@ -442,42 +531,50 @@ class TestHtmlBoard:
 
     def test_page_contains_project_title(self, client):
         body = client.get("/board").data.decode("utf-8")
-        # Should contain the title of at least one fixture
         assert "Add project board feature" in body or "Project" in body
 
     def test_page_contains_board_heading(self, client):
         body = client.get("/board").data.decode("utf-8")
         assert "board" in body.lower() or "Board" in body
 
+    def test_degrades_to_empty_board_without_store(self, tmp_path):
+        """/board never 500s/503s — an unconfigured store renders an empty board."""
+        db_path = str(tmp_path / "f.db")
+        audit = str(tmp_path / "a.jsonl")
+        conn = sqlite3.connect(db_path)
+        init_db(conn)
+        conn.close()
+        app = create_app(db_path, audit)
+        app.config["TESTING"] = True
+        c = app.test_client()
+        resp = c.get("/board")
+        assert resp.status_code == 200
+
 
 # ---------------------------------------------------------------------------
-# 10. No writes to project .md files
+# 10. No writes to the coordination store
 # ---------------------------------------------------------------------------
 
 class TestNoWrites:
-    def test_fixture_files_not_modified(self):
-        """read_project_board() does not modify any fixture .md file."""
-        # Record mtimes before
+    def test_store_files_not_modified(self, store):
+        """read_project_board() does not modify any project file in the store."""
         mtimes_before = {
             f: f.stat().st_mtime
-            for f in FIXTURES_DIR.glob("*.md")
+            for f in store.projects_dir.glob("*.md")
         }
 
-        # Call read_project_board with mocked gh
-        _board_with_gh_mock({"100": "open", "101": "open", "102": "merged"})
+        _board_with_gh_mock(store, {"100": "open", "101": "open", "102": "merged"})
 
-        # Verify mtimes after
         for f, mtime_before in mtimes_before.items():
             mtime_after = f.stat().st_mtime
             assert mtime_after == mtime_before, (
                 f"File {f.name} was modified by read_project_board()!"
             )
 
-    def test_api_does_not_write_files(self, client):
-        """GET /api/board/projects does not modify any fixture .md file."""
+    def test_api_does_not_write_files(self, client, store):
         mtimes_before = {
             f: f.stat().st_mtime
-            for f in FIXTURES_DIR.glob("*.md")
+            for f in store.projects_dir.glob("*.md")
         }
 
         client.get("/api/board/projects")
@@ -490,7 +587,7 @@ class TestNoWrites:
 
 
 # ---------------------------------------------------------------------------
-# 11. Unit tests for helper functions
+# 11. Unit tests for helper functions (unchanged by #1608 — pure logic)
 # ---------------------------------------------------------------------------
 
 class TestHelpers:
@@ -642,19 +739,16 @@ def test_gh_cache_does_not_cache_unknown():
 # /api/board/updates cursor contract (as_of captured before read; echo-back)
 # ---------------------------------------------------------------------------
 
-def test_updates_returns_as_of_cursor(client):
-    """Response carries a server-authoritative `as_of` (ISO) + `now` alias."""
-    import time as _t
-    from datetime import datetime, timezone
-    before = datetime.now(timezone.utc)
+def test_updates_returns_as_of_seq_cursor(client, allocator):
+    """Response carries a server-authoritative int `as_of` (the seq watermark)."""
     resp = client.get("/api/board/updates")
     assert resp.status_code == 200
     body = resp.get_json()
     assert "as_of" in body and "updates" in body
-    assert body["now"] == body["as_of"]  # alias for one release
-    as_of = datetime.fromisoformat(body["as_of"].replace("Z", "+00:00"))
-    # as_of is captured at request time (not in the future, not absurdly stale).
-    assert before.replace(microsecond=0) <= as_of <= datetime.now(timezone.utc)
+    assert isinstance(body["as_of"], int)
+    # as_of is the committed watermark at read time — must not exceed the
+    # allocator's current value (never names an in-flight/future write).
+    assert body["as_of"] <= allocator.current()
 
 
 def test_updates_echo_cursor_excludes_prior_items(client):

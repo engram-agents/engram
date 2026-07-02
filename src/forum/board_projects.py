@@ -1,11 +1,19 @@
 """Project board read model for the forum.
 
-Live-reads BATON_PROJECTS_DIR/*.md on every call — no stored table, no writes.
-The board is a read-only index over the baton files.
+Reads the live UCS coordination store (``CoordinationStore.read_projects()``)
+on every call — no stored table, no writes. The board is a read-only index
+over the same store ``GET /api/projects`` already serves.
 
-Design constraints (forum thread #166):
+**#1608**: repoints the board off the pre-cutover ``BATON_PROJECTS_DIR/*.md``
+glob. That glob went dead at the 2026-06-27 UCS cutover, when ``baton.py``
+moved to writing exclusively through the forum coordination API — the 502
+local files it used to read froze at that instant and never got another
+write. The live source is the same store every other coordination surface
+(``/api/projects``, ``/api/updates``) already reads.
+
+Design constraints (forum thread #166, updated #1608):
 - No stored copy: read fresh on every render, never persist to DB.
-- Never write to projects/*.md — read-only.
+- Read-only: this module never writes to the coordination store.
 - gh-reconcile on read: PR refs that are merged/closed render as 'done'
   regardless of file status. Degrade gracefully if gh is unavailable.
 - Batch gh lookups: one call per distinct PR ref per render, not per row.
@@ -14,38 +22,23 @@ Design constraints (forum thread #166):
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import sys
 import threading
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-# Default projects directory — override via BATON_PROJECTS_DIR env var in tests.
-# Post-Phase-3 the coord store lives at $FORUM_HOME/projects; fall back to
-# ~/.forum/projects (mirrors store_file.default_store_root semantics).
-def _default_projects_dir() -> Path:
-    forum_home = os.environ.get("FORUM_HOME", "").strip()
-    root = Path(forum_home) if forum_home else (Path.home() / ".forum")
-    return root / "projects"
-
 # Valid status values from baton protocol.
 VALID_STATUSES = {"planning", "in-progress", "in-review", "merged", "cancelled"}
 
 # Statuses that mean the item is "done" for board display purposes.
 _FILE_DONE_STATUSES = {"merged", "cancelled"}
-
-# Frontmatter parsing (mirrors baton.py pattern exactly).
-_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
-_FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):\s*(.*)$", re.MULTILINE)
-_PARTICIPANTS_LIST_RE = re.compile(r"^\[?(.*?)\]?$")
 
 # GitHub anchor validation: pr/<N>
 _PR_ANCHOR_RE = re.compile(r"^pr/(\d+)$", re.IGNORECASE)
@@ -82,39 +75,6 @@ def _age_str(ts: Optional[datetime]) -> str:
         return f"{total_secs // 3600}h ago"
     else:
         return f"{total_secs // 86400}d ago"
-
-
-# ---------------------------------------------------------------------------
-# Frontmatter parsing
-# ---------------------------------------------------------------------------
-
-def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    """Extract YAML-ish frontmatter from a baton markdown file.
-
-    Returns (fields_dict, body_text). On parse failure returns ({}, text).
-    Mirrors baton.py _parse_frontmatter exactly.
-    """
-    m = _FRONTMATTER_RE.match(text)
-    if not m:
-        return {}, text
-    fm_block = m.group(1)
-    body = text[m.end():]
-    fields: dict = {}
-    for field_m in _FRONTMATTER_FIELD_RE.finditer(fm_block):
-        key = field_m.group(1).strip().lower()
-        val = field_m.group(2).strip()
-        fields[key] = val
-    return fields, body
-
-
-def _parse_participants(participants_str: str) -> list[str]:
-    """Parse participants field: '[borges, ariadne]' or 'borges,ariadne'.
-
-    Returns a list of lowercase stripped agent names.
-    """
-    m = _PARTICIPANTS_LIST_RE.match(participants_str.strip())
-    inner = m.group(1) if m else participants_str
-    return [p.strip().lower() for p in inner.split(",") if p.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -296,105 +256,73 @@ def _effective_status(
 # Core read model
 # ---------------------------------------------------------------------------
 
-def _projects_dir() -> Path:
-    """Return the baton projects directory path."""
-    env = os.environ.get("BATON_PROJECTS_DIR", "").strip()
-    return Path(env) if env else _default_projects_dir()
+def read_project_board(store) -> list[dict[str, Any]]:
+    """Read every project record from the live coordination store and return
+    a list of project board items.
 
-
-def read_project_board(projects_dir: Optional[Path] = None) -> list[dict[str, Any]]:
-    """Parse all baton .md files and return a list of project board items.
-
-    This is the live read model — called fresh on every render.
-    Never writes to any file.
+    This is the live read model — called fresh on every render. Never writes
+    to the store.
 
     Args:
-        projects_dir: Override directory (for tests). Defaults to
-            $BATON_PROJECTS_DIR or $FORUM_HOME/projects (fallback: ~/.forum/projects).
+        store: a ``CoordinationStore`` (e.g. ``forum.coordination.FileStore``)
+            — the same live backend ``GET /api/projects`` reads. ``None``
+            (coordination store not configured) returns ``[]``.
 
     Returns:
         List of dicts with keys:
           project, title, kind, status, effective_status,
-          turn, turn_since, turn_since_str, participants,
-          github, gh_state, updated_at, age_str
-        Sorted: active items by turn_since (oldest first), then done items.
+          turn, turn_since, turn_reason, participants,
+          github, gh_state, gh_unknown, updated_at, seq, age_str
+        Sorted: active items by turn_since (oldest first), then done items
+        by turn_since (most-recently-done first).
 
-    Malformed files are skipped with a logged warning; they never 500 the board.
+    A record whose raw content has no parseable frontmatter (the store's
+    ``read_projects()`` degrades those to an all-empty ``ProjectRecord``
+    rather than raising) is skipped here — same "malformed → skipped, never
+    500s the board" contract the old glob-reader had for a file with no
+    frontmatter.
     """
-    if projects_dir is None:
-        projects_dir = _projects_dir()
-
-    if not projects_dir.is_dir():
+    if store is None:
         return []
+
+    records = store.read_projects(active_only=False)
 
     items: list[dict[str, Any]] = []
     pr_numbers_to_resolve: list[str] = []
     _seen_pr: set[str] = set()
 
-    # First pass: parse all files, collect PR numbers for batch gh lookup.
+    # First pass: normalize record fields, collect PR numbers for batch gh lookup.
     raw_items: list[dict[str, Any]] = []
-    for md_file in sorted(projects_dir.glob("*.md")):
-        try:
-            text = md_file.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
+    for record in records:
+        # A record with no parseable frontmatter block in its raw content is the
+        # store-backed equivalent of the old "no frontmatter → skip" glob case —
+        # store.read_projects() never raises on it, it just returns empty fields,
+        # so detect it here from the raw text rather than a fragile all-fields-empty
+        # heuristic.
+        if not record.raw.lstrip().startswith("---"):
             print(
-                f"[forum/board] warning: cannot read {md_file}: {exc}",
+                f"[forum/board] warning: no frontmatter in project {record.project_id!r}, skipping",
                 file=sys.stderr,
             )
             continue
 
-        try:
-            fields, _body = _parse_frontmatter(text)
-        except Exception as exc:  # noqa: BLE001
-            print(
-                f"[forum/board] warning: malformed frontmatter in {md_file}: {exc}",
-                file=sys.stderr,
-            )
-            continue
+        project_id = record.project_id
+        title = (record.title or "").strip() or project_id
+        file_status = (record.status or "").strip().lower()
+        turn = (record.turn or "").strip().lower()
+        turn_since_str = (record.turn_since or "").strip()
+        turn_reason = (record.turn_reason or "").strip()
+        participants = list(record.participants)
+        github_ref = (record.github or "").strip().lower()
 
-        if not fields:
-            # No frontmatter — skip silently (plain .md, not a baton file).
-            print(
-                f"[forum/board] warning: no frontmatter in {md_file}, skipping",
-                file=sys.stderr,
-            )
-            continue
-
-        # Extract fields with safe defaults.
-        project_id = (fields.get("project") or "").strip() or md_file.stem
-        title = (fields.get("title") or "").strip() or project_id
-        file_status = (fields.get("status") or "").strip().lower()
-        turn = (fields.get("turn") or "").strip().lower()
-        turn_since_str = (fields.get("turn_since") or "").strip()
-        participants_str = (fields.get("participants") or "").strip()
-        github_ref = (fields.get("github") or "").strip().lower()
-
-        # Strip surrounding quotes from turn_reason (matches baton.py).
-        turn_reason = (fields.get("turn_reason") or "").strip()
-        if turn_reason.startswith('"') and turn_reason.endswith('"'):
-            turn_reason = turn_reason[1:-1]
-
-        participants = _parse_participants(participants_str) if participants_str else []
         turn_since = _parse_iso(turn_since_str)
 
-        # Use file mtime as fallback for updated_at.
-        try:
-            file_mtime = datetime.fromtimestamp(md_file.stat().st_mtime, tz=timezone.utc)
-        except OSError:
-            file_mtime = None
-
-        # Display time: prefer turn_since ("whose turn, since when").
-        updated_at = turn_since or file_mtime
+        # Display time: prefer turn_since ("whose turn, since when"). Unlike the
+        # pre-#1608 glob reader there is no filesystem mtime to fall back on for a
+        # store record, so an unstamped turn_since simply has no display time.
+        updated_at = turn_since
         updated_at_str = (
             updated_at.strftime("%Y-%m-%dT%H:%M:%SZ") if updated_at else ""
-        )
-        # Cursor key for the /updates feed: the file's SERVER-OBSERVED mtime —
-        # set atomically by baton's temp+rename at the instant the file becomes
-        # visible — NOT the writer-stamped turn_since (which precedes visibility
-        # and causes silent missed wakes, #1445). Falls back to display time only
-        # if the mtime is unreadable.
-        cursor_ts_str = (
-            file_mtime.strftime("%Y-%m-%dT%H:%M:%SZ") if file_mtime else updated_at_str
         )
 
         kind = _infer_kind(project_id, github_ref)
@@ -420,7 +348,9 @@ def read_project_board(projects_dir: Optional[Path] = None) -> list[dict[str, An
             "github": github_ref,
             "updated_at": updated_at_str,
             "updated_at_dt": updated_at,
-            "cursor_ts": cursor_ts_str,
+            # The coordination store's module-assigned seq — see filter_updates()
+            # for why this (not a timestamp) is the /updates cursor key post-#1608.
+            "seq": record.seq,
             "_pr_num": pr_m.group(1) if pr_m else None,
         })
 
@@ -466,7 +396,7 @@ def read_project_board(projects_dir: Optional[Path] = None) -> list[dict[str, An
             "gh_state": gh_state,
             "gh_unknown": gh_unknown,
             "updated_at": raw["updated_at"],
-            "cursor_ts": raw["cursor_ts"],
+            "seq": raw["seq"],
             "age_str": age,
         }
         items.append(item)
@@ -499,44 +429,40 @@ def get_board_counts(items: list[dict[str, Any]]) -> dict[str, int]:
 
 def filter_updates(
     items: list[dict[str, Any]],
-    since: Optional[str],
+    since: Optional[int],
     agent: Optional[str],
 ) -> list[dict[str, Any]]:
     """Filter board items to those changed after `since`, optionally for one agent.
 
     Args:
         items:  Full board item list from read_project_board().
-        since:  ISO-8601 cursor string (exclusive: items with cursor_ts > since).
-                None returns all items.
+        since:  EXCLUSIVE seq cursor (items with seq > since). None returns all
+                items (no since-filtering).
         agent:  If provided, only items whose turn == agent.
 
     Returns:
         Filtered list preserving original order.
 
-    Since-cursor correctness (#1445 fix): the cursor keys on `cursor_ts` — the
-    file's SERVER-OBSERVED mtime, which baton's atomic temp+rename sets at the
-    instant the file becomes visible — NOT the writer-stamped `turn_since`.
-    Because the cursor key is set by the same atomic op that makes the file
-    readable, no poll's `as_of` can advance past an item before it is visible,
-    so a court-change is never silently missed. (`turn_since` precedes visibility
-    by the write duration and caused the silent-miss; it stays the display value
-    only.)
+    Since-cursor correctness (#1608): the cursor keys on each item's `seq` — the
+    coordination store's module-assigned, monotonically increasing sequence
+    number, allocated under the `SeqAllocator` lock co-atomically with the write
+    that committed it (fork-4; see `forum.coordination.seq`). This mirrors the
+    unified `/api/updates` feed's cursor (`forum.coordination.updates.build_updates`)
+    and is a STRONGER server-observed-order guarantee than the pre-#1608 mechanism
+    (the baton file's filesystem mtime): seq is assigned atomically at the instant
+    a mutation commits, with no possible race window, so a since-filter keyed on it
+    can never reproduce the #1445 silent-miss class (a court-change visible before
+    its cursor advances past it).
     """
-    since_dt: Optional[datetime] = None
-    if since:
-        since_dt = _parse_iso(since)
-
     result = []
     for item in items:
         # Agent filter first (cheap).
         if agent is not None and item["turn"] != agent.lower().strip():
             continue
 
-        # Since filter keyed on the visibility-monotonic mtime cursor (#1445).
-        if since_dt is not None:
-            item_dt = _parse_iso(item["cursor_ts"])
-            if item_dt is None or item_dt <= since_dt:
-                continue
+        # Since filter keyed on the seq cursor (#1608).
+        if since is not None and item["seq"] <= since:
+            continue
 
         result.append(item)
 
