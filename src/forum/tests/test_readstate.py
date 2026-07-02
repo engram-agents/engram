@@ -27,6 +27,7 @@ import pytest
 from forum import db
 from forum.db import (
     count_unread_all_threads,
+    count_unread_by_category,
     create_reply,
     create_thread,
     get_inbox,
@@ -879,3 +880,116 @@ class TestCLIForumStatus:
         assert data["unread_total"] == 1
         assert data["mention_count"] == 1
         assert data["unread_on_my_threads"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Slice H: count_unread_by_category + /api/agent/<name>/inbox shape
+# ---------------------------------------------------------------------------
+
+class TestUnreadByCategory:
+    """count_unread_by_category groups unread posts by thread category slug."""
+
+    def test_basic_grouping(self, conn):
+        """Unread posts in two different categories appear as separate keys."""
+        a = upsert_agent(conn, "alice")
+        b = upsert_agent(conn, "bob")
+
+        tid1, _ = create_thread(conn, b, "pr-review", "PR 1", "body")
+        tid2, _ = create_thread(conn, b, "inter-agent", "IA 1", "body")
+        create_reply(conn, b, tid1, "reply in pr-review")
+        create_reply(conn, b, tid2, "reply in inter-agent")
+
+        result = count_unread_by_category(conn, a)
+        assert result.get("pr-review", 0) == 2   # OP + reply
+        assert result.get("inter-agent", 0) == 2
+
+    def test_read_posts_excluded(self, conn):
+        """Posts read up to the watermark are NOT counted as unread."""
+        a = upsert_agent(conn, "alice")
+        b = upsert_agent(conn, "bob")
+
+        tid, _ = create_thread(conn, b, "pr-review", "PR X", "body")
+        p1 = create_reply(conn, b, tid, "reply 1")
+        mark_thread_read(conn, a, tid, p1)
+
+        # Add one more unread post after the watermark
+        create_reply(conn, b, tid, "reply 2")
+
+        result = count_unread_by_category(conn, a)
+        assert result.get("pr-review", 0) == 1
+
+    def test_empty_when_all_read(self, conn):
+        """Result is empty when every post has been read."""
+        a = upsert_agent(conn, "alice")
+        b = upsert_agent(conn, "bob")
+
+        tid, _ = create_thread(conn, b, "tools-hooks", "T", "body")
+        p1 = create_reply(conn, b, tid, "r")
+        mark_thread_read(conn, a, tid, p1)
+
+        result = count_unread_by_category(conn, a)
+        assert result == {}
+
+    def test_own_posts_excluded(self, conn):
+        """Alice's own posts are never counted as unread for Alice."""
+        a = upsert_agent(conn, "alice")
+        tid, _ = create_thread(conn, a, "pr-review", "My PR", "body")
+        create_reply(conn, a, tid, "my reply")
+
+        result = count_unread_by_category(conn, a)
+        assert result.get("pr-review", 0) == 0
+
+
+class TestInboxEndpointIncludesByCategory:
+    """/api/agent/<name>/inbox response includes unread_by_category."""
+
+    def test_unread_by_category_in_response(self, client):
+        """inbox endpoint returns unread_by_category dict."""
+        # Post as bob in two categories
+        client.post("/api/post", json={
+            "agent": "bob", "category_slug": "pr-review",
+            "title": "PR", "body_md": "body",
+        })
+        client.post("/api/post", json={
+            "agent": "bob", "category_slug": "inter-agent",
+            "title": "IA", "body_md": "body",
+        })
+        resp = client.get("/api/agent/alice/inbox")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "unread_by_category" in data
+        assert isinstance(data["unread_by_category"], dict)
+        assert data["unread_by_category"].get("pr-review", 0) >= 1
+        assert data["unread_by_category"].get("inter-agent", 0) >= 1
+
+    def test_unread_by_category_empty_when_nothing_unread(self, client):
+        """unread_by_category is empty when no unread posts exist."""
+        resp = client.get("/api/agent/newagent/inbox")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["unread_by_category"] == {}
+
+    def test_unread_by_domain_buckets_correctly(self, client):
+        """unread_by_domain rolls pr-review into 'working' and inter-agent into 'coordination'."""
+        client.post("/api/post", json={
+            "agent": "bob", "category_slug": "pr-review",
+            "title": "PR", "body_md": "body",
+        })
+        client.post("/api/post", json={
+            "agent": "bob", "category_slug": "inter-agent",
+            "title": "IA", "body_md": "body",
+        })
+        resp = client.get("/api/agent/alice/inbox")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "unread_by_domain" in data
+        assert isinstance(data["unread_by_domain"], dict)
+        assert data["unread_by_domain"].get("working", 0) >= 1
+        assert data["unread_by_domain"].get("coordination", 0) >= 1
+
+    def test_unread_by_domain_empty_when_nothing_unread(self, client):
+        """unread_by_domain is empty for a fresh agent with no unread posts."""
+        resp = client.get("/api/agent/brandnewagent/inbox")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["unread_by_domain"] == {}

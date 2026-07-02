@@ -82,7 +82,7 @@ server.py's source text) belong in a small explicit allow-list:
 Entries are **bare basenames** (e.g. `test_engram_core_seam.py`), not
 `tests/`-prefixed paths — the gate matches `basename in allowlist`.
 
-This allow-list lives in `packaging/test-map.json` under the top-level key
+This allow-list lives in `src/engram/packaging/test-map.json` under the top-level key
 `"server_import_allowlist"`. It is seeded at wave 0 with all current
 non-`_payload` server-importing files so the gate passes immediately; each
 subsequent wave drains it as files are converted or retired.
@@ -107,7 +107,7 @@ tests/test_engram_core_seam.py      (listed in server_import_allowlist; static g
 
 **How the gate checks it:** `run_touched_tests.py --audit-imports` runs R2: for
 every `tests/test_*.py` that imports `server`, the file must either match
-`test_*_payload.py` OR appear in `packaging/test-map.json`'s
+`test_*_payload.py` OR appear in `src/engram/packaging/test-map.json`'s
 `server_import_allowlist`. Violations print `file:line: not a payload file and
 not in server_import_allowlist — add to allow-list or rename to
 test_*_payload.py`.
@@ -205,7 +205,7 @@ python3 tools/run_touched_tests.py --dry-run
 
 **Statement:** Non-imported surfaces (hooks, skills, templates, build scripts,
 shell tools) are not affected by this contract. They remain in
-`packaging/test-map.json`'s `mappings` array as layer-2 convention entries
+`src/engram/packaging/test-map.json`'s `mappings` array as layer-2 convention entries
 with explicit glob-to-test mappings. The contract does not move them; it only
 prevents the import layer from being polluted with server transitive closure.
 
@@ -215,7 +215,7 @@ convention map (Layer 2 of selection) correctly fills this gap. The contract
 focuses on making Layer 1 (import graph) accurate for importable modules.
 
 **How to comply:** When adding tests for a hook, skill, template, or build
-script, add a `mappings` entry in `packaging/test-map.json` pointing to the
+script, add a `mappings` entry in `src/engram/packaging/test-map.json` pointing to the
 test glob. Do NOT import the hook script from the test file to trigger Layer 1
 selection — use the convention map entry.
 

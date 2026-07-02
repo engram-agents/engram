@@ -77,6 +77,9 @@ fi
 [ -f "$SRC/src/forum/deploy/engram-forum.service.template" ] || {
   echo "ERROR: unit template not found under $SRC/src/forum/deploy/" >&2; exit 2;
 }
+[ -f "$SRC/tools/engram-pkg/engram-pkg" ] || {
+  echo "ERROR: $SRC/tools/engram-pkg/engram-pkg not found — pack validator required" >&2; exit 2;
+}
 if [ "$DRY_RUN" -eq 0 ]; then
   command -v systemctl >/dev/null || {
     echo "ERROR: systemctl not found (this installer targets systemd --user)" >&2; exit 2;
@@ -154,6 +157,18 @@ else
 fi
 RUN touch "$APP/forum/__init__.py"
 
+echo "==> Snapshotting pack validator → $APP/tools/engram-pkg"
+RUN mkdir -p "$APP/tools/engram-pkg"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  [dry-run] cp $SRC/tools/engram-pkg/engram-pkg → $APP/tools/engram-pkg/engram-pkg"
+elif command -v rsync >/dev/null; then
+  rsync -a --delete \
+      --exclude='__pycache__' --exclude='*.pyc' --exclude='README.md' \
+      "$SRC/tools/engram-pkg/" "$APP/tools/engram-pkg/"
+else
+  cp "$SRC/tools/engram-pkg/engram-pkg" "$APP/tools/engram-pkg/engram-pkg"
+fi
+
 # Build the venv ONLY if it isn't already a working one.
 if [ "$DRY_RUN" -eq 0 ] && [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import flask" 2>/dev/null; then
   echo "==> Reusing existing venv → $VENV ($("$VENV/bin/python" -c 'import flask;print("flask",flask.__version__)'))"
@@ -171,7 +186,7 @@ fi
 echo "==> Rendering unit from template → $UNIT_DIR/$UNIT"
 RUN mkdir -p "$UNIT_DIR"
 if [ "$DRY_RUN" -eq 1 ]; then
-  echo "  [dry-run] sed TEMPLATE-ONLY strip + substitute {{SERVICE_DIR}}→$SERVICE_DIR, {{PORT}}→$PORT"
+  echo "  [dry-run] sed TEMPLATE-ONLY strip + substitute {{FORUM_HOME}}→$SERVICE_DIR, {{PORT}}→$PORT"
   echo "  [dry-run] install rendered unit → $UNIT_DIR/$UNIT"
 else
   # Strip the >>>TEMPLATE-ONLY ... <<<TEMPLATE-ONLY block, then substitute
@@ -216,20 +231,31 @@ if [ "$START" -eq 1 ]; then
     # Gate 1: HTTP health check — hard gate, exits 2 on failure.
     # Gate 2: --verify-only (confirms all runtime deps present) — hard gate, exits 2 on failure.
     # ----------------------------------------------------------------
-    echo "==> Post-install gate 1: HTTP health check"
-    if curl --fail --silent --max-time 5 "http://127.0.0.1:${PORT}/health" >/dev/null; then
-      echo "    OK: forum /health responding on :${PORT}"
-    else
-      echo "ERROR: /health not responding — service may have failed to start." >&2
+    echo "==> Post-install gate 1: HTTP health check (up to 20s — model load grace)"
+    _health_ok=0
+    for _attempt in $(seq 1 20); do
+      if curl --fail --silent --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+        echo "    OK: forum /health responding on :${PORT} (attempt ${_attempt})"
+        _health_ok=1
+        break
+      fi
+      sleep 1
+    done
+    if [ "$_health_ok" -eq 0 ]; then
+      echo "ERROR: /health not responding after 20s — service failed to start." >&2
       echo "       Check: journalctl --user -u $UNIT -n 30" >&2
       exit 2
     fi
 
     echo "==> Post-install gate 2: boot-verify probe"
-    if "$PYTHON" -m forum.server \
+    # Run from $APP so `python -m forum.server` can import the `forum` package —
+    # mirrors the service's WorkingDirectory=$APP. Without this cd the probe
+    # runs in the deploy cwd, hits ModuleNotFoundError: forum, and false-alarms
+    # "service may be degraded" on a perfectly healthy deploy (#1617).
+    if ( cd "$APP" && "$PYTHON" -m forum.server \
         --db "$SERVICE_DIR/forum.db" \
         --audit "$SERVICE_DIR/forum-audit.jsonl" \
-        --verify-only; then
+        --verify-only ); then
       echo "    verify-only passed"
     else
       echo "ERROR: verify-only probe returned non-zero — dep check failed; service may be degraded." >&2

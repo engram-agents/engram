@@ -25,7 +25,16 @@ the unified payload_json signature as of 2026-05-27.
 - **`dev`** is the default branch and the merge target for ALL feature/fix PRs.
   Always open PRs against `dev` unless an explicit release-cut is happening.
 - **`master`** is the stable-release branch. It moves only on explicit release
-  cuts; routine PRs do NOT target master.
+  cuts; routine PRs do NOT target master. **A release cut = opening a formal
+  PR from `dev` → `master`** — this fires the full CI gate (`tests.yml` full
+  suite + `pr-checks` + `non-author-approval`), the thorough pre-release
+  validation. See `docs/RELEASING.md`.
+- **CI cost model (#1597):** dev PRs run only the cheap combined `pr-checks`
+  (static scrubs) + `non-author-approval`. The **full pytest suite does NOT run
+  on dev PRs** — at agent-PR velocity it's too expensive; run **affected-tests
+  locally** and paste the result in your review. The full suite runs once, on
+  the dev→master release PR (above). `affected-tests.yml` is `workflow_dispatch`
+  only.
 - Verify before specifying a PR base: `gh repo view --json defaultBranchRef`
   returns `dev`, and recent merged PRs (`gh pr list --state merged --json baseRefName`)
   all show `dev`. If your session-start banner shows a branch other than `dev`
@@ -71,7 +80,7 @@ template.
    tool used without its discipline is worse than not having it.)
 
 2. **Every shippable is tagged exactly once in the manifest.** The tier map *will
-   be* the single source of truth at `packaging/tiers.json`; `build-plugin.sh
+   be* the single source of truth at `src/build/packaging/tiers.json`; `build-plugin.sh
    --tier` *will* filter through it at **build time** (the
    agent-led install reads the README, prompts the user for tier + multi-agent, and
    builds accordingly — no post-install pruning). **CI must fail the build if any
@@ -79,10 +88,90 @@ template.
    skill, forgot to tier it" cannot drift past review. This is a mechanical gate,
    not vigilance.
 
-*(The `packaging/tiers.json` manifest + the CI tag-once test land with the tiering
+*(The `src/build/packaging/tiers.json` manifest + the CI tag-once test land with the tiering
 rollout. Until they do, the tier of any new artifact is still a required design
 decision — record it in the audit so the manifest is a transcription, not a
 re-derivation.)*
+
+## Plugin build restructures code paths — never rely on the `src/` layout
+
+The plugin build (`build-plugin.sh`) does **not** mirror the `src/engram/` source
+tree into the installed plugin — it **restructures** it. Notably it **flattens
+`hooks/claude/*` → `hooks/*`** and **`skills/claude/*` → `skills/*`** (the
+`claude/` level is dropped), so an installed file sits at a **different nesting
+depth** than its source file. The plugin root is `$CLAUDE_PLUGIN_ROOT`; the source
+checkout has no equivalent marker.
+
+**Therefore: any code that resolves a sibling/companion path at runtime MUST NOT
+assume the source layout.** A fixed `Path(__file__).resolve().parents[N]`
+calibrated against `src/engram/hooks/claude/<f>.py` **overshoots** in the deployed
+`hooks/<f>.py` (one level shallower) — and does so **silently**, because it still
+resolves to *a* path, just the wrong one.
+
+- **Do:** resolve via `$CLAUDE_PLUGIN_ROOT` first (reliably set when hooks/tools
+  run — `hooks.json` invokes every hook as `${CLAUDE_PLUGIN_ROOT}/...`), then fall
+  back to a **walk-parents search for the actual target file** (the nearest
+  ancestor dir that contains what you need), never a fixed `parents[N]`. See
+  `engram-baton-prompt-hook.py` / `engram-forum-prompt-hook.py` for the pattern.
+- **Verify against the DEPLOYED tree, not just `src/`.** This bug class is
+  invisible to CI and unit tests — they run in the `src/` layout, where the
+  source-relative path happens to work — so it surfaces only when the
+  *actually-installed* file runs. The guard is a regression test that recreates
+  the flattened layout (and runs with `$CLAUDE_PLUGIN_ROOT` **unset** to exercise
+  the walk-parents fallback).
+
+*Origin (#1537 → #1539): the pure-API baton prompt-hook used `parents[2]/tools` to
+import `forum_api` — correct in source, overshot to `plugins/tools` (nonexistent)
+in the deployed tree → `_FORUM_API_OK=False` → the hook silently no-op'd. Caught
+only by running the deployed hook, after reviewer-fairy + colleague + CI all
+passed on the source tree. Green CI ≠ deployed-correct when CI exercises only the
+source layout.*
+
+## Plugin deploy: for our LOCAL (directory) marketplace, the SOURCE tree is live
+
+For our **`directory`-source local marketplace**, Claude Code invokes hooks / the
+MCP server / skills **directly from the marketplace SOURCE tree**
+(`~/.engram/marketplace/plugins/engram/`), and `CLAUDE_PLUGIN_ROOT` resolves to
+that path. (`~/.claude/plugins/known_marketplaces.json` sets `installLocation` to
+the source dir itself for a directory source.) The
+`~/.claude/plugins/cache/.../<version>/` snapshots + `installed_plugins.json`
+`installPath` are version **bookkeeping, NOT the live load path** — that's the
+directory-vs-official distinction (official/git marketplaces ARE cache-based; ours
+is not). **Verified 2026-06-28** by instrumenting every hook copy and watching
+which fires in the live session: only the marketplace-tree copy fired, with
+`CLAUDE_PLUGIN_ROOT` = the source.
+
+**What this means for deploys/upgrades (the OPPOSITE of the official-marketplace
+model):**
+
+- **`tools/install-local-marketplace.sh` makes new HOOK / TOOL / SKILL code LIVE
+  immediately** — it rebuilds the source tree, which IS the live path. **No
+  `/plugin update` is needed** for hooks/tools/skills on a directory install
+  (hooks hot-reload: re-read from the source file per prompt).
+- **MCP server is the exception:** it launches from
+  `${CLAUDE_PLUGIN_ROOT}/launch-engram-server.sh` (= the source), but the running
+  *process* is from session start — a changed `server.py` needs a `/mcp` reconnect
+  or a restart to reload the process. The path is the source; the process does not
+  hot-reload.
+- **A changed `hooks.json` registration needs a full Claude Code restart**
+  (registration is read at session start). This is what caused the v0.1.4 four-day
+  silent-hook outage: a guard on marketplace-path-invoked hooks killed all live
+  hooks, *because our live hooks ARE invoked from the marketplace path.*
+
+**To know which code is actually running, instrument the live artifact — never
+infer from a proxy.** A version string, `installed_plugins.json`, or a bash-env
+test will mislead you (each misled me in turn on 2026-06-28 — a stale
+`BATON_PROJECTS_DIR` even made an old hook *look* migrated). The settling test:
+add a stderr/file sentinel to the top of each candidate hook copy, fire a REAL
+prompt (a self-wake counts), and read which copy logged — that, plus
+`CLAUDE_PLUGIN_ROOT` read from *inside* a live hook, are the only ground truth.
+
+*Full system model — why directory-source loads in-place, the per-component scope
+(verified vs inferred), the complete edit-takes-effect table, and the
+verify-the-live-artifact method — lives in
+[`docs/claude-code-plugin-system.md`](docs/claude-code-plugin-system.md) (read
+on-demand; not loaded every session). This behavior is **undocumented upstream** —
+re-verify after any Claude Code version bump.*
 
 ## PR merge-readiness — CI-green gate (both modes)
 

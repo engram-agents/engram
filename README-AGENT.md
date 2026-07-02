@@ -295,6 +295,38 @@ memory mixes voices and whose identity quietly degrades. A user who's come to *k
 their agent won't want that drift — so they'll be glad the gate is there. Present it
 as care, not a rule.
 
+### Phase 1.6 — Ollama model context window (if applicable)
+
+If the human is running Claude Code with an **Ollama-hosted model** (e.g. GLM-4, local
+Llama), Ollama's proxy layer has a ~200K token context limit regardless of the model's
+nominal context window. Claude Code's default auto-compact settings assume the full
+model context, which will fail on Ollama's tighter bound.
+
+**Symptom:** Auto-compact triggers too late, truncating the context and breaking the
+session.
+
+**Workaround:** Set two environment variables in `~/.bash_profile` (or `~/.bashrc`,
+depending on shell):
+
+```bash
+# Ollama context window workaround
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000
+export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=83
+```
+
+**What this does:**
+
+- `CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000` — tells Claude Code the effective context
+  window is 200K tokens (Ollama's actual limit).
+- `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=83` — triggers auto-compact at ~166K tokens
+  (83% of 200K), leaving headroom before Ollama's hard cutoff.
+
+The human must restart Claude Code (or re-source `~/.bash_profile`) after setting
+these for the new values to take effect.
+
+**If the human is using Anthropic-hosted Claude directly (the default), skip this
+section — the standard auto-compact defaults work correctly.**
+
 ### Phase 2 — First session (post-restart)
 
 The new session takes over, fully agent-driven:

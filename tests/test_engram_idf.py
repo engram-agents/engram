@@ -13,6 +13,8 @@ Test coverage:
   7. test_extract_keywords_respects_threshold — min_idf gate
   8. test_extract_keywords_top_k       — top_k truncation
   9. test_extract_keywords_ignores_unknown_tokens — absent tokens silently excluded
+ 10. test_fts_supersede_trigger_removes_from_idf — supersede trigger removes node from
+     FTS index so its tokens no longer appear in IDF vocab
 """
 
 from __future__ import annotations
@@ -300,63 +302,74 @@ class TestIdf:
         result = idf(conn, "anything")
         assert result is None
 
-    def test_idf_token_only_in_superseded_returns_none(self):
-        """Tokens appearing only in superseded nodes return None — not a
-        negative IDF.
+    def test_fts_supersede_trigger_removes_from_idf(self):
+        """When is_current flips to 0 via UPDATE, the supersede trigger removes
+        the node from nodes_fts so idf() returns None for tokens unique to it.
 
-        Regression test for the fts5 indexed-but-superseded gap: nodes_fts
-        has no UPDATE trigger on is_current, so superseded rows stay in the
-        FTS index permanently. Without flooring, df > n_docs yields negative
-        log values; we floor by returning None so callers using min_idf=0.0
-        still see a coherent contract.
+        Regression-prevention for #195: before the trigger was added, superseded
+        nodes stayed in nodes_fts permanently — causing df > n_docs when n_docs
+        was counted from is_current=1 rows, which produces log(<1) < 0.
+
+        This test exercises the trigger path end-to-end: insert a current node,
+        confirm its token has a positive IDF, UPDATE is_current to 0 (firing the
+        trigger), then confirm idf() returns None because the token is gone from
+        the FTS index.
         """
-        # Build inline because _make_minimal_db doesn't support per-doc
-        # is_current overrides. Mixed corpus: 1 current doc without the
-        # token + 2 superseded docs containing it. n_docs=1, df=2 →
-        # log(0.5) < 0 → must return None.
         conn = sqlite3.connect(":memory:")
-        conn.execute("""
+        conn.executescript("""
             CREATE TABLE nodes (
                 rowid INTEGER PRIMARY KEY AUTOINCREMENT,
                 id TEXT NOT NULL, claim TEXT,
                 quoted_text TEXT, interpretation TEXT,
-                is_current INTEGER DEFAULT 1
-            )
-        """)
-        conn.execute("""
+                reported_state TEXT, trigger_text TEXT,
+                is_current INTEGER DEFAULT 1, status TEXT
+            );
             CREATE VIRTUAL TABLE nodes_fts USING fts5(
-                claim, quoted_text, interpretation,
+                claim, quoted_text, interpretation, reported_state, trigger_text,
                 content='nodes', content_rowid='rowid'
-            )
+            );
+            CREATE TRIGGER nodes_fts_insert AFTER INSERT ON nodes BEGIN
+                INSERT INTO nodes_fts(rowid, claim, quoted_text, interpretation,
+                                      reported_state, trigger_text)
+                VALUES (NEW.rowid,
+                        COALESCE(NEW.claim, ''), COALESCE(NEW.quoted_text, ''),
+                        COALESCE(NEW.interpretation, ''), COALESCE(NEW.reported_state, ''),
+                        COALESCE(NEW.trigger_text, ''));
+            END;
+            CREATE TRIGGER nodes_fts_supersede_remove
+            AFTER UPDATE OF is_current ON nodes
+            WHEN NEW.is_current = 0 AND OLD.is_current = 1
+              AND COALESCE(NEW.status, '') != 'retracted' BEGIN
+                INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation,
+                                      reported_state, trigger_text)
+                VALUES ('delete', OLD.rowid,
+                        COALESCE(OLD.claim, ''), COALESCE(OLD.quoted_text, ''),
+                        COALESCE(OLD.interpretation, ''), COALESCE(OLD.reported_state, ''),
+                        COALESCE(OLD.trigger_text, ''));
+            END;
         """)
-        for i, (claim, is_current) in enumerate([
-            ("common everyday words only", 1),
-            ("rarewordzzz appears here", 0),
-            ("rarewordzzz again", 0),
-        ]):
-            conn.execute(
-                "INSERT INTO nodes (id, claim, is_current) VALUES (?, ?, ?)",
-                (f"ob_{i:04d}", claim, is_current),
-            )
-            conn.execute(
-                "INSERT INTO nodes_fts(rowid, claim, quoted_text, interpretation) "
-                "VALUES (last_insert_rowid(), ?, NULL, NULL)",
-                (claim,),
-            )
+        conn.execute("INSERT INTO nodes (id, claim, is_current) VALUES ('ob_0001', 'uniquetoken191 appears here', 1)")
+        conn.execute("INSERT INTO nodes (id, claim, is_current) VALUES ('ob_0002', 'unrelated claim words', 1)")
         ensure_vocab_table(conn)
         conn.commit()
 
-        # Pre-condition: df=2, n_docs=1 → naive log would yield log(0.5) ≈ -0.69
-        df = conn.execute(
-            "SELECT doc FROM nodes_fts_vocab WHERE term = 'rarewordzzz'"
-        ).fetchone()[0]
-        n_docs = conn.execute(
-            "SELECT COUNT(*) FROM nodes WHERE is_current = 1"
-        ).fetchone()[0]
-        assert df == 2 and n_docs == 1, f"setup invariant violated: df={df}, n={n_docs}"
+        # Pre-condition: token in vocab, idf positive.
+        pre = idf(conn, "uniquetoken191")
+        assert pre is not None and pre > 0, f"Expected positive IDF before supersede, got {pre}"
 
-        # The fix: return None instead of leaking negative.
-        assert idf(conn, "rarewordzzz") is None
+        # Fire the trigger by flipping is_current to 0 via UPDATE.
+        conn.execute("UPDATE nodes SET is_current = 0 WHERE id = 'ob_0001'")
+        conn.commit()
+
+        # Post-condition: token removed from FTS index → idf returns None.
+        post = idf(conn, "uniquetoken191")
+        assert post is None, (
+            f"Expected None after supersede (trigger should remove from FTS), got {post}"
+        )
+
+        # Sanity: ob_0002 is still current; n_docs = 1.
+        n_docs = conn.execute("SELECT COUNT(*) FROM nodes WHERE is_current = 1").fetchone()[0]
+        assert n_docs == 1, f"Expected 1 current node after supersede, got {n_docs}"
 
 
 class TestExtractKeywords:

@@ -1,0 +1,468 @@
+name: pr-checks
+
+# Combined per-PR scrub checks (#1597) — one job, one runner, N sequential steps.
+# Previously six separate workflows; the cost saving is 5 fewer runner startups
+# per PR. Faithful preservation: each check's logic is unchanged — only
+# runner-setup overhead is reduced.
+#
+# Checks in order (preserved from their individual workflow files):
+#   1. anti-dup              (was anti-dup-check.yml)
+#   2. no-new-shipped-node-ids   (was check-no-new-shipped-node-ids.yml)
+#   3. pr-body-close-keyword     (was check-pr-body-close-keyword.yml)
+#   4. name-leak-warn            (was name-leak-warn.yml — advisory, never blocks job)
+#   5. invariant-checks          (was invariant-checks.yml — Python 3.11)
+#   6. manifest-gate             (was manifest-gate.yml — Python 3.12)
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: [dev, master]
+
+jobs:
+  pr-checks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read        # name-leak-warn (checkout) + general
+      issues: read          # anti-dup
+      pull-requests: write  # name-leak-warn (PR comment); supersedes anti-dup's read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 needed by no-new-shipped-node-ids and name-leak-warn
+          # for base-branch diff; harmless for checks that don't use history.
+          fetch-depth: 0
+
+      # ── 1. anti-dup ────────────────────────────────────────────────────
+      # (from anti-dup-check.yml)
+      # Issue #1433 — mechanical gate against duplicate-effort PRs.
+      # Problem: discipline-only pre-checks failed under high-parallelism async
+      # work (5+ duplicate-PR collisions on 2026-06-25 despite the convention
+      # adopted the previous day). Two cases this gate catches:
+      #
+      #   1. Target issue already CLOSED (sequential dup — opened after the
+      #      first PR merged and auto-closed the issue). → FAIL hard.
+      #   2. Another open PR already references the same issue with a closing
+      #      keyword (parallel dup — two PRs racing on the same fix). → WARN.
+      #
+      # Scopes to closing keywords only (close/closes/closed, fix/fixes/fixed,
+      # resolve/resolves/resolved) — EPIC/umbrella multi-PR flows that reference
+      # an issue without a closing keyword are not flagged.
+      #
+      # Uses body-text grep (same as trap-check): GitHub's closingIssuesReferences
+      # GraphQL field is dormant on stacked/non-default-base PRs.
+      - name: anti-dup — check target issues for already-closed or competing open PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Strip inline-code spans before grepping — GitHub's auto-close parser
+          # ignores keywords inside backticks (verified #1191), and CLAUDE.md
+          # recommends backticking close-keyword examples to avoid parser trips.
+          # Without stripping, a backtick-wrapped example (e.g. `closes #N`)
+          # would false-hard-fail this gate even though GitHub won't act on it.
+          BODY_STRIPPED=$(printf '%s' "$PR_BODY" | sed 's/`[^`]*`//g')
+
+          # Extract issue numbers referenced with a closing keyword in the body.
+          CLOSING_NS=$(printf '%s' "$BODY_STRIPPED" \
+            | grep -ioE '(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]+#[0-9]+' \
+            | grep -oE '[0-9]+' | sort -u)
+
+          if [ -z "$CLOSING_NS" ]; then
+            echo "No closing-keyword issue references in the PR body. ✓"
+            exit 0
+          fi
+
+          HARD_FAIL=0
+
+          for N in $CLOSING_NS; do
+            # ── Check 1: Is the target issue already CLOSED? ──────────────────
+            STATE=$(gh issue view "$N" --repo "$REPO" --json state \
+              --jq '.state' 2>/dev/null || echo "unknown")
+            if [ "$STATE" = "CLOSED" ]; then
+              echo "::error::Issue #$N is already CLOSED. This PR appears to be a duplicate — the issue was resolved by an earlier PR. Verify before continuing; if this PR supersedes the prior fix, reopen the issue first."
+              HARD_FAIL=1
+            elif [ "$STATE" = "unknown" ]; then
+              echo "::warning::Could not fetch state for issue #$N (API error or issue not found). Manual check recommended."
+            else
+              echo "Issue #$N is open (state=$STATE). ✓"
+            fi
+
+            # ── Check 2: Another open PR already targets the same issue ───────
+            # List open PRs, exclude this PR, grep body for a closing-keyword
+            # reference to #N. (GraphQL closingIssuesReferences is dormant on
+            # stacked PRs, so body-grep is the reliable signal.)
+            # Note: we grep raw bodies here (not stripped) — over-flagging a
+            # competing PR that backticks its keyword is a harmless warning;
+            # the important accuracy is on the hard-fail Check-1 above.
+            # Both $PR_NUMBER and $N are digit-only (extracted via grep [0-9]+),
+            # so direct interpolation into the jq filter is safe (no injection risk).
+            COMPETING=$(gh pr list --repo "$REPO" --state open \
+              --json number,body \
+              --jq '.[] | select(.number != '"$PR_NUMBER"') | select(.body != null) |
+               select(.body | test("(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]+#'"$N"'\\b"; "i")) |
+               .number' 2>/dev/null | tr '\n' ' ' | xargs)
+            if [ -n "$COMPETING" ]; then
+              echo "::warning::Issue #$N already has open PR(s) with a closing keyword: $(printf '#%s ' $COMPETING). Check for duplicate effort. If this PR supersedes those, note it in the PR description."
+            fi
+          done
+
+          if [ "$HARD_FAIL" = "1" ]; then
+            echo ""
+            echo "One or more target issues are already CLOSED. To proceed:"
+            echo "  • If this PR genuinely differs from the merged fix, reopen the"
+            echo "    issue and update the PR body to explain the distinction."
+            echo "  • If this PR duplicates the merged fix, close it."
+            exit 1
+          fi
+
+          echo "All closing-keyword targets are open. ✓"
+
+      # ── 2. no-new-shipped-node-ids ─────────────────────────────────────
+      # (from check-no-new-shipped-node-ids.yml)
+      # Enforces the policy from issue #51 / DEVELOPMENT.md "Shipped files —
+      # no concrete ENGRAM node IDs": PRs to dev or master must not ADD new
+      # concrete ENGRAM node ID references (regex below) inside alpha-released
+      # files. Existing references are grandfathered; the scrub of the existing
+      # corpus happens incrementally in follow-up PRs to issue #51.
+      - name: no-new-shipped-node-ids — fail on newly-added concrete ENGRAM node IDs in shipped files
+        run: |
+          BASE_REF="origin/${{ github.base_ref }}"
+          # The pattern follows engram_ids.py's documented broad shape:
+          # every TYPE_PREFIX in server.py is exactly two lowercase letters,
+          # so `[a-z]{2}_\d{4,}` catches every current type AND future types
+          # without per-add maintenance. Current TYPE_PREFIX set (server.py
+          # ~628): ev, ob, pr, dv, th, ct, qu, ax, df, cj, gl, gt, fl, tk,
+          # ls, pn, cs, ts. The broad form is restrictive enough in practice
+          # (random text rarely matches `xx_NNNN+` boundaries).
+          PATTERN='\b[a-z]{2}_[0-9]{4,}\b'
+
+          # Allowlist scope rationale:
+          #   tests/, paper_draft/, active-work/, cycle/ — non-shipped surfaces
+          #     (cycle/ = self-improvement-cycle process docs — charter, chronicle,
+          #      review packages, dream-pass protocol; node IDs are load-bearing
+          #      provenance there by design, and build-plugin.sh does not bundle it)
+          #   docs/handbook/ — dev-internal developer handbook (accuracy-pass
+          #     reference docs; concrete node IDs are load-bearing provenance
+          #     by design, and the build engine does not bundle docs/ into the
+          #     plugin — same rationale as cycle/ and the other non-shipped surfaces)
+          #   README.md — documents seed-graph IDs that ARE in every install
+          #   CHANGELOG.md — historical record; scrub planned separately
+          #   this workflow file — contains the pattern literally
+          # IN scope (intentionally NOT excluded; flag if added to):
+          #   skills/, agents/, hooks/, integrations/, output-styles/,
+          #   templates/, SKILL.md, CLAUDE.md, USER_GUIDE.md, DEVELOPMENT.md,
+          #   server.py and engram_*.py modules, tools/ (most of it).
+          EXCLUDES=(
+            ':(exclude)tests/'
+            ':(exclude)src/forum/tests/'
+            ':(exclude)paper_draft/'
+            ':(exclude)active-work/'
+            ':(exclude)docs/cycle/'
+            ':(exclude)docs/handbook/'
+            ':(exclude)README.md'
+            ':(exclude)docs/CHANGELOG.md'
+            ':(exclude).github/workflows/pr-checks.yml'
+            # engram_ids.py is the schema-defining module for the node-ID regex.
+            # Its doctests must use ≥4-digit IDs (matching \d{4,}) to be correct.
+            # These are regex-illustration examples, not developer-graph citations.
+            ':(exclude)src/engram/engram_ids.py'
+            # engram_ids.py moved from root to src/engram/ in Phase 1 #1093;
+            # root compat symlink removed in Phase 4. Only the src/ path is tracked.
+            # ':(exclude)engram_ids.py' entry removed (dead after Phase 4).
+          )
+
+          # Capture lines ADDED in this PR (start with '+', skip diff headers
+          # which start with '+++') that contain a concrete node ID. The
+          # `|| true` swallows grep's exit 1 when nothing matches — the
+          # check's verdict comes from $VIOLATIONS being empty vs non-empty,
+          # not from grep's exit code (so an unmatched grep is a PASS, not
+          # a workflow failure).
+          DIFF=$(git diff --no-color "$BASE_REF...HEAD" -- "${EXCLUDES[@]}")
+          VIOLATIONS=$(echo "$DIFF" | grep -E "^\+[^+].*${PATTERN}" || true)
+
+          if [ -n "$VIOLATIONS" ]; then
+            echo "::error::New concrete ENGRAM node IDs introduced in alpha-released files."
+            echo ""
+            echo "Issue #51 policy (DEVELOPMENT.md §Shipped files): concrete node"
+            echo "IDs (regex: ${PATTERN}) reference the developer's graph, which"
+            echo "doesn't exist in any user's install. Substitute with concept"
+            echo "words; cite by claim, not by ID."
+            echo ""
+            echo "Lines added in this PR that trip the check:"
+            echo "$VIOLATIONS"
+            echo ""
+            echo "If a citation is load-bearing, rephrase to describe the"
+            echo "concept inline. If the file is legitimately allowlisted"
+            echo "(seed-graph docs, historical changelog, fixtures), extend"
+            echo "EXCLUDES in this workflow and explain why in the PR body."
+            exit 1
+          fi
+
+          echo "No new concrete node-ID references introduced. ✓"
+
+      # ── 3. pr-body-close-keyword ────────────────────────────────────────
+      # (from check-pr-body-close-keyword.yml)
+      # Issue #539 — structural enforcement of the project's PR-closure convention
+      # (CLAUDE.md "PR — issue closure"; #572). GitHub's auto-close parser fires on
+      # the PR BODY (not the title) and ignores negation, brackets, and backticks
+      # ("does NOT close #N" still auto-closes #N). The #572 convention therefore
+      # REQUIRES a legitimate `Closes #N.` in the body to fire auto-close for the
+      # title's own target — so a fail-ANY-keyword gate is wrong (it would block
+      # every correctly-closing PR). This gate is TRAP-DETECTION: it PASSES the
+      # legitimate target-close and FAILS only an OFF-TARGET body close-keyword
+      # (referencing #M != the title's [closes #N]) — the wrong-issue trap that hit
+      # PR #516 ("does NOT close #510") and PR #537.
+      # Spec: Borges #756 + Ariadne's review on #959; reconciles #539 with #572.
+      #
+      # Body-text grep is intentional: the GraphQL closingIssuesReferences field is
+      # dormant ([]) on non-default-base/stacked PRs and would pass them vacuously
+      # (verified on a stacked-PR review); the body regex works at creation time
+      # regardless of base.
+      - name: pr-body-close-keyword — fail on off-target close-keyword in the PR body
+        env:
+          # Title + body passed via env, NOT inline ${{ }} in run:, to avoid
+          # shell injection from author-controlled content.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # The title's intended close target(s): the [closes #N] / [close #N] /
+          # [closed #N] human-scan bracket form (GitHub's parser ignores it).
+          # A PR may legitimately close several issues, so collect a set.
+          TITLE_NS=$(printf '%s' "$PR_TITLE" \
+            | grep -ioE '\[clos[a-z]*[[:space:]]+#[0-9]+\]' \
+            | grep -oE '[0-9]+' | sort -u)
+
+          # Body close-keyword references (raw — the parser ignores negation /
+          # brackets / backticks, so we must too). Keywords: close/closes/closed,
+          # fix/fixes/fixed, resolve/resolves/resolved, each followed by #<number>.
+          BODY_MS=$(printf '%s' "$PR_BODY" \
+            | grep -ioE '(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]+#[0-9]+' \
+            | grep -oE '#[0-9]+' | tr -d '#' | sort -u)
+
+          if [ -z "$BODY_MS" ]; then
+            echo "No close-keyword references in the PR body. ✓"
+            exit 0
+          fi
+
+          # No title target → can't distinguish intended-close from trap.
+          # Per Borges #756: WARN, don't hard-fail — may be a partial/EPIC slice
+          # referencing an umbrella; the final PR in the series carries the title tag.
+          if [ -z "$TITLE_NS" ]; then
+            echo "::warning::PR body has close-keyword reference(s) [$(echo $BODY_MS | tr '\n' ' ')] but the title has no [closes #N] target."
+            echo "If this is the PR that should close an issue, add [closes #N] to the title AND keep 'Closes #N.' in the body (the body keyword fires GitHub's auto-close; the title bracket is human-scan only)."
+            echo "If it's a partial/EPIC slice that only references an umbrella issue, this is expected — warning only, not a failure."
+            exit 0
+          fi
+
+          # Title target(s) present → any body #M not in the title's target set
+          # is a TRAP. grep -vxF treats TITLE_NS as a newline-separated fixed-
+          # string set; -v -x keeps body M's matching NONE of the targets (the
+          # off-target traps). (A bare `for M in $BODY_MS` mis-splits the
+          # newline-separated list, so use set-difference grep instead.)
+          TRAPS=$(printf '%s\n' "$BODY_MS" | grep -vxF "$TITLE_NS" || true)
+
+          if [ -n "$TRAPS" ]; then
+            echo "::error::Off-target close-keyword in the PR body: $(printf '#%s ' $TRAPS) (the title's close target is $(printf '#%s ' $TITLE_NS))."
+            echo ""
+            echo "GitHub's auto-close parser ignores negation, brackets, and backticks, so a body close-keyword pointing at a NON-target issue auto-closes the WRONG issue on merge:"
+            echo "  \"this PR does NOT close #M\"          -> still auto-closes #M"
+            echo "  \"the scrub PR uses [closes #M]\"      -> still auto-closes #M"
+            echo ""
+            echo "The legitimate close for this PR's own target (the #N in the title's [closes #N]) passes — fix only the off-target reference(s). Paraphrase so no close-keyword precedes a non-target #number:"
+            echo "  instead of: \"does NOT close #M\"               use: \"#M stays open — this is a partial slice\""
+            echo "  instead of: \"the scrub PR uses [closes #M]\"   use: \"the scrub PR carries the close-tag for #M in its title\""
+            exit 1
+          fi
+
+          echo "Body close-keyword(s) all match the title's close target #$(echo $TITLE_NS | tr '\n' ' '). Legitimate. ✓"
+
+      # ── 4. name-leak-warn ──────────────────────────────────────────────
+      # (from name-leak-warn.yml)
+      # Warn-only gate: surface personal/agent name mentions newly added by a PR diff.
+      # Job always exits success — this is an advisory gate, not a merge blocker.
+      # The two scan/comment steps carry continue-on-error: true to preserve
+      # that advisory behavior inside this combined job.
+      #
+      # Activation: an org/repo admin must set the NAME_LEAK_ROSTER secret (one-time
+      # maintainer action). Until then the gate self-skips harmlessly. Fork PRs also
+      # self-skip (secrets are unavailable in fork contexts).
+      #
+      # NAME_LEAK_ROSTER format: newline-separated regex patterns, applied as-written.
+      # Authors encode their own word boundaries / case handling per pattern.
+      # Example:
+      #   \bAlice Example\b
+      #   \bagentname-nick\b
+      - name: name-leak-warn — check for name-leak roster secret
+        id: roster-check
+        run: |
+          if [ -z "$NAME_LEAK_ROSTER" ]; then
+            echo "NAME_LEAK_ROSTER not configured — name-leak warn-gate skipped" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          NAME_LEAK_ROSTER: ${{ secrets.NAME_LEAK_ROSTER }}
+
+      - name: name-leak-warn — compute diff and scan for name mentions
+        if: steps.roster-check.outputs.skip == 'false'
+        id: scan
+        continue-on-error: true
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr.diff
+
+          echo "$NAME_LEAK_ROSTER" > /tmp/roster.txt
+
+          python3 tools/name_leak_warn.py \
+            --roster-file /tmp/roster.txt \
+            --diff-file /tmp/pr.diff \
+            --format json > /tmp/scan_result.json
+
+          # Count matches
+          MATCH_COUNT=$(python3 -c "
+          import json, sys
+          data = json.load(open('/tmp/scan_result.json'))
+          print(len(data.get('matches', [])))
+          ")
+
+          echo "match_count=$MATCH_COUNT" >> "$GITHUB_OUTPUT"
+        env:
+          NAME_LEAK_ROSTER: ${{ secrets.NAME_LEAK_ROSTER }}
+
+      - name: name-leak-warn — post or update PR comment
+        if: steps.roster-check.outputs.skip == 'false'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MATCH_COUNT: ${{ steps.scan.outputs.match_count }}
+        run: |
+          MARKER="<!-- name-leak-warn -->"
+
+          # Find existing comment with our marker (upsert — no spam on re-push)
+          EXISTING_ID=$(gh api \
+            repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
+            --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" \
+            | head -1)
+
+          if [ "$MATCH_COUNT" -gt 0 ]; then
+            # Build comment body listing matches
+            MATCHES_TEXT=$(python3 -c "
+          import json
+          data = json.load(open('/tmp/scan_result.json'))
+          lines = []
+          for m in data.get('matches', []):
+              lines.append(f\"- \`{m['file']}:{m['line_number']}\` (pattern {m['pattern_index']}): \`{m['line'].strip()}\`\")
+          print('\n'.join(lines))
+          ")
+            BODY="${MARKER}
+          ### Name-leak warn-gate: ${MATCH_COUNT} match(es) found
+
+          The following added lines match the name-leak roster. These may be
+          valid citations or unintended leaks — please review each one and
+          decide whether to keep or scrub.
+
+          ${MATCHES_TEXT}
+
+          *This is an advisory comment only — it does not block merge.*"
+          else
+            BODY="${MARKER}
+          ### Name-leak warn-gate: no matches on current tip
+
+          No personal/agent name mentions found in the diff against \`${{ github.base_ref }}\`.
+
+          *This is an advisory comment only — it does not block merge.*"
+          fi
+
+          if [ -n "$EXISTING_ID" ]; then
+            # Update existing comment
+            gh api --method PATCH \
+              repos/${{ github.repository }}/issues/comments/${EXISTING_ID} \
+              -f body="$BODY"
+          else
+            # Create new comment
+            gh pr comment "$PR_NUMBER" --body "$BODY"
+          fi
+
+      # ── 5. invariant-checks ────────────────────────────────────────────
+      # (from invariant-checks.yml)
+      # Always-on whole-repo invariant gates: scan-leaks + frontmatter-lint.
+      #
+      # These are repo-level properties — not per-changed-file — so they must run
+      # on every dev PR regardless of what changed. The import-graph selection in
+      # affected-tests.yml cannot reliably cover them:
+      #
+      #   - scan-leaks reads the whole tree; a .md or .sh change that resolves to
+      #     non-scan-leaks tests silently skips the scan-leaks gate.
+      #   - test_skill_frontmatter_lint.py checks every skill; the skills/claude/
+      #     prefix in test-map.json is stale post-restructuring (#1421 note — the
+      #     actual path is src/engram/skills/claude/; the stale prefix is a follow-up
+      #     to fix in the test-map sweep, but the always-on gate here closes the gap
+      #     in the meantime).
+      #
+      # Two concrete regressions (2026-06-24, v0.1.3 merge wave — issue #1421):
+      #   #1382 (engram-dream-fairy.md): private dev-repo URL leaked into a shipped
+      #     file — scan-leaks never ran on the PR, would have blocked the v0.1.3
+      #     public cut (scan-leaks is the release gate).
+      #   #1391 (engram-health-exam SKILL.md): YAML-breaking colon in description —
+      #     frontmatter-lint wasn't selected for that PR; YAML error slipped through.
+      # Both were caught only because a later PR (#1418) had an unresolvable .sh file
+      # that triggered the full-suite fallback. That is luck, not a gate.
+      #
+      # Split rationale mirrors manifest-gate.yml: cheap stdlib+pytest gates run on
+      # every dev PR independently of the selective unit-test path in affected-tests.yml.
+      - name: Set up Python 3.11 (invariant-checks)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: invariant-checks — install deps (pytest + pyyaml for frontmatter-lint)
+        run: pip install pytest pyyaml
+
+      - name: invariant-checks — scan-leaks (whole-repo structural invariant)
+        # Runs the real-repo integration test: scans the checked-out tree for
+        # structural leak patterns (private dev-repo URLs, main-repo paths) with
+        # no local personal-name config (CI has none). Exit 1 = leak found.
+        run: python3 -m pytest tests/test_scan_leaks.py -q
+
+      - name: invariant-checks — frontmatter-lint (all skill SKILL.md frontmatters)
+        # Checks every src/engram/skills/claude/*/SKILL.md: delimiters present,
+        # yaml.safe_load parses, name + description fields non-empty, name
+        # matches directory. Fails on the first YAML-breaking colon or malformed
+        # frontmatter block.
+        run: python3 -m pytest tests/test_skill_frontmatter_lint.py -q
+
+      # ── 6. manifest-gate ───────────────────────────────────────────────
+      # (from manifest-gate.yml)
+      # Cheap tag-once tiering gate — runs on EVERY dev PR (and master PRs).
+      # This is the sub-second JSON+filesystem check that catches "forgot to
+      # tier a new skill/hook/agent" BEFORE it merges into dev.
+      #
+      # Split rationale (Lei 2026-06-01 CI-economics decision, documented in
+      # tests.yml header): the expensive full pytest matrix suite (~5min wall,
+      # py3.11/3.12) is master-only; cheap scrub gates run on every dev PR.
+      # test_tiers_manifest.py is a pure stdlib+pytest gate (0.02s); it runs
+      # here.  test_tier_sizes.py imports server.py which requires fastmcp and
+      # the full requirements-dev.txt stack — it stays in tests.yml (master-only
+      # matrix).  See tests.yml for the full-suite rationale.
+      - name: Set up Python 3.12 (manifest-gate)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: manifest-gate — install pytest
+        run: pip install pytest
+
+      - name: manifest-gate — run tag-once manifest gate
+        run: python3 -m pytest tests/test_tiers_manifest.py -q
+
+      - name: manifest-gate — run tiers↔test-map completeness check
+        # Asserts every tool tagged in tiers.json has a test-map.json entry
+        # (mapped or unmapped).  Pure stdlib + pytest — no heavy deps needed.
+        # Moved here from the master-only full suite (tests.yml) so missing
+        # entries are caught at dev-PR time rather than only at release-cut.
+        # See issue #1147.
+        run: python3 -m pytest tests/test_run_touched_tests.py::TestMappingCompleteness -q

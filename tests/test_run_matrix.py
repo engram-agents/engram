@@ -115,20 +115,41 @@ def test_pytest_targets_full_vs_selected_vs_empty():
 
 
 def test_compute_image_hash_deterministic_and_input_sensitive(tmp_path):
-    # build a tiny fake repo
+    # build a tiny fake repo with correct paths
     (tmp_path / "docker").mkdir()
     df = tmp_path / "docker" / "Dockerfile.full-default"
     df.write_text("FROM python:3.12\n")
-    (tmp_path / "packaging").mkdir()
-    (tmp_path / "packaging" / "tiers.json").write_text("{}")
-    (tmp_path / "requirements.txt").write_text("pytest\n")
+    (tmp_path / "src" / "build" / "packaging").mkdir(parents=True)
+    (tmp_path / "src" / "build" / "packaging" / "tiers.json").write_text("{}")
+    (tmp_path / "requirements").mkdir()
+    req = tmp_path / "requirements" / "requirements.txt"
+    req.write_text("pytest\n")
     env = rm.P0_ENVS[0]
     h1 = rm.compute_image_hash(env, str(tmp_path))
     h2 = rm.compute_image_hash(env, str(tmp_path))
     assert h1 == h2  # deterministic
     df.write_text("FROM python:3.12\nRUN echo changed\n")
     h3 = rm.compute_image_hash(env, str(tmp_path))
-    assert h3 != h1  # input change invalidates
+    assert h3 != h1  # Dockerfile change invalidates
+    (tmp_path / "src" / "build" / "packaging" / "tiers.json").write_text('{"changed": true}')
+    h4 = rm.compute_image_hash(env, str(tmp_path))
+    assert h4 != h3  # tiers.json change also invalidates
+    req.write_text("pytest\nnumpy\n")
+    h5 = rm.compute_image_hash(env, str(tmp_path))
+    assert h5 != h4  # requirements change also invalidates
+
+
+def test_compute_image_hash_warns_on_missing_input(tmp_path):
+    import warnings
+    # repo with no Dockerfile — should warn, not silently hash <absent>
+    (tmp_path / "src" / "build" / "packaging").mkdir(parents=True)
+    (tmp_path / "src" / "build" / "packaging" / "tiers.json").write_text("{}")
+    env = rm.P0_ENVS[0]
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        rm.compute_image_hash(env, str(tmp_path))
+    missing_warns = [x for x in w if "freshness input missing" in str(x.message)]
+    assert missing_warns, "expected a warning for the missing Dockerfile"
 
 
 def test_parse_pytest_counts():

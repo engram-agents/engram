@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from collections import defaultdict as _ddict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 import engram_core as core
@@ -1215,6 +1217,65 @@ def _diagnose_impl() -> str:
         calibration_weight = 0  # noqa: F841
 
         metrics["calibration"] = calibration
+
+        # ── Cornerstone Coverage (cross-surface) ─────────────────────────
+        # For #931: flag active cornerstones with no delivery channel among
+        # the auto-load surfaces (warm-briefing.md, CLAUDE.md).  A cornerstone
+        # that isn't anchored in at least one surface has effectively zero
+        # recall — detected here rather than by waiting for a dream-fairy miss.
+        #
+        # Coverage criterion: the cornerstone's ID (e.g. "cs_XXXX") appears in
+        # warm-briefing.md (primary channel) OR in CLAUDE.md.  The ID check is
+        # strict and cheap; tag-name matching is added for CLAUDE.md because
+        # that file describes concepts by label without cs_ identifiers.
+        try:
+            cs_rows = conn.execute(
+                "SELECT id, claim, json_extract(metadata, '$.tag') AS tag"
+                " FROM nodes WHERE type='cornerstone' AND is_current=1"
+                " ORDER BY id"
+            ).fetchall()
+
+            wb_path = core.DATA_DIR / "warm-briefing.md"
+            claude_md_path = Path.home() / ".claude" / "CLAUDE.md"
+
+            wb_text = wb_path.read_text(errors="replace") if wb_path.exists() else ""
+            claude_text = (
+                claude_md_path.read_text(errors="replace")
+                if claude_md_path.exists()
+                else ""
+            )
+
+            surfaces_checked = []
+            if wb_path.exists():
+                surfaces_checked.append("warm-briefing.md")
+            if claude_md_path.exists():
+                surfaces_checked.append("CLAUDE.md")
+
+            covered_list: list[dict] = []
+            uncovered_list: list[dict] = []
+            for row in cs_rows:
+                cs_id: str = row["id"]
+                tag: str = row["tag"] or ""
+                title: str = (row["claim"] or "")[:80]
+                in_wb = cs_id in wb_text
+                in_claude = cs_id in claude_text or (
+                    tag and bool(re.search(r"\b" + re.escape(tag) + r"\b", claude_text))
+                )
+                entry = {"id": cs_id, "tag": tag, "title": title}
+                if in_wb or in_claude:
+                    covered_list.append(entry)
+                else:
+                    uncovered_list.append(entry)
+
+            metrics["cornerstone_coverage"] = {
+                "total": len(cs_rows),
+                "covered": len(covered_list),
+                "uncovered": len(uncovered_list),
+                "uncovered_list": uncovered_list,
+                "surfaces_checked": surfaces_checked,
+            }
+        except Exception:
+            metrics["cornerstone_coverage"] = {"error": "cornerstone coverage check failed"}
 
         # ── Health Score (0-100) ─────────────────────────────────────────
         # Single source of truth: the shared helper (charter §6 fold). The

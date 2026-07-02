@@ -157,14 +157,15 @@ def pytest_targets(selection: dict) -> list[str]:
 def _freshness_inputs(env: EnvSpec, repo_root: str) -> list[str]:
     """Files whose change should invalidate a prebuilt image, in stable order."""
     root = Path(repo_root)
-    inputs = [env.dockerfile, "packaging/tiers.json"]
-    inputs += sorted(str(p.relative_to(root)) for p in root.glob("requirements*.txt"))
+    inputs = [env.dockerfile, "src/build/packaging/tiers.json"]
+    inputs += sorted(str(p.relative_to(root)) for p in root.glob("requirements/requirements*.txt"))
     return inputs
 
 
 def compute_image_hash(env: EnvSpec, repo_root: str) -> str:
     """sha256 over the freshness inputs' contents (missing files contribute their
     absence, so deleting an input also invalidates). Deterministic + pure."""
+    import warnings
     h = hashlib.sha256()
     for rel in _freshness_inputs(env, repo_root):
         p = Path(repo_root) / rel
@@ -173,6 +174,11 @@ def compute_image_hash(env: EnvSpec, repo_root: str) -> str:
         if p.is_file():
             h.update(p.read_bytes())
         else:
+            warnings.warn(
+                f"run_matrix: freshness input missing — {rel!r} not found under {repo_root!r}; "
+                "image-staleness detection for this input is degraded",
+                stacklevel=2,
+            )
             h.update(b"<absent>")
         h.update(b"\0")
     return h.hexdigest()

@@ -11,8 +11,9 @@ Tests cover:
 7. author-diverse/collection-uniform → ⚠ uniform caught on collection axis (v2 key test)
 8. Single-axis premises: author-only reports author axis, omits collection
 9. Mixed-axis premises: partial axis omitted (all-or-omit rule)
-10. Single-premise derivation triggers STANDPOINT + FALSIFICATION (n >= 1 gate, #958)
-11. Single-premise chain: ⚠⚠ fires when lineage-uniform and zero verified leaves
+10. Mixed-axis fully partial: all axes partial → "partially unchecked" notice emitted
+11. Single-premise derivation triggers STANDPOINT + FALSIFICATION (n >= 1 gate, #958)
+12. Single-premise chain: ⚠⚠ fires when lineage-uniform and zero verified leaves
 """
 
 import atexit
@@ -788,6 +789,80 @@ def test_standpoint_architecture_partial_data_omit():
 
 
 # ---------------------------------------------------------------------------
+# Test 16: Mixed-axis fully-partial — all axes partial → "partially unchecked"
+# ---------------------------------------------------------------------------
+
+def test_mixed_axis_fully_partial_unchecked_notice():
+    """When every axis has partial coverage (no axis has data on all premises),
+    the inner guard `if parts:` is False — the new else clause must emit
+    'STANDPOINT: partially unchecked (mixed-axis coverage ...)' instead of silence.
+
+    Setup:
+    - Leaf 1: author_id set, collection_id NOT set
+    - Leaf 2: author_id NOT set, collection_id set
+
+    Result: both axis_keys dicts are non-None (so the outer all-non-None gate
+    passes), but for each axis, one leaf has None → _axis_label returns None →
+    neither author nor collection label is emitted → parts is empty → the new
+    else clause fires.
+    """
+    client = fresh_client()
+
+    r1 = client.call("engram_add_observation", {
+        "url": "https://source-mixed-1.com/article",
+        "title": "Source 1 — author only, no collection",
+        "quoted_text": "Phenomenon P occurs at rate 30%.",
+        "interpretation": "Rate measurement from author-attributed source.",
+        "claim": "Rate of P is 30%",
+        "quote_type": "hard_data",
+        "standpoint_author_id": "researcher_alpha",
+        # No standpoint_collection_id — leaf 1 has author, no collection
+    })
+    assert r1.get("status") == "created", f"r1 failed: {r1}"
+
+    r2 = client.call("engram_add_observation", {
+        "url": "https://source-mixed-2.com/article",
+        "title": "Source 2 — collection only, no author",
+        "quoted_text": "Phenomenon P occurs at rate 32%.",
+        "interpretation": "Rate measurement from collection-attributed source.",
+        "claim": "Rate of P is 32%",
+        "quote_type": "hard_data",
+        # No standpoint_author_id — leaf 2 has collection, no author
+        "standpoint_collection_id": "corpus_beta",
+    })
+    assert r2.get("status") == "created", f"r2 failed: {r2}"
+
+    dv = client.call("engram_derive", {
+        "claim": "Rate of P is approximately 30-32%",
+        "supporting_ids": f"{r1['observation_id']},{r2['observation_id']}",
+        "logical_chain": "Two independent measurements of P are similar",
+        "reasoning_type": "inductive_generalization",
+    })
+    assert dv.get("status") == "created", f"Derive failed: {dv}"
+    warnings = dv.get("structure_warnings", [])
+    standpoint_warns = [w for w in warnings if "STANDPOINT" in w]
+
+    # Must emit a partially-unchecked notice (not silence)
+    assert len(standpoint_warns) >= 1, (
+        f"Expected a STANDPOINT warning (partially unchecked), got none. All warnings: {warnings}"
+    )
+    assert any("partially unchecked" in w for w in standpoint_warns), (
+        f"Expected 'partially unchecked' in STANDPOINT warning. Got: {standpoint_warns}"
+    )
+    assert any("mixed-axis" in w for w in standpoint_warns), (
+        f"Expected 'mixed-axis' in STANDPOINT warning. Got: {standpoint_warns}"
+    )
+    # Must NOT emit per-axis labels (all axes are partial)
+    assert not any("author:" in w for w in standpoint_warns), (
+        f"Expected no 'author:' label when axis is partial. Got: {standpoint_warns}"
+    )
+    assert not any("collection:" in w for w in standpoint_warns), (
+        f"Expected no 'collection:' label when axis is partial. Got: {standpoint_warns}"
+    )
+    print(f"  PASS: Fully-partial mixed-axis → 'partially unchecked' notice: {standpoint_warns[0][:100]}")
+
+
+# ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
 
@@ -809,6 +884,7 @@ if __name__ == "__main__":
         test_standpoint_architecture_uniform_warning,
         test_standpoint_architecture_diverse_no_warning,
         test_standpoint_architecture_partial_data_omit,
+        test_mixed_axis_fully_partial_unchecked_notice,
     ]
 
     print(f"\nRunning {len(tests)} standpoint field tests...\n")

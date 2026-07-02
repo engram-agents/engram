@@ -1,5 +1,8 @@
 name: affected-tests
 
+# Moved off per-PR CI (#1597) — run affected-tests locally as a review
+# requirement; the full suite (tests.yml) runs on the dev→master release PR.
+#
 # Import-graph selective pytest on every dev PR.
 # Runs only the tests affected by the PR's changed files via
 # src/engram/tools/run_touched_tests.py (Layer 1: static import graph;
@@ -17,8 +20,7 @@ name: affected-tests
 # dev-PR coverage. A SyntaxError in a hook (#1347 → #1356) merged to dev
 # green because no tests ran on dev PRs. This workflow closes that gap.
 on:
-  pull_request:
-    branches: [dev]
+  workflow_dispatch:
 
 jobs:
   affected-tests:

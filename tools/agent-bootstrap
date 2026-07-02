@@ -6,7 +6,7 @@
 # Substrate role: this script does the kernel-isolation bits only — uid +
 # group + home perms + community-dir membership + a runtime-specific
 # `~/.runtime/start.sh` adapter. Runtime-level install (engram-alpha clone,
-# `bash install.sh` to wire ENGRAM data + cron + hooks, OAuth login) is
+# `bash install-local-marketplace.sh` to wire ENGRAM data + cron + hooks, OAuth login) is
 # deferred to a separate step the user runs from inside the new agent's
 # shell, so this script stays minimal and substrate-stable.
 #
@@ -38,7 +38,7 @@
 #   --alpha-source path to an engram-alpha checkout that the newborn's
 #                  ~/.runtime/install.sh will reference. Default:
 #                  $ENGRAM_ALPHA_SOURCE if set, else /home/agents-shared/engram-alpha if it exists, else empty (pass --alpha-source). Used only to render the
-#                  install.sh path inside the wrapper; the script itself
+#                  install-local-marketplace.sh path inside the wrapper; the script itself
 #                  does NOT clone alpha — that's left for an explicit user
 #                  action inside the newborn shell.
 #
@@ -159,12 +159,11 @@ chmod 0755 "$USER_HOME/.runtime/start.sh"
 # ---------- 4. ~/.runtime/install.sh wrapper (chains to alpha) ----------
 # Thin wrapper so the user inside the newborn shell can run a single
 # command (`bash ~/.runtime/install.sh`) instead of memorising the alpha
-# checkout location. The wrapper just exec's alpha's install.sh, which
-# now also wires cron via Step 8 (per the engram-config-surface epic).
+# checkout location. The wrapper exec's alpha's install-local-marketplace.sh.
 if [[ -n "$ALPHA_SOURCE" ]]; then
     cat >"$USER_HOME/.runtime/install.sh" <<INSTALL_WRAPPER
 #!/bin/bash
-# Wrapper: chain to engram-alpha's install.sh.
+# Wrapper: chain to engram-alpha's install-local-marketplace.sh.
 # Substitute ALPHA_SOURCE by editing this file or via the env var.
 ALPHA_SOURCE="\${ALPHA_SOURCE:-$ALPHA_SOURCE}"
 if [[ ! -d "\$ALPHA_SOURCE" ]]; then
@@ -172,10 +171,7 @@ if [[ ! -d "\$ALPHA_SOURCE" ]]; then
     echo "       Set ALPHA_SOURCE=/path/to/engram-alpha and re-run." >&2
     exit 1
 fi
-# v0.1: claude runtime only. The top-level --runtime validation in
-# agent-bootstrap rejects non-claude values, so this wrapper always
-# chains to install.sh. Multi-runtime support is forthcoming.
-INSTALLER="install.sh"
+INSTALLER="tools/install-local-marketplace.sh"
 [[ -f "\$ALPHA_SOURCE/\$INSTALLER" ]] || { echo "ERROR: installer not found at \$ALPHA_SOURCE/\$INSTALLER" >&2; exit 1; }
 exec bash "\$ALPHA_SOURCE/\$INSTALLER" "\$@"
 INSTALL_WRAPPER
@@ -246,8 +242,8 @@ venv_block = (
 )
 # Insert before the `INSTALLER=` line.
 new = txt.replace(
-    'INSTALLER="install.sh"',
-    venv_block + 'INSTALLER="install.sh"',
+    'INSTALLER="tools/install-local-marketplace.sh"',
+    venv_block + 'INSTALLER="tools/install-local-marketplace.sh"',
 )
 if new == txt:
     sys.exit('ERROR: venv patch anchor not found in install.sh — patch aborted (Section 4 of agent-bootstrap may have changed without updating Section 4.5 anchor)')

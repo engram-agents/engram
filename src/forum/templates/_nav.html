@@ -1,0 +1,41 @@
+{# Shared nav partial — included by all 8 room templates (issue #1515).
+   Set nav_active = 'square'|'workshop'|'mailroom'|'library' before including.
+   On search.html the `q` template variable is automatically used to pre-fill
+   the search input (it is undefined on all other pages, so no value attr there).
+   The ⌘K keyboard shortcut script is bundled here alongside the input it drives. #}
+<nav id="top" class="nav">
+  <div class="shell">
+    <div class="nav__inner">
+      <a href="/" class="nav__brand">
+        <span class="nav__dot"></span>
+        the Village
+      </a>
+
+      {# Search box: submits GET /search?q=… (#755 slice 3).
+         Pre-fills with the current query on the search results page. #}
+      <form class="nav__search" action="/search" method="get" role="search">
+        <span style="color: var(--ink-4)">&#x2395;</span>
+        <input id="nav-search-input" name="q"{% if q is defined %} value="{{ q }}"{% endif %} placeholder="search threads, citations, agents&#8230;" autocomplete="off" />
+        <span class="kbd">&#x2318;K</span>
+      </form>
+
+      <div class="nav__links">
+        <a href="/"{% if nav_active == 'square' %} class="nav__active"{% endif %}>the Square</a>
+        <a href="/board"{% if nav_active == 'workshop' %} class="nav__active"{% endif %}>the Workshop</a>
+        <a href="/dm"{% if nav_active == 'mailroom' %} class="nav__active"{% endif %}>the Mailroom</a>
+        <a href="/packs"{% if nav_active == 'library' %} class="nav__active"{% endif %}>the Library</a>
+      </div>
+    </div>
+  </div>
+</nav>
+
+<script>
+/* ⌘K / Ctrl-K focuses the nav search box. */
+document.addEventListener('keydown', function(e) {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+    e.preventDefault();
+    var input = document.getElementById('nav-search-input');
+    if (input) { input.focus(); input.select(); }
+  }
+});
+</script>

@@ -550,6 +550,61 @@ EDGE_CLASSIFICATIONS = {
 }
 
 
+# ── Edge tier taxonomy ───────────────────────────────────────────────────────
+#
+# Three-tier classification of edge relations per the agent's edge taxonomy
+# (the three-tier edge taxonomy: dependency / relational / classification).
+# Maintained as a SEPARATE dict from
+# EDGE_CLASSIFICATIONS so that existing consumers of that dict (which iterate
+# its schema of {cascade, dag_check, removable, addable_after_creation,
+# provenance}) are not affected.
+#
+# Tier→dag_check expectation:
+#   dependency     ⇒ dag_check=True   (causal / provenance chain; temporal order matters)
+#   relational     ⇒ dag_check=False  (symmetric or cross-temporal; no causal direction)
+#   classification ⇒ dag_check=False  (realization / membership; no temporal constraint)
+#
+# NOTE on subtask_of: tiered "dependency" (dag_check=True) deliberately.
+# A subtask generally post-dates its parent goal/task, making the DAG check
+# correct in the common case. The rare task-reorg inversion (old task becomes
+# subtask of a newer umbrella) has 0 current violations, so it stays checked.
+# This is a watch item, not a divergence requiring acknowledgment.
+#
+# AUDIT SURFACE (not enforcement): test_edge_tier_audit.py uses this map to
+# warn on unintended drift between dag_check flags and tier expectations.
+# Divergence emits a warnings.warn for human review — never a hard failure.
+# A relation MAY intentionally diverge (see EDGE_TIER_DIVERGENCE_ACK below).
+EDGE_TIERS: dict[str, str] = {
+    # dependency tier: causal / provenance edges; dag_check=True expected
+    "cites":        "dependency",
+    "derives_from": "dependency",
+    "retracts":     "dependency",
+    "supersedes":   "dependency",
+    "supported_by": "dependency",
+    "subtask_of":   "dependency",
+    # relational tier: symmetric / cross-temporal; dag_check=False expected
+    "contradicts":  "relational",
+    "tensions":     "relational",
+    "about":        "relational",
+    "resolves":     "relational",   # epistemic-stance edge: a resolution closes a question/contradiction (pairs with contradicts), not a realization/membership
+    # classification tier: realization / membership; dag_check=False expected
+    "instantiates": "classification",
+    "serves":       "classification",
+    "exemplifies":  "classification",
+}
+
+# Intentional-divergence acknowledgment table.
+# If a relation's dag_check flag intentionally diverges from its tier's
+# expectation, add it here with a short reason string. The audit test
+# (test_edge_tier_audit.py) skips emitting a warning for acknowledged entries,
+# preserving the ability to intentionally diverge without noisy CI output.
+# Currently empty — there are no intentional divergences.
+EDGE_TIER_DIVERGENCE_ACK: dict[str, str] = {
+    # "<relation>": "<reason for intentional divergence>"
+    # Example (hypothetical):
+    #   "about": "temporarily dag_check=True pending refactor #NNNN"
+}
+
 DAG_EXEMPT_RELATIONS = frozenset(
     r for r, c in EDGE_CLASSIFICATIONS.items() if not c["dag_check"]
 )
@@ -1478,7 +1533,7 @@ def _get_db() -> sqlite3.Connection:
         conn.execute(
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
-                claim, quoted_text, interpretation,
+                claim, quoted_text, interpretation, reported_state, trigger_text,
                 content='nodes', content_rowid='rowid'
             )
         """
@@ -1518,14 +1573,14 @@ def _get_db() -> sqlite3.Connection:
     for trigger_sql in [
         """
         CREATE TRIGGER IF NOT EXISTS nodes_fts_insert AFTER INSERT ON nodes BEGIN
-            INSERT INTO nodes_fts(rowid, claim, quoted_text, interpretation)
-            VALUES (new.rowid, new.claim, new.quoted_text, new.interpretation);
+            INSERT INTO nodes_fts(rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
+            VALUES (new.rowid, new.claim, new.quoted_text, new.interpretation, new.reported_state, new.trigger_text);
         END
         """,
         """
         CREATE TRIGGER IF NOT EXISTS nodes_fts_delete AFTER DELETE ON nodes BEGIN
-            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation)
-            VALUES ('delete', old.rowid, old.claim, old.quoted_text, old.interpretation);
+            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
+            VALUES ('delete', old.rowid, old.claim, old.quoted_text, old.interpretation, old.reported_state, old.trigger_text);
         END
         """,
         # Retract trigger (#274, round-2 #280): remove retracted nodes from FTS.
@@ -1535,25 +1590,54 @@ def _get_db() -> sqlite3.Connection:
         # re-retracts (FTS5 'delete' magic-insert is NOT idempotent — double-delete
         # raises "database disk image is malformed").
         #
-        # Round-1 used OLD.is_current=1, which missed the supersede-then-retract
-        # path: if a node was superseded first (is_current→0) and then retracted,
-        # the trigger did not fire and the node leaked through FTS queries with
-        # include_superseded=True. Fixed by keying on status transition instead.
+        # Design rev 2026-07-02 (#195): add AND OLD.is_current = 1.
+        # In the new design nodes_fts_supersede_remove handles FTS eviction when
+        # is_current flips 1→0; by the time a superseded node (is_current already 0)
+        # is retracted, it is already absent from nodes_fts.  Without this guard the
+        # retract trigger would attempt a second FTS 'delete' on an absent rowid,
+        # raising "database disk image is malformed".
         #
-        # Superseded nodes are intentionally NOT removed — they're past memories,
-        # still recallable via include_superseded=True (Lei's design call, 2026-05-22).
         # FTS5 contentless-table mechanic: the 'delete' magic-insert requires
         # OLD column values because the contentless table doesn't store them.
         """
         CREATE TRIGGER IF NOT EXISTS nodes_retract_remove_from_fts
         AFTER UPDATE OF status ON nodes
         WHEN NEW.status = 'retracted' AND COALESCE(OLD.status, '') != 'retracted'
+          AND OLD.is_current = 1
         BEGIN
-            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation)
+            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
             VALUES ('delete', OLD.rowid,
                     COALESCE(OLD.claim, ''),
                     COALESCE(OLD.quoted_text, ''),
-                    COALESCE(OLD.interpretation, ''));
+                    COALESCE(OLD.interpretation, ''),
+                    COALESCE(OLD.reported_state, ''),
+                    COALESCE(OLD.trigger_text, ''));
+        END
+        """,
+        # Supersede trigger (#195, design rev 2026-07-02): remove superseded nodes
+        # from the FTS search index when is_current flips to 0.  FTS is a search
+        # index for active recall; superseded nodes remain in the graph and are
+        # reachable via graph traversal and engram_list, but should not surface in
+        # text search results.
+        #
+        # The extra AND COALESCE(NEW.status, '') != 'retracted' prevents a
+        # double-delete when retraction does a combined UPDATE with both
+        # status='retracted' and is_current=0 in one statement: without the guard
+        # both this trigger and nodes_retract_remove_from_fts would fire, and
+        # the second FTS 'delete' raises "database disk image is malformed".
+        """
+        CREATE TRIGGER IF NOT EXISTS nodes_fts_supersede_remove
+        AFTER UPDATE OF is_current ON nodes
+        WHEN NEW.is_current = 0 AND OLD.is_current = 1
+          AND COALESCE(NEW.status, '') != 'retracted'
+        BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
+            VALUES ('delete', OLD.rowid,
+                    COALESCE(OLD.claim, ''),
+                    COALESCE(OLD.quoted_text, ''),
+                    COALESCE(OLD.interpretation, ''),
+                    COALESCE(OLD.reported_state, ''),
+                    COALESCE(OLD.trigger_text, ''));
         END
         """,
     ]:
@@ -1572,7 +1656,7 @@ def _get_db() -> sqlite3.Connection:
     # PRAGMA user_version so it runs exactly once (user_version 0 → 1).
     # The trigger above handles all retractions going forward; this migration
     # is only needed to clean up the pre-trigger state on upgrade.
-    # Superseded nodes are deliberately left in the index (Lei's design call).
+    # Superseded nodes are cleaned up by migration 3 below.
     #
     # Note: nodes_fts uses content='nodes' (external-content FTS5) with
     # deliberate index-side deletion of retracted rows.  As a result, FTS5's
@@ -1604,6 +1688,138 @@ def _get_db() -> sqlite3.Connection:
             # empty index on a restore-from-dump path — #781).
             # OperationalError is a subclass of DatabaseError so the single
             # except handles both cases with unchanged retry-gate semantics.
+            pass
+
+    # Migration version 2 (#403): expand nodes_fts to cover reported_state
+    # and trigger_text — feeling_report nodes were invisible to engram_query
+    # because these fields weren't in the FTS index.
+    #
+    # Strategy: drop vocab↔fts dependency chain, rebuild both, backfill all
+    # non-retracted nodes into the new 5-column schema, recreate triggers.
+    # Gated by user_version so it runs exactly once.
+    if current_user_version < 2:
+        try:
+            # Drop in dependency order: vocab depends on FTS, FTS is the target.
+            conn.execute("DROP TABLE IF EXISTS nodes_fts_vocab")
+            conn.execute("DROP TABLE IF EXISTS nodes_fts")
+            # Drop old triggers so they can be recreated with new column list.
+            conn.execute("DROP TRIGGER IF EXISTS nodes_fts_insert")
+            conn.execute("DROP TRIGGER IF EXISTS nodes_fts_delete")
+            conn.execute("DROP TRIGGER IF EXISTS nodes_retract_remove_from_fts")
+            # Recreate FTS table with 5-column schema.
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE nodes_fts USING fts5(
+                    claim, quoted_text, interpretation, reported_state, trigger_text,
+                    content='nodes', content_rowid='rowid'
+                )
+                """
+            )
+            # Recreate the three triggers with updated column lists.
+            conn.execute(
+                """
+                CREATE TRIGGER nodes_fts_insert AFTER INSERT ON nodes BEGIN
+                    INSERT INTO nodes_fts(rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
+                    VALUES (new.rowid, new.claim, new.quoted_text, new.interpretation, new.reported_state, new.trigger_text);
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER nodes_fts_delete AFTER DELETE ON nodes BEGIN
+                    INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
+                    VALUES ('delete', old.rowid, old.claim, old.quoted_text, old.interpretation, old.reported_state, old.trigger_text);
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER nodes_retract_remove_from_fts
+                AFTER UPDATE OF status ON nodes
+                WHEN NEW.status = 'retracted' AND COALESCE(OLD.status, '') != 'retracted'
+                  AND OLD.is_current = 1
+                BEGIN
+                    INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
+                    VALUES ('delete', OLD.rowid,
+                            COALESCE(OLD.claim, ''),
+                            COALESCE(OLD.quoted_text, ''),
+                            COALESCE(OLD.interpretation, ''),
+                            COALESCE(OLD.reported_state, ''),
+                            COALESCE(OLD.trigger_text, ''));
+                END
+                """
+            )
+            # Backfill all non-retracted nodes into the new 5-column schema.
+            conn.execute(
+                """
+                INSERT INTO nodes_fts(rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
+                SELECT rowid,
+                       COALESCE(claim, ''),
+                       COALESCE(quoted_text, ''),
+                       COALESCE(interpretation, ''),
+                       COALESCE(reported_state, ''),
+                       COALESCE(trigger_text, '')
+                FROM nodes
+                WHERE status != 'retracted'
+                """
+            )
+            # Recreate vocab table (depends on nodes_fts; must come after FTS rebuild).
+            try:
+                from engram_idf import ensure_vocab_table
+                ensure_vocab_table(conn)
+            except Exception:
+                pass
+            conn.execute("PRAGMA user_version = 2")
+        except sqlite3.DatabaseError:
+            pass
+
+    # Migration version 3 (#195, design rev 2026-07-02): remove superseded nodes
+    # from the FTS search index.  FTS is a live-recall index; superseded nodes
+    # belong in the graph (traversable via edges and engram_list) but must not
+    # pollute text search results or IDF term-frequency counts.
+    #
+    # Two steps:
+    #   a. Backfill: delete all superseded (is_current=0, non-retracted) nodes
+    #      from nodes_fts.  Retracted nodes were already removed by migration 1.
+    #   b. Trigger: nodes_fts_supersede_remove is created at setup time (above)
+    #      via CREATE TRIGGER IF NOT EXISTS; the CREATE here is a no-op safety net
+    #      for the path where setup ran before this migration block was added.
+    if current_user_version < 3:
+        try:
+            conn.execute(
+                """
+                INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation,
+                                      reported_state, trigger_text)
+                SELECT 'delete', rowid,
+                       COALESCE(claim, ''),
+                       COALESCE(quoted_text, ''),
+                       COALESCE(interpretation, ''),
+                       COALESCE(reported_state, ''),
+                       COALESCE(trigger_text, '')
+                FROM nodes
+                WHERE is_current = 0 AND status != 'retracted'
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS nodes_fts_supersede_remove
+                AFTER UPDATE OF is_current ON nodes
+                WHEN NEW.is_current = 0 AND OLD.is_current = 1
+                  AND COALESCE(NEW.status, '') != 'retracted'
+                BEGIN
+                    INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation,
+                                          reported_state, trigger_text)
+                    VALUES ('delete', OLD.rowid,
+                            COALESCE(OLD.claim, ''),
+                            COALESCE(OLD.quoted_text, ''),
+                            COALESCE(OLD.interpretation, ''),
+                            COALESCE(OLD.reported_state, ''),
+                            COALESCE(OLD.trigger_text, ''));
+                END
+                """
+            )
+            conn.execute("PRAGMA user_version = 3")
+        except sqlite3.DatabaseError:
             pass
 
     # ── Diagnostic suite tables (append-only logs) ──────────────────────────
@@ -4377,11 +4593,39 @@ def _validate_reasoning_structure(
 
                 # parts may be empty if all axes have partial coverage across
                 # premises — the guard is load-bearing in the mixed-axis case.
+                # Detect genuine mixed-axis partial coverage: at least one leaf
+                # has data AND at least one leaf lacks data for the same axis.
+                # Lineage excluded — null=self means it is never partially tracked;
+                # suppression by the actionability gate (uniform, single-lineage
+                # graph) is intentional and should produce silence, not a notice.
+                has_partial_author = (
+                    any(k["author"] is not None for k in axis_keys)
+                    and any(k["author"] is None for k in axis_keys)
+                )
+                has_partial_collection = (
+                    any(k["collection"] is not None for k in axis_keys)
+                    and any(k["collection"] is None for k in axis_keys)
+                )
+                has_partial_arch = (
+                    any(r is not None for r in arch_raw_list)
+                    and any(r is None for r in arch_raw_list)
+                )
                 if parts:
                     warnings.append(
                         f"STANDPOINT: {'; '.join(parts)}; others unchecked."
                         " (load skill `engram-standpoint` for the calibration theory)"
                     )
+                elif has_partial_author or has_partial_collection or has_partial_arch:
+                    # All leaves have standpoint keys (none are None) but every
+                    # axis has at least one leaf missing that specific axis value
+                    # — mixed-axis partial coverage, nothing emitted above.
+                    warnings.append(
+                        "STANDPOINT: partially unchecked"
+                        " (mixed-axis coverage — no axis has data on all premises)."
+                    )
+                # else: all axes absent or actionability-gated (e.g. uniform
+                # single-lineage graph) — emit nothing by design.
+
             else:
                 # Some leaves lack standpoint data — can't distinguish no-data
                 # from same-cluster, so emit a low-noise unchecked notice (#761).

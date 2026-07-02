@@ -1,4 +1,4 @@
-"""Regression tests for engram_query(include_superseded=True) — issue #191.
+"""Regression tests for engram_query(include_superseded=True) — issues #191, #195.
 
 Background (#191):
     The original bug was that engram_query(include_superseded=True) honored the
@@ -25,18 +25,32 @@ Fixed in #274 (retracted-node FTS leak):
     absent from the FTS index and never appear in results regardless of the flag.
     Test 2 below is updated to assert the corrected behavior.
 
+Design revision (PR #1585, closes #195):
+    The nodes_fts_supersede_remove trigger removes superseded nodes from the
+    FTS index when is_current flips to 0.  This eliminates the df > n_docs
+    mismatch that caused negative IDF scores, and removes the need for the
+    include_superseded parameter in idf() / extract_keywords().
+
+    Behaviorally, this means superseded nodes no longer surface via FTS
+    regardless of include_superseded=True.  Superseded nodes remain in the
+    graph and are reachable via graph traversal (engram_list, edge walks).
+    FTS is a live-recall index, not a history index.
+
+    Tests 1 and 4 below are updated to reflect this: include_superseded=True
+    no longer surfaces superseded nodes via FTS.
+
 Coverage (one item per test function):
-    1. test_query_include_superseded_fts_path — core #191 regression:
-       - include_superseded=False excludes superseded nodes from FTS hits.
-       - include_superseded=True includes them via FTS path.
-       - Current (non-superseded) replacement node surfaces in both modes.
+    1. test_query_include_superseded_fts_path — FTS behavior post-#1585:
+       - include_superseded=False: only current node D surfaces.
+       - include_superseded=True: still only current node D; superseded node B
+         was removed from the FTS index by the trigger at supersede time.
     2. test_query_retracted_behavior_with_include_superseded_flag — #274 fix:
        - Retracted nodes do NOT surface with include_superseded=True (trigger
          removes them from nodes_fts at retraction time).
     3. test_query_include_superseded_false_default_excludes_superseded — sanity
        baseline: default call (no flag) excludes superseded, includes current.
     4. test_query_include_superseded_multiple_superseded_nodes — multiple
-       superseded nodes in one query all surface with flag=True.
+       superseded nodes: none surface via FTS (trigger removed them all).
     5. test_query_include_superseded_semantic_path — semantic-side regression
        for issue #273: _semantic_search honors include_superseded + always
        excludes retracted. Calls _semantic_search directly (slow path) with a
@@ -120,18 +134,22 @@ def _query_ids(qry, query: str, include_superseded: bool = False, top_k: int = 2
 
 
 # ---------------------------------------------------------------------------
-# Test 1: include_superseded=True surfaces superseded nodes via FTS path
+# Test 1: FTS path behavior post-#1585 (supersede trigger removes from index)
 # ---------------------------------------------------------------------------
 
 def test_query_include_superseded_fts_path():
-    """FTS path: superseded node appears with flag=True, absent with flag=False.
+    """FTS path: superseded node no longer surfaces regardless of include_superseded.
 
-    This is the core regression test for #191 (FTS side). A node B is superseded
-    by D. With include_superseded=False, only D surfaces. With include_superseded=True,
-    both B and D surface.
+    Post-PR-#1585 behavior: the nodes_fts_supersede_remove trigger fires when
+    a node is superseded (is_current flips to 0), removing it from the FTS index.
+    Only the current replacement node D surfaces, whether include_superseded is
+    True or False.
+
+    Superseded nodes remain in the graph and are reachable via graph traversal
+    (engram_list, edge walks); the FTS index is a live-recall index only.
 
     Note: ENGRAM_NO_EMBEDDINGS=1 disables semantic search — this test exclusively
-    exercises the FTS path. The semantic path is not yet fixed (see module docstring).
+    exercises the FTS path.
     """
     core, obs, rev = _fresh_mods()
     qry = sys.modules["engram_query"]
@@ -150,7 +168,7 @@ def test_query_include_superseded_fts_path():
         quoted_text="fts191regression uniquemarker refined quote",
     )
 
-    # Supersede B with D.
+    # Supersede B with D — fires the trigger that removes B from nodes_fts.
     sup = json.loads(rev._supersede_impl(
         b_id, d_id, supersede_reason="regression test for issue #191"
     ))
@@ -158,7 +176,7 @@ def test_query_include_superseded_fts_path():
 
     query = "fts191regression uniquemarker"
 
-    # With flag=False: only D (the current node) should appear.
+    # With flag=False: only D (current node) appears.
     ids_false = _query_ids(qry, query, include_superseded=False)
     assert d_id in ids_false, (
         f"Replacement node D ({d_id}) missing from include_superseded=False results: {ids_false}"
@@ -168,14 +186,14 @@ def test_query_include_superseded_fts_path():
         f"Results: {ids_false}"
     )
 
-    # With flag=True: both B (superseded) and D (current) should appear.
+    # With flag=True: still only D. B was removed from the FTS index by the trigger.
     ids_true = _query_ids(qry, query, include_superseded=True)
     assert d_id in ids_true, (
         f"Replacement node D ({d_id}) missing from include_superseded=True results: {ids_true}"
     )
-    assert b_id in ids_true, (
-        f"Superseded node B ({b_id}) should appear with include_superseded=True (FTS path). "
-        f"This is the regression fix from issue #191. Results: {ids_true}"
+    assert b_id not in ids_true, (
+        f"Superseded node B ({b_id}) should NOT appear via FTS even with include_superseded=True. "
+        f"The trigger removes it from the FTS index at supersede time. Results: {ids_true}"
     )
 
 
@@ -191,10 +209,10 @@ def test_query_retracted_behavior_with_include_superseded_flag():
     FTS results regardless of include_superseded — the trigger removes them from the
     index entirely, so the post-filter at line 5314 never sees them.
 
-    Superseded nodes (is_current=0, status=NULL/unchanged) are intentionally kept in
-    nodes_fts per design intent: "they're like past memories that still exist,
-    just the information is not accurate anymore." They continue to surface with
-    include_superseded=True (see test 1 and test 4).
+    Superseded nodes are removed from nodes_fts by the nodes_fts_supersede_remove
+    trigger (PR #1585). Retracted nodes are removed by a separate trigger
+    (nodes_retract_remove_from_fts, PR #274). Both are absent from FTS regardless
+    of include_superseded.
     """
     core, obs, rev = _fresh_mods()
     qry = sys.modules["engram_query"]
@@ -282,16 +300,15 @@ def test_query_include_superseded_false_default_excludes_superseded():
 
 
 # ---------------------------------------------------------------------------
-# Test 4: Multiple superseded nodes — all surface with flag=True
+# Test 4: Multiple superseded nodes — none surface via FTS after #1585
 # ---------------------------------------------------------------------------
 
 def test_query_include_superseded_multiple_superseded_nodes():
-    """All superseded nodes in a chain surface when include_superseded=True.
+    """Multiple superseded nodes are all absent from FTS after the trigger removes them.
 
-    Files C (current), supersedes B with C, and checks B surfaces.
-    Also files E (current), supersedes D with E, and checks both B and D surface.
-    This catches edge cases in the FTS post-filter loop where only one of multiple
-    superseded nodes might surface.
+    Post-PR-#1585: the nodes_fts_supersede_remove trigger fires for every
+    supersede operation, so each superseded node is removed from the FTS index.
+    With include_superseded=True, only the current nodes (C, E) appear.
     """
     core, obs, rev = _fresh_mods()
     qry = sys.modules["engram_query"]
@@ -318,11 +335,12 @@ def test_query_include_superseded_multiple_superseded_nodes():
     assert c_id in ids_false, f"C (current) should appear with flag=False: {ids_false}"
     assert e_id in ids_false, f"E (current) should appear with flag=False: {ids_false}"
 
-    # With flag=True: all four nodes surface (B, C, D, E).
+    # With flag=True: still only current nodes (C, E). Superseded B and D were
+    # removed from the FTS index by the trigger when they were superseded.
     ids_true = _query_ids(qry, query, include_superseded=True)
-    assert b_id in ids_true, f"B (superseded) should appear with flag=True: {ids_true}"
+    assert b_id not in ids_true, f"B (superseded) should NOT appear via FTS with flag=True: {ids_true}"
+    assert d_id not in ids_true, f"D (superseded) should NOT appear via FTS with flag=True: {ids_true}"
     assert c_id in ids_true, f"C (current) should appear with flag=True: {ids_true}"
-    assert d_id in ids_true, f"D (superseded) should appear with flag=True: {ids_true}"
     assert e_id in ids_true, f"E (current) should appear with flag=True: {ids_true}"
 
 

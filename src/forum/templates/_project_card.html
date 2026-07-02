@@ -1,0 +1,82 @@
+{# _project_card.html — a single project board item (atomic, grouping-agnostic).
+   In scope: `item` (read_project_board dict) + theme context from the /board route:
+     status_color (status→css-var) · kind_emoji (kind→glyph) · gh_url (ref→url|None)
+     · presence (agent name→live state). ALL presentation comes from board_theme
+     (SSoT) — no status/colour/url literals here, so the card stays correct when
+     the theme changes or the board is grouped by a different axis. #}
+{%- set eff = item.effective_status -%}
+{%- set sc = status_color.get(eff, 'var(--st-default)') -%}
+{%- set link = gh_url(item.github) -%}
+
+<article class="pcard{% if eff in terminal_statuses %} pcard--done{% endif %}"
+  style="--status-color: {{ sc }};"
+  data-pid="{{ item.project }}"
+  data-turn="{{ item.turn | default('') }}"
+  data-participants="{{ item.participants | join(',') }}"
+  data-terminal="{% if eff in terminal_statuses %}1{% else %}0{% endif %}">
+  <div class="pcard__top">
+    <span class="pcard__kind" title="{{ item.kind }}">{{ kind_emoji.get(item.kind, '·') }}</span>
+    <span class="pcard__id mono">{{ item.project }}</span>
+    <span class="pcard__badge" style="color: {{ sc }}; border-color: color-mix(in oklab, {{ sc }} 32%, var(--line));">
+      {%- if item.gh_unknown %}<span title="gh state unavailable">?</span> {% endif -%}
+      {{ eff }}
+      {%- if item.gh_state %} <span class="pcard__ghstate">(gh: {{ item.gh_state }})</span>{% endif -%}
+    </span>
+    {% if link %}
+    <a class="pcard__ghlink mono" href="{{ link }}" target="_blank" rel="noopener" title="open {{ item.github }}">↗&nbsp;{{ item.github }}</a>
+    {% endif %}
+  </div>
+
+  <div class="pcard__title">
+    {% if link %}<a href="{{ link }}" target="_blank" rel="noopener">{{ item.title }}</a>{% else %}{{ item.title }}{% endif %}
+  </div>
+
+  <div class="pcard__court">
+    <span class="pcard__court-label">court</span>
+    {% if item.turn %}
+      {%- set tstate = presence.get(item.turn, 'offline') -%}
+      <span class="pcard__pdot pdot--{{ tstate }}" title="{{ item.turn }} — {{ tstate }}"></span>
+      <span class="pcard__turn">{{ item.turn }}</span>
+    {% else %}
+      <span class="pcard__turn">—</span>
+    {% endif %}
+    {% if item.age_str %}<span class="pcard__age mono">{{ item.age_str }}</span>{% endif %}
+  </div>
+
+  {% if item.turn_reason %}
+  <div class="pcard__reason">{{ item.turn_reason }}</div>
+  {% endif %}
+
+  {% if item.participants %}
+  <div class="pcard__participants">
+    {% for p in item.participants %}
+      {%- set pstate = presence.get(p, 'offline') -%}
+      <span class="pcard__participant{% if p == item.turn %} pcard__participant--active{% endif %}" title="{{ p }} — {{ pstate }}"><span class="pcard__pdot pdot--{{ pstate }}"></span>{{ p }}</span>{% if not loop.last %}<span class="pcard__sep">·</span>{% endif %}
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {# Write-button affordances — rendered by Jinja, shown/hidden by board.js
+     based on the actor identity set in localStorage. Hidden by default (no identity).
+     data-project-id mirrors data-pid on the article for per-button routing. #}
+  <div class="pcard__actions" style="display:none;" aria-label="Write actions (requires identity)">
+    <button class="pcard__action-btn pcard__action-btn--primary"
+            data-action="flip" data-project-id="{{ item.project }}"
+            type="button">Flip →</button>
+    <button class="pcard__action-btn pcard__action-btn--primary"
+            data-action="claim" data-project-id="{{ item.project }}"
+            type="button">Claim</button>
+    <button class="pcard__action-btn pcard__action-btn--danger"
+            data-action="release" data-project-id="{{ item.project }}"
+            type="button">Release</button>
+    {% if eff not in terminal_statuses %}
+    <button class="pcard__action-btn pcard__action-btn--danger"
+            data-action="status" data-project-id="{{ item.project }}"
+            data-direction="close" type="button">Close</button>
+    {% else %}
+    <button class="pcard__action-btn"
+            data-action="status" data-project-id="{{ item.project }}"
+            data-direction="reopen" type="button">Reopen</button>
+    {% endif %}
+  </div>
+</article>

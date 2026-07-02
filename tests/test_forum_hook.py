@@ -909,3 +909,56 @@ def test_same_second_post_not_excluded_by_cursor(
     )
 
 
+
+
+# ---------------------------------------------------------------------------
+# D) Flattened-topology regression (#1540)
+# ---------------------------------------------------------------------------
+
+import os
+import subprocess
+import sys
+
+
+def test_tools_resolution_in_flattened_deployed_topology(tmp_path):
+    """Regression — parity with #1539's walk-all-parents fix for the baton hook.
+
+    The plugin build FLATTENS hooks/claude/ -> hooks/, so the deployed forum
+    hook sits one level shallower than source. The old ``parents[2]/tools``
+    fallback would overshoot in this topology (CPR-unset case). Walk-all-parents
+    is robust to both depths.
+
+    Recreate the deployed layout (hooks/<name>.py with a SIBLING tools/) with
+    CLAUDE_PLUGIN_ROOT unset and assert that _status_derive resolves: a resolved
+    import leaves derive_own_status as a callable; a broken import leaves it None.
+    """
+    root = tmp_path / "engram"
+    (root / "hooks").mkdir(parents=True)
+    (root / "tools").mkdir()
+    hook_src = HOOK_PATH
+    (root / "hooks" / "engram-forum-prompt-hook.py").write_text(hook_src.read_text())
+    # Stub _status_derive.py so the import can succeed.
+    (root / "tools" / "_status_derive.py").write_text(
+        "def derive_own_status(agent_name): return None, None, None, None\n"
+        "def _read_loop_mode(): return None\n"
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.json").write_text(json.dumps({"agent_name": "luria"}))
+
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_ROOT"}
+    env["ENGRAM_HOME"] = str(home)
+    r = subprocess.run(
+        [sys.executable, "-c",
+         f"import importlib.util, sys; "
+         f"spec = importlib.util.spec_from_file_location('hook', "
+         f"  r'{root}/hooks/engram-forum-prompt-hook.py'); "
+         f"mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); "
+         f"print('resolved' if mod.derive_own_status is not None else 'broken')"
+         ],
+        capture_output=True, text=True, env=env,
+    )
+    assert "resolved" in r.stdout, (
+        "deployed-topology hook failed to resolve _status_derive via walk-parents "
+        f"(stdout={r.stdout!r} stderr={r.stderr!r})"
+    )

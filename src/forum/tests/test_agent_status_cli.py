@@ -108,6 +108,37 @@ def reset_forum_cli_cache(engram_home, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# #1608: _held_baton_turns/_fetch_held_batons now hit the live forum HTTP API
+# (GET /api/projects) rather than globbing PROJECTS_DIR. These small helpers
+# mock that call so TestDeriveOwnStatus/TestStatusAutoPublish stay hermetic —
+# no real network call, no dependency on a forum server happening to be
+# reachable on the test host.
+# ---------------------------------------------------------------------------
+
+class _FakeProjectsResponse:
+    def __init__(self, projects):
+        self._payload = json.dumps({"projects": projects}).encode("utf-8")
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def _mock_forum_projects(monkeypatch, projects=None):
+    """Patch _status_derive's urlopen to return the given /api/projects records."""
+    resp = _FakeProjectsResponse(projects or [])
+    monkeypatch.setattr(
+        _status_derive.urllib.request, "urlopen",
+        lambda req, timeout=None: resp,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Wire-CLI helper — routes HTTP calls through a Flask test client
 # ---------------------------------------------------------------------------
 
@@ -839,17 +870,19 @@ class TestDeriveOwnStatus:
 
     @pytest.fixture
     def derive_env(self, tmp_path, monkeypatch):
-        """Point LOOP_MODE_PATH + PROJECTS_DIR at writable temp locations.
+        """Point LOOP_MODE_PATH at a writable temp location; mock the forum
+        /api/projects call (#1608) to an empty list by default.
 
         Patches _status_derive (where the values are READ by _read_loop_mode
         and _held_baton_turns) rather than forum_cli (which only holds copies
         of the imported names and is not the read site).
         """
         loop_path = tmp_path / "loop-mode.json"
-        proj_dir = tmp_path / "projects"
+        proj_dir = tmp_path / "projects"  # vestigial; PROJECTS_DIR is no longer read
         proj_dir.mkdir()
         monkeypatch.setattr(_status_derive, "LOOP_MODE_PATH", str(loop_path))
         monkeypatch.setattr(_status_derive, "PROJECTS_DIR", str(proj_dir))
+        _mock_forum_projects(monkeypatch, [])
         return loop_path, proj_dir
 
     def test_idle_when_no_loop_no_baton(self, derive_env):
@@ -867,14 +900,12 @@ class TestDeriveOwnStatus:
         assert activity == "Drive the day"
         assert cadence == 2400
 
-    def test_held_baton_adds_queue_and_working(self, derive_env):
-        _, proj_dir = derive_env
-        (proj_dir / "proj-alpha.md").write_text(
-            "---\nproject: proj-alpha\nturn: alice\n---\nbody\n"
-        )
-        (proj_dir / "PR-999.md").write_text(
-            "---\nproject: PR-999\nturn: bob\n---\nbody\n"  # not mine
-        )
+    def test_held_baton_adds_queue_and_working(self, derive_env, monkeypatch):
+        """#1608: held batons come from the live forum API, not a local glob."""
+        _mock_forum_projects(monkeypatch, [
+            {"project_id": "proj-alpha", "turn": "alice", "title": "", "turn_reason": ""},
+            {"project_id": "PR-999", "turn": "bob", "title": "", "turn_reason": ""},  # not mine
+        ])
         state, _, queue, _ = forum_cli.derive_own_status("alice")
         assert state == "working"  # holding a turn ⇒ working even with no loop
         assert queue == ["proj-alpha"]  # only my turn, not bob's
@@ -932,12 +963,16 @@ class TestStatusAutoPublish:
     @pytest.fixture
     def auto_env(self, tmp_path, monkeypatch):
         loop_path = tmp_path / "loop-mode.json"
-        proj_dir = tmp_path / "projects"
+        proj_dir = tmp_path / "projects"  # vestigial; PROJECTS_DIR is no longer read
         proj_dir.mkdir()
         # Patch _status_derive (the read site) not forum_cli (which only holds
         # copies of the imported names).
         monkeypatch.setattr(_status_derive, "LOOP_MODE_PATH", str(loop_path))
         monkeypatch.setattr(_status_derive, "PROJECTS_DIR", str(proj_dir))
+        # #1608: mock the forum /api/projects call to an empty list — no test in
+        # this class asserts on held-baton content, so hermetic-and-empty is the
+        # right default (mirrors derive_env above).
+        _mock_forum_projects(monkeypatch, [])
         return loop_path, proj_dir
 
     def test_auto_publishes_working_with_cadence(self, client, auto_env):

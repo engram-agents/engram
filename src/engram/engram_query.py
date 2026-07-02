@@ -26,6 +26,7 @@ import json
 import math
 import os
 import sqlite3
+import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1699,16 +1700,26 @@ def _surface_impl(
     """Impl for engram_surface — callable with named kwargs for in-server callers."""
     conn = core._get_db()
     try:
+        t0 = time.perf_counter()
         search = _search_nodes(conn, query, top_k=top_k, use_semantic=semantic,
                                embed_query=embed_query)
+        _surface_elapsed_ms = int((time.perf_counter() - t0) * 1000)
         results = search["results"]
 
         if not results:
-            return json.dumps({
+            no_match: dict = {
                 "query": query,
                 "match_count": 0,
                 "message": "No matching nodes found in the knowledge graph.",
-            })
+            }
+            if _surface_elapsed_ms > 500:
+                no_match["_surface_latency_ms"] = _surface_elapsed_ms
+                no_match["_surface_warning"] = (
+                    f"Search phase took {_surface_elapsed_ms}ms (>500ms). "
+                    "For faster results, retry with semantic=false (FTS-only). "
+                    "Issue #819: p95=4.3s tail is under investigation."
+                )
+            return json.dumps(no_match)
 
         # Snapshot wall-clock now once so every humanized timestamp in this
         # surface response is rendered against the same reading (MECH-2 of
@@ -1950,6 +1961,14 @@ def _surface_impl(
                     f"{len(excluded_details) - reachable_count} would be truly lost."
                 ),
             }
+
+        if _surface_elapsed_ms > 500:
+            summary["_surface_latency_ms"] = _surface_elapsed_ms
+            summary["_surface_warning"] = (
+                f"Search phase took {_surface_elapsed_ms}ms (>500ms). "
+                "For faster results, retry with semantic=false (FTS-only). "
+                "Issue #819: p95=4.3s tail is under investigation."
+            )
 
         return json.dumps(core._strip_agent_facing(summary))
     finally:

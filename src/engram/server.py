@@ -1418,6 +1418,23 @@ def engram_add_observation(payload_json: str) -> str:
              "title": "Chat log <YYYY-MM-DD>",
              "source_class": "user_stated"}
 
+    Common usage — citing forum threads, transcript spans, or any ephemeral source:
+        Ephemeral sources (LAN forum threads, session transcript spans, web pages,
+        local files that aren't committed to a repo) MUST be archived first.
+        Raw forum/localhost URLs are rejected by the evidence-URL guard (no stable
+        domain — that's intentional). Use engram-snapshot, which content-addresses
+        the content and emits a file:// URL designed to feed this tool directly:
+
+            engram-snapshot forum:<thread_id>        # archive a forum thread
+            engram-snapshot jsonl:<session-id>       # archive a session transcript span
+            engram-snapshot jsonl:                   # bare — current session (most common)
+            engram-snapshot file:<path>              # archive a local file
+
+        Then cite the returned "file_url" as the url field here. The resulting
+        evidence node is content-hash-pinned + verbatim-checkable even if the
+        original source changes or disappears. For web pages: fetch the page
+        (WebFetch / curl), save to a file, then use engram-snapshot file:<path>.
+
     Args:
         payload_json: JSON object (as a string) with these fields:
             quoted_text (str, required): Exact quote from the source document.
@@ -1516,6 +1533,10 @@ def engram_add_observation_batch(payload_json: str) -> str:
     observation objects (nested-encoding pattern). Each observation in the
     array follows the same shape as engram_add_observation's payload (minus
     the evidence fields, which are shared at the outer level).
+
+    Ephemeral sources (forum threads, transcript spans, local files): archive
+    first with engram-snapshot, then cite the returned file_url. Raw localhost
+    URLs are rejected. See engram_add_observation's docstring for full usage.
 
     Args:
         payload_json: JSON object (as a string) with these fields:

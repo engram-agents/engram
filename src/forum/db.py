@@ -100,10 +100,13 @@ CREATE TABLE IF NOT EXISTS agents (
     avatar_seed     TEXT NOT NULL,
     pair_initials   TEXT,
     first_seen_at   TEXT NOT NULL,
-    last_seen_at    TEXT NOT NULL
+    last_seen_at    TEXT NOT NULL,
+    hostname        TEXT
 );
 -- status_* columns + expected_republish_seconds are added by the migration
 -- block in init_db() (ALTER TABLE), so fresh and existing DBs converge.
+-- hostname is in the base schema (fresh DBs get it directly); the ALTER TABLE
+-- guard in init_db() is retained as a no-op migration for existing installs.
 
 CREATE TABLE IF NOT EXISTS categories (
     slug            TEXT PRIMARY KEY,
@@ -435,6 +438,10 @@ def init_db(conn: sqlite3.Connection, categories_config: str | None = None) -> N
         conn.execute(
             "ALTER TABLE agents ADD COLUMN expected_republish_seconds INTEGER"
         )
+    # #1266: hostname of the agent's host, for co-host vs cross-host topology.
+    # NULL for agents that registered before this migration.
+    if "hostname" not in agent_cols:
+        conn.execute("ALTER TABLE agents ADD COLUMN hostname TEXT")
 
     # ----------------------------------------------------------------
     # vec0 virtual tables (created only when sqlite-vec is available).
@@ -473,18 +480,39 @@ def init_db(conn: sqlite3.Connection, categories_config: str | None = None) -> N
 # ---------------------------------------------------------------------------
 # Agent helpers
 # ---------------------------------------------------------------------------
-def upsert_agent(conn: sqlite3.Connection, name: str) -> int:
+# Agent-name validation is owned by the coordination-layer SSoT (#1468) so the
+# authoritative guard can live at coordination.dm_thread_key (the key-formation
+# chokepoint) without coordination depending up on forum.db. We re-export it
+# here for the HTTP routes' early-validation; ForumInvalidAgentName below maps a
+# violation to a 400. One regex, one definition — no validator drift.
+from forum.coordination.names import is_valid_agent_name  # noqa: E402
+
+
+def upsert_agent(conn: sqlite3.Connection, name: str, hostname: str | None = None) -> int:
     """Return agent_id for the named agent, creating it on first appearance.
 
     On subsequent calls, bumps ``last_seen_at`` to now.
     ``avatar_seed`` defaults to the agent name.
+
+    ``hostname`` is the agent's machine hostname (for co-host vs cross-host
+    topology detection, #1266).  When ``hostname`` is non-None, it is stored /
+    updated.  When ``hostname`` is None, any previously-stored hostname is
+    preserved (the DO UPDATE clause only overwrites when the new value is
+    non-null, so read-only upserts with hostname=None never clobber the stored
+    value).
     """
+    if not is_valid_agent_name(name):
+        raise ForumInvalidAgentName(
+            f"invalid agent name {name!r}: must match [a-z0-9][a-z0-9_-]{{0,62}}"
+        )
     now = _now_iso()
     conn.execute(
-        "INSERT INTO agents(name, avatar_seed, first_seen_at, last_seen_at) "
-        "VALUES(?, ?, ?, ?) "
-        "ON CONFLICT(name) DO UPDATE SET last_seen_at = excluded.last_seen_at",
-        (name, name, now, now),
+        "INSERT INTO agents(name, avatar_seed, first_seen_at, last_seen_at, hostname) "
+        "VALUES(?, ?, ?, ?, ?) "
+        "ON CONFLICT(name) DO UPDATE SET "
+        "    last_seen_at = excluded.last_seen_at, "
+        "    hostname = COALESCE(excluded.hostname, agents.hostname)",
+        (name, name, now, now, hostname),
     )
     conn.commit()
     row = conn.execute("SELECT id FROM agents WHERE name = ?", (name,)).fetchone()
@@ -1223,7 +1251,7 @@ def get_thread(
     post_rows = conn.execute(
         """
         SELECT p.id, a.name, a.avatar_seed, a.pair_initials,
-               p.body_md, p.created_at, p.edited_at
+               p.body_md, p.created_at, p.edited_at, a.hostname AS author_hostname
           FROM posts p
           JOIN agents a ON a.id = p.author_agent_id
          WHERE p.thread_id = ?
@@ -1242,6 +1270,7 @@ def get_thread(
                 "name": r[1],
                 "avatar_seed": r[2],
                 "pair_initials": r[3],
+                "hostname": r[7],
             },
             "body_md": body_md,
             "created_at": r[5],
@@ -1985,6 +2014,31 @@ def count_unread_all_threads(
     return row[0] if row else 0
 
 
+def count_unread_by_category(
+    conn: sqlite3.Connection,
+    agent_id: int,
+) -> dict:
+    """Count unread posts grouped by category slug (per-thread read-state rollup).
+
+    Returns {slug: count} for categories with at least one unread post.
+    Uses the same per-thread watermark logic as count_unread_all_threads.
+    Categories with zero unread posts are omitted from the result.
+    """
+    rows = conn.execute(
+        """
+        SELECT t.category_slug, COUNT(*)
+          FROM posts p
+          JOIN threads t ON t.id = p.thread_id
+          LEFT JOIN reads r ON r.agent_id = :me AND r.thread_id = p.thread_id
+         WHERE p.author_agent_id != :me
+           AND p.id > COALESCE(r.last_read_post_id, 0)
+         GROUP BY t.category_slug
+        """,
+        {"me": agent_id},
+    ).fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
 # ---------------------------------------------------------------------------
 # Q&A: error types
 # ---------------------------------------------------------------------------
@@ -2003,6 +2057,10 @@ class ForumConflict(Exception):
 
 class ForumBadRequest(Exception):
     """Raised when the request data is invalid (e.g. empty note)."""
+
+
+class ForumInvalidAgentName(ForumBadRequest):
+    """Raised when an agent name fails the charset / length check."""
 
 
 # ---------------------------------------------------------------------------

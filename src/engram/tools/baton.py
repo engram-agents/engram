@@ -6,7 +6,7 @@ A thin CLI wrapping the baton file protocol at
 shared projects (PRs, designs, etc.) so agents always know whose move it
 is next.
 
-Twelve subcommands:
+Thirteen subcommands:
   init        Create a new project baton file
   flip        Pass the baton to another participant (PR layer)
   claim       Take a Project-layer baton from the pool (pool → self)
@@ -16,6 +16,7 @@ Twelve subcommands:
   show        Display a project file
   close       Mark a project merged or cancelled
   reopen      Flip a closed baton back to an active status (inverse of close)
+  gc          Batch-close PR-batons whose GitHub PR is merged or closed
   rename      Update the human-readable project title
   anchor      Set or update the github: anchor on an existing baton
   merge       Gate-checked squash merge: baton-turn + CI-green + approval-fresh
@@ -32,12 +33,24 @@ import json
 import os
 import pwd
 import re
+import shutil
 import subprocess
 import sys
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+# Phase 3: thin-client imports — same pattern as tools/ia.py.
+# Explicit path insert ensures this import works when baton.py is loaded via
+# importlib (e.g. in direct-import tests) — Python's automatic script-dir
+# addition only fires when baton.py is the __main__ entry point.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from forum_api import (
+    ForumClient,
+    ForumHttpError,
+    ForumNetworkError,
+    forum_url_from_config,
+)
 
 # ---------------------------------------------------------------------------
 # Environment + paths
@@ -47,8 +60,6 @@ ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
     or str(Path.home() / ".engram")
 )
-BATON_PROJECTS_DIR = os.environ.get("BATON_PROJECTS_DIR", "/home/agents-shared/projects")
-
 # Exit codes
 EXIT_OK = 0
 EXIT_VALIDATION = 1
@@ -58,6 +69,56 @@ EXIT_STATE = 3
 # Valid project statuses
 VALID_STATUSES = {"planning", "in-progress", "in-review", "merged", "cancelled"}
 CLOSED_STATUSES = {"merged", "cancelled"}
+
+# ---------------------------------------------------------------------------
+# Loud-fail API helpers
+# ---------------------------------------------------------------------------
+
+def _api_get(client, path, params=None):
+    """GET via forum API; fail loud on network error or server error."""
+    try:
+        return client.get(path, params=params)
+    except ForumNetworkError as e:
+        print(f"baton: UCS unreachable — {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        print(f"baton: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
+
+
+def _api_get_raw(client, project_id):
+    """GET a single project's raw markdown; clean exit on 404/unreachable."""
+    try:
+        return client.get(f"/api/projects/{project_id}")["raw"]
+    except ForumNetworkError as e:
+        print(f"baton: UCS unreachable — {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(
+                f"baton: project not found: '{project_id}'. "
+                "Use 'baton status' to see active projects.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        print(f"baton: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
+
+
+def _require_multi_agent(config=None) -> None:
+    """Exit with EXIT_STATE if not in multi-agent mode.
+
+    Write commands call this guard at entry. Single-agent installs that
+    run a write command get a clear actionable message rather than an
+    obscure API error.
+    """
+    if not _is_multi_agent_mode(config):
+        print(
+            "baton: this host is in single-agent mode; baton is multi-agent-only.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_STATE)
+
 
 # ---------------------------------------------------------------------------
 # Config helpers (mirrors ia.py conventions)
@@ -110,17 +171,11 @@ def _get_agent_name(config: Optional[dict] = None) -> str:
     return ""
 
 
-def _is_multi_agent_mode(projects_dir: Optional[Path] = None) -> bool:
-    """True if baton projects directory exists (multi-agent gate).
-
-    Baton's multi-agent guard is the projects directory itself — if it
-    doesn't exist, we're in single-agent mode (or the operator hasn't
-    deployed baton). This is simpler than ia.py's config-based gate because
-    baton's deployment model is: multi-agent operators mkdir the directory.
-    """
-    if projects_dir is None:
-        projects_dir = Path(BATON_PROJECTS_DIR)
-    return projects_dir.is_dir()
+def _is_multi_agent_mode(config: Optional[dict] = None) -> bool:
+    """True if config.json mode == 'multi' (mirrors ia.py / the engram hook helper)."""
+    if config is None:
+        config = _load_config()
+    return config.get("mode", "single") == "multi"
 
 
 # ---------------------------------------------------------------------------
@@ -171,11 +226,6 @@ def _parse_participants(participants_str: str) -> list:
 def _format_participants(participants: list) -> str:
     """Format participants list for frontmatter: [borges, ariadne]"""
     return "[" + ", ".join(participants) + "]"
-
-
-def _now_iso() -> str:
-    """Return current UTC time as ISO-8601 with Z suffix."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _parse_iso(ts_str: str) -> Optional[datetime]:
@@ -229,76 +279,8 @@ def _validate_project_id(project_id: str) -> Optional[str]:
     return None
 
 
-def _project_path(project_id: str, projects_dir: Optional[Path] = None) -> Path:
-    """Resolve the filesystem path for a project file."""
-    if projects_dir is None:
-        projects_dir = Path(BATON_PROJECTS_DIR)
-    return projects_dir / f"{project_id}.md"
 
 
-# ---------------------------------------------------------------------------
-# Atomic write helper
-# ---------------------------------------------------------------------------
-
-def _atomic_write(dest: Path, content: str) -> None:
-    """Write content to dest atomically via tmp + os.rename.
-
-    Writes to <dest>.tmp first, then renames to dest. On POSIX systems
-    os.rename is atomic within the same filesystem — a concurrent reader
-    cannot see a partial file.
-    """
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
-    try:
-        tmp.write_text(content, encoding="utf-8")
-        os.rename(str(tmp), str(dest))
-    except OSError as e:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        print(f"baton: write failed: {e}", file=sys.stderr)
-        sys.exit(EXIT_IO)
-
-
-# ---------------------------------------------------------------------------
-# Frontmatter replacement helper
-# ---------------------------------------------------------------------------
-
-def _update_frontmatter(text: str, updates: dict) -> str:
-    """Apply updates dict to frontmatter fields; return full updated text.
-
-    Replaces individual frontmatter values in-place (preserving order of
-    other fields and the body). If a key from updates doesn't exist in the
-    frontmatter, it is appended before the closing ---.
-    """
-    m = _FRONTMATTER_RE.match(text)
-    if not m:
-        # No frontmatter — can't update; caller must handle
-        return text
-
-    fm_block = m.group(1)
-    body = text[m.end():]
-    fm_lines = fm_block.split("\n")
-    found_keys = set()
-
-    new_lines = []
-    for line in fm_lines:
-        fm = _FRONTMATTER_FIELD_RE.match(line)
-        if fm:
-            key = fm.group(1).strip().lower()
-            if key in updates:
-                new_lines.append(f"{key}: {updates[key]}")
-                found_keys.add(key)
-                continue
-        new_lines.append(line)
-
-    # Append any keys that weren't already present
-    for key, val in updates.items():
-        if key not in found_keys:
-            new_lines.append(f"{key}: {val}")
-
-    new_fm_block = "\n".join(new_lines)
-    return f"---\n{new_fm_block}\n---\n{body}"
 
 
 # ---------------------------------------------------------------------------
@@ -579,121 +561,25 @@ def _pr_approval_state(pr_number: str) -> tuple:
     )
 
 
-# ---------------------------------------------------------------------------
-# Turn log helpers
-# ---------------------------------------------------------------------------
-
-def _append_turn_log(body: str, entry: str) -> str:
-    """Append a new turn log entry to the body.
-
-    Finds the '## Turn log' section and appends. Creates the section if
-    absent.
-    """
-    section_header = "## Turn log"
-    if section_header in body:
-        # Append at end of the turn log section
-        return body.rstrip() + "\n" + entry + "\n"
-    else:
-        # Create the section
-        separator = "\n\n" if body.strip() else ""
-        return body.rstrip() + separator + f"\n{section_header}\n\n" + entry + "\n"
 
 
 # ---------------------------------------------------------------------------
 # Project scanning
 # ---------------------------------------------------------------------------
 
-def _scan_projects(
-    projects_dir: Path,
-    agent_name: str = "",
-    active_only: bool = True,
-) -> list:
-    """Scan projects_dir for baton project files.
-
-    Returns list of dicts with keys:
-      project_id, title, status, turn, turn_since, turn_reason, participants, path
-    Files that don't parse cleanly are silently skipped.
-    Sorts by turn_since ascending (oldest baton first).
-    """
-    if not projects_dir.is_dir():
-        return []
-
-    results = []
-    for md_file in projects_dir.glob("*.md"):
-        try:
-            text = md_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-
-        fields, _body = _parse_frontmatter(text)
-        if not fields:
-            continue
-
-        project_id = fields.get("project", "").strip()
-        if not project_id:
-            # Try inferring from filename
-            project_id = md_file.stem
-
-        status = fields.get("status", "").strip().lower()
-        turn = fields.get("turn", "").strip().lower()
-        turn_since_str = fields.get("turn_since", "").strip()
-        turn_reason = fields.get("turn_reason", "").strip()
-        # Strip surrounding quotes from turn_reason if present
-        if turn_reason.startswith('"') and turn_reason.endswith('"'):
-            turn_reason = turn_reason[1:-1]
-        title = fields.get("title", "").strip()
-        participants_str = fields.get("participants", "").strip()
-        participants = _parse_participants(participants_str) if participants_str else []
-        turn_since = _parse_iso(turn_since_str)
-
-        if active_only and status in CLOSED_STATUSES:
-            continue
-
-        results.append({
-            "project_id": project_id,
-            "title": title,
-            "status": status,
-            "turn": turn,
-            "turn_since": turn_since,
-            "turn_since_str": turn_since_str,
-            "turn_reason": turn_reason,
-            "participants": participants,
-            "path": str(md_file),
-        })
-
-    results.sort(key=lambda p: p["turn_since"] or datetime.min.replace(tzinfo=timezone.utc))
-    return results
 
 
 # ---------------------------------------------------------------------------
 # Subcommand: init
 # ---------------------------------------------------------------------------
 
-def cmd_init(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    projects_dir = Path(BATON_PROJECTS_DIR)
-
-    if not projects_dir.is_dir():
-        print(
-            f"baton: projects directory not found: {projects_dir}. "
-            "baton is a multi-agent tool. Create the directory first: "
-            f"mkdir -p {projects_dir}",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_IO)
+def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
+    _require_multi_agent(config)
 
     project_id = args.project_id
     err = _validate_project_id(project_id)
     if err:
         print(err, file=sys.stderr)
-        sys.exit(EXIT_VALIDATION)
-
-    dest = _project_path(project_id, projects_dir)
-    if dest.exists():
-        print(
-            f"baton init: project file already exists: {dest}. "
-            "Use 'baton flip' to pass the baton, or 'baton show' to view.",
-            file=sys.stderr,
-        )
         sys.exit(EXIT_VALIDATION)
 
     # Parse participants
@@ -758,44 +644,30 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str) -> None:
             )
             sys.exit(EXIT_VALIDATION)
 
-    now = _now_iso()
-    participants_str = _format_participants(participants)
     title = args.title or project_id
-
-    # Build the initial reason
     init_reason = f"project initialized by {agent_name or 'unknown'}"
 
-    content_lines = [
-        "---",
-        f"project: {project_id}",
-        f"title: {title}",
-        f"status: {status}",
-        f"turn: {initial_turn}",
-        f"turn_since: {now}",
-        f'turn_reason: "{init_reason}"',
-        f"participants: {participants_str}",
-    ]
-    if github_anchor:
-        content_lines.append(f"github: {github_anchor}")
-    content_lines += [
-        "---",
-        "",
-        f"# {project_id} — {title}",
-        "",
-    ]
-    if colleague_note:
-        content_lines.append(colleague_note)
-    content_lines += [
-        "",
-        "## Turn log",
-        "",
-        f"- {now} initialized → {initial_turn}: {init_reason}",
-        "",
-    ]
-    content = "\n".join(content_lines)
-
-    _atomic_write(dest, content)
-    print(f"baton init: created {dest}")
+    try:
+        client.post("/api/projects", {
+            "agent": agent_name or "baton",
+            "project_id": project_id,
+            "title": title,
+            "status": status,
+            "turn": initial_turn,
+            "turn_reason": init_reason,
+            "github": github_anchor,
+            "participants": participants,
+        })
+    except ForumNetworkError as e:
+        print(f"baton init: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 409:
+            print(f"baton init: project already exists: {project_id}", file=sys.stderr)
+        else:
+            print(f"baton init: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
+    print(f"baton init: created {project_id} (via forum API)")
     print(f"  project:      {project_id}")
     print(f"  title:        {title}")
     print(f"  participants: {', '.join(participants)}")
@@ -833,8 +705,9 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 # Subcommand: flip
 # ---------------------------------------------------------------------------
 
-def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    projects_dir = Path(BATON_PROJECTS_DIR)
+def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
+    _require_multi_agent(config)
+
     project_id = args.project_id
     to_agent = args.to.strip().lower()
     reason = args.reason
@@ -844,27 +717,12 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         print(err, file=sys.stderr)
         sys.exit(EXIT_VALIDATION)
 
-    dest = _project_path(project_id, projects_dir)
-    if not dest.exists():
-        print(
-            f"baton flip: project not found: '{project_id}' "
-            f"(looked for {dest}). "
-            "Use 'baton status' to see active projects.",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_VALIDATION)
-
-    try:
-        text = dest.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        print(f"baton flip: cannot read '{dest}': {e}", file=sys.stderr)
-        sys.exit(EXIT_IO)
-
-    fields, body = _parse_frontmatter(text)
+    raw = _api_get_raw(client, project_id)
+    fields, body = _parse_frontmatter(raw)
     if not fields:
         print(
-            f"baton flip: cannot parse frontmatter from '{dest}'. "
-            "The file may be malformed.",
+            f"baton flip: cannot parse frontmatter for '{project_id}'. "
+            "The record may be malformed.",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
@@ -1001,37 +859,26 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str) -> None:
             )
         # fresh: proceed silently
 
-    now = _now_iso()
     from_agent = fields.get("turn", agent_name or "unknown").strip().lower()
 
-    # Update frontmatter
-    updates = {
-        "turn": to_agent,
-        "turn_since": now,
-        "turn_reason": f'"{reason}"',
-    }
-    updated_text = _update_frontmatter(text, updates)
-
-    # Re-parse to get body after frontmatter update
-    _updated_fields, updated_body = _parse_frontmatter(updated_text)
-
-    # Append turn log entry
-    log_entry = f"- {now} {from_agent} → {to_agent}: {reason}"
-    final_body = _append_turn_log(updated_body, log_entry)
-
-    # Reconstruct final content: frontmatter + updated body
-    fm_m = _FRONTMATTER_RE.match(updated_text)
-    if fm_m:
-        fm_section = updated_text[:fm_m.end()]
-        final_content = fm_section.rstrip("\n") + "\n" + final_body
-    else:
-        final_content = updated_text
-
-    _atomic_write(dest, final_content)
+    try:
+        client.post(f"/api/projects/{project_id}/flip", {
+            "agent": agent_name or from_agent,
+            "to_agent": to_agent,
+            "reason": reason,
+        })
+    except ForumNetworkError as e:
+        print(f"baton flip: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton flip: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        print(f"baton flip: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
     print(f"baton flip: {project_id} → {to_agent}")
     print(f"  from:   {from_agent}")
     print(f"  reason: {reason}")
-    print(f"  at:     {now}")
 
 
 # ---------------------------------------------------------------------------
@@ -1106,7 +953,7 @@ def _is_pool_sentinel(name: str) -> bool:
     return bool(first_token) and name == first_token
 
 
-def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     """Claim a Project-layer baton from the pool.
 
     Equivalent to 'baton flip <project-id> <self> "claimed"' but makes the
@@ -1114,7 +961,8 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     turn == pool sentinel (the install's primary_user); refuses to steal from
     another agent.
     """
-    projects_dir = Path(BATON_PROJECTS_DIR)
+    _require_multi_agent(config)
+
     project_id = args.project_id
 
     err = _validate_project_id(project_id)
@@ -1122,27 +970,12 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         print(err, file=sys.stderr)
         sys.exit(EXIT_VALIDATION)
 
-    dest = _project_path(project_id, projects_dir)
-    if not dest.exists():
-        print(
-            f"baton claim: project not found: '{project_id}' "
-            f"(looked for {dest}). "
-            "Use 'baton status' to see active projects.",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_VALIDATION)
-
-    try:
-        text = dest.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        print(f"baton claim: cannot read '{dest}': {e}", file=sys.stderr)
-        sys.exit(EXIT_IO)
-
-    fields, body = _parse_frontmatter(text)
+    raw = _api_get_raw(client, project_id)
+    fields, body = _parse_frontmatter(raw)
     if not fields:
         print(
-            f"baton claim: cannot parse frontmatter from '{dest}'. "
-            "The file may be malformed.",
+            f"baton claim: cannot parse frontmatter for '{project_id}'. "
+            "The record may be malformed.",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
@@ -1187,33 +1020,21 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_VALIDATION)
 
-    now = _now_iso()
     self_name = agent_name.lower()
-
-    # Atomic write: turn → self, turn_since → now, turn_reason → "claimed"
-    updates = {
-        "turn": self_name,
-        "turn_since": now,
-        "turn_reason": '"claimed"',
-    }
-    updated_text = _update_frontmatter(text, updates)
-
-    # Re-parse to get body after frontmatter update
-    _updated_fields, updated_body = _parse_frontmatter(updated_text)
-
-    # Append turn log entry
-    log_entry = f"- {now} {_pool_sentinel()} → {self_name}: claimed"
-    final_body = _append_turn_log(updated_body, log_entry)
-
-    # Reconstruct final content: frontmatter + updated body
-    fm_m = _FRONTMATTER_RE.match(updated_text)
-    if fm_m:
-        fm_section = updated_text[:fm_m.end()]
-        final_content = fm_section.rstrip("\n") + "\n" + final_body
-    else:
-        final_content = updated_text
-
-    _atomic_write(dest, final_content)
+    try:
+        client.post(f"/api/projects/{project_id}/claim", {
+            "agent": self_name,
+            "pool_sentinel": _pool_sentinel(),
+        })
+    except ForumNetworkError as e:
+        print(f"baton claim: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton claim: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        print(f"baton claim: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
     print(f"baton claim: {project_id} → {self_name}")
 
 
@@ -1221,14 +1042,15 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 # Subcommand: release  (Project layer — self → pool sentinel)
 # ---------------------------------------------------------------------------
 
-def cmd_release(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+def cmd_release(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     """Release a Project-layer baton back to the pool.
 
     Equivalent to 'baton flip <project-id> <pool-sentinel> <reason>' but
     restricted to the current holder (only you can release what you hold).
     With --done, also appends '(done)' to the project title (idempotent).
     """
-    projects_dir = Path(BATON_PROJECTS_DIR)
+    _require_multi_agent(config)
+
     project_id = args.project_id
     mark_done = args.done
     reason = args.reason
@@ -1238,27 +1060,12 @@ def cmd_release(args: argparse.Namespace, config: dict, agent_name: str) -> None
         print(err, file=sys.stderr)
         sys.exit(EXIT_VALIDATION)
 
-    dest = _project_path(project_id, projects_dir)
-    if not dest.exists():
-        print(
-            f"baton release: project not found: '{project_id}' "
-            f"(looked for {dest}). "
-            "Use 'baton status' to see active projects.",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_VALIDATION)
-
-    try:
-        text = dest.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        print(f"baton release: cannot read '{dest}': {e}", file=sys.stderr)
-        sys.exit(EXIT_IO)
-
-    fields, body = _parse_frontmatter(text)
+    raw = _api_get_raw(client, project_id)
+    fields, body = _parse_frontmatter(raw)
     if not fields:
         print(
-            f"baton release: cannot parse frontmatter from '{dest}'. "
-            "The file may be malformed.",
+            f"baton release: cannot parse frontmatter for '{project_id}'. "
+            "The record may be malformed.",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
@@ -1291,45 +1098,24 @@ def cmd_release(args: argparse.Namespace, config: dict, agent_name: str) -> None
         )
         sys.exit(EXIT_VALIDATION)
 
-    now = _now_iso()
-
-    # Build frontmatter updates: turn → pool sentinel, turn_since → now, turn_reason → reason
-    updates: dict = {
-        "turn": _pool_sentinel(),
-        "turn_since": now,
-        "turn_reason": f'"{reason}"',
-    }
-
-    # --done: append "(done)" to title (idempotent)
-    title_renamed = False
-    if mark_done:
-        current_title = fields.get("title", "").strip()
-        if not current_title.endswith("(done)"):
-            new_title = current_title + " (done)"
-            updates["title"] = new_title
-            title_renamed = True
-
-    updated_text = _update_frontmatter(text, updates)
-
-    # Re-parse to get body after frontmatter update
-    _updated_fields, updated_body = _parse_frontmatter(updated_text)
-
-    # Append turn log entry (and a second line if title was renamed)
-    log_entry = f"- {now} {self_name} → {_pool_sentinel()}: {reason}"
-    if title_renamed:
-        log_entry += f"\n- {now} title marked (done)"
-    final_body = _append_turn_log(updated_body, log_entry)
-
-    # Reconstruct final content: frontmatter + updated body
-    fm_m = _FRONTMATTER_RE.match(updated_text)
-    if fm_m:
-        fm_section = updated_text[:fm_m.end()]
-        final_content = fm_section.rstrip("\n") + "\n" + final_body
-    else:
-        final_content = updated_text
-
-    _atomic_write(dest, final_content)
-    print(f"baton release: {project_id} → {_pool_sentinel()}")
+    sentinel = _pool_sentinel()
+    try:
+        client.post(f"/api/projects/{project_id}/release", {
+            "agent": self_name,
+            "pool_sentinel": sentinel,
+            "reason": reason,
+            "done": mark_done,
+        })
+    except ForumNetworkError as e:
+        print(f"baton release: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton release: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        print(f"baton release: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
+    print(f"baton release: {project_id} → {sentinel}")
     if mark_done:
         print("  marked (done)")
 
@@ -1338,17 +1124,23 @@ def cmd_release(args: argparse.Namespace, config: dict, agent_name: str) -> None
 # Subcommand: status
 # ---------------------------------------------------------------------------
 
-def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    projects_dir = Path(BATON_PROJECTS_DIR)
-
-    if not projects_dir.is_dir():
+def cmd_status(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
+    if not _is_multi_agent_mode(config):
         # Single-agent or not deployed — silent exit per spec
         sys.exit(EXIT_OK)
 
-    projects = _scan_projects(projects_dir, agent_name, active_only=True)
+    resp = _api_get(client, "/api/projects", params={"active_only": "true"})
+    projects = resp.get("projects", [])
+
+    # Parse turn_since strings to datetime for _age_str / sorting
+    for p in projects:
+        p["turn_since"] = _parse_iso(p.get("turn_since") or "")
+
+    projects.sort(key=lambda p: p["turn_since"] or datetime.min.replace(tzinfo=timezone.utc))
 
     mine_only = getattr(args, "mine", False)
     if mine_only and agent_name:
+        # Filter client-side by turn (server agent= param filters by PARTICIPANT)
         projects = [p for p in projects if p["turn"] == agent_name.lower()]
 
     if not projects:
@@ -1364,29 +1156,38 @@ def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         ts_age = _age_str(p["turn_since"])
         age_part = f" ({ts_age})" if ts_age else ""
         turn_info = f"turn: {p['turn']}{age_part}"
-        reason_part = f" — {p['turn_reason']}" if p['turn_reason'] else ""
+        turn_reason = p.get("turn_reason", "")
+        # Defensively strip surrounding quotes from turn_reason in case the
+        # server echoes raw YAML values (correct servers return clean strings).
+        if turn_reason.startswith('"') and turn_reason.endswith('"'):
+            turn_reason = turn_reason[1:-1]
+        reason_part = f" — {turn_reason}" if turn_reason else ""
         print(f"  {p['project_id']:<28} {turn_info}{reason_part}")
-        if p["title"] and p["title"] != p["project_id"]:
-            print(f"    {p['title']}")
+        title = p.get("title", "")
+        if title and title != p["project_id"]:
+            print(f"    {title}")
 
 
 # ---------------------------------------------------------------------------
 # Subcommand: mine
 # ---------------------------------------------------------------------------
 
-def cmd_mine(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+def cmd_mine(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     """Shorthand for status --mine."""
     # Inject mine=True and delegate to cmd_status
     args.mine = True
-    cmd_status(args, config, agent_name)
+    cmd_status(args, config, agent_name, client)
 
 
 # ---------------------------------------------------------------------------
 # Subcommand: show
 # ---------------------------------------------------------------------------
 
-def cmd_show(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    projects_dir = Path(BATON_PROJECTS_DIR)
+def cmd_show(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
+    if not _is_multi_agent_mode(config):
+        # Single-agent or not deployed — silent exit per spec
+        sys.exit(EXIT_OK)
+
     project_id = args.project_id
 
     err = _validate_project_id(project_id)
@@ -1394,31 +1195,17 @@ def cmd_show(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         print(err, file=sys.stderr)
         sys.exit(EXIT_VALIDATION)
 
-    dest = _project_path(project_id, projects_dir)
-    if not dest.exists():
-        print(
-            f"baton show: project not found: '{project_id}' "
-            f"(looked for {dest}). "
-            "Use 'baton status' to see active projects.",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_VALIDATION)
-
-    try:
-        text = dest.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        print(f"baton show: cannot read '{dest}': {e}", file=sys.stderr)
-        sys.exit(EXIT_IO)
-
-    print(text, end="" if text.endswith("\n") else "\n")
+    raw = _api_get_raw(client, project_id)
+    print(raw, end="" if raw.endswith("\n") else "\n")
 
 
 # ---------------------------------------------------------------------------
 # Subcommand: close
 # ---------------------------------------------------------------------------
 
-def cmd_close(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    projects_dir = Path(BATON_PROJECTS_DIR)
+def cmd_close(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
+    _require_multi_agent(config)
+
     project_id = args.project_id
     new_status = args.status.strip().lower()
 
@@ -1435,25 +1222,11 @@ def cmd_close(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_VALIDATION)
 
-    dest = _project_path(project_id, projects_dir)
-    if not dest.exists():
-        print(
-            f"baton close: project not found: '{project_id}' "
-            f"(looked for {dest}).",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_VALIDATION)
-
-    try:
-        text = dest.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        print(f"baton close: cannot read '{dest}': {e}", file=sys.stderr)
-        sys.exit(EXIT_IO)
-
-    fields, _body = _parse_frontmatter(text)
+    raw = _api_get_raw(client, project_id)
+    fields, _body = _parse_frontmatter(raw)
     if not fields:
         print(
-            f"baton close: cannot parse frontmatter from '{dest}'.",
+            f"baton close: cannot parse frontmatter for '{project_id}'.",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
@@ -1466,8 +1239,22 @@ def cmd_close(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_VALIDATION)
 
-    updated_text = _update_frontmatter(text, {"status": new_status})
-    _atomic_write(dest, updated_text)
+    close_reason = f"closed by {agent_name or 'agent'}"
+    try:
+        client.post(f"/api/projects/{project_id}/status", {
+            "agent": agent_name or "baton",
+            "new_status": new_status,
+            "reason": close_reason,
+        })
+    except ForumNetworkError as e:
+        print(f"baton close: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton close: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        print(f"baton close: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
     print(f"baton close: {project_id} → {new_status}")
 
 
@@ -1479,13 +1266,14 @@ def cmd_close(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 ACTIVE_STATUSES = {"planning", "in-progress", "in-review"}
 
 
-def cmd_reopen(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+def cmd_reopen(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     """Flip a closed baton back to an active status.
 
     Inverse of cmd_close. Only operates on batons with status: merged or
     cancelled. Refuses if the baton is already in a non-closed status.
     """
-    projects_dir = Path(BATON_PROJECTS_DIR)
+    _require_multi_agent(config)
+
     project_id = args.project_id
     new_status = args.status.strip().lower()
 
@@ -1502,25 +1290,11 @@ def cmd_reopen(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_VALIDATION)
 
-    dest = _project_path(project_id, projects_dir)
-    if not dest.exists():
-        print(
-            f"baton reopen: project not found: '{project_id}' "
-            f"(looked for {dest}).",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_VALIDATION)
-
-    try:
-        text = dest.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        print(f"baton reopen: cannot read '{dest}': {e}", file=sys.stderr)
-        sys.exit(EXIT_IO)
-
-    fields, _body = _parse_frontmatter(text)
+    raw = _api_get_raw(client, project_id)
+    fields, _body = _parse_frontmatter(raw)
     if not fields:
         print(
-            f"baton reopen: cannot parse frontmatter from '{dest}'.",
+            f"baton reopen: cannot parse frontmatter for '{project_id}'.",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
@@ -1534,37 +1308,128 @@ def cmd_reopen(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_VALIDATION)
 
-    now = _now_iso()
     invoker = agent_name or "unknown"
-
-    # Update status in frontmatter
-    updated_text = _update_frontmatter(text, {"status": new_status})
-
-    # Re-parse to get body after frontmatter update
-    _updated_fields, updated_body = _parse_frontmatter(updated_text)
-
-    # Append audit-log entry
-    log_entry = f"- {now} reopened → {invoker}: status was {current_status} → {new_status}"
-    final_body = _append_turn_log(updated_body, log_entry)
-
-    # Reconstruct final content: frontmatter + updated body
-    fm_m = _FRONTMATTER_RE.match(updated_text)
-    if fm_m:
-        fm_section = updated_text[:fm_m.end()]
-        final_content = fm_section.rstrip("\n") + "\n" + final_body
-    else:
-        final_content = updated_text
-
-    _atomic_write(dest, final_content)
+    reopen_reason = f"reopened by {invoker}: status was {current_status} → {new_status}"
+    try:
+        client.post(f"/api/projects/{project_id}/status", {
+            "agent": invoker,
+            "new_status": new_status,
+            "reason": reopen_reason,
+        })
+    except ForumNetworkError as e:
+        print(f"baton reopen: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton reopen: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        print(f"baton reopen: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
     print(f"baton reopen: {project_id} → {new_status}")
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: gc
+# ---------------------------------------------------------------------------
+
+def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
+    """Batch-close PR-batons whose GitHub PR is MERGED or CLOSED.
+
+    Scans all open PR-batons and queries the live GitHub state for each.
+    PRs in MERGED state are closed with status ``merged``; PRs in CLOSED
+    state (without merge) are closed with status ``cancelled``.
+
+    Use ``--dry-run`` to preview changes without applying them.
+    Use ``--limit N`` to cap the number of PR-batons processed per run
+    (default: 30) and bound wall-clock runtime.
+
+    This is the explicit full-sweep complement to the prompt hook's
+    cache-only auto-archive pass.  Agents should run ``baton gc`` at
+    loop-start to drain the backlog of merged/closed PR-batons that the
+    hook cannot reach (uncached anchors).
+    """
+    _require_multi_agent(config)
+
+    if not shutil.which("gh"):
+        print("baton gc: gh CLI not found — cannot query live PR state", file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+    pr_re = re.compile(r"^PR-(\d+)$")
+    dry_run = args.dry_run
+    limit = args.limit
+
+    # Fetch active projects from API (active_only=true filters closed statuses)
+    resp = _api_get(client, "/api/projects", params={"active_only": "true"})
+    all_projects = resp.get("projects", [])
+
+    # Filter to PR-batons, capped at limit
+    pr_batons = []
+    for p in all_projects:
+        pid = p.get("project_id", "")
+        m = pr_re.match(pid)
+        if m:
+            pr_batons.append((pid, m.group(1)))
+            if len(pr_batons) >= limit:
+                break
+
+    closed = skipped = failed = 0
+
+    for project_id, pr_num in pr_batons:
+        try:
+            result = subprocess.run(
+                ["gh", "pr", "view", pr_num, "--json", "state", "-q", ".state"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                print(f"baton gc: gh query failed for {project_id} (pr #{pr_num})", file=sys.stderr)
+                skipped += 1
+                continue
+            state = result.stdout.strip().upper()
+        except Exception as e:
+            print(f"baton gc: error querying {project_id}: {e!r}", file=sys.stderr)
+            skipped += 1
+            continue
+
+        if state == "MERGED":
+            new_status = "merged"
+        elif state == "CLOSED":
+            new_status = "cancelled"
+        else:
+            skipped += 1
+            continue
+
+        if dry_run:
+            print(f"baton gc: would close {project_id} → {new_status} (PR #{pr_num} is {state})")
+            closed += 1
+            continue
+
+        gc_reason = f"gc: PR #{pr_num} is {state}"
+        try:
+            client.post(f"/api/projects/{project_id}/gc", {
+                "agent": agent_name or "baton",
+                "new_status": new_status,
+                "reason": gc_reason,
+            })
+            print(f"baton gc: closed {project_id} → {new_status} (PR #{pr_num})")
+            closed += 1
+        except (ForumNetworkError, ForumHttpError) as e:
+            print(f"baton gc: write failed for {project_id}: {e!r}", file=sys.stderr)
+            failed += 1
+        except Exception as e:
+            print(f"baton gc: unexpected error for {project_id}: {e!r}", file=sys.stderr)
+            failed += 1
+
+    action = "would close" if dry_run else "closed"
+    print(f"baton gc: {action} {closed}, skipped {skipped}, failed {failed}")
 
 
 # ---------------------------------------------------------------------------
 # Subcommand: rename
 # ---------------------------------------------------------------------------
 
-def cmd_rename(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    projects_dir = Path(BATON_PROJECTS_DIR)
+def cmd_rename(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
+    _require_multi_agent(config)
+
     project_id = args.project_id
     new_title = args.title
 
@@ -1573,7 +1438,7 @@ def cmd_rename(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         print(err, file=sys.stderr)
         sys.exit(EXIT_VALIDATION)
 
-    # Validate title before touching the filesystem
+    # Validate title before touching the API
     stripped_title = new_title.strip()
     if not stripped_title:
         print(
@@ -1595,63 +1460,38 @@ def cmd_rename(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_VALIDATION)
 
-    dest = _project_path(project_id, projects_dir)
-    if not dest.exists():
-        print(
-            f"baton rename: project not found: '{project_id}' "
-            f"(looked for {dest}). "
-            "Use 'baton status' to see active projects.",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_VALIDATION)
-
-    try:
-        text = dest.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        print(f"baton rename: cannot read '{dest}': {e}", file=sys.stderr)
-        sys.exit(EXIT_IO)
-
-    fields, body = _parse_frontmatter(text)
+    raw = _api_get_raw(client, project_id)
+    fields, body = _parse_frontmatter(raw)
     if not fields:
         print(
-            f"baton rename: cannot parse frontmatter from '{dest}'. "
-            "The file may be malformed.",
+            f"baton rename: cannot parse frontmatter for '{project_id}'. "
+            "The record may be malformed.",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
 
     if "title" not in fields:
         print(
-            f"baton rename: 'title' field absent in '{dest}' — "
-            "refusing to write to a possibly corrupted file.",
+            f"baton rename: 'title' field absent in '{project_id}' — "
+            "refusing to write to a possibly corrupted record.",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
 
-    old_title = fields["title"]
-
-    # Update frontmatter (preserves field order via _update_frontmatter)
-    updated_text = _update_frontmatter(text, {"title": stripped_title})
-
-    # Re-parse to get body after frontmatter update
-    _updated_fields, updated_body = _parse_frontmatter(updated_text)
-
-    # Append audit line to turn log
-    now = _now_iso()
-    log_entry = (
-        f'- {now} renamed: title from "{old_title}" to "{stripped_title}"'
-    )
-    final_body = _append_turn_log(updated_body, log_entry)
-
-    # Reconstruct final content: frontmatter + updated body
-    fm_m = _FRONTMATTER_RE.match(updated_text)
-    if fm_m:
-        fm_section = updated_text[:fm_m.end()]
-        final_content = fm_section.rstrip("\n") + "\n" + final_body
-    else:
-        final_content = updated_text
-
-    _atomic_write(dest, final_content)
+    try:
+        client.post(f"/api/projects/{project_id}/rename", {
+            "agent": agent_name or "baton",
+            "new_title": stripped_title,
+        })
+    except ForumNetworkError as e:
+        print(f"baton rename: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton rename: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        print(f"baton rename: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
     print(f'baton rename: {project_id} title → "{stripped_title}"')
 
 
@@ -1659,13 +1499,15 @@ def cmd_rename(args: argparse.Namespace, config: dict, agent_name: str) -> None:
 # Subcommand: anchor
 # ---------------------------------------------------------------------------
 
-def cmd_anchor(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+def cmd_anchor(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     """Set or update the github: anchor on an existing baton.
 
-    Mirrors cmd_rename's atomic frontmatter-update pattern:
-    read → validate → _update_frontmatter → atomic write → audit line.
+    Reads the project via the forum API for pre-flight validation (project
+    exists, parseable frontmatter), then delegates the write to the forum
+    API via client.post.
     """
-    projects_dir = Path(BATON_PROJECTS_DIR)
+    _require_multi_agent(config)
+
     project_id = args.project_id
     github_anchor = args.github.strip().lower()
 
@@ -1683,89 +1525,136 @@ def cmd_anchor(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_VALIDATION)
 
-    dest = _project_path(project_id, projects_dir)
-    if not dest.exists():
+    raw = _api_get_raw(client, project_id)
+    fields, body = _parse_frontmatter(raw)
+    if not fields:
         print(
-            f"baton anchor: project not found: '{project_id}' "
-            f"(looked for {dest}). "
-            "Use 'baton status' to see active projects.",
+            f"baton anchor: cannot parse frontmatter for '{project_id}'. "
+            "The record may be malformed.",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
 
     try:
-        text = dest.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        print(f"baton anchor: cannot read '{dest}': {e}", file=sys.stderr)
+        client.post(f"/api/projects/{project_id}/anchor", {
+            "agent": agent_name or "baton",
+            "github": github_anchor,
+        })
+    except ForumNetworkError as e:
+        print(f"baton anchor: {e}", file=sys.stderr)
         sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton anchor: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        print(f"baton anchor: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
+    print(f"baton anchor: {project_id} github → {github_anchor}")
 
-    fields, body = _parse_frontmatter(text)
-    if not fields:
+
+# ---------------------------------------------------------------------------
+# Subcommand: add-participant
+# ---------------------------------------------------------------------------
+
+def cmd_add_participant(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
+    """Add a participant to an existing baton.
+
+    Reads the project via the forum API for pre-flight validation (project
+    exists, parseable frontmatter) and a friendly client-side already-a-
+    participant hint, then delegates the write to the forum API via
+    client.post. The AUTHORITATIVE dedup + agent-is-participant checks are
+    server-side (add_participant() in coordination.projects) — this CLI's
+    own already-present check is a UX nicety only, never the source of truth.
+    """
+    _require_multi_agent(config)
+
+    project_id = args.project_id
+    new_participant = args.participant.strip().lower()
+
+    err = _validate_project_id(project_id)
+    if err:
+        print(err, file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+    if not new_participant:
         print(
-            f"baton anchor: cannot parse frontmatter from '{dest}'. "
-            "The file may be malformed.",
+            "baton add-participant: <participant> must be non-empty.",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
 
-    old_anchor = fields.get("github", "").strip()
-
-    # Update (or add) the github: field in frontmatter
-    updated_text = _update_frontmatter(text, {"github": github_anchor})
-
-    # Re-parse to get body after frontmatter update
-    _updated_fields, updated_body = _parse_frontmatter(updated_text)
-
-    # Append audit line to turn log
-    now = _now_iso()
-    if old_anchor:
-        log_entry = (
-            f'- {now} anchor updated: github from "{old_anchor}" to "{github_anchor}"'
+    raw = _api_get_raw(client, project_id)
+    fields, body = _parse_frontmatter(raw)
+    if not fields:
+        print(
+            f"baton add-participant: cannot parse frontmatter for '{project_id}'. "
+            "The record may be malformed.",
+            file=sys.stderr,
         )
-    else:
-        log_entry = f'- {now} anchor set: github → {github_anchor}'
-    final_body = _append_turn_log(updated_body, log_entry)
+        sys.exit(EXIT_VALIDATION)
 
-    # Reconstruct final content: frontmatter + updated body
-    fm_m = _FRONTMATTER_RE.match(updated_text)
-    if fm_m:
-        fm_section = updated_text[:fm_m.end()]
-        final_content = fm_section.rstrip("\n") + "\n" + final_body
-    else:
-        final_content = updated_text
+    # Friendly client-side hint only — see docstring.
+    participants_str = fields.get("participants", "").strip()
+    current_participants = _parse_participants(participants_str) if participants_str else []
+    already_present = new_participant in current_participants
 
-    _atomic_write(dest, final_content)
-    print(f"baton anchor: {project_id} github → {github_anchor}")
+    try:
+        resp = client.post(f"/api/projects/{project_id}/participants", {
+            "agent": agent_name or "baton",
+            "participant": new_participant,
+        })
+    except ForumNetworkError as e:
+        print(f"baton add-participant: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton add-participant: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        if e.status == 403:
+            print(
+                f"baton add-participant: '{agent_name or 'you'}' must already be a "
+                f"participant of '{project_id}' to add others.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        print(f"baton add-participant: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
+
+    added = resp.get("added", True)
+    if already_present or not added:
+        print(f"baton add-participant: {new_participant} is already a participant of {project_id}.")
+    else:
+        print(f"baton add-participant: {project_id} + participant {new_participant}")
 
 
 # ---------------------------------------------------------------------------
 # Subcommand: merge  (gate-checked merge verb — #999 + #1000)
 # ---------------------------------------------------------------------------
 
-def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str) -> None:
+def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     """Squash-merge a PR through the baton gate ladder.
 
     Gate ladder (all must pass in order):
-      1. Baton exists at projects dir for PR-N.           (never forceable)
-      2. turn == pool sentinel.                            (never forceable)
-      3. CI green via _pr_ci_state.                       (--force skips)
-      4. Approval fresh via _pr_approval_state (oid).     (--force skips)
+      1. Baton exists (via forum API) for PR-N.         (never forceable)
+      2. turn == pool sentinel.                           (never forceable)
+      3. CI green via _pr_ci_state.                      (--force skips)
+      4. Approval fresh via _pr_approval_state (oid).    (--force skips)
       5. gh pr merge <N> --squash.
-      6. On success: append turn-log + set baton status → merged.
+      6. On success: baton status → merged via API.
 
     --force skips gates 3-4 only; never skips 1-2.
     --dry-run prints the ladder verdict without merging.
     """
-    projects_dir = Path(BATON_PROJECTS_DIR)
+    _require_multi_agent(config)
 
     # Resolve project_id and pr_number from the argument (PR-N or bare N)
-    raw = args.pr.strip()
-    m = re.match(r"^(?:PR-|pr-)(\d+)$", raw)
+    raw_arg = args.pr.strip()
+    m = re.match(r"^(?:PR-|pr-)(\d+)$", raw_arg)
     if m:
         pr_number = m.group(1)
         project_id = f"PR-{pr_number}"
     else:
-        pr_number = raw.lstrip("#")
+        pr_number = raw_arg.lstrip("#")
         project_id = f"PR-{pr_number}"
 
     if not pr_number.isdigit():
@@ -1780,27 +1669,12 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str) -> None:
     dry_run = getattr(args, "dry_run", False)
 
     # ---- Gate 1: baton exists ----------------------------------------
-    dest = _project_path(project_id, projects_dir)
-    if not dest.exists():
-        print(
-            f"baton merge: no baton — a PR without a baton is not merge-ready "
-            "(init + run the review pipeline). "
-            f"Looked for {dest}.",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_VALIDATION)
-
-    try:
-        text = dest.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        print(f"baton merge: cannot read '{dest}': {e}", file=sys.stderr)
-        sys.exit(EXIT_IO)
-
-    fields, body = _parse_frontmatter(text)
+    raw = _api_get_raw(client, project_id)
+    fields, body = _parse_frontmatter(raw)
     if not fields:
         print(
-            f"baton merge: cannot parse frontmatter from '{dest}'. "
-            "The file may be malformed.",
+            f"baton merge: cannot parse frontmatter for '{project_id}'. "
+            "The record may be malformed.",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
@@ -1943,40 +1817,31 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         )
         sys.exit(EXIT_IO)
 
-    # ---- Gate 6: post-merge baton closure ----------------------------
-    now = _now_iso()
+    # ---- Gate 6: post-merge baton closure via API ----------------------------
     merge_by = agent_name or "unknown"
-    if force:
-        log_entry = (
-            f"- {now} merged via baton merge by {merge_by} "
-            "(FORCED past gates 3-4)"
-        )
-    else:
-        log_entry = f"- {now} merged via baton merge by {merge_by}"
 
-    # Update frontmatter: set status → merged
-    updated_text = _update_frontmatter(text, {"status": "merged"})
-
-    # Re-parse to get the body after frontmatter update, then append log entry
-    _uf, updated_body = _parse_frontmatter(updated_text)
-    final_body = _append_turn_log(updated_body, log_entry)
-
-    # Reconstruct: frontmatter section + updated body
-    fm_m = _FRONTMATTER_RE.match(updated_text)
-    if fm_m:
-        fm_section = updated_text[:fm_m.end()]
-        final_content = fm_section.rstrip("\n") + "\n" + final_body
-    else:
-        final_content = updated_text
-
-    # The GitHub merge above is irreversible; say so BEFORE the local write so
-    # an _atomic_write failure is diagnosable as merged-on-GitHub/baton-stale.
+    # The GitHub merge above is irreversible; say so BEFORE the API write so
+    # a failure is diagnosable as merged-on-GitHub/baton-stale.
     print(f"baton merge: PR #{pr_number} merged on GitHub; writing baton closure...")
-    _atomic_write(dest, final_content)
+    try:
+        client.post(f"/api/projects/{project_id}/merge", {
+            "agent": merge_by,
+            "forced": force,
+        })
+    except ForumNetworkError as e:
+        print(f"baton merge: server unreachable writing closure: {e}", file=sys.stderr)
+        print(
+            f"  (GitHub merge succeeded; close baton manually: "
+            f"baton close {project_id} --status merged)",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        print(f"baton merge: baton closure failed ({e.status}): {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO)
 
     print(f"baton merge: PR #{pr_number} merged (squash)")
     print(f"  baton: {project_id} → merged")
-    print(f"  at:    {now}")
 
 
 # ---------------------------------------------------------------------------
@@ -2206,6 +2071,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Active status to set (default: in-progress)",
     )
 
+    # -- gc --
+    p_gc = subparsers.add_parser(
+        "gc",
+        help="batch-close PR-batons whose GitHub PR is merged/closed",
+        description=(
+            "Scan all open PR-batons and close any whose live GitHub PR state\n"
+            "is terminal (MERGED → status:merged; CLOSED → status:cancelled).\n\n"
+            "Use --dry-run to preview without applying changes.\n"
+            "Use --limit N to cap the number of PR-batons processed per run\n"
+            "(default: 30) to bound wall-clock runtime.\n\n"
+            "This is the explicit full-sweep complement to the prompt hook's\n"
+            "cache-only auto-archive pass.  Run at loop-start to drain the\n"
+            "backlog of merged/closed PR-batons the hook cannot reach."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_gc.add_argument(
+        "--dry-run", action="store_true", default=False,
+        dest="dry_run",
+        help="list changes without applying them",
+    )
+    p_gc.add_argument(
+        "--limit", type=int, default=30,
+        help="max PR-batons to process per run (default: 30)",
+    )
+    p_gc.set_defaults(func=cmd_gc)
+
     # -- rename --
     p_rename = subparsers.add_parser(
         "rename",
@@ -2248,6 +2140,31 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "GitHub anchor value: pr/<N> or project/<N> (e.g. pr/490, project/4)"
         ),
+    )
+
+    # -- add-participant --
+    p_add_participant = subparsers.add_parser(
+        "add-participant",
+        help="Add an agent to an existing baton's participants list",
+        description=(
+            "Add <participant> to the project's participants list, atomically. "
+            "Appends an audit line to the turn log. Idempotent: adding an "
+            "agent who is already a participant is a no-op, not an error. "
+            "The invoking agent must already be a participant of the baton "
+            "(server-side authorization) — non-participants cannot add "
+            "others. Fixes the 2-reviewer-pipeline friction where 'baton "
+            "flip' to a not-yet-participant refuses with 'not a participant'."
+        ),
+    )
+    p_add_participant.add_argument(
+        "project_id",
+        metavar="PROJECT-ID",
+        help="Project identifier",
+    )
+    p_add_participant.add_argument(
+        "participant",
+        metavar="PARTICIPANT",
+        help="Agent name to add as a participant",
     )
 
     # -- merge --
@@ -2300,32 +2217,38 @@ def main() -> None:
 
     config = _load_config()
     agent_name = _get_agent_name(config)
+    client = ForumClient.from_config(config)
 
-    # Dispatch
+    # Dispatch — all commands receive client (read commands use it for API
+    # reads; write commands use it for both reads and writes).
     if args.subcommand == "init":
-        cmd_init(args, config, agent_name)
+        cmd_init(args, config, agent_name, client)
     elif args.subcommand == "flip":
-        cmd_flip(args, config, agent_name)
+        cmd_flip(args, config, agent_name, client)
     elif args.subcommand == "claim":
-        cmd_claim(args, config, agent_name)
+        cmd_claim(args, config, agent_name, client)
     elif args.subcommand == "release":
-        cmd_release(args, config, agent_name)
+        cmd_release(args, config, agent_name, client)
     elif args.subcommand == "status":
-        cmd_status(args, config, agent_name)
+        cmd_status(args, config, agent_name, client)
     elif args.subcommand == "mine":
-        cmd_mine(args, config, agent_name)
+        cmd_mine(args, config, agent_name, client)
     elif args.subcommand == "show":
-        cmd_show(args, config, agent_name)
+        cmd_show(args, config, agent_name, client)
     elif args.subcommand == "close":
-        cmd_close(args, config, agent_name)
+        cmd_close(args, config, agent_name, client)
     elif args.subcommand == "reopen":
-        cmd_reopen(args, config, agent_name)
+        cmd_reopen(args, config, agent_name, client)
+    elif args.subcommand == "gc":
+        cmd_gc(args, config, agent_name, client)
     elif args.subcommand == "rename":
-        cmd_rename(args, config, agent_name)
+        cmd_rename(args, config, agent_name, client)
     elif args.subcommand == "anchor":
-        cmd_anchor(args, config, agent_name)
+        cmd_anchor(args, config, agent_name, client)
+    elif args.subcommand == "add-participant":
+        cmd_add_participant(args, config, agent_name, client)
     elif args.subcommand == "merge":
-        cmd_merge(args, config, agent_name)
+        cmd_merge(args, config, agent_name, client)
     else:
         parser.print_help()
         sys.exit(EXIT_VALIDATION)

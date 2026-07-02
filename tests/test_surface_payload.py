@@ -125,3 +125,71 @@ def test_missing_required_query_rejected():
     assert "query" in r["error"], (
         f"Expected required-field 'query' in error, got: {r['error']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. Optional latency fields shape (when present)
+# ---------------------------------------------------------------------------
+
+def test_surface_impl_optional_latency_fields_shape():
+    """If _surface_latency_ms appears in the result, validate its shape.
+
+    The threshold (>500ms) will not fire in a fast CI environment, so this
+    is a conditional shape test — it passes whether or not the threshold fires.
+    When the fields ARE present (e.g. a slow test machine or future monkeypatching),
+    they must satisfy their type contracts.
+    """
+    server = fresh_server()
+    result_str = server._surface_impl(query="test", semantic=False)
+    r = json.loads(result_str)
+    assert "error" not in r, f"_surface_impl returned error: {r}"
+    if "_surface_latency_ms" in r:
+        assert isinstance(r["_surface_latency_ms"], int), (
+            f"_surface_latency_ms must be int, got {type(r['_surface_latency_ms'])}"
+        )
+        assert "_surface_warning" in r, (
+            "_surface_warning must be present when _surface_latency_ms is present"
+        )
+        assert isinstance(r["_surface_warning"], str), (
+            f"_surface_warning must be str, got {type(r['_surface_warning'])}"
+        )
+        assert "500ms" in r["_surface_warning"], (
+            f"_surface_warning must mention 500ms threshold, got: {r['_surface_warning']}"
+        )
+        assert "#819" in r["_surface_warning"], (
+            f"_surface_warning must reference issue #819, got: {r['_surface_warning']}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 7. Latency warning fires when _search_nodes is slow (mock-patched)
+# ---------------------------------------------------------------------------
+
+def test_surface_latency_warning_fires_when_slow():
+    """Verify latency fields are injected when _search_nodes exceeds 500ms.
+
+    Uses mock.patch to make time.perf_counter return values that simulate a
+    600ms search phase, then asserts the fields appear with correct types.
+    """
+    import unittest.mock as mock
+    server = fresh_server()
+
+    # side_effect: first call (t0) returns 0.0, second call returns 0.6 (600ms elapsed).
+    with mock.patch("engram_query.time.perf_counter", side_effect=[0.0, 0.6]):
+        result_str = server._surface_impl(query="latency_test", semantic=False)
+
+    r = json.loads(result_str)
+    assert "error" not in r, f"_surface_impl returned error: {r}"
+    assert "_surface_latency_ms" in r, (
+        f"Expected _surface_latency_ms in result when simulated >500ms, got: {list(r.keys())}"
+    )
+    assert r["_surface_latency_ms"] == 600, (
+        f"Expected 600ms, got {r['_surface_latency_ms']}"
+    )
+    assert "_surface_warning" in r, "_surface_warning must accompany _surface_latency_ms"
+    assert "500ms" in r["_surface_warning"], (
+        f"Warning must mention 500ms threshold: {r['_surface_warning']}"
+    )
+    assert "#819" in r["_surface_warning"], (
+        f"Warning must reference issue #819: {r['_surface_warning']}"
+    )

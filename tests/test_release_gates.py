@@ -400,6 +400,16 @@ class TestStampPattern(unittest.TestCase):
                 status, metric, detail = check_stamp_pattern(version)
                 self.assertEqual(status, STATUS_PASS, f"Expected PASS for version={version!r}")
 
+    def test_stamped_version_0_2_0_base_is_pass(self):
+        """Regex is base-version-agnostic (#1607): a 0.2.0-based stamp still
+        matches — proves the gate regex generalizes past the old 0.1.0-only
+        base after the SSoT version bump."""
+        stamped = "0.2.0-dev.20260702163836.745858c"
+        status, metric, detail = check_stamp_pattern(stamped)
+        self.assertEqual(status, STATUS_PASS)
+        self.assertIn("stamp present", metric)
+        self.assertIn(stamped, detail)
+
     # --- (b) static/unstamped version → FAIL ---
 
     def test_static_version_is_fail(self):

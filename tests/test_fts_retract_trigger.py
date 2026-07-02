@@ -12,22 +12,27 @@ Background:
     Migration: a one-shot migration also runs at startup to clean pre-existing
     retracted nodes from the index.
 
-    Superseded nodes are deliberately NOT removed from the index — they are past
-    memories, still recallable via include_superseded=True (design-time decision).
+    Design rev 2026-07-02 (#195): superseded nodes are NOW also removed from the
+    FTS index by a separate trigger (nodes_fts_supersede_remove, AFTER UPDATE OF
+    is_current WHEN is_current flips 1→0 AND status != 'retracted').  The retract
+    trigger has OLD.is_current=1 guard so it does not double-delete an already-
+    superseded node.
 
 Coverage:
     1. test_retract_removes_from_fts — trigger path: retract fires trigger,
        node disappears from direct FTS rowid query.
     2. test_retract_does_not_remove_non_retracted_supersession — superseded
-       nodes stay in FTS; only retracted ones are removed.
+       node removed from FTS by supersede trigger; retracted node also absent;
+       neither interferes with the other.
     3. test_retract_migration_cleans_existing_retracted — one-shot migration
        cleans pre-existing retracted nodes on next _init_db call.
     4. test_query_post_retract_does_not_return_retracted — end-to-end:
        engram_query excludes retracted nodes both before and after retraction,
        and also with include_superseded=True after #274.
-    5. test_supersede_then_retract_still_removes_from_fts — reviewer-found gap
-       (#280 round-1): node superseded first (is_current→0) then retracted must
-       still be removed from FTS. Round-2 trigger fix (status transition gate).
+    5. test_supersede_then_retract_still_removes_from_fts — node superseded
+       first (is_current→0, removed from FTS by supersede trigger) then retracted
+       (retract trigger does not fire on already-superseded node); node remains
+       absent from FTS throughout.
 
 Import-pattern contract (#948 wave 0 pilot — R1):
     This file imports engram_revision, engram_observation, engram_query, and
@@ -183,15 +188,15 @@ def test_retract_removes_from_fts():
 # ---------------------------------------------------------------------------
 
 def test_retract_does_not_remove_non_retracted_supersession():
-    """Superseded nodes must remain in nodes_fts; only retracted nodes are removed.
+    """Superseded nodes are removed from nodes_fts by the supersede trigger;
+    retracting an unrelated node does not affect the superseded node's FTS state.
 
     Files two nodes A (to be superseded) and B (to be retracted). Supersedes A
-    with a replacement C. Retracts B. Verifies A (superseded) is still in FTS
-    and B (retracted) is not.
+    with a replacement C — the supersede trigger removes A from FTS. Retracts B —
+    the retract trigger removes B from FTS. Verifies both are absent.
 
-    Design intent: superseded nodes are past memories — "the information is
-    not accurate anymore" but they still exist and are recallable with
-    include_superseded=True. Only retracted (wrong-from-start) nodes are removed.
+    Design rev 2026-07-02 (#195): superseded nodes are no longer kept in FTS.
+    They remain in the graph and are reachable via edge traversal / engram_list.
     """
     rev, obs, _qry, _core = _make_fresh_mods()
 
@@ -238,17 +243,17 @@ def test_retract_does_not_remove_non_retracted_supersession():
     ))
     assert ret.get("status") == "retracted", f"retract failed: {ret}"
 
-    # A (superseded) must still be in nodes_fts — MATCH query on token_a.
-    assert rowid_a in _fts_match_rowids(token_a), (
-        f"Token '{token_a}' must still match superseded rowid {rowid_a}. "
-        "Superseded nodes are past memories — the retract trigger must not fire "
-        "for supersession (only for status='retracted')."
+    # A (superseded) must be ABSENT from nodes_fts — removed by supersede trigger.
+    assert rowid_a not in _fts_match_rowids(token_a), (
+        f"Token '{token_a}' must not match superseded rowid {rowid_a}. "
+        "The supersede trigger (nodes_fts_supersede_remove) removes nodes from FTS "
+        "when is_current flips to 0 (#195)."
     )
 
-    # B (retracted) must be absent from nodes_fts — MATCH query on token_b.
+    # B (retracted) must also be absent — removed by the retract trigger.
     assert rowid_b not in _fts_match_rowids(token_b), (
         f"Token '{token_b}' must not match retracted rowid {rowid_b}. "
-        "Retracted nodes must be removed from nodes_fts by the trigger."
+        "Retracted nodes are removed from nodes_fts by the retract trigger."
     )
 
 
@@ -402,14 +407,15 @@ def test_query_post_retract_does_not_return_retracted():
 # ---------------------------------------------------------------------------
 
 def test_supersede_then_retract_still_removes_from_fts():
-    """A node that was first superseded, then retracted, is removed from FTS.
+    """A node that was first superseded, then retracted, is absent from FTS throughout.
 
-    The trigger's WHEN clause must fire on the status-transition into 'retracted'
-    regardless of whether the node was already is_current=0 from a prior supersede.
-    Round-1 used WHEN OLD.is_current=1, which missed this path — the supersede
-    flips is_current to 0 before the retract fires, so the condition was false
-    and the node leaked into FTS (surfaced via include_superseded=True queries).
-    Reviewer-found gap (PR #280 round-1).
+    Design rev 2026-07-02 (#195): the supersede trigger (nodes_fts_supersede_remove)
+    removes the node from FTS when is_current flips to 0.  By the time the
+    subsequent retract fires, the node is already absent — the retract trigger
+    (nodes_retract_remove_from_fts) has OLD.is_current=1 guard so it does NOT
+    fire on an already-superseded node, preventing a double-delete.
+
+    Net result: node is absent from FTS after supersede AND after retract.
     """
     rev, obs, qry, _core = _make_fresh_mods()
 
@@ -444,10 +450,11 @@ def test_supersede_then_retract_still_removes_from_fts():
     ))
     assert sup.get("status") == "superseded", f"supersede failed: {sup}"
 
-    # After supersede: A must still be in FTS (superseded nodes are kept).
-    assert rowid_a in _fts_match_rowids(token_a), (
-        f"Token '{token_a}' must still match rowid {rowid_a} after supersede. "
-        "Superseded nodes remain in FTS (design-time decision)."
+    # After supersede: A is already ABSENT from FTS — supersede trigger fired.
+    assert rowid_a not in _fts_match_rowids(token_a), (
+        f"Token '{token_a}' must NOT match rowid {rowid_a} after supersede. "
+        "The supersede trigger (nodes_fts_supersede_remove) removes nodes from FTS "
+        "when is_current flips to 0 (#195)."
     )
 
     # Step 2: Retract A — now is_current=0 AND status transitions to 'retracted'.
@@ -458,15 +465,12 @@ def test_supersede_then_retract_still_removes_from_fts():
     ))
     assert ret.get("status") == "retracted", f"retract failed: {ret}"
 
-    # After retract: A must be ABSENT from FTS.
-    # This is the round-1 failure mode: OLD.is_current was already 0 after
-    # the supersede, so the trigger WHEN clause `OLD.is_current=1` was false
-    # and the node was never removed from the index.
+    # After retract: A remains absent from FTS (was already removed by supersede trigger;
+    # retract trigger has OLD.is_current=1 guard so it does not fire on this path).
     assert rowid_a not in _fts_match_rowids(token_a), (
         f"Token '{token_a}' must NOT match rowid {rowid_a} after supersede+retract. "
-        "The nodes_retract_remove_from_fts trigger must fire on the status transition "
-        "into 'retracted' regardless of is_current. Round-1 trigger (OLD.is_current=1) "
-        "missed this path — round-2 fix uses COALESCE(OLD.status,'')!='retracted'."
+        "Node was removed from FTS by the supersede trigger; retract trigger correctly "
+        "does not fire (OLD.is_current was already 0)."
     )
 
     # Also verify via end-to-end query: include_superseded=True must not return A.

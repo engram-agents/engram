@@ -365,6 +365,42 @@ re-copies if size differs (resumed session may have grown the file).
 
 ---
 
+### Step 4.7 — Back up full `~/.claude/projects/` directory
+
+Run the full-directory backup tool and **capture the result for the sleep summary**.
+Mirrors the complete `~/.claude/projects/` tree (all file types) to
+`~/.engram/claude-projects-archive/`, preserving directory structure.
+Complements Step 4.6 (which archives `.jsonl` logs to a separate retention-independent
+location); this step captures configs, subagent transcripts, and any other artifacts for
+disaster-recovery and migration-safety.
+
+**Scope:** `~/.claude/projects/` only — does not touch `~/.engram/knowledge.db`
+(already handled by the Step 4.5 SQL dump).
+
+```bash
+claude_backup_out=$($HOME/.engram/venv/bin/python3 \
+    "$CLAUDE_PLUGIN_ROOT/tools/backup_claude_projects.py" \
+    2>&1)
+claude_backup_rc=$?
+if [ $claude_backup_rc -eq 0 ]; then
+    claude_backup_status="✓ claude-projects backup OK: $claude_backup_out"
+else
+    claude_backup_status="⚠ claude-projects backup FAILED: $claude_backup_out"
+fi
+```
+
+**Non-blocking**: do not abort sleep on failure. Surface the status in the history milestone:
+
+```
+- claude-projects backup: $claude_backup_status
+```
+
+**Skip if source directory is absent** (tool exits 0 with "0 copied" automatically).
+
+**Deduplication**: uncompressed — skips if size AND mtime match (within 1s); compressed (`--compress`) — skips if mtime matches (within 1s, size not compared since .gz wraps vary). Re-copies if the relevant check fails.
+
+---
+
 ## Phase B — Consolidation orchestration
 
 > **Phase B is MANDATORY whenever you reach it** (see the all-or-nothing invariant in
@@ -435,11 +471,11 @@ python3 -m tools.cohort_dispatch verify-in \
 
 Verify-in checks: (1) valid JSON per chunk, (2) required fields present (id, type, claim), (3) every id resolves in the DB with matching claim (race-window guard against retracted nodes), (4) no duplicate IDs within or across chunks, (5) chunk size ≤ 15. On non-zero exit, do not proceed to dispatch — the cohort has a structural problem to fix first.
 
-### Step 6 — Dispatch all fairies in parallel (8 dream-fairies + N batch-summary-fairies)
+### Step 6 — Dispatch all fairies in parallel (9 dream-fairies + N batch-summary-fairies)
 
 Single `Agent`-tool message with all calls, each `run_in_background=true`.
 
-**Fairies 1-8** — `subagent_type="engram-dream-fairy"`, one per well-supported category. **Use these exact substitution values** (canonical from `engram-dream-fairy.md`; do NOT derive from memory or prior-session context — the category numbering changes across versions and must be read here each dispatch):
+**Fairies 1-9** — `subagent_type="engram-dream-fairy"`, one per well-supported category. **Use these exact substitution values** (canonical from `engram-dream-fairy.md`; do NOT derive from memory or prior-session context — the category numbering changes across versions and must be read here each dispatch):
 
 | `{N}` | `{CATEGORY_NAME}` | `{SLUG}` |
 |-------|-------------------|----------|
@@ -451,10 +487,11 @@ Single `Agent`-tool message with all calls, each `run_in_background=true`.
 | 6 | Recent-resolution echoes | resolution-echoes |
 | 7 | Missing principle-edges (instantiates/serves) | missing-edges |
 | 8 | Open tasks with stale external references | stale-task-refs |
+| 9 | Cornerstone auto-load surface coverage gaps | coverage-gaps |
 
 Prompt template (substitute `{N}`, `{CATEGORY_NAME}`, `{SLUG}` from the table above):
 
-> Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md`. Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only file path + 5-bullet TL;DR for this category. Do NOT run other categories or the heuristic categories (9, 10).
+> Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md`. Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only file path + 5-bullet TL;DR for this category. Do NOT run other categories or the heuristic categories (10, 11).
 
 **Batch-summary fairies** — one `subagent_type="engram-batch-summary-fairy"` per chunk from the manifest (typically 1–4 fairies for a 50-node cohort at chunk-size=15). For each chunk, construct a short dispatch prompt inline using the paths from the manifest. Example:
 
@@ -474,10 +511,19 @@ All fairies fire in parallel with `run_in_background=true`; the harness fires a 
 
 Receive each fairy's task-notification as it arrives. Collect from the completion result:
 
-- **Fairies 1-8**: file path (`~/.engram/dream/<TODAY>-fairy-<N>-<SLUG>.md`) + 5-bullet TL;DR. Full report content lives on disk at the cited path.
+- **Fairies 1-9**: file path (`~/.engram/dream/<TODAY>-fairy-<N>-<SLUG>.md`) + 5-bullet TL;DR. Full report content lives on disk at the cited path.
 - **Batch-summary fairies**: write each fairy's returned JSON to `<cohort-dir>/chunk-N/agent_output.json`.
 
-**Fairy timeout**: if any fairy doesn't return within 15 minutes of dispatch, mark it as timed-out. For dream-fairies, note the timeout in the master's spawn prompt. For batch-summary fairies, mark the affected chunk as missing.
+**Fairy timeout**: if any fairy doesn't return within the model-appropriate window, mark it as timed-out.
+
+| Model family | Expected completion | Timeout (mark timed-out) |
+|---|---|---|
+| Claude / Anthropic | 3–5 min per fairy | **15 min** |
+| Ollama / GLM (local) | 15–25 min per fairy | **30 min** |
+
+Use the model family of the fairy's assigned runtime. If the fairy's model family is not explicitly set in the dispatch, apply the parent's timeout row. If unsure, default to 30 min to avoid premature abort. For dream-fairies, note the timeout in the master's spawn prompt. For batch-summary fairies, mark the affected chunk as missing.
+
+*(Origin: Zephyr's first GLM-5 sleep cycle, 2026-06-28 — dream master was dispatched prematurely while GLM-5 fairies were still running at 15 min; batch-summary chunks 2-3 never completed. See #1533.)*
 
 **After all batch-summary fairy outputs are written, run validate:**
 
@@ -614,7 +660,7 @@ Agent(
     DREAM-FAIRY REPORTS (full content on disk — read each before integrating):
     - Category 1 (<CAT1_NAME>): ~/.engram/dream/<TODAY>-fairy-1-<SLUG1>.md — TL;DR: <bullets>
     - Category 2 (<CAT2_NAME>): ~/.engram/dream/<TODAY>-fairy-2-<SLUG2>.md — TL;DR: <bullets>
-    - ... (categories 3-7 similar) ...
+    - ... (categories 3-8 similar) ...
     [Or "Category N (<NAME>) TIMED OUT — proceeding without" for any fairy that didn't return]
 
     COHORT METADATA:
@@ -625,7 +671,7 @@ Agent(
     - Recall summaries already applied by parent in Step 7.5: X applied, Y failures deferred to next cycle
     - SSoT modules live at: <engram-alpha-repo-path>/tools/ (recall_summary_validator, recall_summary_payload)
 
-    Call engram_reflect first for your initial agenda. Read all 8 dream-fairy reports from disk. Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items. Execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring → task_closures; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
+    Call engram_reflect first for your initial agenda. Read all 9 dream-fairy reports from disk. Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items. Execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring → task_closures → coverage_gaps; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
 
     FINAL RETURN: dream record path + top-line counts (resolved / superseded / promoted / refuted / recall-summaries applied) + health score delta + flagged-for-user count. The parent relays this to the user verbatim.""",
     run_in_background=true

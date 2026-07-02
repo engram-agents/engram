@@ -14,8 +14,8 @@ When alpha graduates to beta or stable:
 
 ## Branch model
 
-- **`dev`** is the active development branch. All PRs merge here. CI runs against dev.
-- **`master`** holds tagged release points only. Fast-forwarded to specific dev SHAs at release-cut time. Routine PRs do NOT target master (see `CLAUDE.md` Branching convention section).
+- **`dev`** is the active development branch. All feature/fix PRs merge here. Dev PRs run only the cheap `pr-checks` (combined static scrubs) + `non-author-approval` — the **full pytest suite does NOT run on dev PRs** (run affected-tests **locally** as a review requirement; at agent-PR velocity, per-PR test CI is too expensive). See `CLAUDE.md`.
+- **`master`** holds tagged release points only. A release is cut by opening a **PR from `dev` → `master`**, which fires the **full CI gate** (`tests.yml` full suite + `pr-checks` + `non-author-approval`) — the thorough pre-release validation. Routine PRs do NOT target master (see `CLAUDE.md` Branching convention section).
 - **release tags** (`v0.MINOR.PATCH-alpha`) point at the same SHA master is fast-forwarded to.
 
 ## Cutting a release
@@ -46,20 +46,26 @@ git commit -am "docs: CHANGELOG for v0.MINOR.PATCH-alpha"
 
 *__Note on the initial cut:__ when cutting v0.1.0-alpha, the `Unreleased` section starts empty. Survey the historical commits since project inception (e.g. `git log --oneline --no-merges`) and populate `Unreleased` with notable changes before moving to step 3. Subsequent cuts accumulate the changelog incrementally as PRs land.*
 
-### 3. Fast-forward master + tag
+### 3. Open the release PR (dev → master) — the full CI gate
 
-From engram-alpha root:
+Cut the release by opening a **PR from `dev` → `master`** (not a direct fast-forward). This PR **is** the release gate: the full `tests.yml` suite + `pr-checks` + `non-author-approval` run on it — the thorough validation that deliberately does NOT run per-dev-PR. Fix anything red before releasing; a release whose gate didn't pass never gets tagged.
 
 ```bash
-DEV_SHA=$(git rev-parse dev)
-git checkout master
-git merge --ff-only "$DEV_SHA"
-git tag -a "v0.MINOR.PATCH-alpha" -m "v0.MINOR.PATCH-alpha — short summary"
-git push origin master --tags
-git checkout dev
+gh pr create --base master --head dev \
+  --title "release: v0.MINOR.PATCH-alpha — short summary" \
+  --body "Release cut to master. The full CI gate runs on this PR."
 ```
 
-If `--ff-only` fails, master has diverged from dev — investigate before forcing.
+Wait for all checks green + a colleague fresh-eye, then merge the PR and tag the release SHA on master:
+
+```bash
+gh pr merge <PR-number> --merge        # master now holds the release SHA(s)
+git fetch origin master
+git tag -a "v0.MINOR.PATCH-alpha" -m "v0.MINOR.PATCH-alpha — short summary" origin/master
+git push origin "v0.MINOR.PATCH-alpha"
+```
+
+If CI is red on the release PR, treat it exactly like any blocked PR — fix on dev; the release PR re-runs CI on the new tip.
 
 ### 4. Publish GitHub Release
 

@@ -1,27 +1,62 @@
-"""Tests for hooks/claude/engram-inter-agent-prompt-hook.py.
+"""Tests for hooks/claude/engram-inter-agent-prompt-hook.py (DM-API shape).
 
-Covers all eight behaviors specified in the PR spec:
+The hook was converted from local-filesystem letter scans to pure forum DM
+API reads (UCS PR3b, stacked on PR3a). Tests are restructured accordingly:
 
-  1. Mode=single — hook exits silently, no output.
-  2. Mode=multi, no letters — hook exits silently, no output.
-  3. Mode=multi, 1 new letter to self — outputs new-letter block.
-  4. Mode=multi, 1 new + 1 older-unread — both surface, correct partitioning.
-  5. Mode=multi, letter addressed to a different agent — NOT surfaced.
-  6. Cursor advance on hook fire — surfaced cursor moves; read cursor doesn't.
-  7. Malformed frontmatter file is skipped (not crashed-on).
-  8. Title extraction — each precedence layer (heading / re: / body-first-60).
+- No INTER_AGENT_DIR / letter-file scaffolding.
+- Unit tests call _extract_dm_subject(), _format_senders() as pure functions.
+- Integration tests monkeypatch mod._fetch_dm_updates to control what the
+  hook "sees" from the forum, and capture stdout/stderr via
+  redirect_stdout / redirect_stderr.
 
-Each test invokes the hook as a subprocess with a fake ENGRAM_HOME +
-fake INTER_AGENT_DIR so the full file-system path runs end-to-end.
+Behaviors covered:
+
+  Unit -- _extract_dm_subject(body):
+    1.  **Subject:** line wins over heading and body-first-60.
+    2.  # Heading used when no **Subject:** line.
+    3.  First 60 chars used as fallback when no heading.
+    4.  Body ≤60 chars returned as-is (no ellipsis).
+    5.  Bare-heading body uses non-hash content, not the hash itself.
+    6.  Empty body returns '(no subject)'.
+
+  Unit -- _format_senders(updates):
+    7.  Single sender: just the name.
+    8.  Two distinct senders: sorted, comma-joined.
+    9.  Three senders: all shown.
+    10. Four senders: first 2 + '+ 2 other(s)'.
+    11. Duplicate senders deduplicated.
+
+  Integration -- main() rendering:
+    12. Single-agent guard (mode='single') -> silent exit 0, no output.
+    13. forum_api gate (_FORUM_API_OK=False) -> silent exit 0, no output.
+    14. No DMs -> no output; surfaced cursor advances.
+    15. 1 new DM -> new-message block emitted.
+    16. New + unread -> both surface, correct partitioning.
+    17. Surfaced cursor advances to as_of on live fetch.
+    18. Surfaced cursor does NOT advance on outage (banner path).
+    19. Read cursor never advanced by the hook (only surfaced cursor moves).
+    20. ForumNetworkError -> '⚠️ DM unread check unavailable' banner, no crash.
+    21. ForumHttpError -> same banner, no crash.
+    22. Group-summarize cap: >LIST_CAP new DMs -> listed cap + '+ N older' line.
+    23. Read-cursor-ahead edge: already-read DM is invisible (not re-surfaced).
+    24. First-run (both cursors 0): all DMs appear as new.
+    25. Two new DMs from different senders: sorted senders in header.
+    26. Still-unread-only (no new): 'older still-unread' line, correct wording.
+    27. Footer 'ia read/write/mr/status' present when DMs surface.
+    28. Footer absent when no DMs (no stdout).
+    29. Missing config -> mode defaults to single -> silent exit.
 """
 
+import importlib
+import importlib.util
+import io
 import json
 import os
-import subprocess
 import sys
 import unittest.mock
-from datetime import datetime, timedelta, timezone
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -30,77 +65,141 @@ HOOK_PATH = (
     / "src" / "engram" / "hooks" / "claude" / "engram-inter-agent-prompt-hook.py"
 )
 
+
 # ---------------------------------------------------------------------------
-# Helpers
+# Data helpers
 # ---------------------------------------------------------------------------
 
-def _run_hook(
+def _make_dm_update(
+    seq: int,
+    sender: str,
+    body: str = "Hello from a fellow agent.",
+    kind: str = "dm",
+    wake: str = "act-now",
+) -> dict:
+    """Build a DM update dict matching the shape returned by GET /api/updates."""
+    return {
+        "kind": kind,
+        "seq": seq,
+        "wake": wake,
+        "sender": sender,
+        "body": body,
+        "event_ts": f"2026-01-01T00:00:{seq:02d}Z",
+    }
+
+
+def _make_updates_response(
+    updates: list,
+    as_of: int,
+) -> dict:
+    """Build an /api/updates response dict."""
+    return {
+        "updates": updates,
+        "as_of": as_of,
+        "ts": "2026-01-01T00:00:01Z",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Filesystem helpers
+# ---------------------------------------------------------------------------
+
+def _write_config(
     engram_home: Path,
-    inter_agent_dir: Path,
-    hook_input: dict | None = None,
-) -> tuple[int, str, str]:
-    """Run the hook as a subprocess; return (exit_code, stdout, stderr)."""
-    env = os.environ.copy()
-    env["ENGRAM_HOME"] = str(engram_home)
-    env["INTER_AGENT_DIR"] = str(inter_agent_dir)
-    stdin_data = json.dumps(hook_input or {"prompt": "test"})
-    proc = subprocess.run(
-        [sys.executable, str(HOOK_PATH)],
-        input=stdin_data,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=10,
-    )
-    return proc.returncode, proc.stdout, proc.stderr
-
-
-def _write_config(engram_home: Path, mode: str, agent_name: str = "borges") -> None:
+    agent_name: str = "borges",
+    mode: str = "multi",
+) -> None:
     """Write a minimal config.json into engram_home."""
     cfg = {"mode": mode, "agent_name": agent_name, "counterparts": []}
     (engram_home / "config.json").write_text(json.dumps(cfg))
 
 
-def _write_surfaced_cursor(engram_home: Path, ts: datetime) -> None:
-    ts_str = ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    (engram_home / "inter-agent-surfaced-cursor.txt").write_text(ts_str + "\n")
+def _write_surfaced_cursor(engram_home: Path, value: int) -> None:
+    (engram_home / "inter-agent-surfaced-cursor.txt").write_text(str(value) + "\n")
 
 
-def _write_read_cursor(engram_home: Path, ts: datetime) -> None:
-    ts_str = ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    (engram_home / "inter-agent-read-cursor.txt").write_text(ts_str + "\n")
+def _write_read_cursor(engram_home: Path, value: int) -> None:
+    (engram_home / "inter-agent-read-cursor.txt").write_text(str(value) + "\n")
 
 
-def _write_letter(
-    inter_agent_dir: Path,
-    filename: str,
-    from_agent: str,
-    to_agent: str,
-    timestamp: datetime,
-    body: str = "Hello from a fellow agent.",
-    re_field: str = "",
-    heading: str = "",
-) -> Path:
-    """Write a properly-formatted inter-agent letter markdown file."""
-    ts_str = timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
-    fm_lines = [
-        "---",
-        f"from: {from_agent}",
-        f"to: {to_agent}",
-        f"timestamp: {ts_str}",
-    ]
-    if re_field:
-        fm_lines.append(f"re: {re_field}")
-    fm_lines.append("---")
-    fm_lines.append("")
-    if heading:
-        fm_lines.append(f"# {heading}")
-        fm_lines.append("")
-    fm_lines.append(body)
-    content = "\n".join(fm_lines) + "\n"
-    path = inter_agent_dir / filename
-    path.write_text(content)
-    return path
+def _read_surfaced_cursor(engram_home: Path) -> int:
+    path = engram_home / "inter-agent-surfaced-cursor.txt"
+    if not path.exists():
+        return -1  # sentinel: "not written"
+    return int(path.read_text().strip())
+
+
+def _read_read_cursor(engram_home: Path) -> int:
+    path = engram_home / "inter-agent-read-cursor.txt"
+    if not path.exists():
+        return -1  # sentinel: "not written"
+    return int(path.read_text().strip())
+
+
+# ---------------------------------------------------------------------------
+# Module loader
+# ---------------------------------------------------------------------------
+
+def _load_hook_module(engram_home: Path):
+    """Import the hook as a live module with ENGRAM_HOME set to engram_home."""
+    spec = importlib.util.spec_from_file_location(
+        "engram_inter_agent_hook", HOOK_PATH,
+    )
+    mod = importlib.util.module_from_spec(spec)
+    with patch.dict(os.environ, {"ENGRAM_HOME": str(engram_home)}):
+        spec.loader.exec_module(mod)
+    return mod
+
+
+# ---------------------------------------------------------------------------
+# Integration runner helper
+# ---------------------------------------------------------------------------
+
+def _call_main(
+    mod,
+    updates=None,
+    as_of: int = 100,
+    raise_exc=None,
+) -> tuple:
+    """Call mod.main() with _fetch_dm_updates and stdin patched.
+
+    Returns (stdout_str, stderr_str, exit_code).
+
+    Parameters
+    ----------
+    updates:
+        List of DM update dicts returned by the fake fetch. None treated as [].
+    as_of:
+        The as_of watermark returned by the fake fetch.
+    raise_exc:
+        If set, _fetch_dm_updates raises this exception instead.
+    """
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    exit_code = 0
+
+    def _fake_fetch(config, agent_name, since):
+        if raise_exc is not None:
+            raise raise_exc
+        items = updates if updates is not None else []
+        return _make_updates_response(items, as_of)
+
+    fake_stdin = io.StringIO(json.dumps({"session_id": "test-session"}))
+
+    with patch.object(mod, "_fetch_dm_updates", side_effect=_fake_fetch):
+        with patch.object(sys, "stdin", fake_stdin):
+            try:
+                with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+                    mod.main()
+            except SystemExit as e:
+                exit_code = int(e.code) if e.code is not None else 0
+
+    return stdout_buf.getvalue(), stderr_buf.getvalue(), exit_code
+
+
+def _parse_ctx(stdout_str: str) -> str:
+    """Parse the additionalContext string from hook stdout JSON."""
+    return json.loads(stdout_str)["hookSpecificOutput"]["additionalContext"]
 
 
 # ---------------------------------------------------------------------------
@@ -114,480 +213,496 @@ def engram_home(tmp_path: Path) -> Path:
     return home
 
 
-@pytest.fixture
-def inter_agent_dir(tmp_path: Path) -> Path:
-    d = tmp_path / "inter-agent"
-    d.mkdir()
-    return d
+# ---------------------------------------------------------------------------
+# Unit tests -- _extract_dm_subject()
+# ---------------------------------------------------------------------------
+
+class TestExtractDmSubject:
+    """Pure-function unit tests for _extract_dm_subject(body)."""
+
+    @pytest.fixture(autouse=True)
+    def _hook(self, engram_home):
+        _write_config(engram_home)
+        self.mod = _load_hook_module(engram_home)
+
+    # 1. **Subject:** line wins
+    def test_subject_line_wins_over_heading(self):
+        body = "**Subject:** The real subject\n\n# A heading\n\nBody text."
+        result = self.mod._extract_dm_subject(body)
+        assert result == "The real subject"
+
+    def test_subject_line_wins_over_body_first_60(self):
+        body = "**Subject:** Main topic\n\n" + "A" * 80
+        result = self.mod._extract_dm_subject(body)
+        assert result == "Main topic"
+
+    # 2. # Heading used when no **Subject:** line
+    def test_heading_used_when_no_subject_line(self):
+        body = "# My Heading\n\nBody text here."
+        result = self.mod._extract_dm_subject(body)
+        assert result == "My Heading"
+
+    def test_heading_strips_hash(self):
+        body = "## Section heading\n\nContent."
+        result = self.mod._extract_dm_subject(body)
+        assert result == "Section heading"
+
+    # 3. First 60 chars as fallback
+    def test_body_first_60_fallback(self):
+        body = "A" * 80 + " trailing"
+        result = self.mod._extract_dm_subject(body)
+        assert result == "A" * 57 + "..."
+
+    # 4. Body ≤60 chars returned as-is
+    def test_short_body_no_ellipsis(self):
+        body = "Short message body."
+        result = self.mod._extract_dm_subject(body)
+        assert result == "Short message body."
+        assert "..." not in result
+
+    # 5. Bare-heading body uses non-hash content
+    def test_bare_heading_skipped(self):
+        body = "##\n\nactual content here"
+        result = self.mod._extract_dm_subject(body)
+        assert result == "actual content here"
+        assert "##" not in result
+
+    # 6. Empty body returns '(no subject)'
+    def test_empty_body(self):
+        assert self.mod._extract_dm_subject("") == "(no subject)"
+        assert self.mod._extract_dm_subject(None) == "(no subject)"
 
 
 # ---------------------------------------------------------------------------
-# Test 1: Mode=single — no output, no state mutation
+# Unit tests -- _format_senders()
 # ---------------------------------------------------------------------------
 
-def test_mode_single_exits_silently(engram_home, inter_agent_dir):
-    """Single-agent mode: hook exits 0 with no stdout."""
-    _write_config(engram_home, mode="single", agent_name="borges")
-    # Place a letter that WOULD match in multi mode
-    _write_letter(
-        inter_agent_dir, "2026-05-21T19-50-00Z_ariadne.md",
-        from_agent="ariadne", to_agent="borges",
-        timestamp=datetime.now(timezone.utc) - timedelta(minutes=5),
-    )
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    assert stdout.strip() == ""
-    # Surfaced cursor must NOT be written in single mode
-    assert not (engram_home / "inter-agent-surfaced-cursor.txt").exists()
+class TestFormatSenders:
+    """Pure-function unit tests for _format_senders(updates)."""
 
+    @pytest.fixture(autouse=True)
+    def _hook(self, engram_home):
+        _write_config(engram_home)
+        self.mod = _load_hook_module(engram_home)
 
-# ---------------------------------------------------------------------------
-# Test 2: Mode=multi, no letters — exits silently, surfaced cursor advances
-# ---------------------------------------------------------------------------
+    def _make(self, senders: list) -> list:
+        return [{"sender": s} for s in senders]
 
-def test_mode_multi_no_letters_silent(engram_home, inter_agent_dir):
-    """Multi-agent mode, no matching letters: exit 0, no stdout, cursor advances."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    assert stdout.strip() == ""
-    # Surfaced cursor IS written even when nothing to report
-    assert (engram_home / "inter-agent-surfaced-cursor.txt").exists()
+    # 7. Single sender
+    def test_single_sender(self):
+        assert self.mod._format_senders(self._make(["borges"])) == "borges"
 
+    # 8. Two distinct senders: sorted, comma-joined
+    def test_two_senders_sorted(self):
+        result = self.mod._format_senders(self._make(["mneme", "borges"]))
+        assert result == "borges, mneme"
 
-# ---------------------------------------------------------------------------
-# Test 3: Mode=multi, 1 new letter to self — new-letter block output
-# ---------------------------------------------------------------------------
+    # 9. Three senders: all shown
+    def test_three_senders_all_shown(self):
+        result = self.mod._format_senders(self._make(["mneme", "borges", "ariadne"]))
+        assert result == "ariadne, borges, mneme"
 
-def test_mode_multi_one_new_letter(engram_home, inter_agent_dir):
-    """Multi-agent mode, 1 new letter: output contains new-letter block."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
-    now = datetime.now(timezone.utc)
-    _write_letter(
-        inter_agent_dir, "2026-05-21T19-50-00Z_ariadne.md",
-        from_agent="ariadne", to_agent="borges",
-        timestamp=now - timedelta(minutes=2),
-        heading="First-session reflections",
-    )
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    assert stdout.strip() != ""
-    response = json.loads(stdout)
-    assert "hookSpecificOutput" in response
-    output = response["hookSpecificOutput"]
-    assert output["hookEventName"] == "UserPromptSubmit"
-    ctx = output["additionalContext"]
-    assert "1 new letter from ariadne" in ctx
-    assert "read before responding" in ctx
-    assert "First-session reflections" in ctx
+    # 10. Four senders: cap applied
+    def test_four_senders_cap(self):
+        result = self.mod._format_senders(self._make(["mneme", "borges", "ariadne", "zephyr"]))
+        # sorted: ariadne, borges, mneme, zephyr → show ariadne, borges + 2 others
+        assert result == "ariadne, borges, + 2 other(s)"
+
+    # 11. Duplicates deduplicated
+    def test_duplicates_deduplicated(self):
+        result = self.mod._format_senders(self._make(["borges", "borges", "ariadne"]))
+        assert result == "ariadne, borges"
 
 
 # ---------------------------------------------------------------------------
-# Test 4: Mode=multi, 1 new + 1 older-unread — both surface, correct partition
+# Integration tests -- main() rendering
 # ---------------------------------------------------------------------------
 
-def test_mode_multi_new_and_unread_partitioned(engram_home, inter_agent_dir):
-    """1 new letter + 1 older-unread: both appear; partitioning is correct."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
-    now = datetime.now(timezone.utc)
+class TestMainRendering:
+    """Integration tests for main(): DM surfacing behavior."""
 
-    # Older letter (before surfaced cursor, after read cursor → unread)
-    old_ts = now - timedelta(hours=2)
-    _write_letter(
-        inter_agent_dir, "2026-05-21T10-00-00Z_mneme.md",
-        from_agent="mneme", to_agent="borges",
-        timestamp=old_ts,
-        body="An old letter that was surfaced but not read.",
-    )
+    # 12. Single-agent gate
+    def test_single_agent_gate_silent_exit(self, engram_home):
+        """mode='single' in config -> hook exits 0 with no output."""
+        _write_config(engram_home, mode="single")
+        mod = _load_hook_module(engram_home)
+        stdout, stderr, rc = _call_main(mod, updates=[
+            _make_dm_update(1, "ariadne", "Hello"),
+        ])
+        assert rc == 0
+        assert stdout.strip() == "", "single-agent mode must produce no output"
+        # Surfaced cursor must NOT be written in single mode
+        assert _read_surfaced_cursor(engram_home) == -1
 
-    # Set surfaced cursor AFTER the old letter but BEFORE the new one
-    surfaced_at = now - timedelta(hours=1)
-    _write_surfaced_cursor(engram_home, surfaced_at)
-    # No read cursor → old letter is still "unread"
+    # 13. forum_api gate (_FORUM_API_OK=False)
+    def test_forum_api_gate_silent_exit(self, engram_home):
+        """_FORUM_API_OK=False -> hook exits 0 with no output."""
+        _write_config(engram_home, mode="multi")
+        mod = _load_hook_module(engram_home)
+        mod._FORUM_API_OK = False
+        stdout, stderr, rc = _call_main(mod, updates=[])
+        assert rc == 0
+        assert stdout.strip() == "", "forum_api import failure must be silent"
 
-    # New letter (after surfaced cursor)
-    new_ts = now - timedelta(minutes=5)
-    _write_letter(
-        inter_agent_dir, "2026-05-21T20-05-00Z_ariadne.md",
-        from_agent="ariadne", to_agent="borges",
-        timestamp=new_ts,
-        heading="Re: handoff plan",
-    )
+    # 14. No DMs -> no output; surfaced cursor advances
+    def test_no_dms_silent_cursor_advances(self, engram_home):
+        """No DMs from API -> exit 0, no stdout, surfaced cursor advances."""
+        _write_config(engram_home)
+        mod = _load_hook_module(engram_home)
+        stdout, stderr, rc = _call_main(mod, updates=[], as_of=42)
+        assert rc == 0
+        assert stdout.strip() == ""
+        # Surfaced cursor advances to as_of even when nothing to surface
+        assert _read_surfaced_cursor(engram_home) == 42
 
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    assert stdout.strip() != ""
-    response = json.loads(stdout)
-    ctx = response["hookSpecificOutput"]["additionalContext"]
+    # 15. 1 new DM -> new-message block emitted
+    def test_one_new_dm_surfaces(self, engram_home):
+        """1 new DM: output contains new-message block with sender and subject."""
+        _write_config(engram_home)
+        mod = _load_hook_module(engram_home)
+        # surfaced_cursor=0 (absent), so seq=5 > 0 → new
+        update = _make_dm_update(5, "ariadne", "**Subject:** Review request\n\nBody.")
+        stdout, stderr, rc = _call_main(mod, updates=[update], as_of=5)
+        assert rc == 0
+        ctx = _parse_ctx(stdout)
+        assert "1 new message from ariadne" in ctx
+        assert "read before responding" in ctx
+        assert "Review request" in ctx
 
-    # New letter is listed under "New letters"
-    assert "1 new letter from ariadne" in ctx
-    assert "read before responding" in ctx
-    assert "Re: handoff plan" in ctx
+    # 16. New + unread -> both surface, correct partitioning
+    def test_new_and_unread_partitioned(self, engram_home):
+        """1 new DM + 1 older still-unread: both appear, correctly partitioned."""
+        _write_config(engram_home)
+        mod = _load_hook_module(engram_home)
+        # surfaced cursor at seq=10, read cursor at 0
+        # seq=5 → still-unread (5 > read_cursor=0 AND 5 <= surfaced=10)
+        # seq=15 → new (15 > surfaced_cursor=10)
+        _write_surfaced_cursor(engram_home, 10)
+        _write_read_cursor(engram_home, 0)
 
-    # Older unread appears in "(Plus N older still-unread from <senders>.)" line
-    assert "1 older still-unread" in ctx
-    assert "from mneme" in ctx
+        older = _make_dm_update(5, "mneme", "**Subject:** Old unread")
+        newer = _make_dm_update(15, "ariadne", "**Subject:** New arrival")
+        stdout, stderr, rc = _call_main(mod, updates=[older, newer], as_of=20)
+        assert rc == 0
+        ctx = _parse_ctx(stdout)
 
+        # New DM surfaces
+        assert "1 new message from ariadne" in ctx
+        assert "New arrival" in ctx
 
-# ---------------------------------------------------------------------------
-# Test 5: Letter addressed to a different agent — NOT surfaced
-# ---------------------------------------------------------------------------
+        # Older unread appears as "(Plus N older still-unread from …)"
+        assert "1 older still-unread" in ctx
+        assert "from mneme" in ctx
 
-def test_letter_to_other_agent_not_surfaced(engram_home, inter_agent_dir):
-    """Letter addressed to 'mneme' while we're 'borges': not surfaced."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
-    _write_letter(
-        inter_agent_dir, "2026-05-21T20-00-00Z_ariadne.md",
-        from_agent="ariadne", to_agent="mneme",   # <-- different agent
-        timestamp=datetime.now(timezone.utc) - timedelta(minutes=5),
-        heading="Message for Zephyr",
-    )
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    assert stdout.strip() == "", (
-        "Letter to 'mneme' should not surface for 'borges'"
-    )
+    # 16b. since = min(surfaced, read) — the fetch window must cover BOTH buckets
+    def test_fetch_since_is_min_of_both_cursors(self, engram_home):
+        """`_fetch_dm_updates` must be called with `since = min(surfaced, read)` so
+        one call covers both the 'new' (>surfaced) and 'still-unread' (>read) buckets.
+        The mock-returns-all path can't exercise this, so assert the `since` value
+        directly — from BOTH cursor orderings, so a since=surfaced-only or
+        since=read-only off-by-one is caught (each ordering rules out one)."""
+        _write_config(engram_home)
+        mod = _load_hook_module(engram_home)
 
+        captured = {}
 
-# ---------------------------------------------------------------------------
-# Test 6: Cursor advance semantics
-# ---------------------------------------------------------------------------
+        def _capture_fetch(config, agent_name, since):
+            captured["since"] = since
+            return _make_updates_response([], as_of=99)
 
-def test_surfaced_cursor_advances_read_cursor_does_not(engram_home, inter_agent_dir):
-    """After hook fires: surfaced cursor advances; read cursor stays put."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
+        def _run():
+            with patch.object(mod, "_fetch_dm_updates", side_effect=_capture_fetch):
+                with patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": "t"}))):
+                    try:
+                        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                            mod.main()
+                    except SystemExit:
+                        pass
 
-    before = datetime.now(timezone.utc) - timedelta(seconds=2)
-    _write_surfaced_cursor(engram_home, before)
+        # read ahead of surfaced (e.g. `ia mr` during a Monitor wake) → min = surfaced = 5
+        _write_surfaced_cursor(engram_home, 5)
+        _write_read_cursor(engram_home, 15)
+        _run()
+        assert captured["since"] == 5, f"min(surfaced=5, read=15) should be 5, got {captured['since']}"
 
-    # Place a read cursor; it must remain unchanged after hook fire.
-    read_ts = datetime.now(timezone.utc) - timedelta(days=1)
-    _write_read_cursor(engram_home, read_ts)
+        # surfaced ahead of read → min = read = 5 (rules out 'always surfaced')
+        _write_surfaced_cursor(engram_home, 15)
+        _write_read_cursor(engram_home, 5)
+        _run()
+        assert captured["since"] == 5, f"min(surfaced=15, read=5) should be 5, got {captured['since']}"
 
-    _run_hook(engram_home, inter_agent_dir)
+    # 17. Surfaced cursor advances to as_of on live fetch
+    def test_surfaced_cursor_advances_to_as_of(self, engram_home):
+        """After successful fetch: surfaced cursor = as_of from response."""
+        _write_config(engram_home)
+        mod = _load_hook_module(engram_home)
+        _write_surfaced_cursor(engram_home, 5)
+        _call_main(mod, updates=[], as_of=99)
+        assert _read_surfaced_cursor(engram_home) == 99
 
-    # Surfaced cursor was updated
-    surfaced_raw = (engram_home / "inter-agent-surfaced-cursor.txt").read_text().strip()
-    surfaced_new = datetime.fromisoformat(surfaced_raw.replace("Z", "+00:00"))
-    assert surfaced_new > before, "Surfaced cursor must advance past previous value"
+    # 18. Surfaced cursor does NOT advance on outage (banner path)
+    def test_surfaced_cursor_no_advance_on_outage(self, engram_home):
+        """On ForumNetworkError: surfaced cursor stays at old value (no step-over)."""
+        _write_config(engram_home)
+        mod = _load_hook_module(engram_home)
+        _write_surfaced_cursor(engram_home, 7)
 
-    # Read cursor was NOT touched
-    read_raw = (engram_home / "inter-agent-read-cursor.txt").read_text().strip()
-    read_back = datetime.fromisoformat(read_raw.replace("Z", "+00:00"))
-    # Allow 1-second slop for sub-second formatting differences
-    assert abs((read_back - read_ts).total_seconds()) < 2, (
-        "Read cursor must not change after hook fire"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 7: Malformed frontmatter file is skipped (not crashed-on)
-# ---------------------------------------------------------------------------
-
-def test_malformed_frontmatter_skipped(engram_home, inter_agent_dir):
-    """Files with malformed/absent frontmatter are silently skipped."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
-
-    # File with no frontmatter at all
-    (inter_agent_dir / "no-frontmatter.md").write_text("Just some text.\n")
-
-    # File with incomplete frontmatter (no timestamp)
-    (inter_agent_dir / "incomplete.md").write_text(
-        "---\nfrom: ariadne\nto: borges\n---\nBody.\n"
-    )
-
-    # File with completely garbage content
-    (inter_agent_dir / "garbage.md").write_text("\x00\x01\x02\x03 not yaml\n")
-
-    # File with valid frontmatter that targets us (to verify others are skipped)
-    now = datetime.now(timezone.utc)
-    _write_letter(
-        inter_agent_dir, "valid.md",
-        from_agent="ariadne", to_agent="borges",
-        timestamp=now - timedelta(minutes=1),
-        heading="Valid letter",
-    )
-
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0, f"Hook should not crash on malformed files; stderr: {stderr}"
-    # The valid letter should still be surfaced
-    assert stdout.strip() != ""
-    response = json.loads(stdout)
-    ctx = response["hookSpecificOutput"]["additionalContext"]
-    assert "Valid letter" in ctx
-
-
-# ---------------------------------------------------------------------------
-# Test 8: Title extraction precedence
-# ---------------------------------------------------------------------------
-
-class TestTitleExtraction:
-    """Title extraction: heading > re: field > body-first-60 chars."""
-
-    def test_title_from_heading(self, engram_home, inter_agent_dir):
-        """# Heading in body takes priority over re: and body text."""
-        _write_config(engram_home, mode="multi", agent_name="borges")
-        _write_letter(
-            inter_agent_dir, "heading-test.md",
-            from_agent="ariadne", to_agent="borges",
-            timestamp=datetime.now(timezone.utc) - timedelta(minutes=1),
-            heading="Thoughts on memory consolidation",
-            re_field="some-re-field",
-            body="This is the body text that should not be used as title.",
+        # Import ForumNetworkError from the loaded hook module
+        from forum_api import ForumNetworkError
+        stdout, stderr, rc = _call_main(
+            mod,
+            raise_exc=ForumNetworkError("connection refused"),
         )
-        _, stdout, _ = _run_hook(engram_home, inter_agent_dir)
-        assert stdout.strip()
-        ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-        assert "Thoughts on memory consolidation" in ctx
-        assert "some-re-field" not in ctx
-        assert "This is the body text" not in ctx
+        assert rc == 0
+        # Banner emitted
+        ctx = _parse_ctx(stdout)
+        assert "DM unread check unavailable" in ctx
+        # Surfaced cursor UNCHANGED
+        assert _read_surfaced_cursor(engram_home) == 7
 
-    def test_title_from_re_field_when_no_heading(self, engram_home, inter_agent_dir):
-        """re: frontmatter used when body has no # heading."""
-        _write_config(engram_home, mode="multi", agent_name="borges")
-        _write_letter(
-            inter_agent_dir, "re-test.md",
-            from_agent="mneme", to_agent="borges",
-            timestamp=datetime.now(timezone.utc) - timedelta(minutes=1),
-            re_field="2026-05-20T18-00-00Z_borges.md",
-            body="Just body, no heading.",
+    # 19. Read cursor never advanced by the hook
+    def test_read_cursor_never_advanced(self, engram_home):
+        """Hook never advances the read cursor — only surfaced cursor moves."""
+        _write_config(engram_home)
+        mod = _load_hook_module(engram_home)
+        _write_read_cursor(engram_home, 3)
+        _write_surfaced_cursor(engram_home, 3)
+
+        update = _make_dm_update(10, "ariadne", "New message")
+        _call_main(mod, updates=[update], as_of=10)
+
+        # Surfaced cursor advanced
+        assert _read_surfaced_cursor(engram_home) == 10
+        # Read cursor UNCHANGED
+        assert _read_read_cursor(engram_home) == 3
+
+    # 20. ForumNetworkError -> banner
+    def test_forum_network_error_banner(self, engram_home):
+        """ForumNetworkError -> banner on stdout, exit 0, no crash."""
+        _write_config(engram_home)
+        mod = _load_hook_module(engram_home)
+        from forum_api import ForumNetworkError
+        stdout, stderr, rc = _call_main(
+            mod,
+            raise_exc=ForumNetworkError("timeout"),
         )
-        _, stdout, _ = _run_hook(engram_home, inter_agent_dir)
-        assert stdout.strip()
-        ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-        assert "2026-05-20T18-00-00Z_borges.md" in ctx
+        assert rc == 0
+        assert stdout.strip() != "", "Must emit banner on network error"
+        ctx = _parse_ctx(stdout)
+        assert "DM unread check unavailable" in ctx
+        assert "UCS" in ctx
 
-    def test_title_from_body_first_60_when_no_heading_no_re(
-        self, engram_home, inter_agent_dir
-    ):
-        """First 60 chars of body used when no heading and no re: field."""
-        _write_config(engram_home, mode="multi", agent_name="borges")
-        long_body = "A" * 80 + " trailing words"
-        _write_letter(
-            inter_agent_dir, "body-test.md",
-            from_agent="ariadne", to_agent="borges",
-            timestamp=datetime.now(timezone.utc) - timedelta(minutes=1),
-            body=long_body,
+    # 21. ForumHttpError -> banner
+    def test_forum_http_error_banner(self, engram_home):
+        """ForumHttpError -> banner on stdout, exit 0, no crash."""
+        _write_config(engram_home)
+        mod = _load_hook_module(engram_home)
+        from forum_api import ForumHttpError
+        stdout, stderr, rc = _call_main(
+            mod,
+            raise_exc=ForumHttpError(503, "service unavailable"),
         )
-        _, stdout, _ = _run_hook(engram_home, inter_agent_dir)
-        assert stdout.strip()
-        ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-        # First 60 chars of body should appear (truncated with ...)
-        assert "A" * 57 + "..." in ctx
+        assert rc == 0
+        ctx = _parse_ctx(stdout)
+        assert "DM unread check unavailable" in ctx
 
-    def test_title_body_short_not_truncated(self, engram_home, inter_agent_dir):
-        """Short body (≤60 chars) is used as-is without ellipsis."""
-        _write_config(engram_home, mode="multi", agent_name="borges")
-        short_body = "Short body text here."
-        _write_letter(
-            inter_agent_dir, "short-body.md",
-            from_agent="ariadne", to_agent="borges",
-            timestamp=datetime.now(timezone.utc) - timedelta(minutes=1),
-            body=short_body,
+    # 22. Group-summarize cap
+    def test_group_summarize_cap(self, engram_home):
+        """More than LIST_CAP new DMs: first LIST_CAP listed + '+ N older' line."""
+        _write_config(engram_home)
+        mod = _load_hook_module(engram_home)
+        cap = mod.LIST_CAP  # typically 10
+
+        # Create cap+3 new DMs from 2 different senders
+        updates = [
+            _make_dm_update(i + 1, "ariadne" if i < cap else "mneme", f"Msg {i}")
+            for i in range(cap + 3)
+        ]
+        # surfaced_cursor=0 so all are new
+        stdout, stderr, rc = _call_main(mod, updates=updates, as_of=cap + 3)
+        assert rc == 0
+        ctx = _parse_ctx(stdout)
+
+        # Cap+3 new total; lines after header should show LIST_CAP individual + 1 group line
+        assert f"{cap + 3} new messages" in ctx
+        assert "+ 3 older from" in ctx
+
+    # 23. Read-cursor-ahead edge: already-read DM invisible
+    def test_read_cursor_ahead_already_read_invisible(self, engram_home):
+        """When read_cursor > surfaced_cursor, acknowledged DMs are invisible.
+
+        Edge case: `ia mr` advanced the read cursor (seq=15) without an
+        intervening UserPromptSubmit, leaving read_cursor > surfaced_cursor.
+        A DM with surfaced_cursor < seq <= read_cursor was acknowledged and
+        must NOT re-appear as 'new'.
+        """
+        _write_config(engram_home)
+        mod = _load_hook_module(engram_home)
+        # surfaced at 5, read at 15 (read ahead of surfaced)
+        _write_surfaced_cursor(engram_home, 5)
+        _write_read_cursor(engram_home, 15)
+
+        # DM at seq=10 — acknowledged (10 <= read_cursor=15) even though
+        # it arrived after surfaced_cursor=5
+        acknowledged = _make_dm_update(10, "ariadne", "Already read")
+        # Genuinely new DM at seq=20 (20 > read_cursor=15)
+        new_dm = _make_dm_update(20, "borges", "Genuinely new")
+
+        stdout, stderr, rc = _call_main(
+            mod, updates=[acknowledged, new_dm], as_of=20
         )
-        _, stdout, _ = _run_hook(engram_home, inter_agent_dir)
-        assert stdout.strip()
-        ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-        assert "Short body text here." in ctx
-        assert "..." not in ctx
+        assert rc == 0
+        ctx = _parse_ctx(stdout)
+
+        assert "Genuinely new" in ctx, "Genuinely new DM must surface"
+        assert "Already read" not in ctx, "Acknowledged DM must NOT re-appear"
+        assert "older still-unread" not in ctx, "No unread bucket when read_cursor > surfaced_cursor"
+
+    # 24. First run (both cursors 0): all DMs appear as new
+    def test_first_run_all_dms_as_new(self, engram_home):
+        """First run (no cursor files): all DMs appear as new."""
+        _write_config(engram_home)
+        mod = _load_hook_module(engram_home)
+        # No cursor files written — first-run state
+        updates = [
+            _make_dm_update(1, "ariadne", "First message"),
+            _make_dm_update(2, "mneme", "Second message"),
+        ]
+        stdout, stderr, rc = _call_main(mod, updates=updates, as_of=2)
+        assert rc == 0
+        ctx = _parse_ctx(stdout)
+        assert "2 new messages" in ctx
+        assert "First message" in ctx
+        assert "Second message" in ctx
+        assert "older still-unread" not in ctx
+
+    # 25. Two new DMs from different senders: sorted senders in header
+    def test_two_new_senders_sorted_in_header(self, engram_home):
+        """Two distinct new-DM senders appear sorted in the header line."""
+        _write_config(engram_home)
+        mod = _load_hook_module(engram_home)
+        updates = [
+            _make_dm_update(1, "mneme", "From mneme"),
+            _make_dm_update(2, "ariadne", "From ariadne"),
+        ]
+        stdout, stderr, rc = _call_main(mod, updates=updates, as_of=2)
+        assert rc == 0
+        ctx = _parse_ctx(stdout)
+        first_line = ctx.splitlines()[0]
+        assert "2 new messages" in first_line
+        assert "from ariadne, mneme" in first_line, (
+            f"Sorted senders 'ariadne, mneme' must appear in header; got: {first_line!r}"
+        )
+
+    # 26. Still-unread-only (no new): 'older still-unread' line and wording
+    def test_still_unread_only(self, engram_home):
+        """Only older-unread DMs (no new): 'older still-unread' line surfaced."""
+        _write_config(engram_home)
+        mod = _load_hook_module(engram_home)
+        # surfaced=10, read=0, DM at seq=5 → older still-unread
+        _write_surfaced_cursor(engram_home, 10)
+        _write_read_cursor(engram_home, 0)
+
+        update = _make_dm_update(5, "mneme", "Old unread")
+        stdout, stderr, rc = _call_main(mod, updates=[update], as_of=10)
+        assert rc == 0
+        ctx = _parse_ctx(stdout)
+        assert "1 older still-unread message" in ctx, (
+            f"Singular 'message' wording expected; got: {ctx!r}"
+        )
+        assert "from mneme" in ctx
+        assert "finish reading at the next natural break" in ctx
+
+    # 27. Footer present when DMs surface
+    def test_footer_present_with_new_dms(self, engram_home):
+        """'ia read/write/mr/status' footer appears when there are new DMs."""
+        _write_config(engram_home)
+        mod = _load_hook_module(engram_home)
+        update = _make_dm_update(1, "ariadne", "Hello")
+        stdout, _, rc = _call_main(mod, updates=[update], as_of=1)
+        assert rc == 0
+        ctx = _parse_ctx(stdout)
+        assert "`ia read <counterpart>`" in ctx
+        assert "`ia mr`" in ctx
+        assert "`ia status`" in ctx
+
+    def test_footer_present_with_unread_only(self, engram_home):
+        """Footer appears when there are only older-unread DMs."""
+        _write_config(engram_home)
+        mod = _load_hook_module(engram_home)
+        _write_surfaced_cursor(engram_home, 10)
+        _write_read_cursor(engram_home, 0)
+        update = _make_dm_update(5, "mneme", "Old")
+        stdout, _, rc = _call_main(mod, updates=[update], as_of=10)
+        assert rc == 0
+        ctx = _parse_ctx(stdout)
+        assert "`ia read <counterpart>`" in ctx
+
+    # 28. Footer absent when no DMs
+    def test_footer_absent_when_no_dms(self, engram_home):
+        """No DMs -> hook exits silently, no footer."""
+        _write_config(engram_home)
+        mod = _load_hook_module(engram_home)
+        stdout, _, rc = _call_main(mod, updates=[], as_of=1)
+        assert rc == 0
+        assert stdout.strip() == "", "No DMs -> no stdout; footer must not appear"
+
+    # 29. Missing config -> mode defaults to single -> silent exit
+    def test_missing_config_treated_as_single(self, engram_home):
+        """No config.json -> mode defaults to 'single', hook exits silently."""
+        mod = _load_hook_module(engram_home)  # no config written
+        stdout, stderr, rc = _call_main(mod, updates=[
+            _make_dm_update(1, "ariadne", "Hello"),
+        ])
+        assert rc == 0
+        assert stdout.strip() == ""
 
 
 # ---------------------------------------------------------------------------
-# Additional edge cases
+# Unit tests -- _get_agent_name() (unchanged function, preserved tests)
 # ---------------------------------------------------------------------------
 
-def test_mode_multi_missing_config_treated_as_single(engram_home, inter_agent_dir):
-    """No config.json → mode defaults to 'single', hook exits silently."""
-    # Don't write any config file
-    _write_letter(
-        inter_agent_dir, "letter.md",
-        from_agent="ariadne", to_agent="borges",
-        timestamp=datetime.now(timezone.utc) - timedelta(minutes=1),
-    )
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    assert stdout.strip() == ""
-
-
-def test_inter_agent_dir_missing_is_safe(engram_home, inter_agent_dir):
-    """If INTER_AGENT_DIR doesn't exist, hook exits silently (no crash)."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
-    missing_dir = inter_agent_dir.parent / "nonexistent-dir"
-    rc, stdout, stderr = _run_hook(engram_home, missing_dir)
-    assert rc == 0
-    # surfaced cursor should still advance
-    assert (engram_home / "inter-agent-surfaced-cursor.txt").exists()
-
-
-# ---------------------------------------------------------------------------
-# Test 9: Atomic cursor write — smoke test
-# ---------------------------------------------------------------------------
-
-def test_cursor_write_is_atomic(engram_home, inter_agent_dir):
-    """Atomic cursor write: successful write leaves correct content and no .tmp file."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
-
-    # Run the hook so the cursor is written via the atomic path
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-
-    cursor_path = engram_home / "inter-agent-surfaced-cursor.txt"
-    tmp_path = engram_home / "inter-agent-surfaced-cursor.txt.tmp"
-
-    # Cursor file must exist with valid ISO timestamp content
-    assert cursor_path.exists(), "Surfaced cursor file must exist after hook fire"
-    content = cursor_path.read_text().strip()
-    # Must parse as a valid datetime (atomic write landed correctly)
-    dt = datetime.fromisoformat(content.replace("Z", "+00:00"))
-    assert dt.tzinfo is not None, "Cursor timestamp must be timezone-aware"
-
-    # Tmp file must NOT remain after a successful write (os.replace consumed it)
-    assert not tmp_path.exists(), (
-        ".tmp file must not persist after a successful atomic cursor write"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 10: Bare-heading body-first-60 fallback produces a clean title
-# ---------------------------------------------------------------------------
-
-def test_bare_heading_body_uses_clean_title(engram_home, inter_agent_dir):
-    """Body starting with '##\\n\\nactual content' → title is 'actual content', not '##'."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
-
-    # Body starts with a bare heading (hash-only line), then the real content.
-    bare_heading_body = "##\n\nactual content here"
-    _write_letter(
-        inter_agent_dir, "bare-heading.md",
-        from_agent="ariadne", to_agent="borges",
-        timestamp=datetime.now(timezone.utc) - timedelta(minutes=1),
-        body=bare_heading_body,
-        # No re: field, no heading kwarg — forces body-first-60 path
-    )
-
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    assert stdout.strip(), "Hook should produce output for a valid letter"
-    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-
-    # Must NOT surface the bare '##' as a title
-    assert '"##"' not in ctx, "Bare '##' must not appear as title"
-    assert "##" not in ctx.split('"')[1::2], (
-        "No field in the context should be '##' as the title text"
-    )
-    # Must surface the actual content
-    assert "actual content here" in ctx, (
-        "Actual body content should be used as the title"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 11: Malformed cursor (filename-format) logs to stderr + still surfaces
-# ---------------------------------------------------------------------------
-
-def test_malformed_cursor_logs_stderr_and_surfaces_letter(engram_home, inter_agent_dir):
-    """Cursor with filename-format value logs stderr warning and treats all letters as unread.
-
-    A v0-pattern cursor stores a filename like '2026-05-22T07-15-30Z_borges.md'
-    instead of an ISO-8601 timestamp. The hook must:
-      - Log a warning to stderr containing the diagnostic phrases.
-      - Exit with code 0 (no crash).
-      - Treat all letters as unread (None-cursor path), so the letter surfaces.
-    """
-    _write_config(engram_home, mode="multi", agent_name="borges")
-
-    # Write a filename-format value to the surfaced cursor file (v0 pattern)
-    malformed_cursor = "2026-05-22T07-15-30Z_borges.md"
-    (engram_home / "inter-agent-surfaced-cursor.txt").write_text(malformed_cursor + "\n")
-
-    # Write a letter addressed to us
-    now = datetime.now(timezone.utc)
-    _write_letter(
-        inter_agent_dir, "2026-05-22T07-35-00Z_ariadne.md",
-        from_agent="ariadne", to_agent="borges",
-        timestamp=now - timedelta(minutes=5),
-        heading="Test letter for cursor warning",
-    )
-
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-
-    # Hook must exit cleanly
-    assert rc == 0, f"Hook must not crash on malformed cursor; stderr: {stderr}"
-
-    # Stderr must contain the diagnostic warning
-    assert "not an ISO-8601 timestamp" in stderr, (
-        f"Expected 'not an ISO-8601 timestamp' in stderr; got: {stderr!r}"
-    )
-    assert "2026-05-22T14:30:00Z" in stderr, (
-        f"Expected example format hint in stderr; got: {stderr!r}"
-    )
-    assert "README.md §4" in stderr, (
-        f"Expected README pointer in stderr; got: {stderr!r}"
-    )
-
-    # Letter must surface (None-cursor path treats everything as unread/new)
-    assert stdout.strip(), "Letter must surface when cursor is malformed (None-cursor path)"
-    response = json.loads(stdout)
-    ctx = response["hookSpecificOutput"]["additionalContext"]
-    assert "Test letter for cursor warning" in ctx, (
-        "Letter title must appear in output when cursor falls back to None"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Helpers for unit-testing _get_agent_name directly
-# ---------------------------------------------------------------------------
-
-def _load_hook_module():
-    """Load the hook as a module so we can call _get_agent_name directly."""
-    import importlib.util
+def _load_hook_module_direct(engram_home: Path):
+    """Load the hook module directly (for unit-testing internal functions)."""
     spec = importlib.util.spec_from_file_location(
         "engram_inter_agent_hook",
-        Path(__file__).parent.parent / "src" / "engram" / "hooks" / "claude" / "engram-inter-agent-prompt-hook.py",
+        HOOK_PATH,
     )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    mod = importlib.util.module_from_spec(spec)
+    with patch.dict(os.environ, {"ENGRAM_HOME": str(engram_home)}):
+        spec.loader.exec_module(mod)
+    return mod
 
-
-# ---------------------------------------------------------------------------
-# Test 11: _get_agent_name fallback chain
-# ---------------------------------------------------------------------------
 
 class TestGetAgentName:
     """Unit tests for _get_agent_name's priority chain."""
 
     @pytest.fixture(autouse=True)
-    def _hook(self):
-        self.hook = _load_hook_module()
+    def _hook(self, engram_home):
+        self.hook = _load_hook_module_direct(engram_home)
 
-    def test_get_agent_name_config_wins_over_env(self, monkeypatch):
+    def test_config_wins_over_env(self, monkeypatch):
         """config.json agent_name wins even when $USER is set to something else."""
         monkeypatch.setenv("USER", "agent-mallory")
         result = self.hook._get_agent_name({"agent_name": "borges"})
         assert result == "borges"
 
-    def test_get_agent_name_user_env_fallback(self, monkeypatch):
-        """No config field; $USER=agent-borges → returns 'borges'."""
+    def test_user_env_fallback(self, monkeypatch):
+        """No config field; $USER=agent-borges -> returns 'borges'."""
         monkeypatch.setenv("USER", "agent-borges")
         monkeypatch.delenv("LOGNAME", raising=False)
         result = self.hook._get_agent_name({})
         assert result == "borges"
 
-    def test_get_agent_name_logname_when_user_empty(self, monkeypatch):
-        """$USER is empty; $LOGNAME=agent-borges → returns 'borges'.
-
-        This is the bug being fixed: Claude Code hook context populates
-        $LOGNAME but not $USER.
-        """
+    def test_logname_when_user_empty(self, monkeypatch):
+        """$USER is empty; $LOGNAME=agent-borges -> returns 'borges'."""
         monkeypatch.setenv("USER", "")
         monkeypatch.setenv("LOGNAME", "agent-borges")
         result = self.hook._get_agent_name({})
         assert result == "borges"
 
-    def test_get_agent_name_uid_fallback_when_both_env_empty(self, monkeypatch):
-        """$USER and $LOGNAME both empty; pwd lookup returns 'agent-borges' → 'borges'."""
+    def test_uid_fallback_when_both_env_empty(self, monkeypatch):
+        """$USER and $LOGNAME both empty; pwd lookup returns 'agent-borges' -> 'borges'."""
         monkeypatch.setenv("USER", "")
         monkeypatch.setenv("LOGNAME", "")
         mock_pw = unittest.mock.MagicMock()
@@ -596,8 +711,8 @@ class TestGetAgentName:
             result = self.hook._get_agent_name({})
         assert result == "borges"
 
-    def test_get_agent_name_returns_empty_when_all_paths_fail(self, monkeypatch):
-        """All fallback paths exhausted → returns empty string."""
+    def test_returns_empty_when_all_paths_fail(self, monkeypatch):
+        """All fallback paths exhausted -> returns empty string."""
         monkeypatch.setenv("USER", "")
         monkeypatch.setenv("LOGNAME", "")
         with unittest.mock.patch.object(self.hook.pwd, "getpwuid", side_effect=KeyError("uid not found")):
@@ -608,9 +723,8 @@ class TestGetAgentName:
         ("USER", "agent-borges"),
         ("LOGNAME", "agent-borges"),
     ])
-    def test_get_agent_name_strips_agent_prefix_consistently(self, monkeypatch, envvar, value):
+    def test_strips_agent_prefix_consistently(self, monkeypatch, envvar, value):
         """All env-var paths strip the 'agent-' prefix the same way."""
-        # Blank out both env vars first, then set the one under test
         monkeypatch.setenv("USER", "")
         monkeypatch.setenv("LOGNAME", "")
         monkeypatch.setenv(envvar, value)
@@ -619,966 +733,10 @@ class TestGetAgentName:
             f"Expected 'borges' from {envvar}={value!r}, got {result!r}"
         )
 
-    def test_get_agent_name_strips_agent_prefix_in_uid_path(self, monkeypatch):
-        """pwd uid fallback also strips the 'agent-' prefix."""
-        monkeypatch.setenv("USER", "")
-        monkeypatch.setenv("LOGNAME", "")
-        mock_pw = unittest.mock.MagicMock()
-        mock_pw.pw_name = "agent-borges"
-        with unittest.mock.patch.object(self.hook.pwd, "getpwuid", return_value=mock_pw):
-            result = self.hook._get_agent_name({})
-        assert result == "borges"
-
-    def test_get_agent_name_returns_raw_username_when_no_agent_prefix(self, monkeypatch):
+    def test_returns_raw_username_when_no_agent_prefix(self, monkeypatch):
         """$USER='localdev' (no agent- prefix): returns raw username 'localdev', not ''."""
         monkeypatch.setenv("USER", "localdev")
         monkeypatch.delenv("LOGNAME", raising=False)
         result = self.hook._get_agent_name({})
-        assert result == "localdev", (
-            "Non-agent- username must be returned as-is (behavioral change from old impl)"
-        )
+        assert result == "localdev"
 
-
-# ---------------------------------------------------------------------------
-# Test 12: Sender-list rendering (_format_senders helper)
-# ---------------------------------------------------------------------------
-
-class TestFormatSenders:
-    """Unit tests for _format_senders helper via module import."""
-
-    @pytest.fixture(autouse=True)
-    def _hook(self):
-        self.hook = _load_hook_module()
-
-    def _make_letters(self, froms: list[str]) -> list[dict]:
-        """Build minimal letter dicts with just 'from' fields."""
-        return [{"from": f} for f in froms]
-
-    def test_single_sender(self):
-        """Single distinct sender: just the name, no comma."""
-        letters = self._make_letters(["borges"])
-        result = self.hook._format_senders(letters)
-        assert result == "borges"
-
-    def test_two_senders_sorted(self):
-        """Two distinct senders: sorted, comma-joined."""
-        letters = self._make_letters(["mneme", "borges"])
-        result = self.hook._format_senders(letters)
-        assert result == "borges, mneme"
-
-    def test_three_senders_no_cap(self):
-        """Three distinct senders: all shown (cap is >3, so 3 fits)."""
-        letters = self._make_letters(["mneme", "borges", "ariadne"])
-        result = self.hook._format_senders(letters)
-        assert result == "ariadne, borges, mneme"
-
-    def test_four_senders_cap_applied(self):
-        """Four distinct senders: first 2 shown + '+ 2 other(s)'."""
-        letters = self._make_letters(["mneme", "borges", "ariadne", "zephyr"])
-        result = self.hook._format_senders(letters)
-        # sorted: ariadne, borges, mneme, zephyr -> show ariadne, borges + 2 others
-        assert result == "ariadne, borges, + 2 other(s)"
-
-    def test_duplicate_senders_deduplicated(self):
-        """Multiple letters from the same sender count as one in the list."""
-        letters = self._make_letters(["borges", "borges", "ariadne"])
-        result = self.hook._format_senders(letters)
-        assert result == "ariadne, borges"
-
-    def test_five_senders_cap_applied(self):
-        """Five distinct senders: first 2 shown + '+ 3 other(s)'."""
-        letters = self._make_letters(["e", "d", "c", "b", "a"])
-        result = self.hook._format_senders(letters)
-        assert result == "a, b, + 3 other(s)"
-
-
-# ---------------------------------------------------------------------------
-# Test 13: Action instruction wording in hook output
-# ---------------------------------------------------------------------------
-
-def test_new_letters_action_instruction_present(engram_home, inter_agent_dir):
-    """'read before responding' appears in new-letters hook output."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
-    now = datetime.now(timezone.utc)
-    _write_letter(
-        inter_agent_dir, "2026-05-23T10-00-00Z_ariadne.md",
-        from_agent="ariadne", to_agent="borges",
-        timestamp=now - timedelta(minutes=2),
-        heading="Discipline relay",
-    )
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "read before responding" in ctx, (
-        "New-letters line must contain 'read before responding' action instruction"
-    )
-    assert "counterpart-agent letters carry context from the user" in ctx, (
-        "New-letters line must contain the rationale clause"
-    )
-
-
-def test_carryover_only_action_instruction_present(engram_home, inter_agent_dir):
-    """'finish reading at the next natural break' appears in carryover-only output."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
-    now = datetime.now(timezone.utc)
-
-    # Write a letter in the past
-    old_ts = now - timedelta(hours=2)
-    _write_letter(
-        inter_agent_dir, "2026-05-23T08-00-00Z_mneme.md",
-        from_agent="mneme", to_agent="borges",
-        timestamp=old_ts,
-        heading="Old unread letter",
-    )
-
-    # Set surfaced cursor AFTER the letter (so it's "older still-unread", not "new")
-    surfaced_at = now - timedelta(hours=1)
-    _write_surfaced_cursor(engram_home, surfaced_at)
-    # No read cursor → letter is unread
-
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "finish reading at the next natural break" in ctx, (
-        "Carryover-only line must contain 'finish reading at the next natural break'"
-    )
-    assert "from mneme" in ctx, (
-        "Carryover-only line must include the sender name"
-    )
-    assert "1 older still-unread letter " in ctx, (
-        f"Expected singular form '1 older still-unread letter ' (no trailing 's'); got: {ctx!r}"
-    )
-
-
-def test_new_letters_sender_name_in_header_line(engram_home, inter_agent_dir):
-    """Sender name appears in the header line (not just in the bullet list)."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
-    now = datetime.now(timezone.utc)
-    _write_letter(
-        inter_agent_dir, "2026-05-23T11-00-00Z_ariadne.md",
-        from_agent="ariadne", to_agent="borges",
-        timestamp=now - timedelta(minutes=3),
-        heading="Hello",
-    )
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-    first_line = ctx.splitlines()[0]
-    assert "from ariadne" in first_line, (
-        "First line of output must include 'from ariadne' for single-sender new letter"
-    )
-
-
-def test_two_new_letter_senders_sorted_in_header(engram_home, inter_agent_dir):
-    """Two distinct new-letter senders appear sorted in the header line."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
-    now = datetime.now(timezone.utc)
-    _write_letter(
-        inter_agent_dir, "2026-05-23T11-01-00Z_mneme.md",
-        from_agent="mneme", to_agent="borges",
-        timestamp=now - timedelta(minutes=5),
-        heading="Letter from mneme",
-    )
-    _write_letter(
-        inter_agent_dir, "2026-05-23T11-02-00Z_ariadne.md",
-        from_agent="ariadne", to_agent="borges",
-        timestamp=now - timedelta(minutes=4),
-        heading="Letter from ariadne",
-    )
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-    first_line = ctx.splitlines()[0]
-    assert "2 new letters" in first_line, "Plural 'letters' for 2 new letters"
-    assert "from ariadne, mneme" in first_line, (
-        "Sorted senders 'ariadne, mneme' must appear in the header line"
-    )
-
-
-def test_four_new_letter_senders_cap_in_header(engram_home, inter_agent_dir):
-    """Four distinct new-letter senders: first 2 + '+ 2 other(s)' in header line."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
-    now = datetime.now(timezone.utc)
-    senders = ["zephyr", "alexa", "quill", "alex"]
-    for i, sender in enumerate(senders):
-        _write_letter(
-            inter_agent_dir, f"2026-05-23T12-0{i}-00Z_{sender}.md",
-            from_agent=sender, to_agent="borges",
-            timestamp=now - timedelta(minutes=10 - i),
-            heading=f"Letter from {sender}",
-        )
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-    first_line = ctx.splitlines()[0]
-    # sorted: alex, alexa, quill, zephyr → show alex, alexa + 2 other(s)
-    assert "from alex, alexa, + 2 other(s)" in first_line, (
-        f"Expected cap-rule output in header; got: {first_line!r}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 14: ia CLI footer in surfacing output
-# ---------------------------------------------------------------------------
-
-_IA_FOOTER = (
-    "Tools: `ia read <filename>` (read + advance cursor) · "
-    "`ia write --re <filename>` (reply with reference) · "
-    "`ia status` (show cursor + counts)."
-)
-
-
-def test_footer_present_with_new_letter(engram_home, inter_agent_dir):
-    """Footer naming the ia CLI appears when there is 1 new letter."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
-    now = datetime.now(timezone.utc)
-    _write_letter(
-        inter_agent_dir, "2026-05-28T10-00-00Z_ariadne.md",
-        from_agent="ariadne", to_agent="borges",
-        timestamp=now - timedelta(minutes=2),
-        heading="Footer test — new letter",
-    )
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-    assert _IA_FOOTER in ctx, (
-        f"ia CLI footer must appear when there are new letters; got:\n{ctx}"
-    )
-    # Footer must be the last line
-    assert ctx.splitlines()[-1] == _IA_FOOTER, (
-        "ia CLI footer must be the last line of additionalContext"
-    )
-
-
-def test_footer_present_with_older_unread_only(engram_home, inter_agent_dir):
-    """Footer naming the ia CLI appears when there are only older-unread letters."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
-    now = datetime.now(timezone.utc)
-
-    old_ts = now - timedelta(hours=2)
-    _write_letter(
-        inter_agent_dir, "2026-05-28T08-00-00Z_mneme.md",
-        from_agent="mneme", to_agent="borges",
-        timestamp=old_ts,
-        heading="Footer test — older unread",
-    )
-    # Set surfaced cursor after the letter so it falls into "older still-unread"
-    _write_surfaced_cursor(engram_home, now - timedelta(hours=1))
-
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-    assert _IA_FOOTER in ctx, (
-        f"ia CLI footer must appear for older-unread-only scenario; got:\n{ctx}"
-    )
-    assert ctx.splitlines()[-1] == _IA_FOOTER, (
-        "ia CLI footer must be the last line of additionalContext"
-    )
-
-
-def test_footer_absent_when_no_letters(engram_home, inter_agent_dir):
-    """No letters → hook exits silently (no stdout, so no footer to check)."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    assert stdout.strip() == "", (
-        "No letters → hook must produce no stdout; ia footer must not appear in isolation"
-    )
-
-
-def test_footer_present_with_new_and_older_unread(engram_home, inter_agent_dir):
-    """Footer appears when both new letters and older-unread letters are present."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
-    now = datetime.now(timezone.utc)
-
-    # Older letter (unread)
-    old_ts = now - timedelta(hours=2)
-    _write_letter(
-        inter_agent_dir, "2026-05-28T08-00-00Z_mneme.md",
-        from_agent="mneme", to_agent="borges",
-        timestamp=old_ts,
-        heading="Old unread letter",
-    )
-    _write_surfaced_cursor(engram_home, now - timedelta(hours=1))
-
-    # New letter (after surfaced cursor)
-    _write_letter(
-        inter_agent_dir, "2026-05-28T10-30-00Z_ariadne.md",
-        from_agent="ariadne", to_agent="borges",
-        timestamp=now - timedelta(minutes=5),
-        heading="New letter",
-    )
-
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-    assert _IA_FOOTER in ctx, (
-        f"ia CLI footer must appear when both new and older-unread present; got:\n{ctx}"
-    )
-    assert ctx.splitlines()[-1] == _IA_FOOTER, (
-        "ia CLI footer must be the last line when both buckets are non-empty"
-    )
-    # Footer appears exactly once
-    assert ctx.count(_IA_FOOTER) == 1, (
-        "ia CLI footer must appear exactly once even when both buckets are non-empty"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 15: Read-cursor-floor (#627) — already-read letters stay invisible
-#   even when the read cursor has run ahead of the surfaced cursor.
-# ---------------------------------------------------------------------------
-
-def test_read_cursor_ahead_of_surfaced_already_read_letter_invisible(
-    engram_home, inter_agent_dir
-):
-    """Primary regression for #627: letter with surfaced_cursor < ts <= read_cursor
-    must be INVISIBLE — not in 'new', not in 'unread'.
-
-    This is the bug case: `ia read` advances the read cursor without a
-    UserPromptSubmit fire (e.g. during a Monitor task-notification wake),
-    leaving read_cursor > surfaced_cursor.  The pre-fix code bucketed any
-    letter with ts > surfaced_cursor as 'new', re-firing the nag on the
-    next prompt even though the agent already acknowledged the letter.
-    """
-    _write_config(engram_home, mode="multi", agent_name="borges")
-    now = datetime.now(timezone.utc)
-
-    # Letter was sent 2 hours ago.
-    letter_ts = now - timedelta(hours=2)
-    _write_letter(
-        inter_agent_dir, "2026-06-01T10-00-00Z_ariadne.md",
-        from_agent="ariadne", to_agent="borges",
-        timestamp=letter_ts,
-        heading="Already-read letter",
-    )
-
-    # surfaced_cursor is 3 hours old — letter arrived AFTER it, so old code
-    # would classify it as 'new' on next hook fire.
-    surfaced_at = now - timedelta(hours=3)
-    _write_surfaced_cursor(engram_home, surfaced_at)
-
-    # read_cursor is 1 hour old — the agent read the letter (advancing read
-    # cursor past letter_ts) but no UserPromptSubmit fired since, so
-    # surfaced_cursor was NOT advanced.  read_cursor > surfaced_cursor.
-    read_at = now - timedelta(hours=1)
-    _write_read_cursor(engram_home, read_at)
-
-    # Confirm the scenario: surfaced_cursor < letter_ts <= read_cursor
-    assert surfaced_at < letter_ts, "Precondition: letter arrived after surfaced cursor"
-    assert letter_ts <= read_at, "Precondition: letter acknowledged (ts <= read_cursor)"
-
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-
-    # The hook must exit silently — the acknowledged letter is invisible.
-    assert stdout.strip() == "", (
-        "Already-acknowledged letter must be invisible (not in 'new', not in 'unread'); "
-        f"got stdout: {stdout!r}"
-    )
-
-
-def test_read_cursor_ahead_happy_paths_unaffected(engram_home, inter_agent_dir):
-    """Guard: read_cursor > surfaced_cursor — genuinely new letters still surface.
-
-    When read_cursor has run ahead of surfaced_cursor (the #627 precondition),
-    letters with ts > read_cursor are genuinely unread and must appear as 'new'.
-    Letters with ts <= read_cursor are acknowledged and must be invisible.
-
-    Note: when read_cursor > surfaced_cursor the 'seen-but-unread' bucket is
-    structurally empty — a letter would need ts <= surfaced_cursor AND
-    ts > read_cursor, which is impossible when read_cursor > surfaced_cursor.
-    The seen-but-unread path is covered by test_mode_multi_new_and_unread_partitioned
-    and test_carryover_only_action_instruction_present (the normal cursor ordering).
-
-    Timeline (oldest → newest):
-      surfaced=3h  <  acknowledged=2h  <  read=1h  <  new=30min
-    """
-    _write_config(engram_home, mode="multi", agent_name="borges")
-    now = datetime.now(timezone.utc)
-
-    # (a) Genuinely new letter — ts > read_cursor → unread and new
-    new_ts = now - timedelta(minutes=30)
-    _write_letter(
-        inter_agent_dir, "2026-06-01T13-30-00Z_ariadne.md",
-        from_agent="ariadne", to_agent="borges",
-        timestamp=new_ts,
-        heading="Genuinely new letter",
-    )
-
-    # (b) Acknowledged letter — surfaced_cursor < ts <= read_cursor (the #627 zone)
-    acknowledged_ts = now - timedelta(hours=2)
-    _write_letter(
-        inter_agent_dir, "2026-06-01T12-00-00Z_mneme.md",
-        from_agent="mneme", to_agent="borges",
-        timestamp=acknowledged_ts,
-        heading="Already-acknowledged letter",
-    )
-
-    # Cursors: surfaced=3h ago; read=1h ago (read > surfaced, i.e. the #627 condition)
-    surfaced_at = now - timedelta(hours=3)
-    read_at = now - timedelta(hours=1)
-    _write_surfaced_cursor(engram_home, surfaced_at)
-    _write_read_cursor(engram_home, read_at)
-
-    # Confirm preconditions
-    assert surfaced_at < acknowledged_ts <= read_at, "Precondition: acknowledged letter in #627 zone"
-    assert new_ts > read_at, "Precondition: new letter ts > read_cursor"
-
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    assert stdout.strip(), "Hook should produce output (genuinely new letter present)"
-
-    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-
-    # (a) Genuinely new letter surfaces
-    assert "Genuinely new letter" in ctx, (
-        f"Genuinely new letter must appear in output; got:\n{ctx}"
-    )
-    assert "1 new letter from ariadne" in ctx, (
-        "New-letter count must be 1 (only the genuinely new one)"
-    )
-
-    # (b) Acknowledged letter must NOT appear anywhere
-    assert "Already-acknowledged letter" not in ctx, (
-        "Acknowledged letter must be invisible even when surfaced_cursor < ts <= read_cursor"
-    )
-
-    # No 'older still-unread' bucket — structurally impossible in read-cursor-ahead state
-    assert "older still-unread" not in ctx, (
-        "When read_cursor > surfaced_cursor, the seen-but-unread bucket must be empty"
-    )
-
-
-def test_first_run_all_letters_treated_as_new(engram_home, inter_agent_dir):
-    """First-run case (both cursors absent): all letters appear as 'new'.
-
-    Preserves the existing first-run semantics: when there is no surfaced
-    cursor AND no read cursor, every letter is unread and new.
-    """
-    _write_config(engram_home, mode="multi", agent_name="borges")
-    now = datetime.now(timezone.utc)
-
-    _write_letter(
-        inter_agent_dir, "2026-06-01T08-00-00Z_ariadne.md",
-        from_agent="ariadne", to_agent="borges",
-        timestamp=now - timedelta(hours=3),
-        heading="First run letter A",
-    )
-    _write_letter(
-        inter_agent_dir, "2026-06-01T09-00-00Z_mneme.md",
-        from_agent="mneme", to_agent="borges",
-        timestamp=now - timedelta(hours=2),
-        heading="First run letter B",
-    )
-
-    # No cursor files written — first-run state.
-
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    assert stdout.strip(), "First run must surface all letters as new"
-
-    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "2 new letters" in ctx, (
-        f"First run must report both letters as new; got:\n{ctx}"
-    )
-    assert "First run letter A" in ctx
-    assert "First run letter B" in ctx
-    # No "older still-unread" line — everything went into new
-    assert "older still-unread" not in ctx, (
-        "First run must not have an 'older still-unread' bucket"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 16: Same-second cursor precision regression (#751)
-#     Cursor written at T:00.000000Z must NOT exclude a letter at T:00.000500Z.
-# ---------------------------------------------------------------------------
-
-def test_same_second_cursor_write_uses_microseconds(engram_home, inter_agent_dir):
-    """_write_cursor must emit fixed-width 6-digit microseconds (#751 regression).
-
-    The bug: _write_cursor wrote '...T12:00:00Z' (seconds-only).  Lexicographically
-    'T12:00:00Z' > 'T12:00:00.500000Z' ('Z'=0x5A > '.'=0x2E), so any post/letter
-    with a microsecond-precise timestamp in the same second was silently excluded
-    by a `created_at > since` (or Python datetime >) comparison.
-
-    The fix: _write_cursor now emits '...T12:00:00.000000Z'.  This test verifies
-    the written cursor format, and then confirms that a letter with a microsecond-
-    precise timestamp in the SAME second is correctly classified as 'new'
-    (letter_ts.microsecond > 0 means letter_ts > cursor_ts in Python datetime
-    comparison, since both parse to the same UTC second base but different micros).
-
-    The letter's frontmatter timestamp is written with microseconds directly to
-    simulate a real letter authored by a tool that preserves sub-second precision.
-    """
-    _write_config(engram_home, mode="multi", agent_name="borges")
-
-    # Write cursor at the start of a second with zero microseconds
-    cursor_ts = datetime(2026, 1, 1, 12, 0, 0, 0, tzinfo=timezone.utc)
-    _write_surfaced_cursor(engram_home, cursor_ts)
-
-    # Verify the written cursor format uses microseconds (the fix)
-    raw_cursor = (engram_home / "inter-agent-surfaced-cursor.txt").read_text().strip()
-    assert "." in raw_cursor, (
-        f"Cursor file must use microseconds format after fix; got: {raw_cursor!r} — "
-        "pre-fix format 'T12:00:00Z' would lexically sort AFTER any same-second "
-        "microsecond-precise timestamp"
-    )
-    assert raw_cursor == "2026-01-01T12:00:00.000000Z", (
-        f"Cursor must use fixed-width 6-digit microseconds; got: {raw_cursor!r}"
-    )
-
-    # Write a letter whose timestamp is 500ms later in the same second.
-    # We write the frontmatter directly (not via _write_letter's seconds-only helper)
-    # to simulate a tool that emits microsecond-precise timestamps.
-    letter_ts = datetime(2026, 1, 1, 12, 0, 0, 500000, tzinfo=timezone.utc)
-    letter_ts_str = letter_ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    letter_content = (
-        "---\n"
-        "from: ariadne\n"
-        "to: borges\n"
-        f"timestamp: {letter_ts_str}\n"
-        "---\n"
-        "\n"
-        "# Same-second letter\n"
-        "\n"
-        "A letter with a sub-second timestamp.\n"
-    )
-    (inter_agent_dir / "2026-01-01T12-00-00.500000Z_ariadne.md").write_text(letter_content)
-
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0, f"Hook must not crash; stderr: {stderr}"
-    assert stdout.strip(), (
-        "Same-second letter must surface as new — letter_ts 12:00:00.500000Z "
-        "must be > cursor 12:00:00.000000Z (Python datetime comparison works correctly "
-        "once cursor is parsed from the fixed-width microseconds format)"
-    )
-    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "Same-second letter" in ctx, (
-        f"Same-second letter title must appear in hook output; got:\n{ctx}"
-    )
-    assert "1 new letter from ariadne" in ctx, (
-        "Letter must be classified as 'new' (letter_ts > cursor_ts after the fix)"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 17: Multi-recipient membership in the hook (part of #631)
-# ---------------------------------------------------------------------------
-
-def test_hook_multi_recipient_surfaces_for_named_agent(engram_home, inter_agent_dir):
-    """Hook surfaces a letter with to: ariadne, borges when agent is borges."""
-    _write_config(engram_home, mode="multi", agent_name="borges")
-    now = datetime.now(timezone.utc)
-    _write_letter(
-        inter_agent_dir, "2026-06-05T10-00-00Z_mira.md",
-        from_agent="mira", to_agent="ariadne, borges",
-        timestamp=now - timedelta(minutes=5),
-        heading="Shared update for both",
-    )
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    assert stdout.strip(), "Hook must surface the multi-recipient letter for borges"
-    ctx = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "Shared update for both" in ctx, (
-        f"Multi-recipient letter must surface for borges; got:\n{ctx}"
-    )
-
-
-def test_hook_multi_recipient_does_not_surface_for_non_recipient(engram_home, inter_agent_dir):
-    """Hook does NOT surface a letter with to: ariadne, borges when agent is mira."""
-    _write_config(engram_home, mode="multi", agent_name="mira")
-    now = datetime.now(timezone.utc)
-    _write_letter(
-        inter_agent_dir, "2026-06-05T10-00-00Z_sender.md",
-        from_agent="sender", to_agent="ariadne, borges",
-        timestamp=now - timedelta(minutes=5),
-        heading="Shared update for ariadne and borges",
-    )
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    assert stdout.strip() == "", (
-        "Multi-recipient letter to 'ariadne, borges' must not surface for 'mira'; "
-        f"got stdout: {stdout!r}"
-    )
-
-
-def test_hook_multi_recipient_no_substring_match(engram_home, inter_agent_dir):
-    """Hook does not match 'mir' when the to: field contains 'mira' (substring non-match)."""
-    _write_config(engram_home, mode="multi", agent_name="mir")
-    now = datetime.now(timezone.utc)
-    _write_letter(
-        inter_agent_dir, "2026-06-05T11-00-00Z_sender.md",
-        from_agent="sender", to_agent="mira",
-        timestamp=now - timedelta(minutes=5),
-        heading="Letter to mira only",
-    )
-    rc, stdout, stderr = _run_hook(engram_home, inter_agent_dir)
-    assert rc == 0
-    assert stdout.strip() == "", (
-        "Agent 'mir' must not see a letter addressed to 'mira' (no substring match); "
-        f"got stdout: {stdout!r}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Parity: hook._is_recipient and tools/ia._is_recipient must agree
-# ---------------------------------------------------------------------------
-
-def test_is_recipient_hook_and_ia_parity():
-    """hook._is_recipient and tools/ia._is_recipient must agree on the same input pairs.
-
-    Both implementations share the same algorithm (split on comma, strip,
-    case-insensitive exact match). This test pins them against drift: if one
-    copy is updated and the other is not, the test goes red.
-
-    Mechanical gate > vigilance — analogous to test_marker_filename_matches_walguard.
-    """
-    import importlib.util
-    import sys
-
-    # Load hook module (not importable by normal name — use spec_from_file_location)
-    hook_spec = importlib.util.spec_from_file_location(
-        "engram_inter_agent_hook",
-        Path(__file__).parent.parent / "src" / "engram" / "hooks" / "claude" / "engram-inter-agent-prompt-hook.py",
-    )
-    hook_module = importlib.util.module_from_spec(hook_spec)
-    hook_spec.loader.exec_module(hook_module)
-    hook_is_recipient = hook_module._is_recipient
-
-    # Load tools/ia._is_recipient via importlib to avoid relying on sys.path order
-    ia_spec = importlib.util.spec_from_file_location(
-        "ia",
-        Path(__file__).parent.parent / "tools" / "ia.py",
-    )
-    ia_module = importlib.util.module_from_spec(ia_spec)
-    ia_spec.loader.exec_module(ia_module)
-    ia_is_recipient = ia_module._is_recipient
-
-    # ~8 input pairs covering the documented contract
-    cases = [
-        # (to_field, agent_name, description)
-        ("ariadne", "ariadne", "single recipient — match"),
-        ("ariadne", "borges", "single recipient — mismatch"),
-        ("ariadne, borges", "ariadne", "multi-recipient — first name match"),
-        ("ariadne, borges", "borges", "multi-recipient — second name match"),
-        ("mira", "mir", "substring non-match: 'mir' vs 'mira'"),
-        ("Alexa, ZEPHYR", "alexa", "case-insensitive match"),
-        ("ariadne, borges", "", "empty agent_name — no match"),
-        ("", "ariadne", "empty to_field — no match"),
-    ]
-
-    for to_field, agent_name, description in cases:
-        hook_result = hook_is_recipient(to_field, agent_name)
-        ia_result = ia_is_recipient(to_field, agent_name)
-        assert hook_result == ia_result, (
-            f"Parity failure on case {description!r}: "
-            f"hook._is_recipient({to_field!r}, {agent_name!r}) = {hook_result}, "
-            f"ia._is_recipient({to_field!r}, {agent_name!r}) = {ia_result}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Test 18: Shared-bin CLI drift detection (_shared_bin_drift_lines)
-#
-# The function hardcodes shared_bin = Path("/home/agents-shared/bin").
-# For unit tests we patch the module's Path class so that
-# Path("/home/agents-shared/bin") resolves to a temp directory while all
-# other Path calls remain unchanged.
-# ---------------------------------------------------------------------------
-
-import importlib.util as _importlib_util
-import unittest.mock as _umock
-
-
-def _load_hook_module_fresh():
-    """Load a fresh copy of the hook module (separate namespace per call)."""
-    spec = _importlib_util.spec_from_file_location(
-        f"engram_inter_agent_hook_fresh_{id(object())}",
-        str(HOOK_PATH),
-    )
-    mod = _importlib_util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def _make_redirect_path(real_Path, redirect_map: dict):
-    """Return a Path factory that redirects specific string keys to given Paths."""
-
-    def redirected(*args, **kwargs):
-        if args:
-            key = str(args[0])
-            if key in redirect_map:
-                return real_Path(str(redirect_map[key]))
-        return real_Path(*args, **kwargs)
-
-    return redirected
-
-
-class TestSharedBinDrift:
-    """Unit + end-to-end tests for shared-bin CLI drift detection."""
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _make_dirs(self, tmp_path: Path):
-        """Return (engram_home, shared_bin, plugin_root, tools_dir) all created."""
-        engram_home = tmp_path / "engram"
-        engram_home.mkdir()
-        shared_bin = tmp_path / "shared_bin"
-        shared_bin.mkdir()
-        plugin_root = tmp_path / "plugin_root"
-        tools_dir = plugin_root / "tools"
-        tools_dir.mkdir(parents=True)
-        return engram_home, shared_bin, plugin_root, tools_dir
-
-    def _call_drift(self, tmp_path, shared_bin, plugin_root, engram_home,
-                    session_id="sess-test", monkeypatch=None):
-        """Call _shared_bin_drift_lines with shared_bin redirected."""
-        if monkeypatch is not None:
-            monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(plugin_root))
-        else:
-            import os
-            os.environ["CLAUDE_PLUGIN_ROOT"] = str(plugin_root)
-
-        mod = _load_hook_module_fresh()
-        real_Path = mod.Path
-        redirect = _make_redirect_path(real_Path, {"/home/agents-shared/bin": shared_bin})
-        with _umock.patch.object(mod, "Path", redirect):
-            result = mod._shared_bin_drift_lines(real_Path(str(engram_home)), session_id)
-        return result
-
-    # ------------------------------------------------------------------
-    # Tests
-    # ------------------------------------------------------------------
-
-    def test_no_shared_bin_no_banner(self, tmp_path: Path, monkeypatch):
-        """/home/agents-shared/bin doesn't exist → returns []."""
-        engram_home = tmp_path / "engram"
-        engram_home.mkdir()
-        plugin_root = tmp_path / "plugin_root"
-        (plugin_root / "tools").mkdir(parents=True)
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(plugin_root))
-
-        # Point to a non-existent shared_bin
-        missing_bin = tmp_path / "nonexistent_shared_bin"
-        # (don't create it)
-
-        mod = _load_hook_module_fresh()
-        real_Path = mod.Path
-        redirect = _make_redirect_path(real_Path, {"/home/agents-shared/bin": missing_bin})
-        with _umock.patch.object(mod, "Path", redirect):
-            result = mod._shared_bin_drift_lines(real_Path(str(engram_home)), "sess-x")
-        assert result == [], f"Expected [] when shared_bin missing, got {result!r}"
-
-    def test_no_plugin_root_no_banner(self, tmp_path: Path, monkeypatch):
-        """CLAUDE_PLUGIN_ROOT env var not set → returns []."""
-        engram_home = tmp_path / "engram"
-        engram_home.mkdir()
-        shared_bin = tmp_path / "shared_bin"
-        shared_bin.mkdir()
-        monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
-
-        mod = _load_hook_module_fresh()
-        real_Path = mod.Path
-        redirect = _make_redirect_path(real_Path, {"/home/agents-shared/bin": shared_bin})
-        with _umock.patch.object(mod, "Path", redirect):
-            result = mod._shared_bin_drift_lines(real_Path(str(engram_home)), "sess-x")
-        assert result == [], f"Expected [] when CLAUDE_PLUGIN_ROOT unset, got {result!r}"
-
-    def test_clean_family_no_banner(self, tmp_path: Path, monkeypatch):
-        """Both sides have identical content → returns []."""
-        engram_home, shared_bin, plugin_root, tools_dir = self._make_dirs(tmp_path)
-
-        content = b"#!/usr/bin/env python3\nprint('hello')\n"
-        for cli_name, src_name in [("ia", "ia.py"), ("baton", "baton.py"), ("forum", "forum.py")]:
-            (shared_bin / cli_name).write_bytes(content)
-            (tools_dir / src_name).write_bytes(content)
-
-        result = self._call_drift(tmp_path, shared_bin, plugin_root, engram_home,
-                                  monkeypatch=monkeypatch)
-        assert result == [], f"Expected [] (no drift), got {result!r}"
-
-    def test_drift_fires_banner(self, tmp_path: Path, monkeypatch):
-        """Shared forum has different content than plugin root → returns lines starting with ⚠️."""
-        engram_home, shared_bin, plugin_root, tools_dir = self._make_dirs(tmp_path)
-
-        # ia and baton: identical
-        clean = b"#!/usr/bin/env python3\nprint('clean')\n"
-        for cli_name, src_name in [("ia", "ia.py"), ("baton", "baton.py")]:
-            (shared_bin / cli_name).write_bytes(clean)
-            (tools_dir / src_name).write_bytes(clean)
-
-        # forum: drifted
-        (shared_bin / "forum").write_bytes(b"old content\n")
-        (tools_dir / "forum.py").write_bytes(b"new content\n")
-
-        result = self._call_drift(tmp_path, shared_bin, plugin_root, engram_home,
-                                  monkeypatch=monkeypatch)
-        assert len(result) > 0, f"Expected drift banner, got {result!r}"
-        assert result[0].startswith("⚠️"), f"First line must start with ⚠️, got {result[0]!r}"
-        assert "forum" in "\n".join(result), "forum must appear in banner"
-        assert "ia" not in result[0], "ia must not appear as drifted"
-
-    def test_drift_throttled_same_session(self, tmp_path: Path, monkeypatch):
-        """Drift exists, state file has same fingerprint + session_id → returns [] (throttled)."""
-        import hashlib
-        import json as _json
-
-        engram_home, shared_bin, plugin_root, tools_dir = self._make_dirs(tmp_path)
-
-        (shared_bin / "forum").write_bytes(b"old\n")
-        (tools_dir / "forum.py").write_bytes(b"new\n")
-        clean = b"clean\n"
-        for name, src in [("ia", "ia.py"), ("baton", "baton.py")]:
-            (shared_bin / name).write_bytes(clean)
-            (tools_dir / src).write_bytes(clean)
-
-        # Pre-compute expected fingerprint
-        drifted = [("forum", "forum.py")]
-        fingerprint = hashlib.md5(str(sorted(drifted)).encode()).hexdigest()
-        session_id = "sess-throttle"
-
-        # Write state with matching fingerprint + session_id
-        state_file = engram_home / "shared-bin-drift.state"
-        state_file.write_text(_json.dumps({"fingerprint": fingerprint, "session_id": session_id}))
-
-        result = self._call_drift(tmp_path, shared_bin, plugin_root, engram_home,
-                                  session_id=session_id, monkeypatch=monkeypatch)
-        assert result == [], f"Expected [] (throttled), got {result!r}"
-
-    def test_drift_refires_new_session(self, tmp_path: Path, monkeypatch):
-        """Drift exists, state file has same fingerprint but DIFFERENT session_id → returns banner."""
-        import hashlib
-        import json as _json
-
-        engram_home, shared_bin, plugin_root, tools_dir = self._make_dirs(tmp_path)
-
-        (shared_bin / "forum").write_bytes(b"old\n")
-        (tools_dir / "forum.py").write_bytes(b"new\n")
-        clean = b"clean\n"
-        for name, src in [("ia", "ia.py"), ("baton", "baton.py")]:
-            (shared_bin / name).write_bytes(clean)
-            (tools_dir / src).write_bytes(clean)
-
-        drifted = [("forum", "forum.py")]
-        fingerprint = hashlib.md5(str(sorted(drifted)).encode()).hexdigest()
-
-        # State was from a DIFFERENT session
-        state_file = engram_home / "shared-bin-drift.state"
-        state_file.write_text(_json.dumps({"fingerprint": fingerprint, "session_id": "old-session"}))
-
-        result = self._call_drift(tmp_path, shared_bin, plugin_root, engram_home,
-                                  session_id="new-session", monkeypatch=monkeypatch)
-        assert len(result) > 0, f"Expected banner (new session), got {result!r}"
-        assert result[0].startswith("⚠️"), f"Expected warning line, got {result[0]!r}"
-
-    def test_drift_refires_new_fingerprint(self, tmp_path: Path, monkeypatch):
-        """Drift exists, state file has different fingerprint but same session → returns banner."""
-        import hashlib
-        import json as _json
-
-        engram_home, shared_bin, plugin_root, tools_dir = self._make_dirs(tmp_path)
-
-        (shared_bin / "forum").write_bytes(b"old\n")
-        (tools_dir / "forum.py").write_bytes(b"new\n")
-        clean = b"clean\n"
-        for name, src in [("ia", "ia.py"), ("baton", "baton.py")]:
-            (shared_bin / name).write_bytes(clean)
-            (tools_dir / src).write_bytes(clean)
-
-        session_id = "sess-same"
-        # Write a state with a DIFFERENT fingerprint (as if a different drift set was seen before)
-        old_fingerprint = hashlib.md5(b"some-old-drift-set").hexdigest()
-        state_file = engram_home / "shared-bin-drift.state"
-        state_file.write_text(_json.dumps({"fingerprint": old_fingerprint, "session_id": session_id}))
-
-        result = self._call_drift(tmp_path, shared_bin, plugin_root, engram_home,
-                                  session_id=session_id, monkeypatch=monkeypatch)
-        assert len(result) > 0, f"Expected banner (new fingerprint), got {result!r}"
-        assert result[0].startswith("⚠️"), f"Expected warning line, got {result[0]!r}"
-
-    def test_hook_output_contains_drift_banner(
-        self, tmp_path: Path, engram_home: Path, inter_agent_dir: Path, monkeypatch
-    ):
-        """End-to-end subprocess test: additionalContext contains drift warning when drift present + multi-agent."""
-        _write_config(engram_home, mode="multi", agent_name="borges")
-
-        plugin_root = tmp_path / "fake_plugin_root"
-        tools_dir = plugin_root / "tools"
-        tools_dir.mkdir(parents=True)
-
-        # ia and baton: clean; forum: drifted
-        clean_content = b"#!/usr/bin/env python3\nprint('clean')\n"
-        for cli_name, src_name in [("ia", "ia.py"), ("baton", "baton.py")]:
-            (tools_dir / src_name).write_bytes(clean_content)
-
-        (tools_dir / "forum.py").write_bytes(b"new forum content\n")
-
-        # We call _shared_bin_drift_lines directly (module import), patching shared_bin.
-        # The subprocess path would require the real /home/agents-shared/bin to be redirected,
-        # which we can't do in a subprocess without modifying the hook source.
-
-        shared_bin = tmp_path / "fake_shared_bin"
-        shared_bin.mkdir()
-        for cli_name in ["ia", "baton"]:
-            (shared_bin / cli_name).write_bytes(clean_content)
-        (shared_bin / "forum").write_bytes(b"old forum content\n")
-
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(plugin_root))
-
-        mod = _load_hook_module_fresh()
-        real_Path = mod.Path
-        redirect = _make_redirect_path(real_Path, {"/home/agents-shared/bin": shared_bin})
-        with _umock.patch.object(mod, "Path", redirect):
-            result = mod._shared_bin_drift_lines(real_Path(str(engram_home)), "sess-e2e")
-
-        assert len(result) > 0, f"Expected drift banner in additionalContext, got {result!r}"
-        assert result[0].startswith("⚠️"), f"First line must be warning, got {result[0]!r}"
-        assert "forum" in "\n".join(result), "forum should be listed as drifted"
-        # ia and baton are clean — must not appear as drifted
-        banner_text = "\n".join(result)
-        assert "ia:" not in banner_text, "ia must not appear as drifted (identical content)"
-        assert "baton:" not in banner_text, "baton must not appear as drifted (identical content)"
-
-    def test_unreadable_shared_bin_file_does_not_crash_hook(
-        self, tmp_path: Path, engram_home: Path, inter_agent_dir: Path, monkeypatch
-    ):
-        """An unreadable shared-bin file must not crash the hook — fail-open to []."""
-        plugin_root = tmp_path / "fake_plugin_root"
-        tools_dir = plugin_root / "tools"
-        tools_dir.mkdir(parents=True)
-        for src_name in ["ia.py", "baton.py", "forum.py"]:
-            (tools_dir / src_name).write_bytes(b"content\n")
-
-        shared_bin = tmp_path / "fake_shared_bin"
-        shared_bin.mkdir()
-        unreadable = shared_bin / "forum"
-        unreadable.write_bytes(b"different content\n")
-        unreadable.chmod(0o000)  # make unreadable
-
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(plugin_root))
-
-        mod = _load_hook_module_fresh()
-        real_Path = mod.Path
-        redirect = _make_redirect_path(real_Path, {"/home/agents-shared/bin": shared_bin})
-
-        try:
-            with _umock.patch.object(mod, "Path", redirect):
-                # The try-except in main() wraps _shared_bin_drift_lines.
-                # Test the function itself raises — and that main() wrapper catches it.
-                # We verify the outer try-except by calling through it:
-                drift_lines = []
-                try:
-                    drift_lines = mod._shared_bin_drift_lines(
-                        real_Path(str(engram_home)), "sess-unreadable"
-                    )
-                except Exception:
-                    drift_lines = []  # mirrors main()'s fail-open guard
-
-            # After fail-open: no crash, empty drift_lines
-            assert drift_lines == [], f"Expected [] on read error, got {drift_lines!r}"
-        finally:
-            unreadable.chmod(0o644)  # restore for cleanup

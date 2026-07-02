@@ -1,6 +1,6 @@
 # 00 — Complete File Inventory
 
-*Generated 2026-06-05 from dev tip; every file in the repo, its ship status per `packaging/tiers.json`, and its mechanism assignment (filled during the sweep). Regenerate mechanically (generation script: see PR #856 thread; tools/ home pending); never hand-edit counts. The handbook's own files are not indexed.*
+*Generated 2026-06-05 from dev tip; every file in the repo, its ship status per `src/build/packaging/tiers.json`, and its mechanism assignment (filled during the sweep). Regenerate mechanically (generation script: see PR #856 thread; tools/ home pending); never hand-edit counts. The handbook's own files are not indexed.*
 
 
 **Census** (2026-06-05 snapshot; Gemini CLI lane files removed by #865 2026-06-06): 385 files · 121 shipped (tier-mapped) · 9 manifest-excluded (tracked, deliberately not shipped) · 204 dev-only · 13 repo-only (outside build-plugin.sh universe, repo-clone-only by design) · 33 forum-deploy (manifest-excluded, ships via forum deploy path, issue #868) · 4 zombie-suspect (remaining after #865 removed 30 gemini-lane zombie-suspects) · 1 unmapped ⚠ (in-universe gap, needs adjudication)
@@ -190,15 +190,15 @@
 |---|---|---|---|---|
 | `output-styles/claude/proactive-with-carveouts.md` | shipped | convenience | _?_ | _unswept_ |
 
-## packaging (5 files)
+## src/build/packaging (5 files)
 
 | file | ship | tier/reason | mechanism | status |
 |---|---|---|---|---|
-| `packaging/README.md` | dev-only | — | _?_ | _unswept_ |
-| `packaging/mcp.json` | dev-only | — | _?_ | _unswept_ |
-| `packaging/platforms/claude-code.json` | dev-only | — | _?_ | _unswept_ |
-| `packaging/platforms/codex.json` | dev-only | — | _?_ | _unswept_ |
-| `packaging/tiers.json` | dev-only | — | _?_ | _unswept_ |
+| `src/build/packaging/README.md` | dev-only | — | _?_ | _unswept_ |
+| `src/build/packaging/mcp.json` | dev-only | — | _?_ | _unswept_ |
+| `src/build/packaging/platforms/claude-code.json` | dev-only | — | _?_ | _unswept_ |
+| `src/build/packaging/platforms/codex.json` | dev-only | — | _?_ | _unswept_ |
+| `src/build/packaging/tiers.json` | dev-only | — | _?_ | _unswept_ |
 
 ## skills/claude (25 files)
 
