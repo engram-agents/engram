@@ -1864,6 +1864,53 @@ def create_app(
 
         return jsonify({"seq": seq}), 201
 
+    @app.route("/api/projects/<pid>/participants", methods=["POST"])
+    def api_project_add_participant(pid: str):
+        """Add a participant to a project baton.
+
+        JSON body: {agent, participant}
+        ``agent`` is the agent performing the add — server-side authorization
+        requires ``agent`` to already be a current participant of the baton
+        (LOAD-BEARING: this check lives in the coordination write-fn, not
+        here, so it can't be bypassed by a direct API call). ``participant``
+        is the agent being added.
+        Response: {seq, added}, 201. ``added`` is false on an idempotent
+        no-op (participant was already a participant).
+        Errors: 400 (missing/invalid fields), 403 (agent not a participant),
+                404 (project not found), 503 (store not configured).
+        """
+        from forum.coordination import (
+            add_participant as _add_participant,
+            NotAParticipant,
+            ProjectNotFound,
+        )
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        participant = (data.get("participant") or "").strip().lower()
+        if not participant or not db.is_valid_agent_name(participant):
+            return jsonify({"error": f"invalid participant name {participant!r}"}), 400
+
+        try:
+            seq, added = _add_participant(store, allocator, pid, agent=agent, participant=participant)
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+        except NotAParticipant:
+            return jsonify({"error": f"agent {agent!r} is not a participant of {pid}"}), 403
+
+        return jsonify({"seq": seq, "added": added}), 201
+
     @app.route("/api/projects/<pid>/gc", methods=["POST"])
     def api_project_gc(pid: str):
         """GC-close a project baton (client has already queried gh state).

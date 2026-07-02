@@ -8,9 +8,11 @@ import pytest
 
 from forum.coordination import (
     FileStore,
+    NotAParticipant,
     ProjectAlreadyExists,
     ProjectNotFound,
     SeqAllocator,
+    add_participant,
     anchor,
     claim,
     close,
@@ -595,6 +597,114 @@ def test_anchor_does_not_touch_turn_fields(store, allocator):
 def test_anchor_missing_project_raises(store, allocator):
     with pytest.raises(ProjectNotFound):
         anchor(store, allocator, "PR-nope", github_anchor="pr/490")
+
+
+# ---------------------------------------------------------------------------
+# add_participant() tests
+# ---------------------------------------------------------------------------
+# Seed baton (_baton()) participants: [ariadne, borges].
+
+
+def test_add_participant_appends_new_participant(store, allocator):
+    seq, added = add_participant(
+        store, allocator, "PR-1",
+        agent="ariadne", participant="luria",
+        ts="2026-06-26T12:00:00Z",
+    )
+    assert added is True
+    assert seq == 1  # first allocation above the seeded seq 0
+
+    raw = store.read_project("PR-1")
+    fields, _ = md.parse_frontmatter(raw)
+    participants = _participants_list(fields["participants"])
+    assert participants == ["ariadne", "borges", "luria"]
+    assert "- 2026-06-26T12:00:00Z ariadne added participant: luria" in raw
+    assert fields["seq"] == "1"
+
+
+def test_add_participant_byte_exact_golden(store, allocator):
+    add_participant(
+        store, allocator, "PR-1",
+        agent="ariadne", participant="luria",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = store.read_project("PR-1")
+    assert "- 2026-06-26T12:00:00Z ariadne added participant: luria" in raw
+
+
+def test_add_participant_normalizes_case(store, allocator):
+    add_participant(store, allocator, "PR-1", agent="ARIADNE", participant="  LURIA ")
+    fields, _ = md.parse_frontmatter(store.read_project("PR-1"))
+    assert "luria" in _participants_list(fields["participants"])
+
+
+def test_add_participant_idempotent_no_op_on_already_present(store, allocator):
+    """Adding an already-present participant is a no-op: no dup, no error, no new seq/log line."""
+    seq, added = add_participant(store, allocator, "PR-1", agent="ariadne", participant="borges")
+    assert added is False
+    assert seq == 0  # no write happened; the seeded baton's last-committed seq
+
+    raw = store.read_project("PR-1")
+    fields, _ = md.parse_frontmatter(raw)
+    # participants list unchanged — no duplicate "borges" entry
+    assert _participants_list(fields["participants"]) == ["ariadne", "borges"]
+    assert "added participant" not in raw
+
+
+def test_add_participant_idempotent_case_insensitive(store, allocator):
+    """Dedup compares case-insensitively even though the stored list is already lowercase."""
+    seq, added = add_participant(store, allocator, "PR-1", agent="ariadne", participant="BORGES")
+    assert added is False
+
+
+def test_add_participant_does_not_duplicate_across_two_calls(store, allocator):
+    add_participant(store, allocator, "PR-1", agent="ariadne", participant="luria")
+    seq2, added2 = add_participant(store, allocator, "PR-1", agent="ariadne", participant="luria")
+    assert added2 is False
+    raw = store.read_project("PR-1")
+    fields, _ = md.parse_frontmatter(raw)
+    participants = _participants_list(fields["participants"])
+    assert participants.count("luria") == 1
+
+
+def test_add_participant_agent_not_a_participant_raises(store, allocator):
+    """A non-participant cannot add others — the load-bearing server-side auth guard."""
+    with pytest.raises(NotAParticipant):
+        add_participant(store, allocator, "PR-1", agent="casey", participant="luria")
+
+    # no mutation occurred
+    raw = store.read_project("PR-1")
+    assert "added participant" not in raw
+
+
+def test_add_participant_does_not_touch_turn_fields(store, allocator):
+    add_participant(
+        store, allocator, "PR-1",
+        agent="ariadne", participant="luria",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = store.read_project("PR-1")
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["turn"] == "ariadne"
+    assert fields["turn_since"] == "2026-06-26T00:00:00Z"
+    assert fields["turn_reason"] == '"start"'
+
+
+def test_add_participant_returns_monotonic_seq(store, allocator):
+    seq1, _ = add_participant(store, allocator, "PR-1", agent="ariadne", participant="luria")
+    seq2, _ = add_participant(store, allocator, "PR-1", agent="ariadne", participant="lei")
+    assert seq2 > seq1
+
+
+def test_add_participant_missing_project_raises(store, allocator):
+    with pytest.raises(ProjectNotFound):
+        add_participant(store, allocator, "PR-nope", agent="ariadne", participant="luria")
+
+
+def _participants_list(participants_field: str) -> list:
+    """Parse the frontmatter participants field ('[a, b]') into a list, for assertions."""
+    inner = participants_field.strip().lstrip("[").rstrip("]")
+    return [p.strip() for p in inner.split(",") if p.strip()]
 
 
 # ---------------------------------------------------------------------------

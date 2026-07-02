@@ -32,8 +32,10 @@ from .store import (
 from .store_file import FileStore, default_store_root
 from .dm import dm_send, dm_read, dm_list
 from .projects import (
+    NotAParticipant,
     ProjectAlreadyExists,
     ProjectNotFound,
+    add_participant,
     flip,
     claim,
     release,
@@ -58,8 +60,10 @@ __all__ = [
     "dm_send",
     "dm_read",
     "dm_list",
+    "NotAParticipant",
     "ProjectAlreadyExists",
     "ProjectNotFound",
+    "add_participant",
     "flip",
     "claim",
     "release",

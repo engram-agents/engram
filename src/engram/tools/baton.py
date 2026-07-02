@@ -1553,6 +1553,81 @@ def cmd_anchor(args: argparse.Namespace, config: dict, agent_name: str, client: 
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: add-participant
+# ---------------------------------------------------------------------------
+
+def cmd_add_participant(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
+    """Add a participant to an existing baton.
+
+    Reads the project via the forum API for pre-flight validation (project
+    exists, parseable frontmatter) and a friendly client-side already-a-
+    participant hint, then delegates the write to the forum API via
+    client.post. The AUTHORITATIVE dedup + agent-is-participant checks are
+    server-side (add_participant() in coordination.projects) — this CLI's
+    own already-present check is a UX nicety only, never the source of truth.
+    """
+    _require_multi_agent(config)
+
+    project_id = args.project_id
+    new_participant = args.participant.strip().lower()
+
+    err = _validate_project_id(project_id)
+    if err:
+        print(err, file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+    if not new_participant:
+        print(
+            "baton add-participant: <participant> must be non-empty.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    raw = _api_get_raw(client, project_id)
+    fields, body = _parse_frontmatter(raw)
+    if not fields:
+        print(
+            f"baton add-participant: cannot parse frontmatter for '{project_id}'. "
+            "The record may be malformed.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    # Friendly client-side hint only — see docstring.
+    participants_str = fields.get("participants", "").strip()
+    current_participants = _parse_participants(participants_str) if participants_str else []
+    already_present = new_participant in current_participants
+
+    try:
+        resp = client.post(f"/api/projects/{project_id}/participants", {
+            "agent": agent_name or "baton",
+            "participant": new_participant,
+        })
+    except ForumNetworkError as e:
+        print(f"baton add-participant: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton add-participant: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        if e.status == 403:
+            print(
+                f"baton add-participant: '{agent_name or 'you'}' must already be a "
+                f"participant of '{project_id}' to add others.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        print(f"baton add-participant: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
+
+    added = resp.get("added", True)
+    if already_present or not added:
+        print(f"baton add-participant: {new_participant} is already a participant of {project_id}.")
+    else:
+        print(f"baton add-participant: {project_id} + participant {new_participant}")
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: merge  (gate-checked merge verb — #999 + #1000)
 # ---------------------------------------------------------------------------
 
@@ -2067,6 +2142,31 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # -- add-participant --
+    p_add_participant = subparsers.add_parser(
+        "add-participant",
+        help="Add an agent to an existing baton's participants list",
+        description=(
+            "Add <participant> to the project's participants list, atomically. "
+            "Appends an audit line to the turn log. Idempotent: adding an "
+            "agent who is already a participant is a no-op, not an error. "
+            "The invoking agent must already be a participant of the baton "
+            "(server-side authorization) — non-participants cannot add "
+            "others. Fixes the 2-reviewer-pipeline friction where 'baton "
+            "flip' to a not-yet-participant refuses with 'not a participant'."
+        ),
+    )
+    p_add_participant.add_argument(
+        "project_id",
+        metavar="PROJECT-ID",
+        help="Project identifier",
+    )
+    p_add_participant.add_argument(
+        "participant",
+        metavar="PARTICIPANT",
+        help="Agent name to add as a participant",
+    )
+
     # -- merge --
     p_merge = subparsers.add_parser(
         "merge",
@@ -2145,6 +2245,8 @@ def main() -> None:
         cmd_rename(args, config, agent_name, client)
     elif args.subcommand == "anchor":
         cmd_anchor(args, config, agent_name, client)
+    elif args.subcommand == "add-participant":
+        cmd_add_participant(args, config, agent_name, client)
     elif args.subcommand == "merge":
         cmd_merge(args, config, agent_name, client)
     else:

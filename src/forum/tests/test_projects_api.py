@@ -409,6 +409,76 @@ class TestProjectAnchor:
 
 
 # ---------------------------------------------------------------------------
+# POST /api/projects/<pid>/participants
+# ---------------------------------------------------------------------------
+# Seeded PR-42 participants: [ariadne, luria] (see the `app` fixture above).
+
+class TestProjectAddParticipant:
+    def test_add_participant_returns_201_and_added_true(self, client):
+        resp = client.post("/api/projects/PR-42/participants", json={
+            "agent": "ariadne",
+            "participant": "borges",
+        })
+        assert resp.status_code == 201
+        data = resp.get_json()
+        assert data["added"] is True
+        assert "seq" in data
+
+    def test_add_participant_idempotent_no_op_returns_added_false(self, client):
+        resp = client.post("/api/projects/PR-42/participants", json={
+            "agent": "ariadne",
+            "participant": "ariadne",  # already a seeded participant
+        })
+        assert resp.status_code == 201
+        data = resp.get_json()
+        assert data["added"] is False
+
+    def test_add_participant_403_when_agent_not_a_participant(self, client):
+        resp = client.post("/api/projects/PR-42/participants", json={
+            "agent": "casey",  # not in [ariadne, luria]
+            "participant": "borges",
+        })
+        assert resp.status_code == 403
+
+    def test_add_participant_400_missing_agent(self, client):
+        resp = client.post("/api/projects/PR-42/participants", json={
+            "participant": "borges",
+        })
+        assert resp.status_code == 400
+
+    def test_add_participant_400_missing_participant(self, client):
+        resp = client.post("/api/projects/PR-42/participants", json={
+            "agent": "ariadne",
+        })
+        assert resp.status_code == 400
+
+    def test_add_participant_404_missing_project(self, client):
+        resp = client.post("/api/projects/MISSING/participants", json={
+            "agent": "ariadne",
+            "participant": "borges",
+        })
+        assert resp.status_code == 404
+
+    def test_add_participant_persists_in_subsequent_read(self, client):
+        """The added participant is visible on a later GET (persisted, not just echoed).
+
+        This is the API-layer half of the flip-unblock regression guard — the
+        CLI-level half (baton flip actually SUCCEEDS post-add, the check that
+        matters since 'not a participant' is enforced client-side in
+        cmd_flip) lives in tests/test_baton.py.
+        """
+        add_resp = client.post("/api/projects/PR-42/participants", json={
+            "agent": "ariadne",
+            "participant": "borges",
+        })
+        assert add_resp.status_code == 201
+
+        show_resp = client.get("/api/projects/PR-42")
+        assert show_resp.status_code == 200
+        assert "borges" in show_resp.get_json()["raw"]
+
+
+# ---------------------------------------------------------------------------
 # POST /api/projects/<pid>/gc
 # ---------------------------------------------------------------------------
 

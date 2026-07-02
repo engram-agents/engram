@@ -1792,3 +1792,131 @@ class TestCiStateDedup:
             state, detail = baton._pr_ci_state("123")
         assert state == "red"
         assert "trap-check" in detail
+
+
+# ===========================================================================
+# CATEGORY 14: add-participant subcommand (#1609)
+# ===========================================================================
+
+class TestAddParticipant:
+    """baton add-participant: arg wiring, error mapping, and the flip-unblock
+    end-to-end regression guard (the whole point of the verb)."""
+
+    def test_add_participant_posts_agent_and_participant(self):
+        """Happy path: POSTs to /participants with {agent, participant}."""
+        client = _make_client(
+            post_return={"seq": 5, "added": True},
+            get_return={"raw": _make_raw_baton("PR-600")},
+        )
+        args = argparse.Namespace(project_id="PR-600", participant="lei")
+        _baton.cmd_add_participant(args, MULTI_CONFIG, "borges", client)
+
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-600/participants"
+        assert body["agent"] == "borges"
+        assert body["participant"] == "lei"
+
+    def test_add_participant_normalizes_participant_case(self):
+        client = _make_client(
+            post_return={"seq": 5, "added": True},
+            get_return={"raw": _make_raw_baton("PR-601")},
+        )
+        args = argparse.Namespace(project_id="PR-601", participant="  LEI ")
+        _baton.cmd_add_participant(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["participant"] == "lei"
+
+    def test_add_participant_missing_project_exits_nonzero(self, capsys):
+        """add-participant on a non-existent project exits non-zero."""
+        client = _make_client()
+        client.get.side_effect = ForumHttpError(404, '{"error": "not found"}')
+        args = argparse.Namespace(project_id="PR-NONE", participant="lei")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_add_participant(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        captured = capsys.readouterr()
+        assert "not found" in captured.err.lower() or "PR-NONE" in captured.err
+
+    def test_add_participant_bad_project_id_exits_nonzero(self, engram_home):
+        """add-participant with a malformed --project-id exits non-zero before any API call."""
+        _write_config(engram_home, "borges")
+        rc, stdout, stderr = _run_baton(
+            engram_home, "add-participant", "not a valid id!", "lei",
+        )
+        assert rc != 0
+
+    def test_add_participant_server_403_maps_to_exit_validation(self, capsys):
+        """Server-side NotAParticipant (agent not a current participant) → EXIT_VALIDATION."""
+        client = _make_client(get_return={"raw": _make_raw_baton("PR-602")})
+        client.post.side_effect = ForumHttpError(403, '{"error": "agent not a participant"}')
+        args = argparse.Namespace(project_id="PR-602", participant="lei")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_add_participant(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        captured = capsys.readouterr()
+        assert "participant" in captured.err.lower()
+
+    def test_add_participant_server_confirms_already_present_prints_friendly_message(self, capsys):
+        """Server signals added=False (idempotent no-op) → friendly already-present message."""
+        client = _make_client(
+            post_return={"seq": 3, "added": False},
+            get_return={"raw": _make_raw_baton("PR-603")},
+        )
+        args = argparse.Namespace(project_id="PR-603", participant="ariadne")  # already a seeded participant
+        _baton.cmd_add_participant(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "already a participant" in captured.out.lower()
+
+    def test_add_participant_single_agent_mode_exits_state(self):
+        """add-participant in single-agent mode refuses (write command)."""
+        client = _make_client()
+        args = argparse.Namespace(project_id="PR-604", participant="lei")
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_add_participant(args, {"mode": "single"}, "borges", client)
+        assert exc_info.value.code == EXIT_STATE
+
+    def test_add_participant_then_flip_to_new_participant_succeeds(self, monkeypatch):
+        """End-to-end regression guard: the whole point of the verb (#1609).
+
+        Before add-participant, cmd_flip refuses ('not a participant') because
+        the client-side check in cmd_flip reads the participants list from the
+        baton. After add-participant, a baton read reflecting the addition
+        (simulating the real server write) lets cmd_flip succeed.
+        """
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr: ("unknown", "no gh"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr: ("unknown", "no gh"))
+
+        seed_raw = _make_raw_baton("PR-605", participants="[borges, ariadne]")
+
+        # Step 1: flip to a not-yet-participant fails client-side.
+        client = _make_client(get_return={"raw": seed_raw})
+        flip_args = argparse.Namespace(
+            project_id="PR-605", to="lei", reason="please review", force=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(flip_args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+
+        # Step 2: add-participant succeeds (server would persist this).
+        client.post.return_value = {"seq": 1, "added": True}
+        add_args = argparse.Namespace(project_id="PR-605", participant="lei")
+        _baton.cmd_add_participant(add_args, MULTI_CONFIG, "borges", client)
+
+        # Step 3: simulate the server's post-add state (lei now a participant),
+        # then flip to lei succeeds.
+        client.get.return_value = {
+            "raw": _make_raw_baton("PR-605", participants="[borges, ariadne, lei]"),
+        }
+        client.post.reset_mock()
+        client.post.return_value = {"seq": 2}
+        _baton.cmd_flip(flip_args, MULTI_CONFIG, "borges", client)
+        client.post.assert_called_once()
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-605/flip"
+        assert body["to_agent"] == "lei"

@@ -15,11 +15,19 @@ This slice lands ``flip`` (the most-used op) and the shared pattern; ``claim``,
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from . import markdown as md
 from .seq import SeqAllocator
 from .store import CoordinationStore
+
+# Participants list format: [alice, bob] or alice,bob — the same on-disk
+# grammar tools/baton.py and store_file.py already parse. A third private copy
+# here (rather than a cross-module import) mirrors the deliberate
+# self-containment store_file.py's docstring already calls out for this exact
+# grammar duplication.
+_PARTICIPANTS_LIST_RE = re.compile(r"^\[?(.*?)\]?$")
 
 
 class ProjectNotFound(Exception):
@@ -36,6 +44,48 @@ class ProjectAlreadyExists(Exception):
     The CLI/route layer maps this to its own already-exists error + exit code;
     the write-fn does not assume how the caller reports it.
     """
+
+
+class NotAParticipant(Exception):
+    """Raised by ``add_participant`` when ``agent`` is not a current participant.
+
+    Server-side authorization guard — LOAD-BEARING, unlike the validation in
+    every other write-fn in this module (documented there as "the caller's
+    job"). This check lives HERE, not in the CLI, because a CLI-only check is
+    bypassable by a direct API call. The CLI/route layer maps this to its own
+    not-authorized error + exit code (typically HTTP 403); the write-fn does
+    not assume how the caller reports it.
+    """
+
+
+def _parse_participants(participants_str: str) -> list:
+    """Parse ``[borges, ariadne]`` / ``borges,ariadne`` → lowercase name list.
+
+    Mirrors ``store_file.FileStore._parse_participants`` / ``tools/baton.py``
+    ``_parse_participants`` (the identical on-disk grammar, kept self-contained
+    per the existing triplication convention rather than a cross-package import).
+    """
+    m = _PARTICIPANTS_LIST_RE.match(participants_str.strip())
+    inner = m.group(1) if m else participants_str
+    return [p.strip().lower() for p in inner.split(",") if p.strip()]
+
+
+def _format_participants(participants: list) -> str:
+    """Format a participants list for frontmatter: ``[borges, ariadne]``."""
+    return "[" + ", ".join(participants) + "]"
+
+
+def _coerce_seq(raw: str) -> int:
+    """Parse a frontmatter ``seq:`` value to int; 0 when absent/garbage.
+
+    Mirrors ``store_file._coerce_seq`` — used by ``add_participant`` to report
+    the baton's last-committed seq on its idempotent no-op path (no new write
+    happens, so no new seq is allocated).
+    """
+    try:
+        return int(raw.strip())
+    except (ValueError, AttributeError):
+        return 0
 
 
 def flip(
@@ -508,6 +558,79 @@ def anchor(
     with allocator.allocate() as seq:
         store.write_project(project_id, final, seq=seq)
     return seq
+
+
+def add_participant(
+    store: CoordinationStore,
+    allocator: SeqAllocator,
+    project_id: str,
+    *,
+    agent: str,
+    participant: str,
+    ts: Optional[str] = None,
+) -> tuple[int, bool]:
+    """Add ``participant`` to a project baton's participants list; return ``(seq, added)``.
+
+    Pure write body of ``baton cmd_add_participant``: reads the current
+    ``participants`` list, appends ``participant`` (lowercased) if not already
+    present, appends a turn-log entry documenting the addition, and writes
+    atomically under the allocator lock (fork-4).
+
+    Server-side authorization (LOAD-BEARING — unlike the other write-fns in
+    this module, whose validation is documented as "the caller's job"):
+    ``agent`` MUST already be a current participant of the baton. This check
+    lives HERE, not in the CLI, because a CLI-only check is bypassable by a
+    direct API call.
+
+    Dedup / idempotency: if ``participant`` (compared case-insensitively) is
+    already a participant, this is a no-op — no duplicate list entry, no
+    turn-log line, no new seq allocated, no error. The baton's last-committed
+    seq (parsed from its current ``seq:`` frontmatter field) is returned
+    instead, with ``added=False``.
+
+    Log format: ``- {ts} {agent} added participant: {participant}``
+
+    Args:
+        agent: the agent performing the add; must already be a participant.
+        participant: the agent name to add (normalised to lowercase).
+        ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
+
+    Returns:
+        ``(seq, added)`` — ``seq`` is the seq of this mutation, or the
+        baton's last-committed seq if this call was a no-op; ``added`` is
+        ``True`` iff ``participant`` was newly added.
+
+    Raises:
+        ProjectNotFound: if ``project_id`` has no existing baton file.
+        NotAParticipant: if ``agent`` is not a current participant of the baton.
+    """
+    content = store.read_project(project_id)
+    if content is None:
+        raise ProjectNotFound(project_id)
+
+    fields, _ = md.parse_frontmatter(content)
+    current_participants = _parse_participants(fields.get("participants", ""))
+
+    agent_n = agent.strip().lower()
+    if agent_n not in current_participants:
+        raise NotAParticipant(agent_n)
+
+    participant_n = participant.strip().lower()
+    if participant_n in current_participants:
+        return _coerce_seq(fields.get("seq", "")), False
+
+    now = ts or md.now_iso()
+    new_participants = list(current_participants) + [participant_n]
+    participants_str = _format_participants(new_participants)
+
+    updated = md.update_frontmatter(content, {"participants": participants_str})
+    _, body = md.parse_frontmatter(updated)
+    body = md.append_turn_log(body, f"- {now} {agent_n} added participant: {participant_n}")
+    final = md.reattach_frontmatter(updated, body)
+
+    with allocator.allocate() as seq:
+        store.write_project(project_id, final, seq=seq)
+    return seq, True
 
 
 def init(
