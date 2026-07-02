@@ -9,7 +9,8 @@ Coverage:
   5. Multi-pattern: multiple patterns in roster, correct pattern_index reported.
   6. No-real-names hygiene: tools/name_leak_warn.py itself contains no real
      personal/agent names (mirrors test_scan_leaks.py's example-file hygiene test).
-  7. Workflow hygiene: name-leak-warn.yml contains no real personal/agent names.
+  7. Workflow hygiene: pr-checks.yml (which now hosts the name-leak-warn job,
+     post-#1598 consolidation) contains no real personal/agent names.
   8. load_roster: absent file is an IO error — exits 1 (SystemExit(1)).
   9. load_roster: invalid regex in roster triggers exit 1 (usage error).
 """
@@ -27,7 +28,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOOL_PATH = REPO_ROOT / "tools" / "name_leak_warn.py"
-WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "name-leak-warn.yml"
+# #1598 (2026-07-01) folded the standalone name-leak-warn.yml workflow into
+# pr-checks.yml as a job/steps ("was name-leak-warn.yml") — the standalone
+# file no longer exists, so the hygiene check now targets pr-checks.yml.
+WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "pr-checks.yml"
 
 _spec = importlib.util.spec_from_file_location("name_leak_warn", TOOL_PATH)
 _mod = importlib.util.module_from_spec(_spec)
@@ -240,11 +244,12 @@ def test_tool_file_no_real_names():
 
 
 # ---------------------------------------------------------------------------
-# Test 7: workflow hygiene — name-leak-warn.yml
+# Test 7: workflow hygiene — pr-checks.yml (hosts the name-leak-warn job)
 # ---------------------------------------------------------------------------
 
 def test_workflow_file_no_real_names():
-    """name-leak-warn.yml must contain no real personal/agent names."""
+    """pr-checks.yml (the name-leak-warn job's home post-#1598) must contain
+    no real personal/agent names."""
     import re
 
     assert WORKFLOW_PATH.exists(), f"workflow file not found: {WORKFLOW_PATH}"
@@ -260,7 +265,7 @@ def test_workflow_file_no_real_names():
             violations.append(f"  line {i}: {line.strip()[:100]}")
 
     assert not violations, (
-        f".github/workflows/name-leak-warn.yml contains real personal/agent names:\n"
+        f".github/workflows/pr-checks.yml contains real personal/agent names:\n"
         + "\n".join(violations)
     )
 

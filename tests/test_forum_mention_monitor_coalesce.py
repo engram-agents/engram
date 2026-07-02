@@ -158,9 +158,21 @@ def test_five_mentions_across_five_polls_coalesce_to_one_emit(tmp_path):
     server = _MockMentionsServer(payload_fn)
     server.start()
     try:
+        # poll_seconds=0.15 delivers all 5 mentions by ~t=0.75s; coalesce_seconds=3
+        # keeps the window open until ~t=3.15s — a ~2.4s margin between last
+        # delivery and window-elapse. The original 0.4s poll / 2s coalesce pairing
+        # left only a ~0.4s margin, which a loaded CI runner's scheduling jitter
+        # could (and did) eat, causing a premature elapse-check to split the
+        # flush into two emits instead of one (observed in CI, passed locally).
+        # Note: the underlying script checks elapsed time via `date +%s`
+        # (whole-second resolution, forum-mention-monitor.sh), so the effective
+        # margin also depends on where the run starts relative to a second
+        # boundary, not just the fractional-second deltas above — the wider
+        # nominal margin here is what actually buys robustness, not sub-second
+        # precision in this math.
         lines, seen_file = _run_monitor(
             tmp_path, server.port,
-            poll_seconds="0.4", coalesce_seconds="2",
+            poll_seconds="0.15", coalesce_seconds="3",
             run_seconds=6.0,
         )
     finally:
