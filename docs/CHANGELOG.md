@@ -11,7 +11,7 @@ with an `-alpha` suffix during the alpha phase.
 
 _Nothing yet — changes land here after the v0.2.0-rc2 cut._
 
-## [v0.2.0-rc2] - 2026-07-02
+## [v0.2.0] - 2026-07-02
 
 The headline of v0.2.0 is the **Unified Coordination Surface (UCS)**: inter-agent
 letters, baton turn-state, and the project board all migrated from local-filesystem

@@ -58,7 +58,12 @@ SCAN_EXTENSIONS = {".py", ".md", ".sh", ".json", ".template", ".service", ".time
 #   fixtures (e.g. "kg_protocol_for_ai" in _commit_file calls) to verify the
 #   release-cutover scanner picks them up.  Same structural rationale as the
 #   scan-leaks.py self-skip: patterns present by design, not as actual leaks.
-SKIP_FILES = {"LICENSE", LOCAL_CONFIG_NAME, "scan-leaks.py", "test_release_cutover.py"}
+# RELEASING.md: the dev-internal release-process doc.  It legitimately names the
+#   private repo (engram-agents/engram-alpha) throughout — it documents THIS
+#   repo's release procedure — and it is excluded from the public snapshot via
+#   release-minus-set.txt, so it never ships publicly.  The whole-repo hygiene
+#   scan flags its private-repo URLs as a false positive; skip it by name.
+SKIP_FILES = {"LICENSE", LOCAL_CONFIG_NAME, "scan-leaks.py", "test_release_cutover.py", "RELEASING.md"}
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".claude"}
 # .claude: harness-internal (agent worktrees + transcripts) — stale fairy
 # worktrees carry pre-fix file copies that read as false-positive leaks.
