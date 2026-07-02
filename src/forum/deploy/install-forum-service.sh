@@ -248,10 +248,14 @@ if [ "$START" -eq 1 ]; then
     fi
 
     echo "==> Post-install gate 2: boot-verify probe"
-    if "$PYTHON" -m forum.server \
+    # Run from $APP so `python -m forum.server` can import the `forum` package —
+    # mirrors the service's WorkingDirectory=$APP. Without this cd the probe
+    # runs in the deploy cwd, hits ModuleNotFoundError: forum, and false-alarms
+    # "service may be degraded" on a perfectly healthy deploy (#1617).
+    if ( cd "$APP" && "$PYTHON" -m forum.server \
         --db "$SERVICE_DIR/forum.db" \
         --audit "$SERVICE_DIR/forum-audit.jsonl" \
-        --verify-only; then
+        --verify-only ); then
       echo "    verify-only passed"
     else
       echo "ERROR: verify-only probe returned non-zero — dep check failed; service may be degraded." >&2
