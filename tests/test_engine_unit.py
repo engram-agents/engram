@@ -459,7 +459,7 @@ class TestComputeBuildVersion:
 
         monkeypatch.setattr(_subprocess, "check_output", _fake_check_output)
 
-        version_str = self.compute_build_version(str(tmp_path))
+        version_str = self.compute_build_version(str(tmp_path), "0.1.0")
 
         # The sha component must be "g0149257", not "0149257".
         # After the timestamp-first reorder, sha is the SECOND prerelease
@@ -482,6 +482,24 @@ class TestComputeBuildVersion:
         assert re.match(r"^[a-zA-Z][a-zA-Z0-9]*$", sha_part), (
             f"Prerelease sha identifier is not an alphanumeric non-numeric identifier: "
             f"{sha_part!r} (full version: {version_str!r})"
+        )
+
+    def test_base_version_is_threaded_through_not_hardcoded(self, monkeypatch, tmp_path):
+        """Anti-regression for #1607: the base version must come from the
+        caller-supplied ``base_version`` argument, not a hardcoded "0.1.0".
+
+        This is the test that would have caught Mira's bug: the release build
+        stamped every rebuild as ``0.1.0-dev...`` regardless of the actual
+        ``plugin.json`` version because the base version was hardcoded in the
+        return statement instead of threaded through from the SSoT.
+        """
+        version_str = self.compute_build_version(str(tmp_path), "0.2.0")
+
+        assert version_str.startswith("0.2.0-dev."), (
+            f"Expected version to start with '0.2.0-dev.'; got: {version_str!r}"
+        )
+        assert not version_str.startswith("0.1.0"), (
+            f"Version must not carry the old hardcoded '0.1.0' base; got: {version_str!r}"
         )
 
 

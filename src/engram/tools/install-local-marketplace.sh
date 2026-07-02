@@ -372,7 +372,11 @@ PY
       log "WARN: could not derive new cache basename — skipping compat symlink step"
     else
       shopt -s nullglob
-      for old_dir in "$CACHE_PARENT"/0.1.0-dev.*; do
+      # Version-agnostic: matches "<base>-dev.<stamp>.<sha>" for ANY base
+      # version (0.1.0, 0.2.0, future bumps), not just 0.1.0. The "-dev."
+      # substring keeps this from matching a plain (non-dev) release-tagged
+      # cache dir that might otherwise sit alongside these in $CACHE_PARENT.
+      for old_dir in "$CACHE_PARENT"/*-dev.*; do
         [[ -e "$old_dir" || -L "$old_dir" ]] || continue
         [[ "$(basename "$old_dir")" == "$NEW_BASE" ]] && continue
         log "Symlinking stale cache dir for in-session compat: $(basename "$old_dir") -> $NEW_BASE"
