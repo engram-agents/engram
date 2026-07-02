@@ -1590,19 +1590,46 @@ def _get_db() -> sqlite3.Connection:
         # re-retracts (FTS5 'delete' magic-insert is NOT idempotent — double-delete
         # raises "database disk image is malformed").
         #
-        # Round-1 used OLD.is_current=1, which missed the supersede-then-retract
-        # path: if a node was superseded first (is_current→0) and then retracted,
-        # the trigger did not fire and the node leaked through FTS queries with
-        # include_superseded=True. Fixed by keying on status transition instead.
+        # Design rev 2026-07-02 (#195): add AND OLD.is_current = 1.
+        # In the new design nodes_fts_supersede_remove handles FTS eviction when
+        # is_current flips 1→0; by the time a superseded node (is_current already 0)
+        # is retracted, it is already absent from nodes_fts.  Without this guard the
+        # retract trigger would attempt a second FTS 'delete' on an absent rowid,
+        # raising "database disk image is malformed".
         #
-        # Superseded nodes are intentionally NOT removed — they're past memories,
-        # still recallable via include_superseded=True (Lei's design call, 2026-05-22).
         # FTS5 contentless-table mechanic: the 'delete' magic-insert requires
         # OLD column values because the contentless table doesn't store them.
         """
         CREATE TRIGGER IF NOT EXISTS nodes_retract_remove_from_fts
         AFTER UPDATE OF status ON nodes
         WHEN NEW.status = 'retracted' AND COALESCE(OLD.status, '') != 'retracted'
+          AND OLD.is_current = 1
+        BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
+            VALUES ('delete', OLD.rowid,
+                    COALESCE(OLD.claim, ''),
+                    COALESCE(OLD.quoted_text, ''),
+                    COALESCE(OLD.interpretation, ''),
+                    COALESCE(OLD.reported_state, ''),
+                    COALESCE(OLD.trigger_text, ''));
+        END
+        """,
+        # Supersede trigger (#195, design rev 2026-07-02): remove superseded nodes
+        # from the FTS search index when is_current flips to 0.  FTS is a search
+        # index for active recall; superseded nodes remain in the graph and are
+        # reachable via graph traversal and engram_list, but should not surface in
+        # text search results.
+        #
+        # The extra AND COALESCE(NEW.status, '') != 'retracted' prevents a
+        # double-delete when retraction does a combined UPDATE with both
+        # status='retracted' and is_current=0 in one statement: without the guard
+        # both this trigger and nodes_retract_remove_from_fts would fire, and
+        # the second FTS 'delete' raises "database disk image is malformed".
+        """
+        CREATE TRIGGER IF NOT EXISTS nodes_fts_supersede_remove
+        AFTER UPDATE OF is_current ON nodes
+        WHEN NEW.is_current = 0 AND OLD.is_current = 1
+          AND COALESCE(NEW.status, '') != 'retracted'
         BEGIN
             INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
             VALUES ('delete', OLD.rowid,
@@ -1629,7 +1656,7 @@ def _get_db() -> sqlite3.Connection:
     # PRAGMA user_version so it runs exactly once (user_version 0 → 1).
     # The trigger above handles all retractions going forward; this migration
     # is only needed to clean up the pre-trigger state on upgrade.
-    # Superseded nodes are deliberately left in the index (Lei's design call).
+    # Superseded nodes are cleaned up by migration 3 below.
     #
     # Note: nodes_fts uses content='nodes' (external-content FTS5) with
     # deliberate index-side deletion of retracted rows.  As a result, FTS5's
@@ -1710,6 +1737,7 @@ def _get_db() -> sqlite3.Connection:
                 CREATE TRIGGER nodes_retract_remove_from_fts
                 AFTER UPDATE OF status ON nodes
                 WHEN NEW.status = 'retracted' AND COALESCE(OLD.status, '') != 'retracted'
+                  AND OLD.is_current = 1
                 BEGIN
                     INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
                     VALUES ('delete', OLD.rowid,
@@ -1742,6 +1770,55 @@ def _get_db() -> sqlite3.Connection:
             except Exception:
                 pass
             conn.execute("PRAGMA user_version = 2")
+        except sqlite3.DatabaseError:
+            pass
+
+    # Migration version 3 (#195, design rev 2026-07-02): remove superseded nodes
+    # from the FTS search index.  FTS is a live-recall index; superseded nodes
+    # belong in the graph (traversable via edges and engram_list) but must not
+    # pollute text search results or IDF term-frequency counts.
+    #
+    # Two steps:
+    #   a. Backfill: delete all superseded (is_current=0, non-retracted) nodes
+    #      from nodes_fts.  Retracted nodes were already removed by migration 1.
+    #   b. Trigger: nodes_fts_supersede_remove is created at setup time (above)
+    #      via CREATE TRIGGER IF NOT EXISTS; the CREATE here is a no-op safety net
+    #      for the path where setup ran before this migration block was added.
+    if current_user_version < 3:
+        try:
+            conn.execute(
+                """
+                INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation,
+                                      reported_state, trigger_text)
+                SELECT 'delete', rowid,
+                       COALESCE(claim, ''),
+                       COALESCE(quoted_text, ''),
+                       COALESCE(interpretation, ''),
+                       COALESCE(reported_state, ''),
+                       COALESCE(trigger_text, '')
+                FROM nodes
+                WHERE is_current = 0 AND status != 'retracted'
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS nodes_fts_supersede_remove
+                AFTER UPDATE OF is_current ON nodes
+                WHEN NEW.is_current = 0 AND OLD.is_current = 1
+                  AND COALESCE(NEW.status, '') != 'retracted'
+                BEGIN
+                    INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation,
+                                          reported_state, trigger_text)
+                    VALUES ('delete', OLD.rowid,
+                            COALESCE(OLD.claim, ''),
+                            COALESCE(OLD.quoted_text, ''),
+                            COALESCE(OLD.interpretation, ''),
+                            COALESCE(OLD.reported_state, ''),
+                            COALESCE(OLD.trigger_text, ''));
+                END
+                """
+            )
+            conn.execute("PRAGMA user_version = 3")
         except sqlite3.DatabaseError:
             pass
 

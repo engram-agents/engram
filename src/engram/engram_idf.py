@@ -164,17 +164,16 @@ def idf(
     token is absent from the vocabulary (callers should treat this as "unknown
     to corpus" — neither noise nor signal).
 
+    ``nodes_fts`` indexes only current (non-superseded, non-retracted) nodes —
+    superseded nodes are removed from the index by the ``nodes_fts_supersede_remove``
+    trigger at supersede time, and retracted nodes are removed by
+    ``nodes_retract_remove_from_fts``.  This means ``nodes_fts_vocab`` df counts
+    and the current-node ``n_docs`` are always coherent: df can never exceed
+    n_docs for a valid corpus.
+
     *n_docs* is the total count of current nodes used for IDF normalisation.
     Pass it explicitly when looping over many tokens to avoid a repeated
-    ``COUNT(*)`` query.  When omitted, the function queries
-    ``SELECT COUNT(*) FROM nodes WHERE is_current=1`` once.
-
-    Note: ``nodes_fts`` has no UPDATE trigger on ``is_current``, so superseded
-    nodes remain indexed.  When a token appears only in superseded nodes,
-    ``df > n_docs`` is possible and the raw log would go negative.  We floor at
-    zero by returning ``None`` for such tokens — semantically "this token has
-    no meaningful signal in the live corpus."  The structural fix (FTS UPDATE
-    trigger) is out of scope for this PR.
+    ``COUNT(*)`` query.  When omitted, the function queries the current-node count.
     """
     if n_docs is None:
         row = conn.execute(
@@ -189,12 +188,9 @@ def idf(
         "SELECT doc FROM nodes_fts_vocab WHERE term = ?",
         (token,),
     ).fetchone()
+    df = row[0] if row is not None else None
 
-    if row is None:
-        return None
-
-    df = row[0]
-    if df <= 0 or df > n_docs:
+    if df is None or df <= 0 or df > n_docs:
         return None
 
     return math.log(n_docs / df)
@@ -225,7 +221,6 @@ def extract_keywords(
     if stopwords is None:
         stopwords = STOPWORDS
 
-    # Resolve n_docs once for the entire call.
     row = conn.execute(
         "SELECT COUNT(*) FROM nodes WHERE is_current = 1"
     ).fetchone()
