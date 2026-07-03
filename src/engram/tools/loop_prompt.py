@@ -28,6 +28,7 @@ tools/_status_derive.py.
 """
 
 import argparse
+import html
 import json
 import sys
 
@@ -90,12 +91,20 @@ def is_loop_wake(body: str) -> bool:
     Strips leading whitespace before checking, so slight prompt indentation or
     leading newlines don't defeat the detection.
 
+    Also HTML-unescapes ``body`` before checking, so a marker that was
+    mangled into its HTML-escaped form (e.g. an agent hand-constructing
+    ``&lt;loop-wake&gt;`` instead of real angle brackets when composing a
+    ``ScheduleWakeup`` prompt) still classifies identically to the plain
+    marker. This is effect-layer robustness: an agent-construction error in
+    how the marker gets embedded can't silently defeat detection and get
+    misclassified as a human prompt (gh#1646).
+
     Parameters
     ----------
     body:
         The raw prompt body string (e.g. ``payload.get("prompt", "")``).
     """
-    return body.lstrip().startswith(LOOP_WAKE_MARKER)
+    return html.unescape(body).lstrip().startswith(LOOP_WAKE_MARKER)
 
 
 # ---------------------------------------------------------------------------
