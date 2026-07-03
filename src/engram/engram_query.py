@@ -1814,21 +1814,26 @@ def _surface_impl(
         # MECH-5: in addition to aggregate counts, surface the full
         # warnings shape per-node so agents can act on specific taints
         # without a follow-up engram_inspect call.
-        stale_count = 0
-        tainted_count = 0
+        #
+        # Single-source-of-truth (Borges, colleague review on #1604/gh#1621):
+        # the aggregate counts and the per-node ⚠ markers must derive from
+        # the SAME source (warned_nodes / _extract_warnings), not from an
+        # independent raw string-match. The prior raw-match approach
+        # ('"stale_by": [' in meta_str) matches even an EMPTY stale_by: []
+        # list, while _extract_warnings correctly treats an empty list as
+        # "not actually tainted/stale" and omits it — so the two signals
+        # could silently disagree (a visible "Warnings: 2 stale" with only
+        # one, or zero, ⚠ STALE marker actually shown). Computing the counts
+        # from warned_nodes (built below via _extract_warnings) makes that
+        # drift structurally impossible.
         warned_nodes: dict[str, dict] = {}
         for n in results:
             meta_str = n.get("metadata", "")
-            if isinstance(meta_str, str) and meta_str:
-                # Anchored to the serialized JSON list shape to avoid
-                # false positives from claim text containing these phrases.
-                if '"stale_by": [' in meta_str:
-                    stale_count += 1
-                if '"tainted_by": [' in meta_str:
-                    tainted_count += 1
             w = _extract_warnings(meta_str, conn)
             if w:
                 warned_nodes[n["id"]] = w
+        stale_count = sum(1 for w in warned_nodes.values() if w.get("stale_by"))
+        tainted_count = sum(1 for w in warned_nodes.values() if w.get("tainted_by"))
         # Attach warnings inline on top_claims / special entries so callers
         # can notice without cross-referencing the warned_nodes map.
         for entry in top_claims:
@@ -1855,11 +1860,24 @@ def _surface_impl(
                 kw = json.loads(kw_raw) if kw_raw else None
             except (json.JSONDecodeError, TypeError):
                 kw = None
-            matched_meta.append({
+            meta_entry = {
                 "id": n["id"],
                 "type": n.get("type"),
                 "recall_keywords": kw,
-            })
+            }
+            # Lightweight boolean taint/staleness signal (MECH-5 follow-up) —
+            # reuse the warned_nodes map already built above rather than
+            # recomputing. Others is keyword-only/lossy-by-design, so only a
+            # boolean pair is attached here (not the full warnings dict);
+            # omitted entirely for clean nodes, matching the top_claims /
+            # special_nodes convention of omitting "warnings" when absent.
+            w = warned_nodes.get(n["id"])
+            if w:
+                if w.get("tainted_by"):
+                    meta_entry["tainted"] = True
+                if w.get("stale_by"):
+                    meta_entry["stale"] = True
+            matched_meta.append(meta_entry)
 
         summary = {
             "query": query,

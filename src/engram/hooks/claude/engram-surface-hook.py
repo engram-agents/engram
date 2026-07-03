@@ -544,6 +544,19 @@ def render_one_node_line(entry: dict, *, conf_prefix: bool, type_tag: bool) -> s
     recall_summary = entry.get("recall_summary")
     recall_keywords = entry.get("recall_keywords")
 
+    # Taint/staleness marker — additive-only: entries with no "warnings" key
+    # (the common case) render byte-identical to prior output.
+    warnings = entry.get("warnings")
+    warn_marker = ""
+    if warnings:
+        tags = []
+        if warnings.get("tainted_by"):
+            tags.append("TAINTED")
+        if warnings.get("stale_by"):
+            tags.append("STALE")
+        if tags:
+            warn_marker = f"⚠ {'/'.join(tags)} "
+
     # Build prefix tokens (conf / type-tag)
     prefix_parts = []
     if type_tag:
@@ -570,7 +583,7 @@ def render_one_node_line(entry: dict, *, conf_prefix: bool, type_tag: bool) -> s
     else:
         body = claim
 
-    return f"- [{nid}] {prefix}{age_tag}{kw_prefix}{body}"
+    return f"- {warn_marker}[{nid}] {prefix}{age_tag}{kw_prefix}{body}"
 
 
 def format_nudge(result: dict, pack_results: list[dict] | None = None) -> str:
@@ -625,8 +638,8 @@ def format_nudge(result: dict, pack_results: list[dict] | None = None) -> str:
     # Age / issues
     age = result.get("age", {})
     issues = result.get("issues", {})
-    stale = issues.get("stale_count", 0) if isinstance(issues, dict) else 0
-    tainted = issues.get("tainted_count", 0) if isinstance(issues, dict) else 0
+    stale = issues.get("stale_nodes", 0) if isinstance(issues, dict) else 0
+    tainted = issues.get("tainted_nodes", 0) if isinstance(issues, dict) else 0
     if stale or tainted:
         parts = []
         if stale:
@@ -662,7 +675,15 @@ def format_nudge(result: dict, pack_results: list[dict] | None = None) -> str:
             mid = m.get("id", "?")
             kw = m.get("recall_keywords") or []
             kw_str = " · ".join(f"`{k}`" for k in kw)
-            lines.append(f"    - [{mid}] {kw_str}")
+            # Taint/staleness marker — same compact style as render_one_node_line
+            # (§2); additive-only, omitted for clean entries.
+            tags = []
+            if m.get("tainted"):
+                tags.append("TAINTED")
+            if m.get("stale"):
+                tags.append("STALE")
+            others_marker = f"⚠ {'/'.join(tags)} " if tags else ""
+            lines.append(f"    - {others_marker}[{mid}] {kw_str}")
     elif not (special or top_claims or others_with_kw):
         # No content rendered yet — fall back to the legacy flat IDs line so
         # the digest is never silently empty when matches exist.
