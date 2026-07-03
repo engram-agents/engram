@@ -2312,6 +2312,173 @@ def _get_tier_threshold(conn: sqlite3.Connection, tier: int) -> float:
     return row["importance_score"] if row else 0.0
 
 
+def _compute_recall_set_continuity(conn: sqlite3.Connection, checkpoint_mode: str) -> dict:
+    """Compute the Recall-Set Continuity metric (v1) for the current checkpoint.
+
+    Recall-Set Continuity = Jaccard similarity J(A,B) = |A∩B| / |A∪B| between
+    the active-recallable (tier1+tier2 / "searchable") node-ID set at this
+    checkpoint (B, the "current" set) and the set stored at the
+    immediately-prior diagnostic_history row (A, the "prior" set). Tier1 is
+    a verified strict subset of tier2 (see _get_tier_threshold — tier1's
+    percentile threshold is always >= tier2's, i.e. more selective), so
+    "tier1+tier2 membership" reduces to just the tier2-threshold set; no
+    separate tier1 query or literal set-union is needed.
+
+    Called from BOTH the engram_nap wrapper AND the engram_advance_turn
+    (sleep) wrapper (server.py), at every diagnostic_history checkpoint —
+    NOT from engram_diagnose() itself. engram_diagnose() is its own
+    directly-callable MCP tool ("Use any time" per its docstring), not
+    checkpoint-only, so computing and injecting this here (rather than
+    inside _diagnose_impl) keeps ad-hoc engram_diagnose() calls from
+    carrying a tier2_max_nodes-sized (default 1000) node-ID list on every
+    invocation.
+
+    Cadence decision (Borges, the metric's designer, 2026-07-02): the
+    original design intent said "every nap," which the first implementation
+    took literally (nap-only). That was an accidental scope gap, not the
+    intent — "every nap" was shorthand for "every checkpoint." The sleep
+    boundary is in fact the SINGLE MOST MEANINGFUL measurement point:
+    turn-advance triggers forgetting (decay -> tier demotion) PLUS
+    consolidation (retract/supersede/dream), so the Jaccard ACROSS sleep
+    directly answers whether a day's consolidation preserved mental
+    continuity — exactly the question the metric exists to watch. Excluding
+    it would blind the metric to its own primary use case, and it would
+    also break the timeseries daily (every nap immediately following a
+    sleep would show a spurious jaccard=None). Hence: compute at every
+    checkpoint, nap and sleep alike.
+
+    `checkpoint_mode` ("nap" or "advance_turn") is stored alongside the
+    result so downstream readers (health-alerting, the paper) can
+    distinguish the two cases: a big J drop AT a sleep checkpoint is
+    expected and meaningful (consolidation reshaping); a big J drop AT a
+    plain nap checkpoint is the actual alarm (unexpected continuity
+    disruption within a day, no consolidation to explain it). The prior
+    row's mode is also surfaced (`prior_checkpoint_mode`) for the same
+    reason — a nap-to-nap comparison and a sleep-to-nap comparison carry
+    different interpretive weight even when both land on a "nap" current
+    checkpoint.
+
+    Returns a dict meant to be stored verbatim under
+    metrics["recall_set_continuity"] in the new diagnostic_history row:
+        {
+            "checkpoint_mode": str,           # "nap" or "session" (engram_advance_turn) — the
+                                               # literal mode string _checkpoint_internal uses
+            "tier2_ids": [...],               # current tier2 (searchable) node-ID set
+            "set_size": int,
+            "jaccard": float | None,          # None only when undefined (see reason)
+            "prior_snapshot_turn": int | None,
+            "prior_checkpoint_mode": str | None,  # mode of the row diffed against
+            "reason": str | None,             # populated iff jaccard is None
+        }
+
+    Jaccard undefined cases (jaccard is None, never a fabricated 0.0/1.0):
+      - No prior diagnostic_history row exists at all (first-ever checkpoint).
+      - A prior row exists but predates this feature (no
+        recall_set_continuity.tier2_ids key in its metrics blob) — a
+        one-time transition cost for rows written before this metric (or
+        before the sleep-cadence fix) shipped. Once every checkpoint writes
+        the key, the immediately-prior row always has it, so this is not an
+        ongoing steady-state gap — we deliberately do NOT search further
+        back than one row for an older comparable snapshot (that would
+        silently widen the comparison window in a way the "consecutive
+        checkpoints" framing doesn't intend; a fresh None here is more
+        honest than a stale multi-checkpoint-old comparison presented as if
+        it were "the prior").
+
+    Zero-division convention: if BOTH the current and prior sets are empty
+    (|A ∪ B| = 0), jaccard is defined as 1.0 — two empty recall-sets are
+    treated as trivially/maximally continuous (the common Jaccard convention
+    for the degenerate empty/empty case), rather than surfacing None. None
+    is reserved for "there is no prior set to compare against" — a distinct
+    condition from "the sets we DO have happen to both be empty."
+
+    Storage pruning (Borges, colleague review on #1632): `tier2_ids` is
+    ONLY ever read from the immediately-prior row (`ORDER BY id DESC LIMIT
+    1`) — historical rows' tier2_ids are never re-read, only their
+    already-computed `jaccard` is (for the timeseries). Left unpruned,
+    diagnostic_history would carry a full up-to-tier2_max_nodes ID list in
+    EVERY row forever (~15-20KB/row at default tier2_max_nodes=1000, and
+    the table has no pruning). So once THIS checkpoint has diffed against
+    the prior row, we strip `tier2_ids` from that prior row's stored
+    metrics blob (in place, via a targeted UPDATE) — only the newest row
+    ever carries the full ID list at rest. The prior row's `jaccard`,
+    `checkpoint_mode`, etc. are left untouched (still needed for the
+    timeseries); only the now-superfluous ID list is dropped.
+    """
+    tier2_threshold = _get_tier_threshold(conn, 2)
+    current_ids = {
+        row["id"] for row in conn.execute(
+            "SELECT id FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
+            (tier2_threshold,),
+        ).fetchall()
+    }
+
+    prior_row = conn.execute(
+        "SELECT id, turn, metrics FROM diagnostic_history ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+
+    result: dict = {
+        "checkpoint_mode": checkpoint_mode,
+        "tier2_ids": sorted(current_ids),
+        "set_size": len(current_ids),
+        "jaccard": None,
+        "prior_snapshot_turn": None,
+        "prior_checkpoint_mode": None,
+        "reason": None,
+    }
+
+    if prior_row is None:
+        result["reason"] = "no prior diagnostic_history row — first checkpoint ever"
+        return result
+
+    try:
+        prior_metrics = json.loads(prior_row["metrics"])
+    except (TypeError, ValueError):
+        result["reason"] = (
+            "prior diagnostic_history row's metrics blob was not parseable JSON"
+        )
+        return result
+
+    prior_rsc = prior_metrics.get("recall_set_continuity") if isinstance(prior_metrics, dict) else None
+    if not isinstance(prior_rsc, dict) or "tier2_ids" not in prior_rsc:
+        result["reason"] = (
+            "prior diagnostic_history row has no comparable tier2_ids — either "
+            "predates the Recall-Set Continuity metric, or predates the "
+            "sleep-cadence fix (was written by a checkpoint type that didn't "
+            "compute this metric yet), or its tier2_ids were already pruned "
+            "after a later checkpoint diffed against it"
+        )
+        result["prior_snapshot_turn"] = prior_row["turn"]
+        return result
+
+    prior_ids = set(prior_rsc["tier2_ids"])
+    result["prior_snapshot_turn"] = prior_row["turn"]
+    result["prior_checkpoint_mode"] = prior_rsc.get("checkpoint_mode")
+
+    union_size = len(current_ids | prior_ids)
+    if union_size == 0:
+        result["jaccard"] = 1.0
+    else:
+        intersection_size = len(current_ids & prior_ids)
+        result["jaccard"] = round(intersection_size / union_size, 6)
+
+    # Prune the prior row's now-superfluous tier2_ids in place — it has
+    # served its one purpose (this diff) and will never be read again.
+    # Best-effort: pruning failure must never break the checkpoint itself.
+    try:
+        prior_rsc_pruned = dict(prior_rsc)
+        prior_rsc_pruned.pop("tier2_ids", None)
+        prior_metrics["recall_set_continuity"] = prior_rsc_pruned
+        conn.execute(
+            "UPDATE diagnostic_history SET metrics = ? WHERE id = ?",
+            (json.dumps(prior_metrics), prior_row["id"]),
+        )
+    except Exception:
+        pass
+
+    return result
+
+
 def _stamp_new_node(conn: sqlite3.Connection, node_id: str,
                      confidence: float = 0.5, surprise: float = 0.0):
     """Set importance and compute embedding on a freshly created node."""

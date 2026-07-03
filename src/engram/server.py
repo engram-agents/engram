@@ -2044,6 +2044,19 @@ def engram_nap(payload_json: str) -> str:
     Returns:
         JSON with previous_turn (unchanged from current_turn since no
         advance), changes summary, graph stats, and memory tiers.
+        `diagnostic_snapshot.recall_set_continuity` carries the Recall-Set
+        Continuity metric (v1, #1630) — Jaccard similarity of the tier2
+        (searchable, which strictly contains tier1) node-ID set against the
+        prior checkpoint's snapshot: {jaccard, set_size, prior_snapshot_turn,
+        prior_checkpoint_mode} plus a `reason` key when jaccard is null (no
+        prior checkpoint to compare, or the prior snapshot predates this
+        metric). Computed at EVERY diagnostic_history checkpoint — both
+        engram_nap and engram_advance_turn (sleep) — per the metric
+        designer's call: the sleep boundary is the most meaningful
+        measurement point (consolidation reshaping), so excluding it would
+        blind the metric to its own primary use case. NOT computed by
+        ad-hoc engram_diagnose() calls — see _compute_recall_set_continuity
+        docstring.
         On payload-parsing failure, returns {"error": "..."}.
 
     See _nap_impl for full semantics — kept callable with named kwargs for
@@ -2074,6 +2087,19 @@ def engram_nap(payload_json: str) -> str:
         diag_metrics = json.loads(engram_diagnose())
         conn2 = core._get_db()
         try:
+            # Recall-Set Continuity (v1, #1630): Jaccard similarity of the
+            # tier1+tier2 (searchable) node-ID set between consecutive
+            # diagnostic_history checkpoints (nap AND sleep — see
+            # _compute_recall_set_continuity docstring for the cadence
+            # decision). Computed HERE (nap wrapper), not inside
+            # engram_diagnose()/_diagnose_impl — engram_diagnose is its own
+            # directly-callable MCP tool (not checkpoint-only), so injecting
+            # the up-to-tier2_max_nodes ID list into _diagnose_impl's own
+            # return value would bloat every ad-hoc engram_diagnose() call.
+            # Must run BEFORE the INSERT below so it reads the prior row,
+            # not the row it's about to add.
+            recall_continuity = core._compute_recall_set_continuity(conn2, mode)
+            diag_metrics["recall_set_continuity"] = recall_continuity
             conn2.execute(
                 """INSERT INTO diagnostic_history (timestamp, turn, checkpoint_mode, metrics)
                    VALUES (?, ?, ?, ?)""",
@@ -2083,6 +2109,17 @@ def engram_nap(payload_json: str) -> str:
             result_dict["diagnostic_snapshot"] = {
                 "stored": True,
                 "health_score": diag_metrics.get("health_score"),
+                # Compact nap-output view: jaccard + set size + provenance,
+                # never the full tier2_ids list (that stays in the stored
+                # diagnostic_history row only — see _compute_recall_set_continuity).
+                "recall_set_continuity": {
+                    "checkpoint_mode": recall_continuity["checkpoint_mode"],
+                    "jaccard": recall_continuity["jaccard"],
+                    "set_size": recall_continuity["set_size"],
+                    "prior_snapshot_turn": recall_continuity["prior_snapshot_turn"],
+                    "prior_checkpoint_mode": recall_continuity["prior_checkpoint_mode"],
+                    **({"reason": recall_continuity["reason"]} if recall_continuity["reason"] else {}),
+                },
             }
         finally:
             conn2.close()
@@ -2158,6 +2195,12 @@ def engram_advance_turn(payload_json: str) -> str:
     Returns:
         JSON with new turn number, changes summary, graph stats, and memory
         tiers.
+        `diagnostic_snapshot.recall_set_continuity` carries the Recall-Set
+        Continuity metric (v1, #1630) — same shape and semantics as
+        engram_nap's (see that tool's docstring + engram_core's
+        _compute_recall_set_continuity docstring). Computed here too, not
+        just at nap: the sleep boundary's forgetting + consolidation makes
+        it the single most meaningful measurement point for this metric.
         On payload-parsing failure, returns {"error": "..."}.
 
     See _advance_turn_impl for full semantics — kept callable with named kwargs
@@ -2188,6 +2231,15 @@ def engram_advance_turn(payload_json: str) -> str:
         diag_metrics = json.loads(engram_diagnose())
         conn2 = core._get_db()
         try:
+            # Recall-Set Continuity (v1, #1630) — computed at the sleep
+            # checkpoint too, per the metric designer's call: the sleep
+            # boundary (forgetting + consolidation) is the most meaningful
+            # measurement point, not the least. See
+            # _compute_recall_set_continuity's docstring for the full
+            # cadence-decision rationale. Must run BEFORE the INSERT below
+            # so it reads the prior row, not the row it's about to add.
+            recall_continuity = core._compute_recall_set_continuity(conn2, mode)
+            diag_metrics["recall_set_continuity"] = recall_continuity
             conn2.execute(
                 """INSERT INTO diagnostic_history (timestamp, turn, checkpoint_mode, metrics)
                    VALUES (?, ?, ?, ?)""",
@@ -2197,6 +2249,14 @@ def engram_advance_turn(payload_json: str) -> str:
             result_dict["diagnostic_snapshot"] = {
                 "stored": True,
                 "health_score": diag_metrics.get("health_score"),
+                "recall_set_continuity": {
+                    "checkpoint_mode": recall_continuity["checkpoint_mode"],
+                    "jaccard": recall_continuity["jaccard"],
+                    "set_size": recall_continuity["set_size"],
+                    "prior_snapshot_turn": recall_continuity["prior_snapshot_turn"],
+                    "prior_checkpoint_mode": recall_continuity["prior_checkpoint_mode"],
+                    **({"reason": recall_continuity["reason"]} if recall_continuity["reason"] else {}),
+                },
             }
         finally:
             conn2.close()
