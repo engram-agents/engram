@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import socket
@@ -1285,6 +1286,55 @@ def _add_observation_impl(
             result["yellow_card_warning"] = _yellow_forward
 
         conn.commit()
+
+        # --- Stage 1 auto-suggest: person-mention detection (§4 of person typed schema) ---
+        # Scan the new claim text against name + aliases of every current person node.
+        # On match, add an action-hint suggesting the caller wire an about-edge.
+        #
+        # CRITICAL CONSTRAINT: mentions ≠ about; name-match is necessary but not
+        # sufficient — the caller confirms whether the claim is actually ABOUT the
+        # person. Never auto-wire. This is a suggestion only.
+        try:
+            person_rows = conn.execute(
+                "SELECT id, metadata FROM nodes WHERE type = 'person' AND is_current = 1"
+            ).fetchall()
+            person_mentions = []
+            claim_lower = claim.lower()
+            for prow in person_rows:
+                pmeta = json.loads(prow["metadata"] or "{}")
+                pname = pmeta.get("name", "")
+                paliases = pmeta.get("aliases", [])
+                vocab = [pname] + (paliases if isinstance(paliases, list) else [])
+                def _term_matches(term: str) -> bool:
+                    t = term.lower()
+                    # Plain \b is Unicode-aware and treats CJK characters as
+                    # \w, so it forms no boundary between a CJK char and an
+                    # adjacent ASCII term — it silently misses "Lei" in
+                    # "我见到了Lei昨天" just as much as it misses "石磊" in
+                    # "我和石磊讨论了" (verified empirically: branching only on
+                    # term.isascii() still fails the ASCII-glued-to-CJK case,
+                    # since \b itself is the thing that can't see a CJK-vs-
+                    # ASCII transition as a boundary). Fix: define "boundary"
+                    # in ASCII-word terms only — not preceded/followed by an
+                    # ASCII letter/digit/underscore. This still blocks the
+                    # "Al" ⊂ "Alex" false positive (both ASCII) while treating
+                    # any CJK-adjacent position as a valid boundary.
+                    pattern = r'(?<![A-Za-z0-9_])' + re.escape(t) + r'(?![A-Za-z0-9_])'
+                    return re.search(pattern, claim_lower) is not None
+
+                if any(_term_matches(term) for term in vocab if term):
+                    person_mentions.append({
+                        "person_id": prow["id"],
+                        "person_name": pname,
+                        "message": f"mentions {pname} — wire an about-edge?",
+                    })
+            if person_mentions:
+                result["person_mentions"] = person_mentions
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "Stage-1 person-mention suggestion scan failed", exc_info=True
+            )
+            # Never let suggestion scan block the primary result
 
         # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
         # Emit AFTER commit per the honesty axiom (structural honesty): logging an event

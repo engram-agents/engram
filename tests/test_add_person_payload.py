@@ -1,10 +1,16 @@
 """Tests for engram_add_person single-payload signature (wave 2c-ii of ob_1499).
 
+Updated in feat/person-node-typed-schema to reflect the new typed schema:
+  - `role` is now a deprecated alias for `relation` (still accepted, flagged in response)
+  - `description` / `logical_chain` are no longer accepted (no prose bin)
+  - `relation` is optional (was required as `role` before)
+  - Response uses `relation` key, not `role`
+
 Coverage:
   1. Happy path — well-formed payload creates a person.
-  2. Optional fields (description, aliases, is_self) respected.
+  2. Optional fields (aliases, is_self) respected; description rejected.
   3. Schema enforcement — invalid JSON, non-object, unknown fields.
-  4. Required-field validation — missing name / role rejected.
+  4. Required-field validation — missing name rejected; role/relation optional.
   5. Internal helper — _add_person_impl works with named kwargs.
 """
 
@@ -36,6 +42,7 @@ def fresh_server():
 
 
 def test_payload_json_creates_person():
+    """Happy path with role as deprecated alias — accepted, stored as relation."""
     server = fresh_server()
     payload = {
         "name": "Alex",
@@ -45,20 +52,38 @@ def test_payload_json_creates_person():
     assert "error" not in r, r
     assert "person_id" in r and r["person_id"].startswith("pn_"), r
     assert r["name"] == "Alex"
-    assert r["role"] == "primary collaborator"
+    # Response uses 'relation' key (role is now a deprecated alias)
+    assert r["relation"] == "primary collaborator"
+    # Deprecation warning is present when role is used without relation
+    assert "deprecation_warning" in r
 
 
 def test_payload_json_with_optional_fields():
+    """Optional fields (aliases) are respected; description is no longer accepted."""
     server = fresh_server()
+    # description removed from payload — it's no longer in the schema
     payload = {
         "name": "Alex",
         "role": "colleague",
-        "description": "Backend engineer.",
         "aliases": "A,Alexander",
     }
     r = json.loads(server.engram_add_person(payload_json=json.dumps(payload)))
     assert "error" not in r, r
     assert r["aliases"] == ["A", "Alexander"], r
+
+
+def test_payload_json_description_rejected():
+    """description is not in the new typed schema — rejected as unknown field."""
+    server = fresh_server()
+    payload = {
+        "name": "Alex",
+        "role": "colleague",
+        "description": "Backend engineer.",
+    }
+    r = json.loads(server.engram_add_person(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert "Unknown fields" in r["error"]
+    assert "description" in r["error"]
 
 
 def test_payload_json_is_self_flag():
@@ -98,10 +123,15 @@ def test_payload_json_missing_name_rejected():
     assert "error" in r and "name" in r["error"], r
 
 
-def test_payload_json_missing_role_rejected():
+def test_payload_json_role_optional():
+    """role/relation is now OPTIONAL (was required as `role` in old schema).
+    name alone is sufficient to create a person node.
+    """
     server = fresh_server()
     r = json.loads(server.engram_add_person(payload_json=json.dumps({"name": "x"})))
-    assert "error" in r and "role" in r["error"], r
+    assert "error" not in r, r
+    assert r["person_id"].startswith("pn_"), r
+    assert r["relation"] == ""
 
 
 def test_payload_json_empty_string_name_rejected():

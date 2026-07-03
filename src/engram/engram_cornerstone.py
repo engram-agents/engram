@@ -400,7 +400,7 @@ def _link_about_impl(
             person_id = self_row["id"]
 
         person = conn.execute(
-            "SELECT id, type, is_current FROM nodes WHERE id = ?", (person_id,)
+            "SELECT id, type, is_current, metadata FROM nodes WHERE id = ?", (person_id,)
         ).fetchone()
         if not person:
             return json.dumps({"error": f"Person '{person_id}' not found."})
@@ -427,11 +427,31 @@ def _link_about_impl(
         except sqlite3.IntegrityError:
             created = False  # Edge already exists
 
-        return json.dumps({
+        # --- Stage 2 auto-suggest: special-moment candidate (§4 of person typed schema) ---
+        # After wiring an about-edge, suggest the caller consider adding this node
+        # to the person's special_moments highlights list. Light + rare; decline is
+        # the common case — most about-edges are ordinary. The nudge ensures a real
+        # moment is never missed because the agent forgot the field exists.
+        result: dict = {
             "status": "linked" if created else "already_linked",
             "node_id": node_id,
             "person_id": person_id,
             "relation": "about",
+        }
+
+        # Stage 2 auto-suggest: only for newly-created edges (not redundant re-links).
+        if created and person:
+            person_meta = json.loads(person["metadata"] or "{}")
+            person_name = person_meta.get("name", person_id)
+            result["special_moment_suggestion"] = {
+                "person_id": person_id,
+                "person_name": person_name,
+                "source_node_id": node_id,
+                "message": f"add to {person_name}'s special_moments?",
+            }
+
+        return json.dumps({
+            **result,
         })
     finally:
         conn.close()

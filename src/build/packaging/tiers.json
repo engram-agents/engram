@@ -735,6 +735,14 @@
     {
       "path": "src/engram/tools/baton-migrate-to-coord-store.py",
       "reason": "one-shot state migration helper: reads existing baton files from the old agents-shared path and POSTs to the new /api/projects/* routes (Phase 3 UCS migration); not a recurring shipped mechanism"
+    },
+    {
+      "path": "src/engram/tools/migrate_stranded_supported_by.py",
+      "reason": "one-shot cleanup: re-roots cs/ls supported_by edges stranded before PR #1281 landed (issue #1587); not a recurring shipped mechanism"
+    },
+    {
+      "path": "src/engram/tools/migrate_person_nodes.py",
+      "reason": "one-shot dry-run guide: extracts typed fields from legacy free-form person node prose; produces a human-review report, never auto-applies; not a recurring shipped mechanism"
     }
   ],
   "repo_only": [

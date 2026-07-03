@@ -434,6 +434,12 @@ def _add_trust_signal_impl(*args, **kwargs):
 def _set_person_lineage_impl(*args, **kwargs):
     return _trust_mod._set_person_lineage_impl(*args, **kwargs)
 
+def _update_person_impl(*args, **kwargs):
+    return _trust_mod._update_person_impl(*args, **kwargs)
+
+def _add_special_moment_impl(*args, **kwargs):
+    return _trust_mod._add_special_moment_impl(*args, **kwargs)
+
 # ---- end #872 wave-3 compat forwarders --------------------------------
 
 # ---- #872 wave-4 family imports --------------------------------------
@@ -3006,7 +3012,18 @@ def engram_activate_goal(payload_json: str) -> str:
 
 
 _ADD_PERSON_FIELDS = frozenset({
-    "name", "role", "description", "aliases", "context_ids", "is_self",
+    # Required
+    "name",
+    # Typed relational fields (shared human + agent; mutable-with-trace)
+    "relation", "pronouns", "trust_tier", "aliases", "location_contact",
+    # Agent-specific identity fields (immutable)
+    "lineage", "architecture", "first_session_date",
+    # Immutable identity
+    "birthday",
+    # Structural flags
+    "context_ids", "is_self",
+    # Deprecated alias for relation (accepted, flagged in response)
+    "role",
 })
 
 
@@ -3043,25 +3060,40 @@ _ADD_PERSON_FIELDS = frozenset({
     },
 )
 def engram_add_person(payload_json: str) -> str:
-    """Record a person the agent knows and interacts with.
+    """Record a person the agent knows and interacts with (typed-schema form).
 
-    Single-payload signature (wave 2c-ii of the antml-prefix swallow risk — see issue #55): pass
-    ALL fields as one JSON object string in `payload_json`.
+    Single-payload signature (wave 2c-ii of the antml-prefix swallow risk — see
+    issue #55): pass ALL fields as one JSON object string in `payload_json`.
+
+    Person nodes use typed fields in metadata (no free-form description/logical_chain
+    bins). Facts about a person go in observations linked via engram_link_about.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
-            name (str, required): The person's name.
-            role (str, required): Their role or relationship to the agent.
-            description (str, optional): Background, expertise, traits, or other context.
-            aliases (str, optional): Comma-separated alternative names.
+            name (str, required): The person's name. Immutable after creation.
+            relation (str, optional): Role/relationship (e.g. "primary collaborator",
+                "daughter"). Mutable-with-trace via engram_update_person.
+            pronouns (str, optional): Free-form pronoun string. Mutable-with-trace.
+            trust_tier (str, optional): Trust tier string — same values as the
+                nodes.trust_tier column ("self", "primary_user", "user_family",
+                "our_side", "known_external", "unknown", "suspect").
+                Mutable-with-trace (elevated review flag on change).
+            aliases (str or list, optional): Alternative names for Stage 1
+                auto-suggest matching. CSV string or JSON list. Mutable-with-trace.
+            location_contact (str, optional): Address/contact info. Mutable-with-trace.
+            birthday (str, optional): ISO date string. Immutable.
+            lineage (str, optional): Agent lineage ("anthropic:claude-sonnet"). Immutable.
+            architecture (str, optional): Agent architecture descriptor. Immutable.
+            first_session_date (str, optional): ISO date of first interaction. Immutable.
             context_ids (str, optional): Comma-separated node IDs for context references.
             is_self (bool, optional): Mark as the agent's own self-anchor (only one allowed).
+            role (str, optional): DEPRECATED — alias for relation. Accepted, flagged in response.
 
     Returns:
         JSON with the new person node ID. On payload-parsing failure,
         returns {"error": "..."}.
 
-    See _add_person_impl for full semantics.
+    See _add_person_impl in engram_trust.py for full semantics.
     """
     try:
         params = json.loads(payload_json)
@@ -3086,6 +3118,88 @@ def engram_add_person(payload_json: str) -> str:
         })
 
     return _trust_mod._add_person_impl(**params)
+
+
+_UPDATE_PERSON_FIELDS = frozenset({
+    "node_id", "updates", "reason",
+})
+
+
+# DESIGN INTENT — engram_update_person
+# ------------------------------------
+# In-place update of mutable person-node fields: relation, pronouns, trust_tier,
+# aliases, location_contact. Does NOT create a new node (not a supersede).
+# Immutable fields (name, birthday, lineage, architecture, first_session_date)
+# are rejected — corrections require supersede.
+#
+# Field-trace audit: every mutable change appends {prior_value, changed_at} to
+# metadata.field_traces[field] — append-only, never mutates existing entries.
+#
+# Cascade flag: emits a 'field-value-changed' flag into metadata.field_changed_flags
+# of all current nodes that cite or are about this person. trust_tier changes
+# carry review_required=True (elevated, non-dismissible); all others are cheap
+# (dismissible). Coarse-emit: node-scoped, not field-scoped.
+@mcp.tool(
+    name="engram_update_person",
+    annotations={
+        "title": "Update Mutable Fields on a Person Node",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_update_person(payload_json: str) -> str:
+    """Update mutable fields on an existing person node in-place.
+
+    No supersede, no new node — modifies metadata directly. Records prior values
+    in field_traces (append-only). Emits a field-value-changed cascade flag to
+    nodes that cite or are about this person.
+
+    Immutable fields (name, birthday, lineage, architecture, first_session_date)
+    are rejected — use engram_supersede for corrections.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            node_id (str, required): Person node ID (pn_NNNN). Must be
+                type='person' and is_current=1.
+            updates (dict, required): Map of field → new_value. Mutable fields:
+                relation, pronouns, trust_tier, aliases, location_contact.
+                Attempting to update an immutable field returns an error.
+            reason (str, optional): Human-readable explanation for the change.
+
+    Returns:
+        JSON with status, node_id, updated_fields, field_traces_delta,
+        cascade_flagged_nodes. trust_tier_elevated=True when trust_tier changed.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _UPDATE_PERSON_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_UPDATE_PERSON_FIELDS)}"
+        })
+
+    # Ensure updates is a dict, not a string or list.
+    if "updates" in params and not isinstance(params["updates"], dict):
+        return json.dumps({
+            "error": (
+                f"'updates' must be a JSON object (dict of field → value), "
+                f"got {type(params['updates']).__name__}."
+            )
+        })
+
+    return _trust_mod._update_person_impl(
+        node_id=params.get("node_id", ""),
+        updates=params.get("updates", {}),
+        reason=params.get("reason", ""),
+    )
 
 
 _SET_TRUST_TIER_FIELDS = frozenset({

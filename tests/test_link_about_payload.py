@@ -52,7 +52,7 @@ def _seed_self_anchor_and_obs(server):
     p = json.loads(server.engram_add_person(payload_json=json.dumps({
         "name": "Test Self",
         "role": "agent",
-        "description": "self-anchor for tests",
+        # description removed: no longer in typed person-node schema
         "is_self": True,
     })))
     person_id = p.get("person_id") or p.get("node_id")
@@ -178,7 +178,7 @@ def test_retracted_explicit_person_id_rejected_by_is_current_guard():
     p2 = json.loads(server.engram_add_person(payload_json=json.dumps({
         "name": "Other Person",
         "role": "user",
-        "description": "Non-self person for retraction test.",
+        # description removed: no longer in typed person-node schema
     })))
     p2_id = p2.get("person_id") or p2.get("node_id")
     _retract_node(server, p2_id)
