@@ -13,7 +13,7 @@ Usage:
 
 Migrated from monolithic test_full_lifecycle.py to pytest 2026-05-06.
 Tests live under tests/. CI runs the same invocation via
-.github/workflows/tests.yml on PRs to dev / master.
+.github/workflows/tests.yml on PRs to dev / main.
 """
 
 import importlib.util

@@ -1,6 +1,6 @@
 name: tests
 
-# Expensive full pytest suite — MASTER-ONLY by design (release merges).
+# Expensive full pytest suite — MAIN-ONLY by design (release merges).
 # Running this on every dev PR is too costly on the GitHub Actions free tier
 # (~5min wall × the py3.11/3.12 matrix per run). Dev-PR coverage is instead:
 #   - the cheap scrub gates (check-no-new-shipped-node-ids.yml + manifest-gate.yml) on every PR, and
@@ -9,9 +9,9 @@ name: tests
 # (Decision: Lei 2026-06-01 — CI economics for the alpha release.)
 on:
   pull_request:
-    branches: [master]
+    branches: [main]
   push:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
 
 jobs:

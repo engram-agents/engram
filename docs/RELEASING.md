@@ -5,8 +5,8 @@ engram-alpha is a **private** repo. There is a separate **public** repo,
 user-facing release snapshots — one squashed commit per version. A release
 has two stages:
 
-1. **Private rc cut** — `dev → master` in this (private) repo, full CI gate,
-   tagged `vMAJOR.MINOR.PATCH-rc<N>` on `master`.
+1. **Private rc cut** — `dev → main` in this (private) repo, full CI gate,
+   tagged `vMAJOR.MINOR.PATCH-rc<N>` on `main`.
 2. **Public release** — after a dogfood window on the rc, `tools/release-cutover.py`
    publishes a clean, leak-scrubbed squashed snapshot to the public repo,
    tagged with the **clean** `vMAJOR.MINOR.PATCH` (no `-rc`).
@@ -25,11 +25,11 @@ Both stages are documented below.
 
 Semver pre-1.0, split by which repo the tag lives in:
 
-- **Private (`master`, this repo)**: `vMAJOR.MINOR.PATCH-rc<N>` — e.g.
+- **Private (`main`, this repo)**: `vMAJOR.MINOR.PATCH-rc<N>` — e.g.
   `v0.2.0-rc1`, `v0.2.0-rc2`. `<N>` increments if a fix round is needed before
   the cut is ready to promote publicly (e.g. `v0.1.3-rc1` → `v0.1.3-rc2`).
   Applies to any release regardless of MAJOR/MINOR/PATCH size — the `-rc`
-  suffix marks "cut to master, under dogfood validation," not a version-size
+  suffix marks "cut to main, under dogfood validation," not a version-size
   class.
 - **Public (`engram-agents/engram`)**: clean `vMAJOR.MINOR.PATCH` — e.g.
   `v0.2.0`, `v0.1.3`. **No `-rc` suffix ever reaches the public repo.**
@@ -41,7 +41,7 @@ Historical private tags (for calibration — no `-alpha` anywhere): `v0.1.0`,
 `v0.1.2-rc1`, `v0.1.2-rc2`, `v0.1.3`, `v0.1.3-rc1`, `v0.1.3-rc2`, `v0.1.4`,
 `v0.2.0-rc1`, `v0.2.0-rc2`. *(`v0.1.3` is a clean, no-`-rc` private tag —
 it predates this two-repo model; a `git tag -l` will show it. Since the split,
-private `master` tags always carry `-rc<N>`.)*
+private `main` tags always carry `-rc<N>`.)*
 
 When MINOR/MAJOR bumps happen: MINOR for feature waves (new node type, new
 hook architecture, new MCP-tool category), PATCH for bugfixes + small
@@ -66,26 +66,26 @@ alpha to a backward-compatibility commitment — not yet reached.
   on `engram-agents`, invisible without org-admin. Don't be misled by the
   repo-level API showing "disabled": the empirical behavior is what governs —
   always PR.)*
-- **`master`** holds tagged release points only. A release is cut by opening a
-  **PR from `dev` → `master`**, which fires the **full CI gate** (`tests.yml`
+- **`main`** holds tagged release points only. A release is cut by opening a
+  **PR from `dev` → `main`**, which fires the **full CI gate** (`tests.yml`
   full suite + `pr-checks` + `non-author-approval`) — the thorough pre-release
-  validation. Routine PRs do NOT target master (see `CLAUDE.md` Branching
+  validation. Routine PRs do NOT target main (see `CLAUDE.md` Branching
   convention section).
-- **The `dev→master` PR merges as a MERGE COMMIT, not a fast-forward or a
-  squash.** The merge commit on `master` has two parents (previous `master` +
+- **The `dev→main` PR merges as a MERGE COMMIT, not a fast-forward or a
+  squash.** The merge commit on `main` has two parents (previous `main` +
   the `dev` tip), so `dev`'s content — and its tip as a parent — is captured on
-  `master`, and the release tag points at that merge commit. This requires
+  `main`, and the release tag points at that merge commit. This requires
   **"Allow merge commits" to be enabled** in the repo's merge settings (see the
   merge-settings section below); a squash-merge would collapse the history and
   drop the ancestry link, and is wrong for a release cut.
-- **Private release tags** (`vMAJOR.MINOR.PATCH-rc<N>`) point at that `master`
+- **Private release tags** (`vMAJOR.MINOR.PATCH-rc<N>`) point at that `main`
   merge commit. **Public release tags** (`vMAJOR.MINOR.PATCH`, no `-rc`) live in
   the separate `engram-agents/engram` repo, cut from a validated rc — see
   "Publishing to the public repo" below.
 
 ### Repo merge settings — must allow merge commits
 
-The `dev→master` release model needs a **merge commit** (above). GitHub merge
+The `dev→main` release model needs a **merge commit** (above). GitHub merge
 settings are **repo-wide**, so confirm **"Allow merge commits"** is enabled in
 Settings → General → Pull Requests before cutting:
 
@@ -101,27 +101,27 @@ and left the next cut still conflicting. Fix: an admin enabled merge commits.
 Policy after: squash for routine `dev` PRs (discipline — keeps `dev` linear),
 merge-commit for the release PR.)*
 
-## Keeping `master` and `dev` from diverging
+## Keeping `main` and `dev` from diverging
 
-`master` and `dev` must not accumulate **independent** history, or the
-`dev→master` release PR conflicts. The failure mode is a fix authored *separately*
+`main` and `dev` must not accumulate **independent** history, or the
+`dev→main` release PR conflicts. The failure mode is a fix authored *separately*
 on each branch (two different commits touching the same lines) — that is a real
 merge conflict. The disciplines that prevent it:
 
 - **All changes land on `dev` first**, via the normal PR workflow — including
-  fixes. `master` only advances via the `dev→master` release merge. If you never
-  commit directly to `master`, `master` stays an ancestor of `dev` and the
+  fixes. `main` only advances via the `dev→main` release merge. If you never
+  commit directly to `main`, `main` stays an ancestor of `dev` and the
   release PR never conflicts. This is the default; prefer it.
-- **A hotfix needed on an already-released `master`** (can't wait for the next
+- **A hotfix needed on an already-released `main`** (can't wait for the next
   full cut): author the fix on `dev` first (normal PR), then **cherry-pick that
-  commit onto `master`** via a hotfix PR + a patch-tag bump. Cherry-pick copies
-  the fix's content *identically* to `master`, so the next `dev→master` merge
+  commit onto `main`** via a hotfix PR + a patch-tag bump. Cherry-pick copies
+  the fix's content *identically* to `main`, so the next `dev→main` merge
   sees the same change already applied on both sides → **no conflict**. (It does
-  create a new SHA on `master`, so the merge still produces a merge commit rather
+  create a new SHA on `main`, so the merge still produces a merge commit rather
   than a fast-forward, but it won't conflict — which is the part that hurts.)
-  This is strictly better than authoring the hotfix independently on `master`.
-- **Fallback — if a fix ever *does* land directly on `master`** (emergency,
-  bypassing dev-first): **immediately `git merge master → dev`** (via a PR) to
+  This is strictly better than authoring the hotfix independently on `main`.
+- **Fallback — if a fix ever *does* land directly on `main`** (emergency,
+  bypassing dev-first): **immediately `git merge main → dev`** (via a PR) to
   re-sync, before `dev` accumulates more and the divergence compounds.
 
 *(One-time reconciliation, 2026-07-02: before the `v0.2.0-rc2` cut, `master` had
@@ -136,7 +136,7 @@ start from that clean-ancestor state; the disciplines above keep it that way.)*
 These steps assume `dev` is at the SHA you want to release and CI is green.
 
 **Before you start:**
-- `git pull` (fast-forward your local `dev`/`master` to `origin`) before running
+- `git pull` (fast-forward your local `dev`/`main` to `origin`) before running
   any build tooling (`tools/install-local-marketplace.sh` etc.) as part of this
   process. The build stamps whatever is in your **local working tree** — it does
   not fetch or check freshness against `origin`. A stale local checkout silently
@@ -182,13 +182,13 @@ fixed by #1623). Bump this in the same PR as the CHANGELOG update (step 3).
 The changelog lives at **`docs/CHANGELOG.md`** (not root `CHANGELOG.md`).
 
 Before cutting, **prune `[Unreleased]`**: check it against what's already
-shipped in a previous release (diff against `origin/master`'s CHANGELOG
+shipped in a previous release (diff against `origin/main`'s CHANGELOG
 section, or the last release tag) and remove anything that's actually already
 released — the `[Unreleased]` section should only ever contain changes that
 landed on `dev` since the last cut. (This file has drifted before — stale
 already-shipped entries left in `[Unreleased]`, and some patch releases
 never got their own `## [vX.Y.Z] - DATE` section. Check for both when you
-touch this file. If `master` has release sections `dev` lacks — from hotfixes
+touch this file. If `main` has release sections `dev` lacks — from hotfixes
 — **union** them in when reconciling, don't drop either side.)
 
 Move the `Unreleased` section to a new versioned section: `## [vMAJOR.MINOR.PATCH]
@@ -218,24 +218,24 @@ project inception (e.g. `git log --oneline --no-merges`) and populate
 `Unreleased` with notable changes before moving to step 4. Subsequent cuts
 accumulate the changelog incrementally as PRs land.*
 
-### 4. Open the release PR (dev → master) — the full CI gate
+### 4. Open the release PR (dev → main) — the full CI gate
 
-Cut the release by opening a **PR from `dev` → `master`** (not a direct
+Cut the release by opening a **PR from `dev` → `main`** (not a direct
 push). This PR **is** the release gate: the full `tests.yml` suite +
 `pr-checks` + `non-author-approval` run on it — the thorough validation that
 deliberately does NOT run per-dev-PR.
 
 ```bash
-gh pr create --base master --head dev \
+gh pr create --base main --head dev \
   --title "release: vMAJOR.MINOR.PATCH-rc<N> — short summary" \
-  --body "Release cut to master. The full CI gate runs on this PR."
+  --body "Release cut to main. The full CI gate runs on this PR."
 ```
 
-**If the release PR is CONFLICTING** (`mergeStateStatus: DIRTY`): `master` has
-diverged from `dev` (independent commits on `master`). Reconcile it once — merge
-`origin/master` into `dev` on a branch (a **merge commit**, so `master` becomes
+**If the release PR is CONFLICTING** (`mergeStateStatus: DIRTY`): `main` has
+diverged from `dev` (independent commits on `main`). Reconcile it once — merge
+`origin/main` into `dev` on a branch (a **merge commit**, so `main` becomes
 an ancestor of `dev`; union any CHANGELOG sections), PR that to `dev`, then the
-release PR goes clean. See "Keeping `master` and `dev` from diverging" above.
+release PR goes clean. See "Keeping `main` and `dev` from diverging" above.
 
 **If CI is red on the release PR**: treat it exactly like any blocked PR — fix
 on `dev` via a normal PR, and the release PR re-runs the full gate on the new
@@ -245,12 +245,12 @@ review before merging; the full-suite verification happens when the release PR
 re-runs, not on the fix PR. Never tag on red.
 
 Once the full gate is green **and** a colleague has given a fresh-eye approval,
-merge the PR **as a merge commit** and tag the release SHA on `master`:
+merge the PR **as a merge commit** and tag the release SHA on `main`:
 
 ```bash
 gh pr merge <PR-number> --merge        # MERGE COMMIT — not --squash
-git fetch origin master
-git tag -a "vMAJOR.MINOR.PATCH-rc<N>" -m "vMAJOR.MINOR.PATCH-rc<N> — short summary" origin/master
+git fetch origin main
+git tag -a "vMAJOR.MINOR.PATCH-rc<N>" -m "vMAJOR.MINOR.PATCH-rc<N> — short summary" origin/main
 git push origin "vMAJOR.MINOR.PATCH-rc<N>"
 git ls-remote --tags origin "vMAJOR.MINOR.PATCH-rc<N>"   # verify the tag landed on origin (not local HEAD)
 ```
@@ -266,12 +266,12 @@ GitHub auto-creates a Releases entry when you push a tag. Edit it to:
 ## Dogfood-before-public
 
 **Do not cut the public release immediately after the rc tag.** The rc tag on
-`master` is the validation window: the whole agent family upgrades to the rc
+`main` is the validation window: the whole agent family upgrades to the rc
 and dogfoods it (at least a day) before anyone runs `release-cutover.py`
 against the public repo. Concretely:
 
 - Every agent (and human) on the rc pool runs
-  `git pull origin master && tools/install-local-marketplace.sh` (or checks
+  `git pull origin main && tools/install-local-marketplace.sh` (or checks
   out the rc tag) to get onto the new build.
 - Normal work continues on this build; anything that surfaces (a broken
   hook, a mis-stamped version, an unexpected migration issue) is a **fix
@@ -324,7 +324,7 @@ Key flags (from `--help`):
   from the script location to the enclosing `.git` root; pass it explicitly
   only if that heuristic misfires (e.g. running from an unusual checkout).
 - `--source-ref` — git ref to snapshot (tag/branch/sha); default `HEAD`.
-  Point this at the validated **rc tag** on `master`
+  Point this at the validated **rc tag** on `main`
   (`--source-ref v0.2.0-rc2`), not just whatever `HEAD` happens to be.
 - `--minus-set` — path to the minus-set file; default
   `<source>/release-minus-set.txt`. **This file is the only hand-maintained
@@ -393,24 +393,24 @@ internal family dogfood window, a forum post to the relevant thread (with
 ## After the cut
 
 - Record the release in ENGRAM via `engram_add_observation` (the tag SHA +
-  `master` state make good `hard_data` evidence).
+  `main` state make good `hard_data` evidence).
 - Append the milestone to `~/.engram/history/YYYY-MM-DD.md`.
-- Continue normal dev work on `dev`. `master` sits at the new tag until the
+- Continue normal dev work on `dev`. `main` sits at the new tag until the
   next cut.
 
 ## Anti-patterns
 
-- **Don't squash-merge the `dev→master` release PR.** Use `--merge` (a merge
+- **Don't squash-merge the `dev→main` release PR.** Use `--merge` (a merge
   commit). Squash collapses the release history into one commit and drops the
   ancestry link to `dev`, so the *next* cut conflicts. (This needs "Allow merge
   commits" enabled — see Repo merge settings.)
-- **Don't author a fix independently on `master`.** That is what makes
-  `master` and `dev` diverge. Fixes go to `dev` first; a needed `master`
+- **Don't author a fix independently on `main`.** That is what makes
+  `main` and `dev` diverge. Fixes go to `dev` first; a needed `main`
   hotfix is a **cherry-pick** of the `dev` commit (identical content → no future
-  conflict). See "Keeping `master` and `dev` from diverging."
+  conflict). See "Keeping `main` and `dev` from diverging."
 - **Don't skip the CHANGELOG update.** Users read this; future-self also
   reads this to remember what was in each version. When reconciling with
-  `master`'s hotfix sections, **union** — never drop a side.
+  `main`'s hotfix sections, **union** — never drop a side.
 - **Don't tag while CI is red.** A tag points at a specific SHA; if that
   SHA's tests fail, users hit broken state. The full suite runs *only* on the
   release PR, so this is the one place it's checked — take it seriously.
