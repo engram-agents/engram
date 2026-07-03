@@ -724,6 +724,157 @@ def test_confidence_ordering():
 
 
 # ---------------------------------------------------------------------------
+# Independence advisory tests (#1313)
+# ---------------------------------------------------------------------------
+
+def test_independence_advisory_collinear():
+    """inductive_generalization over same-lineage premises → independence_advisory emitted."""
+    print("\ntest_independence_advisory_collinear")
+    client = fresh_client()
+    r1 = client.call("engram_add_observation", {
+        "url": "https://example.com/a", "title": "Obs A",
+        "quoted_text": "Data point A.", "interpretation": "A",
+        "claim": "Data A", "quote_type": "hard_data",
+        "standpoint_lineage": "anthropic:sonnet",
+    })
+    r2 = client.call("engram_add_observation", {
+        "url": "https://example.com/b", "title": "Obs B",
+        "quoted_text": "Data point B.", "interpretation": "B",
+        "claim": "Data B", "quote_type": "hard_data",
+        "standpoint_lineage": "anthropic:sonnet",
+    })
+    result = client.call("engram_derive", {
+        "claim": "General pattern from A and B",
+        "supporting_ids": f"{r1['observation_id']},{r2['observation_id']}",
+        "logical_chain": "A and B both show the pattern",
+        "reasoning_type": "inductive_generalization",
+    })
+    assert result.get("status") == "created", f"Expected created, got: {result}"
+    adv = result.get("independence_advisory")
+    assert adv is not None, "Expected independence_advisory for same-lineage premises"
+    assert adv["collinear_verdict"] == "collinear", f"Expected collinear, got: {adv}"
+    assert adv["shared_lineage"] == "anthropic:sonnet"
+    assert r1["observation_id"] in adv["collinear_premise_ids"]
+    assert r2["observation_id"] in adv["collinear_premise_ids"]
+    print("  PASS: independence_advisory present for collinear premises")
+
+
+def test_independence_advisory_diverse():
+    """inductive_generalization over diverse-lineage premises → no advisory."""
+    print("\ntest_independence_advisory_diverse")
+    client = fresh_client()
+    r1 = client.call("engram_add_observation", {
+        "url": "https://example.com/a", "title": "Obs A",
+        "quoted_text": "Data point A.", "interpretation": "A",
+        "claim": "Data A", "quote_type": "hard_data",
+        "standpoint_lineage": "anthropic:sonnet",
+    })
+    r2 = client.call("engram_add_observation", {
+        "url": "https://example.com/b", "title": "Obs B",
+        "quoted_text": "Data point B.", "interpretation": "B",
+        "claim": "Data B", "quote_type": "hard_data",
+        "standpoint_lineage": "openai:gpt4",
+    })
+    result = client.call("engram_derive", {
+        "claim": "General pattern from A and B",
+        "supporting_ids": f"{r1['observation_id']},{r2['observation_id']}",
+        "logical_chain": "A and B both show the pattern from independent sources",
+        "reasoning_type": "inductive_generalization",
+    })
+    assert result.get("status") == "created", f"Expected created, got: {result}"
+    assert result.get("independence_advisory") is None, (
+        f"Expected no advisory for diverse lineages, got: {result.get('independence_advisory')}"
+    )
+    print("  PASS: no independence_advisory for diverse-lineage premises")
+
+
+def test_independence_advisory_unknown_lineage():
+    """inductive_generalization with no lineage data → no advisory (undetermined)."""
+    print("\ntest_independence_advisory_unknown_lineage")
+    client = fresh_client()
+    r1 = client.call("engram_add_observation", {
+        "url": "https://example.com/a", "title": "Obs A",
+        "quoted_text": "Data point A.", "interpretation": "A",
+        "claim": "Data A", "quote_type": "hard_data",
+    })
+    r2 = client.call("engram_add_observation", {
+        "url": "https://example.com/b", "title": "Obs B",
+        "quoted_text": "Data point B.", "interpretation": "B",
+        "claim": "Data B", "quote_type": "hard_data",
+    })
+    result = client.call("engram_derive", {
+        "claim": "General pattern from A and B",
+        "supporting_ids": f"{r1['observation_id']},{r2['observation_id']}",
+        "logical_chain": "A and B both show the pattern",
+        "reasoning_type": "inductive_generalization",
+    })
+    assert result.get("status") == "created", f"Expected created, got: {result}"
+    assert result.get("independence_advisory") is None, (
+        f"Expected no advisory when lineage unknown, got: {result.get('independence_advisory')}"
+    )
+    print("  PASS: no independence_advisory when standpoint_lineage is unknown")
+
+
+def test_independence_advisory_not_for_deductive():
+    """Independence advisory only fires for inductive_generalization, not deductive."""
+    print("\ntest_independence_advisory_not_for_deductive")
+    client = fresh_client()
+    r1 = client.call("engram_add_observation", {
+        "url": "https://example.com/a", "title": "Obs A",
+        "quoted_text": "P implies Q.", "interpretation": "Conditional",
+        "claim": "P implies Q", "quote_type": "hard_data",
+        "standpoint_lineage": "anthropic:sonnet",
+    })
+    r2 = client.call("engram_add_observation", {
+        "url": "https://example.com/b", "title": "Obs B",
+        "quoted_text": "P is true.", "interpretation": "Antecedent",
+        "claim": "P is true", "quote_type": "hard_data",
+        "standpoint_lineage": "anthropic:sonnet",
+    })
+    result = client.call("engram_derive", {
+        "claim": "Q is true",
+        "supporting_ids": f"{r1['observation_id']},{r2['observation_id']}",
+        "logical_chain": "P implies Q, and P, therefore Q",
+        "reasoning_type": "deductive_modus_ponens",
+    })
+    assert result.get("status") == "created", f"Expected created, got: {result}"
+    assert result.get("independence_advisory") is None, (
+        f"Expected no advisory for deductive reasoning, got: {result.get('independence_advisory')}"
+    )
+    print("  PASS: no independence_advisory for deductive_modus_ponens")
+
+
+def test_independence_advisory_single_known_lineage():
+    """Single obs with known lineage + one without: advisory must NOT fire (undetermined)."""
+    print("\ntest_independence_advisory_single_known_lineage")
+    client = fresh_client()
+    r1 = client.call("engram_add_observation", {
+        "url": "https://example.com/a", "title": "Obs with lineage",
+        "quoted_text": "Pattern X holds in context A.", "interpretation": "Pattern",
+        "claim": "Pattern X holds", "quote_type": "hard_data",
+        "standpoint_lineage": "anthropic:sonnet",
+    })
+    r2 = client.call("engram_add_observation", {
+        "url": "https://example.com/b", "title": "Obs without lineage",
+        "quoted_text": "Pattern X holds in context B.", "interpretation": "Pattern",
+        "claim": "Pattern X also holds", "quote_type": "hard_data",
+        # no standpoint_lineage — lineage unknown/unrecorded
+    })
+    result = client.call("engram_derive", {
+        "claim": "Pattern X generalizes",
+        "supporting_ids": f"{r1['observation_id']},{r2['observation_id']}",
+        "logical_chain": "Both contexts show the same pattern",
+        "reasoning_type": "inductive_generalization",
+    })
+    assert result.get("status") == "created", f"Expected created, got: {result}"
+    assert result.get("independence_advisory") is None, (
+        "Expected no advisory when only 1 of 2 premises has known lineage "
+        f"(undetermined, not collinear). Got: {result.get('independence_advisory')}"
+    )
+    print("  PASS: no advisory when only 1 premise has known lineage")
+
+
+# ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
 
@@ -746,6 +897,11 @@ if __name__ == "__main__":
         test_resolve_with_reasoning_type,
         test_stats_reasoning_breakdown,
         test_confidence_ordering,
+        test_independence_advisory_collinear,
+        test_independence_advisory_diverse,
+        test_independence_advisory_unknown_lineage,
+        test_independence_advisory_not_for_deductive,
+        test_independence_advisory_single_known_lineage,
     ]
 
     print(f"\nRunning {len(tests)} reasoning type tests...\n")
