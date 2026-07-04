@@ -499,7 +499,6 @@ def _stats_impl(mode: str = "all", sections=None) -> str:
         if _want("memory"):
             result["memory"] = {
                 "current_turn": core._get_current_turn(),
-                "tier1_threshold": core._get_tier_threshold(conn, 1),
                 "tier2_threshold": core._get_tier_threshold(conn, 2),
             }
 
@@ -812,20 +811,13 @@ def _diagnose_impl() -> str:
         current_turn = core._get_current_turn()
         memory["current_turn"] = current_turn
 
-        t1 = core._get_tier_threshold(conn, 1)
         t2 = core._get_tier_threshold(conn, 2)
-        tier1_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
-            (t1,),
-        ).fetchone()["c"] if t1 > 0 else total_current
         tier2_count = conn.execute(
             "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
             (t2,),
         ).fetchone()["c"] if t2 > 0 else total_current
         memory["tiers"] = {
-            "tier1_working": tier1_count,
-            "tier1_threshold": round(t1, 4),
-            "tier2_searchable": tier2_count,
+            "tier2_queryable": tier2_count,
             "tier2_threshold": round(t2, 4),
             "tier3_total": total_current,
         }
@@ -1293,7 +1285,6 @@ def _diagnose_impl() -> str:
         ).fetchone()
 
         metrics["config_summary"] = {
-            "tier1_max_nodes": mem.get("tier1_max_nodes", 200),
             "tier2_max_nodes": mem.get("tier2_max_nodes", 1000),
             "decay_base": mem.get("decay_base", 1.014),
             "current_turn": mem.get("current_turn", 0),

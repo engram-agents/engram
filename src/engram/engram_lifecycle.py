@@ -129,13 +129,8 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
             for r in new_nodes
         ]
 
-        # Memory tier stats
-        t1 = core._get_tier_threshold(conn, 1)
+        # Memory tier stats (two-tier: queryable vs faded; tier-1 retired)
         t2 = core._get_tier_threshold(conn, 2)
-        tier1_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
-            (t1,),
-        ).fetchone()["c"] if t1 > 0 else current_count
         tier2_count = conn.execute(
             "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
             (t2,),
@@ -154,7 +149,7 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
             f"**New nodes ({len(new_node_summary)}):**\n{new_nodes_text}\n\n"
             f"**Graph totals:** {current_count} current nodes ({node_count} total), {edge_count} edges\n"
             f"**By type:** {', '.join(f'{t}: {c}' for t, c in sorted(type_counts.items()))}\n"
-            f"**Memory tiers:** working={tier1_count}, searchable={tier2_count}, total={current_count}\n"
+            f"**Memory tiers:** queryable={tier2_count}, total={current_count}\n"
             f"\n---\n"
         )
 
@@ -185,8 +180,7 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
                 "by_type": type_counts,
             },
             "memory_tiers": {
-                "tier1_working_memory": tier1_count,
-                "tier2_searchable": tier2_count,
+                "tier2_queryable": tier2_count,
                 "tier3_total": current_count,
                 "decay_base": mem.get("decay_base", 1.014),
             },
@@ -308,8 +302,8 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
     try:
         report = {}
 
-        # Tier 1: only reflect on working memory (high-importance nodes)
-        t1 = core._get_tier_threshold(conn, 1)
+        # Gate reflect sub-scans on tier-2 (queryable) threshold; tier-1 is retired.
+        t2 = core._get_tier_threshold(conn, 2)
 
         # 1. Unresolved contradictions (open and partially resolved)
         # LOW-VOLUME: source-swap description → recall_summary with claim fallback.
@@ -534,7 +528,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
             })
         report["recent_feeling_reports"] = recent_feeling_reports
 
-        # 5. Weakly-grounded nodes (low confidence, in working memory)
+        # 5. Weakly-grounded nodes (low confidence, in queryable memory)
         # HIGH-VOLUME: tiered by importance_score DESC. Top summary_top_k get
         # summary-style (claim from recall_summary OR claim); remainder get
         # keyword-style (keywords from recall_keywords; no "claim" key).
@@ -546,7 +540,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
                AND confidence < 0.5 AND type NOT IN ('evidence', 'contradiction', 'question')
                AND COALESCE(importance_score, 0) >= ?
                ORDER BY imp DESC, confidence ASC LIMIT 10""",
-            (t1,),
+            (t2,),
         ).fetchall()
         weakly_grounded = []
         for i, w in enumerate(weak):
@@ -566,7 +560,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
                 weakly_grounded.append(entry)
         report["weakly_grounded"] = weakly_grounded
 
-        # 6. Single-source derivations (in working memory)
+        # 6. Single-source derivations (in queryable memory)
         # HIGH-VOLUME: tiered by importance_score DESC. Top summary_top_k get
         # summary-style; remainder get keyword-style.
         derivations = conn.execute(
@@ -576,7 +570,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
                WHERE type = 'derivation' AND is_current = 1
                AND COALESCE(importance_score, 0) >= ?
                ORDER BY imp DESC, id ASC""",
-            (t1,),
+            (t2,),
         ).fetchall()
         # Filter to thin-support (support_count <= 1), preserving importance order.
         thin_support_candidates = []
@@ -600,21 +594,21 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
             else:
                 # Tier 2: keyword-style (no "claim" key)
                 entry = {"id": d["id"], "support_count": support_count,
-                         "confidence": d["confidence"]}  # may be None — consistent with tier-1
+                         "confidence": d["confidence"]}  # may be None
                 kws = core._reflect_keywords(d)
                 if kws is not None:
                     entry["keywords"] = kws
                 thin_support.append(entry)
         report["thin_support_derivations"] = thin_support
 
-        # 7. Same-source observation tension check (in working memory)
+        # 7. Same-source observation tension check (in queryable memory)
         evidence_with_multiple = conn.execute(
             """SELECT evidence_id, COUNT(*) as obs_count FROM nodes
                WHERE type IN ('observation_factual', 'observation_predictive')
                AND is_current = 1 AND evidence_id IS NOT NULL
                AND COALESCE(importance_score, 0) >= ?
                GROUP BY evidence_id HAVING obs_count >= 2""",
-            (t1,),
+            (t2,),
         ).fetchall()
 
         same_source_tensions = []
@@ -629,7 +623,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
             )
         report["same_source_review"] = same_source_tensions
 
-        # 8. Uncited observations (in working memory, not referenced by any derivation)
+        # 8. Uncited observations (in queryable memory, not referenced by any derivation)
         # HIGH-VOLUME: tiered by importance_score DESC. Top summary_top_k get
         # summary-style; remainder get keyword-style.
         uncited = conn.execute(
@@ -651,7 +645,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
                )
                ORDER BY imp DESC, n.id ASC
                LIMIT 15""",
-            (t1,),
+            (t2,),
         ).fetchall()
         uncited_observations = []
         for i, u in enumerate(uncited):
@@ -754,19 +748,14 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
             for r in support_lost_rows
         ]
 
-        # Summary counts
+        # Summary counts (two-tier: queryable vs faded; tier-1 retired)
         total_current = conn.execute(
             "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1"
         ).fetchone()["c"]
-        tier1_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
-            (t1,),
-        ).fetchone()["c"] if t1 > 0 else total_current
-        tier2_t = core._get_tier_threshold(conn, 2)
         tier2_count = conn.execute(
             "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
-            (tier2_t,),
-        ).fetchone()["c"] if tier2_t > 0 else total_current
+            (t2,),
+        ).fetchone()["c"] if t2 > 0 else total_current
 
         report["summary"] = {
             "contradictions": len(report["unresolved_contradictions"]),
@@ -786,8 +775,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
             "recent_feeling_reports": len(report["recent_feeling_reports"]),
         }
         report["memory_tiers"] = {
-            "tier1_working_memory": tier1_count,
-            "tier2_searchable": tier2_count,
+            "tier2_queryable": tier2_count,
             "tier3_total": total_current,
             "current_turn": core._get_current_turn(),
         }

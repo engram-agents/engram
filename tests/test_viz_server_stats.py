@@ -77,25 +77,26 @@ class TestResolveAgentConfig(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_reads_tier_sizes_from_config_json(self):
-        # Drop a config.json with production-shaped tier sizes
+        # Drop a config.json with production-shaped tier sizes.
+        # tier1_max_nodes is retired (#1220) and no longer returned.
         config_path = self.engram_home / "config.json"
-        config_path.write_text('{"memory": {"tier1_max_nodes": 200, "tier2_max_nodes": 4000, "decay_base": 1.014}}')
+        config_path.write_text('{"memory": {"tier2_max_nodes": 4000, "decay_base": 1.014}}')
         cfg = viz_server._resolve_agent_config("test")
-        self.assertEqual(cfg["tier1_max_nodes"], 200)
+        self.assertNotIn("tier1_max_nodes", cfg)
         self.assertEqual(cfg["tier2_max_nodes"], 4000)
         self.assertEqual(cfg["decay_base"], 1.014)
 
     def test_returns_defaults_when_config_missing(self):
         # No config.json file in the engram_home dir
         cfg = viz_server._resolve_agent_config("test")
-        self.assertEqual(cfg["tier1_max_nodes"], 200)
+        self.assertNotIn("tier1_max_nodes", cfg)
         self.assertEqual(cfg["tier2_max_nodes"], 1000)  # default
         self.assertEqual(cfg["decay_base"], 1.014)
 
     def test_returns_defaults_when_config_malformed(self):
         (self.engram_home / "config.json").write_text("not valid json {{")
         cfg = viz_server._resolve_agent_config("test")
-        self.assertEqual(cfg["tier1_max_nodes"], 200)
+        self.assertNotIn("tier1_max_nodes", cfg)
         self.assertEqual(cfg["tier2_max_nodes"], 1000)  # default
 
     def test_returns_defaults_when_memory_section_absent(self):
@@ -108,10 +109,10 @@ class TestResolveAgentConfig(unittest.TestCase):
         self.assertEqual(cfg["tier2_max_nodes"], 1000)
 
     def test_partial_config_falls_back_per_field(self):
-        # Only tier2_max_nodes set; others should default
+        # Only tier2_max_nodes set; decay_base should default
         (self.engram_home / "config.json").write_text('{"memory": {"tier2_max_nodes": 4000}}')
         cfg = viz_server._resolve_agent_config("test")
-        self.assertEqual(cfg["tier1_max_nodes"], 200)  # default
+        self.assertNotIn("tier1_max_nodes", cfg)
         self.assertEqual(cfg["tier2_max_nodes"], 4000)  # from config
         self.assertEqual(cfg["decay_base"], 1.014)  # default
 

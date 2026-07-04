@@ -340,7 +340,6 @@ def engram_sandbox(data_dir: str | Path | None = None, keep: bool = False):
                     "memory": {
                         "decay_base": 1.014,
                         "current_turn": 0,
-                        "tier1_max_nodes": 200,
                         "tier2_max_nodes": 2000,
                     },
                     "mode": "single",
@@ -792,7 +791,6 @@ def _ensure_data_dir():
             "memory": {
                 "decay_base": 1.014,
                 "current_turn": 0,
-                "tier1_max_nodes": 200,
                 "tier2_max_nodes": 1000,
             },
             "embedding": {
@@ -2106,10 +2104,10 @@ def _get_memory_config() -> dict:
         config = json.loads(CONFIG_PATH.read_text())
         return config.get("memory", {
             "decay_base": 1.014, "current_turn": 0,
-            "tier1_max_nodes": 200, "tier2_max_nodes": 1000,
+            "tier2_max_nodes": 1000,
         })
     return {"decay_base": 1.014, "current_turn": 0,
-            "tier1_max_nodes": 200, "tier2_max_nodes": 1000}
+            "tier2_max_nodes": 1000}
 
 
 def _get_current_turn() -> int:
@@ -2279,18 +2277,17 @@ def _get_tier_threshold(conn: sqlite3.Connection, tier: int) -> float:
     node counts. Returns the score at the Nth percentile, where N is the
     target count for this tier.
 
-    Tier 1 (working memory): used by reflect, checkpoint, stats
-    Tier 2 (searchable): used by query, add_* auto-similarity-hints
+    Tier 1 (working memory): RETIRED — tier1_max_nodes config key removed.
+                             Callers use tier=2 instead.
+    Tier 2 (queryable): used by reflect, checkpoint, stats, query, add_* similarity-hints
     Tier 3 (total): no threshold, everything visible
     """
     if tier >= 3:
         return 0.0  # no filter
 
     mem = _get_memory_config()
-    if tier == 1:
-        max_nodes = mem.get("tier1_max_nodes", 200)
-    else:
-        max_nodes = mem.get("tier2_max_nodes", 1000)
+    # Tier 1 is retired; fall through to tier-2 handling for any legacy callers.
+    max_nodes = mem.get("tier2_max_nodes", 1000)
 
     # Count active current nodes
     total = conn.execute(
