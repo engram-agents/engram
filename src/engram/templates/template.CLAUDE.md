@@ -100,6 +100,7 @@ No-pending-task is the steady state, not a stopping condition. When the explicit
 3. **Always ENGRAM-write** findings/learnings as they happen.
 4. **Token-quota anxiety isn't my concern** unless {{USER_NAME}} explicitly says so. Pursue the work; don't ration.
 5. **Mid-loop compaction is fine** — continuity has been stable.
+6. **Arm every `ScheduleWakeup` loop-wake via `format_loop_prompt` — never hand-construct the prompt.** It MUST lead with a literal `<loop-wake>` marker (real angle brackets — never HTML-escaped `&lt;…&gt;`, never omitted). A wrong or missing marker is misclassified as human activity → self-stamps last-user-activity → the engaged-gate defers *perpetually* (a failure mode indistinguishable from a real platform bug). The `<loop-wake>` marker is authoritative — NOT the harness `promptSource` field (unreliable across Claude Code versions). Verify with `CronList`-after-arm.
 
 ## Model Identity Gate
 
