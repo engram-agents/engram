@@ -135,11 +135,17 @@ MCP server / skills **directly from the marketplace SOURCE tree**
 that path. (`~/.claude/plugins/known_marketplaces.json` sets `installLocation` to
 the source dir itself for a directory source.) The
 `~/.claude/plugins/cache/.../<version>/` snapshots + `installed_plugins.json`
-`installPath` are version **bookkeeping, NOT the live load path** — that's the
-directory-vs-official distinction (official/git marketplaces ARE cache-based; ours
-is not). **Verified 2026-06-28** by instrumenting every hook copy and watching
-which fires in the live session: only the marketplace-tree copy fired, with
-`CLAUDE_PLUGIN_ROOT` = the source.
+`installPath` are version **bookkeeping, NOT the live load path — for hooks /
+skills / tools.** **The one exception is AGENTS (sub-agents / fairies): they load
+from the `installPath` cache snapshot, NOT the source tree** (live-verified #1639,
+2026-07-02) — so for agents the cache IS the live path, and `installPath` points at
+a `.../cache/.../<version>/` snapshot, not the source dir. Mind the two distinct
+fields: marketplace `installLocation` (`known_marketplaces.json`) = source; plugin
+`installPath` (`installed_plugins.json`) = cache snapshot. Hooks/skills/tools follow
+`installLocation`; agents follow `installPath`. **Verified 2026-06-28** by
+instrumenting every hook copy and watching which fires in the live session: only the
+marketplace-tree copy fired, with `CLAUDE_PLUGIN_ROOT` = the source (that test
+covered hooks; the agent path was separately verified in #1639).
 
 **What this means for deploys/upgrades (the OPPOSITE of the official-marketplace
 model):**
@@ -148,7 +154,15 @@ model):**
   immediately** — it rebuilds the source tree, which IS the live path. **No
   `/plugin update` is needed** for hooks/tools/skills on a directory install
   (hooks hot-reload: re-read from the source file per prompt).
-- **MCP server is the exception:** it launches from
+- **AGENTS are an exception (like the official-marketplace model):** sub-agent /
+  fairy specs (`agents/*.md`) load from the `installPath` **cache snapshot**, not the
+  source tree — so a rebuilt source is inert for agents until you **`/plugin
+  marketplace update engram-local` + `/reload-plugins`** (a full restart also works,
+  but is heavier). This failed silently in #1639: the #1551 dual-prefix MCP-tool fix
+  lived in source but never reached dispatched dream-fairies, which ran with zero
+  ENGRAM MCP access until the cache was refreshed. Verify an agent change by
+  dispatching one and confirming its tools (a stale-cache agent fails *silently*).
+- **MCP server is also an exception:** it launches from
   `${CLAUDE_PLUGIN_ROOT}/launch-engram-server.sh` (= the source), but the running
   *process* is from session start — a changed `server.py` needs a `/mcp` reconnect
   or a restart to reload the process. The path is the source; the process does not
