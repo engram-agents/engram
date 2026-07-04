@@ -109,6 +109,12 @@ NXDOMAIN_ERRNOS = {
     getattr(socket, "EAI_NODATA", -5),  # not defined on all platforms
 }
 
+# Stable-ID pattern for standpoint_author_id (#1348 convention).
+# Valid forms: pn_\d+ (in-graph person node) or <prefix>:<value> (namespaced
+# string such as orcid:…, doi-author:…, domain:handle).  Compiled once at
+# import time — same pattern as _LINEAGE_RE in engram_core.
+_STABLE_ID_RE = re.compile(r"^pn_\d+$|^[a-z][a-z0-9-]*:.+$")
+
 
 # ---------------------------------------------------------------------------
 # A-local helpers
@@ -978,6 +984,22 @@ def _add_observation_impl(
             }
         )
 
+    # standpoint_author_id stable-ID check — warn-not-reject (#1348).
+    # A stable ID is either a pn_* node reference or a namespaced string of
+    # the form <prefix>:<value> where prefix matches [a-z][a-z0-9-]*.
+    # Raw display names (e.g. "John Smith", "Lei") fail both patterns; the
+    # independence gate needs same-author → same-string, and display names
+    # are unreliable join keys. The write always proceeds — this is advisory.
+    _author_id_warning: Optional[str] = None
+    if standpoint_author_id:
+        if not _STABLE_ID_RE.match(standpoint_author_id):
+            _author_id_warning = (
+                f"standpoint_author_id '{standpoint_author_id}' looks like a display name "
+                "rather than a stable ID. Use a pn_* node ID for in-graph entities, or a "
+                "namespaced string (orcid:…, doi-author:…, domain:handle) for external "
+                "authors. See #1348 convention."
+            )
+
     # fs_class validation (Phase 2): accepted values only, per D1 filing-time contract.
     _VALID_FS_CLASSES = ("re-executable", "frozen")
     if fs_class is not None and fs_class not in _VALID_FS_CLASSES:
@@ -1284,6 +1306,9 @@ def _add_observation_impl(
 
         if _yellow_forward:
             result["yellow_card_warning"] = _yellow_forward
+
+        if _author_id_warning:
+            result["warnings"] = result.get("warnings", []) + [_author_id_warning]
 
         conn.commit()
 
