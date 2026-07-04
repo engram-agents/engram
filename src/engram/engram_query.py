@@ -829,15 +829,18 @@ def _build_inspect_recall_view(
     })
     node_recall = {k: v for k, v in node.items() if k not in _RECALL_OMIT}
 
-    # Promote quote_verified from metadata blob so provenance is visible at
-    # recall time without requiring view="deep". Only added for observation nodes
-    # that carry the field (set by #1204). See #1283.
+    # Promote select metadata fields so provenance is visible at recall time
+    # without requiring view="deep". Only added when the field is present.
+    # - quote_verified: observation nodes (set by #1204). See #1283.
+    # - warrant: derivation nodes carrying the Toulmin bridging principle.
     _raw_meta = node.get("metadata")
     if _raw_meta:
         try:
             _meta = json.loads(_raw_meta) if isinstance(_raw_meta, str) else _raw_meta
             if "quote_verified" in _meta:
                 node_recall["quote_verified"] = _meta["quote_verified"]
+            if node.get("type") == "derivation" and "warrant" in _meta and _meta["warrant"]:
+                node_recall["warrant"] = _meta["warrant"]
         except (json.JSONDecodeError, TypeError):
             pass
 

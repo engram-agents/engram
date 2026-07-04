@@ -192,3 +192,65 @@ def test_impl_callable_with_kwargs():
     ))
     assert "error" not in r, r
     assert "derivation_id" in r
+
+
+def test_warrant_stored_in_derive_meta():
+    """Happy path: warrant string round-trips into the node's stored metadata."""
+    server = fresh_server()
+    obs_a, obs_b = _seed_premises(server)
+    warrant_text = "When two premises are jointly established, their conjunction entails the derived claim."
+    payload = {
+        "claim": "A and B together entail C via the warrant.",
+        "supporting_ids": f"{obs_a},{obs_b}",
+        "logical_chain": "Premises A and B, mediated by the bridging principle, yield C.",
+        "reasoning_type": "deductive_modus_ponens",
+        "warrant": warrant_text,
+    }
+    r = json.loads(server.engram_derive(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    dv_id = r["derivation_id"]
+
+    # Use view="deep" to access the raw metadata field (parsed_metadata is
+    # stripped by _strip_agent_facing in the recall view).
+    inspect_r = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": dv_id, "view": "deep"})))
+    assert "error" not in inspect_r, inspect_r
+    raw_meta = inspect_r["node"]["metadata"]
+    meta = json.loads(raw_meta)
+    assert meta.get("warrant") == warrant_text, meta
+
+
+def test_warrant_omitted_leaves_no_key():
+    """Omission equivalence: omitting warrant leaves no warrant key in metadata (backward compat)."""
+    server = fresh_server()
+    obs_a, obs_b = _seed_premises(server)
+    payload = {
+        "claim": "Backward-compat: derive without warrant.",
+        "supporting_ids": f"{obs_a},{obs_b}",
+        "logical_chain": "Premises A and B entail C — no bridging principle needed.",
+        "reasoning_type": "deductive_modus_ponens",
+    }
+    r = json.loads(server.engram_derive(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    dv_id = r["derivation_id"]
+
+    inspect_r = json.loads(server.engram_inspect(payload_json=json.dumps({"node_id": dv_id, "view": "deep"})))
+    assert "error" not in inspect_r, inspect_r
+    raw_meta = inspect_r["node"]["metadata"]
+    meta = json.loads(raw_meta)
+    assert "warrant" not in meta, f"warrant key must be absent when not supplied: {meta}"
+
+
+def test_warrant_non_string_rejected():
+    """Non-string warrant is rejected with a clear error (type guard analogous to use_stale)."""
+    server = fresh_server()
+    obs_a, obs_b = _seed_premises(server)
+    payload = {
+        "claim": "Type-guard test for warrant.",
+        "supporting_ids": f"{obs_a},{obs_b}",
+        "logical_chain": "Premises stand.",
+        "reasoning_type": "deductive_modus_ponens",
+        "warrant": 42,
+    }
+    r = json.loads(server.engram_derive(payload_json=json.dumps(payload)))
+    assert "error" in r, f"warrant=42 should be rejected: {r}"
+    assert "warrant must be a string" in r["error"], r

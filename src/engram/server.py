@@ -4635,7 +4635,7 @@ def engram_report_feeling(payload_json: str) -> str:
 # Set of legitimate field names for the engram_derive payload.
 _DERIVE_FIELDS = frozenset({
     "claim", "supporting_ids", "logical_chain", "reasoning_type",
-    "derivation_mode", "context_ids", "use_stale",
+    "derivation_mode", "context_ids", "use_stale", "warrant",
 })
 
 
@@ -4702,6 +4702,12 @@ def engram_derive(payload_json: str) -> str:
                 references (e.g. definitions). Creates 'cites' edges.
             use_stale (bool, optional): Opt-in override for MECH-5 stale-premise
                 guard. Default False. Has no effect on tainted premises.
+            warrant (str, optional): The Toulmin warrant — the general principle
+                or rule that licenses this inference (why do these premises
+                support this claim?). Example: "Agents that record findings at
+                the moment of discovery retain the thought-construction, not just
+                the recall." Leave blank if the bridging principle is fully
+                captured in logical_chain.
 
     Returns:
         JSON with the new derivation node ID, computed confidence, reasoning

@@ -105,6 +105,7 @@ def _derive_impl(
     derivation_mode: str = "chain",
     context_ids: str = "",
     use_stale: bool = False,
+    warrant: str = "",
 ) -> str:
     """Internal implementation — see engram_derive MCP tool for the public
     payload schema. Kept callable with named kwargs for in-server callers.
@@ -153,6 +154,10 @@ def _derive_impl(
             derivation — the new derivation will carry a metadata.built_on_stale audit
             marker so future maintenance tools can auto-redirect edges to replacements.
             Has no effect on tainted premises (taint is always a hard block — no override).
+        warrant: The Toulmin warrant — the general principle or rule that licenses this
+            inference (why do these premises support this claim?). Stored in derive_meta
+            for audit. Leave blank if the bridging principle is fully captured in
+            logical_chain.
 
     Returns:
         JSON with the new derivation node ID, computed confidence, reasoning type, and supporting nodes.
@@ -173,6 +178,8 @@ def _derive_impl(
                 "JSON encodes `true`/`false` not `\"true\"`/`\"false\"`."
             )
         })
+    if warrant and not isinstance(warrant, str):
+        return json.dumps({"error": f"warrant must be a string, got {type(warrant).__name__}"})
 
     if reasoning_type and reasoning_type not in REASONING_TYPES:
         return json.dumps({
@@ -225,6 +232,7 @@ def _derive_impl(
             reasoning_type=reasoning_type,
             context_ids=ctx,
             use_stale=use_stale,
+            extra_meta={"warrant": warrant} if warrant else None,
         )
         if block is not None:
             # --- engram.tool.engram_call event — blocked path (DESIGN.md §4.2) ---
