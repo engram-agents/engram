@@ -1436,7 +1436,7 @@ def _add_observation_batch_impl(
             - standpoint_author_id (optional): Persistent cross-session entity ID for who produced this observation's source claim ("who observes" axis).
             - standpoint_collection_id (optional): Corpus or work identity for this observation's source ("vantage" axis).
             - standpoint_override_tag (optional): Free-form standpoint label when the cluster key is insufficient.
-            - standpoint_lineage (optional): Training lineage "provider:family" (e.g. "anthropic:opus") for the source claim's producer.
+            - standpoint_lineage (optional): Training lineage "provider:family" (e.g. "anthropic:opus") for the source claim's producer. Marks the EVIDENCE SOURCE that produced the claim, not who authored this node — you always author your own nodes; lineage differs only when citing another agent's or a human's evidence.
             - standpoint_architecture (optional): Cognitive architecture of the source's producer. Enum: transformer | vision-spatial | embodied-sensorimotor | graph-neural | human | other. Tracks architectural (not just training) diversity — Class A calibration exposure.
         url: URL of the source document. The evidence node is auto-created or reused.
         title: Title of the source document (required if url is provided).

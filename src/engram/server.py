@@ -1474,7 +1474,7 @@ def engram_add_observation(payload_json: str) -> str:
                 emitted (but the write proceeds) if the value looks like a raw display name.
             standpoint_collection_id (str, optional): Corpus or work identity for the source ("vantage" axis). Independent axis in per-axis standpoint cluster key.
             standpoint_override_tag (str, optional): Free-form standpoint label for when the computed cluster key is insufficient (lab measurements, personal comms, introspective self-reports).
-            standpoint_lineage (str, optional): Training lineage of the source claim's producer, format "provider:family" (e.g. "anthropic:opus"). The most load-bearing bias axis for AI-agent premises; format-validated, rejected with a redirecting error if malformed.
+            standpoint_lineage (str, optional): Training lineage of the source claim's producer, format "provider:family" (e.g. "anthropic:opus"). The most load-bearing bias axis for AI-agent premises; format-validated, rejected with a redirecting error if malformed. Marks the EVIDENCE SOURCE that produced the claim, not who authored this node — you always author your own nodes, including your interpretation; lineage differs only when you're citing another agent's or a human's evidence.
             standpoint_architecture (str, optional): Cognitive architecture of the source's producer. Enum: transformer | vision-spatial | embodied-sensorimotor | graph-neural | human | other. Tracks architectural (not just training) diversity — Class A calibration exposure. Use "human" for human sources, "transformer" for other LLMs, omit for self-observations when explicit tracking is not desired.
             fs_class (str, optional): Falsification-sensitivity class — "re-executable" (Class 1: claim can be re-tested by re-running the measurement) or "frozen" (Class 2: claim records a past event that cannot be re-executed). Omit or pass null to let the Phase-1 proxy (derived from quote_type) apply. When provided, takes priority over the proxy and the FALSIFICATION line drops the "(proxy:quote_type)" label. When the class is ambiguous (e.g. a re-readable file that records past state), omit and let the proxy apply — hesitation is the correct signal to omit.
             source_repo (str, optional): Absolute path to an alternative git repository to use for git operations. When omitted, the git repo is auto-detected from the file:// URL's directory. Use this for cross-repo citations where the cited file lives outside the target repo (e.g. a plugin file deployed to ~/.engram/ that is committed in the plugin source tree ~/engram-alpha/).
@@ -1568,7 +1568,10 @@ def engram_add_observation_batch(payload_json: str) -> str:
                 string for external authors; display names emit a warning),
                 standpoint_collection_id, standpoint_override_tag,
                 standpoint_lineage (format "provider:family", e.g. "anthropic:opus" —
-                the most load-bearing bias axis for AI-agent premises; format-validated),
+                the most load-bearing bias axis for AI-agent premises; format-validated;
+                marks the EVIDENCE SOURCE that produced the claim, not who authored this
+                node — differs from your own lineage only when citing another agent's or
+                a human's evidence),
                 standpoint_architecture (transformer | vision-spatial | embodied-sensorimotor
                 | graph-neural | human | other),
                 fs_class ("re-executable" for Class 1 claims that can be re-tested by
