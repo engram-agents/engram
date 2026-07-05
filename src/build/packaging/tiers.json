@@ -164,6 +164,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/backup_claude_projects.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/build-plugin.sh",
       "tier": "convenience",
       "source": "src/build/build-plugin.sh"
@@ -237,7 +241,17 @@
       "multi_agent": true
     },
     {
+      "path": "tools/collab-baton-monitor.sh",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
       "path": "tools/forum-mention-monitor.sh",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
+      "path": "tools/forum-updates-monitor.sh",
       "tier": "convenience",
       "multi_agent": true
     },
@@ -265,7 +279,32 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/tripwire.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/forum_api.py",
+      "tier": "convenience",
+      "multi_agent": true
+    },
+    {
       "path": "tools/_status_derive.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/engram-loop-gate.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/presence.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/loop_prompt.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/engram-mode.py",
       "tier": "convenience"
     },
     {
@@ -622,8 +661,16 @@
       "reason": "test file for tools/backup_session_logs.py — CI tooling only, never ships"
     },
     {
+      "path": "tools/test_backup_claude_projects.py",
+      "reason": "pytest test suite for backup_claude_projects.py; CI tooling only, never ships"
+    },
+    {
       "path": "tools/test_forum_cli.py",
       "reason": "test file for tools/forum.py — CI tooling only, never ships"
+    },
+    {
+      "path": "tools/test_tripwire.py",
+      "reason": "test file for tools/tripwire.py — CI tooling only, never ships"
     },
     {
       "path": "tools/test_forum_backup.py",
@@ -684,6 +731,10 @@
     {
       "path": "src/forum/deploy/engram-forum-backup.timer",
       "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; systemd timer unit for the forum host, not part of the plugin bundle (issue #868)"
+    },
+    {
+      "path": "src/engram/tools/baton-migrate-to-coord-store.py",
+      "reason": "one-shot state migration helper: reads existing baton files from the old agents-shared path and POSTs to the new /api/projects/* routes (Phase 3 UCS migration); not a recurring shipped mechanism"
     }
   ],
   "repo_only": [

@@ -84,6 +84,16 @@
         ]
       },
       {
+        "matcher": "mcp__plugin_engram_engram__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-toolcall-repair.py\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
         "matcher": "Bash",
         "hooks": [
           {

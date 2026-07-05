@@ -121,7 +121,7 @@ per-env × per-bucket result table; exit nonzero if ANY env fails
 ## 4. Image maintenance — the staleness trap, named
 
 Prebuilt images go stale against requirements/schema changes. Two mechanical guards:
-images rebuild automatically when `requirements*.txt` / `packaging/tiers.json` /
+images rebuild automatically when `requirements*.txt` / `src/build/packaging/tiers.json` /
 `Dockerfile.*` change (hash-stamped, lazy rebuild on next run); and a weekly freshness
 assertion in the doctor surface rather than a human remembering. An image that fails
 freshness is EXCLUDED loudly from the matrix run report, never silently skipped

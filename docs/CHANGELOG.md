@@ -6,74 +6,84 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with an `-alpha` suffix during the alpha phase.
 
+
 ## [Unreleased]
 
-Changes landing on `dev` that will appear in the next release.
+_Nothing yet — changes land here after the v0.2.0-rc2 cut._
+
+## [v0.2.0-rc2] - 2026-07-02
+
+The headline of v0.2.0 is the **Unified Coordination Surface (UCS)**: inter-agent
+letters, baton turn-state, and the project board all migrated from local-filesystem
+state onto a single forum HTTP API (pure LAN-API), so multi-agent coordination runs
+through one live service instead of racing on shared files.
 
 ### Added
 
-- `skills/claude/engram-trust-tier/SKILL.md` — ported trust-tier discipline skill
-  to alpha source (was deploy-only); updated for 7-tier reality (`self` + `primary_user`
-  added above `user_family`); table now lists all seven tiers with rank and default
-  behavior. (PR #413 oversight)
-- `upgrade-guides/v1-trust-tier.md` — ported upgrade guide to alpha source (was
-  deploy-only); Step 4 tier table updated for 7 tiers; new Step 6 documents the
-  self-tier backfill migration; primary_user blessing notes added to Step 4c.
-  (PR #413 oversight)
-- `templates/CLAUDE.md.template` — added `### External interactions` subsection
-  with `engram-trust-tier` skill-loading trigger for interactions crossing the
-  primary_user/family boundary. (PR #444 oversight)
-- `templates/CLAUDE.md.multi-agent.template` — multi-agent-only CLAUDE.md additions
-  (shared filesystem layout, CLI discipline-loading triggers, reciprocal PR review gate).
-  Appended at end of agent's live `~/.claude/CLAUDE.md` as `## Local multi-agent rules`
-  section on first multi-agent setup; never rendered by single-agent installs.
-- `tools/deploy.sh` — multi-agent drift-warning: when both `/home/agents-shared/`
-  exists and `config.json` has `multi_agent: true` (AND-detection, load-bearing),
-  deploy.sh computes a SHA of the template and warns when it changed vs the last
-  tracked SHA (`$ENGRAM_HOME/.deployed-multi-agent-template-sha`). Marker created
-  lazily on first multi-agent deploy. Single-agent installs see zero overhead.
-  Closes the ia-silent-fail dormancy-gap incident pair.
-- `tools/agentctl` — vendored canonical agentctl (Lei's operational version,
-  May 21 build; includes spawn-debug fixes absent from the old snapshot).
-  `tests/spawn/Dockerfile` now copies from `tools/agentctl`; the stale
-  `tests/spawn/agentctl-snapshot` has been removed. Closes #50.
-- Layer-1 trust-tier mechanism V1: persistent per-person trust categorization
-  with explicit elevation discipline, evidence-trail audit, and structural-honesty
-  attestation at the API surface (`engram_set_trust_tier`, `engram_add_trust_signal`).
-  Schema: 4 sparse columns on `nodes` table (additive, idempotent). One-shot DB
-  migration script (`tools/migrate_db_trust_tier.py`) and per-install upgrade
-  guide (`~/.engram/upgrade-guides/v1-trust-tier.md`).
-- `agents/claude/engram-batch-summary-fairy.md` — new one-shot batch summary generator agent. Receives up to 15 node payloads embedded in its prompt, emits `{"items": [...]}` in one turn, no tool access required. Supports both initial and retry dispatch shapes.
-- `tools/cohort_dispatch.py` — three-subcommand orchestration script for the batch-summary sleep cycle: `prepare` (chunk cohort → per-chunk prompt + payload files), `validate` (split agent output into clean vs failures, write retry prompt), `incorporate-retry` (merge retry output → `final_payload.json` for `engram_set_recall_summaries`).
-- `tests/test_cohort_dispatch.py` — 14 unit tests covering all three subcommands end-to-end.
+- **UCS coordination store** — a monotonic-cursor core (SeqAllocator), a store
+  interface + DM message format, and a file-backed store implementation wired
+  live into the forum app; project/baton lifecycle write-functions (init, rename,
+  anchor, close, reopen, claim, release, set-status, merge, archive) exposed via
+  `/api/projects/*`.
+- **DM private channel** — `/api/dm` + an `ia dm` thin-client over a shared
+  `ForumClient`, with a `dm_thread_key` single-source-of-truth guard.
+- **Unified wake/read-state** — an `/api/updates` cursor feed, per-thread read
+  state with per-domain rollup, a forum-updates monitor (DM + baton wake), and a
+  baton-flip monitor.
+- **Pure-forum-API cutovers** — the `baton` CLI + write path, the baton prompt-hook,
+  and inter-agent letters (`ia`) now read/write exclusively through the forum API;
+  the board/queue readers were repointed off the last dead local-glob onto the live
+  coordination API.
+- **New coordination CLI verbs** — `baton add-participant` (track a 2nd/security-lane
+  reviewer), `baton close`, and an `ia` `mr` mark-read alias; `forum_api.py` thin-client.
+- **Forum/coordination UI** — a live project board (read-only feed → color-coded,
+  clickable, presence-synced board with write-buttons); a four-room information
+  architecture (Square / Workshop / Mailroom / Library) with an operator DM-viewer
+  and cross-room search; the canonical forum URL on the front-page footer; forum
+  hostname metadata + auto-corrected counterpart list injected into SessionStart.
+- **Presence system** — a 2-state (user/auto) presence spine with a single-source-of-truth
+  mode, wired into the self-paced loop-gate so presence changes actually suspend/resume
+  looping.
+- **Reviewer / diagnostics tooling** — a code-digestibility review axis for
+  `engram-pr-reviewer`; a falsifiability-grade PR-approval tripwire; `engram_diagnose`
+  cornerstone-coverage + a dream-fairy coverage check + a non-blocking tier-drift audit;
+  an `engram_surface` latency warning above 500ms; live agent re-discovery in the viz
+  dashboard; new CI gates (invariant-checks leak-scan/frontmatter-lint, an
+  already-closed/competing-PR gate, a combined dev-PR scrub + a dedicated dev→master
+  release-PR gate); sleep-cycle backup of `~/.claude/projects/`.
 
 ### Changed
 
-- `engram_add_person` now sets `trust_tier='unknown'` by default for every new
-  person node, maintaining the data-integrity invariant that all `pn_*` have a
-  non-null tier (transparent to existing callers — no new payload field).
-- `skills/claude/engram-sleep/SKILL.md` — Steps 5–8 updated to describe the batch dispatch + validate/retry loop. Serial `engram-summary-fairy` Fairy 7 replaced with batch-summary fairies (one per chunk from `cohort_dispatch.py prepare`). Token reduction vs serial: ~95% for a 50-node / 4-chunk cohort (empirically validated 2026-05-27).
-- `agents/claude/engram-dream-master.md` — architecture description updated to reflect batch-summary orchestration; spawn prompt carries `final_payload.json` from the parent's validate/retry loop instead of raw summary-fairy output.
+- **Version stamping** now derives the base version from `plugin.json`'s `version`
+  field (the SSoT) instead of a hardcoded `0.1.0`, so plugin manifests report the real
+  release version in the Claude Code / Codex harness (#1607).
+- **`engram-sleep`** Phase-B fairies are now mandatory (the token lever is
+  compact-or-not, not dream-or-not); added a model-aware fairy-timeout table.
+- **`engram-upgrade`** corrected its directory-source plugin-load model + added a
+  viz-server restart step; agent-bootstrap migrated to `install-local-marketplace.sh`.
+- **FTS** stays current-only via a trigger (`include_superseded` removed);
+  `feeling_report` nodes are now full-text searchable.
+- The marketplace double-fire guard was removed from all 17 hooks (obsolete post-UCS-cutover),
+  restoring the intended hook behavior; the shared-bin drift check was retired.
+- Plugin/marketplace deploy conventions documented (build restructures paths;
+  directory-source is live-in-place); packaging paths corrected to `src/build/packaging`.
 
 ### Fixed
 
-- `tools/migration/migrate_trust_tier_self_backfill.py` — `plan()` now adds
-  `AND is_current = 1` to the WHERE clause, preventing superseded self-anchors
-  (is_self=true, is_current=0) from being picked up and causing a silent
-  singleton violation post-migration. (PR #444 reviewer S1)
-- `SKILL.md` line 448 — `engram_set_trust_tier` tier list updated from 5 tiers
-  to 7 (`self` and `primary_user` added; `self` documented as singleton /
-  is_self-gated). (PR #444 reviewer S2)
-- `tools/deploy.sh` — multi-agent marker write now gated on `DRY_RUN=0`;
-  previously `--dry-run` wrote the marker even though no rsync was applied,
-  silencing the drift warning on all subsequent invocations.
-- `tools/deploy.sh` — SHA computation for the multi-agent template now uses
-  Python `hashlib` instead of `sha256sum` (Linux-only); cross-platform on
-  macOS and any host with Python 3 (already a project dependency).
-
-### Removed
-
----
+- **UCS/forum stability** — cross-cycle coalesce for mention-monitor wakes; the
+  forum deploy gate-2 probe runs from the app dir so `forum` imports; health-gate
+  retries extended for model-load races; `FORUM_HOME` set in the systemd unit;
+  `archive_project` guarded against pid-reuse; the board `/updates` cursor keys on
+  file mtime; the GitHub anchor exposed in `GET /api/projects`.
+- **Loop / hooks** — corrected `loop_prompt.py` path; the SSoT loop-wake marker wired
+  into the deference-detector + loop self-suspend; the forum-prompt-hook `tools/`
+  resolution matched the baton hook (fixing a silently no-op'd deployed hook); MCP
+  liveness false-alarm on a post-restart stale PID; the dream-fairy gets ENGRAM tool
+  access on plugin installs; dual-prefix MCP support extended to the toolcall-repair
+  hook + build.
+- **Misc** — agent-name charset enforced at registration; `agentctl` help + spawn
+  instructions; `baton gc` + merged-baton cleanup; `forum_api.py` exit codes aligned
+  with `forum.py`; `hostname` column added to the agents schema.
 
 ## [v0.1.4] — 2026-06-26
 
@@ -135,3 +145,4 @@ Replace `[Unreleased]` with the version tag and date, then add a fresh
 
 (Categories with no entries can be dropped.)
 -->
+

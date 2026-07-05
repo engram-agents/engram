@@ -50,7 +50,7 @@
 ### 4. engine — plugin build system
 **what** — Multi-phase plugin assembly + flow-execution CLI; tiered output, multi-agent flag, platform targets.
 **verbs** — build (--tier, --multi-agent, --output, --target claude-code|codex, --identity, --engram-home) · plan · run (--ack-changeset, --allow-branch) · doctor.
-**state surfaces** — R: packaging/tiers.json, packaging/platforms/*.json; W: build/plugin/.
+**state surfaces** — R: src/build/packaging/tiers.json, src/build/packaging/platforms/*.json; W: build/plugin/.
 **tier** — convenience.
 **status** — PROD-VERIFIED for claude-code target (every build); **codex target SCAFFOLDED-UNTESTED** — handlers exist (build.py:206–302: emit_codex_plugin_json, emit_codex_mcp_json, rewrite_hooks_for_codex) but no codex-target test. (#803 shipped it 2026-06-05; expected-young.)
 **tests** — test_engine_flows.py, test_engine_unit.py, test_engine_phase3.py, test_engine_steps.py.

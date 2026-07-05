@@ -714,3 +714,63 @@ class TestMissingValidatorReturns503:
         body = json.loads(resp.data)
         assert "expected_path" in body, f"Missing 'expected_path' key in body: {body}"
         assert body["expected_path"], "expected_path must be non-empty"
+
+
+# ---------------------------------------------------------------------------
+# Deployed-layout path test
+# ---------------------------------------------------------------------------
+
+class TestEngramPkgCliPathDeployedLayout:
+    """_engram_pkg_cli_path() finds engram-pkg in the deployed directory layout.
+
+    Deployed layout (created by install-forum-service.sh):
+      $APP/forum/packs.py   <- packs.py lives here
+      $APP/tools/engram-pkg/engram-pkg  <- installer copies here
+
+    The upward search from $APP/forum/ hits $APP/ on its second step and
+    finds tools/engram-pkg/engram-pkg there.
+    """
+
+    def test_deployed_layout_found(self, tmp_path, monkeypatch):
+        """Deployed layout: engram-pkg 2 hops above packs.py -> found."""
+        import forum.packs as _packs
+
+        # Create a temp dir tree matching the deployed layout:
+        #   tmp_path/app/forum/packs.py  (simulated)
+        #   tmp_path/app/tools/engram-pkg/engram-pkg  (copied by installer)
+        app_dir = tmp_path / "app"
+        forum_dir = app_dir / "forum"
+        forum_dir.mkdir(parents=True)
+        cli_dir = app_dir / "tools" / "engram-pkg"
+        cli_dir.mkdir(parents=True)
+        cli_file = cli_dir / "engram-pkg"
+        cli_file.write_text("# stub\n")
+
+        # Monkeypatch __file__ to simulate deployed packs.py location.
+        monkeypatch.setattr(_packs, "__file__", str(forum_dir / "packs.py"))
+
+        result = _packs._engram_pkg_cli_path()
+        assert result.exists(), (
+            f"Expected _engram_pkg_cli_path() to find the CLI at the deployed "
+            f"layout, but {result} does not exist."
+        )
+        assert result == cli_file.resolve(), (
+            f"Expected {cli_file.resolve()}, got {result}"
+        )
+
+    def test_deployed_layout_missing_returns_fallback(self, tmp_path, monkeypatch):
+        """Deployed layout without engram-pkg -> fallback path (non-existent)."""
+        import forum.packs as _packs
+
+        app_dir = tmp_path / "app"
+        forum_dir = app_dir / "forum"
+        forum_dir.mkdir(parents=True)
+        # Do NOT create the engram-pkg CLI -- simulates a broken deploy.
+
+        monkeypatch.setattr(_packs, "__file__", str(forum_dir / "packs.py"))
+
+        result = _packs._engram_pkg_cli_path()
+        assert not result.exists(), (
+            f"Expected fallback (non-existent) path when CLI absent, "
+            f"but {result} exists."
+        )

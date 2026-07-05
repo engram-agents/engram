@@ -31,6 +31,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -142,6 +143,24 @@ DEFAULT_PORT = 5001
 # Maps name -> {"name": str, "label": str, "db": str (resolved abs path)}.
 AGENTS: dict = {}
 DEFAULT_AGENT: str = ""
+
+# ---------------------------------------------------------------------------
+# Live agent registry cache — refreshed on a TTL so newly-born agents appear
+# in the UI without restarting the viz server.  Seeded by main(); refreshed by
+# _refresh_agents_if_stale() at every registry read that drives the UI.
+# ---------------------------------------------------------------------------
+
+_AGENT_CACHE_TTL_SECONDS: float = 45.0
+_AGENT_CACHE_TS: float = 0.0  # time.monotonic() of last successful scan; 0 → never
+
+# Startup mode — set in main() so _refresh_agents_if_stale replays the same path.
+# "single_db"         → --db explicit or --no-autodetect without --config; static.
+# "config_only"       → --no-autodetect --config; reload config on TTL (no home-scan).
+# "discover_merge"    → discover + --config; re-scan + merge on TTL.
+# "discover_only"     → discover, no --config, agents found; re-scan on TTL.
+# "discover_fallback" → discover, no --config, nothing found; retry discovery on TTL.
+_AGENT_STARTUP_MODE: str = ""
+_AGENT_STARTUP_CONFIG: str = ""  # --config path for modes that need it
 
 # ---------------------------------------------------------------------------
 # Config write infrastructure — per-agent backup tracking.
@@ -2749,6 +2768,74 @@ def _merge_config_over_discovered(discovered: dict, config_path: str) -> tuple[d
     return agents, default
 
 
+def _refresh_agents_if_stale(ttl_seconds: float | None = None) -> None:
+    """Refresh AGENTS/DEFAULT_AGENT when the cache is older than ttl_seconds.
+
+    Clock: time.monotonic() — patchable in tests via unittest.mock.patch.
+
+    Modes that re-scan home directories: discover_merge, discover_only,
+    discover_fallback.  Static modes (single_db) never re-scan.
+
+    Fail-safe: on any exception, keep the last-good registry and log a warning
+    so the calling request still succeeds.
+    """
+    global AGENTS, DEFAULT_AGENT, _AGENT_CACHE_TS
+
+    ttl = ttl_seconds if ttl_seconds is not None else _AGENT_CACHE_TTL_SECONDS
+    now = time.monotonic()
+    if now - _AGENT_CACHE_TS <= ttl:
+        return  # within TTL — cache hit
+
+    if _AGENT_STARTUP_MODE in ("single_db", ""):
+        # Static registry or not yet seeded by main() — nothing to refresh.
+        return
+
+    try:
+        if _AGENT_STARTUP_MODE == "config_only":
+            new_agents, new_default = _load_config(_AGENT_STARTUP_CONFIG)
+        elif _AGENT_STARTUP_MODE == "discover_merge":
+            discovered = discover_agents()
+            if not discovered:
+                # Empty discover in merge-mode is a transient scan failure (homes
+                # briefly unreadable) — startup found agents in this mode, so an
+                # empty result now is a regression, not "all agents gone". Merging
+                # {} would narrow the registry to config-explicit agents and drop
+                # discovered-only ones for one TTL. Keep last-good (symmetric with
+                # the discover_only/fallback guard below).
+                _AGENT_CACHE_TS = now
+                return
+            new_agents, new_default = _merge_config_over_discovered(
+                discovered, _AGENT_STARTUP_CONFIG
+            )
+        elif _AGENT_STARTUP_MODE in ("discover_only", "discover_fallback"):
+            new_agents = discover_agents()
+            if new_agents:
+                new_default = _pick_default(new_agents)
+            else:
+                # Nothing found — keep current registry, bump timestamp to avoid
+                # hammering on a persistently empty scan.
+                _AGENT_CACHE_TS = now
+                return
+        else:
+            _disc_log.debug(
+                "_refresh_agents_if_stale: unknown mode %r, skipping", _AGENT_STARTUP_MODE
+            )
+            return
+
+        AGENTS = new_agents
+        DEFAULT_AGENT = new_default
+        _AGENT_CACHE_TS = now
+        _disc_log.debug(
+            "_refresh_agents_if_stale: refreshed registry (%d agents, default=%r)",
+            len(AGENTS), DEFAULT_AGENT,
+        )
+    except Exception as exc:
+        _disc_log.warning(
+            "_refresh_agents_if_stale: refresh failed, keeping last-good registry: %s", exc
+        )
+        _AGENT_CACHE_TS = now  # avoid hammering on persistent failure
+
+
 def _resolve_agent(query_string: str) -> tuple[str, str]:
     """Pick an agent given the query string. Returns (name, db_path).
 
@@ -2757,6 +2844,7 @@ def _resolve_agent(query_string: str) -> tuple[str, str]:
     handler can surface a clear error instead of silently swapping in the
     default.
     """
+    _refresh_agents_if_stale()
     qs = parse_qs(query_string or "")
     requested = qs.get("agent", [None])[0]
     name = requested or DEFAULT_AGENT
@@ -2767,6 +2855,7 @@ def _resolve_agent(query_string: str) -> tuple[str, str]:
 
 def get_agents_meta() -> list:
     """Per-agent status snapshot for /api/agents (drives the UI dropdown)."""
+    _refresh_agents_if_stale()
     out = []
     for name, info in AGENTS.items():
         entry = {"name": name, "label": info.get("label", name), "db": info["db"]}
@@ -5294,7 +5383,7 @@ def main():
     if args.config and args.db:
         parser.error("--config and --db are mutually exclusive")
 
-    global AGENTS, DEFAULT_AGENT
+    global AGENTS, DEFAULT_AGENT, _AGENT_STARTUP_MODE, _AGENT_STARTUP_CONFIG, _AGENT_CACHE_TS
 
     if args.db:
         # Explicit --db always forces single-agent mode (unchanged behavior).
@@ -5303,30 +5392,41 @@ def main():
             db = os.path.join(db, "knowledge.db")
         AGENTS = {"default": {"name": "default", "label": "Default", "db": db}}
         DEFAULT_AGENT = "default"
+        _AGENT_STARTUP_MODE = "single_db"
     elif args.no_autodetect:
         # Opt-out: explicit-config-only path (old behavior).
         if args.config:
             AGENTS, DEFAULT_AGENT = _load_config(args.config)
+            _AGENT_STARTUP_MODE = "config_only"
+            _AGENT_STARTUP_CONFIG = args.config
         else:
             db = DEFAULT_DB
             AGENTS = {"default": {"name": "default", "label": "Default", "db": db}}
             DEFAULT_AGENT = "default"
+            _AGENT_STARTUP_MODE = "single_db"
     else:
         # Default path: auto-detect is the base.
         discovered = discover_agents()
         if args.config:
             # Layer explicit config on top of discovered.
             AGENTS, DEFAULT_AGENT = _merge_config_over_discovered(discovered, args.config)
+            _AGENT_STARTUP_MODE = "discover_merge"
+            _AGENT_STARTUP_CONFIG = args.config
         elif discovered:
             # Pure auto-detect: prefer the launching context's own agent as
             # default; fall back to alphabetically first for determinism.
             AGENTS = discovered
             DEFAULT_AGENT = _pick_default(AGENTS)
+            _AGENT_STARTUP_MODE = "discover_only"
         else:
             # Nothing discovered and no config — fall back to single-agent default.
             db = DEFAULT_DB
             AGENTS = {"default": {"name": "default", "label": "Default", "db": db}}
             DEFAULT_AGENT = "default"
+            _AGENT_STARTUP_MODE = "discover_fallback"
+
+    # Seed the live-refresh cache timestamp so the first request is a cache hit.
+    _AGENT_CACHE_TS = time.monotonic()
 
     HTTPServer.allow_reuse_address = True
     bind = args.bind or "127.0.0.1"

@@ -688,17 +688,18 @@ The newborn is at $user_name. To complete the birth:
   1. Enter the newborn's bash login shell:
        agentctl bash $newborn_tag
 
-  2. Inside that shell, materialize ENGRAM (runs alpha installer):
-       bash ~/.runtime/install.sh
+  2. Inside that shell, install Claude Code in the new agent's account.
+       (Follow the current Claude Code install instructions for the platform.)
 
-  3. Login to the LLM provider (interactive):
-       claude login           # or gemini login
+  3. In the first session, ask the agent to install ENGRAM from the
+     plugin marketplace:
+       claude                 # At the first prompt, ask the agent to install
+                              # ENGRAM from the plugin marketplace, then exit.
+                              # On the next session start (after ENGRAM installs),
+                              # the SessionStart hook fires engram-first-session
+                              # → agent generates 3 candidate names → you pick.
 
-  4. Start the first session:
-       claude                 # SessionStart hook fires engram-first-session
-                              # → agent generates 3 candidate names → you pick
-
-  5. From the operator's shell (NOT inside the newborn shell), finalize the rename:
+  4. From the operator's shell (NOT inside the newborn shell), finalize the rename:
        sudo agentctl finalize-name $newborn_tag <chosen-name>
 
 To abandon a newborn before finalize-name (simple cleanup):
@@ -1217,6 +1218,23 @@ PYTHON
 JSON
     chown "$chosen_user:$chosen_user" "$chosen_home/.engram/finalize-name-complete.json" 2>/dev/null || true
 
+    # Deferred viz-ACL marker: Step 7's setfacl is gated on [[ -d "$_engram_dir" ]]
+    # but the agent installs ENGRAM AFTER finalize-name runs, so Step 7 silently
+    # no-ops for newly-born agents. Write a marker at HOME root (always writable
+    # at finalize time) so the post-install SessionStart hook can apply the ACL
+    # on first session after ENGRAM is installed. Only written when VIZ_OPERATOR
+    # is set (mirrors Step 7's guard). Closes #1525.
+    if [[ -n "${VIZ_OPERATOR:-}" ]]; then
+        cat > "$chosen_home/.engram-finalize-pending.json" <<JSON
+{
+  "viz_operator": "${VIZ_OPERATOR}",
+  "chosen_name": "${chosen}",
+  "finalized_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+JSON
+        chown "$chosen_user:$chosen_user" "$chosen_home/.engram-finalize-pending.json" 2>/dev/null || true
+    fi
+
     # Restart the ENGRAM surface daemon (a.k.a. recall daemon) under
     # the new uid. Step 1.5 killed it along with the newborn's other
     # processes to clear usermod's "user is currently used" block;
@@ -1546,7 +1564,7 @@ cmd_share_status() {
 }
 
 cmd_help() {
-    sed -n '3,33p' "$0"
+    sed -n '3,61p' "$0"
 }
 
 # ---------- internal verb: __expand-session-args ----------

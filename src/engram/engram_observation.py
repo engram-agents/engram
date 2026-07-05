@@ -785,6 +785,15 @@ def _add_evidence_impl(
             # Check 2: TLD — hostname must contain a dot (rejects fabricated
             # single-label hosts like 'session-transcript', 'conversation')
             if "." not in hostname:
+                if hostname == "localhost":
+                    return json.dumps({
+                        "error": f"Cannot cite a localhost URL directly — local/LAN addresses are not "
+                        "stable evidence sources. To cite a forum post or local file, archive it first: "
+                        "`engram-snapshot forum:<thread_id>` (forum thread) or "
+                        "`engram-snapshot file:<path>` (local file), then cite the resulting "
+                        "file:// evidence record returned by the snapshot tool."
+                        + _HONESTY_REMINDER
+                    })
                 return json.dumps({
                     "error": f"Invalid hostname '{hostname}' in URL — no TLD found. "
                     "This looks like a fabricated domain. Real web URLs have a domain "

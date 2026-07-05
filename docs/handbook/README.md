@@ -12,7 +12,7 @@ Three needs, one artifact (Lei, 2026-06-04 + 2026-06-05):
 
 ## Method (bottom-up, per Lei 2026-06-05)
 
-1. **Census** (`00-inventory.md`, generated): every file in the repo → ship status per `packaging/tiers.json` → mechanism assignment. Nothing escapes the table.
+1. **Census** (`00-inventory.md`, generated): every file in the repo → ship status per `src/build/packaging/tiers.json` → mechanism assignment. Nothing escapes the table.
 2. **Sweep**: file by file, layer by layer. Each file gets assigned to a mechanism; each mechanism gets a page with **verified** status — run it or trace its delivery path to ground truth, never status-from-memory. First-draft archaeology is fairy-friendly; accuracy review is Borges + Lei.
 3. **Zombie hunt**: for every mechanism, answer the #824 question explicitly — *"if this were silently broken, what would we observe, and have we observed its absence?"* A mechanism whose output is never independently observed is `zombie-suspect` by default until verified.
 4. **Synthesis** (`09-synthesis.md`, written last): how the layers compose into the current user experience.

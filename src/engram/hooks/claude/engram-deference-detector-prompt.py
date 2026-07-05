@@ -27,11 +27,51 @@ DEFERENCE_MARKER_PATH = os.path.join(ENGRAM_HOME, "deference-detected.json")
 LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
 DEFERENCE_COOLDOWN_PATH = os.path.join(ENGRAM_HOME, "deference-cooldown-at.txt")
 
+# ---------------------------------------------------------------------------
+# loop_prompt import — SSoT for the loop-wake marker.
+#
+# Resolve tools/ in BOTH deploy topologies (same pattern as
+# engram-time-bar-hook.py / engram-baton-prompt-hook.py):
+#   Source:  src/engram/hooks/claude/<name>.py → src/engram/tools/
+#   Plugin:  <root>/hooks/<name>.py             → <root>/tools/
+# A fixed parents[N] overshoots in the deployed (flattened) tree.
+# Prefer $CLAUDE_PLUGIN_ROOT/tools when set; else walk parents and take the
+# first dir that actually contains loop_prompt.py.
+#
+# FAIL-SAFE: if the import fails for any reason the hook must NOT crash.
+# Fall back to the locally-defined _LOOP_WAKE_MARKER_FALLBACK constant so
+# prefix-based classification still works.  A regression test asserts this
+# fallback equals loop_prompt.LOOP_WAKE_MARKER so the two can't silently
+# diverge (#1594).
+# ---------------------------------------------------------------------------
+
+_LOOP_WAKE_MARKER_FALLBACK: str = "<loop-wake>"
+
+_lp_candidates = []
+_lp_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
+if _lp_plugin_root:
+    _lp_candidates.append(Path(_lp_plugin_root) / "tools")
+for _lp_parent in Path(__file__).resolve().parents:
+    _lp_candidates.append(_lp_parent / "tools")
+_LP_TOOLS_DIR = next(
+    (c for c in _lp_candidates if (c / "loop_prompt.py").exists()), None
+)
+if _LP_TOOLS_DIR is not None and str(_LP_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(_LP_TOOLS_DIR))
+try:
+    from loop_prompt import LOOP_WAKE_MARKER as _LOOP_WAKE_MARKER
+except Exception:
+    _LOOP_WAKE_MARKER = _LOOP_WAKE_MARKER_FALLBACK
+
 
 def _is_cron_prompt(prompt: str, loop_marker_path: str) -> bool:
     """Return True if the prompt looks like a cron-fired heartbeat, not a real user message."""
     stripped = prompt.strip()
-    # Autonomous-loop sentinels
+    # SSoT loop-wake marker (format_loop_prompt prepends this; see tools/loop_prompt.py).
+    if stripped.startswith(_LOOP_WAKE_MARKER):
+        return True
+    # Autonomous-loop sentinels — kept for back-compat with loops that predate
+    # the format_loop_prompt SSoT (#1594).
     if stripped in ("<<autonomous-loop>>", "<<autonomous-loop-dynamic>>"):
         return True
     # Canonical ScheduleWakeup stub prefix — loop continuations that don't set

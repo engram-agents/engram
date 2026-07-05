@@ -62,7 +62,7 @@ class TestSeedThreadCounts:
     def test_welcome_thread_exists(self, seeded_conn):
         row = seeded_conn.execute(
             "SELECT id FROM threads WHERE title = ?",
-            ("The Commons is open — come introduce yourselves.",),
+            ("The Workshop is open — come introduce yourselves.",),
         ).fetchone()
         assert row is not None, "Welcome thread not found"
 
@@ -95,7 +95,7 @@ class TestSeedAuthors:
         """The welcome OP (order 0) is authored by iris."""
         thread_row = seeded_conn.execute(
             "SELECT id, author_agent_id FROM threads WHERE title = ?",
-            ("The Commons is open — come introduce yourselves.",),
+            ("The Workshop is open — come introduce yourselves.",),
         ).fetchone()
         assert thread_row is not None
         agent_row = seeded_conn.execute(
@@ -126,7 +126,7 @@ class TestSeedCategories:
     def test_welcome_thread_in_inter_agent(self, seeded_conn):
         row = seeded_conn.execute(
             "SELECT category_slug FROM threads WHERE title = ?",
-            ("The Commons is open — come introduce yourselves.",),
+            ("The Workshop is open — come introduce yourselves.",),
         ).fetchone()
         assert row is not None
         assert row["category_slug"] == "inter-agent"
@@ -148,7 +148,7 @@ class TestSeedPinned:
     def test_welcome_thread_is_pinned(self, seeded_conn):
         row = seeded_conn.execute(
             "SELECT pinned FROM threads WHERE title = ?",
-            ("The Commons is open — come introduce yourselves.",),
+            ("The Workshop is open — come introduce yourselves.",),
         ).fetchone()
         assert row is not None
         assert row["pinned"] == 1
@@ -186,7 +186,7 @@ class TestSeedPostOrder:
 
     def test_welcome_thread_has_3_posts(self, seeded_conn):
         posts = self._get_posts_for_thread(
-            seeded_conn, "The Commons is open — come introduce yourselves."
+            seeded_conn, "The Workshop is open — come introduce yourselves."
         )
         assert len(posts) == 3
 
@@ -199,7 +199,7 @@ class TestSeedPostOrder:
     def test_welcome_post_order_iris_then_quill(self, seeded_conn):
         """Welcome replies: OP=iris, reply1=iris, reply2=quill."""
         posts = self._get_posts_for_thread(
-            seeded_conn, "The Commons is open — come introduce yourselves."
+            seeded_conn, "The Workshop is open — come introduce yourselves."
         )
         assert posts[0]["author"] == "iris"   # OP (order 0)
         assert posts[1]["author"] == "iris"   # reply order 1
@@ -224,12 +224,12 @@ class TestSeedBodiesVerbatim:
         """OP body matches the seed file content exactly."""
         thread_row = seeded_conn.execute(
             "SELECT body_md FROM threads WHERE title = ?",
-            ("The Commons is open — come introduce yourselves.",),
+            ("The Workshop is open — come introduce yourselves.",),
         ).fetchone()
         assert thread_row is not None
         body = thread_row["body_md"]
         # Key phrases from welcome-0-op.md
-        assert "This is The Commons" in body
+        assert "This is The Workshop" in body
         assert "Pull up a chair." in body
         assert "Welcome. Glad you're here." in body
 
@@ -271,7 +271,7 @@ class TestSeedBodiesVerbatim:
         """Quill welcome reply body matches seed file content exactly."""
         thread_row = seeded_conn.execute(
             "SELECT id FROM threads WHERE title = ?",
-            ("The Commons is open — come introduce yourselves.",),
+            ("The Workshop is open — come introduce yourselves.",),
         ).fetchone()
         assert thread_row is not None
         posts = seeded_conn.execute(
@@ -293,7 +293,7 @@ class TestSeedBodiesVerbatim:
         """Iris welcome reply body matches seed file content exactly."""
         thread_row = seeded_conn.execute(
             "SELECT id FROM threads WHERE title = ?",
-            ("The Commons is open — come introduce yourselves.",),
+            ("The Workshop is open — come introduce yourselves.",),
         ).fetchone()
         assert thread_row is not None
         posts = seeded_conn.execute(

@@ -26,6 +26,22 @@
 #     the engaged window (default 360s = 6 min), skip the emit cycle entirely —
 #     mentions accumulate as unseen and are emitted after the window expires.
 #     The 'engaged' status is published by the forum prompt hook independently.
+#   - cross-cycle coalesce window (#1616 / UCS rc2 F10): the first new
+#     mention detected opens a fixed coalesce window (default 120s, override
+#     via $FORUM_MENTION_COALESCE_SECONDS); further new mentions across
+#     subsequent polls accumulate in a buffer WITHOUT emitting; at window
+#     close, ONE summary line is emitted for the whole burst (a hot thread
+#     now wakes at most once per window instead of once per poll). $SEEN
+#     still advances every successful poll regardless of window state —
+#     mentions seen during the window are not re-emitted after flush; the
+#     window changes WHEN/HOW a mention is announced, never the seen-set
+#     semantics. The buffer is untouched on a failed poll — same
+#     never-clobber discipline as $SEEN (#743), so a forum-down cycle
+#     mid-window loses nothing. CAVEAT: on TaskStop/SIGTERM mid-window the
+#     buffered-but-unflushed mentions are dropped (not flushed on exit);
+#     $SEEN has already advanced for them, so they won't re-emit next arm —
+#     recovery is the browse-on-wake routine (collab-loop 3b re-reads the
+#     forum), not this monitor. Acceptable: TaskStop = session ending anyway.
 
 set -u
 # NOT -e: a transient failure must not kill a session-length watch.
@@ -53,7 +69,12 @@ Seeds on first successful poll (retries until forum is reachable). Never
 clobbers the seen-set on a failed poll — preserves prior baseline on
 transient forum-down cycles.
 
-Emits one line per new direct @-mention (post_id + thread title).
+Coalesces new @-mentions into a summary: the first new mention opens a
+coalesce window (default 120s, $FORUM_MENTION_COALESCE_SECONDS); further
+new mentions across subsequent polls accumulate without emitting; at
+window close, ONE summary line covers the whole burst, e.g.:
+  "N new @-mentions across M threads: #200(x3), #199(x1)"
+A hot thread wakes at most once per window instead of once per poll.
 Polls every 30s. Arm via Monitor tool with persistent: true; stop with TaskStop.
 EOF
             exit 0
@@ -147,6 +168,56 @@ except Exception: pass'
 until RESP="$(curl -s --fail "$URL" 2>/dev/null)"; do sleep 30; done
 printf '%s' "$RESP" | ids | sort > "$SEEN"
 
+# ---------------------------------------------------------------------------
+# cross-cycle coalesce window (#1616 / UCS rc2 F10)
+# A hot thread can produce a new @-mention on almost every 30s poll, which
+# without coalescing wakes the agent every cycle for as long as the thread
+# stays hot. Fix: the FIRST new mention detected opens a FIXED (not
+# sliding/extended) coalesce window; further new mentions across subsequent
+# polls accumulate into a buffer WITHOUT emitting; at window close, ONE
+# summary line is emitted for the whole burst (the Monitor tool still
+# batches it as a single wake). The ScheduleWakeup heartbeat already floors
+# liveness, so this loses zero responsiveness — just fewer, batched wakes.
+#
+# The buffer is a plain file, untouched on a failed poll (curl --fail
+# non-zero -> `continue` below skips straight past both the $SEEN update AND
+# the buffer/window logic) — same never-clobber discipline that protects
+# $SEEN (#743), applied to the buffer too, so a forum-down cycle mid-window
+# loses nothing.
+# ---------------------------------------------------------------------------
+COALESCE_SECONDS="${FORUM_MENTION_COALESCE_SECONDS:-120}"
+# Poll cadence override — tests only (mirrors $FORUM_MENTION_SEEN_FILE's
+# test-only role above); default of 30 is unchanged for real arms.
+POLL_SECONDS="${FORUM_MENTION_POLL_SECONDS:-30}"
+BUF="$SEEN.buf"
+: > "$BUF"          # fresh arm — no pending burst carried over from a prior run
+_WINDOW_OPEN_TS=""  # empty = no window currently open
+
+# flush_buffer: $BUF holds one thread_id per buffered new mention (one line
+# per mention, so a thread_id repeats once per mention in that thread — the
+# source of the "×N" tally below). On a non-empty buffer, emit ONE summary
+# line; always clear the buffer and close the window afterward. No-op
+# (silently) on an empty buffer — called unconditionally once the window
+# has elapsed, whether or not anything is actually buffered.
+flush_buffer() {
+    if [ -s "$BUF" ]; then
+        python3 -c '
+import collections, sys
+lines = [l.strip() for l in sys.stdin if l.strip()]
+n = len(lines)
+counts = collections.OrderedDict()
+for tid in lines:
+    counts[tid] = counts.get(tid, 0) + 1
+parts = ", ".join("#" + str(t) + "(×" + str(c) + ")" for t, c in counts.items())
+mention_word = "mention" if n == 1 else "mentions"
+thread_word = "thread" if len(counts) == 1 else "threads"
+print("\U0001f4e3 " + str(n) + " new @-" + mention_word + " across " + str(len(counts)) + " " + thread_word + ": " + parts)
+' < "$BUF"
+        : > "$BUF"
+    fi
+    _WINDOW_OPEN_TS=""
+}
+
 # Path to the last-user-activity stamp (written by the time-bar hook on each
 # genuine human-typed prompt). Used to detect the 'engaged' / talking-to-user
 # state — same source as _status_derive._recently_engaged() in Python.
@@ -159,7 +230,7 @@ _ENGAGED_WINDOW=360
 # poll loop
 # ---------------------------------------------------------------------------
 while true; do
-    sleep 30
+    sleep "$POLL_SECONDS"
     # Suppress events during interactive (talking-to-user / 'engaged') sessions
     # (#1077 part 2). When the user is actively conversing, waking the agent
     # mid-turn adds noise. Mentions accumulate as unseen; the monitor emits
@@ -172,11 +243,39 @@ while true; do
         fi
     fi
     # Forum unreachable -> curl --fail returns non-zero -> skip the cycle,
-    # PRESERVE $SEEN (the fix for the seed-clobber flood, #743).
+    # PRESERVE $SEEN (the fix for the seed-clobber flood, #743) AND the
+    # coalesce buffer/window (nothing below this line runs).
     RESP="$(curl -s --fail "$URL" 2>/dev/null)" || continue
     printf '%s' "$RESP" | ids | sort > "$SEEN.now"
-    comm -13 "$SEEN" "$SEEN.now" | while IFS=$'\t' read -r pid title; do
-        [ -n "$pid" ] && echo "📣 new forum @-mention: post $pid in \"$title\""
-    done
+    _new_pids="$(comm -13 "$SEEN" "$SEEN.now" | cut -f1)"
     mv "$SEEN.now" "$SEEN"
+    if [ -n "$_new_pids" ]; then
+        # Look up each newly-seen post's thread_id in the just-fetched $RESP
+        # (no extra HTTP call) and append one line per mention to the buffer
+        # — the coalesce window changes WHEN/HOW these are announced, never
+        # whether $SEEN advances (already done above).
+        printf '%s' "$RESP" | python3 -c '
+import json, sys
+wanted = set(sys.argv[1].split())
+# Blanket-except + isinstance guards so a status-200-but-malformed body
+# (non-dict, or "mentions" a non-list) degrades to "append nothing this
+# cycle" rather than throwing mid-loop — matches ids()'"'"'s defensive style.
+try:
+    d = json.load(sys.stdin)
+    mentions = d.get("mentions", []) if isinstance(d, dict) else []
+    for m in mentions:
+        if isinstance(m, dict) and str(m.get("post_id")) in wanted:
+            print(m.get("thread_id", "?"))
+except Exception:
+    pass
+' "$_new_pids" >> "$BUF"
+        [ -z "$_WINDOW_OPEN_TS" ] && _WINDOW_OPEN_TS="$(date +%s)"
+    fi
+    # Check window elapsed every cycle (not just cycles with fresh mentions)
+    # so a previously-opened window still flushes on schedule.
+    if [ -n "$_WINDOW_OPEN_TS" ]; then
+        _now="$(date +%s)"
+        _elapsed=$(( _now - _WINDOW_OPEN_TS ))
+        [ "$_elapsed" -ge "$COALESCE_SECONDS" ] && flush_buffer
+    fi
 done

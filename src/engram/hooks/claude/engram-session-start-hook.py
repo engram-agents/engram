@@ -40,7 +40,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -193,6 +193,22 @@ def _check_mcp_health(engram_home: str) -> tuple[bool, str | None]:
         return True, None
 
 
+def _is_any_server_py_running() -> bool:
+    """Return True if any server.py process is running (pgrep secondary check).
+
+    Used by _check_mcp_write_tool_marker to distinguish a truly dead server
+    from a post-restart race where the marker PID is stale but the server is
+    alive.  Best-effort: returns False on any error so the caller degrades to
+    the conservative (unhealthy) path rather than a false positive.
+    """
+    import subprocess as _sp
+    try:
+        r = _sp.run(["pgrep", "-f", "server.py"], capture_output=True, timeout=2)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
     """Check whether the MCP server wrote its initialization-complete marker.
 
@@ -231,6 +247,14 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
         except OSError as e:
             if e.errno == _errno.EPERM:
                 return True, None  # exists, no permission to signal — still running
+            # Marker PID is dead — server may have restarted and not yet refreshed
+            # the marker (race between restart and this hook). Secondary check: is
+            # any server.py actually running right now?
+            if _is_any_server_py_running():
+                # A live server.py found — stale marker, not a dead server.
+                # Return healthy; server will refresh the marker on its next
+                # startup write (or already has — hook just caught the window).
+                return True, None
             return False, f"mcp-tools-ready.json stale (server PID {pid} no longer running)"
     except Exception:
         return True, None  # advisory — never block session start
@@ -480,6 +504,188 @@ def write_agent_registration(
     except Exception:
         # Fail-soft: never raise from a multi-agent convenience side-effect.
         pass
+
+
+PEER_STALE_HOURS = 24  # mirror ia.py's default
+
+
+def update_counterparts_from_registry(
+    agent_name: str,
+    config_path: str,
+    registry_dir: str = AGENT_REGISTRY_DIR,
+) -> None:
+    """Update config.json's counterparts list from the live agent registry.
+
+    Replaces the manually-maintained counterparts list with ground truth derived
+    from the shared registry.  Co-host peers (same hostname as the current agent)
+    are the ones reachable via ia/baton and therefore the meaningful counterpart
+    set.  Cross-host peers are excluded.
+
+    Stale entries (older than PEER_STALE_HOURS from ia.py, mirrored here as 24h)
+    are excluded — same policy as ia.py's scan_peers().
+
+    Fail-soft: any exception is silently caught, identical to
+    write_agent_registration.  Never raises.  The gate:
+    - shared-fs root must exist (same as write_agent_registration).
+    - config.json must be readable and writable.
+    - registry_dir must be a directory.
+    If any of those fail, silently returns.
+
+    Write is atomic: temp file in same directory as config.json + os.replace.
+
+    Args:
+        agent_name   : This agent's own name (used to exclude self from peers).
+        config_path  : Absolute path to config.json.
+        registry_dir : Path to the agent registry directory.
+                       Override in tests via AGENTS_SHARED_DIR env.
+    """
+    try:
+        registry_path = Path(registry_dir)
+        if not registry_path.is_dir():
+            return
+
+        own_hostname = socket.gethostname()
+        now = datetime.now(timezone.utc)
+        stale_delta_seconds = PEER_STALE_HOURS * 3600
+
+        co_host_names: list[str] = []
+        for json_file in sorted(registry_path.glob("*.json")):
+            try:
+                text = json_file.read_text(encoding="utf-8")
+                record = json.loads(text)
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue  # skip malformed/unreadable files
+
+            if not isinstance(record, dict):
+                continue
+
+            peer_name = record.get("agent_name", "").strip()
+            peer_hostname = record.get("hostname", "").strip()
+
+            # Must have both name and hostname
+            if not peer_name or not peer_hostname:
+                continue
+
+            # Exclude self
+            if peer_name.lower() == agent_name.lower():
+                continue
+
+            # Skip stale entries
+            registered_at_str = record.get("registered_at")
+            if registered_at_str:
+                try:
+                    registered_dt = datetime.fromisoformat(
+                        registered_at_str.replace("Z", "+00:00")
+                    )
+                    if registered_dt.tzinfo is None:
+                        registered_dt = registered_dt.replace(tzinfo=timezone.utc)
+                    age_seconds = (now - registered_dt).total_seconds()
+                    if age_seconds > stale_delta_seconds:
+                        continue  # stale — skip
+                except (ValueError, TypeError):
+                    pass  # can't parse age — include conservatively
+
+            # Co-host only: same hostname as this agent
+            if peer_hostname != own_hostname:
+                continue
+
+            co_host_names.append(peer_name)
+
+        co_host_names.sort()
+
+        # If the registry has entries but we found zero co-host peers, the registry
+        # is likely in a transient state (simultaneous restarts filtering all entries
+        # as stale).  Skip the write to avoid blanking the counterparts list spuriously.
+        # If the registry is genuinely empty (no .json files), fall through and clear.
+        if not co_host_names and any(registry_path.glob("*.json")):
+            return
+
+        # Read current config.json
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+
+        config["counterparts"] = co_host_names
+
+        # Atomic write: temp in same dir as config.json, then os.replace
+        config_dir = os.path.dirname(config_path)
+        fd, tmp_path = tempfile.mkstemp(dir=config_dir, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
+                f.write("\n")
+            os.replace(tmp_path, config_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception:
+        # Fail-soft: never raise from a multi-agent convenience side-effect.
+        pass
+
+
+def peer_topology_block(agent_name: str) -> str:
+    """Return a one-line co-host / cross-host peer summary for startup context.
+
+    Reads the shared agent registry (same dir as write_agent_registration writes
+    to) and classifies each live peer by hostname. Injected only on fresh-startup
+    so agents walk in knowing which peers are ia/baton-reachable vs forum-only.
+    Returns "" when the registry is absent (single-agent install), empty, or on
+    any error — never blocks session start.
+    """
+    if not agent_name:
+        return ""  # can't exclude self reliably without knowing our own name
+    try:
+        registry_path = Path(AGENT_REGISTRY_DIR)
+        if not registry_path.is_dir():
+            return ""
+
+        own_hostname = socket.gethostname()
+        now = datetime.now(timezone.utc)
+        stale_delta = timedelta(hours=PEER_STALE_HOURS)
+
+        cohost: list[str] = []
+        crosshost: list[str] = []
+
+        for json_file in sorted(registry_path.glob("*.json")):
+            try:
+                record = json.loads(json_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+
+            peer_name = record.get("agent_name", "").strip()
+            hostname = record.get("hostname", "").strip()
+            if not peer_name or not hostname or peer_name.lower() == agent_name.lower():
+                continue
+
+            # Skip stale entries (peer not active).
+            reg_at = record.get("registered_at")
+            if reg_at:  # no registered_at → treat as live (fail-open: missing timestamp ≠ stale)
+                try:
+                    reg_dt = datetime.fromisoformat(reg_at.replace("Z", "+00:00"))
+                    if (now - reg_dt) > stale_delta:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            if hostname == own_hostname:
+                cohost.append(peer_name)
+            else:
+                crosshost.append(peer_name)
+
+        if not cohost and not crosshost:
+            return ""
+
+        parts: list[str] = []
+        if cohost:
+            parts.append(f"co-host (ia/baton): {', '.join(cohost)}")
+        if crosshost:
+            parts.append(f"cross-host (forum): {', '.join(crosshost)}")
+
+        return f"[Peer topology — {'; '.join(parts)}]"
+    except Exception:
+        return ""
 
 
 def starred_block(engram_home: str) -> str:
@@ -1067,6 +1273,137 @@ def forum_monitor_block() -> str:
     )
 
 
+def _apply_pending_viz_acl(engram_home: str) -> None:
+    """Apply deferred viz/operator ACL when finalize-name ran before ENGRAM install.
+
+    finalize-name's Step 7 setfacl is gated on [[ -d "$_engram_dir" ]], but new
+    agents install ENGRAM post-finalize, so Step 7 silently no-ops for them.
+    finalize-name now writes a deferred marker at ~/.engram-finalize-pending.json
+    (HOME root, always writable at finalize time). This helper picks up that
+    marker on the first SessionStart after ENGRAM is installed and applies the
+    ACL so the viz dashboard can see the agent.
+
+    Scope note: finalize-name's Step 7 globs ~/.engram* (covers lineage variants
+    like .engram-gemini); this deferred helper only operates on the single
+    ENGRAM_HOME dir, which is correct here — lineage dirs don't exist at first
+    session, and Step 7 still covers them when finalize runs post-install.
+
+    Fail-safe: the entire body is wrapped in try/except Exception so this
+    helper NEVER raises or blocks session start — same advisory posture as the
+    _check_* helpers in this file. All subprocess calls use list args (never
+    shell=True). viz_operator is validated against POSIX username chars before
+    being interpolated into any command arg (injection-safe).
+
+    Removal policy:
+      - Marker removed:  viz_operator missing/empty, invalid charset, ACL already
+                         present, setfacl succeeded.
+      - Marker retained: setfacl/getfacl unavailable (retry in richer env),
+                         engram_home dir absent (ENGRAM not yet installed), any
+                         subprocess failure (retry next session).
+    """
+    try:
+        import shutil as _shutil
+
+        marker_path = os.path.join(os.path.expanduser("~"), ".engram-finalize-pending.json")
+        if not os.path.exists(marker_path):
+            return  # common case: no pending marker; must be cheap
+
+        # Parse marker JSON. A corrupt/unreadable marker is unrecoverable — we
+        # can't extract viz_operator — so DELETE it rather than retry forever.
+        # Unlike the tool-absent / .engram-absent cases (which self-resolve when
+        # the environment changes), a malformed file never would; leaving it
+        # would zombie every future session. Re-run finalize-name to regenerate.
+        try:
+            with open(marker_path) as _f:
+                _data = json.load(_f)
+        except Exception:
+            try:
+                os.remove(marker_path)
+            except Exception:
+                pass
+            return
+
+        viz_operator = (_data.get("viz_operator") or "").strip()
+        if not viz_operator:
+            try:
+                os.remove(marker_path)
+            except Exception:
+                pass
+            return
+
+        # Injection-safe charset validation: POSIX username chars only
+        if not re.match(r"^[a-z_][a-z0-9_-]*$", viz_operator):
+            try:
+                os.remove(marker_path)
+            except Exception:
+                pass
+            return
+
+        # setfacl/getfacl must be available; leave marker if not (retry later)
+        if not _shutil.which("setfacl") or not _shutil.which("getfacl"):
+            return
+
+        # engram_home must exist; if not, ENGRAM not yet installed — leave marker
+        if not os.path.isdir(engram_home):
+            return
+
+        # Idempotency: if ACL already present, just remove the marker
+        try:
+            _gf = subprocess.run(
+                ["getfacl", "--", engram_home],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if f"user:{viz_operator}:" in _gf.stdout:
+                try:
+                    os.remove(marker_path)
+                except Exception:
+                    pass
+                return
+        except Exception:
+            return  # leave marker on getfacl failure; retry next session
+
+        # Apply ACL — the agent owns ~/.engram, so no sudo required
+        try:
+            _r1 = subprocess.run(
+                ["setfacl", "-R", "-m", f"u:{viz_operator}:rX", engram_home],
+                capture_output=True,
+                timeout=30,
+            )
+            if _r1.returncode != 0:
+                return  # leave marker; retry next session
+
+            _r2 = subprocess.run(
+                ["setfacl", "-R", "-d", "-m", f"u:{viz_operator}:rX", engram_home],
+                capture_output=True,
+                timeout=30,
+            )
+            if _r2.returncode != 0:
+                return  # leave marker
+
+            # config.json rw (viz config-edit tab). Best-effort: its return code
+            # is intentionally not checked — marker removal is tied to the rX
+            # grant above (the load-bearing read access), not the rw upgrade.
+            _config_json = os.path.join(engram_home, "config.json")
+            if os.path.isfile(_config_json):
+                subprocess.run(
+                    ["setfacl", "-m", f"u:{viz_operator}:rw", _config_json],
+                    capture_output=True,
+                    timeout=10,
+                )
+        except Exception:
+            return  # leave marker; never raise
+
+        # Success: remove the pending marker
+        try:
+            os.remove(marker_path)
+        except Exception:
+            pass  # idempotent on next session via getfacl check
+    except Exception:
+        return  # outer guard: NEVER block or break session start
+
+
 def main() -> None:
     _t0 = time.perf_counter()
 
@@ -1085,6 +1422,7 @@ def main() -> None:
     # peers can discover co-host vs cross-host topology. Fail-soft: the shared
     # filesystem may not exist (single-host install), and write_agent_registration
     # is wrapped in a broad try/except that swallows all errors silently.
+    _agent_name = ""
     try:
         _config_path = os.path.join(ENGRAM_HOME, "config.json")
         with open(_config_path) as _cf:
@@ -1092,6 +1430,7 @@ def main() -> None:
         _agent_name = _cfg.get("agent_name", "").strip()
         if _agent_name:
             write_agent_registration(_agent_name)
+            update_counterparts_from_registry(_agent_name, _config_path, AGENT_REGISTRY_DIR)
     except Exception:
         pass  # fail-soft: never break SessionStart for registration
 
@@ -1132,6 +1471,9 @@ def main() -> None:
         monitor_block = forum_monitor_block()
         if monitor_block:
             lines.append(monitor_block)
+        peer_block = peer_topology_block(_agent_name)
+        if peer_block:
+            lines.append(peer_block)
     else:
         lines.append(
             f"[Session start reading — re-read {WARM_BRIEFING_PATH} before "
@@ -1185,6 +1527,17 @@ def main() -> None:
         _starred = starred_block(ENGRAM_HOME)
         if _starred:
             lines.append(_starred)
+    except Exception:
+        pass
+
+    # ── Deferred viz-ACL application ──────────────────────────────────────
+    # Pick up the pending marker written by agentctl finalize-name when
+    # ~/.engram didn't exist yet (agent installs ENGRAM post-finalize). Applies
+    # the ACL now that ~/.engram is present. Entirely advisory: _apply_pending_viz_acl
+    # is internally wrapped in try/except and never raises; this outer guard is
+    # belt-and-suspenders. Closes #1525.
+    try:
+        _apply_pending_viz_acl(ENGRAM_HOME)
     except Exception:
         pass
 

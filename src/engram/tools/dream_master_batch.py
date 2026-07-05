@@ -23,6 +23,7 @@ Bucket names match the dream-master's action categories:
   goal_tension_resolutions — engram_resolve on gt_* nodes
   edge_wiring         — engram_add_edge calls (Category 7 missing-edge suggestions)
   task_closures       — engram_update_task calls (Category 8 stale-task-ref closures)
+  coverage_gaps       — Category 9 cornerstone auto-load surface gaps (human-action items)
 
 Suggestion-string → bucket routing uses the SUGGESTION_ROUTING table below;
 add new entries when the dream-fairy spec adds new suggestion types.
@@ -46,6 +47,7 @@ BUCKET_CORNERSTONE_MOVES = "cornerstone_moves"
 BUCKET_GOAL_TENSION_RESOLUTIONS = "goal_tension_resolutions"
 BUCKET_EDGE_WIRING = "edge_wiring"
 BUCKET_TASK_CLOSURES = "task_closures"
+BUCKET_COVERAGE_GAPS = "coverage_gaps"
 BUCKET_UNKNOWN = "unknown"
 
 ALL_BUCKET_NAMES = (
@@ -58,6 +60,7 @@ ALL_BUCKET_NAMES = (
     BUCKET_GOAL_TENSION_RESOLUTIONS,
     BUCKET_EDGE_WIRING,
     BUCKET_TASK_CLOSURES,
+    BUCKET_COVERAGE_GAPS,
     BUCKET_UNKNOWN,
 )
 
@@ -102,6 +105,11 @@ SUGGESTION_ROUTING: list[tuple[str, str]] = [
     (r"\blesson\b", BUCKET_LESSONS),
     (r"\bregister.*incident\b", BUCKET_LESSONS),
     (r"\bincident.*lesson\b", BUCKET_LESSONS),
+    # Coverage gap patterns (Category 9) — MUST precede generic cornerstone patterns
+    # because coverage-gap suggestions contain "cornerstone" but route to the
+    # human-action bucket, not cornerstone_moves.
+    (r"\bauto.load surface\b", BUCKET_COVERAGE_GAPS),
+    (r"\bwarm.briefing anchor\b", BUCKET_COVERAGE_GAPS),
     # Cornerstone patterns
     (r"\bcornerstone\b", BUCKET_CORNERSTONE_MOVES),
     (r"\banchors?\b", BUCKET_CORNERSTONE_MOVES),

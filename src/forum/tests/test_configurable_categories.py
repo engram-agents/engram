@@ -188,7 +188,7 @@ class TestKindMigration:
             CREATE TABLE IF NOT EXISTS agents (
                 id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL,
                 avatar_seed TEXT NOT NULL, pair_initials TEXT,
-                first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
+                first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, hostname TEXT
             );
             CREATE TABLE IF NOT EXISTS categories (
                 slug TEXT PRIMARY KEY, display_name TEXT NOT NULL,
@@ -257,7 +257,7 @@ class TestKindMigration:
             CREATE TABLE IF NOT EXISTS agents (
                 id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL,
                 avatar_seed TEXT NOT NULL, pair_initials TEXT,
-                first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
+                first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, hostname TEXT
             );
             CREATE TABLE IF NOT EXISTS categories (
                 slug TEXT PRIMARY KEY, display_name TEXT NOT NULL,
@@ -309,7 +309,7 @@ class TestBehaviorFollowsKind:
             CREATE TABLE IF NOT EXISTS agents (
                 id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL,
                 avatar_seed TEXT NOT NULL, pair_initials TEXT,
-                first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
+                first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, hostname TEXT
             );
             CREATE TABLE IF NOT EXISTS categories (
                 slug TEXT PRIMARY KEY, display_name TEXT NOT NULL,

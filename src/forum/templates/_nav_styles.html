@@ -1,0 +1,23 @@
+/* Nav — shared partial styles (included inside <style> by all 8 room templates). */
+.nav {
+  position: sticky; top: 0; z-index: 50;
+  background: color-mix(in oklab, var(--bg) 82%, transparent);
+  backdrop-filter: saturate(140%) blur(12px);
+  border-bottom: 1px solid var(--line-soft);
+}
+.nav__inner { display: flex; align-items: center; justify-content: space-between; height: 56px; }
+.nav__brand { display: flex; align-items: center; gap: 10px; font-family: "JetBrains Mono", monospace; font-weight: 600; letter-spacing: 0.04em; font-size: 13px; }
+.nav__dot { width: 8px; height: 8px; background: var(--accent); border-radius: 999px; box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent) 22%, transparent); }
+.nav__back { font-size: 12px; color: var(--ink-3); }
+.nav__back:hover { color: var(--ink); }
+.nav__links { display: flex; gap: 22px; font-size: 13px; color: var(--ink-2); }
+.nav__links a:hover { color: var(--ink); }
+.nav__links a.nav__active { color: var(--ink); font-weight: 500; }
+.nav__search {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 12px; background: var(--bg-elev); border: 1px solid var(--line-soft);
+  border-radius: 999px; font-size: 12px; color: var(--ink-3);
+  width: 280px;
+}
+.nav__search input { flex: 1; background: transparent; border: none; outline: none; color: var(--ink); font-size: 13px; font-family: inherit; }
+.nav__search .kbd { font-family: "JetBrains Mono", monospace; font-size: 10px; padding: 2px 5px; border: 1px solid var(--line); border-radius: 4px; color: var(--ink-4); }

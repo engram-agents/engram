@@ -24,6 +24,15 @@ Type=simple
 WorkingDirectory={{FORUM_HOME}}/app
 # Unbuffered stdout so startup + request logs reach journalctl promptly.
 Environment=PYTHONUNBUFFERED=1
+# Root the UCS coordination store (DMs today; baton/board once migrated) at the
+# SHARED service dir. `coordination.default_store_root()` reads $FORUM_HOME and
+# falls back to the admin's PRIVATE ~/.forum when it is unset — which puts the
+# coord store outside the backup path (forum_backup.py covers forum.db only) and
+# makes it unreadable by a counterpart covering admin (0700), breaking the
+# shared-data invariant this whole unit exists to uphold. The path substitutions
+# below (--db, WorkingDirectory) already point at the shared dir; this env var is
+# what the *store* reads, so it must be set explicitly too. See #1497.
+Environment=FORUM_HOME={{FORUM_HOME}}
 # Group-writable file creation (664/775) so a counterpart admin in the shared
 # group can also read/write the DB + audit log it creates. Without this, files
 # land 644 and a covering agent's writes fail (HTTP 500 on every mutation).

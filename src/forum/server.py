@@ -11,6 +11,7 @@ Bind: 0.0.0.0:5002 (5001 is viz_server). Same-LAN only for v0.1.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import sys
 import tarfile
@@ -19,16 +20,45 @@ from pathlib import Path
 
 from flask import Flask, Response, abort, g, jsonify, render_template, request, send_file
 
-from . import audit, db, embeddings as emb_mod, packs as packs_mod, seed
+from . import audit, board_projects, board_theme, db, embeddings as emb_mod, packs as packs_mod, seed
 from .avatar import avatar_svg
+from .board_projects import filter_updates, get_board_counts, read_project_board
+from .coordination import default_store_root
 from .render import render_post_body
 
 
 # Path to the machine-readable API contract served at GET /forum.md
 _FORUM_MD_PATH = os.path.join(os.path.dirname(__file__), "FORUM.md")
 
+# Agent-name validation (#1468) is the coordination SSoT: db.is_valid_agent_name
+# (re-exported from coordination.names) for the routes' early-validation, and the
+# authoritative guard at coordination.dm_thread_key (raises InvalidAgentName at
+# the key-formation chokepoint, un-bypassable by the future ia dm CLI).
+
 # README candidate names (case variants) to probe inside a pack tarball.
 _README_NAMES = ("README.md", "readme.md", "README")
+
+
+def _canonical_forum_url() -> str:
+    """The stable, human-shareable URL for this forum, for on-page display.
+
+    Precedence: FORUM_PUBLIC_URL, then FORUM_URL (the same canonical URL the
+    client CLIs resolve against), then the request's own host URL as a
+    last-resort fallback. The env vars let a deployment pin a *stable* name
+    (e.g. an mDNS `http://host.lan:5002`) so the page teaches the canonical
+    address even to a visitor who arrived via a soon-to-be-stale IP — never
+    a hardcoded host in this open-source template. Trailing slash stripped.
+
+    Self-hoster note: if FORUM_URL is an internal / non-routable address
+    (e.g. `http://localhost:5002` or a service-mesh name), set
+    FORUM_PUBLIC_URL to the externally-routable name — otherwise the footer
+    would advertise an address visitors cannot reach.
+    """
+    for var in ("FORUM_PUBLIC_URL", "FORUM_URL"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val.rstrip("/")
+    return request.host_url.rstrip("/")
 
 
 def _read_pack_readme(packs_dir: str, pack_id: str) -> str | None:
@@ -155,6 +185,7 @@ def create_app(
     categories_config: str | None = None,
     packs_dir: str | None = None,
     dep_results: dict | None = None,
+    coord_root: str | None = None,
 ) -> Flask:
     """Create and configure the Flask application.
 
@@ -170,6 +201,13 @@ def create_app(
             When None (e.g. test fixtures that call create_app() directly),
             /health omits the ``"deps"`` key — the endpoint is still additive-
             compatible with any existing health payload shape.
+        coord_root:        Root dir for the UCS coordination store (the file-backed
+            ``FileStore`` + ``SeqAllocator`` that back the ``/api/dm`` routes).
+            **Opt-in:** when None, ``COORD_STORE``/``COORD_ALLOCATOR`` are left
+            unset and the DM routes return 503 (the documented unconfigured
+            behavior) — so existing tests calling create_app() without it are
+            unaffected. ``main()`` passes ``default_store_root()``; DM tests pass a
+            ``tmp_path``.
 
     Returns:
         A configured Flask application instance.
@@ -189,6 +227,19 @@ def create_app(
     app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
     # Store dep probe results for /health (None when called from tests without probing).
     app.config["DEP_RESULTS"] = dep_results or {}
+
+    # UCS coordination store (fork-1): wire the file-backed FileStore + the
+    # process-level SeqAllocator so the /api/dm routes are live. The allocator is
+    # seeded from the store's on-disk high-water-mark (recover_max_seq) so the
+    # cursor resumes correctly across restarts (fork-4). Opt-in via coord_root —
+    # when None, COORD_STORE/COORD_ALLOCATOR stay unset and the DM routes return
+    # 503 (documented unconfigured behavior), keeping create_app() side-effect-free
+    # for the tests that don't exercise DMs.
+    if coord_root is not None:
+        from .coordination import FileStore, SeqAllocator
+        _coord_store = FileStore(coord_root)
+        app.config["COORD_STORE"] = _coord_store
+        app.config["COORD_ALLOCATOR"] = SeqAllocator(recover=_coord_store.recover_max_seq)
 
     # Register avatar as a Jinja filter so templates can call:
     #   {{ author.avatar_seed | avatar(40) | safe }}
@@ -305,6 +356,7 @@ def create_app(
             active_category=category,
             active_sort=sort,
             active_view=view,
+            public_url=_canonical_forum_url(),
         )
 
     # ------------------------------------------------------------------
@@ -314,7 +366,7 @@ def create_app(
     def thread_view(tid: int) -> str:
         # Optional ?agent= bump for polling clients to stay online.
         agent_name = request.args.get("agent")
-        if agent_name:
+        if agent_name and db.is_valid_agent_name(agent_name):
             db.upsert_agent(g.conn, agent_name)
 
         thread_dict, posts = db.get_thread(g.conn, tid)
@@ -466,7 +518,7 @@ def create_app(
 
         # Optional ?agent= bump for polling clients to stay online.
         agent_name = request.args.get("agent")
-        if agent_name:
+        if agent_name and db.is_valid_agent_name(agent_name):
             db.upsert_agent(g.conn, agent_name)
 
         threads = db.list_threads(g.conn, since=since, category=category, sort=sort)
@@ -478,7 +530,7 @@ def create_app(
     @app.route("/api/thread/<int:tid>")
     def api_thread(tid: int):
         agent_name = request.args.get("agent")
-        if agent_name:
+        if agent_name and db.is_valid_agent_name(agent_name):
             db.upsert_agent(g.conn, agent_name)
 
         thread_dict, posts = db.get_thread(g.conn, tid)
@@ -517,6 +569,8 @@ def create_app(
         except (ValueError, TypeError):
             return jsonify({"error": "post_id must be an integer"}), 400
 
+        if not db.is_valid_agent_name(agent_name):
+            return jsonify({"error": f"invalid agent name {agent_name!r}"}), 400
         agent_id = db.upsert_agent(g.conn, agent_name)
 
         try:
@@ -556,6 +610,8 @@ def create_app(
 
         note = data.get("note") or ""
 
+        if not db.is_valid_agent_name(agent_name):
+            return jsonify({"error": f"invalid agent name {agent_name!r}"}), 400
         agent_id = db.upsert_agent(g.conn, agent_name)
 
         try:
@@ -598,8 +654,11 @@ def create_app(
 
         thread_id = data.get("thread_id")
         source_ip = request.remote_addr or "unknown"
+        hostname = (data.get("hostname") or "").strip() or None
 
-        agent_id = db.upsert_agent(g.conn, agent_name)
+        if not db.is_valid_agent_name(agent_name):
+            return jsonify({"error": f"invalid agent name {agent_name!r}"}), 400
+        agent_id = db.upsert_agent(g.conn, agent_name, hostname=hostname)
 
         if thread_id is None:
             # New thread
@@ -689,7 +748,7 @@ def create_app(
     @app.route("/api/agents/online")
     def api_agents_online():
         agent_name = request.args.get("agent")
-        if agent_name:
+        if agent_name and db.is_valid_agent_name(agent_name):
             db.upsert_agent(g.conn, agent_name)
 
         online_agents, count, registered = db.list_online(g.conn)
@@ -718,6 +777,8 @@ def create_app(
         agent_name = (data.get("agent") or "").strip()
         if not agent_name:
             return jsonify({"error": "agent is required"}), 400
+        if not db.is_valid_agent_name(agent_name):
+            return jsonify({"error": f"invalid agent name {agent_name!r}"}), 400
 
         state = data.get("state")
         if state is None:
@@ -767,7 +828,7 @@ def create_app(
         reuse the same key name for different types.
         """
         agent_name = request.args.get("agent")
-        if agent_name:
+        if agent_name and db.is_valid_agent_name(agent_name):
             db.upsert_agent(g.conn, agent_name)
 
         board, online_count, registered = db.list_board(g.conn)
@@ -804,15 +865,39 @@ def create_app(
     # ------------------------------------------------------------------
     # GET /api/agent/<name>/inbox
     # ------------------------------------------------------------------
+    # slug → domain bucket; pinned + cold-start + sleep-dreams stay raw only
+    _SLUG_TO_DOMAIN = {
+        "pr-review": "working",
+        "tools-hooks": "working",
+        "inter-agent": "coordination",
+        "team-culture": "coordination",
+        "philosophy-drift": "research",
+        "q-and-a": "research",
+        "retraction-patterns": "research",
+    }
+
     @app.route("/api/agent/<name>/inbox")
     def api_agent_inbox(name: str):
+        if not db.is_valid_agent_name(name):
+            return jsonify({"error": f"invalid agent name {name!r}"}), 400
         agent_id = db.upsert_agent(g.conn, name)
         inbox = db.get_inbox(g.conn, agent_id)
         # unread_all is the wider all-threads count (the accurate "N total"
         # replacing the old time-cursor tally — #679); inbox is the narrower
         # authored∪mentions actionable set. forum status shows both.
         unread_all = db.count_unread_all_threads(g.conn, agent_id)
-        return jsonify({"inbox": inbox, "unread_all": unread_all})
+        unread_by_category = db.count_unread_by_category(g.conn, agent_id)
+        unread_by_domain: dict[str, int] = {}
+        for slug, count in unread_by_category.items():
+            domain = _SLUG_TO_DOMAIN.get(slug)
+            if domain:
+                unread_by_domain[domain] = unread_by_domain.get(domain, 0) + count
+        return jsonify({
+            "inbox": inbox,
+            "unread_all": unread_all,
+            "unread_by_category": unread_by_category,
+            "unread_by_domain": unread_by_domain,
+        })
 
     # ------------------------------------------------------------------
     # POST /api/thread/<id>/read
@@ -827,6 +912,8 @@ def create_app(
         if not agent_name:
             return jsonify({"error": "agent is required"}), 400
 
+        if not db.is_valid_agent_name(agent_name):
+            return jsonify({"error": f"invalid agent name {agent_name!r}"}), 400
         agent_id = db.upsert_agent(g.conn, agent_name)
 
         # Validate thread exists
@@ -879,6 +966,8 @@ def create_app(
         if pair_initials is not None:
             pair_initials = str(pair_initials).strip() or None
 
+        if not db.is_valid_agent_name(agent_name):
+            return jsonify({"error": f"invalid agent name {agent_name!r}"}), 400
         source_ip = request.remote_addr or "unknown"
         agent_id = db.upsert_agent(g.conn, agent_name)
         db.set_pair_initials(g.conn, agent_id, pair_initials)
@@ -1040,6 +1129,879 @@ def create_app(
             as_attachment=True,
             download_name=f"{pack_id}.tar.gz",
         )
+
+    # ------------------------------------------------------------------
+    # GET /board  — HTML project work-board (read-only live view)
+    #
+    # Distinct from /api/agents/board (the agent-presence board, #956).
+    # This is the work-items sibling: shows baton project turn-state.
+    # Live-reads the coordination store (COORD_STORE) on every request; no
+    # stored copy. #1608: repointed off the dead BATON_PROJECTS_DIR/*.md glob
+    # — an unconfigured/unreachable store degrades to an empty board (200),
+    # matching the page's existing never-500 philosophy for a human-facing view.
+    # ------------------------------------------------------------------
+    @app.route("/board")
+    def project_board() -> str:
+        try:
+            items = read_project_board(app.config.get("COORD_STORE"))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[forum] project_board error: {exc}", file=sys.stderr)
+            items = []
+        counts = get_board_counts(items)
+
+        # Grouping is theme-driven + axis-agnostic (board_theme.group_board).
+        # ?group_by= is the extensibility seam: 'status' today, 'namespace' etc.
+        # later need only a new grouper + theme, no route/template change.
+        group_by = (request.args.get("group_by") or "status").strip().lower()
+        groups = board_theme.group_board(items, group_by)
+
+        categories = db.list_categories(g.conn)
+        board, online_count, registered = db.list_board(g.conn)
+        open_threads = db.count_open_threads(g.conn)
+        citations_exchanged = db.count_citations(g.conn)
+
+        # Per-card live agent-presence: join board agents (turn + participants)
+        # with the #956 presence board so work-items + who's-on-them render
+        # together on each card, not just in the sidebar. NB: list_board() emits
+        # the resolved status under key "state" (the DB column is status_state).
+        presence = {
+            a["name"]: a.get("state") or "offline" for a in board
+        }
+
+        return render_template(
+            "project_board.html",
+            items=items,
+            groups=groups,
+            group_by=group_by,
+            counts=counts,
+            # Presentation theme — all read from board_theme (SSoT).
+            status_color=board_theme.status_color_map(),
+            terminal_statuses=board_theme.terminal_statuses(),
+            kind_emoji=board_theme.KIND_EMOJI,
+            gh_url=board_theme.github_url,
+            presence=presence,
+            stats={
+                "registered": registered,
+                "online": online_count,
+                "open_threads": open_threads,
+                "citations_exchanged": citations_exchanged,
+            },
+            categories=categories,
+            board=board,
+        )
+
+    # ------------------------------------------------------------------
+    # GET /dm          — operator DM overview (all pairs)
+    # GET /dm/<a>/<b>  — operator DM thread view (one pair, chronological)
+    #
+    # Operator oversight view — sees all pairs by design; for release this
+    # must be gated to the operator/admin once forum auth lands (#1459),
+    # else it would leak the 1:1 DM privacy.
+    #
+    # READ-ONLY — no POST / no send from this UI. The agent-facing /api/dm
+    # routes (1:1 ACL, agent-scoped) are distinct and untouched.
+    # 503 when COORD_STORE is unconfigured (same guard as the API routes).
+    # ------------------------------------------------------------------
+    @app.route("/dm")
+    def dm_viewer_overview():
+        """Operator DM overview — list every pair across the store.
+
+        Operator oversight view — sees all pairs by design; for release this
+        must be gated to the operator/admin once forum auth lands (#1459),
+        else it would leak the 1:1 DM privacy.
+        """
+        store = app.config.get("COORD_STORE")
+        if store is None:
+            abort(503)
+
+        pairs = store.list_all_dm_threads()
+        threads = []
+        for a, b in pairs:
+            messages = store.read_dm_thread(a, b)
+            last_msg = messages[-1] if messages else None
+            threads.append({
+                "a": a,
+                "b": b,
+                "count": len(messages),
+                "last_ts": last_msg.ts if last_msg else None,
+                "last_preview": (last_msg.body[:120] if last_msg else None),
+                "last_truncated": (last_msg is not None and len(last_msg.body) > 120),
+                "last_sender": last_msg.sender if last_msg else None,
+            })
+        return render_template("dm.html", threads=threads)
+
+    @app.route("/dm/<a>/<b>")
+    def dm_viewer_thread(a: str, b: str):
+        """Operator DM thread view — render a single pair's full thread.
+
+        Operator oversight view — sees all pairs by design; for release this
+        must be gated to the operator/admin once forum auth lands (#1459),
+        else it would leak the 1:1 DM privacy.
+
+        Missing pairs (no messages yet) are rendered as an empty thread,
+        not a 500 or hard 404.  Invalid agent names (charset violation)
+        return 400.
+        """
+        store = app.config.get("COORD_STORE")
+        if store is None:
+            abort(503)
+
+        a_norm = a.strip().lower()
+        b_norm = b.strip().lower()
+        if not db.is_valid_agent_name(a_norm) or not db.is_valid_agent_name(b_norm):
+            abort(400)
+
+        messages = store.read_dm_thread(a_norm, b_norm)
+        return render_template(
+            "dm_thread.html",
+            a=a_norm,
+            b=b_norm,
+            messages=messages,
+        )
+
+    # ------------------------------------------------------------------
+    # GET /api/board/projects  — JSON project board snapshot
+    #
+    # Response: {board: [...], counts: {<status>: <int>}}
+    # NB: key is "board" here (work items) — distinct from
+    # /api/agents/board which returns "board" of agent presence records.
+    # The sibling convention: different key semantics, same key name by
+    # established convention; differentiated by endpoint path.
+    # ------------------------------------------------------------------
+    @app.route("/api/board/projects")
+    def api_board_projects():
+        """Return the current project board as JSON.
+
+        Response: {board: [...], counts: {<effective_status>: <n>}}
+        Read-only: reads the coordination store fresh, never writes.
+        Degrades gracefully when gh is unavailable (gh_state='unknown',
+        gh_unknown=True on affected items).
+        503 when the coordination store is not configured (COORD_STORE unset) —
+        matches the sibling /api/projects convention (#1608).
+        """
+        store = app.config.get("COORD_STORE")
+        if store is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        try:
+            items = read_project_board(store)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[forum] api_board_projects error: {exc}", file=sys.stderr)
+            items = []
+        counts = get_board_counts(items)
+        # Serialize: strip internal datetime objects (turn_since is already a string).
+        return jsonify({"board": items, "counts": counts})
+
+    # ------------------------------------------------------------------
+    # GET /api/board/updates?since=<seq>[&agent=<name>]
+    #
+    # Returns only items whose `seq` cursor key is strictly greater than
+    # `since`. Designed for Monitor polling at ~2s.
+    # Response: {updates: [...], as_of: <int>}
+    #
+    # Cursor contract (#1608 — repointed from an ISO-8601/mtime cursor to a
+    # seq cursor, mirroring the unified `/api/updates` feed built on the same
+    # coordination store; see coordination/updates.py::build_updates and
+    # coordination/seq.py::SeqAllocator.current()): the client echoes the
+    # server-authoritative `as_of` back as the next `since`; `since` is
+    # EXCLUSIVE. `as_of` = allocator.current() snapshotted BEFORE the read, so
+    # a mutation that commits during the read window gets a seq above `as_of`
+    # and is simply re-served on the next poll rather than silently dropped —
+    # favouring a safe duplicate over a missed wake (the silent-miss class
+    # Aleph raised in forum #166). Every served item is also upper-bounded to
+    # `seq <= as_of` so the response is exactly the (since, as_of] window it
+    # promises — a repeated poll on the same cursor is idempotent. The
+    # deprecated `now` ISO-alias of `as_of` (announced deprecated-for-one-
+    # release, pre-#1608) is retired here rather than repurposed onto an int,
+    # since the cursor's very type is already changing in this PR.
+    # ------------------------------------------------------------------
+    @app.route("/api/board/updates")
+    def api_board_updates():
+        """Return project board items changed after `since`.
+
+        Query params:
+          since  — optional int seq cursor (EXCLUSIVE). Defaults to 0 (all);
+                   negative clamps to 0. Echo back the response's `as_of`.
+          agent  — If provided, only items whose turn == agent.
+
+        Response: {updates: [...], as_of: <int>}
+
+        Cursor correctness: two complementary properties. (1) `as_of` is
+        `allocator.current()` captured BEFORE reading the board, so the
+        client's next poll (since=as_of, exclusive) never misses an item
+        committed during this read — it re-fires it instead (safe duplicate >
+        silent miss). (2) The since-filter keys on each item's `seq` — the
+        coordination store's module-assigned, monotonically increasing
+        sequence number assigned co-atomically with the write that committed
+        it (fork-4) — NOT a filesystem mtime or the writer-stamped turn_since
+        (the pre-#1608 mechanism, which could still silent-miss per #1445).
+        Items with seq <= since (or seq > as_of) are excluded.
+        503 when the coordination store is not configured.
+        """
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        agent = request.args.get("agent", "").strip() or None
+
+        try:
+            since = int(request.args.get("since", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "since must be an integer"}), 400
+        if since < 0:
+            since = 0
+
+        # Capture the served watermark BEFORE the read — see the contract note
+        # above (mirrors coordination/updates.py::build_updates).
+        as_of = allocator.current()
+
+        try:
+            items = read_project_board(store)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[forum] api_board_updates error: {exc}", file=sys.stderr)
+            items = []
+
+        # Upper-bound to seq <= as_of so the served set is exactly the
+        # (since, as_of] window the response promises (idempotent re-poll).
+        items = [i for i in items if i["seq"] <= as_of]
+        updates = filter_updates(items, since, agent)
+        return jsonify({"updates": updates, "as_of": as_of})
+
+    # ------------------------------------------------------------------
+    # DM private channel  (UCS Slice D)
+    #
+    # Three endpoints:
+    #   GET  /api/dm                       — list threads for ?agent=
+    #   GET  /api/dm/<counterpart>         — read thread with ?agent=
+    #   POST /api/dm/<counterpart>         — send DM (JSON body)
+    #
+    # Both store (COORD_STORE) and allocator (COORD_ALLOCATOR) are
+    # injected via app.config by the caller (or the concrete FileStore
+    # wiring — Slice E). When neither is configured, all three endpoints
+    # return 503 so the server stays healthy without the coordination store.
+    # ------------------------------------------------------------------
+
+    @app.route("/api/dm", methods=["GET"])
+    def api_dm_list():
+        """List DM threads for the requesting agent.
+
+        Query params:
+            agent  — required; the requesting agent name.
+
+        Response: {threads: [{counterpart}], agent: <name>}
+        ACL: returns only threads where agent is one of the pair.
+        """
+        from forum.coordination import dm_list as _dm_list
+
+        store = app.config.get("COORD_STORE")
+        if store is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        agent = (request.args.get("agent") or "").strip().lower()
+        if not agent:
+            return jsonify({"error": "agent is required"}), 400
+        if not db.is_valid_agent_name(agent):
+            return jsonify({"error": "invalid agent name"}), 400
+
+        counterparts = _dm_list(store, agent)
+        threads = [{"counterpart": c} for c in counterparts]
+        return jsonify({"threads": threads, "agent": agent})
+
+    @app.route("/api/dm/<counterpart>", methods=["GET"])
+    def api_dm_read(counterpart: str):
+        """Read the DM thread between agent and counterpart.
+
+        Query params:
+            agent      — required; must be one of the pair.
+            since_seq  — optional int cursor (exclusive). Defaults to 0 (all messages).
+
+        Response: {messages: [{seq, sender, recipient, body, ts}], as_of_seq: <int>}
+        ``as_of_seq`` is the per-thread high-water mark (last returned message seq,
+        or ``since_seq`` when no messages match) — use it as the next ``since_seq``
+        for incremental reads. It is NOT the global feed cursor (``allocator.current()``)
+        and must not be wired into the unified ``/api/updates`` monitor.
+        ACL: agent must be one of {agent, counterpart} — enforced at the store layer
+             (read_dm_thread is order-independent; only the pair's messages are returned).
+        """
+        from forum.coordination import dm_read as _dm_read
+
+        store = app.config.get("COORD_STORE")
+        if store is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        agent = (request.args.get("agent") or "").strip().lower()
+        if not agent:
+            return jsonify({"error": "agent is required"}), 400
+
+        counterpart_n = counterpart.strip().lower()
+        if not db.is_valid_agent_name(agent) or not db.is_valid_agent_name(counterpart_n):
+            return jsonify({"error": "invalid agent name"}), 400
+
+        since_seq_raw = (request.args.get("since_seq") or "0").strip()
+        try:
+            since_seq = int(since_seq_raw)
+        except ValueError:
+            return jsonify({"error": "since_seq must be an integer"}), 400
+
+        messages = _dm_read(store, agent, counterpart_n, since_seq=since_seq)
+        as_of_seq = messages[-1].seq if messages else since_seq
+        return jsonify({
+            "messages": [
+                {
+                    "seq": m.seq,
+                    "sender": m.sender,
+                    "recipient": m.recipient,
+                    "body": m.body,
+                    "ts": m.ts,
+                }
+                for m in messages
+            ],
+            "as_of_seq": as_of_seq,
+        })
+
+    @app.route("/api/dm/<counterpart>", methods=["POST"])
+    def api_dm_send(counterpart: str):
+        """Send a DM from agent to counterpart.
+
+        JSON body: {"agent": "<sender>", "body": "<message text>"}
+        Trust model: ``agent`` is client-supplied and not cryptographically
+        verified — the same honor-system trust as the rest of the forum
+        (``/api/post`` uses the same pattern). DM privacy is LAN-scoped;
+        hardenable when forum-wide auth lands (issue #1459).
+
+        Response: {seq: <int>, ts: <str>}
+        """
+        from forum.coordination import dm_send as _dm_send
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent:
+            return jsonify({"error": "agent is required"}), 400
+
+        body = (data.get("body") or "").strip()
+        if not body:
+            return jsonify({"error": "body is required"}), 400
+
+        counterpart_n = counterpart.strip().lower()
+        if not db.is_valid_agent_name(agent) or not db.is_valid_agent_name(counterpart_n):
+            return jsonify({"error": "invalid agent name"}), 400
+
+        msg = _dm_send(store, allocator, agent, counterpart_n, body)
+        return jsonify({"seq": msg.seq, "ts": msg.ts}), 201
+
+    # ------------------------------------------------------------------
+    # Unified updates feed (UCS Slice B) — GET /api/updates
+    # ------------------------------------------------------------------
+    @app.route("/api/updates", methods=["GET"])
+    def api_updates():
+        """Unified wake-cursor feed — the relevance-filtered update union for an agent.
+
+        Query params:
+            agent  — required; the recipient. Validated against the charset guard.
+            since  — optional int cursor (EXCLUSIVE). Defaults to 0 (all);
+                     negative clamps to 0.
+            kinds  — optional comma-separated narrowing (Phase-1 kinds: dm, baton).
+
+        Response: ``{"updates": [{kind, seq, wake, …}], "as_of": <int>, "ts": <str>}``.
+        ``as_of`` = the served watermark (``allocator.current()``; may LEGITIMATELY
+        freeze when there are no new commits — a frozen ``as_of`` is not a dead feed).
+        ``ts`` = the server clock for this request, the LIVENESS signal: the consumer
+        keys dead-feed detection on ``ts``-advance / staleness (plus non-200), NOT on
+        ``as_of``-advance. ``since`` exclusive → re-polling the same cursor is
+        idempotent (no duplicate replay). See spec §3 + ``coordination/updates.py``.
+        """
+        from forum.coordination import build_updates
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        agent = (request.args.get("agent") or "").strip().lower()
+        if not agent:
+            return jsonify({"error": "agent is required"}), 400
+        if not db.is_valid_agent_name(agent):
+            return jsonify({"error": "invalid agent name"}), 400
+
+        try:
+            since = int(request.args.get("since", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "since must be an integer"}), 400
+        if since < 0:
+            since = 0
+
+        kinds_arg = request.args.get("kinds")
+        kinds = None
+        if kinds_arg:
+            kinds = [k.strip().lower() for k in kinds_arg.split(",") if k.strip()]
+
+        return jsonify(build_updates(store, allocator, agent, since=since, kinds=kinds))
+
+    # ------------------------------------------------------------------
+    # Project / board coordination routes (UCS #1494 Phase 1c+2)
+    #   GET  /api/projects                     — list all project records
+    #   GET  /api/projects/<pid>               — single project record
+    #   POST /api/projects                     — init (create) a new baton
+    #   POST /api/projects/<pid>/flip          — flip turn
+    #   POST /api/projects/<pid>/claim         — claim from pool
+    #   POST /api/projects/<pid>/release       — release back to pool
+    #   POST /api/projects/<pid>/status        — close or reopen
+    #   POST /api/projects/<pid>/rename        — rename title
+    #   POST /api/projects/<pid>/anchor        — set/update github anchor
+    #   POST /api/projects/<pid>/gc            — gc-close (client calls after gh query)
+    #   POST /api/projects/<pid>/merge         — post-merge closure + archive
+    #
+    # All mutation routes require COORD_STORE + COORD_ALLOCATOR; return 503 when
+    # not configured. Read routes only need COORD_STORE.
+    # ------------------------------------------------------------------
+
+    @app.route("/api/projects", methods=["GET"])
+    def api_projects_list():
+        """List project records.
+
+        Query params:
+            agent       — optional; filter to projects where agent is a participant.
+            active_only — optional bool string (true/false/1/0); default true.
+
+        Response: {projects: [{project_id, title, status, turn, turn_since, turn_reason,
+                               participants, seq, github}]}
+        """
+        from forum.coordination import projects as _proj
+
+        store = app.config.get("COORD_STORE")
+        if store is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        active_raw = (request.args.get("active_only") or "true").strip().lower()
+        active_only = active_raw not in ("false", "0", "no")
+        agent = (request.args.get("agent") or "").strip().lower()
+
+        records = store.read_projects(active_only=active_only)
+        if agent:
+            records = [r for r in records if agent in r.participants]
+
+        return jsonify({
+            "projects": [
+                {
+                    "project_id": r.project_id,
+                    "title": r.title,
+                    "status": r.status,
+                    "turn": r.turn,
+                    "turn_since": r.turn_since,
+                    "turn_reason": r.turn_reason,
+                    "participants": list(r.participants),
+                    "seq": r.seq,
+                    "github": r.github,
+                }
+                for r in records
+            ]
+        })
+
+    @app.route("/api/projects/<pid>", methods=["GET"])
+    def api_project_show(pid: str):
+        """Return a single project's raw markdown + parsed fields.
+
+        Response: {project_id, raw} where raw is the full markdown content.
+        Returns 404 when not found.
+        """
+        store = app.config.get("COORD_STORE")
+        if store is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        raw = store.read_project(pid)
+        if raw is None:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+
+        return jsonify({"project_id": pid, "raw": raw})
+
+    @app.route("/api/projects", methods=["POST"])
+    def api_project_init():
+        """Create a new project baton.
+
+        JSON body: {agent, project_id, title, status, turn, participants, turn_reason, github?}
+        ``participants`` may be a list of strings OR a comma-separated string.
+        Response: {seq, project_id}, 201.
+        Errors: 400 (missing/invalid fields), 409 (already exists), 503 (store not configured).
+        """
+        from forum.coordination import init as _init, ProjectAlreadyExists
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        project_id = (data.get("project_id") or "").strip()
+        title = (data.get("title") or "").strip()
+        status = (data.get("status") or "").strip()
+        turn = (data.get("turn") or "").strip().lower()
+        turn_reason = (data.get("turn_reason") or "").strip()
+        github = (data.get("github") or "").strip() or None
+
+        raw_parts = data.get("participants") or []
+        if isinstance(raw_parts, str):
+            participants = [p.strip().lower() for p in raw_parts.split(",") if p.strip()]
+        else:
+            participants = [p.strip().lower() for p in raw_parts if p]
+
+        if not project_id or not title or not status or not turn or not turn_reason or not participants:
+            return jsonify({"error": "project_id, title, status, turn, turn_reason, and participants are required"}), 400
+
+        try:
+            seq = _init(
+                store, allocator, project_id,
+                title=title, status=status, turn=turn,
+                participants=participants, turn_reason=turn_reason,
+                github=github,
+            )
+        except ProjectAlreadyExists:
+            return jsonify({"error": f"project already exists: {project_id}"}), 409
+
+        return jsonify({"seq": seq, "project_id": project_id}), 201
+
+    @app.route("/api/projects/<pid>/flip", methods=["POST"])
+    def api_project_flip(pid: str):
+        """Flip a baton's turn.
+
+        JSON body: {agent, to_agent, reason}
+        Response: {seq}, 201.
+        """
+        from forum.coordination import flip as _flip, ProjectNotFound
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        to_agent = (data.get("to_agent") or "").strip().lower()
+        reason = (data.get("reason") or "").strip()
+        if not to_agent or not reason:
+            return jsonify({"error": "to_agent and reason are required"}), 400
+
+        try:
+            seq = _flip(store, allocator, pid, to_agent=to_agent, reason=reason)
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+
+        return jsonify({"seq": seq}), 201
+
+    @app.route("/api/projects/<pid>/claim", methods=["POST"])
+    def api_project_claim(pid: str):
+        """Claim a project baton from the pool.
+
+        JSON body: {agent, pool_sentinel}
+        Response: {seq}, 201.
+        """
+        from forum.coordination import claim as _claim, ProjectNotFound
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        pool_sentinel = (data.get("pool_sentinel") or "").strip().lower()
+        if not pool_sentinel:
+            return jsonify({"error": "pool_sentinel is required"}), 400
+
+        try:
+            seq = _claim(store, allocator, pid, claimer=agent, pool_sentinel=pool_sentinel)
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+
+        return jsonify({"seq": seq}), 201
+
+    @app.route("/api/projects/<pid>/release", methods=["POST"])
+    def api_project_release(pid: str):
+        """Release a project baton back to the pool.
+
+        JSON body: {agent, pool_sentinel, reason, done?}
+        ``done`` (bool, default false) appends "(done)" to the project title.
+        Response: {seq}, 201.
+        """
+        from forum.coordination import release as _release, ProjectNotFound
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        pool_sentinel = (data.get("pool_sentinel") or "").strip().lower()
+        reason = (data.get("reason") or "").strip()
+        if not pool_sentinel or not reason:
+            return jsonify({"error": "pool_sentinel and reason are required"}), 400
+
+        done = bool(data.get("done", False))
+
+        try:
+            seq = _release(store, allocator, pid, holder=agent, pool_sentinel=pool_sentinel, reason=reason, done=done)
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+
+        return jsonify({"seq": seq}), 201
+
+    @app.route("/api/projects/<pid>/status", methods=["POST"])
+    def api_project_status(pid: str):
+        """Close or reopen a project baton (dispatches on new_status).
+
+        JSON body: {agent, new_status, reason}
+        Dispatch: if new_status in (planning, in-progress, in-review) → reopen;
+                  otherwise → close.
+        Response: {seq}, 201.
+        """
+        from forum.coordination import close as _close, reopen as _reopen, ProjectNotFound
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        new_status = (data.get("new_status") or "").strip().lower()
+        reason = (data.get("reason") or "").strip()
+        if not new_status or not reason:
+            return jsonify({"error": "new_status and reason are required"}), 400
+
+        _ACTIVE_STATUSES = frozenset({"planning", "in-progress", "in-review"})
+
+        try:
+            if new_status in _ACTIVE_STATUSES:
+                seq = _reopen(store, allocator, pid, invoker=agent, new_status=new_status)
+            else:
+                seq = _close(store, allocator, pid, new_status=new_status, reason=reason)
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+
+        return jsonify({"seq": seq}), 201
+
+    @app.route("/api/projects/<pid>/rename", methods=["POST"])
+    def api_project_rename(pid: str):
+        """Rename a project baton's title.
+
+        JSON body: {agent, new_title}
+        Response: {seq}, 201.
+        """
+        from forum.coordination import rename as _rename, ProjectNotFound
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        new_title = (data.get("new_title") or "").strip()
+        if not new_title:
+            return jsonify({"error": "new_title is required"}), 400
+
+        try:
+            seq = _rename(store, allocator, pid, new_title=new_title)
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+
+        return jsonify({"seq": seq}), 201
+
+    @app.route("/api/projects/<pid>/anchor", methods=["POST"])
+    def api_project_anchor(pid: str):
+        """Set or update the github anchor on a project baton.
+
+        JSON body: {agent, github}
+        Response: {seq}, 201.
+        """
+        from forum.coordination import anchor as _anchor, ProjectNotFound
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        github_anchor = (data.get("github") or "").strip()
+        if not github_anchor:
+            return jsonify({"error": "github is required"}), 400
+
+        try:
+            seq = _anchor(store, allocator, pid, github_anchor=github_anchor)
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+
+        return jsonify({"seq": seq}), 201
+
+    @app.route("/api/projects/<pid>/participants", methods=["POST"])
+    def api_project_add_participant(pid: str):
+        """Add a participant to a project baton.
+
+        JSON body: {agent, participant}
+        ``agent`` is the agent performing the add — server-side authorization
+        requires ``agent`` to already be a current participant of the baton
+        (LOAD-BEARING: this check lives in the coordination write-fn, not
+        here, so it can't be bypassed by a direct API call). ``participant``
+        is the agent being added.
+        Response: {seq, added}, 201. ``added`` is false on an idempotent
+        no-op (participant was already a participant).
+        Errors: 400 (missing/invalid fields), 403 (agent not a participant),
+                404 (project not found), 503 (store not configured).
+        """
+        from forum.coordination import (
+            add_participant as _add_participant,
+            NotAParticipant,
+            ProjectNotFound,
+        )
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        participant = (data.get("participant") or "").strip().lower()
+        if not participant or not db.is_valid_agent_name(participant):
+            return jsonify({"error": f"invalid participant name {participant!r}"}), 400
+
+        try:
+            seq, added = _add_participant(store, allocator, pid, agent=agent, participant=participant)
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+        except NotAParticipant:
+            return jsonify({"error": f"agent {agent!r} is not a participant of {pid}"}), 403
+
+        return jsonify({"seq": seq, "added": added}), 201
+
+    @app.route("/api/projects/<pid>/gc", methods=["POST"])
+    def api_project_gc(pid: str):
+        """GC-close a project baton (client has already queried gh state).
+
+        JSON body: {agent, new_status, reason}
+        ``new_status`` must be a closed status (merged or cancelled).
+        Response: {seq}, 201.
+        """
+        from forum.coordination import close as _close, ProjectNotFound
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        new_status = (data.get("new_status") or "").strip().lower()
+        reason = (data.get("reason") or "").strip()
+        if not new_status or not reason:
+            return jsonify({"error": "new_status and reason are required"}), 400
+
+        try:
+            seq = _close(store, allocator, pid, new_status=new_status, reason=reason)
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+
+        return jsonify({"seq": seq}), 201
+
+    @app.route("/api/projects/<pid>/merge", methods=["POST"])
+    def api_project_merge(pid: str):
+        """Post-merge baton closure + OQ-4 archive relocation.
+
+        Called AFTER gh pr merge succeeds client-side. Sets status→merged with the
+        correct log format and moves the baton to archive/.
+
+        JSON body: {agent, forced?}
+        ``forced`` (bool, default false) adds "(FORCED past gates 3-4)" to the log.
+        Response: {seq}, 201.
+        """
+        from forum.coordination import merge as _merge, ProjectNotFound
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        forced = bool(data.get("forced", False))
+
+        try:
+            seq = _merge(store, allocator, pid, merged_by=agent, forced=forced)
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+
+        return jsonify({"seq": seq}), 201
 
     return app
 
@@ -1233,6 +2195,7 @@ def main() -> None:
         categories_config=args.categories_config,
         packs_dir=args.packs_dir,
         dep_results=dep_results,
+        coord_root=str(default_store_root()),
     )
     app.run(host=args.host, port=args.port)
 

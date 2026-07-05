@@ -1,47 +1,45 @@
 #!/usr/bin/env python3
-"""UserPromptSubmit hook: surface unread inter-agent letters to the recipient.
+"""UserPromptSubmit hook: surface unread DM messages to the agent.
 
-On every prompt, if the agent is in multi-agent mode, scans
-/home/agents-shared/inter-agent/ for markdown letters addressed to this
-agent and injects a summary of new and still-unread letters into the
-session context.
+On every prompt, in multi-agent mode, queries the forum DM update feed
+(GET /api/updates?agent=<me>&kinds=dm) for unread DMs and injects a
+summary into the session context.
 
-Two-cursor state (see DESIGN.md Layer 3):
-  - inter-agent-surfaced-cursor.txt: advances on every hook fire. Drives
-    the "new since last prompt" bucket. After the hook fires, letters that
-    were "new" drop to "older still-unread" on the next prompt.
+Two int (as_of) cursors:
+  - inter-agent-surfaced-cursor.txt: advances to the API `as_of` watermark
+    on every LIVE fetch. Drives the "new since last prompt" bucket. After the
+    hook fires, DMs that were "new" drop to "older still-unread" on the next
+    prompt. NOT advanced on outage (banner path) — a DM arriving during an
+    outage is never stepped over.
   - inter-agent-read-cursor.txt: advances only when the agent explicitly
-    acknowledges a letter (via engram-letter skill or manual cursor edit).
+    marks DMs as read (via `ia mr`). The hook READS it, NEVER advances it.
     Drives the "older still-unread" tally.
 
-Title extraction precedence (per DESIGN.md Layer 2):
-  1. First non-frontmatter `# Heading` line in the body.
-  2. The `re:` frontmatter field.
-  3. First 60 characters of the body text.
+Subject extraction precedence (from DM body):
+  1. **Subject:** bold-prefix line (PR3a `ia write` convention).
+  2. First `# Heading` line in the body.
+  3. First 60 characters of body text.
 
-Token budget cap: if "new since last prompt" exceeds 10 letters,
-group-summarize with a "+ N older from <authors>" line.
+Token budget cap: if "new since last prompt" exceeds LIST_CAP messages,
+group-summarize with a "+ N older from <senders>" line.
 
 Anti-patterns guarded:
   - Mode gate is the first check — single-agent installs
     see exactly zero behavior change.
   - Read cursor is NEVER advanced here; only surfaced cursor advances.
-  - No LLM calls, no network, no DB — file-system reads only.
-    Timeout budget: 5 seconds max.
+  - No LLM calls, no local-FS letter reads — one forum API call only.
+    Fail-open on unreachable: injects a brief warning banner, never crashes.
+  - No local INTER_AGENT_DIR fallback (the UCS pure-API invariant).
 
-Part of the inter-agent-comms-v1 cohort (PR 3), stacked on PR 1's
-mode-gate foundation (is_multi_agent_mode, get_counterparts helpers).
-
-Design doc: see project design notes.
+Part of the UCS PR3b migration (hooks/claude → forum DM API).
+Stacked on PR3a (ia.py DM CLI). Pattern reference: engram-baton-prompt-hook.py.
 """
 
-import hashlib
 import json
 import os
 import pwd
 import re
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -49,13 +47,46 @@ ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
     or str(Path.home() / ".engram")
 )
-INTER_AGENT_DIR = os.environ.get("INTER_AGENT_DIR", "/home/agents-shared/inter-agent")
 
 SURFACED_CURSOR_PATH = os.path.join(ENGRAM_HOME, "inter-agent-surfaced-cursor.txt")
 READ_CURSOR_PATH = os.path.join(ENGRAM_HOME, "inter-agent-read-cursor.txt")
 
 # If "new since last prompt" exceeds this, group-summarize instead of listing.
 LIST_CAP = 10
+
+# ---------------------------------------------------------------------------
+# Pure-API (UCS invariant): this hook reads DM state ONLY via the forum HTTP
+# API — no local-filesystem fallback.  forum_api ships in tools/.
+#
+# Resolve tools/ in BOTH topologies (mirrors engram-baton-prompt-hook.py) — a
+# fixed parents[N] is WRONG because the build FLATTENS hooks/claude/ -> hooks/,
+# so the deployed hook sits one level shallower than the source.  Prefer
+# $CLAUDE_PLUGIN_ROOT/tools when set, else walk parents and take the first dir
+# that actually contains forum_api.py.  Import is best-effort: a failure sets
+# _FORUM_API_OK=False, degrading the hook to a silent no-op rather than
+# crashing the prompt.
+# ---------------------------------------------------------------------------
+_tools_candidates = []
+_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
+if _plugin_root:
+    _tools_candidates.append(Path(_plugin_root) / "tools")
+for _parent in Path(__file__).resolve().parents:
+    _tools_candidates.append(_parent / "tools")
+_TOOLS_DIR = next(
+    (c for c in _tools_candidates if (c / "forum_api.py").exists()), None
+)
+if _TOOLS_DIR is not None and str(_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TOOLS_DIR))
+try:
+    from forum_api import (
+        ForumClient,
+        ForumNetworkError,
+        ForumHttpError,
+        forum_url_from_config,
+    )
+    _FORUM_API_OK = True
+except Exception:
+    _FORUM_API_OK = False
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +104,7 @@ def _load_config() -> dict:
     return {}
 
 
-def _get_agent_name(config: dict | None = None) -> str:
+def _get_agent_name(config: Optional[dict] = None) -> str:
     """Resolve this agent's own name.
 
     Priority:
@@ -82,12 +113,11 @@ def _get_agent_name(config: dict | None = None) -> str:
       3. $LOGNAME env var, agent- prefix stripped (Claude Code hook context
          populates $LOGNAME but not $USER).
       4. pwd.getpwuid(os.getuid()).pw_name, agent- prefix stripped.
-      5. Empty string (hook will see no matching letters — safe).
+      5. Empty string (hook will see no matching DMs — safe).
 
     Username layers (USER, LOGNAME, pwd) return the raw username if it doesn't
     start with `agent-` — caller (multi-agent mode) must validate via
-    counterparts list. Old `_get_agent_name` returned "" for non-agent
-    usernames; this is a deliberate behavioral change.
+    counterparts list.
     """
     if config is None:
         config = _load_config()
@@ -115,7 +145,7 @@ def _get_agent_name(config: dict | None = None) -> str:
     return ""
 
 
-def _is_multi_agent_mode(config: dict | None = None) -> bool:
+def _is_multi_agent_mode(config: Optional[dict] = None) -> bool:
     """True if config.json mode == 'multi'. Mirrors engram_client helper."""
     if config is None:
         config = _load_config()
@@ -123,105 +153,73 @@ def _is_multi_agent_mode(config: dict | None = None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Cursor helpers
+# Int cursor helpers  (as_of integer stored in cursor files)
 # ---------------------------------------------------------------------------
 
-def _read_cursor(path: str) -> Optional[datetime]:
-    """Read a cursor file; return UTC datetime or None if absent/invalid."""
+def _read_cursor_int(path: str) -> int:
+    """Read the cursor file; return int or 0 if absent/invalid."""
     try:
         raw = Path(path).read_text().strip()
+        return int(raw)
     except (OSError, ValueError):
-        return None
-    if not raw:
-        return None
-    try:
-        # Normalize trailing Z to +00:00 for fromisoformat compat
-        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        print(
-            f"[engram-inter-agent-hook] cursor at {path} is not an ISO-8601 timestamp "
-            f"(got: {raw[:200]!r}) — treating all letters as unread. "
-            f"Expected format: '2026-05-22T14:30:00Z'. See inter-agent/README.md §4.",
-            file=sys.stderr,
-        )
-        return None
+        return 0
 
 
-def _write_cursor(path: str, ts: datetime) -> None:
-    """Write a UTC datetime to a cursor file (ISO format with Z suffix).
+def _write_cursor_int(path: str, value: int) -> None:
+    """Write the cursor int to file atomically (tmp + os.replace).
 
-    Uses an atomic tmp + os.replace pattern so a concurrent hook fire cannot
-    read an empty or partial file between O_TRUNC and the write completing.
+    Uses atomic tmp + os.replace so a concurrent hook fire cannot read an
+    empty or partial file. Fail-open: logs to stderr on write error rather
+    than crashing the hook.
     """
-    ts_str = ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     dest = Path(path)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
     try:
-        tmp.write_text(ts_str + "\n")
-        os.replace(tmp, dest)  # atomic on POSIX
+        tmp.write_text(str(value) + "\n")
+        os.replace(tmp, dest)
     except OSError as e:
-        # Best-effort cleanup of tmp on failure; preserve old cursor.
         try:
             tmp.unlink()
         except OSError:
             pass
-        # Don't crash the hook on cursor-write failure — log to stderr and continue.
         print(f"WARN: cursor write failed: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
-# Letter parsing
+# DM body / subject extraction
 # ---------------------------------------------------------------------------
 
-_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
-_FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):\s*(.*)$", re.MULTILINE)
+_SUBJECT_RE = re.compile(r"^\*\*Subject:\*\*\s*(.+)$", re.MULTILINE)
 
 
-def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    """Extract YAML-ish frontmatter from a markdown letter.
-
-    Returns (fields_dict, body_text). On parse failure returns ({}, text).
-    Only parses simple key: value pairs — no nested YAML; sufficient for
-    the established frontmatter format (from, to, timestamp, re).
-    """
-    m = _FRONTMATTER_RE.match(text)
-    if not m:
-        return {}, text
-    fm_block = m.group(1)
-    body = text[m.end():]
-    fields = {}
-    for field_m in _FRONTMATTER_FIELD_RE.finditer(fm_block):
-        key = field_m.group(1).strip().lower()
-        val = field_m.group(2).strip()
-        fields[key] = val
-    return fields, body
-
-
-def _extract_title(fields: dict, body: str) -> str:
-    """Extract a display title from a parsed letter.
+def _extract_dm_subject(body: str) -> str:
+    """Extract a display subject from a DM body.
 
     Precedence:
-      1. First non-frontmatter `# Heading` line in the body.
-      2. The `re:` frontmatter field.
-      3. First 60 chars of body text (stripped).
+      1. ``**Subject:**`` bold-prefix line (PR3a ia write convention).
+      2. First ``# Heading`` line in the body.
+      3. First 60 chars of body text (stripped of leading hash lines).
     """
-    # Priority 1: first # heading in body
-    for line in body.splitlines():
+    text = body or ""
+
+    # Priority 1: **Subject:** line
+    m = _SUBJECT_RE.search(text)
+    if m:
+        subj = m.group(1).strip()
+        if subj:
+            return subj
+
+    # Priority 2: first # heading in body
+    for line in text.splitlines():
         line = line.strip()
         if line.startswith("#"):
             title = line.lstrip("#").strip()
             if title:
                 return title
 
-    # Priority 2: re: frontmatter field
-    re_field = fields.get("re", "").strip()
-    if re_field:
-        return re_field
-
-    # Priority 3: body-first-60 fallback. Skip hash-only / empty lines (those
-    # would produce a degenerate title like '##' or '').
+    # Priority 3: body-first-60 fallback — skip hash-only / empty lines
     body_lines = [
-        ln for ln in body.split("\n")
+        ln for ln in text.split("\n")
         if ln.strip() and ln.strip().lstrip("#").strip()
     ]
     if body_lines:
@@ -230,31 +228,20 @@ def _extract_title(fields: dict, body: str) -> str:
             return first_line[:57] + "..."
         return first_line
 
-    return "(no title)"
+    return "(no subject)"
 
 
-def _parse_letter_timestamp(ts_str: str) -> Optional[datetime]:
-    """Parse a frontmatter timestamp string into a UTC datetime."""
-    if not ts_str:
-        return None
-    try:
-        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-    except ValueError:
-        return None
+# ---------------------------------------------------------------------------
+# Sender formatting
+# ---------------------------------------------------------------------------
 
+def _format_senders(updates: list) -> str:
+    """Return a comma-joined sender string from a list of DM update dicts.
 
-def _format_ts(ts: datetime) -> str:
-    """Format a datetime for display: YYYY-MM-DDTHH:MMZ"""
-    return ts.strftime("%Y-%m-%dT%H:%MZ")
-
-
-def _format_senders(letters: list[dict]) -> str:
-    """Return a comma-joined sender string from a list of letter dicts.
-
-    Extracts sorted distinct 'from' values. If more than 3 distinct senders,
+    Extracts sorted distinct 'sender' values. If more than 3 distinct senders,
     shows first 2 followed by '+ K other(s)'.
     """
-    senders = sorted({l["from"] for l in letters})
+    senders = sorted({u.get("sender", "unknown") for u in updates})
     if len(senders) <= 3:
         return ", ".join(senders)
     shown = senders[:2]
@@ -263,137 +250,40 @@ def _format_senders(letters: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Letter scanning
+# Forum API: DM updates fetch
 # ---------------------------------------------------------------------------
 
-def _is_recipient(to_field: str, agent_name: str) -> bool:
-    """Return True iff agent_name is a whole-name match in the to: field.
+def _fetch_dm_updates(config: dict, agent_name: str, since: int) -> dict:
+    """GET /api/updates?agent=<agent>&kinds=dm&since=<since>.
 
-    Membership test: split on commas, strip whitespace, exact match — NOT
-    substring. "mira" does not match "miranda"; "ariadne" does not match a
-    to: field of "aria, borges".
+    Returns the full response dict: {updates: [...], as_of: int, ts: str}.
+    Raises ForumNetworkError / ForumHttpError on failure.
+    There is NO local-FS fallback — DM state lives only in the forum service.
 
-    Both to_field and agent_name are compared case-insensitively.
+    Short timeout (3s): runs synchronously on every prompt; a half-dead forum
+    must not stall the prompt beyond the hook's time budget.
     """
-    if not agent_name or not to_field:
-        return False
-    agent_lower = agent_name.strip().lower()
-    for name in to_field.split(","):
-        if name.strip().lower() == agent_lower:
-            return True
-    return False
-
-
-def _scan_letters(agent_name: str) -> list[dict]:
-    """Scan INTER_AGENT_DIR for letters addressed to agent_name.
-
-    Returns a list of dicts with keys: path, timestamp, from, title.
-    Files that don't parse cleanly are silently skipped.
-    """
-    inter_dir = Path(INTER_AGENT_DIR)
-    if not inter_dir.is_dir():
-        return []
-
-    letters = []
-    for md_file in inter_dir.glob("*.md"):
-        try:
-            text = md_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-
-        fields, body = _parse_frontmatter(text)
-        if not fields:
-            # No frontmatter — skip (malformed or README)
-            continue
-
-        # Must have a valid 'to' field that names our agent (membership test —
-        # exact whole-name match in the comma-split list, not substring).
-        to_field = fields.get("to", "").strip()
-        if not _is_recipient(to_field, agent_name):
-            continue
-
-        # Must have a parseable timestamp
-        ts = _parse_letter_timestamp(fields.get("timestamp", ""))
-        if ts is None:
-            continue
-
-        title = _extract_title(fields, body)
-        from_field = fields.get("from", "unknown").strip()
-
-        letters.append({
-            "path": str(md_file),
-            "timestamp": ts,
-            "from": from_field,
-            "title": title,
-        })
-
-    # Sort by timestamp ascending (oldest first within each bucket)
-    letters.sort(key=lambda l: l["timestamp"])
-    return letters
-
-
-# ---------------------------------------------------------------------------
-# Shared-bin drift detection
-# ---------------------------------------------------------------------------
-
-def _shared_bin_drift_lines(engram_home: Path, session_id: str) -> list[str]:
-    """Return banner lines for drifted shared-bin CLIs, or [] if clean/skip."""
-    shared_bin = Path("/home/agents-shared/bin")
-    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
-    if not shared_bin.exists() or not plugin_root:
-        return []
-
-    FAMILY = [("ia", "ia.py"), ("baton", "baton.py"), ("forum", "forum.py")]
-
-    def _md5(p: Path) -> str:
-        return hashlib.md5(p.read_bytes()).hexdigest()
-
-    drifted = []
-    for cli_name, src_name in FAMILY:
-        shared = shared_bin / cli_name
-        src = Path(plugin_root) / "tools" / src_name
-        if not shared.exists() or not src.exists():
-            continue
-        if _md5(shared) != _md5(src):
-            drifted.append((cli_name, src_name))
-
-    if not drifted:
-        return []
-
-    # Compute fingerprint of the drift set
-    fingerprint = hashlib.md5(str(sorted(drifted)).encode()).hexdigest()
-
-    # Once-per-session throttle: skip if same fingerprint + session already warned
-    state_file = engram_home / "shared-bin-drift.state"
-    try:
-        state = json.loads(state_file.read_text())
-        if state.get("fingerprint") == fingerprint and state.get("session_id") == session_id:
-            return []  # throttled — already warned this session
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
-
-    # Write state (update fingerprint + session)
-    try:
-        state_file.write_text(json.dumps({"fingerprint": fingerprint, "session_id": session_id}))
-    except OSError:
-        pass  # non-fatal: if we can't write state, we'll warn again next prompt
-
-    lines = ["⚠️ shared-bin CLI drift detected (multi-agent):"]
-    for cli_name, src_name in drifted:
-        lines.append(
-            f"  - {cli_name}: sudo cp \"$CLAUDE_PLUGIN_ROOT/tools/{src_name}\""
-            f" /home/agents-shared/bin/{cli_name}"
-        )
-    lines.append(
-        "Refresh before agents resume to avoid silent divergence. "
-        "Use `engram_diagnose` for the on-demand check."
-    )
-    return lines
+    client = ForumClient(forum_url_from_config(config), timeout=3)
+    return client.get("/api/updates", params={
+        "agent": agent_name,
+        "kinds": "dm",
+        "since": str(since),
+    })
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+def _emit_context(text: str) -> None:
+    """Emit an additionalContext block on stdout (the UserPromptSubmit channel)."""
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": text,
+        }
+    }))
+
 
 def main() -> None:
     # ── Read stdin payload (session_id for drift throttle) ────────────────────
@@ -406,128 +296,133 @@ def main() -> None:
     # ── Config (single load) ──────────────────────────────────────────────────
     config = _load_config()
 
-    # ── Mode gate ─────────────────────────────────────────────────────────────
-    # First check — single-agent installs see zero output, zero state mutation.
-    if not _is_multi_agent_mode(config):
+    # ── Mode gate (FIRST check) ───────────────────────────────────────────────
+    # Single-agent installs (or forum_api import failure) see zero output and
+    # zero state mutation.
+    if not _FORUM_API_OK or not _is_multi_agent_mode(config):
         sys.exit(0)
 
     # ── Read cursors ──────────────────────────────────────────────────────────
-    surfaced_cursor = _read_cursor(SURFACED_CURSOR_PATH)  # may be None
-    read_cursor = _read_cursor(READ_CURSOR_PATH)           # may be None
+    surfaced_cursor = _read_cursor_int(SURFACED_CURSOR_PATH)  # 0 if absent
+    read_cursor = _read_cursor_int(READ_CURSOR_PATH)           # 0 if absent
 
     # ── Resolve own name ──────────────────────────────────────────────────────
     agent_name = _get_agent_name(config)
-    # Even if agent_name is empty, scanning returns nothing (no match).
 
-    # ── Scan letters ──────────────────────────────────────────────────────────
-    all_letters = _scan_letters(agent_name)
+    # ── Fetch DM updates from forum API (loud-on-failure) ────────────────────
+    # Pass since=min(surfaced_cursor, read_cursor) to retrieve all items that
+    # may fall into either the "new" or "still-unread" buckets.
+    since = min(surfaced_cursor, read_cursor)
+    live_fetch = False
+    new_as_of = surfaced_cursor  # fallback if fetch fails (should not be used)
+    try:
+        data = _fetch_dm_updates(config, agent_name, since)
+        updates = data.get("updates", [])
+        new_as_of = int(data.get("as_of", surfaced_cursor))
+        live_fetch = True
+    except (ForumNetworkError, ForumHttpError) as e:
+        # UCS invariant: fail LOUD — inject a banner rather than rendering
+        # nothing silently. The forum being down IS a problem the agent should
+        # see. Never fall back to local FS reads (the UCS pure-API invariant).
+        _emit_context(
+            f"⚠️ DM unread check unavailable (UCS) — forum API error: {e}"
+        )
+        return
+    except Exception:
+        # Belt-and-suspenders: unexpected error must never crash the prompt.
+        _emit_context("⚠️ DM unread check unavailable (UCS)")
+        return
 
     # ── Partition ─────────────────────────────────────────────────────────────
-    # Acknowledged (ts <= read_cursor) → invisible first, regardless of surfaced cursor.
-    # Of the remaining unread letters:
-    #   new_letters:   ts > surfaced_cursor (arrived since last prompt)
-    #   unread_letters: ts <= surfaced_cursor (seen before, still unread)
-    now = datetime.now(timezone.utc)
-
-    new_letters = []
-    unread_letters = []
-
-    for letter in all_letters:
-        ts = letter["timestamp"]
-        # Already acknowledged (ts <= read_cursor) → invisible, regardless of the
-        # surfaced cursor. The read cursor can run AHEAD of the surfaced cursor when
-        # a letter is read via `ia read` without an intervening UserPromptSubmit fire
-        # (e.g. a Monitor task-notification wake), so the "new" bucket must also
-        # require the letter to be unread. (#627)
-        is_unread = read_cursor is None or ts > read_cursor
+    # Acknowledged (seq <= read_cursor) → invisible, regardless of surfaced.
+    # Of the remaining unread items:
+    #   new_dms:    seq > surfaced_cursor (arrived since last prompt)
+    #   unread_dms: seq <= surfaced_cursor (seen before, not yet read)
+    #
+    # Guard for the read-cursor-ahead edge case: when `ia mr` was called
+    # without an intervening UserPromptSubmit (e.g. during a Monitor wake),
+    # read_cursor can exceed surfaced_cursor.  Items with
+    # surfaced_cursor < seq <= read_cursor are acknowledged and must be
+    # invisible — the is_unread check below catches them before partitioning.
+    new_dms = []
+    unread_dms = []
+    for item in updates:
+        seq = int(item.get("seq", 0))
+        # Already acknowledged — skip
+        is_unread = seq > read_cursor
         if not is_unread:
             continue
-        if surfaced_cursor is None or ts > surfaced_cursor:
-            new_letters.append(letter)
+        if seq > surfaced_cursor:
+            new_dms.append(item)
         else:
-            unread_letters.append(letter)
+            unread_dms.append(item)
 
-    # ── Advance surfaced cursor ───────────────────────────────────────────────
-    # Always advance, even if nothing to surface — keeps the delta window current.
-    # Read cursor is NOT touched here; only explicit acknowledgment advances it.
-    _write_cursor(SURFACED_CURSOR_PATH, now)
+    # Sort by seq ascending (oldest first within each bucket)
+    new_dms.sort(key=lambda u: int(u.get("seq", 0)))
+    unread_dms.sort(key=lambda u: int(u.get("seq", 0)))
 
-    # ── Shared-bin drift check (inside mode gate; prepend when present) ───────
-    # Fail-open: drift check is advisory; letters channel is primary.
-    # An unreadable file during a shared-bin refresh must never kill the hook.
-    try:
-        drift_lines = _shared_bin_drift_lines(Path(ENGRAM_HOME), session_id)
-    except Exception:
-        drift_lines = []
+    # ── Advance surfaced cursor on LIVE fetch only ────────────────────────────
+    # Always advance to the current watermark, even if nothing to surface —
+    # keeps the delta window current.  Never advance on banner path (early
+    # return above) so DMs arriving during an outage are not stepped over.
+    if live_fetch:
+        _write_cursor_int(SURFACED_CURSOR_PATH, new_as_of)
 
     # ── Exit silently if nothing to report ────────────────────────────────────
-    if not new_letters and not unread_letters and not drift_lines:
+    if not new_dms and not unread_dms:
         sys.exit(0)
 
     # ── Build injection block ─────────────────────────────────────────────────
-    # Drift warning comes first — it is more operationally urgent than the letter list.
-    lines = list(drift_lines)
+    lines: list = []
 
-    n_new = len(new_letters)
+    n_new = len(new_dms)
     if n_new > 0:
-        senders_new = _format_senders(new_letters)
-        letter_word = "letter" if n_new == 1 else "letters"
+        senders_new = _format_senders(new_dms)
+        msg_word = "message" if n_new == 1 else "messages"
         lines.append(
-            f"\U0001f4ec {n_new} new {letter_word} from {senders_new}"
+            f"\U0001f4ec {n_new} new {msg_word} from {senders_new}"
             f" — read before responding"
-            f" (counterpart-agent letters carry context from the user you'd otherwise miss)."
+            f" (counterpart-agent messages carry context from the user you'd otherwise miss)."
         )
         if n_new <= LIST_CAP:
-            for letter in new_letters:
-                ts_str = _format_ts(letter["timestamp"])
-                lines.append(
-                    f"  - [{ts_str}] from {letter['from']} — \"{letter['title']}\""
-                )
+            for item in new_dms:
+                subject = _extract_dm_subject(item.get("body", ""))
+                sender = item.get("sender", "unknown")
+                lines.append(f"  - from {sender} — \"{subject}\"")
         else:
             # Group-summarize when over the cap
-            shown = new_letters[:LIST_CAP]
-            rest = new_letters[LIST_CAP:]
-            for letter in shown:
-                ts_str = _format_ts(letter["timestamp"])
-                lines.append(
-                    f"  - [{ts_str}] from {letter['from']} — \"{letter['title']}\""
-                )
-            rest_authors = sorted({l["from"] for l in rest})
-            authors_str = ", ".join(rest_authors)
-            lines.append(
-                f"  + {len(rest)} older from {authors_str}"
-            )
+            shown = new_dms[:LIST_CAP]
+            rest = new_dms[LIST_CAP:]
+            for item in shown:
+                subject = _extract_dm_subject(item.get("body", ""))
+                sender = item.get("sender", "unknown")
+                lines.append(f"  - from {sender} — \"{subject}\"")
+            rest_senders = sorted({u.get("sender", "unknown") for u in rest})
+            lines.append(f"  + {len(rest)} older from {', '.join(rest_senders)}")
 
-    n_unread = len(unread_letters)
+    n_unread = len(unread_dms)
     if n_unread > 0:
         if n_new > 0:
-            senders_unread = _format_senders(unread_letters)
+            senders_unread = _format_senders(unread_dms)
             lines.append(f"  (Plus {n_unread} older still-unread from {senders_unread}.)")
         else:
-            senders_unread = _format_senders(unread_letters)
+            senders_unread = _format_senders(unread_dms)
             lines.append(
-                f"\U0001f4ec {n_unread} older still-unread letter{'s' if n_unread != 1 else ''}"
+                f"\U0001f4ec {n_unread} older still-unread message{'s' if n_unread != 1 else ''}"
                 f" from {senders_unread} — finish reading at the next natural break."
             )
 
-    # Footer: name the CLI so the natural-affordance path IS the cursor-aware one.
-    # Only add if there are letters (the footer is letter-context — not drift-only).
-    if new_letters or unread_letters:
+    # Footer: name the CLI so the natural-affordance path is the cursor-aware one.
+    # Only add if there are DMs (the footer is DM-context — not drift-only).
+    if new_dms or unread_dms:
         lines.append(
-            "Tools: `ia read <filename>` (read + advance cursor) · "
-            "`ia write --re <filename>` (reply with reference) · "
+            "Tools: `ia read <counterpart>` (read thread) · "
+            "`ia write --to <counterpart>` (send DM) · "
+            "`ia mr` (mark-read) · "
             "`ia status` (show cursor + counts)."
         )
 
-    context = "\n".join(lines)
-
-    response = {
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": context,
-        }
-    }
-    print(json.dumps(response))
+    _emit_context("\n".join(lines))
 
 
 if __name__ == "__main__":

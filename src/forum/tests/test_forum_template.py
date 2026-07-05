@@ -428,3 +428,48 @@ class TestRemovedElementsAbsent:
         # Deliberately KEPT (slice 2 implements it) — guard against
         # over-removal as much as re-introduction.
         assert "Open questions" in render_forum(app)
+
+
+class TestCanonicalUrlFooter:
+    """The front page displays a stable, shareable forum URL in the footer
+    (Clio's request, 2026-06-29 mDNS cutover) — resolved server-side, never a
+    hardcoded host in this open-source template."""
+
+    def test_url_rendered_when_passed(self, app):
+        with app.app_context():
+            from flask import render_template
+            html = render_template(
+                "forum.html", public_url="http://chameleon.lan:5002", **FIXTURE_CONTEXT
+            )
+        assert "the forum lives at" in html
+        assert "http://chameleon.lan:5002" in html
+
+    def test_url_line_absent_when_not_passed(self, app):
+        # The default render helper omits public_url (mirrors a test-caller);
+        # the footer must render cleanly with no URL line, not error.
+        assert "the forum lives at" not in render_forum(app)
+
+
+class TestCanonicalUrlHelper:
+    """_canonical_forum_url() precedence: FORUM_PUBLIC_URL > FORUM_URL > host."""
+
+    def test_public_url_env_wins(self, app, monkeypatch):
+        monkeypatch.setenv("FORUM_PUBLIC_URL", "http://chameleon.lan:5002/")
+        monkeypatch.setenv("FORUM_URL", "http://ignored:5002")
+        from forum.server import _canonical_forum_url
+        with app.test_request_context("/"):
+            assert _canonical_forum_url() == "http://chameleon.lan:5002"
+
+    def test_forum_url_fallback(self, app, monkeypatch):
+        monkeypatch.delenv("FORUM_PUBLIC_URL", raising=False)
+        monkeypatch.setenv("FORUM_URL", "http://host.lan:5002/")
+        from forum.server import _canonical_forum_url
+        with app.test_request_context("/"):
+            assert _canonical_forum_url() == "http://host.lan:5002"
+
+    def test_host_url_last_resort(self, app, monkeypatch):
+        monkeypatch.delenv("FORUM_PUBLIC_URL", raising=False)
+        monkeypatch.delenv("FORUM_URL", raising=False)
+        from forum.server import _canonical_forum_url
+        with app.test_request_context("/", base_url="http://192.168.1.5:5002"):
+            assert _canonical_forum_url() == "http://192.168.1.5:5002"

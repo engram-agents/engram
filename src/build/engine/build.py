@@ -113,10 +113,10 @@ SKIP_FILES = {"scan-leaks.py"}
 # ---------------------------------------------------------------------------
 
 
-def compute_build_version(repo_root: str) -> str:
+def compute_build_version(repo_root: str, base_version: str) -> str:
     """Compute a unique per-rebuild plugin version string.
 
-    Format: ``0.1.0-dev.<YYYYMMDDHHMMss>.<sha7>``
+    Format: ``<base_version>-dev.<YYYYMMDDHHMMss>.<sha7>``
 
     The prerelease form (``-dev.``) is used rather than semver build metadata
     (``+``) because the Claude Code plugin manager's comparison semantics for
@@ -142,12 +142,19 @@ def compute_build_version(repo_root: str) -> str:
     ----------
     repo_root:
         Absolute path to the engram-alpha repo root.  Used for ``git rev-parse``.
+    base_version:
+        The SSoT base version to stamp onto (e.g. ``plugin.json``'s ``"version"``
+        field, read by the caller).  The caller is responsible for reading the
+        current SSoT value and a sensible fallback (e.g. ``"0.1.0"``) if
+        ``plugin.json`` is missing or malformed — this function does not read
+        ``plugin.json`` itself and does not hardcode a base version.
 
     Returns
     -------
     str
-        Version string, e.g. ``"0.1.0-dev.20260606153042.1a4c9b4"``.
-        Falls back to ``"0.1.0-dev.<stamp>.unknown"`` if git is unavailable.
+        Version string, e.g. ``"0.1.0-dev.20260606153042.1a4c9b4"`` for
+        ``base_version="0.1.0"``.  Falls back to
+        ``"<base_version>-dev.<stamp>.unknown"`` if git is unavailable.
     """
     # Short SHA of HEAD at the source tree
     try:
@@ -177,7 +184,7 @@ def compute_build_version(repo_root: str) -> str:
     # The sha remains as the second identifier for per-commit uniqueness.
     # (The 14-digit timestamp begins with '2', so no leading-zero issue there;
     # the isdigit guard above still applies to sha7, now the second identifier.)
-    return f"0.1.0-dev.{stamp}.{sha7}"
+    return f"{base_version}-dev.{stamp}.{sha7}"
 
 
 # ---------------------------------------------------------------------------
@@ -519,18 +526,28 @@ def _toml_array(values: list[str]) -> str:
 def _engram_mcp_tool_names(tools: list[str] | str) -> list[str]:
     """Extract raw ENGRAM MCP tool names from Claude-style tool identifiers.
 
-    Claude agent specs name MCP tools as ``mcp__engram__engram_query``.
-    Codex MCP policy allowlists use the server-local tool name
-    (``engram_query``) under the installed plugin MCP policy table.
+    Claude agent specs name MCP tools as ``mcp__engram__engram_query`` (direct
+    install) or ``mcp__plugin_engram_engram__engram_query`` (plugin install).
+    Codex MCP policy allowlists use the server-local tool name (``engram_query``)
+    under the installed plugin MCP policy table. Both prefixes strip to the same
+    local name; deduplicate so a spec listing both forms emits each name once.
     """
     if tools == "*":
         return []
-    prefix = "mcp__engram__"
-    return [
-        tool[len(prefix) :]
-        for tool in tools
-        if isinstance(tool, str) and tool.startswith(prefix)
-    ]
+    _PREFIXES = ("mcp__engram__", "mcp__plugin_engram_engram__")
+    seen: set[str] = set()
+    result: list[str] = []
+    for tool in tools:
+        if not isinstance(tool, str):
+            continue
+        for prefix in _PREFIXES:
+            if tool.startswith(prefix):
+                name = tool[len(prefix):]
+                if name not in seen:
+                    seen.add(name)
+                    result.append(name)
+                break
+    return result
 
 
 def _emit_codex_agent_toml(
@@ -886,9 +903,18 @@ def build_plugin(
     # outside the source_root tree (e.g. src/build/engine ships as bundle tools/engine).
     source_root = manifest.get("source_root", ".")
 
+    # Read the SSoT base version from plugin.json before stamping — this is a
+    # deliberately separate, compact read here rather than reusing the
+    # plugin_data load further down (§2. Manifests), which happens too late in
+    # execution order: build_version must exist before the copy/emit steps
+    # below that consume it.
+    base_version_plugin_json = os.path.join(repo_root, "plugin.json")
+    with open(base_version_plugin_json, encoding="utf-8") as f:
+        base_version = json.load(f).get("version", "0.1.0")
+
     # Compute build version once — threaded through to all version-bearing outputs
     # so all emitted files carry the same stamp within a single build invocation.
-    build_version = compute_build_version(repo_root)
+    build_version = compute_build_version(repo_root, base_version)
 
     # Load platform profile
     profile = load_platform_profile(repo_root, target)

@@ -1,40 +1,44 @@
 #!/usr/bin/env python3
 """ia — Inter-Agent CLI
 
-A thin CLI wrapping the inter-agent file protocol at
-/home/agents-shared/inter-agent/. Provides validated letter creation,
-cursor-tracked reading, and quick status checks.
+A thin CLI wrapping the forum DM API for inter-agent messaging.
+Replaces the file-based letter protocol with the forum DM channel.
 
-Ten subcommands:
-  list        Show letters addressed to me (default: unread only)
-  read        Display a letter; advance read cursor to its timestamp
-  write       Create a new letter via $EDITOR with validated frontmatter
-  mark-read   Advance read cursor without displaying a letter
-  cursor      Show or set the read cursor
-  status      Quick health check (agent name, mode, cursor, unread count)
-  star        Star a letter to re-surface it at continuity-reset points
-  unstar      Remove a letter from the starred list
-  starred     List all starred letters
-  peers       Show known peers (co-host vs cross-host) from the agent registry
+Seven subcommands:
+  list        Show my DM threads (GET /api/dm)
+  read        Display messages with a counterpart (GET /api/dm/<counterpart>)
+  write       Send a DM — body from stdin, --body-file, or $EDITOR
+  mark-read   Advance read cursor to current as_of from /api/updates
+  cursor      Show or set the read cursor (as_of integer)
+  status      Quick health check (agent name, DM threads, unread count)
+  peers       Show known agents from the forum registry
 
-Design doc: ariadne-desk/projects/inter-agent-cli/DESIGN.md (v2, 2026-05-23)
-Protocol:   inter-agent/README.md
-Hook ref:   hooks/claude/engram-inter-agent-prompt-hook.py (parsing conventions)
+PURE LAN-API: no local inter-agent/ filesystem reads or writes.
+If the forum API is unreachable, commands FAIL LOUD (stderr + non-zero exit).
+
+Design: UCS PR3a — pure DM-API migration.
+Forum API: /api/dm, /api/updates?kinds=dm, /api/agents/online
+Hook ref:   hooks/claude/engram-inter-agent-prompt-hook.py (wired in PR3b)
 """
 
 import argparse
 import json
 import os
 import pwd
-import re
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timedelta, timezone
+import urllib.parse
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+# Explicit path insert ensures this import works when ia.py is loaded via
+# importlib (e.g. in direct-import tests) — Python's automatic script-dir
+# addition only fires when ia.py is the __main__ entry point.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from forum_api import ForumClient, ForumHttpError, ForumNetworkError, forum_url_from_config
 
 # ---------------------------------------------------------------------------
 # Environment + paths
@@ -44,19 +48,10 @@ ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
     or str(Path.home() / ".engram")
 )
-INTER_AGENT_DIR = os.environ.get("INTER_AGENT_DIR", "/home/agents-shared/inter-agent")
 
-# Agent registration directory (parallel to inter-agent/ and projects/).
-# Override via AGENTS_SHARED_DIR for testing.
-_AGENTS_SHARED_ROOT = os.environ.get("AGENTS_SHARED_DIR", "/home/agents-shared")
-AGENT_REGISTRY_DIR = os.environ.get("AGENT_REGISTRY_DIR", os.path.join(_AGENTS_SHARED_ROOT, "agents"))
-
+# Read cursor: stores the /api/updates as_of integer.
+# Path kept stable so PR3b hook can still read it.
 READ_CURSOR_PATH = os.path.join(ENGRAM_HOME, "inter-agent-read-cursor.txt")
-SURFACED_CURSOR_PATH = os.path.join(ENGRAM_HOME, "inter-agent-surfaced-cursor.txt")
-STARRED_LIST_PATH = os.path.join(ENGRAM_HOME, "inter-agent-starred.json")
-
-# Staleness threshold for agent registration files (24 hours)
-PEER_STALE_HOURS = 24
 
 # Exit codes per DESIGN §7
 EXIT_OK = 0
@@ -65,135 +60,9 @@ EXIT_IO = 2
 EXIT_STATE = 3
 
 # ---------------------------------------------------------------------------
-# Peer registry helpers
+# Config helpers
 # ---------------------------------------------------------------------------
 
-
-def scan_peers(
-    own_name: str,
-    registry_dir: str = AGENT_REGISTRY_DIR,
-    stale_hours: int = PEER_STALE_HOURS,
-    _now: Optional[datetime] = None,
-) -> list:
-    """Scan the agent registry and classify peers relative to this agent.
-
-    Reads every *.json file in registry_dir (excluding own_name.json), parses
-    the registration record, and classifies each peer as co-host (same
-    hostname) or cross-host (different hostname). Marks entries older than
-    stale_hours as stale. Robust to malformed or missing files — skips and
-    continues rather than raising.
-
-    Args:
-        own_name     : This agent's name (used to exclude self).
-        registry_dir : Path to the directory containing *.json registration
-                       files. (Override in tests.)
-        stale_hours  : Age threshold in hours above which a peer entry is
-                       marked stale. Default 24h.
-        _now         : Override the current time (for testing).
-
-    Returns:
-        A list of dicts, one per peer, sorted by agent_name:
-          {
-            "agent_name" : str,
-            "hostname"   : str,
-            "pid"        : int | None,
-            "registered_at": str | None,   # ISO-8601 UTC string or None
-            "topology"   : "co-host" | "cross-host",
-            "age_seconds": float | None,   # None if registered_at missing/invalid
-            "stale"      : bool,
-          }
-        Malformed entries (missing/invalid agent_name or hostname) are skipped.
-    """
-    registry_path = Path(registry_dir)
-    if not registry_path.is_dir():
-        return []
-
-    own_hostname = socket.gethostname()
-    now = _now if _now is not None else datetime.now(timezone.utc)
-    stale_delta = timedelta(hours=stale_hours)
-
-    results = []
-    for json_file in sorted(registry_path.glob("*.json")):
-        try:
-            text = json_file.read_text(encoding="utf-8")
-            record = json.loads(text)
-        except (OSError, json.JSONDecodeError, ValueError):
-            continue  # skip malformed/unreadable files
-
-        if not isinstance(record, dict):
-            continue
-
-        agent_name = record.get("agent_name", "").strip()
-        hostname = record.get("hostname", "").strip()
-
-        # Must have both agent_name and hostname to be useful
-        if not agent_name or not hostname:
-            continue
-
-        # Exclude self
-        if agent_name.lower() == own_name.lower():
-            continue
-
-        try:
-            pid_raw = record.get("pid")
-            pid = int(pid_raw) if pid_raw is not None else None
-        except (ValueError, TypeError):
-            pid = None  # non-numeric pid field — skip coercion, continue
-
-        registered_at_str = record.get("registered_at")
-        age_seconds: Optional[float] = None
-        stale = False
-        if registered_at_str:
-            try:
-                registered_dt = datetime.fromisoformat(
-                    registered_at_str.replace("Z", "+00:00")
-                )
-                if registered_dt.tzinfo is None:
-                    registered_dt = registered_dt.replace(tzinfo=timezone.utc)
-                age_td = now - registered_dt
-                age_seconds = age_td.total_seconds()
-                stale = age_td > stale_delta
-            except (ValueError, TypeError):
-                pass  # leave age_seconds=None, stale=False
-
-        topology = "co-host" if hostname == own_hostname else "cross-host"
-
-        results.append({
-            "agent_name": agent_name,
-            "hostname": hostname,
-            "pid": pid,
-            "registered_at": registered_at_str,
-            "topology": topology,
-            "age_seconds": age_seconds,
-            "stale": stale,
-        })
-
-    results.sort(key=lambda p: p["agent_name"].lower())
-    return results
-
-
-def _format_age(age_seconds: Optional[float]) -> str:
-    """Format an age in seconds as a human-readable string."""
-    if age_seconds is None:
-        return "unknown"
-    total = int(age_seconds)
-    if total < 60:
-        return f"{total}s"
-    elif total < 3600:
-        return f"{total // 60}m"
-    elif total < 86400:
-        h = total // 3600
-        m = (total % 3600) // 60
-        return f"{h}h{m:02d}m"
-    else:
-        d = total // 86400
-        h = (total % 86400) // 3600
-        return f"{d}d{h:02d}h"
-
-
-# ---------------------------------------------------------------------------
-# Config helpers  (mirrors hook conventions, does NOT import from hook)
-# ---------------------------------------------------------------------------
 
 def _load_config() -> dict:
     """Load $ENGRAM_HOME/config.json. Returns {} on any failure."""
@@ -250,8 +119,9 @@ def _is_multi_agent_mode(config: Optional[dict] = None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Mode gate  (DESIGN §9.4)
+# Mode gate  (DM commands require multi-agent mode)
 # ---------------------------------------------------------------------------
+
 
 def _check_multi_agent_mode(config: Optional[dict] = None) -> None:
     """Exit with code 3 and actionable message if mode != 'multi'."""
@@ -285,42 +155,30 @@ def _check_multi_agent_mode(config: Optional[dict] = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Cursor helpers  (identical contract to hook's _read_cursor / _write_cursor)
+# Cursor helpers  (as_of integer stored at READ_CURSOR_PATH)
 # ---------------------------------------------------------------------------
 
-def _read_cursor(path: str) -> Optional[datetime]:
-    """Read a cursor file; return UTC datetime or None if absent/invalid."""
+
+def _read_cursor_int(path: str) -> int:
+    """Read the cursor file; return int or 0 if absent/invalid."""
     try:
         raw = Path(path).read_text().strip()
+        return int(raw)
     except (OSError, ValueError):
-        return None
-    if not raw:
-        return None
-    try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        print(
-            f"ia: cursor at {path} is not an ISO-8601 timestamp "
-            f"(got: {raw[:200]!r}) — treating as unread. "
-            f"Expected format: '2026-05-22T14:30:00Z'. "
-            f"See inter-agent/README.md §4.",
-            file=sys.stderr,
-        )
-        return None
+        return 0
 
 
-def _write_cursor(path: str, ts: datetime) -> None:
-    """Write a UTC datetime to a cursor file atomically (tmp + os.rename).
+def _write_cursor_int(path: str, value: int) -> None:
+    """Write the cursor int to file atomically (tmp + os.replace).
 
-    Uses the same atomic tmp + os.replace pattern as the hook's _write_cursor
-    so concurrent hook fires cannot read a partial cursor file.
+    Uses the same atomic tmp + os.replace pattern as hook helpers so
+    concurrent reads cannot observe a partial write.
     """
-    ts_str = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
     dest = Path(path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
     try:
-        tmp.write_text(ts_str + "\n")
+        tmp.write_text(str(value) + "\n")
         os.replace(tmp, dest)
     except OSError as e:
         try:
@@ -331,384 +189,49 @@ def _write_cursor(path: str, ts: datetime) -> None:
         sys.exit(EXIT_IO)
 
 
-def _cursor_str(ts: Optional[datetime]) -> str:
-    """Format a cursor datetime for display, or '(none)' if absent."""
-    if ts is None:
-        return "(none)"
-    return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+# ---------------------------------------------------------------------------
+# Loud-fail API helpers  (mirrors baton.py pattern)
+# ---------------------------------------------------------------------------
 
 
-def _parse_iso_timestamp(value: str, context: str = "") -> datetime:
-    """Parse an ISO-8601 UTC timestamp string; exit 1 on failure.
-
-    Rejects filename-format values (e.g. '2026-05-22T07-15-30Z_borges.md')
-    with a clear error message pointing to README §4.
-    """
-    prefix = f"ia {context}: " if context else "ia: "
-    # Detect filename-format (dashes-for-colons pattern after the T)
-    if re.search(r"T\d{2}-\d{2}-\d{2}", value):
-        print(
-            f"{prefix}invalid cursor format — got filename-format "
-            f"'{value}' (dashes instead of colons after T). "
-            f"The cursor stores the ISO timestamp, not the filename. "
-            f"Expected format: '2026-05-22T07:15:30Z'. "
-            f"See inter-agent/README.md §4.",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_VALIDATION)
+def _api_get(client: ForumClient, path: str, params: Optional[dict] = None) -> dict:
+    """GET via forum API; fail loud on network error or server error."""
     try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        # Ensure timezone-aware
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except ValueError:
-        print(
-            f"{prefix}invalid ISO-8601 timestamp '{value}'. "
-            f"Expected format: '2026-05-22T14:30:00Z'. "
-            f"See inter-agent/README.md §4.",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_VALIDATION)
-
-
-# ---------------------------------------------------------------------------
-# Frontmatter parsing  (identical contract to hook's _parse_frontmatter)
-# ---------------------------------------------------------------------------
-
-_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
-_FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):\s*(.*)$", re.MULTILINE)
-
-
-def _parse_frontmatter(text: str) -> tuple:
-    """Extract YAML-ish frontmatter from a markdown letter.
-
-    Returns (fields_dict, body_text). On parse failure returns ({}, text).
-    Only parses simple key: value pairs — no nested YAML; sufficient for
-    the established frontmatter format (from, to, timestamp, re).
-
-    # v2 candidate: switch to yaml.safe_load if frontmatter grows beyond
-    # the simple 4-field flat-string shape. Would require vendoring PyYAML.
-    """
-    m = _FRONTMATTER_RE.match(text)
-    if not m:
-        return {}, text
-    fm_block = m.group(1)
-    body = text[m.end():]
-    fields = {}
-    for field_m in _FRONTMATTER_FIELD_RE.finditer(fm_block):
-        key = field_m.group(1).strip().lower()
-        val = field_m.group(2).strip()
-        fields[key] = val
-    return fields, body
-
-
-def _extract_title(fields: dict, body: str) -> str:
-    """Extract a display title from a parsed letter.
-
-    Precedence (mirrors hook's _extract_title):
-      1. First non-frontmatter `# Heading` line in the body.
-      2. The `re:` frontmatter field.
-      3. First 60 chars of body text (stripped).
-    """
-    for line in body.splitlines():
-        line = line.strip()
-        if line.startswith("#"):
-            title = line.lstrip("#").strip()
-            if title:
-                return title
-
-    re_field = fields.get("re", "").strip()
-    if re_field:
-        return re_field
-
-    body_lines = [
-        ln for ln in body.split("\n")
-        if ln.strip() and ln.strip().lstrip("#").strip()
-    ]
-    if body_lines:
-        first_line = body_lines[0].strip().lstrip("#").strip()
-        if len(first_line) > 60:
-            return first_line[:57] + "..."
-        return first_line
-
-    return "(no title)"
-
-
-def _parse_letter_timestamp(ts_str: str) -> Optional[datetime]:
-    """Parse a frontmatter timestamp string into a UTC datetime."""
-    if not ts_str:
-        return None
-    try:
-        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-def _format_ts(ts: datetime) -> str:
-    """Format a datetime for display: YYYY-MM-DDTHH:MMZ"""
-    return ts.strftime("%Y-%m-%dT%H:%MZ")
-
-
-# ---------------------------------------------------------------------------
-# Frontmatter validation  (DESIGN §5)
-# ---------------------------------------------------------------------------
-
-def _validate_frontmatter(
-    fields: dict,
-    agent_name: str,
-    inter_agent_dir: Path,
-    context: str = "write",
-) -> list:
-    """Validate frontmatter fields per DESIGN §5.
-
-    Returns a list of error strings (empty = valid).
-    """
-    errors = []
-
-    # from: required, must match our agent name (no impersonation)
-    from_val = fields.get("from", "").strip()
-    if not from_val:
-        errors.append(
-            f"ia {context}: invalid frontmatter — `from:` is missing or empty "
-            f"(must be '{agent_name}')"
-        )
-    elif from_val != agent_name:
-        errors.append(
-            f"ia {context}: invalid frontmatter — `from: {from_val}` does not match "
-            f"agent name `{agent_name}` (impersonation check). "
-            f"See inter-agent/README.md §2."
-        )
-
-    # to: required, non-empty
-    to_val = fields.get("to", "").strip()
-    if not to_val:
-        errors.append(
-            f"ia {context}: invalid frontmatter — `to:` is missing or empty. "
-            f"See inter-agent/README.md §2."
-        )
-
-    # timestamp: required, valid ISO-8601 UTC
-    ts_val = fields.get("timestamp", "").strip()
-    if not ts_val:
-        errors.append(
-            f"ia {context}: invalid frontmatter — `timestamp:` is missing or empty. "
-            f"Expected format: '2026-05-23T14:10:00Z'. "
-            f"See inter-agent/README.md §2."
-        )
-    else:
-        if re.search(r"T\d{2}-\d{2}-\d{2}", ts_val):
-            errors.append(
-                f"ia {context}: invalid frontmatter — `timestamp: {ts_val}` uses "
-                f"filename-format (dashes instead of colons). "
-                f"Use ISO format with colons: '2026-05-23T14:10:00Z'. "
-                f"See inter-agent/README.md §2."
-            )
-        else:
-            try:
-                datetime.fromisoformat(ts_val.replace("Z", "+00:00"))
-            except ValueError:
-                errors.append(
-                    f"ia {context}: invalid frontmatter — `timestamp: {ts_val}` is not "
-                    f"valid ISO-8601. Expected: '2026-05-23T14:10:00Z'. "
-                    f"See inter-agent/README.md §2."
-                )
-
-    # re: optional; if present, the referenced file must exist
-    re_val = fields.get("re", "").strip()
-    if re_val:
-        re_path = inter_agent_dir / re_val
-        if not re_path.exists():
-            errors.append(
-                f"ia {context}: invalid frontmatter — `re: {re_val}` references "
-                f"non-existent file (looked in {inter_agent_dir}). "
-                f"See inter-agent/README.md §2."
-            )
-
-    return errors
-
-
-# ---------------------------------------------------------------------------
-# Letter scanning
-# ---------------------------------------------------------------------------
-
-def _is_recipient(to_field: str, agent_name: str) -> bool:
-    """Return True iff agent_name is a whole-name match in the to: field.
-
-    Membership test: split on commas, strip whitespace, exact match — NOT
-    substring. "mira" does not match "miranda"; "ariadne" does not match a
-    to: field of "aria, borges".
-
-    Both to_field and agent_name are compared case-insensitively.
-
-    Examples:
-      _is_recipient("ariadne", "ariadne")          -> True
-      _is_recipient("ariadne, borges", "borges")   -> True
-      _is_recipient("ariadne, borges", "aria")     -> False
-      _is_recipient("mira", "mir")                 -> False
-    """
-    if not agent_name or not to_field:
-        return False
-    agent_lower = agent_name.strip().lower()
-    for name in to_field.split(","):
-        if name.strip().lower() == agent_lower:
-            return True
-    return False
-
-
-def _scan_letters(agent_name: str, inter_agent_dir: Path) -> tuple:
-    """Scan inter_agent_dir for letters addressed to agent_name.
-
-    Returns (letters, skipped_count) where:
-      letters      — list of dicts: {path, filename, timestamp, from, title, fields}
-      skipped_count — count of .md files dropped due to unparseable frontmatter
-    """
-    if not inter_agent_dir.is_dir():
-        return [], 0
-
-    letters = []
-    skipped = 0
-    for md_file in inter_agent_dir.glob("*.md"):
-        try:
-            text = md_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            skipped += 1
-            continue
-
-        fields, body = _parse_frontmatter(text)
-        if not fields:
-            skipped += 1
-            continue
-
-        to_field = fields.get("to", "").strip()
-        if not _is_recipient(to_field, agent_name):
-            continue
-
-        ts = _parse_letter_timestamp(fields.get("timestamp", ""))
-        if ts is None:
-            skipped += 1
-            continue
-
-        title = _extract_title(fields, body)
-        from_field = fields.get("from", "unknown").strip()
-
-        letters.append({
-            "path": str(md_file),
-            "filename": md_file.name,
-            "timestamp": ts,
-            "from": from_field,
-            "title": title,
-            "fields": fields,
-        })
-
-    letters.sort(key=lambda l: l["timestamp"])
-    return letters, skipped
-
-
-def _filter_unread(letters: list, read_cursor: Optional[datetime]) -> list:
-    """Return letters with timestamp > read_cursor (or all if cursor is None)."""
-    if read_cursor is None:
-        return letters
-    return [l for l in letters if l["timestamp"] > read_cursor]
-
-
-def _scan_replied_filenames(agent_name: str, inter_agent_dir: Path) -> set:
-    """Scan inter_agent_dir for outgoing letters (from: agent_name) with a re: field.
-
-    Returns the set of all filenames referenced by `re:` across outgoing letters.
-    Graceful on malformed letters (skips silently — frontmatter errors are not
-    load-bearing for this scan).
-    """
-    if not inter_agent_dir.is_dir():
-        return set()
-
-    replied = set()
-    for md_file in inter_agent_dir.glob("*.md"):
-        try:
-            text = md_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-
-        fields, _ = _parse_frontmatter(text)
-        if not fields:
-            continue
-
-        from_field = fields.get("from", "").strip().lower()
-        if not agent_name or from_field != agent_name.lower():
-            continue
-
-        re_field = fields.get("re", "").strip()
-        if re_field:
-            replied.add(re_field)
-
-    return replied
-
-
-# ---------------------------------------------------------------------------
-# Starred letters helpers  (per-agent star list, pointer-not-injection)
-# ---------------------------------------------------------------------------
-
-STARRED_CAP = 10  # max entries rendered in the starred surface block
-STARRED_STALE_DAYS = 7  # soft TTL for staleness nudge (nudge only, never auto-drop)
-
-
-def _read_starred(starred_path: str = STARRED_LIST_PATH) -> list:
-    """Read the starred-letters list; return [] on missing/corrupt file.
-
-    Each entry is a dict with at minimum {"filename": ..., "starred_at": ..., "note": ...}.
-    Snapshot entries (added at star-time) also carry {"from": ..., "title": ...} so the
-    list surface can render without re-parsing the source letter.
-    Tolerates any read or parse failure (missing file, invalid JSON, non-list shape).
-    """
-    try:
-        raw = Path(starred_path).read_text(encoding="utf-8")
-        data = json.loads(raw)
-        if isinstance(data, list):
-            return data
-        return []
-    except (OSError, json.JSONDecodeError, ValueError):
-        return []
-
-
-def _write_starred(entries: list, starred_path: str = STARRED_LIST_PATH) -> None:
-    """Write the starred-letters list atomically (tmp + os.replace).
-
-    Uses the same atomic tmp + os.replace pattern as _write_cursor so concurrent
-    hook fires cannot read a partial starred file.
-    """
-    dest = Path(starred_path)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
-    try:
-        tmp.write_text(json.dumps(entries, indent=2), encoding="utf-8")
-        os.replace(tmp, dest)
-    except OSError as e:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        print(f"ia: starred-list write failed: {e}", file=sys.stderr)
+        return client.get(path, params=params)
+    except ForumNetworkError as e:
+        print(f"ia: forum unreachable — {e}", file=sys.stderr)
         sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        print(f"ia: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
+
+
+def _api_post(client: ForumClient, path: str, payload: dict) -> dict:
+    """POST via forum API; fail loud on network error or server error."""
+    try:
+        return client.post(path, payload)
+    except ForumNetworkError as e:
+        print(f"ia: forum unreachable — {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        print(f"ia: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
 
 
 # ---------------------------------------------------------------------------
-# $EDITOR helpers  (DESIGN §9.2)
+# Editor helper
 # ---------------------------------------------------------------------------
+
 
 def _find_editor() -> Optional[str]:
-    """Resolve the editor to use: $VISUAL -> $EDITOR -> nano -> vi.
-
-    Returns the editor command string, or None if none are available.
-    """
+    """Resolve the editor to use: $VISUAL -> $EDITOR -> nano -> vi."""
     for envvar in ("VISUAL", "EDITOR"):
         val = os.environ.get(envvar, "").strip()
         if val:
             return val
-
     for fallback in ("nano", "vi"):
         if shutil.which(fallback) is not None:
             return fallback
-
     return None
 
 
@@ -716,246 +239,122 @@ def _find_editor() -> Optional[str]:
 # Subcommand: list
 # ---------------------------------------------------------------------------
 
+
 def cmd_list(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    inter_agent_dir = Path(INTER_AGENT_DIR)
-    all_letters, skipped_count = _scan_letters(agent_name, inter_agent_dir)
+    """List DM threads: GET /api/dm?agent=<me>"""
+    forum_url = getattr(args, "forum_url", None) or forum_url_from_config(config)
+    client = ForumClient(forum_url)
 
-    # Apply --from filter
-    if args.from_agent:
-        all_letters = [l for l in all_letters if l["from"].lower() == args.from_agent.lower()]
-
-    # Apply --since filter
-    since_dt: Optional[datetime] = None
-    if args.since:
-        since_dt = _parse_iso_timestamp(args.since, context="list")
-        all_letters = [l for l in all_letters if l["timestamp"] > since_dt]
-
-    # Apply --all vs --unread (default unread)
-    if not args.all:
-        read_cursor = _read_cursor(READ_CURSOR_PATH)
-        all_letters = _filter_unread(all_letters, read_cursor)
-
-    # Apply --limit
-    if args.limit is not None:
-        all_letters = all_letters[:args.limit]
+    data = _api_get(client, "/api/dm", params={"agent": agent_name})
+    threads = data.get("threads", [])
 
     if args.format == "json":
-        output = []
-        for l in all_letters:
-            output.append({
-                "timestamp": l["timestamp"].strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "from": l["from"],
-                "title": l["title"],
-                "path": l["path"],
-                "filename": l["filename"],
-            })
-        print(json.dumps(output, indent=2))
-        if skipped_count > 0:
-            print(
-                f"note: skipped {skipped_count} file(s) with unparseable frontmatter",
-                file=sys.stderr,
-            )
+        print(json.dumps(threads, indent=2))
         return
 
-    # Compute which incoming letters have been replied to (outgoing re: references)
-    replied_set = _scan_replied_filenames(agent_name, inter_agent_dir)
+    if not threads:
+        print("DM threads (0): no active threads.")
+        return
 
-    # Human format
-    label = "ALL" if args.all else "UNREAD"
-    count = len(all_letters)
-    if count == 0:
-        print(f"{label} (0): no letters found.")
-    else:
-        print(f"{label} ({count}):")
-        for l in all_letters:
-            ts_str = _format_ts(l["timestamp"])
-            replied_marker = "  [REPLIED]" if l["filename"] in replied_set else ""
-            print(f"  {ts_str}  {l['from']:<12}  \"{l['title']}\"{replied_marker}")
-            print(f"    {l['filename']}")
-
-    if skipped_count > 0:
-        print(
-            f"note: skipped {skipped_count} file(s) with unparseable frontmatter",
-            file=sys.stderr,
-        )
+    print(f"DM threads ({len(threads)}):")
+    for t in threads:
+        print(f"  ↔ {t['counterpart']}")
 
 
 # ---------------------------------------------------------------------------
 # Subcommand: read
 # ---------------------------------------------------------------------------
 
+
 def cmd_read(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    inter_agent_dir = Path(INTER_AGENT_DIR)
+    """Read messages with a counterpart: GET /api/dm/<counterpart>?agent=<me>"""
+    forum_url = getattr(args, "forum_url", None) or forum_url_from_config(config)
+    client = ForumClient(forum_url)
 
-    if args.latest:
-        # Find the most recent unread letter
-        all_letters, _ = _scan_letters(agent_name, inter_agent_dir)
-        read_cursor = _read_cursor(READ_CURSOR_PATH)
-        unread = _filter_unread(all_letters, read_cursor)
-        if not unread:
-            print("ia read: no unread letters.")
-            sys.exit(EXIT_OK)
-        letter_info = unread[-1]  # most recent
-        letter_path = Path(letter_info["path"])
-    else:
-        # Resolve the named letter
-        filename = args.filename
-        # Accept bare filename or full path
-        candidate = Path(filename)
-        if not candidate.is_absolute():
-            candidate = inter_agent_dir / candidate
-        if not candidate.exists():
-            print(
-                f"ia read: file not found: '{filename}' "
-                f"(looked in {inter_agent_dir}). "
-                f"Use 'ia list' to see available letters. "
-                f"See inter-agent/README.md §4.",
-                file=sys.stderr,
-            )
-            sys.exit(EXIT_VALIDATION)
-        letter_path = candidate
-        try:
-            text = letter_path.read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            print(f"ia read: cannot read '{letter_path}': {e}", file=sys.stderr)
-            sys.exit(EXIT_IO)
-        fields, body = _parse_frontmatter(text)
-        if not fields:
-            letter_info = {"timestamp": None}
-        else:
-            ts = _parse_letter_timestamp(fields.get("timestamp", ""))
-            letter_info = {"timestamp": ts, "fields": fields}
+    counterpart = args.counterpart.strip().lower()
+    since_seq = getattr(args, "since_seq", 0) or 0
 
-    # Print the letter
     try:
-        text = letter_path.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        print(f"ia read: cannot read '{letter_path}': {e}", file=sys.stderr)
+        data = client.get(
+            f"/api/dm/{urllib.parse.quote(counterpart)}",
+            params={"agent": agent_name, "since_seq": str(since_seq)},
+        )
+    except ForumNetworkError as e:
+        print(f"ia read: forum unreachable — {e}", file=sys.stderr)
         sys.exit(EXIT_IO)
-    print(text, end="" if text.endswith("\n") else "\n")
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"(no DM thread with {counterpart})")
+            return
+        print(f"ia read: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
 
-    # Advance read cursor to letter's timestamp (monotonic; --force overrides)
-    ts = letter_info.get("timestamp")
-    if ts is not None:
-        current_cursor = _read_cursor(READ_CURSOR_PATH)
-        if current_cursor is not None and ts < current_cursor and not args.force:
-            # Letter is older than cursor — don't retreat
-            print(
-                "note: read cursor not advanced — letter is older than current cursor "
-                "(use --force to advance)",
-                file=sys.stderr,
-            )
-        else:
-            _write_cursor(READ_CURSOR_PATH, ts)
+    messages = data.get("messages", [])
+    if not messages:
+        print(f"(no messages with {counterpart})")
+        return
+
+    if args.format == "json":
+        print(json.dumps(messages, indent=2))
+        return
+
+    for msg in messages:
+        print(f"\n--- seq={msg['seq']} from={msg['sender']} at={msg['ts']} ---")
+        print(msg["body"])
 
 
 # ---------------------------------------------------------------------------
 # Subcommand: write
 # ---------------------------------------------------------------------------
 
+
+def _encode_body(body_text: str, recipients: list, subject: Optional[str]) -> str:
+    """Encode the DM body with optional To/Subject header block.
+
+    Client-side encoding convention (lossless):
+      - If multiple recipients: prepend ``**To:** r1, r2`` + blank line.
+      - If subject given: prepend ``**Subject:** S`` + blank line.
+      - Then the body.
+
+    Encoding order: To-line first (if multi-recipient), then Subject line
+    (if given), then body — mirrors typical letter header ordering.
+    """
+    header_lines: list = []
+    if len(recipients) > 1:
+        header_lines.append(f"**To:** {', '.join(recipients)}")
+        header_lines.append("")
+    if subject:
+        header_lines.append(f"**Subject:** {subject}")
+        header_lines.append("")
+
+    if header_lines:
+        return "\n".join(header_lines) + "\n" + body_text.lstrip("\n")
+    return body_text
+
+
 def cmd_write(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    inter_agent_dir = Path(INTER_AGENT_DIR)
-
-    # Handle --reply FILENAME: resolve source, auto-fill --to, set --re
-    if args.reply:
-        reply_filename = args.reply
-        reply_path = inter_agent_dir / reply_filename
-        if not reply_path.exists():
-            print(
-                f"ia write: --reply: source letter '{reply_filename}' not found "
-                f"(looked in {inter_agent_dir}). "
-                f"Use 'ia list --all' to see available letters.",
-                file=sys.stderr,
-            )
-            sys.exit(EXIT_VALIDATION)
-        try:
-            reply_text = reply_path.read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            print(f"ia write: --reply: cannot read '{reply_path}': {e}", file=sys.stderr)
-            sys.exit(EXIT_IO)
-        reply_fields, _ = _parse_frontmatter(reply_text)
-        if not reply_fields:
-            print(
-                f"ia write: --reply: cannot parse frontmatter from '{reply_filename}'. "
-                f"See inter-agent/README.md §2.",
-                file=sys.stderr,
-            )
-            sys.exit(EXIT_VALIDATION)
-        source_from = reply_fields.get("from", "").strip()
-        if not source_from:
-            print(
-                f"ia write: --reply: source letter '{reply_filename}' has no `from:` field.",
-                file=sys.stderr,
-            )
-            sys.exit(EXIT_VALIDATION)
-        # If --to was explicitly given, verify it matches the source's sender
-        if args.to is not None and args.to != source_from:
-            print(
-                f"ia write: --reply conflict: source letter is from '{source_from}' "
-                f"but --to '{args.to}' was also specified. "
-                f"Remove --to to reply to '{source_from}', or use "
-                f"'--re {reply_filename} --to {args.to}' to reference the letter "
-                f"while writing to a different recipient.",
-                file=sys.stderr,
-            )
-            sys.exit(EXIT_VALIDATION)
-        # Auto-fill --to from source and set --re
-        args.to = source_from
-        args.re = reply_filename
-
-    # Guard: --to must be set by now (either directly or via --reply)
-    if not args.to:
+    """Send DM(s): POST /api/dm/<recipient> for each recipient in --to."""
+    # Parse and validate recipients
+    recipients_raw = args.to or ""
+    recipients = [r.strip().lower() for r in recipients_raw.split(",") if r.strip()]
+    if not recipients:
         print(
-            "ia write: --to is required (or use --reply FILENAME to auto-fill from source).",
+            "ia write: --to is required (at least one recipient).",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
 
-    # Normalize --to: trim whitespace around commas; canonical form is "name1, name2".
-    # Applies to both single-recipient ("borges") and multi-recipient ("ariadne, borges").
-    args.to = ", ".join(n.strip() for n in args.to.split(",") if n.strip())
-    if not args.to:
-        print(
-            "ia write: --to value is empty after stripping; specify at least one recipient.",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_VALIDATION)
+    for r in recipients:
+        if not r.replace("-", "").replace("_", "").isalnum():
+            print(
+                f"ia write: invalid recipient name '{r}' — "
+                "agent names may only contain letters, digits, hyphens, and underscores.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
 
-    # Build the timestamp for the new letter
-    now = datetime.now(timezone.utc)
-    ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    # Build filename: <ISO-dashes>_<agent-name>.md
-    ts_dashes = now.strftime("%Y-%m-%dT%H-%M-%SZ")
-    filename = f"{ts_dashes}_{agent_name}.md"
-    dest_path = inter_agent_dir / filename
-
-    # Build frontmatter
-    fm_lines = [
-        "---",
-        f"from: {agent_name}",
-        f"to: {args.to}",
-        f"timestamp: {ts_str}",
-    ]
-    if args.re:
-        fm_lines.append(f"re: {args.re}")
-    fm_lines.append("---")
-    fm_lines.append("")
-    if args.title:
-        fm_lines.append(f"# {args.title}")
-        fm_lines.append("")
-
-    template = "\n".join(fm_lines) + "\n"
-
-    # Get body
-    if args.body_file and args.from_stdin:
-        print(
-            "ia write: --body-file and --from-stdin are mutually exclusive; "
-            "use one or the other.",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_VALIDATION)
-
+    # Resolve body source
+    body_text: str
     if args.body_file:
         body_path = Path(args.body_file)
         if not body_path.exists():
@@ -965,27 +364,18 @@ def cmd_write(args: argparse.Namespace, config: dict, agent_name: str) -> None:
             )
             sys.exit(EXIT_VALIDATION)
         try:
-            body = body_path.read_text(encoding="utf-8")
+            body_text = body_path.read_text(encoding="utf-8")
         except OSError as e:
             print(
                 f"ia write: --body-file: cannot read '{args.body_file}': {e}",
                 file=sys.stderr,
             )
             sys.exit(EXIT_IO)
-        if body.lstrip().startswith("---"):
-            print(
-                "ia write: warning: --body-file content starts with '---'; "
-                "frontmatter is auto-assembled, so this will appear as literal "
-                "body text. Supply ONLY the body.",
-                file=sys.stderr,
-            )
-        full_content = template + body
-    elif args.from_stdin:
-        # Stdin mode: read the full letter content from stdin.
-        # The caller is expected to provide complete content (frontmatter + body).
-        full_content = sys.stdin.read()
+    elif args.from_stdin or not sys.stdin.isatty():
+        # Read body from stdin
+        body_text = sys.stdin.read()
     else:
-        # Open $EDITOR
+        # Open $EDITOR with a simple template (no frontmatter — body only)
         editor = _find_editor()
         if editor is None:
             print(
@@ -994,13 +384,22 @@ def cmd_write(args: argparse.Namespace, config: dict, agent_name: str) -> None:
             )
             sys.exit(EXIT_STATE)
 
-        # Write template to a temp file and open the editor
+        subject = getattr(args, "subject", None) or ""
+        template_lines = [
+            "# Write your message body below this line.",
+            "# Lines starting with # are not stripped — include them if meaningful.",
+            "",
+        ]
+        if subject:
+            template_lines.insert(0, f"# Subject: {subject}")
+            template_lines.insert(1, "")
+        template = "\n".join(template_lines) + "\n"
+
         with tempfile.NamedTemporaryFile(
             mode="w",
             suffix=".md",
             prefix="ia-write-",
             delete=False,
-            dir="/tmp",
         ) as tf:
             tf.write(template)
             tmp_name = tf.name
@@ -1014,463 +413,166 @@ def cmd_write(args: argparse.Namespace, config: dict, agent_name: str) -> None:
                 )
                 sys.exit(EXIT_IO)
             with open(tmp_name, encoding="utf-8") as f:
-                full_content = f.read()
+                body_text = f.read()
         finally:
             try:
                 os.unlink(tmp_name)
             except OSError:
                 pass
 
-    # Pre-parse guard: catches bare 'to:' (empty value) before the regex parser's
-    # merge quirk, which would otherwise silently misroute the letter. Runs for
-    # --from-stdin, --body-file, and editor mode (the user can clear the 'to:'
-    # field in the editor, or a body file can supply incomplete content).
-    fm_raw_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", full_content, re.DOTALL)
-    if fm_raw_match:
-        fm_raw = fm_raw_match.group(1)
-        if re.search(r"^to:\s*$", fm_raw, re.MULTILINE):
+    if not body_text or not body_text.strip():
+        print("ia write: body is empty (nothing to send).", file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+    subject = getattr(args, "subject", None)
+    encoded = _encode_body(body_text, recipients, subject)
+
+    forum_url = getattr(args, "forum_url", None) or forum_url_from_config(config)
+    client = ForumClient(forum_url)
+
+    # POST to each recipient (N separate 1:1 DM threads). Collect-and-continue:
+    # attempt EVERY recipient, report each, and exit non-zero iff any failed —
+    # so a mid-list failure neither aborts the remaining sends nor hides the
+    # partial delivery (the multi-recipient send is non-atomic by construction;
+    # this makes the partial state visible instead of silently truncating).
+    failures = []
+    for recipient in recipients:
+        try:
+            result = client.post(
+                f"/api/dm/{urllib.parse.quote(recipient)}",
+                {"agent": agent_name, "body": encoded},
+            )
+        except ForumNetworkError as e:
             print(
-                "ia write: invalid frontmatter — 'to:' line is empty; "
-                "specify a recipient.",
+                f"ia write: FAILED to {recipient} — forum unreachable: {e}",
                 file=sys.stderr,
             )
-            sys.exit(EXIT_VALIDATION)
-
-    # Validate the frontmatter of what's been written
-    fields, body_text = _parse_frontmatter(full_content)
-    if not fields:
-        print(
-            "ia write: could not parse frontmatter from the letter. "
-            "Make sure the letter starts with --- ... --- block. "
-            "See inter-agent/README.md §2.",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_VALIDATION)
-
-    errors = _validate_frontmatter(fields, agent_name, inter_agent_dir, context="write")
-    if errors:
-        for err in errors:
-            print(err, file=sys.stderr)
-        sys.exit(EXIT_VALIDATION)
-
-    # Warn if body is empty
-    if not body_text.strip():
-        print(
-            "ia write: warning — letter body is empty. Sending anyway.",
-            file=sys.stderr,
-        )
-
-    # Atomic write: tmp + os.link (collision-safe), then chmod 644.
-    #
-    # Why os.link instead of os.rename:
-    #   os.rename(src, dst) silently replaces dst on POSIX — so two `ia write`
-    #   calls by the same agent in the same second produce the same dest_path and
-    #   the second clobbers the first (silent data loss).  os.link(src, dst) is
-    #   atomic AND raises FileExistsError if dst already exists, so it is race-free
-    #   unlike a check-then-rename (TOCTOU).  On collision we bump a numeric suffix
-    #   (-2, -3, …) and retry, capping at _LINK_MAX_ATTEMPTS.
-    #
-    # Suffix scheme: first letter keeps the clean name <ts>_<agent>.md; on
-    # collision use <ts>_<agent>-2.md, -3.md, etc.
-    if not inter_agent_dir.is_dir():
-        print(
-            f"ia write: inter-agent dir not found: {inter_agent_dir}. "
-            f"See inter-agent/README.md §8.",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_IO)
-
-    _LINK_MAX_ATTEMPTS = 100
-    tmp_path = inter_agent_dir / (filename + ".tmp")
-    try:
-        tmp_path.write_text(full_content, encoding="utf-8")
-    except OSError as e:
-        print(f"ia write: failed to write letter: {e}", file=sys.stderr)
-        sys.exit(EXIT_IO)
-
-    # Attempt to claim a unique destination name.
-    # First attempt: the clean name.  On FileExistsError, bump suffix.
-    base, ext = filename[:-3], ".md"  # split "2026-…T…Z_name.md" → ("2026-…T…Z_name", ".md")
-    claimed_path = None
-    for attempt in range(1, _LINK_MAX_ATTEMPTS + 1):
-        candidate_name = filename if attempt == 1 else f"{base}-{attempt}{ext}"
-        candidate_path = inter_agent_dir / candidate_name
-        try:
-            os.link(str(tmp_path), str(candidate_path))
-            claimed_path = candidate_path
-            break
-        except FileExistsError:
+            failures.append(recipient)
             continue
-        except OSError as e:
-            # Unexpected error (e.g. cross-device, permissions) — clean up and abort
-            print(f"ia write: failed to publish letter: {e}", file=sys.stderr)
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-            sys.exit(EXIT_IO)
-
-    try:
-        tmp_path.unlink()
-    except OSError:
-        pass
-
-    if claimed_path is None:
+        except ForumHttpError as e:
+            print(
+                f"ia write: FAILED to {recipient} — server error {e.status}: {e.body}",
+                file=sys.stderr,
+            )
+            failures.append(recipient)
+            continue
         print(
-            f"ia write: collision loop exhausted after {_LINK_MAX_ATTEMPTS} attempts "
-            f"(all candidate names already exist — this should not happen in normal use).",
+            f"ia write: sent to {recipient} "
+            f"(seq={result.get('seq')}, ts={result.get('ts')})"
+        )
+    if failures:
+        print(
+            f"ia write: {len(failures)} of {len(recipients)} deliveries FAILED "
+            f"({', '.join(failures)}); the others were sent. Re-send only to the "
+            f"failed recipients to avoid duplicates.",
             file=sys.stderr,
         )
         sys.exit(EXIT_IO)
-
-    try:
-        os.chmod(claimed_path, 0o644)
-    except OSError as e:
-        print(f"ia write: warning — could not set permissions on letter: {e}", file=sys.stderr)
-
-    print(f"ia write: sent → {claimed_path.name}")
 
 
 # ---------------------------------------------------------------------------
 # Subcommand: mark-read
 # ---------------------------------------------------------------------------
 
+
 def cmd_mark_read(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    inter_agent_dir = Path(INTER_AGENT_DIR)
-    current_cursor = _read_cursor(READ_CURSOR_PATH)
+    """Advance read cursor to current as_of: GET /api/updates?kinds=dm."""
+    forum_url = getattr(args, "forum_url", None) or forum_url_from_config(config)
+    client = ForumClient(forum_url)
 
-    if args.all:
-        # Advance cursor to now
-        new_ts = datetime.now(timezone.utc)
-    elif args.up_to:
-        new_ts = _parse_iso_timestamp(args.up_to, context="mark-read")
-    else:
-        # Resolve letter filename
-        filename = args.filename
-        candidate = Path(filename)
-        if not candidate.is_absolute():
-            candidate = inter_agent_dir / candidate
-        if not candidate.exists():
-            print(
-                f"ia mark-read: file not found: '{filename}' "
-                f"(looked in {inter_agent_dir}). "
-                f"See inter-agent/README.md §4.",
-                file=sys.stderr,
-            )
-            sys.exit(EXIT_VALIDATION)
-        try:
-            text = candidate.read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            print(f"ia mark-read: cannot read '{candidate}': {e}", file=sys.stderr)
-            sys.exit(EXIT_IO)
-        fields, _ = _parse_frontmatter(text)
-        ts_str = fields.get("timestamp", "")
-        new_ts = _parse_letter_timestamp(ts_str)
-        if new_ts is None:
-            print(
-                f"ia mark-read: cannot parse timestamp from '{filename}'. "
-                f"Expected '2026-05-22T14:30:00Z'. "
-                f"See inter-agent/README.md §2.",
-                file=sys.stderr,
-            )
-            sys.exit(EXIT_VALIDATION)
+    cursor = _read_cursor_int(READ_CURSOR_PATH)
 
-    # Monotonic check (unless --force)
-    if current_cursor is not None and new_ts < current_cursor and not args.force:
-        print(
-            f"ia mark-read: refusing to move cursor backward "
-            f"(current: {_cursor_str(current_cursor)}, requested: {_cursor_str(new_ts)}). "
-            f"Pass --force to override (e.g., cursor recovery). "
-            f"See inter-agent/README.md §4.",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_VALIDATION)
-
-    _write_cursor(READ_CURSOR_PATH, new_ts)
-    print(f"ia mark-read: cursor advanced to {_cursor_str(new_ts)}")
+    data = _api_get(
+        client,
+        "/api/updates",
+        params={
+            "agent": agent_name,
+            "since": str(cursor),
+            "kinds": "dm",
+        },
+    )
+    as_of = data.get("as_of", cursor)
+    _write_cursor_int(READ_CURSOR_PATH, as_of)
+    print(f"ia mark-read: cursor advanced to {as_of}")
 
 
 # ---------------------------------------------------------------------------
 # Subcommand: cursor
 # ---------------------------------------------------------------------------
 
+
 def cmd_cursor(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    # --type requires --advanced
-    if hasattr(args, "type") and args.type and not getattr(args, "advanced", False):
-        print(
-            "ia cursor: --type requires --advanced. "
-            "If you're sure you want to touch the hook's surfaced cursor, "
-            "pass --advanced --type surfaced. "
-            "See inter-agent/README.md §4.",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_VALIDATION)
-
-    # Determine which cursor to operate on
-    cursor_type = getattr(args, "type", None) or "read"
-    if cursor_type == "surfaced":
-        cursor_path = SURFACED_CURSOR_PATH
-    else:
-        cursor_path = READ_CURSOR_PATH
-
-    if args.set_ts:
-        # Set the cursor (with monotonic check)
-        new_ts = _parse_iso_timestamp(args.set_ts, context="cursor")
-        current = _read_cursor(cursor_path)
-
-        if current is not None and new_ts < current and not args.force:
+    """Show or set the read cursor (as_of integer)."""
+    if args.set_val is not None:
+        try:
+            new_val = int(args.set_val)
+        except (ValueError, TypeError):
             print(
-                f"ia cursor: refusing to set cursor backward "
-                f"(current: {_cursor_str(current)}, requested: {_cursor_str(new_ts)}). "
-                f"Pass --force to override. "
-                f"See inter-agent/README.md §4.",
+                f"ia cursor: --set value must be an integer; got '{args.set_val}'.",
                 file=sys.stderr,
             )
             sys.exit(EXIT_VALIDATION)
-
-        _write_cursor(cursor_path, new_ts)
-        print(f"ia cursor: {cursor_type} cursor set to {_cursor_str(new_ts)}")
+        _write_cursor_int(READ_CURSOR_PATH, new_val)
+        print(f"ia cursor: set to {new_val}")
     else:
-        # Show cursor (default)
-        ts = _read_cursor(cursor_path)
-        print(f"{cursor_type} cursor: {_cursor_str(ts)}")
+        val = _read_cursor_int(READ_CURSOR_PATH)
+        print(f"read cursor: {val}")
 
 
 # ---------------------------------------------------------------------------
 # Subcommand: status
 # ---------------------------------------------------------------------------
 
+
 def cmd_status(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    inter_agent_dir = Path(INTER_AGENT_DIR)
-
+    """Quick health check: agent name, mode, DM threads, unread count."""
     mode = config.get("mode", "single")
-    read_cursor = _read_cursor(READ_CURSOR_PATH)
-    surfaced_cursor = _read_cursor(SURFACED_CURSOR_PATH)
+    forum_url = getattr(args, "forum_url", None) or forum_url_from_config(config)
+    cursor = _read_cursor_int(READ_CURSOR_PATH)
 
-    # Check dir writability
-    dir_exists = inter_agent_dir.is_dir()
-    dir_writable = os.access(inter_agent_dir, os.W_OK) if dir_exists else False
-    dir_status = "writable" if dir_writable else ("exists (not writable)" if dir_exists else "NOT FOUND")
+    client = ForumClient(forum_url)
 
-    # Count unread (scan once; reuse for correspondents below)
-    if dir_exists and agent_name:
-        all_letters, _ = _scan_letters(agent_name, inter_agent_dir)
-        unread = _filter_unread(all_letters, read_cursor)
-        unread_count = len(unread)
-        # Unreplied: all incoming letters (any time) with no outgoing re: reference
-        replied_set = _scan_replied_filenames(agent_name, inter_agent_dir)
-        unreplied_count = sum(
-            1 for l in all_letters if l["filename"] not in replied_set
+    # Attempt to get DM thread count (graceful on unreachable — status is diagnostic)
+    thread_count: Optional[int] = None
+    unread_count: Optional[int] = None
+
+    try:
+        dm_data = client.get("/api/dm", params={"agent": agent_name})
+        thread_count = len(dm_data.get("threads", []))
+    except (ForumNetworkError, ForumHttpError):
+        pass
+
+    try:
+        upd_data = client.get(
+            "/api/updates",
+            params={"agent": agent_name, "since": str(cursor), "kinds": "dm"},
         )
-    else:
-        all_letters = []
-        unread_count = 0
-        replied_set = set()
-        unreplied_count = 0
-
-    # Unique senders seen in letters to me (recently-active proxy; DESIGN §9.3 note)
-    active_correspondents: list = []
-    if dir_exists and agent_name:
-        seen_from = sorted({l["from"] for l in all_letters})
-        active_correspondents = seen_from
-
-    now = datetime.now(timezone.utc)
-
-    def _age_str(ts: Optional[datetime]) -> str:
-        if ts is None:
-            return ""
-        delta = now - ts
-        total_secs = int(delta.total_seconds())
-        if total_secs < 60:
-            return f" ({total_secs}s ago)"
-        elif total_secs < 3600:
-            return f" ({total_secs // 60} min ago)"
-        elif total_secs < 86400:
-            return f" ({total_secs // 3600}h ago)"
-        else:
-            return f" ({total_secs // 86400}d ago)"
+        unread_count = len(upd_data.get("updates", []))
+    except (ForumNetworkError, ForumHttpError):
+        pass
 
     if args.format == "json":
         output = {
             "agent": agent_name or "(unknown)",
             "mode": mode,
-            "inter_agent_dir": str(inter_agent_dir),
-            "dir_writable": dir_writable,
-            "read_cursor": _cursor_str(read_cursor),
-            "surfaced_cursor": _cursor_str(surfaced_cursor),
-            "unread_letters": unread_count,
-            "unreplied_letters": unreplied_count,
-            "active_correspondents": active_correspondents,
+            "forum_url": forum_url,
+            "read_cursor": cursor,
+            "dm_threads": thread_count,
+            "unread_dm_messages": unread_count,
         }
         print(json.dumps(output, indent=2))
         return
 
     # Human format
-    print(f"agent:           {agent_name or '(unknown)'}")
-    print(f"mode:            {mode}")
-    print(f"inter-agent-dir: {inter_agent_dir} ({dir_status})")
-    print(f"read cursor:     {_cursor_str(read_cursor)}{_age_str(read_cursor)}")
-    print(f"surfaced cursor: {_cursor_str(surfaced_cursor)}{_age_str(surfaced_cursor)}")
-    print(f"unread letters:  {unread_count}")
-    if unreplied_count > 0:
-        print(f"unreplied:       {unreplied_count}")
-    if active_correspondents:
-        print(f"correspondents:  {', '.join(active_correspondents)}")
-    else:
-        print(f"correspondents:  (none)")
+    thread_str = str(thread_count) if thread_count is not None else "(unreachable)"
+    unread_str = str(unread_count) if unread_count is not None else "(unreachable)"
 
-
-# ---------------------------------------------------------------------------
-# Subcommand: star
-# ---------------------------------------------------------------------------
-
-def cmd_star(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    inter_agent_dir = Path(INTER_AGENT_DIR)
-
-    filename = args.filename
-    # Validate the filename exists in inter-agent/ and parse it once to snapshot from+title
-    candidate = Path(filename)
-    if not candidate.is_absolute():
-        candidate = inter_agent_dir / filename
-    if not candidate.exists():
-        print(
-            f"ia star: file not found: '{filename}' "
-            f"(looked in {inter_agent_dir}). "
-            f"Use 'ia list --all' to see available letters.",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_VALIDATION)
-
-    # Parse letter once (validation + snapshot)
-    try:
-        text = candidate.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        print(f"ia star: cannot read '{candidate}': {e}", file=sys.stderr)
-        sys.exit(EXIT_IO)
-    fields, body = _parse_frontmatter(text)
-    snapshot_from = fields.get("from", "unknown").strip() if fields else "unknown"
-    snapshot_title = _extract_title(fields, body) if fields else "(no title)"
-
-    # Use basename only in the starred list (not full path)
-    if Path(filename).is_absolute():
-        filename = Path(filename).name
-
-    entries = _read_starred()
-    note = args.note or ""
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    # Idempotent: update note (and refresh snapshot fields) if already starred
-    for entry in entries:
-        if entry.get("filename") == filename:
-            if note:
-                entry["note"] = note
-            # Refresh snapshot fields in case letter was edited since last star
-            entry["from"] = snapshot_from
-            entry["title"] = snapshot_title
-            print(f"ia star: '{filename}' already starred (updated note)" if note else
-                  f"ia star: '{filename}' already starred (no-op)")
-            _write_starred(entries)
-            return
-
-    entries.append({
-        "filename": filename,
-        "from": snapshot_from,
-        "title": snapshot_title,
-        "starred_at": now_str,
-        "note": note,
-    })
-    _write_starred(entries)
-    print(f"ia star: starred '{filename}'")
-
-
-# ---------------------------------------------------------------------------
-# Subcommand: unstar
-# ---------------------------------------------------------------------------
-
-def cmd_unstar(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    filename = args.filename
-    # Normalize to basename
-    filename = Path(filename).name
-
-    entries = _read_starred()
-    new_entries = [e for e in entries if e.get("filename") != filename]
-
-    if len(new_entries) == len(entries):
-        print(f"ia unstar: '{filename}' was not starred (no-op)")
-        return
-
-    _write_starred(new_entries)
-    print(f"ia unstar: unstarred '{filename}'")
-
-
-# ---------------------------------------------------------------------------
-# Subcommand: starred
-# ---------------------------------------------------------------------------
-
-def cmd_starred(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    inter_agent_dir = Path(INTER_AGENT_DIR)
-
-    entries = _read_starred()
-
-    if args.format == "json":
-        print(json.dumps(entries, indent=2))
-        return
-
-    # Human format: show each entry with from · title · filename · note · staleness
-    if not entries:
-        print("starred (0): no starred letters.")
-        return
-
-    now = datetime.now(timezone.utc)
-    print(f"starred ({len(entries)}):")
-    skipped = 0
-    shown = 0
-    missing_count = 0
-    for entry in entries:
-        filename = entry.get("filename", "").strip()
-        if not filename:
-            skipped += 1
-            continue
-
-        # Read from/title from snapshot; graceful fallback for old entries lacking snapshot fields
-        from_agent = (entry.get("from") or "").strip() or "unknown"
-        title = (entry.get("title") or "").strip() or "(no title)"
-        note = entry.get("note", "").strip()
-        starred_at_str = entry.get("starred_at", "")
-
-        # Check source letter existence (warn but still render from snapshot)
-        letter_path = inter_agent_dir / filename
-        if not letter_path.exists():
-            missing_count += 1
-
-        note_part = f"  note: {note}" if note else ""
-        missing_part = "  [source letter no longer present]" if not letter_path.exists() else ""
-
-        # Staleness nudge
-        stale_part = ""
-        if starred_at_str:
-            try:
-                starred_dt = datetime.strptime(starred_at_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                age_days = (now - starred_dt).days
-                if age_days >= STARRED_STALE_DAYS:
-                    stale_part = f"  ⚠ stale {age_days}d — unstar if resolved"
-            except ValueError:
-                pass
-
-        print(f"  {from_agent:<12}  \"{title}\"")
-        print(f"    {filename}{note_part}{missing_part}{stale_part}")
-        shown += 1
-
-    if missing_count > 0:
-        print(
-            f"note: {missing_count} starred letter(s) no longer exist in {inter_agent_dir}",
-            file=sys.stderr,
-        )
-    if skipped > 0:
-        print(
-            f"note: {skipped} starred entry/entries skipped (missing filename field)",
-            file=sys.stderr,
-        )
+    print(f"agent:        {agent_name or '(unknown)'}")
+    print(f"mode:         {mode}")
+    print(f"forum:        {forum_url}")
+    print(f"read cursor:  {cursor}")
+    print(f"DM threads:   {thread_str}")
+    print(f"unread DMs:   {unread_str}")
 
 
 # ---------------------------------------------------------------------------
@@ -1479,59 +581,51 @@ def cmd_starred(args: argparse.Namespace, config: dict, agent_name: str) -> None
 
 
 def cmd_peers(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    """Scan the agent registry and display co-host vs cross-host peers."""
-    registry_dir = getattr(args, "registry_dir", None) or AGENT_REGISTRY_DIR
-    peers = scan_peers(agent_name, registry_dir=registry_dir)
+    """Show known agents from the forum registry: GET /api/agents/online."""
+    forum_url = getattr(args, "forum_url", None) or forum_url_from_config(config)
+    client = ForumClient(forum_url)
+
+    data = _api_get(client, "/api/agents/online", params={"agent": agent_name})
+    online = data.get("online", [])
+    registered = data.get("registered", len(online))
 
     if args.format == "json":
-        print(json.dumps(peers, indent=2))
+        print(json.dumps(data, indent=2))
         return
+
+    # Filter out self for peers display
+    peers = [
+        a for a in online
+        if (a.get("name") or "").lower() != agent_name.lower()
+    ]
 
     if not peers:
-        print("peers (0): no peer registration files found.")
-        reg_path = Path(registry_dir)
-        if not reg_path.is_dir():
-            print(
-                f"  (registry dir does not exist: {registry_dir})",
-                file=sys.stderr,
-            )
+        print(f"peers (0 of {registered} registered): no peers online.")
         return
 
-    cohost = [p for p in peers if p["topology"] == "co-host"]
-    crosshost = [p for p in peers if p["topology"] == "cross-host"]
-
-    def _render_peer(p: dict) -> str:
-        stale_marker = "  (stale)" if p["stale"] else ""
-        return (
-            f"  {p['agent_name']:<14}  {p['hostname']:<20}  "
-            f"{p['topology']:<12}  {_format_age(p['age_seconds'])}"
-            f"{stale_marker}"
-        )
-
-    header = f"{'agent':<14}  {'hostname':<20}  {'topology':<12}  age"
-    print(header)
-    print("-" * len(header))
-    for p in cohost + crosshost:
-        print(_render_peer(p))
-    print(f"\n{len(cohost)} co-host, {len(crosshost)} cross-host "
-          f"({len([p for p in peers if p['stale']])} stale)")
+    print(f"peers ({len(peers)} of {registered} registered):")
+    for a in peers:
+        name = a.get("name") or "(unknown)"
+        state = a.get("state", "")
+        state_str = f"  [{state}]" if state else ""
+        print(f"  {name:<16}{state_str}")
 
 
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ia",
         description=(
-            "Inter-agent CLI — list, read, and write letters over the "
-            "file-based inter-agent protocol."
+            "Inter-agent CLI — send and receive direct messages via the forum DM channel."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Protocol docs: inter-agent/README.md\n"
-            "Design doc:    ariadne-desk/projects/inter-agent-cli/DESIGN.md\n"
+            "All DM commands require multi-agent mode (mode='multi' in config.json).\n"
+            "Forum API must be reachable for DM commands; `status` is graceful if unreachable.\n"
         ),
     )
     subparsers = parser.add_subparsers(dest="subcommand", metavar="subcommand")
@@ -1540,160 +634,116 @@ def build_parser() -> argparse.ArgumentParser:
     # -- list --
     p_list = subparsers.add_parser(
         "list",
-        help="Show letters addressed to me (default: unread only)",
+        help="Show my DM threads (GET /api/dm)",
         description=(
-            "List letters addressed to this agent. "
-            "Defaults to unread (timestamp > read cursor). "
-            "Use --all to see every letter."
+            "List all DM threads this agent has. Each thread is a 1:1 conversation "
+            "with one counterpart. Use 'ia read <counterpart>' to see messages."
         ),
-    )
-    list_mode = p_list.add_mutually_exclusive_group()
-    list_mode.add_argument(
-        "--all", action="store_true", default=False,
-        help="Show all letters (not just unread)",
-    )
-    list_mode.add_argument(
-        "--unread", action="store_true", default=False,
-        help="Show only unread letters (default)",
-    )
-    p_list.add_argument(
-        "--from", dest="from_agent", metavar="AGENT",
-        help="Filter to letters from a specific sender",
-    )
-    p_list.add_argument(
-        "--since", metavar="ISO-TIMESTAMP",
-        help="Filter to letters after this timestamp (ISO-8601, e.g. '2026-05-22T14:00:00Z')",
-    )
-    p_list.add_argument(
-        "--limit", type=int, metavar="N",
-        help="Cap output to N letters",
     )
     p_list.add_argument(
         "--format", choices=["human", "json"], default="human",
         help="Output format: human (default) or json",
     )
+    p_list.add_argument(
+        "--forum-url", dest="forum_url", default=None,
+        help=argparse.SUPPRESS,  # internal / testing override
+    )
 
     # -- read --
     p_read = subparsers.add_parser(
         "read",
-        help="Display a letter; advance read cursor to its timestamp",
+        help="Display messages with a counterpart (GET /api/dm/<counterpart>)",
         description=(
-            "Print a letter's full contents (frontmatter + body) to stdout "
-            "and advance the read cursor to the letter's timestamp."
+            "Print all DM messages in a thread with a specific counterpart. "
+            "Optionally fetch only messages newer than --since-seq."
         ),
     )
-    read_target = p_read.add_mutually_exclusive_group(required=True)
-    read_target.add_argument(
-        "filename", nargs="?", default=None,
-        metavar="FILENAME",
-        help="Letter filename (full path or basename from inter-agent/)",
-    )
-    read_target.add_argument(
-        "--latest", action="store_true",
-        help="Read the most recent unread letter",
+    p_read.add_argument(
+        "counterpart",
+        metavar="COUNTERPART",
+        help="The other agent in the thread (e.g. 'borges')",
     )
     p_read.add_argument(
-        "--force", action="store_true",
-        help="Advance cursor even if it would move backward (cursor recovery)",
+        "--since-seq", dest="since_seq", type=int, default=0, metavar="N",
+        help="Return messages with seq > N (default 0 = all)",
+    )
+    p_read.add_argument(
+        "--format", choices=["human", "json"], default="human",
+        help="Output format: human (default) or json",
+    )
+    p_read.add_argument(
+        "--forum-url", dest="forum_url", default=None,
+        help=argparse.SUPPRESS,  # internal / testing override
     )
 
     # -- write --
     p_write = subparsers.add_parser(
         "write",
-        help="Create a new letter via $EDITOR with validated frontmatter",
+        help="Send a DM (body from stdin, --body-file, or $EDITOR)",
         description=(
-            "Open $EDITOR (or $VISUAL → nano → vi fallback) with a pre-populated "
-            "frontmatter template, validate on save, and write atomically to "
-            "inter-agent/."
+            "Send a direct message to one or more agents. Body comes from stdin "
+            "(piped), --body-file, or $EDITOR (when stdin is a terminal). "
+            "For multiple recipients, one DM is posted to each 1:1 thread. "
+            "A **To:** header is prepended when sending to multiple recipients "
+            "so each recipient knows others were included (no silent BCC)."
         ),
     )
     p_write.add_argument(
-        "--to", required=False, default=None, metavar="AGENT[,AGENT,...]",
+        "--to", required=True, metavar="AGENT[,AGENT,...]",
         help=(
             "Recipient(s) — one name or a comma-separated list (e.g. 'ariadne,borges'). "
-            "Whitespace around commas is tolerated. ONE file is written regardless of "
-            "recipient count; the to: frontmatter line carries all names. "
-            "Required unless --reply is used (which auto-fills --to from the source letter)."
+            "Each recipient gets their own 1:1 DM thread with the same body."
         ),
     )
     p_write.add_argument(
-        "--re", metavar="FILENAME",
-        help="Filename of the letter being replied to (must exist in inter-agent/)",
-    )
-    p_write.add_argument(
-        "--reply", metavar="FILENAME",
+        "--subject", metavar="TEXT", default=None,
         help=(
-            "Convenience shorthand: reply to a specific letter by filename. "
-            "Auto-fills --to from the source letter's `from:` field and populates `re:`. "
-            "If --to is also given, it must match the source's sender or the command errors out."
+            "Optional subject line; prepended as '**Subject:** TEXT' before the body."
         ),
     )
     p_write.add_argument(
-        "--title", metavar="TEXT",
-        help="Optional # Heading for the letter body",
-    )
-    p_write.add_argument(
-        "--from-stdin", action="store_true",
+        "--body-file", dest="body_file", metavar="PATH", default=None,
         help=(
-            "Read the FULL letter from stdin — frontmatter block (--- / from: / to: / "
-            "timestamp: / ---) PLUS body. Fails with 'could not parse frontmatter' if "
-            "body-only content is passed. Use --body-file instead when you only have "
-            "the body and want frontmatter auto-assembled. "
-            "(filename timestamp is always send-time; if your stdin frontmatter "
-            "specifies a different timestamp, they will diverge by design — "
-            "frontmatter ts is authoritative for readers.)"
+            "Path to a file containing the message body. "
+            "Mutually exclusive with piped stdin; $EDITOR is skipped when this is set."
         ),
     )
     p_write.add_argument(
-        "--body-file", metavar="PATH",
+        "--from-stdin", dest="from_stdin", action="store_true",
         help=(
-            "Path to a file containing ONLY the letter body (no frontmatter); "
-            "frontmatter (from/to/timestamp) is auto-assembled from flags. "
-            "Body is read verbatim (no shell processing) — the safe path "
-            "for content with backticks/$vars/angle-brackets. "
-            "If the file accidentally includes a '---' frontmatter block, a warning "
-            "is emitted but the letter is still sent as-is. "
-            "Mutually exclusive with --from-stdin."
+            "Force reading body from stdin even if stdin is a terminal. "
+            "Useful in scripts that pipe content explicitly."
         ),
+    )
+    p_write.add_argument(
+        "--forum-url", dest="forum_url", default=None,
+        help=argparse.SUPPRESS,  # internal / testing override
     )
 
     # -- mark-read --
     p_mr = subparsers.add_parser(
         "mark-read",
-        help="Advance read cursor without displaying a letter",
+        aliases=["mr"],
+        help="Advance read cursor to current as_of from /api/updates",
         description=(
-            "Advance the read cursor (marks letters as acknowledged) "
-            "without printing them. Cursor is monotonic — pass --force "
-            "to move it backward (recovery scenarios)."
+            "Poll GET /api/updates?kinds=dm and advance the local read cursor "
+            "to the returned as_of watermark. Used by the prompt-hook to "
+            "surface unread DMs."
         ),
     )
-    mr_target = p_mr.add_mutually_exclusive_group(required=True)
-    mr_target.add_argument(
-        "filename", nargs="?", default=None,
-        metavar="FILENAME",
-        help="Advance cursor to this letter's timestamp",
-    )
-    mr_target.add_argument(
-        "--all", action="store_true",
-        help="Advance cursor to now (clears all unread)",
-    )
-    mr_target.add_argument(
-        "--up-to", metavar="ISO-TIMESTAMP",
-        help="Advance cursor to a specific timestamp",
-    )
     p_mr.add_argument(
-        "--force", action="store_true",
-        help="Allow cursor to move backward (recovery scenarios)",
+        "--forum-url", dest="forum_url", default=None,
+        help=argparse.SUPPRESS,  # internal / testing override
     )
 
     # -- cursor --
     p_cursor = subparsers.add_parser(
         "cursor",
-        help="Show or set the read cursor",
+        help="Show or set the read cursor (as_of integer)",
         description=(
-            "Show or set the inter-agent read cursor. "
-            "The cursor stores an ISO-8601 UTC timestamp — not a filename. "
-            "Cursor advance is monotonic by default; use --force for recovery."
+            "Show or set the DM read cursor. The cursor is an integer "
+            "(the as_of watermark from /api/updates), stored locally at "
+            "~/.engram/inter-agent-read-cursor.txt."
         ),
     )
     cursor_action = p_cursor.add_mutually_exclusive_group()
@@ -1702,100 +752,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print current cursor value (default)",
     )
     cursor_action.add_argument(
-        "--set", dest="set_ts", metavar="ISO-TIMESTAMP",
-        help="Set cursor to this timestamp (ISO-8601, e.g. '2026-05-22T14:30:00Z')",
-    )
-    p_cursor.add_argument(
-        "--advanced", action="store_true",
-        help="Enable advanced cursor operations (required for --type surfaced)",
-    )
-    p_cursor.add_argument(
-        "--type", dest="type", choices=["read", "surfaced"], default=None,
-        help=(
-            "Which cursor to operate on: 'read' (default) or 'surfaced' "
-            "(hook-managed; requires --advanced)."
-        ),
-    )
-    p_cursor.add_argument(
-        "--force", action="store_true",
-        help="Allow cursor to move backward (recovery scenarios)",
+        "--set", dest="set_val", metavar="INT",
+        help="Set cursor to this integer value",
     )
 
     # -- status --
     p_status = subparsers.add_parser(
         "status",
-        help="Quick health check (agent name, mode, cursor, unread count)",
+        help="Quick health check (agent name, mode, DM threads, unread count)",
         description=(
-            "Show a quick summary of inter-agent state: "
-            "agent identity, mode, directory writability, cursor values, "
-            "and unread letter count."
+            "Show a summary of DM state: agent identity, mode, forum URL, "
+            "read cursor, DM thread count, and unread message count."
         ),
     )
     p_status.add_argument(
         "--format", choices=["human", "json"], default="human",
         help="Output format: human (default) or json",
     )
-
-    # -- star --
-    p_star = subparsers.add_parser(
-        "star",
-        help="Star a letter to re-surface it at session-start and post-compaction",
-        description=(
-            "Mark a letter as key cross-session context. Starred letters are "
-            "surfaced as concise pointers at session-start and post-compaction "
-            "so important agreements survive experiential resets. "
-            "Idempotent: starring an already-starred letter updates the note "
-            "or is a no-op."
-        ),
-    )
-    p_star.add_argument(
-        "filename",
-        metavar="FILENAME",
-        help="Letter filename (basename or full path in inter-agent/)",
-    )
-    p_star.add_argument(
-        "--note", metavar="TEXT", default="",
-        help="Optional note describing why this letter is starred",
-    )
-
-    # -- unstar --
-    p_unstar = subparsers.add_parser(
-        "unstar",
-        help="Remove a letter from the starred list",
-        description=(
-            "Remove a letter from the starred list. No-op if the letter is not "
-            "currently starred."
-        ),
-    )
-    p_unstar.add_argument(
-        "filename",
-        metavar="FILENAME",
-        help="Letter filename (basename or full path) to unstar",
-    )
-
-    # -- starred --
-    p_starred = subparsers.add_parser(
-        "starred",
-        help="List starred letters with from · title · filename · note",
-        description=(
-            "Show all starred letters with their sender, title, filename, and note. "
-            "Warns if a starred letter's file no longer exists."
-        ),
-    )
-    p_starred.add_argument(
-        "--format", choices=["human", "json"], default="human",
-        help="Output format: human (default) or json",
+    p_status.add_argument(
+        "--forum-url", dest="forum_url", default=None,
+        help=argparse.SUPPRESS,  # internal / testing override
     )
 
     # -- peers --
     p_peers = subparsers.add_parser(
         "peers",
-        help="Show known peers from the agent registry, classified co-host vs cross-host",
+        help="Show known agents from the forum registry",
         description=(
-            "Scan /home/agents-shared/agents/ for peer registration files and "
-            "classify each peer as co-host (same hostname — ia/baton reachable) "
-            "or cross-host (different hostname — forum only). "
-            "Entries older than 24h are marked stale."
+            "GET /api/agents/online — list agents that are currently online "
+            "according to the forum registry."
         ),
     )
     p_peers.add_argument(
@@ -1803,7 +788,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format: human (default) or json",
     )
     p_peers.add_argument(
-        "--registry-dir", dest="registry_dir", metavar="PATH", default=None,
+        "--forum-url", dest="forum_url", default=None,
         help=argparse.SUPPRESS,  # internal / testing override
     )
 
@@ -1814,17 +799,16 @@ def build_parser() -> argparse.ArgumentParser:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
     config = _load_config()
 
-    # Mode gate for all subcommands except status and peers.
-    # status: shows single-mode state to help diagnose misconfiguration.
-    # peers: read-only registry query, useful precisely to diagnose topology
-    #        before committing to multi-agent mode; mirrors the status rationale.
-    _MODE_GATE_EXEMPT = {"status", "peers"}
+    # All DM commands require multi-agent mode.
+    # status is exempt: it's a diagnostic utility that shows current mode.
+    _MODE_GATE_EXEMPT = {"status"}
     if args.subcommand not in _MODE_GATE_EXEMPT:
         _check_multi_agent_mode(config)
 
@@ -1843,12 +827,6 @@ def main() -> None:
         cmd_cursor(args, config, agent_name)
     elif args.subcommand == "status":
         cmd_status(args, config, agent_name)
-    elif args.subcommand == "star":
-        cmd_star(args, config, agent_name)
-    elif args.subcommand == "unstar":
-        cmd_unstar(args, config, agent_name)
-    elif args.subcommand == "starred":
-        cmd_starred(args, config, agent_name)
     elif args.subcommand == "peers":
         cmd_peers(args, config, agent_name)
     else:
