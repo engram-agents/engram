@@ -27,12 +27,15 @@ import graph) and this PR fixes with an explicit test-map.json mapping entry
 — see that file for detail.
 """
 
+import argparse
 import json
 import os
 import shutil
 import sys
 import tempfile
 from pathlib import Path
+
+import pytest
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _TOOLS_PERF_DIR = os.path.join(_REPO_ROOT, "tools", "perf")
@@ -93,6 +96,85 @@ def test_replay_bench_self_compare_clean():
         assert cr["compared"] == 12
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_replay_bench_concurrency_shape():
+    """Smoke test for the v1.1 concurrent replay scenario (--concurrency):
+    run the same tiny trace at N=1 and N=4 against ONE shared sandbox, and
+    confirm the per-N report has sane shape/stats — a correctness/shape
+    check, not a real perf benchmark (see the module docstring above for why
+    a real benchmark run belongs in the PR handoff, not this test)."""
+    tmp = Path(tempfile.mkdtemp(prefix="engram_test_replay_bench_concurrency_"))
+    try:
+        seed_dir = tmp / "seed"
+        replay_bench.make_scratch_graph(seed_dir, n_nodes=3)
+
+        trace_path = tmp / "trace.jsonl"
+        n_written = trace_from_telemetry.generate_trace(
+            seed_dir, trace_path, n_calls=12, seed=1234
+        )
+        assert n_written == 12
+
+        report, per_n_results = replay_bench.run_concurrent_replay(
+            trace_path, seed_dir, concurrency_levels=[1, 4]
+        )
+
+        assert report["schema_version"] == replay_bench.CONCURRENCY_SCHEMA_VERSION
+        assert report["concurrency_levels"] == [1, 4]
+        assert set(per_n_results.keys()) == {1, 4}
+
+        for n in (1, 4):
+            entry = report["by_concurrency"][str(n)]
+            assert entry["concurrency"] == n
+            assert entry["call_count"] == 12
+            assert len(per_n_results[n]) == 12
+            # Per-tool call counts must add back up to the total per N.
+            assert sum(s["count"] for s in entry["per_tool"].values()) == 12
+            assert entry["distinct_threads_used"] >= 1
+
+            qs = entry["queueing_signature"]
+            assert qs["escalation_ratio"] is None or qs["escalation_ratio"] >= 0
+
+        md = replay_bench._render_concurrency_markdown(report)
+        assert "# Replay bench concurrency report" in md
+        assert "N = 1" in md
+        assert "N = 4" in md
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_queueing_signature_helper():
+    flat = replay_bench._queueing_signature([10.0, 10.0, 10.0, 10.0])
+    assert flat["escalation_ratio"] == 1.0
+    # Round 2 (reviewer-fairy finding): the caveat must be present and non-empty
+    # whenever a real ratio is computed, not just in the fewer-than-2-calls case —
+    # a bare ratio with no note reads as "no contention" to a future reader.
+    assert flat["note"]
+
+    escalating = replay_bench._queueing_signature([10.0, 10.0, 20.0, 20.0])
+    assert escalating["escalation_ratio"] == 2.0
+    assert escalating["note"]
+
+    single = replay_bench._queueing_signature([5.0])
+    assert single["escalation_ratio"] is None
+    assert single["first_half_mean_ms"] is None
+
+
+def test_parse_concurrency_levels():
+    assert replay_bench._parse_concurrency_levels("1,4,8") == [1, 4, 8]
+    assert replay_bench._parse_concurrency_levels(" 1 , 4 ") == [1, 4]
+    assert replay_bench._parse_concurrency_levels("1,,4") == [1, 4]  # blank segments skipped
+
+    with pytest.raises(argparse.ArgumentTypeError):
+        replay_bench._parse_concurrency_levels("not-an-int")
+    with pytest.raises(argparse.ArgumentTypeError):
+        replay_bench._parse_concurrency_levels("0")
+    with pytest.raises(argparse.ArgumentTypeError):
+        replay_bench._parse_concurrency_levels("-1")
+    with pytest.raises(argparse.ArgumentTypeError):
+        replay_bench._parse_concurrency_levels("")
+    with pytest.raises(argparse.ArgumentTypeError):
+        replay_bench._parse_concurrency_levels("  ,  ")
 
 
 def test_percentile_and_masking_helpers():

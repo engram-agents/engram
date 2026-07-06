@@ -127,11 +127,14 @@ def _sample_node_ids(db_path: Path, limit: int = 2000) -> tuple[list[str], list[
         conn.close()
 
 
-def _expand_to_n(seq: list[str], n: int, rng: random.Random) -> list[str]:
+def _expand_to_n(seq: list[str], n: int) -> list[str]:
     """Expand/contract a real call-mix sequence to exactly n entries.
 
     len(seq) >= n: systematic (evenly-spaced) sample, preserving relative order.
     len(seq) <  n: tile the sequence (repeat in order) until length n.
+
+    Deterministic — both branches are pure index arithmetic, no randomness
+    involved (an earlier `rng` parameter here was unused and has been removed).
     """
     if not seq:
         return []
@@ -189,6 +192,12 @@ def generate_trace(data_dir, out_path, n_calls: int = 300, seed: int | None = No
             f"— dropping {sorted(NODE_ID_TOOLS)} from the call mix.",
             file=sys.stderr,
         )
+    # Currently unreachable given today's READ_TOOLS/NODE_ID_TOOLS constants —
+    # there are always non-node-id tools (engram_query/engram_surface/
+    # engram_list) left in usable_tools even when node_ids is empty and
+    # NODE_ID_TOOLS is dropped above. This is a defensive guard against a
+    # FUTURE edit to those constants that makes READ_TOOLS all node-id tools,
+    # not dead code to delete.
     if not usable_tools:
         raise RuntimeError(
             f"No usable tools remain for {db_path} — graph has no nodes at all."
@@ -197,7 +206,7 @@ def generate_trace(data_dir, out_path, n_calls: int = 300, seed: int | None = No
     call_mix = [t for t in call_mix if t in usable_tools]
 
     if call_mix:
-        sequence = _expand_to_n(call_mix, n_calls, rng)
+        sequence = _expand_to_n(call_mix, n_calls)
     else:
         print(
             f"[trace_from_telemetry] WARNING: no tool_timing rows found for "
