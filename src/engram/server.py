@@ -21,6 +21,7 @@ import socket
 import sqlite3
 import subprocess
 import textwrap
+import threading
 import time
 import uuid as _uuid
 from datetime import datetime, timedelta, timezone
@@ -1050,25 +1051,113 @@ mcp = FastMCP("engram_mcp")
 # records its wall-clock duration to the tool_timing table. The instrumentation
 # is best-effort: any failure is swallowed rather than allowed to break the
 # tool call. Query via engram_diagnose (see the "tool_timing" section).
+#
+# #1670: this used to call _get_db() (~89ms per call in cProfile evidence,
+# #1668) purely to write one INSERT. It now uses a dedicated, lazily-created
+# module-level connection that skips _get_db()'s full setup/backfill/
+# DAG-check machinery entirely — just WAL + busy_timeout pragmas and the
+# tool_timing table/index DDL (idempotent, same as _get_db()'s copy).
+# Guarded by _timing_conn_lock so create+insert+commit never race across
+# FastMCP's threadpool workers.
 # ---------------------------------------------------------------------------
+
+_timing_conn_lock = threading.Lock()
+_timing_conn: Optional[sqlite3.Connection] = None
+_timing_conn_path: Optional[str] = None
+
+
+def _get_timing_conn() -> sqlite3.Connection:
+    """Return the shared tool-timing connection, (re)creating it if needed.
+
+    Caller MUST hold _timing_conn_lock. Reopens if the resolved DB path
+    changed (test isolation via engram_sandbox()/_configure_paths reroutes
+    core.DB_PATH mid-process) or if the cached connection went stale.
+    """
+    global _timing_conn, _timing_conn_path
+    # .resolve() keeps this path key consistent with _get_db()'s guard key
+    # (symlink/relative aliases collapse to one identity; see engram_core).
+    resolved_path = str(core.DB_PATH.resolve())
+    if _timing_conn is not None and _timing_conn_path == resolved_path:
+        return _timing_conn
+    if _timing_conn is not None:
+        try:
+            _timing_conn.close()
+        except Exception:
+            pass
+
+    # Ensure the FULL schema (not just tool_timing) exists for this resolved
+    # path before we start writing to it. This used to happen as an
+    # ACCIDENTAL side effect of the old _record_tool_timing() calling
+    # _get_db() (server.py's OWN always-fresh `core` reference — see the
+    # module-docstring house rule on `import engram_core as core`) on every
+    # single tool call, which ran _get_db()'s full one-time schema/backfill
+    # block unconditionally. engram-pkg's `cmd_init` (scripts/engram-pkg)
+    # relies on exactly that: it bootstraps a fresh package DB by calling
+    # `client.call("engram_stats")` as a "no-op trigger" and depends on
+    # SOME `_get_db()` call reaching the schema-creation code along the way
+    # — it does NOT reliably get there through engram_stats() itself (that
+    # tool delegates to the separately-imported engram_stats.py family
+    # module, which can hold a stale `core` reference across repeated
+    # EngramClient(...) instantiations in one process — a pre-existing
+    # cross-module staleness footgun in EngramClient's module-purge list,
+    # out of scope for this PR to fix). Losing that accidental bootstrap
+    # broke `engram-pkg init`/scope-export (tests/test_scope_export.py) when
+    # #1670 stopped routing every timing write through the heavy path.
+    # core._get_db() call here is a ONE-TIME cost per resolved path (thanks
+    # to #1669's guard — a fresh path pays the full one-time setup exactly
+    # once; every later call, from anywhere, sees schema_present()==True and
+    # is cheap), so this restores the old bootstrap behavior without
+    # reintroducing a per-call cost.
+    try:
+        core._get_db().close()
+    except Exception:
+        pass
+
+    conn = sqlite3.connect(resolved_path, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    # Same DDL as the tool_timing table/indexes created in _get_db()'s
+    # one-time setup — idempotent (CREATE ... IF NOT EXISTS), so whichever
+    # of the two paths gets there first is fine.
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS tool_timing (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp   TEXT NOT NULL,
+            tool_name   TEXT NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            status      TEXT NOT NULL,
+            turn        INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_tool_timing_name_ts
+            ON tool_timing(tool_name, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_tool_timing_turn
+            ON tool_timing(turn);
+        """
+    )
+    _timing_conn = conn
+    _timing_conn_path = resolved_path
+    return conn
+
 
 def _record_tool_timing(tool_name: str, duration_ms: int, status: str) -> None:
     """Record one tool call's latency. Never raises — best-effort only."""
     try:
-        conn = _get_db()
-        turn = _get_current_turn()
-        conn.execute(
-            "INSERT INTO tool_timing (timestamp, tool_name, duration_ms, status, turn) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (
-                datetime.now(timezone.utc).isoformat(),
-                tool_name,
-                int(duration_ms),
-                status,
-                turn,
-            ),
-        )
-        conn.commit()
+        with _timing_conn_lock:
+            conn = _get_timing_conn()
+            turn = _get_current_turn()
+            conn.execute(
+                "INSERT INTO tool_timing (timestamp, tool_name, duration_ms, status, turn) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    tool_name,
+                    int(duration_ms),
+                    status,
+                    turn,
+                ),
+            )
+            conn.commit()
     except Exception:
         pass
 

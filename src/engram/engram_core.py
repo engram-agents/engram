@@ -28,6 +28,7 @@ import socket
 import sqlite3
 import subprocess
 import textwrap
+import threading
 import time
 import uuid as _uuid
 from datetime import date, datetime, timedelta, timezone
@@ -73,36 +74,60 @@ _VEC_BACKEND_AVAILABLE = _SQLITE_VEC_IMPORT_OK
 
 class EmbeddingManager:
     """Manages embedding model loading and computation.
-    
+
     Lazy-loads the model on first use. Stores the model name in the KG's
     config to prevent mixing embeddings from different models.
+
+    #1675: FastMCP dispatches sync tools on a real threadpool, so two
+    concurrent first-touch tool calls could previously race into
+    _load_model() at once — double-loading the model (wasted work / memory)
+    or, worse, one thread observing self._model set to a partially-
+    constructed SentenceTransformer from the other thread (no documented
+    thread-safety guarantee for concurrent construction). _lock guards the
+    lazy-load path with double-checked locking, and also serializes
+    .encode() calls: sentence-transformers documents no thread-safety
+    contract for concurrent encode() on one model instance, so correctness
+    comes first here — concurrent embed() calls now queue rather than race.
+    Known follow-up: this trades away encode() throughput under concurrent
+    load (only one embed at a time, process-wide); if that becomes a
+    bottleneck, look at either a small connection-pool-style set of model
+    instances or moving encode() off the request thread entirely.
     """
 
     def __init__(self):
         self._model = None
         self._model_name = None
         self._failed_models = set()  # cache download failures
+        self._lock = threading.Lock()
 
     def _load_model(self, model_name: str):
         """Load the sentence-transformers model. Auto-downloads from HuggingFace."""
+        # Fast path: no lock if already loaded for this model_name.
         if self._model is not None and self._model_name == model_name:
             return
         if model_name in self._failed_models:
             return  # already tried and failed
-        try:
-            from sentence_transformers import SentenceTransformer
-            self._model = SentenceTransformer(model_name)
-            self._model_name = model_name
-        except ImportError:
-            self._model = None
-            self._model_name = None
-            self._failed_models.add(model_name)
-        except Exception as e:
-            import sys
-            print(f"[engram] Failed to load embedding model '{model_name}': {e}", file=sys.stderr)
-            self._model = None
-            self._model_name = None
-            self._failed_models.add(model_name)
+        with self._lock:
+            # Re-check inside the lock (double-checked locking) — another
+            # thread may have finished loading (or failed) while we waited.
+            if self._model is not None and self._model_name == model_name:
+                return
+            if model_name in self._failed_models:
+                return
+            try:
+                from sentence_transformers import SentenceTransformer
+                self._model = SentenceTransformer(model_name)
+                self._model_name = model_name
+            except ImportError:
+                self._model = None
+                self._model_name = None
+                self._failed_models.add(model_name)
+            except Exception as e:
+                import sys
+                print(f"[engram] Failed to load embedding model '{model_name}': {e}", file=sys.stderr)
+                self._model = None
+                self._model_name = None
+                self._failed_models.add(model_name)
 
     def is_available(self) -> bool:
         """Check if sentence-transformers is installed."""
@@ -121,7 +146,13 @@ class EmbeddingManager:
         self._load_model(model_name)
         if self._model is None:
             return None
-        vector = self._model.encode(text, convert_to_numpy=True)
+        # Serialize encode() calls (see class docstring #1675) — no
+        # documented thread-safety guarantee for concurrent encode() on one
+        # sentence-transformers model instance.
+        with self._lock:
+            if self._model is None:
+                return None
+            vector = self._model.encode(text, convert_to_numpy=True)
         return vector.tolist()
 
     def embed_batch(self, texts: list[str], model_name: str) -> Optional[list[list[float]]]:
@@ -131,7 +162,10 @@ class EmbeddingManager:
         self._load_model(model_name)
         if self._model is None:
             return None
-        vectors = self._model.encode(texts, convert_to_numpy=True)
+        with self._lock:
+            if self._model is None:
+                return None
+            vectors = self._model.encode(texts, convert_to_numpy=True)
         return vectors.tolist()
 
     @staticmethod
@@ -188,6 +222,23 @@ _walguard_startup_done: bool = False
 
 
 _walguard_disabled_logged: bool = False
+
+
+# ── #1669: one-shot guard for the per-call backfill/DAG-check block ────────
+# cProfile evidence (2026-07-06, umbrella #1668) showed _get_db() spending
+# 65-96% of its time re-running an unguarded backfill/migration/DAG-check
+# block on EVERY call, in contrast to the schema migrations in the same
+# function that correctly gate on PRAGMA user_version. _db_setup_done_paths
+# tracks which resolved DB paths have already had that block run
+# successfully IN THIS PROCESS — intentionally NOT persisted to disk, so a
+# process restart re-runs the block once (safe; the block is idempotent).
+# A path is added to the set ONLY after the block completes without
+# exception, so a failure (e.g. a transient sqlite lock) leaves the path
+# unmarked and the block retries on the next _get_db() call.
+_db_setup_done_paths: set[str] = set()
+
+
+_db_setup_lock = threading.Lock()
 
 
 def _configure_paths(data_dir: str | Path) -> None:
@@ -1256,47 +1307,24 @@ def _walguard_degraded_banner() -> str:
         return ""
 
 
-def _get_db() -> sqlite3.Connection:
-    """Get a database connection, creating tables if needed.
+def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
+    """Run the one-shot backfill/migration/DAG-check block for `conn`.
 
-    Fails LOUD if the DB file is missing or seed-empty — the plugin packaging
-    has no installer-script precondition, so missing DB means engram-first-session
-    needs to bootstrap (which it does via bootstrap.py, called from the skill).
-    Per-call check is intentionally lazy: subsequent calls after bootstrap.py
-    runs in the same session succeed without MCP restart (no /mcp dance).
+    Extracted from _get_db() (#1669) so it can be gated by a once-per-
+    process guard keyed on the resolved DB path (_db_setup_done_paths /
+    _db_setup_lock, defined above _configure_paths) instead of re-running
+    on every single _get_db() call. Nothing in this function's BEHAVIOR
+    changed -- every migration/backfill here is already idempotent
+    (schema migrations gate on PRAGMA user_version; the backfills gate on
+    NULL/absence checks) -- only the CALL FREQUENCY changed, from 'every
+    _get_db() call' to 'first call per resolved DB path, per process.'
 
-    Guard-bypass env vars (set when running in a controlled environment that
-    doesn't need the guards):
-      - ENGRAM_BOOTSTRAP=1 — bootstrap.py sets this in its own process before
-        calling engram_add_axiom / engram_add_definition / engram_add_goal to
-        seed the graph; that call chain goes through _get_db(), so without the
-        bypass the fail-loud guards block the very seeding that's supposed to
-        satisfy them (chicken-and-egg).
-      - ENGRAM_NO_DB_GUARDS=1 — test-mode bypass (matches ENGRAM_NO_EMBEDDINGS
-        / ENGRAM_NO_POLARITY precedent). The test fixtures monkey-patch DATA_DIR
-        and DB_PATH to a tempdir, then call tool handlers whose first _get_db()
-        opens-and-creates the DB; the fail-loud would block the legitimate
-        test-fixture setup. conftest.py sets this once at session start.
-
-    Both are scoped to the env that sets them (bootstrap subprocess + pytest
-    session). The production MCP server never sets either, so guards stay
-    active for real user flows.
+    Caller contract: only invoke while holding _db_setup_lock, and only
+    mark the path done (add to _db_setup_done_paths) AFTER this function
+    returns without raising -- a failure here must leave the path
+    unmarked so the next _get_db() call retries the whole block
+    (guard-after-success, not guard-after-attempt).
     """
-    bootstrap_mode = (
-        os.environ.get("ENGRAM_BOOTSTRAP") == "1"
-        or os.environ.get("ENGRAM_NO_DB_GUARDS") == "1"
-    )
-    if not DB_PATH.exists() and not bootstrap_mode:
-        raise RuntimeError(_db_missing_message())
-    _ensure_data_dir()
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    _load_vec_extension(conn)
-
-    _assert_sqlite_version(conn)
-
     # Create tables
     conn.executescript(
         """
@@ -1931,6 +1959,79 @@ def _get_db() -> sqlite3.Connection:
                 )
     except Exception:
         pass  # Don't block startup on check failures
+
+
+def _get_db() -> sqlite3.Connection:
+    """Get a database connection, creating tables if needed.
+
+    Fails LOUD if the DB file is missing or seed-empty — the plugin packaging
+    has no installer-script precondition, so missing DB means engram-first-session
+    needs to bootstrap (which it does via bootstrap.py, called from the skill).
+    Per-call check is intentionally lazy: subsequent calls after bootstrap.py
+    runs in the same session succeed without MCP restart (no /mcp dance).
+
+    Guard-bypass env vars (set when running in a controlled environment that
+    doesn't need the guards):
+      - ENGRAM_BOOTSTRAP=1 — bootstrap.py sets this in its own process before
+        calling engram_add_axiom / engram_add_definition / engram_add_goal to
+        seed the graph; that call chain goes through _get_db(), so without the
+        bypass the fail-loud guards block the very seeding that's supposed to
+        satisfy them (chicken-and-egg).
+      - ENGRAM_NO_DB_GUARDS=1 — test-mode bypass (matches ENGRAM_NO_EMBEDDINGS
+        / ENGRAM_NO_POLARITY precedent). The test fixtures monkey-patch DATA_DIR
+        and DB_PATH to a tempdir, then call tool handlers whose first _get_db()
+        opens-and-creates the DB; the fail-loud would block the legitimate
+        test-fixture setup. conftest.py sets this once at session start.
+
+    Both are scoped to the env that sets them (bootstrap subprocess + pytest
+    session). The production MCP server never sets either, so guards stay
+    active for real user flows.
+    """
+    bootstrap_mode = (
+        os.environ.get("ENGRAM_BOOTSTRAP") == "1"
+        or os.environ.get("ENGRAM_NO_DB_GUARDS") == "1"
+    )
+    if not DB_PATH.exists() and not bootstrap_mode:
+        raise RuntimeError(_db_missing_message())
+    _ensure_data_dir()
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    _load_vec_extension(conn)
+
+    _assert_sqlite_version(conn)
+
+    # #1669: run the backfill/migration/DAG-check block once per resolved
+    # DB path per process (guard-after-success; see _db_setup_done_paths).
+    #
+    # The path-keyed set alone is NOT sufficient: some callers (notably test
+    # fixtures — e.g. tests/test_engram_add_edge.py's fresh_server(), which
+    # shutil.rmtree()s and recreates the SAME tempdir across many tests in
+    # one process) delete and recreate the DB file at an already-"done"
+    # path, which would otherwise leave a brand-new, table-less DB file
+    # wrongly skipped. So a "done" path is also cheaply re-verified via a
+    # single sqlite_master lookup for the `nodes` table (an indexed catalog
+    # lookup — negligible next to the backfill/DAG-check block it guards)
+    # before trusting the guard; a miss re-runs the full one-time setup.
+    # .resolve() so symlink/relative aliases of the same physical DB file
+    # share one guard key (reviewer-fairy suggestion, PR #1678). Worst case
+    # without it was a redundant idempotent setup run, not corruption.
+    resolved_db_path = str(DB_PATH.resolve())
+
+    def _schema_present() -> bool:
+        try:
+            return conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes'"
+            ).fetchone() is not None
+        except sqlite3.Error:
+            return False
+
+    if resolved_db_path not in _db_setup_done_paths or not _schema_present():
+        with _db_setup_lock:
+            if resolved_db_path not in _db_setup_done_paths or not _schema_present():
+                _run_db_one_time_setup(conn)
+                _db_setup_done_paths.add(resolved_db_path)
 
     # Empty-graph sentinel — DB exists but bootstrap.py never seeded it.
     # Distinct from the DB-missing case at the top: this happens if bootstrap
