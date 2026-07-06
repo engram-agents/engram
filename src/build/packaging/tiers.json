@@ -344,6 +344,12 @@
       "tier": "dev"
     },
     {
+      "path": "tools/perf",
+      "tier": "dev",
+      "source": "tools/perf",
+      "note": "replay-bench perf harness (blueprint #1667/#1668) -- a measurement/benchmarking harness for ENGRAM-development use, same class as the recall-measurement harness and other dev-only baselines. Real files directly under repo-root tools/perf/ (not symlinked from src/engram/), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution (src/engram/tools/perf) would wrongly flag this as dangling."
+    },
+    {
       "path": "tools/ghpr.sh",
       "tier": "dev"
     },

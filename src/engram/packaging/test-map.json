@@ -271,6 +271,13 @@
       "note": "The runner itself is a fail-open trigger \u2014 changes to it always trigger full suite in production. This entry is for the completeness gate only."
     },
     {
+      "path_prefix_or_glob": "tools/perf/*.py",
+      "test_globs": [
+        "tests/test_replay_bench.py"
+      ],
+      "note": "tools/perf/ is the first subdirectory under tools/ \u2014 _discover_repo_modules() only globs tools/*.py non-recursively, so modules here aren't registered as repo module stems and the test file's bare `import replay_bench`/`import trace_from_telemetry` (via manual sys.path insertion, not `from tools.perf.X import`) never lands in the import graph either. Without this entry, an edit to either file gets a fast-CI subset that silently omits its own test, with no fail-open backstop (found by the reviewer-fairy on PR #1676)."
+    },
+    {
       "path_prefix_or_glob": "tools/scan-leaks.py",
       "test_globs": [
         "tests/test_tier_build_filter.py",
