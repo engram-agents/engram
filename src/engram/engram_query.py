@@ -1095,6 +1095,12 @@ def _max_cosine_to_selected(candidate: dict, selected: list[dict]) -> float:
 
     Uses EmbeddingManager.cosine_similarity (pure Python, no numpy dep).
     Returns 0.0 when either embedding is absent (cold-start: no penalty).
+
+    Public signature preserved for backward compat (re-exported via
+    server.py). `_mmr_rerank`'s hot loop does NOT call this — it uses the
+    decode/norm-cached fast path below (`_build_mmr_embedding_cache` +
+    `_max_cosine_to_selected_cached`) to avoid re-decoding/re-norming the
+    same node's embedding on every pairwise comparison (alpha #1674).
     """
     e_c = _decode_embedding(candidate.get("_embedding"))
     if e_c is None:
@@ -1105,6 +1111,80 @@ def _max_cosine_to_selected(candidate: dict, selected: list[dict]) -> float:
         if e_s is None:
             continue
         sim = core._embedder.cosine_similarity(e_c, e_s)
+        if sim > best:
+            best = sim
+    return best
+
+
+def _cosine_from_cache(
+    vec_a: list[float], norm_a: float, vec_b: list[float], norm_b: float
+) -> float:
+    """Cosine similarity from precomputed vectors + norms.
+
+    Mirrors core.EmbeddingManager.cosine_similarity's dot-product summation
+    (identical generator expression, identical left-to-right order — the
+    load-bearing piece for bit-identical output) and its zero-norm guard,
+    but consumes norms that were computed once upstream rather than
+    recomputing them on every call. Only the redundant norm/decode work is
+    eliminated; the arithmetic itself is unchanged (alpha #1674).
+    """
+    dot = sum(x * y for x, y in zip(vec_a, vec_b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _build_mmr_embedding_cache(
+    candidates: list[dict],
+) -> dict:
+    """Decode + norm every candidate's embedding exactly once, upfront.
+
+    Keyed by each candidate dict's "id" field (the stable identifier all
+    MMR candidate dicts carry — see `_node_to_dict` / `_search_nodes`
+    callers). Falls back to `id(candidate)` object identity on the rare
+    chance a candidate lacks an "id" key, so the cache never crashes even
+    if that invariant is ever violated upstream.
+
+    Value per key is `(vec, norm)` when the candidate has a decodable
+    embedding, or None (cold-start — matches `_decode_embedding`'s
+    None-on-unavailable contract) when it doesn't.
+    """
+    cache: dict = {}
+    for c in candidates:
+        key = c.get("id", id(c))
+        vec = _decode_embedding(c.get("_embedding"))
+        if vec is None:
+            cache[key] = None
+        else:
+            cache[key] = (vec, sum(x * x for x in vec) ** 0.5)
+    return cache
+
+
+def _max_cosine_to_selected_cached(
+    candidate: dict, selected: list[dict], cache: dict
+) -> float:
+    """Fast-path `_max_cosine_to_selected`, consuming a precomputed cache.
+
+    Behaviorally identical to `_max_cosine_to_selected` (same dot-product
+    summation order, same zero-norm guard, same 0.0-on-missing-embedding
+    return) — only the decode + norm computation is served from `cache`
+    (built once per `_mmr_rerank` call by `_build_mmr_embedding_cache`)
+    instead of being redone on every pairwise call. Used only by
+    `_mmr_rerank`'s O(n²) hot loop (alpha #1674).
+    """
+    key = candidate.get("id", id(candidate))
+    entry = cache.get(key)
+    if entry is None:
+        return 0.0
+    vec_c, norm_c = entry
+    best = 0.0
+    for s in selected:
+        skey = s.get("id", id(s))
+        sentry = cache.get(skey)
+        if sentry is None:
+            continue
+        vec_s, norm_s = sentry
+        sim = _cosine_from_cache(vec_c, norm_c, vec_s, norm_s)
         if sim > best:
             best = sim
     return best
@@ -1154,11 +1234,16 @@ def _mmr_rerank(
     # silently.  First slot is highest composite (before diversity matters).
     remaining.sort(key=lambda c: c.get("_composite", 0.0), reverse=True)
     selected: list[dict] = [remaining.pop(0)]
+    # Decode + norm each candidate's embedding exactly once, upfront, rather
+    # than re-decoding/re-norming on every pairwise comparison inside the
+    # O(n²) loop below (alpha #1674). Arithmetic is unchanged — only the
+    # redundant recomputation is eliminated — so output stays bit-identical.
+    embedding_cache = _build_mmr_embedding_cache(candidates)
     while remaining and len(selected) < top_k:
         best: dict | None = None
         best_score = float("-inf")
         for c in remaining:
-            max_sim = _max_cosine_to_selected(c, selected)
+            max_sim = _max_cosine_to_selected_cached(c, selected, embedding_cache)
             mmr_score = c.get("_composite", 0.0) * (1.0 - (1.0 - mmr_lambda) * max_sim)
             if mmr_score > best_score:
                 best_score = mmr_score

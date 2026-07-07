@@ -305,6 +305,162 @@ def test_mmr_pool_expansion():
 
 
 # ---------------------------------------------------------------------------
+# Bit-identical regression: cached fast path vs. a frozen reference algorithm
+# (alpha #1674 — decode/norm caching in _mmr_rerank's O(n^2) loop must not
+# change output by even one ULP; this is the load-bearing guarantee of that
+# fix).  The reference implementation below is a self-contained copy of the
+# PRE-#1674 algorithm (decode + cosine_similarity recomputed on every
+# pairwise call, exactly as _max_cosine_to_selected did before the fix) —
+# it does NOT call any of _mmr_rerank's cache helpers, so this comparison is
+# two independently-written implementations, not the fix checking itself.
+#
+# Non-tautology was additionally verified manually (not committed, since it
+# requires transiently breaking the source): a deliberate one-line bug
+# (`x * y` -> `x + y` in the dot-product term) was introduced into
+# `_cosine_from_cache` and this reference comparison was re-run — it failed
+# immediately (divergent node order on 3 of the 6 shapes below), proving the
+# comparison has teeth. The bug was then reverted before committing.
+# ---------------------------------------------------------------------------
+
+
+def _reference_decode_embedding(raw):
+    """Frozen copy of _decode_embedding — decode-per-call, no caching."""
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, (str, bytes)):
+        try:
+            decoded = json.loads(raw)
+            if isinstance(decoded, list):
+                return decoded
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return None
+
+
+def _reference_cosine_similarity(a, b):
+    """Frozen copy of core.EmbeddingManager.cosine_similarity."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _reference_max_cosine_to_selected(candidate, selected):
+    """Frozen copy of the PRE-#1674 _max_cosine_to_selected: decodes both
+    the candidate's and every selected node's embedding fresh, every call."""
+    e_c = _reference_decode_embedding(candidate.get("_embedding"))
+    if e_c is None:
+        return 0.0
+    best = 0.0
+    for s in selected:
+        e_s = _reference_decode_embedding(s.get("_embedding"))
+        if e_s is None:
+            continue
+        sim = _reference_cosine_similarity(e_c, e_s)
+        if sim > best:
+            best = sim
+    return best
+
+
+def _reference_mmr_rerank(candidates, top_k, mmr_lambda):
+    """Frozen copy of the PRE-#1674 _mmr_rerank greedy loop (no embedding
+    cache — calls _reference_max_cosine_to_selected, which re-decodes and
+    re-norms on every pairwise comparison, exactly as the old code did)."""
+    if not candidates:
+        return []
+    remaining = list(candidates)
+    remaining.sort(key=lambda c: c.get("_composite", 0.0), reverse=True)
+    selected = [remaining.pop(0)]
+    while remaining and len(selected) < top_k:
+        best = None
+        best_score = float("-inf")
+        for c in remaining:
+            max_sim = _reference_max_cosine_to_selected(c, selected)
+            mmr_score = c.get("_composite", 0.0) * (1.0 - (1.0 - mmr_lambda) * max_sim)
+            if mmr_score > best_score:
+                best_score = mmr_score
+                best = c
+        if best is None:
+            break
+        remaining.remove(best)
+        selected.append(best)
+    return selected
+
+
+def _random_unit_vec(rng, dim):
+    values = [rng.uniform(-1.0, 1.0) for _ in range(dim)]
+    norm = math.sqrt(sum(v * v for v in values))
+    if norm == 0:
+        return values
+    return [v / norm for v in values]
+
+
+def _make_realistic_pool(n, dim, seed, dup_ratio=0.3, missing_ratio=0.0):
+    """Build a candidate pool with real-shaped (seeded random) embeddings,
+    a mix of near-duplicate and diverse directions, and optionally some
+    candidates with missing embeddings (cold-start/partial coverage)."""
+    import random
+
+    rng = random.Random(seed)
+    base_dirs = [_random_unit_vec(rng, dim) for _ in range(max(2, n // 4))]
+    candidates = []
+    for i in range(n):
+        composite = 0.95 - i * (0.9 / max(n, 1))
+        cand = {"id": f"ob_{i:04d}", "_composite": composite}
+        if rng.random() >= missing_ratio:
+            direction = base_dirs[i % len(base_dirs)] if rng.random() < dup_ratio \
+                else _random_unit_vec(rng, dim)
+            cand["_embedding"] = json.dumps(direction)
+        candidates.append(cand)
+    return candidates
+
+
+# Varying pool shapes: sizes, missing embeddings, heavy near-duplicates,
+# singleton, and empty — matches the alpha #1674 verification requirements.
+_BIT_IDENTICAL_SHAPES = [
+    dict(n=5, dim=8, seed=1, top_k=3),
+    dict(n=20, dim=16, seed=2, top_k=10),
+    dict(n=40, dim=8, seed=3, top_k=10, missing_ratio=0.3),
+    dict(n=15, dim=8, seed=4, top_k=15, dup_ratio=0.8),
+    dict(n=1, dim=8, seed=5, top_k=1),
+    dict(n=0, dim=8, seed=6, top_k=5),
+]
+
+
+@pytest.mark.parametrize("shape", _BIT_IDENTICAL_SHAPES, ids=[
+    f"n{s['n']}_top{s['top_k']}" for s in _BIT_IDENTICAL_SHAPES
+])
+def test_mmr_rerank_bit_identical_to_reference_algorithm(shape):
+    """_mmr_rerank's cached fast path must produce EXACTLY the same output
+    (same node order, same dict identity/contents) as the frozen
+    pre-#1674 reference algorithm, across varied pool shapes."""
+    srv = fresh_server()
+    shape = dict(shape)
+    top_k = shape.pop("top_k")
+    candidates = _make_realistic_pool(**shape)
+
+    # Independent copies so neither call can mutate shared state.
+    fast_result = srv._mmr_rerank([dict(c) for c in candidates], top_k=top_k, mmr_lambda=0.5)
+    reference_result = _reference_mmr_rerank([dict(c) for c in candidates], top_k=top_k, mmr_lambda=0.5)
+
+    fast_ids = [c["id"] for c in fast_result]
+    reference_ids = [c["id"] for c in reference_result]
+    assert fast_ids == reference_ids, (
+        f"Node order diverged from reference algorithm.\n"
+        f"Fast:      {fast_ids}\nReference: {reference_ids}"
+    )
+    # Full dict contents must also match exactly (bit-identical, not just
+    # same IDs) — compares _composite (and any other keys) verbatim.
+    assert fast_result == reference_result, (
+        f"Result dicts diverged from reference algorithm for shape {shape}."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Integration tests: _search_nodes + engram_surface + engram_query
 # ---------------------------------------------------------------------------
 
