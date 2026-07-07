@@ -133,7 +133,15 @@ FEELING_NUDGE_MARKER = os.path.join(ENGRAM_HOME, "feeling-nudge-active.json")
 WARM_BRIEFING_PATH = os.path.join(ENGRAM_HOME, "warm-briefing.md")
 ERROR_PATTERNS_PATH = os.path.join(ENGRAM_HOME, "error_patterns.json")
 ERROR_INCIDENTS_PATH = os.path.join(ENGRAM_HOME, "error_incidents.json")
+CORNERSTONE_ANCHORS_PATH = os.path.join(ENGRAM_HOME, "cornerstone_anchors.json")
+CORNERSTONE_ANCHOR_STATE_PATH = os.path.join(ENGRAM_HOME, "cornerstone-anchor-state.json")
 KNOWLEDGE_DB_PATH = os.path.join(ENGRAM_HOME, "knowledge.db")
+
+# Cross-prompt cooldown for cornerstone anchors: once a cornerstone fires,
+# suppress it for this many prompts. Prevents the habituation failure — a
+# principle nudge that fires every prompt trains the agent to dismiss it
+# (#1691; same failure class the stop-hook #840/#845 gates solved).
+CORNERSTONE_ANCHOR_COOLDOWN_PROMPTS = 10
 
 def get_user_name() -> str:
     """Read primary_user from $ENGRAM_HOME/config.json; fall back to 'the human'."""
@@ -909,6 +917,97 @@ def check_incident_tripwire(matched_ids: list) -> str:
     return "\n".join(warnings)
 
 
+def check_cornerstone_anchor(matched_ids: list, prompt_count: int) -> str:
+    """Check if any surfaced IDs are exemplars of a cornerstone (#1691).
+
+    Reads $ENGRAM_HOME/cornerstone_anchors.json (exemplar IDs → cornerstone
+    info, rebuilt by engram_register_exemplar). Same incident-index
+    architecture as the lesson tripwire: concrete situations are the
+    matching surface; the abstract principle is reached via the
+    exemplifies edge. A direct match on the cornerstone's own ID also
+    fires (the cornerstone itself can surface).
+
+    Cross-prompt cooldown: a cornerstone that fired within the last
+    CORNERSTONE_ANCHOR_COOLDOWN_PROMPTS prompts is suppressed, so anchors
+    stay salient instead of becoming banner blindness. State keyed on the
+    prompts_since_compaction counter; a counter reset (compaction) clears
+    the cooldown, which is correct — re-anchoring after a context reset is
+    exactly when the nudge is most valuable.
+    """
+    if not matched_ids:
+        return ""
+
+    try:
+        return _check_cornerstone_anchor_inner(matched_ids, prompt_count)
+    except Exception:
+        # This hook runs on EVERY prompt — a malformed cache (valid JSON,
+        # wrong shape) must degrade to silence, never break the hook.
+        return ""
+
+
+def _check_cornerstone_anchor_inner(matched_ids: list, prompt_count: int) -> str:
+    """Body of check_cornerstone_anchor — see its docstring."""
+    try:
+        with open(CORNERSTONE_ANCHORS_PATH, "r") as f:
+            index = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return ""
+    if not index or not isinstance(index, dict):
+        return ""
+
+    # Direct cornerstone-ID hits: build a reverse view so a surfaced
+    # cornerstone fires its own anchor even with no exemplar in the match.
+    by_cornerstone = {}
+    for entry in index.values():
+        cid = entry.get("cornerstone_id", "")
+        if cid:
+            by_cornerstone[cid] = entry
+
+    try:
+        with open(CORNERSTONE_ANCHOR_STATE_PATH, "r") as f:
+            state = json.load(f)
+        if not isinstance(state, dict):
+            state = {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        state = {}
+
+    lines = []
+    fired = set()
+    for mid in matched_ids:
+        entry = index.get(mid) or by_cornerstone.get(mid)
+        if not entry:
+            continue
+        cid = entry.get("cornerstone_id", "")
+        if not cid or cid in fired:
+            continue
+        last = state.get(cid)
+        # Cooldown: suppress if fired recently in this counter epoch.
+        # A counter reset (last > prompt_count) reads as cooldown expired.
+        if (
+            isinstance(last, (int, float))
+            and last <= prompt_count
+            and (prompt_count - last) < CORNERSTONE_ANCHOR_COOLDOWN_PROMPTS
+        ):
+            continue
+        fired.add(cid)
+        anchor = entry.get("anchor_line") or entry.get("cornerstone_claim", "")
+        if anchor:
+            lines.append(f"[Cornerstone anchor ({cid})]: {anchor}")
+
+    if not lines:
+        return ""
+
+    for cid in fired:
+        state[cid] = prompt_count
+    try:
+        with open(CORNERSTONE_ANCHOR_STATE_PATH, "w") as f:
+            json.dump(state, f)
+    except OSError:
+        pass  # state write failure → worst case an early re-fire; never block
+
+    return "\n".join(lines)
+
+
 def format_nap_warning(count: int) -> str:
     """Generate consolidation warning based on prompt count."""
     if count >= NAP_URGENT_THRESHOLD:
@@ -1036,6 +1135,14 @@ def main():
         tripwire = check_error_patterns(prompt)
     if tripwire:
         parts.append(tripwire)
+
+    # Cornerstone anchor — sibling of the lesson tripwire for orienting
+    # principles (#1691). Cooldown-gated so anchors stay salient.
+    cornerstone_anchor = check_cornerstone_anchor(
+        matched_ids, counter["prompts_since_compaction"]
+    )
+    if cornerstone_anchor:
+        parts.append(cornerstone_anchor)
 
     # Warn if daemon is down (semantic search degraded).
     # Distinguish a cold-start warmup (recent launch attempt) from a

@@ -255,7 +255,7 @@ def _configure_paths(data_dir: str | Path) -> None:
     DATA_DIR and DB_PATH contaminated the production engram with 5 test nodes.
     """
     global DATA_DIR, DB_PATH, SNAPSHOT_PATH, CONFIG_PATH, LOG_PATH
-    global FEELING_NUDGE_MARKER, ERROR_INCIDENTS_PATH
+    global FEELING_NUDGE_MARKER, ERROR_INCIDENTS_PATH, CORNERSTONE_ANCHORS_PATH
     global _walguard_last_check, _walguard_startup_done, _walguard_disabled_logged
     DATA_DIR = Path(data_dir)
     DB_PATH = DATA_DIR / "knowledge.db"
@@ -264,6 +264,7 @@ def _configure_paths(data_dir: str | Path) -> None:
     LOG_PATH = DATA_DIR / "session_log.md"
     FEELING_NUDGE_MARKER = DATA_DIR / "feeling-nudge-active.json"
     ERROR_INCIDENTS_PATH = str(DATA_DIR / "error_incidents.json")
+    CORNERSTONE_ANCHORS_PATH = str(DATA_DIR / "cornerstone_anchors.json")
     # Reset walguard state when paths change (e.g. test isolation)
     _walguard_last_check = 0.0
     _walguard_startup_done = False
@@ -3570,6 +3571,7 @@ _REMOVABLE_EDGE_RELATIONS = frozenset(
 
 
 ERROR_INCIDENTS_PATH = str(DATA_DIR / "error_incidents.json")
+CORNERSTONE_ANCHORS_PATH = str(DATA_DIR / "cornerstone_anchors.json")
 
 
 # ---------------------------------------------------------------------------
@@ -4166,6 +4168,64 @@ def _rebuild_incidents_cache() -> dict:
             "incident_count": len(index),
             "lesson_count": len(lesson_count),
             "path": ERROR_INCIDENTS_PATH,
+        }
+    finally:
+        conn.close()
+
+
+def _rebuild_cornerstone_anchors_cache() -> dict:
+    """Rebuild the cornerstone_anchors.json cache from the graph.
+
+    Sibling of _rebuild_incidents_cache for cornerstone targets (the
+    "future cornerstone-tripwire mechanism" reserved in
+    engram_register_exemplar — #1691). Walks `exemplifies` edges
+    (exemplar → cornerstone) and pairs each exemplar with its
+    cornerstone's claim + anchor line. The anchor line is the behavioral
+    one-liner from metadata `anchor_line` (same voice as the
+    warm-briefing anchor section); falls back to the claim when unset.
+
+    Unlike lessons (whose exemplars are error incidents), cornerstone
+    exemplars are ordinary claim-bearing nodes — the concrete situations
+    the principle proved itself in. The surface hook matches situations
+    to situations and reaches the principle via the edge, so more
+    exemplars = more matching surface area.
+
+    Idempotent; returns a summary dict with counts.
+    """
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """SELECT e.source_id AS exemplar_id, e.target_id AS cornerstone_id,
+                      n.claim AS cs_claim, n.metadata AS cs_meta
+               FROM edges e
+               JOIN nodes n ON n.id = e.target_id
+               WHERE e.relation = 'exemplifies' AND n.type = 'cornerstone'
+                 AND n.is_current = 1"""
+        ).fetchall()
+
+        index: dict[str, dict] = {}
+        cornerstone_count: set[str] = set()
+        for r in rows:
+            try:
+                meta = json.loads(r["cs_meta"]) if r["cs_meta"] else {}
+            except (TypeError, json.JSONDecodeError):
+                meta = {}
+            index[r["exemplar_id"]] = {
+                "cornerstone_id": r["cornerstone_id"],
+                "cornerstone_claim": r["cs_claim"],
+                "anchor_line": meta.get("anchor_line", "") or r["cs_claim"],
+            }
+            cornerstone_count.add(r["cornerstone_id"])
+
+        os.makedirs(os.path.dirname(CORNERSTONE_ANCHORS_PATH), exist_ok=True)
+        with open(CORNERSTONE_ANCHORS_PATH, "w") as f:
+            json.dump(index, f, indent=2)
+
+        return {
+            "status": "rebuilt",
+            "exemplar_count": len(index),
+            "cornerstone_count": len(cornerstone_count),
+            "path": CORNERSTONE_ANCHORS_PATH,
         }
     finally:
         conn.close()

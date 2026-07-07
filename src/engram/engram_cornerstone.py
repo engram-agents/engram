@@ -522,12 +522,18 @@ def _remove_edge_impl(
         # Best-effort cache rebuild for the exemplifies side-effect surface.
         # Outside the transaction so a JSON-write failure can't roll back the
         # edge delete. Mirrors engram_lesson_register_incident's pattern.
+        # Both hot-path caches (lesson incidents + cornerstone anchors,
+        # #1691) resync so the generic edge tools can't strand either.
         cache_rebuild = None
         if relation == "exemplifies":
             try:
                 cache_rebuild = core._rebuild_incidents_cache()
             except Exception as exc:
                 cache_rebuild = {"status": "error", "detail": str(exc)}
+            try:
+                core._rebuild_cornerstone_anchors_cache()
+            except Exception:
+                pass  # best-effort; anchor staleness is non-fatal
 
         result = {
             "status": "removed",
@@ -696,6 +702,10 @@ def _add_edge_impl(
                 cache_rebuild = core._rebuild_incidents_cache()
             except Exception as exc:
                 cache_rebuild = {"status": "error", "detail": str(exc)}
+            try:
+                core._rebuild_cornerstone_anchors_cache()
+            except Exception:
+                pass  # best-effort; anchor staleness is non-fatal (#1691)
 
         result = {
             "status": "created",

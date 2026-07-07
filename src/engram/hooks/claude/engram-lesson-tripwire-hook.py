@@ -21,8 +21,9 @@ THREE-WAY TAXONOMY OF LESSON RETRIEVAL CUES (forum thread #135):
 
 HOW THIS HOOK WORKS
 ===================
-Fires on every Bash or MCP-tool PreToolUse event. Queries active lessons that
-have a `situation_pattern` field in their metadata JSON. For Bash calls, matches
+Fires on every Bash or MCP-tool PreToolUse event. Queries active lessons AND
+cornerstones that have a `situation_pattern` field in their metadata JSON
+(#1691 — cornerstones nudge via `scaffolding_nudge` or `anchor_line`). For Bash calls, matches
 the pending command against each pattern. For MCP calls, matches against
 "{tool_name} {json(args)}" — so a pattern like `engram_add_observation` fires
 before that specific MCP tool call. For any match, injects the lesson's
@@ -44,10 +45,13 @@ DB_PATH = Path(ENGRAM_HOME) / "knowledge.db"
 
 _QUERY = """
 SELECT
-    json_extract(metadata, '$.scaffolding_nudge') AS nudge,
+    COALESCE(
+        json_extract(metadata, '$.scaffolding_nudge'),
+        json_extract(metadata, '$.anchor_line')
+    ) AS nudge,
     json_extract(metadata, '$.situation_pattern')  AS pattern
 FROM nodes
-WHERE type = 'lesson'
+WHERE type IN ('lesson', 'cornerstone')
   AND is_current = 1
   AND memory_status = 'active'
   AND json_extract(metadata, '$.situation_pattern') IS NOT NULL

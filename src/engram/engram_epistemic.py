@@ -958,12 +958,17 @@ def _register_exemplar_impl(
         "exemplar_count": exemplar_count,
     }
 
-    # Tripwire cache refresh: only fires for lesson targets.
-    # For cornerstone targets, no cache today — future cornerstone-tripwire
-    # mechanism may extend this.
+    # Tripwire cache refresh — each target type has its own hot-path cache
+    # scanned by the surface hook (#1691: cornerstone anchors join lessons).
     if target_row["type"] == "lesson":
         try:
             cache_result = core._rebuild_incidents_cache()
+        except Exception as exc:
+            cache_result = {"status": "error", "detail": str(exc)}
+        result["cache_rebuild"] = cache_result
+    elif target_row["type"] == "cornerstone":
+        try:
+            cache_result = core._rebuild_cornerstone_anchors_cache()
         except Exception as exc:
             cache_result = {"status": "error", "detail": str(exc)}
         result["cache_rebuild"] = cache_result
