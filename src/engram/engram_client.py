@@ -349,14 +349,46 @@ class EngramClient:
             os.environ["ENGRAM_HOME"] = resolved_dir
 
         # Import fresh — needed if we're running multiple clients
-        # with different db_dirs in the same process. Purge server AND
-        # engram_core as a PAIR (#872 wave 1): the path globals live on
-        # engram_core, and a fresh server importing the CACHED core would
-        # share path state with every prior client — client #2's
-        # _configure_paths would silently redirect client #1's live paths.
-        # Each client gets its own version-coherent server+core module pair.
-        for _mod in ("server", "engram_core"):
-            sys.modules.pop(_mod, None)
+        # with different db_dirs in the same process. Purge server,
+        # engram_core, AND every "family" module (#872 waves 2-9) as one unit
+        # (#1679): the path globals live on engram_core, and each family
+        # module binds its own module-level `core` reference via
+        # `import engram_core as core` (the project's canonical
+        # shared-state-access convention). If a family module is left in
+        # sys.modules while server+engram_core are purged and re-imported,
+        # server.py's re-execution finds the family module ALREADY cached
+        # and reuses it as-is — so that family module's `core` still points
+        # at the FIRST client's now-stale engram_core object, not the fresh
+        # one. Calls that route through a family module (e.g. engram_stats,
+        # engram_observation) would then silently read/write against the
+        # first client's DATA_DIR/DB_PATH instead of this client's.
+        #
+        # Purge by PREFIX ("server" exactly, or any "engram_*" module other
+        # than this module itself) rather than an enumerated list of family
+        # module names. An enumerated list is exactly the shape that caused
+        # #1679: the original purge tuple (server, engram_core) silently fell
+        # out of sync as family modules were added across #872 waves 2-9, and
+        # a hardcoded 14-name list here would fall out of sync again the next
+        # time a 13th family module is added — nothing would catch it, since
+        # nothing derives the list from the modules that actually exist.
+        # Matching by prefix is self-updating: any current or future
+        # engram_* module gets purged and forced to re-bind a fresh `core`
+        # on each new EngramClient instantiation, with no list to maintain.
+        #
+        # Self-exclusion: this __init__ method is executing as code that
+        # lives INSIDE the "engram_client" module. Purging "engram_client"
+        # from sys.modules here would not affect the currently-executing
+        # frame (the function object keeps running), but it would orphan the
+        # cached module — a subsequent `import engram_client` anywhere else
+        # in the process would re-execute the module body and mint a NEW
+        # EngramClient class object, breaking isinstance checks and any
+        # module-level state associated with the original import. The
+        # established prefix-purge pattern elsewhere in this codebase (see
+        # tests/test_scope_export.py's _fresh_server_at helper) carries this
+        # same self-exclusion for the same reason.
+        for _mod in list(sys.modules):
+            if _mod == "server" or (_mod.startswith("engram_") and _mod != "engram_client"):
+                sys.modules.pop(_mod, None)
         import server as _server
 
         # Redirect ALL module-level paths via the centralized function.
