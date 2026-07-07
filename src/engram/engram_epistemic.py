@@ -56,6 +56,10 @@ def _update_incident_index(lesson_id: str, lesson_claim: str,
             json.dump(index, f, indent=2)
     except Exception:
         pass  # Best-effort; never block lesson creation
+    try:
+        core._rebuild_principle_triggers()  # unified registry (#1698 slice 1)
+    except Exception:
+        pass  # best-effort; legacy cache above remains the hooks' read path
 
 
 # ---------------------------------------------------------------------------
@@ -972,5 +976,12 @@ def _register_exemplar_impl(
         except Exception as exc:
             cache_result = {"status": "error", "detail": str(exc)}
         result["cache_rebuild"] = cache_result
+    # Unified registry (#1698 slice 1) — additive alongside the legacy
+    # caches until the unified hook check lands (design doc §2 migration).
+    if target_row["type"] in ("lesson", "cornerstone"):
+        try:
+            core._rebuild_principle_triggers()
+        except Exception:
+            pass  # best-effort; legacy caches remain the hooks' read path
 
     return json.dumps(result)

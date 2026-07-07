@@ -534,6 +534,11 @@ def _remove_edge_impl(
                 core._rebuild_cornerstone_anchors_cache()
             except Exception:
                 pass  # best-effort; anchor staleness is non-fatal
+        if relation in ("exemplifies", "instantiates", "serves", "tensions"):
+            try:
+                core._rebuild_principle_triggers()  # unified registry (#1698)
+            except Exception:
+                pass  # best-effort
 
         result = {
             "status": "removed",
@@ -706,6 +711,11 @@ def _add_edge_impl(
                 core._rebuild_cornerstone_anchors_cache()
             except Exception:
                 pass  # best-effort; anchor staleness is non-fatal (#1691)
+        if relation in ("exemplifies", "instantiates", "serves", "tensions"):
+            try:
+                core._rebuild_principle_triggers()  # unified registry (#1698)
+            except Exception:
+                pass  # best-effort
 
         result = {
             "status": "created",

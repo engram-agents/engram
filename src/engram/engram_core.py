@@ -256,6 +256,7 @@ def _configure_paths(data_dir: str | Path) -> None:
     """
     global DATA_DIR, DB_PATH, SNAPSHOT_PATH, CONFIG_PATH, LOG_PATH
     global FEELING_NUDGE_MARKER, ERROR_INCIDENTS_PATH, CORNERSTONE_ANCHORS_PATH
+    global PRINCIPLE_TRIGGERS_PATH
     global _walguard_last_check, _walguard_startup_done, _walguard_disabled_logged
     DATA_DIR = Path(data_dir)
     DB_PATH = DATA_DIR / "knowledge.db"
@@ -265,6 +266,7 @@ def _configure_paths(data_dir: str | Path) -> None:
     FEELING_NUDGE_MARKER = DATA_DIR / "feeling-nudge-active.json"
     ERROR_INCIDENTS_PATH = str(DATA_DIR / "error_incidents.json")
     CORNERSTONE_ANCHORS_PATH = str(DATA_DIR / "cornerstone_anchors.json")
+    PRINCIPLE_TRIGGERS_PATH = str(DATA_DIR / "principle_triggers.json")
     # Reset walguard state when paths change (e.g. test isolation)
     _walguard_last_check = 0.0
     _walguard_startup_done = False
@@ -3572,6 +3574,7 @@ _REMOVABLE_EDGE_RELATIONS = frozenset(
 
 ERROR_INCIDENTS_PATH = str(DATA_DIR / "error_incidents.json")
 CORNERSTONE_ANCHORS_PATH = str(DATA_DIR / "cornerstone_anchors.json")
+PRINCIPLE_TRIGGERS_PATH = str(DATA_DIR / "principle_triggers.json")
 
 
 # ---------------------------------------------------------------------------
@@ -4226,6 +4229,105 @@ def _rebuild_cornerstone_anchors_cache() -> dict:
             "exemplar_count": len(index),
             "cornerstone_count": len(cornerstone_count),
             "path": CORNERSTONE_ANCHORS_PATH,
+        }
+    finally:
+        conn.close()
+
+
+# Principle-trigger surfaces (#1698 slice 1): one row per
+# (edge relation, principle type) pair. Each spec is
+# (relation, principle_type, kind, nudge_metadata_key, mode, bidirectional).
+# `tensions` is the relational-tier violation flavor (Lei 2026-07-07, design
+# doc §7): a tension edge touching a goal makes the OTHER end a trigger, in
+# either direction (tensions has no causal direction — see its
+# EDGE_CLASSIFICATIONS entry).
+_PRINCIPLE_TRIGGER_SPECS = (
+    ("exemplifies", "lesson", "lesson", "scaffolding_nudge", None, False),
+    ("exemplifies", "cornerstone", "cornerstone", "anchor_line", None, False),
+    ("instantiates", "axiom", "axiom", "surfacing_nudge", None, False),
+    ("serves", "goal", "goal", "surfacing_nudge", None, False),
+    ("tensions", "goal", "goal", "surfacing_nudge", "tension", True),
+)
+
+
+def _rebuild_principle_triggers() -> dict:
+    """Rebuild the unified principle_triggers.json registry (#1698 slice 1).
+
+    One registry over all four principle kinds, derived entirely from edges
+    per _PRINCIPLE_TRIGGER_SPECS. Entry shape:
+        trigger_node_id -> {principle_id, kind, claim, nudge,
+                            situation_pattern?, mode?}
+
+    Migration shim: this is ADDITIVE — the legacy caches
+    (error_incidents.json, cornerstone_anchors.json) keep being written by
+    their own rebuilds and remain what the hooks read until the unified
+    check lands (design doc §2, implementation PR 2 of 3). Same-trigger
+    multi-principle collisions resolve last-spec-wins — a NEW tradeoff this
+    unified keyspace introduces (the per-kind legacy caches never faced
+    cross-kind collisions); slice 2's read path should treat it as a
+    deliberate choice, not inherited precedent.
+
+    Idempotent full rewrite; returns a summary dict; never raises past the
+    connection (callers wrap best-effort).
+    """
+    conn = _get_db()
+    try:
+        index: dict[str, dict] = {}
+        by_kind: dict[str, int] = {}
+        for relation, ptype, kind, nudge_key, mode, bidirectional in _PRINCIPLE_TRIGGER_SPECS:
+            rows = conn.execute(
+                """SELECT e.source_id AS trigger_id, e.target_id AS principle_id,
+                          n.claim AS claim, n.metadata AS meta
+                   FROM edges e
+                   JOIN nodes n ON n.id = e.target_id
+                   WHERE e.relation = ? AND n.type = ? AND n.is_current = 1""",
+                (relation, ptype),
+            ).fetchall()
+            if bidirectional:
+                rows = list(rows) + list(conn.execute(
+                    """SELECT e.target_id AS trigger_id, e.source_id AS principle_id,
+                              n.claim AS claim, n.metadata AS meta
+                       FROM edges e
+                       JOIN nodes n ON n.id = e.source_id
+                       WHERE e.relation = ? AND n.type = ? AND n.is_current = 1""",
+                    (relation, ptype),
+                ).fetchall())
+            for r in rows:
+                if r["trigger_id"] == r["principle_id"]:
+                    continue
+                try:
+                    meta = json.loads(r["meta"]) if r["meta"] else {}
+                except (TypeError, json.JSONDecodeError):
+                    meta = {}
+                entry: dict = {
+                    "principle_id": r["principle_id"],
+                    "kind": kind,
+                    "claim": r["claim"],
+                    "nudge": meta.get(nudge_key, "") or r["claim"],
+                }
+                pattern = meta.get("situation_pattern", "")
+                if pattern:
+                    entry["situation_pattern"] = pattern
+                if mode:
+                    entry["mode"] = mode
+                index[r["trigger_id"]] = entry
+
+        # Count SURVIVING entries per kind (post last-spec-wins), not rows
+        # processed — a node serving two goals is one trigger, not two
+        # (#1702 reviewer-fairy).
+        for entry in index.values():
+            k = entry["kind"]
+            by_kind[k] = by_kind.get(k, 0) + 1
+
+        os.makedirs(os.path.dirname(PRINCIPLE_TRIGGERS_PATH), exist_ok=True)
+        with open(PRINCIPLE_TRIGGERS_PATH, "w") as f:
+            json.dump(index, f, indent=2)
+
+        return {
+            "status": "rebuilt",
+            "trigger_count": len(index),
+            "by_kind": by_kind,
+            "path": PRINCIPLE_TRIGGERS_PATH,
         }
     finally:
         conn.close()

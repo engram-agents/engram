@@ -329,6 +329,10 @@ def _add_task_impl(
         }
         if goal_id and not non_current_goal_id:
             result["serves_goal"] = goal_id
+            try:
+                core._rebuild_principle_triggers()  # unified registry (#1698)
+            except Exception:
+                pass  # best-effort
         if non_current_goal_id:
             result["non_current_goal_id"] = non_current_goal_id
         if impl_ids:
