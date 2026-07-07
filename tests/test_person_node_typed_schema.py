@@ -8,6 +8,8 @@ Coverage:
   5. Stage 1 auto-suggest: name-match fires suggestion, does NOT auto-wire about-edge
   6. Stage 2 auto-suggest: link_about response carries special_moment_suggestion
   7. special_moments cap (7) + rotation: oldest removed from list, about-edge preserved
+  8. engram_add_special_moment MCP tool — payload validation + happy path +
+     round-trip with engram_link_about's special_moment_suggestion (#1705)
 """
 
 import atexit
@@ -559,6 +561,8 @@ def test_stage2_link_about_carries_suggestion():
     assert sug["source_node_id"] == obs_id
     assert "SuggestionTarget" in sug["person_name"]
     assert "add to" in sug["message"].lower()
+    assert "how" in sug, f"No 'how' key (self-documenting nudge): {sug}"
+    assert "engram_add_special_moment" in sug["how"]
 
 
 # ---------------------------------------------------------------------------
@@ -661,3 +665,276 @@ def test_special_moments_cap_and_rotation():
         )
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# §8 — engram_add_special_moment MCP tool (#1705)
+#
+# The internal impl (_add_special_moment_impl) is already exercised directly
+# above (§3, test_special_moments_cap_and_rotation) and in
+# tests/test_person_node_typed_schema.py's own history — that internal-logic
+# coverage is NOT duplicated here. These tests go through the MCP wrapper
+# specifically: payload validation, delegate-through-correctly, and a
+# lightweight spot-check that the wrapper doesn't break cap+rotation.
+# ---------------------------------------------------------------------------
+
+def _make_person_and_anchor(server, name="MomentTarget", claim="A notable thing happened"):
+    """Helper: create a person node + a real, linked anchor observation.
+
+    Returns (person_id, node_id) suitable for engram_add_special_moment.
+    """
+    rp = json.loads(server.engram_add_person(payload_json=json.dumps({
+        "name": name,
+        "relation": "colleague",
+    })))
+    assert "error" not in rp, rp
+    pid = rp["person_id"]
+
+    obs = json.loads(server.engram_add_observation(payload_json=json.dumps({
+        "claim": claim,
+        "quoted_text": claim[:20],
+        "interpretation": "interesting event",
+        "quote_type": "hard_data",
+        "url": "https://example.com/test-evidence",
+        "title": "test evidence",
+    })))
+    assert "error" not in obs, obs
+    obs_id = obs["observation_id"]
+
+    link = json.loads(server.engram_link_about(payload_json=json.dumps({
+        "node_id": obs_id,
+        "person_id": pid,
+    })))
+    assert "error" not in link, link
+
+    return pid, obs_id, link
+
+
+def test_add_special_moment_tool_happy_path():
+    """MCP wrapper: happy path creates a special_moments entry."""
+    server = fresh_server()
+    pid, obs_id, _link = _make_person_and_anchor(server)
+
+    r = json.loads(server.engram_add_special_moment(payload_json=json.dumps({
+        "person_id": pid,
+        "description": "First real conversation about the project's direction.",
+        "node_id": obs_id,
+    })))
+    assert "error" not in r, r
+    assert r["status"] == "added", r
+    assert r["person_id"] == pid
+    assert r["slot_count"] == 1
+    descriptions = [m["description"] for m in r["special_moments"]]
+    assert "First real conversation about the project's direction." in descriptions
+
+    # Confirm it landed in the person node's metadata, not just the response.
+    import engram_core as core
+    conn = core._get_db()
+    try:
+        row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (pid,)).fetchone()
+        meta = json.loads(row["metadata"])
+        assert len(meta["special_moments"]) == 1
+        assert meta["special_moments"][0]["node_id"] == obs_id
+    finally:
+        conn.close()
+
+
+def test_add_special_moment_tool_unknown_field_rejected():
+    """Unknown top-level fields in payload_json are rejected before delegation."""
+    server = fresh_server()
+    pid, obs_id, _link = _make_person_and_anchor(server)
+
+    r = json.loads(server.engram_add_special_moment(payload_json=json.dumps({
+        "person_id": pid,
+        "description": "x",
+        "node_id": obs_id,
+        "bogus": "reject",
+    })))
+    assert "error" in r, r
+    assert "Unknown fields" in r["error"]
+    assert "bogus" in r["error"]
+
+
+def test_add_special_moment_tool_missing_required_fields():
+    """Each of person_id/description/node_id blank is rejected by the impl,
+    passed through unmangled by the MCP wrapper."""
+    server = fresh_server()
+    pid, obs_id, _link = _make_person_and_anchor(server)
+
+    missing_person = json.loads(server.engram_add_special_moment(payload_json=json.dumps({
+        "description": "x",
+        "node_id": obs_id,
+    })))
+    assert "error" in missing_person, missing_person
+    assert "person_id" in missing_person["error"]
+
+    missing_description = json.loads(server.engram_add_special_moment(payload_json=json.dumps({
+        "person_id": pid,
+        "node_id": obs_id,
+    })))
+    assert "error" in missing_description, missing_description
+    assert "description" in missing_description["error"]
+
+    missing_node_id = json.loads(server.engram_add_special_moment(payload_json=json.dumps({
+        "person_id": pid,
+        "description": "x",
+    })))
+    assert "error" in missing_node_id, missing_node_id
+    assert "node_id" in missing_node_id["error"]
+
+
+def test_add_special_moment_tool_person_not_found():
+    """A nonexistent person_id is rejected — delegate-through-correctly, no
+    re-derivation of internal validation logic."""
+    server = fresh_server()
+    _pid, obs_id, _link = _make_person_and_anchor(server)
+
+    r = json.loads(server.engram_add_special_moment(payload_json=json.dumps({
+        "person_id": "pn_9999999",
+        "description": "x",
+        "node_id": obs_id,
+    })))
+    assert "error" in r, r
+    assert "not found" in r["error"].lower()
+
+
+def test_add_special_moment_tool_person_not_type_person():
+    """A node_id that resolves but isn't type='person' is rejected."""
+    server = fresh_server()
+    _pid, obs_id, _link = _make_person_and_anchor(server)
+
+    r = json.loads(server.engram_add_special_moment(payload_json=json.dumps({
+        "person_id": obs_id,  # an observation node, not a person node
+        "description": "x",
+        "node_id": obs_id,
+    })))
+    assert "error" in r, r
+    assert "not 'person'" in r["error"] or "not a" in r["error"].lower()
+
+
+def test_add_special_moment_tool_person_not_current():
+    """A retracted person node is rejected."""
+    server = fresh_server()
+    pid, obs_id, _link = _make_person_and_anchor(server)
+
+    retract = json.loads(server.engram_retract(payload_json=json.dumps({
+        "node_id": pid,
+        "error_type": "hallucinated_claim",
+        "reason": "Test retraction — MCP wrapper is_current guard test.",
+    })))
+    assert "error" not in retract, retract
+
+    r = json.loads(server.engram_add_special_moment(payload_json=json.dumps({
+        "person_id": pid,
+        "description": "x",
+        "node_id": obs_id,
+    })))
+    assert "error" in r, r
+    assert "not current" in r["error"].lower()
+
+
+def test_add_special_moment_tool_anchor_not_found_or_not_current():
+    """The anchor node_id must reference a real, current node."""
+    server = fresh_server()
+    pid, obs_id, _link = _make_person_and_anchor(server)
+
+    not_found = json.loads(server.engram_add_special_moment(payload_json=json.dumps({
+        "person_id": pid,
+        "description": "x",
+        "node_id": "ob_9999999",
+    })))
+    assert "error" in not_found, not_found
+    assert "not found" in not_found["error"].lower()
+
+    retract = json.loads(server.engram_retract(payload_json=json.dumps({
+        "node_id": obs_id,
+        "error_type": "hallucinated_claim",
+        "reason": "Test retraction — anchor not-current guard test.",
+    })))
+    assert "error" not in retract, retract
+
+    not_current = json.loads(server.engram_add_special_moment(payload_json=json.dumps({
+        "person_id": pid,
+        "description": "x",
+        "node_id": obs_id,
+    })))
+    assert "error" in not_current, not_current
+    assert "not current" in not_current["error"].lower()
+
+
+def test_add_special_moment_tool_cap_and_rotation_spot_check():
+    """Lighter spot-check (3 calls) that the MCP wrapper doesn't break the
+    cap+rotation behavior already exhaustively tested in §3 for the
+    internal impl. Uses a cap smaller than 7 isn't available (cap is a
+    module constant), so this only confirms accumulation works through the
+    wrapper — full 7-then-8 rotation coverage stays in test_special_moments_
+    cap_and_rotation above."""
+    server = fresh_server()
+    pid, _obs_id, _link = _make_person_and_anchor(server)
+
+    node_ids = []
+    for i in range(3):
+        obs = json.loads(server.engram_add_observation(payload_json=json.dumps({
+            "claim": f"Moment {i+1}",
+            "quoted_text": f"moment {i+1}",
+            "interpretation": "a special event",
+            "quote_type": "hard_data",
+            "url": "https://example.com/test-evidence",
+            "title": "test evidence",
+        })))
+        obs_id = obs["observation_id"]
+        server.engram_link_about(payload_json=json.dumps({
+            "node_id": obs_id, "person_id": pid,
+        }))
+        node_ids.append(obs_id)
+
+        r = json.loads(server.engram_add_special_moment(payload_json=json.dumps({
+            "person_id": pid,
+            "description": f"Description for moment {i+1}",
+            "node_id": obs_id,
+        })))
+        assert "error" not in r, r
+        assert r["slot_count"] == i + 1, r
+
+    assert len(r["special_moments"]) == 3
+    assert [m["node_id"] for m in r["special_moments"]] == node_ids
+
+
+def test_add_special_moment_tool_round_trip_with_link_about_suggestion():
+    """The person_id/node_id from a real engram_link_about suggestion can be
+    fed directly into engram_add_special_moment and succeeds."""
+    server = fresh_server()
+    rp = json.loads(server.engram_add_person(payload_json=json.dumps({
+        "name": "RoundTripTarget",
+        "relation": "collaborator",
+    })))
+    pid = rp["person_id"]
+
+    obs = json.loads(server.engram_add_observation(payload_json=json.dumps({
+        "claim": "A genuinely notable exchange happened",
+        "quoted_text": "notable exchange",
+        "interpretation": "worth remembering",
+        "quote_type": "hard_data",
+        "url": "https://example.com/test-evidence",
+        "title": "test evidence",
+    })))
+    obs_id = obs["observation_id"]
+
+    link = json.loads(server.engram_link_about(payload_json=json.dumps({
+        "node_id": obs_id,
+        "person_id": pid,
+    })))
+    assert "error" not in link, link
+    assert "special_moment_suggestion" in link, link
+    sug = link["special_moment_suggestion"]
+    assert sug["person_id"] == pid
+    assert sug["source_node_id"] == obs_id
+
+    # Feed the suggestion's own fields straight into the confirm tool.
+    r = json.loads(server.engram_add_special_moment(payload_json=json.dumps({
+        "person_id": sug["person_id"],
+        "description": "Confirmed via the special_moment_suggestion round-trip.",
+        "node_id": sug["source_node_id"],
+    })))
+    assert "error" not in r, r
+    assert r["status"] == "added", r

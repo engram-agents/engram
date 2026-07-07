@@ -448,6 +448,11 @@ def _link_about_impl(
                 "person_name": person_name,
                 "source_node_id": node_id,
                 "message": f"add to {person_name}'s special_moments?",
+                "how": (
+                    "call engram_add_special_moment with {person_id, "
+                    "node_id (use this source_node_id), description "
+                    "(your read of the moment)}"
+                ),
             }
 
         return json.dumps({

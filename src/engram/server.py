@@ -3370,6 +3370,88 @@ def engram_update_person(payload_json: str) -> str:
     )
 
 
+_ADD_SPECIAL_MOMENT_FIELDS = frozenset({
+    "person_id", "description", "node_id",
+})
+
+
+# DESIGN INTENT — engram_add_special_moment
+# ------------------------------------------
+# Confirm step for the special_moment_suggestion nudge that engram_link_about
+# emits after every new `about` edge (see _link_about_impl in
+# engram_cornerstone.py). PR #1604 shipped the curated special_moments
+# highlights field (max 7, oldest rotated out on cap) plus its write path
+# (_add_special_moment_impl in engram_trust.py) but deliberately left it
+# module-level only — "moments enter via Stage 2 workflow" — so there was no
+# way for an agent to act on the nudge. This tool closes that #1587/#1604 gap
+# by exposing the existing, already-tested impl as an MCP tool. No new write
+# logic here — purely a thin validating wrapper.
+#
+# Single-payload signature (payload_json), per this repo's MCP tool
+# parameter-style convention (see project CLAUDE.md) — every @mcp.tool()
+# function takes one JSON-string param, never multi-arg, to eliminate the
+# antml-prefix argument-swallow surface.
+@mcp.tool(
+    name="engram_add_special_moment",
+    annotations={
+        "title": "Add a Special Moment to a Person Node",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_add_special_moment(payload_json: str) -> str:
+    """Record a curated "special moment" highlight on a person node.
+
+    This is the confirm step for the special_moment_suggestion nudge that
+    engram_link_about returns after wiring a new `about` edge — when that
+    nudge fires, call this tool to actually commit the highlight instead of
+    letting the suggestion go unactioned.
+
+    Appends {description, node_id, added_at} to the person node's
+    metadata.special_moments list. Max 7 slots: once at cap, the oldest
+    entry is rotated out of the list (its underlying `about` edge is NOT
+    removed — special_moments is a highlights reel over the full history,
+    not the history itself). Not idempotent: calling this twice with the
+    same arguments appends a second, separate entry.
+
+    Args:
+        payload_json: JSON object (as a string) with these REQUIRED fields:
+            person_id (str): Target person node ID (pn_NNNN). Must be
+                type='person' and is_current=1, or this returns an error.
+            description (str): Qualitative description of the moment (the
+                agent's own read on why it's notable).
+            node_id (str): The epistemic anchor — the observation or other
+                node this moment is grounded in. Must reference a real,
+                current node, or this returns an error.
+
+    Returns:
+        JSON with status="added", person_id, the updated special_moments
+        list, slot_count, and cap. On any validation failure (person not
+        found / not type=person / not current; description or node_id
+        missing/blank; anchor node not found / not current) returns
+        {"error": "..."} instead.
+
+    See _add_special_moment_impl in engram_trust.py for full semantics.
+    """
+    try:
+        params = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return json.dumps({"error": "payload_json must be a JSON object"})
+
+    unknown = set(params.keys()) - _ADD_SPECIAL_MOMENT_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ADD_SPECIAL_MOMENT_FIELDS)}"
+        })
+
+    return _trust_mod._add_special_moment_impl(**params)
+
+
 _SET_TRUST_TIER_FIELDS = frozenset({
     "target_pn", "tier", "justification_obs_id", "primary_user_approval_obtained",
 })
