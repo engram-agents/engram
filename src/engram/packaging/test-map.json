@@ -423,6 +423,10 @@
       "reason": "Dev-tier baseline tool; no dedicated test file"
     },
     {
+      "path": "tools/recall_repetition_analysis.py",
+      "reason": "Dev-tier measurement/acceptance-metric CLI (recall-triggering blueprint #1688 P1/#1689); no dedicated test file. Its core repeat-fraction formula is exercised indirectly by tests/test_surface_ledger_suppression.py's synthetic-verification test, which reuses the same trailing-k-window definition."
+    },
+    {
       "path": "tools/compute_task_time.py",
       "reason": "No dedicated test file found"
     },

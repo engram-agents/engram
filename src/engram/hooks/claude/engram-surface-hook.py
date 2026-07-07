@@ -236,6 +236,199 @@ def _get_auto_surface_config() -> dict:
         return defaults
 
 
+# Surfaced-recency suppression defaults — recall-triggering blueprint §3-P1
+# (issue #1689). Overridden by config.json's `recall_suppression` section,
+# same read pattern as `_get_auto_surface_config`.
+DEFAULT_SUPPRESSION_K = 5   # trailing-prompt window
+DEFAULT_SUPPRESSION_M = 3   # repeat-count threshold before full suppression
+
+# Ledger retention (~/.engram/surface-ledger.json). Two independent bounds,
+# applied together (belt-and-suspenders — either alone would bound growth,
+# combining them tolerates occasional gaps without losing the trailing-k
+# signal): per-session entries older than DEFAULT_LEDGER_ENTRY_MAX_AGE_HOURS
+# are dropped, and each session's remaining entries are capped at
+# max(4*k, DEFAULT_LEDGER_RETENTION_ENTRIES) — a safety margin over the
+# configured k so the window read never runs dry on catch-up/out-of-order
+# writes. Sessions with no activity in DEFAULT_LEDGER_SESSION_MAX_AGE_HOURS
+# are dropped entirely, so the ledger doesn't accumulate one entry-set per
+# session forever across the life of the install.
+DEFAULT_LEDGER_ENTRY_MAX_AGE_HOURS = 24
+DEFAULT_LEDGER_RETENTION_ENTRIES = 20
+DEFAULT_LEDGER_SESSION_MAX_AGE_HOURS = 48
+
+
+def _get_suppression_config() -> dict:
+    """Read recall_suppression tunables from $ENGRAM_HOME/config.json.
+
+    Returns {k, m} with defaults if config absent / malformed / section
+    missing. Never raises. Same read pattern as _get_auto_surface_config.
+    """
+    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    defaults = {"k": DEFAULT_SUPPRESSION_K, "m": DEFAULT_SUPPRESSION_M}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        section = config.get("recall_suppression", {})
+        return {
+            "k": int(section.get("k", defaults["k"])),
+            "m": int(section.get("m", defaults["m"])),
+        }
+    except (OSError, ValueError, json.JSONDecodeError, TypeError):
+        return defaults
+
+
+def _surface_ledger_path() -> str:
+    """Path to the surfaced-recency ledger. Reads the module-level ENGRAM_HOME
+    name at call time (not a frozen module-load-time constant) so tests that
+    override `hook.ENGRAM_HOME` after import (the established pattern in this
+    file's test suite — see e.g. test_surface_hook_attached_packs.py) redirect
+    ledger I/O correctly, same as get_user_name()'s dynamic ENGRAM_HOME read.
+    """
+    return os.path.join(ENGRAM_HOME, "surface-ledger.json")
+
+
+def _read_surface_ledger() -> dict:
+    """Read the surfaced ledger. Any failure → {} (fail-open — the ledger is
+    an advisory cache for render-layer suppression, never a source of truth).
+    """
+    try:
+        with open(_surface_ledger_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
+        return {}
+
+
+def _write_surface_ledger(ledger: dict) -> None:
+    """Best-effort ledger write. Any failure is swallowed — fail-open."""
+    try:
+        path = _surface_ledger_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(ledger, f)
+    except Exception:
+        pass
+
+
+def _prune_surface_ledger(
+    ledger: dict, *, now_ts: float, retention_entries: int,
+    entry_max_age_hours: float, session_max_age_hours: float,
+) -> dict:
+    """Prune the ledger: drop inactive sessions, trim each session's entries.
+
+    A session is dropped entirely if its most-recent entry is older than
+    session_max_age_hours (checked against the RAW last entry, before
+    per-entry age filtering — this is what bounds the ledger's total size
+    across the life of the install). Surviving sessions have entries older
+    than entry_max_age_hours dropped, then are capped at the last
+    retention_entries entries.
+    """
+    entry_cutoff = now_ts - (entry_max_age_hours * 3600)
+    session_cutoff = now_ts - (session_max_age_hours * 3600)
+    pruned: dict = {}
+    for sid, entries in ledger.items():
+        if not isinstance(entries, list) or not entries:
+            continue
+        last = entries[-1]
+        last_ts = last.get("ts", 0) if isinstance(last, dict) else 0
+        if last_ts < session_cutoff:
+            continue  # session inactive too long — drop entirely
+        fresh = [e for e in entries if isinstance(e, dict) and e.get("ts", 0) >= entry_cutoff]
+        fresh = fresh[-retention_entries:]
+        if fresh:
+            pruned[sid] = fresh
+    return pruned
+
+
+def _append_surface_ledger_entry(session_id: str, rendered_ids, *, k: int) -> None:
+    """Append this prompt's actually-rendered node ids to the surfaced ledger
+    for session_id, then prune. Best-effort / fail-open throughout — the
+    ledger is an advisory cache; any I/O or parse failure here must never
+    break the hook. See docs/recall-triggering-blueprint.md §3-P1.
+    """
+    try:
+        now_ts = time.time()
+        ledger = _read_surface_ledger()
+        entries = ledger.get(session_id, [])
+        if not isinstance(entries, list):
+            entries = []
+        entries.append({"ts": now_ts, "ids": sorted(set(rendered_ids))})
+        ledger[session_id] = entries
+        retention_entries = max(4 * max(int(k), 1), DEFAULT_LEDGER_RETENTION_ENTRIES)
+        ledger = _prune_surface_ledger(
+            ledger,
+            now_ts=now_ts,
+            retention_entries=retention_entries,
+            entry_max_age_hours=DEFAULT_LEDGER_ENTRY_MAX_AGE_HOURS,
+            session_max_age_hours=DEFAULT_LEDGER_SESSION_MAX_AGE_HOURS,
+        )
+        _write_surface_ledger(ledger)
+    except Exception:
+        pass
+
+
+def _get_trailing_window_ids(session_id: str, k: int) -> list:
+    """Return the id-lists of the trailing k ledger entries for session_id.
+
+    [] on any failure or when the session has no history (fail-open — a
+    fresh/unknown session simply renders full-tier, as today).
+    """
+    try:
+        if k <= 0:
+            return []
+        ledger = _read_surface_ledger()
+        entries = ledger.get(session_id, [])
+        if not isinstance(entries, list):
+            return []
+        trailing = entries[-k:]
+        return [
+            e.get("ids", []) for e in trailing
+            if isinstance(e, dict) and isinstance(e.get("ids"), list)
+        ]
+    except Exception:
+        return []
+
+
+def _count_occurrences_in_window(node_id, window) -> int:
+    """Count how many of the trailing-k ledger entries contain node_id."""
+    if not node_id:
+        return 0
+    return sum(1 for ids in window if node_id in ids)
+
+
+def _classify_suppression(count: int, m: int) -> str:
+    """Classify a node's render tier from its prior-occurrence count within
+    the trailing k window (per issue #1689's demotion tiers):
+      0 or 1 prior occurrence  → "full"    (render as today)
+      2 .. m-1 prior occurrences → "others"  (demote to keyword-only)
+      >= m prior occurrences   → "suppress" (don't render at all)
+    """
+    if count <= 1:
+        return "full"
+    if count < m:
+        return "others"
+    return "suppress"
+
+
+def _others_candidate_from_full_entry(entry: dict) -> dict:
+    """Build a matched_meta-shaped candidate (id, recall_keywords, [tainted],
+    [stale]) from a full special/top_claim entry — used when a would-be
+    full-tier render is demoted to the Others (keyword-only) tier.
+    """
+    kw = entry.get("recall_keywords")
+    cand: dict = {
+        "id": entry.get("id"),
+        "recall_keywords": kw if isinstance(kw, list) else None,
+    }
+    w = entry.get("warnings")
+    if w:
+        if w.get("tainted_by"):
+            cand["tainted"] = True
+        if w.get("stale_by"):
+            cand["stale"] = True
+    return cand
+
+
 def _get_attached_packs() -> list[dict]:
     """Read attached_packs from $ENGRAM_HOME/config.json.
 
@@ -594,16 +787,24 @@ def render_one_node_line(entry: dict, *, conf_prefix: bool, type_tag: bool) -> s
     return f"- {warn_marker}[{nid}] {prefix}{age_tag}{kw_prefix}{body}"
 
 
-def format_nudge(result: dict, pack_results: list[dict] | None = None) -> str:
+def format_nudge(
+    result: dict,
+    pack_results: list[dict] | None = None,
+    session_id: str | None = None,
+) -> str:
     """Format engram_surface result into a compact nudge string.
 
-    Layout (2026-05-19 redesign):
+    Layout (2026-05-19 redesign; suppression tiers added 2026-07-07, #1689):
       1. Header
-      2. Noteworthy: <type counts> (when specials present)
-      3. Specials section (rendered with full content, BEFORE top_claims)
-      4. Top claims section (with keyword+summary format)
-      5. Warnings / Memory / IDs / footer
-      6. Attached-library section (when pack_results is non-empty)
+      2. Suppressed-count line (when this render suppressed ≥1 node)
+      3. Noteworthy: <type counts> (when specials present)
+      4. Specials section (rendered with full content, BEFORE top_claims)
+      5. Top claims section (with keyword+summary format)
+      6. Worth revisiting: not-recalled-recently reservation (when a
+         special/top_claim slot was freed — by suppression or by fewer than
+         3 nodes qualifying naturally)
+      7. Warnings / Memory / Others / IDs / footer
+      8. Attached-library section (when pack_results is non-empty)
 
     Types: line dropped — Noteworthy already conveys the type breakdown for
     specials, and when no specials are present the Types line is stats-noise.
@@ -611,37 +812,147 @@ def format_nudge(result: dict, pack_results: list[dict] | None = None) -> str:
     pack_results: list of node dicts from _query_attached_packs(), each tagged
     with 'pack_id'. Omitted or empty → section not rendered (zero-packs invariant:
     byte-identical output to prior behavior when no packs are configured).
+
+    session_id: recall-triggering blueprint §3-P1 surfaced-ledger suppression
+    (issue #1689). When None (the legacy call shape — every pre-existing
+    caller/test in this repo omits it), suppression is disabled entirely: every
+    candidate classifies as "full" tier and the not-recalled reservation never
+    fires, so output is byte-identical to pre-suppression behavior (this is
+    the "zero-suppression invariant" this file's tests pin). When a session_id
+    is provided (main() always passes one), nodes surfaced ≥2 times in the
+    trailing k prompts for this session demote to Others-tier or suppress
+    entirely — render-layer only, matching/ranking are untouched. This
+    function owns the ledger read (to compute tiers) AND the ledger write (to
+    record what was actually rendered) — see docs/recall-triggering-blueprint.md
+    §3-P1 for the design.
     """
     total = result.get("match_count", 0)
     if total == 0:
         return ""
 
+    # --- Suppression setup ---------------------------------------------
+    suppression_active = session_id is not None
+    sup_cfg = {"k": DEFAULT_SUPPRESSION_K, "m": DEFAULT_SUPPRESSION_M}
+    window: list = []
+    if suppression_active:
+        sup_cfg = _get_suppression_config()
+        window = _get_trailing_window_ids(session_id, sup_cfg["k"])
+
+    def _tier_for(nid) -> str:
+        if not suppression_active or not nid:
+            return "full"
+        count = _count_occurrences_in_window(nid, window)
+        return _classify_suppression(count, sup_cfg["m"])
+
     lines = []
     lines.append(f"[ENGRAM Recall: {total} nodes match your query]")
 
+    rendered_ids_this_prompt: set = set()
+    suppressed_ids: set = set()
+    demoted_candidates: list[dict] = []
+
     # Special nodes — rendered BEFORE top_claims
     special = result.get("special_nodes", [])
+    special_rendered_count = 0
     if special:
         from collections import Counter
+        # Noteworthy reflects the ORIGINAL matched special set (match
+        # composition), not the post-suppression render count — a demoted/
+        # suppressed special is still "noteworthy" in kind.
         type_counts_special = Counter(n.get("type", "unknown") for n in special)
         parts = [f"{c} {t}" for t, c in type_counts_special.items()]
         lines.append(f"  Noteworthy: {', '.join(parts)}")
-        lines.append("  Specials:")
+        special_lines = []
         # Defensive [:3] — engram_surface already caps specials at 3 (server.py:5269),
         # but the slice here protects against any future surface payload that returns more.
         for s in special[:3]:
-            line = render_one_node_line(s, conf_prefix=True, type_tag=True)
-            lines.append(f"    {line}")
+            nid = s.get("id")
+            tier = _tier_for(nid)
+            if tier == "full":
+                line = render_one_node_line(s, conf_prefix=True, type_tag=True)
+                special_lines.append(f"    {line}")
+                rendered_ids_this_prompt.add(nid)
+                special_rendered_count += 1
+            elif tier == "others":
+                demoted_candidates.append(_others_candidate_from_full_entry(s))
+            else:  # "suppress"
+                suppressed_ids.add(nid)
+        if special_lines:
+            lines.append("  Specials:")
+            lines.extend(special_lines)
 
     # Top claims (keyword+summary format)
     top_claims = result.get("top_claims", [])
+    top_claims_rendered_count = 0
     if top_claims:
-        lines.append("  Top claims:")
+        top_claim_lines = []
         # Defensive [:3] — engram_surface already caps top_claims at 3 (server.py:5296);
         # same future-proofing as above.
         for c in top_claims[:3]:
-            line = render_one_node_line(c, conf_prefix=True, type_tag=False)
-            lines.append(f"    {line}")
+            nid = c.get("id")
+            tier = _tier_for(nid)
+            if tier == "full":
+                line = render_one_node_line(c, conf_prefix=True, type_tag=False)
+                top_claim_lines.append(f"    {line}")
+                rendered_ids_this_prompt.add(nid)
+                top_claims_rendered_count += 1
+            elif tier == "others":
+                demoted_candidates.append(_others_candidate_from_full_entry(c))
+            else:  # "suppress"
+                suppressed_ids.add(nid)
+        if top_claim_lines:
+            lines.append("  Top claims:")
+            lines.extend(top_claim_lines)
+
+    matched_meta = result.get("matched_meta") or []
+
+    # --- Not-recalled slot reservation (recall-triggering blueprint §3-P1,
+    # second lever) — reserve up to 2 of the special/top_claim slots freed by
+    # suppression above, OR simply left empty because fewer than 3 nodes
+    # qualified naturally, for the top-ranked matches from
+    # age.not_recalled_recently. Full-tier quality needs confidence /
+    # recall_summary / created_ago, which matched_meta does not carry
+    # (id, type, recall_keywords[, tainted, stale] only) — so these render at
+    # Others (keyword-only) quality with a distinguishing section header
+    # instead of inventing fields that don't exist upstream.
+    reserved_lines: list[str] = []
+    if suppression_active:
+        freed_slots = max(0, 3 - special_rendered_count) + max(0, 3 - top_claims_rendered_count)
+        reserve_n = min(2, freed_slots)
+        if reserve_n > 0:
+            not_recalled_ids = result.get("age", {}).get("not_recalled_recently", [])
+            if isinstance(not_recalled_ids, list):
+                meta_by_id = {m.get("id"): m for m in matched_meta}
+                already_placed = (
+                    rendered_ids_this_prompt | suppressed_ids
+                    | {d.get("id") for d in demoted_candidates}
+                )
+                for nid in not_recalled_ids:
+                    if len(reserved_lines) >= reserve_n:
+                        break
+                    if not nid or nid in already_placed:
+                        continue
+                    if _tier_for(nid) == "suppress":
+                        continue
+                    meta = meta_by_id.get(nid)
+                    if not meta:
+                        continue  # no metadata available upstream — skip, don't invent fields
+                    kw = meta.get("recall_keywords")
+                    if not (isinstance(kw, list) and len(kw) >= 1):
+                        continue  # no keywords — no recognition value, matches Others discipline
+                    kw_str = " · ".join(f"`{k}`" for k in kw)
+                    tags = []
+                    if meta.get("tainted"):
+                        tags.append("TAINTED")
+                    if meta.get("stale"):
+                        tags.append("STALE")
+                    marker = f"⚠ {'/'.join(tags)} " if tags else ""
+                    reserved_lines.append(f"    - {marker}[{nid}] {kw_str}")
+                    rendered_ids_this_prompt.add(nid)
+                    already_placed.add(nid)
+        if reserved_lines:
+            lines.append("  Worth revisiting (not recalled recently):")
+            lines.extend(reserved_lines)
 
     # Age / issues
     age = result.get("age", {})
@@ -666,14 +977,31 @@ def format_nudge(result: dict, pack_results: list[dict] | None = None) -> str:
     # (no-keywords nodes provide no recognition value in skim, just noise).
     # Keywords-only (no summary) gives the agent a faceted index for "which of
     # these should I inspect" while preserving the lossy-by-design noetic-register.
-    rendered_ids = {s.get("id") for s in special[:3]} | {c.get("id") for c in top_claims[:3]}
-    matched_meta = result.get("matched_meta") or []
-    others = [m for m in matched_meta if m.get("id") not in rendered_ids]
+    #
+    # Suppression tiers apply here too (issue #1689 §3-P1: "Specials follow
+    # the same rule" — so do Others candidates): a node hitting the suppress
+    # threshold is dropped even from keyword-only tier; demoted specials/
+    # top_claims are merged into this same pool, at the same keyword-required
+    # discipline as natural Others candidates.
+    excluded_from_others = (
+        rendered_ids_this_prompt | suppressed_ids
+        | {d.get("id") for d in demoted_candidates}
+    )
+    others_candidates: list[dict] = []
+    for m in matched_meta:
+        mid = m.get("id")
+        if mid in excluded_from_others:
+            continue
+        if _tier_for(mid) == "suppress":
+            suppressed_ids.add(mid)
+            continue
+        others_candidates.append(m)
+    others_candidates.extend(demoted_candidates)
     # Filter to nodes with at least 1 keyword; drop bare-ID entries entirely
     # (per the maintainer issue #234 Findings 1+2): no-keywords nodes provide
     # no recognition value in skim, just noise.
     others_with_kw = [
-        m for m in others
+        m for m in others_candidates
         if isinstance(m.get("recall_keywords"), list)
         and len(m.get("recall_keywords") or []) >= 1
     ]
@@ -701,7 +1029,8 @@ def format_nudge(result: dict, pack_results: list[dict] | None = None) -> str:
 
     # Attached-library section — appended AFTER all own-graph content.
     # Only rendered when pack results exist; zero packs → section omitted
-    # entirely, preserving byte-identical output to current behavior.
+    # entirely, preserving byte-identical output to current behavior. Pack
+    # content is out of scope for suppression (#1689) — separate provenance.
     if pack_results:
         lines.append("  From attached libraries (read-only — cite, never import):")
         for pr in pack_results:
@@ -714,6 +1043,31 @@ def format_nudge(result: dict, pack_results: list[dict] | None = None) -> str:
         lines.append("    (pack nodes: deep-read via engram-pkg --pkg <path> inspect <id> — engram_inspect reads own-graph only)")
 
     lines.append("  Use engram_inspect(node_id) for details, engram_get_subgraph for full chains.")
+
+    # Suppressed-count line — inserted right after the header (index 1) so
+    # it's the first thing noticed, honesty-about-lossiness per §3-P1. Only
+    # rendered when this render actually suppressed ≥1 node (zero-suppression
+    # invariant: absent whenever nothing was suppressed, same discipline as
+    # this file's zero-packs invariant).
+    if suppression_active and suppressed_ids:
+        lines.insert(1, f"  (+{len(suppressed_ids)} recently shown — engram_surface for full list)")
+
+    # --- Ledger write: record what was ACTUALLY rendered this prompt -----
+    # (specials/top_claims full-tier + not-recalled reservation + Others,
+    # at whatever tier each landed — suppressed ids are intentionally
+    # excluded, so a suppressed node's occurrence count naturally decays out
+    # of future trailing-k windows once its last real rendering ages out).
+    if suppression_active:
+        # Slice must match the render slice above (others_with_kw[:15]) —
+        # recording the unsliced set would mark ids beyond the render cutoff
+        # as "seen" when the agent never actually saw them, silently
+        # inflating their occurrence count toward demotion/suppression
+        # before a single real rendering (Kepler's #1697 colleague-review
+        # catch — the mirror-image bug of the repetition this PR fixes).
+        all_rendered_ids = rendered_ids_this_prompt | {m.get("id") for m in others_with_kw[:15]}
+        all_rendered_ids.discard(None)
+        _append_surface_ledger_entry(session_id, all_rendered_ids, k=sup_cfg["k"])
+
     return "\n".join(lines)
 
 
@@ -1245,7 +1599,11 @@ def main():
 
     # ENGRAM recall nudge
     if result is not None:
-        nudge = format_nudge(result, pack_results=pack_results)
+        nudge = format_nudge(
+            result,
+            pack_results=pack_results,
+            session_id=hook_input.get("session_id", "unknown"),
+        )
         if nudge:
             parts.append(nudge)
         elif pack_results:
