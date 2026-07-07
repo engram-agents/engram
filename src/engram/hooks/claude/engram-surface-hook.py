@@ -429,6 +429,87 @@ def _others_candidate_from_full_entry(entry: dict) -> dict:
     return cand
 
 
+# Per-prompt injection budget — recall-triggering blueprint §3-P4 (issue
+# #1692). Overridden by config.json's `recall_budget` section, same read
+# pattern as `_get_auto_surface_config` / `_get_suppression_config`.
+#
+# Default is deliberately generous ("current typical render" per the
+# blueprint, with headroom): a dense render (3 specials + 3 top claims + 2
+# not-recalled reservations + 15 Others lines + a handful of attached-pack
+# lines) runs well under 4,000 chars in practice, so 6,000 chars gives
+# comfortable margin without being effectively unlimited. This is the number
+# that makes the backward-compat invariant (default config → byte-identical
+# output to pre-P4) hold structurally rather than by accident.
+DEFAULT_RECALL_BUDGET_TOTAL_CHARS = 6000
+DEFAULT_RECALL_BUDGET_ENABLED = True
+
+
+def _get_budget_config() -> dict:
+    """Read recall_budget tunables from $ENGRAM_HOME/config.json.
+
+    Returns {total_chars, enabled} with defaults if config absent / malformed
+    / section missing. Never raises. Same read pattern as
+    _get_auto_surface_config / _get_suppression_config.
+    """
+    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    defaults = {
+        "total_chars": DEFAULT_RECALL_BUDGET_TOTAL_CHARS,
+        "enabled": DEFAULT_RECALL_BUDGET_ENABLED,
+    }
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        section = config.get("recall_budget", {})
+        return {
+            "total_chars": int(section.get("total_chars", defaults["total_chars"])),
+            "enabled": bool(section.get("enabled", defaults["enabled"])),
+        }
+    except (OSError, ValueError, json.JSONDecodeError, TypeError):
+        return defaults
+
+
+def _budget_try_spend(line_text: str, budget_state: dict) -> bool:
+    """Attempt to spend a rendered line's cost against the remaining budget.
+
+    budget_state is a small mutable dict the caller owns across an entire
+    format_nudge() render:
+      {"remaining": int | None, "exhausted": bool,
+       "chars_rendered": int, "nodes_shown": int, "nodes_cut_budget": int}
+
+    remaining=None means the budget is disabled (unlimited) — every line
+    fits, and only chars_rendered/nodes_shown bookkeeping happens (no cuts
+    are ever recorded). This is the kill-switch path (recall_budget.enabled
+    = False) and is what keeps that path byte-identical to the pre-P4 fixed
+    3/3/15 caps.
+
+    Once exhausted (a line didn't fit), ALL subsequent calls return False —
+    the allocator is a one-way stop, not a skip-ahead-to-find-something-
+    smaller re-ranker (deliberate simplification, see PR body / issue #1692).
+    This is why every remaining tier's candidates still need to be walked by
+    the caller (not early-`break`ed out of): nodes_cut_budget must count every
+    candidate that was eligible to render but didn't fit, across all tiers.
+
+    Cost = len(line_text) + 1, the +1 accounting for the joining "\n" each
+    rendered line contributes when the caller later does "\n".join(lines).
+    """
+    if budget_state["exhausted"]:
+        budget_state["nodes_cut_budget"] += 1
+        return False
+    if budget_state["remaining"] is None:
+        budget_state["chars_rendered"] += len(line_text) + 1
+        budget_state["nodes_shown"] += 1
+        return True
+    cost = len(line_text) + 1
+    if cost > budget_state["remaining"]:
+        budget_state["exhausted"] = True
+        budget_state["nodes_cut_budget"] += 1
+        return False
+    budget_state["remaining"] -= cost
+    budget_state["chars_rendered"] += cost
+    budget_state["nodes_shown"] += 1
+    return True
+
+
 def _get_attached_packs() -> list[dict]:
     """Read attached_packs from $ENGRAM_HOME/config.json.
 
@@ -791,10 +872,12 @@ def format_nudge(
     result: dict,
     pack_results: list[dict] | None = None,
     session_id: str | None = None,
+    stats: dict | None = None,
 ) -> str:
     """Format engram_surface result into a compact nudge string.
 
-    Layout (2026-05-19 redesign; suppression tiers added 2026-07-07, #1689):
+    Layout (2026-05-19 redesign; suppression tiers added 2026-07-07, #1689;
+    injection budget added 2026-07-07, #1692):
       1. Header
       2. Suppressed-count line (when this render suppressed ≥1 node)
       3. Noteworthy: <type counts> (when specials present)
@@ -812,6 +895,8 @@ def format_nudge(
     pack_results: list of node dicts from _query_attached_packs(), each tagged
     with 'pack_id'. Omitted or empty → section not rendered (zero-packs invariant:
     byte-identical output to prior behavior when no packs are configured).
+    Pack lines are NOT counted against the injection budget below — same
+    "separate provenance" discipline #1689 already applied to suppression.
 
     session_id: recall-triggering blueprint §3-P1 surfaced-ledger suppression
     (issue #1689). When None (the legacy call shape — every pre-existing
@@ -825,7 +910,61 @@ def format_nudge(
     function owns the ledger read (to compute tiers) AND the ledger write (to
     record what was actually rendered) — see docs/recall-triggering-blueprint.md
     §3-P1 for the design.
+
+    Injection budget (recall-triggering blueprint §3-P4, issue #1692):
+    node-line candidates across ALL tiers (Specials → Top claims → not-
+    recalled reservation → Others, the existing fixed tier-priority order)
+    are rendered against a single global per-prompt character budget
+    (config.json `recall_budget.total_chars`; `recall_budget.enabled` is a
+    kill switch). The existing fixed per-tier caps (3 specials / 3 top
+    claims / ≤2 reservations / 15 Others) are UNCHANGED — the budget is an
+    additional gate applied within those caps, not a replacement for them,
+    and it never re-sorts: each tier's candidates are walked in their
+    existing (already relevance-sorted upstream) order, and the first
+    candidate that doesn't fit the remaining budget trips a one-way
+    "exhausted" flag — every later candidate, in this tier and every
+    subsequent tier, is cut too (never re-checked against a since-freed
+    budget, never skipped-past in search of a smaller one that would fit).
+    This is a deliberate simplification: engram_query.py does not surface a
+    per-candidate relevance score to this render layer, so this function
+    treats "existing arrival order" as the relevance signal instead of
+    inventing a synthetic composite score — see the PR body for the full
+    rationale. Structural header/footer lines (Noteworthy, section titles,
+    Warnings, Memory, the trailing "Use engram_inspect..." line, the
+    suppressed-count line) are NOT counted against the budget — only the
+    variable-length per-candidate node lines are, since those are what scale
+    with match volume. Budget-cut candidates are dropped entirely (never
+    demoted to Others — Others is itself budget-gated) and are NOT recorded
+    in the surfaced ledger (the agent never actually saw them).
+    Default config (recall_budget absent, or enabled=True with the generous
+    default total_chars) is byte-identical to pre-#1692 output for any
+    realistically-sized render — the default is sized well above what the
+    existing fixed caps can ever produce. `recall_budget.enabled=False` is
+    the explicit kill switch: every candidate is treated as unlimited-budget
+    (structurally identical to the pre-#1692 code path).
+
+    stats: optional caller-owned dict, mutated in place (out-parameter) with
+    render telemetry for the engram.surface.render_size event (issue #1692):
+    {budget_enabled, budget_total_chars, budget_exhausted, chars_rendered,
+    nodes_shown, nodes_suppressed, nodes_cut_budget}. Populated even on the
+    total==0 early-return (all zeroed / budget config echoed) so callers can
+    rely on the dict shape unconditionally. None (the default) skips
+    telemetry entirely — no behavior change, matches the pack_results /
+    session_id optional-param precedent above.
     """
+    budget_cfg = _get_budget_config()
+    if stats is not None:
+        stats.clear()
+        stats.update({
+            "budget_enabled": budget_cfg["enabled"],
+            "budget_total_chars": budget_cfg["total_chars"] if budget_cfg["enabled"] else None,
+            "budget_exhausted": False,
+            "chars_rendered": 0,
+            "nodes_shown": 0,
+            "nodes_suppressed": 0,
+            "nodes_cut_budget": 0,
+        })
+
     total = result.get("match_count", 0)
     if total == 0:
         return ""
@@ -844,12 +983,34 @@ def format_nudge(
         count = _count_occurrences_in_window(nid, window)
         return _classify_suppression(count, sup_cfg["m"])
 
+    # --- Budget setup -------------------------------------------------
+    # remaining=None when recall_budget.enabled=False (the kill switch) —
+    # unlimited: every candidate fits, matching the pre-#1692 fixed-cap
+    # behavior exactly.
+    budget_state = {
+        "remaining": budget_cfg["total_chars"] if budget_cfg["enabled"] else None,
+        "exhausted": False,
+        "chars_rendered": 0,
+        "nodes_shown": 0,
+        "nodes_cut_budget": 0,
+    }
+
     lines = []
     lines.append(f"[ENGRAM Recall: {total} nodes match your query]")
 
     rendered_ids_this_prompt: set = set()
     suppressed_ids: set = set()
     demoted_candidates: list[dict] = []
+    # Nodes that were eligible (full-tier or Others-tier) in one section but
+    # got cut by the budget rather than rendered. Kept SEPARATE from
+    # rendered_ids_this_prompt (which must stay ledger-accurate — a
+    # budget-cut node was never actually seen, so it must never be written
+    # to the surfaced ledger) but still needs to exclude the node from being
+    # re-evaluated (and re-counted as a SECOND cut) by a later section that
+    # also considers it — e.g. a budget-cut top claim that's also present in
+    # matched_meta would otherwise fall through to the Others pool and get
+    # counted twice. See PR #1701 round-1 review + its double-count follow-up.
+    budget_cut_ids: set = set()
 
     # Special nodes — rendered BEFORE top_claims
     special = result.get("special_nodes", [])
@@ -870,9 +1031,17 @@ def format_nudge(
             tier = _tier_for(nid)
             if tier == "full":
                 line = render_one_node_line(s, conf_prefix=True, type_tag=True)
-                special_lines.append(f"    {line}")
-                rendered_ids_this_prompt.add(nid)
-                special_rendered_count += 1
+                rendered_line = f"    {line}"
+                if _budget_try_spend(rendered_line, budget_state):
+                    special_lines.append(rendered_line)
+                    rendered_ids_this_prompt.add(nid)
+                    special_rendered_count += 1
+                else:
+                    # eligible (full-tier) but budget-cut — dropped, not
+                    # demoted, not marked "seen" (agent never saw this
+                    # line), but still excluded from Others below so it's
+                    # not re-evaluated and double-counted as a second cut.
+                    budget_cut_ids.add(nid)
             elif tier == "others":
                 demoted_candidates.append(_others_candidate_from_full_entry(s))
             else:  # "suppress"
@@ -893,9 +1062,17 @@ def format_nudge(
             tier = _tier_for(nid)
             if tier == "full":
                 line = render_one_node_line(c, conf_prefix=True, type_tag=False)
-                top_claim_lines.append(f"    {line}")
-                rendered_ids_this_prompt.add(nid)
-                top_claims_rendered_count += 1
+                rendered_line = f"    {line}"
+                if _budget_try_spend(rendered_line, budget_state):
+                    top_claim_lines.append(rendered_line)
+                    rendered_ids_this_prompt.add(nid)
+                    top_claims_rendered_count += 1
+                else:
+                    # eligible (full-tier) but budget-cut — dropped, not
+                    # demoted, not marked "seen" (agent never saw this
+                    # line), but still excluded from Others below so it's
+                    # not re-evaluated and double-counted as a second cut.
+                    budget_cut_ids.add(nid)
             elif tier == "others":
                 demoted_candidates.append(_others_candidate_from_full_entry(c))
             else:  # "suppress"
@@ -930,6 +1107,17 @@ def format_nudge(
                 for nid in not_recalled_ids:
                     if len(reserved_lines) >= reserve_n:
                         break
+                    # No early exit on budget_state["exhausted"] here (unlike
+                    # the reserve_n cap above): _budget_try_spend's own
+                    # contract (see its docstring) is that nodes_cut_budget
+                    # counts every candidate that reaches it post-exhaustion,
+                    # not just the first. Breaking early here would silently
+                    # undercount cuts for every remaining eligible candidate
+                    # (PR #1701 round-1 review finding — reproduced empirically:
+                    # 15 eligible Others candidates, budget for 3, undercounted
+                    # 12 cuts as 1). Eligibility filtering below is cheap
+                    # (dict lookups, no I/O) so walking the full list even
+                    # once budget is spent is not a real cost concern.
                     if not nid or nid in already_placed:
                         continue
                     if _tier_for(nid) == "suppress":
@@ -947,7 +1135,12 @@ def format_nudge(
                     if meta.get("stale"):
                         tags.append("STALE")
                     marker = f"⚠ {'/'.join(tags)} " if tags else ""
-                    reserved_lines.append(f"    - {marker}[{nid}] {kw_str}")
+                    reserved_line = f"    - {marker}[{nid}] {kw_str}"
+                    if not _budget_try_spend(reserved_line, budget_state):
+                        already_placed.add(nid)
+                        budget_cut_ids.add(nid)
+                        continue
+                    reserved_lines.append(reserved_line)
                     rendered_ids_this_prompt.add(nid)
                     already_placed.add(nid)
         if reserved_lines:
@@ -986,6 +1179,7 @@ def format_nudge(
     excluded_from_others = (
         rendered_ids_this_prompt | suppressed_ids
         | {d.get("id") for d in demoted_candidates}
+        | budget_cut_ids
     )
     others_candidates: list[dict] = []
     for m in matched_meta:
@@ -1005,21 +1199,42 @@ def format_nudge(
         if isinstance(m.get("recall_keywords"), list)
         and len(m.get("recall_keywords") or []) >= 1
     ]
-    if others_with_kw:
+    # Budget-gated render pass. Built into a separate list first (rather than
+    # appending straight to `lines`) so the "  Others:" header — like
+    # "  Specials:" / "  Top claims:" above — is only emitted when at least
+    # one Others candidate actually survived the budget, never as an empty
+    # header (which the pre-budget code could never produce, since
+    # others_with_kw truthiness and "will anything render" were the same
+    # question before #1692).
+    others_rendered_lines: list[str] = []
+    others_rendered_ids: set = set()
+    for m in others_with_kw[:15]:
+        # No early exit on budget_state["exhausted"]: this slice is already
+        # bounded at 15 AND already fully eligibility-filtered (keyword +
+        # non-suppressed), so every remaining item genuinely would render if
+        # budget allowed — _budget_try_spend's nodes_cut_budget count relies
+        # on being called for each of them post-exhaustion, not just the
+        # first (PR #1701 round-1 review finding — see the reservation loop
+        # above for the same fix + fuller rationale).
+        mid = m.get("id", "?")
+        kw = m.get("recall_keywords") or []
+        kw_str = " · ".join(f"`{k}`" for k in kw)
+        # Taint/staleness marker — same compact style as render_one_node_line
+        # (§2); additive-only, omitted for clean entries.
+        tags = []
+        if m.get("tainted"):
+            tags.append("TAINTED")
+        if m.get("stale"):
+            tags.append("STALE")
+        others_marker = f"⚠ {'/'.join(tags)} " if tags else ""
+        others_line = f"    - {others_marker}[{mid}] {kw_str}"
+        if not _budget_try_spend(others_line, budget_state):
+            continue
+        others_rendered_lines.append(others_line)
+        others_rendered_ids.add(mid)
+    if others_rendered_lines:
         lines.append("  Others:")
-        for m in others_with_kw[:15]:
-            mid = m.get("id", "?")
-            kw = m.get("recall_keywords") or []
-            kw_str = " · ".join(f"`{k}`" for k in kw)
-            # Taint/staleness marker — same compact style as render_one_node_line
-            # (§2); additive-only, omitted for clean entries.
-            tags = []
-            if m.get("tainted"):
-                tags.append("TAINTED")
-            if m.get("stale"):
-                tags.append("STALE")
-            others_marker = f"⚠ {'/'.join(tags)} " if tags else ""
-            lines.append(f"    - {others_marker}[{mid}] {kw_str}")
+        lines.extend(others_rendered_lines)
     elif not (special or top_claims or others_with_kw):
         # No content rendered yet — fall back to the legacy flat IDs line so
         # the digest is never silently empty when matches exist.
@@ -1058,15 +1273,29 @@ def format_nudge(
     # excluded, so a suppressed node's occurrence count naturally decays out
     # of future trailing-k windows once its last real rendering ages out).
     if suppression_active:
-        # Slice must match the render slice above (others_with_kw[:15]) —
-        # recording the unsliced set would mark ids beyond the render cutoff
-        # as "seen" when the agent never actually saw them, silently
+        # Must match the render set above, not the pre-budget candidate set
+        # (others_with_kw[:15]) — recording ids the budget cut would mark
+        # them "seen" when the agent never actually saw them, silently
         # inflating their occurrence count toward demotion/suppression
-        # before a single real rendering (Kepler's #1697 colleague-review
-        # catch — the mirror-image bug of the repetition this PR fixes).
-        all_rendered_ids = rendered_ids_this_prompt | {m.get("id") for m in others_with_kw[:15]}
+        # before a single real rendering. Same discipline as the pre-#1692
+        # slice-must-match-render-slice fix (Kepler's #1697 colleague-review
+        # catch), now extended to the budget cut too (#1692).
+        all_rendered_ids = rendered_ids_this_prompt | others_rendered_ids
         all_rendered_ids.discard(None)
         _append_surface_ledger_entry(session_id, all_rendered_ids, k=sup_cfg["k"])
+
+    # --- Stats out-parameter: final telemetry for engram.surface.render_size
+    # (issue #1692). chars_rendered/nodes_shown/nodes_cut_budget come from
+    # budget_state (populated as lines were gated above); nodes_suppressed
+    # is the #1689 suppression count (independent of the budget).
+    if stats is not None:
+        stats.update({
+            "budget_exhausted": budget_state["exhausted"],
+            "chars_rendered": budget_state["chars_rendered"],
+            "nodes_shown": budget_state["nodes_shown"],
+            "nodes_suppressed": len(suppressed_ids),
+            "nodes_cut_budget": budget_state["nodes_cut_budget"],
+        })
 
     return "\n".join(lines)
 
@@ -1598,11 +1827,16 @@ def main():
         pack_results = []
 
     # ENGRAM recall nudge
+    # _render_stats stays {} unless format_nudge actually runs (result is
+    # not None) — see the engram.surface.render_size emission below, which
+    # gates on this dict being non-empty.
+    _render_stats: dict = {}
     if result is not None:
         nudge = format_nudge(
             result,
             pack_results=pack_results,
             session_id=hook_input.get("session_id", "unknown"),
+            stats=_render_stats,
         )
         if nudge:
             parts.append(nudge)
@@ -1637,6 +1871,29 @@ def main():
             "  Deep-read pack nodes: engram-pkg --pkg <pack-path> inspect <node-id> (pack-scoped recall lands in a later slice).]"
         )
         parts.append("\n".join(pack_lines))
+
+    # Emit engram.surface.render_size event for the structured event log
+    # (recall-triggering blueprint §3-P4, issue #1692). Mirrors the
+    # engram.surface.fire emission above: same Emitter singleton (idempotent
+    # re-init), same best-effort/never-raise failure-mode contract. Only
+    # fires when format_nudge actually ran (_render_stats non-empty) — see
+    # its out-parameter docstring for why an untouched {} means "skipped".
+    if _render_stats:
+        try:
+            sys.path.insert(0, ENGRAM_HOME)  # ~/.engram/ contains the emitter
+            from engram_log_emitter import Emitter
+            _emitter2 = Emitter.init(
+                session_id=hook_input.get("session_id", "unknown"),
+                transcript_path=hook_input.get("transcript_path", ""),
+            )
+            _emitter2.emit(
+                event_type="engram.surface.render_size",
+                level=1,
+                data=dict(_render_stats),
+            )
+        except Exception:
+            # Emitter failures must not break the hook — drop silently.
+            pass
 
     # Write reminder (from Stop hook)
     write_reminder = check_write_reminder()
