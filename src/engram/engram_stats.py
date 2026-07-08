@@ -1269,6 +1269,85 @@ def _diagnose_impl() -> str:
         except Exception:
             metrics["cornerstone_coverage"] = {"error": "cornerstone coverage check failed"}
 
+        # ── Principle Coverage (#1698 slice 3) ────────────────────────────
+        # Broader than cornerstone_coverage above: all four principle-family
+        # kinds (lesson/cornerstone/axiom/goal), and a wider set of recall
+        # channels than just the two auto-load surfaces — a principle is
+        # "covered" if it's reachable via ANY of: the unified
+        # principle_triggers.json registry (registry_trigger — the #1698
+        # trigger mechanism itself), a situation_pattern on its own metadata
+        # (situation_pattern — the cognitive-tripwire keyword-match path),
+        # a warm-briefing.md mention (warm_briefing_anchor), or a CLAUDE.md
+        # mention (claude_md). Read-only, degrades gracefully (missing
+        # registry/files -> everything reports uncovered rather than
+        # raising — the honest answer when those files are genuinely
+        # absent), matching this function's documented side-effect-free
+        # contract.
+        try:
+            principle_rows = conn.execute(
+                """SELECT id, type, claim, metadata FROM nodes
+                   WHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')
+                     AND is_current = 1 AND memory_status = 'active'"""
+            ).fetchall()
+
+            try:
+                with open(core.PRINCIPLE_TRIGGERS_PATH, "r") as f:
+                    _pt_registry = json.load(f)
+                covered_ids = {
+                    e.get("principle_id") for e in _pt_registry.values() if e.get("principle_id")
+                }
+            except (FileNotFoundError, json.JSONDecodeError):
+                covered_ids = set()
+
+            # Independent read of the same two auto-load surfaces
+            # cornerstone_coverage above already reads (wb_path/claude_md_path) --
+            # deliberately NOT reusing that block's wb_text/claude_text locals:
+            # this try/except is meant to degrade on its own (missing files ->
+            # empty text -> everything reports uncovered) without an implicit
+            # dependency on cornerstone_coverage's try block having reached
+            # those assignments first.
+            _pc_wb_path = core.DATA_DIR / "warm-briefing.md"
+            _pc_claude_path = Path.home() / ".claude" / "CLAUDE.md"
+            _pc_wb_text = _pc_wb_path.read_text(errors="replace") if _pc_wb_path.exists() else ""
+            _pc_claude_text = (
+                _pc_claude_path.read_text(errors="replace") if _pc_claude_path.exists() else ""
+            )
+
+            uncovered: list[dict] = []
+            for row in principle_rows:
+                nid = row["id"]
+                channels: list[str] = []
+                if nid in covered_ids:
+                    channels.append("registry_trigger")
+                try:
+                    meta = json.loads(row["metadata"]) if row["metadata"] else {}
+                except (TypeError, json.JSONDecodeError):
+                    meta = {}
+                if meta.get("situation_pattern"):
+                    channels.append("situation_pattern")
+                if nid in _pc_wb_text:
+                    channels.append("warm_briefing_anchor")
+                if nid in _pc_claude_text:
+                    channels.append("claude_md")
+                if not channels:
+                    uncovered.append({
+                        "id": nid,
+                        "type": row["type"],
+                        "claim": (row["claim"] or "")[:120],
+                        "cheapest_fix": (
+                            "register one exemplar (engram_register_exemplar / "
+                            "engram_lesson_register_incident)"
+                        ),
+                    })
+
+            metrics["principle_coverage"] = {
+                "total_principles": len(principle_rows),
+                "covered_count": len(principle_rows) - len(uncovered),
+                "uncovered": uncovered,
+            }
+        except Exception:
+            metrics["principle_coverage"] = {"error": "principle coverage check failed"}
+
         # ── Health Score (0-100) ─────────────────────────────────────────
         # Single source of truth: the shared helper (charter §6 fold). The
         # intermediates computed above remain for their own report sections;

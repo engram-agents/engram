@@ -19,18 +19,26 @@ Coverage:
      registry graceful "".
   §6 PreToolUse _QUERY broadening (slice 2, engram-lesson-tripwire-hook.py) —
      axiom/goal rows now returned; claim fallback when no nudge field set.
+  §7 Slice 3 — decay/enactment/telemetry + principle_coverage (#1698 slice 3):
+     state-shape migration (bare int -> rich dict), effective-cooldown decay
+     math + RETIREMENT_CEILING_PROMPTS cap, axiom decay exemption (Fork-2),
+     engram.trigger.fire telemetry shape, enactment detection (Stop hook),
+     reset-on-incident, and engram_diagnose's principle_coverage section.
 """
 
 from __future__ import annotations
 
 import atexit
 import importlib.util
+import io
 import json
 import os
 import shutil
 import sqlite3
 import sys
 import tempfile
+import types
+import unittest.mock as mock
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -486,8 +494,10 @@ def test_check_principle_triggers_cap_and_cap_loser_not_stamped(tmp_path, monkey
 
     with open(tmp_path / "principle-trigger-state.json") as f:
         state = json.load(f)
-    assert state.get("ls_cap") == 5
-    assert state.get("ax_cap") == 5
+    # #1698 slice 3: state entries are now the rich dict shape
+    # ({last_fired_prompt, strength, enactments, fires}), not a bare int.
+    assert state.get("ls_cap", {}).get("last_fired_prompt") == 5
+    assert state.get("ax_cap", {}).get("last_fired_prompt") == 5
     assert "cs_cap" not in state, "cap-losing candidate must NOT be stamped in cooldown state"
     assert "gl_cap" not in state, "cap-losing candidate must NOT be stamped in cooldown state"
 
@@ -625,3 +635,350 @@ def test_load_tripwires_falls_back_to_claim_when_no_nudge_field(tmp_path):
         "row with situation_pattern but no nudge field must fall back to "
         "claim, not be silently dropped"
     )
+
+
+# ---------------------------------------------------------------------------
+# §7 Slice 3 — decay/enactment/telemetry + principle_coverage (#1698 slice 3)
+# ---------------------------------------------------------------------------
+
+
+def test_state_shape_migration_upconverts_bare_int(tmp_path, monkeypatch):
+    """A slice-2 bare-int state entry ({"pid": last_fired_prompt}) is
+    upconverted to the rich dict shape on read, and the rewritten file
+    persists the dict shape (§1.1)."""
+    mod = _load_surface_hook(tmp_path, monkeypatch)
+    registry = {
+        "ob_mig": {
+            "principle_id": "ls_mig", "kind": "lesson",
+            "claim": "Migration lesson claim.", "nudge": "Migration nudge.",
+        }
+    }
+    _write_json(tmp_path / "principle_triggers.json", registry)
+    _write_json(tmp_path / "principle-trigger-state.json", {"ls_mig": 5})
+
+    # Migrated entry has enactments=0 -> effective cooldown == flat base
+    # (10). prompt_count=20 is well past it, so this must fire.
+    result = mod.check_principle_triggers(["ob_mig"], prompt_count=20)
+    assert result != "", "lesson must fire once past its (migrated, undecayed) cooldown"
+
+    with open(tmp_path / "principle-trigger-state.json") as f:
+        state = json.load(f)
+    entry = state["ls_mig"]
+    assert isinstance(entry, dict), "state entry must be upconverted to the rich dict shape"
+    assert entry["last_fired_prompt"] == 20
+    assert entry["fires"] == 1
+    assert entry["enactments"] == 0
+    assert entry["strength"] == 1.0
+
+
+def test_effective_cooldown_decays_and_caps_at_retirement_ceiling(tmp_path, monkeypatch):
+    """A lesson with enactments=2 needs 4x base_cooldown prompts before it's
+    eligible again (§1.2); a very high enactments count is capped at
+    RETIREMENT_CEILING_PROMPTS rather than growing unbounded."""
+    mod = _load_surface_hook(tmp_path, monkeypatch)
+    registry = {
+        "ob_decay": {
+            "principle_id": "ls_decay", "kind": "lesson",
+            "claim": "Decay lesson claim.", "nudge": "Decay nudge.",
+        }
+    }
+    _write_json(tmp_path / "principle_triggers.json", registry)
+    _write_json(tmp_path / "principle-trigger-state.json", {
+        "ls_decay": {"last_fired_prompt": 10, "strength": 1.0, "enactments": 2, "fires": 3},
+    })
+
+    base = mod.PRINCIPLE_TRIGGER_COOLDOWN_PROMPTS
+    expected_cooldown = base * (2 ** 2)  # 4x base, per design doc §4
+
+    result = mod.check_principle_triggers(["ob_decay"], prompt_count=10 + expected_cooldown - 1)
+    assert result == "", "must still be suppressed one prompt short of the decayed cooldown"
+
+    result = mod.check_principle_triggers(["ob_decay"], prompt_count=10 + expected_cooldown)
+    assert result != "", "must fire once the decayed cooldown has fully elapsed"
+
+    # Retirement ceiling: unit-check the decay math directly -- an
+    # end-to-end fixture for an extreme enactments count would need a
+    # prompt_count in the tens of thousands, which adds nothing beyond
+    # what the direct math check already proves.
+    assert mod._effective_cooldown("lesson", {"enactments": 10}) == mod.RETIREMENT_CEILING_PROMPTS
+    assert mod._effective_cooldown("cornerstone", {"enactments": 0}) == base
+
+
+def test_axiom_exempt_from_decay_keeps_flat_cooldown(tmp_path, monkeypatch):
+    """kind=axiom uses the flat base cooldown regardless of enactments --
+    Fork-2 (forum #229/#230/#231, Kepler-confirmed): axiom never decays but
+    is still cooldown-suppressed between fires (§1.2)."""
+    mod = _load_surface_hook(tmp_path, monkeypatch)
+    registry = {
+        "ob_ax_decay": {
+            "principle_id": "ax_decay", "kind": "axiom",
+            "claim": "Axiom claim.", "nudge": "Axiom nudge.",
+        }
+    }
+    _write_json(tmp_path / "principle_triggers.json", registry)
+    _write_json(tmp_path / "principle-trigger-state.json", {
+        "ax_decay": {"last_fired_prompt": 10, "strength": 1.0, "enactments": 5, "fires": 6},
+    })
+
+    base = mod.PRINCIPLE_TRIGGER_COOLDOWN_PROMPTS
+    # If decay applied, base * 2**5 (32x base) would still suppress here;
+    # axiom exemption means the FLAT base cooldown governs instead.
+    result = mod.check_principle_triggers(["ob_ax_decay"], prompt_count=10 + base - 1)
+    assert result == "", "axiom must still be suppressed within the flat base cooldown"
+    result = mod.check_principle_triggers(["ob_ax_decay"], prompt_count=10 + base)
+    assert result != "", (
+        "axiom must fire once past the flat base cooldown -- NOT decayed by enactments=5"
+    )
+
+
+def test_effective_cooldown_clamps_enactments_before_exponentiating(tmp_path, monkeypatch):
+    """Reviewer-fairy flag (PR #1717): a corrupted/huge `enactments` value
+    (e.g. hand-edited state file) must not force building an enormous
+    integer before min() clamps the result -- the clamp must happen BEFORE
+    2**enactments is computed, not just after. Calling _effective_cooldown
+    directly with a pathological value must return promptly and correctly
+    (capped at RETIREMENT_CEILING_PROMPTS), proving the pre-exponent clamp
+    is in effect rather than relying on min()'s post-hoc cap alone."""
+    mod = _load_surface_hook(tmp_path, monkeypatch)
+    huge_entry = {"last_fired_prompt": 0, "strength": 1.0, "enactments": 10_000_000, "fires": 1}
+    result = mod._effective_cooldown("lesson", huge_entry)
+    assert result == mod.RETIREMENT_CEILING_PROMPTS, (
+        "a pathological enactments value must clamp to the retirement ceiling, "
+        "not attempt to compute 2**10_000_000"
+    )
+    # Sanity: a legitimate small value still behaves as documented (base * 2**enactments).
+    small_entry = {"last_fired_prompt": 0, "strength": 1.0, "enactments": 2, "fires": 1}
+    base = mod.PRINCIPLE_TRIGGER_COOLDOWN_PROMPTS
+    assert mod._effective_cooldown("lesson", small_entry) == min(base * 4, mod.RETIREMENT_CEILING_PROMPTS)
+
+
+def test_engram_trigger_fire_emitted_with_correct_shape(tmp_path, monkeypatch):
+    """engram.trigger.fire is emitted once per rendered firing, with the
+    exact {principle_id, kind, trigger_id, prompt_seq} shape (§1.3). Full
+    main() integration -- the emission lives at the call site in main(),
+    not inside check_principle_triggers_full itself (spec's preferred
+    placement; see engram-surface-hook.py main()'s comment)."""
+    import engram_log_emitter
+    monkeypatch.setattr(engram_log_emitter, "_EMITTER_INSTANCE", None)
+
+    mod = _load_surface_hook(tmp_path, monkeypatch)
+    registry = {
+        "ob_fire": {
+            "principle_id": "ls_fire", "kind": "lesson",
+            "claim": "Fire-telemetry lesson claim.", "nudge": "Fire nudge.",
+        }
+    }
+    _write_json(tmp_path / "principle_triggers.json", registry)
+
+    monkeypatch.setattr(
+        mod, "query_daemon",
+        lambda *a, **kw: {"matched_ids": ["ob_fire"], "match_count": 1},
+    )
+    monkeypatch.setattr(mod, "query_fts_fallback", lambda *a, **kw: None)
+    monkeypatch.setattr(mod, "_get_auto_surface_config", lambda: {
+        "idf_gate_enabled": False,
+        "short_prompt_threshold_chars": 0,
+        "prev_response_tail_chars": 0,
+    })
+    monkeypatch.setattr(mod, "_query_attached_packs", lambda *a, **kw: [])
+    monkeypatch.setattr(mod, "format_nudge", lambda *a, **kw: "")
+    monkeypatch.setattr(mod, "check_write_reminder", lambda: "")
+    monkeypatch.setattr(mod, "check_repair_marker", lambda: "")
+    monkeypatch.setattr(mod, "check_feeling_nudge_marker", lambda: "")
+    monkeypatch.setattr(mod, "check_warm_briefing", lambda count: "")
+    monkeypatch.setattr(mod, "format_nap_warning", lambda count: "")
+    monkeypatch.setattr(mod, "_check_mcp_write_tool_marker", lambda *a: (True, None))
+
+    session_id = "trigger-fire-telemetry-test"
+    hook_input = json.dumps({
+        "prompt": "irrelevant prompt text",
+        "session_id": session_id,
+        "transcript_path": str(tmp_path / "t.jsonl"),
+    })
+
+    orig_context_tracker = sys.modules.get("context_tracker")
+    sys.modules["context_tracker"] = types.SimpleNamespace(
+        estimate_usage=lambda *a, **kw: None,
+        format_drowsiness=lambda *a, **kw: "",
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(hook_input))
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    try:
+        try:
+            mod.main()
+        except SystemExit:
+            pass
+    finally:
+        if orig_context_tracker is not None:
+            sys.modules["context_tracker"] = orig_context_tracker
+        else:
+            sys.modules.pop("context_tracker", None)
+
+    log_path = tmp_path / "logs" / "sessions" / f"{session_id}.l1.jsonl"
+    assert log_path.exists(), "expected the structured event log to be written"
+    events = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+    fire_events = [e for e in events if e.get("event_type") == "engram.trigger.fire"]
+    assert len(fire_events) == 1, f"expected exactly one engram.trigger.fire event, got {fire_events}"
+    assert fire_events[0]["data"] == {
+        "principle_id": "ls_fire", "kind": "lesson",
+        "trigger_id": "ob_fire", "prompt_seq": 1,
+    }
+
+
+_CREDIT_MENTION_STOP_HOOK_PATH = (
+    PROJECT_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-utility-credit-mention-stop.py"
+)
+
+
+def _load_credit_mention_stop_hook(engram_home, monkeypatch):
+    """Import the Stop hook as a module against a scratch ENGRAM_HOME (same
+    hyphenated-filename pattern as _load_surface_hook above)."""
+    monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
+    sys.modules.pop("engram_credit_mention_stop_pt", None)
+    spec = importlib.util.spec_from_file_location(
+        "engram_credit_mention_stop_pt", str(_CREDIT_MENTION_STOP_HOOK_PATH)
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_enactment_detection_increments_when_no_recent_fire(tmp_path, monkeypatch):
+    """A mentioned principle ID with no trigger fire in the trailing window
+    increments enactments and emits engram.trigger.enactment; a mentioned ID
+    that DID fire recently does not (§2/§4)."""
+    import engram_log_emitter
+    monkeypatch.setattr(engram_log_emitter, "_EMITTER_INSTANCE", None)
+
+    mod = _load_credit_mention_stop_hook(tmp_path, monkeypatch)
+    registry = {
+        "ob_trig_a": {"principle_id": "ls_no_fire", "kind": "lesson", "claim": "c1", "nudge": "n1"},
+        "ob_trig_b": {"principle_id": "ls_recent_fire", "kind": "lesson", "claim": "c2", "nudge": "n2"},
+    }
+    _write_json(tmp_path / "principle_triggers.json", registry)
+    _write_json(tmp_path / "prompt-counter.json", {"prompts_since_compaction": 50, "last_reset": ""})
+    _write_json(tmp_path / "principle-trigger-state.json", {
+        # 20 prompts since last fire -- past the 10-prompt enactment window.
+        "ls_no_fire": {"last_fired_prompt": 30, "strength": 1.0, "enactments": 0, "fires": 1},
+        # 5 prompts since last fire -- inside the window, must NOT enact.
+        "ls_recent_fire": {"last_fired_prompt": 45, "strength": 1.0, "enactments": 0, "fires": 1},
+    })
+
+    mod._check_enactments(
+        ["ls_no_fire", "ls_recent_fire"],
+        session_id="enact-test", transcript_path=str(tmp_path / "t.jsonl"),
+    )
+
+    with open(tmp_path / "principle-trigger-state.json") as f:
+        state = json.load(f)
+    assert state["ls_no_fire"]["enactments"] == 1, "no recent fire -> enactment increments"
+    assert state["ls_recent_fire"]["enactments"] == 0, "fired recently (within window) -> no enactment"
+
+    log_path = tmp_path / "logs" / "sessions" / "enact-test.l1.jsonl"
+    assert log_path.exists()
+    events = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+    enactment_events = [e for e in events if e.get("event_type") == "engram.trigger.enactment"]
+    assert len(enactment_events) == 1, f"expected exactly one engram.trigger.enactment event, got {enactment_events}"
+    assert enactment_events[0]["data"] == {"principle_id": "ls_no_fire", "prompt_seq": 50}
+
+
+def test_reset_on_incident_clears_enactments():
+    """Registering a NEW exemplar against a principle with enactments=3
+    resets it to 0 (§3)."""
+    server = fresh_server()
+    import engram_core as core
+
+    lesson_id, incident_id = _seed_lesson(server, claim="Reset-on-incident lesson.")
+    core._rebuild_principle_triggers()
+
+    state_path = os.path.join(str(core.DATA_DIR), "principle-trigger-state.json")
+    with open(state_path, "w") as f:
+        json.dump({lesson_id: {"last_fired_prompt": 5, "strength": 1.0, "enactments": 3, "fires": 4}}, f)
+
+    new_incident = _seed_axiom(server, "A fresh incident exemplifying the lesson.")
+    r = json.loads(server.engram_register_exemplar(payload_json=json.dumps({
+        "target_id": lesson_id, "exemplar_id": new_incident,
+    })))
+    assert "error" not in r, r
+
+    with open(state_path) as f:
+        state = json.load(f)
+    assert state[lesson_id]["enactments"] == 0, "new exemplar registration must reset enactments to 0"
+    assert state[lesson_id]["last_fired_prompt"] == 5, "reset must not disturb last_fired_prompt"
+    assert state[lesson_id]["fires"] == 4, "reset must not disturb fires"
+
+
+def _patch_stats_home(fake_home):
+    """Patch Path.home() as seen by engram_stats's own `Path` import, so the
+    principle_coverage CLAUDE.md check doesn't read the REAL
+    ~/.claude/CLAUDE.md during this test (mirrors
+    test_diagnose_cornerstone_coverage.py's _patch_home)."""
+    import engram_stats
+    patcher = mock.patch("engram_stats.Path")
+    m = patcher.start()
+    m.home.return_value = fake_home
+    return patcher
+
+
+def test_principle_coverage_uncovered_and_covered_channels(tmp_path):
+    """A principle with zero channels appears in uncovered with a non-empty
+    cheapest_fix; one with a registry entry, a situation_pattern, a
+    warm-briefing mention, or a CLAUDE.md mention does not (§4)."""
+    server = fresh_server()
+    import engram_core as core
+    import engram_stats
+
+    # Uncovered: a bare axiom, no edges/metadata/surface mentions at all.
+    uncovered_id = _seed_axiom(server, "Uncovered axiom claim.")
+
+    # Covered via registry_trigger: a goal with a serves edge, registry rebuilt.
+    registry_goal_id = _seed_goal(server, aspiration="Registry-covered goal.")
+    serves_source = _seed_axiom(server, "Serves-edge source for registry coverage.")
+    _add_edge(server, serves_source, registry_goal_id, "serves")
+    core._rebuild_principle_triggers()
+
+    # Covered via situation_pattern: set directly on the node's metadata
+    # (bypasses the tool surface -- situation_pattern is only exposed via
+    # engram_add_lesson today, and every lesson also gets an automatic
+    # registry_trigger via its required incident_ids, which would conflate
+    # the two channels; a bare axiom with metadata patched directly isolates
+    # the situation_pattern channel cleanly).
+    pattern_id = _seed_axiom(server, "Pattern-covered axiom claim.")
+    conn = core._get_db()
+    try:
+        conn.execute(
+            "UPDATE nodes SET metadata = ? WHERE id = ?",
+            (json.dumps({"situation_pattern": "some-test-pattern"}), pattern_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Covered via warm_briefing_anchor.
+    wb_id = _seed_axiom(server, "Warm-briefing-covered axiom claim.")
+    (core.DATA_DIR / "warm-briefing.md").write_text(f"Anchored: {wb_id} — test principle.\n")
+
+    # Covered via claude_md.
+    claude_id = _seed_axiom(server, "CLAUDE-md-covered axiom claim.")
+    fake_home = tmp_path / "fake_home_principle_coverage"
+    claude_md_dir = fake_home / ".claude"
+    claude_md_dir.mkdir(parents=True)
+    (claude_md_dir / "CLAUDE.md").write_text(f"Rule: {claude_id} always applies.\n")
+
+    patcher = _patch_stats_home(fake_home)
+    try:
+        r = json.loads(server._diagnose_impl())
+    finally:
+        patcher.stop()
+
+    pc = r["principle_coverage"]
+    uncovered_ids = {e["id"] for e in pc["uncovered"]}
+
+    assert uncovered_id in uncovered_ids, "a principle with zero channels must appear in uncovered"
+    uncovered_entry = next(e for e in pc["uncovered"] if e["id"] == uncovered_id)
+    assert uncovered_entry["cheapest_fix"], "uncovered entries must carry a non-empty cheapest_fix"
+
+    assert registry_goal_id not in uncovered_ids, "registry_trigger channel must exclude from uncovered"
+    assert pattern_id not in uncovered_ids, "situation_pattern channel must exclude from uncovered"
+    assert wb_id not in uncovered_ids, "warm_briefing_anchor channel must exclude from uncovered"
+    assert claude_id not in uncovered_ids, "claude_md channel must exclude from uncovered"

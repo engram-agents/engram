@@ -772,7 +772,10 @@ class TestStandaloneMiniNudgeFooter(unittest.TestCase):
         orig_daemon = self.hook.query_daemon
         orig_fts = self.hook.query_fts_fallback
         orig_pack = self.hook._query_attached_packs
-        orig_tripwire = self.hook.check_principle_triggers
+        # #1698 slice 3: main() now calls check_principle_triggers_full
+        # (returns (text, rendered)) rather than check_principle_triggers
+        # directly — stub the function main() actually invokes.
+        orig_tripwire = self.hook.check_principle_triggers_full
         orig_patterns = self.hook.check_error_patterns
         orig_write = self.hook.check_write_reminder
         orig_repair = self.hook.check_repair_marker
@@ -782,7 +785,7 @@ class TestStandaloneMiniNudgeFooter(unittest.TestCase):
         self.hook.query_daemon = lambda *a, **kw: own_graph_result
         self.hook.query_fts_fallback = lambda *a, **kw: own_graph_result
         self.hook._query_attached_packs = lambda *a, **kw: pack_results
-        self.hook.check_principle_triggers = lambda *a, **kw: ""
+        self.hook.check_principle_triggers_full = lambda *a, **kw: ("", [])
         self.hook.check_error_patterns = lambda *a, **kw: ""
         self.hook.check_write_reminder = lambda *a, **kw: ""
         self.hook.check_repair_marker = lambda *a, **kw: ""
@@ -816,7 +819,7 @@ class TestStandaloneMiniNudgeFooter(unittest.TestCase):
             self.hook.query_daemon = orig_daemon
             self.hook.query_fts_fallback = orig_fts
             self.hook._query_attached_packs = orig_pack
-            self.hook.check_principle_triggers = orig_tripwire
+            self.hook.check_principle_triggers_full = orig_tripwire
             self.hook.check_error_patterns = orig_patterns
             self.hook.check_write_reminder = orig_write
             self.hook.check_repair_marker = orig_repair

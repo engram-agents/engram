@@ -152,6 +152,14 @@ PRINCIPLE_TRIGGER_COOLDOWN_PROMPTS = 10  # same value as today's CORNERSTONE_ANC
 PRINCIPLE_TRIGGER_CAP = 2  # design doc §3 point 3
 _PRINCIPLE_KIND_PRIORITY = {"lesson": 0, "axiom": 1, "cornerstone": 2, "goal": 3}  # lower = higher priority
 
+# #1698 slice 3 — decay/enactment state shape + effective cooldown (design
+# doc §4). RETIREMENT_CEILING_PROMPTS is the cap on how far a non-axiom
+# principle's effective cooldown can grow via repeated fires-without-
+# enactment; once reached the principle is, in practice, retired from
+# injection (its cooldown almost never clears) but stays in the registry
+# (still "covered" per engram_diagnose's principle_coverage, §4 below).
+RETIREMENT_CEILING_PROMPTS = 160  # design doc §4: "effectively retired"
+
 def get_user_name() -> str:
     """Read primary_user from $ENGRAM_HOME/config.json; fall back to 'the human'."""
     try:
@@ -1475,19 +1483,77 @@ def check_principle_triggers(matched_ids: list, prompt_count: int) -> str:
     in existing transcripts/tests. Axiom and goal are new kinds with no
     prior rendering to preserve; they use the design doc's generic
     "[Principle trigger (...)]" register-tagged form.
+
+    #1698 slice 3 note: this remains a thin string-only wrapper around
+    `check_principle_triggers_full` on PURPOSE — slice 2's own test suite
+    (test_principle_triggers_registry.py §5) locks down `result == expected`
+    / `result.split(...)` / `"x" in result` against a plain string return.
+    The slice-3 design doc §3 suggestion to have this function itself return
+    `(text, rendered)` would have broken all 7 of those byte-compat tests;
+    `check_principle_triggers_full` (below) carries the richer pair for the
+    one caller (this file's `main()`) that needs `rendered` for
+    `engram.trigger.fire` telemetry.
+    """
+    text, _rendered = check_principle_triggers_full(matched_ids, prompt_count)
+    return text
+
+
+def check_principle_triggers_full(matched_ids: list, prompt_count: int) -> tuple[str, list]:
+    """Same check as `check_principle_triggers`, but also returns the
+    `rendered` list (`[(kind, principle_id, entry, matched_trigger_id), ...]`)
+    of everything that actually fired this call -- the #1698 slice-3 caller
+    (`main()`) uses this to emit one `engram.trigger.fire` telemetry event
+    per rendered firing without re-deriving the cap/cooldown decision.
     """
     if not matched_ids:
-        return ""
+        return "", []
     try:
         return _check_principle_triggers_inner(matched_ids, prompt_count)
     except Exception:
         # Runs on every prompt — a malformed cache must degrade to
         # silence, never break the hook (same contract as the function
         # this replaces).
-        return ""
+        return "", []
 
 
-def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> str:
+def _effective_cooldown(kind: str, state_entry: dict) -> int:
+    """#1698 slice 3, design doc §4 decay math.
+
+    Fork-2 (forum #229/#230/#231, Kepler-confirmed): `kind == "axiom"` is
+    exempt from decay -- it KEEPS the flat base cooldown forever (never
+    grows, never retires) but is still cooldown-suppressed between fires.
+    The other three kinds (lesson/cornerstone/goal) grow their effective
+    cooldown exponentially per UN-PROMPTED ENACTMENT (`enactments` on the
+    principle's own state entry, incremented by `_check_enactments` in
+    engram-utility-credit-mention-stop.py when the practice recurs without a
+    recent trigger fire) -- i.e. internalization drives decay, not the other
+    way around. (Colleague-review catch, Ariadne, PR #1717: the previous
+    wording "per firing-without-enactment" named the opposite driver -- a
+    future "fix" toward that wrong docstring would have decayed the
+    principle you keep ignoring instead of the one you've internalized.)
+    Capped at RETIREMENT_CEILING_PROMPTS.
+    """
+    base = PRINCIPLE_TRIGGER_COOLDOWN_PROMPTS
+    if kind == "axiom":
+        return base
+    enactments = state_entry.get("enactments", 0) if isinstance(state_entry, dict) else 0
+    try:
+        enactments = int(enactments)
+    except (TypeError, ValueError):
+        enactments = 0
+    # Reviewer-fairy flag (PR #1717): clamp BEFORE exponentiating, not just
+    # after via min(). A corrupted/huge `enactments` value (e.g. hand-edited
+    # state file) would otherwise force Python to build an enormous integer
+    # before the min() ever applies -- a hang/memory spike in a hook whose
+    # contract is "never crash, never block a prompt." 8 is already past the
+    # point (2**5 * base=10 -> 320 > RETIREMENT_CEILING_PROMPTS=160) where a
+    # larger exponent changes nothing, so this clamp never affects legitimate
+    # values.
+    enactments = min(max(enactments, 0), 8)
+    return min(base * (2 ** enactments), RETIREMENT_CEILING_PROMPTS)
+
+
+def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tuple[str, list]:
     try:
         with open(PRINCIPLE_TRIGGERS_PATH, "r") as f:
             registry = json.load(f)
@@ -1502,9 +1568,9 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> str
         # parallel legacy read path) is a simplification; flagging this
         # explicitly for reviewer/Kepler to confirm or override, since the
         # design doc's literal words say "fallback to legacy."
-        return ""
+        return "", []
     if not registry or not isinstance(registry, dict):
-        return ""
+        return "", []
 
     # Reverse view: a matched ID that IS a principle's own node ID (not a
     # trigger) also fires -- mirrors today's by_cornerstone reverse lookup,
@@ -1532,10 +1598,29 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> str
     except (FileNotFoundError, json.JSONDecodeError):
         state = {}
 
-    # Gather all candidates that matched AND are past cooldown, deduped
-    # per principle_id (one firing per principle per prompt -- same
-    # semantics as today's `fired`/`seen_lessons` sets, now shared across
-    # all four kinds since it's one registry).
+    # #1698 slice 3 §1.1 — migration on read: a bare int entry is the
+    # slice-2 shape (last_fired_prompt only). Upconvert in memory here;
+    # the rich dict shape gets written back naturally the next time this
+    # function actually stamps state below (lazy, idempotent upgrade-on-
+    # touch, same spirit as slice 1's cache migration shim). Every state
+    # entry present in the file is normalized here, not just ones that fire
+    # this call, so a state write later in this same call persists the
+    # upgraded shape for the whole file, not just the touched principles.
+    for _mig_pid, _mig_entry in list(state.items()):
+        if isinstance(_mig_entry, int):
+            state[_mig_pid] = {
+                "last_fired_prompt": _mig_entry,
+                "strength": 1.0,
+                "enactments": 0,
+                "fires": 0,
+            }
+
+    # Gather all candidates that matched AND are past their EFFECTIVE
+    # cooldown (#1698 slice 3 §1.2 — decay math replaces the flat
+    # PRINCIPLE_TRIGGER_COOLDOWN_PROMPTS comparison), deduped per
+    # principle_id (one firing per principle per prompt -- same semantics
+    # as today's `fired`/`seen_lessons` sets, now shared across all four
+    # kinds since it's one registry).
     candidates = []  # list of (kind, principle_id, entry, matched_via)
     seen_principles = set()
     for mid in matched_ids:
@@ -1545,18 +1630,23 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> str
         pid = entry.get("principle_id", "")
         if not pid or pid in seen_principles:
             continue
-        last = state.get(pid)
+        kind = entry.get("kind", "")
+        state_entry = state.get(pid)
+        if not isinstance(state_entry, dict):
+            state_entry = {}
+        last = state_entry.get("last_fired_prompt")
+        effective_cooldown = _effective_cooldown(kind, state_entry)
         if (
             isinstance(last, (int, float))
             and last <= prompt_count
-            and (prompt_count - last) < PRINCIPLE_TRIGGER_COOLDOWN_PROMPTS
+            and (prompt_count - last) < effective_cooldown
         ):
             continue
         seen_principles.add(pid)
-        candidates.append((entry.get("kind", ""), pid, entry, mid))
+        candidates.append((kind, pid, entry, mid))
 
     if not candidates:
-        return ""
+        return "", []
 
     # Priority sort (lesson > axiom > cornerstone > goal), cap total to 2.
     # NOTE this is a real behavior change for lessons, which previously had
@@ -1576,7 +1666,7 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> str
     # ever writes the 4 known kinds); matters if a 5th kind is ever added.
     candidates = [c for c in candidates if c[0] in _PRINCIPLE_KIND_PRIORITY]
     if not candidates:
-        return ""
+        return "", []
     candidates.sort(key=lambda c: _PRINCIPLE_KIND_PRIORITY[c[0]])
     rendered = candidates[:PRINCIPLE_TRIGGER_CAP]
 
@@ -1613,15 +1703,31 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> str
     # suppressed for a firing it never got to make. Matches old code's
     # semantics (`for cid in fired: state[cid] = prompt_count` where `fired`
     # was exactly the rendered set).
+    #
+    # #1698 slice 3 §1.1/§1.3: stamp the RICH shape (last_fired_prompt +
+    # fires incremented; strength/enactments carried over or defaulted).
+    # `engram.trigger.fire` telemetry (one emission per rendered principle)
+    # is intentionally NOT emitted here -- design doc §1.3 / spec §1.3
+    # prefers the call-site placement in main() (hook_input/the existing
+    # `_emitter` singleton are already in scope there; this function stays a
+    # pure `(matched_ids, prompt_count) -> (text, rendered)` function with no
+    # session_id/transcript_path threading). The caller emits from `rendered`.
     for _kind, pid, _entry, _mid in rendered:
-        state[pid] = prompt_count
+        existing = state.get(pid)
+        if not isinstance(existing, dict):
+            existing = {"strength": 1.0, "enactments": 0, "fires": 0}
+        existing["last_fired_prompt"] = prompt_count
+        existing["fires"] = existing.get("fires", 0) + 1
+        existing.setdefault("strength", 1.0)
+        existing.setdefault("enactments", 0)
+        state[pid] = existing
     try:
         with open(PRINCIPLE_TRIGGER_STATE_PATH, "w") as f:
             json.dump(state, f)
     except OSError:
         pass  # state write failure -> worst case an early re-fire; never block
 
-    return "\n".join(lines)
+    return "\n".join(lines), rendered
 
 
 def format_nap_warning(count: int) -> str:
@@ -1747,7 +1853,7 @@ def main():
     # kinds (lesson/cornerstone/axiom/goal), replacing the separate
     # check_incident_tripwire + check_cornerstone_anchor calls.
     matched_ids = result.get("matched_ids", []) if result else []
-    principle_triggers = check_principle_triggers(
+    principle_triggers, _principle_rendered = check_principle_triggers_full(
         matched_ids, counter["prompts_since_compaction"]
     )
     if not principle_triggers:
@@ -1756,8 +1862,39 @@ def main():
         # unification unchanged (design doc doesn't mention it; it's Locus-3
         # semantic-content matching, orthogonal to the trigger registry).
         principle_triggers = check_error_patterns(prompt)
+        _principle_rendered = []  # keyword fallback has no registry firing to emit telemetry for
     if principle_triggers:
         parts.append(principle_triggers)
+
+    # #1698 slice 3 §1.3 — engram.trigger.fire telemetry, one emission per
+    # rendered principle firing. Call-site placement (spec's preferred
+    # option): reuses the `_emitter` singleton already initialized above
+    # (Emitter.init is documented idempotent, but reusing avoids a second
+    # construction) and keeps check_principle_triggers_full a pure
+    # (matched_ids, prompt_count) -> (text, rendered) function with no
+    # hook_input/session_id threading of its own.
+    if _principle_rendered:
+        try:
+            sys.path.insert(0, ENGRAM_HOME)
+            from engram_log_emitter import Emitter
+            _emitter3 = Emitter.init(
+                session_id=hook_input.get("session_id", "unknown"),
+                transcript_path=hook_input.get("transcript_path", ""),
+            )
+            for _kind, _pid, _entry, _mid in _principle_rendered:
+                _emitter3.emit(
+                    event_type="engram.trigger.fire",
+                    level=1,
+                    data={
+                        "principle_id": _pid,
+                        "kind": _kind,
+                        "trigger_id": _mid,
+                        "prompt_seq": counter["prompts_since_compaction"],
+                    },
+                )
+        except Exception:
+            # Emitter failures must not break the hook — drop silently.
+            pass
 
     # Warn if daemon is down (semantic search degraded).
     # Distinguish a cold-start warmup (recent launch attempt) from a

@@ -4372,6 +4372,53 @@ def _rebuild_principle_triggers() -> dict:
         conn.close()
 
 
+def _reset_principle_enactments(principle_id: str) -> None:
+    """Reset enactments to 0 for principle_id in principle-trigger-state.json
+    (#1698 slice 3 §3 — "registering a NEW exemplar/incident against the
+    principle resets enactments to 0 (full strength)").
+
+    Best-effort: a write failure here must never fail the exemplar-
+    registration call it's attached to.
+
+    Cross-process write (spec §3 flag for reviewer): this file has, through
+    slices 1-2, only ever been touched by the hook scripts (separate
+    subprocesses invoked by Claude Code); this is the first time server-side
+    (MCP process) code writes it. Path is resolved via DATA_DIR (the same
+    module-level global the hooks' own ENGRAM_HOME resolution is meant to
+    mirror — see `_configure_paths` above for the single source of truth on
+    path redirection, e.g. under test isolation) rather than hand-rolling a
+    second resolution scheme. Write is atomic (tmp + os.replace), matching
+    the hooks' own pattern, so a concurrent hook-side read never sees a
+    partial write.
+
+    Colleague-review note (Ariadne, PR #1717): the atomicity claim above
+    covers only TORN READS, not a LOST UPDATE — a concurrent hook-side
+    read-modify-write racing this function can still silently drop
+    whichever side loses (last-writer-wins on the whole file). Tracked as
+    #1720 (same TOCTOU class #1709 fixed with flock); not yet guarded here.
+    """
+    path = os.path.join(DATA_DIR, "principle-trigger-state.json")
+    try:
+        with open(path, "r") as f:
+            state = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        state = {}
+    entry = state.get(principle_id)
+    if isinstance(entry, int):
+        entry = {"last_fired_prompt": entry, "strength": 1.0, "enactments": 0, "fires": 0}
+    if not isinstance(entry, dict):
+        entry = {"last_fired_prompt": 0, "strength": 1.0, "enactments": 0, "fires": 0}
+    entry["enactments"] = 0
+    state[principle_id] = entry
+    try:
+        tmp = str(path) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # #872 wave-5 rolling promotions — _create_derivation (shared by B + E)
 # ---------------------------------------------------------------------------

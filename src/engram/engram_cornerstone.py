@@ -544,6 +544,16 @@ def _remove_edge_impl(
                 core._rebuild_principle_triggers()  # unified registry (#1698)
             except Exception:
                 pass  # best-effort
+        # NOTE (#1698 slice 3 §3, flagged for reviewer): NOT calling
+        # core._reset_principle_enactments() here on purpose — this is
+        # _remove_edge_impl, so this rebuild fires on an edge REMOVAL, not a
+        # new exemplar/incident registration. Resetting enactments to 0
+        # ("full strength") on a removal would contradict the reset-on-
+        # incident design intent (§3: reset happens when NEW evidence is
+        # recorded, not when an edge is undone). The reset call is wired
+        # only at the ADD-side call sites: engram_epistemic.py's
+        # _register_exemplar_impl, this file's _add_edge_impl below, and
+        # engram_tasks.py's serves-edge site.
 
         result = {
             "status": "removed",
@@ -721,6 +731,13 @@ def _add_edge_impl(
                 core._rebuild_principle_triggers()  # unified registry (#1698)
             except Exception:
                 pass  # best-effort
+            # Reset-on-incident (#1698 slice 3 §3): this generic edge-add is
+            # itself the "new trigger edge just written" event for whichever
+            # of the four kinds `target_id` is — full strength again.
+            try:
+                core._reset_principle_enactments(target_id)
+            except Exception:
+                pass  # best-effort; never fail edge creation on this
 
         result = {
             "status": "created",

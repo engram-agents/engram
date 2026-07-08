@@ -983,5 +983,11 @@ def _register_exemplar_impl(
             core._rebuild_principle_triggers()
         except Exception:
             pass  # best-effort; legacy caches remain the hooks' read path
+        # Reset-on-incident (#1698 slice 3 §3): a NEW exemplar just landed
+        # against this principle — full strength again.
+        try:
+            core._reset_principle_enactments(target_id)
+        except Exception:
+            pass  # best-effort; never fail exemplar registration on this
 
     return json.dumps(result)
