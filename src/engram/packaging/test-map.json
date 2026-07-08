@@ -11,6 +11,16 @@
       "note": "context_tracker.py is imported by the session-start hook and tested via direct subprocess calls"
     },
     {
+      "path_prefix_or_glob": "hooks/claude/_hooklib.py",
+      "test_globs": [
+        "tests/test_hooklib.py",
+        "tests/test_baton_hook.py",
+        "tests/test_tiers_manifest.py",
+        "tests/test_run_touched_tests.py"
+      ],
+      "note": "gh#1657 SSoT for tools/-resolution shared by the baton/inter-agent/forum prompt hooks. Each hook dynamically imports it via a runtime sys.path insert (not a static `import` statement), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping. Currently consumed by the baton hook (slice 1); inter-agent and forum will be added to this note as their own re-point slices land."
+    },
+    {
       "path_prefix_or_glob": "hooks/claude/engram-baton-prompt-hook.py",
       "test_globs": [
         "tests/test_baton_hook.py",

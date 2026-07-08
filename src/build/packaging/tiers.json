@@ -429,6 +429,10 @@
       "identity_coupled": true
     },
     {
+      "path": "hooks/claude/_hooklib.py",
+      "tier": "convenience"
+    },
+    {
       "path": "hooks/claude/engram-inter-agent-prompt-hook.py",
       "tier": "convenience",
       "multi_agent": true,
