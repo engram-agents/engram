@@ -2000,6 +2000,34 @@ def _get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    # #1672 (blueprint H6): conservative SQLite defaults measured in effect
+    # (synchronous=FULL, mmap_size=0, cache_size~2MB, temp_store=file). Each
+    # change below is faster-never-looser: it does not weaken graph
+    # consistency (no corruption risk), only the durability window of the
+    # most recent commit(s) -- acceptable for a git-backed, git-snapshotted
+    # substrate.
+    #
+    # synchronous=NORMAL (from FULL): with journal_mode=WAL (already set
+    # above), NORMAL still fsyncs at every WAL checkpoint, so the WAL itself
+    # can't be corrupted by a crash of this process. Per SQLite's own docs
+    # (pragma.html#pragma_synchronous), a WAL+NORMAL transaction can still
+    # roll back the last few committed-since-checkpoint transactions on a
+    # power loss OR an OS/kernel-level crash -- narrower than FULL's
+    # durability, but never a corruption risk. SQLite's own docs recommend
+    # NORMAL as the standard pairing with WAL for exactly this reason.
+    conn.execute("PRAGMA synchronous=NORMAL")
+    # mmap_size (from 0): memory-map the DB file for reads, cutting a
+    # read()-syscall + copy per page. Read-only optimization -- no effect on
+    # write durability or consistency guarantees.
+    conn.execute("PRAGMA mmap_size=268435456")  # 256MB
+    # cache_size (from SQLite's ~2MB default, -2000): larger page cache
+    # reduces disk I/O for repeated reads within a connection's lifetime.
+    # Negative value = size in KiB (SQLite convention), not a page count.
+    conn.execute("PRAGMA cache_size=-64000")  # ~64MB
+    # temp_store=MEMORY (from file): temp b-trees/sort spills (e.g. ORDER BY,
+    # CREATE INDEX) use RAM instead of disk temp files. No persistence
+    # implication -- temp storage is never durable in either mode.
+    conn.execute("PRAGMA temp_store=MEMORY")
     conn.execute("PRAGMA foreign_keys=ON")
     _load_vec_extension(conn)
 
