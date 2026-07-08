@@ -12,12 +12,14 @@ correctness backstop — for sessions where compact_boundary is absent or
 stale the tracker falls back to the marker; for normal sessions it is a
 belt-and-suspenders efficiency hedge (avoids rescanning from the top).
 
-Also surfaces starred inter-agent letters as concise pointers in
-additionalContext so load-bearing cross-session agreements survive the
-experiential reset a compaction represents.
+Also renders two continuity surfaces into additionalContext so load-bearing
+context survives the experiential reset a compaction represents: the live
+focus list read verbatim from the DB (the deterministic focus channel, #1655)
+and starred inter-agent letters as concise pointers.
 """
 import json
 import os
+import sqlite3
 import sys
 import time
 from datetime import datetime, timezone
@@ -30,6 +32,69 @@ from context_tracker import find_active_jsonl
 INTER_AGENT_DIR = os.environ.get("INTER_AGENT_DIR", "/home/agents-shared/inter-agent")
 STARRED_CAP = 10
 STARRED_STALE_DAYS = 7  # soft TTL for staleness nudge (nudge only, never auto-drop)
+FOCUS_LIST_CAP = 15  # mirrors engram_focus.FOCUS_LIST_CAP (write-side enforced cap)
+
+
+def focus_block(engram_home: str) -> str:
+    """Render the live focus list as a deterministic, verbatim continuity block.
+
+    Queries the active focus list directly from knowledge.db (read-only) so the
+    "deterministic focus channel" is an actual mechanism at PostCompact, not a
+    prose convention the compacting model may skip (issue #1655). One line per
+    node, rendered VERBATIM (id, claim, focus_reason are never truncated):
+
+        - [<id>] (<focus_reason>) <claim>
+        - [<id>] <claim>                (when focus_reason is empty/NULL)
+
+    Returns "" when the DB is missing, the focus list is empty, or any read
+    error occurs. Never raises — hook must not block post-compact.
+    """
+    try:
+        db_path = os.path.join(engram_home, "knowledge.db")
+        if not os.path.exists(db_path):
+            return ""
+
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, claim, focus_reason FROM nodes "
+                "WHERE focused_at IS NOT NULL AND is_current = 1 "
+                "ORDER BY focused_at"
+            ).fetchall()
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        if not rows:
+            return ""
+
+        lines = []
+        for row in rows:
+            node_id = row["id"]
+            claim = row["claim"]
+            focus_reason = row["focus_reason"]
+            if focus_reason:
+                lines.append(f"  - [{node_id}] ({focus_reason}) {claim}")
+            else:
+                lines.append(f"  - [{node_id}] {claim}")
+
+        total = len(lines)
+        display_lines = lines[:FOCUS_LIST_CAP]
+        remaining = total - len(display_lines)
+
+        header = "📌 Focused nodes — the deterministic focus channel (verbatim, must survive compaction):"
+        block_lines = [header] + display_lines
+        if remaining > 0:
+            block_lines.append(f"  ... +{remaining} more")
+        return "\n".join(block_lines)
+    except Exception:
+        # Hook discipline: never surface focus-block errors at post-compact.
+        return ""
 
 
 def starred_block(engram_home: str) -> str:
@@ -180,10 +245,17 @@ def main() -> None:
     except OSError:
         pass
 
-    # Starred letters surface: emit as additionalContext so load-bearing
-    # cross-session agreements survive the experiential reset. Silent skip on
-    # any failure — hook must not block post-compact.
+    # Continuity surfaces: emit as additionalContext so load-bearing context
+    # survives the experiential reset — the live focus list (the deterministic
+    # focus channel, #1655) first, then starred letters. Silent skip on any
+    # failure — hook must not block post-compact.
     context_lines = []
+    try:
+        focus = focus_block(ENGRAM_HOME)
+        if focus:
+            context_lines.append(focus)
+    except Exception:
+        pass
     try:
         starred = starred_block(ENGRAM_HOME)
         if starred:
