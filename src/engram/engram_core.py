@@ -4392,12 +4392,35 @@ REASONING_STRUCTURE = {
 }
 
 
+def _open_contradiction_ids(conn: sqlite3.Connection, node_id: str) -> list:
+    """Return IDs of live, unresolved contradiction nodes disputing node_id.
+
+    "Open" per #1654's settled semantics: no `resolves` closure has landed
+    yet. A contradiction's status only leaves 'active' (→ 'resolved' or
+    'partially_resolved') once a resolves edge is wired against it
+    (_resolve_impl), so status='active' IS the "no resolves closure" test
+    from the issue text — matches the existing obsolescence-scan convention
+    (engram_query._pattern_contradiction_obsolescence_ready).
+    """
+    rows = conn.execute(
+        """SELECT DISTINCT ct.id FROM edges e
+           JOIN nodes ct ON ct.id = e.source_id
+           WHERE e.target_id = ? AND e.relation = 'contradicts'
+             AND ct.type = 'contradiction' AND ct.is_current = 1
+             AND ct.status = 'active'
+           ORDER BY ct.id""",
+        (node_id,),
+    ).fetchall()
+    return [r["id"] for r in rows]
+
+
 def _validate_premises(
     supporting_ids: list,
     conn: sqlite3.Connection,
     use_stale: bool = False,
-) -> tuple[Optional[dict], list]:
-    """MECH-5 taint/stale blocking guard for engram_derive.
+    use_contested: bool = False,
+) -> tuple[Optional[dict], list, list]:
+    """MECH-5 taint/stale/contradicted blocking guard for engram_derive.
 
     Classifies each supporting premise and blocks derivations built on
     compromised foundations — the Mao-Cao compounding pattern that
@@ -4406,23 +4429,47 @@ def _validate_premises(
     Rules:
       - Any premise with metadata.tainted_by → hard block (BLOCKED_TAINTED).
         No override. Taint means an upstream was retracted (proven wrong).
+      - Any premise sitting on the open side of an unresolved contradiction
+        (a live ct_ node, no resolves closure) AND use_contested=False →
+        soft block (BLOCKED_CONTRADICTED, #1654). Agent opts in with
+        use_contested=True — a contradiction is a live dispute, not a
+        refutation, so building on it is a deliberate, loudly-marked
+        choice, not a hard wall. Checked before stale (a disputed claim is
+        a more acute concern than a merely-superseded one).
       - Any premise with metadata.stale_by AND use_stale=False →
         soft block (BLOCKED_STALE). Agent opts in with use_stale=True
         when the upstream update is judged irrelevant to current logic.
-      - Mixed taint + stale → treated as tainted (taint dominates).
+      - Mixed taint + (contradicted|stale) → treated as tainted (taint
+        dominates — it is a hard block with no override, and short-
+        circuits both other checks for that premise).
+      - Contested and stale are NOT mutually exclusive with each other: a
+        premise can be both superseded AND sitting on a still-open
+        contradiction (e.g. supersede fires on one side of a live dispute
+        without auto-resolving it — issue #229's documented workflow).
+        Both are classified independently, so BOTH overrides
+        (use_contested AND use_stale) must clear before such a premise is
+        allowed through — clearing only one would silently drop the
+        other's guard.
 
     Returns:
-        (block_response, stale_ids)
-        - block_response: None if premises are clean (or stale-opt-in
-          covers them). Otherwise a dict ready for json.dumps with a
-          structured block error.
+        (block_response, stale_ids, contested_ids)
+        - block_response: None if premises are clean (or opt-ins cover
+          them). Otherwise a dict ready for json.dumps with a structured
+          block error.
         - stale_ids: list of premise IDs that are stale (for the caller
           to stamp metadata.built_on_stale when use_stale=True lets us
           proceed).
+        - contested_ids: list of premise IDs sitting on an open
+          contradiction (for the caller to auto-stamp
+          metadata.built_on_contested when use_contested=True lets us
+          proceed — the stamp is NEVER author-supplied, only ever written
+          by this override path, so it can't be gamed/omitted).
     """
     tainted_premises = []
+    contested_premises = []
     stale_premises = []
     stale_ids: list = []
+    contested_ids: list = []
     for sid in supporting_ids:
         row = conn.execute(
             "SELECT metadata, status, is_current, superseded_by FROM nodes WHERE id = ?",
@@ -4454,6 +4501,18 @@ def _validate_premises(
         if is_superseded_here and sid not in stale_by:
             stale_by.insert(0, sid)
 
+        # Taint dominates unconditionally, so only compute contested/stale
+        # when the premise isn't already tainted. But contested and stale
+        # are NOT mutually exclusive with each other — a premise can be
+        # BOTH superseded AND sitting on a still-open contradiction (e.g.
+        # supersede fires on one side of a live dispute; the contradiction
+        # isn't auto-resolved by that — issue #229's documented workflow).
+        # Classifying one branch (via elif) silently drops the other's
+        # signal, letting a premise slip past BLOCKED_STALE (or vice versa)
+        # just because it also happened to be contested. Track both
+        # independently so each applicable override is required on its own.
+        open_ct_ids = [] if tainted_by else _open_contradiction_ids(conn, sid)
+
         if tainted_by:
             retraction_info = []
             for rid in tainted_by:
@@ -4475,23 +4534,30 @@ def _validate_premises(
                 "id": sid,
                 "retracted_by": retraction_info,
             })
-        elif stale_by:
-            replacement_info = []
-            for old_id in stale_by:
-                drow = conn.execute(
-                    "SELECT superseded_by FROM nodes WHERE id = ?", (old_id,)
-                ).fetchone()
-                replacement_info.append({
-                    "superseded_id": old_id,
-                    "replaced_by_id": drow["superseded_by"] if drow else None,
+        else:
+            if open_ct_ids:
+                contested_premises.append({
+                    "id": sid,
+                    "open_contradictions": open_ct_ids,
                 })
-            stale_premises.append({
-                "id": sid,
-                "stale_because": replacement_info,
-            })
-            stale_ids.append(sid)
+                contested_ids.append(sid)
+            if stale_by:
+                replacement_info = []
+                for old_id in stale_by:
+                    drow = conn.execute(
+                        "SELECT superseded_by FROM nodes WHERE id = ?", (old_id,)
+                    ).fetchone()
+                    replacement_info.append({
+                        "superseded_id": old_id,
+                        "replaced_by_id": drow["superseded_by"] if drow else None,
+                    })
+                stale_premises.append({
+                    "id": sid,
+                    "stale_because": replacement_info,
+                })
+                stale_ids.append(sid)
 
-    # Taint dominates — block even if use_stale=True.
+    # Taint dominates — block even if use_stale/use_contested=True.
     if tainted_premises:
         return ({
             "status": "blocked_tainted",
@@ -4504,7 +4570,26 @@ def _validate_premises(
                 "engram_ask if the conclusion's validity under the correction "
                 "is non-obvious."
             ),
-        }, stale_ids)
+        }, stale_ids, contested_ids)
+
+    # #1654 — a premise under an open, unresolved contradiction is a live
+    # dispute, not (yet) a refutation. Block by default so new derivations
+    # don't silently compound on contested ground; the override is a
+    # deliberate, loudly-marked choice (mirrors use_stale/BLOCKED_STALE).
+    if contested_premises and not use_contested:
+        return ({
+            "status": "blocked_contradicted",
+            "error": "BLOCKED_CONTRADICTED: premise(s) sit on an open, unresolved contradiction.",
+            "contested_premises": contested_premises,
+            "guidance": (
+                "Either resolve the contradiction first (engram_resolve against "
+                "the ct_ node), or retry with use_contested=True if you're "
+                "deliberately building on the contested side while the dispute "
+                "is still open — writes a metadata.built_on_contested audit "
+                "marker (auto-stamped, not author-supplied) so resolution "
+                "pressure on the open contradiction stays measurable."
+            ),
+        }, stale_ids, contested_ids)
 
     if stale_premises and not use_stale:
         return ({
@@ -4517,9 +4602,9 @@ def _validate_premises(
                 "update does not affect your logic), OR cite the replacement "
                 "premise(s) directly via their IDs."
             ),
-        }, stale_ids)
+        }, stale_ids, contested_ids)
 
-    return (None, stale_ids)
+    return (None, stale_ids, contested_ids)
 
 
 def _trace_evidence_roots(conn: sqlite3.Connection, node_id: str, max_depth: int = 4096) -> set:
@@ -5201,6 +5286,7 @@ def _create_derivation(
     reasoning_type: str,
     context_ids: Optional[list] = None,
     use_stale: bool = False,
+    use_contested: bool = False,
     extra_meta: Optional[dict] = None,
     history_reason: Optional[str] = None,
 ) -> tuple:
@@ -5225,6 +5311,10 @@ def _create_derivation(
         context_ids: optional 'cites' targets; missing IDs are silently
             filtered (legacy engram_derive behavior)
         use_stale: MECH-5 opt-in for stale premises
+        use_contested: MECH-5 opt-in for premises under an open,
+            unresolved contradiction (#1654) — the resolution-pressure
+            valve. metadata.built_on_contested is auto-stamped by this
+            path only, never author-supplied.
         extra_meta: merged into derivation metadata after reasoning
             fields — use for resolve-specific keys (resolves,
             resolution_status)
@@ -5234,12 +5324,14 @@ def _create_derivation(
     Returns:
         (block, success) — exactly one is non-None.
           block: MECH-5 guard response ready for json.dumps when a
-            premise was tainted or stale without opt-in
+            premise was tainted, contradicted, or stale without opt-in
           success: dict with node_id, confidence, reasoning_type,
-            reasoning_class, stale_ids, structure_warnings,
+            reasoning_class, stale_ids, contested_ids, structure_warnings,
             bumped_count, context_nodes
     """
-    block, stale_ids = _validate_premises(supporting_ids, conn, use_stale=use_stale)
+    block, stale_ids, contested_ids = _validate_premises(
+        supporting_ids, conn, use_stale=use_stale, use_contested=use_contested,
+    )
     if block is not None:
         return (block, None)
 
@@ -5258,8 +5350,22 @@ def _create_derivation(
     derive_meta = {"reasoning_type": reasoning_type, "reasoning_class": rclass}
     if use_stale and stale_ids:
         derive_meta["built_on_stale"] = stale_ids
+    if use_contested and contested_ids:
+        derive_meta["built_on_contested"] = contested_ids
     if extra_meta:
-        derive_meta.update(extra_meta)
+        # By-CONSTRUCTION guarantee, not by-convention (Borges's #1711 review):
+        # these two audit stamps are auto-written by their override paths
+        # ONLY and must never be spoofable/removable via extra_meta, even if
+        # a future caller gains a generic extra_meta/metadata passthrough.
+        # No caller does today (extra_meta is hardcoded to {"warrant": ...}
+        # at the one call site), but that's an accident of today's callers,
+        # not a structural guarantee — strip the reserved keys unconditionally
+        # rather than relying on no one ever setting them.
+        safe_extra_meta = {
+            k: v for k, v in extra_meta.items()
+            if k not in ("built_on_stale", "built_on_contested")
+        }
+        derive_meta.update(safe_extra_meta)
 
     reason_line = history_reason or (
         f"Derived ({reasoning_type}, discount={discount}) from {len(supporting_ids)} premises"
@@ -5312,6 +5418,7 @@ def _create_derivation(
         "reasoning_type": reasoning_type,
         "reasoning_class": rclass,
         "stale_ids": stale_ids,
+        "contested_ids": contested_ids,
         "structure_warnings": structure_warnings,
         "bumped_count": bumped_count,
         "context_nodes": ctx_used,

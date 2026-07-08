@@ -4825,7 +4825,7 @@ def engram_report_feeling(payload_json: str) -> str:
 # Set of legitimate field names for the engram_derive payload.
 _DERIVE_FIELDS = frozenset({
     "claim", "supporting_ids", "logical_chain", "reasoning_type",
-    "derivation_mode", "context_ids", "use_stale", "warrant",
+    "derivation_mode", "context_ids", "use_stale", "use_contested", "warrant",
 })
 
 
@@ -4847,11 +4847,16 @@ _DERIVE_FIELDS = frozenset({
 # is mathematically valid ONLY when premises cite DISTINCT evidence sources —
 # misusing it on co-sourced premises produces structurally inflated confidence.
 #
-# MECH-5 stale-premise + tainted-premise guards (use_stale opt-in): a derivation
-# resting on premises that have been superseded or retracted gets BLOCKED at
-# filing time. The block is a feature: it surfaces "this reasoning needs to be
-# re-grounded" rather than letting derivation chains rot silently. the honesty axiom
-# honesty-is-structural in action.
+# MECH-5 stale-premise + tainted-premise + contradicted-premise guards
+# (use_stale / use_contested opt-ins): a derivation resting on premises that
+# have been superseded, retracted, or sit on an open unresolved contradiction
+# (#1654) gets BLOCKED at filing time. The block is a feature: it surfaces
+# "this reasoning needs to be re-grounded (or the dispute resolved)" rather
+# than letting derivation chains rot silently, or compound on contested
+# ground without a trace. the honesty axiom honesty-is-structural in action.
+# The contradiction guard is deliberately overridable (a live dispute isn't a
+# refutation) but the override auto-stamps metadata.built_on_contested —
+# never author-supplied — so opting in stays measurable, not a laundering path.
 #
 # derivation_mode is legacy (kept for back-compat); prefer reasoning_type.
 @mcp.tool(
@@ -4892,6 +4897,12 @@ def engram_derive(payload_json: str) -> str:
                 references (e.g. definitions). Creates 'cites' edges.
             use_stale (bool, optional): Opt-in override for MECH-5 stale-premise
                 guard. Default False. Has no effect on tainted premises.
+            use_contested (bool, optional): Opt-in override for MECH-5
+                contradicted-premise guard (#1654) — set True only when
+                deliberately building on a premise under an open, unresolved
+                contradiction (e.g. composing the derivation that will resolve
+                it). Default False. Auto-stamps metadata.built_on_contested
+                (never author-supplied). Has no effect on tainted premises.
             warrant (str, optional): The Toulmin warrant — the general principle
                 or rule that licenses this inference (why do these premises
                 support this claim?). Example: "Agents that record findings at
@@ -4902,8 +4913,8 @@ def engram_derive(payload_json: str) -> str:
     Returns:
         JSON with the new derivation node ID, computed confidence, reasoning
         type, and supporting nodes. If premises are compromised, returns a
-        structured block response (BLOCKED_TAINTED or BLOCKED_STALE). On
-        payload-parsing failure, returns {"error": "..."}.
+        structured block response (BLOCKED_TAINTED, BLOCKED_CONTRADICTED, or
+        BLOCKED_STALE). On payload-parsing failure, returns {"error": "..."}.
 
     See _derive_impl for full reasoning-type list, confidence-computation
     semantics, and structural-validation details.

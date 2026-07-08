@@ -69,12 +69,18 @@ def _mk_obs(obs, claim: str, quote_type: str = "hard_data") -> str:
 
 
 def _mk_dv(derive, claim: str, supporting_ids: list,
-           reasoning_type: str = "authority_expert") -> str:
+           reasoning_type: str = "authority_expert",
+           use_contested: bool = True) -> str:
+    # use_contested defaults True here: every call site in this file composes
+    # a derivation citing one side of a contradiction filed moments earlier
+    # (still open at that point) in order to then resolve it — exactly the
+    # #1654 resolution-pressure-valve use case, not an incidental collision.
     r = json.loads(derive._derive_impl(
         claim=claim,
         supporting_ids=",".join(supporting_ids),
         logical_chain=f"Reasoning for: {claim}",
         reasoning_type=reasoning_type,
+        use_contested=use_contested,
     ))
     assert "derivation_id" in r, r
     return r["derivation_id"]
