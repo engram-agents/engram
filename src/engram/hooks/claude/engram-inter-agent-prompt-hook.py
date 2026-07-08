@@ -58,25 +58,31 @@ LIST_CAP = 10
 # Pure-API (UCS invariant): this hook reads DM state ONLY via the forum HTTP
 # API — no local-filesystem fallback.  forum_api ships in tools/.
 #
-# Resolve tools/ in BOTH topologies (mirrors engram-baton-prompt-hook.py) — a
-# fixed parents[N] is WRONG because the build FLATTENS hooks/claude/ -> hooks/,
-# so the deployed hook sits one level shallower than the source.  Prefer
-# $CLAUDE_PLUGIN_ROOT/tools when set, else walk parents and take the first dir
-# that actually contains forum_api.py.  Import is best-effort: a failure sets
-# _FORUM_API_OK=False, degrading the hook to a silent no-op rather than
-# crashing the prompt.
+# Resolve tools/ in BOTH topologies via the shared _hooklib helper (gh#1657 —
+# this walk-parents logic was duplicated byte-for-byte across this hook and
+# engram-baton-prompt-hook.py, slice 1 of which extracted it; this is slice 2,
+# a byte-identical swap since this hook shares baton's marker file
+# (forum_api.py) and candidate ordering exactly). _hooklib.py lives alongside
+# this file in both topologies (source: hooks/claude/; deployed: hooks/), so
+# no walk-parents is needed to find it — but this repo's own test loaders
+# (importlib.util.spec_from_file_location) don't auto-add a script's own
+# directory to sys.path the way a real `python3 hooks/x.py` invocation does,
+# so this hook adds its own directory explicitly before importing _hooklib.
+# Import is best-effort throughout: any failure degrades the hook to a
+# silent no-op rather than crashing the prompt. (Behavior note, same as
+# slice 1: the pre-extraction inline walk-parents loop was NOT itself
+# wrapped in try/except -- wrapping it here is a deliberate tightening to
+# match this file's own "never crash the prompt" discipline, not an
+# accidental behavior change.)
 # ---------------------------------------------------------------------------
-_tools_candidates = []
-_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
-if _plugin_root:
-    _tools_candidates.append(Path(_plugin_root) / "tools")
-for _parent in Path(__file__).resolve().parents:
-    _tools_candidates.append(_parent / "tools")
-_TOOLS_DIR = next(
-    (c for c in _tools_candidates if (c / "forum_api.py").exists()), None
-)
-if _TOOLS_DIR is not None and str(_TOOLS_DIR) not in sys.path:
-    sys.path.insert(0, str(_TOOLS_DIR))
+_this_dir = str(Path(__file__).resolve().parent)
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+try:
+    from _hooklib import resolve_tools_dir
+    _TOOLS_DIR = resolve_tools_dir("forum_api.py")
+except Exception:
+    _TOOLS_DIR = None
 try:
     from forum_api import (
         ForumClient,

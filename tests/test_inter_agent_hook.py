@@ -740,3 +740,60 @@ class TestGetAgentName:
         result = self.hook._get_agent_name({})
         assert result == "localdev"
 
+
+
+# ---------------------------------------------------------------------------
+# Flattened-topology regression (gh#1657 -- _hooklib extraction, slice 2)
+# ---------------------------------------------------------------------------
+
+import subprocess
+
+
+def test_hooklib_resolution_in_flattened_deployed_topology(tmp_path):
+    """The plugin build FLATTENS hooks/claude/ -> hooks/, so the deployed
+    inter-agent hook sits one level shallower than source, AND _hooklib.py
+    (its sibling since gh#1657 slice 2) must be found alongside it in that
+    same flattened layout. Mirrors the baton hook's own regression test
+    (added in slice 1), per Aleph's review note on PR #1726: keep the
+    per-hook flattened-topology test as each hook is re-pointed, so a
+    future build-layout change can't silently break resolution for one
+    hook while the others still pass.
+    """
+    root = tmp_path / "engram"
+    (root / "hooks").mkdir(parents=True)
+    (root / "tools").mkdir()
+    hooklib_src = (
+        Path(__file__).parent.parent
+        / "src" / "engram" / "hooks" / "claude" / "_hooklib.py"
+    )
+    (root / "hooks" / "engram-inter-agent-prompt-hook.py").write_text(HOOK_PATH.read_text())
+    (root / "hooks" / "_hooklib.py").write_text(hooklib_src.read_text())
+    # Stub forum_api.py so the import can succeed.
+    (root / "tools" / "forum_api.py").write_text(
+        "class ForumClient:\n"
+        "    def __init__(self, *a, **k): pass\n"
+        "class ForumNetworkError(Exception): pass\n"
+        "class ForumHttpError(Exception):\n"
+        "    def __init__(self, status=0, body=''): self.status=status; self.body=body\n"
+        "def forum_url_from_config(config): return 'http://localhost:5002'\n"
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.json").write_text(json.dumps({"agent_name": "luria", "mode": "multi"}))
+
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_ROOT"}
+    env["ENGRAM_HOME"] = str(home)
+    r = subprocess.run(
+        [sys.executable, "-c",
+         f"import importlib.util, sys; "
+         f"spec = importlib.util.spec_from_file_location('hook', "
+         f"  r'{root}/hooks/engram-inter-agent-prompt-hook.py'); "
+         f"mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); "
+         f"print('resolved' if mod._FORUM_API_OK and mod._TOOLS_DIR is not None else 'broken')"
+         ],
+        capture_output=True, text=True, env=env,
+    )
+    assert "resolved" in r.stdout, (
+        "deployed-topology hook failed to resolve _hooklib/forum_api via "
+        f"walk-parents (stdout={r.stdout!r} stderr={r.stderr!r})"
+    )
