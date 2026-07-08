@@ -1065,6 +1065,59 @@ _timing_conn_lock = threading.Lock()
 _timing_conn: Optional[sqlite3.Connection] = None
 _timing_conn_path: Optional[str] = None
 
+# #1685: separate guard, separate concern from _timing_conn/_timing_conn_path
+# above. _timing_conn_* caches the tool-timing connection itself;
+# _schema_bootstrap_paths below tracks "have we ensured the FULL ENGRAM schema
+# exists for this resolved DB path yet" — a one-time-per-path side effect that
+# _get_timing_conn() used to smuggle in on its own cache-miss path (see
+# _ensure_schema_bootstrap()'s docstring for why that coupling existed and why
+# it's been pulled out). Dedicated lock rather than reusing _timing_conn_lock:
+# keeps the two independent concerns from serializing on each other, and
+# avoids any risk of _ensure_schema_bootstrap()'s call into core._get_db()
+# re-entering timing-connection code while _timing_conn_lock is already held.
+_schema_bootstrap_lock = threading.Lock()
+_schema_bootstrap_paths: set[str] = set()
+
+
+def _ensure_schema_bootstrap() -> None:
+    """Best-effort, once-per-resolved-path trigger for the FULL ENGRAM schema.
+
+    Never raises — called from the tool-call hot path (_timing_mcp_tool's
+    `timed()` finally block, on every single MCP tool call), so any failure
+    here must never break the tool call it's piggybacking on.
+
+    Why this exists (condensed from the pre-#1685 version of this comment,
+    which lived inside _get_timing_conn() itself): engram-pkg's `cmd_init`
+    bootstraps a fresh package DB by calling `client.call("engram_stats")` as
+    a "no-op trigger", relying on SOME _get_db() call reaching the
+    schema-creation code along the way. It does NOT reliably get there
+    through engram_stats() itself — that tool delegates to the separately
+    -imported engram_stats.py family module, which can hold a stale `core`
+    reference across repeated EngramClient(...) instantiations in one process
+    (a pre-existing cross-module staleness footgun, out of scope here). What
+    actually makes cmd_init work is that _timing_mcp_tool's wrapper calls
+    _record_tool_timing() (and, as of #1685, this function) on every tool
+    call, including engram_stats — so this indirect path is the real
+    bootstrap trigger, not engram_stats() directly. See
+    tests/test_scope_export.py::TestCmdInit for the regression coverage (GH
+    #851 originally; re-verified for #1685's refactor).
+
+    core._get_db() is a ONE-TIME cost per resolved path (#1669's guard: once
+    schema_present() is True for a path, every later call — from anywhere —
+    is cheap), so gating on _schema_bootstrap_paths here just avoids paying
+    even that one-time cost more than once; it's not a correctness
+    requirement (core._get_db() itself is idempotent).
+    """
+    resolved_path = str(core.DB_PATH.resolve())
+    with _schema_bootstrap_lock:
+        if resolved_path in _schema_bootstrap_paths:
+            return
+        _schema_bootstrap_paths.add(resolved_path)
+    try:
+        core._get_db().close()
+    except Exception:
+        pass
+
 
 def _get_timing_conn() -> sqlite3.Connection:
     """Return the shared tool-timing connection, (re)creating it if needed.
@@ -1072,6 +1125,12 @@ def _get_timing_conn() -> sqlite3.Connection:
     Caller MUST hold _timing_conn_lock. Reopens if the resolved DB path
     changed (test isolation via engram_sandbox()/_configure_paths reroutes
     core.DB_PATH mid-process) or if the cached connection went stale.
+
+    This function's ONLY job is tool-timing connection lifecycle — creating
+    the connection and its own tool_timing table/index DDL. It does NOT touch
+    the full ENGRAM schema; see _ensure_schema_bootstrap() (called separately,
+    from _timing_mcp_tool's wrapper) for that concern (#1685 decoupled the
+    two — they used to be smuggled together here).
     """
     global _timing_conn, _timing_conn_path
     # .resolve() keeps this path key consistent with _get_db()'s guard key
@@ -1085,37 +1144,37 @@ def _get_timing_conn() -> sqlite3.Connection:
         except Exception:
             pass
 
-    # Ensure the FULL schema (not just tool_timing) exists for this resolved
-    # path before we start writing to it. This used to happen as an
-    # ACCIDENTAL side effect of the old _record_tool_timing() calling
-    # _get_db() (server.py's OWN always-fresh `core` reference — see the
-    # module-docstring house rule on `import engram_core as core`) on every
-    # single tool call, which ran _get_db()'s full one-time schema/backfill
-    # block unconditionally. engram-pkg's `cmd_init` (scripts/engram-pkg)
-    # relies on exactly that: it bootstraps a fresh package DB by calling
-    # `client.call("engram_stats")` as a "no-op trigger" and depends on
-    # SOME `_get_db()` call reaching the schema-creation code along the way
-    # — it does NOT reliably get there through engram_stats() itself (that
-    # tool delegates to the separately-imported engram_stats.py family
-    # module, which can hold a stale `core` reference across repeated
-    # EngramClient(...) instantiations in one process — a pre-existing
-    # cross-module staleness footgun in EngramClient's module-purge list,
-    # out of scope for this PR to fix). Losing that accidental bootstrap
-    # broke `engram-pkg init`/scope-export (tests/test_scope_export.py) when
-    # #1670 stopped routing every timing write through the heavy path.
-    # core._get_db() call here is a ONE-TIME cost per resolved path (thanks
-    # to #1669's guard — a fresh path pays the full one-time setup exactly
-    # once; every later call, from anywhere, sees schema_present()==True and
-    # is cheap), so this restores the old bootstrap behavior without
-    # reintroducing a per-call cost.
-    try:
-        core._get_db().close()
-    except Exception:
-        pass
-
     conn = sqlite3.connect(resolved_path, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
+    # #1685 (blueprint H6 follow-up to #1672/#1684): apply the same
+    # faster-never-looser PRAGMA reasoning #1672 measured for _get_db() to
+    # this connection. Audited per-PRAGMA rather than copy-pasted — this
+    # connection's only workload is one INSERT+COMMIT per tool call (see
+    # _record_tool_timing()), no SELECT/scan/temp-b-tree usage.
+    #
+    # synchronous=NORMAL (from FULL): applies directly — same small, frequent
+    # INSERT+COMMIT hot-path cost #1672 targeted in _get_db(). With
+    # journal_mode=WAL (already set above), NORMAL still fsyncs at every WAL
+    # checkpoint, so the WAL itself can't be corrupted by a crash of this
+    # process — only the durability window of the most recent commit(s)
+    # narrows (never a corruption risk). SQLite's own docs recommend NORMAL
+    # as the standard pairing with WAL for exactly this reason.
+    conn.execute("PRAGMA synchronous=NORMAL")
+    # cache_size: modest bump only (not #1672's 64MB) — this table is small
+    # and write-only, so a large page cache buys little, but a small bump is
+    # cheap insurance and keeps both hot-path connections' tuning postures
+    # consistent/legible. ~8MB, vs SQLite's ~2MB default (-2000).
+    conn.execute("PRAGMA cache_size=-8000")
+    # mmap_size and temp_store=MEMORY intentionally SKIPPED: both are
+    # read/scan optimizations (mmap_size cuts read()-syscall cost for paged
+    # reads; temp_store=MEMORY speeds ORDER BY / CREATE INDEX temp-b-tree
+    # spills). _record_tool_timing()'s only operation on this connection is
+    # a single-row INSERT — no SELECT, no scan, no sort, no index build — so
+    # neither PRAGMA has a workload to optimize here. Audited per issue
+    # #1685's own note that these are "less relevant" for a write-only
+    # connection; confirmed by reading _record_tool_timing() rather than
+    # assumed.
     # Same DDL as the tool_timing table/indexes created in _get_db()'s
     # one-time setup — idempotent (CREATE ... IF NOT EXISTS), so whichever
     # of the two paths gets there first is fine.
@@ -1338,6 +1397,12 @@ def _timing_mcp_tool(*args, **kwargs):
                 raise
             finally:
                 duration_ms = int((time.perf_counter() - start) * 1000)
+                # #1685: schema-bootstrap trigger lives here now (was buried
+                # inside _get_timing_conn()) — same "runs after every tool
+                # call regardless of success/failure" position/ordering as
+                # _record_tool_timing() below, just decoupled into its own
+                # named, best-effort, once-per-path function.
+                _ensure_schema_bootstrap()
                 _record_tool_timing(func.__name__, duration_ms, timing_status)
                 # Dual-emission: also write to logs/index.db for the viz-server
                 # stats dashboard. result_status is extracted from the tool's
