@@ -1273,6 +1273,57 @@ def forum_monitor_block() -> str:
     )
 
 
+def forum_updates_monitor_block() -> str:
+    """Emit a forum updates monitor arm instruction at session startup.
+
+    Interim stopgap (dual-arm): arms forum-updates-monitor.sh (real-time DM +
+    baton-turn-flip events over the cursor-based /api/updates feed) alongside
+    forum_monitor_block()'s existing @-mention monitor. Today these are two
+    separate scripts/Monitor instances; a deeper unification that would merge
+    mention into the /api/updates feed itself is tracked separately — see
+    engram-alpha issue #1661 — and is NOT attempted by this function.
+
+    Only fires for interactive role + source=="startup" (source guard is at the
+    call site in main()). Silent "" when forum is unconfigured (no forum.url in
+    config.json) or the monitor script is absent — hook must never block start.
+
+    Resolves forum-updates-monitor.sh via _resolve_runtime_dir so it works in
+    both plugin install layout (<plugin_root>/tools/) and dev source tree
+    layout (~/engram-alpha/tools/). Follows the forum_monitor_block() pattern.
+
+    Returns:
+        Instruction string when forum is configured + script exists, else "".
+    """
+    if _EFFECTIVE_SESSION_ROLE != "interactive":
+        return ""
+
+    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+        forum_cfg = config.get("forum", {})
+        if not forum_cfg or not forum_cfg.get("url"):
+            return ""
+    except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+        return ""
+
+    runtime_dir = _resolve_runtime_dir(ENGRAM_HOME)
+    script_path = os.path.join(runtime_dir, "tools", "forum-updates-monitor.sh")
+    if not os.path.exists(script_path):
+        return ""
+
+    return (
+        "[Forum updates monitor] forum.url is configured. On your FIRST prompt "
+        "this session, arm the persistent forum updates monitor (it is "
+        "session-scoped and must be re-armed each startup):\n"
+        f'  Call Monitor(command="bash {script_path} --kinds dm,baton", persistent=true)\n'
+        "  This wakes you within ~30s on new DM + baton-turn-flip events over "
+        "the /api/updates coordination feed. The script self-guards against "
+        "duplicate instances (last-arm-wins). See engram-collaborating-loop "
+        "skill §Mechanism 3a."
+    )
+
+
 def _apply_pending_viz_acl(engram_home: str) -> None:
     """Apply deferred viz/operator ACL when finalize-name ran before ENGRAM install.
 
@@ -1471,6 +1522,9 @@ def main() -> None:
         monitor_block = forum_monitor_block()
         if monitor_block:
             lines.append(monitor_block)
+        updates_monitor_block = forum_updates_monitor_block()
+        if updates_monitor_block:
+            lines.append(updates_monitor_block)
         peer_block = peer_topology_block(_agent_name)
         if peer_block:
             lines.append(peer_block)
