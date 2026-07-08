@@ -5,10 +5,18 @@ Coverage:
      edges to cornerstone targets, writes the index, anchor_line falls back
      to the claim, and engram_register_exemplar on a cornerstone target
      triggers the rebuild (the previously-reserved slot).
-  §2 Surface-hook check — check_cornerstone_anchor fires on a surfaced
-     exemplar ID and on the cornerstone's own ID; cross-prompt cooldown
-     suppresses within the window, expires after it, and clears on a
-     compaction counter reset; missing cache is silent.
+  §2 Surface-hook check — check_cornerstone_anchor was folded into the
+     unified check_principle_triggers (#1698 slice 2). Most of this
+     section's original coverage (exemplar-ID firing, cooldown
+     suppress/expire, missing-registry silence) is now redundant with
+     tests/test_principle_triggers_registry.py's §5 byte-compat/cooldown
+     suite for kind=cornerstone. What survives here are the cornerstone-kind
+     behaviors NOT exercised there: direct-principal-ID firing via the
+     by_principle reverse lookup, the compaction counter-reset case, and
+     malformed-registry-shape silence. Also added (reviewer-fairy flag on
+     PR #1713): the lesson-kind counterpart of the direct-ID test, since
+     unification widened the by_principle reverse lookup to all four kinds,
+     not cornerstone-only as it was pre-#1698.
 """
 
 from __future__ import annotations
@@ -139,7 +147,11 @@ def test_register_exemplar_cornerstone_rebuilds_cache():
 
 
 # ---------------------------------------------------------------------------
-# §2 Surface-hook check_cornerstone_anchor
+# §2 Surface-hook check_principle_triggers (cornerstone kind) — surviving
+# gap-coverage after the check_cornerstone_anchor -> check_principle_triggers
+# fold (#1698 slice 2). See tests/test_principle_triggers_registry.py §5 for
+# the byte-compat + cooldown + missing-registry coverage this section used
+# to carry.
 # ---------------------------------------------------------------------------
 
 
@@ -162,70 +174,83 @@ def _load_surface_hook(engram_home: str):
             os.environ["ENGRAM_HOME"] = old
 
 
-def _hook_with_index(tmpdir: str):
+def _hook_with_registry(tmpdir: str):
+    """Unified-registry counterpart to the retired _hook_with_index — writes
+    principle_triggers.json (kind: cornerstone) instead of the folded
+    cornerstone_anchors.json shape."""
     hook = _load_surface_hook(tmpdir)
-    index = {
+    registry = {
         "ob_9001": {
-            "cornerstone_id": "cs_9001",
-            "cornerstone_claim": "Gate the decidable.",
-            "anchor_line": "If a machine can check it, make it a mechanism.",
+            "principle_id": "cs_9001",
+            "kind": "cornerstone",
+            "claim": "Gate the decidable.",
+            "nudge": "If a machine can check it, make it a mechanism.",
         }
     }
-    with open(hook.CORNERSTONE_ANCHORS_PATH, "w") as f:
-        json.dump(index, f)
+    with open(hook.PRINCIPLE_TRIGGERS_PATH, "w") as f:
+        json.dump(registry, f)
     return hook
 
 
-def test_fires_on_exemplar_id(tmp_path):
-    hook = _hook_with_index(str(tmp_path))
-    out = hook.check_cornerstone_anchor(["ob_9001"], prompt_count=5)
-    assert "cs_9001" in out
-    assert "make it a mechanism" in out
-
-
 def test_fires_on_direct_cornerstone_id(tmp_path):
-    hook = _hook_with_index(str(tmp_path))
-    out = hook.check_cornerstone_anchor(["cs_9001"], prompt_count=5)
+    """A matched ID that IS the cornerstone's own principle_id (not a
+    trigger) fires via the by_principle reverse lookup -- not exercised by
+    test_principle_triggers_registry.py's byte-compat tests, which only
+    match on trigger IDs, never on a principal's own ID."""
+    hook = _hook_with_registry(str(tmp_path))
+    out = hook.check_principle_triggers(["cs_9001"], prompt_count=5)
     assert "cs_9001" in out
 
 
-def test_cooldown_suppresses_within_window(tmp_path):
-    hook = _hook_with_index(str(tmp_path))
-    assert hook.check_cornerstone_anchor(["ob_9001"], prompt_count=5)
-    assert hook.check_cornerstone_anchor(["ob_9001"], prompt_count=7) == ""
-
-
-def test_cooldown_expires(tmp_path):
-    hook = _hook_with_index(str(tmp_path))
-    hook.check_cornerstone_anchor(["ob_9001"], prompt_count=5)
-    window = hook.CORNERSTONE_ANCHOR_COOLDOWN_PROMPTS
-    assert hook.check_cornerstone_anchor(["ob_9001"], prompt_count=5 + window)
+def test_fires_on_direct_lesson_id(tmp_path):
+    """Reviewer-fairy flag (PR #1713): the by_principle reverse lookup is
+    generalized across all four kinds by unification, not cornerstone-only
+    as it was pre-#1698 (check_incident_tripwire had no such reverse lookup
+    for lessons at all). A matched ID that IS a lesson's own principle_id
+    (not an incident/trigger ID) now fires too -- this is the lesson-kind
+    counterpart to test_fires_on_direct_cornerstone_id above, closing the
+    gap the reviewer-fairy identified as untested."""
+    hook = _load_surface_hook(str(tmp_path))
+    registry = {
+        "ob_9002": {
+            "principle_id": "ls_9002",
+            "kind": "lesson",
+            "claim": "Verify before trusting a claim about system state.",
+            "nudge": "Check the live artifact, not the report.",
+        }
+    }
+    with open(hook.PRINCIPLE_TRIGGERS_PATH, "w") as f:
+        json.dump(registry, f)
+    out = hook.check_principle_triggers(["ls_9002"], prompt_count=5)
+    assert "ls_9002" in out
+    # Byte-compat register still applies even when reached via direct ID --
+    # the lesson rendering doesn't distinguish how principle_id was matched.
+    assert "[ENGRAM Tripwire (ls_9002)" in out
 
 
 def test_counter_reset_clears_cooldown(tmp_path):
-    hook = _hook_with_index(str(tmp_path))
-    hook.check_cornerstone_anchor(["ob_9001"], prompt_count=20)
+    """A compaction-driven prompt-counter reset (current prompt_count below
+    the last-fired count) must clear the cooldown -- not exercised by
+    test_check_principle_triggers_cooldown_suppresses_regardless_of_kind,
+    which only tests monotonically-increasing prompt_count."""
+    hook = _hook_with_registry(str(tmp_path))
+    hook.check_principle_triggers(["ob_9001"], prompt_count=20)
     # Compaction resets the counter; last_fired(20) > current(1) → allowed
-    assert hook.check_cornerstone_anchor(["ob_9001"], prompt_count=1)
-
-
-def test_missing_cache_is_silent(tmp_path):
-    hook = _hook_with_index(str(tmp_path))
-    os.remove(hook.CORNERSTONE_ANCHORS_PATH)
-    assert hook.check_cornerstone_anchor(["ob_9001"], prompt_count=5) == ""
+    assert hook.check_principle_triggers(["ob_9001"], prompt_count=1)
 
 
 def test_malformed_cache_shape_is_silent(tmp_path):
     """Valid JSON, wrong shape (e.g. a list, or string entries) must degrade
     to silence — the hook runs on every prompt (reviewer-fairy suggestion,
-    PR #1695)."""
-    hook = _hook_with_index(str(tmp_path))
-    with open(hook.CORNERSTONE_ANCHORS_PATH, "w") as f:
+    PR #1695). Not exercised by test_principle_triggers_registry.py's §5
+    suite, which only tests well-formed registries."""
+    hook = _hook_with_registry(str(tmp_path))
+    with open(hook.PRINCIPLE_TRIGGERS_PATH, "w") as f:
         json.dump(["not", "a", "dict"], f)
-    assert hook.check_cornerstone_anchor(["ob_9001"], prompt_count=5) == ""
-    with open(hook.CORNERSTONE_ANCHORS_PATH, "w") as f:
+    assert hook.check_principle_triggers(["ob_9001"], prompt_count=5) == ""
+    with open(hook.PRINCIPLE_TRIGGERS_PATH, "w") as f:
         json.dump({"ob_9001": "entry-is-a-string-not-a-dict"}, f)
-    assert hook.check_cornerstone_anchor(["ob_9001"], prompt_count=5) == ""
+    assert hook.check_principle_triggers(["ob_9001"], prompt_count=5) == ""
 
 
 def test_generic_edge_tools_resync_anchor_cache():

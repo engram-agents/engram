@@ -4303,12 +4303,21 @@ def _rebuild_principle_triggers() -> dict:
         index: dict[str, dict] = {}
         by_kind: dict[str, int] = {}
         for relation, ptype, kind, nudge_key, mode, bidirectional in _PRINCIPLE_TRIGGER_SPECS:
+            # Trigger-side is_current fix (#1698, Luria's catch, confirmed by
+            # Sol reviewing #1702): the join previously filtered only the
+            # principle side (n.is_current = 1); a retracted/superseded
+            # trigger node still landed in the registry keyed by its node
+            # ID. Added join on the trigger side (t), filtered
+            # is_current = 1, in both the forward and bidirectional-reverse
+            # queries below.
             rows = conn.execute(
                 """SELECT e.source_id AS trigger_id, e.target_id AS principle_id,
                           n.claim AS claim, n.metadata AS meta
                    FROM edges e
                    JOIN nodes n ON n.id = e.target_id
-                   WHERE e.relation = ? AND n.type = ? AND n.is_current = 1""",
+                   JOIN nodes t ON t.id = e.source_id
+                   WHERE e.relation = ? AND n.type = ? AND n.is_current = 1
+                     AND t.is_current = 1""",
                 (relation, ptype),
             ).fetchall()
             if bidirectional:
@@ -4317,7 +4326,9 @@ def _rebuild_principle_triggers() -> dict:
                               n.claim AS claim, n.metadata AS meta
                        FROM edges e
                        JOIN nodes n ON n.id = e.source_id
-                       WHERE e.relation = ? AND n.type = ? AND n.is_current = 1""",
+                       JOIN nodes t ON t.id = e.target_id
+                       WHERE e.relation = ? AND n.type = ? AND n.is_current = 1
+                         AND t.is_current = 1""",
                     (relation, ptype),
                 ).fetchall())
             for r in rows:

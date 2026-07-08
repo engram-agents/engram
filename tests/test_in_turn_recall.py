@@ -178,11 +178,11 @@ def test_tripwire_and_recall_compose(tmp_path, monkeypatch, capsys):
     conn = sqlite3.connect(hook.DB_PATH)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS nodes (
-               id TEXT PRIMARY KEY, type TEXT, is_current INT,
+               id TEXT PRIMARY KEY, type TEXT, claim TEXT, is_current INT,
                memory_status TEXT, metadata TEXT)"""
     )
     conn.execute(
-        """INSERT INTO nodes VALUES ('ls_1', 'lesson', 1, 'active',
+        """INSERT INTO nodes VALUES ('ls_1', 'lesson', 'Placeholder lesson claim.', 1, 'active',
            json_object('situation_pattern', 'danger-cmd',
                        'scaffolding_nudge', 'Check the guard first.'))"""
     )

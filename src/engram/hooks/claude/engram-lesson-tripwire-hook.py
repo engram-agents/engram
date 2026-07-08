@@ -47,11 +47,13 @@ _QUERY = """
 SELECT
     COALESCE(
         json_extract(metadata, '$.scaffolding_nudge'),
-        json_extract(metadata, '$.anchor_line')
+        json_extract(metadata, '$.anchor_line'),
+        json_extract(metadata, '$.surfacing_nudge'),
+        claim
     ) AS nudge,
     json_extract(metadata, '$.situation_pattern')  AS pattern
 FROM nodes
-WHERE type IN ('lesson', 'cornerstone')
+WHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')
   AND is_current = 1
   AND memory_status = 'active'
   AND json_extract(metadata, '$.situation_pattern') IS NOT NULL

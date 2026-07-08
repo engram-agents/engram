@@ -113,7 +113,7 @@ class TestMcpLivenessIntegration:
                             lambda: {"idf_gate_enabled": False,
                                      "short_prompt_threshold_chars": 0,
                                      "prev_response_tail_chars": 0})
-        monkeypatch.setattr(mod, "check_incident_tripwire", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "check_principle_triggers", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "check_error_patterns", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_query_attached_packs", lambda *a, **kw: [])
         monkeypatch.setattr(mod, "format_nudge", lambda *a, **kw: "")

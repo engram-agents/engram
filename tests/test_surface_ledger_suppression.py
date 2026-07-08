@@ -432,26 +432,37 @@ class TestLedgerRetentionPruning(LedgerTestBase):
 
 class TestTripwireExemptFromSuppression(LedgerTestBase):
     def test_tripwire_ignores_ledger_state(self):
-        """check_incident_tripwire has no session_id parameter and doesn't
-        consult the surfaced ledger at all — it fires purely from
-        error_incidents.json regardless of surfaced-ledger repeat count."""
-        incidents_path = os.path.join(self.tmp, "error_incidents.json")
-        with open(incidents_path, "w", encoding="utf-8") as f:
+        """check_principle_triggers (lesson kind; #1698 slice 2 renamed this
+        from check_incident_tripwire) has no session_id parameter and
+        doesn't consult the surfaced ledger at all — it fires purely from
+        principle_triggers.json regardless of surfaced-ledger repeat
+        count."""
+        registry_path = os.path.join(self.tmp, "principle_triggers.json")
+        with open(registry_path, "w", encoding="utf-8") as f:
             json.dump({
                 "ob_ledger_tripwire": {
-                    "lesson_id": "ls_0001",
-                    "lesson_claim": "test lesson",
-                    "scaffolding_nudge": "do the corrective action",
+                    "principle_id": "ls_0001",
+                    "kind": "lesson",
+                    "claim": "test lesson",
+                    "nudge": "do the corrective action",
                 }
             }, f)
-        self.hook.ERROR_INCIDENTS_PATH = incidents_path
+        self.hook.PRINCIPLE_TRIGGERS_PATH = registry_path
 
         # Seed the surfaced ledger as if this id had already been suppressed
         # 10 times over — the tripwire must still fire every time.
         self._seed_ledger("s1", [["ob_ledger_tripwire"]] * 10)
 
-        result1 = self.hook.check_incident_tripwire(["ob_ledger_tripwire"])
-        result2 = self.hook.check_incident_tripwire(["ob_ledger_tripwire"])
+        # Two calls separated by the cross-kind cooldown window: unification
+        # (#1698 slice 2) gave lessons a real cross-prompt cooldown they
+        # never had before, so two IDENTICAL prompt_counts would now be
+        # suppressed by cooldown -- a different mechanism than the one this
+        # test targets. Separating by the window isolates ledger-exemption
+        # (this test's subject) from cooldown-suppression (a real, unrelated
+        # behavior change).
+        window = self.hook.PRINCIPLE_TRIGGER_COOLDOWN_PROMPTS
+        result1 = self.hook.check_principle_triggers(["ob_ledger_tripwire"], prompt_count=1)
+        result2 = self.hook.check_principle_triggers(["ob_ledger_tripwire"], prompt_count=1 + window)
         self.assertIn("ENGRAM Tripwire", result1)
         self.assertIn("ENGRAM Tripwire", result2)
         self.assertEqual(result1, result2)

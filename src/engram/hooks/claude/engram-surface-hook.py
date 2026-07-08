@@ -143,6 +143,15 @@ KNOWLEDGE_DB_PATH = os.path.join(ENGRAM_HOME, "knowledge.db")
 # (#1691; same failure class the stop-hook #840/#845 gates solved).
 CORNERSTONE_ANCHOR_COOLDOWN_PROMPTS = 10
 
+# Unified principle-trigger registry (#1698 slice 2) — one registry,
+# four kinds (lesson/cornerstone/axiom/goal), replacing the separate
+# error-incidents + cornerstone-anchors read paths below.
+PRINCIPLE_TRIGGERS_PATH = os.path.join(ENGRAM_HOME, "principle_triggers.json")
+PRINCIPLE_TRIGGER_STATE_PATH = os.path.join(ENGRAM_HOME, "principle-trigger-state.json")
+PRINCIPLE_TRIGGER_COOLDOWN_PROMPTS = 10  # same value as today's CORNERSTONE_ANCHOR_COOLDOWN_PROMPTS
+PRINCIPLE_TRIGGER_CAP = 2  # design doc §3 point 3
+_PRINCIPLE_KIND_PRIORITY = {"lesson": 0, "axiom": 1, "cornerstone": 2, "goal": 3}  # lower = higher priority
+
 def get_user_name() -> str:
     """Read primary_user from $ENGRAM_HOME/config.json; fall back to 'the human'."""
     try:
@@ -1456,137 +1465,161 @@ def check_error_patterns(prompt: str) -> str:
     return "\n".join(warnings)
 
 
-def check_incident_tripwire(matched_ids: list) -> str:
-    """Check if any engram_surface matched IDs are error incident observations.
+def check_principle_triggers(matched_ids: list, prompt_count: int) -> str:
+    """Unified principle-trigger check (#1698 slice 2) — one registry, four
+    kinds (lesson/cornerstone/axiom/goal), replacing the separate
+    check_incident_tripwire + check_cornerstone_anchor.
 
-    Reads $ENGRAM_HOME/error_incidents.json (maps incident obs IDs → lesson info).
-    When a matched node is an incident, surfaces the lesson's scaffolding_nudge.
-
-    This is the primary tripwire mechanism (incident-based architecture):
-    - Incidents are written in task-level language → semantically matchable
-    - Lessons are abstract patterns → surfaced via graph edge, not direct match
-    - More incidents linked to a lesson = more matching surface area
+    Byte-compatibility requirement: lesson and cornerstone renderings must
+    stay IDENTICAL to their pre-unification format — both are load-bearing
+    in existing transcripts/tests. Axiom and goal are new kinds with no
+    prior rendering to preserve; they use the design doc's generic
+    "[Principle trigger (...)]" register-tagged form.
     """
     if not matched_ids:
         return ""
-
     try:
-        with open(ERROR_INCIDENTS_PATH, "r") as f:
-            index = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return ""
-
-    if not index:
-        return ""
-
-    warnings = []
-    seen_lessons = set()
-    for mid in matched_ids:
-        if mid in index:
-            entry = index[mid]
-            lesson_id = entry.get("lesson_id", "")
-            if lesson_id in seen_lessons:
-                continue  # Don't repeat the same lesson
-            seen_lessons.add(lesson_id)
-            nudge = entry.get("scaffolding_nudge", "")
-            lesson_claim = entry.get("lesson_claim", "")
-            if nudge:
-                warnings.append(
-                    f"[ENGRAM Tripwire ({lesson_id}): {lesson_claim}]\n"
-                    f"  Action: {nudge}\n"
-                    f"  (Triggered by incident match: {mid})"
-                )
-
-    return "\n".join(warnings)
-
-
-def check_cornerstone_anchor(matched_ids: list, prompt_count: int) -> str:
-    """Check if any surfaced IDs are exemplars of a cornerstone (#1691).
-
-    Reads $ENGRAM_HOME/cornerstone_anchors.json (exemplar IDs → cornerstone
-    info, rebuilt by engram_register_exemplar). Same incident-index
-    architecture as the lesson tripwire: concrete situations are the
-    matching surface; the abstract principle is reached via the
-    exemplifies edge. A direct match on the cornerstone's own ID also
-    fires (the cornerstone itself can surface).
-
-    Cross-prompt cooldown: a cornerstone that fired within the last
-    CORNERSTONE_ANCHOR_COOLDOWN_PROMPTS prompts is suppressed, so anchors
-    stay salient instead of becoming banner blindness. State keyed on the
-    prompts_since_compaction counter; a counter reset (compaction) clears
-    the cooldown, which is correct — re-anchoring after a context reset is
-    exactly when the nudge is most valuable.
-    """
-    if not matched_ids:
-        return ""
-
-    try:
-        return _check_cornerstone_anchor_inner(matched_ids, prompt_count)
+        return _check_principle_triggers_inner(matched_ids, prompt_count)
     except Exception:
-        # This hook runs on EVERY prompt — a malformed cache (valid JSON,
-        # wrong shape) must degrade to silence, never break the hook.
+        # Runs on every prompt — a malformed cache must degrade to
+        # silence, never break the hook (same contract as the function
+        # this replaces).
         return ""
 
 
-def _check_cornerstone_anchor_inner(matched_ids: list, prompt_count: int) -> str:
-    """Body of check_cornerstone_anchor — see its docstring."""
+def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> str:
     try:
-        with open(CORNERSTONE_ANCHORS_PATH, "r") as f:
-            index = json.load(f)
+        with open(PRINCIPLE_TRIGGERS_PATH, "r") as f:
+            registry = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
+        # Deviation from design doc §2's literal "fallback to legacy":
+        # slice 1's rebuild is additive and runs at the same 3 sites the
+        # legacy caches already rebuild from, so this file is realistically
+        # only absent in the brief window right after an upgrade before any
+        # lesson/cornerstone/axiom/goal edge write has happened -- and in
+        # that window the legacy caches would also be empty of anything
+        # meaningful. Returning "" here (rather than re-implementing a
+        # parallel legacy read path) is a simplification; flagging this
+        # explicitly for reviewer/Kepler to confirm or override, since the
+        # design doc's literal words say "fallback to legacy."
         return ""
-    if not index or not isinstance(index, dict):
+    if not registry or not isinstance(registry, dict):
         return ""
 
-    # Direct cornerstone-ID hits: build a reverse view so a surfaced
-    # cornerstone fires its own anchor even with no exemplar in the match.
-    by_cornerstone = {}
-    for entry in index.values():
-        cid = entry.get("cornerstone_id", "")
-        if cid:
-            by_cornerstone[cid] = entry
+    # Reverse view: a matched ID that IS a principle's own node ID (not a
+    # trigger) also fires -- mirrors today's by_cornerstone reverse lookup,
+    # generalized across all four kinds. Reviewer-fairy flag (PR #1713):
+    # pre-unification, only cornerstones had this reverse lookup
+    # (check_incident_tripwire had no equivalent for lessons); unification
+    # widens direct-ID firing to lesson/axiom/goal too. This is intentional
+    # (the registry doesn't distinguish "reached via trigger" from "reached
+    # via own ID" per kind) but wasn't called out as a flagged deviation at
+    # write time -- documented here as the third one alongside sec2.2/sec2.3
+    # in the spec, with `test_fires_on_direct_lesson_id` covering the
+    # previously-untested lesson-kind path (test_fires_on_direct_cornerstone_id
+    # already covered cornerstone).
+    by_principle = {}
+    for entry in registry.values():
+        pid = entry.get("principle_id", "")
+        if pid:
+            by_principle[pid] = entry
 
     try:
-        with open(CORNERSTONE_ANCHOR_STATE_PATH, "r") as f:
+        with open(PRINCIPLE_TRIGGER_STATE_PATH, "r") as f:
             state = json.load(f)
         if not isinstance(state, dict):
             state = {}
     except (FileNotFoundError, json.JSONDecodeError):
         state = {}
 
-    lines = []
-    fired = set()
+    # Gather all candidates that matched AND are past cooldown, deduped
+    # per principle_id (one firing per principle per prompt -- same
+    # semantics as today's `fired`/`seen_lessons` sets, now shared across
+    # all four kinds since it's one registry).
+    candidates = []  # list of (kind, principle_id, entry, matched_via)
+    seen_principles = set()
     for mid in matched_ids:
-        entry = index.get(mid) or by_cornerstone.get(mid)
+        entry = registry.get(mid) or by_principle.get(mid)
         if not entry:
             continue
-        cid = entry.get("cornerstone_id", "")
-        if not cid or cid in fired:
+        pid = entry.get("principle_id", "")
+        if not pid or pid in seen_principles:
             continue
-        last = state.get(cid)
-        # Cooldown: suppress if fired recently in this counter epoch.
-        # A counter reset (last > prompt_count) reads as cooldown expired.
+        last = state.get(pid)
         if (
             isinstance(last, (int, float))
             and last <= prompt_count
-            and (prompt_count - last) < CORNERSTONE_ANCHOR_COOLDOWN_PROMPTS
+            and (prompt_count - last) < PRINCIPLE_TRIGGER_COOLDOWN_PROMPTS
         ):
             continue
-        fired.add(cid)
-        anchor = entry.get("anchor_line") or entry.get("cornerstone_claim", "")
-        if anchor:
-            lines.append(f"[Cornerstone anchor ({cid})]: {anchor}")
+        seen_principles.add(pid)
+        candidates.append((entry.get("kind", ""), pid, entry, mid))
 
-    if not lines:
+    if not candidates:
         return ""
 
-    for cid in fired:
-        state[cid] = prompt_count
+    # Priority sort (lesson > axiom > cornerstone > goal), cap total to 2.
+    # NOTE this is a real behavior change for lessons, which previously had
+    # NO cross-prompt cooldown (only per-fire dedup) -- unification means
+    # lessons now share the same fixed cooldown as cornerstones did. This
+    # is what design doc §6 means by "v1 fixed cooldown carried over" --
+    # carried over to ALL kinds, not just cornerstone. Flagging explicitly
+    # since it changes observed lesson-tripwire cadence.
+    #
+    # Filter to known kinds BEFORE the cap slice (Ariadne's colleague-review
+    # catch on PR #1713, corroborating the reviewer-fairy's own flag): the
+    # render loop's `else: continue` only skips producing a line for an
+    # unrecognized kind -- it doesn't stop that candidate from consuming a
+    # cap slot or getting cooldown-stamped, since both happen against
+    # `rendered` unconditionally. Filtering here fixes it properly instead of
+    # relying on the render-loop guard alone. Latent today (registry only
+    # ever writes the 4 known kinds); matters if a 5th kind is ever added.
+    candidates = [c for c in candidates if c[0] in _PRINCIPLE_KIND_PRIORITY]
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda c: _PRINCIPLE_KIND_PRIORITY[c[0]])
+    rendered = candidates[:PRINCIPLE_TRIGGER_CAP]
+
+    lines = []
+    for kind, pid, entry, mid in rendered:
+        claim = entry.get("claim", "")
+        nudge = entry.get("nudge", "") or claim
+        if kind == "lesson":
+            # BYTE-COMPATIBLE with pre-unification check_incident_tripwire.
+            # mid here is the incident/trigger ID (was `mid` in old code).
+            lines.append(
+                f"[ENGRAM Tripwire ({pid}): {claim}]\n"
+                f"  Action: {nudge}\n"
+                f"  (Triggered by incident match: {mid})"
+            )
+        elif kind == "cornerstone":
+            # BYTE-COMPATIBLE with pre-unification check_cornerstone_anchor.
+            lines.append(f"[Cornerstone anchor ({pid})]: {nudge}")
+        elif kind == "axiom":
+            lines.append(f"[Principle trigger ({pid}, constraining)]: {claim} → Constraint: {nudge}")
+        elif kind == "goal":
+            lines.append(f"[Principle trigger ({pid}, directional)]: {claim} → Serves: {nudge}")
+        else:
+            # Unreachable in practice: `candidates` is now pre-filtered to
+            # known kinds above, before the cap slice. Kept as a
+            # belt-and-suspenders backstop (an unrecognized kind must not
+            # produce a garbage line even if the upstream filter is ever
+            # bypassed) -- the real fix for cap-slot/cooldown consumption is
+            # the pre-filter, per Ariadne's colleague-review catch on #1713.
+            continue
+
+    # Stamp cooldown ONLY for what actually rendered (top 2 after the cap) --
+    # a cap-bumped candidate stays eligible next prompt rather than being
+    # suppressed for a firing it never got to make. Matches old code's
+    # semantics (`for cid in fired: state[cid] = prompt_count` where `fired`
+    # was exactly the rendered set).
+    for _kind, pid, _entry, _mid in rendered:
+        state[pid] = prompt_count
     try:
-        with open(CORNERSTONE_ANCHOR_STATE_PATH, "w") as f:
+        with open(PRINCIPLE_TRIGGER_STATE_PATH, "w") as f:
             json.dump(state, f)
     except OSError:
-        pass  # state write failure → worst case an early re-fire; never block
+        pass  # state write failure -> worst case an early re-fire; never block
 
     return "\n".join(lines)
 
@@ -1710,22 +1743,21 @@ def main():
     # Build context parts
     parts = []
 
-    # Cognitive tripwire — incident-based matching (primary) or keyword fallback
+    # Unified principle-trigger check (#1698 slice 2) — one registry, four
+    # kinds (lesson/cornerstone/axiom/goal), replacing the separate
+    # check_incident_tripwire + check_cornerstone_anchor calls.
     matched_ids = result.get("matched_ids", []) if result else []
-    tripwire = check_incident_tripwire(matched_ids)
-    if not tripwire:
-        # Fallback to keyword matching when no incident matches found
-        tripwire = check_error_patterns(prompt)
-    if tripwire:
-        parts.append(tripwire)
-
-    # Cornerstone anchor — sibling of the lesson tripwire for orienting
-    # principles (#1691). Cooldown-gated so anchors stay salient.
-    cornerstone_anchor = check_cornerstone_anchor(
+    principle_triggers = check_principle_triggers(
         matched_ids, counter["prompts_since_compaction"]
     )
-    if cornerstone_anchor:
-        parts.append(cornerstone_anchor)
+    if not principle_triggers:
+        # Preserve the semantic-keyword fallback for lessons specifically --
+        # this is independent of the incident-index match and must survive
+        # unification unchanged (design doc doesn't mention it; it's Locus-3
+        # semantic-content matching, orthogonal to the trigger registry).
+        principle_triggers = check_error_patterns(prompt)
+    if principle_triggers:
+        parts.append(principle_triggers)
 
     # Warn if daemon is down (semantic search degraded).
     # Distinguish a cold-start warmup (recent launch attempt) from a
