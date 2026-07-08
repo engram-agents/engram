@@ -4372,6 +4372,44 @@ def _rebuild_principle_triggers() -> dict:
         conn.close()
 
 
+def _with_state_lock(lock_path, fn):
+    """Run fn() (a read-modify-write closure) while holding an exclusive,
+    BLOCKING flock on lock_path. Unlike #1709's non-blocking pattern, this
+    one blocks -- the critical section is a fast local file read+write (no
+    daemon round-trip), so a brief wait is cheap and correctness (no lost
+    update) matters more than never-block here. Degrades to running fn()
+    unlocked if fcntl/lockfile-open fails (non-POSIX, permissions) -- same
+    never-crash contract as #1709's degrade path, just without the
+    non-blocking contention branch (there's nothing to suppress; fn() still
+    runs, just unprotected).
+
+    #1720: this exact ~15-line helper is duplicated in
+    src/engram/hooks/claude/engram-surface-hook.py rather than shared -- this
+    module (engram_core.py, MCP server process) and the hook script (a
+    separate subprocess invoked by Claude Code) have no shared import surface
+    today, and a new shared module for ~15 lines isn't worth the engineering
+    (see spec docs/specs/1720-principle-state-write-race.md). If either copy
+    changes, check the other.
+    """
+    try:
+        import fcntl
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    except Exception:
+        return fn()  # degrade: run unlocked rather than crash or skip
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)  # blocking -- no LOCK_NB
+        return fn()
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
 def _reset_principle_enactments(principle_id: str) -> None:
     """Reset enactments to 0 for principle_id in principle-trigger-state.json
     (#1698 slice 3 §3 — "registering a NEW exemplar/incident against the
@@ -4391,32 +4429,42 @@ def _reset_principle_enactments(principle_id: str) -> None:
     the hooks' own pattern, so a concurrent hook-side read never sees a
     partial write.
 
-    Colleague-review note (Ariadne, PR #1717): the atomicity claim above
-    covers only TORN READS, not a LOST UPDATE — a concurrent hook-side
-    read-modify-write racing this function can still silently drop
-    whichever side loses (last-writer-wins on the whole file). Tracked as
-    #1720 (same TOCTOU class #1709 fixed with flock); not yet guarded here.
+    #1720: the read-modify-write below now runs under a blocking flock (see
+    `_with_state_lock`) to close the LOST-UPDATE race flagged in colleague
+    review (Ariadne, PR #1717): the atomicity claim above only ever covered
+    TORN READS, not a concurrent hook-side read-modify-write silently
+    dropping whichever side loses (last-writer-wins on the whole file). Same
+    TOCTOU class #1709 fixed with flock, but blocking rather than
+    non-blocking-suppress -- see docs/specs/1720-principle-state-write-race.md
+    "Why NOT #1709's non-blocking-suppress pattern" for why this path can't
+    use #1709's shape (this call site is not on the render-decision path, so
+    blocking briefly here is safe).
     """
     path = os.path.join(DATA_DIR, "principle-trigger-state.json")
-    try:
-        with open(path, "r") as f:
-            state = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        state = {}
-    entry = state.get(principle_id)
-    if isinstance(entry, int):
-        entry = {"last_fired_prompt": entry, "strength": 1.0, "enactments": 0, "fires": 0}
-    if not isinstance(entry, dict):
-        entry = {"last_fired_prompt": 0, "strength": 1.0, "enactments": 0, "fires": 0}
-    entry["enactments"] = 0
-    state[principle_id] = entry
-    try:
-        tmp = str(path) + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(state, f)
-        os.replace(tmp, path)
-    except OSError:
-        pass
+    lock_path = path + ".lock"
+
+    def _do_reset():
+        try:
+            with open(path, "r") as f:
+                state = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            state = {}
+        entry = state.get(principle_id)
+        if isinstance(entry, int):
+            entry = {"last_fired_prompt": entry, "strength": 1.0, "enactments": 0, "fires": 0}
+        if not isinstance(entry, dict):
+            entry = {"last_fired_prompt": 0, "strength": 1.0, "enactments": 0, "fires": 0}
+        entry["enactments"] = 0
+        state[principle_id] = entry
+        try:
+            tmp = str(path) + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    _with_state_lock(lock_path, _do_reset)
 
 
 # ---------------------------------------------------------------------------

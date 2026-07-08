@@ -982,3 +982,193 @@ def test_principle_coverage_uncovered_and_covered_channels(tmp_path):
     assert pattern_id not in uncovered_ids, "situation_pattern channel must exclude from uncovered"
     assert wb_id not in uncovered_ids, "warm_briefing_anchor channel must exclude from uncovered"
     assert claude_id not in uncovered_ids, "claude_md channel must exclude from uncovered"
+
+
+# ---------------------------------------------------------------------------
+# §8 — #1720 atomic read-modify-write for principle-trigger-state.json
+#
+# Fixes the cross-process lost-update race between the hook-side write-back
+# (_check_principle_triggers_inner, engram-surface-hook.py) and the
+# server-side reset (_reset_principle_enactments, engram_core.py): both
+# read-whole-file / modify-in-memory / atomic-write-whole-file, so whichever
+# writes last silently discards the other's change to a DIFFERENT
+# principal's entry in the same file. The fix is a dedicated BLOCKING flock
+# (`_with_state_lock`, duplicated once per file -- see the spec's "Why NOT
+# #1709's non-blocking-suppress pattern": this is the primary T1
+# lesson-tripwire render path, so silently suppressing on contention
+# (#1709's shape) is not an option here).
+# ---------------------------------------------------------------------------
+
+
+def _fresh_core_with_data_dir(tmp_path, monkeypatch):
+    """Import a fresh engram_core (no full server bootstrap needed --
+    _reset_principle_enactments / _with_state_lock only touch DATA_DIR,
+    not the DB), with DATA_DIR monkeypatched to tmp_path so it resolves
+    principle-trigger-state.json to the SAME file the hook-side module
+    (loaded via _load_surface_hook against the same tmp_path as ENGRAM_HOME)
+    uses.
+
+    Full-suite-only flake (caught by running the full sibling suite per
+    handoff discipline, NOT visible file-in-isolation): a plain `import
+    engram_core` after the sys.modules purge below is vulnerable to
+    cross-test sys.path pollution elsewhere in the suite (some earlier test,
+    exercising a hook's `_resolve_runtime_dir` fallback chain, ends up
+    inserting the PARENT checkout's `src/engram` -- this worktree lives
+    nested under `.claude/worktrees/<id>/` inside the main checkout tree --
+    ahead of this worktree's own `src/engram` in `sys.path`). Explicitly
+    forcing this worktree's `src/engram` to `sys.path[0]` immediately before
+    the import makes resolution deterministic regardless of what any other
+    test file has done to `sys.path` -- matches this file's own
+    `_load_surface_hook` pattern of never trusting ambient `sys.path` order
+    for locating repo-local modules under test."""
+    for key in list(sys.modules):
+        if key == "server" or key.startswith("engram_"):
+            del sys.modules[key]
+    src_engram = str(PROJECT_ROOT / "src" / "engram")
+    if src_engram in sys.path:
+        sys.path.remove(src_engram)
+    sys.path.insert(0, src_engram)
+    import engram_core as core
+    assert Path(core.__file__).resolve() == (PROJECT_ROOT / "src" / "engram" / "engram_core.py").resolve(), (
+        f"engram_core resolved to {core.__file__!r}, not this worktree's copy -- "
+        "sys.path pollution from another test file (see docstring)"
+    )
+    monkeypatch.setattr(core, "DATA_DIR", str(tmp_path))
+    return core
+
+
+def test_concurrent_hook_and_reset_writes_lose_no_update(tmp_path, monkeypatch):
+    """Core regression for #1720: concurrent hook-side write-backs
+    (_check_principle_triggers_inner, via check_principle_triggers) and a
+    concurrent server-side _reset_principle_enactments call, all against the
+    SAME state file, threaded with a threading.Barrier for maximal overlap.
+    After all complete, every principal the reset call touched must show
+    enactments == 0, AND every principal the hook-side calls stamped must
+    show the expected last_fired_prompt/fires -- proving BOTH writers'
+    updates survive (the pre-#1720 bug: last-writer-wins on the whole file
+    silently drops whichever side loses)."""
+    import threading
+
+    core = _fresh_core_with_data_dir(tmp_path, monkeypatch)
+    mod = _load_surface_hook(tmp_path, monkeypatch)
+
+    n_hook = 5
+    n_reset = 5
+
+    registry = {
+        f"ob_hook_{i}": {
+            "principle_id": f"ls_hook_{i}",
+            "kind": "lesson",
+            "claim": f"Hook claim {i}.",
+            "nudge": f"Hook nudge {i}.",
+        }
+        for i in range(n_hook)
+    }
+    _write_json(tmp_path / "principle_triggers.json", registry)
+
+    # Reset-side principals start with nonzero enactments (and other fields
+    # that must survive the reset untouched); hook-side principals start
+    # absent from state (fresh fire).
+    initial_state = {
+        f"ls_reset_{i}": {"last_fired_prompt": 5, "strength": 1.0, "enactments": 7, "fires": 3}
+        for i in range(n_reset)
+    }
+    _write_json(tmp_path / "principle-trigger-state.json", initial_state)
+
+    barrier = threading.Barrier(n_hook + n_reset)
+
+    def hook_worker(i):
+        barrier.wait()
+        mod.check_principle_triggers([f"ob_hook_{i}"], prompt_count=100)
+
+    def reset_worker(i):
+        barrier.wait()
+        core._reset_principle_enactments(f"ls_reset_{i}")
+
+    threads = [threading.Thread(target=hook_worker, args=(i,)) for i in range(n_hook)]
+    threads += [threading.Thread(target=reset_worker, args=(i,)) for i in range(n_reset)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    with open(tmp_path / "principle-trigger-state.json") as f:
+        final_state = json.load(f)
+
+    for i in range(n_reset):
+        pid = f"ls_reset_{i}"
+        assert pid in final_state, f"{pid} lost entirely from final state -- lost update"
+        assert final_state[pid]["enactments"] == 0, f"{pid} reset must survive concurrent hook writes"
+        assert final_state[pid]["last_fired_prompt"] == 5, f"{pid} reset must not disturb last_fired_prompt"
+        assert final_state[pid]["fires"] == 3, f"{pid} reset must not disturb fires"
+
+    for i in range(n_hook):
+        pid = f"ls_hook_{i}"
+        assert pid in final_state, f"{pid} lost entirely from final state -- lost update"
+        assert final_state[pid]["last_fired_prompt"] == 100, f"{pid} hook-side stamp must survive concurrent reset writes"
+        assert final_state[pid]["fires"] == 1, f"{pid} hook-side fires-increment must survive"
+
+
+def test_with_state_lock_degrades_when_lockfile_open_fails(tmp_path, monkeypatch):
+    """A _with_state_lock call that can't set up (lockfile open fails) still
+    runs its closure -- degrades unlocked, never raises, never skips the
+    read-modify-write. Exercises BOTH duplicated copies of the helper
+    (engram_core.py + engram-surface-hook.py), since the spec duplicates
+    rather than shares this ~15-line helper (#1720)."""
+    core = _fresh_core_with_data_dir(tmp_path, monkeypatch)
+    mod = _load_surface_hook(tmp_path, monkeypatch)
+
+    def _broken_open(*a, **kw):
+        raise OSError("simulated: lockfile open unavailable")
+
+    for helper in (core._with_state_lock, mod._with_state_lock):
+        called = {"n": 0}
+
+        def _closure():
+            called["n"] += 1
+            return "ran-unlocked"
+
+        with mock.patch("os.open", _broken_open):
+            result = helper(str(tmp_path / "some.lock"), _closure)
+
+        assert called["n"] == 1, f"{helper.__module__}._with_state_lock must still run its closure when lock setup fails"
+        assert result == "ran-unlocked"
+
+
+def test_with_state_lock_releases_lock_when_closure_raises(tmp_path, monkeypatch):
+    """The flock is released (via `finally`) even when the wrapped closure
+    raises. Exercises BOTH duplicated copies of the helper (engram_core.py +
+    engram-surface-hook.py) (#1720)."""
+    import fcntl
+
+    core = _fresh_core_with_data_dir(tmp_path, monkeypatch)
+    mod = _load_surface_hook(tmp_path, monkeypatch)
+
+    def _raising_closure():
+        raise RuntimeError("deliberate closure failure")
+
+    for helper in (core._with_state_lock, mod._with_state_lock):
+        lock_path = tmp_path / f"release-{helper.__module__}.lock"
+
+        raised = False
+        try:
+            helper(str(lock_path), _raising_closure)
+        except RuntimeError:
+            raised = True
+        assert raised, f"{helper.__module__}._with_state_lock must propagate the closure's exception, not swallow it"
+
+        # If the lock were still held (finally didn't run / didn't unlock),
+        # a fresh non-blocking acquire attempt on a NEW fd for the same path
+        # would raise BlockingIOError -- flock is per-open-file-description,
+        # not per-process, so a same-process second fd still contends
+        # (verified pattern: test_lock_contention_suppresses_not_blocks in
+        # test_in_turn_recall.py).
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+            assert False, f"{helper.__module__}._with_state_lock did not release the lock when the closure raised"
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)

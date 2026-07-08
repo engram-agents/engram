@@ -1553,6 +1553,62 @@ def _effective_cooldown(kind: str, state_entry: dict) -> int:
     return min(base * (2 ** enactments), RETIREMENT_CEILING_PROMPTS)
 
 
+def _migrate_bare_int_entries(state: dict) -> None:
+    """In-place upconvert any bare-int entry (slice-2 shape: last_fired_prompt
+    only) to the rich slice-3 dict shape. Reviewer-fairy flag (PR #1725):
+    factored out of two identical inline loops (the outer snapshot read and
+    the write-back's fresh re-read under the lock) -- both live in this same
+    module/scope, so unlike the cross-process `_with_state_lock` duplication
+    there's no import-surface constraint justifying two live copies of the
+    same logic here."""
+    for pid, entry in list(state.items()):
+        if isinstance(entry, int):
+            state[pid] = {
+                "last_fired_prompt": entry,
+                "strength": 1.0,
+                "enactments": 0,
+                "fires": 0,
+            }
+
+
+def _with_state_lock(lock_path, fn):
+    """Run fn() (a read-modify-write closure) while holding an exclusive,
+    BLOCKING flock on lock_path. Unlike #1709's non-blocking pattern, this
+    one blocks -- the critical section is a fast local file read+write (no
+    daemon round-trip), so a brief wait is cheap and correctness (no lost
+    update) matters more than never-block here. Degrades to running fn()
+    unlocked if fcntl/lockfile-open fails (non-POSIX, permissions) -- same
+    never-crash contract as #1709's degrade path, just without the
+    non-blocking contention branch (there's nothing to suppress; fn() still
+    runs, just unprotected).
+
+    #1720: this exact ~15-line helper is duplicated in engram_core.py
+    (the MCP server process) rather than shared -- this hook script (a
+    separate subprocess invoked by Claude Code) and engram_core.py have no
+    shared import surface today, and a new shared module for ~15 lines isn't
+    worth the engineering (see spec
+    docs/specs/1720-principle-state-write-race.md). If either copy changes,
+    check the other.
+    """
+    try:
+        import fcntl
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    except Exception:
+        return fn()  # degrade: run unlocked rather than crash or skip
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)  # blocking -- no LOCK_NB
+        return fn()
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
 def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tuple[str, list]:
     try:
         with open(PRINCIPLE_TRIGGERS_PATH, "r") as f:
@@ -1606,14 +1662,7 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tup
     # entry present in the file is normalized here, not just ones that fire
     # this call, so a state write later in this same call persists the
     # upgraded shape for the whole file, not just the touched principles.
-    for _mig_pid, _mig_entry in list(state.items()):
-        if isinstance(_mig_entry, int):
-            state[_mig_pid] = {
-                "last_fired_prompt": _mig_entry,
-                "strength": 1.0,
-                "enactments": 0,
-                "fires": 0,
-            }
+    _migrate_bare_int_entries(state)
 
     # Gather all candidates that matched AND are past their EFFECTIVE
     # cooldown (#1698 slice 3 §1.2 — decay math replaces the flat
@@ -1712,20 +1761,65 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tup
     # `_emitter` singleton are already in scope there; this function stays a
     # pure `(matched_ids, prompt_count) -> (text, rendered)` function with no
     # session_id/transcript_path threading). The caller emits from `rendered`.
-    for _kind, pid, _entry, _mid in rendered:
-        existing = state.get(pid)
-        if not isinstance(existing, dict):
-            existing = {"strength": 1.0, "enactments": 0, "fires": 0}
-        existing["last_fired_prompt"] = prompt_count
-        existing["fires"] = existing.get("fires", 0) + 1
-        existing.setdefault("strength", 1.0)
-        existing.setdefault("enactments", 0)
-        state[pid] = existing
-    try:
-        with open(PRINCIPLE_TRIGGER_STATE_PATH, "w") as f:
-            json.dump(state, f)
-    except OSError:
-        pass  # state write failure -> worst case an early re-fire; never block
+    #
+    # #1720: the write-back runs under a blocking `_with_state_lock`, and
+    # re-reads the state file FRESH from disk inside the lock rather than
+    # reusing the `state` snapshot read at the top of this function -- a
+    # concurrent server-side `_reset_principle_enactments` call (engram_core.py,
+    # MCP server process) could have landed between that snapshot read and
+    # now; merging this call's updates onto the stale snapshot would silently
+    # clobber that reset (the lost-update race this spec fixes). The
+    # cooldown/decay DECISION above (which principles matched, `rendered`)
+    # still comes from the snapshot read -- only the write-back needs
+    # exclusivity with the other writer (see spec's "Why NOT #1709's
+    # non-blocking-suppress pattern").
+    def _write_back():
+        try:
+            with open(PRINCIPLE_TRIGGER_STATE_PATH, "r") as f:
+                fresh_state = json.load(f)
+            if not isinstance(fresh_state, dict):
+                fresh_state = {}
+        except (FileNotFoundError, json.JSONDecodeError):
+            fresh_state = {}
+
+        # Re-apply the same bare-int-entry upconversion (§1.1) done on the
+        # snapshot read above -- that migrated copy isn't reused here (it may
+        # be stale relative to a concurrent writer), so this freshly-read
+        # copy needs its own migration pass to preserve the existing
+        # opportunistic whole-file-migrates-on-any-write behavior.
+        _migrate_bare_int_entries(fresh_state)
+
+        for _kind, pid, _entry, _mid in rendered:
+            existing = fresh_state.get(pid)
+            if not isinstance(existing, dict):
+                existing = {"strength": 1.0, "enactments": 0, "fires": 0}
+            existing["last_fired_prompt"] = prompt_count
+            existing["fires"] = existing.get("fires", 0) + 1
+            existing.setdefault("strength", 1.0)
+            existing.setdefault("enactments", 0)
+            fresh_state[pid] = existing
+
+        try:
+            # Additional #1720 hardening, found during self-review: this
+            # write was a direct `open(...,'w')` even pre-#1720 (unlike
+            # _reset_principle_enactments's tmp+os.replace) -- fine before,
+            # because the lock now held here means no COOPERATING writer can
+            # interleave, but a concurrent snapshot READ (the one at the top
+            # of this function, which deliberately stays outside the lock)
+            # could still observe a torn/truncated file mid-write and
+            # degrade to an empty state, risking a spurious re-fire. Switch
+            # to tmp+os.replace so a reader never sees a partial write,
+            # matching the convention already used by _reset_principle_
+            # enactments and by _write_state in the sibling in_turn_recall
+            # state file.
+            tmp = str(PRINCIPLE_TRIGGER_STATE_PATH) + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(fresh_state, f)
+            os.replace(tmp, str(PRINCIPLE_TRIGGER_STATE_PATH))
+        except OSError:
+            pass  # state write failure -> worst case an early re-fire; never block
+
+    _with_state_lock(str(PRINCIPLE_TRIGGER_STATE_PATH) + ".lock", _write_back)
 
     return "\n".join(lines), rendered
 
