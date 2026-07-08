@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from forum.board_projects import (
+    DEFAULT_GITHUB_REPO,
     _batch_gh_reconcile,
     _effective_status,
     _gh_pr_state,
@@ -123,11 +124,16 @@ def _board_with_gh_mock(store, gh_mock: dict) -> list:
     """Call read_project_board(store) with gh state mocked.
 
     Args:
-        gh_mock: dict mapping pr_number string → state string.
+        gh_mock: dict mapping pr_number string → state string (bare number,
+            not repo-qualified -- #1715 threaded (repo, pr_number) tuples
+            through the real reconciliation, but every fixture in this file
+            uses an unqualified pr/<N> anchor, which always resolves to
+            DEFAULT_GITHUB_REPO, so this helper still takes bare pr_number
+            keys for readability and translates to the real tuple keys).
             Any PR number not in the dict returns 'unknown'.
     """
-    def _fake_batch(pr_numbers):
-        return {pr: gh_mock.get(pr, "unknown") for pr in pr_numbers}
+    def _fake_batch(pr_refs):
+        return {(repo, num): gh_mock.get(num, "unknown") for repo, num in pr_refs}
 
     with patch("forum.board_projects._batch_gh_reconcile", side_effect=_fake_batch):
         return read_project_board(store)
@@ -261,8 +267,8 @@ class TestGhReconcile:
 class TestGhDegrade:
     def test_gh_unknown_does_not_crash(self, store):
         """When gh returns unknown, board still renders (no exception)."""
-        def _always_unknown(pr_numbers):
-            return {pr: "unknown" for pr in pr_numbers}
+        def _always_unknown(pr_refs):
+            return {ref: "unknown" for ref in pr_refs}
 
         with patch("forum.board_projects._batch_gh_reconcile", side_effect=_always_unknown):
             items = read_project_board(store)
@@ -272,8 +278,8 @@ class TestGhDegrade:
 
     def test_gh_unknown_sets_flag(self, store):
         """Items with PR refs and unknown gh state have gh_unknown=True."""
-        def _always_unknown(pr_numbers):
-            return {pr: "unknown" for pr in pr_numbers}
+        def _always_unknown(pr_refs):
+            return {ref: "unknown" for ref in pr_refs}
 
         with patch("forum.board_projects._batch_gh_reconcile", side_effect=_always_unknown):
             items = read_project_board(store)
@@ -593,13 +599,13 @@ class TestNoWrites:
 class TestHelpers:
     def test_effective_status_gh_merged_overrides_inprogress(self):
         """_effective_status: gh merged overrides in-progress file status."""
-        eff, gh = _effective_status("in-progress", "pr/42", {"42": "merged"})
+        eff, gh = _effective_status("in-progress", "pr/42", {(DEFAULT_GITHUB_REPO, "42"): "merged"})
         assert eff == "done"
         assert gh == "merged"
 
     def test_effective_status_gh_closed_overrides_inreview(self):
         """_effective_status: gh closed overrides in-review file status."""
-        eff, gh = _effective_status("in-review", "pr/42", {"42": "closed"})
+        eff, gh = _effective_status("in-review", "pr/42", {(DEFAULT_GITHUB_REPO, "42"): "closed"})
         assert eff == "done"
         assert gh == "closed"
 
@@ -611,14 +617,35 @@ class TestHelpers:
 
     def test_effective_status_open_pr_passthrough(self):
         """_effective_status: open PR → file status passes through."""
-        eff, gh = _effective_status("in-review", "pr/42", {"42": "open"})
+        eff, gh = _effective_status("in-review", "pr/42", {(DEFAULT_GITHUB_REPO, "42"): "open"})
         assert eff == "in-review"
         assert gh == "open"
 
     def test_effective_status_unknown_gh_passthrough(self):
         """_effective_status: unknown gh state → file status passes through."""
-        eff, gh = _effective_status("in-progress", "pr/42", {"42": "unknown"})
+        eff, gh = _effective_status("in-progress", "pr/42", {(DEFAULT_GITHUB_REPO, "42"): "unknown"})
         assert eff == "in-progress"
+        assert gh == "unknown"
+
+    def test_effective_status_repo_qualified_anchor(self):
+        """_effective_status: a repo-qualified anchor (#1715) resolves against
+        that repo's key in gh_states, not DEFAULT_GITHUB_REPO."""
+        eff, gh = _effective_status(
+            "in-progress", "pr/engram-agents/engram-paper/22",
+            {("engram-agents/engram-paper", "22"): "merged"},
+        )
+        assert eff == "done"
+        assert gh == "merged"
+
+    def test_effective_status_repo_qualified_does_not_collide_with_default(self):
+        """A repo-qualified anchor must NOT be satisfied by a DEFAULT_GITHUB_REPO
+        entry for the same bare number -- this is the exact #1715 collision
+        shape (engram-paper PR-22 must never read engram-alpha's PR #22)."""
+        eff, gh = _effective_status(
+            "in-progress", "pr/engram-agents/engram-paper/22",
+            {(DEFAULT_GITHUB_REPO, "22"): "merged"},  # wrong repo's entry
+        )
+        assert eff == "in-progress"  # not reconciled -- falls to 'unknown'
         assert gh == "unknown"
 
     def test_get_board_counts(self):
@@ -637,7 +664,7 @@ class TestHelpers:
     def test_gh_pr_state_returns_unknown_on_gh_unavailable(self):
         """_gh_pr_state returns 'unknown' when gh is not on PATH."""
         with patch("forum.board_projects.subprocess.run", side_effect=FileNotFoundError):
-            result = _gh_pr_state("999")
+            result = _gh_pr_state("999", DEFAULT_GITHUB_REPO)
         assert result == "unknown"
 
     def test_gh_pr_state_returns_unknown_on_nonzero_exit(self):
@@ -647,7 +674,7 @@ class TestHelpers:
         mock_result.stdout = ""
         mock_result.stderr = "not found"
         with patch("forum.board_projects.subprocess.run", return_value=mock_result):
-            result = _gh_pr_state("999")
+            result = _gh_pr_state("999", DEFAULT_GITHUB_REPO)
         assert result == "unknown"
 
     def test_gh_pr_state_parses_merged(self):
@@ -656,7 +683,7 @@ class TestHelpers:
         mock_result.returncode = 0
         mock_result.stdout = json.dumps({"state": "MERGED"})
         with patch("forum.board_projects.subprocess.run", return_value=mock_result):
-            result = _gh_pr_state("42")
+            result = _gh_pr_state("42", DEFAULT_GITHUB_REPO)
         assert result == "merged"
 
     def test_gh_pr_state_parses_closed(self):
@@ -665,7 +692,7 @@ class TestHelpers:
         mock_result.returncode = 0
         mock_result.stdout = json.dumps({"state": "CLOSED"})
         with patch("forum.board_projects.subprocess.run", return_value=mock_result):
-            result = _gh_pr_state("42")
+            result = _gh_pr_state("42", DEFAULT_GITHUB_REPO)
         assert result == "closed"
 
     def test_gh_pr_state_parses_open(self):
@@ -674,13 +701,13 @@ class TestHelpers:
         mock_result.returncode = 0
         mock_result.stdout = json.dumps({"state": "OPEN"})
         with patch("forum.board_projects.subprocess.run", return_value=mock_result):
-            result = _gh_pr_state("42")
+            result = _gh_pr_state("42", DEFAULT_GITHUB_REPO)
         assert result == "open"
 
     def test_batch_gh_reconcile_deduplicates(self):
-        """One _gh_pr_state call per distinct PR; result + cache populated.
+        """One _gh_pr_state call per distinct (repo, PR); result + cache populated.
 
-        read_project_board pre-dedupes PR numbers before calling this, so the
+        read_project_board pre-dedupes PR refs before calling this, so the
         input is distinct. Clear the cache before/after so this test neither
         pollutes nor is polluted by the module-level gh cache.
         """
@@ -688,15 +715,36 @@ class TestHelpers:
         bp._clear_gh_cache()
         call_log = []
 
-        def _fake_gh_pr_state(pr_num):
-            call_log.append(pr_num)
+        def _fake_gh_pr_state(pr_num, repo):
+            call_log.append((repo, pr_num))
             return "open"
 
         try:
             with patch("forum.board_projects._gh_pr_state", side_effect=_fake_gh_pr_state):
-                result = _batch_gh_reconcile(["42", "43"])
-            assert result == {"42": "open", "43": "open"}
-            assert sorted(call_log) == ["42", "43"]  # one call per distinct PR
+                result = _batch_gh_reconcile([(DEFAULT_GITHUB_REPO, "42"), (DEFAULT_GITHUB_REPO, "43")])
+            assert result == {(DEFAULT_GITHUB_REPO, "42"): "open", (DEFAULT_GITHUB_REPO, "43"): "open"}
+            assert sorted(call_log) == [(DEFAULT_GITHUB_REPO, "42"), (DEFAULT_GITHUB_REPO, "43")]
+        finally:
+            bp._clear_gh_cache()
+
+    def test_batch_gh_reconcile_same_number_different_repo_does_not_collide(self):
+        """#1715's core regression: two different repos' PR of the SAME
+        number must resolve independently, never share a cache entry or a
+        gh query result."""
+        from forum import board_projects as bp
+        bp._clear_gh_cache()
+
+        def _fake_gh_pr_state(pr_num, repo):
+            return "merged" if repo == DEFAULT_GITHUB_REPO else "open"
+
+        try:
+            with patch("forum.board_projects._gh_pr_state", side_effect=_fake_gh_pr_state):
+                result = _batch_gh_reconcile([
+                    (DEFAULT_GITHUB_REPO, "22"),
+                    ("engram-agents/engram-paper", "22"),
+                ])
+            assert result[(DEFAULT_GITHUB_REPO, "22")] == "merged"
+            assert result[("engram-agents/engram-paper", "22")] == "open"
         finally:
             bp._clear_gh_cache()
 
@@ -713,10 +761,11 @@ def test_gh_cache_suppresses_repeat_calls():
     """
     from forum import board_projects as bp
     bp._clear_gh_cache()
+    ref = (DEFAULT_GITHUB_REPO, "1005")
     try:
         with patch("forum.board_projects._gh_pr_state", return_value="merged") as m:
-            assert bp._batch_gh_reconcile(["1005"]) == {"1005": "merged"}
-            assert bp._batch_gh_reconcile(["1005"]) == {"1005": "merged"}  # cached
+            assert bp._batch_gh_reconcile([ref]) == {ref: "merged"}
+            assert bp._batch_gh_reconcile([ref]) == {ref: "merged"}  # cached
             assert m.call_count == 1
     finally:
         bp._clear_gh_cache()
@@ -726,10 +775,11 @@ def test_gh_cache_does_not_cache_unknown():
     """'unknown' is not cached, so a transient gh outage self-heals next call."""
     from forum import board_projects as bp
     bp._clear_gh_cache()
+    ref = (DEFAULT_GITHUB_REPO, "1005")
     try:
         with patch("forum.board_projects._gh_pr_state", return_value="unknown") as m:
-            bp._batch_gh_reconcile(["1005"])
-            bp._batch_gh_reconcile(["1005"])  # not cached → re-queries
+            bp._batch_gh_reconcile([ref])
+            bp._batch_gh_reconcile([ref])  # not cached → re-queries
             assert m.call_count == 2
     finally:
         bp._clear_gh_cache()

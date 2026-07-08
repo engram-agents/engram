@@ -67,6 +67,24 @@ def test_github_url_variants():
     assert t.github_url("nonsense") is None
 
 
+def test_github_url_repo_qualified_pr_anchor():
+    """#1715 reviewer-fairy-caught: a repo-qualified anchor
+    (pr/<owner>/<repo>/<N>) must link to ITS OWN repo, not GITHUB_REPO --
+    the pre-fix `ref[3:]` slice glued 'owner/repo/N' onto GITHUB_REPO's URL,
+    producing a broken link."""
+    assert (
+        t.github_url("pr/engram-agents/engram-paper/22")
+        == "https://github.com/engram-agents/engram-paper/pull/22"
+    )
+    assert (
+        t.github_url("PR/Engram-Agents/Engram-Paper/22")
+        == "https://github.com/engram-agents/engram-paper/pull/22"
+    )
+    # Malformed qualified form (only one path segment) -- rejected, not
+    # silently mis-parsed into a broken link.
+    assert t.github_url("pr/only-one-segment/22") is None
+
+
 # --- helpers --------------------------------------------------------------
 
 def test_status_color_map_covers_theme():

@@ -539,6 +539,49 @@ class TestMainRendering:
 
 
 # ---------------------------------------------------------------------------
+# Unit tests -- #1715 repo-qualified anchor parsing + threading
+# ---------------------------------------------------------------------------
+
+class TestParsePrAnchorRepoQualified:
+    """#1715 reviewer-fairy-caught gap: the naive anchor[3:] slice this hook
+    used produced 'owner/repo/N' verbatim for a repo-qualified anchor, which
+    gh would reject as a garbage PR-number positional arg. _parse_pr_anchor
+    fixes this; these tests lock its contract directly."""
+
+    def test_bare_anchor_resolves_default_repo(self, engram_home):
+        mod = _load_hook_module(engram_home)
+        assert mod._parse_pr_anchor("pr/1005") == (mod._DEFAULT_GITHUB_REPO, "1005")
+
+    def test_qualified_anchor_resolves_its_own_repo(self, engram_home):
+        mod = _load_hook_module(engram_home)
+        assert mod._parse_pr_anchor("pr/engram-agents/engram-paper/22") == (
+            "engram-agents/engram-paper", "22",
+        )
+
+    def test_non_pr_anchor_returns_none(self, engram_home):
+        mod = _load_hook_module(engram_home)
+        assert mod._parse_pr_anchor("project/4") is None
+        assert mod._parse_pr_anchor("nonsense") is None
+
+    def test_get_live_status_threads_repo_to_fetch_pr_status(self, engram_home):
+        """_get_live_status must pass the ANCHOR's own repo to
+        _fetch_pr_status, not silently drop it or pass the whole
+        owner/repo/N tail as a garbage pr_num."""
+        mod = _load_hook_module(engram_home)
+        calls = []
+
+        def _fake_fetch(pr_num, repo=None):
+            calls.append((pr_num, repo))
+            return "OPEN"
+
+        with patch.object(mod, "_fetch_pr_status", side_effect=_fake_fetch):
+            result = mod._get_live_status("pr/engram-agents/engram-paper/22", {})
+
+        assert result == "OPEN"
+        assert calls == [("22", "engram-agents/engram-paper")]
+
+
+# ---------------------------------------------------------------------------
 # Unit tests -- _auto_archive_merged_pr_batons()
 # ---------------------------------------------------------------------------
 

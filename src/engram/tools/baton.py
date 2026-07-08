@@ -263,8 +263,53 @@ def _age_str(ts: Optional[datetime]) -> str:
 
 _PROJECT_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*-[A-Za-z0-9][A-Za-z0-9_-]*$")
 
-# GitHub anchor value validation: pr/<N> or project/<N>
-_GITHUB_ANCHOR_RE = re.compile(r"^(pr|project)/\d+$")
+# GitHub anchor value validation: pr/<N>, pr/<owner>/<repo>/<N> (repo-qualified,
+# #1715), or project/<N>. Repo-qualification is REQUIRED for any PR-baton
+# whose PR does not live in DEFAULT_GITHUB_REPO (#1715: bare pr/<N> anchors
+# are matched against gh's ambient cwd repo everywhere they're reconciled --
+# for a baton tracking a PR in a different repo, this silently matches the
+# wrong repo's PR of the same number).
+_GITHUB_ANCHOR_RE = re.compile(
+    r"^(?:pr/(?:[\w.-]+/[\w.-]+/)?\d+|project/\d+)$"
+)
+
+# Historical default: nearly every PR-baton created before #1715 tracks a PR
+# in the installation's own home repo, and bare pr/<N> anchors relied on gh's
+# ambient-cwd resolution happening to land there. Pinning it explicitly
+# (rather than leaving gh to infer it from cwd) makes existing unqualified
+# anchors resolve correctly and DETERMINISTICALLY regardless of what
+# directory a reconciliation call happens to run from -- the ambient-cwd
+# dependence was itself part of the #1715 bug class, not just the missing
+# --repo flag.
+#
+# Read from $ENGRAM_DEFAULT_GITHUB_REPO, NOT hardcoded as a private-repo
+# literal: this source tree is scanned pre-release (tools/scan-leaks.py) for
+# exactly this shape of leak (a private dev-repo name baked into shipped
+# code). The public-safe fallback below is what an actual OSS install wants
+# by default; a private dev repo (e.g. this one) sets the env var in its own
+# runtime environment, which is never scanned.
+DEFAULT_GITHUB_REPO = os.environ.get("ENGRAM_DEFAULT_GITHUB_REPO", "engram-agents/engram")
+
+
+def _parse_github_anchor(value: str) -> Optional[tuple]:
+    """Parse a github anchor value into (kind, repo, number).
+
+    kind is 'pr' or 'project'. repo is 'owner/repo' if the anchor is
+    repo-qualified, else None (caller should apply DEFAULT_GITHUB_REPO).
+    number is the PR/project number as a string. Returns None if `value`
+    doesn't match a known anchor shape (caller should treat as "no anchor").
+    """
+    if not value:
+        return None
+    m = re.match(r"^pr/(?:([\w.-]+)/([\w.-]+)/)?(\d+)$", value)
+    if m:
+        owner, repo, number = m.group(1), m.group(2), m.group(3)
+        repo_qualified = f"{owner}/{repo}" if owner and repo else None
+        return ("pr", repo_qualified, number)
+    m = re.match(r"^project/(\d+)$", value)
+    if m:
+        return ("project", None, m.group(1))
+    return None
 
 
 def _validate_project_id(project_id: str) -> Optional[str]:
@@ -327,7 +372,7 @@ def _dedupe_checks_by_latest(checks: list) -> list:
     return list(latest.values())
 
 
-def _pr_ci_state(pr_number: str) -> tuple:
+def _pr_ci_state(pr_number: str, repo: Optional[str] = None) -> tuple:
     """Query GitHub CI state for a pull request via `gh`.
 
     Returns (state, detail) where state is one of:
@@ -336,13 +381,20 @@ def _pr_ci_state(pr_number: str) -> tuple:
       "pending" — no failure, but at least one check still running
       "unknown" — could not obtain a verdict (degraded; advisory only)
 
-    The gh call uses cwd-based repo inference; a failure here is expected
-    when invoked outside the repo tree and must NOT hard-block the caller.
+    #1715: pass `repo` (owner/repo) explicitly when the caller's anchor is
+    repo-qualified. Without it, the gh call falls back to cwd-based repo
+    inference — a failure here is expected when invoked outside the repo
+    tree and must NOT hard-block the caller, but for a genuinely
+    cross-repo PR-baton this means the CI-green gate is checking the
+    WRONG repo's PR entirely if cwd happens to resolve to some repo.
     """
+    cmd = ["gh", "pr", "view", pr_number,
+           "--json", "statusCheckRollup,mergeStateStatus"]
+    if repo:
+        cmd += ["--repo", repo]
     try:
         result = subprocess.run(
-            ["gh", "pr", "view", pr_number,
-             "--json", "statusCheckRollup,mergeStateStatus"],
+            cmd,
             capture_output=True,
             text=True,
             timeout=15,
@@ -417,7 +469,7 @@ def _pr_ci_state(pr_number: str) -> tuple:
 # Approval-staleness helper for the flip guard (#1002)
 # ---------------------------------------------------------------------------
 
-def _pr_approval_state(pr_number: str) -> tuple:
+def _pr_approval_state(pr_number: str, repo: Optional[str] = None) -> tuple:
     """Query GitHub for post-approval tip movement on a pull request via `gh`.
 
     Companion to _pr_ci_state (#974): that guard checks CI is green NOW;
@@ -433,7 +485,14 @@ def _pr_approval_state(pr_number: str) -> tuple:
     reads stale BY DESIGN (conservative: a rebased tip was not the reviewed
     tip; the colleague must re-approve).
 
-    Two gh calls:
+    #1715: when `repo` (owner/repo) is given (a repo-qualified anchor),
+    it's used directly and the `gh repo view` cwd-inference step (below)
+    is skipped entirely — cwd-inference is exactly the mechanism that let
+    this guard silently check the wrong repo for a genuinely cross-repo
+    PR-baton. Without `repo`, falls back to the original cwd-inferred
+    lookup for bare/unqualified anchors.
+
+    Two gh calls (only the first is skipped when `repo` is supplied):
       1. gh repo view --json nameWithOwner  (cwd-inferred repo identity)
       2. gh api graphql querying headRefOid and reviews(last:50){state,commit{oid}}
 
@@ -455,36 +514,41 @@ def _pr_approval_state(pr_number: str) -> tuple:
         return ("unknown", f"PR number {pr_number!r} is not numeric")
     pr_number = pr_str
 
-    # Step 1: resolve repo nameWithOwner (same effective scoping as today's
-    # `gh pr view` — cwd-inferred from the working tree).
-    try:
-        repo_result = subprocess.run(
-            ["gh", "repo", "view", "--json", "nameWithOwner"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except FileNotFoundError:
-        return ("unknown", "gh not found on PATH")
-    except subprocess.TimeoutExpired:
-        return ("unknown", "gh timed out after 15s")
-    except OSError as exc:
-        return ("unknown", f"gh exec error: {exc}")
+    if repo:
+        if "/" not in repo:
+            return ("unknown", f"repo {repo!r} is not owner/repo shaped")
+        owner, repo_name = repo.split("/", 1)
+    else:
+        # Step 1: resolve repo nameWithOwner (cwd-inferred from the working
+        # tree) — only reached for a bare/unqualified anchor.
+        try:
+            repo_result = subprocess.run(
+                ["gh", "repo", "view", "--json", "nameWithOwner"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except FileNotFoundError:
+            return ("unknown", "gh not found on PATH")
+        except subprocess.TimeoutExpired:
+            return ("unknown", "gh timed out after 15s")
+        except OSError as exc:
+            return ("unknown", f"gh exec error: {exc}")
 
-    if repo_result.returncode != 0:
-        detail = (repo_result.stderr or "").strip() or f"gh exit {repo_result.returncode}"
-        return ("unknown", detail)
+        if repo_result.returncode != 0:
+            detail = (repo_result.stderr or "").strip() or f"gh exit {repo_result.returncode}"
+            return ("unknown", detail)
 
-    raw_repo = (repo_result.stdout or "").strip()
-    if not raw_repo:
-        return ("unknown", "gh repo view returned empty output")
+        raw_repo = (repo_result.stdout or "").strip()
+        if not raw_repo:
+            return ("unknown", "gh repo view returned empty output")
 
-    try:
-        repo_data = json.loads(raw_repo)
-        name_with_owner = repo_data["nameWithOwner"]
-        owner, repo_name = name_with_owner.split("/", 1)
-    except (json.JSONDecodeError, ValueError, KeyError):
-        return ("unknown", "gh repo view returned unparseable JSON or missing nameWithOwner")
+        try:
+            repo_data = json.loads(raw_repo)
+            name_with_owner = repo_data["nameWithOwner"]
+            owner, repo_name = name_with_owner.split("/", 1)
+        except (json.JSONDecodeError, ValueError, KeyError):
+            return ("unknown", "gh repo view returned unparseable JSON or missing nameWithOwner")
 
     # Step 2: GraphQL — fetch headRefOid and last 50 reviews with commit oid.
     query = (
@@ -639,10 +703,61 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
         if not _GITHUB_ANCHOR_RE.match(github_anchor):
             print(
                 f"baton init: invalid --github value '{github_anchor}'. "
-                "Expected pr/<N> or project/<N> (e.g. pr/490, project/4).",
+                "Expected pr/<N>, pr/<owner>/<repo>/<N>, or project/<N> "
+                "(e.g. pr/490, pr/engram-agents/engram-paper/22, project/4).",
                 file=sys.stderr,
             )
             sys.exit(EXIT_VALIDATION)
+
+    # Auto-derive a bare pr/<N> anchor from a PR-<N> project_id when the
+    # caller didn't pass --github at all (#1715: every PR-baton should carry
+    # SOME anchor from creation, not rely on downstream code re-deriving the
+    # PR number from project_id -- that re-derivation, done ad hoc in two
+    # different places pre-#1715, is exactly what let a repo-unqualified
+    # match silently corrupt a cross-repo baton's stored status).
+    if github_anchor is None:
+        _pr_from_id = re.match(r"^(?:PR-|pr-)(\d+)$", project_id)
+        if _pr_from_id:
+            github_anchor = f"pr/{_pr_from_id.group(1)}"
+
+    # --repo qualifies a pr/<N> anchor to pr/<owner>/<repo>/<N> (#1715).
+    # Required for any PR-baton whose PR is NOT in DEFAULT_GITHUB_REPO --
+    # unqualified anchors reconcile against DEFAULT_GITHUB_REPO, which is
+    # correct for the historical majority but silently wrong for any other
+    # repo's PR that happens to share the number.
+    repo_arg = getattr(args, "repo", None)
+    if repo_arg is not None:
+        repo_arg = repo_arg.strip().lower()
+        if not re.match(r"^[\w.-]+/[\w.-]+$", repo_arg):
+            print(
+                f"baton init: invalid --repo value '{repo_arg}'. "
+                "Expected owner/repo (e.g. engram-agents/engram-paper).",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        parsed = _parse_github_anchor(github_anchor) if github_anchor else None
+        if parsed is None or parsed[0] != "pr":
+            print(
+                "baton init: --repo only applies to a PR anchor "
+                "(pr/<N> or a PR-<N> project_id) -- "
+                f"got github anchor {github_anchor!r} for project_id {project_id!r}.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        # If --github was ALREADY repo-qualified with a DIFFERENT repo,
+        # silently overwriting it with --repo's value would drop the
+        # anchor's real repo with no warning (reviewer-fairy-flagged
+        # operator-error case, #1715). Reject rather than guess which one
+        # is intended.
+        if parsed[1] is not None and parsed[1] != repo_arg:
+            print(
+                f"baton init: --github already specifies repo {parsed[1]!r}, "
+                f"which conflicts with --repo {repo_arg!r}. Pass only one, "
+                "or make them agree.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        github_anchor = f"pr/{repo_arg}/{parsed[2]}"
 
     title = args.title or project_id
     init_reason = f"project initialized by {agent_name or 'unknown'}"
@@ -754,12 +869,24 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     # sentinel (the "presenting for merge" signal per #51 protocol).
     # .strip().lower() is intentional case-normalization — the github: field is
     # user-authored YAML and may be mixed-case; matching _pool_sentinel()'s lowering.
+    #
+    # #1715 fix (reviewer-fairy-caught blocker): the old bare `^pr/(\d+)$`
+    # regex silently failed to match a repo-qualified anchor
+    # (pr/<owner>/<repo>/<N>), which meant this ENTIRE guard block --
+    # CI-green, post-approval-staleness, AND the colleague-approval gate --
+    # was skipped with zero warning for exactly the cross-repo PR-batons
+    # this repo-qualification feature exists to support. Use the shared
+    # anchor parser instead, and thread the resolved repo through to both
+    # gh-querying helpers so they check the ANCHOR's repo, not gh's
+    # ambient-cwd guess.
     github_anchor = fields.get("github", "").strip().lower()
     _flip_force = args.force
-    _pr_anchor_match = re.match(r"^pr/(\d+)$", github_anchor)
+    _parsed_anchor = _parse_github_anchor(github_anchor)
+    _pr_anchor_match = _parsed_anchor is not None and _parsed_anchor[0] == "pr"
     if _pr_anchor_match and _is_pool_sentinel(to_agent):
-        _pr_num = _pr_anchor_match.group(1)
-        _ci_state, _ci_detail = _pr_ci_state(_pr_num)
+        _pr_num = _parsed_anchor[2]
+        _pr_repo = _parsed_anchor[1] or DEFAULT_GITHUB_REPO
+        _ci_state, _ci_detail = _pr_ci_state(_pr_num, repo=_pr_repo)
         if _ci_state in ("red", "pending"):
             if _flip_force:
                 print(
@@ -790,7 +917,7 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
         # --force). no_approval is now handled by the colleague-gate below
         # (#1267): it rejects when a colleague participant is present, and
         # warns-only in single-agent mode (no colleague to perform the review).
-        _ap_state, _ap_detail = _pr_approval_state(_pr_num)
+        _ap_state, _ap_detail = _pr_approval_state(_pr_num, repo=_pr_repo)
         if _ap_state == "stale":
             if _flip_force:
                 print(
@@ -1354,7 +1481,6 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
         print("baton gc: gh CLI not found — cannot query live PR state", file=sys.stderr)
         sys.exit(EXIT_VALIDATION)
 
-    pr_re = re.compile(r"^PR-(\d+)$")
     dry_run = args.dry_run
     limit = args.limit
 
@@ -1362,26 +1488,46 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
     resp = _api_get(client, "/api/projects", params={"active_only": "true"})
     all_projects = resp.get("projects", [])
 
-    # Filter to PR-batons, capped at limit
+    # Filter to PR-batons, capped at limit. #1715: the PR number (and repo)
+    # come from the stored `github` anchor, NOT re-derived from project_id
+    # via regex -- that re-derivation had NO repo awareness at all and
+    # queried gh with a bare number, silently matching whatever repo gh's
+    # ambient cwd happened to resolve to. A PR-baton with no github anchor
+    # is skipped rather than guessed at (its project_id alone is not
+    # sufficient to safely identify a PR + repo pair).
     pr_batons = []
+    ungauged = 0
     for p in all_projects:
         pid = p.get("project_id", "")
-        m = pr_re.match(pid)
-        if m:
-            pr_batons.append((pid, m.group(1)))
-            if len(pr_batons) >= limit:
-                break
+        if not pid.upper().startswith("PR-"):
+            continue
+        parsed = _parse_github_anchor((p.get("github") or "").strip().lower())
+        if parsed is None or parsed[0] != "pr":
+            ungauged += 1
+            continue
+        _, repo, pr_num = parsed
+        pr_batons.append((pid, repo or DEFAULT_GITHUB_REPO, pr_num))
+        if len(pr_batons) >= limit:
+            break
+
+    if ungauged:
+        print(
+            f"baton gc: skipped {ungauged} PR-baton(s) with no/invalid github "
+            "anchor -- run 'baton anchor <id> --github pr/<owner>/<repo>/<N>' "
+            "to make them gc-eligible.",
+            file=sys.stderr,
+        )
 
     closed = skipped = failed = 0
 
-    for project_id, pr_num in pr_batons:
+    for project_id, repo, pr_num in pr_batons:
         try:
             result = subprocess.run(
-                ["gh", "pr", "view", pr_num, "--json", "state", "-q", ".state"],
+                ["gh", "pr", "view", pr_num, "--repo", repo, "--json", "state", "-q", ".state"],
                 capture_output=True, text=True, timeout=10,
             )
             if result.returncode != 0:
-                print(f"baton gc: gh query failed for {project_id} (pr #{pr_num})", file=sys.stderr)
+                print(f"baton gc: gh query failed for {project_id} (repo {repo}, pr #{pr_num})", file=sys.stderr)
                 skipped += 1
                 continue
             state = result.stdout.strip().upper()
@@ -1399,18 +1545,18 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
             continue
 
         if dry_run:
-            print(f"baton gc: would close {project_id} → {new_status} (PR #{pr_num} is {state})")
+            print(f"baton gc: would close {project_id} → {new_status} ({repo}#{pr_num} is {state})")
             closed += 1
             continue
 
-        gc_reason = f"gc: PR #{pr_num} is {state}"
+        gc_reason = f"gc: {repo}#{pr_num} is {state}"
         try:
             client.post(f"/api/projects/{project_id}/gc", {
                 "agent": agent_name or "baton",
                 "new_status": new_status,
                 "reason": gc_reason,
             })
-            print(f"baton gc: closed {project_id} → {new_status} (PR #{pr_num})")
+            print(f"baton gc: closed {project_id} → {new_status} ({repo}#{pr_num})")
             closed += 1
         except (ForumNetworkError, ForumHttpError) as e:
             print(f"baton gc: write failed for {project_id}: {e!r}", file=sys.stderr)
@@ -1520,7 +1666,8 @@ def cmd_anchor(args: argparse.Namespace, config: dict, agent_name: str, client: 
     if not _GITHUB_ANCHOR_RE.match(github_anchor):
         print(
             f"baton anchor: invalid --github value '{github_anchor}'. "
-            "Expected pr/<N> or project/<N> (e.g. pr/490, project/4).",
+            "Expected pr/<N>, pr/<owner>/<repo>/<N>, or project/<N> "
+            "(e.g. pr/490, pr/engram-agents/engram-paper/22, project/4).",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
@@ -1703,13 +1850,35 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
         )
         sys.exit(EXIT_VALIDATION)
 
+    # #1715 (reviewer-fairy-caught, round 2): resolve the repo from the
+    # baton's stored `github` anchor, the SAME pattern already used in
+    # cmd_flip -- never trust gh's ambient-cwd inference for a genuinely
+    # cross-repo PR-baton. This gate's stakes are higher than cmd_flip's:
+    # gate 5 below performs an IRREVERSIBLE `gh pr merge --squash`, so
+    # silently resolving the wrong repo here doesn't just misreport a
+    # status, it can squash-merge an unrelated PR that happens to share
+    # this baton's PR number in whatever repo gh's cwd resolves to.
+    _merge_repo = DEFAULT_GITHUB_REPO
+    _merge_anchor = _parse_github_anchor(fields.get("github", "").strip().lower())
+    if _merge_anchor is not None and _merge_anchor[0] == "pr":
+        _merge_repo = _merge_anchor[1] or DEFAULT_GITHUB_REPO
+        if _merge_anchor[2] != pr_number:
+            print(
+                f"baton merge: PR number mismatch -- '{args.pr}' resolves to "
+                f"#{pr_number}, but {project_id}'s stored github anchor "
+                f"points at #{_merge_anchor[2]}. Refusing rather than "
+                "guessing which is correct.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+
     # ---- Gate 3: CI green (skippable with --force) --------------------
     _ci_verdict = "green"
     if force:
         # Audit-trail parity with cmd_flip --force: still query the actual
         # state so the forced merge's warning (and turn-log) record what was
         # bypassed, not just that something was.
-        _ci_state, _ci_detail = _pr_ci_state(pr_number)
+        _ci_state, _ci_detail = _pr_ci_state(pr_number, repo=_merge_repo)
         print(
             f"warning: --force — skipping CI-green check for PR #{pr_number} "
             f"(actual: {_ci_state} — {_ci_detail})",
@@ -1717,7 +1886,7 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
         )
         _ci_verdict = f"skipped (--force; actual: {_ci_state})"
     else:
-        _ci_state, _ci_detail = _pr_ci_state(pr_number)
+        _ci_state, _ci_detail = _pr_ci_state(pr_number, repo=_merge_repo)
         if _ci_state in ("red", "pending"):
             print(
                 f"baton merge: CI is {_ci_state} on PR #{pr_number} "
@@ -1739,7 +1908,7 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
     # ---- Gate 4: approval fresh (skippable with --force) --------------
     _ap_verdict = "fresh"
     if force:
-        _ap_state, _ap_detail = _pr_approval_state(pr_number)
+        _ap_state, _ap_detail = _pr_approval_state(pr_number, repo=_merge_repo)
         print(
             f"warning: --force — skipping approval-fresh check for PR "
             f"#{pr_number} (actual: {_ap_state} — {_ap_detail})",
@@ -1747,7 +1916,7 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
         )
         _ap_verdict = f"skipped (--force; actual: {_ap_state})"
     else:
-        _ap_state, _ap_detail = _pr_approval_state(pr_number)
+        _ap_state, _ap_detail = _pr_approval_state(pr_number, repo=_merge_repo)
         if _ap_state == "stale":
             print(
                 f"baton merge: tip moved after approval on PR #{pr_number} "
@@ -1779,9 +1948,13 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
         return
 
     # ---- Gate 5: gh pr merge --squash --------------------------------
+    # #1715: --repo is REQUIRED here, not optional -- this is the single
+    # most consequential gh call in this whole bug class (an irreversible
+    # squash-merge). Omitting --repo would let gh's ambient-cwd guess
+    # decide which repo's PR #N gets merged.
     try:
         merge_result = subprocess.run(
-            ["gh", "pr", "merge", pr_number, "--squash"],
+            ["gh", "pr", "merge", pr_number, "--squash", "--repo", _merge_repo],
             capture_output=True,
             text=True,
             timeout=60,
@@ -1901,8 +2074,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--github", metavar="ANCHOR",
         help=(
             "GitHub anchor for live status in the auto-pull hook. "
-            "Format: pr/<N> or project/<N> (e.g. pr/490, project/4). "
-            "Without this, only batons named PR-<N> resolve automatically."
+            "Format: pr/<N>, pr/<owner>/<repo>/<N>, or project/<N> "
+            "(e.g. pr/490, pr/engram-agents/engram-paper/22, project/4). "
+            "A PR-<N> project_id auto-derives pr/<N> if this is omitted."
+        ),
+    )
+    p_init.add_argument(
+        "--repo", metavar="OWNER/REPO",
+        help=(
+            "Repo-qualify a PR anchor (e.g. engram-agents/engram-paper). "
+            "REQUIRED for any PR-baton whose PR is not in "
+            f"{DEFAULT_GITHUB_REPO} (#1715) -- an unqualified pr/<N> anchor "
+            "reconciles against that default repo, which silently matches "
+            "the wrong PR if the real one lives elsewhere and happens to "
+            "share the number."
         ),
     )
     p_init.add_argument(
@@ -2138,7 +2323,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_anchor.add_argument(
         "--github", metavar="ANCHOR", required=True,
         help=(
-            "GitHub anchor value: pr/<N> or project/<N> (e.g. pr/490, project/4)"
+            "GitHub anchor value: pr/<N>, pr/<owner>/<repo>/<N>, or project/<N> "
+            "(e.g. pr/490, pr/engram-agents/engram-paper/22, project/4). "
+            f"Repo-qualify (#1715) any PR not in {DEFAULT_GITHUB_REPO}."
         ),
     )
 

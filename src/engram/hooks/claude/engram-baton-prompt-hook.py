@@ -95,6 +95,32 @@ _GH_TIMEOUT = 4
 # GitHub Project owner (used for project-anchor queries)
 _GH_OWNER = os.environ.get("BATON_GH_OWNER", "engram-agents")
 
+# #1715: default repo a BARE pr/<N> anchor resolves against. Same variable
+# name as tools/baton.py's own DEFAULT_GITHUB_REPO / board_projects.py's own
+# copy -- read here too (self-contained; this hook is a standalone deployed
+# script and must not assume it can import a sibling module post-plugin-
+# restructure, per this repo's CLAUDE.md). Public-safe fallback, not the
+# private dev-repo literal (tools/scan-leaks.py flags that shape of leak).
+_DEFAULT_GITHUB_REPO = os.environ.get("ENGRAM_DEFAULT_GITHUB_REPO", "engram-agents/engram")
+
+# #1715: pr/<N> (bare) or pr/<owner>/<repo>/<N> (repo-qualified) -- mirrors
+# tools/baton.py's _GITHUB_ANCHOR_RE / _parse_github_anchor.
+_PR_ANCHOR_RE = re.compile(r"^pr/(?:([\w.-]+)/([\w.-]+)/)?(\d+)$", re.IGNORECASE)
+
+
+def _parse_pr_anchor(anchor: str) -> Optional[tuple]:
+    """Parse a pr/<N> or pr/<owner>/<repo>/<N> anchor into (repo, pr_number).
+
+    repo defaults to _DEFAULT_GITHUB_REPO for a bare anchor. Returns None if
+    the anchor isn't PR-shaped at all.
+    """
+    m = _PR_ANCHOR_RE.match(anchor.strip().lower())
+    if not m:
+        return None
+    owner, repo_name, pr_num = m.groups()
+    repo = f"{owner}/{repo_name}" if owner and repo_name else _DEFAULT_GITHUB_REPO
+    return (repo, pr_num)
+
 # Frontmatter parsing (same regex as ia.py / inter-agent hook)
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):\s*(.*)$", re.MULTILINE)
@@ -288,19 +314,25 @@ def _gh_available() -> bool:
     return shutil.which("gh") is not None
 
 
-def _fetch_pr_status(pr_num: str) -> Optional[str]:
+def _fetch_pr_status(pr_num: str, repo: Optional[str] = None) -> Optional[str]:
     """Call ``gh pr view`` and return a short render string, or None on error.
 
     Returns strings like ``"MERGED"``, ``"OPEN · review:APPROVED"``,
     ``"OPEN · review:REVIEW_REQUIRED"``, etc.
+
+    #1715: pass `repo` (owner/repo) for a repo-qualified anchor so this
+    queries the ANCHOR's actual repo, not gh's ambient-cwd guess.
     """
+    cmd = [
+        "gh", "pr", "view", pr_num,
+        "--json", "state,reviewDecision,title",
+        "--jq", "[.state, .reviewDecision] | join(\"|\")",
+    ]
+    if repo:
+        cmd += ["--repo", repo]
     try:
         result = subprocess.run(
-            [
-                "gh", "pr", "view", pr_num,
-                "--json", "state,reviewDecision,title",
-                "--jq", "[.state, .reviewDecision] | join(\"|\")",
-            ],
+            cmd,
             capture_output=True,
             text=True,
             timeout=_GH_TIMEOUT,
@@ -396,8 +428,14 @@ def _get_live_status(anchor: str, cache: dict) -> str:
         render: Optional[str] = None
         try:
             if anchor.startswith("pr/"):
-                pr_num = anchor[3:]
-                render = _fetch_pr_status(pr_num)
+                # #1715: parse (repo, pr_num) instead of a naive anchor[3:]
+                # slice -- the slice produced "owner/repo/N" verbatim for a
+                # repo-qualified anchor, which gh would reject as a garbage
+                # PR-number argument.
+                parsed = _parse_pr_anchor(anchor)
+                if parsed is not None:
+                    pr_repo, pr_num = parsed
+                    render = _fetch_pr_status(pr_num, repo=pr_repo)
             elif anchor.startswith("project/"):
                 project_num = anchor[8:]
                 render = _fetch_project_status(project_num)

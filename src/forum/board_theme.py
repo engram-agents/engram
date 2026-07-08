@@ -23,16 +23,32 @@ Two extension axes are designed in from the start:
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Callable, Optional
 
 # ---------------------------------------------------------------------------
-# Where clickable refs point. Runtime-configurable via FORUM_GITHUB_REPO so the
-# shipped public snapshot carries no private dev-repo reference (the scan-leaks
-# structural invariant), while the team's forum deployment points it at its
-# working repo by setting the env var. Default = the public repo. This is also
-# strictly more modular than a hardcoded constant: repoint with zero code change.
-# ---------------------------------------------------------------------------
-GITHUB_REPO = os.environ.get("FORUM_GITHUB_REPO", "engram-agents/engram")
+# Where clickable refs point for a BARE (unqualified) anchor. Runtime-
+# configurable so the shipped public snapshot carries no private dev-repo
+# reference (the scan-leaks structural invariant), while the team's forum
+# deployment points it at its working repo by setting the env var. Default =
+# the public repo. This is also strictly more modular than a hardcoded
+# constant: repoint with zero code change.
+#
+# #1715: reads $ENGRAM_DEFAULT_GITHUB_REPO first -- the same variable
+# board_projects.py's/baton.py's own DEFAULT_GITHUB_REPO reads -- so a bare
+# anchor resolves to the SAME repo across gh-reconciliation and the display
+# link. $FORUM_GITHUB_REPO is kept as a fallback for any deployment that set
+# only the older, board_theme-specific name.
+GITHUB_REPO = os.environ.get(
+    "ENGRAM_DEFAULT_GITHUB_REPO",
+    os.environ.get("FORUM_GITHUB_REPO", "engram-agents/engram"),
+)
+
+# #1715: a repo-qualified anchor (pr/<owner>/<repo>/<N>) must link to ITS OWN
+# repo, not GITHUB_REPO -- the naive `ref[3:]` slice (pre-fix) glued the
+# qualified anchor's full "owner/repo/N" tail onto GITHUB_REPO's URL,
+# producing a broken link. Mirrors board_projects.py's _PR_ANCHOR_RE.
+_PR_ANCHOR_RE = re.compile(r"^pr/(?:([\w.-]+)/([\w.-]+)/)?(\d+)$", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -98,12 +114,18 @@ def terminal_statuses() -> set[str]:
 
 
 def github_url(github_ref: str) -> Optional[str]:
-    """Resolve a baton `github` ref (e.g. 'pr/1005') to a clickable URL, or None."""
+    """Resolve a baton `github` ref (e.g. 'pr/1005' or the #1715 repo-qualified
+    'pr/<owner>/<repo>/1005') to a clickable URL, or None."""
     if not github_ref:
         return None
     ref = github_ref.strip().lower()
     if ref.startswith("pr/"):
-        return f"https://github.com/{GITHUB_REPO}/pull/{ref[3:]}"
+        m = _PR_ANCHOR_RE.match(ref)
+        if not m:
+            return None
+        owner, repo_name, number = m.groups()
+        repo = f"{owner}/{repo_name}" if owner and repo_name else GITHUB_REPO
+        return f"https://github.com/{repo}/pull/{number}"
     if ref.startswith("issue/"):
         return f"https://github.com/{GITHUB_REPO}/issues/{ref[6:]}"
     if ref.startswith("#"):
