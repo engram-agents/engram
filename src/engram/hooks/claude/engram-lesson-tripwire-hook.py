@@ -158,7 +158,9 @@ def _in_turn_config() -> dict:
 
 def _resolve_runtime_dir() -> str:
     """Locate engram_idf.py — plugin root (two levels up, flat layout) first,
-    then ENGRAM_HOME snapshot, then the dev-source fallback. Same ladder as
+    then ENGRAM_HOME snapshot, then a walk-parents search for the nearest
+    ancestor whose own src/engram/ actually contains engram_idf.py, then the
+    dev-source fallback (last-ditch, unchanged). Same ladder as
     engram-surface-hook.py; never a fixed parents[N] against src/ layout."""
     explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
     if explicit:
@@ -168,7 +170,25 @@ def _resolve_runtime_dir() -> str:
         return plugin_root
     if os.path.exists(os.path.join(ENGRAM_HOME, "engram_idf.py")):
         return ENGRAM_HOME
-    return os.path.expanduser("~/engram-alpha/src/engram")
+    # Walk parents from __file__ and take the first ancestor that actually
+    # contains src/engram/engram_idf.py, instead of guessing a fixed
+    # absolute path (#1712: the fixed guess resolves to the WRONG checkout
+    # when this process is running from a git worktree nested under the
+    # guessed path, e.g. .claude/worktrees/<id>/ under ~/engram-alpha --
+    # silently shadowing the actually-running copy with a sibling one).
+    # Reviewer-fairy blocker (PR #1727, found in the sibling surface-hook
+    # copy, applied here too for consistency): Path.exists() raises
+    # PermissionError on an unreadable ancestor instead of returning False
+    # like os.path.exists() does at the rungs above -- wrap so this function
+    # keeps its never-raises contract regardless of caller-side guarding.
+    try:
+        for parent in Path(__file__).resolve().parents:
+            candidate = parent / "src" / "engram"
+            if (candidate / "engram_idf.py").exists():
+                return str(candidate)
+    except OSError:
+        pass
+    return os.path.expanduser("~/engram-alpha/src/engram")  # last-ditch, unchanged
 
 
 def _query_recall_daemon(query: str, top_k: int = 5) -> dict | None:

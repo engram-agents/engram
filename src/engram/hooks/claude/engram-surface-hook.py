@@ -18,6 +18,7 @@ import socket
 import sqlite3
 import sys
 import time
+from pathlib import Path
 
 HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -46,7 +47,15 @@ def _resolve_runtime_dir(engram_home: str) -> str:
       3. $ENGRAM_HOME if it bundles a snapshot (scatter-install fallback only —
          reached only when there is no plugin bundle; covers scatter installs
          that copy engram_client.py into the data dir).
-      4. ~/engram-alpha (live-source fallback for dev installs).
+      4. Walk parents from __file__ for the nearest ancestor whose own
+         src/engram/ actually contains engram_client.py, instead of guessing a
+         fixed absolute path (#1712: the fixed guess resolves to the WRONG
+         checkout when this process is running from a git worktree nested
+         under the guessed path, e.g. .claude/worktrees/<id>/ under
+         ~/engram-alpha -- silently shadowing the actually-running copy with
+         a sibling one).
+      5. ~/engram-alpha (live-source fallback for dev installs, last-ditch,
+         unchanged).
     """
     explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
     if explicit:
@@ -58,7 +67,24 @@ def _resolve_runtime_dir(engram_home: str) -> str:
         return plugin_root
     if os.path.exists(os.path.join(engram_home, "engram_client.py")):
         return engram_home
-    return os.path.expanduser("~/engram-alpha")
+    # Reviewer-fairy blocker (PR #1727): this function is called at bare
+    # module-import time below (`PROJECT_DIR = _resolve_runtime_dir(...)`,
+    # unguarded), so the walk itself must never raise. Path.exists() --
+    # unlike os.path.exists() used at every other rung above -- raises
+    # PermissionError on an unreadable ancestor instead of returning False;
+    # an unhandled exception here would crash the whole hook process at
+    # import time. Same precedent as _hooklib.resolve_tools_dir's own
+    # docstring ("the caller's own import should be wrapped... and degrade
+    # to a silent no-op on failure") -- wrapped here instead of at the call
+    # site so this function keeps its existing never-raises contract.
+    try:
+        for parent in Path(__file__).resolve().parents:
+            candidate = parent / "src" / "engram"
+            if (candidate / "engram_client.py").exists():
+                return str(candidate)
+    except OSError:
+        pass
+    return os.path.expanduser("~/engram-alpha")  # last-ditch, unchanged
 
 
 ENGRAM_HOME = _resolve_engram_home()
