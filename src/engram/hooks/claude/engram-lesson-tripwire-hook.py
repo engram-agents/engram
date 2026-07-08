@@ -204,109 +204,155 @@ def check_in_turn_recall(match_target: str) -> str:
     if not cfg["enabled"]:
         return ""
 
-    # Gate 2 — cooldown (state-file read only; no DB touched). Broad except:
-    # any state-read failure (incl. PermissionError) must degrade to empty
-    # state, never block the tripwire path.
+    # Atomic cooldown claim (#1709) — non-blocking exclusive flock over the
+    # WHOLE check->record sequence below (cooldown read, novelty gate, daemon
+    # query, _record_fire/_write_state). Under concurrent PreToolUse
+    # invocations, exactly one caller wins the lock and proceeds; every
+    # contender returns "" immediately (suppress, never block — a lost race
+    # only risks a miss, which this T2 default-off channel already tolerates
+    # per _write_state's docstring). Locks a DEDICATED lockfile, never
+    # STATE_PATH itself (STATE_PATH is rewritten via os.replace, which would
+    # break the lock's file-descriptor association).
+    lock_fd = None
+    lock_acquired = False
     try:
-        with open(STATE_PATH, "r") as f:
-            state = json.load(f)
-        if not isinstance(state, dict):
+        import fcntl
+        lock_fd = os.open(str(STATE_PATH) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    except Exception:
+        # fcntl unavailable (non-POSIX) or the lockfile couldn't be opened
+        # (e.g. permissions) — degrade to the unlocked path exactly as
+        # before this fix. The race is a perf issue, not a correctness one;
+        # disabling the feature over an environment limitation would be
+        # worse than accepting the (already-tolerated) race.
+        lock_fd = None
+    else:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_acquired = True
+        except (BlockingIOError, OSError):
+            # Another caller currently holds the claim on this fire-window —
+            # suppress immediately rather than block.
+            try:
+                os.close(lock_fd)
+            except Exception:
+                pass
+            return ""
+
+    try:
+        # Gate 2 — cooldown (state-file read only; no DB touched). Broad
+        # except: any state-read failure (incl. PermissionError) must
+        # degrade to empty state, never block the tripwire path.
+        try:
+            with open(STATE_PATH, "r") as f:
+                state = json.load(f)
+            if not isinstance(state, dict):
+                state = {}
+        except Exception:
             state = {}
-    except Exception:
-        state = {}
-    now = time.time()
-    last_fire = state.get("last_fire_ts", 0)
-    if isinstance(last_fire, (int, float)) and (now - last_fire) < cfg["cooldown_seconds"]:
-        return ""
+        now = time.time()
+        last_fire = state.get("last_fire_ts", 0)
+        if isinstance(last_fire, (int, float)) and (now - last_fire) < cfg["cooldown_seconds"]:
+            return ""
 
-    # Gate 3 — high-IDF novel terms in the pending tool call.
-    # extract_keywords returns (token, idf_score) PAIRS — unwrap to tokens
-    # (#1696 reviewer-fairy blocker: the flat-string treatment TypeError'd
-    # against the real module and was masked by a wrong-contract test stub).
-    runtime_dir = _resolve_runtime_dir()
-    if runtime_dir not in sys.path:
-        sys.path.insert(0, runtime_dir)
-    try:
-        from engram_idf import extract_keywords
-        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=1.0)
+        # Gate 3 — high-IDF novel terms in the pending tool call.
+        # extract_keywords returns (token, idf_score) PAIRS — unwrap to tokens
+        # (#1696 reviewer-fairy blocker: the flat-string treatment TypeError'd
+        # against the real module and was masked by a wrong-contract test stub).
+        runtime_dir = _resolve_runtime_dir()
+        if runtime_dir not in sys.path:
+            sys.path.insert(0, runtime_dir)
         try:
-            pairs = extract_keywords(conn, match_target, min_idf=cfg["min_idf"], top_k=5)
-        finally:
-            conn.close()
-        terms = [tok for tok, _score in pairs]
-    except Exception:
-        return ""
-    if not terms:
-        return ""
-    seen_terms = {t for ts in state.get("recent_term_sets", []) if isinstance(ts, list) for t in ts}
-    novel = [t for t in terms if t not in seen_terms]
-    if not novel:
-        return ""
+            from engram_idf import extract_keywords
+            conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=1.0)
+            try:
+                pairs = extract_keywords(conn, match_target, min_idf=cfg["min_idf"], top_k=5)
+            finally:
+                conn.close()
+            terms = [tok for tok, _score in pairs]
+        except Exception:
+            return ""
+        if not terms:
+            return ""
+        seen_terms = {t for ts in state.get("recent_term_sets", []) if isinstance(ts, list) for t in ts}
+        novel = [t for t in terms if t not in seen_terms]
+        if not novel:
+            return ""
 
-    def _write_state() -> None:
-        """Best-effort atomic state write (tmp + os.replace so a concurrent
-        reader never sees a truncated file; a lost race only risks an early
-        re-fire, which is acceptable for this T2 channel)."""
-        try:
-            tmp = str(STATE_PATH) + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(state, f)
-            os.replace(tmp, str(STATE_PATH))
-        except OSError:
-            pass
+        def _write_state() -> None:
+            """Best-effort atomic state write (tmp + os.replace so a concurrent
+            reader never sees a truncated file; a lost race only risks an early
+            re-fire, which is acceptable for this T2 channel)."""
+            try:
+                tmp = str(STATE_PATH) + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(state, f)
+                os.replace(tmp, str(STATE_PATH))
+            except OSError:
+                pass
 
-    def _record_fire() -> None:
-        """Stamp cooldown + term-set memory. Runs on EVERY gate-pass — also
-        when nothing new rendered — so a near-miss (novel terms, daemon hits
-        all already-rendered) cannot re-trigger the daemon on every call
-        (#1696 reviewer-fairy: the render-only stamping bypassed gate 2)."""
-        state["last_fire_ts"] = now
-        term_sets = state.get("recent_term_sets", [])
-        if not isinstance(term_sets, list):
-            term_sets = []
-        term_sets.append(list(terms))
-        state["recent_term_sets"] = term_sets[-_RECENT_TERM_SETS_KEPT:]
+        def _record_fire() -> None:
+            """Stamp cooldown + term-set memory. Runs on EVERY gate-pass — also
+            when nothing new rendered — so a near-miss (novel terms, daemon hits
+            all already-rendered) cannot re-trigger the daemon on every call
+            (#1696 reviewer-fairy: the render-only stamping bypassed gate 2)."""
+            state["last_fire_ts"] = now
+            term_sets = state.get("recent_term_sets", [])
+            if not isinstance(term_sets, list):
+                term_sets = []
+            term_sets.append(list(terms))
+            state["recent_term_sets"] = term_sets[-_RECENT_TERM_SETS_KEPT:]
 
-    # Gate passed — query the daemon with the novel terms.
-    result = _query_recall_daemon(" ".join(novel))
-    if not result or not result.get("match_count"):
+        # Gate passed — query the daemon with the novel terms.
+        result = _query_recall_daemon(" ".join(novel))
+        if not result or not result.get("match_count"):
+            _record_fire()
+            _write_state()
+            return ""
+
+        recent_ids = set(state.get("recent_ids", []))
+        lines = []
+        rendered_ids = []
+        pool = (result.get("special_nodes") or []) + (result.get("top_claims") or [])
+        for n in pool:
+            if len(lines) >= cfg["max_lines"]:
+                break
+            nid = n.get("id", "?")
+            if nid in recent_ids:
+                continue
+            kw = n.get("recall_keywords")
+            kw_str = (" · ".join(f"`{k}`" for k in kw) + " — ") if isinstance(kw, list) and kw else ""
+            body = n.get("recall_summary") or (n.get("claim", "") or "")[:120]
+            lines.append(f"  - [{nid}] {kw_str}{body}")
+            rendered_ids.append(nid)
+
         _record_fire()
+        if not lines:
+            _write_state()
+            return ""
+
+        ids = state.get("recent_ids", [])
+        if not isinstance(ids, list):
+            ids = []
+        ids.extend(rendered_ids)
+        state["recent_ids"] = ids[-_RECENT_IDS_KEPT:]
         _write_state()
-        return ""
 
-    recent_ids = set(state.get("recent_ids", []))
-    lines = []
-    rendered_ids = []
-    pool = (result.get("special_nodes") or []) + (result.get("top_claims") or [])
-    for n in pool:
-        if len(lines) >= cfg["max_lines"]:
-            break
-        nid = n.get("id", "?")
-        if nid in recent_ids:
-            continue
-        kw = n.get("recall_keywords")
-        kw_str = (" · ".join(f"`{k}`" for k in kw) + " — ") if isinstance(kw, list) and kw else ""
-        body = n.get("recall_summary") or (n.get("claim", "") or "")[:120]
-        lines.append(f"  - [{nid}] {kw_str}{body}")
-        rendered_ids.append(nid)
-
-    _record_fire()
-    if not lines:
-        _write_state()
-        return ""
-
-    ids = state.get("recent_ids", [])
-    if not isinstance(ids, list):
-        ids = []
-    ids.extend(rendered_ids)
-    state["recent_ids"] = ids[-_RECENT_IDS_KEPT:]
-    _write_state()
-
-    return (
-        f"[ENGRAM in-turn recall — novel terms: {', '.join(novel)}]\n"
-        + "\n".join(lines)
-        + "\n  (ambient action-moment recall; engram_inspect(id) for detail)"
-    )
+        return (
+            f"[ENGRAM in-turn recall — novel terms: {', '.join(novel)}]\n"
+            + "\n".join(lines)
+            + "\n  (ambient action-moment recall; engram_inspect(id) for detail)"
+        )
+    finally:
+        if lock_fd is not None and lock_acquired:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except Exception:
+                pass
 
 
 def main() -> None:

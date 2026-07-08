@@ -9,6 +9,11 @@ Coverage:
   5. recently-rendered node IDs are excluded
   6. daemon unreachable — silence
   7. tripwire hit and recall compose (both render when both fire)
+  8. near-miss (gate passes, nothing new to render) still stamps cooldown
+  9. concurrent invocations — atomic cooldown claim (#1709): only one caller
+     fires under contention
+  10. lock contention suppresses immediately, never blocks
+  11. missing/failed lock setup degrades to the unlocked path (never crashes)
 
 engram_idf and the daemon socket are stubbed: the gate logic is under test,
 not IDF extraction or the daemon (covered by their own tests).
@@ -235,3 +240,95 @@ def test_near_miss_still_stamps_cooldown(tmp_path, monkeypatch):
     # daemon is queried again.
     assert hook.check_in_turn_recall("iota call") == ""
     assert daemon_calls["n"] == 1, "cooldown failed to throttle a near-miss retrigger"
+
+
+def test_concurrent_calls_only_one_fires(tmp_path, monkeypatch):
+    """Core regression for #1709: the cooldown claim must be atomic. Under
+    concurrent PreToolUse invocations, multiple callers must NOT all read
+    'no recent fire' before any of them stamps last_fire_ts — exactly one
+    thread wins the non-blocking flock claim and queries the daemon; every
+    other concurrent caller returns "" (suppressed, not blocked)."""
+    import threading
+
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path), cooldown_seconds=0)
+    _stub_idf([["novelterm"]])
+
+    daemon_calls = {"n": 0}
+    call_lock = threading.Lock()
+
+    def counting_daemon(q, top_k=5):
+        with call_lock:
+            daemon_calls["n"] += 1
+        return _daemon_result(["ob_1"])
+
+    monkeypatch.setattr(hook, "_query_recall_daemon", counting_daemon)
+
+    n_workers = 8
+    barrier = threading.Barrier(n_workers)
+    results: list = [None] * n_workers
+
+    def worker(i):
+        barrier.wait()  # maximize concurrent overlap
+        results[i] = hook.check_in_turn_recall("concurrent novelterm call")
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert daemon_calls["n"] == 1, f"expected exactly 1 daemon query under contention, got {daemon_calls['n']}"
+    fired = [r for r in results if r]
+    suppressed = [r for r in results if r == ""]
+    assert len(fired) == 1, f"expected exactly 1 winner, got {len(fired)}: {results}"
+    assert len(suppressed) == n_workers - 1
+
+    state = json.load(open(hook.STATE_PATH))
+    assert state["last_fire_ts"] > 0
+
+
+def test_lock_contention_suppresses_not_blocks(tmp_path, monkeypatch):
+    """A caller that cannot acquire the lock (already held elsewhere) must
+    return "" promptly — suppress, never block."""
+    import fcntl
+    import time
+
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path), cooldown_seconds=0)
+    _stub_idf([["zeta"]])
+    monkeypatch.setattr(hook, "_query_recall_daemon", lambda q, top_k=5: _daemon_result(["ob_1"]))
+
+    lockpath = str(hook.STATE_PATH) + ".lock"
+    fd = os.open(lockpath, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        start = time.monotonic()
+        result = hook.check_in_turn_recall("zeta call while locked")
+        elapsed = time.monotonic() - start
+        assert result == ""
+        assert elapsed < 1.0, "check_in_turn_recall blocked instead of suppressing on contention"
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def test_missing_fcntl_degrades_to_unlocked(tmp_path, monkeypatch):
+    """If lock setup fails entirely (fcntl unavailable / lockfile open
+    fails), the function must still run the normal (unlocked) path — never
+    crash, never silently disable the feature."""
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path), cooldown_seconds=0)
+    _stub_idf([["omega"]])
+    monkeypatch.setattr(hook, "_query_recall_daemon", lambda q, top_k=5: _daemon_result(["ob_1"]))
+
+    def broken_open(*a, **kw):
+        raise OSError("simulated: lockfile open unavailable")
+
+    monkeypatch.setattr(hook.os, "open", broken_open)
+
+    out = hook.check_in_turn_recall("omega call")
+    assert "ENGRAM in-turn recall" in out
+    assert "ob_1" in out
+    state = json.load(open(hook.STATE_PATH))
+    assert state["last_fire_ts"] > 0
