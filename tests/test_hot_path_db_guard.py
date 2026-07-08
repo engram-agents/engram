@@ -159,7 +159,12 @@ class TestFailedSetupRetries:
                 core._get_db()
 
             # Path must NOT have been marked done after the failed attempt.
-            resolved_path = str(core.DB_PATH)
+            # .resolve() to match _get_db()'s own guard key (engram_core.py
+            # stores str(DB_PATH.resolve()) in _db_setup_done_paths) -- on
+            # macOS, /tmp is a symlink to /private/tmp, so an unresolved path
+            # here never matches the resolved one the guard actually stores
+            # (#1686).
+            resolved_path = str(core.DB_PATH.resolve())
             assert resolved_path not in core._db_setup_done_paths, (
                 "a raising setup attempt must not mark the path done"
             )
