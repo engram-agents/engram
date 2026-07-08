@@ -187,6 +187,21 @@ verify-the-live-artifact method — lives in
 on-demand; not loaded every session). This behavior is **undocumented upstream** —
 re-verify after any Claude Code version bump.*
 
+## PR merge authority — the substrate-feature gate
+
+Once a PR is merge-ready (next section), **who merges it** depends on what it
+changes: **substrate-concept features → Lei reads the PR first**; **fixes +
+non-substrate → the team merges after peer review**. This gate is
+**engram-alpha-only** — other repos (umwelt, soma) carry their own delegated
+authority. During an explicit Lei-absence day-grant, a settled substrate PR may
+be merged to `dev` (revertible) while the irreversible live-deploy stays Lei's.
+
+This is a pointer, not the policy. The single source of truth — the full rule,
+the substrate/non-substrate discriminator, per-project scope, the day-grant
+carve-out, examples, gray-area calls, and the baton turn-target corollary — lives
+in **[`docs/PR-MERGE-POLICY.md`](docs/PR-MERGE-POLICY.md)**. Read it there; don't
+re-derive the rule from this summary.
+
 ## PR merge-readiness — CI-green gate (both modes)
 
 Merge-readiness has **two** gates, not one: a PR is merge-ready only when it is
