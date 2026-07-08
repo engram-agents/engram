@@ -20,6 +20,25 @@ Usage:
     python viz_server.py --db /path/to/knowledge.db      # single-agent custom
     python viz_server.py --config /path/to/agents.json   # auto-detect + override
     python viz_server.py --no-autodetect --config agents.json  # explicit-only
+
+Deployment / restart model (operator-launched, not agent-managed):
+    In a multi-agent install this server is normally started by the OPERATOR
+    (a privileged user with read access to every agent's ENGRAM data directory)
+    via a small launch script or command — NOT by an individual agent, whose
+    user typically lacks the cross-agent read access that auto-detect and
+    --config need. The process is long-lived: started once, outside any agent
+    session, and it keeps running across agent restarts and upgrades.
+
+    Consequences for an agent operating on the codebase:
+    * You generally CANNOT restart this server yourself — it runs under a
+      different user, so `pkill`/relaunch will fail on permissions (and you
+      should not try; it is shared infrastructure you do not own). Ask the
+      operator to re-run their launch script instead.
+    * After an upgrade that changes THIS file, the running process keeps
+      executing the OLD code until the operator restarts it — the source on
+      disk being new is not enough. So the correct post-upgrade action is:
+      ask the operator to restart, then confirm the new code is live via
+      GET /api/health (a `health_score` field means it responded).
 """
 
 import argparse
