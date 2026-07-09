@@ -35,6 +35,30 @@ os.environ.setdefault("ENGRAM_NO_DB_GUARDS", "1")
 
 
 @pytest.fixture(autouse=True)
+def _stop_snapshot_worker():
+    """Stop + reset the #1673 async snapshot worker after each test.
+
+    engram_snapshot_worker runs a module-level singleton background thread that any
+    test hitting the async _commit_snapshot path starts. Without this teardown the
+    thread (and its module globals) leak across tests, polluting later ones (e.g. a
+    thread still processing a torn-down tempdir's queue). Safe no-op when the module
+    was never imported or no worker started."""
+    yield
+    mod = sys.modules.get("engram_snapshot_worker")
+    if mod is not None:
+        try:
+            mod.stop_worker(timeout=2.0)
+            # Reset singleton state so the next test starts clean.
+            mod._started = False
+            mod._worker_thread = None
+            mod._seq_counter = 0
+            mod._stop.clear()
+            mod._work_event.clear()
+        except Exception:
+            pass
+
+
+@pytest.fixture(autouse=True)
 def _restore_context_tracker_in_sys_modules():
     """Restore sys.modules['context_tracker'] to its pre-test state after each test.
 

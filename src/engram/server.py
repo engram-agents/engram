@@ -6391,6 +6391,23 @@ if __name__ == "__main__":
     # and engram_nap / engram_advance_turn will report version_control.git_committed=False.
     _init_git()
 
+    # #1673: start the async snapshot worker and REPLAY any snapshot-commit jobs
+    # left pending by a prior crash (e.g. a SIGKILL between the durable enqueue and
+    # the git commit) BEFORE serving. start_worker() also clears a stale
+    # .git/index.lock from such a crash so the async lane isn't wedged. Best-effort:
+    # a worker-start failure must never block server boot — checkpoints then fall
+    # back to the synchronous commit path.
+    try:
+        import engram_snapshot_worker
+        engram_snapshot_worker.start_worker()
+    except Exception as _sw_e:
+        import sys as _sys
+        print(
+            f"[engram] snapshot worker startup failed "
+            f"(checkpoints will use the sync commit path): {_sw_e}",
+            file=_sys.stderr,
+        )
+
     # Pre-warm embedding model on a daemon thread so mcp.run() can start
     # serving connections immediately. On cold caches under concurrent system
     # load, synchronous pre-warm can exceed Claude Code's 30s MCP connection

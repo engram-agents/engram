@@ -32,6 +32,10 @@
       "tier": "essential"
     },
     {
+      "path": "engram_snapshot_worker.py",
+      "tier": "essential"
+    },
+    {
       "path": "engram_core.py",
       "tier": "essential"
     },

@@ -481,7 +481,7 @@ class TestCommitSnapshotDumpFieldsOnEarlyReturn:
         conn = self._conn()
         with self._snapshot_patch(), self._failing_dump_patch():
             with mock.patch.object(self.server.core, "_git", return_value=self._fake_git_result(0, "", "")):
-                result = self.server._commit_snapshot(conn, "test", "nap")
+                result = self.server.core._commit_snapshot_sync(conn, "test", "nap")
         conn.close()
         assert result.get("reason") == "no changes since last commit", (
             f"Expected 'no changes since last commit' reason; got: {result}"
@@ -504,7 +504,7 @@ class TestCommitSnapshotDumpFieldsOnEarlyReturn:
                     self._fake_git_result(1, stderr="git add error"),  # git add → fail
                 ],
             ):
-                result = self.server._commit_snapshot(conn, "test", "nap")
+                result = self.server.core._commit_snapshot_sync(conn, "test", "nap")
         conn.close()
         assert "sql_dump_error" in result, (
             f"Expected sql_dump_error in 'git add failed' return; got: {result}"
@@ -525,7 +525,7 @@ class TestCommitSnapshotDumpFieldsOnEarlyReturn:
                     self._fake_git_result(0, stdout="abc123"),  # rev-parse HEAD
                 ],
             ):
-                result = self.server._commit_snapshot(conn, "test", "nap")
+                result = self.server.core._commit_snapshot_sync(conn, "test", "nap")
         conn.close()
         assert "sql_dump_error" in result, (
             f"Expected sql_dump_error in 'no changes since last commit' return; got: {result}"
@@ -546,7 +546,7 @@ class TestCommitSnapshotDumpFieldsOnEarlyReturn:
                     self._fake_git_result(1, stderr="commit error"),          # git commit → fail
                 ],
             ):
-                result = self.server._commit_snapshot(conn, "test", "nap")
+                result = self.server.core._commit_snapshot_sync(conn, "test", "nap")
         conn.close()
         assert "sql_dump_error" in result, (
             f"Expected sql_dump_error in 'git commit failed' return; got: {result}"
@@ -622,7 +622,7 @@ class TestCommitSnapshotPushUsesHEAD:
         with self._snapshot_patch():
             with mock.patch("engram_backup.dump_stripped", return_value={}):
                 with mock.patch.object(self.server.core, "_git", side_effect=recording_git):
-                    result = self.server._commit_snapshot(conn, "test", "nap")
+                    result = self.server.core._commit_snapshot_sync(conn, "test", "nap")
         conn.close()
 
         push_calls = [c for c in git_calls if c[0] == "push"]
@@ -658,7 +658,7 @@ class TestCommitSnapshotPushUsesHEAD:
         with self._snapshot_patch():
             with mock.patch("engram_backup.dump_stripped", return_value={}):
                 with mock.patch.object(self.server.core, "_git", side_effect=fake_git):
-                    result = self.server._commit_snapshot(conn, "test", "nap")
+                    result = self.server.core._commit_snapshot_sync(conn, "test", "nap")
         conn.close()
         assert "remote_push" in result, f"'remote_push' key missing from result: {result}"
         assert result["remote_push"] == "success", (
@@ -753,7 +753,7 @@ class TestCommitSnapshotSkipsGitignored:
 
             with mock.patch.object(srv.core, "_generate_snapshot", return_value="# test snapshot\n"):
                 with mock.patch("engram_backup.dump_stripped", return_value={}):
-                    result = srv._commit_snapshot(conn, "test", "nap")
+                    result = srv.core._commit_snapshot_sync(conn, "test", "nap")
             conn.close()
 
             # The commit must have proceeded (not aborted by the ignored .db file)
@@ -808,7 +808,7 @@ class TestCommitSnapshotSkipsGitignored:
         with self._snapshot_patch():
             with mock.patch("engram_backup.dump_stripped", return_value={}):
                 with mock.patch.object(self.server.core, "_git", side_effect=recording_git):
-                    result = self.server._commit_snapshot(conn, "test", "nap")
+                    result = self.server.core._commit_snapshot_sync(conn, "test", "nap")
         conn.close()
 
         assert result.get("git_committed") is True, f"Commit should have proceeded: {result}"
@@ -846,7 +846,7 @@ class TestCommitSnapshotSkipsGitignored:
         with self._snapshot_patch():
             with mock.patch("engram_backup.dump_stripped", return_value={}):
                 with mock.patch.object(self.server.core, "_git", side_effect=fake_git):
-                    result = self.server._commit_snapshot(conn, "test", "nap")
+                    result = self.server.core._commit_snapshot_sync(conn, "test", "nap")
         conn.close()
         assert "skipped_ignored" not in result, (
             f"skipped_ignored should not appear when nothing was dropped: {result}"
@@ -874,7 +874,7 @@ class TestCommitSnapshotSkipsGitignored:
         with self._snapshot_patch():
             with mock.patch("engram_backup.dump_stripped", return_value={}):
                 with mock.patch.object(self.server.core, "_git", side_effect=fake_git):
-                    result = self.server._commit_snapshot(conn, "test", "nap")
+                    result = self.server.core._commit_snapshot_sync(conn, "test", "nap")
         conn.close()
         # With rc>1 (error), all files are kept → commit proceeds
         assert result.get("git_committed") is True, (
@@ -908,7 +908,7 @@ class TestCommitSnapshotSkipsGitignored:
         with self._snapshot_patch():
             with mock.patch("engram_backup.dump_stripped", return_value={}):
                 with mock.patch.object(self.server.core, "_git", side_effect=fake_git):
-                    result = self.server._commit_snapshot(conn, "test", "nap")
+                    result = self.server.core._commit_snapshot_sync(conn, "test", "nap")
         conn.close()
 
         assert result.get("git_committed") is False, (

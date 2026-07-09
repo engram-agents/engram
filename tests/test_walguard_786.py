@@ -1259,7 +1259,10 @@ class TestNapWalShmRaceOrderingFix:
 
         with mock.patch.object(_eb, "dump_stripped", side_effect=spy_dump_stripped), \
              mock.patch.object(self.server.core, "_git", side_effect=self._mock_git):
-            result = self.server._commit_snapshot(spy_conn, "ordering test", "test")
+            # #1673: the public _commit_snapshot dispatches normal modes to the async
+            # worker (no sync dump). The dump-before-checkpoint invariant lives in the
+            # synchronous carrier (emergency/fallback), so test it there directly.
+            result = self.server.core._commit_snapshot_sync(spy_conn, "ordering test", "test")
         spy_conn.close()
 
         assert "dump_stripped" in call_order, (
@@ -1303,7 +1306,9 @@ class TestNapWalShmRaceOrderingFix:
         spy_conn.row_factory = sqlite3.Row
 
         with mock.patch.object(self.server.core, "_git", side_effect=self._mock_git):
-            self.server._commit_snapshot(spy_conn, "mode guard test", "test")
+            # #1673: RESTART-not-TRUNCATE is a sync-carrier invariant; the async path
+            # is covered separately (test_async_path_releases_read_mark_and_checkpoints).
+            self.server.core._commit_snapshot_sync(spy_conn, "mode guard test", "test")
         spy_conn.close()
 
         assert checkpoint_sqls, (
@@ -1359,7 +1364,9 @@ class TestNapWalShmRaceOrderingFix:
 
         with mock.patch.object(_eb, "dump_stripped", side_effect=failing_dump_stripped), \
              mock.patch.object(self.server.core, "_git", side_effect=self._mock_git):
-            result = self.server._commit_snapshot(spy_conn, "dump failure test", "test")
+            # #1673: dump-failure-skips-checkpoint is a sync-carrier branch (the async
+            # path has no sync dump). Test the carrier directly.
+            result = self.server.core._commit_snapshot_sync(spy_conn, "dump failure test", "test")
 
         # (a) wal_checkpoint must NOT have been called.
         assert "wal_checkpoint" not in call_order, (
@@ -1418,7 +1425,11 @@ class TestNapWalShmRaceOrderingFix:
         assert expected_nodes >= 3, f"fixture must have >= 3 nodes; got {expected_nodes}"
 
         with mock.patch.object(self.server.core, "_git", side_effect=self._mock_git):
-            result = self.server._commit_snapshot(conn, "wal freshness test", "test")
+            # #1673: WAL-resident data surviving the dump is a sync-carrier property
+            # (Connection.backup captures WAL without a prior checkpoint). The async
+            # path captures the same WAL-resident view into the immutable per-turn
+            # snapshot; that binary→dump roundtrip is covered on-branch (increment 4).
+            result = self.server.core._commit_snapshot_sync(conn, "wal freshness test", "test")
         conn.close()
 
         # knowledge.sql must have been written.
@@ -1438,6 +1449,43 @@ class TestNapWalShmRaceOrderingFix:
             f"expected {expected_nodes} nodes, restored {restored_nodes}.\n"
             f"This means dump_stripped missed WAL-resident writes — #786 fix broken."
         )
+
+    def test_async_path_releases_read_mark_and_captures_snapshot(self):
+        """#1673: a normal checkpoint dispatches to the async worker. The SYNC side
+        (the durability boundary) must, before returning: capture a fsync'd immutable
+        per-turn binary snapshot under the #786 read-mark, RELEASE the read-mark (no
+        dangling txn on the live conn), durably enqueue the commit job, and surface
+        snapshot_lag (R3). The async consumer is exercised by test_snapshot_worker;
+        here start_worker is a no-op so the assertions on the captured file are
+        deterministic (no consumer thread races them)."""
+        import engram_snapshot_worker as _sw
+
+        conn = self._make_minimal_db()
+        try:
+            with mock.patch.object(self.server.core, "_git", side_effect=self._mock_git), \
+                 mock.patch.object(_sw, "start_worker", lambda: None):
+                result = self.server._commit_snapshot(conn, "async dispatch test", "test")
+
+            assert result.get("async") is True, f"expected async dispatch; result={result}"
+            # #786: the read-mark's COMMIT fired — no dangling open transaction.
+            assert not conn.in_transaction, "read-mark not released after async capture"
+            # R1/R2: a fsync'd, immutable, keyed (turn,seq) per-turn snapshot exists.
+            cap = result.get("binary_backup", {})
+            assert cap.get("fsynced") is True, f"capture not fsynced; result={result}"
+            snap = Path(cap["path"])
+            assert snap.exists(), f"captured snapshot missing at {snap}"
+            assert snap.parent.name == ".pending"
+            assert snap.name == f"snapshot-{result['enqueued_turn']}-{result['enqueued_seq']}.db"
+            # the captured binary is a real, independent, queryable DB
+            c2 = sqlite3.connect(str(snap))
+            assert c2.execute("SELECT count(*) FROM nodes").fetchone()[0] >= 1
+            c2.close()
+            # R3: the durable job is enqueued and lag is surfaced to the caller.
+            assert "snapshot_lag" in result
+            assert _sw._pending_jobs(), "commit job was not durably enqueued"
+        finally:
+            _sw.stop_worker(timeout=2.0)
+            conn.close()
 
 
 # ---------------------------------------------------------------------------

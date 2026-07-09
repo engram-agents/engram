@@ -3305,7 +3305,155 @@ def _commit_snapshot(
     mode: str,
     skip_checkpoint: bool = False,
 ) -> dict:
-    """Generate the markdown snapshot, write it, and commit ~/.engram/.git.
+    """Durable snapshot dispatch (#1673).
+
+    Normal nap/session checkpoints take the ASYNC path: a per-turn fsync'd binary
+    snapshot is captured synchronously (the durability boundary) and the slow
+    iterdump→knowledge.sql + git commit/push is enqueued to the serialized snapshot
+    worker, moving the ~87% turn-advance cost off the hot path.
+
+    The delicate cases stay on the proven SYNCHRONOUS path (_commit_snapshot_sync):
+      - mode == "emergency": the walguard #786 dump must secure data inline before
+        returning — an enqueue-and-return would defeat the point.
+      - a degraded WAL marker is present: we're mid-corruption-handling; keep the
+        careful sync ordering unchanged.
+      - the async worker can't run (git unavailable / import or start failure) or
+        the sync binary capture fails: fall back to sync so no turn loses durability.
+    """
+    degraded = False
+    try:
+        import engram_walguard as _wg
+        degraded = _wg.read_degraded_marker(DATA_DIR) is not None
+    except Exception:
+        pass  # can't read marker → conservative: treat as not-degraded, dispatch normally
+
+    if mode != "emergency" and not degraded:
+        async_result = _commit_snapshot_async(conn, message, mode, skip_checkpoint)
+        if async_result is not None:
+            return async_result
+        # async unavailable or capture failed → fall through; durability preserved sync.
+
+    result = _commit_snapshot_sync(conn, message, mode, skip_checkpoint)
+    # R3 on the sync path too: an emergency/degraded/fallback checkpoint should still
+    # surface the async worker's backlog loudly (a git history that silently stops
+    # advancing is a false-in-the-graph failure). Best-effort; never blocks the commit.
+    try:
+        import engram_snapshot_worker as _sw
+        if isinstance(result, dict):
+            result.setdefault("snapshot_lag", _sw.compute_snapshot_lag())
+    except Exception:
+        pass
+    return result
+
+
+def _commit_snapshot_async(
+    conn: sqlite3.Connection,
+    message: str,
+    mode: str,
+    skip_checkpoint: bool,
+) -> Optional[dict]:
+    """#1673 async path. Returns the result dict on success, or None to signal the
+    caller to fall back to the synchronous path (git unavailable / worker cannot
+    run / the sync binary capture failed — never silently drop a turn's durability).
+
+    SYNC work here (the durability boundary, before returning):
+      1. #786 WAL read-mark on conn.
+      2. Per-turn fsync'd immutable binary snapshot (R1/R2), keyed (turn, seq).
+      3. Release read-mark; WAL RESTART checkpoint (unchanged skip rules).
+      4. Daily coarse binary ladder (_write_binary_backup), unchanged.
+      5. Durably enqueue + fsync the async commit job; return only after the fsync.
+    The worker then regenerates knowledge.sql + graph_snapshot.md from the captured
+    immutable snapshot and commits/pushes them (R5: it never touches the live WAL).
+    """
+    global _git_available
+
+    # The worker's job is a git commit; without git it can't make progress, so let
+    # the sync path (which reports git-unavailable) handle that case.
+    if not _git_available:
+        _init_git()
+    if not _git_available:
+        return None
+
+    try:
+        import engram_snapshot_worker as _sw
+        _sw.start_worker()  # idempotent: seeds seq, clears stale lock, replays, starts thread
+    except Exception as e:
+        print(f"[engram] snapshot worker unavailable, using sync commit: {e}", file=sys.stderr)
+        return None
+
+    turn = _get_current_turn()
+
+    # 1. #786 read-mark on conn — a real-page read forces a genuine WAL read mark so
+    #    the capture sees a consistent committed view (identical discipline to the
+    #    sync dump; verified conn.backup() works while this txn is open). Guard: don't
+    #    BEGIN if conn already has an open transaction.
+    _held_read_txn = False
+    if not conn.in_transaction:
+        try:
+            conn.execute("BEGIN DEFERRED")
+            _held_read_txn = True
+            conn.execute("SELECT count(*) FROM sqlite_master")
+        except Exception:
+            pass  # best-effort; capture still runs
+
+    # 2. Per-turn durable binary snapshot (R1/R2) under the read-mark.
+    seq = _sw.next_seq()
+    capture = _sw.write_durable_snapshot(conn, turn, seq)
+
+    # 3a. Release the read-mark before the RESTART checkpoint (RESTART needs all
+    #     WAL readers gone).
+    if _held_read_txn:
+        try:
+            conn.execute("COMMIT")
+        except Exception:
+            pass
+
+    # If the sync capture failed, we have NOT secured this turn — fall back to sync
+    # so durability is not silently dropped.
+    if capture.get("error"):
+        return None
+
+    # 3b. WAL RESTART checkpoint (same skip rules; no sync dump ⇒ no _dump_error gate).
+    wal_warning = None
+    if not skip_checkpoint:
+        try:
+            conn.execute("PRAGMA wal_checkpoint(RESTART)")
+        except Exception as e:
+            wal_warning = f"wal_checkpoint failed: {e}"
+
+    # 4. Daily coarse binary ladder (best-effort, unchanged) — retained alongside the
+    #    per-turn snapshots for the coarse 7-day restore window.
+    _db_backup_result = _write_binary_backup(str(DB_PATH), DATA_DIR / "db-backup")
+
+    # 5. Durably enqueue the async commit job (fsync'd inside enqueue_job) — the tool
+    #    returns only after this, honoring the "return after enqueue + fsync" guarantee.
+    _sw.enqueue_job(turn, seq, message, mode)
+
+    result = {
+        "async": True,
+        # git_committed is intentionally None here: the commit is pending in the
+        # worker. The only programmatic reader of git_committed is the walguard
+        # emergency path, which always takes the sync branch.
+        "git_committed": None,
+        "enqueued_turn": turn,
+        "enqueued_seq": seq,
+        "binary_backup": capture,
+        "db_backup": _db_backup_result,
+        "snapshot_lag": _sw.compute_snapshot_lag(),
+    }
+    if wal_warning:
+        result["wal_warning"] = wal_warning
+    return result
+
+
+def _commit_snapshot_sync(
+    conn: sqlite3.Connection,
+    message: str,
+    mode: str,
+    skip_checkpoint: bool = False,
+) -> dict:
+    """Synchronous snapshot + git commit (the pre-#1673 path, kept as the emergency
+    and fallback carrier). Generate the markdown snapshot, write it, and commit ~/.engram/.git.
 
     This is the durable version-controlled record of the graph state. It is the
     safety net for schema migrations and other invasive operations: if anything
