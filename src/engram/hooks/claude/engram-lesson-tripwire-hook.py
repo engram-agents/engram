@@ -247,16 +247,38 @@ def check_in_turn_recall(match_target: str) -> str:
     # break the lock's file-descriptor association).
     lock_fd = None
     lock_acquired = False
+    lock_degraded = False
+    lock_degrade_reason = ""
     try:
         import fcntl
         lock_fd = os.open(str(STATE_PATH) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
-    except Exception:
+    except Exception as exc:
         # fcntl unavailable (non-POSIX) or the lockfile couldn't be opened
         # (e.g. permissions) — degrade to the unlocked path exactly as
         # before this fix. The race is a perf issue, not a correctness one;
         # disabling the feature over an environment limitation would be
         # worse than accepting the (already-tolerated) race.
+        #
+        # #1737: this degrade was completely silent -- nothing distinguished
+        # "locked and suppressed correctly" from "running unlocked," which
+        # cost a full diagnosis round during PR #1733's review (a shared-/tmp
+        # lockfile collision made this fallback engage, and the only tell was
+        # stampede-shaped latency numbers downstream). Two cheap, never-
+        # block/never-raise tells: one stderr line now (hook stderr goes to
+        # hook logs, not the model -- safe on every call), and a state-file
+        # flag below wherever state ends up written this call, so any future
+        # bench/diagnostic can see it without re-deriving the cause.
         lock_fd = None
+        lock_degraded = True
+        lock_degrade_reason = f"{type(exc).__name__}: {exc}"
+        try:
+            print(
+                f"[engram-lesson-tripwire-hook] in_turn_recall lock degraded to "
+                f"unlocked path: {lock_degrade_reason}",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
     else:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -281,6 +303,37 @@ def check_in_turn_recall(match_target: str) -> str:
                 state = {}
         except Exception:
             state = {}
+        # #1737: carry the degrade tell into the state file, EAGERLY
+        # persisted the moment the flag transitions -- independent of
+        # whatever the cooldown/novelty gates below decide to do. Reviewer-
+        # fairy catch on PR #1742's first review: piggybacking purely on
+        # record_fire/_write_state (which several early-return gates below
+        # skip entirely) meant the flag could go stale in BOTH directions
+        # under sustained cooldown-heavy traffic -- under-reporting an
+        # ongoing degrade (never written because every call keeps hitting
+        # the cooldown gate), or over-reporting a resolved one (a stale
+        # True surviving because no call has reached a write since
+        # recovery). Eagerly writing just the transition, here, before any
+        # gate can short-circuit, closes both gaps while still only paying
+        # the extra write on an actual True<->False flip (steady state,
+        # once clear, costs nothing).
+        prev_degraded = bool(state.get("lock_degraded"))
+        if lock_degraded:
+            state["lock_degraded"] = True
+            state["lock_degrade_reason"] = lock_degrade_reason
+            flag_changed = not prev_degraded
+        else:
+            flag_changed = prev_degraded
+            state.pop("lock_degraded", None)
+            state.pop("lock_degrade_reason", None)
+        if flag_changed:
+            try:
+                _tmp = str(STATE_PATH) + ".tmp"
+                with open(_tmp, "w") as f:
+                    json.dump(state, f)
+                os.replace(_tmp, str(STATE_PATH))
+            except OSError:
+                pass
         now = time.time()
         last_fire = state.get("last_fire_ts", 0)
         if isinstance(last_fire, (int, float)) and (now - last_fire) < cfg["cooldown_seconds"]:

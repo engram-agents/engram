@@ -17,6 +17,10 @@ Coverage:
   12. no explicit min_idf: effective threshold = min_idf_ratio * ln(n_docs) (#1734)
   13. explicit min_idf: passed through verbatim, ignoring graph size (#1734)
   14. n_docs == 0: silent, no extract_keywords/daemon call (#1734)
+  15. lock degrade stamps state["lock_degraded"]/reason + emits a stderr
+      tell (#1737) -- the silent fallback now has an observable trace
+  16. the degrade flag is cleared on the next call once the lock recovers
+      (#1737) -- a stale flag must not outlive the condition it reports
 
 engram_idf and the daemon socket are stubbed: the gate logic is under test,
 not IDF extraction or the daemon (covered by their own tests).
@@ -386,6 +390,125 @@ def test_missing_fcntl_degrades_to_unlocked(tmp_path, monkeypatch):
     assert "ob_1" in out
     state = json.load(open(hook.STATE_PATH))
     assert state["last_fire_ts"] > 0
+
+
+def test_lock_degrade_stamps_state_and_emits_stderr_tell(tmp_path, monkeypatch, capsys):
+    """#1737: a lock-setup failure must leave an observable trace -- both a
+    stderr line (hook logs, never shown to the model) and a state-file flag
+    -- instead of the previously-silent fallback to unlocked."""
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path), cooldown_seconds=0)
+    _stub_idf([["omega"]])
+    monkeypatch.setattr(hook, "_query_recall_daemon", lambda q, top_k=5: _daemon_result(["ob_1"]))
+
+    def broken_open(*a, **kw):
+        raise PermissionError("simulated: lockfile open unavailable")
+
+    monkeypatch.setattr(hook.os, "open", broken_open)
+
+    out = hook.check_in_turn_recall("omega call")
+    assert "ENGRAM in-turn recall" in out, "degrade must still run the unlocked path, not go silent"
+
+    state = json.load(open(hook.STATE_PATH))
+    assert state["lock_degraded"] is True
+    assert "PermissionError" in state["lock_degrade_reason"]
+
+    captured = capsys.readouterr()
+    assert "lock degraded to unlocked path" in captured.err
+    assert "PermissionError" in captured.err
+
+
+def test_lock_degrade_flag_cleared_once_lock_recovers(tmp_path, monkeypatch):
+    """The lock_degraded flag reflects only the LATEST call -- a stale flag
+    from an earlier degrade must not persist once the lock is healthy
+    again, or a diagnostic reading the state file would misreport a
+    recovered install as still-degraded."""
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path), cooldown_seconds=0)
+    _stub_idf([["omega"], ["zeta"]])
+    monkeypatch.setattr(hook, "_query_recall_daemon", lambda q, top_k=5: _daemon_result(["ob_1"]))
+
+    real_open = hook.os.open
+
+    def broken_open(*a, **kw):
+        raise PermissionError("simulated: lockfile open unavailable")
+
+    monkeypatch.setattr(hook.os, "open", broken_open)
+    hook.check_in_turn_recall("omega call")
+    state = json.load(open(hook.STATE_PATH))
+    assert state["lock_degraded"] is True
+
+    monkeypatch.setattr(hook.os, "open", real_open)
+    hook.check_in_turn_recall("zeta call")
+    state = json.load(open(hook.STATE_PATH))
+    assert "lock_degraded" not in state
+    assert "lock_degrade_reason" not in state
+
+
+def test_lock_degrade_persists_even_when_cooldown_gate_short_circuits(tmp_path, monkeypatch):
+    """Reviewer-fairy catch (PR #1742 first review): a degraded call that
+    ALSO hits the cooldown gate must still persist the flag -- the original
+    implementation only stamped the in-memory state dict and relied on a
+    later _write_state() call that several early-return gates (cooldown
+    among them) skip entirely, so the flag could silently never reach disk
+    under sustained cooldown-heavy traffic."""
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path), cooldown_seconds=9999)
+    _stub_idf([["omega"]])
+    monkeypatch.setattr(hook, "_query_recall_daemon", lambda q, top_k=5: _daemon_result(["ob_1"]))
+
+    # Prime the cooldown with a normal (non-degraded) fire first.
+    hook.check_in_turn_recall("prime call")
+
+    def broken_open(*a, **kw):
+        raise PermissionError("simulated: lockfile open unavailable")
+
+    monkeypatch.setattr(hook.os, "open", broken_open)
+
+    # This call degrades AND immediately hits the just-primed cooldown gate
+    # (9999s) -- the old code returned "" here without ever calling
+    # _write_state(), so the flag never reached disk.
+    result = hook.check_in_turn_recall("degraded call under cooldown")
+    assert result == "", "sanity: cooldown gate should still suppress the render"
+
+    state = json.load(open(hook.STATE_PATH))
+    assert state["lock_degraded"] is True, (
+        "degrade flag must persist even when the cooldown gate short-circuits "
+        "the rest of the function"
+    )
+
+
+def test_lock_degrade_flag_clears_even_when_cooldown_gate_short_circuits(tmp_path, monkeypatch):
+    """Symmetric case: once the lock recovers, a call that ALSO hits the
+    cooldown gate must still clear a stale flag from an earlier degrade --
+    otherwise a recovered install can misreport as still-degraded for as
+    long as calls keep short-circuiting before a write."""
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path), cooldown_seconds=9999)
+    _stub_idf([["omega"], ["zeta"]])
+    monkeypatch.setattr(hook, "_query_recall_daemon", lambda q, top_k=5: _daemon_result(["ob_1"]))
+
+    real_open = hook.os.open
+
+    def broken_open(*a, **kw):
+        raise PermissionError("simulated: lockfile open unavailable")
+
+    monkeypatch.setattr(hook.os, "open", broken_open)
+    hook.check_in_turn_recall("degraded prime call")
+    state = json.load(open(hook.STATE_PATH))
+    assert state["lock_degraded"] is True
+
+    monkeypatch.setattr(hook.os, "open", real_open)
+    # Lock is healthy again, but the just-primed cooldown (9999s) will
+    # short-circuit this call before it ever reaches _write_state().
+    result = hook.check_in_turn_recall("recovered call under cooldown")
+    assert result == "", "sanity: cooldown gate should still suppress the render"
+
+    state = json.load(open(hook.STATE_PATH))
+    assert "lock_degraded" not in state, (
+        "a recovered lock must clear the stale flag even when the cooldown "
+        "gate short-circuits the rest of the function"
+    )
 
 
 # ---------------------------------------------------------------------------
