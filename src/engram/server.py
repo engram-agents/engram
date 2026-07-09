@@ -1117,6 +1117,20 @@ def _ensure_schema_bootstrap() -> None:
         core._get_db().close()
     except Exception:
         pass
+    # #1740: principle_triggers registry rebuild used to fire ONLY from
+    # mutation paths (edge writes, lesson/cornerstone/task/goal updates), so a
+    # deployed registry shape/logic fix stayed inert until an unrelated
+    # principle-affecting write happened to trigger a rebuild. Piggyback one
+    # unconditional rebuild here, at the same once-per-resolved-path gate that
+    # stands in for "server startup" for this process — always rebuild (no
+    # mtime/shape guard: it's one indexed query over edges, milliseconds at
+    # our graph sizes, and unconditional also self-heals a deleted/corrupted
+    # registry file). Best-effort: never let a rebuild failure block startup.
+    try:
+        core._rebuild_principle_triggers()
+    except Exception as exc:
+        import sys
+        print(f"[engram-startup] principle_triggers rebuild failed: {exc!r}", file=sys.stderr)
 
 
 def _get_timing_conn() -> sqlite3.Connection:

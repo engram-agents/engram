@@ -1305,3 +1305,34 @@ def test_principle_triggers_old_shape_single_dict_still_read(tmp_path, monkeypat
     _write_json(tmp_path / "principle_triggers.json", registry)
     result = mod.check_principle_triggers(["ob_9101"], prompt_count=5)
     assert "[ENGRAM Tripwire (ls_9101)" in result
+
+
+# ---------------------------------------------------------------------------
+# §8 Startup rebuild (#1740) — _ensure_schema_bootstrap() in server.py is the
+# once-per-resolved-path trigger that stands in for "server startup" (fires
+# from the first MCP tool call's timing wrapper, gated so it only runs once
+# per process/DB-path). Before #1740 it never touched the principle_triggers
+# registry, so a deployed rebuild-logic fix stayed inert until an unrelated
+# mutation happened to fire a rebuild. These tests cover the startup-time
+# rebuild call added there.
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_schema_bootstrap_rebuilds_principle_triggers_once():
+    """_ensure_schema_bootstrap() must invoke core._rebuild_principle_triggers()
+    exactly once (the once-per-resolved-path gate covers repeat calls too)."""
+    server = fresh_server()
+    with mock.patch.object(server.core, "_rebuild_principle_triggers") as m:
+        server._ensure_schema_bootstrap()
+        server._ensure_schema_bootstrap()
+    m.assert_called_once()
+
+
+def test_ensure_schema_bootstrap_survives_rebuild_exception():
+    """A raising rebuild must not propagate -- startup must never be blocked
+    by a principle_triggers rebuild failure."""
+    server = fresh_server()
+    with mock.patch.object(
+        server.core, "_rebuild_principle_triggers", side_effect=RuntimeError("boom")
+    ):
+        server._ensure_schema_bootstrap()  # must not raise
