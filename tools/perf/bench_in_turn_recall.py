@@ -58,21 +58,30 @@ DEFAULT_ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engra
 # payloads (claim/interpretation text), NOT short generic CLI commands.
 # CALIBRATION NOTE (found empirically 2026-07-08, see report): short strings
 # like "baton status" or "ia read ariadne" never clear the real default
-# min_idf=6.0 bar in this graph -- extract_keywords returns terms=[] and gate 3
+# min_idf bar in a small graph -- extract_keywords returns terms=[] and gate 3
 # short-circuits before ever reaching the daemon, which silently collapses the
 # "worst case" and "realistic mix" scenarios into the SAME cheap no-op path.
 # These targets deliberately mirror real engram_add_observation/add_edge
 # tool_input shapes (this session's own recent calls) so the IDF gate behaves
 # the way it does in production.
 #
-# INSTRUMENT-HONESTY NOTE (Kepler's colleague review, #1734): the IDF ceiling
-# is ln(N) for N current nodes, so min_idf=6.0 needs a graph of ~400+ current
-# nodes before it can EVER pass -- on smaller graphs gate 3 returns terms=[]
-# for every target, rich prose included, and scenarios B/C silently collapse
-# into the same no-daemon path as A while still rendering plausible-looking
-# latency numbers. Two mitigations below: --min-idf is now a CLI flag (not
-# hardcoded), and every scenario/level reports daemon_queries so a silent
-# collapse is visible in the report rather than misread as a real measurement.
+# INSTRUMENT-HONESTY NOTE, round 2 (Kepler, #1746 / forum #244): round 1
+# (#1734) fixed the SYMPTOM (a fixed min_idf=6.0 needs ~400+ current nodes to
+# ever pass) but not the DISEASE -- the bench always passed an EXPLICIT
+# min_idf into the hook's config, which the hook treats as an absolute
+# override (cfg["min_idf"] is not None), so the bench could never exercise
+# the hook's own graph-size-relative DEFAULT path (#1738: min_idf_ratio * ln
+# (n_docs), no override) at all -- only ever an explicit-override path, no
+# matter what number was passed. Whether that number happened to clear ln(N)
+# for a given graph's current size was luck, not measurement of the real
+# default behavior. Fix: --min-idf now defaults to None (no override) and
+# --min-idf-ratio defaults to 0.7 (matching the hook's own default) -- an
+# unspecified --min-idf means the bench measures EXACTLY what the hook would
+# do by default on the graph at hand, the same way production actually
+# behaves, not a guessed absolute. daemon_queries (the #1733 instrument-
+# honesty field) remains the tell if a run still silently collapses to
+# gate-only (e.g. against a very small or very large graph where even the
+# ratio default doesn't clear for these specific sample strings).
 _SAMPLE_TARGETS = [
     'mcp__plugin_engram_engram__engram_add_observation quoted_text hand-typed ScheduleWakeup prompt produced HTML-escaped loop-wake marker interpretation situation_pattern PreToolUse tripwire recurrence claim',
     'mcp__plugin_engram_engram__engram_add_edge source_id trigger target_id principle relation exemplifies instantiates cornerstone lesson axiom goal',
@@ -154,7 +163,8 @@ def _time_calls(fn, targets: list[str], n_workers: int) -> list[float]:
     return durations
 
 
-def run(engram_home: str, n_calls: int, concurrency_levels: list[int], min_idf: float = 6.0) -> dict:
+def run(engram_home: str, n_calls: int, concurrency_levels: list[int],
+        min_idf: float | None = None, min_idf_ratio: float = 0.7) -> dict:
     mod = _load_hook(engram_home)
 
     # Redirect the one write side-effect to a PER-RUN unique scratch dir --
@@ -180,11 +190,17 @@ def run(engram_home: str, n_calls: int, concurrency_levels: list[int], min_idf: 
         daemon_counter = _DaemonQueryCounter(mod._query_recall_daemon)
         mod._query_recall_daemon = daemon_counter
 
-        report = {"engram_home": engram_home, "n_calls": n_calls, "min_idf": min_idf, "scenarios": {}}
+        report = {
+            "engram_home": engram_home, "n_calls": n_calls,
+            "min_idf": min_idf, "min_idf_ratio": min_idf_ratio,
+            "min_idf_source": "explicit-override" if min_idf is not None else "hook-default-ratio",
+            "scenarios": {},
+        }
 
         # --- Scenario A: baseline (disabled) ---
         mod._in_turn_config = lambda: {
-            "enabled": False, "cooldown_seconds": 60, "max_lines": 3, "min_idf": min_idf,
+            "enabled": False, "cooldown_seconds": 60, "max_lines": 3,
+            "min_idf": min_idf, "min_idf_ratio": min_idf_ratio,
         }
         scratch_state.unlink(missing_ok=True)
         targets = [_SAMPLE_TARGETS[i % len(_SAMPLE_TARGETS)] for i in range(n_calls)]
@@ -202,7 +218,8 @@ def run(engram_home: str, n_calls: int, concurrency_levels: list[int], min_idf: 
 
         # --- Scenario B: worst-case (enabled, cooldown=0, forced-novel every call) ---
         mod._in_turn_config = lambda: {
-            "enabled": True, "cooldown_seconds": 0, "max_lines": 3, "min_idf": min_idf,
+            "enabled": True, "cooldown_seconds": 0, "max_lines": 3,
+            "min_idf": min_idf, "min_idf_ratio": min_idf_ratio,
         }
         b_results = {}
         for nw in concurrency_levels:
@@ -222,7 +239,8 @@ def run(engram_home: str, n_calls: int, concurrency_levels: list[int], min_idf: 
 
         # --- Scenario C: realistic mix (enabled, default cooldown, repeating vocab) ---
         mod._in_turn_config = lambda: {
-            "enabled": True, "cooldown_seconds": 60, "max_lines": 3, "min_idf": min_idf,
+            "enabled": True, "cooldown_seconds": 60, "max_lines": 3,
+            "min_idf": min_idf, "min_idf_ratio": min_idf_ratio,
         }
         c_results = {}
         for nw in concurrency_levels:
@@ -248,18 +266,29 @@ def main(argv=None) -> None:
     p.add_argument("--n-calls", type=int, default=40)
     p.add_argument("--concurrency", default="1,4,8")
     p.add_argument(
-        "--min-idf", type=float, default=6.0,
-        help="IDF threshold for gate 3 (default 6.0, today's production default). "
-             "The IDF ceiling is ln(N) for N current nodes -- on graphs under "
-             "~400 nodes, 6.0 never clears and every call short-circuits before "
-             "the daemon. Lower this to calibrate against a smaller graph "
-             "(Kepler used 4.0 live per #1734).",
+        "--min-idf", type=float, default=None,
+        help="Explicit IDF threshold for gate 3, OVERRIDING the hook's own "
+             "graph-size-relative default (#1738: min_idf_ratio * ln(n_docs)). "
+             "Default: unset -- an unspecified --min-idf means the bench "
+             "measures exactly what the hook would do by default on this "
+             "graph, not a guessed absolute (#1746 finding: a bench that "
+             "always passes an explicit min_idf can never exercise the "
+             "hook's real default path at all, no matter what number is "
+             "passed). Pass this only to force a SPECIFIC threshold, e.g. to "
+             "reproduce a config.json override or probe a boundary.",
+    )
+    p.add_argument(
+        "--min-idf-ratio", type=float, default=0.7,
+        help="min_idf_ratio to use when --min-idf is unset (default 0.7, "
+             "matching the hook's own production default). Ignored when "
+             "--min-idf is explicitly set.",
     )
     p.add_argument("--json-out")
     args = p.parse_args(argv)
 
     levels = [int(x) for x in args.concurrency.split(",")]
-    report = run(args.engram_home, args.n_calls, levels, min_idf=args.min_idf)
+    report = run(args.engram_home, args.n_calls, levels,
+                min_idf=args.min_idf, min_idf_ratio=args.min_idf_ratio)
     print(json.dumps(report, indent=2))
     if args.json_out:
         with open(args.json_out, "w") as f:
