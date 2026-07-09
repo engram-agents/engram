@@ -85,9 +85,10 @@
       "path_prefix_or_glob": "hooks/claude/engram-lesson-tripwire-hook.py",
       "test_globs": [
         "tests/test_lesson_tripwire.py",
-        "tests/test_in_turn_recall.py"
+        "tests/test_in_turn_recall.py",
+        "tests/test_principle_triggers_registry.py"
       ],
-      "note": "PreToolUse hook that surfaces lesson tripwires on Bash and MCP tool calls (issues #1203 + #1297)"
+      "note": "PreToolUse hook that surfaces lesson tripwires on Bash and MCP tool calls (issues #1203 + #1297). test_principle_triggers_registry.py added #1731 -- its own docstring (Coverage §6) already documented covering this hook's PreToolUse _QUERY broadening, but it was missing from this glob (found while fixing #1731, same completeness-gap class as this morning's tools/perf/*.py <-> test_in_turn_recall.py gap)."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-postcompact-hook.py",
@@ -140,8 +141,10 @@
         "tests/test_engine_unit.py",
         "tests/test_tier_build_filter.py",
         "tests/test_tiers_manifest.py",
-        "tests/test_recall_injection_budget.py"
-      ]
+        "tests/test_recall_injection_budget.py",
+        "tests/test_principle_triggers_registry.py"
+      ],
+      "note": "test_principle_triggers_registry.py added #1731 -- its own docstring (Coverage §5) already documented covering this hook's unified check_principle_triggers consumer, but it was missing from this glob (found while fixing #1731, same completeness-gap class as this morning's tools/perf/*.py <-> test_in_turn_recall.py gap)."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-time-bar-hook.py",

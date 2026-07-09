@@ -1293,9 +1293,18 @@ def _diagnose_impl() -> str:
             try:
                 with open(core.PRINCIPLE_TRIGGERS_PATH, "r") as f:
                     _pt_registry = json.load(f)
-                covered_ids = {
-                    e.get("principle_id") for e in _pt_registry.values() if e.get("principle_id")
-                }
+                # #1731: registry values are LISTS of entries (a dual-role
+                # trigger node now gets one entry per principle it triggers,
+                # instead of the old single-dict-per-trigger last-spec-wins
+                # shape). Tolerate an old-shape single dict too (lazy-read
+                # shim, same as the surface hook's consumer).
+                covered_ids = set()
+                for _raw in _pt_registry.values():
+                    _entries = _raw if isinstance(_raw, list) else [_raw]
+                    for _e in _entries:
+                        _pid = _e.get("principle_id")
+                        if _pid:
+                            covered_ids.add(_pid)
             except (FileNotFoundError, json.JSONDecodeError):
                 covered_ids = set()
 

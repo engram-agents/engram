@@ -332,7 +332,15 @@ def _check_enactments(
             registry = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return
-    principle_ids = {e.get("principle_id") for e in registry.values() if e.get("principle_id")}
+    # #1731: registry values are LISTS of entries (a dual-role trigger node
+    # now gets one entry per principle it triggers). Tolerate an old-shape
+    # single dict too (lazy-read shim, same as the surface hook's consumer).
+    principle_ids = set()
+    for _raw in registry.values():
+        for _e in (_raw if isinstance(_raw, list) else [_raw]):
+            _pid = _e.get("principle_id")
+            if _pid:
+                principle_ids.add(_pid)
     hits = principle_ids & set(mentioned_ids)
     if not hits:
         return

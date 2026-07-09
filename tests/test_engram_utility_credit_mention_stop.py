@@ -666,3 +666,55 @@ def test_main_full_pipeline_bumps_utility_via_stdin(monkeypatch, tmp_path):
         f"Activation smoke test failed: utility_score={val!r}, expected 0.10. "
         "The full main() pipeline did not bump the utility score for the mentioned node."
     )
+
+
+# --------------------------------------------------------------------------- #
+# _check_enactments against the list-valued principle_triggers.json (#1731)
+# --------------------------------------------------------------------------- #
+
+
+def test_check_enactments_reads_list_valued_registry(tmp_path):
+    """#1731: principle_triggers.json values are lists of entries (a
+    dual-role trigger gets one entry per principle). _check_enactments'
+    principle_ids extraction must handle that shape, not just the old
+    bare-dict-per-trigger one -- otherwise a mentioned principle_id is
+    silently never recognized as an enactment (AttributeError swallowed by
+    the caller's broad except, per the Stop-hook's own failure-isolation
+    style)."""
+    registry = {
+        "ob_dual": [
+            {"principle_id": "ls_dual", "kind": "lesson", "claim": "L", "nudge": "N"},
+            {"principle_id": "ax_dual", "kind": "axiom", "claim": "A", "nudge": "N2"},
+        ],
+    }
+    with open(hook.PRINCIPLE_TRIGGERS_PATH, "w") as f:
+        json.dump(registry, f)
+    with open(hook.PROMPT_COUNTER_PATH, "w") as f:
+        json.dump({"prompts_since_compaction": 50}, f)
+    # No prior fire recorded -> first mention past the enactment window counts.
+
+    hook._check_enactments(["ls_dual"])
+
+    with open(hook.PRINCIPLE_TRIGGER_STATE_PATH) as f:
+        state = json.load(f)
+    assert state["ls_dual"]["enactments"] == 1, (
+        f"expected an enactment recorded for the dual-role trigger's lesson entry; got {state}"
+    )
+
+
+def test_check_enactments_still_reads_old_shape_single_dict(tmp_path):
+    """Lazy-read shim: a registry file still in the pre-#1731 bare-dict
+    shape must still be read correctly here too."""
+    registry = {
+        "ob_old": {"principle_id": "ls_old", "kind": "lesson", "claim": "L", "nudge": "N"},
+    }
+    with open(hook.PRINCIPLE_TRIGGERS_PATH, "w") as f:
+        json.dump(registry, f)
+    with open(hook.PROMPT_COUNTER_PATH, "w") as f:
+        json.dump({"prompts_since_compaction": 50}, f)
+
+    hook._check_enactments(["ls_old"])
+
+    with open(hook.PRINCIPLE_TRIGGER_STATE_PATH) as f:
+        state = json.load(f)
+    assert state["ls_old"]["enactments"] == 1

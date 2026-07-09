@@ -1666,11 +1666,23 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tup
     # in the spec, with `test_fires_on_direct_lesson_id` covering the
     # previously-untested lesson-kind path (test_fires_on_direct_cornerstone_id
     # already covered cornerstone).
+    # #1731: registry values are now LISTS of entries (a dual-role trigger
+    # node has one entry per principle it triggers, no longer collapsed to
+    # one via last-spec-wins). Tolerate an old-shape single-dict entry too
+    # (lazy-read shim) — a registry file written before this fix deploys and
+    # not yet rebuilt looks like {trigger_id: {...}} rather than
+    # {trigger_id: [{...}]}.
+    def _entry_list(raw):
+        if raw is None:
+            return []
+        return raw if isinstance(raw, list) else [raw]
+
     by_principle = {}
-    for entry in registry.values():
-        pid = entry.get("principle_id", "")
-        if pid:
-            by_principle[pid] = entry
+    for raw_entries in registry.values():
+        for entry in _entry_list(raw_entries):
+            pid = entry.get("principle_id", "")
+            if pid:
+                by_principle.setdefault(pid, entry)
 
     try:
         with open(PRINCIPLE_TRIGGER_STATE_PATH, "r") as f:
@@ -1699,26 +1711,35 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tup
     candidates = []  # list of (kind, principle_id, entry, matched_via)
     seen_principles = set()
     for mid in matched_ids:
-        entry = registry.get(mid) or by_principle.get(mid)
-        if not entry:
-            continue
-        pid = entry.get("principle_id", "")
-        if not pid or pid in seen_principles:
-            continue
-        kind = entry.get("kind", "")
-        state_entry = state.get(pid)
-        if not isinstance(state_entry, dict):
-            state_entry = {}
-        last = state_entry.get("last_fired_prompt")
-        effective_cooldown = _effective_cooldown(kind, state_entry)
-        if (
-            isinstance(last, (int, float))
-            and last <= prompt_count
-            and (prompt_count - last) < effective_cooldown
-        ):
-            continue
-        seen_principles.add(pid)
-        candidates.append((kind, pid, entry, mid))
+        # #1731: a dual-role trigger now yields MULTIPLE entries (e.g. one
+        # exemplifies-lesson entry AND one instantiates-axiom entry for the
+        # same node) — iterate all of them per matched trigger instead of
+        # picking just one, so a dual-role node's lesson tripwire can no
+        # longer be silently shadowed by its axiom role. The existing
+        # priority sort + cap below (unchanged) arbitrates exactly as it
+        # already does across different triggers matched in one prompt.
+        raw = registry.get(mid)
+        entries = _entry_list(raw) if raw is not None else (
+            [by_principle[mid]] if mid in by_principle else []
+        )
+        for entry in entries:
+            pid = entry.get("principle_id", "")
+            if not pid or pid in seen_principles:
+                continue
+            kind = entry.get("kind", "")
+            state_entry = state.get(pid)
+            if not isinstance(state_entry, dict):
+                state_entry = {}
+            last = state_entry.get("last_fired_prompt")
+            effective_cooldown = _effective_cooldown(kind, state_entry)
+            if (
+                isinstance(last, (int, float))
+                and last <= prompt_count
+                and (prompt_count - last) < effective_cooldown
+            ):
+                continue
+            seen_principles.add(pid)
+            candidates.append((kind, pid, entry, mid))
 
     if not candidates:
         return "", []

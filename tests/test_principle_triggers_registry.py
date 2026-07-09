@@ -145,18 +145,22 @@ def test_rebuild_all_four_kinds():
     assert result["status"] == "rebuilt"
     reg = _read_registry(core)
 
-    assert reg[incident_id]["kind"] == "lesson"
-    assert reg[incident_id]["nudge"] == "Watch for this pattern."
-    assert reg[cs_ex]["kind"] == "cornerstone"
-    assert reg[cs_ex]["principle_id"] == cs_id
-    assert reg[ax_inst]["kind"] == "axiom"
-    assert reg[ax_inst]["principle_id"] == ax_id
-    assert reg[goal_ob]["kind"] == "goal"
-    assert reg[goal_ob]["principle_id"] == goal_id
-    assert "mode" not in reg[goal_ob]
+    # #1731: registry values are LISTS of entries (one per principle a
+    # trigger relates to). None of these fixtures are dual-role, so each
+    # list has exactly one entry -- [0] throughout.
+    assert reg[incident_id][0]["kind"] == "lesson"
+    assert reg[incident_id][0]["nudge"] == "Watch for this pattern."
+    assert reg[cs_ex][0]["kind"] == "cornerstone"
+    assert reg[cs_ex][0]["principle_id"] == cs_id
+    assert reg[ax_inst][0]["kind"] == "axiom"
+    assert reg[ax_inst][0]["principle_id"] == ax_id
+    assert reg[goal_ob][0]["kind"] == "goal"
+    assert reg[goal_ob][0]["principle_id"] == goal_id
+    assert "mode" not in reg[goal_ob][0]
     # nudge falls back to the principle claim when no surfacing_nudge
-    assert reg[goal_ob]["nudge"] == reg[goal_ob]["claim"]
+    assert reg[goal_ob][0]["nudge"] == reg[goal_ob][0]["claim"]
     assert result["by_kind"]["goal"] >= 1
+    assert all(len(v) == 1 for v in reg.values()), "no dual-role triggers expected in this fixture"
 
 
 def test_tensions_edge_tags_mode_and_is_bidirectional():
@@ -171,10 +175,10 @@ def test_tensions_edge_tags_mode_and_is_bidirectional():
 
     core._rebuild_principle_triggers()
     reg = _read_registry(core)
-    assert reg[ob_a]["mode"] == "tension"
-    assert reg[ob_a]["principle_id"] == goal_id
-    assert reg[ob_b]["mode"] == "tension", "goal→node tensions direction missed"
-    assert reg[ob_b]["principle_id"] == goal_id
+    assert reg[ob_a][0]["mode"] == "tension"
+    assert reg[ob_a][0]["principle_id"] == goal_id
+    assert reg[ob_b][0]["mode"] == "tension", "goal→node tensions direction missed"
+    assert reg[ob_b][0]["principle_id"] == goal_id
 
 
 def test_rebuild_idempotent_and_excludes_superseded():
@@ -211,7 +215,7 @@ def test_generic_serves_edge_from_observation_refreshes_registry():
 
     reg = _read_registry(core)
     assert thought in reg, "add_edge(serves) did not refresh the registry"
-    assert reg[thought]["kind"] == "goal"
+    assert reg[thought][0]["kind"] == "goal"
 
     # remove_edge resyncs too
     r = json.loads(server.engram_remove_edge(payload_json=json.dumps({
@@ -233,7 +237,7 @@ def test_register_exemplar_refreshes_registry():
         "target_id": cs_id, "exemplar_id": ex,
     })))
     reg = _read_registry(core)
-    assert ex in reg and reg[ex]["kind"] == "cornerstone"
+    assert ex in reg and reg[ex][0]["kind"] == "cornerstone"
 
 
 def test_add_task_serves_refreshes_registry():
@@ -248,7 +252,7 @@ def test_add_task_serves_refreshes_registry():
     assert "error" not in r, r
     task_id = r["task_id"]
     reg = _read_registry(core)
-    assert task_id in reg and reg[task_id]["kind"] == "goal"
+    assert task_id in reg and reg[task_id][0]["kind"] == "goal"
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +280,7 @@ def test_legacy_caches_still_written():
         legacy = json.load(f)
     reg = _read_registry(core)
     assert ex in legacy and ex in reg
-    assert legacy[ex]["cornerstone_id"] == reg[ex]["principle_id"]
+    assert legacy[ex]["cornerstone_id"] == reg[ex][0]["principle_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -1172,3 +1176,132 @@ def test_with_state_lock_releases_lock_when_closure_raises(tmp_path, monkeypatch
             assert False, f"{helper.__module__}._with_state_lock did not release the lock when the closure raised"
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# §8 Dual-role trigger nodes (#1731) — list-valued registry keyspace
+# ---------------------------------------------------------------------------
+#
+# Live-verify catch (Kepler's install, first deploy of slices 1-3): a
+# trigger node that both exemplifies a lesson AND instantiates an axiom
+# collided under the original single-dict-per-trigger keyspace. Rebuild
+# order in _PRINCIPLE_TRIGGER_SPECS processes lesson before axiom, and the
+# rebuild's last-spec-wins assignment (`index[trigger_id] = entry`) meant
+# axiom always overwrote lesson silently -- a T1 safety tripwire going dark
+# with no error anywhere. Fix: registry values are LISTS of entries; the
+# consumer iterates all of them per matched trigger and lets the existing
+# priority/cap logic (already built for cross-trigger arbitration) do the
+# same job across entries WITHIN one trigger.
+
+
+def test_dual_role_trigger_keeps_both_entries():
+    """A trigger that both exemplifies a lesson and instantiates an axiom
+    must survive in the registry with BOTH entries, not last-spec-wins
+    collapse to whichever spec runs later in _PRINCIPLE_TRIGGER_SPECS."""
+    server = fresh_server()
+    import engram_core as core
+
+    lesson_id, incident_id = _seed_lesson(server)
+    ax_id = _seed_axiom(server, "An axiom the dual-role node also grounds.")
+    _add_edge(server, incident_id, ax_id, "instantiates")
+
+    core._rebuild_principle_triggers()
+    reg = _read_registry(core)
+
+    assert incident_id in reg
+    assert isinstance(reg[incident_id], list), "registry values must be lists (#1731)"
+    kinds = {e["kind"] for e in reg[incident_id]}
+    assert kinds == {"lesson", "axiom"}, (
+        f"dual-role trigger must keep BOTH entries, not collapse to one; got kinds={kinds}"
+    )
+    principle_ids = {e["principle_id"] for e in reg[incident_id]}
+    assert principle_ids == {lesson_id, ax_id}
+
+
+def test_dual_role_trigger_by_kind_counts_both():
+    """The rebuild summary's by_kind tally counts a dual-role trigger's
+    lesson AND axiom entries separately -- neither survivor is invisible to
+    the count just because they share a trigger node."""
+    server = fresh_server()
+    import engram_core as core
+
+    _, incident_id = _seed_lesson(server)
+    ax_id = _seed_axiom(server, "Second axiom for by_kind counting.")
+    _add_edge(server, incident_id, ax_id, "instantiates")
+
+    result = core._rebuild_principle_triggers()
+    assert result["by_kind"].get("lesson", 0) >= 1
+    assert result["by_kind"].get("axiom", 0) >= 1
+
+
+def test_check_principle_triggers_dual_role_renders_both_under_cap(tmp_path, monkeypatch):
+    """Consumer side of #1731: a dual-role trigger's list entries both
+    produce candidates. With cap=2 and nothing else matched, both the
+    lesson and the axiom render -- the lesson (highest priority) is no
+    longer silently shadowed by the axiom sharing its trigger id."""
+    mod = _load_surface_hook(tmp_path, monkeypatch)
+    registry = {
+        "ob_9099": [
+            {
+                "principle_id": "ls_9099",
+                "kind": "lesson",
+                "claim": "Dual-role lesson claim.",
+                "nudge": "Do the corrective action.",
+            },
+            {
+                "principle_id": "ax_9099",
+                "kind": "axiom",
+                "claim": "Dual-role axiom claim.",
+                "nudge": "Constraint text.",
+            },
+        ],
+    }
+    _write_json(tmp_path / "principle_triggers.json", registry)
+    text, rendered = mod.check_principle_triggers_full(["ob_9099"], prompt_count=5)
+    kinds_rendered = {r[0] for r in rendered}
+    assert "lesson" in kinds_rendered, "dual-role trigger's lesson entry must not be silently dropped"
+    assert "axiom" in kinds_rendered, "both entries fit within cap=2 and should both render"
+    assert "[ENGRAM Tripwire (ls_9099)" in text
+    assert "[Principle trigger (ax_9099, constraining)]" in text
+
+
+def test_check_principle_triggers_dual_role_beats_unrelated_lower_priority_under_cap(tmp_path, monkeypatch):
+    """A dual-role trigger contributes 2 candidates (lesson, axiom); a
+    THIRD, unrelated goal-kind trigger also matches in the same prompt.
+    Cap=2 keeps the two higher-priority entries (both from the dual-role
+    trigger) and drops the goal -- the arbitration the fix delegates to the
+    existing priority/cap logic, now correctly reachable within one
+    trigger's own entries and not just across different triggers."""
+    mod = _load_surface_hook(tmp_path, monkeypatch)
+    registry = {
+        "ob_9099": [
+            {"principle_id": "ls_9099", "kind": "lesson", "claim": "L", "nudge": "N1"},
+            {"principle_id": "ax_9099", "kind": "axiom", "claim": "A", "nudge": "N2"},
+        ],
+        "ob_9100": {"principle_id": "gl_9100", "kind": "goal", "claim": "G", "nudge": "N3"},
+    }
+    _write_json(tmp_path / "principle_triggers.json", registry)
+    text, rendered = mod.check_principle_triggers_full(["ob_9099", "ob_9100"], prompt_count=5)
+    kinds_rendered = [r[0] for r in rendered]
+    assert kinds_rendered == ["lesson", "axiom"], f"expected lesson+axiom to win the cap; got {kinds_rendered}"
+    assert "gl_9100" not in text
+
+
+def test_principle_triggers_old_shape_single_dict_still_read(tmp_path, monkeypatch):
+    """Lazy-read shim: a registry file still in the pre-#1731 shape (a bare
+    dict per trigger, not a list) must still be read correctly -- covers the
+    window right after this fix deploys, before the next rebuild rewrites
+    the file. (The byte-compat tests above already exercise this
+    incidentally; this test names the shim explicitly.)"""
+    mod = _load_surface_hook(tmp_path, monkeypatch)
+    registry = {
+        "ob_9101": {
+            "principle_id": "ls_9101",
+            "kind": "lesson",
+            "claim": "Old-shape claim.",
+            "nudge": "Old-shape nudge.",
+        }
+    }
+    _write_json(tmp_path / "principle_triggers.json", registry)
+    result = mod.check_principle_triggers(["ob_9101"], prompt_count=5)
+    assert "[ENGRAM Tripwire (ls_9101)" in result

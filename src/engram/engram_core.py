@@ -4282,25 +4282,35 @@ def _rebuild_principle_triggers() -> dict:
     """Rebuild the unified principle_triggers.json registry (#1698 slice 1).
 
     One registry over all four principle kinds, derived entirely from edges
-    per _PRINCIPLE_TRIGGER_SPECS. Entry shape:
-        trigger_node_id -> {principle_id, kind, claim, nudge,
-                            situation_pattern?, mode?}
+    per _PRINCIPLE_TRIGGER_SPECS. Entry shape (list-valued since #1731):
+        trigger_node_id -> [{principle_id, kind, claim, nudge,
+                             situation_pattern?, mode?}, ...]
+
+    List-valued keyspace (#1731 fix): a dual-role trigger node — one that
+    both exemplifies a lesson AND instantiates an axiom, say — used to
+    collide under the original single-dict-per-trigger keyspace
+    (last-spec-wins, silently dropping whichever spec ran earlier in
+    _PRINCIPLE_TRIGGER_SPECS; lesson ran first, so it always lost to axiom).
+    That was a real, live incident: a dual-role node's lesson tripwire went
+    silently dark on first deploy (issue #1731) because the unified read
+    path (slice 2) has no legacy fallback for a trigger the registry can see
+    but only under the WRONG kind. Every (trigger, principle) relationship
+    now gets its own list entry; the consumer iterates all of them per
+    matched trigger and lets the existing cap/priority logic (lesson >
+    axiom > cornerstone > goal) arbitrate, exactly as it already does across
+    DIFFERENT triggers matched in the same prompt.
 
     Migration shim: this is ADDITIVE — the legacy caches
     (error_incidents.json, cornerstone_anchors.json) keep being written by
     their own rebuilds and remain what the hooks read until the unified
-    check lands (design doc §2, implementation PR 2 of 3). Same-trigger
-    multi-principle collisions resolve last-spec-wins — a NEW tradeoff this
-    unified keyspace introduces (the per-kind legacy caches never faced
-    cross-kind collisions); slice 2's read path should treat it as a
-    deliberate choice, not inherited precedent.
+    check lands (design doc §2, implementation PR 2 of 3).
 
     Idempotent full rewrite; returns a summary dict; never raises past the
     connection (callers wrap best-effort).
     """
     conn = _get_db()
     try:
-        index: dict[str, dict] = {}
+        index: dict[str, list[dict]] = {}
         by_kind: dict[str, int] = {}
         for relation, ptype, kind, nudge_key, mode, bidirectional in _PRINCIPLE_TRIGGER_SPECS:
             # Trigger-side is_current fix (#1698, Luria's catch, confirmed by
@@ -4349,14 +4359,17 @@ def _rebuild_principle_triggers() -> dict:
                     entry["situation_pattern"] = pattern
                 if mode:
                     entry["mode"] = mode
-                index[r["trigger_id"]] = entry
+                index.setdefault(r["trigger_id"], []).append(entry)
 
-        # Count SURVIVING entries per kind (post last-spec-wins), not rows
-        # processed — a node serving two goals is one trigger, not two
-        # (#1702 reviewer-fairy).
-        for entry in index.values():
-            k = entry["kind"]
-            by_kind[k] = by_kind.get(k, 0) + 1
+        # Count every surviving entry across every trigger's list — #1731
+        # removed the last-spec-wins collision, so a dual-role trigger (one
+        # node with two-plus entries) now correctly counts once per kind,
+        # same as #1702's original "count survivors, not rows processed"
+        # intent, just generalized to a list instead of a single winner.
+        for entries in index.values():
+            for entry in entries:
+                k = entry["kind"]
+                by_kind[k] = by_kind.get(k, 0) + 1
 
         os.makedirs(os.path.dirname(PRINCIPLE_TRIGGERS_PATH), exist_ok=True)
         with open(PRINCIPLE_TRIGGERS_PATH, "w") as f:
