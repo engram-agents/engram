@@ -29,6 +29,15 @@ distribution anchors present — not just semantic labels. Closes the
 access≠presence gap. Sourced from engram_stats(sections=
 ["confidence"]) + engram_stats(mode="7-turn", sections=["confidence"]).
 Silent skip on any stats failure: hook never blocks session start.
+
+The live focus list (the deterministic focus channel, #1732) is also
+rendered verbatim on every SessionStart, regardless of source. It
+originally shipped at PostCompact (#1655/#1710), but PostCompact is a
+side-effects-only Claude Code hook event that cannot inject
+additionalContext at all — so that render never actually reached the
+model. SessionStart fires for source=="compact" too, so this is the
+correct render point; Lei's 2026-07-09 scope call additionally extended
+it to fresh/resumed sessions, not just post-compact ones.
 """
 import hashlib
 import json
@@ -434,6 +443,7 @@ def format_calibration_block(conf_all: dict, conf_7d: dict, current_turn: int) -
 INTER_AGENT_DIR = os.environ.get("INTER_AGENT_DIR", "/home/agents-shared/inter-agent")
 STARRED_CAP = 10
 STARRED_STALE_DAYS = 7  # soft TTL for staleness nudge (nudge only, never auto-drop)
+FOCUS_LIST_CAP = 15  # mirrors engram_focus.FOCUS_LIST_CAP (write-side enforced cap)
 
 # Agent registration directory (parallel to inter-agent/ and projects/)
 AGENTS_SHARED_ROOT = os.environ.get("AGENTS_SHARED_DIR", "/home/agents-shared")
@@ -685,6 +695,72 @@ def peer_topology_block(agent_name: str) -> str:
 
         return f"[Peer topology — {'; '.join(parts)}]"
     except Exception:
+        return ""
+
+
+def focus_block(engram_home: str) -> str:
+    """Render the live focus list as a deterministic, verbatim continuity block.
+
+    Queries the active focus list directly from knowledge.db (read-only) so the
+    "deterministic focus channel" is an actual mechanism at every session start,
+    not a prose convention the compacting model may skip (issue #1732 — the
+    channel was originally shipped at PostCompact via #1655/#1710, but
+    PostCompact is a side-effects-only Claude Code hook event that cannot
+    inject additionalContext; SessionStart (fired for every source, including
+    source=="compact") is the correct render point). One line per node,
+    rendered VERBATIM (id, claim, focus_reason are never truncated):
+
+        - [<id>] (<focus_reason>) <claim>
+        - [<id>] <claim>                (when focus_reason is empty/NULL)
+
+    Returns "" when the DB is missing, the focus list is empty, or any read
+    error occurs. Never raises — hook must not block session start.
+    """
+    try:
+        db_path = os.path.join(engram_home, "knowledge.db")
+        if not os.path.exists(db_path):
+            return ""
+
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, claim, focus_reason FROM nodes "
+                "WHERE focused_at IS NOT NULL AND is_current = 1 "
+                "ORDER BY focused_at"
+            ).fetchall()
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        if not rows:
+            return ""
+
+        lines = []
+        for row in rows:
+            node_id = row["id"]
+            claim = row["claim"]
+            focus_reason = row["focus_reason"]
+            if focus_reason:
+                lines.append(f"  - [{node_id}] ({focus_reason}) {claim}")
+            else:
+                lines.append(f"  - [{node_id}] {claim}")
+
+        total = len(lines)
+        display_lines = lines[:FOCUS_LIST_CAP]
+        remaining = total - len(display_lines)
+
+        header = "📌 Focused nodes — the deterministic focus channel (verbatim, must survive compaction):"
+        block_lines = [header] + display_lines
+        if remaining > 0:
+            block_lines.append(f"  ... +{remaining} more")
+        return "\n".join(block_lines)
+    except Exception:
+        # Hook discipline: never surface focus-block errors at session start.
         return ""
 
 
@@ -1569,6 +1645,22 @@ def main() -> None:
             lines.append(_cal_block)
     except Exception:
         # Hook discipline: never surface calibration errors to session start.
+        pass
+
+    # ── Focus list surface ─────────────────────────────────────────────────
+    # Render the live focus list verbatim at EVERY session start (startup,
+    # compact, resume — Lei's 2026-07-09 scope call on #1732: "even for a
+    # fresh new session, knowing what's focused is a good thing"), not just
+    # post-compaction. This is the deterministic focus channel's actual
+    # mechanism — #1655/#1710 shipped it at PostCompact, which cannot inject
+    # additionalContext at all (confirmed against CC docs, forum #241); moving
+    # it here is the fix. Silent skip on any failure — hook must not block
+    # session start.
+    try:
+        _focus = focus_block(ENGRAM_HOME)
+        if _focus:
+            lines.append(_focus)
+    except Exception:
         pass
 
     # ── Starred letters surface ────────────────────────────────────────────

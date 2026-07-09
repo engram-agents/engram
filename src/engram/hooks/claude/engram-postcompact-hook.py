@@ -12,161 +12,24 @@ correctness backstop — for sessions where compact_boundary is absent or
 stale the tracker falls back to the marker; for normal sessions it is a
 belt-and-suspenders efficiency hedge (avoids rescanning from the top).
 
-Also renders two continuity surfaces into additionalContext so load-bearing
-context survives the experiential reset a compaction represents: the live
-focus list read verbatim from the DB (the deterministic focus channel, #1655)
-and starred inter-agent letters as concise pointers.
+This hook does NOT render additionalContext continuity surfaces (focus list,
+starred letters) despite an earlier design (#1655/#1710) attempting to do so:
+PostCompact is a side-effects-only Claude Code hook event and cannot inject
+additionalContext at all (confirmed against CC docs, forum #241, 2026-07-09)
+— the JSON this hook used to print with hookEventName=="PostCompact" was
+silently discarded by the harness every time. The live focus list now
+renders at SessionStart instead (source=="compact" fires there too — see
+engram-session-start-hook.py, #1732); starred letters were already covered
+there unconditionally and never needed to move.
 """
 import json
 import os
-import sqlite3
 import sys
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import find_active_jsonl
-
-# Inter-agent dir (mirrors ia.py convention)
-INTER_AGENT_DIR = os.environ.get("INTER_AGENT_DIR", "/home/agents-shared/inter-agent")
-STARRED_CAP = 10
-STARRED_STALE_DAYS = 7  # soft TTL for staleness nudge (nudge only, never auto-drop)
-FOCUS_LIST_CAP = 15  # mirrors engram_focus.FOCUS_LIST_CAP (write-side enforced cap)
-
-
-def focus_block(engram_home: str) -> str:
-    """Render the live focus list as a deterministic, verbatim continuity block.
-
-    Queries the active focus list directly from knowledge.db (read-only) so the
-    "deterministic focus channel" is an actual mechanism at PostCompact, not a
-    prose convention the compacting model may skip (issue #1655). One line per
-    node, rendered VERBATIM (id, claim, focus_reason are never truncated):
-
-        - [<id>] (<focus_reason>) <claim>
-        - [<id>] <claim>                (when focus_reason is empty/NULL)
-
-    Returns "" when the DB is missing, the focus list is empty, or any read
-    error occurs. Never raises — hook must not block post-compact.
-    """
-    try:
-        db_path = os.path.join(engram_home, "knowledge.db")
-        if not os.path.exists(db_path):
-            return ""
-
-        conn = None
-        try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT id, claim, focus_reason FROM nodes "
-                "WHERE focused_at IS NOT NULL AND is_current = 1 "
-                "ORDER BY focused_at"
-            ).fetchall()
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-
-        if not rows:
-            return ""
-
-        lines = []
-        for row in rows:
-            node_id = row["id"]
-            claim = row["claim"]
-            focus_reason = row["focus_reason"]
-            if focus_reason:
-                lines.append(f"  - [{node_id}] ({focus_reason}) {claim}")
-            else:
-                lines.append(f"  - [{node_id}] {claim}")
-
-        total = len(lines)
-        display_lines = lines[:FOCUS_LIST_CAP]
-        remaining = total - len(display_lines)
-
-        header = "📌 Focused nodes — the deterministic focus channel (verbatim, must survive compaction):"
-        block_lines = [header] + display_lines
-        if remaining > 0:
-            block_lines.append(f"  ... +{remaining} more")
-        return "\n".join(block_lines)
-    except Exception:
-        # Hook discipline: never surface focus-block errors at post-compact.
-        return ""
-
-
-def starred_block(engram_home: str) -> str:
-    """Render starred inter-agent letters as concise pointers.
-
-    One line per entry: ⭐ [<from>] "<title>" — ia read <filename>
-    Stars older than STARRED_STALE_DAYS get a trailing nudge: ⚠ stale Nd — unstar if resolved
-    Reads from/title from snapshot fields stored at star-time — does NOT re-open or re-parse
-    the source letter. If the source letter was deleted, still renders from the snapshot.
-    Returns empty string when the list is empty, the file is missing, or any
-    read error occurs. Never raises — hook must not block post-compact.
-    """
-    try:
-        starred_path = os.path.join(engram_home, "inter-agent-starred.json")
-        try:
-            raw = Path(starred_path).read_text(encoding="utf-8")
-            entries = json.loads(raw)
-            if not isinstance(entries, list):
-                return ""
-        except (OSError, json.JSONDecodeError, ValueError):
-            return ""
-
-        if not entries:
-            return ""
-
-        now = datetime.now(timezone.utc)
-        lines = []
-        skipped = 0
-        for entry in entries:
-            filename = entry.get("filename", "").strip()
-            if not filename:
-                skipped += 1
-                continue
-
-            # Read from/title from snapshot; graceful fallback for old entries lacking snapshot fields
-            from_agent = (entry.get("from") or "").strip() or "unknown"
-            title = (entry.get("title") or "").strip() or "(no title)"
-            note = entry.get("note", "").strip()
-            note_part = f" — {note}" if note else ""
-
-            # Staleness nudge: compute age from starred_at
-            stale_part = ""
-            starred_at_str = entry.get("starred_at", "")
-            if starred_at_str:
-                try:
-                    starred_dt = datetime.strptime(starred_at_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                    age_days = (now - starred_dt).days
-                    if age_days >= STARRED_STALE_DAYS:
-                        stale_part = f"  ⚠ stale {age_days}d — unstar if resolved"
-                except ValueError:
-                    pass
-
-            lines.append(f"  ⭐ [{from_agent}] \"{title}\" — ia read {filename}{note_part}{stale_part}")
-
-        if not lines:
-            return ""
-
-        total = len(lines)
-        display_lines = lines[:STARRED_CAP]
-        remaining = total - len(display_lines)
-        header = f"⭐ {total} starred letter(s) — key cross-session context, re-read if relevant:"
-        block_lines = [header] + display_lines
-        if remaining > 0:
-            block_lines.append(f"  ... +{remaining} more (ia starred to see all)")
-        if skipped > 0:
-            block_lines.append(
-                f"  (note: {skipped} starred entry/entries skipped (missing filename field))"
-            )
-        return "\n".join(block_lines)
-    except Exception:
-        # Hook discipline: never surface starred-block errors at post-compact.
-        return ""
 
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
@@ -245,38 +108,11 @@ def main() -> None:
     except OSError:
         pass
 
-    # Continuity surfaces: emit as additionalContext so load-bearing context
-    # survives the experiential reset — the live focus list (the deterministic
-    # focus channel, #1655) first, then starred letters. Silent skip on any
-    # failure — hook must not block post-compact.
-    context_lines = []
-    try:
-        focus = focus_block(ENGRAM_HOME)
-        if focus:
-            context_lines.append(focus)
-    except Exception:
-        pass
-    try:
-        starred = starred_block(ENGRAM_HOME)
-        if starred:
-            context_lines.append(starred)
-    except Exception:
-        pass
-
+    # No additionalContext is emitted here — see module docstring: PostCompact
+    # cannot inject additionalContext at all, so there is nothing useful to
+    # print. The marker write above is this hook's entire job.
     _duration_ms = int((time.perf_counter() - _t0) * 1000)
-
-    if context_lines:
-        output_obj = {
-            "hookSpecificOutput": {
-                "hookEventName": "PostCompact",
-                "additionalContext": "\n".join(context_lines),
-            }
-        }
-        output_str = json.dumps(output_obj)
-        print(output_str)
-        _emit_hook_fire(session_id, transcript_path, _duration_ms)
-    else:
-        _emit_hook_fire(session_id, transcript_path, _duration_ms)
+    _emit_hook_fire(session_id, transcript_path, _duration_ms)
 
 
 if __name__ == "__main__":

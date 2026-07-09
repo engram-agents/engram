@@ -91,9 +91,9 @@
     {
       "path_prefix_or_glob": "hooks/claude/engram-postcompact-hook.py",
       "test_globs": [
-        "tests/test_starred_block.py",
         "tests/test_engine_phase3.py"
-      ]
+      ],
+      "note": "starred_block()/focus_block() no longer live here (#1732, 2026-07-09) -- PostCompact cannot inject additionalContext at all, so both moved to/stayed at engram-session-start-hook.py. test_starred_block.py dropped from this glob since it no longer imports this file; test_engine_phase3.py kept for the INTER_AGENT_DIR dead-assignment premise + leak-pattern bundling checks, which still apply."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-session-start-hook.py",
@@ -101,13 +101,16 @@
         "tests/test_session_start_hook_auto_sleep_cron.py",
         "tests/test_session_start_hook_calibration.py",
         "tests/test_session_start_hook_mcp_health.py",
+        "tests/test_session_start_hook_focus_render.py",
         "tests/test_per_session_marker_prune.py",
         "tests/test_starred_block.py",
+        "tests/test_focus_block.py",
         "tests/test_fairy_policy.py",
         "tests/test_resolve_runtime_dir_plugin.py",
         "tests/test_engine_phase3.py",
         "tests/test_engine_unit.py"
-      ]
+      ],
+      "note": "focus_block() moved here from engram-postcompact-hook.py (#1732, 2026-07-09) -- test_focus_block.py and the new test_session_start_hook_focus_render.py added accordingly."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-stop-hook.py",

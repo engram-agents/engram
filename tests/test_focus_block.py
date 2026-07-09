@@ -1,8 +1,14 @@
-"""Tests for the focus_block() surface helper wired into the PostCompact hook.
+"""Tests for the focus_block() surface helper wired into the SessionStart hook.
 
-Verifies (issue #1655): the live focus list renders at PostCompact via
-additionalContext, verbatim, so the "deterministic focus channel" is an
-actual mechanism rather than a prose convention the compacting model may skip.
+Verifies (issue #1732, moved from PostCompact per #1655/#1710): the live focus
+list renders at every SessionStart via additionalContext, verbatim, so the
+"deterministic focus channel" is an actual mechanism rather than a prose
+convention the compacting model may skip. PostCompact was the original render
+point (#1655/#1710) but PostCompact is a side-effects-only Claude Code hook
+event that cannot inject additionalContext at all (confirmed against CC docs,
+forum #241, 2026-07-09) — SessionStart fires for source=="compact" too, and is
+the correct point; Lei's 2026-07-09 scope call additionally extended the
+render to every session start, not just post-compact ones.
 
 Covers:
   1. focus_block() returns "" when knowledge.db doesn't exist.
@@ -24,15 +30,15 @@ from unittest.mock import MagicMock
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_POSTCOMPACT_HOOK_PATH = _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-postcompact-hook.py"
+_SESSION_START_HOOK_PATH = _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
 
 
 # ---------------------------------------------------------------------------
 # Module-load helper (mirrors tests/test_starred_block.py's pattern)
 # ---------------------------------------------------------------------------
 
-def _load_postcompact_module(engram_home: Path):
-    """Load the Claude postcompact hook with ENGRAM_HOME set.
+def _load_session_start_module(engram_home: Path):
+    """Load the Claude session-start hook with ENGRAM_HOME set.
 
     Stubs context_tracker so module-level imports don't fail. Forces a fresh
     import each call so env changes take effect.
@@ -47,12 +53,12 @@ def _load_postcompact_module(engram_home: Path):
     stub_ct.find_active_jsonl = MagicMock(return_value=None)
     sys.modules["context_tracker"] = stub_ct
 
-    module_name = "engram_postcompact_hook"
+    module_name = "engram_session_start_hook_for_focus_block_test"
     for mod_name in list(sys.modules.keys()):
         if mod_name == module_name:
             del sys.modules[mod_name]
 
-    spec = importlib.util.spec_from_file_location(module_name, _POSTCOMPACT_HOOK_PATH)
+    spec = importlib.util.spec_from_file_location(module_name, _SESSION_START_HOOK_PATH)
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
@@ -114,18 +120,18 @@ def engram_home(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 class TestFocusBlockHelper:
-    """focus_block() renders the live focus list verbatim for PostCompact."""
+    """focus_block() renders the live focus list verbatim for SessionStart."""
 
     def test_nonexistent_db_returns_empty(self, engram_home):
         """Returns '' when knowledge.db doesn't exist (no raise)."""
-        mod = _load_postcompact_module(engram_home)
+        mod = _load_session_start_module(engram_home)
         result = mod.focus_block(str(engram_home))
         assert result == "", f"expected '' when db missing; got {result!r}"
 
     def test_empty_db_returns_empty(self, engram_home):
         """Returns '' when there are no focused-current rows."""
         _make_db(engram_home)
-        mod = _load_postcompact_module(engram_home)
+        mod = _load_session_start_module(engram_home)
         result = mod.focus_block(str(engram_home))
         assert result == "", f"expected '' for empty focus list; got {result!r}"
 
@@ -152,7 +158,7 @@ class TestFocusBlockHelper:
             "2026-07-08T09:00:00Z", "old thread", 0,
         )
 
-        mod = _load_postcompact_module(engram_home)
+        mod = _load_session_start_module(engram_home)
         result = mod.focus_block(str(engram_home))
 
         assert result != "", "expected non-empty output"
@@ -181,6 +187,6 @@ class TestFocusBlockHelper:
                 db_path, f"ob_{i:04d}", f"Claim number {i}.",
                 f"2026-07-08T10:{i:02d}:00Z", None, 1,
             )
-        mod = _load_postcompact_module(engram_home)
+        mod = _load_session_start_module(engram_home)
         result = mod.focus_block(str(engram_home))
         assert "+3 more" in result, f"expected '+3 more' tail; got {result!r}"
