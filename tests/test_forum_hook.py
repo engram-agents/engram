@@ -928,15 +928,27 @@ def test_tools_resolution_in_flattened_deployed_topology(tmp_path):
     fallback would overshoot in this topology (CPR-unset case). Walk-all-parents
     is robust to both depths.
 
-    Recreate the deployed layout (hooks/<name>.py with a SIBLING tools/) with
-    CLAUDE_PLUGIN_ROOT unset and assert that _status_derive resolves: a resolved
-    import leaves derive_own_status as a callable; a broken import leaves it None.
+    Updated for gh#1657 slice 3: the hook now resolves tools/ via the shared
+    hooks/claude/_hooklib.py (extracted in slice 1, already re-pointed for
+    baton/inter-agent in slices 1-2) rather than its own inline walk-parents
+    copy, so _hooklib.py must also be present as a sibling in the recreated
+    flattened layout for the import to succeed.
+
+    Recreate the deployed layout (hooks/<name>.py with a SIBLING tools/ AND a
+    SIBLING _hooklib.py) with CLAUDE_PLUGIN_ROOT unset and assert that
+    _status_derive resolves: a resolved import leaves derive_own_status as a
+    callable; a broken import leaves it None.
     """
     root = tmp_path / "engram"
     (root / "hooks").mkdir(parents=True)
     (root / "tools").mkdir()
     hook_src = HOOK_PATH
+    hooklib_src = (
+        Path(__file__).parent.parent
+        / "src" / "engram" / "hooks" / "claude" / "_hooklib.py"
+    )
     (root / "hooks" / "engram-forum-prompt-hook.py").write_text(hook_src.read_text())
+    (root / "hooks" / "_hooklib.py").write_text(hooklib_src.read_text())
     # Stub _status_derive.py so the import can succeed.
     (root / "tools" / "_status_derive.py").write_text(
         "def derive_own_status(agent_name): return None, None, None, None\n"

@@ -80,23 +80,28 @@ _DEFAULT_FORUM_URL = "http://localhost:5002"
 # ---------------------------------------------------------------------------
 # _status_derive import (spec §2, Q2)
 #
-# Resolve tools/ in BOTH topologies: plugin (CLAUDE_PLUGIN_ROOT/tools) AND
-# source-tree/dev (hooks/claude/ -> ../../tools). Keying solely off
-# CLAUDE_PLUGIN_ROOT would silently no-op auto-publish in a dev checkout —
-# exactly where the feature is most likely to be dogfooded (Kepler S1, #1087).
+# Resolve tools/ in BOTH topologies via the shared _hooklib helper (gh#1657,
+# slice 3 of 3 -- this walk-parents logic was near-identical to the baton/
+# inter-agent hooks' own copies, parameterized on a different marker file:
+# _status_derive.py rather than forum_api.py, since this hook's own import
+# needs a different tools/ module). _hooklib.py lives alongside this file in
+# both topologies (source: hooks/claude/; deployed: hooks/), so no
+# walk-parents is needed to find it -- but this repo's own test loaders
+# (importlib.util.spec_from_file_location) don't auto-add a script's own
+# directory to sys.path the way a real `python3 hooks/x.py` invocation does,
+# so this hook adds its own directory explicitly before importing _hooklib.
 # If the import fails for ANY reason, derive_own_status is set to None and the
 # publish silently no-ops — the existing thread/mention surfacing is unaffected.
 # ---------------------------------------------------------------------------
 
-_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
-_candidates = []
-if _plugin_root:
-    _candidates.append(Path(_plugin_root) / "tools")          # plugin: hooks/ -> tools/
-for _parent in Path(__file__).resolve().parents:              # walk-all-parents fallback
-    _candidates.append(_parent / "tools")
-_tools_dir = next((c for c in _candidates if (c / "_status_derive.py").exists()), None)
-if _tools_dir is not None and str(_tools_dir) not in sys.path:
-    sys.path.insert(0, str(_tools_dir))
+_this_dir = str(Path(__file__).resolve().parent)
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+try:
+    from _hooklib import resolve_tools_dir
+    _tools_dir = resolve_tools_dir("_status_derive.py")
+except Exception:
+    _tools_dir = None
 try:
     from _status_derive import derive_own_status, _read_loop_mode
 except Exception:
