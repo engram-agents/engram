@@ -84,7 +84,8 @@
     {
       "path_prefix_or_glob": "hooks/claude/engram-lesson-tripwire-hook.py",
       "test_globs": [
-        "tests/test_lesson_tripwire.py"
+        "tests/test_lesson_tripwire.py",
+        "tests/test_in_turn_recall.py"
       ],
       "note": "PreToolUse hook that surfaces lesson tripwires on Bash and MCP tool calls (issues #1203 + #1297)"
     },

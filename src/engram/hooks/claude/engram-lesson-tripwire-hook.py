@@ -34,6 +34,7 @@ TIER: T2 (Convenience) — degrades gracefully on DB unavailability; never block
 Issues: #1203 (Bash/locus-1) + #1297 (MCP/locus-2) — lesson-tripwire encoding-specificity gap.
 """
 import json
+import math
 import os
 import re
 import sqlite3
@@ -135,22 +136,33 @@ _RECENT_IDS_KEPT = 30
 
 
 def _in_turn_config() -> dict:
-    """Read auto_surface.in_turn_recall from config.json; safe defaults."""
+    """Read auto_surface.in_turn_recall from config.json; safe defaults.
+
+    min_idf is graph-size-relative by default (#1734): IDF's ceiling is
+    ln(N_current_nodes), so a fixed absolute threshold dead-zones small
+    graphs (6.0 was unreachable under ~400 nodes). min_idf_ratio=0.7 gives
+    ~4.16 at 380 nodes and ~6.03 at 5500 nodes — matching both
+    empirically-working absolute values. An explicit min_idf still wins
+    verbatim (absolute override; existing configs keep exact behavior).
+    """
     defaults = {
         "enabled": False,
         "cooldown_seconds": 60,
         "max_lines": 3,
-        "min_idf": 6.0,
+        "min_idf": None,
+        "min_idf_ratio": 0.7,
     }
     try:
         with open(Path(ENGRAM_HOME) / "config.json", "r", encoding="utf-8") as f:
             config = json.load(f)
         section = (config.get("auto_surface", {}) or {}).get("in_turn_recall", {}) or {}
+        raw_min_idf = section.get("min_idf")
         return {
             "enabled": bool(section.get("enabled", defaults["enabled"])),
             "cooldown_seconds": int(section.get("cooldown_seconds", defaults["cooldown_seconds"])),
             "max_lines": int(section.get("max_lines", defaults["max_lines"])),
-            "min_idf": float(section.get("min_idf", defaults["min_idf"])),
+            "min_idf": float(raw_min_idf) if raw_min_idf is not None else None,
+            "min_idf_ratio": float(section.get("min_idf_ratio", defaults["min_idf_ratio"])),
         }
     except Exception:
         return defaults
@@ -285,7 +297,16 @@ def check_in_turn_recall(match_target: str) -> str:
             from engram_idf import extract_keywords
             conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=1.0)
             try:
-                pairs = extract_keywords(conn, match_target, min_idf=cfg["min_idf"], top_k=5)
+                if cfg["min_idf"] is not None:
+                    effective_min_idf = cfg["min_idf"]
+                else:
+                    n_docs = conn.execute(
+                        "SELECT COUNT(*) FROM nodes WHERE is_current = 1"
+                    ).fetchone()[0]
+                    if n_docs == 0:
+                        return ""
+                    effective_min_idf = cfg["min_idf_ratio"] * math.log(n_docs)
+                pairs = extract_keywords(conn, match_target, min_idf=effective_min_idf, top_k=5)
             finally:
                 conn.close()
             terms = [tok for tok, _score in pairs]

@@ -14,6 +14,9 @@ Coverage:
      fires under contention
   10. lock contention suppresses immediately, never blocks
   11. missing/failed lock setup degrades to the unlocked path (never crashes)
+  12. no explicit min_idf: effective threshold = min_idf_ratio * ln(n_docs) (#1734)
+  13. explicit min_idf: passed through verbatim, ignoring graph size (#1734)
+  14. n_docs == 0: silent, no extract_keywords/daemon call (#1734)
 
 engram_idf and the daemon socket are stubbed: the gate logic is under test,
 not IDF extraction or the daemon (covered by their own tests).
@@ -91,8 +94,59 @@ def _enable(hook, tmp: str, **overrides):
         json.dump(cfg, f)
     # knowledge.db must exist for the sqlite ro-open not to fail the gate —
     # the stubbed extract_keywords never reads it, but the connect does.
+    # A 'nodes' table with >=1 current row is seeded too: since #1734, the
+    # default (no explicit min_idf) path computes min_idf_ratio * ln(n_docs)
+    # from a live COUNT(*) query, so the table must exist and be non-empty
+    # for the default-config tests to reach the gate at all. Schema matches
+    # test_tripwire_and_recall_compose's own CREATE TABLE IF NOT EXISTS so
+    # the two don't conflict when both touch the same DB file.
     import sqlite3
-    sqlite3.connect(Path(tmp) / "knowledge.db").close()
+    conn = sqlite3.connect(Path(tmp) / "knowledge.db")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS nodes (
+               id TEXT PRIMARY KEY, type TEXT, claim TEXT, is_current INT,
+               memory_status TEXT, metadata TEXT)"""
+    )
+    conn.execute(
+        "INSERT INTO nodes VALUES ('seed_1', 'observation', 'seed node', 1, 'active', '{}')"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _stub_idf_capture(terms):
+    """Install a fake engram_idf whose extract_keywords records the min_idf
+    it was called with, into the returned dict (key 'min_idf')."""
+    captured = {}
+
+    def extract_keywords(conn, text, min_idf=4.0, top_k=5):
+        captured["min_idf"] = min_idf
+        return [(t, 7.5) for t in terms]
+
+    fake = types.ModuleType("engram_idf")
+    fake.extract_keywords = extract_keywords
+    sys.modules["engram_idf"] = fake
+    return captured
+
+
+def _seed_node_count(db_path, n):
+    """Replace the nodes table contents with exactly n current rows."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS nodes (
+               id TEXT PRIMARY KEY, type TEXT, claim TEXT, is_current INT,
+               memory_status TEXT, metadata TEXT)"""
+    )
+    conn.execute("DELETE FROM nodes")
+    for i in range(n):
+        conn.execute(
+            "INSERT INTO nodes VALUES (?, 'observation', 'seed', 1, 'active', '{}')",
+            (f"seed_{i}",),
+        )
+    conn.commit()
+    conn.close()
 
 
 def _daemon_result(ids):
@@ -332,3 +386,66 @@ def test_missing_fcntl_degrades_to_unlocked(tmp_path, monkeypatch):
     assert "ob_1" in out
     state = json.load(open(hook.STATE_PATH))
     assert state["last_fire_ts"] > 0
+
+
+# ---------------------------------------------------------------------------
+# #1734 — graph-size-relative min_idf default
+# ---------------------------------------------------------------------------
+
+def test_default_min_idf_is_ratio_of_ln_n_docs(tmp_path, monkeypatch):
+    """No explicit min_idf configured: effective threshold is
+    min_idf_ratio (default 0.7) * ln(n_docs), computed from a live
+    COUNT(*) of current nodes -- not the old fixed 6.0 default."""
+    import math
+
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path))
+    _seed_node_count(hook.DB_PATH, 12)
+    captured = _stub_idf_capture(["novelterm"])
+    monkeypatch.setattr(hook, "_query_recall_daemon", lambda q, top_k=5: _daemon_result(["ob_1"]))
+
+    hook.check_in_turn_recall("some novel query")
+
+    expected = 0.7 * math.log(12)
+    assert abs(captured["min_idf"] - expected) < 1e-6
+
+
+def test_explicit_min_idf_passed_through_verbatim(tmp_path, monkeypatch):
+    """An explicit min_idf in config is an absolute override honored
+    verbatim, regardless of graph size -- existing configs keep exact
+    pre-#1734 behavior."""
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path), min_idf=4.0)
+    _seed_node_count(hook.DB_PATH, 12)
+    captured = _stub_idf_capture(["novelterm"])
+    monkeypatch.setattr(hook, "_query_recall_daemon", lambda q, top_k=5: _daemon_result(["ob_1"]))
+
+    hook.check_in_turn_recall("some novel query")
+
+    assert captured["min_idf"] == 4.0
+
+
+def test_zero_docs_is_silent_no_daemon_call(tmp_path, monkeypatch):
+    """n_docs == 0 (empty graph): return "" without calling extract_keywords
+    or the recall daemon -- nothing to recall anyway."""
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path))
+    _seed_node_count(hook.DB_PATH, 0)
+
+    def failing_extract_keywords(conn, text, min_idf=4.0, top_k=5):
+        raise AssertionError("extract_keywords must not be called when n_docs == 0")
+
+    fake = types.ModuleType("engram_idf")
+    fake.extract_keywords = failing_extract_keywords
+    sys.modules["engram_idf"] = fake
+
+    daemon_calls = {"n": 0}
+
+    def counting_daemon(q, top_k=5):
+        daemon_calls["n"] += 1
+        return _daemon_result(["ob_1"])
+
+    monkeypatch.setattr(hook, "_query_recall_daemon", counting_daemon)
+
+    assert hook.check_in_turn_recall("some query") == ""
+    assert daemon_calls["n"] == 0
