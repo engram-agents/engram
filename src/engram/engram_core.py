@@ -4555,7 +4555,29 @@ def _with_state_lock(lock_path, fn):
     try:
         import fcntl
         fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-    except Exception:
+    except Exception as exc:
+        # #1743: this degrade was silent -- nothing distinguished "locked and
+        # protected" from "running unlocked," the same diagnosis-costing gap
+        # #1737/#1742 fixed for the non-blocking cooldown lock. Emit one
+        # never-block/never-raise stderr tell (hook/server stderr goes to logs,
+        # not the model, so it is safe on every call) so a fallback-to-unlocked
+        # -- which leaves fn()'s read-modify-write unprotected against a lost
+        # update -- leaves a trace instead of being invisible. (#1742's
+        # state-file-flag half does not map onto this generic helper, which has
+        # no access to fn()'s state dict; the stderr line is the proportionate
+        # tell here.) Kept byte-identical with the sibling copy (surface-hook /
+        # engram_core) per the #1720 sync note above -- if one changes, change
+        # the other.
+        try:
+            import sys
+            print(
+                f"[engram _with_state_lock] flock degraded to UNLOCKED "
+                f"({lock_path}): {type(exc).__name__}: {exc} -- read-modify-write "
+                f"is unprotected; a concurrent write may be lost",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
         return fn()  # degrade: run unlocked rather than crash or skip
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)  # blocking -- no LOCK_NB

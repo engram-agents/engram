@@ -1336,3 +1336,28 @@ def test_ensure_schema_bootstrap_survives_rebuild_exception():
         server.core, "_rebuild_principle_triggers", side_effect=RuntimeError("boom")
     ):
         server._ensure_schema_bootstrap()  # must not raise
+
+
+def test_with_state_lock_degrades_visibly_when_lock_unopenable(tmp_path, capsys):
+    """#1743: a blocking-flock degrade-to-unlocked must not be silent.
+
+    When fcntl/lockfile-open fails, _with_state_lock still runs fn() (never
+    crash or skip) but must emit a stderr tell so the fallback-to-unlocked --
+    which leaves fn()'s read-modify-write unprotected against a lost update --
+    is not invisible (the diagnosis-costing gap #1737/#1742 fixed for the
+    non-blocking cooldown lock).
+    """
+    fresh_server()
+    import engram_core as core
+
+    ran = []
+    # Parent dir is absent -> os.open(O_CREAT) raises -> the degrade branch,
+    # without any monkeypatching.
+    bad_lock = tmp_path / "no-such-subdir" / "state.lock"
+    result = core._with_state_lock(str(bad_lock), lambda: (ran.append(1), "FN_RESULT")[1])
+
+    assert result == "FN_RESULT"   # fn() still ran -- degrade, not skip/crash
+    assert ran == [1]
+    err = capsys.readouterr().err
+    assert "degraded to UNLOCKED" in err   # the fail-visible tell fired
+    assert "may be lost" in err
