@@ -168,7 +168,7 @@ def _resolve_mcp_server_path(engram_home: str) -> str:
     return os.path.expanduser("~/engram-alpha/server.py")
 
 
-def _check_mcp_health(engram_home: str) -> tuple[bool, str | None]:
+def _check_mcp_health(engram_home: str) -> tuple[bool | None, str | None]:
     """Check whether the ENGRAM MCP server process is running.
 
     Uses pgrep -f to search for the resolved server.py path in process
@@ -176,10 +176,20 @@ def _check_mcp_health(engram_home: str) -> tuple[bool, str | None]:
     path relationship. Hard timeout of 1s. Any unexpected exception is treated
     as ok=True (advisory probe — never block session start).
 
+    Tri-state result (see #1754):
+        True  — server process found (up), the platform defers startup
+                probing, or the probe itself errored (advisory fail-open).
+        False — pgrep completed and found NO process (confirmed absent).
+        None  — the probe was INDETERMINATE (pgrep timed out under
+                cold-start contention). A timeout is not evidence of
+                absence, so the caller must NOT render the hard "OFFLINE →
+                tell the user immediately" alarm for this case — that is a
+                cry-wolf false-negative. The per-prompt write-tool marker
+                check confirms real liveness on the first prompt.
+
     Returns:
-        (ok, reason): ok=True if process found, the platform defers startup
-                      probing, or the probe itself errors; ok=False with a
-                      reason string otherwise.
+        (status, reason): status per the tri-state above; reason is a
+                          human string for the False / None cases, else None.
     """
     if not _startup_mcp_health_probe_allowed():
         return True, None
@@ -196,7 +206,10 @@ def _check_mcp_health(engram_home: str) -> tuple[bool, str | None]:
             return True, None
         return False, "no engram server process found"
     except subprocess.TimeoutExpired:
-        return False, "pgrep timed out"
+        # Indeterminate, NOT absent: the probe never completed (busy box at
+        # cold start). Signal the third state so the caller renders a soft
+        # "inconclusive" note instead of a false OFFLINE alarm (#1754).
+        return None, "pgrep timed out"
     except Exception:
         # Advisory: probe errors are treated as ok to avoid blocking session start.
         return True, None
@@ -1707,15 +1720,23 @@ def main() -> None:
     # the old PID in the marker yet. Same class of false alarm as the daemon-
     # start probe retired in #1157. Check deferred to UserPromptSubmit (surface
     # hook) where the race window is long past.
-    mcp_ok, mcp_reason = _check_mcp_health(ENGRAM_HOME)
+    mcp_status, mcp_reason = _check_mcp_health(ENGRAM_HOME)
     stale_ok, stale_reason = _check_backup_staleness(ENGRAM_HOME)
 
-    if not mcp_ok or not stale_ok:
+    # Tri-state (#1754): False = confirmed absent (hard alarm); None =
+    # indeterminate probe (soft note, no "tell the user immediately" — a
+    # pgrep timeout is not evidence the server is down); True = up (silent).
+    mcp_offline = mcp_status is False
+    mcp_inconclusive = mcp_status is None
+
+    if mcp_offline or mcp_inconclusive or not stale_ok:
         lines.append("")
         lines.append("⚠️  ENGRAM substrate health:")
-        if not mcp_ok:
+        if mcp_offline:
             lines.append(f"  MCP server: OFFLINE ({mcp_reason})")
             lines.append("  → Tell the user immediately. ENGRAM tool calls will fail.")
+        elif mcp_inconclusive:
+            lines.append(f"  MCP liveness: inconclusive ({mcp_reason}) — will confirm on first prompt")
         if not stale_ok:
             lines.append(f"  Git backup: {stale_reason}")
             lines.append("  → Run engram-nap or engram-sleep to update the git backup.")
