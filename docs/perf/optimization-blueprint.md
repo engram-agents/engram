@@ -149,6 +149,13 @@ Priority order (expected impact × risk):
 - **M1** One persistent **substrate daemon** serving MCP server *and* hooks (today: 19
   interpreter spawns per event class + an MCP process + a surface daemon). Hooks become
   thin socket clients (~ms); models loaded once per host.
+  - *Note (2026-07-10, Kepler ruling):* **#1680's fat-hook merge (fix-a, "Slice-2") is
+    superseded by M1 — do NOT re-pick it.** M1 eliminates the spawn+import cost class the
+    merge targeted and restructures the hook layer into thin clients anyway, so the merge
+    was a higher-cost interim win for a soon-restructured layer (and its blast-radius — the
+    identity_coupled fixtures + the #713 anti-regression test + ~13 docs — makes the twice-over
+    rewrite not worth it). Kept: #1680 **Slice-1** (`_prompthooklib` shared-prologue extraction,
+    merged) — it's a down-payment on M1 (thin clients reuse the shared prologue).
 - **M2** Replace torch/sentence-transformers with **ONNXRuntime int8** (or GGUF/
   llama.cpp embedder). *Demoted from latency-play to footprint-play by F1*: models
   aren't the per-call bottleneck, but torch is still the heaviest dependency
