@@ -23,6 +23,19 @@
       "note": "gh#1657 SSoT for tools/-resolution shared by the baton/inter-agent/forum prompt hooks. Each hook dynamically imports it via a runtime sys.path insert (not a static `import` statement), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping. Consumed by all three hooks as of slice 3 (baton, inter-agent, forum) -- gh#1657 complete."
     },
     {
+      "path_prefix_or_glob": "hooks/claude/_prompthooklib.py",
+      "test_globs": [
+        "tests/test_prompthooklib.py",
+        "tests/test_baton_hook.py",
+        "tests/test_inter_agent_hook.py",
+        "tests/test_forum_hook.py",
+        "tests/test_forum_hook_publish.py",
+        "tests/test_tiers_manifest.py",
+        "tests/test_run_touched_tests.py"
+      ],
+      "note": "gh#1680 slice 1 SSoT for the config/agent-name/emit-context/resolve-tools-dir prologue shared by the baton/inter-agent/forum prompt hooks. Each hook dynamically imports it via a runtime sys.path insert (not a static `import` statement, same as _hooklib.py above), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping."
+    },
+    {
       "path_prefix_or_glob": "hooks/claude/engram-baton-prompt-hook.py",
       "test_globs": [
         "tests/test_baton_hook.py",

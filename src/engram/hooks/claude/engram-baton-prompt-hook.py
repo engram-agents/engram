@@ -35,7 +35,6 @@ CLI:          tools/baton.py
 
 import json
 import os
-import pwd
 import re
 import shutil
 import subprocess
@@ -65,14 +64,27 @@ from typing import Optional
 # the hook. Wrapping it here is a deliberate tightening to match this
 # file's existing "never crash the prompt" discipline for every other
 # best-effort import below, not an accidental behavior change.)
+#
+# gh#1680 slice 1: the config/agent-name/emit-context/resolve-tools-dir
+# prologue previously inlined here now lives in the shared _prompthooklib
+# module (same directory, same sys.path bootstrap as _hooklib below).
+# _PROMPTHOOKLIB_OK gates main() -- if the shared module somehow fails to
+# import, the hook degrades to a silent no-op rather than crashing, same
+# discipline as every other best-effort import in this prologue.
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 try:
-    from _hooklib import resolve_tools_dir
-    _TOOLS_DIR = resolve_tools_dir("forum_api.py")
+    from _prompthooklib import (
+        load_config as _load_config_impl,
+        get_agent_name as _get_agent_name_impl,
+        emit_context as _emit_context,
+        bootstrap_tools_dir as _bootstrap_tools_dir,
+    )
+    _PROMPTHOOKLIB_OK = True
 except Exception:
-    _TOOLS_DIR = None
+    _PROMPTHOOKLIB_OK = False
+_TOOLS_DIR = _bootstrap_tools_dir("forum_api.py") if _PROMPTHOOKLIB_OK else None
 try:
     from forum_api import (
         ForumClient,
@@ -136,55 +148,26 @@ _PR_ID_RE = re.compile(r"^PR-(\d+)$")
 
 
 # ---------------------------------------------------------------------------
-# Config helpers  (mirrors engram-inter-agent-prompt-hook.py exactly)
+# Config helpers -- delegate to _prompthooklib (gh#1680 slice 1). Thin
+# per-hook wrappers, not bare aliases: they pin ENGRAM_HOME (this hook's own
+# module constant, captured once at import time above) as an explicit arg,
+# preserving both (a) the exact zero-arg call signature every existing call
+# site and test-monkeypatch already depends on, and (b) the "frozen at
+# import time" ENGRAM_HOME timing the pre-extraction inline code had --
+# the shared load_config()'s own default (re-reading os.environ at call
+# time) is NOT equivalent when ENGRAM_HOME changes between a hook's import
+# and its main() call, which the test harness's `patch.dict` (scoped only
+# around exec_module) actually does.
 # ---------------------------------------------------------------------------
 
 def _load_config() -> dict:
     """Load $ENGRAM_HOME/config.json. Returns {} on any failure."""
-    config_path = Path(ENGRAM_HOME) / "config.json"
-    if config_path.exists():
-        try:
-            return json.loads(config_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
+    return _load_config_impl(ENGRAM_HOME)
 
 
 def _get_agent_name(config: Optional[dict] = None) -> str:
-    """Resolve this agent's own name.
-
-    Priority:
-      1. config.json["agent_name"] field (explicit; wins if set).
-      2. $USER env var, agent- prefix stripped.
-      3. $LOGNAME env var, agent- prefix stripped (Claude Code hook context
-         populates $LOGNAME but not $USER).
-      4. pwd.getpwuid(os.getuid()).pw_name, agent- prefix stripped.
-      5. Empty string (hook will see no matching projects — safe).
-    """
-    if config is None:
-        config = _load_config()
-    name = config.get("agent_name", "").strip()
-    if name:
-        return name
-
-    def _strip_agent_prefix(username: str) -> str:
-        if username.startswith("agent-"):
-            return username[len("agent-"):]
-        return username
-
-    for envvar in ("USER", "LOGNAME"):
-        username = os.environ.get(envvar, "").strip()
-        if username:
-            return _strip_agent_prefix(username)
-
-    try:
-        username = pwd.getpwuid(os.getuid()).pw_name
-        if username:
-            return _strip_agent_prefix(username)
-    except KeyError:
-        pass
-
-    return ""
+    """Resolve this agent's own name. See _prompthooklib.get_agent_name."""
+    return _get_agent_name_impl(config, ENGRAM_HOME)
 
 
 # ---------------------------------------------------------------------------
@@ -631,18 +614,17 @@ def _auto_archive_merged_pr_batons(projects: list, cache: dict) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-
-def _emit_context(text: str) -> None:
-    """Emit an additionalContext block on stdout (the UserPromptSubmit channel)."""
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": text,
-        }
-    }))
+# _emit_context now lives in _prompthooklib (gh#1680 slice 1); imported above.
 
 
 def main() -> None:
+    # ── Prologue-lib gate (gh#1680 slice 1) ───────────────────────────────────
+    # If _prompthooklib somehow failed to import, _load_config/_get_agent_name/
+    # _emit_context are unavailable -- degrade to a silent no-op, matching
+    # every other best-effort import in this hook's prologue.
+    if not _PROMPTHOOKLIB_OK:
+        sys.exit(0)
+
     # ── Config + agent name ───────────────────────────────────────────────────
     config = _load_config()
     agent_name = _get_agent_name(config)

@@ -930,11 +930,16 @@ import subprocess
 def test_hooklib_resolution_in_flattened_deployed_topology(tmp_path):
     """The plugin build FLATTENS hooks/claude/ -> hooks/, so the deployed
     baton hook sits one level shallower than source, AND _hooklib.py (its
-    new sibling, gh#1657) must be found alongside it in that same flattened
-    layout. Recreate the deployed layout (hook + _hooklib.py as siblings,
-    with a further-nested tools/) and confirm both resolve with
-    CLAUDE_PLUGIN_ROOT unset -- this hook had no such regression test before
-    the _hooklib extraction; forum's equivalent (#1540) is the model.
+    sibling, gh#1657) AND _prompthooklib.py (its sibling, gh#1680 slice 1)
+    must both be found alongside it in that same flattened layout. Recreate
+    the deployed layout (hook + _hooklib.py + _prompthooklib.py as siblings,
+    with a further-nested tools/) and confirm, with CLAUDE_PLUGIN_ROOT unset:
+      (a) tools/ resolves (_FORUM_API_OK, _TOOLS_DIR)
+      (b) config loads via _load_config()
+      (c) agent name resolves via _get_agent_name(config)
+      (d) emit_context() prints the identical additionalContext envelope
+    -- this hook had no such regression test before the _hooklib extraction;
+    forum's equivalent (#1540) is the model.
     """
     root = tmp_path / "engram"
     (root / "hooks").mkdir(parents=True)
@@ -943,8 +948,13 @@ def test_hooklib_resolution_in_flattened_deployed_topology(tmp_path):
         Path(__file__).parent.parent
         / "src" / "engram" / "hooks" / "claude" / "_hooklib.py"
     )
+    prompthooklib_src = (
+        Path(__file__).parent.parent
+        / "src" / "engram" / "hooks" / "claude" / "_prompthooklib.py"
+    )
     (root / "hooks" / "engram-baton-prompt-hook.py").write_text(HOOK_PATH.read_text())
     (root / "hooks" / "_hooklib.py").write_text(hooklib_src.read_text())
+    (root / "hooks" / "_prompthooklib.py").write_text(prompthooklib_src.read_text())
     # Stub forum_api.py so the import can succeed.
     (root / "tools" / "forum_api.py").write_text(
         "class ForumClient:\n"
@@ -960,17 +970,40 @@ def test_hooklib_resolution_in_flattened_deployed_topology(tmp_path):
 
     env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_ROOT"}
     env["ENGRAM_HOME"] = str(home)
+    probe_script = (
+        "import importlib.util, sys, io, json, contextlib\n"
+        "spec = importlib.util.spec_from_file_location('hook', "
+        f"  r'{root}/hooks/engram-baton-prompt-hook.py')\n"
+        "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)\n"
+        "print('resolved' if mod._FORUM_API_OK and mod._TOOLS_DIR is not None else 'broken')\n"
+        "cfg = mod._load_config()\n"
+        "print('config_ok' if cfg.get('agent_name') == 'luria' else f'config_broken:{cfg!r}')\n"
+        "name = mod._get_agent_name(cfg)\n"
+        "print('name_ok' if name == 'luria' else f'name_broken:{name!r}')\n"
+        "buf = io.StringIO()\n"
+        "with contextlib.redirect_stdout(buf):\n"
+        "    mod._emit_context('hello world')\n"
+        "envelope = json.loads(buf.getvalue())\n"
+        "expected = {'hookSpecificOutput': {'hookEventName': 'UserPromptSubmit', 'additionalContext': 'hello world'}}\n"
+        "print('emit_ok' if envelope == expected else f'emit_broken:{envelope!r}')\n"
+    )
     r = subprocess.run(
-        [sys.executable, "-c",
-         f"import importlib.util, sys; "
-         f"spec = importlib.util.spec_from_file_location('hook', "
-         f"  r'{root}/hooks/engram-baton-prompt-hook.py'); "
-         f"mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); "
-         f"print('resolved' if mod._FORUM_API_OK and mod._TOOLS_DIR is not None else 'broken')"
-         ],
+        [sys.executable, "-c", probe_script],
         capture_output=True, text=True, env=env,
     )
     assert "resolved" in r.stdout, (
         "deployed-topology hook failed to resolve _hooklib/forum_api via "
         f"walk-parents (stdout={r.stdout!r} stderr={r.stderr!r})"
+    )
+    assert "config_ok" in r.stdout, (
+        f"deployed-topology hook failed to load config via _prompthooklib "
+        f"(stdout={r.stdout!r} stderr={r.stderr!r})"
+    )
+    assert "name_ok" in r.stdout, (
+        f"deployed-topology hook failed to resolve agent name via _prompthooklib "
+        f"(stdout={r.stdout!r} stderr={r.stderr!r})"
+    )
+    assert "emit_ok" in r.stdout, (
+        f"deployed-topology hook's emit_context envelope diverged "
+        f"(stdout={r.stdout!r} stderr={r.stderr!r})"
     )

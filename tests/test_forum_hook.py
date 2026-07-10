@@ -934,10 +934,18 @@ def test_tools_resolution_in_flattened_deployed_topology(tmp_path):
     copy, so _hooklib.py must also be present as a sibling in the recreated
     flattened layout for the import to succeed.
 
-    Recreate the deployed layout (hooks/<name>.py with a SIBLING tools/ AND a
-    SIBLING _hooklib.py) with CLAUDE_PLUGIN_ROOT unset and assert that
-    _status_derive resolves: a resolved import leaves derive_own_status as a
-    callable; a broken import leaves it None.
+    Updated again for gh#1680 slice 1: config/agent-name resolution also now
+    delegates to the shared _prompthooklib module (same directory), so that
+    must be present as a sibling too. Extended assertions cover (a) tools/
+    resolution (unchanged), (b) config loads, (c) agent name resolves --
+    this hook has no local _emit_context to check (see _prompthooklib.py's
+    module docstring for why that helper was NOT extracted into forum's
+    call site).
+
+    Recreate the deployed layout (hooks/<name>.py with a SIBLING tools/ AND
+    SIBLING _hooklib.py / _prompthooklib.py) with CLAUDE_PLUGIN_ROOT unset
+    and assert that _status_derive resolves: a resolved import leaves
+    derive_own_status as a callable; a broken import leaves it None.
     """
     root = tmp_path / "engram"
     (root / "hooks").mkdir(parents=True)
@@ -947,8 +955,13 @@ def test_tools_resolution_in_flattened_deployed_topology(tmp_path):
         Path(__file__).parent.parent
         / "src" / "engram" / "hooks" / "claude" / "_hooklib.py"
     )
+    prompthooklib_src = (
+        Path(__file__).parent.parent
+        / "src" / "engram" / "hooks" / "claude" / "_prompthooklib.py"
+    )
     (root / "hooks" / "engram-forum-prompt-hook.py").write_text(hook_src.read_text())
     (root / "hooks" / "_hooklib.py").write_text(hooklib_src.read_text())
+    (root / "hooks" / "_prompthooklib.py").write_text(prompthooklib_src.read_text())
     # Stub _status_derive.py so the import can succeed.
     (root / "tools" / "_status_derive.py").write_text(
         "def derive_own_status(agent_name): return None, None, None, None\n"
@@ -960,17 +973,30 @@ def test_tools_resolution_in_flattened_deployed_topology(tmp_path):
 
     env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_ROOT"}
     env["ENGRAM_HOME"] = str(home)
+    probe_script = (
+        "import importlib.util, sys\n"
+        "spec = importlib.util.spec_from_file_location('hook', "
+        f"  r'{root}/hooks/engram-forum-prompt-hook.py')\n"
+        "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)\n"
+        "print('resolved' if mod.derive_own_status is not None else 'broken')\n"
+        "cfg = mod._load_config()\n"
+        "print('config_ok' if cfg.get('agent_name') == 'luria' else f'config_broken:{cfg!r}')\n"
+        "name = mod._get_agent_name(cfg)\n"
+        "print('name_ok' if name == 'luria' else f'name_broken:{name!r}')\n"
+    )
     r = subprocess.run(
-        [sys.executable, "-c",
-         f"import importlib.util, sys; "
-         f"spec = importlib.util.spec_from_file_location('hook', "
-         f"  r'{root}/hooks/engram-forum-prompt-hook.py'); "
-         f"mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); "
-         f"print('resolved' if mod.derive_own_status is not None else 'broken')"
-         ],
+        [sys.executable, "-c", probe_script],
         capture_output=True, text=True, env=env,
     )
     assert "resolved" in r.stdout, (
         "deployed-topology hook failed to resolve _status_derive via walk-parents "
+        f"(stdout={r.stdout!r} stderr={r.stderr!r})"
+    )
+    assert "config_ok" in r.stdout, (
+        f"deployed-topology hook failed to load config via _prompthooklib "
+        f"(stdout={r.stdout!r} stderr={r.stderr!r})"
+    )
+    assert "name_ok" in r.stdout, (
+        f"deployed-topology hook failed to resolve agent name via _prompthooklib "
         f"(stdout={r.stdout!r} stderr={r.stderr!r})"
     )

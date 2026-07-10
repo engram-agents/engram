@@ -437,6 +437,10 @@
       "tier": "convenience"
     },
     {
+      "path": "hooks/claude/_prompthooklib.py",
+      "tier": "convenience"
+    },
+    {
       "path": "hooks/claude/engram-inter-agent-prompt-hook.py",
       "tier": "convenience",
       "multi_agent": true,
