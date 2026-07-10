@@ -1434,6 +1434,27 @@ def _timing_mcp_tool(*args, **kwargs):
 mcp.tool = _timing_mcp_tool
 
 
+# ---------------------------------------------------------------------------
+# payload_json parsing helper (#1683)
+# ---------------------------------------------------------------------------
+def _parse_payload(payload_json):
+    """Parse a tool's payload_json string into a dict.
+
+    Returns (params, None) on success, or (None, <error-envelope-json-str>) on
+    failure. Catches TypeError (non-str payload) alongside JSONDecodeError so a
+    non-string payload returns the standard error envelope instead of an uncaught
+    exception (issue #1683). Error strings are byte-identical to the prior inline
+    blocks — this is behavior-preserving except that TypeError is now caught.
+    """
+    try:
+        params = json.loads(payload_json)
+    except (json.JSONDecodeError, TypeError) as e:
+        return None, json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return None, json.dumps({"error": "payload_json must be a JSON object"})
+    return params, None
+
+
 # ---- Ingestion tools ----
 
 
@@ -1483,12 +1504,9 @@ def engram_add_evidence(payload_json: str) -> str:
 
     See _add_evidence_impl for the full URL-validation + trust-pool semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_EVIDENCE_FIELDS
     if unknown:
@@ -1652,12 +1670,9 @@ def engram_add_observation(payload_json: str) -> str:
         JSON with the new observation ID, confidence, evidence ID, and any prediction node created.
         On payload-parsing failure, returns {"error": "..."} with no node created.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_OBSERVATION_FIELDS
     if unknown:
@@ -1762,12 +1777,9 @@ def engram_add_observation_batch(payload_json: str) -> str:
     See _add_observation_batch_impl for full per-observation semantics + the
     evidence-resolution logic.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_OBSERVATION_BATCH_FIELDS
     if unknown:
@@ -1849,12 +1861,9 @@ def engram_surface(payload_json: str) -> str:
     See _surface_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _SURFACE_FIELDS
     if unknown:
         return json.dumps({
@@ -1953,12 +1962,9 @@ def engram_inspect(payload_json: str) -> str:
     See _inspect_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _INSPECT_FIELDS
     if unknown:
         return json.dumps({
@@ -2054,12 +2060,9 @@ def engram_query(payload_json: str) -> str:
     See _query_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _QUERY_FIELDS
     if unknown:
         return json.dumps({
@@ -2150,12 +2153,9 @@ def engram_get_subgraph(payload_json: str) -> str:
     See _subgraph_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _SUBGRAPH_FIELDS
     if unknown:
         return json.dumps({
@@ -2249,12 +2249,9 @@ def engram_nap(payload_json: str) -> str:
     See _nap_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _NAP_FIELDS
     if unknown:
         return json.dumps({
@@ -2393,12 +2390,9 @@ def engram_advance_turn(payload_json: str) -> str:
     See _advance_turn_impl for full semantics — kept callable with named kwargs
     for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _ADVANCE_TURN_FIELDS
     if unknown:
         return json.dumps({
@@ -2538,12 +2532,9 @@ def engram_reflect(payload_json: str = "{}") -> str:
     See _reflect_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _REFLECT_FIELDS
     if unknown:
         return json.dumps({
@@ -2649,12 +2640,9 @@ def engram_stats(payload_json: str = "{}") -> str:
             window (conditional): present only when mode != "all".
     """
     # ── Parse + validate payload ───────────────────────────────────────────
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     mode = params.get("mode", "all")
     sections_param = params.get("sections", None)
@@ -2809,12 +2797,9 @@ def engram_history(payload_json: str) -> str:
     See _history_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _HISTORY_FIELDS
     if unknown:
         return json.dumps({
@@ -2883,12 +2868,9 @@ def engram_add_axiom(payload_json: str) -> str:
 
     See _add_axiom_impl for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_AXIOM_FIELDS
     if unknown:
@@ -2952,12 +2934,9 @@ def engram_add_definition(payload_json: str) -> str:
 
     See _add_definition_impl for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_DEFINITION_FIELDS
     if unknown:
@@ -3034,12 +3013,9 @@ def engram_add_conjecture(payload_json: str) -> str:
 
     See _add_conjecture_impl for full lifecycle semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_CONJECTURE_FIELDS
     if unknown:
@@ -3107,12 +3083,9 @@ def engram_add_goal(payload_json: str) -> str:
 
     See _add_goal_impl for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_GOAL_FIELDS
     if unknown:
@@ -3178,12 +3151,9 @@ def engram_deactivate_goal(payload_json: str) -> str:
 
     See _deactivate_goal_impl for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _DEACTIVATE_GOAL_FIELDS
     if unknown:
@@ -3241,12 +3211,9 @@ def engram_activate_goal(payload_json: str) -> str:
 
     See _activate_goal_impl for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ACTIVATE_GOAL_FIELDS
     if unknown:
@@ -3342,12 +3309,9 @@ def engram_add_person(payload_json: str) -> str:
 
     See _add_person_impl in engram_trust.py for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_PERSON_FIELDS
     if unknown:
@@ -3419,12 +3383,9 @@ def engram_update_person(payload_json: str) -> str:
         JSON with status, node_id, updated_fields, field_traces_delta,
         cascade_flagged_nodes. trust_tier_elevated=True when trust_tier changed.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _UPDATE_PERSON_FIELDS
     if unknown:
@@ -3514,12 +3475,9 @@ def engram_add_special_moment(payload_json: str) -> str:
 
     See _add_special_moment_impl in engram_trust.py for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_SPECIAL_MOMENT_FIELDS
     if unknown:
@@ -3595,12 +3553,9 @@ def engram_set_trust_tier(payload_json: str) -> str:
             attestation fields. Read the error message carefully — it names
             the required fields and explains the structural-honesty stake.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _SET_TRUST_TIER_FIELDS
     if unknown:
         return json.dumps({
@@ -3667,12 +3622,9 @@ def engram_set_person_lineage(payload_json: str) -> str:
         JSON with status ("ok"), person_id, model_provider, model_family,
         model_version.  On error: {"error": "..."}.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _SET_PERSON_LINEAGE_FIELDS
     if unknown:
         return json.dumps({
@@ -3763,12 +3715,9 @@ def engram_add_trust_signal(payload_json: str) -> str:
         - weight in [0.0, 1.0]
         - All 5 required fields present
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _ADD_TRUST_SIGNAL_FIELDS
     if unknown:
         return json.dumps({
@@ -3840,12 +3789,9 @@ def engram_add_cornerstone(payload_json: str) -> str:
 
     See _add_cornerstone_impl for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_CORNERSTONE_FIELDS
     if unknown:
@@ -3921,12 +3867,9 @@ def engram_outgrow_cornerstone(payload_json: str) -> str:
     See _outgrow_cornerstone_impl for full semantics — kept callable with
     named kwargs for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _OUTGROW_CORNERSTONE_FIELDS
     if unknown:
@@ -3997,12 +3940,9 @@ def engram_link_about(payload_json: str) -> str:
     See _link_about_impl for full semantics — kept callable with named kwargs
     for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _LINK_ABOUT_FIELDS
     if unknown:
@@ -4088,12 +4028,9 @@ def engram_remove_edge(payload_json: str) -> str:
           - 'no_op_not_found': edge did not exist; idempotent success.
           - 'error': payload invalid, nodes missing, or relation not whitelisted.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _REMOVE_EDGE_FIELDS
     if unknown:
@@ -4191,12 +4128,9 @@ def engram_add_edge(payload_json: str) -> str:
           - 'no_op_already_exists': edge already existed; idempotent success.
           - 'error': payload invalid, nodes missing, or relation not whitelisted.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_EDGE_FIELDS
     if unknown:
@@ -4275,12 +4209,9 @@ def engram_scan_emergence(payload_json: str = "") -> str:
     kwargs for in-server callers.
     """
     payload_json = payload_json or "{}"
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _SCAN_EMERGENCE_FIELDS
     if unknown:
@@ -4353,12 +4284,9 @@ def engram_goal_tension(payload_json: str) -> str:
     See _goal_tension_impl for full semantics — kept callable with named
     kwargs for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _GOAL_TENSION_FIELDS
     if unknown:
@@ -4447,12 +4375,9 @@ def engram_add_lesson(payload_json: str) -> str:
 
     See _add_lesson_impl for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_LESSON_FIELDS
     if unknown:
@@ -4530,12 +4455,9 @@ def engram_lesson_register_incident(payload_json: str) -> str:
     See _lesson_register_incident_impl for direct named-kwarg access.
     Delegates to _register_exemplar_impl internally.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _LESSON_REGISTER_INCIDENT_FIELDS
     if unknown:
@@ -4633,12 +4555,9 @@ def engram_register_exemplar(payload_json: str) -> str:
         design intent).
         On payload-parsing failure, returns {"error": "..."}.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _REGISTER_EXEMPLAR_FIELDS
     if unknown:
@@ -4716,12 +4635,9 @@ def engram_add_task(payload_json: str) -> str:
 
     See _add_task_impl for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_TASK_FIELDS
     if unknown:
@@ -4794,12 +4710,9 @@ def engram_update_task(payload_json: str) -> str:
     See _update_task_impl for the full importance-rebalancing semantics —
     kept callable with named kwargs for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _UPDATE_TASK_FIELDS
     if unknown:
@@ -4878,12 +4791,9 @@ def engram_report_feeling(payload_json: str) -> str:
     See _report_feeling_impl for full semantics — kept callable with named
     kwargs for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _REPORT_FEELING_FIELDS
     if unknown:
@@ -4998,12 +4908,9 @@ def engram_derive(payload_json: str) -> str:
     See _derive_impl for full reasoning-type list, confidence-computation
     semantics, and structural-validation details.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _DERIVE_FIELDS
     if unknown:
@@ -5074,12 +4981,9 @@ def engram_contradict(payload_json: str) -> str:
 
     See _contradict_impl for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _CONTRADICT_FIELDS
     if unknown:
@@ -5150,12 +5054,9 @@ def engram_ask(payload_json: str) -> str:
     See _ask_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ASK_FIELDS
     if unknown:
@@ -5248,12 +5149,9 @@ def engram_resolve(payload_json: str) -> str:
     See _resolve_impl for full semantics — kept callable with named kwargs
     for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _RESOLVE_FIELDS
     if unknown:
@@ -5331,12 +5229,9 @@ def engram_supersede(payload_json: str) -> str:
 
     See _supersede_impl for full semantics + workflow + validation rules.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _SUPERSEDE_FIELDS
     if unknown:
@@ -5444,12 +5339,9 @@ def engram_retract(payload_json: str) -> str:
 
     See _retract_impl for full semantics + error-type catalog.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _RETRACT_FIELDS
     if unknown:
@@ -5519,12 +5411,9 @@ def engram_focus(payload_json: str) -> str:
     See _focus_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _FOCUS_FIELDS
     if unknown:
         return json.dumps({
@@ -5573,12 +5462,9 @@ def engram_unfocus(payload_json: str) -> str:
     See _unfocus_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _UNFOCUS_FIELDS
     if unknown:
         return json.dumps({
@@ -5653,12 +5539,9 @@ def engram_focus_save(payload_json: str) -> str:
     See _focus_save_impl for full semantics — kept callable with named kwargs
     for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _FOCUS_SAVE_FIELDS
     if unknown:
         return json.dumps({
@@ -5708,12 +5591,9 @@ def engram_focus_load(payload_json: str) -> str:
     See _focus_load_impl for full semantics — kept callable with named kwargs
     for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _FOCUS_LOAD_FIELDS
     if unknown:
         return json.dumps({
@@ -5761,12 +5641,9 @@ def engram_focus_swap(payload_json: str) -> str:
     See _focus_swap_impl for full semantics — kept callable with named kwargs
     for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _FOCUS_SWAP_FIELDS
     if unknown:
         return json.dumps({
@@ -5834,12 +5711,9 @@ def engram_focus_delete_set(payload_json: str) -> str:
     See _focus_delete_set_impl for full semantics — kept callable with named
     kwargs for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _FOCUS_DELETE_SET_FIELDS
     if unknown:
         return json.dumps({
@@ -6030,12 +5904,9 @@ def engram_list(payload_json: str = "{}") -> str:
     See _list_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _LIST_FIELDS
     if unknown:
         return json.dumps({
@@ -6144,12 +6015,9 @@ def engram_query_pattern(payload_json: str) -> str:
     See _query_pattern_impl for full semantics — kept callable with named
     kwargs for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _QUERY_PATTERN_FIELDS
     if unknown:
         return json.dumps({
@@ -6218,12 +6086,9 @@ def engram_embedding_cluster(payload_json: str) -> str:
             embedding_model: model used for stored embeddings (informational).
         On error: {"error": "..."}.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _EMBEDDING_CLUSTER_FIELDS
     if unknown:
         return json.dumps({
