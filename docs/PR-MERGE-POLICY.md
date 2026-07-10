@@ -45,15 +45,17 @@ Merge once colleague-converged + CI-green, **no per-PR Lei permission needed**:
 
 Surface notable ones in the **post-merge digest** so Lei can see what landed and why — but don't gate on them.
 
-## When Lei is away — the delegated day-grant (merge-to-dev vs live-deploy)
+## When Lei is away — the standing when-away grant (merge-to-dev vs live-deploy)
 
-Lei sometimes grants explicit day-scoped merge authority to an architect / coordinator while he's away (e.g. *"you have my authorization to merge PRs when they are ready"*, given alongside the day's build directive). That grant **can cover substrate merges — but only to `dev`, and only for the merge, not the deploy.** The reasoning (interpretation logged 2026-07-08, **pending Lei's post-return confirmation**):
+**Confirmed and upgraded to a standing rule by Lei, 2026-07-10** (recorded in the commander's graph that day; his words: *"you got my authorization to merge substrate PRs … Unless otherwise stated, when I'm away, you have my authorization to merge on them"*). The 2026-07-08 day-grant interpretation below was confirmed retroactively at the same time; the grant no longer needs to be re-issued per day. "Otherwise stated" means Lei can suspend it for a day or a topic; absent that, it holds whenever he's away.
+
+Substrate merges under the standing grant cover **`dev` only, and the merge only — never the deploy:**
 
 - **Merge-to-`dev` is revertible.** Nothing touches the running substrate until Lei runs the live deploy (`install-local-marketplace.sh` rebuild + `/mcp` reconnect + reload/restart). The **irreversible step — the live deploy — stays Lei's**, always.
-- So a substrate PR that is colleague-converged + CI-green, whose *design* was already settled with Lei (or with the architect under the grant) and carries **no design novelty at merge time**, may be merged to `dev` under the grant. It joins a **merged-but-not-live-verified batch** that Lei deploys + verifies together on return.
-- The grantee **logs the authority interpretation** (e.g. in `ask-lei`) for Lei's confirmation — the grant is not a standing rule, and holding an *older* reservation over the *intent* of an explicit fresh grant is the failure mode this addresses.
+- So a substrate PR that is colleague-converged + CI-green, whose *design* was already settled with Lei (or with the architect/commander) and carries **no design novelty at merge time**, may be merged to `dev`. It joins a **merged-but-not-live-verified batch** that Lei deploys + verifies together on return.
+- **Log notable substrate merges** made under the grant (post-merge digest / `ask-lei`) so Lei sees what landed and why — an awareness surface now, no longer a per-grant confirmation gate.
 
-The default outside such a grant is unchanged: substrate → Lei. This carve-out is narrow (explicit grant + design already settled + dev-only + logged), not a general relaxation.
+The boundary outside the grant is unchanged: substrate PRs with **unsettled design or design novelty at merge time** still go to Lei first, away or not. The carve-out remains merge-not-deploy, dev-only, settled-design-only.
 
 ## At merge time — the natural checkpoint
 
