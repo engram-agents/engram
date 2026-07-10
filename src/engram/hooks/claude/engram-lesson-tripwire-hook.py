@@ -131,8 +131,27 @@ def build_match_target(hook_input: dict) -> str:
 
 STATE_PATH = Path(ENGRAM_HOME) / "in-turn-recall-state.json"
 SOCKET_PATH = Path(ENGRAM_HOME) / "recall-daemon.sock"
+LEDGER_PATH = Path(ENGRAM_HOME) / "in-turn-recall-ledger.jsonl"
 _RECENT_TERM_SETS_KEPT = 10
 _RECENT_IDS_KEPT = 30
+
+
+def _append_ledger(build_entry) -> None:
+    """Best-effort append of one JSONL telemetry entry per gate-passing
+    in-turn-recall fire (#1749). Takes a zero-arg callable so that entry
+    CONSTRUCTION runs inside the guard too — an exception while building
+    the dict (e.g. a malformed hook_input) must be swallowed exactly like
+    a write failure, never escape into the recall path (review round 2).
+    Never-raises: a ledger failure must never suppress or delay the
+    tripwire/recall path. Call sites are inside the existing flock-guarded
+    region, so appends are already serialized here -- no new locking is
+    added."""
+    try:
+        entry = build_entry()
+        with open(LEDGER_PATH, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
 
 
 def _in_turn_config() -> dict:
@@ -228,8 +247,13 @@ def _query_recall_daemon(query: str, top_k: int = 5) -> dict | None:
         return None
 
 
-def check_in_turn_recall(match_target: str) -> str:
-    """Budgeted general recall at action-moment, behind the novelty gate."""
+def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> str:
+    """Budgeted general recall at action-moment, behind the novelty gate.
+
+    hook_input (#1749): the raw PreToolUse payload, passed through from
+    main() so the fire ledger can stamp session_id/transcript_path/tool_name
+    per entry. Optional -- existing callers/tests that don't pass it keep
+    working, with those fields recorded as null."""
     import time
 
     cfg = _in_turn_config()
@@ -396,22 +420,41 @@ def check_in_turn_recall(match_target: str) -> str:
             term_sets.append(list(terms))
             state["recent_term_sets"] = term_sets[-_RECENT_TERM_SETS_KEPT:]
 
+        def _ledger_entry(outcome: str, match_count: int, rendered_ids_: list, skipped_recent_: int) -> dict:
+            return {
+                "ts": now,
+                "session_id": hook_input.get("session_id") if hook_input else None,
+                "transcript_path": hook_input.get("transcript_path") if hook_input else None,
+                "tool_name": hook_input.get("tool_name") if hook_input else None,
+                "novel_terms": novel,
+                "terms": terms,
+                "effective_min_idf": effective_min_idf,
+                "match_count": match_count,
+                "rendered_ids": rendered_ids_,
+                "skipped_recent": skipped_recent_,
+                "cooldown_seconds": cfg["cooldown_seconds"],
+                "outcome": outcome,
+            }
+
         # Gate passed — query the daemon with the novel terms.
         result = _query_recall_daemon(" ".join(novel))
         if not result or not result.get("match_count"):
             _record_fire()
             _write_state()
+            _append_ledger(lambda: _ledger_entry("no_matches", 0, [], 0))
             return ""
 
         recent_ids = set(state.get("recent_ids", []))
         lines = []
         rendered_ids = []
+        skipped_recent = 0
         pool = (result.get("special_nodes") or []) + (result.get("top_claims") or [])
         for n in pool:
             if len(lines) >= cfg["max_lines"]:
                 break
             nid = n.get("id", "?")
             if nid in recent_ids:
+                skipped_recent += 1
                 continue
             kw = n.get("recall_keywords")
             kw_str = (" · ".join(f"`{k}`" for k in kw) + " — ") if isinstance(kw, list) and kw else ""
@@ -422,6 +465,7 @@ def check_in_turn_recall(match_target: str) -> str:
         _record_fire()
         if not lines:
             _write_state()
+            _append_ledger(lambda: _ledger_entry("all_suppressed", result.get("match_count", 0), [], skipped_recent))
             return ""
 
         ids = state.get("recent_ids", [])
@@ -430,6 +474,7 @@ def check_in_turn_recall(match_target: str) -> str:
         ids.extend(rendered_ids)
         state["recent_ids"] = ids[-_RECENT_IDS_KEPT:]
         _write_state()
+        _append_ledger(lambda: _ledger_entry("rendered", result.get("match_count", 0), rendered_ids, skipped_recent))
 
         return (
             f"[ENGRAM in-turn recall — novel terms: {', '.join(novel)}]\n"
@@ -474,7 +519,7 @@ def main() -> None:
         # In-turn ambient recall (#1690) — independently guarded; a recall
         # failure must never suppress a tripwire hit (and vice versa).
         try:
-            recall = check_in_turn_recall(match_target)
+            recall = check_in_turn_recall(match_target, hook_input)
         except Exception:
             recall = ""
         if recall:

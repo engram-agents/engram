@@ -21,6 +21,13 @@ Coverage:
       tell (#1737) -- the silent fallback now has an observable trace
   16. the degrade flag is cleared on the next call once the lock recovers
       (#1737) -- a stale flag must not outlive the condition it reports
+  17. a rendered gate-passing fire appends one ledger line (#1749)
+  18. a gate-pass with zero daemon matches appends outcome "no_matches" (#1749)
+  19. a ledger write failure never breaks the recall return value (#1749)
+  20. hook_input=None (legacy call shape) still works; entry has null
+      session fields (#1749)
+  21. a ledger entry-CONSTRUCTION failure (truthy non-dict hook_input) never
+      breaks the recall return value — the guard covers the builder (#1749)
 
 engram_idf and the daemon socket are stubbed: the gate logic is under test,
 not IDF extraction or the daemon (covered by their own tests).
@@ -572,3 +579,108 @@ def test_zero_docs_is_silent_no_daemon_call(tmp_path, monkeypatch):
 
     assert hook.check_in_turn_recall("some query") == ""
     assert daemon_calls["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# #1749 — append-only JSONL fire ledger
+# ---------------------------------------------------------------------------
+
+def _read_ledger(hook):
+    if not hook.LEDGER_PATH.exists():
+        return []
+    with open(hook.LEDGER_PATH) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def test_ledger_appends_one_line_for_rendered_fire(tmp_path, monkeypatch):
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path))
+    _stub_idf([["replay", "harness"]])
+    monkeypatch.setattr(hook, "_query_recall_daemon", lambda q, top_k=5: _daemon_result(["ob_1", "ob_2"]))
+
+    hook_input = {
+        "session_id": "sess_1",
+        "transcript_path": "/tmp/t.jsonl",
+        "tool_name": "Bash",
+    }
+    out = hook.check_in_turn_recall("Bash python replay-bench harness run", hook_input)
+    assert "ENGRAM in-turn recall" in out
+
+    entries = _read_ledger(hook)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["outcome"] == "rendered"
+    assert entry["rendered_ids"] == ["ob_1", "ob_2"]
+    assert entry["novel_terms"] == ["replay", "harness"]
+    assert entry["cooldown_seconds"] == 60
+    assert entry["session_id"] == "sess_1"
+    assert entry["transcript_path"] == "/tmp/t.jsonl"
+    assert entry["tool_name"] == "Bash"
+
+
+def test_ledger_appends_no_matches_outcome(tmp_path, monkeypatch):
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path))
+    _stub_idf([["zeta"]])
+    monkeypatch.setattr(hook, "_query_recall_daemon", lambda q, top_k=5: None)
+
+    assert hook.check_in_turn_recall("zeta call", {"session_id": "s"}) == ""
+
+    entries = _read_ledger(hook)
+    assert len(entries) == 1
+    assert entries[0]["outcome"] == "no_matches"
+    assert entries[0]["rendered_ids"] == []
+
+
+def test_ledger_write_failure_does_not_break_recall(tmp_path, monkeypatch):
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path))
+    _stub_idf([["replay", "harness"]])
+    monkeypatch.setattr(hook, "_query_recall_daemon", lambda q, top_k=5: _daemon_result(["ob_1"]))
+
+    real_open = open
+
+    def broken_open(path, *a, **kw):
+        if str(path) == str(hook.LEDGER_PATH):
+            raise OSError("simulated: ledger append unavailable")
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(hook, "open", broken_open, raising=False)
+
+    out = hook.check_in_turn_recall("Bash python replay-bench harness run")
+    assert "ENGRAM in-turn recall" in out
+    assert "ob_1" in out
+    assert not hook.LEDGER_PATH.exists()
+
+
+def test_ledger_legacy_call_shape_null_session_fields(tmp_path, monkeypatch):
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path))
+    _stub_idf([["replay", "harness"]])
+    monkeypatch.setattr(hook, "_query_recall_daemon", lambda q, top_k=5: _daemon_result(["ob_1"]))
+
+    out = hook.check_in_turn_recall("Bash python replay-bench harness run")
+    assert "ENGRAM in-turn recall" in out
+
+    entries = _read_ledger(hook)
+    assert len(entries) == 1
+    assert entries[0]["session_id"] is None
+    assert entries[0]["transcript_path"] is None
+    assert entries[0]["tool_name"] is None
+
+
+def test_ledger_entry_construction_failure_does_not_break_recall(tmp_path, monkeypatch):
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path))
+    _stub_idf([["replay", "harness"]])
+    monkeypatch.setattr(hook, "_query_recall_daemon", lambda q, top_k=5: _daemon_result(["ob_1"]))
+
+    # Truthy NON-DICT hook_input: `.get()` raises AttributeError while the
+    # entry is being CONSTRUCTED. Review round 2's blocker: construction ran
+    # outside the never-raises guard, so this escaped and silently discarded
+    # the already-computed recall on the rendered path. The guard must
+    # swallow it and still return the render; no ledger line is written.
+    out = hook.check_in_turn_recall("Bash python replay-bench harness run", "bogus")
+    assert "ENGRAM in-turn recall" in out
+    assert "ob_1" in out
+    assert _read_ledger(hook) == []
