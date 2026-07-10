@@ -50,6 +50,19 @@ from engram_confidence import (  # noqa: E402
 )
 
 
+# #1682: belt-and-suspenders against HuggingFace Hub's online etag-check
+# retry ladder (6 x 10s + backoff ~= 83s stall, recurred 4x on a slow/
+# unreachable HF Hub). EmbeddingManager._load_model() below now loads
+# cached models fully offline (local_files_only=True), which already avoids
+# any HF Hub network call — this env var is a second line of defense so
+# that even a residual online etag-check (e.g. a first-time download, or a
+# future code path that doesn't set local_files_only) times out in ~1s
+# instead of ~83s. Set before any huggingface_hub / sentence_transformers
+# import (both are imported lazily, inside functions, later in this
+# module). setdefault() so an operator override in the environment wins.
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "1")
+
+
 try:
     import sqlite_vec as _sqlite_vec
     _SQLITE_VEC_IMPORT_OK = True
@@ -101,7 +114,13 @@ class EmbeddingManager:
         self._lock = threading.Lock()
 
     def _load_model(self, model_name: str):
-        """Load the sentence-transformers model. Auto-downloads from HuggingFace."""
+        """Load the sentence-transformers model.
+
+        Offline-first (#1682): tries local_files_only=True so a cached model
+        never triggers HF Hub's online etag-check (source of an ~83s stall
+        when HF Hub is slow/unreachable). Falls back to a one-time online
+        download on a genuine cache-miss — auto-downloads from HuggingFace.
+        """
         # Fast path: no lock if already loaded for this model_name.
         if self._model is not None and self._model_name == model_name:
             return
@@ -116,7 +135,35 @@ class EmbeddingManager:
                 return
             try:
                 from sentence_transformers import SentenceTransformer
-                self._model = SentenceTransformer(model_name)
+                try:
+                    # #1682: offline-first load. A cached model loads with
+                    # ZERO HuggingFace Hub network traffic — no online
+                    # etag-check, so the ~83s stall (HF Hub slow/unreachable)
+                    # cannot happen on the common warm-cache path (every
+                    # daemon warmup / MCP server restart after the first
+                    # successful load).
+                    self._model = SentenceTransformer(model_name, local_files_only=True)
+                except Exception:
+                    # Cache-miss: this install does NOT pre-download the
+                    # embedder model as a discrete install step (verified —
+                    # no install script calls SentenceTransformer(...); the
+                    # daemon's own background pre-warm in server.py only
+                    # loads an ALREADY-cached model, it does not download).
+                    # The genuine first-time download happens here, lazily,
+                    # on first real use — README-AGENT.md's documented
+                    # "first cold launch loads the sentence-transformer
+                    # model (~80 MB); later launches hit the warm cache"
+                    # behavior. Fall back to a one-time online download so
+                    # a fresh install keeps working; every subsequent load
+                    # hits the local_files_only path above.
+                    import sys as _sys
+                    print(
+                        f"[engram] Embedding model '{model_name}' not in "
+                        f"local HF cache — downloading once (online); "
+                        f"subsequent loads are offline.",
+                        file=_sys.stderr,
+                    )
+                    self._model = SentenceTransformer(model_name)
                 self._model_name = model_name
             except ImportError:
                 self._model = None
