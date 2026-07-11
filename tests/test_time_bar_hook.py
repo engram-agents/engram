@@ -323,6 +323,29 @@ class TestLoopWakeClassification:
         assert twice == once
 
 
+class TestIsHumanPromptHtmlEntityNormalization:
+    """gh#1646, Layer 2 — _is_human_prompt's fallback prefix check must
+    classify identically whether the loop-wake marker arrives plain or
+    HTML-escaped, so an agent-construction mistake (&lt;loop-wake&gt; instead
+    of real angle brackets) can't silently fall through to a false 'human'
+    classification."""
+
+    def test_escaped_loop_wake_marker_is_not_human(self):
+        """The incident case: &lt;loop-wake&gt; body → non-human (False)."""
+        payload = _cc_payload("&lt;loop-wake&gt;\n...core...")
+        assert tbh._is_human_prompt(payload) is False
+
+    def test_plain_loop_wake_marker_is_not_human(self):
+        """Plain marker (unchanged behavior) still classifies as non-human."""
+        payload = _cc_payload("<loop-wake>\n...core...")
+        assert tbh._is_human_prompt(payload) is False
+
+    def test_normal_human_prompt_is_still_human(self):
+        """A normal human prompt is not misclassified as non-human."""
+        payload = _cc_payload("a normal human prompt")
+        assert tbh._is_human_prompt(payload) is True
+
+
 class TestSSoTGuard:
     """The hook's fallback marker string equals loop_prompt.LOOP_WAKE_MARKER.
 

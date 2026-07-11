@@ -183,6 +183,61 @@ def test_session_start_claude_still_emits_mcp_offline_when_probe_reliable(
     assert "MCP server: OFFLINE (no engram server process found)" in ctx
 
 
+def test_pgrep_timeout_is_indeterminate_not_offline(tmp_path, monkeypatch):
+    """#1754: a pgrep TIMEOUT is indeterminate (None), not confirmed-absent (False).
+
+    A timeout means the probe never completed (busy box at cold start) — it is
+    NOT evidence the server is down, so _check_mcp_health must signal the third
+    state so the caller can avoid the cry-wolf OFFLINE alarm.
+    """
+    engram_home = tmp_path / "engram"
+    engram_home.mkdir()
+    mod = _load_hook_module(monkeypatch, engram_home)
+    runtime_root = _set_runtime_platform(monkeypatch, mod, tmp_path, "claude-code")
+    (runtime_root / "server.py").write_text("# test server\n")
+    monkeypatch.delenv("CODEX_PLUGIN_ROOT", raising=False)
+
+    run = MagicMock(side_effect=mod.subprocess.TimeoutExpired(["pgrep"], 1))
+    monkeypatch.setattr(mod.subprocess, "run", run)
+
+    status, reason = mod._check_mcp_health(str(engram_home))
+    assert status is None  # indeterminate — NOT False (confirmed absent)
+    assert reason == "pgrep timed out"
+    run.assert_called_once()
+
+
+def test_session_start_pgrep_timeout_emits_soft_note_not_offline(tmp_path, monkeypatch):
+    """#1754: a pgrep timeout renders a soft 'inconclusive' note, never the hard
+    'OFFLINE → tell the user immediately' alarm."""
+    engram_home = tmp_path / "engram"
+    (engram_home / "sessions").mkdir(parents=True)
+    mod = _load_hook_module(monkeypatch, engram_home)
+    runtime_root = _set_runtime_platform(monkeypatch, mod, tmp_path, "claude-code")
+    (runtime_root / "server.py").write_text("# test server\n")
+    monkeypatch.delenv("CODEX_PLUGIN_ROOT", raising=False)
+    monkeypatch.setattr(
+        mod.subprocess,
+        "run",
+        MagicMock(side_effect=mod.subprocess.TimeoutExpired(["pgrep"], 1)),
+    )
+
+    result = _run_hook_main(
+        mod,
+        {
+            "session_id": "claude-session",
+            "transcript_path": str(tmp_path / "transcript.jsonl"),
+            "source": "startup",
+        },
+    )
+
+    ctx = result["hookSpecificOutput"]["additionalContext"]
+    # The cry-wolf alarm MUST NOT fire on an indeterminate probe.
+    assert "MCP server: OFFLINE" not in ctx
+    assert "Tell the user immediately" not in ctx
+    # A soft, honest note IS emitted instead.
+    assert "MCP liveness: inconclusive (pgrep timed out)" in ctx
+
+
 def test_marker_absent_returns_false(tmp_path, monkeypatch):
     """When server running but marker absent → write-tool liveness is False."""
     engram_home = tmp_path / "engram"

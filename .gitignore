@@ -51,3 +51,4 @@ active-work/
 # in the very file that's supposed to prevent them leaking). Authors
 # populate this locally; see .scan-leaks-local.json.example for the shape.
 .scan-leaks-local.json
+.venv-dev/

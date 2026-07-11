@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ghpr.sh — lightweight repo-local PR helper: bundle touched-tests + cost-log + push.
 #
-# WHY (Lei, 2026-06-12): the full pytest suite is master-only in CI (CI-economics,
+# WHY (Lei, 2026-06-12): the full pytest suite is main-only in CI (CI-economics,
 # private repo = 2000 Actions-min/month, and CI fires on EVERY push so one PR ×
 # N review rounds = N runs). Before committing budget to a GitHub PR-suite
 # workflow, we SIMULATE the proposed gate LOCALLY on each PR push and LOG the
@@ -88,7 +88,7 @@ cmd_push() {
   branch="$(git rev-parse --abbrev-ref HEAD)"
   base_branch="${base#origin/}"
   [ "$branch" = "HEAD" ] && die "detached HEAD — checkout a branch first"
-  [[ "$branch" =~ ^(dev|master)$ ]] && die "refusing to push from $branch directly"
+  [[ "$branch" =~ ^(dev|main)$ ]] && die "refusing to push from $branch directly"
 
   echo "==> fetching $base ..."
   git fetch origin "$base_branch" >/dev/null 2>&1 || die "git fetch origin $base_branch failed"

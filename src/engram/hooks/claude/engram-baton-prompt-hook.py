@@ -35,7 +35,6 @@ CLI:          tools/baton.py
 
 import json
 import os
-import pwd
 import re
 import shutil
 import subprocess
@@ -48,25 +47,44 @@ from typing import Optional
 # Pure-API (UCS invariant): this hook reads coordination state ONLY via the
 # forum HTTP API — no local-filesystem fallback. forum_api ships in tools/.
 #
-# Resolve tools/ in BOTH topologies (mirrors engram-forum-prompt-hook.py) — a
-# fixed parents[N] is WRONG because the two trees differ in depth: the build
-# FLATTENS hooks/claude/ -> hooks/, so the deployed hook sits one level
-# shallower than the source. Source: src/engram/hooks/claude/<name>.py ->
-# src/engram/tools/. Plugin: <root>/hooks/<name>.py -> <root>/tools/. Prefer
-# $CLAUDE_PLUGIN_ROOT/tools when set, else walk parents and take the first dir
-# that actually contains forum_api.py. Import is best-effort: a failure
-# degrades the hook to a silent no-op rather than crashing the prompt.
-_tools_candidates = []
-_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
-if _plugin_root:
-    _tools_candidates.append(Path(_plugin_root) / "tools")
-for _parent in Path(__file__).resolve().parents:
-    _tools_candidates.append(_parent / "tools")
-_TOOLS_DIR = next(
-    (c for c in _tools_candidates if (c / "forum_api.py").exists()), None
-)
-if _TOOLS_DIR is not None and str(_TOOLS_DIR) not in sys.path:
-    sys.path.insert(0, str(_TOOLS_DIR))
+# Resolve tools/ in BOTH topologies via the shared _hooklib helper (gh#1657 —
+# this walk-parents logic was duplicated byte-for-byte across this hook and
+# engram-inter-agent-prompt-hook.py; extracted to stop the two from silently
+# drifting apart the way forum's own copy once did, #1558). _hooklib.py lives
+# alongside this file in both topologies (source: hooks/claude/; deployed:
+# hooks/), so no walk-parents is needed to FIND it — but the module-loading
+# path used by this repo's own tests (importlib.util.spec_from_file_location)
+# does not auto-add a script's own directory to sys.path the way a real
+# `python3 hooks/x.py` invocation does, so this hook adds its own directory
+# explicitly before importing _hooklib. Import is best-effort throughout:
+# any failure degrades the hook to a silent no-op rather than crashing the
+# prompt. (Behavior note: the pre-extraction inline code did NOT wrap the
+# walk-parents loop itself in try/except -- a mid-walk exception, e.g. a
+# permission error from Path.exists(), would have propagated and crashed
+# the hook. Wrapping it here is a deliberate tightening to match this
+# file's existing "never crash the prompt" discipline for every other
+# best-effort import below, not an accidental behavior change.)
+#
+# gh#1680 slice 1: the config/agent-name/emit-context/resolve-tools-dir
+# prologue previously inlined here now lives in the shared _prompthooklib
+# module (same directory, same sys.path bootstrap as _hooklib below).
+# _PROMPTHOOKLIB_OK gates main() -- if the shared module somehow fails to
+# import, the hook degrades to a silent no-op rather than crashing, same
+# discipline as every other best-effort import in this prologue.
+_this_dir = str(Path(__file__).resolve().parent)
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+try:
+    from _prompthooklib import (
+        load_config as _load_config_impl,
+        get_agent_name as _get_agent_name_impl,
+        emit_context as _emit_context,
+        bootstrap_tools_dir as _bootstrap_tools_dir,
+    )
+    _PROMPTHOOKLIB_OK = True
+except Exception:
+    _PROMPTHOOKLIB_OK = False
+_TOOLS_DIR = _bootstrap_tools_dir("forum_api.py") if _PROMPTHOOKLIB_OK else None
 try:
     from forum_api import (
         ForumClient,
@@ -95,6 +113,32 @@ _GH_TIMEOUT = 4
 # GitHub Project owner (used for project-anchor queries)
 _GH_OWNER = os.environ.get("BATON_GH_OWNER", "engram-agents")
 
+# #1715: default repo a BARE pr/<N> anchor resolves against. Same variable
+# name as tools/baton.py's own DEFAULT_GITHUB_REPO / board_projects.py's own
+# copy -- read here too (self-contained; this hook is a standalone deployed
+# script and must not assume it can import a sibling module post-plugin-
+# restructure, per this repo's CLAUDE.md). Public-safe fallback, not the
+# private dev-repo literal (tools/scan-leaks.py flags that shape of leak).
+_DEFAULT_GITHUB_REPO = os.environ.get("ENGRAM_DEFAULT_GITHUB_REPO", "engram-agents/engram")
+
+# #1715: pr/<N> (bare) or pr/<owner>/<repo>/<N> (repo-qualified) -- mirrors
+# tools/baton.py's _GITHUB_ANCHOR_RE / _parse_github_anchor.
+_PR_ANCHOR_RE = re.compile(r"^pr/(?:([\w.-]+)/([\w.-]+)/)?(\d+)$", re.IGNORECASE)
+
+
+def _parse_pr_anchor(anchor: str) -> Optional[tuple]:
+    """Parse a pr/<N> or pr/<owner>/<repo>/<N> anchor into (repo, pr_number).
+
+    repo defaults to _DEFAULT_GITHUB_REPO for a bare anchor. Returns None if
+    the anchor isn't PR-shaped at all.
+    """
+    m = _PR_ANCHOR_RE.match(anchor.strip().lower())
+    if not m:
+        return None
+    owner, repo_name, pr_num = m.groups()
+    repo = f"{owner}/{repo_name}" if owner and repo_name else _DEFAULT_GITHUB_REPO
+    return (repo, pr_num)
+
 # Frontmatter parsing (same regex as ia.py / inter-agent hook)
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):\s*(.*)$", re.MULTILINE)
@@ -104,55 +148,26 @@ _PR_ID_RE = re.compile(r"^PR-(\d+)$")
 
 
 # ---------------------------------------------------------------------------
-# Config helpers  (mirrors engram-inter-agent-prompt-hook.py exactly)
+# Config helpers -- delegate to _prompthooklib (gh#1680 slice 1). Thin
+# per-hook wrappers, not bare aliases: they pin ENGRAM_HOME (this hook's own
+# module constant, captured once at import time above) as an explicit arg,
+# preserving both (a) the exact zero-arg call signature every existing call
+# site and test-monkeypatch already depends on, and (b) the "frozen at
+# import time" ENGRAM_HOME timing the pre-extraction inline code had --
+# the shared load_config()'s own default (re-reading os.environ at call
+# time) is NOT equivalent when ENGRAM_HOME changes between a hook's import
+# and its main() call, which the test harness's `patch.dict` (scoped only
+# around exec_module) actually does.
 # ---------------------------------------------------------------------------
 
 def _load_config() -> dict:
     """Load $ENGRAM_HOME/config.json. Returns {} on any failure."""
-    config_path = Path(ENGRAM_HOME) / "config.json"
-    if config_path.exists():
-        try:
-            return json.loads(config_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
+    return _load_config_impl(ENGRAM_HOME)
 
 
 def _get_agent_name(config: Optional[dict] = None) -> str:
-    """Resolve this agent's own name.
-
-    Priority:
-      1. config.json["agent_name"] field (explicit; wins if set).
-      2. $USER env var, agent- prefix stripped.
-      3. $LOGNAME env var, agent- prefix stripped (Claude Code hook context
-         populates $LOGNAME but not $USER).
-      4. pwd.getpwuid(os.getuid()).pw_name, agent- prefix stripped.
-      5. Empty string (hook will see no matching projects — safe).
-    """
-    if config is None:
-        config = _load_config()
-    name = config.get("agent_name", "").strip()
-    if name:
-        return name
-
-    def _strip_agent_prefix(username: str) -> str:
-        if username.startswith("agent-"):
-            return username[len("agent-"):]
-        return username
-
-    for envvar in ("USER", "LOGNAME"):
-        username = os.environ.get(envvar, "").strip()
-        if username:
-            return _strip_agent_prefix(username)
-
-    try:
-        username = pwd.getpwuid(os.getuid()).pw_name
-        if username:
-            return _strip_agent_prefix(username)
-    except KeyError:
-        pass
-
-    return ""
+    """Resolve this agent's own name. See _prompthooklib.get_agent_name."""
+    return _get_agent_name_impl(config, ENGRAM_HOME)
 
 
 # ---------------------------------------------------------------------------
@@ -288,19 +303,25 @@ def _gh_available() -> bool:
     return shutil.which("gh") is not None
 
 
-def _fetch_pr_status(pr_num: str) -> Optional[str]:
+def _fetch_pr_status(pr_num: str, repo: Optional[str] = None) -> Optional[str]:
     """Call ``gh pr view`` and return a short render string, or None on error.
 
     Returns strings like ``"MERGED"``, ``"OPEN · review:APPROVED"``,
     ``"OPEN · review:REVIEW_REQUIRED"``, etc.
+
+    #1715: pass `repo` (owner/repo) for a repo-qualified anchor so this
+    queries the ANCHOR's actual repo, not gh's ambient-cwd guess.
     """
+    cmd = [
+        "gh", "pr", "view", pr_num,
+        "--json", "state,reviewDecision,title",
+        "--jq", "[.state, .reviewDecision] | join(\"|\")",
+    ]
+    if repo:
+        cmd += ["--repo", repo]
     try:
         result = subprocess.run(
-            [
-                "gh", "pr", "view", pr_num,
-                "--json", "state,reviewDecision,title",
-                "--jq", "[.state, .reviewDecision] | join(\"|\")",
-            ],
+            cmd,
             capture_output=True,
             text=True,
             timeout=_GH_TIMEOUT,
@@ -396,8 +417,14 @@ def _get_live_status(anchor: str, cache: dict) -> str:
         render: Optional[str] = None
         try:
             if anchor.startswith("pr/"):
-                pr_num = anchor[3:]
-                render = _fetch_pr_status(pr_num)
+                # #1715: parse (repo, pr_num) instead of a naive anchor[3:]
+                # slice -- the slice produced "owner/repo/N" verbatim for a
+                # repo-qualified anchor, which gh would reject as a garbage
+                # PR-number argument.
+                parsed = _parse_pr_anchor(anchor)
+                if parsed is not None:
+                    pr_repo, pr_num = parsed
+                    render = _fetch_pr_status(pr_num, repo=pr_repo)
             elif anchor.startswith("project/"):
                 project_num = anchor[8:]
                 render = _fetch_project_status(project_num)
@@ -587,18 +614,17 @@ def _auto_archive_merged_pr_batons(projects: list, cache: dict) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-
-def _emit_context(text: str) -> None:
-    """Emit an additionalContext block on stdout (the UserPromptSubmit channel)."""
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": text,
-        }
-    }))
+# _emit_context now lives in _prompthooklib (gh#1680 slice 1); imported above.
 
 
 def main() -> None:
+    # ── Prologue-lib gate (gh#1680 slice 1) ───────────────────────────────────
+    # If _prompthooklib somehow failed to import, _load_config/_get_agent_name/
+    # _emit_context are unavailable -- degrade to a silent no-op, matching
+    # every other best-effort import in this hook's prologue.
+    if not _PROMPTHOOKLIB_OK:
+        sys.exit(0)
+
     # ── Config + agent name ───────────────────────────────────────────────────
     config = _load_config()
     agent_name = _get_agent_name(config)

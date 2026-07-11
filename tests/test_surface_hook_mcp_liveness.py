@@ -113,7 +113,10 @@ class TestMcpLivenessIntegration:
                             lambda: {"idf_gate_enabled": False,
                                      "short_prompt_threshold_chars": 0,
                                      "prev_response_tail_chars": 0})
-        monkeypatch.setattr(mod, "check_incident_tripwire", lambda *a, **kw: None)
+        # #1698 slice 3: main() now calls check_principle_triggers_full
+        # (returns (text, rendered)) rather than check_principle_triggers
+        # directly — stub the function main() actually invokes.
+        monkeypatch.setattr(mod, "check_principle_triggers_full", lambda *a, **kw: ("", []))
         monkeypatch.setattr(mod, "check_error_patterns", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_query_attached_packs", lambda *a, **kw: [])
         monkeypatch.setattr(mod, "format_nudge", lambda *a, **kw: "")

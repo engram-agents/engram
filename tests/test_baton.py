@@ -1588,32 +1588,32 @@ class TestPoolSentinel:
         assert release_body["pool_sentinel"] == "alice"
 
     def test_sentinel_accepts_short_form_first_token(self, engram_home, monkeypatch):
-        """Pool initialized with turn='lei' works when primary_user='Lei Shi'.
+        """Pool initialized with turn='alex' works when primary_user='Alex Chen'.
 
-        Regression test for issue #1309: _pool_sentinel() returns 'lei shi',
-        but pools are often initialized with just the first token ('lei').
+        Regression test for issue #1309: _pool_sentinel() returns 'alex chen',
+        but pools are often initialized with just the first token ('alex').
         _is_pool_sentinel must accept both forms.
         """
-        lei_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
-        _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
 
         client = _make_client(
             post_return={"seq": 1},
             get_return={"raw": _make_raw_baton(
-                "pool-short-form-test", title="short-form sentinel test", turn="lei",
+                "pool-short-form-test", title="short-form sentinel test", turn="alex",
                 participants="[borges, ariadne]", status="in-progress",
             )},
         )
 
-        # Claim: _is_pool_sentinel("lei") must return True for sentinel "lei shi"
+        # Claim: _is_pool_sentinel("alex") must return True for sentinel "alex chen"
         args_claim = argparse.Namespace(project_id="pool-short-form-test")
-        _baton.cmd_claim(args_claim, lei_config, "borges", client)
+        _baton.cmd_claim(args_claim, owner_config, "borges", client)
 
         _, claim_body = client.post.call_args[0]
         assert claim_body["agent"] == "borges"
-        assert claim_body["pool_sentinel"] == "lei shi"
+        assert claim_body["pool_sentinel"] == "alex chen"
 
         # Simulate server write (borges holds baton after claim)
         client.reset_mock()
@@ -1623,36 +1623,36 @@ class TestPoolSentinel:
         )}
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
 
-        # Release: sentinel must be full "lei shi"
+        # Release: sentinel must be full "alex chen"
         args_release = argparse.Namespace(
             project_id="pool-short-form-test", done=False, reason="released",
         )
-        _baton.cmd_release(args_release, lei_config, "borges", client)
+        _baton.cmd_release(args_release, owner_config, "borges", client)
 
         _, release_body = client.post.call_args[0]
-        assert release_body["pool_sentinel"] == "lei shi"
+        assert release_body["pool_sentinel"] == "alex chen"
 
     def test_merge_gate2_accepts_short_form_sentinel(self, engram_home, monkeypatch, capsys):
-        """baton merge Gate 2 accepts short-form sentinel 'lei' with primary_user='Lei Shi'.
+        """baton merge Gate 2 accepts short-form sentinel 'alex' with primary_user='Alex Chen'.
 
         Regression test for the missed comparison site in cmd_merge (issue #1309):
         Gate 2 used raw != sentinel instead of _is_pool_sentinel, so a PR baton
-        with turn='lei' (short form, written by baton flip) would block merge
+        with turn='alex' (short form, written by baton flip) would block merge
         with "turn is with lei — not presented for merge."
         """
-        lei_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
-        _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
-        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr: ("unknown", "no gh"))
-        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr: ("unknown", "no gh"))
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr, repo=None: ("unknown", "no gh"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr, repo=None: ("unknown", "no gh"))
 
         # Baton with short-form sentinel in turn (the bug trigger).
         # No github: anchor → Gates 3/4 (CI + approval) are skipped automatically.
         client = _make_client(
             post_return={"seq": 1},
             get_return={"raw": _make_raw_baton(
-                "PR-9999", title="short-form merge gate test", turn="lei",
+                "PR-9999", title="short-form merge gate test", turn="alex",
                 participants="[borges, ariadne]", status="in-progress",
             )},
         )
@@ -1660,10 +1660,135 @@ class TestPoolSentinel:
         # --dry-run --force: skips CI (Gate 3) + approval (Gate 4); no real gh call.
         # Should pass Gate 2 without "not presented for merge" error.
         args = argparse.Namespace(pr="PR-9999", dry_run=True, force=True)
-        _baton.cmd_merge(args, lei_config, "borges", client)
+        _baton.cmd_merge(args, owner_config, "borges", client)
 
         captured = capsys.readouterr()
         assert "gate 2 (turn=sentinel): PASS" in captured.out
+
+    def test_merge_repo_qualified_ci_red_refuses(self, engram_home, monkeypatch, capsys):
+        """#1715 round-2 (reviewer-fairy-caught blocker): cmd_merge is a
+        sibling gh consumer of the same `github` anchor field, and its
+        CI-green gate is checked against gh's ambient-cwd repo unless the
+        anchor's own repo is threaded through -- for an irreversible
+        `gh pr merge --squash`, that's the most dangerous instance of the
+        whole #1715 bug class. Prove the gate actually fires against the
+        ANCHOR's repo, not just that some CI check happened."""
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
+        monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        calls = []
+
+        def _fake_ci_state(pr_num, repo=None):
+            calls.append(("ci", pr_num, repo))
+            return ("red", "check 'pr-checks' conclusion=FAILURE")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr, repo=None: ("unknown", "not reached"))
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-9300", turn="alex", github="pr/engram-agents/engram-paper/9300",
+            )},
+        )
+        args = argparse.Namespace(pr="PR-9300", dry_run=False, force=False)
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_merge(args, owner_config, "borges", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        assert ("ci", "9300", "engram-agents/engram-paper") in calls
+        captured = capsys.readouterr()
+        assert "CI is red" in captured.err
+
+    def test_merge_pr_number_mismatch_refuses(self, engram_home, monkeypatch, capsys):
+        """The anchor's own PR number disagreeing with the CLI-resolved
+        number is a red flag worth refusing on, not silently picking one --
+        this would otherwise be a way for a mismatched/stale anchor to merge
+        the wrong PR entirely."""
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
+        monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr, repo=None: ("unknown", "no gh"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr, repo=None: ("unknown", "no gh"))
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-9301", turn="alex", github="pr/engram-agents/engram-paper/9999",
+            )},
+        )
+        args = argparse.Namespace(pr="PR-9301", dry_run=False, force=False)
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_merge(args, owner_config, "borges", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        captured = capsys.readouterr()
+        assert "mismatch" in captured.err
+
+    def test_merge_calls_gh_with_repo_flag(self, engram_home, monkeypatch):
+        """The actual gate-5 `gh pr merge` invocation must carry --repo --
+        this is the single most consequential call in the whole #1715 bug
+        class (an irreversible squash-merge)."""
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
+        monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr, repo=None: ("green", "ok"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr, repo=None: ("fresh", "ok"))
+
+        captured_cmds = []
+
+        def _fake_run(cmd, **kwargs):
+            captured_cmds.append(cmd)
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        monkeypatch.setattr(_baton.subprocess, "run", _fake_run)
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9302", turn="alex", github="pr/engram-agents/engram-paper/9302",
+            )},
+        )
+        args = argparse.Namespace(pr="PR-9302", dry_run=False, force=False)
+        _baton.cmd_merge(args, owner_config, "borges", client)
+
+        assert len(captured_cmds) == 1
+        cmd = captured_cmds[0]
+        assert "--repo" in cmd
+        assert cmd[cmd.index("--repo") + 1] == "engram-agents/engram-paper"
+        assert "9302" in cmd
+
+    def test_merge_bare_anchor_resolves_default_repo(self, engram_home, monkeypatch):
+        """Backward-compat: a baton with no github anchor at all (pre-#1715)
+        still merges, resolving against DEFAULT_GITHUB_REPO rather than
+        erroring or leaving repo unresolved."""
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
+        monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        calls = []
+
+        def _fake_ci_state(pr_num, repo=None):
+            calls.append(("ci", pr_num, repo))
+            return ("green", "ok")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr, repo=None: ("fresh", "ok"))
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton("PR-9303", turn="alex")},
+        )
+        args = argparse.Namespace(pr="PR-9303", dry_run=True, force=False)
+        _baton.cmd_merge(args, owner_config, "borges", client)
+
+        assert ("ci", "9303", _baton.DEFAULT_GITHUB_REPO) in calls
 
     def test_missing_config_fails_loud(self, capsys):
         """cmd_claim with empty config (no mode) exits EXIT_STATE (single-agent mode).
@@ -1808,30 +1933,30 @@ class TestAddParticipant:
             post_return={"seq": 5, "added": True},
             get_return={"raw": _make_raw_baton("PR-600")},
         )
-        args = argparse.Namespace(project_id="PR-600", participant="lei")
+        args = argparse.Namespace(project_id="PR-600", participant="alex")
         _baton.cmd_add_participant(args, MULTI_CONFIG, "borges", client)
 
         url, body = client.post.call_args[0]
         assert url == "/api/projects/PR-600/participants"
         assert body["agent"] == "borges"
-        assert body["participant"] == "lei"
+        assert body["participant"] == "alex"
 
     def test_add_participant_normalizes_participant_case(self):
         client = _make_client(
             post_return={"seq": 5, "added": True},
             get_return={"raw": _make_raw_baton("PR-601")},
         )
-        args = argparse.Namespace(project_id="PR-601", participant="  LEI ")
+        args = argparse.Namespace(project_id="PR-601", participant="  ALEX ")
         _baton.cmd_add_participant(args, MULTI_CONFIG, "borges", client)
 
         _, body = client.post.call_args[0]
-        assert body["participant"] == "lei"
+        assert body["participant"] == "alex"
 
     def test_add_participant_missing_project_exits_nonzero(self, capsys):
         """add-participant on a non-existent project exits non-zero."""
         client = _make_client()
         client.get.side_effect = ForumHttpError(404, '{"error": "not found"}')
-        args = argparse.Namespace(project_id="PR-NONE", participant="lei")
+        args = argparse.Namespace(project_id="PR-NONE", participant="alex")
 
         with pytest.raises(SystemExit) as exc_info:
             _baton.cmd_add_participant(args, MULTI_CONFIG, "borges", client)
@@ -1843,7 +1968,7 @@ class TestAddParticipant:
         """add-participant with a malformed --project-id exits non-zero before any API call."""
         _write_config(engram_home, "borges")
         rc, stdout, stderr = _run_baton(
-            engram_home, "add-participant", "not a valid id!", "lei",
+            engram_home, "add-participant", "not a valid id!", "alex",
         )
         assert rc != 0
 
@@ -1851,7 +1976,7 @@ class TestAddParticipant:
         """Server-side NotAParticipant (agent not a current participant) → EXIT_VALIDATION."""
         client = _make_client(get_return={"raw": _make_raw_baton("PR-602")})
         client.post.side_effect = ForumHttpError(403, '{"error": "agent not a participant"}')
-        args = argparse.Namespace(project_id="PR-602", participant="lei")
+        args = argparse.Namespace(project_id="PR-602", participant="alex")
 
         with pytest.raises(SystemExit) as exc_info:
             _baton.cmd_add_participant(args, MULTI_CONFIG, "borges", client)
@@ -1874,7 +1999,7 @@ class TestAddParticipant:
     def test_add_participant_single_agent_mode_exits_state(self):
         """add-participant in single-agent mode refuses (write command)."""
         client = _make_client()
-        args = argparse.Namespace(project_id="PR-604", participant="lei")
+        args = argparse.Namespace(project_id="PR-604", participant="alex")
         with pytest.raises(SystemExit) as exc_info:
             _baton.cmd_add_participant(args, {"mode": "single"}, "borges", client)
         assert exc_info.value.code == EXIT_STATE
@@ -1896,7 +2021,7 @@ class TestAddParticipant:
         # Step 1: flip to a not-yet-participant fails client-side.
         client = _make_client(get_return={"raw": seed_raw})
         flip_args = argparse.Namespace(
-            project_id="PR-605", to="lei", reason="please review", force=False,
+            project_id="PR-605", to="dana", reason="please review", force=False,
         )
         with pytest.raises(SystemExit) as exc_info:
             _baton.cmd_flip(flip_args, MULTI_CONFIG, "borges", client)
@@ -1905,13 +2030,13 @@ class TestAddParticipant:
 
         # Step 2: add-participant succeeds (server would persist this).
         client.post.return_value = {"seq": 1, "added": True}
-        add_args = argparse.Namespace(project_id="PR-605", participant="lei")
+        add_args = argparse.Namespace(project_id="PR-605", participant="dana")
         _baton.cmd_add_participant(add_args, MULTI_CONFIG, "borges", client)
 
-        # Step 3: simulate the server's post-add state (lei now a participant),
-        # then flip to lei succeeds.
+        # Step 3: simulate the server's post-add state (dana now a participant),
+        # then flip to dana succeeds.
         client.get.return_value = {
-            "raw": _make_raw_baton("PR-605", participants="[borges, ariadne, lei]"),
+            "raw": _make_raw_baton("PR-605", participants="[borges, ariadne, dana]"),
         }
         client.post.reset_mock()
         client.post.return_value = {"seq": 2}
@@ -1919,4 +2044,350 @@ class TestAddParticipant:
         client.post.assert_called_once()
         url, body = client.post.call_args[0]
         assert url == "/api/projects/PR-605/flip"
-        assert body["to_agent"] == "lei"
+        assert body["to_agent"] == "dana"
+
+
+# ---------------------------------------------------------------------------
+# #1715: repo-qualified PR anchors (fixes PR-baton IDs colliding across repos)
+# ---------------------------------------------------------------------------
+
+class TestParseGithubAnchor:
+    def test_bare_pr_number(self):
+        assert _baton._parse_github_anchor("pr/22") == ("pr", None, "22")
+
+    def test_repo_qualified_pr(self):
+        assert _baton._parse_github_anchor("pr/engram-agents/engram-paper/22") == (
+            "pr", "engram-agents/engram-paper", "22",
+        )
+
+    def test_project_form(self):
+        assert _baton._parse_github_anchor("project/4") == ("project", None, "4")
+
+    def test_empty_string_returns_none(self):
+        assert _baton._parse_github_anchor("") is None
+
+    def test_garbage_returns_none(self):
+        assert _baton._parse_github_anchor("not-an-anchor") is None
+
+
+class TestInitRepoQualification:
+    def test_init_auto_derives_bare_anchor_from_pr_project_id(self, monkeypatch):
+        """A PR-<N> project_id with no --github auto-derives pr/<N> (#1715) --
+        every PR-baton should carry SOME anchor from creation, not rely on
+        downstream code re-deriving the number from project_id ad hoc."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-9001", title="auto anchor", participants="borges,ariadne",
+            status="planning", turn=None, github=None, repo=None, colleague=None,
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body.get("github") == "pr/9001"
+
+    def test_init_with_repo_qualifies_anchor(self, monkeypatch):
+        """--repo combines with the (auto-derived or explicit) pr/<N> anchor
+        into the repo-qualified form."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-22", title="cross-repo PR", participants="luria,borges",
+            status="in-progress", turn=None, github=None,
+            repo="engram-agents/engram-paper", colleague=None,
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body.get("github") == "pr/engram-agents/engram-paper/22"
+
+    def test_init_with_repo_but_no_pr_anchor_rejected(self, monkeypatch):
+        """--repo without a PR-shaped anchor (e.g. a project_id that isn't
+        PR-<N> and no explicit --github) is a validation error, not a silent
+        no-op -- --repo only makes sense qualifying a PR anchor."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="pool-something", title="not a PR baton",
+            participants="borges,ariadne", status="planning", turn=None,
+            github=None, repo="engram-agents/engram-paper", colleague=None,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+
+    def test_init_rejects_malformed_repo_value(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-22", title="bad repo", participants="borges,ariadne",
+            status="planning", turn=None, github=None,
+            repo="not-a-valid-repo-format", colleague=None,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+
+    def test_github_anchor_regex_accepts_repo_qualified_form(self):
+        assert _baton._GITHUB_ANCHOR_RE.match("pr/engram-agents/engram-paper/22")
+        assert _baton._GITHUB_ANCHOR_RE.match("pr/22")
+        assert _baton._GITHUB_ANCHOR_RE.match("project/4")
+        assert not _baton._GITHUB_ANCHOR_RE.match("pr/only-one-segment/22")
+
+    def test_init_conflicting_github_and_repo_rejected(self, monkeypatch):
+        """Reviewer-fairy-flagged operator-error case: an already
+        repo-qualified --github combined with a DIFFERENT --repo must not
+        silently overwrite the anchor's real repo -- reject and ask the
+        caller to reconcile, rather than guess which one is intended."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-22", title="conflicting repo",
+            participants="borges,ariadne", status="planning", turn=None,
+            github="pr/engram-agents/engram-paper/22",
+            repo="engram-agents/some-other-repo", colleague=None,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+
+    def test_init_agreeing_github_and_repo_accepted(self, monkeypatch):
+        """The non-conflicting case (--repo restates the SAME repo the
+        --github anchor already carries) must still succeed."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-22", title="agreeing repo",
+            participants="borges,ariadne", status="planning", turn=None,
+            github="pr/engram-agents/engram-paper/22",
+            repo="engram-agents/engram-paper", colleague=None,
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body.get("github") == "pr/engram-agents/engram-paper/22"
+
+
+class TestGcRepoAware:
+    """#1715: cmd_gc must never guess a repo -- it reads the stored `github`
+    anchor per project (never re-derives the PR number from project_id via
+    regex, which has zero repo awareness) and SKIPS any PR-baton lacking a
+    parseable PR anchor rather than defaulting silently."""
+
+    def test_gc_uses_repo_from_github_field_not_ambient_cwd(self, monkeypatch):
+        client = _make_client(get_return={"projects": [
+            {"project_id": "PR-22", "github": "pr/engram-agents/engram-paper/22"},
+        ]})
+        captured_cmds = []
+
+        def _fake_run(cmd, **kwargs):
+            captured_cmds.append(cmd)
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "OPEN"
+            return result
+
+        monkeypatch.setattr(_baton.subprocess, "run", _fake_run)
+        args = argparse.Namespace(dry_run=True, limit=30)
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        assert len(captured_cmds) == 1
+        cmd = captured_cmds[0]
+        assert "--repo" in cmd
+        assert cmd[cmd.index("--repo") + 1] == "engram-agents/engram-paper"
+        assert "22" in cmd
+
+    def test_gc_defaults_unqualified_anchor_to_default_repo_explicitly(self, monkeypatch):
+        """A bare pr/<N> anchor (no repo) still passes --repo explicitly
+        (DEFAULT_GITHUB_REPO), never omits it to fall back on gh's ambient
+        cwd -- that ambient-cwd fallback was itself part of the #1715 bug."""
+        client = _make_client(get_return={"projects": [
+            {"project_id": "PR-1711", "github": "pr/1711"},
+        ]})
+        captured_cmds = []
+
+        def _fake_run(cmd, **kwargs):
+            captured_cmds.append(cmd)
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "MERGED"
+            return result
+
+        monkeypatch.setattr(_baton.subprocess, "run", _fake_run)
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        assert len(captured_cmds) == 1
+        cmd = captured_cmds[0]
+        assert "--repo" in cmd
+        assert cmd[cmd.index("--repo") + 1] == _baton.DEFAULT_GITHUB_REPO
+
+    def test_gc_skips_pr_baton_with_no_github_anchor(self, monkeypatch, capsys):
+        """A PR-<N> baton with no (or unparseable) github field is skipped,
+        not guessed at -- the pre-#1715 behavior derived the PR number from
+        project_id alone and queried gh with zero repo context."""
+        client = _make_client(get_return={"projects": [
+            {"project_id": "PR-9999", "github": None},
+        ]})
+        called = []
+        monkeypatch.setattr(_baton.subprocess, "run", lambda *a, **kw: called.append(a) or MagicMock(returncode=0, stdout="OPEN"))
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        assert called == []  # no gh call at all for the ungauged baton
+        captured = capsys.readouterr()
+        assert "skipped 1 PR-baton" in captured.err
+
+    def test_gc_two_different_repos_same_number_both_handled_correctly(self, monkeypatch):
+        """The exact #1715 collision shape: two PR-batons for the SAME bare
+        number (22) in DIFFERENT repos must each query their OWN repo and
+        never share a result (reviewer-fairy caught: the original version of
+        this test constructed only one project, so it never actually
+        exercised the collision -- it was equivalent to the single-project
+        test just above it)."""
+        client = _make_client(get_return={"projects": [
+            {"project_id": "PR-9200", "github": "pr/engram-agents/engram-paper/22"},
+            {"project_id": "PR-9201", "github": "pr/22"},  # bare -> DEFAULT_GITHUB_REPO
+        ]})
+        captured_cmds = []
+
+        def _fake_run(cmd, **kwargs):
+            captured_cmds.append(cmd)
+            repo = cmd[cmd.index("--repo") + 1]
+            result = MagicMock()
+            result.returncode = 0
+            # Different verdicts per repo -- proves the two #22s are queried
+            # (and therefore could resolve) independently, not conflated.
+            result.stdout = "MERGED" if repo == "engram-agents/engram-paper" else "OPEN"
+            return result
+
+        monkeypatch.setattr(_baton.subprocess, "run", _fake_run)
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        assert len(captured_cmds) == 2
+        by_repo = {cmd[cmd.index("--repo") + 1]: cmd for cmd in captured_cmds}
+        assert "engram-agents/engram-paper" in by_repo
+        assert _baton.DEFAULT_GITHUB_REPO in by_repo
+        # Both invocations target PR number 22, and each carries its OWN repo
+        # -- confirms they are not the same call, and neither's repo bleeds
+        # into the other's.
+        assert "22" in by_repo["engram-agents/engram-paper"]
+        assert "22" in by_repo[_baton.DEFAULT_GITHUB_REPO]
+
+
+class TestFlipRepoQualifiedGuard:
+    """#1715 reviewer-fairy-caught blocker: cmd_flip's CI-green/approval-
+    freshness/colleague-approval guard used a bare `^pr/(\\d+)$` regex that
+    silently failed to match a repo-qualified anchor -- meaning the ENTIRE
+    guard block was skipped, with no warning, for exactly the cross-repo
+    PR-batons this feature exists to support. These tests prove the guard
+    fires (and the resolved repo is threaded to the gh-querying helpers)
+    for a repo-qualified anchor, not just the bare form."""
+
+    def test_flip_repo_qualified_ci_red_refuses(self, monkeypatch, capsys):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        calls = []
+
+        def _fake_ci_state(pr_num, repo=None):
+            calls.append(("ci", pr_num, repo))
+            return ("red", "check 'pr-checks' conclusion=FAILURE")
+
+        def _fake_approval_state(pr_num, repo=None):
+            calls.append(("approval", pr_num, repo))
+            return ("unknown", "not reached")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-9100", github="pr/engram-agents/engram-paper/9100",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9100", to="casey", reason="ready", force=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        # The guard actually ran, and ran against the QUALIFIED repo, not
+        # DEFAULT_GITHUB_REPO or an unresolved/None value.
+        assert ("ci", "9100", "engram-agents/engram-paper") in calls
+        captured = capsys.readouterr()
+        assert "CI is red" in captured.err
+
+    def test_flip_repo_qualified_ci_green_proceeds(self, monkeypatch):
+        """Sanity companion: a genuinely green, fresh, approved cross-repo
+        PR-baton still flips successfully -- the fix doesn't just make the
+        guard fire, it must resolve correctly on the happy path too."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        calls = []
+
+        def _fake_ci_state(pr_num, repo=None):
+            calls.append(("ci", pr_num, repo))
+            return ("green", "mergeStateStatus=CLEAN")
+
+        def _fake_approval_state(pr_num, repo=None):
+            calls.append(("approval", pr_num, repo))
+            return ("fresh", "approved at current tip")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9101", github="pr/engram-agents/engram-paper/9101",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9101", to="casey", reason="ready", force=False,
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        assert ("ci", "9101", "engram-agents/engram-paper") in calls
+        assert ("approval", "9101", "engram-agents/engram-paper") in calls
+
+    def test_flip_bare_anchor_still_resolves_default_repo(self, monkeypatch):
+        """Backward-compat: an existing bare pr/<N> anchor still triggers
+        the guard (unlike before this test existed to prove it) and
+        resolves against DEFAULT_GITHUB_REPO, not None/unresolved."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        calls = []
+
+        def _fake_ci_state(pr_num, repo=None):
+            calls.append(("ci", pr_num, repo))
+            return ("green", "mergeStateStatus=CLEAN")
+
+        def _fake_approval_state(pr_num, repo=None):
+            calls.append(("approval", pr_num, repo))
+            return ("fresh", "approved at current tip")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton("PR-9102", github="pr/9102")},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9102", to="casey", reason="ready", force=False,
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+        assert ("ci", "9102", _baton.DEFAULT_GITHUB_REPO) in calls

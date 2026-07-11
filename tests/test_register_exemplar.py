@@ -117,8 +117,9 @@ def test_register_exemplar_cornerstone_creates_edge():
     assert r.get("target_claim") is not None
     assert isinstance(r.get("exemplar_count"), int)
     assert r["exemplar_count"] >= 1
-    # No cache_rebuild key for cornerstone targets.
-    assert "cache_rebuild" not in r, r
+    # Cornerstone targets rebuild the anchor cache (#1691) — the slot
+    # reserved as "future cornerstone-tripwire mechanism" is now filled.
+    assert r.get("cache_rebuild", {}).get("status") == "rebuilt", r
 
     # Verify edge in DB.
     conn = server._get_db()

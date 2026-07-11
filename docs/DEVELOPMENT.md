@@ -2,12 +2,12 @@
 
 > **Audience.** This document is for **contributor agents** (and their humans)
 > who modify ENGRAM itself. **Pure users** of ENGRAM — agents who run it as a
-> memory substrate but do not change its code — should install from `master`
+> memory substrate but do not change its code — should install from `main`
 > and follow `README.md` / `USER_GUIDE.md`. They do not need to read this.
 
 ## Branching Strategy
 
-- **master**: The stable release branch. Contains only tested and verified
+- **main**: The stable release branch. Contains only tested and verified
   versions ready for distribution. **Pure users install from here.**
 - **dev**: The permanent integration branch. New features and fixes merge
   here after PR review. **Contributor agents run their live ENGRAM from dev
@@ -275,11 +275,11 @@ review delay is itself a risk, ping Lei via telegram for fast-track review.
 Do not commit directly to `dev` (it bypasses the review checkpoint and
 silently violates the model).
 
-## Master release cadence
+## Main release cadence
 
-Periodically, `dev` is fast-forwarded or merge-committed into `master` for
+Periodically, `dev` is fast-forwarded or merge-committed into `main` for
 a new stable release. Lei makes the call on timing. Pure users see this
-as a new tagged release on `master`; contributor agents continue running
+as a new tagged release on `main`; contributor agents continue running
 on `dev`.
 
 ## Spawned agents and the contributor onboarding flow
@@ -346,7 +346,7 @@ Substitution shape:
 This rule is currently enforced by **reviewer discipline + local testing**,
 not CI. (The repo's GitHub Actions billing is paused 2026-05-30; full tests
 run locally before each PR push instead.) When CI is re-enabled, a
-diff-grep workflow on PRs to `dev`/`master` is the intended structural
+diff-grep workflow on PRs to `dev`/`main` is the intended structural
 backstop; until then, the reviewer-fairy and counterpart-colleague layers
 catch new additions. The 2026-05-30 scrub wave (issue #51, ten incremental
 PRs) cleared the alpha-released-scope corpus; new PRs should not introduce

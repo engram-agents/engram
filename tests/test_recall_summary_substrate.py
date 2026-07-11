@@ -804,3 +804,302 @@ def test_format_nudge_others_legacy_fallback_when_only_others():
     assert "ob_only_1" in output and "ob_only_2" in output, (
         f"Expected both matched IDs in fallback:\n{output}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests 16-20: gh#1621 — per-node TAINTED/STALE marker + aggregate-warnings
+# dead-code fix (server emits "stale_nodes"/"tainted_nodes", hook previously
+# read "stale_count"/"tainted_count" — always a dict-get miss).
+# ---------------------------------------------------------------------------
+
+
+# ---- Test 16: aggregate Warnings line — regression test for the dead-code
+#      key-mismatch bug (§1) ----
+
+
+def test_format_nudge_warnings_line_renders_with_correct_keys():
+    """format_nudge must read issues['stale_nodes'] / issues['tainted_nodes']
+    (the keys _surface_impl actually emits), not the nonexistent
+    'stale_count' / 'tainted_count'. Without the fix this dict-get always
+    misses and the Warnings line never renders regardless of graph state."""
+    hook = _load_hook_module()
+
+    claim = _claim_entry(node_id="ob_warn", claim="Some claim.", confidence=0.80)
+    result = _make_result(top_claims=[claim])
+    result["issues"] = {"stale_nodes": 2, "tainted_nodes": 1}
+
+    output = hook.format_nudge(result)
+
+    assert "2 stale, 1 tainted" in output, (
+        f"Expected aggregate Warnings line with correct counts:\n{output}"
+    )
+    assert "Warnings:" in output, f"Expected 'Warnings:' line:\n{output}"
+
+
+def test_format_nudge_warnings_line_absent_when_issues_empty():
+    """No stale/tainted keys (or empty dict) -> no Warnings line rendered."""
+    hook = _load_hook_module()
+
+    claim = _claim_entry(node_id="ob_clean", claim="Clean claim.", confidence=0.80)
+    result = _make_result(top_claims=[claim])
+    result["issues"] = {}
+
+    output = hook.format_nudge(result)
+    assert "Warnings:" not in output, f"Unexpected Warnings line:\n{output}"
+
+
+# ---- Test 17: render_one_node_line — marker present for tainted/stale
+#      entries (§2) ----
+
+
+def test_render_one_node_line_renders_tainted_marker():
+    """An entry carrying warnings.tainted_by renders the ⚠ TAINTED marker."""
+    hook = _load_hook_module()
+
+    entry = _claim_entry(node_id="ob_tainted", claim="A tainted claim.", confidence=0.70)
+    entry["warnings"] = {"tainted_by": [{"retracted_id": "ob_9999"}]}
+
+    line = hook.render_one_node_line(entry, conf_prefix=True, type_tag=False)
+    assert "⚠ TAINTED" in line, f"Expected TAINTED marker in line:\n{line}"
+    assert "[ob_tainted]" in line, f"Expected node id in line:\n{line}"
+
+
+def test_render_one_node_line_renders_stale_marker():
+    """An entry carrying warnings.stale_by renders the ⚠ STALE marker."""
+    hook = _load_hook_module()
+
+    entry = _claim_entry(node_id="ob_stale", claim="A stale claim.", confidence=0.70)
+    entry["warnings"] = {"stale_by": [{"superseded_id": "ob_8888"}]}
+
+    line = hook.render_one_node_line(entry, conf_prefix=True, type_tag=False)
+    assert "⚠ STALE" in line, f"Expected STALE marker in line:\n{line}"
+
+
+def test_render_one_node_line_renders_both_markers_combined():
+    """An entry carrying both tainted_by and stale_by renders both tags
+    joined with '/'."""
+    hook = _load_hook_module()
+
+    entry = _claim_entry(node_id="ob_both", claim="Both-warned claim.", confidence=0.70)
+    entry["warnings"] = {
+        "tainted_by": [{"retracted_id": "ob_9999"}],
+        "stale_by": [{"superseded_id": "ob_8888"}],
+    }
+
+    line = hook.render_one_node_line(entry, conf_prefix=True, type_tag=False)
+    assert "⚠ TAINTED/STALE" in line, f"Expected combined marker in line:\n{line}"
+
+
+def test_render_one_node_line_clean_entry_byte_identical_to_no_warnings_key():
+    """A clean entry (no 'warnings' key at all) renders byte-identical
+    whether or not the marker feature exists — the additive-only regression
+    guard from §2. Compares against the same entry with an explicit
+    warnings=None (also clean) to confirm no marker text leaks in."""
+    hook = _load_hook_module()
+
+    entry_no_key = _claim_entry(node_id="ob_clean", claim="A clean claim.", confidence=0.70)
+    assert "warnings" not in entry_no_key
+
+    line = hook.render_one_node_line(entry_no_key, conf_prefix=True, type_tag=False)
+    assert "⚠" not in line, f"Unexpected marker glyph in clean entry line:\n{line}"
+    assert line == "- [ob_clean] (conf 0.70) · 0d  A clean claim.", (
+        f"Clean-entry line changed shape unexpectedly:\n{line!r}"
+    )
+
+
+# ---- Test 18: format_nudge end-to-end — Specials/Top-claims marker (§2) ----
+
+
+def test_format_nudge_top_claims_tainted_entry_renders_marker():
+    """End-to-end: a top_claims entry with warnings.tainted_by renders the
+    marker inside the full format_nudge output."""
+    hook = _load_hook_module()
+
+    tainted_claim = _claim_entry(
+        node_id="ob_tc_tainted", claim="Tainted top claim.", confidence=0.75,
+    )
+    tainted_claim["warnings"] = {"tainted_by": [{"retracted_id": "ob_x"}]}
+
+    result = _make_result(top_claims=[tainted_claim])
+    output = hook.format_nudge(result)
+
+    assert "⚠ TAINTED" in output, f"Expected marker in format_nudge output:\n{output}"
+    assert "[ob_tc_tainted]" in output
+
+
+# ---- Test 19: matched_meta / Others section — tainted/stale marker (§3) ----
+
+
+def test_format_nudge_others_section_renders_tainted_marker():
+    """A matched_meta Others entry with tainted=True renders the ⚠ TAINTED
+    marker in the Others section."""
+    hook = _load_hook_module()
+
+    matched_meta = [
+        {
+            "id": "ob_other_tainted",
+            "type": "observation_factual",
+            "recall_keywords": ["some-kw"],
+            "tainted": True,
+        },
+    ]
+    result = _make_result(
+        match_count=1,
+        matched_ids=["ob_other_tainted"],
+        matched_meta=matched_meta,
+    )
+    output = hook.format_nudge(result)
+
+    assert "Others:" in output, f"Expected Others section:\n{output}"
+    assert "⚠ TAINTED [ob_other_tainted]" in output, (
+        f"Expected TAINTED marker before Others entry id:\n{output}"
+    )
+
+
+def test_format_nudge_others_section_renders_stale_marker():
+    """A matched_meta Others entry with stale=True renders the ⚠ STALE
+    marker in the Others section."""
+    hook = _load_hook_module()
+
+    matched_meta = [
+        {
+            "id": "ob_other_stale",
+            "type": "observation_factual",
+            "recall_keywords": ["some-kw"],
+            "stale": True,
+        },
+    ]
+    result = _make_result(
+        match_count=1,
+        matched_ids=["ob_other_stale"],
+        matched_meta=matched_meta,
+    )
+    output = hook.format_nudge(result)
+
+    assert "⚠ STALE [ob_other_stale]" in output, (
+        f"Expected STALE marker before Others entry id:\n{output}"
+    )
+
+
+def test_format_nudge_others_section_clean_entry_unchanged():
+    """A matched_meta Others entry with no tainted/stale keys (the common
+    case) renders with no marker — additive-only regression guard."""
+    hook = _load_hook_module()
+
+    matched_meta = [
+        {
+            "id": "ob_other_clean",
+            "type": "observation_factual",
+            "recall_keywords": ["some-kw"],
+        },
+    ]
+    result = _make_result(
+        match_count=1,
+        matched_ids=["ob_other_clean"],
+        matched_meta=matched_meta,
+    )
+    output = hook.format_nudge(result)
+
+    assert "⚠" not in output, f"Unexpected marker glyph in clean Others output:\n{output}"
+    assert "    - [ob_other_clean] `some-kw`" in output, (
+        f"Clean Others line changed shape unexpectedly:\n{output}"
+    )
+
+
+# ---- Test 20: engram_surface server-side — matched_meta carries tainted/
+#      stale booleans, reusing warned_nodes (§3a) ----
+
+
+def test_engram_surface_matched_meta_carries_tainted_signal():
+    """A node with metadata.tainted_by set (via a retraction that taints a
+    dependent node) surfaces matched_meta[i]['tainted']=True; a clean node
+    in the same result carries no 'tainted'/'stale' keys at all (omitted,
+    matching the top_claims/special_nodes 'warnings' omission convention)."""
+    srv = fresh_server()
+    conn = fresh_conn(srv)
+
+    keyword = "quorumtaint"
+    base_id = _add_obs(srv, f"{keyword} base observation that will be retracted")
+    dependent_id = _add_obs(srv, f"{keyword} dependent observation built on the base")
+    clean_id = _add_obs(srv, f"{keyword} entirely unrelated clean observation")
+
+    # Manually taint the dependent node's metadata the same way the
+    # retraction-cascade machinery would (avoids depending on unrelated
+    # cascade-trigger mechanics not under test here).
+    row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (dependent_id,)).fetchone()
+    meta = json.loads(row["metadata"]) if row and row["metadata"] else {}
+    meta["tainted_by"] = [base_id]
+    conn.execute(
+        "UPDATE nodes SET metadata = ? WHERE id = ?",
+        (json.dumps(meta), dependent_id),
+    )
+    conn.commit()
+
+    result = json.loads(
+        srv.engram_surface(payload_json=json.dumps({"query": keyword, "top_k": 10, "semantic": False}))
+    )
+    matched_meta = result.get("matched_meta", [])
+    by_id = {m["id"]: m for m in matched_meta}
+
+    assert dependent_id in by_id, f"Expected dependent node in matched_meta: {by_id.keys()}"
+    assert by_id[dependent_id].get("tainted") is True, (
+        f"Expected tainted=True on the dependent node's matched_meta entry: {by_id[dependent_id]}"
+    )
+
+    assert clean_id in by_id, f"Expected clean node in matched_meta: {by_id.keys()}"
+    assert "tainted" not in by_id[clean_id], (
+        f"Clean node should omit 'tainted' key entirely: {by_id[clean_id]}"
+    )
+    assert "stale" not in by_id[clean_id], (
+        f"Clean node should omit 'stale' key entirely: {by_id[clean_id]}"
+    )
+
+
+def test_engram_surface_empty_taint_list_does_not_inflate_aggregate_count():
+    """Regression test (Borges, colleague review on gh#1621): a node
+    carrying an EMPTY metadata.stale_by/tainted_by list (e.g. left behind
+    by cascade machinery that clears the list without removing the key)
+    must NOT inflate the aggregate 'Warnings: N stale, M tainted' count —
+    the count and the per-node ⚠ markers must derive from the SAME source
+    (_extract_warnings via warned_nodes), which correctly treats an empty
+    list as "not actually tainted/stale." A raw string-match approach
+    (matching on '"stale_by": [' regardless of what follows) would count
+    this node while rendering zero markers for it — the exact
+    count-vs-marker disagreement this test guards against."""
+    srv = fresh_server()
+    conn = fresh_conn(srv)
+
+    keyword = "emptytaintlist"
+    empty_list_id = _add_obs(srv, f"{keyword} node with an emptied stale_by list")
+    genuinely_stale_id = _add_obs(srv, f"{keyword} node with a real stale_by entry")
+
+    row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (empty_list_id,)).fetchone()
+    meta = json.loads(row["metadata"]) if row and row["metadata"] else {}
+    meta["stale_by"] = []  # emptied, e.g. by a resolution pass — key present, list empty
+    conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?", (json.dumps(meta), empty_list_id))
+
+    row2 = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (genuinely_stale_id,)).fetchone()
+    meta2 = json.loads(row2["metadata"]) if row2 and row2["metadata"] else {}
+    # stale_by/tainted_by hold plain node-ID strings (_extract_warnings looks
+    # each one up and enriches it into a {superseded_id, replaced_by_id,
+    # superseded_at} dict on the way OUT — the raw metadata shape in is just IDs).
+    meta2["stale_by"] = ["ob_9999"]
+    conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?", (json.dumps(meta2), genuinely_stale_id))
+    conn.commit()
+
+    result_json = srv.engram_surface(payload_json=json.dumps({"query": keyword, "top_k": 10, "semantic": False}))
+    result = json.loads(result_json)
+    assert result.get("issues", {}).get("stale_nodes") == 1, (
+        f"Only the genuinely-stale node (non-empty stale_by) should count; "
+        f"the empty-list node must not inflate it: {result.get('issues')}"
+    )
+
+    hook = _load_hook_module()
+    output = hook.format_nudge(result)
+    assert "1 stale" in output, f"Aggregate line should say '1 stale', not 2:\n{output}"
+    # The empty-list node's own output line must carry no ⚠ marker.
+    empty_node_lines = [ln for ln in output.splitlines() if empty_list_id in ln]
+    assert empty_node_lines, f"Expected {empty_list_id} to appear in output:\n{output}"
+    assert all("⚠" not in ln for ln in empty_node_lines), (
+        f"Empty-stale_by node must not render a ⚠ marker: {empty_node_lines}"
+    )

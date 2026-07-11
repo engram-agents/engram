@@ -409,6 +409,10 @@ def test_existing_canonical_node_resolves_contradiction_in_one_call():
         "supporting_ids": ob_b,
         "logical_chain": "Source B applies the operational criterion correctly.",
         "reasoning_type": "authority_expert",
+        # ob_b sits on the ct_id contradiction filed above, still open at
+        # this point — composing the resolving derivation itself is exactly
+        # the #1654 resolution-pressure-valve use case for use_contested.
+        "use_contested": True,
     })))
     assert synth_dv["confidence"] >= 0.7, (
         f"Test sanity: synth_dv needs conf >= 0.7 to test the regression; "

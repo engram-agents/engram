@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import sys
 import tempfile
 import types
@@ -509,6 +510,204 @@ class TestResolveRuntimeDirShadowRegression(unittest.TestCase):
             _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-utility-credit-mention-stop.py",
             sentinel="engram_ids.py",
         )
+
+
+class TestResolveRuntimeDirWalkParents(unittest.TestCase):
+    """Regression tests for #1712: the absolute-path last-ditch fallback is
+    replaced by a walk-parents search in BOTH `_resolve_runtime_dir`
+    functions (engram-lesson-tripwire-hook.py, no-arg; engram-surface-hook.py,
+    takes engram_home). Recreates the worktree-nesting hazard directly:
+    `<tmp>/main-repo/.claude/worktrees/fake-agent/` nested under
+    `<tmp>/main-repo/`, matching this repo's own dispatch pattern and real
+    relative hook depth (src/engram/hooks/claude/<hook>.py).
+
+    The real hook file is COPIED to the worktree-nested location (not just
+    referenced) so that `Path(__file__).resolve()` inside the loaded module
+    genuinely resolves under the fake worktree -- exercising the actual,
+    unmodified walk-parents code added by this fix, not a reimplementation.
+    """
+
+    # (hook_path, marker_filename, takes_engram_home_arg, expected last-ditch
+    # fallback string -- the ORIGINAL hardcoded guess, unchanged by this fix)
+    _HOOKS = [
+        (
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-lesson-tripwire-hook.py",
+            "engram_idf.py",
+            False,
+            os.path.expanduser("~/engram-alpha/src/engram"),
+        ),
+        (
+            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py",
+            "engram_client.py",
+            True,
+            os.path.expanduser("~/engram-alpha"),
+        ),
+    ]
+
+    @staticmethod
+    def _build_worktree_tree(tmp_path: Path, hook_path: Path):
+        """<tmp>/main-repo/.claude/worktrees/fake-agent/src/engram/hooks/claude/<hook>.py
+        -- a copy of the real hook file, nested at this repo's real relative
+        depth under a fake worktree, itself nested under a fake main-repo."""
+        main_repo = tmp_path / "main-repo"
+        worktree = main_repo / ".claude" / "worktrees" / "fake-agent"
+        worktree_hook_dir = worktree / "src" / "engram" / "hooks" / "claude"
+        worktree_hook_dir.mkdir(parents=True)
+        worktree_hook_file = worktree_hook_dir / hook_path.name
+        shutil.copy2(hook_path, worktree_hook_file)
+        return main_repo, worktree, worktree_hook_file
+
+    @staticmethod
+    def _call_resolver(loaded_fn, takes_arg: bool, engram_home: str):
+        return loaded_fn(engram_home) if takes_arg else loaded_fn()
+
+    def _resolve_with_clean_env(self, worktree_hook_file: Path, takes_arg: bool,
+                                 data_home: Path) -> str:
+        fn = _load_function_clean(worktree_hook_file)
+        with patch.dict(os.environ, {"ENGRAM_HOME": str(data_home)}, clear=False):
+            os.environ.pop("ENGRAM_RUNTIME_DIR", None)
+            return self._call_resolver(fn, takes_arg, str(data_home))
+
+    def test_worktree_own_copy_wins_over_ancestor(self):
+        """Worktree has its OWN src/engram/<marker> -- the walk-parents
+        search must return the WORKTREE's own copy (nearer ancestor), not
+        the main-repo's (spec Tests item 2). Main-repo ALSO gets a copy so
+        the assertion actually distinguishes "own copy wins" from "walked
+        past it and found the ancestor's instead"."""
+        for hook_path, marker, takes_arg, _ in self._HOOKS:
+            with self.subTest(hook=hook_path.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    tmp_path = Path(tmp)
+                    main_repo, worktree, worktree_hook_file = self._build_worktree_tree(
+                        tmp_path, hook_path
+                    )
+                    main_repo_engram_dir = main_repo / "src" / "engram"
+                    main_repo_engram_dir.mkdir(parents=True)
+                    (main_repo_engram_dir / marker).write_text("# main-repo stub\n")
+
+                    own_engram_dir = worktree / "src" / "engram"
+                    (own_engram_dir / marker).write_text("# worktree's own stub\n")
+
+                    data_home = tmp_path / "data-only-home"
+                    data_home.mkdir()
+
+                    result = self._resolve_with_clean_env(
+                        worktree_hook_file, takes_arg, data_home
+                    )
+
+                    self.assertEqual(
+                        result,
+                        str(own_engram_dir),
+                        f"[{hook_path.name}] expected worktree's own "
+                        f"{own_engram_dir!r}, got {result!r}",
+                    )
+
+    def test_worktree_walks_up_to_ancestor_copy(self):
+        """Worktree has NO <marker> anywhere in its own tree; only the
+        main-repo (an ancestor beyond the worktree) does -- the walk-parents
+        search must find the ancestor's copy (spec Tests item 3, distinct
+        from item 2's "worktree has its own copy" case)."""
+        for hook_path, marker, takes_arg, _ in self._HOOKS:
+            with self.subTest(hook=hook_path.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    tmp_path = Path(tmp)
+                    main_repo, worktree, worktree_hook_file = self._build_worktree_tree(
+                        tmp_path, hook_path
+                    )
+                    # Worktree's own src/engram/ deliberately has NO marker.
+                    main_repo_engram_dir = main_repo / "src" / "engram"
+                    main_repo_engram_dir.mkdir(parents=True)
+                    (main_repo_engram_dir / marker).write_text("# main-repo stub\n")
+
+                    data_home = tmp_path / "data-only-home"
+                    data_home.mkdir()
+
+                    result = self._resolve_with_clean_env(
+                        worktree_hook_file, takes_arg, data_home
+                    )
+
+                    self.assertEqual(
+                        result,
+                        str(main_repo_engram_dir),
+                        f"[{hook_path.name}] expected ancestor's "
+                        f"{main_repo_engram_dir!r}, got {result!r}",
+                    )
+
+    def test_last_ditch_fallback_preserved_when_nothing_found(self):
+        """Nothing found anywhere in the walked parents -- must still return
+        the ORIGINAL hardcoded fallback string, proving the old fallback is
+        preserved (additive hardening), not removed (spec Tests item 4)."""
+        for hook_path, marker, takes_arg, expected_last_ditch in self._HOOKS:
+            with self.subTest(hook=hook_path.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    tmp_path = Path(tmp)
+                    main_repo, worktree, worktree_hook_file = self._build_worktree_tree(
+                        tmp_path, hook_path
+                    )
+                    # No marker anywhere in the tree -- every walk-parents
+                    # candidate misses.
+                    data_home = tmp_path / "data-only-home"
+                    data_home.mkdir()
+
+                    result = self._resolve_with_clean_env(
+                        worktree_hook_file, takes_arg, data_home
+                    )
+
+                    self.assertEqual(
+                        result,
+                        expected_last_ditch,
+                        f"[{hook_path.name}] expected last-ditch "
+                        f"{expected_last_ditch!r}, got {result!r}",
+                    )
+
+    def test_permission_error_mid_walk_degrades_to_last_ditch(self):
+        """Reviewer-fairy blocker (PR #1727): an unreadable ancestor
+        directory mid-walk must degrade to the last-ditch fallback, not
+        crash. pathlib.Path.exists() -- unlike os.path.exists() used at the
+        rungs above -- raises PermissionError instead of returning False on
+        a permission-denied path component. Since engram-surface-hook.py
+        calls this function at bare MODULE-IMPORT time (unguarded), an
+        unhandled exception here would crash the whole hook process."""
+        for hook_path, marker, takes_arg, expected_last_ditch in self._HOOKS:
+            with self.subTest(hook=hook_path.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    tmp_path = Path(tmp)
+                    main_repo, worktree, worktree_hook_file = self._build_worktree_tree(
+                        tmp_path, hook_path
+                    )
+                    # No marker anywhere findable -- same empty tree as the
+                    # last-ditch test, but additionally lock down the
+                    # worktree's own src/engram/ dir so a mid-walk .exists()
+                    # check on a path under it raises PermissionError rather
+                    # than returning False.
+                    own_engram_dir = worktree / "src" / "engram"
+                    data_home = tmp_path / "data-only-home"
+                    data_home.mkdir()
+
+                    # Load the function BEFORE locking down the directory --
+                    # importing the hook module itself needs to traverse
+                    # worktree/src/engram/hooks/claude/<hook>.py, which lives
+                    # UNDER the same directory we're about to chmod. Only the
+                    # subsequent CALL (which does the walk-parents .exists()
+                    # checks) should hit the permission wall.
+                    fn = _load_function_clean(worktree_hook_file)
+                    os.chmod(own_engram_dir, 0o000)
+                    try:
+                        with patch.dict(os.environ, {"ENGRAM_HOME": str(data_home)}, clear=False):
+                            os.environ.pop("ENGRAM_RUNTIME_DIR", None)
+                            result = self._call_resolver(fn, takes_arg, str(data_home))
+                    finally:
+                        # Restore permissions so TemporaryDirectory cleanup
+                        # (which must delete this dir) doesn't itself fail.
+                        os.chmod(own_engram_dir, 0o755)
+
+                    self.assertEqual(
+                        result,
+                        expected_last_ditch,
+                        f"[{hook_path.name}] expected degrade-to-last-ditch "
+                        f"{expected_last_ditch!r} on a permission error "
+                        f"mid-walk, got {result!r}",
+                    )
 
 
 if __name__ == "__main__":

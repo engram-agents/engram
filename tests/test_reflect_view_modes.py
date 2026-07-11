@@ -458,11 +458,11 @@ def test_untouched_categories_preserve_shape():
 
 
 # ---------------------------------------------------------------------------
-# 8. Sort-by-importance: highest importance scores land in Tier 1
+# 8. Sort-by-importance: reflect sub-scans (§5/§6/§7) gate on tier-2 threshold
 # ---------------------------------------------------------------------------
 
-def test_high_importance_nodes_get_tier1():
-    """Nodes with higher importance_score land in Tier 1 (summary-style)."""
+def test_high_importance_nodes_gate_on_tier2():
+    """Reflect sub-scans gate on tier-2 (queryable) threshold; nodes above it appear."""
     server = fresh_server()
 
     # Create 3 low-confidence obs with explicit importance scores

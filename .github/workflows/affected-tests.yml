@@ -1,7 +1,7 @@
 name: affected-tests
 
 # Moved off per-PR CI (#1597) — run affected-tests locally as a review
-# requirement; the full suite (tests.yml) runs on the dev→master release PR.
+# requirement; the full suite (tests.yml) runs on the dev→main release PR.
 #
 # Import-graph selective pytest on every dev PR.
 # Runs only the tests affected by the PR's changed files via
@@ -12,9 +12,9 @@ name: affected-tests
 # suite so a new surface can never silently escape coverage.
 #
 # This gate intentionally does NOT replace the full suite (tests.yml,
-# master-only). Its output — "SUBSET green" or "Full suite green (fallback)"
+# main-only). Its output — "SUBSET green" or "Full suite green (fallback)"
 # — is an iteration signal, not a convergence claim. The full suite gates
-# merge-readiness at master-merge time.
+# merge-readiness at main-merge time.
 #
 # Decision (Lei 2026-06-23, issue #1358): mechanical gate > vigilance for
 # dev-PR coverage. A SyntaxError in a hook (#1347 → #1356) merged to dev

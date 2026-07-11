@@ -35,6 +35,65 @@ from engram_log_emitter import emit_if_initialized
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _check_premise_independence(conn: "sqlite3.Connection", premise_ids: list[str]) -> "dict | None":
+    """Check whether premise observations share a single standpoint_lineage (collinear).
+
+    Returns an advisory dict when all known-lineage observation premises come
+    from one lineage — indicating that an inductive_generalization confidence
+    boost is unwarranted.  Returns None when premises are diverse or no
+    known-lineage observations exist (undetermined).
+
+    Only observation-type nodes carry meaningful standpoint_lineage.  Derived
+    nodes, axioms, and observations without standpoint_lineage are skipped.
+    If fewer than 2 observations with known lineage are found, the gate cannot
+    fire (not enough signal to conclude collinearity).
+    """
+    lineage_map: dict[str, list[str]] = {}  # lineage → [node_ids]
+    for nid in premise_ids:
+        row = conn.execute(
+            "SELECT type, standpoint_lineage FROM nodes WHERE id = ?", (nid,)
+        ).fetchone()
+        if not row:
+            continue
+        if not row["type"].startswith("observation"):
+            continue
+        lineage = (row["standpoint_lineage"] or "").strip()
+        if not lineage:
+            continue
+        lineage_map.setdefault(lineage, []).append(nid)
+
+    n_clusters = len(lineage_map)
+    if n_clusters != 1:
+        # 0 → undetermined (no known lineages); ≥2 → diverse. Both are fine.
+        return None
+
+    shared_lineage = next(iter(lineage_map))
+    collinear_ids = lineage_map[shared_lineage]
+    # Require ≥2 same-lineage obs: a single known-lineage premise with others
+    # having no lineage recorded is undetermined, not collinear.
+    if len(collinear_ids) < 2:
+        return None
+    return {
+        "collinear_verdict": "collinear",
+        "shared_lineage": shared_lineage,
+        "collinear_premise_ids": collinear_ids,
+        "message": (
+            f"independence_advisory: all {len(collinear_ids)} observation premise(s) "
+            f"share standpoint_lineage '{shared_lineage}'. "
+            "inductive_generalization confidence (0.95 level) assumes independent "
+            "sources — same-lineage premises are correlated, not independent. "
+            "Consider: (a) adding a cross-lineage observation before generalizing, "
+            "(b) downgrading to abductive_best_explanation (0.55) to reflect the "
+            "actual evidence strength, or (c) proceed if you have reasons to "
+            "believe independence holds despite shared lineage (note in logical_chain)."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # B impls
 # ---------------------------------------------------------------------------
 
@@ -46,6 +105,8 @@ def _derive_impl(
     derivation_mode: str = "chain",
     context_ids: str = "",
     use_stale: bool = False,
+    use_contested: bool = False,
+    warrant: str = "",
 ) -> str:
     """Internal implementation — see engram_derive MCP tool for the public
     payload schema. Kept callable with named kwargs for in-server callers.
@@ -94,11 +155,24 @@ def _derive_impl(
             derivation — the new derivation will carry a metadata.built_on_stale audit
             marker so future maintenance tools can auto-redirect edges to replacements.
             Has no effect on tainted premises (taint is always a hard block — no override).
+        use_contested: Opt-in override for MECH-5 contradicted-premise guard (#1654).
+            Set to True ONLY when you're deliberately building on a premise that sits
+            on an open, unresolved contradiction (a live ct_ node with no resolves
+            closure yet) — e.g. composing the very derivation that will resolve it.
+            Auto-stamps metadata.built_on_contested (never author-supplied — this is
+            a security property, not a courtesy: it lets the graph count how many
+            derivations are knowingly riding on a still-open dispute, making
+            resolution pressure measurable). Has no effect on tainted premises.
+        warrant: The Toulmin warrant — the general principle or rule that licenses this
+            inference (why do these premises support this claim?). Stored in derive_meta
+            for audit. Leave blank if the bridging principle is fully captured in
+            logical_chain.
 
     Returns:
         JSON with the new derivation node ID, computed confidence, reasoning type, and supporting nodes.
         If premises are compromised, returns a structured block response:
           - BLOCKED_TAINTED: any premise was retracted; no override path.
+          - BLOCKED_CONTRADICTED: premise(s) sit on an open contradiction and use_contested=False.
           - BLOCKED_STALE: premise(s) have superseded upstream and use_stale=False.
     """
     # Per the bool-string-truthy lesson: bool-string truthy trap at wrapper boundary. JSON-string
@@ -114,6 +188,17 @@ def _derive_impl(
                 "JSON encodes `true`/`false` not `\"true\"`/`\"false\"`."
             )
         })
+    if not isinstance(use_contested, bool):
+        return json.dumps({
+            "error": (
+                f"use_contested must be a JSON boolean (true/false), got "
+                f"{type(use_contested).__name__}: {use_contested!r}. "
+                "Some MCP clients emit booleans as strings — make sure your "
+                "JSON encodes `true`/`false` not `\"true\"`/`\"false\"`."
+            )
+        })
+    if warrant and not isinstance(warrant, str):
+        return json.dumps({"error": f"warrant must be a string, got {type(warrant).__name__}"})
 
     if reasoning_type and reasoning_type not in REASONING_TYPES:
         return json.dumps({
@@ -150,6 +235,14 @@ def _derive_impl(
                          f"If you want to reference a definition, use context_ids instead of supporting_ids.",
             })
 
+        # Independence advisory for inductive_generalization (#1313):
+        # A generalization over same-lineage premises inflates confidence beyond
+        # what the evidence warrants. Emit an advisory (not a hard-block) so the
+        # agent can reconsider the reasoning_type before the derivation is filed.
+        independence_advisory: dict | None = None
+        if reasoning_type == "inductive_generalization":
+            independence_advisory = _check_premise_independence(conn, ids)
+
         block, success = core._create_derivation(
             conn,
             claim=claim,
@@ -158,6 +251,8 @@ def _derive_impl(
             reasoning_type=reasoning_type,
             context_ids=ctx,
             use_stale=use_stale,
+            use_contested=use_contested,
+            extra_meta={"warrant": warrant} if warrant else None,
         )
         if block is not None:
             # --- engram.tool.engram_call event — blocked path (DESIGN.md §4.2) ---
@@ -173,6 +268,8 @@ def _derive_impl(
                     "result_node_id": None,
                 },
             )
+            if independence_advisory:
+                block["independence_advisory"] = independence_advisory
             return json.dumps(block)
 
         conn.commit()
@@ -194,6 +291,10 @@ def _derive_impl(
             result["structure_warnings"] = success["structure_warnings"]
         if use_stale and success["stale_ids"]:
             result["built_on_stale"] = success["stale_ids"]
+        if use_contested and success["contested_ids"]:
+            result["built_on_contested"] = success["contested_ids"]
+        if independence_advisory:
+            result["independence_advisory"] = independence_advisory
 
         # --- engram.tool.engram_call event — success path (DESIGN.md §4.2) ---
         emit_if_initialized(

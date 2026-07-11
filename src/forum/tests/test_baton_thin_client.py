@@ -763,9 +763,15 @@ class TestCmdGc:
         return MagicMock(returncode=0, stdout=f"{state}\n", stderr="")
 
     def test_closes_merged_pr_baton(self, monkeypatch):
-        """A PR-baton whose gh state is MERGED → POST /api/projects/<pid>/gc (merged)."""
+        """A PR-baton whose gh state is MERGED → POST /api/projects/<pid>/gc (merged).
+
+        #1715: cmd_gc reads the PR number (and repo) from the stored
+        `github` anchor, not by re-deriving it from project_id -- a baton
+        with no anchor is skipped (see TestGcRepoAware in tests/test_baton.py),
+        so this fixture must carry one to remain gc-eligible.
+        """
         client = _make_client(
-            get_return={"projects": [{"project_id": "PR-500"}]},
+            get_return={"projects": [{"project_id": "PR-500", "github": "pr/500"}]},
             post_return={"seq": 9},
         )
         monkeypatch.setattr(_baton.shutil, "which", lambda name: "/usr/bin/gh")
@@ -781,7 +787,7 @@ class TestCmdGc:
 
     def test_dry_run_does_not_post(self, monkeypatch):
         """--dry-run previews without writing."""
-        client = _make_client(get_return={"projects": [{"project_id": "PR-501"}]})
+        client = _make_client(get_return={"projects": [{"project_id": "PR-501", "github": "pr/501"}]})
         monkeypatch.setattr(_baton.shutil, "which", lambda name: "/usr/bin/gh")
         monkeypatch.setattr(_baton.subprocess, "run", lambda *a, **k: self._gh_state("MERGED"))
         args = _ns(dry_run=True, limit=30)

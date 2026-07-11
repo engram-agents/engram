@@ -12,6 +12,7 @@ behavioral hooks. Best-effort: any failure swallows silently.
 Emits engram.hook.fire event for per-hook fire metadata (alpha #175, DESIGN.md §4.3).
 """
 
+import html
 import json
 import os
 import sys
@@ -66,7 +67,11 @@ except Exception:
 
 def _is_cron_prompt(prompt: str, loop_marker_path: str) -> bool:
     """Return True if the prompt looks like a cron-fired heartbeat, not a real user message."""
-    stripped = prompt.strip()
+    # HTML-unescape before stripping so an escaped/mangled marker (e.g. an
+    # agent hand-constructing &lt;loop-wake&gt; or &lt;&lt;autonomous-loop&gt;&gt;
+    # instead of real angle brackets) still classifies identically to the
+    # plain form. One normalize here covers every check below (gh#1646).
+    stripped = html.unescape(prompt).strip()
     # SSoT loop-wake marker (format_loop_prompt prepends this; see tools/loop_prompt.py).
     if stripped.startswith(_LOOP_WAKE_MARKER):
         return True

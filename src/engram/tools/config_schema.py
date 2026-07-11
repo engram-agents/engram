@@ -164,11 +164,7 @@ SCHEMA: list[dict] = [
     },
 
     # ---- Tier B ----
-    {"key": "memory.tier1_max_nodes", "section": "memory", "tier": TIER_B,
-     "type": "integer", "control": "int", "min": 50, "max": 10000,
-     "label": "Tier-1 max nodes",
-     "tooltip": "How many nodes the agent holds in actively-searchable working memory. Higher = better recall on long sessions but more compute per query. Tune to your hardware.",
-     "editable": True, "restart_required": False},
+    # tier1_max_nodes is retired — removed from schema (#1220)
     {"key": "memory.tier2_max_nodes", "section": "memory", "tier": TIER_B,
      "type": "integer", "control": "int", "min": 100, "max": 100000,
      "label": "Tier-2 max nodes",

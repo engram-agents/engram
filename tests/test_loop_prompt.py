@@ -16,9 +16,20 @@ Behaviors covered:
     9. Empty string → is_loop_wake False.
    10. Starts with marker but has extra whitespace before → is_loop_wake True (lstrip).
 
+  Unit — is_loop_wake HTML-entity normalization (gh#1646, Layer 2):
+   13. HTML-escaped marker (&lt;loop-wake&gt;) classifies as loop-wake (the
+       incident case — an agent hand-constructed the escaped literal).
+   14. Plain marker still classifies (unchanged behavior).
+   15. Leading whitespace + escaped marker still classifies.
+   16. Plain human text is not misclassified as loop-wake.
+   17. Empty string is not loop-wake.
+
   SSoT guard:
    11. LOOP_WAKE_MARKER equals the string literal "<loop-wake>".
    12. CLI module imports cleanly (no import-time side-effects crash).
+   18. The deference-detector hook's fallback constant
+       (_LOOP_WAKE_MARKER_FALLBACK) equals loop_prompt.LOOP_WAKE_MARKER, so
+       the two can't silently diverge.
 """
 
 import importlib.util
@@ -31,6 +42,20 @@ LP_PATH = Path(__file__).parent.parent / "src" / "engram" / "tools" / "loop_prom
 _spec = importlib.util.spec_from_file_location("loop_prompt_test", LP_PATH)
 lp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(lp)
+
+DEFERENCE_HOOK_PATH = (
+    Path(__file__).parent.parent
+    / "src"
+    / "engram"
+    / "hooks"
+    / "claude"
+    / "engram-deference-detector-prompt.py"
+)
+_dd_spec = importlib.util.spec_from_file_location(
+    "deference_detector_prompt_test", DEFERENCE_HOOK_PATH
+)
+dd = importlib.util.module_from_spec(_dd_spec)
+_dd_spec.loader.exec_module(dd)
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +151,37 @@ class TestIsLoopWake:
 
 
 # ---------------------------------------------------------------------------
+# is_loop_wake — HTML-entity normalization (gh#1646, Layer 2)
+# ---------------------------------------------------------------------------
+
+class TestIsLoopWakeHtmlEntityNormalization:
+    """is_loop_wake must classify identically whether the marker arrives
+    plain or HTML-escaped, so an agent-construction mistake (writing
+    &lt;loop-wake&gt; instead of real angle brackets into a ScheduleWakeup
+    prompt) can't silently defeat detection."""
+
+    def test_escaped_marker_is_loop_wake(self):
+        """The incident case: &lt;loop-wake&gt; classifies as loop-wake."""
+        assert lp.is_loop_wake("&lt;loop-wake&gt;\n...core...")
+
+    def test_plain_marker_is_loop_wake(self):
+        """Plain marker (unchanged behavior) still classifies as loop-wake."""
+        assert lp.is_loop_wake("<loop-wake>\n...core...")
+
+    def test_leading_whitespace_plus_escaped_marker_is_loop_wake(self):
+        """Leading whitespace + escaped marker still classifies."""
+        assert lp.is_loop_wake("  &lt;loop-wake&gt; x")
+
+    def test_normal_human_prompt_is_not_loop_wake(self):
+        """A normal human prompt is not misclassified as loop-wake."""
+        assert not lp.is_loop_wake("a normal human prompt")
+
+    def test_empty_string_is_not_loop_wake(self):
+        """Empty string returns False."""
+        assert not lp.is_loop_wake("")
+
+
+# ---------------------------------------------------------------------------
 # SSoT guard
 # ---------------------------------------------------------------------------
 
@@ -142,3 +198,9 @@ class TestSSoT:
         assert hasattr(lp, "LOOP_WAKE_MARKER")
         assert hasattr(lp, "format_loop_prompt")
         assert hasattr(lp, "is_loop_wake")
+
+    def test_deference_hook_fallback_matches_ssot(self):
+        """The deference-detector hook's fallback constant
+        (_LOOP_WAKE_MARKER_FALLBACK) must equal loop_prompt.LOOP_WAKE_MARKER
+        so the two can't silently diverge (#1594)."""
+        assert dd._LOOP_WAKE_MARKER_FALLBACK == lp.LOOP_WAKE_MARKER

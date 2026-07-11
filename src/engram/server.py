@@ -21,6 +21,7 @@ import socket
 import sqlite3
 import subprocess
 import textwrap
+import threading
 import time
 import uuid as _uuid
 from datetime import datetime, timedelta, timezone
@@ -433,6 +434,12 @@ def _add_trust_signal_impl(*args, **kwargs):
 
 def _set_person_lineage_impl(*args, **kwargs):
     return _trust_mod._set_person_lineage_impl(*args, **kwargs)
+
+def _update_person_impl(*args, **kwargs):
+    return _trust_mod._update_person_impl(*args, **kwargs)
+
+def _add_special_moment_impl(*args, **kwargs):
+    return _trust_mod._add_special_moment_impl(*args, **kwargs)
 
 # ---- end #872 wave-3 compat forwarders --------------------------------
 
@@ -1044,25 +1051,186 @@ mcp = FastMCP("engram_mcp")
 # records its wall-clock duration to the tool_timing table. The instrumentation
 # is best-effort: any failure is swallowed rather than allowed to break the
 # tool call. Query via engram_diagnose (see the "tool_timing" section).
+#
+# #1670: this used to call _get_db() (~89ms per call in cProfile evidence,
+# #1668) purely to write one INSERT. It now uses a dedicated, lazily-created
+# module-level connection that skips _get_db()'s full setup/backfill/
+# DAG-check machinery entirely — just WAL + busy_timeout pragmas and the
+# tool_timing table/index DDL (idempotent, same as _get_db()'s copy).
+# Guarded by _timing_conn_lock so create+insert+commit never race across
+# FastMCP's threadpool workers.
 # ---------------------------------------------------------------------------
+
+_timing_conn_lock = threading.Lock()
+_timing_conn: Optional[sqlite3.Connection] = None
+_timing_conn_path: Optional[str] = None
+
+# #1685: separate guard, separate concern from _timing_conn/_timing_conn_path
+# above. _timing_conn_* caches the tool-timing connection itself;
+# _schema_bootstrap_paths below tracks "have we ensured the FULL ENGRAM schema
+# exists for this resolved DB path yet" — a one-time-per-path side effect that
+# _get_timing_conn() used to smuggle in on its own cache-miss path (see
+# _ensure_schema_bootstrap()'s docstring for why that coupling existed and why
+# it's been pulled out). Dedicated lock rather than reusing _timing_conn_lock:
+# keeps the two independent concerns from serializing on each other, and
+# avoids any risk of _ensure_schema_bootstrap()'s call into core._get_db()
+# re-entering timing-connection code while _timing_conn_lock is already held.
+_schema_bootstrap_lock = threading.Lock()
+_schema_bootstrap_paths: set[str] = set()
+
+
+def _ensure_schema_bootstrap() -> None:
+    """Best-effort, once-per-resolved-path trigger for the FULL ENGRAM schema.
+
+    Never raises — called from the tool-call hot path (_timing_mcp_tool's
+    `timed()` finally block, on every single MCP tool call), so any failure
+    here must never break the tool call it's piggybacking on.
+
+    Why this exists (condensed from the pre-#1685 version of this comment,
+    which lived inside _get_timing_conn() itself): engram-pkg's `cmd_init`
+    bootstraps a fresh package DB by calling `client.call("engram_stats")` as
+    a "no-op trigger", relying on SOME _get_db() call reaching the
+    schema-creation code along the way. It does NOT reliably get there
+    through engram_stats() itself — that tool delegates to the separately
+    -imported engram_stats.py family module, which can hold a stale `core`
+    reference across repeated EngramClient(...) instantiations in one process
+    (a pre-existing cross-module staleness footgun, out of scope here). What
+    actually makes cmd_init work is that _timing_mcp_tool's wrapper calls
+    _record_tool_timing() (and, as of #1685, this function) on every tool
+    call, including engram_stats — so this indirect path is the real
+    bootstrap trigger, not engram_stats() directly. See
+    tests/test_scope_export.py::TestCmdInit for the regression coverage (GH
+    #851 originally; re-verified for #1685's refactor).
+
+    core._get_db() is a ONE-TIME cost per resolved path (#1669's guard: once
+    schema_present() is True for a path, every later call — from anywhere —
+    is cheap), so gating on _schema_bootstrap_paths here just avoids paying
+    even that one-time cost more than once; it's not a correctness
+    requirement (core._get_db() itself is idempotent).
+    """
+    resolved_path = str(core.DB_PATH.resolve())
+    with _schema_bootstrap_lock:
+        if resolved_path in _schema_bootstrap_paths:
+            return
+        _schema_bootstrap_paths.add(resolved_path)
+    try:
+        core._get_db().close()
+    except Exception:
+        pass
+    # #1740: principle_triggers registry rebuild used to fire ONLY from
+    # mutation paths (edge writes, lesson/cornerstone/task/goal updates), so a
+    # deployed registry shape/logic fix stayed inert until an unrelated
+    # principle-affecting write happened to trigger a rebuild. Piggyback one
+    # unconditional rebuild here, at the same once-per-resolved-path gate that
+    # stands in for "server startup" for this process — always rebuild (no
+    # mtime/shape guard: it's one indexed query over edges, milliseconds at
+    # our graph sizes, and unconditional also self-heals a deleted/corrupted
+    # registry file). Best-effort: never let a rebuild failure block startup.
+    try:
+        core._rebuild_principle_triggers()
+    except Exception as exc:
+        import sys
+        print(f"[engram-startup] principle_triggers rebuild failed: {exc!r}", file=sys.stderr)
+
+
+def _get_timing_conn() -> sqlite3.Connection:
+    """Return the shared tool-timing connection, (re)creating it if needed.
+
+    Caller MUST hold _timing_conn_lock. Reopens if the resolved DB path
+    changed (test isolation via engram_sandbox()/_configure_paths reroutes
+    core.DB_PATH mid-process) or if the cached connection went stale.
+
+    This function's ONLY job is tool-timing connection lifecycle — creating
+    the connection and its own tool_timing table/index DDL. It does NOT touch
+    the full ENGRAM schema; see _ensure_schema_bootstrap() (called separately,
+    from _timing_mcp_tool's wrapper) for that concern (#1685 decoupled the
+    two — they used to be smuggled together here).
+    """
+    global _timing_conn, _timing_conn_path
+    # .resolve() keeps this path key consistent with _get_db()'s guard key
+    # (symlink/relative aliases collapse to one identity; see engram_core).
+    resolved_path = str(core.DB_PATH.resolve())
+    if _timing_conn is not None and _timing_conn_path == resolved_path:
+        return _timing_conn
+    if _timing_conn is not None:
+        try:
+            _timing_conn.close()
+        except Exception:
+            pass
+
+    conn = sqlite3.connect(resolved_path, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    # #1685 (blueprint H6 follow-up to #1672/#1684): apply the same
+    # faster-never-looser PRAGMA reasoning #1672 measured for _get_db() to
+    # this connection. Audited per-PRAGMA rather than copy-pasted — this
+    # connection's only workload is one INSERT+COMMIT per tool call (see
+    # _record_tool_timing()), no SELECT/scan/temp-b-tree usage.
+    #
+    # synchronous=NORMAL (from FULL): applies directly — same small, frequent
+    # INSERT+COMMIT hot-path cost #1672 targeted in _get_db(). With
+    # journal_mode=WAL (already set above), NORMAL still fsyncs at every WAL
+    # checkpoint, so the WAL itself can't be corrupted by a crash of this
+    # process — only the durability window of the most recent commit(s)
+    # narrows (never a corruption risk). SQLite's own docs recommend NORMAL
+    # as the standard pairing with WAL for exactly this reason.
+    conn.execute("PRAGMA synchronous=NORMAL")
+    # cache_size: modest bump only (not #1672's 64MB) — this table is small
+    # and write-only, so a large page cache buys little, but a small bump is
+    # cheap insurance and keeps both hot-path connections' tuning postures
+    # consistent/legible. ~8MB, vs SQLite's ~2MB default (-2000).
+    conn.execute("PRAGMA cache_size=-8000")
+    # mmap_size and temp_store=MEMORY intentionally SKIPPED: both are
+    # read/scan optimizations (mmap_size cuts read()-syscall cost for paged
+    # reads; temp_store=MEMORY speeds ORDER BY / CREATE INDEX temp-b-tree
+    # spills). _record_tool_timing()'s only operation on this connection is
+    # a single-row INSERT — no SELECT, no scan, no sort, no index build — so
+    # neither PRAGMA has a workload to optimize here. Audited per issue
+    # #1685's own note that these are "less relevant" for a write-only
+    # connection; confirmed by reading _record_tool_timing() rather than
+    # assumed.
+    # Same DDL as the tool_timing table/indexes created in _get_db()'s
+    # one-time setup — idempotent (CREATE ... IF NOT EXISTS), so whichever
+    # of the two paths gets there first is fine.
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS tool_timing (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp   TEXT NOT NULL,
+            tool_name   TEXT NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            status      TEXT NOT NULL,
+            turn        INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_tool_timing_name_ts
+            ON tool_timing(tool_name, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_tool_timing_turn
+            ON tool_timing(turn);
+        """
+    )
+    _timing_conn = conn
+    _timing_conn_path = resolved_path
+    return conn
+
 
 def _record_tool_timing(tool_name: str, duration_ms: int, status: str) -> None:
     """Record one tool call's latency. Never raises — best-effort only."""
     try:
-        conn = _get_db()
-        turn = _get_current_turn()
-        conn.execute(
-            "INSERT INTO tool_timing (timestamp, tool_name, duration_ms, status, turn) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (
-                datetime.now(timezone.utc).isoformat(),
-                tool_name,
-                int(duration_ms),
-                status,
-                turn,
-            ),
-        )
-        conn.commit()
+        with _timing_conn_lock:
+            conn = _get_timing_conn()
+            turn = _get_current_turn()
+            conn.execute(
+                "INSERT INTO tool_timing (timestamp, tool_name, duration_ms, status, turn) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    tool_name,
+                    int(duration_ms),
+                    status,
+                    turn,
+                ),
+            )
+            conn.commit()
     except Exception:
         pass
 
@@ -1243,6 +1411,12 @@ def _timing_mcp_tool(*args, **kwargs):
                 raise
             finally:
                 duration_ms = int((time.perf_counter() - start) * 1000)
+                # #1685: schema-bootstrap trigger lives here now (was buried
+                # inside _get_timing_conn()) — same "runs after every tool
+                # call regardless of success/failure" position/ordering as
+                # _record_tool_timing() below, just decoupled into its own
+                # named, best-effort, once-per-path function.
+                _ensure_schema_bootstrap()
                 _record_tool_timing(func.__name__, duration_ms, timing_status)
                 # Dual-emission: also write to logs/index.db for the viz-server
                 # stats dashboard. result_status is extracted from the tool's
@@ -1258,6 +1432,27 @@ def _timing_mcp_tool(*args, **kwargs):
 
 
 mcp.tool = _timing_mcp_tool
+
+
+# ---------------------------------------------------------------------------
+# payload_json parsing helper (#1683)
+# ---------------------------------------------------------------------------
+def _parse_payload(payload_json):
+    """Parse a tool's payload_json string into a dict.
+
+    Returns (params, None) on success, or (None, <error-envelope-json-str>) on
+    failure. Catches TypeError (non-str payload) alongside JSONDecodeError so a
+    non-string payload returns the standard error envelope instead of an uncaught
+    exception (issue #1683). Error strings are byte-identical to the prior inline
+    blocks — this is behavior-preserving except that TypeError is now caught.
+    """
+    try:
+        params = json.loads(payload_json)
+    except (json.JSONDecodeError, TypeError) as e:
+        return None, json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
+    if not isinstance(params, dict):
+        return None, json.dumps({"error": "payload_json must be a JSON object"})
+    return params, None
 
 
 # ---- Ingestion tools ----
@@ -1309,12 +1504,9 @@ def engram_add_evidence(payload_json: str) -> str:
 
     See _add_evidence_impl for the full URL-validation + trust-pool semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_EVIDENCE_FIELDS
     if unknown:
@@ -1343,6 +1535,7 @@ _ADD_OBSERVATION_FIELDS = frozenset({
     "fs_class",
     "source_repo",
     "repo_path",
+    "session_id",
 })
 
 
@@ -1383,11 +1576,23 @@ def engram_add_observation(payload_json: str) -> str:
     Pass all fields as one JSON object string in payload_json.
 
     Source identification: provide EITHER url+title (evidence node auto-created
-    or reused) OR evidence_id (cite an existing evidence node). If both given,
-    evidence_id takes precedence.
+    or reused) OR evidence_id (cite an existing evidence node) OR session_id
+    (cite the current chat — the server resolves the transcript for you).
+    evidence_id takes precedence over url when both are given (pre-existing
+    behavior); session_id may not be combined with url or evidence_id —
+    passing it alongside either is an error.
 
     If is_predictive=true, also creates or links a Prediction node for the
     forward-looking claim. Pass predicted_event to name the target.
+
+    Simplest — citing the CURRENT chat (pass your injected session_id; the
+    server resolves the transcript, defaults quote_type=personal_communication
+    + source_class=user_stated; a wrong or stale session_id fails loud via the
+    same server-side verbatim-quote check used by every other filing path —
+    no separate verify step needed, but the quote must still be an exact
+    substring of the transcript):
+        {"quoted_text": "...", "interpretation": "...", "claim": "...",
+         "session_id": "<the session id injected at session start / shown in your banner>"}
 
     Common usage — citing the user's chat log as evidence
     (the most common friction point for new sessions; verbatim-quote check is
@@ -1440,22 +1645,36 @@ def engram_add_observation(payload_json: str) -> str:
             quoted_text (str, required): Exact quote from the source document.
             interpretation (str, required): Agent's reasoning about what this quote means.
             claim (str, required): The atomic, falsifiable claim this observation supports.
-            quote_type (str, required): One of: hard_data, official_statement, attributed_analysis, counterfactual_inference, unnamed_source, personal_communication, editorial.
+            quote_type (str, required unless session_id is set): One of: hard_data, official_statement, attributed_analysis, counterfactual_inference, unnamed_source, personal_communication, editorial. When session_id is the source and quote_type is omitted, it defaults to 'personal_communication'.
             url (str, optional): URL of the source document. The evidence node is auto-created or reused.
             title (str, optional): Title of the source document (required if url is provided).
             domain (str, optional): Source domain (auto-extracted from URL if omitted).
             source_date (str, optional): Publication date in ISO format (e.g. '2026-03-20').
-            evidence_id (str, optional): ID of an existing evidence node. Use this OR url+title, not both.
+            evidence_id (str, optional): ID of an existing evidence node. Use this OR url+title OR session_id, not more than one.
+            session_id (str, optional): The current session's id (as injected at session start). The server resolves it to the session's transcript via the data directory's sessions/<session_id>.json and cites that as the evidence source — mutually exclusive with url and evidence_id (passing session_id alongside either is an error). When session_id is the source, quote_type defaults to 'personal_communication' and source_class defaults to 'user_stated' if omitted. A wrong/stale session_id fails loud via the same server-side verbatim-quote check as every other path — it does not bypass verification.
             is_predictive (bool, optional): Whether this observation records a forward-looking prediction.
             predicted_event (str, optional): Required if is_predictive. The event being predicted.
             resolution_timeframe (str, optional): Optional timeframe for when the prediction should be resolvable.
-            source_class (str, optional): Epistemic origin — 'external' (default), 'introspective' (×0.95 confidence discount), or 'user_stated'.
+            source_class (str, optional): Epistemic origin — 'external' (default; 'user_stated' when session_id is the source and source_class is omitted), 'introspective' (×0.95 confidence discount), or 'user_stated'.
             content_hash (str, optional): SHA-256 hash of file content (for file-based evidence).
             git_sha (str, optional): Git commit SHA when the file was read (for file-based evidence).
-            standpoint_author_id (str, optional): Persistent cross-session entity ID for who produced the source claim (the "who observes" axis). Used for provenance-uniformity detection.
+            standpoint_author_id (str, optional): Persistent cross-session entity ID for who
+                produced the source claim (the "who observes" axis). Used for provenance-uniformity
+                detection. Tiered convention (proposed-pending-Lei-ratification): for in-graph
+                entities (peer agents, anyone already a person node) use the pn_* node ID — it
+                carries trust-tier, bio, and about edges. For external one-off authors (a cited
+                journalist, paper author) use a canonical namespaced string such as
+                orcid:0000-0001-2345-6789, doi-author:10.1000/xyz123, or domain:handle — NOT a raw
+                display name; the independence gate needs same-author → same-string and
+                different-author → different-string, and display names are bad join keys ('J. Smith'
+                ≠ 'John Smith'; homonym collisions). Promote a namespaced string to a pn_* node when
+                the author becomes load-bearing (cited ≥2 times or a reliability view forms) —
+                mirrors conjecture→derivation promotion. Non-goal: minting a person node for every
+                author; the independence gate needs only a stable equality key. A format warning is
+                emitted (but the write proceeds) if the value looks like a raw display name.
             standpoint_collection_id (str, optional): Corpus or work identity for the source ("vantage" axis). Independent axis in per-axis standpoint cluster key.
             standpoint_override_tag (str, optional): Free-form standpoint label for when the computed cluster key is insufficient (lab measurements, personal comms, introspective self-reports).
-            standpoint_lineage (str, optional): Training lineage of the source claim's producer, format "provider:family" (e.g. "anthropic:opus"). The most load-bearing bias axis for AI-agent premises; format-validated, rejected with a redirecting error if malformed.
+            standpoint_lineage (str, optional): Training lineage of the source claim's producer, format "provider:family" (e.g. "anthropic:opus"). The most load-bearing bias axis for AI-agent premises; format-validated, rejected with a redirecting error if malformed. Marks the EVIDENCE SOURCE that produced the claim, not who authored this node — you always author your own nodes, including your interpretation; lineage differs only when you're citing another agent's or a human's evidence.
             standpoint_architecture (str, optional): Cognitive architecture of the source's producer. Enum: transformer | vision-spatial | embodied-sensorimotor | graph-neural | human | other. Tracks architectural (not just training) diversity — Class A calibration exposure. Use "human" for human sources, "transformer" for other LLMs, omit for self-observations when explicit tracking is not desired.
             fs_class (str, optional): Falsification-sensitivity class — "re-executable" (Class 1: claim can be re-tested by re-running the measurement) or "frozen" (Class 2: claim records a past event that cannot be re-executed). Omit or pass null to let the Phase-1 proxy (derived from quote_type) apply. When provided, takes priority over the proxy and the FALSIFICATION line drops the "(proxy:quote_type)" label. When the class is ambiguous (e.g. a re-readable file that records past state), omit and let the proxy apply — hesitation is the correct signal to omit.
             source_repo (str, optional): Absolute path to an alternative git repository to use for git operations. When omitted, the git repo is auto-detected from the file:// URL's directory. Use this for cross-repo citations where the cited file lives outside the target repo (e.g. a plugin file deployed to ~/.engram/ that is committed in the plugin source tree ~/engram-alpha/).
@@ -1465,12 +1684,9 @@ def engram_add_observation(payload_json: str) -> str:
         JSON with the new observation ID, confidence, evidence ID, and any prediction node created.
         On payload-parsing failure, returns {"error": "..."} with no node created.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_OBSERVATION_FIELDS
     if unknown:
@@ -1544,9 +1760,15 @@ def engram_add_observation_batch(payload_json: str) -> str:
                 observation objects. Each observation must have quoted_text,
                 interpretation, claim, quote_type; optional is_predictive,
                 predicted_event, resolution_timeframe, source_class,
-                standpoint_author_id, standpoint_collection_id, standpoint_override_tag,
+                standpoint_author_id (see tiered-ID convention in
+                engram_add_observation — pn_* for in-graph entities, namespaced
+                string for external authors; display names emit a warning),
+                standpoint_collection_id, standpoint_override_tag,
                 standpoint_lineage (format "provider:family", e.g. "anthropic:opus" —
-                the most load-bearing bias axis for AI-agent premises; format-validated),
+                the most load-bearing bias axis for AI-agent premises; format-validated;
+                marks the EVIDENCE SOURCE that produced the claim, not who authored this
+                node — differs from your own lineage only when citing another agent's or
+                a human's evidence),
                 standpoint_architecture (transformer | vision-spatial | embodied-sensorimotor
                 | graph-neural | human | other),
                 fs_class ("re-executable" for Class 1 claims that can be re-tested by
@@ -1569,12 +1791,9 @@ def engram_add_observation_batch(payload_json: str) -> str:
     See _add_observation_batch_impl for full per-observation semantics + the
     evidence-resolution logic.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_OBSERVATION_BATCH_FIELDS
     if unknown:
@@ -1656,12 +1875,9 @@ def engram_surface(payload_json: str) -> str:
     See _surface_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _SURFACE_FIELDS
     if unknown:
         return json.dumps({
@@ -1760,12 +1976,9 @@ def engram_inspect(payload_json: str) -> str:
     See _inspect_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _INSPECT_FIELDS
     if unknown:
         return json.dumps({
@@ -1861,12 +2074,9 @@ def engram_query(payload_json: str) -> str:
     See _query_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _QUERY_FIELDS
     if unknown:
         return json.dumps({
@@ -1957,12 +2167,9 @@ def engram_get_subgraph(payload_json: str) -> str:
     See _subgraph_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _SUBGRAPH_FIELDS
     if unknown:
         return json.dumps({
@@ -2038,17 +2245,27 @@ def engram_nap(payload_json: str) -> str:
     Returns:
         JSON with previous_turn (unchanged from current_turn since no
         advance), changes summary, graph stats, and memory tiers.
+        `diagnostic_snapshot.recall_set_continuity` carries the Recall-Set
+        Continuity metric (v1, #1630) — Jaccard similarity of the tier2
+        (searchable, which strictly contains tier1) node-ID set against the
+        prior checkpoint's snapshot: {jaccard, set_size, prior_snapshot_turn,
+        prior_checkpoint_mode} plus a `reason` key when jaccard is null (no
+        prior checkpoint to compare, or the prior snapshot predates this
+        metric). Computed at EVERY diagnostic_history checkpoint — both
+        engram_nap and engram_advance_turn (sleep) — per the metric
+        designer's call: the sleep boundary is the most meaningful
+        measurement point (consolidation reshaping), so excluding it would
+        blind the metric to its own primary use case. NOT computed by
+        ad-hoc engram_diagnose() calls — see _compute_recall_set_continuity
+        docstring.
         On payload-parsing failure, returns {"error": "..."}.
 
     See _nap_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _NAP_FIELDS
     if unknown:
         return json.dumps({
@@ -2068,6 +2285,19 @@ def engram_nap(payload_json: str) -> str:
         diag_metrics = json.loads(engram_diagnose())
         conn2 = core._get_db()
         try:
+            # Recall-Set Continuity (v1, #1630): Jaccard similarity of the
+            # tier1+tier2 (searchable) node-ID set between consecutive
+            # diagnostic_history checkpoints (nap AND sleep — see
+            # _compute_recall_set_continuity docstring for the cadence
+            # decision). Computed HERE (nap wrapper), not inside
+            # engram_diagnose()/_diagnose_impl — engram_diagnose is its own
+            # directly-callable MCP tool (not checkpoint-only), so injecting
+            # the up-to-tier2_max_nodes ID list into _diagnose_impl's own
+            # return value would bloat every ad-hoc engram_diagnose() call.
+            # Must run BEFORE the INSERT below so it reads the prior row,
+            # not the row it's about to add.
+            recall_continuity = core._compute_recall_set_continuity(conn2, mode)
+            diag_metrics["recall_set_continuity"] = recall_continuity
             conn2.execute(
                 """INSERT INTO diagnostic_history (timestamp, turn, checkpoint_mode, metrics)
                    VALUES (?, ?, ?, ?)""",
@@ -2077,6 +2307,17 @@ def engram_nap(payload_json: str) -> str:
             result_dict["diagnostic_snapshot"] = {
                 "stored": True,
                 "health_score": diag_metrics.get("health_score"),
+                # Compact nap-output view: jaccard + set size + provenance,
+                # never the full tier2_ids list (that stays in the stored
+                # diagnostic_history row only — see _compute_recall_set_continuity).
+                "recall_set_continuity": {
+                    "checkpoint_mode": recall_continuity["checkpoint_mode"],
+                    "jaccard": recall_continuity["jaccard"],
+                    "set_size": recall_continuity["set_size"],
+                    "prior_snapshot_turn": recall_continuity["prior_snapshot_turn"],
+                    "prior_checkpoint_mode": recall_continuity["prior_checkpoint_mode"],
+                    **({"reason": recall_continuity["reason"]} if recall_continuity["reason"] else {}),
+                },
             }
         finally:
             conn2.close()
@@ -2152,17 +2393,20 @@ def engram_advance_turn(payload_json: str) -> str:
     Returns:
         JSON with new turn number, changes summary, graph stats, and memory
         tiers.
+        `diagnostic_snapshot.recall_set_continuity` carries the Recall-Set
+        Continuity metric (v1, #1630) — same shape and semantics as
+        engram_nap's (see that tool's docstring + engram_core's
+        _compute_recall_set_continuity docstring). Computed here too, not
+        just at nap: the sleep boundary's forgetting + consolidation makes
+        it the single most meaningful measurement point for this metric.
         On payload-parsing failure, returns {"error": "..."}.
 
     See _advance_turn_impl for full semantics — kept callable with named kwargs
     for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _ADVANCE_TURN_FIELDS
     if unknown:
         return json.dumps({
@@ -2182,6 +2426,15 @@ def engram_advance_turn(payload_json: str) -> str:
         diag_metrics = json.loads(engram_diagnose())
         conn2 = core._get_db()
         try:
+            # Recall-Set Continuity (v1, #1630) — computed at the sleep
+            # checkpoint too, per the metric designer's call: the sleep
+            # boundary (forgetting + consolidation) is the most meaningful
+            # measurement point, not the least. See
+            # _compute_recall_set_continuity's docstring for the full
+            # cadence-decision rationale. Must run BEFORE the INSERT below
+            # so it reads the prior row, not the row it's about to add.
+            recall_continuity = core._compute_recall_set_continuity(conn2, mode)
+            diag_metrics["recall_set_continuity"] = recall_continuity
             conn2.execute(
                 """INSERT INTO diagnostic_history (timestamp, turn, checkpoint_mode, metrics)
                    VALUES (?, ?, ?, ?)""",
@@ -2191,6 +2444,14 @@ def engram_advance_turn(payload_json: str) -> str:
             result_dict["diagnostic_snapshot"] = {
                 "stored": True,
                 "health_score": diag_metrics.get("health_score"),
+                "recall_set_continuity": {
+                    "checkpoint_mode": recall_continuity["checkpoint_mode"],
+                    "jaccard": recall_continuity["jaccard"],
+                    "set_size": recall_continuity["set_size"],
+                    "prior_snapshot_turn": recall_continuity["prior_snapshot_turn"],
+                    "prior_checkpoint_mode": recall_continuity["prior_checkpoint_mode"],
+                    **({"reason": recall_continuity["reason"]} if recall_continuity["reason"] else {}),
+                },
             }
         finally:
             conn2.close()
@@ -2285,12 +2546,9 @@ def engram_reflect(payload_json: str = "{}") -> str:
     See _reflect_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _REFLECT_FIELDS
     if unknown:
         return json.dumps({
@@ -2396,12 +2654,9 @@ def engram_stats(payload_json: str = "{}") -> str:
             window (conditional): present only when mode != "all".
     """
     # ── Parse + validate payload ───────────────────────────────────────────
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     mode = params.get("mode", "all")
     sections_param = params.get("sections", None)
@@ -2556,12 +2811,9 @@ def engram_history(payload_json: str) -> str:
     See _history_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _HISTORY_FIELDS
     if unknown:
         return json.dumps({
@@ -2630,12 +2882,9 @@ def engram_add_axiom(payload_json: str) -> str:
 
     See _add_axiom_impl for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_AXIOM_FIELDS
     if unknown:
@@ -2699,12 +2948,9 @@ def engram_add_definition(payload_json: str) -> str:
 
     See _add_definition_impl for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_DEFINITION_FIELDS
     if unknown:
@@ -2781,12 +3027,9 @@ def engram_add_conjecture(payload_json: str) -> str:
 
     See _add_conjecture_impl for full lifecycle semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_CONJECTURE_FIELDS
     if unknown:
@@ -2854,12 +3097,9 @@ def engram_add_goal(payload_json: str) -> str:
 
     See _add_goal_impl for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_GOAL_FIELDS
     if unknown:
@@ -2925,12 +3165,9 @@ def engram_deactivate_goal(payload_json: str) -> str:
 
     See _deactivate_goal_impl for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _DEACTIVATE_GOAL_FIELDS
     if unknown:
@@ -2988,12 +3225,9 @@ def engram_activate_goal(payload_json: str) -> str:
 
     See _activate_goal_impl for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ACTIVATE_GOAL_FIELDS
     if unknown:
@@ -3006,7 +3240,18 @@ def engram_activate_goal(payload_json: str) -> str:
 
 
 _ADD_PERSON_FIELDS = frozenset({
-    "name", "role", "description", "aliases", "context_ids", "is_self",
+    # Required
+    "name",
+    # Typed relational fields (shared human + agent; mutable-with-trace)
+    "relation", "pronouns", "trust_tier", "aliases", "location_contact",
+    # Agent-specific identity fields (immutable)
+    "lineage", "architecture", "first_session_date",
+    # Immutable identity
+    "birthday",
+    # Structural flags
+    "context_ids", "is_self",
+    # Deprecated alias for relation (accepted, flagged in response)
+    "role",
 })
 
 
@@ -3022,7 +3267,7 @@ _ADD_PERSON_FIELDS = frozenset({
 # anchor has metadata.is_self=1; it's the implicit default for engram_link_about
 # when person_id is unset. Exactly ONE self-anchor per graph.
 #
-# aliases field: cross-mapping for names (e.g. Lei Shi / 石磊 / @LeiShi GitHub).
+# aliases field: cross-mapping for names (e.g. Jane Doe / 王伟 / @janedoe GitHub).
 # Recall queries match on any alias, so "did Lei mention X" finds claims
 # linked via the unified pn_NNNN (the primary-user person-node) regardless of which alias was used at filing.
 #
@@ -3043,32 +3288,44 @@ _ADD_PERSON_FIELDS = frozenset({
     },
 )
 def engram_add_person(payload_json: str) -> str:
-    """Record a person the agent knows and interacts with.
+    """Record a person the agent knows and interacts with (typed-schema form).
 
-    Single-payload signature (wave 2c-ii of the antml-prefix swallow risk — see issue #55): pass
-    ALL fields as one JSON object string in `payload_json`.
+    Single-payload signature (wave 2c-ii of the antml-prefix swallow risk — see
+    issue #55): pass ALL fields as one JSON object string in `payload_json`.
+
+    Person nodes use typed fields in metadata (no free-form description/logical_chain
+    bins). Facts about a person go in observations linked via engram_link_about.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
-            name (str, required): The person's name.
-            role (str, required): Their role or relationship to the agent.
-            description (str, optional): Background, expertise, traits, or other context.
-            aliases (str, optional): Comma-separated alternative names.
+            name (str, required): The person's name. Immutable after creation.
+            relation (str, optional): Role/relationship (e.g. "primary collaborator",
+                "daughter"). Mutable-with-trace via engram_update_person.
+            pronouns (str, optional): Free-form pronoun string. Mutable-with-trace.
+            trust_tier (str, optional): Trust tier string — same values as the
+                nodes.trust_tier column ("self", "primary_user", "user_family",
+                "our_side", "known_external", "unknown", "suspect").
+                Mutable-with-trace (elevated review flag on change).
+            aliases (str or list, optional): Alternative names for Stage 1
+                auto-suggest matching. CSV string or JSON list. Mutable-with-trace.
+            location_contact (str, optional): Address/contact info. Mutable-with-trace.
+            birthday (str, optional): ISO date string. Immutable.
+            lineage (str, optional): Agent lineage ("anthropic:claude-sonnet"). Immutable.
+            architecture (str, optional): Agent architecture descriptor. Immutable.
+            first_session_date (str, optional): ISO date of first interaction. Immutable.
             context_ids (str, optional): Comma-separated node IDs for context references.
             is_self (bool, optional): Mark as the agent's own self-anchor (only one allowed).
+            role (str, optional): DEPRECATED — alias for relation. Accepted, flagged in response.
 
     Returns:
         JSON with the new person node ID. On payload-parsing failure,
         returns {"error": "..."}.
 
-    See _add_person_impl for full semantics.
+    See _add_person_impl in engram_trust.py for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_PERSON_FIELDS
     if unknown:
@@ -3086,6 +3343,164 @@ def engram_add_person(payload_json: str) -> str:
         })
 
     return _trust_mod._add_person_impl(**params)
+
+
+_UPDATE_PERSON_FIELDS = frozenset({
+    "node_id", "updates", "reason",
+})
+
+
+# DESIGN INTENT — engram_update_person
+# ------------------------------------
+# In-place update of mutable person-node fields: relation, pronouns, trust_tier,
+# aliases, location_contact. Does NOT create a new node (not a supersede).
+# Immutable fields (name, birthday, lineage, architecture, first_session_date)
+# are rejected — corrections require supersede.
+#
+# Field-trace audit: every mutable change appends {prior_value, changed_at} to
+# metadata.field_traces[field] — append-only, never mutates existing entries.
+#
+# Cascade flag: emits a 'field-value-changed' flag into metadata.field_changed_flags
+# of all current nodes that cite or are about this person. trust_tier changes
+# carry review_required=True (elevated, non-dismissible); all others are cheap
+# (dismissible). Coarse-emit: node-scoped, not field-scoped.
+@mcp.tool(
+    name="engram_update_person",
+    annotations={
+        "title": "Update Mutable Fields on a Person Node",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_update_person(payload_json: str) -> str:
+    """Update mutable fields on an existing person node in-place.
+
+    No supersede, no new node — modifies metadata directly. Records prior values
+    in field_traces (append-only). Emits a field-value-changed cascade flag to
+    nodes that cite or are about this person.
+
+    Immutable fields (name, birthday, lineage, architecture, first_session_date)
+    are rejected — use engram_supersede for corrections.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            node_id (str, required): Person node ID (pn_NNNN). Must be
+                type='person' and is_current=1.
+            updates (dict, required): Map of field → new_value. Mutable fields:
+                relation, pronouns, trust_tier, aliases, location_contact.
+                Attempting to update an immutable field returns an error.
+            reason (str, optional): Human-readable explanation for the change.
+
+    Returns:
+        JSON with status, node_id, updated_fields, field_traces_delta,
+        cascade_flagged_nodes. trust_tier_elevated=True when trust_tier changed.
+    """
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
+
+    unknown = set(params.keys()) - _UPDATE_PERSON_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_UPDATE_PERSON_FIELDS)}"
+        })
+
+    # Ensure updates is a dict, not a string or list.
+    if "updates" in params and not isinstance(params["updates"], dict):
+        return json.dumps({
+            "error": (
+                f"'updates' must be a JSON object (dict of field → value), "
+                f"got {type(params['updates']).__name__}."
+            )
+        })
+
+    return _trust_mod._update_person_impl(
+        node_id=params.get("node_id", ""),
+        updates=params.get("updates", {}),
+        reason=params.get("reason", ""),
+    )
+
+
+_ADD_SPECIAL_MOMENT_FIELDS = frozenset({
+    "person_id", "description", "node_id",
+})
+
+
+# DESIGN INTENT — engram_add_special_moment
+# ------------------------------------------
+# Confirm step for the special_moment_suggestion nudge that engram_link_about
+# emits after every new `about` edge (see _link_about_impl in
+# engram_cornerstone.py). PR #1604 shipped the curated special_moments
+# highlights field (max 7, oldest rotated out on cap) plus its write path
+# (_add_special_moment_impl in engram_trust.py) but deliberately left it
+# module-level only — "moments enter via Stage 2 workflow" — so there was no
+# way for an agent to act on the nudge. This tool closes that #1587/#1604 gap
+# by exposing the existing, already-tested impl as an MCP tool. No new write
+# logic here — purely a thin validating wrapper.
+#
+# Single-payload signature (payload_json), per this repo's MCP tool
+# parameter-style convention (see project CLAUDE.md) — every @mcp.tool()
+# function takes one JSON-string param, never multi-arg, to eliminate the
+# antml-prefix argument-swallow surface.
+@mcp.tool(
+    name="engram_add_special_moment",
+    annotations={
+        "title": "Add a Special Moment to a Person Node",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_add_special_moment(payload_json: str) -> str:
+    """Record a curated "special moment" highlight on a person node.
+
+    This is the confirm step for the special_moment_suggestion nudge that
+    engram_link_about returns after wiring a new `about` edge — when that
+    nudge fires, call this tool to actually commit the highlight instead of
+    letting the suggestion go unactioned.
+
+    Appends {description, node_id, added_at} to the person node's
+    metadata.special_moments list. Max 7 slots: once at cap, the oldest
+    entry is rotated out of the list (its underlying `about` edge is NOT
+    removed — special_moments is a highlights reel over the full history,
+    not the history itself). Not idempotent: calling this twice with the
+    same arguments appends a second, separate entry.
+
+    Args:
+        payload_json: JSON object (as a string) with these REQUIRED fields:
+            person_id (str): Target person node ID (pn_NNNN). Must be
+                type='person' and is_current=1, or this returns an error.
+            description (str): Qualitative description of the moment (the
+                agent's own read on why it's notable).
+            node_id (str): The epistemic anchor — the observation or other
+                node this moment is grounded in. Must reference a real,
+                current node, or this returns an error.
+
+    Returns:
+        JSON with status="added", person_id, the updated special_moments
+        list, slot_count, and cap. On any validation failure (person not
+        found / not type=person / not current; description or node_id
+        missing/blank; anchor node not found / not current) returns
+        {"error": "..."} instead.
+
+    See _add_special_moment_impl in engram_trust.py for full semantics.
+    """
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
+
+    unknown = set(params.keys()) - _ADD_SPECIAL_MOMENT_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_ADD_SPECIAL_MOMENT_FIELDS)}"
+        })
+
+    return _trust_mod._add_special_moment_impl(**params)
 
 
 _SET_TRUST_TIER_FIELDS = frozenset({
@@ -3152,12 +3567,9 @@ def engram_set_trust_tier(payload_json: str) -> str:
             attestation fields. Read the error message carefully — it names
             the required fields and explains the structural-honesty stake.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _SET_TRUST_TIER_FIELDS
     if unknown:
         return json.dumps({
@@ -3224,12 +3636,9 @@ def engram_set_person_lineage(payload_json: str) -> str:
         JSON with status ("ok"), person_id, model_provider, model_family,
         model_version.  On error: {"error": "..."}.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _SET_PERSON_LINEAGE_FIELDS
     if unknown:
         return json.dumps({
@@ -3320,12 +3729,9 @@ def engram_add_trust_signal(payload_json: str) -> str:
         - weight in [0.0, 1.0]
         - All 5 required fields present
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _ADD_TRUST_SIGNAL_FIELDS
     if unknown:
         return json.dumps({
@@ -3397,12 +3803,9 @@ def engram_add_cornerstone(payload_json: str) -> str:
 
     See _add_cornerstone_impl for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_CORNERSTONE_FIELDS
     if unknown:
@@ -3478,12 +3881,9 @@ def engram_outgrow_cornerstone(payload_json: str) -> str:
     See _outgrow_cornerstone_impl for full semantics — kept callable with
     named kwargs for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _OUTGROW_CORNERSTONE_FIELDS
     if unknown:
@@ -3554,12 +3954,9 @@ def engram_link_about(payload_json: str) -> str:
     See _link_about_impl for full semantics — kept callable with named kwargs
     for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _LINK_ABOUT_FIELDS
     if unknown:
@@ -3645,12 +4042,9 @@ def engram_remove_edge(payload_json: str) -> str:
           - 'no_op_not_found': edge did not exist; idempotent success.
           - 'error': payload invalid, nodes missing, or relation not whitelisted.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _REMOVE_EDGE_FIELDS
     if unknown:
@@ -3748,12 +4142,9 @@ def engram_add_edge(payload_json: str) -> str:
           - 'no_op_already_exists': edge already existed; idempotent success.
           - 'error': payload invalid, nodes missing, or relation not whitelisted.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_EDGE_FIELDS
     if unknown:
@@ -3832,12 +4223,9 @@ def engram_scan_emergence(payload_json: str = "") -> str:
     kwargs for in-server callers.
     """
     payload_json = payload_json or "{}"
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _SCAN_EMERGENCE_FIELDS
     if unknown:
@@ -3910,12 +4298,9 @@ def engram_goal_tension(payload_json: str) -> str:
     See _goal_tension_impl for full semantics — kept callable with named
     kwargs for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _GOAL_TENSION_FIELDS
     if unknown:
@@ -4004,12 +4389,9 @@ def engram_add_lesson(payload_json: str) -> str:
 
     See _add_lesson_impl for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_LESSON_FIELDS
     if unknown:
@@ -4087,12 +4469,9 @@ def engram_lesson_register_incident(payload_json: str) -> str:
     See _lesson_register_incident_impl for direct named-kwarg access.
     Delegates to _register_exemplar_impl internally.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _LESSON_REGISTER_INCIDENT_FIELDS
     if unknown:
@@ -4190,12 +4569,9 @@ def engram_register_exemplar(payload_json: str) -> str:
         design intent).
         On payload-parsing failure, returns {"error": "..."}.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _REGISTER_EXEMPLAR_FIELDS
     if unknown:
@@ -4273,12 +4649,9 @@ def engram_add_task(payload_json: str) -> str:
 
     See _add_task_impl for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ADD_TASK_FIELDS
     if unknown:
@@ -4351,12 +4724,9 @@ def engram_update_task(payload_json: str) -> str:
     See _update_task_impl for the full importance-rebalancing semantics —
     kept callable with named kwargs for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _UPDATE_TASK_FIELDS
     if unknown:
@@ -4435,12 +4805,9 @@ def engram_report_feeling(payload_json: str) -> str:
     See _report_feeling_impl for full semantics — kept callable with named
     kwargs for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _REPORT_FEELING_FIELDS
     if unknown:
@@ -4461,7 +4828,7 @@ def engram_report_feeling(payload_json: str) -> str:
 # Set of legitimate field names for the engram_derive payload.
 _DERIVE_FIELDS = frozenset({
     "claim", "supporting_ids", "logical_chain", "reasoning_type",
-    "derivation_mode", "context_ids", "use_stale",
+    "derivation_mode", "context_ids", "use_stale", "use_contested", "warrant",
 })
 
 
@@ -4483,11 +4850,16 @@ _DERIVE_FIELDS = frozenset({
 # is mathematically valid ONLY when premises cite DISTINCT evidence sources —
 # misusing it on co-sourced premises produces structurally inflated confidence.
 #
-# MECH-5 stale-premise + tainted-premise guards (use_stale opt-in): a derivation
-# resting on premises that have been superseded or retracted gets BLOCKED at
-# filing time. The block is a feature: it surfaces "this reasoning needs to be
-# re-grounded" rather than letting derivation chains rot silently. the honesty axiom
-# honesty-is-structural in action.
+# MECH-5 stale-premise + tainted-premise + contradicted-premise guards
+# (use_stale / use_contested opt-ins): a derivation resting on premises that
+# have been superseded, retracted, or sit on an open unresolved contradiction
+# (#1654) gets BLOCKED at filing time. The block is a feature: it surfaces
+# "this reasoning needs to be re-grounded (or the dispute resolved)" rather
+# than letting derivation chains rot silently, or compound on contested
+# ground without a trace. the honesty axiom honesty-is-structural in action.
+# The contradiction guard is deliberately overridable (a live dispute isn't a
+# refutation) but the override auto-stamps metadata.built_on_contested —
+# never author-supplied — so opting in stays measurable, not a laundering path.
 #
 # derivation_mode is legacy (kept for back-compat); prefer reasoning_type.
 @mcp.tool(
@@ -4528,22 +4900,31 @@ def engram_derive(payload_json: str) -> str:
                 references (e.g. definitions). Creates 'cites' edges.
             use_stale (bool, optional): Opt-in override for MECH-5 stale-premise
                 guard. Default False. Has no effect on tainted premises.
+            use_contested (bool, optional): Opt-in override for MECH-5
+                contradicted-premise guard (#1654) — set True only when
+                deliberately building on a premise under an open, unresolved
+                contradiction (e.g. composing the derivation that will resolve
+                it). Default False. Auto-stamps metadata.built_on_contested
+                (never author-supplied). Has no effect on tainted premises.
+            warrant (str, optional): The Toulmin warrant — the general principle
+                or rule that licenses this inference (why do these premises
+                support this claim?). Example: "Agents that record findings at
+                the moment of discovery retain the thought-construction, not just
+                the recall." Leave blank if the bridging principle is fully
+                captured in logical_chain.
 
     Returns:
         JSON with the new derivation node ID, computed confidence, reasoning
         type, and supporting nodes. If premises are compromised, returns a
-        structured block response (BLOCKED_TAINTED or BLOCKED_STALE). On
-        payload-parsing failure, returns {"error": "..."}.
+        structured block response (BLOCKED_TAINTED, BLOCKED_CONTRADICTED, or
+        BLOCKED_STALE). On payload-parsing failure, returns {"error": "..."}.
 
     See _derive_impl for full reasoning-type list, confidence-computation
     semantics, and structural-validation details.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _DERIVE_FIELDS
     if unknown:
@@ -4614,12 +4995,9 @@ def engram_contradict(payload_json: str) -> str:
 
     See _contradict_impl for full semantics.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _CONTRADICT_FIELDS
     if unknown:
@@ -4690,12 +5068,9 @@ def engram_ask(payload_json: str) -> str:
     See _ask_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _ASK_FIELDS
     if unknown:
@@ -4788,12 +5163,9 @@ def engram_resolve(payload_json: str) -> str:
     See _resolve_impl for full semantics — kept callable with named kwargs
     for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _RESOLVE_FIELDS
     if unknown:
@@ -4871,12 +5243,9 @@ def engram_supersede(payload_json: str) -> str:
 
     See _supersede_impl for full semantics + workflow + validation rules.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _SUPERSEDE_FIELDS
     if unknown:
@@ -4984,12 +5353,9 @@ def engram_retract(payload_json: str) -> str:
 
     See _retract_impl for full semantics + error-type catalog.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
 
     unknown = set(params.keys()) - _RETRACT_FIELDS
     if unknown:
@@ -5059,12 +5425,9 @@ def engram_focus(payload_json: str) -> str:
     See _focus_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _FOCUS_FIELDS
     if unknown:
         return json.dumps({
@@ -5113,12 +5476,9 @@ def engram_unfocus(payload_json: str) -> str:
     See _unfocus_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _UNFOCUS_FIELDS
     if unknown:
         return json.dumps({
@@ -5193,12 +5553,9 @@ def engram_focus_save(payload_json: str) -> str:
     See _focus_save_impl for full semantics — kept callable with named kwargs
     for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _FOCUS_SAVE_FIELDS
     if unknown:
         return json.dumps({
@@ -5248,12 +5605,9 @@ def engram_focus_load(payload_json: str) -> str:
     See _focus_load_impl for full semantics — kept callable with named kwargs
     for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _FOCUS_LOAD_FIELDS
     if unknown:
         return json.dumps({
@@ -5301,12 +5655,9 @@ def engram_focus_swap(payload_json: str) -> str:
     See _focus_swap_impl for full semantics — kept callable with named kwargs
     for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _FOCUS_SWAP_FIELDS
     if unknown:
         return json.dumps({
@@ -5374,12 +5725,9 @@ def engram_focus_delete_set(payload_json: str) -> str:
     See _focus_delete_set_impl for full semantics — kept callable with named
     kwargs for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _FOCUS_DELETE_SET_FIELDS
     if unknown:
         return json.dumps({
@@ -5570,12 +5918,9 @@ def engram_list(payload_json: str = "{}") -> str:
     See _list_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _LIST_FIELDS
     if unknown:
         return json.dumps({
@@ -5684,12 +6029,9 @@ def engram_query_pattern(payload_json: str) -> str:
     See _query_pattern_impl for full semantics — kept callable with named
     kwargs for in-server callers.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _QUERY_PATTERN_FIELDS
     if unknown:
         return json.dumps({
@@ -5758,12 +6100,9 @@ def engram_embedding_cluster(payload_json: str) -> str:
             embedding_model: model used for stored embeddings (informational).
         On error: {"error": "..."}.
     """
-    try:
-        params = json.loads(payload_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
-    if not isinstance(params, dict):
-        return json.dumps({"error": "payload_json must be a JSON object"})
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
     unknown = set(params.keys()) - _EMBEDDING_CLUSTER_FIELDS
     if unknown:
         return json.dumps({
@@ -5930,6 +6269,23 @@ if __name__ == "__main__":
     # Best-effort: if git is missing or init fails, core._git_available stays False
     # and engram_nap / engram_advance_turn will report version_control.git_committed=False.
     _init_git()
+
+    # #1673: start the async snapshot worker and REPLAY any snapshot-commit jobs
+    # left pending by a prior crash (e.g. a SIGKILL between the durable enqueue and
+    # the git commit) BEFORE serving. start_worker() also clears a stale
+    # .git/index.lock from such a crash so the async lane isn't wedged. Best-effort:
+    # a worker-start failure must never block server boot — checkpoints then fall
+    # back to the synchronous commit path.
+    try:
+        import engram_snapshot_worker
+        engram_snapshot_worker.start_worker()
+    except Exception as _sw_e:
+        import sys as _sys
+        print(
+            f"[engram] snapshot worker startup failed "
+            f"(checkpoints will use the sync commit path): {_sw_e}",
+            file=_sys.stderr,
+        )
 
     # Pre-warm embedding model on a daemon thread so mcp.run() can start
     # serving connections immediately. On cold caches under concurrent system

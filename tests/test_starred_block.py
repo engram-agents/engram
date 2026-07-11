@@ -1,4 +1,5 @@
-"""Tests for the starred_block() surface helper wired into the Claude hooks.
+"""Tests for the starred_block() surface helper wired into the Claude
+session-start hook.
 
 Verifies:
   1. starred_block() returns "" when no starred JSON file exists.
@@ -10,8 +11,14 @@ Verifies:
   6. starred_block() caps at 10 entries and appends "+N more" tail.
   7. starred_block() returns "" on corrupt starred JSON (graceful).
 
-Tests cover the Claude session-start hook and postcompact hook implementations
-(both contain the same starred_block function with the same contract).
+Historical note (#1732, 2026-07-09): this used to also parametrize over the
+postcompact hook's own starred_block(), on the premise that both hooks render
+additionalContext. That premise was wrong — PostCompact is a side-effects-only
+Claude Code hook event and cannot inject additionalContext at all (confirmed
+against CC docs, forum #241) — so the postcompact copy was always dead code.
+It was removed from engram-postcompact-hook.py rather than left as a
+misleading no-op; session-start hook is the only real render point and
+already covered both startup and compact/resume unconditionally.
 """
 
 import importlib.util
@@ -26,7 +33,6 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SESSION_START_HOOK_PATH = _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
-_POSTCOMPACT_HOOK_PATH = _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-postcompact-hook.py"
 
 
 # ---------------------------------------------------------------------------
@@ -73,13 +79,6 @@ def _load_session_start_module(engram_home: Path, inter_agent_dir: Path):
     """Load the Claude session-start hook."""
     return _load_hook_module(
         _SESSION_START_HOOK_PATH, "engram_session_start_hook", engram_home, inter_agent_dir
-    )
-
-
-def _load_postcompact_module(engram_home: Path, inter_agent_dir: Path):
-    """Load the Claude postcompact hook."""
-    return _load_hook_module(
-        _POSTCOMPACT_HOOK_PATH, "engram_postcompact_hook", engram_home, inter_agent_dir
     )
 
 
@@ -131,16 +130,18 @@ def inter_agent_dir(tmp_path: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Parametrize over both hook implementations
+# Helper — the single (session-start) starred_block() implementation
 # ---------------------------------------------------------------------------
 
 def _get_starred_block_fns(engram_home, inter_agent_dir):
-    """Return the starred_block functions from the Claude hook implementations."""
+    """Return the starred_block function from the Claude session-start hook.
+
+    Kept as a list-of-(name, fn) to minimize the diff against the previous
+    two-hook parametrization — every test below still loops over this.
+    """
     ss_mod = _load_session_start_module(engram_home, inter_agent_dir)
-    pc_mod = _load_postcompact_module(engram_home, inter_agent_dir)
     return [
         ("claude-session-start", ss_mod.starred_block),
-        ("claude-postcompact", pc_mod.starred_block),
     ]
 
 
@@ -149,7 +150,7 @@ def _get_starred_block_fns(engram_home, inter_agent_dir):
 # ---------------------------------------------------------------------------
 
 class TestStarredBlockHelper:
-    """starred_block() in both hooks renders the same contract."""
+    """starred_block() renders the documented contract."""
 
     def test_no_starred_file_returns_empty(self, engram_home, inter_agent_dir):
         """Returns '' when no inter-agent-starred.json file exists."""

@@ -28,6 +28,7 @@ import socket
 import sqlite3
 import subprocess
 import textwrap
+import threading
 import time
 import uuid as _uuid
 from datetime import date, datetime, timedelta, timezone
@@ -47,6 +48,19 @@ from engram_confidence import (  # noqa: E402
     REASONING_DISCOUNT,
     ABDUCTIVE_CONFIDENCE_CAP,
 )
+
+
+# #1682: belt-and-suspenders against HuggingFace Hub's online etag-check
+# retry ladder (6 x 10s + backoff ~= 83s stall, recurred 4x on a slow/
+# unreachable HF Hub). EmbeddingManager._load_model() below now loads
+# cached models fully offline (local_files_only=True), which already avoids
+# any HF Hub network call — this env var is a second line of defense so
+# that even a residual online etag-check (e.g. a first-time download, or a
+# future code path that doesn't set local_files_only) times out in ~1s
+# instead of ~83s. Set before any huggingface_hub / sentence_transformers
+# import (both are imported lazily, inside functions, later in this
+# module). setdefault() so an operator override in the environment wins.
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "1")
 
 
 try:
@@ -73,36 +87,94 @@ _VEC_BACKEND_AVAILABLE = _SQLITE_VEC_IMPORT_OK
 
 class EmbeddingManager:
     """Manages embedding model loading and computation.
-    
+
     Lazy-loads the model on first use. Stores the model name in the KG's
     config to prevent mixing embeddings from different models.
+
+    #1675: FastMCP dispatches sync tools on a real threadpool, so two
+    concurrent first-touch tool calls could previously race into
+    _load_model() at once — double-loading the model (wasted work / memory)
+    or, worse, one thread observing self._model set to a partially-
+    constructed SentenceTransformer from the other thread (no documented
+    thread-safety guarantee for concurrent construction). _lock guards the
+    lazy-load path with double-checked locking, and also serializes
+    .encode() calls: sentence-transformers documents no thread-safety
+    contract for concurrent encode() on one model instance, so correctness
+    comes first here — concurrent embed() calls now queue rather than race.
+    Known follow-up: this trades away encode() throughput under concurrent
+    load (only one embed at a time, process-wide); if that becomes a
+    bottleneck, look at either a small connection-pool-style set of model
+    instances or moving encode() off the request thread entirely.
     """
 
     def __init__(self):
         self._model = None
         self._model_name = None
         self._failed_models = set()  # cache download failures
+        self._lock = threading.Lock()
 
     def _load_model(self, model_name: str):
-        """Load the sentence-transformers model. Auto-downloads from HuggingFace."""
+        """Load the sentence-transformers model.
+
+        Offline-first (#1682): tries local_files_only=True so a cached model
+        never triggers HF Hub's online etag-check (source of an ~83s stall
+        when HF Hub is slow/unreachable). Falls back to a one-time online
+        download on a genuine cache-miss — auto-downloads from HuggingFace.
+        """
+        # Fast path: no lock if already loaded for this model_name.
         if self._model is not None and self._model_name == model_name:
             return
         if model_name in self._failed_models:
             return  # already tried and failed
-        try:
-            from sentence_transformers import SentenceTransformer
-            self._model = SentenceTransformer(model_name)
-            self._model_name = model_name
-        except ImportError:
-            self._model = None
-            self._model_name = None
-            self._failed_models.add(model_name)
-        except Exception as e:
-            import sys
-            print(f"[engram] Failed to load embedding model '{model_name}': {e}", file=sys.stderr)
-            self._model = None
-            self._model_name = None
-            self._failed_models.add(model_name)
+        with self._lock:
+            # Re-check inside the lock (double-checked locking) — another
+            # thread may have finished loading (or failed) while we waited.
+            if self._model is not None and self._model_name == model_name:
+                return
+            if model_name in self._failed_models:
+                return
+            try:
+                from sentence_transformers import SentenceTransformer
+                try:
+                    # #1682: offline-first load. A cached model loads with
+                    # ZERO HuggingFace Hub network traffic — no online
+                    # etag-check, so the ~83s stall (HF Hub slow/unreachable)
+                    # cannot happen on the common warm-cache path (every
+                    # daemon warmup / MCP server restart after the first
+                    # successful load).
+                    self._model = SentenceTransformer(model_name, local_files_only=True)
+                except Exception:
+                    # Cache-miss: this install does NOT pre-download the
+                    # embedder model as a discrete install step (verified —
+                    # no install script calls SentenceTransformer(...); the
+                    # daemon's own background pre-warm in server.py only
+                    # loads an ALREADY-cached model, it does not download).
+                    # The genuine first-time download happens here, lazily,
+                    # on first real use — README-AGENT.md's documented
+                    # "first cold launch loads the sentence-transformer
+                    # model (~80 MB); later launches hit the warm cache"
+                    # behavior. Fall back to a one-time online download so
+                    # a fresh install keeps working; every subsequent load
+                    # hits the local_files_only path above.
+                    import sys as _sys
+                    print(
+                        f"[engram] Embedding model '{model_name}' not in "
+                        f"local HF cache — downloading once (online); "
+                        f"subsequent loads are offline.",
+                        file=_sys.stderr,
+                    )
+                    self._model = SentenceTransformer(model_name)
+                self._model_name = model_name
+            except ImportError:
+                self._model = None
+                self._model_name = None
+                self._failed_models.add(model_name)
+            except Exception as e:
+                import sys
+                print(f"[engram] Failed to load embedding model '{model_name}': {e}", file=sys.stderr)
+                self._model = None
+                self._model_name = None
+                self._failed_models.add(model_name)
 
     def is_available(self) -> bool:
         """Check if sentence-transformers is installed."""
@@ -121,7 +193,13 @@ class EmbeddingManager:
         self._load_model(model_name)
         if self._model is None:
             return None
-        vector = self._model.encode(text, convert_to_numpy=True)
+        # Serialize encode() calls (see class docstring #1675) — no
+        # documented thread-safety guarantee for concurrent encode() on one
+        # sentence-transformers model instance.
+        with self._lock:
+            if self._model is None:
+                return None
+            vector = self._model.encode(text, convert_to_numpy=True)
         return vector.tolist()
 
     def embed_batch(self, texts: list[str], model_name: str) -> Optional[list[list[float]]]:
@@ -131,7 +209,10 @@ class EmbeddingManager:
         self._load_model(model_name)
         if self._model is None:
             return None
-        vectors = self._model.encode(texts, convert_to_numpy=True)
+        with self._lock:
+            if self._model is None:
+                return None
+            vectors = self._model.encode(texts, convert_to_numpy=True)
         return vectors.tolist()
 
     @staticmethod
@@ -190,6 +271,23 @@ _walguard_startup_done: bool = False
 _walguard_disabled_logged: bool = False
 
 
+# ── #1669: one-shot guard for the per-call backfill/DAG-check block ────────
+# cProfile evidence (2026-07-06, umbrella #1668) showed _get_db() spending
+# 65-96% of its time re-running an unguarded backfill/migration/DAG-check
+# block on EVERY call, in contrast to the schema migrations in the same
+# function that correctly gate on PRAGMA user_version. _db_setup_done_paths
+# tracks which resolved DB paths have already had that block run
+# successfully IN THIS PROCESS — intentionally NOT persisted to disk, so a
+# process restart re-runs the block once (safe; the block is idempotent).
+# A path is added to the set ONLY after the block completes without
+# exception, so a failure (e.g. a transient sqlite lock) leaves the path
+# unmarked and the block retries on the next _get_db() call.
+_db_setup_done_paths: set[str] = set()
+
+
+_db_setup_lock = threading.Lock()
+
+
 def _configure_paths(data_dir: str | Path) -> None:
     """Reconfigure ALL module-level path globals from a single data_dir.
 
@@ -204,7 +302,8 @@ def _configure_paths(data_dir: str | Path) -> None:
     DATA_DIR and DB_PATH contaminated the production engram with 5 test nodes.
     """
     global DATA_DIR, DB_PATH, SNAPSHOT_PATH, CONFIG_PATH, LOG_PATH
-    global FEELING_NUDGE_MARKER, ERROR_INCIDENTS_PATH
+    global FEELING_NUDGE_MARKER, ERROR_INCIDENTS_PATH, CORNERSTONE_ANCHORS_PATH
+    global PRINCIPLE_TRIGGERS_PATH
     global _walguard_last_check, _walguard_startup_done, _walguard_disabled_logged
     DATA_DIR = Path(data_dir)
     DB_PATH = DATA_DIR / "knowledge.db"
@@ -213,6 +312,8 @@ def _configure_paths(data_dir: str | Path) -> None:
     LOG_PATH = DATA_DIR / "session_log.md"
     FEELING_NUDGE_MARKER = DATA_DIR / "feeling-nudge-active.json"
     ERROR_INCIDENTS_PATH = str(DATA_DIR / "error_incidents.json")
+    CORNERSTONE_ANCHORS_PATH = str(DATA_DIR / "cornerstone_anchors.json")
+    PRINCIPLE_TRIGGERS_PATH = str(DATA_DIR / "principle_triggers.json")
     # Reset walguard state when paths change (e.g. test isolation)
     _walguard_last_check = 0.0
     _walguard_startup_done = False
@@ -340,7 +441,6 @@ def engram_sandbox(data_dir: str | Path | None = None, keep: bool = False):
                     "memory": {
                         "decay_base": 1.014,
                         "current_turn": 0,
-                        "tier1_max_nodes": 200,
                         "tier2_max_nodes": 2000,
                     },
                     "mode": "single",
@@ -792,7 +892,6 @@ def _ensure_data_dir():
             "memory": {
                 "decay_base": 1.014,
                 "current_turn": 0,
-                "tier1_max_nodes": 200,
                 "tier2_max_nodes": 1000,
             },
             "embedding": {
@@ -1258,47 +1357,24 @@ def _walguard_degraded_banner() -> str:
         return ""
 
 
-def _get_db() -> sqlite3.Connection:
-    """Get a database connection, creating tables if needed.
+def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
+    """Run the one-shot backfill/migration/DAG-check block for `conn`.
 
-    Fails LOUD if the DB file is missing or seed-empty — the plugin packaging
-    has no installer-script precondition, so missing DB means engram-first-session
-    needs to bootstrap (which it does via bootstrap.py, called from the skill).
-    Per-call check is intentionally lazy: subsequent calls after bootstrap.py
-    runs in the same session succeed without MCP restart (no /mcp dance).
+    Extracted from _get_db() (#1669) so it can be gated by a once-per-
+    process guard keyed on the resolved DB path (_db_setup_done_paths /
+    _db_setup_lock, defined above _configure_paths) instead of re-running
+    on every single _get_db() call. Nothing in this function's BEHAVIOR
+    changed -- every migration/backfill here is already idempotent
+    (schema migrations gate on PRAGMA user_version; the backfills gate on
+    NULL/absence checks) -- only the CALL FREQUENCY changed, from 'every
+    _get_db() call' to 'first call per resolved DB path, per process.'
 
-    Guard-bypass env vars (set when running in a controlled environment that
-    doesn't need the guards):
-      - ENGRAM_BOOTSTRAP=1 — bootstrap.py sets this in its own process before
-        calling engram_add_axiom / engram_add_definition / engram_add_goal to
-        seed the graph; that call chain goes through _get_db(), so without the
-        bypass the fail-loud guards block the very seeding that's supposed to
-        satisfy them (chicken-and-egg).
-      - ENGRAM_NO_DB_GUARDS=1 — test-mode bypass (matches ENGRAM_NO_EMBEDDINGS
-        / ENGRAM_NO_POLARITY precedent). The test fixtures monkey-patch DATA_DIR
-        and DB_PATH to a tempdir, then call tool handlers whose first _get_db()
-        opens-and-creates the DB; the fail-loud would block the legitimate
-        test-fixture setup. conftest.py sets this once at session start.
-
-    Both are scoped to the env that sets them (bootstrap subprocess + pytest
-    session). The production MCP server never sets either, so guards stay
-    active for real user flows.
+    Caller contract: only invoke while holding _db_setup_lock, and only
+    mark the path done (add to _db_setup_done_paths) AFTER this function
+    returns without raising -- a failure here must leave the path
+    unmarked so the next _get_db() call retries the whole block
+    (guard-after-success, not guard-after-attempt).
     """
-    bootstrap_mode = (
-        os.environ.get("ENGRAM_BOOTSTRAP") == "1"
-        or os.environ.get("ENGRAM_NO_DB_GUARDS") == "1"
-    )
-    if not DB_PATH.exists() and not bootstrap_mode:
-        raise RuntimeError(_db_missing_message())
-    _ensure_data_dir()
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    _load_vec_extension(conn)
-
-    _assert_sqlite_version(conn)
-
     # Create tables
     conn.executescript(
         """
@@ -1934,6 +2010,107 @@ def _get_db() -> sqlite3.Connection:
     except Exception:
         pass  # Don't block startup on check failures
 
+
+def _get_db() -> sqlite3.Connection:
+    """Get a database connection, creating tables if needed.
+
+    Fails LOUD if the DB file is missing or seed-empty — the plugin packaging
+    has no installer-script precondition, so missing DB means engram-first-session
+    needs to bootstrap (which it does via bootstrap.py, called from the skill).
+    Per-call check is intentionally lazy: subsequent calls after bootstrap.py
+    runs in the same session succeed without MCP restart (no /mcp dance).
+
+    Guard-bypass env vars (set when running in a controlled environment that
+    doesn't need the guards):
+      - ENGRAM_BOOTSTRAP=1 — bootstrap.py sets this in its own process before
+        calling engram_add_axiom / engram_add_definition / engram_add_goal to
+        seed the graph; that call chain goes through _get_db(), so without the
+        bypass the fail-loud guards block the very seeding that's supposed to
+        satisfy them (chicken-and-egg).
+      - ENGRAM_NO_DB_GUARDS=1 — test-mode bypass (matches ENGRAM_NO_EMBEDDINGS
+        / ENGRAM_NO_POLARITY precedent). The test fixtures monkey-patch DATA_DIR
+        and DB_PATH to a tempdir, then call tool handlers whose first _get_db()
+        opens-and-creates the DB; the fail-loud would block the legitimate
+        test-fixture setup. conftest.py sets this once at session start.
+
+    Both are scoped to the env that sets them (bootstrap subprocess + pytest
+    session). The production MCP server never sets either, so guards stay
+    active for real user flows.
+    """
+    bootstrap_mode = (
+        os.environ.get("ENGRAM_BOOTSTRAP") == "1"
+        or os.environ.get("ENGRAM_NO_DB_GUARDS") == "1"
+    )
+    if not DB_PATH.exists() and not bootstrap_mode:
+        raise RuntimeError(_db_missing_message())
+    _ensure_data_dir()
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    # #1672 (blueprint H6): conservative SQLite defaults measured in effect
+    # (synchronous=FULL, mmap_size=0, cache_size~2MB, temp_store=file). Each
+    # change below is faster-never-looser: it does not weaken graph
+    # consistency (no corruption risk), only the durability window of the
+    # most recent commit(s) -- acceptable for a git-backed, git-snapshotted
+    # substrate.
+    #
+    # synchronous=NORMAL (from FULL): with journal_mode=WAL (already set
+    # above), NORMAL still fsyncs at every WAL checkpoint, so the WAL itself
+    # can't be corrupted by a crash of this process. Per SQLite's own docs
+    # (pragma.html#pragma_synchronous), a WAL+NORMAL transaction can still
+    # roll back the last few committed-since-checkpoint transactions on a
+    # power loss OR an OS/kernel-level crash -- narrower than FULL's
+    # durability, but never a corruption risk. SQLite's own docs recommend
+    # NORMAL as the standard pairing with WAL for exactly this reason.
+    conn.execute("PRAGMA synchronous=NORMAL")
+    # mmap_size (from 0): memory-map the DB file for reads, cutting a
+    # read()-syscall + copy per page. Read-only optimization -- no effect on
+    # write durability or consistency guarantees.
+    conn.execute("PRAGMA mmap_size=268435456")  # 256MB
+    # cache_size (from SQLite's ~2MB default, -2000): larger page cache
+    # reduces disk I/O for repeated reads within a connection's lifetime.
+    # Negative value = size in KiB (SQLite convention), not a page count.
+    conn.execute("PRAGMA cache_size=-64000")  # ~64MB
+    # temp_store=MEMORY (from file): temp b-trees/sort spills (e.g. ORDER BY,
+    # CREATE INDEX) use RAM instead of disk temp files. No persistence
+    # implication -- temp storage is never durable in either mode.
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA foreign_keys=ON")
+    _load_vec_extension(conn)
+
+    _assert_sqlite_version(conn)
+
+    # #1669: run the backfill/migration/DAG-check block once per resolved
+    # DB path per process (guard-after-success; see _db_setup_done_paths).
+    #
+    # The path-keyed set alone is NOT sufficient: some callers (notably test
+    # fixtures — e.g. tests/test_engram_add_edge.py's fresh_server(), which
+    # shutil.rmtree()s and recreates the SAME tempdir across many tests in
+    # one process) delete and recreate the DB file at an already-"done"
+    # path, which would otherwise leave a brand-new, table-less DB file
+    # wrongly skipped. So a "done" path is also cheaply re-verified via a
+    # single sqlite_master lookup for the `nodes` table (an indexed catalog
+    # lookup — negligible next to the backfill/DAG-check block it guards)
+    # before trusting the guard; a miss re-runs the full one-time setup.
+    # .resolve() so symlink/relative aliases of the same physical DB file
+    # share one guard key (reviewer-fairy suggestion, PR #1678). Worst case
+    # without it was a redundant idempotent setup run, not corruption.
+    resolved_db_path = str(DB_PATH.resolve())
+
+    def _schema_present() -> bool:
+        try:
+            return conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes'"
+            ).fetchone() is not None
+        except sqlite3.Error:
+            return False
+
+    if resolved_db_path not in _db_setup_done_paths or not _schema_present():
+        with _db_setup_lock:
+            if resolved_db_path not in _db_setup_done_paths or not _schema_present():
+                _run_db_one_time_setup(conn)
+                _db_setup_done_paths.add(resolved_db_path)
+
     # Empty-graph sentinel — DB exists but bootstrap.py never seeded it.
     # Distinct from the DB-missing case at the top: this happens if bootstrap
     # crashed mid-run, or the user created an empty knowledge.db manually.
@@ -2106,10 +2283,10 @@ def _get_memory_config() -> dict:
         config = json.loads(CONFIG_PATH.read_text())
         return config.get("memory", {
             "decay_base": 1.014, "current_turn": 0,
-            "tier1_max_nodes": 200, "tier2_max_nodes": 1000,
+            "tier2_max_nodes": 1000,
         })
     return {"decay_base": 1.014, "current_turn": 0,
-            "tier1_max_nodes": 200, "tier2_max_nodes": 1000}
+            "tier2_max_nodes": 1000}
 
 
 def _get_current_turn() -> int:
@@ -2279,18 +2456,17 @@ def _get_tier_threshold(conn: sqlite3.Connection, tier: int) -> float:
     node counts. Returns the score at the Nth percentile, where N is the
     target count for this tier.
 
-    Tier 1 (working memory): used by reflect, checkpoint, stats
-    Tier 2 (searchable): used by query, add_* auto-similarity-hints
+    Tier 1 (working memory): RETIRED — tier1_max_nodes config key removed.
+                             Callers use tier=2 instead.
+    Tier 2 (queryable): used by reflect, checkpoint, stats, query, add_* similarity-hints
     Tier 3 (total): no threshold, everything visible
     """
     if tier >= 3:
         return 0.0  # no filter
 
     mem = _get_memory_config()
-    if tier == 1:
-        max_nodes = mem.get("tier1_max_nodes", 200)
-    else:
-        max_nodes = mem.get("tier2_max_nodes", 1000)
+    # Tier 1 is retired; fall through to tier-2 handling for any legacy callers.
+    max_nodes = mem.get("tier2_max_nodes", 1000)
 
     # Count active current nodes
     total = conn.execute(
@@ -2310,6 +2486,173 @@ def _get_tier_threshold(conn: sqlite3.Connection, tier: int) -> float:
     ).fetchone()
 
     return row["importance_score"] if row else 0.0
+
+
+def _compute_recall_set_continuity(conn: sqlite3.Connection, checkpoint_mode: str) -> dict:
+    """Compute the Recall-Set Continuity metric (v1) for the current checkpoint.
+
+    Recall-Set Continuity = Jaccard similarity J(A,B) = |A∩B| / |A∪B| between
+    the active-recallable (tier1+tier2 / "searchable") node-ID set at this
+    checkpoint (B, the "current" set) and the set stored at the
+    immediately-prior diagnostic_history row (A, the "prior" set). Tier1 is
+    a verified strict subset of tier2 (see _get_tier_threshold — tier1's
+    percentile threshold is always >= tier2's, i.e. more selective), so
+    "tier1+tier2 membership" reduces to just the tier2-threshold set; no
+    separate tier1 query or literal set-union is needed.
+
+    Called from BOTH the engram_nap wrapper AND the engram_advance_turn
+    (sleep) wrapper (server.py), at every diagnostic_history checkpoint —
+    NOT from engram_diagnose() itself. engram_diagnose() is its own
+    directly-callable MCP tool ("Use any time" per its docstring), not
+    checkpoint-only, so computing and injecting this here (rather than
+    inside _diagnose_impl) keeps ad-hoc engram_diagnose() calls from
+    carrying a tier2_max_nodes-sized (default 1000) node-ID list on every
+    invocation.
+
+    Cadence decision (Borges, the metric's designer, 2026-07-02): the
+    original design intent said "every nap," which the first implementation
+    took literally (nap-only). That was an accidental scope gap, not the
+    intent — "every nap" was shorthand for "every checkpoint." The sleep
+    boundary is in fact the SINGLE MOST MEANINGFUL measurement point:
+    turn-advance triggers forgetting (decay -> tier demotion) PLUS
+    consolidation (retract/supersede/dream), so the Jaccard ACROSS sleep
+    directly answers whether a day's consolidation preserved mental
+    continuity — exactly the question the metric exists to watch. Excluding
+    it would blind the metric to its own primary use case, and it would
+    also break the timeseries daily (every nap immediately following a
+    sleep would show a spurious jaccard=None). Hence: compute at every
+    checkpoint, nap and sleep alike.
+
+    `checkpoint_mode` ("nap" or "advance_turn") is stored alongside the
+    result so downstream readers (health-alerting, the paper) can
+    distinguish the two cases: a big J drop AT a sleep checkpoint is
+    expected and meaningful (consolidation reshaping); a big J drop AT a
+    plain nap checkpoint is the actual alarm (unexpected continuity
+    disruption within a day, no consolidation to explain it). The prior
+    row's mode is also surfaced (`prior_checkpoint_mode`) for the same
+    reason — a nap-to-nap comparison and a sleep-to-nap comparison carry
+    different interpretive weight even when both land on a "nap" current
+    checkpoint.
+
+    Returns a dict meant to be stored verbatim under
+    metrics["recall_set_continuity"] in the new diagnostic_history row:
+        {
+            "checkpoint_mode": str,           # "nap" or "session" (engram_advance_turn) — the
+                                               # literal mode string _checkpoint_internal uses
+            "tier2_ids": [...],               # current tier2 (searchable) node-ID set
+            "set_size": int,
+            "jaccard": float | None,          # None only when undefined (see reason)
+            "prior_snapshot_turn": int | None,
+            "prior_checkpoint_mode": str | None,  # mode of the row diffed against
+            "reason": str | None,             # populated iff jaccard is None
+        }
+
+    Jaccard undefined cases (jaccard is None, never a fabricated 0.0/1.0):
+      - No prior diagnostic_history row exists at all (first-ever checkpoint).
+      - A prior row exists but predates this feature (no
+        recall_set_continuity.tier2_ids key in its metrics blob) — a
+        one-time transition cost for rows written before this metric (or
+        before the sleep-cadence fix) shipped. Once every checkpoint writes
+        the key, the immediately-prior row always has it, so this is not an
+        ongoing steady-state gap — we deliberately do NOT search further
+        back than one row for an older comparable snapshot (that would
+        silently widen the comparison window in a way the "consecutive
+        checkpoints" framing doesn't intend; a fresh None here is more
+        honest than a stale multi-checkpoint-old comparison presented as if
+        it were "the prior").
+
+    Zero-division convention: if BOTH the current and prior sets are empty
+    (|A ∪ B| = 0), jaccard is defined as 1.0 — two empty recall-sets are
+    treated as trivially/maximally continuous (the common Jaccard convention
+    for the degenerate empty/empty case), rather than surfacing None. None
+    is reserved for "there is no prior set to compare against" — a distinct
+    condition from "the sets we DO have happen to both be empty."
+
+    Storage pruning (Borges, colleague review on #1632): `tier2_ids` is
+    ONLY ever read from the immediately-prior row (`ORDER BY id DESC LIMIT
+    1`) — historical rows' tier2_ids are never re-read, only their
+    already-computed `jaccard` is (for the timeseries). Left unpruned,
+    diagnostic_history would carry a full up-to-tier2_max_nodes ID list in
+    EVERY row forever (~15-20KB/row at default tier2_max_nodes=1000, and
+    the table has no pruning). So once THIS checkpoint has diffed against
+    the prior row, we strip `tier2_ids` from that prior row's stored
+    metrics blob (in place, via a targeted UPDATE) — only the newest row
+    ever carries the full ID list at rest. The prior row's `jaccard`,
+    `checkpoint_mode`, etc. are left untouched (still needed for the
+    timeseries); only the now-superfluous ID list is dropped.
+    """
+    tier2_threshold = _get_tier_threshold(conn, 2)
+    current_ids = {
+        row["id"] for row in conn.execute(
+            "SELECT id FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
+            (tier2_threshold,),
+        ).fetchall()
+    }
+
+    prior_row = conn.execute(
+        "SELECT id, turn, metrics FROM diagnostic_history ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+
+    result: dict = {
+        "checkpoint_mode": checkpoint_mode,
+        "tier2_ids": sorted(current_ids),
+        "set_size": len(current_ids),
+        "jaccard": None,
+        "prior_snapshot_turn": None,
+        "prior_checkpoint_mode": None,
+        "reason": None,
+    }
+
+    if prior_row is None:
+        result["reason"] = "no prior diagnostic_history row — first checkpoint ever"
+        return result
+
+    try:
+        prior_metrics = json.loads(prior_row["metrics"])
+    except (TypeError, ValueError):
+        result["reason"] = (
+            "prior diagnostic_history row's metrics blob was not parseable JSON"
+        )
+        return result
+
+    prior_rsc = prior_metrics.get("recall_set_continuity") if isinstance(prior_metrics, dict) else None
+    if not isinstance(prior_rsc, dict) or "tier2_ids" not in prior_rsc:
+        result["reason"] = (
+            "prior diagnostic_history row has no comparable tier2_ids — either "
+            "predates the Recall-Set Continuity metric, or predates the "
+            "sleep-cadence fix (was written by a checkpoint type that didn't "
+            "compute this metric yet), or its tier2_ids were already pruned "
+            "after a later checkpoint diffed against it"
+        )
+        result["prior_snapshot_turn"] = prior_row["turn"]
+        return result
+
+    prior_ids = set(prior_rsc["tier2_ids"])
+    result["prior_snapshot_turn"] = prior_row["turn"]
+    result["prior_checkpoint_mode"] = prior_rsc.get("checkpoint_mode")
+
+    union_size = len(current_ids | prior_ids)
+    if union_size == 0:
+        result["jaccard"] = 1.0
+    else:
+        intersection_size = len(current_ids & prior_ids)
+        result["jaccard"] = round(intersection_size / union_size, 6)
+
+    # Prune the prior row's now-superfluous tier2_ids in place — it has
+    # served its one purpose (this diff) and will never be read again.
+    # Best-effort: pruning failure must never break the checkpoint itself.
+    try:
+        prior_rsc_pruned = dict(prior_rsc)
+        prior_rsc_pruned.pop("tier2_ids", None)
+        prior_metrics["recall_set_continuity"] = prior_rsc_pruned
+        conn.execute(
+            "UPDATE diagnostic_history SET metrics = ? WHERE id = ?",
+            (json.dumps(prior_metrics), prior_row["id"]),
+        )
+    except Exception:
+        pass
+
+    return result
 
 
 def _stamp_new_node(conn: sqlite3.Connection, node_id: str,
@@ -3009,7 +3352,155 @@ def _commit_snapshot(
     mode: str,
     skip_checkpoint: bool = False,
 ) -> dict:
-    """Generate the markdown snapshot, write it, and commit ~/.engram/.git.
+    """Durable snapshot dispatch (#1673).
+
+    Normal nap/session checkpoints take the ASYNC path: a per-turn fsync'd binary
+    snapshot is captured synchronously (the durability boundary) and the slow
+    iterdump→knowledge.sql + git commit/push is enqueued to the serialized snapshot
+    worker, moving the ~87% turn-advance cost off the hot path.
+
+    The delicate cases stay on the proven SYNCHRONOUS path (_commit_snapshot_sync):
+      - mode == "emergency": the walguard #786 dump must secure data inline before
+        returning — an enqueue-and-return would defeat the point.
+      - a degraded WAL marker is present: we're mid-corruption-handling; keep the
+        careful sync ordering unchanged.
+      - the async worker can't run (git unavailable / import or start failure) or
+        the sync binary capture fails: fall back to sync so no turn loses durability.
+    """
+    degraded = False
+    try:
+        import engram_walguard as _wg
+        degraded = _wg.read_degraded_marker(DATA_DIR) is not None
+    except Exception:
+        pass  # can't read marker → conservative: treat as not-degraded, dispatch normally
+
+    if mode != "emergency" and not degraded:
+        async_result = _commit_snapshot_async(conn, message, mode, skip_checkpoint)
+        if async_result is not None:
+            return async_result
+        # async unavailable or capture failed → fall through; durability preserved sync.
+
+    result = _commit_snapshot_sync(conn, message, mode, skip_checkpoint)
+    # R3 on the sync path too: an emergency/degraded/fallback checkpoint should still
+    # surface the async worker's backlog loudly (a git history that silently stops
+    # advancing is a false-in-the-graph failure). Best-effort; never blocks the commit.
+    try:
+        import engram_snapshot_worker as _sw
+        if isinstance(result, dict):
+            result.setdefault("snapshot_lag", _sw.compute_snapshot_lag())
+    except Exception:
+        pass
+    return result
+
+
+def _commit_snapshot_async(
+    conn: sqlite3.Connection,
+    message: str,
+    mode: str,
+    skip_checkpoint: bool,
+) -> Optional[dict]:
+    """#1673 async path. Returns the result dict on success, or None to signal the
+    caller to fall back to the synchronous path (git unavailable / worker cannot
+    run / the sync binary capture failed — never silently drop a turn's durability).
+
+    SYNC work here (the durability boundary, before returning):
+      1. #786 WAL read-mark on conn.
+      2. Per-turn fsync'd immutable binary snapshot (R1/R2), keyed (turn, seq).
+      3. Release read-mark; WAL RESTART checkpoint (unchanged skip rules).
+      4. Daily coarse binary ladder (_write_binary_backup), unchanged.
+      5. Durably enqueue + fsync the async commit job; return only after the fsync.
+    The worker then regenerates knowledge.sql + graph_snapshot.md from the captured
+    immutable snapshot and commits/pushes them (R5: it never touches the live WAL).
+    """
+    global _git_available
+
+    # The worker's job is a git commit; without git it can't make progress, so let
+    # the sync path (which reports git-unavailable) handle that case.
+    if not _git_available:
+        _init_git()
+    if not _git_available:
+        return None
+
+    try:
+        import engram_snapshot_worker as _sw
+        _sw.start_worker()  # idempotent: seeds seq, clears stale lock, replays, starts thread
+    except Exception as e:
+        print(f"[engram] snapshot worker unavailable, using sync commit: {e}", file=sys.stderr)
+        return None
+
+    turn = _get_current_turn()
+
+    # 1. #786 read-mark on conn — a real-page read forces a genuine WAL read mark so
+    #    the capture sees a consistent committed view (identical discipline to the
+    #    sync dump; verified conn.backup() works while this txn is open). Guard: don't
+    #    BEGIN if conn already has an open transaction.
+    _held_read_txn = False
+    if not conn.in_transaction:
+        try:
+            conn.execute("BEGIN DEFERRED")
+            _held_read_txn = True
+            conn.execute("SELECT count(*) FROM sqlite_master")
+        except Exception:
+            pass  # best-effort; capture still runs
+
+    # 2. Per-turn durable binary snapshot (R1/R2) under the read-mark.
+    seq = _sw.next_seq()
+    capture = _sw.write_durable_snapshot(conn, turn, seq)
+
+    # 3a. Release the read-mark before the RESTART checkpoint (RESTART needs all
+    #     WAL readers gone).
+    if _held_read_txn:
+        try:
+            conn.execute("COMMIT")
+        except Exception:
+            pass
+
+    # If the sync capture failed, we have NOT secured this turn — fall back to sync
+    # so durability is not silently dropped.
+    if capture.get("error"):
+        return None
+
+    # 3b. WAL RESTART checkpoint (same skip rules; no sync dump ⇒ no _dump_error gate).
+    wal_warning = None
+    if not skip_checkpoint:
+        try:
+            conn.execute("PRAGMA wal_checkpoint(RESTART)")
+        except Exception as e:
+            wal_warning = f"wal_checkpoint failed: {e}"
+
+    # 4. Daily coarse binary ladder (best-effort, unchanged) — retained alongside the
+    #    per-turn snapshots for the coarse 7-day restore window.
+    _db_backup_result = _write_binary_backup(str(DB_PATH), DATA_DIR / "db-backup")
+
+    # 5. Durably enqueue the async commit job (fsync'd inside enqueue_job) — the tool
+    #    returns only after this, honoring the "return after enqueue + fsync" guarantee.
+    _sw.enqueue_job(turn, seq, message, mode)
+
+    result = {
+        "async": True,
+        # git_committed is intentionally None here: the commit is pending in the
+        # worker. The only programmatic reader of git_committed is the walguard
+        # emergency path, which always takes the sync branch.
+        "git_committed": None,
+        "enqueued_turn": turn,
+        "enqueued_seq": seq,
+        "binary_backup": capture,
+        "db_backup": _db_backup_result,
+        "snapshot_lag": _sw.compute_snapshot_lag(),
+    }
+    if wal_warning:
+        result["wal_warning"] = wal_warning
+    return result
+
+
+def _commit_snapshot_sync(
+    conn: sqlite3.Connection,
+    message: str,
+    mode: str,
+    skip_checkpoint: bool = False,
+) -> dict:
+    """Synchronous snapshot + git commit (the pre-#1673 path, kept as the emergency
+    and fallback carrier). Generate the markdown snapshot, write it, and commit ~/.engram/.git.
 
     This is the durable version-controlled record of the graph state. It is the
     safety net for schema migrations and other invasive operations: if anything
@@ -3305,6 +3796,8 @@ _REMOVABLE_EDGE_RELATIONS = frozenset(
 
 
 ERROR_INCIDENTS_PATH = str(DATA_DIR / "error_incidents.json")
+CORNERSTONE_ANCHORS_PATH = str(DATA_DIR / "cornerstone_anchors.json")
+PRINCIPLE_TRIGGERS_PATH = str(DATA_DIR / "principle_triggers.json")
 
 
 # ---------------------------------------------------------------------------
@@ -3906,6 +4399,304 @@ def _rebuild_incidents_cache() -> dict:
         conn.close()
 
 
+def _rebuild_cornerstone_anchors_cache() -> dict:
+    """Rebuild the cornerstone_anchors.json cache from the graph.
+
+    Sibling of _rebuild_incidents_cache for cornerstone targets (the
+    "future cornerstone-tripwire mechanism" reserved in
+    engram_register_exemplar — #1691). Walks `exemplifies` edges
+    (exemplar → cornerstone) and pairs each exemplar with its
+    cornerstone's claim + anchor line. The anchor line is the behavioral
+    one-liner from metadata `anchor_line` (same voice as the
+    warm-briefing anchor section); falls back to the claim when unset.
+
+    Unlike lessons (whose exemplars are error incidents), cornerstone
+    exemplars are ordinary claim-bearing nodes — the concrete situations
+    the principle proved itself in. The surface hook matches situations
+    to situations and reaches the principle via the edge, so more
+    exemplars = more matching surface area.
+
+    Idempotent; returns a summary dict with counts.
+    """
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """SELECT e.source_id AS exemplar_id, e.target_id AS cornerstone_id,
+                      n.claim AS cs_claim, n.metadata AS cs_meta
+               FROM edges e
+               JOIN nodes n ON n.id = e.target_id
+               WHERE e.relation = 'exemplifies' AND n.type = 'cornerstone'
+                 AND n.is_current = 1"""
+        ).fetchall()
+
+        index: dict[str, dict] = {}
+        cornerstone_count: set[str] = set()
+        for r in rows:
+            try:
+                meta = json.loads(r["cs_meta"]) if r["cs_meta"] else {}
+            except (TypeError, json.JSONDecodeError):
+                meta = {}
+            index[r["exemplar_id"]] = {
+                "cornerstone_id": r["cornerstone_id"],
+                "cornerstone_claim": r["cs_claim"],
+                "anchor_line": meta.get("anchor_line", "") or r["cs_claim"],
+            }
+            cornerstone_count.add(r["cornerstone_id"])
+
+        os.makedirs(os.path.dirname(CORNERSTONE_ANCHORS_PATH), exist_ok=True)
+        with open(CORNERSTONE_ANCHORS_PATH, "w") as f:
+            json.dump(index, f, indent=2)
+
+        return {
+            "status": "rebuilt",
+            "exemplar_count": len(index),
+            "cornerstone_count": len(cornerstone_count),
+            "path": CORNERSTONE_ANCHORS_PATH,
+        }
+    finally:
+        conn.close()
+
+
+# Principle-trigger surfaces (#1698 slice 1): one row per
+# (edge relation, principle type) pair. Each spec is
+# (relation, principle_type, kind, nudge_metadata_key, mode, bidirectional).
+# `tensions` is the relational-tier violation flavor (Lei 2026-07-07, design
+# doc §7): a tension edge touching a goal makes the OTHER end a trigger, in
+# either direction (tensions has no causal direction — see its
+# EDGE_CLASSIFICATIONS entry).
+_PRINCIPLE_TRIGGER_SPECS = (
+    ("exemplifies", "lesson", "lesson", "scaffolding_nudge", None, False),
+    ("exemplifies", "cornerstone", "cornerstone", "anchor_line", None, False),
+    ("instantiates", "axiom", "axiom", "surfacing_nudge", None, False),
+    ("serves", "goal", "goal", "surfacing_nudge", None, False),
+    ("tensions", "goal", "goal", "surfacing_nudge", "tension", True),
+)
+
+
+def _rebuild_principle_triggers() -> dict:
+    """Rebuild the unified principle_triggers.json registry (#1698 slice 1).
+
+    One registry over all four principle kinds, derived entirely from edges
+    per _PRINCIPLE_TRIGGER_SPECS. Entry shape (list-valued since #1731):
+        trigger_node_id -> [{principle_id, kind, claim, nudge,
+                             situation_pattern?, mode?}, ...]
+
+    List-valued keyspace (#1731 fix): a dual-role trigger node — one that
+    both exemplifies a lesson AND instantiates an axiom, say — used to
+    collide under the original single-dict-per-trigger keyspace
+    (last-spec-wins, silently dropping whichever spec ran earlier in
+    _PRINCIPLE_TRIGGER_SPECS; lesson ran first, so it always lost to axiom).
+    That was a real, live incident: a dual-role node's lesson tripwire went
+    silently dark on first deploy (issue #1731) because the unified read
+    path (slice 2) has no legacy fallback for a trigger the registry can see
+    but only under the WRONG kind. Every (trigger, principle) relationship
+    now gets its own list entry; the consumer iterates all of them per
+    matched trigger and lets the existing cap/priority logic (lesson >
+    axiom > cornerstone > goal) arbitrate, exactly as it already does across
+    DIFFERENT triggers matched in the same prompt.
+
+    Migration shim: this is ADDITIVE — the legacy caches
+    (error_incidents.json, cornerstone_anchors.json) keep being written by
+    their own rebuilds and remain what the hooks read until the unified
+    check lands (design doc §2, implementation PR 2 of 3).
+
+    Idempotent full rewrite; returns a summary dict; never raises past the
+    connection (callers wrap best-effort).
+    """
+    conn = _get_db()
+    try:
+        index: dict[str, list[dict]] = {}
+        by_kind: dict[str, int] = {}
+        for relation, ptype, kind, nudge_key, mode, bidirectional in _PRINCIPLE_TRIGGER_SPECS:
+            # Trigger-side is_current fix (#1698, Luria's catch, confirmed by
+            # Sol reviewing #1702): the join previously filtered only the
+            # principle side (n.is_current = 1); a retracted/superseded
+            # trigger node still landed in the registry keyed by its node
+            # ID. Added join on the trigger side (t), filtered
+            # is_current = 1, in both the forward and bidirectional-reverse
+            # queries below.
+            rows = conn.execute(
+                """SELECT e.source_id AS trigger_id, e.target_id AS principle_id,
+                          n.claim AS claim, n.metadata AS meta
+                   FROM edges e
+                   JOIN nodes n ON n.id = e.target_id
+                   JOIN nodes t ON t.id = e.source_id
+                   WHERE e.relation = ? AND n.type = ? AND n.is_current = 1
+                     AND t.is_current = 1""",
+                (relation, ptype),
+            ).fetchall()
+            if bidirectional:
+                rows = list(rows) + list(conn.execute(
+                    """SELECT e.target_id AS trigger_id, e.source_id AS principle_id,
+                              n.claim AS claim, n.metadata AS meta
+                       FROM edges e
+                       JOIN nodes n ON n.id = e.source_id
+                       JOIN nodes t ON t.id = e.target_id
+                       WHERE e.relation = ? AND n.type = ? AND n.is_current = 1
+                         AND t.is_current = 1""",
+                    (relation, ptype),
+                ).fetchall())
+            for r in rows:
+                if r["trigger_id"] == r["principle_id"]:
+                    continue
+                try:
+                    meta = json.loads(r["meta"]) if r["meta"] else {}
+                except (TypeError, json.JSONDecodeError):
+                    meta = {}
+                entry: dict = {
+                    "principle_id": r["principle_id"],
+                    "kind": kind,
+                    "claim": r["claim"],
+                    "nudge": meta.get(nudge_key, "") or r["claim"],
+                }
+                pattern = meta.get("situation_pattern", "")
+                if pattern:
+                    entry["situation_pattern"] = pattern
+                if mode:
+                    entry["mode"] = mode
+                index.setdefault(r["trigger_id"], []).append(entry)
+
+        # Count every surviving entry across every trigger's list — #1731
+        # removed the last-spec-wins collision, so a dual-role trigger (one
+        # node with two-plus entries) now correctly counts once per kind,
+        # same as #1702's original "count survivors, not rows processed"
+        # intent, just generalized to a list instead of a single winner.
+        for entries in index.values():
+            for entry in entries:
+                k = entry["kind"]
+                by_kind[k] = by_kind.get(k, 0) + 1
+
+        os.makedirs(os.path.dirname(PRINCIPLE_TRIGGERS_PATH), exist_ok=True)
+        with open(PRINCIPLE_TRIGGERS_PATH, "w") as f:
+            json.dump(index, f, indent=2)
+
+        return {
+            "status": "rebuilt",
+            "trigger_count": len(index),
+            "by_kind": by_kind,
+            "path": PRINCIPLE_TRIGGERS_PATH,
+        }
+    finally:
+        conn.close()
+
+
+def _with_state_lock(lock_path, fn):
+    """Run fn() (a read-modify-write closure) while holding an exclusive,
+    BLOCKING flock on lock_path. Unlike #1709's non-blocking pattern, this
+    one blocks -- the critical section is a fast local file read+write (no
+    daemon round-trip), so a brief wait is cheap and correctness (no lost
+    update) matters more than never-block here. Degrades to running fn()
+    unlocked if fcntl/lockfile-open fails (non-POSIX, permissions) -- same
+    never-crash contract as #1709's degrade path, just without the
+    non-blocking contention branch (there's nothing to suppress; fn() still
+    runs, just unprotected).
+
+    #1720: this exact ~15-line helper is duplicated in
+    src/engram/hooks/claude/engram-surface-hook.py rather than shared -- this
+    module (engram_core.py, MCP server process) and the hook script (a
+    separate subprocess invoked by Claude Code) have no shared import surface
+    today, and a new shared module for ~15 lines isn't worth the engineering
+    (see spec docs/specs/1720-principle-state-write-race.md). If either copy
+    changes, check the other.
+    """
+    try:
+        import fcntl
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    except Exception as exc:
+        # #1743: this degrade was silent -- nothing distinguished "locked and
+        # protected" from "running unlocked," the same diagnosis-costing gap
+        # #1737/#1742 fixed for the non-blocking cooldown lock. Emit one
+        # never-block/never-raise stderr tell (hook/server stderr goes to logs,
+        # not the model, so it is safe on every call) so a fallback-to-unlocked
+        # -- which leaves fn()'s read-modify-write unprotected against a lost
+        # update -- leaves a trace instead of being invisible. (#1742's
+        # state-file-flag half does not map onto this generic helper, which has
+        # no access to fn()'s state dict; the stderr line is the proportionate
+        # tell here.) Kept byte-identical with the sibling copy (surface-hook /
+        # engram_core) per the #1720 sync note above -- if one changes, change
+        # the other.
+        try:
+            import sys
+            print(
+                f"[engram _with_state_lock] flock degraded to UNLOCKED "
+                f"({lock_path}): {type(exc).__name__}: {exc} -- read-modify-write "
+                f"is unprotected; a concurrent write may be lost",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
+        return fn()  # degrade: run unlocked rather than crash or skip
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)  # blocking -- no LOCK_NB
+        return fn()
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
+def _reset_principle_enactments(principle_id: str) -> None:
+    """Reset enactments to 0 for principle_id in principle-trigger-state.json
+    (#1698 slice 3 §3 — "registering a NEW exemplar/incident against the
+    principle resets enactments to 0 (full strength)").
+
+    Best-effort: a write failure here must never fail the exemplar-
+    registration call it's attached to.
+
+    Cross-process write (spec §3 flag for reviewer): this file has, through
+    slices 1-2, only ever been touched by the hook scripts (separate
+    subprocesses invoked by Claude Code); this is the first time server-side
+    (MCP process) code writes it. Path is resolved via DATA_DIR (the same
+    module-level global the hooks' own ENGRAM_HOME resolution is meant to
+    mirror — see `_configure_paths` above for the single source of truth on
+    path redirection, e.g. under test isolation) rather than hand-rolling a
+    second resolution scheme. Write is atomic (tmp + os.replace), matching
+    the hooks' own pattern, so a concurrent hook-side read never sees a
+    partial write.
+
+    #1720: the read-modify-write below now runs under a blocking flock (see
+    `_with_state_lock`) to close the LOST-UPDATE race flagged in colleague
+    review (Ariadne, PR #1717): the atomicity claim above only ever covered
+    TORN READS, not a concurrent hook-side read-modify-write silently
+    dropping whichever side loses (last-writer-wins on the whole file). Same
+    TOCTOU class #1709 fixed with flock, but blocking rather than
+    non-blocking-suppress -- see docs/specs/1720-principle-state-write-race.md
+    "Why NOT #1709's non-blocking-suppress pattern" for why this path can't
+    use #1709's shape (this call site is not on the render-decision path, so
+    blocking briefly here is safe).
+    """
+    path = os.path.join(DATA_DIR, "principle-trigger-state.json")
+    lock_path = path + ".lock"
+
+    def _do_reset():
+        try:
+            with open(path, "r") as f:
+                state = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            state = {}
+        entry = state.get(principle_id)
+        if isinstance(entry, int):
+            entry = {"last_fired_prompt": entry, "strength": 1.0, "enactments": 0, "fires": 0}
+        if not isinstance(entry, dict):
+            entry = {"last_fired_prompt": 0, "strength": 1.0, "enactments": 0, "fires": 0}
+        entry["enactments"] = 0
+        state[principle_id] = entry
+        try:
+            tmp = str(path) + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    _with_state_lock(lock_path, _do_reset)
+
+
 # ---------------------------------------------------------------------------
 # #872 wave-5 rolling promotions — _create_derivation (shared by B + E)
 # ---------------------------------------------------------------------------
@@ -3937,12 +4728,35 @@ REASONING_STRUCTURE = {
 }
 
 
+def _open_contradiction_ids(conn: sqlite3.Connection, node_id: str) -> list:
+    """Return IDs of live, unresolved contradiction nodes disputing node_id.
+
+    "Open" per #1654's settled semantics: no `resolves` closure has landed
+    yet. A contradiction's status only leaves 'active' (→ 'resolved' or
+    'partially_resolved') once a resolves edge is wired against it
+    (_resolve_impl), so status='active' IS the "no resolves closure" test
+    from the issue text — matches the existing obsolescence-scan convention
+    (engram_query._pattern_contradiction_obsolescence_ready).
+    """
+    rows = conn.execute(
+        """SELECT DISTINCT ct.id FROM edges e
+           JOIN nodes ct ON ct.id = e.source_id
+           WHERE e.target_id = ? AND e.relation = 'contradicts'
+             AND ct.type = 'contradiction' AND ct.is_current = 1
+             AND ct.status = 'active'
+           ORDER BY ct.id""",
+        (node_id,),
+    ).fetchall()
+    return [r["id"] for r in rows]
+
+
 def _validate_premises(
     supporting_ids: list,
     conn: sqlite3.Connection,
     use_stale: bool = False,
-) -> tuple[Optional[dict], list]:
-    """MECH-5 taint/stale blocking guard for engram_derive.
+    use_contested: bool = False,
+) -> tuple[Optional[dict], list, list]:
+    """MECH-5 taint/stale/contradicted blocking guard for engram_derive.
 
     Classifies each supporting premise and blocks derivations built on
     compromised foundations — the Mao-Cao compounding pattern that
@@ -3951,23 +4765,47 @@ def _validate_premises(
     Rules:
       - Any premise with metadata.tainted_by → hard block (BLOCKED_TAINTED).
         No override. Taint means an upstream was retracted (proven wrong).
+      - Any premise sitting on the open side of an unresolved contradiction
+        (a live ct_ node, no resolves closure) AND use_contested=False →
+        soft block (BLOCKED_CONTRADICTED, #1654). Agent opts in with
+        use_contested=True — a contradiction is a live dispute, not a
+        refutation, so building on it is a deliberate, loudly-marked
+        choice, not a hard wall. Checked before stale (a disputed claim is
+        a more acute concern than a merely-superseded one).
       - Any premise with metadata.stale_by AND use_stale=False →
         soft block (BLOCKED_STALE). Agent opts in with use_stale=True
         when the upstream update is judged irrelevant to current logic.
-      - Mixed taint + stale → treated as tainted (taint dominates).
+      - Mixed taint + (contradicted|stale) → treated as tainted (taint
+        dominates — it is a hard block with no override, and short-
+        circuits both other checks for that premise).
+      - Contested and stale are NOT mutually exclusive with each other: a
+        premise can be both superseded AND sitting on a still-open
+        contradiction (e.g. supersede fires on one side of a live dispute
+        without auto-resolving it — issue #229's documented workflow).
+        Both are classified independently, so BOTH overrides
+        (use_contested AND use_stale) must clear before such a premise is
+        allowed through — clearing only one would silently drop the
+        other's guard.
 
     Returns:
-        (block_response, stale_ids)
-        - block_response: None if premises are clean (or stale-opt-in
-          covers them). Otherwise a dict ready for json.dumps with a
-          structured block error.
+        (block_response, stale_ids, contested_ids)
+        - block_response: None if premises are clean (or opt-ins cover
+          them). Otherwise a dict ready for json.dumps with a structured
+          block error.
         - stale_ids: list of premise IDs that are stale (for the caller
           to stamp metadata.built_on_stale when use_stale=True lets us
           proceed).
+        - contested_ids: list of premise IDs sitting on an open
+          contradiction (for the caller to auto-stamp
+          metadata.built_on_contested when use_contested=True lets us
+          proceed — the stamp is NEVER author-supplied, only ever written
+          by this override path, so it can't be gamed/omitted).
     """
     tainted_premises = []
+    contested_premises = []
     stale_premises = []
     stale_ids: list = []
+    contested_ids: list = []
     for sid in supporting_ids:
         row = conn.execute(
             "SELECT metadata, status, is_current, superseded_by FROM nodes WHERE id = ?",
@@ -3999,6 +4837,18 @@ def _validate_premises(
         if is_superseded_here and sid not in stale_by:
             stale_by.insert(0, sid)
 
+        # Taint dominates unconditionally, so only compute contested/stale
+        # when the premise isn't already tainted. But contested and stale
+        # are NOT mutually exclusive with each other — a premise can be
+        # BOTH superseded AND sitting on a still-open contradiction (e.g.
+        # supersede fires on one side of a live dispute; the contradiction
+        # isn't auto-resolved by that — issue #229's documented workflow).
+        # Classifying one branch (via elif) silently drops the other's
+        # signal, letting a premise slip past BLOCKED_STALE (or vice versa)
+        # just because it also happened to be contested. Track both
+        # independently so each applicable override is required on its own.
+        open_ct_ids = [] if tainted_by else _open_contradiction_ids(conn, sid)
+
         if tainted_by:
             retraction_info = []
             for rid in tainted_by:
@@ -4020,23 +4870,30 @@ def _validate_premises(
                 "id": sid,
                 "retracted_by": retraction_info,
             })
-        elif stale_by:
-            replacement_info = []
-            for old_id in stale_by:
-                drow = conn.execute(
-                    "SELECT superseded_by FROM nodes WHERE id = ?", (old_id,)
-                ).fetchone()
-                replacement_info.append({
-                    "superseded_id": old_id,
-                    "replaced_by_id": drow["superseded_by"] if drow else None,
+        else:
+            if open_ct_ids:
+                contested_premises.append({
+                    "id": sid,
+                    "open_contradictions": open_ct_ids,
                 })
-            stale_premises.append({
-                "id": sid,
-                "stale_because": replacement_info,
-            })
-            stale_ids.append(sid)
+                contested_ids.append(sid)
+            if stale_by:
+                replacement_info = []
+                for old_id in stale_by:
+                    drow = conn.execute(
+                        "SELECT superseded_by FROM nodes WHERE id = ?", (old_id,)
+                    ).fetchone()
+                    replacement_info.append({
+                        "superseded_id": old_id,
+                        "replaced_by_id": drow["superseded_by"] if drow else None,
+                    })
+                stale_premises.append({
+                    "id": sid,
+                    "stale_because": replacement_info,
+                })
+                stale_ids.append(sid)
 
-    # Taint dominates — block even if use_stale=True.
+    # Taint dominates — block even if use_stale/use_contested=True.
     if tainted_premises:
         return ({
             "status": "blocked_tainted",
@@ -4049,7 +4906,26 @@ def _validate_premises(
                 "engram_ask if the conclusion's validity under the correction "
                 "is non-obvious."
             ),
-        }, stale_ids)
+        }, stale_ids, contested_ids)
+
+    # #1654 — a premise under an open, unresolved contradiction is a live
+    # dispute, not (yet) a refutation. Block by default so new derivations
+    # don't silently compound on contested ground; the override is a
+    # deliberate, loudly-marked choice (mirrors use_stale/BLOCKED_STALE).
+    if contested_premises and not use_contested:
+        return ({
+            "status": "blocked_contradicted",
+            "error": "BLOCKED_CONTRADICTED: premise(s) sit on an open, unresolved contradiction.",
+            "contested_premises": contested_premises,
+            "guidance": (
+                "Either resolve the contradiction first (engram_resolve against "
+                "the ct_ node), or retry with use_contested=True if you're "
+                "deliberately building on the contested side while the dispute "
+                "is still open — writes a metadata.built_on_contested audit "
+                "marker (auto-stamped, not author-supplied) so resolution "
+                "pressure on the open contradiction stays measurable."
+            ),
+        }, stale_ids, contested_ids)
 
     if stale_premises and not use_stale:
         return ({
@@ -4062,9 +4938,9 @@ def _validate_premises(
                 "update does not affect your logic), OR cite the replacement "
                 "premise(s) directly via their IDs."
             ),
-        }, stale_ids)
+        }, stale_ids, contested_ids)
 
-    return (None, stale_ids)
+    return (None, stale_ids, contested_ids)
 
 
 def _trace_evidence_roots(conn: sqlite3.Connection, node_id: str, max_depth: int = 4096) -> set:
@@ -4746,6 +5622,7 @@ def _create_derivation(
     reasoning_type: str,
     context_ids: Optional[list] = None,
     use_stale: bool = False,
+    use_contested: bool = False,
     extra_meta: Optional[dict] = None,
     history_reason: Optional[str] = None,
 ) -> tuple:
@@ -4770,6 +5647,10 @@ def _create_derivation(
         context_ids: optional 'cites' targets; missing IDs are silently
             filtered (legacy engram_derive behavior)
         use_stale: MECH-5 opt-in for stale premises
+        use_contested: MECH-5 opt-in for premises under an open,
+            unresolved contradiction (#1654) — the resolution-pressure
+            valve. metadata.built_on_contested is auto-stamped by this
+            path only, never author-supplied.
         extra_meta: merged into derivation metadata after reasoning
             fields — use for resolve-specific keys (resolves,
             resolution_status)
@@ -4779,12 +5660,14 @@ def _create_derivation(
     Returns:
         (block, success) — exactly one is non-None.
           block: MECH-5 guard response ready for json.dumps when a
-            premise was tainted or stale without opt-in
+            premise was tainted, contradicted, or stale without opt-in
           success: dict with node_id, confidence, reasoning_type,
-            reasoning_class, stale_ids, structure_warnings,
+            reasoning_class, stale_ids, contested_ids, structure_warnings,
             bumped_count, context_nodes
     """
-    block, stale_ids = _validate_premises(supporting_ids, conn, use_stale=use_stale)
+    block, stale_ids, contested_ids = _validate_premises(
+        supporting_ids, conn, use_stale=use_stale, use_contested=use_contested,
+    )
     if block is not None:
         return (block, None)
 
@@ -4803,8 +5686,22 @@ def _create_derivation(
     derive_meta = {"reasoning_type": reasoning_type, "reasoning_class": rclass}
     if use_stale and stale_ids:
         derive_meta["built_on_stale"] = stale_ids
+    if use_contested and contested_ids:
+        derive_meta["built_on_contested"] = contested_ids
     if extra_meta:
-        derive_meta.update(extra_meta)
+        # By-CONSTRUCTION guarantee, not by-convention (Borges's #1711 review):
+        # these two audit stamps are auto-written by their override paths
+        # ONLY and must never be spoofable/removable via extra_meta, even if
+        # a future caller gains a generic extra_meta/metadata passthrough.
+        # No caller does today (extra_meta is hardcoded to {"warrant": ...}
+        # at the one call site), but that's an accident of today's callers,
+        # not a structural guarantee — strip the reserved keys unconditionally
+        # rather than relying on no one ever setting them.
+        safe_extra_meta = {
+            k: v for k, v in extra_meta.items()
+            if k not in ("built_on_stale", "built_on_contested")
+        }
+        derive_meta.update(safe_extra_meta)
 
     reason_line = history_reason or (
         f"Derived ({reasoning_type}, discount={discount}) from {len(supporting_ids)} premises"
@@ -4857,6 +5754,7 @@ def _create_derivation(
         "reasoning_type": reasoning_type,
         "reasoning_class": rclass,
         "stale_ids": stale_ids,
+        "contested_ids": contested_ids,
         "structure_warnings": structure_warnings,
         "bumped_count": bumped_count,
         "context_nodes": ctx_used,

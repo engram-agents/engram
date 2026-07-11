@@ -32,6 +32,7 @@ Additive-only: if any signal fails to read, the bar renders with a best-effort
 label ('unknown', 'parse-error', etc) rather than crashing. The hook writes to
 stdout only; stderr is reserved for diagnostics the agent shouldn't see.
 """
+import html
 import json
 import os
 import sys
@@ -204,6 +205,11 @@ def _is_human_prompt(payload: dict) -> bool:
          with any known non-human prefix (<task-notification>, <command-message>,
          <command-name>, <local-command>). If yes → not human.
 
+    The prompt body is HTML-unescaped before the prefix check, so a marker
+    mangled into its escaped form (e.g. &lt;loop-wake&gt; instead of real
+    angle brackets) still classifies as non-human rather than falling through
+    to a false "human" stamp (gh#1646).
+
     Fail-safe: on any parsing problem, returns False (no stamp) rather than
     risking a false "human" classification.
     """
@@ -215,7 +221,7 @@ def _is_human_prompt(payload: dict) -> bool:
         # promptSource absent: fall back to body-prefix exclusion.
         prompt = payload.get("prompt") or ""
         if isinstance(prompt, str):
-            stripped = prompt.lstrip()
+            stripped = html.unescape(prompt).lstrip()
             for prefix in _NON_HUMAN_PREFIXES:
                 if stripped.startswith(prefix):
                     return False

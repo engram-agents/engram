@@ -80,23 +80,43 @@ _DEFAULT_FORUM_URL = "http://localhost:5002"
 # ---------------------------------------------------------------------------
 # _status_derive import (spec §2, Q2)
 #
-# Resolve tools/ in BOTH topologies: plugin (CLAUDE_PLUGIN_ROOT/tools) AND
-# source-tree/dev (hooks/claude/ -> ../../tools). Keying solely off
-# CLAUDE_PLUGIN_ROOT would silently no-op auto-publish in a dev checkout —
-# exactly where the feature is most likely to be dogfooded (Kepler S1, #1087).
+# Resolve tools/ in BOTH topologies via the shared _hooklib helper (gh#1657,
+# slice 3 of 3 -- this walk-parents logic was near-identical to the baton/
+# inter-agent hooks' own copies, parameterized on a different marker file:
+# _status_derive.py rather than forum_api.py, since this hook's own import
+# needs a different tools/ module). _hooklib.py lives alongside this file in
+# both topologies (source: hooks/claude/; deployed: hooks/), so no
+# walk-parents is needed to find it -- but this repo's own test loaders
+# (importlib.util.spec_from_file_location) don't auto-add a script's own
+# directory to sys.path the way a real `python3 hooks/x.py` invocation does,
+# so this hook adds its own directory explicitly before importing _hooklib.
 # If the import fails for ANY reason, derive_own_status is set to None and the
 # publish silently no-ops — the existing thread/mention surfacing is unaffected.
+#
+# gh#1680 slice 1: the config/agent-name/resolve-tools-dir prologue
+# previously inlined here now lives in the shared _prompthooklib module
+# (same directory, same sys.path bootstrap used below). _PROMPTHOOKLIB_OK
+# gates main() -- if the shared module somehow fails to import, the hook
+# degrades to a silent no-op rather than crashing, same discipline as every
+# other best-effort import in this prologue. (emit_context is NOT imported
+# here -- this hook builds its own response dict inline at the end of
+# main(), a differently-shaped call site that had no local _emit_context
+# helper to deduplicate; see _prompthooklib.py's module docstring.)
 # ---------------------------------------------------------------------------
 
-_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
-_candidates = []
-if _plugin_root:
-    _candidates.append(Path(_plugin_root) / "tools")          # plugin: hooks/ -> tools/
-for _parent in Path(__file__).resolve().parents:              # walk-all-parents fallback
-    _candidates.append(_parent / "tools")
-_tools_dir = next((c for c in _candidates if (c / "_status_derive.py").exists()), None)
-if _tools_dir is not None and str(_tools_dir) not in sys.path:
-    sys.path.insert(0, str(_tools_dir))
+_this_dir = str(Path(__file__).resolve().parent)
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+try:
+    from _prompthooklib import (
+        load_config as _load_config_impl,
+        get_agent_name as _get_agent_name_impl,
+        bootstrap_tools_dir as _bootstrap_tools_dir,
+    )
+    _PROMPTHOOKLIB_OK = True
+except Exception:
+    _PROMPTHOOKLIB_OK = False
+_tools_dir = _bootstrap_tools_dir("_status_derive.py") if _PROMPTHOOKLIB_OK else None
 try:
     from _status_derive import derive_own_status, _read_loop_mode
 except Exception:
@@ -105,42 +125,23 @@ except Exception:
 
 
 # ---------------------------------------------------------------------------
-# Config helpers
+# Config helpers -- delegate to _prompthooklib (gh#1680 slice 1). Thin
+# per-hook wrappers, not bare aliases: they pin ENGRAM_HOME (this hook's own
+# module constant, captured once at import time above) as an explicit arg,
+# preserving both (a) the exact zero-arg / single-arg call signatures every
+# existing call site and test-monkeypatch already depends on, and (b) the
+# "frozen at import time" ENGRAM_HOME timing the pre-extraction inline code
+# had.
 # ---------------------------------------------------------------------------
 
 def _load_config() -> dict:
     """Load $ENGRAM_HOME/config.json. Returns {} on any failure."""
-    config_path = Path(ENGRAM_HOME) / "config.json"
-    if config_path.exists():
-        try:
-            return json.loads(config_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
+    return _load_config_impl(ENGRAM_HOME)
 
 
 def _get_agent_name(config: dict) -> str:
     """Resolve agent name from config. Returns '' if not set."""
-    import pwd
-    name = config.get("agent_name", "").strip()
-    if name:
-        return name
-
-    def _strip(u: str) -> str:
-        return u[len("agent-"):] if u.startswith("agent-") else u
-
-    for envvar in ("USER", "LOGNAME"):
-        u = os.environ.get(envvar, "").strip()
-        if u:
-            return _strip(u)
-
-    try:
-        u = pwd.getpwuid(os.getuid()).pw_name
-        if u:
-            return _strip(u)
-    except KeyError:
-        pass
-    return ""
+    return _get_agent_name_impl(config, ENGRAM_HOME)
 
 
 def _get_forum_url(config: dict) -> str:
@@ -484,6 +485,13 @@ def _format_mention_line(mentions: list) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # ── Prologue-lib gate (gh#1680 slice 1) ───────────────────────────────────
+    # If _prompthooklib somehow failed to import, _load_config/_get_agent_name
+    # are unavailable -- degrade to a silent no-op, matching every other
+    # best-effort import in this hook's prologue.
+    if not _PROMPTHOOKLIB_OK:
+        sys.exit(0)
+
     # ── Config ────────────────────────────────────────────────────────────────
     config = _load_config()
 

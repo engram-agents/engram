@@ -83,12 +83,14 @@ def _mk_obs(obs, claim: str, quote_type: str = "hard_data") -> str:
 
 
 def _mk_dv(derive, claim: str, supporting_ids: list,
-           reasoning_type: str = "deductive_modus_ponens") -> str:
+           reasoning_type: str = "deductive_modus_ponens",
+           use_contested: bool = False) -> str:
     r = json.loads(derive._derive_impl(
         claim=claim,
         supporting_ids=",".join(supporting_ids),
         logical_chain=f"Reasoning for: {claim}",
         reasoning_type=reasoning_type,
+        use_contested=use_contested,
     ))
     assert "derivation_id" in r, r
     return r["derivation_id"]
@@ -115,10 +117,13 @@ def test_supersede_marks_contradiction_stale_by_premise():
     ob_b = _mk_obs(obs, "Claim A does not hold.")
     ct_id = _mk_ct(derive, ob_a, ob_b, "Disagreement about A.")
 
-    # Need 2 obs for deductive_modus_ponens
+    # Need 2 obs for deductive_modus_ponens. ob_a sits on the open ct_id
+    # contradiction filed above, so citing it as a premise now requires the
+    # #1654 use_contested opt-in — deliberate here, this test's target
+    # assertion is the cross-type supersede rejection below, not the guard.
     ob_a2 = _mk_obs(obs, "Claim A reframed under stricter reading.")
     dv_new = _mk_dv(derive, "Refined version of ob_a — same surface, sharper framing.",
-                    [ob_a, ob_a2])
+                    [ob_a, ob_a2], use_contested=True)
 
     r = json.loads(rev._supersede_impl(
         old_node_id=ob_a,
@@ -343,3 +348,288 @@ def test_both_sides_superseded_preserves_all_replacements():
     assert isinstance(stale_repl, dict), f"stale_replacement should be dict, got {type(stale_repl)}"
     assert stale_repl.get(ob_a) == ob_a_refined, f"entry for {ob_a} wrong: {stale_repl}"
     assert stale_repl.get(ob_b) == ob_b_refined, f"entry for {ob_b} wrong: {stale_repl}"
+
+
+# ── #1654 — BLOCKED_CONTRADICTED premise guard ─────────────────────────────
+
+
+def test_contradict_itself_is_cascade_free():
+    """Filing a contradiction taints/stales NEITHER side — cascade rides
+    resolution (retract/supersede), never contradict itself. This is the
+    settled #1654 semantics (Kepler+Borges DM 2026-07-04): a contradiction
+    is a live dispute, not a refutation."""
+    rev, obs, derive, qry, core = _make_fresh_mods()
+    ob_a = _mk_obs(obs, "Claim A holds.")
+    ob_b = _mk_obs(obs, "Claim A does not hold.")
+    _mk_ct(derive, ob_a, ob_b, "Disagreement about A.")
+
+    for nid in (ob_a, ob_b):
+        node = json.loads(qry._inspect_impl(node_id=nid, view="deep", dream_mode=True))
+        meta = json.loads(node["node"]["metadata"]) if node["node"].get("metadata") else {}
+        assert "tainted_by" not in meta, f"{nid} should not be tainted by mere contradiction: {meta}"
+        assert "stale_by" not in meta, f"{nid} should not be staled by mere contradiction: {meta}"
+
+
+def test_derive_blocked_contradicted_on_open_dispute():
+    """A premise sitting on an open, unresolved contradiction blocks new
+    derivations citing it by default — the #1654 guard."""
+    rev, obs, derive, qry, core = _make_fresh_mods()
+    ob_a = _mk_obs(obs, "Claim A holds.")
+    ob_b = _mk_obs(obs, "Claim A does not hold.")
+    ct_id = _mk_ct(derive, ob_a, ob_b, "Disagreement about A.")
+    ob_other = _mk_obs(obs, "An unrelated corroborating claim.")
+
+    r = json.loads(derive._derive_impl(
+        claim="Building further on the disputed claim A.",
+        supporting_ids=f"{ob_a},{ob_other}",
+        logical_chain="Combining A with an unrelated premise.",
+        reasoning_type="deductive_modus_ponens",
+    ))
+    assert r.get("status") == "blocked_contradicted", r
+    assert r["error"].startswith("BLOCKED_CONTRADICTED"), r
+    assert {p["id"] for p in r["contested_premises"]} == {ob_a}, r
+    assert r["contested_premises"][0]["open_contradictions"] == [ct_id], r
+    assert "derivation_id" not in r
+
+
+def test_derive_use_contested_override_succeeds_and_auto_stamps():
+    """use_contested=True lets the derivation proceed and auto-stamps
+    metadata.built_on_contested — the resolution-pressure valve."""
+    rev, obs, derive, qry, core = _make_fresh_mods()
+    ob_a = _mk_obs(obs, "Claim A holds.")
+    ob_b = _mk_obs(obs, "Claim A does not hold.")
+    _mk_ct(derive, ob_a, ob_b, "Disagreement about A.")
+    ob_other = _mk_obs(obs, "An unrelated corroborating claim.")
+
+    r = json.loads(derive._derive_impl(
+        claim="Deliberately building on the disputed claim A.",
+        supporting_ids=f"{ob_a},{ob_other}",
+        logical_chain="Combining A with an unrelated premise, knowingly contested.",
+        reasoning_type="deductive_modus_ponens",
+        use_contested=True,
+    ))
+    assert "derivation_id" in r, r
+    assert r["built_on_contested"] == [ob_a], r
+
+    node = json.loads(qry._inspect_impl(node_id=r["derivation_id"], view="deep", dream_mode=True))
+    meta = json.loads(node["node"]["metadata"])
+    assert meta["built_on_contested"] == [ob_a], meta
+
+
+def test_derive_no_override_still_blocked_contradicted():
+    """Sanity companion to the auto-stamp test: without use_contested,
+    _derive_impl offers no way to note/acknowledge the dispute and proceed
+    — it's a hard block_contradicted, full stop. (The payload-level check
+    that an author-supplied built_on_contested field is rejected as an
+    unknown field lives in test_derive_payload.py, which has the
+    server.engram_derive fixture this file deliberately doesn't import —
+    see this file's R1 import-pattern contract.)"""
+    rev, obs, derive, qry, core = _make_fresh_mods()
+    ob_a = _mk_obs(obs, "Claim A holds.")
+    ob_b = _mk_obs(obs, "Claim A does not hold.")
+    _mk_ct(derive, ob_a, ob_b, "Disagreement about A.")
+    ob_other = _mk_obs(obs, "An unrelated corroborating claim.")
+
+    r_no_override = json.loads(derive._derive_impl(
+        claim="Attempting to note the dispute without opting in.",
+        supporting_ids=f"{ob_a},{ob_other}",
+        logical_chain="No override requested.",
+        reasoning_type="deductive_modus_ponens",
+    ))
+    assert r_no_override.get("status") == "blocked_contradicted", r_no_override
+
+
+def test_derive_succeeds_without_override_after_contradiction_resolved():
+    """Once the contradiction is resolved (a resolves edge wired against
+    it), the premise is no longer 'open' and ordinary derive succeeds with
+    no override needed."""
+    rev, obs, derive, qry, core = _make_fresh_mods()
+    ob_a = _mk_obs(obs, "Source A holds P.")
+    ob_b = _mk_obs(obs, "Source B holds not P.")
+    ct_id = _mk_ct(derive, ob_a, ob_b, "Source A vs Source B on P.")
+    ob_other = _mk_obs(obs, "An unrelated corroborating claim.")
+
+    # Blocked while open.
+    blocked = json.loads(derive._derive_impl(
+        claim="Building on A while still disputed.",
+        supporting_ids=f"{ob_a},{ob_other}",
+        logical_chain="Should be blocked.",
+        reasoning_type="deductive_modus_ponens",
+    ))
+    assert blocked.get("status") == "blocked_contradicted", blocked
+
+    # Resolve the contradiction (root-cause resolver, per #229 pure-wire
+    # semantics — resolving_node_id must be claim-bearing and current).
+    ob_resolver = _mk_obs(obs, "Adjudication: A overreached, P does not hold under the operational reading.")
+    res = json.loads(rev._resolve_impl(
+        target_id=ct_id,
+        resolving_node_id=ob_resolver,
+    ))
+    assert res.get("status") == "resolution_created", res
+
+    ct_inspect = json.loads(qry._inspect_impl(node_id=ct_id, dream_mode=True))
+    assert ct_inspect["node"]["status"] in ("resolved", "partially_resolved"), ct_inspect["node"]["status"]
+
+    # Now derive citing ob_a succeeds with no override — no open contradiction remains.
+    after = json.loads(derive._derive_impl(
+        claim="Building on A now that the dispute is resolved.",
+        supporting_ids=f"{ob_a},{ob_other}",
+        logical_chain="No longer disputed.",
+        reasoning_type="deductive_modus_ponens",
+    ))
+    assert "derivation_id" in after, after
+    assert "built_on_contested" not in after, after
+
+
+def test_taint_dominates_contradiction():
+    """A premise that is BOTH retracted (tainted) AND under an open
+    contradiction reports BLOCKED_TAINTED, not BLOCKED_CONTRADICTED — taint
+    is the hard, unconditional block."""
+    rev, obs, derive, qry, core = _make_fresh_mods()
+    ob_a = _mk_obs(obs, "Claim A holds.")
+    ob_b = _mk_obs(obs, "Claim A does not hold.")
+    _mk_ct(derive, ob_a, ob_b, "Disagreement about A.")
+    ob_other = _mk_obs(obs, "An unrelated corroborating claim.")
+
+    ret = json.loads(rev._retract_impl(
+        node_id=ob_a, error_type="other", reason="test: proven wrong",
+    ))
+    assert ret.get("status") == "retracted", ret
+
+    r = json.loads(derive._derive_impl(
+        claim="Trying to build on a retracted, contested premise.",
+        supporting_ids=f"{ob_a},{ob_other}",
+        logical_chain="Should be tainted-blocked, not contradicted-blocked.",
+        reasoning_type="deductive_modus_ponens",
+        use_contested=True,
+    ))
+    assert r.get("status") == "blocked_tainted", r
+
+
+def test_stale_and_contested_are_independent_not_elif():
+    """A premise can be BOTH superseded (stale) AND sitting on a still-open
+    contradiction (contested) at the same time — supersede fires on one
+    side of a live dispute without auto-resolving it (#229's documented
+    workflow). Both guards must be cleared independently; clearing only
+    use_contested must NOT silently bypass BLOCKED_STALE (or vice versa).
+
+    Regression test for a reviewer-fairy-caught blocker on PR #1711: the
+    original implementation used an elif chain that let 'contested' win
+    over 'stale' for a single premise, discarding the stale classification
+    (and the built_on_stale audit stamp) entirely once a premise was also
+    contested.
+    """
+    rev, obs, derive, qry, core = _make_fresh_mods()
+    ob_a = _mk_obs(obs, "Claim A holds.")
+    ob_b = _mk_obs(obs, "Claim A does not hold.")
+    _mk_ct(derive, ob_a, ob_b, "Disagreement about A.")
+
+    # Supersede ob_a — it's now stale (has a current successor) AND still
+    # contested (the contradiction above was never resolved).
+    ob_a2 = _mk_obs(obs, "Claim A, refined.")
+    sup = json.loads(rev._supersede_impl(
+        old_node_id=ob_a, new_node_id=ob_a2, supersede_reason="refined reading",
+    ))
+    assert sup.get("status") == "superseded", sup
+
+    ob_other = _mk_obs(obs, "An unrelated corroborating claim.")
+
+    # use_contested alone must NOT be enough — ob_a is still stale too.
+    r1 = json.loads(derive._derive_impl(
+        claim="Building on ob_a with only the contested override.",
+        supporting_ids=f"{ob_a},{ob_other}",
+        logical_chain="Only opting into the contradiction override.",
+        reasoning_type="deductive_modus_ponens",
+        use_contested=True,
+        use_stale=False,
+    ))
+    assert r1.get("status") == "blocked_stale", r1
+    assert {p["id"] for p in r1["stale_premises"]} == {ob_a}, r1
+
+    # use_stale alone must NOT be enough — ob_a is still contested too.
+    r2 = json.loads(derive._derive_impl(
+        claim="Building on ob_a with only the stale override.",
+        supporting_ids=f"{ob_a},{ob_other}",
+        logical_chain="Only opting into the stale override.",
+        reasoning_type="deductive_modus_ponens",
+        use_contested=False,
+        use_stale=True,
+    ))
+    assert r2.get("status") == "blocked_contradicted", r2
+    assert {p["id"] for p in r2["contested_premises"]} == {ob_a}, r2
+
+    # Both overrides together clear it, and both audit stamps are written.
+    r3 = json.loads(derive._derive_impl(
+        claim="Building on ob_a with both overrides.",
+        supporting_ids=f"{ob_a},{ob_other}",
+        logical_chain="Opting into both.",
+        reasoning_type="deductive_modus_ponens",
+        use_contested=True,
+        use_stale=True,
+    ))
+    assert "derivation_id" in r3, r3
+    assert r3["built_on_contested"] == [ob_a], r3
+    assert r3["built_on_stale"] == [ob_a], r3
+
+
+def test_extra_meta_cannot_spoof_or_remove_auto_stamps():
+    """By-construction hardening (Borges's #1711 review): the built_on_stale
+    / built_on_contested auto-stamps must survive even if extra_meta
+    contains those keys — dict.update() ordering alone is a by-convention
+    guarantee (safe only because today's one caller hardcodes
+    extra_meta={"warrant": ...}), not a structural one. _create_derivation
+    must strip reserved keys from extra_meta unconditionally so a future
+    generic extra_meta passthrough can't silently spoof or blank the stamp.
+    """
+    rev, obs, derive, qry, core = _make_fresh_mods()
+    ob_a = _mk_obs(obs, "Claim A holds.")
+    ob_b = _mk_obs(obs, "Claim A does not hold.")
+    _mk_ct(derive, ob_a, ob_b, "Disagreement about A.")
+    ob_other = _mk_obs(obs, "An unrelated corroborating claim.")
+
+    conn = core._get_db()
+    try:
+        block, success = core._create_derivation(
+            conn,
+            claim="Attempting to spoof the stamp via extra_meta.",
+            supporting_ids=[ob_a, ob_other],
+            logical_chain="extra_meta carries a forged built_on_contested value.",
+            reasoning_type="deductive_modus_ponens",
+            use_contested=True,
+            # A malicious/careless caller tries to override the real stamp.
+            extra_meta={"built_on_contested": ["forged_id"], "warrant": "legit warrant"},
+        )
+        assert block is None, block
+        conn.commit()
+    finally:
+        conn.close()
+
+    node = json.loads(qry._inspect_impl(node_id=success["node_id"], view="deep", dream_mode=True))
+    meta = json.loads(node["node"]["metadata"])
+    assert meta["built_on_contested"] == [ob_a], (
+        f"extra_meta must not override the auto-stamp; got {meta.get('built_on_contested')}"
+    )
+    assert meta["warrant"] == "legit warrant", "non-reserved extra_meta keys should still pass through"
+
+
+def test_use_contested_true_with_no_contested_premise_is_a_no_op():
+    """use_contested=True is harmless when no premise is actually contested
+    — no built_on_contested stamp gets written just because the flag was
+    passed (mirrors use_stale's existing no-op-when-clean behavior)."""
+    rev, obs, derive, qry, core = _make_fresh_mods()
+    ob_a = _mk_obs(obs, "An uncontested claim.")
+    ob_b = _mk_obs(obs, "Another uncontested claim.")
+
+    r = json.loads(derive._derive_impl(
+        claim="Deriving from two clean premises with the flag on regardless.",
+        supporting_ids=f"{ob_a},{ob_b}",
+        logical_chain="Neither premise is disputed.",
+        reasoning_type="deductive_modus_ponens",
+        use_contested=True,
+    ))
+    assert "derivation_id" in r, r
+    assert "built_on_contested" not in r, r
+
+    node = json.loads(qry._inspect_impl(node_id=r["derivation_id"], view="deep", dream_mode=True))
+    meta = json.loads(node["node"]["metadata"])
+    assert "built_on_contested" not in meta, meta

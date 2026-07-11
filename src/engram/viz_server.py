@@ -20,6 +20,25 @@ Usage:
     python viz_server.py --db /path/to/knowledge.db      # single-agent custom
     python viz_server.py --config /path/to/agents.json   # auto-detect + override
     python viz_server.py --no-autodetect --config agents.json  # explicit-only
+
+Deployment / restart model (operator-launched, not agent-managed):
+    In a multi-agent install this server is normally started by the OPERATOR
+    (a privileged user with read access to every agent's ENGRAM data directory)
+    via a small launch script or command — NOT by an individual agent, whose
+    user typically lacks the cross-agent read access that auto-detect and
+    --config need. The process is long-lived: started once, outside any agent
+    session, and it keeps running across agent restarts and upgrades.
+
+    Consequences for an agent operating on the codebase:
+    * You generally CANNOT restart this server yourself — it runs under a
+      different user, so `pkill`/relaunch will fail on permissions (and you
+      should not try; it is shared infrastructure you do not own). Ask the
+      operator to re-run their launch script instead.
+    * After an upgrade that changes THIS file, the running process keeps
+      executing the OLD code until the operator restarts it — the source on
+      disk being new is not enough. So the correct post-upgrade action is:
+      ask the operator to restart, then confirm the new code is live via
+      GET /api/health (a `health_score` field means it responded).
 """
 
 import argparse
@@ -1006,15 +1025,14 @@ let highlightDepth = 2;
 let newNodeIds = new Set();
 let _whatsNewInitialised = false;
 
-// Memory tier thresholds. These mirror the agent's $ENGRAM_HOME/config.json
-// values (memory.tier1_max_nodes / tier2_max_nodes) — fetched at page load
-// from /api/meta so the viz reflects the ACTUAL config, not the historical
-// default that diverged silently (Lei caught this 2026-05-17: viz was
-// showing many nodes as tier 3 because TIER2_MAX=1000 was hardcoded while
-// production config had tier2_max_nodes=4000). The defaults below are used
-// only as a fallback until /api/meta resolves; the call site near line 1705
-// overrides these from the meta response.
-let TIER1_MAX = 200;
+// Memory tier threshold. Mirrors the agent's $ENGRAM_HOME/config.json
+// value (memory.tier2_max_nodes) — fetched at page load from /api/meta
+// so the viz reflects the ACTUAL config, not the historical default
+// (Lei caught this 2026-05-17: viz was showing many nodes as tier 3
+// because TIER2_MAX=1000 was hardcoded while production config had
+// tier2_max_nodes=4000). The default below is used only as a fallback
+// until /api/meta resolves. Tier-1 is retired (#1220); two tiers remain:
+// queryable (importance_score >= TIER2_MAX rank) vs faded.
 let TIER2_MAX = 1000;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1155,14 +1173,15 @@ function nodeRadius(d) {
   return 7 + c * 10;
 }
 
-// Compute memory tiers for current nodes based on importance_score ranking
+// Compute memory tiers for current nodes based on importance_score ranking.
+// Two tiers: queryable (rank < TIER2_MAX) → tier 2, faded → tier 3.
+// Tier-1 is retired (#1220).
 function computeTiers(nodes) {
   const current = nodes.filter(n => n.is_current).slice();
   current.sort((a, b) => (b.importance_score || 0) - (a.importance_score || 0));
   const tierMap = {};
   current.forEach((n, i) => {
-    if (i < TIER1_MAX) tierMap[n.id] = 1;
-    else if (i < TIER2_MAX) tierMap[n.id] = 2;
+    if (i < TIER2_MAX) tierMap[n.id] = 2;
     else tierMap[n.id] = 3;
   });
   // Non-current nodes get tier 3
@@ -1173,8 +1192,9 @@ function computeTiers(nodes) {
 function nodeOpacity(d, tierMap) {
   if (!showTierOpacity) return 1.0;
   const tier = tierMap[d.id] || 3;
-  if (tier === 1) return 1.0;
-  if (tier === 2) return 0.55;
+  // Two tiers: queryable (2) → full opacity, faded (3) → dimmed.
+  // Tier-1 is retired (#1220).
+  if (tier === 2) return 1.0;
   return 0.2;
 }
 
@@ -2351,16 +2371,13 @@ async function loadAgents() {
         setCurrentAgent(current);
       }
     }
-    // Always fetch meta to populate db-path-label and sync tier thresholds.
+    // Always fetch meta to populate db-path-label and sync tier threshold.
     // Different agents can have different config.json values; without this
-    // re-sync, switching agents would leave the prior agent's TIER1_MAX/
-    // TIER2_MAX active and compute tiers wrong.
+    // re-sync, switching agents would leave the prior agent's TIER2_MAX
+    // active and compute tiers wrong. Tier-1 is retired (#1220).
     fetch(withAgent('/api/meta')).then(r => r.json()).then(m => {
       document.getElementById('db-path-label').textContent = m.db_path || '';
       if (m.memory_config) {
-        if (typeof m.memory_config.tier1_max_nodes === 'number') {
-          TIER1_MAX = m.memory_config.tier1_max_nodes;
-        }
         if (typeof m.memory_config.tier2_max_nodes === 'number') {
           TIER2_MAX = m.memory_config.tier2_max_nodes;
         }
@@ -2490,16 +2507,13 @@ document.getElementById('auto-refresh-cb').onchange = function() {
   }
 };
 
-// Set db path label (agent-aware) AND sync memory tier thresholds from
+// Set db path label (agent-aware) AND sync memory tier threshold from
 // the agent's config (Lei 2026-05-17: viz tier classification was wrong
 // because tier sizes were hardcoded JS constants instead of read from
-// $ENGRAM_HOME/config.json).
+// $ENGRAM_HOME/config.json). Tier-1 is retired (#1220).
 fetch(withAgent('/api/meta')).then(r => r.json()).then(m => {
   document.getElementById('db-path-label').textContent = m.db_path || '';
   if (m.memory_config) {
-    if (typeof m.memory_config.tier1_max_nodes === 'number') {
-      TIER1_MAX = m.memory_config.tier1_max_nodes;
-    }
     if (typeof m.memory_config.tier2_max_nodes === 'number') {
       TIER2_MAX = m.memory_config.tier2_max_nodes;
     }
@@ -3609,7 +3623,7 @@ def _resolve_agent_config(agent_name: str) -> dict:
     (e.g. tier2_max=4000 in production) rather than viz-side hardcoded defaults
     (tier2=1000 in the original JS, which mis-classified ~3000 nodes as tier 3).
     """
-    defaults = {"tier1_max_nodes": 200, "tier2_max_nodes": 1000, "decay_base": 1.014}
+    defaults = {"tier2_max_nodes": 1000, "decay_base": 1.014}
     agent_meta = AGENTS.get(agent_name)
     if not agent_meta:
         return defaults
@@ -3625,7 +3639,6 @@ def _resolve_agent_config(agent_name: str) -> dict:
             config = json.load(f)
         mem = config.get("memory", {})
         return {
-            "tier1_max_nodes": int(mem.get("tier1_max_nodes", defaults["tier1_max_nodes"])),
             "tier2_max_nodes": int(mem.get("tier2_max_nodes", defaults["tier2_max_nodes"])),
             "decay_base": float(mem.get("decay_base", defaults["decay_base"])),
         }

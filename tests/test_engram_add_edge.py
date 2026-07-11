@@ -57,7 +57,7 @@ def _seed_self_anchor_and_obs(server):
     p = json.loads(server.engram_add_person(payload_json=json.dumps({
         "name": "Test Self",
         "role": "agent",
-        "description": "self-anchor for add-edge tests",
+        # description removed: no longer in typed person-node schema
         "is_self": True,
     })))
     person_id = p.get("person_id") or p.get("node_id")

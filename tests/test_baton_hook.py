@@ -539,6 +539,49 @@ class TestMainRendering:
 
 
 # ---------------------------------------------------------------------------
+# Unit tests -- #1715 repo-qualified anchor parsing + threading
+# ---------------------------------------------------------------------------
+
+class TestParsePrAnchorRepoQualified:
+    """#1715 reviewer-fairy-caught gap: the naive anchor[3:] slice this hook
+    used produced 'owner/repo/N' verbatim for a repo-qualified anchor, which
+    gh would reject as a garbage PR-number positional arg. _parse_pr_anchor
+    fixes this; these tests lock its contract directly."""
+
+    def test_bare_anchor_resolves_default_repo(self, engram_home):
+        mod = _load_hook_module(engram_home)
+        assert mod._parse_pr_anchor("pr/1005") == (mod._DEFAULT_GITHUB_REPO, "1005")
+
+    def test_qualified_anchor_resolves_its_own_repo(self, engram_home):
+        mod = _load_hook_module(engram_home)
+        assert mod._parse_pr_anchor("pr/engram-agents/engram-paper/22") == (
+            "engram-agents/engram-paper", "22",
+        )
+
+    def test_non_pr_anchor_returns_none(self, engram_home):
+        mod = _load_hook_module(engram_home)
+        assert mod._parse_pr_anchor("project/4") is None
+        assert mod._parse_pr_anchor("nonsense") is None
+
+    def test_get_live_status_threads_repo_to_fetch_pr_status(self, engram_home):
+        """_get_live_status must pass the ANCHOR's own repo to
+        _fetch_pr_status, not silently drop it or pass the whole
+        owner/repo/N tail as a garbage pr_num."""
+        mod = _load_hook_module(engram_home)
+        calls = []
+
+        def _fake_fetch(pr_num, repo=None):
+            calls.append((pr_num, repo))
+            return "OPEN"
+
+        with patch.object(mod, "_fetch_pr_status", side_effect=_fake_fetch):
+            result = mod._get_live_status("pr/engram-agents/engram-paper/22", {})
+
+        assert result == "OPEN"
+        assert calls == [("22", "engram-agents/engram-paper")]
+
+
+# ---------------------------------------------------------------------------
 # Unit tests -- _auto_archive_merged_pr_batons()
 # ---------------------------------------------------------------------------
 
@@ -875,3 +918,92 @@ class TestAutoArchiveIntegration:
         assert "hookSpecificOutput" in response
         ctx = response["hookSpecificOutput"]["additionalContext"]
         assert "PR-1300" in ctx, "in-court baton must still appear despite baton-close crash"
+
+
+# ---------------------------------------------------------------------------
+# Flattened-topology regression (gh#1657 -- _hooklib extraction)
+# ---------------------------------------------------------------------------
+
+import subprocess
+
+
+def test_hooklib_resolution_in_flattened_deployed_topology(tmp_path):
+    """The plugin build FLATTENS hooks/claude/ -> hooks/, so the deployed
+    baton hook sits one level shallower than source, AND _hooklib.py (its
+    sibling, gh#1657) AND _prompthooklib.py (its sibling, gh#1680 slice 1)
+    must both be found alongside it in that same flattened layout. Recreate
+    the deployed layout (hook + _hooklib.py + _prompthooklib.py as siblings,
+    with a further-nested tools/) and confirm, with CLAUDE_PLUGIN_ROOT unset:
+      (a) tools/ resolves (_FORUM_API_OK, _TOOLS_DIR)
+      (b) config loads via _load_config()
+      (c) agent name resolves via _get_agent_name(config)
+      (d) emit_context() prints the identical additionalContext envelope
+    -- this hook had no such regression test before the _hooklib extraction;
+    forum's equivalent (#1540) is the model.
+    """
+    root = tmp_path / "engram"
+    (root / "hooks").mkdir(parents=True)
+    (root / "tools").mkdir()
+    hooklib_src = (
+        Path(__file__).parent.parent
+        / "src" / "engram" / "hooks" / "claude" / "_hooklib.py"
+    )
+    prompthooklib_src = (
+        Path(__file__).parent.parent
+        / "src" / "engram" / "hooks" / "claude" / "_prompthooklib.py"
+    )
+    (root / "hooks" / "engram-baton-prompt-hook.py").write_text(HOOK_PATH.read_text())
+    (root / "hooks" / "_hooklib.py").write_text(hooklib_src.read_text())
+    (root / "hooks" / "_prompthooklib.py").write_text(prompthooklib_src.read_text())
+    # Stub forum_api.py so the import can succeed.
+    (root / "tools" / "forum_api.py").write_text(
+        "class ForumClient:\n"
+        "    def __init__(self, *a, **k): pass\n"
+        "class ForumNetworkError(Exception): pass\n"
+        "class ForumHttpError(Exception):\n"
+        "    def __init__(self, status=0, body=''): self.status=status; self.body=body\n"
+        "def forum_url_from_config(config): return 'http://localhost:5002'\n"
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.json").write_text(json.dumps({"agent_name": "luria", "mode": "multi"}))
+
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_ROOT"}
+    env["ENGRAM_HOME"] = str(home)
+    probe_script = (
+        "import importlib.util, sys, io, json, contextlib\n"
+        "spec = importlib.util.spec_from_file_location('hook', "
+        f"  r'{root}/hooks/engram-baton-prompt-hook.py')\n"
+        "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)\n"
+        "print('resolved' if mod._FORUM_API_OK and mod._TOOLS_DIR is not None else 'broken')\n"
+        "cfg = mod._load_config()\n"
+        "print('config_ok' if cfg.get('agent_name') == 'luria' else f'config_broken:{cfg!r}')\n"
+        "name = mod._get_agent_name(cfg)\n"
+        "print('name_ok' if name == 'luria' else f'name_broken:{name!r}')\n"
+        "buf = io.StringIO()\n"
+        "with contextlib.redirect_stdout(buf):\n"
+        "    mod._emit_context('hello world')\n"
+        "envelope = json.loads(buf.getvalue())\n"
+        "expected = {'hookSpecificOutput': {'hookEventName': 'UserPromptSubmit', 'additionalContext': 'hello world'}}\n"
+        "print('emit_ok' if envelope == expected else f'emit_broken:{envelope!r}')\n"
+    )
+    r = subprocess.run(
+        [sys.executable, "-c", probe_script],
+        capture_output=True, text=True, env=env,
+    )
+    assert "resolved" in r.stdout, (
+        "deployed-topology hook failed to resolve _hooklib/forum_api via "
+        f"walk-parents (stdout={r.stdout!r} stderr={r.stderr!r})"
+    )
+    assert "config_ok" in r.stdout, (
+        f"deployed-topology hook failed to load config via _prompthooklib "
+        f"(stdout={r.stdout!r} stderr={r.stderr!r})"
+    )
+    assert "name_ok" in r.stdout, (
+        f"deployed-topology hook failed to resolve agent name via _prompthooklib "
+        f"(stdout={r.stdout!r} stderr={r.stderr!r})"
+    )
+    assert "emit_ok" in r.stdout, (
+        f"deployed-topology hook's emit_context envelope diverged "
+        f"(stdout={r.stdout!r} stderr={r.stderr!r})"
+    )

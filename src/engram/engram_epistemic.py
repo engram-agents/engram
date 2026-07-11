@@ -56,6 +56,10 @@ def _update_incident_index(lesson_id: str, lesson_claim: str,
             json.dump(index, f, indent=2)
     except Exception:
         pass  # Best-effort; never block lesson creation
+    try:
+        core._rebuild_principle_triggers()  # unified registry (#1698 slice 1)
+    except Exception:
+        pass  # best-effort; legacy cache above remains the hooks' read path
 
 
 # ---------------------------------------------------------------------------
@@ -958,14 +962,32 @@ def _register_exemplar_impl(
         "exemplar_count": exemplar_count,
     }
 
-    # Tripwire cache refresh: only fires for lesson targets.
-    # For cornerstone targets, no cache today — future cornerstone-tripwire
-    # mechanism may extend this.
+    # Tripwire cache refresh — each target type has its own hot-path cache
+    # scanned by the surface hook (#1691: cornerstone anchors join lessons).
     if target_row["type"] == "lesson":
         try:
             cache_result = core._rebuild_incidents_cache()
         except Exception as exc:
             cache_result = {"status": "error", "detail": str(exc)}
         result["cache_rebuild"] = cache_result
+    elif target_row["type"] == "cornerstone":
+        try:
+            cache_result = core._rebuild_cornerstone_anchors_cache()
+        except Exception as exc:
+            cache_result = {"status": "error", "detail": str(exc)}
+        result["cache_rebuild"] = cache_result
+    # Unified registry (#1698 slice 1) — additive alongside the legacy
+    # caches until the unified hook check lands (design doc §2 migration).
+    if target_row["type"] in ("lesson", "cornerstone"):
+        try:
+            core._rebuild_principle_triggers()
+        except Exception:
+            pass  # best-effort; legacy caches remain the hooks' read path
+        # Reset-on-incident (#1698 slice 3 §3): a NEW exemplar just landed
+        # against this principle — full strength again.
+        try:
+            core._reset_principle_enactments(target_id)
+        except Exception:
+            pass  # best-effort; never fail exemplar registration on this
 
     return json.dumps(result)

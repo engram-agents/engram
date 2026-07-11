@@ -11,6 +11,31 @@
       "note": "context_tracker.py is imported by the session-start hook and tested via direct subprocess calls"
     },
     {
+      "path_prefix_or_glob": "hooks/claude/_hooklib.py",
+      "test_globs": [
+        "tests/test_hooklib.py",
+        "tests/test_baton_hook.py",
+        "tests/test_inter_agent_hook.py",
+        "tests/test_forum_hook.py",
+        "tests/test_tiers_manifest.py",
+        "tests/test_run_touched_tests.py"
+      ],
+      "note": "gh#1657 SSoT for tools/-resolution shared by the baton/inter-agent/forum prompt hooks. Each hook dynamically imports it via a runtime sys.path insert (not a static `import` statement), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping. Consumed by all three hooks as of slice 3 (baton, inter-agent, forum) -- gh#1657 complete."
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/_prompthooklib.py",
+      "test_globs": [
+        "tests/test_prompthooklib.py",
+        "tests/test_baton_hook.py",
+        "tests/test_inter_agent_hook.py",
+        "tests/test_forum_hook.py",
+        "tests/test_forum_hook_publish.py",
+        "tests/test_tiers_manifest.py",
+        "tests/test_run_touched_tests.py"
+      ],
+      "note": "gh#1680 slice 1 SSoT for the config/agent-name/emit-context/resolve-tools-dir prologue shared by the baton/inter-agent/forum prompt hooks. Each hook dynamically imports it via a runtime sys.path insert (not a static `import` statement, same as _hooklib.py above), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping."
+    },
+    {
       "path_prefix_or_glob": "hooks/claude/engram-baton-prompt-hook.py",
       "test_globs": [
         "tests/test_baton_hook.py",
@@ -72,16 +97,18 @@
     {
       "path_prefix_or_glob": "hooks/claude/engram-lesson-tripwire-hook.py",
       "test_globs": [
-        "tests/test_lesson_tripwire.py"
+        "tests/test_lesson_tripwire.py",
+        "tests/test_in_turn_recall.py",
+        "tests/test_principle_triggers_registry.py"
       ],
-      "note": "PreToolUse hook that surfaces lesson tripwires on Bash and MCP tool calls (issues #1203 + #1297)"
+      "note": "PreToolUse hook that surfaces lesson tripwires on Bash and MCP tool calls (issues #1203 + #1297). test_principle_triggers_registry.py added #1731 -- its own docstring (Coverage §6) already documented covering this hook's PreToolUse _QUERY broadening, but it was missing from this glob (found while fixing #1731, same completeness-gap class as this morning's tools/perf/*.py <-> test_in_turn_recall.py gap)."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-postcompact-hook.py",
       "test_globs": [
-        "tests/test_starred_block.py",
         "tests/test_engine_phase3.py"
-      ]
+      ],
+      "note": "starred_block()/focus_block() no longer live here (#1732, 2026-07-09) -- PostCompact cannot inject additionalContext at all, so both moved to/stayed at engram-session-start-hook.py. test_starred_block.py dropped from this glob since it no longer imports this file; test_engine_phase3.py kept for the INTER_AGENT_DIR dead-assignment premise + leak-pattern bundling checks, which still apply."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-session-start-hook.py",
@@ -89,13 +116,16 @@
         "tests/test_session_start_hook_auto_sleep_cron.py",
         "tests/test_session_start_hook_calibration.py",
         "tests/test_session_start_hook_mcp_health.py",
+        "tests/test_session_start_hook_focus_render.py",
         "tests/test_per_session_marker_prune.py",
         "tests/test_starred_block.py",
+        "tests/test_focus_block.py",
         "tests/test_fairy_policy.py",
         "tests/test_resolve_runtime_dir_plugin.py",
         "tests/test_engine_phase3.py",
         "tests/test_engine_unit.py"
-      ]
+      ],
+      "note": "focus_block() moved here from engram-postcompact-hook.py (#1732, 2026-07-09) -- test_focus_block.py and the new test_session_start_hook_focus_render.py added accordingly."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-stop-hook.py",
@@ -123,8 +153,11 @@
         "tests/test_resolve_runtime_dir_plugin.py",
         "tests/test_engine_unit.py",
         "tests/test_tier_build_filter.py",
-        "tests/test_tiers_manifest.py"
-      ]
+        "tests/test_tiers_manifest.py",
+        "tests/test_recall_injection_budget.py",
+        "tests/test_principle_triggers_registry.py"
+      ],
+      "note": "test_principle_triggers_registry.py added #1731 -- its own docstring (Coverage §5) already documented covering this hook's unified check_principle_triggers consumer, but it was missing from this glob (found while fixing #1731, same completeness-gap class as this morning's tools/perf/*.py <-> test_in_turn_recall.py gap)."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-time-bar-hook.py",
@@ -271,6 +304,13 @@
       "note": "The runner itself is a fail-open trigger \u2014 changes to it always trigger full suite in production. This entry is for the completeness gate only."
     },
     {
+      "path_prefix_or_glob": "tools/perf/*.py",
+      "test_globs": [
+        "tests/test_replay_bench.py"
+      ],
+      "note": "tools/perf/ is the first subdirectory under tools/ \u2014 _discover_repo_modules() only globs tools/*.py non-recursively, so modules here aren't registered as repo module stems and the test file's bare `import replay_bench`/`import trace_from_telemetry` (via manual sys.path insertion, not `from tools.perf.X import`) never lands in the import graph either. Without this entry, an edit to either file gets a fast-CI subset that silently omits its own test, with no fail-open backstop (found by the reviewer-fairy on PR #1676)."
+    },
+    {
       "path_prefix_or_glob": "tools/scan-leaks.py",
       "test_globs": [
         "tests/test_tier_build_filter.py",
@@ -414,6 +454,10 @@
     {
       "path": "tools/antml_repair_baseline.py",
       "reason": "Dev-tier baseline tool; no dedicated test file"
+    },
+    {
+      "path": "tools/recall_repetition_analysis.py",
+      "reason": "Dev-tier measurement/acceptance-metric CLI (recall-triggering blueprint #1688 P1/#1689); no dedicated test file. Its core repeat-fraction formula is exercised indirectly by tests/test_surface_ledger_suppression.py's synthetic-verification test, which reuses the same trailing-k-window definition."
     },
     {
       "path": "tools/compute_task_time.py",

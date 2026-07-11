@@ -9,6 +9,11 @@ Behaviors covered:
     4. 'Loop continuation.' prefix → still True (back-compat).
     5. Plain human message → False.
 
+  _is_cron_prompt — HTML-entity normalization (gh#1646, Layer 2):
+    9. Escaped &lt;loop-wake&gt; → True (the incident case).
+   10. Escaped &lt;&lt;autonomous-loop&gt;&gt; → True.
+   11. Plain forms still classify (agnostic to escaped-vs-plain).
+
   SSoT guard:
     6. Hook's _LOOP_WAKE_MARKER_FALLBACK == loop_prompt.LOOP_WAKE_MARKER.
 
@@ -94,6 +99,50 @@ class TestIsCronPrompt:
         """An empty prompt → False (stripped is '', no prefix matches)."""
         loop_marker = str(tmp_path / "loop-mode.json")
         assert ddp._is_cron_prompt("", loop_marker) is False
+
+
+# ---------------------------------------------------------------------------
+# _is_cron_prompt — HTML-entity normalization (gh#1646, Layer 2)
+# ---------------------------------------------------------------------------
+
+class TestIsCronPromptHtmlEntityNormalization:
+    """_is_cron_prompt must classify identically whether a marker/sentinel
+    arrives plain or HTML-escaped, so an agent-construction mistake (writing
+    &lt;loop-wake&gt; or &lt;&lt;autonomous-loop&gt;&gt; instead of real angle
+    brackets into a ScheduleWakeup prompt) can't silently defeat detection and
+    fall through to the deference-detector's presence/deference gate."""
+
+    def test_escaped_loop_wake_marker_is_cron(self, tmp_path):
+        """The incident case: &lt;loop-wake&gt; classifies as cron/loop-wake."""
+        loop_marker = str(tmp_path / "loop-mode.json")
+        body = "&lt;loop-wake&gt;\n...core..."
+        assert ddp._is_cron_prompt(body, loop_marker) is True
+
+    def test_plain_loop_wake_marker_is_cron(self, tmp_path):
+        """Plain marker (unchanged behavior) still classifies as cron/loop-wake."""
+        loop_marker = str(tmp_path / "loop-mode.json")
+        body = "<loop-wake>\n...core..."
+        assert ddp._is_cron_prompt(body, loop_marker) is True
+
+    def test_escaped_autonomous_loop_sentinel_is_cron(self, tmp_path):
+        """Escaped &lt;&lt;autonomous-loop&gt;&gt; → True."""
+        loop_marker = str(tmp_path / "loop-mode.json")
+        assert ddp._is_cron_prompt("&lt;&lt;autonomous-loop&gt;&gt;", loop_marker) is True
+
+    def test_escaped_autonomous_loop_dynamic_sentinel_is_cron(self, tmp_path):
+        """Escaped &lt;&lt;autonomous-loop-dynamic&gt;&gt; → True."""
+        loop_marker = str(tmp_path / "loop-mode.json")
+        assert ddp._is_cron_prompt("&lt;&lt;autonomous-loop-dynamic&gt;&gt;", loop_marker) is True
+
+    def test_plain_autonomous_loop_sentinel_still_cron(self, tmp_path):
+        """Plain <<autonomous-loop>> still classifies (agnostic)."""
+        loop_marker = str(tmp_path / "loop-mode.json")
+        assert ddp._is_cron_prompt("<<autonomous-loop>>", loop_marker) is True
+
+    def test_normal_human_prompt_is_not_cron(self, tmp_path):
+        """A normal human prompt is not misclassified as cron/loop-wake."""
+        loop_marker = str(tmp_path / "loop-mode.json")
+        assert ddp._is_cron_prompt("a normal human prompt", loop_marker) is False
 
 
 # ---------------------------------------------------------------------------

@@ -32,6 +32,10 @@
       "tier": "essential"
     },
     {
+      "path": "engram_snapshot_worker.py",
+      "tier": "essential"
+    },
+    {
       "path": "engram_core.py",
       "tier": "essential"
     },
@@ -328,6 +332,12 @@
       "tier": "dev"
     },
     {
+      "path": "tools/recall_repetition_analysis.py",
+      "tier": "dev",
+      "source": "tools/recall_repetition_analysis.py",
+      "note": "recall-repetition acceptance-metric measurement tool (recall-triggering blueprint #1688 P1/#1689) -- a measurement/benchmarking harness for ENGRAM-development use, same class as tools/perf's replay-bench harness. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution (src/engram/tools/recall_repetition_analysis.py) would wrongly flag this as dangling."
+    },
+    {
       "path": "tools/deference_baseline.py",
       "tier": "dev"
     },
@@ -342,6 +352,12 @@
     {
       "path": "tools/run_touched_tests.py",
       "tier": "dev"
+    },
+    {
+      "path": "tools/perf",
+      "tier": "dev",
+      "source": "tools/perf",
+      "note": "replay-bench perf harness (blueprint #1667/#1668) -- a measurement/benchmarking harness for ENGRAM-development use, same class as the recall-measurement harness and other dev-only baselines. Real files directly under repo-root tools/perf/ (not symlinked from src/engram/), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution (src/engram/tools/perf) would wrongly flag this as dangling."
     },
     {
       "path": "tools/ghpr.sh",
@@ -415,6 +431,14 @@
       "path": "hooks/claude/engram-end-of-day-hook.py",
       "tier": "convenience",
       "identity_coupled": true
+    },
+    {
+      "path": "hooks/claude/_hooklib.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "hooks/claude/_prompthooklib.py",
+      "tier": "convenience"
     },
     {
       "path": "hooks/claude/engram-inter-agent-prompt-hook.py",
@@ -735,6 +759,14 @@
     {
       "path": "src/engram/tools/baton-migrate-to-coord-store.py",
       "reason": "one-shot state migration helper: reads existing baton files from the old agents-shared path and POSTs to the new /api/projects/* routes (Phase 3 UCS migration); not a recurring shipped mechanism"
+    },
+    {
+      "path": "src/engram/tools/migrate_stranded_supported_by.py",
+      "reason": "one-shot cleanup: re-roots cs/ls supported_by edges stranded before PR #1281 landed (issue #1587); not a recurring shipped mechanism"
+    },
+    {
+      "path": "src/engram/tools/migrate_person_nodes.py",
+      "reason": "one-shot dry-run guide: extracts typed fields from legacy free-form person node prose; produces a human-review report, never auto-applies; not a recurring shipped mechanism"
     }
   ],
   "repo_only": [

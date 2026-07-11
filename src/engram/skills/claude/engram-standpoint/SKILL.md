@@ -39,6 +39,8 @@ The standpoint check for any axis fires ONLY when ALL observation-leaf premises 
 
 `standpoint_lineage` on observations you file yourself (about your own reasoning, from your own reading) may be omitted — your own lineage is known from `config.json`. But when you cite other agents' or humans' claims, set `standpoint_lineage` to their lineage. If you cite only your own observations in a derivation, lineage will be uniform (you are one lineage) — that is correct; the check reflects reality.
 
+**What "lineage" actually means (the recurring point of confusion):** `standpoint_lineage` marks the EVIDENCE SOURCE that produced the claim, NOT who authored the node recording it. ENGRAM bans node-copying — every node in your graph is created by you, including your own interpretation of what happened. So an observation tagged `anthropic:opus` lineage "from Ari" means Ari produced the underlying evidence (Ari ran the command, read the source, had the conversation) — not that you copied Ari's node into your graph. Lineage tracks *where the evidence came from*; it's orthogonal to *who recorded it*. Without this distinction it's easy to reason "I always author my own nodes, so how could a node ever be another lineage?" — the answer is that authorship and evidence-source are different axes.
+
 ## Reading the STANDPOINT warning
 
 `engram_derive` returns warnings like:

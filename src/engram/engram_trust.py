@@ -43,11 +43,23 @@ INTERNAL_THRESHOLD = 3  # our_side and above
 
 def _add_person_impl(
     name: str = "",
-    role: str = "",
-    description: str = "",
-    aliases: str = "",
+    # Typed relational fields (shared human + agent)
+    birthday: str = "",
+    relation: str = "",
+    pronouns: str = "",
+    trust_tier: str = "",
+    aliases=None,
+    location_contact: str = "",
+    # Agent-specific identity fields (immutable)
+    lineage: str = "",
+    architecture: str = "",
+    first_session_date: str = "",
+    # Compat / structural flags
     context_ids: str = "",
     is_self: bool = False,
+    # Deprecated: role is accepted as an alias for relation.
+    # Filed under 'relation' in metadata; the old 'role' key is not written.
+    role: str = "",
 ) -> str:
     """Internal implementation — see engram_add_person MCP tool for the public
     payload schema. Kept callable with named kwargs for in-server callers.
@@ -56,8 +68,8 @@ def _add_person_impl(
 
     Person nodes represent people in the agent's relational world — collaborators,
     evaluators, stakeholders. They are the relational layer of ENGRAM, lighter-schema
-    than epistemic nodes (the recall-summary derivation): no confidence scores, no evidence requirements,
-    no claim-bearing participation.
+    than epistemic nodes (the recall-summary derivation): no confidence scores, no
+    evidence requirements, no claim-bearing participation.
 
     Person nodes are NON-CLAIM-BEARING: a person is not a truth-claim about the world.
     They cannot serve as derivation premises. However, observations and derivations
@@ -67,32 +79,54 @@ def _add_person_impl(
     as goals and axioms. Like all anchored types, survival past ~50 turns still
     requires active recall.
 
-    Facts about a person should be stored as user_stated observations linked to the
-    person node, not as fields on the person node itself. The person node captures
-    WHO; observations capture WHAT IS KNOWN ABOUT THEM.
+    Typed fields replace the old free-form description/logical_chain bins. Facts
+    about a person should be stored as user_stated observations linked to the
+    person node via engram_link_about. The person node captures WHO + structured
+    identity facts; observations capture WHAT IS KNOWN ABOUT THEM.
+
+    Mutable-with-trace fields (relation, pronouns, trust_tier, aliases,
+    location_contact) record prior values in metadata.field_traces when changed
+    via engram_update_person. Immutable fields (name, birthday, lineage,
+    architecture, first_session_date) may only be corrected via supersede.
 
     Args:
-        name: The person's name.
-        role: Their role or relationship to the agent (e.g. "primary collaborator",
-              "external evaluator", "colleague").
-        description: Background, expertise, personality traits, or other context.
-        aliases: Comma-separated alternative names or identifiers for this person
-                 (e.g. "Alex,A" for matching name-prefix messages).
-        context_ids: Optional comma-separated node IDs for context references.
-                     Creates cites edges (e.g. link to goals they serve).
+        name: The person's name (required). Immutable — legal corrections
+              require supersede with #1587 guard.
+        birthday: ISO date string (e.g. "1990-06-15"). Immutable.
+        relation: Their role/relationship to the agent (e.g. "primary collaborator",
+                  "daughter", "colleague"). Mutable-with-trace.
+                  DEPRECATED ALIAS: 'role' is accepted; stored as 'relation'.
+        pronouns: Free-form pronoun string (e.g. "she/her"). Mutable-with-trace.
+        trust_tier: Trust tier string (same values as nodes.trust_tier column:
+                    "self", "primary_user", "user_family", "our_side",
+                    "known_external", "unknown", "suspect"). Mutable-with-trace
+                    with elevated review flag on change via engram_update_person.
+                    If provided here, sets both metadata.trust_tier and the
+                    nodes.trust_tier column.
+        aliases: List of alternative names/identifiers for this person used by
+                 the Stage 1 auto-suggest pipeline (e.g. ["Wei", "王伟"]).
+                 Also accepted as a comma-separated string for backward compat.
+                 Mutable-with-trace.
+        location_contact: Address or contact info. Mutable-with-trace.
+        lineage: Agent lineage string (e.g. "anthropic:claude-sonnet"). Immutable.
+        architecture: Agent architecture descriptor. Immutable.
+        first_session_date: ISO date of first interaction. Immutable.
+        context_ids: Optional comma-separated node IDs. Creates cites edges
+                     (e.g. link to goals they serve).
         is_self: Mark this person node as the agent's own self-anchor.
-                 Only one self-node should exist; subsequent attempts will be
-                 rejected. The self-node serves as the target of `about` edges
-                 from self-observations, enabling emergence-scan to find
-                 identity-forming patterns.
+                 Only one self-node should exist; subsequent attempts are rejected.
+        role: DEPRECATED — accepted as alias for relation; prefer relation.
 
     Returns:
         JSON with the new person node ID.
     """
     if not name or not name.strip():
         return json.dumps({"error": "name is required and cannot be empty."})
-    if not role or not role.strip():
-        return json.dumps({"error": "role is required and cannot be empty."})
+
+    # Resolve relation: prefer explicit 'relation', fall back to deprecated 'role'.
+    resolved_relation = relation.strip() if relation and relation.strip() else (
+        role.strip() if role and role.strip() else ""
+    )
 
     conn = core._get_db()
     try:
@@ -108,23 +142,57 @@ def _add_person_impl(
         node_id = core._next_id(conn, "person")
         now = core._now()
 
-        claim_text = f"{name} — {role}"
-        alias_list = [s.strip() for s in core._as_csv(aliases).split(",") if s.strip()]
+        # claim: human-readable summary from typed fields.
+        claim_text = f"{name.strip()} — {resolved_relation}" if resolved_relation else name.strip()
 
+        # Parse aliases — accept list or CSV string.
+        if isinstance(aliases, list):
+            alias_list = [str(a).strip() for a in aliases if str(a).strip()]
+        elif aliases:
+            alias_list = [s.strip() for s in core._as_csv(aliases).split(",") if s.strip()]
+        else:
+            alias_list = []
+
+        # Build typed metadata — no free-form description/logical_chain bins.
         meta_dict = {
-            "name": name,
-            "role": role,
+            "name": name.strip(),
             "aliases": alias_list,
+            "special_moments": [],  # §3: initialized empty, max 7, rotate on cap
+            "field_traces": {},     # §2: mutable-field prior-value audit trail
         }
+        if resolved_relation:
+            meta_dict["relation"] = resolved_relation
+        if pronouns and pronouns.strip():
+            meta_dict["pronouns"] = pronouns.strip()
+        if trust_tier and trust_tier.strip():
+            if trust_tier.strip() not in TIER_RANK:
+                return json.dumps({
+                    "error": f"Invalid trust_tier '{trust_tier.strip()}'. "
+                             f"Must be one of: {', '.join(sorted(TIER_RANK, key=lambda t: TIER_RANK[t], reverse=True))}"
+                })
+            meta_dict["trust_tier"] = trust_tier.strip()
+        if location_contact and location_contact.strip():
+            meta_dict["location_contact"] = location_contact.strip()
+        if birthday and birthday.strip():
+            meta_dict["birthday"] = birthday.strip()
+        # Agent-specific immutable fields
+        if lineage and lineage.strip():
+            meta_dict["lineage"] = lineage.strip()
+        if architecture and architecture.strip():
+            meta_dict["architecture"] = architecture.strip()
+        if first_session_date and first_session_date.strip():
+            meta_dict["first_session_date"] = first_session_date.strip()
         if is_self:
             meta_dict["is_self"] = True
-        meta = json.dumps(meta_dict)
+
+        # Resolve trust_tier column: use provided value or fall back to 'unknown'.
+        tier_col = trust_tier.strip() if trust_tier and trust_tier.strip() else "unknown"
 
         conn.execute(
-            """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
+            """INSERT INTO nodes (id, type, claim, created_at,
                status, metadata, trust_tier)
-               VALUES (?, 'person', ?, ?, ?, 'active', ?, 'unknown')""",
-            (node_id, claim_text, now, description, meta),
+               VALUES (?, 'person', ?, ?, 'active', ?, ?)""",
+            (node_id, claim_text, now, json.dumps(meta_dict), tier_col),
         )
 
         context = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
@@ -149,16 +217,328 @@ def _add_person_impl(
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
-        return json.dumps({
+
+        result = {
             "status": "created",
             "person_id": node_id,
-            "name": name,
-            "role": role,
+            "name": name.strip(),
+            "relation": resolved_relation,
             "aliases": alias_list,
             "context_nodes": context,
+        }
+        if role and not relation:
+            result["deprecation_warning"] = (
+                "'role' is deprecated — use 'relation' instead. "
+                "Value accepted and stored as 'relation'."
+            )
+        return json.dumps(result)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Person update impl (engram_update_person)
+# ---------------------------------------------------------------------------
+
+# Fields that may be changed in-place via engram_update_person.
+_PERSON_MUTABLE_FIELDS = frozenset({
+    "relation", "pronouns", "trust_tier", "aliases", "location_contact",
+})
+# Fields that are immutable — must be corrected via supersede.
+_PERSON_IMMUTABLE_FIELDS = frozenset({
+    "name", "birthday", "lineage", "architecture", "first_session_date",
+})
+
+# Max special_moments slots per person node (§3).
+_SPECIAL_MOMENTS_CAP = 7
+
+
+def _update_person_impl(
+    node_id: str = "",
+    updates: dict = None,
+    reason: str = "",
+) -> str:
+    """Internal implementation — see engram_update_person MCP tool.
+
+    Update mutable fields on an existing person node in-place (no supersede,
+    no new node). Records prior values in metadata.field_traces (append-only).
+    Emits a field-value-changed cascade flag to nodes citing this person.
+
+    Args:
+        node_id: Person node ID (pn_NNNN). Must be type='person', is_current=1.
+        updates: Dict of field → new_value. Only mutable fields accepted:
+                 relation, pronouns, trust_tier, aliases, location_contact.
+                 Immutable-field updates are rejected with a clear error.
+        reason: Optional human-readable explanation for the change.
+
+    Returns:
+        JSON with status, node_id, updated_fields, field_traces_delta.
+    """
+    if updates is None:
+        updates = {}
+    if not node_id or not node_id.strip():
+        return json.dumps({"error": "node_id is required and cannot be empty."})
+    if not updates:
+        return json.dumps({"error": "updates must be a non-empty dict of field → new_value."})
+
+    # Reject immutable fields early — give a clear error before any DB touch.
+    immutable_attempted = set(updates.keys()) & _PERSON_IMMUTABLE_FIELDS
+    if immutable_attempted:
+        return json.dumps({
+            "error": (
+                f"Cannot update immutable field(s): {sorted(immutable_attempted)}. "
+                f"Immutable fields (name, birthday, lineage, architecture, "
+                f"first_session_date) may only be corrected via supersede "
+                f"(engram_supersede) with the #1587 guard for name changes. "
+                f"Mutable fields: {sorted(_PERSON_MUTABLE_FIELDS)}."
+            )
+        })
+    unknown_fields = set(updates.keys()) - _PERSON_MUTABLE_FIELDS - _PERSON_IMMUTABLE_FIELDS
+    if unknown_fields:
+        return json.dumps({
+            "error": (
+                f"Unknown person field(s): {sorted(unknown_fields)}. "
+                f"Mutable (updatable): {sorted(_PERSON_MUTABLE_FIELDS)}. "
+                f"Immutable (supersede only): {sorted(_PERSON_IMMUTABLE_FIELDS)}."
+            )
+        })
+
+    conn = core._get_db()
+    try:
+        row = conn.execute(
+            "SELECT id, type, is_current, metadata, trust_tier FROM nodes WHERE id = ?",
+            (node_id.strip(),),
+        ).fetchone()
+        if not row:
+            return json.dumps({"error": f"Node '{node_id}' not found."})
+        if row["type"] != "person":
+            return json.dumps({
+                "error": (
+                    f"Node '{node_id}' is type '{row['type']}', not 'person'. "
+                    f"engram_update_person only operates on person nodes."
+                )
+            })
+        if not row["is_current"]:
+            return json.dumps({
+                "error": (
+                    f"Node '{node_id}' is not current (retracted or superseded). "
+                    f"Use engram_inspect('{node_id}') to find the current successor."
+                )
+            })
+
+        meta = json.loads(row["metadata"] or "{}")
+        if "field_traces" not in meta:
+            meta["field_traces"] = {}
+
+        now = core._now()
+        updated_fields = {}
+        field_traces_delta = {}
+        trust_tier_changed = False
+
+        for field, new_value in updates.items():
+            current_value = meta.get(field)
+
+            # Append prior value to trace (append-only — never mutate existing entries).
+            if field not in meta["field_traces"]:
+                meta["field_traces"][field] = []
+            meta["field_traces"][field].append({
+                "prior_value": current_value,
+                "changed_at": now,
+            })
+            field_traces_delta[field] = {"prior_value": current_value, "changed_at": now}
+
+            # Apply the new value.
+            if field == "aliases":
+                # Accept list or CSV string — normalize to list.
+                if isinstance(new_value, list):
+                    new_value = [str(a).strip() for a in new_value if str(a).strip()]
+                elif isinstance(new_value, str):
+                    new_value = [s.strip() for s in new_value.split(",") if s.strip()]
+                meta["aliases"] = new_value
+            elif field == "trust_tier":
+                if str(new_value) not in TIER_RANK:
+                    return json.dumps({
+                        "error": f"Invalid trust_tier '{new_value}'. "
+                                 f"Must be one of: {', '.join(sorted(TIER_RANK, key=lambda t: TIER_RANK[t], reverse=True))}"
+                    })
+                meta[field] = str(new_value)
+            else:
+                meta[field] = new_value
+
+            updated_fields[field] = new_value
+
+            if field == "trust_tier":
+                trust_tier_changed = True
+
+        # Persist metadata update (no new node, same node_id).
+        update_sql = "UPDATE nodes SET metadata = ?"
+        update_params: list = [json.dumps(meta)]
+
+        # Keep nodes.trust_tier column in sync when trust_tier is updated.
+        if trust_tier_changed:
+            update_sql += ", trust_tier = ?"
+            update_params.append(str(updates["trust_tier"]))
+
+        update_sql += " WHERE id = ?"
+        update_params.append(node_id.strip())
+        conn.execute(update_sql, update_params)
+
+        core._log_edit(conn, "person_field_updated", node_id.strip(), "person", {
+            "updated_fields": updated_fields,
+            "reason": reason or None,
+        })
+
+        # Emit field-value-changed cascade flags to all nodes that cite this person.
+        # Coarse-emit: node-scoped — any node with a cites or about edge to this
+        # person gets flagged. Carries field + prior_value in each flag entry.
+        # trust_tier changes → elevated (review_required=True, non-dismissible).
+        # All other changes → cheap (dismissible on prior→new triage).
+        flagged_nodes = []
+        citing_rows = conn.execute(
+            "SELECT DISTINCT source_id FROM edges "
+            "WHERE target_id = ? AND relation IN ('cites', 'about', 'derives_from')",
+            (node_id.strip(),),
+        ).fetchall()
+        for citing in citing_rows:
+            src = citing["source_id"]
+            src_row = conn.execute(
+                "SELECT id, type, metadata FROM nodes WHERE id = ? AND is_current = 1",
+                (src,),
+            ).fetchone()
+            if not src_row:
+                continue
+            src_meta = json.loads(src_row["metadata"] or "{}")
+            if "field_changed_flags" not in src_meta:
+                src_meta["field_changed_flags"] = []
+            for field, new_value in updates.items():
+                prior = field_traces_delta[field]["prior_value"]
+                flag_entry = {
+                    "person_id": node_id.strip(),
+                    "field": field,
+                    "prior_value": prior,
+                    "new_value": new_value,
+                    "changed_at": now,
+                    "review_required": field == "trust_tier",
+                    "dismissible": field != "trust_tier",
+                }
+                src_meta["field_changed_flags"].append(flag_entry)
+            conn.execute(
+                "UPDATE nodes SET metadata = ? WHERE id = ?",
+                (json.dumps(src_meta), src),
+            )
+            flagged_nodes.append(src)
+
+        conn.commit()
+
+        return json.dumps({
+            "status": "updated",
+            "node_id": node_id.strip(),
+            "updated_fields": updated_fields,
+            "field_traces_delta": field_traces_delta,
+            "cascade_flagged_nodes": flagged_nodes,
+            "cascade_flag_type": "field-value-changed",
+            "trust_tier_elevated": trust_tier_changed,
         })
     finally:
         conn.close()
+
+
+def _add_special_moment_impl(
+    person_id: str = "",
+    description: str = "",
+    node_id: str = "",
+) -> str:
+    """Add a special moment to a person node (§3 — called from link_about Stage 2).
+
+    Appends {description, node_id, added_at} to metadata.special_moments.
+    Max 7 slots: when beyond cap, the oldest entry is removed from the list
+    (but the about-edge from that entry's node_id remains — the edge IS the
+    full history; special_moments is the highlights reel).
+
+    Validates that node_id references a real current node.
+
+    Args:
+        person_id: pn_NNNN to update.
+        description: Qualitative description of the moment (agent's read).
+        node_id: The observation or other node this moment is anchored to.
+
+    Returns:
+        JSON with status and the updated special_moments list.
+    """
+    if not person_id or not person_id.strip():
+        return json.dumps({"error": "person_id is required."})
+    if not description or not description.strip():
+        return json.dumps({"error": "description is required."})
+    if not node_id or not node_id.strip():
+        return json.dumps({"error": "node_id is required (epistemic anchor for the moment)."})
+
+    conn = core._get_db()
+    try:
+        pn_row = conn.execute(
+            "SELECT id, type, is_current, metadata FROM nodes WHERE id = ?",
+            (person_id.strip(),),
+        ).fetchone()
+        if not pn_row:
+            return json.dumps({"error": f"Person node '{person_id}' not found."})
+        if pn_row["type"] != "person":
+            return json.dumps({
+                "error": f"Node '{person_id}' is type '{pn_row['type']}', not 'person'."
+            })
+        if not pn_row["is_current"]:
+            return json.dumps({
+                "error": f"Person node '{person_id}' is not current (retracted or superseded)."
+            })
+
+        # Validate the anchor node exists and is current.
+        anchor = conn.execute(
+            "SELECT id, is_current FROM nodes WHERE id = ?", (node_id.strip(),)
+        ).fetchone()
+        if not anchor:
+            return json.dumps({
+                "error": f"Anchor node '{node_id}' not found. node_id must reference a real node."
+            })
+        if not anchor["is_current"]:
+            return json.dumps({
+                "error": f"Anchor node '{node_id}' is not current (retracted or superseded). "
+                         f"Use engram_inspect('{node_id}') to find the current successor."
+            })
+
+        meta = json.loads(pn_row["metadata"] or "{}")
+        moments = meta.get("special_moments", [])
+
+        now = core._now()
+        new_entry = {
+            "description": description.strip(),
+            "node_id": node_id.strip(),
+            "added_at": now,
+        }
+
+        # Rotation: when at or above cap, remove oldest (about-edge stays).
+        if len(moments) >= _SPECIAL_MOMENTS_CAP:
+            moments.pop(0)  # oldest entry removed from highlights; about-edge preserved
+
+        moments.append(new_entry)
+        meta["special_moments"] = moments
+
+        conn.execute(
+            "UPDATE nodes SET metadata = ? WHERE id = ?",
+            (json.dumps(meta), person_id.strip()),
+        )
+        core._log_edit(conn, "special_moment_added", person_id.strip(), "person", {
+            "anchor_node_id": node_id.strip(),
+        })
+        conn.commit()
+
+        return json.dumps({
+            "status": "added",
+            "person_id": person_id.strip(),
+            "special_moments": moments,
+            "slot_count": len(moments),
+            "cap": _SPECIAL_MOMENTS_CAP,
+        })
+    finally:
+        conn.close()
+
 
 
 # ---------------------------------------------------------------------------

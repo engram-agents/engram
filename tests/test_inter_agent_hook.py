@@ -740,3 +740,92 @@ class TestGetAgentName:
         result = self.hook._get_agent_name({})
         assert result == "localdev"
 
+
+
+# ---------------------------------------------------------------------------
+# Flattened-topology regression (gh#1657 -- _hooklib extraction, slice 2)
+# ---------------------------------------------------------------------------
+
+import subprocess
+
+
+def test_hooklib_resolution_in_flattened_deployed_topology(tmp_path):
+    """The plugin build FLATTENS hooks/claude/ -> hooks/, so the deployed
+    inter-agent hook sits one level shallower than source, AND _hooklib.py
+    (its sibling since gh#1657 slice 2) AND _prompthooklib.py (its sibling
+    since gh#1680 slice 1) must both be found alongside it in that same
+    flattened layout. Mirrors the baton hook's own regression test (added
+    in slice 1), per Aleph's review note on PR #1726: keep the per-hook
+    flattened-topology test as each hook is re-pointed, so a future
+    build-layout change can't silently break resolution for one hook while
+    the others still pass. Extended for gh#1680 slice 1 to also confirm
+    (b) config loads, (c) agent name resolves, (d) emit_context prints the
+    identical additionalContext envelope -- all now delegated to
+    _prompthooklib rather than defined locally.
+    """
+    root = tmp_path / "engram"
+    (root / "hooks").mkdir(parents=True)
+    (root / "tools").mkdir()
+    hooklib_src = (
+        Path(__file__).parent.parent
+        / "src" / "engram" / "hooks" / "claude" / "_hooklib.py"
+    )
+    prompthooklib_src = (
+        Path(__file__).parent.parent
+        / "src" / "engram" / "hooks" / "claude" / "_prompthooklib.py"
+    )
+    (root / "hooks" / "engram-inter-agent-prompt-hook.py").write_text(HOOK_PATH.read_text())
+    (root / "hooks" / "_hooklib.py").write_text(hooklib_src.read_text())
+    (root / "hooks" / "_prompthooklib.py").write_text(prompthooklib_src.read_text())
+    # Stub forum_api.py so the import can succeed.
+    (root / "tools" / "forum_api.py").write_text(
+        "class ForumClient:\n"
+        "    def __init__(self, *a, **k): pass\n"
+        "class ForumNetworkError(Exception): pass\n"
+        "class ForumHttpError(Exception):\n"
+        "    def __init__(self, status=0, body=''): self.status=status; self.body=body\n"
+        "def forum_url_from_config(config): return 'http://localhost:5002'\n"
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.json").write_text(json.dumps({"agent_name": "luria", "mode": "multi"}))
+
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_ROOT"}
+    env["ENGRAM_HOME"] = str(home)
+    probe_script = (
+        "import importlib.util, sys, io, json, contextlib\n"
+        "spec = importlib.util.spec_from_file_location('hook', "
+        f"  r'{root}/hooks/engram-inter-agent-prompt-hook.py')\n"
+        "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)\n"
+        "print('resolved' if mod._FORUM_API_OK and mod._TOOLS_DIR is not None else 'broken')\n"
+        "cfg = mod._load_config()\n"
+        "print('config_ok' if cfg.get('agent_name') == 'luria' else f'config_broken:{cfg!r}')\n"
+        "name = mod._get_agent_name(cfg)\n"
+        "print('name_ok' if name == 'luria' else f'name_broken:{name!r}')\n"
+        "buf = io.StringIO()\n"
+        "with contextlib.redirect_stdout(buf):\n"
+        "    mod._emit_context('hello world')\n"
+        "envelope = json.loads(buf.getvalue())\n"
+        "expected = {'hookSpecificOutput': {'hookEventName': 'UserPromptSubmit', 'additionalContext': 'hello world'}}\n"
+        "print('emit_ok' if envelope == expected else f'emit_broken:{envelope!r}')\n"
+    )
+    r = subprocess.run(
+        [sys.executable, "-c", probe_script],
+        capture_output=True, text=True, env=env,
+    )
+    assert "resolved" in r.stdout, (
+        "deployed-topology hook failed to resolve _hooklib/forum_api via "
+        f"walk-parents (stdout={r.stdout!r} stderr={r.stderr!r})"
+    )
+    assert "config_ok" in r.stdout, (
+        f"deployed-topology hook failed to load config via _prompthooklib "
+        f"(stdout={r.stdout!r} stderr={r.stderr!r})"
+    )
+    assert "name_ok" in r.stdout, (
+        f"deployed-topology hook failed to resolve agent name via _prompthooklib "
+        f"(stdout={r.stdout!r} stderr={r.stderr!r})"
+    )
+    assert "emit_ok" in r.stdout, (
+        f"deployed-topology hook's emit_context envelope diverged "
+        f"(stdout={r.stdout!r} stderr={r.stderr!r})"
+    )

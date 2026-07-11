@@ -47,10 +47,10 @@ def _set_recall_summaries_impl(payload_json: str) -> str:
     # -- Parse payload --
     try:
         payload = json.loads(payload_json)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         return json.dumps({
             "error": "invalid JSON in payload_json",
-            "got": payload_json[:100],
+            "got": str(payload_json)[:100],
         })
 
     if not isinstance(payload, dict) or not isinstance(payload.get("summaries"), list):

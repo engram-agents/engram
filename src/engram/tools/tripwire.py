@@ -14,6 +14,23 @@ Two signals count as falsifiable:
 
 Review bodies from gh api .../reviews do NOT count as traces.
 
+What the grade means (scope — do not over-read):
+  - Falsifiable-grade certifies CONTACT with the locus (the approver
+    demonstrably engaged a specific line / section / premise), NEVER that
+    their conclusion is correct. A commit or line-anchored comment proves the
+    approver touched the artifact; it says nothing about whether their take is
+    right. Same cut as "attestation-grade != render-fidelity": a grade attaches
+    to the event/contact, never to the meaning/correctness layered on it.
+  - The property is DELIVERABLE-AGNOSTIC. A falsifiable trace is an attestation
+    anchored to a checkable *locus* in the artifact, whatever the artifact is:
+    a line (code), a named section (spec / design doc), or a premise (an ENGRAM
+    derivation that derives_from it with a real logical_chain). A bare "looks
+    sound" attached to no locus is say-so-grade regardless of deliverable type.
+    This v0.1 tool checks the CODE instance only (commits + PR line-comments,
+    where the gh endpoints live); a locus-aware v2 would generalize to design /
+    graph deliverables. The docstring states the property; the tool implements
+    one instance of it.
+
 Config inference (when --approver is omitted):
   self_lineage contains "opus"   → approver = agent_name  (self-check)
   self_lineage contains "sonnet" → approver = peer field

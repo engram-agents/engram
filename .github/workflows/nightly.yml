@@ -1,0 +1,62 @@
+name: nightly
+
+# Scheduled full pytest suite on dev (#1656, Lei-endorsed 2026-07-04).
+#
+# Since #1597 demoted affected-tests off per-PR CI, no tests run on dev PRs —
+# so the dev→main release cut was the first end-to-end exercise, catching latent
+# breakage weeks late (RELEASING.md documented exactly this on rc2). This nightly
+# run closes that gap: breakage merged to dev surfaces within ~a day, at a
+# fraction of per-PR cost. It COMPLEMENTS, does not replace: the cheap per-PR
+# scrub gates, the local full-suite run convention on PRs, and the main-only
+# release gate (tests.yml).
+#
+# Scheduled workflows run from the DEFAULT branch (dev) and check it out by
+# default — so this exercises dev, which is the whole point.
+on:
+  schedule:
+    # 07:37 UTC daily — deliberately off-peak and off-:00. GitHub queues
+    # on-the-hour scheduled runs heavily and can skip them under load; an
+    # odd minute lands far more reliably.
+    - cron: "37 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      # Don't cancel 3.12 just because 3.11 failed (or vice versa) — we want
+      # the full signal from a nightly, not a first-failure abort.
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      # Skip the optional sentence-transformers embedding path so we don't pay
+      # the ~500MB model download per run. Tests pass either way. (Mirrors
+      # tests.yml / affected-tests.yml.)
+      ENGRAM_NO_EMBEDDINGS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements/requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements/requirements-dev.txt
+          # src/forum/tests/ import forum.server (Flask + bleach + markdown-it-py +
+          # beautifulsoup4 + html5lib) — deps live in src/forum/requirements.txt,
+          # not the main requirements. (Same as tests.yml.)
+          pip install -r src/forum/requirements.txt
+
+      - name: Run full pytest suite
+        # Same explicit paths as tests.yml (pytest.ini sets no testpaths):
+        # the main suite AND src/forum/tests/.
+        run: pytest tests/ src/forum/tests/ -v --tb=short
