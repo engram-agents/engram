@@ -80,6 +80,7 @@ import re
 import socket
 import sqlite3
 import subprocess
+from datetime import date
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -881,11 +882,84 @@ def _add_evidence_impl(
         conn.close()
 
 
+# Allowlist for session_id path components: UUID-ish / hyphenated hex tokens
+# only. session_id is untrusted input used to build a filesystem path — this
+# gate MUST run before any filesystem access to block '../' traversal (do
+# NOT rely on the marker file simply not existing).
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _resolve_session_transcript(session_id: str) -> dict:
+    """Resolve a session_id (as injected at Claude Code session start) to a
+    citable transcript file:// url + a derived title.
+
+    Reads ``<engram_core.DATA_DIR>/sessions/<session_id>.json`` (the marker
+    written by the SessionStart hook) and its ``transcript_path`` field.
+    Never raises — every failure mode is returned as {"error": "..."}.
+
+    Returns {"url": "file://...", "title": "Chat log YYYY-MM-DD"} on success.
+    """
+    if not session_id or not _SESSION_ID_RE.fullmatch(session_id):
+        return {
+            "error": (
+                f"Invalid session_id {session_id!r}: must contain only letters, "
+                "digits, '_', '-' (no '/', '\\', '.', or other path separators). "
+                "Pass an explicit 'url' instead."
+            )
+        }
+
+    marker_path = core.DATA_DIR / "sessions" / f"{session_id}.json"
+    try:
+        with open(marker_path, "r", encoding="utf-8") as f:
+            marker = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {
+            "error": (
+                f"No session marker at {marker_path} (or unreadable); "
+                "pass an explicit 'url' instead."
+            )
+        }
+
+    transcript_path = marker.get("transcript_path") or ""
+    if not transcript_path:
+        return {
+            "error": (
+                f"Session marker at {marker_path} has no 'transcript_path' "
+                "(or unreadable); pass an explicit 'url' instead."
+            )
+        }
+
+    if not os.path.exists(transcript_path):
+        return {
+            "error": (
+                f"Transcript file '{transcript_path}' (from session marker "
+                f"{marker_path}) does not exist on disk. The session may not "
+                "have flushed yet, or the marker is stale. Pass an explicit "
+                "'url' instead."
+            )
+        }
+
+    started_at = marker.get("started_at") or ""
+    date_str = ""
+    if len(started_at) >= 10 and started_at[4:5] == "-" and started_at[7:8] == "-":
+        date_str = started_at[:10]
+    else:
+        try:
+            date_str = date.fromtimestamp(os.path.getmtime(transcript_path)).isoformat()
+        except OSError:
+            date_str = ""
+
+    return {
+        "url": "file://" + transcript_path,
+        "title": f"Chat log {date_str}".rstrip(),
+    }
+
+
 def _add_observation_impl(
     quoted_text: str = "",
     interpretation: str = "",
     claim: str = "",
-    quote_type: str = "",
+    quote_type: Optional[str] = None,
     url: str = "",
     title: str = "",
     domain: str = "",
@@ -894,7 +968,7 @@ def _add_observation_impl(
     is_predictive: bool = False,
     predicted_event: str = "",
     resolution_timeframe: str = "",
-    source_class: str = "external",
+    source_class: Optional[str] = None,
     content_hash: str = "",
     git_sha: str = "",
     standpoint_author_id: str = "",
@@ -905,10 +979,22 @@ def _add_observation_impl(
     fs_class=None,
     source_repo: str = "",
     repo_path: str = "",
+    session_id: str = "",
 ) -> str:
     """Internal implementation — see engram_add_observation MCP tool for the
     public payload schema. Kept callable with named kwargs for in-server
     callers (engram_add_observation_batch, engram_retract replacement path).
+
+    NOTE on source_class default: the signature default is None (sentinel for
+    "caller truly omitted it"), not "external" — this lets the session_id path
+    apply its own ergonomic default (user_stated) only when the caller truly
+    omitted the field, without stomping an explicit choice. Using None (not
+    "") matters: a caller that explicitly passes source_class="" must still
+    hit the VALID_SOURCE_CLASSES rejection below, not be silently defaulted —
+    only true omission (None) triggers a default. The historical "external"
+    default is restored just below when session_id is not the source.
+    Callers that always pass source_class explicitly (the batch impl) are
+    unaffected either way.
     """
     # Per the bool-string-truthy lesson: bool-string truthy trap at wrapper boundary. JSON-string
     # "false" is truthy in Python, so an `is_predictive: "false"` payload
@@ -924,6 +1010,41 @@ def _add_observation_impl(
                 "JSON encodes `true`/`false` not `\"true\"`/`\"false\"`."
             )
         })
+
+    # session_id resolution — precedence evidence_id > url > session_id.
+    # Runs BEFORE the required-field check below because it may supply
+    # ergonomic defaults for quote_type/source_class, and before evidence
+    # resolution because it may supply url/title. Feeds into the EXISTING
+    # auto-create/reuse-by-url evidence path unchanged — no duplicated logic.
+    if session_id:
+        if evidence_id or url:
+            return json.dumps({
+                "error": (
+                    "Provide exactly one source form: 'session_id' (cite the "
+                    "current chat), 'url' (+ 'title'), or 'evidence_id' — "
+                    "not more than one."
+                )
+            })
+        _session_resolved = _resolve_session_transcript(session_id)
+        if _session_resolved.get("error"):
+            return json.dumps({"error": _session_resolved["error"]})
+        url = _session_resolved["url"]
+        title = _session_resolved["title"]
+        # Ergonomic defaults — ONLY on the session_id path. The url/
+        # evidence_id paths keep today's behavior (quote_type stays
+        # required there; source_class stays defaulted to "external" below).
+        if quote_type is None:
+            quote_type = "personal_communication"
+        if source_class is None:
+            source_class = "user_stated"
+
+    # Restore the historical default now that the session_id ergonomic
+    # default (if any) has had its chance to apply. Only true omission
+    # (None) defaults here — an explicit source_class="" from a caller
+    # falls through unchanged to the VALID_SOURCE_CLASSES check below and
+    # errors loudly, matching pre-session_id dev behavior.
+    if source_class is None:
+        source_class = "external"
 
     missing = [
         name for name, val in (

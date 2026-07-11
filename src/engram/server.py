@@ -1535,6 +1535,7 @@ _ADD_OBSERVATION_FIELDS = frozenset({
     "fs_class",
     "source_repo",
     "repo_path",
+    "session_id",
 })
 
 
@@ -1575,11 +1576,23 @@ def engram_add_observation(payload_json: str) -> str:
     Pass all fields as one JSON object string in payload_json.
 
     Source identification: provide EITHER url+title (evidence node auto-created
-    or reused) OR evidence_id (cite an existing evidence node). If both given,
-    evidence_id takes precedence.
+    or reused) OR evidence_id (cite an existing evidence node) OR session_id
+    (cite the current chat — the server resolves the transcript for you).
+    evidence_id takes precedence over url when both are given (pre-existing
+    behavior); session_id may not be combined with url or evidence_id —
+    passing it alongside either is an error.
 
     If is_predictive=true, also creates or links a Prediction node for the
     forward-looking claim. Pass predicted_event to name the target.
+
+    Simplest — citing the CURRENT chat (pass your injected session_id; the
+    server resolves the transcript, defaults quote_type=personal_communication
+    + source_class=user_stated; a wrong or stale session_id fails loud via the
+    same server-side verbatim-quote check used by every other filing path —
+    no separate verify step needed, but the quote must still be an exact
+    substring of the transcript):
+        {"quoted_text": "...", "interpretation": "...", "claim": "...",
+         "session_id": "<the session id injected at session start / shown in your banner>"}
 
     Common usage — citing the user's chat log as evidence
     (the most common friction point for new sessions; verbatim-quote check is
@@ -1632,16 +1645,17 @@ def engram_add_observation(payload_json: str) -> str:
             quoted_text (str, required): Exact quote from the source document.
             interpretation (str, required): Agent's reasoning about what this quote means.
             claim (str, required): The atomic, falsifiable claim this observation supports.
-            quote_type (str, required): One of: hard_data, official_statement, attributed_analysis, counterfactual_inference, unnamed_source, personal_communication, editorial.
+            quote_type (str, required unless session_id is set): One of: hard_data, official_statement, attributed_analysis, counterfactual_inference, unnamed_source, personal_communication, editorial. When session_id is the source and quote_type is omitted, it defaults to 'personal_communication'.
             url (str, optional): URL of the source document. The evidence node is auto-created or reused.
             title (str, optional): Title of the source document (required if url is provided).
             domain (str, optional): Source domain (auto-extracted from URL if omitted).
             source_date (str, optional): Publication date in ISO format (e.g. '2026-03-20').
-            evidence_id (str, optional): ID of an existing evidence node. Use this OR url+title, not both.
+            evidence_id (str, optional): ID of an existing evidence node. Use this OR url+title OR session_id, not more than one.
+            session_id (str, optional): The current session's id (as injected at session start). The server resolves it to the session's transcript via <DATA_DIR>/sessions/<session_id>.json and cites that as the evidence source — mutually exclusive with url and evidence_id (passing session_id alongside either is an error). When session_id is the source, quote_type defaults to 'personal_communication' and source_class defaults to 'user_stated' if omitted. A wrong/stale session_id fails loud via the same server-side verbatim-quote check as every other path — it does not bypass verification.
             is_predictive (bool, optional): Whether this observation records a forward-looking prediction.
             predicted_event (str, optional): Required if is_predictive. The event being predicted.
             resolution_timeframe (str, optional): Optional timeframe for when the prediction should be resolvable.
-            source_class (str, optional): Epistemic origin — 'external' (default), 'introspective' (×0.95 confidence discount), or 'user_stated'.
+            source_class (str, optional): Epistemic origin — 'external' (default; 'user_stated' when session_id is the source and source_class is omitted), 'introspective' (×0.95 confidence discount), or 'user_stated'.
             content_hash (str, optional): SHA-256 hash of file content (for file-based evidence).
             git_sha (str, optional): Git commit SHA when the file was read (for file-based evidence).
             standpoint_author_id (str, optional): Persistent cross-session entity ID for who
