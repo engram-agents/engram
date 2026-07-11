@@ -120,8 +120,9 @@ def build_match_target(hook_input: dict) -> str:
 # the spawn the tripwire already pays for.
 #
 # Novelty gate (all must pass, else silence):
-#   1. config auto_surface.in_turn_recall.enabled is true (default FALSE —
-#      flips on only after replay-bench blesses the latency, per blueprint)
+#   1. config auto_surface.in_turn_recall.enabled is true (default TRUE +
+#      zero cooldown since v0.3.0 — #1746, validated by the zero-cooldown
+#      ledger experiment; enabled=false is the per-install kill-switch)
 #   2. cooldown: ≥ cooldown_seconds since the last in-turn fire (cheap
 #      state-file check, runs before any DB work)
 #   3. the pending tool call's args contain ≥1 high-IDF term not seen in
@@ -165,8 +166,14 @@ def _in_turn_config() -> dict:
     verbatim (absolute override; existing configs keep exact behavior).
     """
     defaults = {
-        "enabled": False,
-        "cooldown_seconds": 60,
+        # Defaults flipped for v0.3.0 (#1746, Lei's 2026-07-10 ruling): the
+        # release-candidate default is ON with ZERO channel cooldown — the
+        # n=252 zero-cooldown ledger showed junk fires render nothing and
+        # cost ~0.7s daemon time/hr, while the render-side layers (recent_ids
+        # + term-set memory) handle repetition. cooldown_seconds is retained
+        # as a config knob (and kill-switch enabled=false stays documented).
+        "enabled": True,
+        "cooldown_seconds": 0,
         "max_lines": 3,
         "min_idf": None,
         "min_idf_ratio": 0.7,

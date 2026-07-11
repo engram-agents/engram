@@ -171,7 +171,22 @@ def _daemon_result(ids):
     }
 
 
-def test_disabled_by_default(tmp_path):
+def test_enabled_by_default_with_zero_cooldown(tmp_path):
+    """v0.3.0 default flip (#1746, Lei 2026-07-10): ON + zero cooldown."""
+    hook = _load_hook(str(tmp_path))
+    cfg = hook._in_turn_config()
+    assert cfg["enabled"] is True
+    assert cfg["cooldown_seconds"] == 0
+
+
+def test_disabled_via_kill_switch(tmp_path):
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path), enabled=False)
+    assert hook.check_in_turn_recall("engram_derive some novel thing") == ""
+
+
+def test_fails_safe_with_no_db(tmp_path):
+    """Defaults-on with no knowledge.db: gate 3's ro-connect fails -> silent."""
     hook = _load_hook(str(tmp_path))
     assert hook.check_in_turn_recall("engram_derive some novel thing") == ""
 
@@ -194,12 +209,12 @@ def test_fires_and_updates_state(tmp_path, monkeypatch):
 
 def test_cooldown_suppresses_second_fire(tmp_path, monkeypatch):
     hook = _load_hook(str(tmp_path))
-    _enable(hook, str(tmp_path))
+    _enable(hook, str(tmp_path), cooldown_seconds=60)  # explicit: tests the throttle
     _stub_idf([["alpha"], ["beta"]])
     monkeypatch.setattr(hook, "_query_recall_daemon", lambda q, top_k=5: _daemon_result(["ob_1"]))
 
     assert hook.check_in_turn_recall("first alpha call")
-    # beta is novel, but the cooldown (default 60s) blocks before IDF runs
+    # beta is novel, but the 60s cooldown blocks before IDF runs
     assert hook.check_in_turn_recall("second beta call") == ""
 
 
@@ -285,7 +300,7 @@ def test_near_miss_still_stamps_cooldown(tmp_path, monkeypatch):
     otherwise near-misses re-trigger the daemon on every tool call (#1696
     reviewer-fairy empirical repro: 5 unthrottled daemon hits in a row)."""
     hook = _load_hook(str(tmp_path))
-    _enable(hook, str(tmp_path))  # default 60s cooldown
+    _enable(hook, str(tmp_path), cooldown_seconds=60)  # explicit: tests the throttle mechanism
     _stub_idf([["theta"], ["iota"], ["kappa"]])
     daemon_calls = {"n": 0}
 
@@ -612,7 +627,7 @@ def test_ledger_appends_one_line_for_rendered_fire(tmp_path, monkeypatch):
     assert entry["outcome"] == "rendered"
     assert entry["rendered_ids"] == ["ob_1", "ob_2"]
     assert entry["novel_terms"] == ["replay", "harness"]
-    assert entry["cooldown_seconds"] == 60
+    assert entry["cooldown_seconds"] == 0  # v0.3.0 default (#1746)
     assert entry["session_id"] == "sess_1"
     assert entry["transcript_path"] == "/tmp/t.jsonl"
     assert entry["tool_name"] == "Bash"
