@@ -516,7 +516,12 @@ class TestLoopGatePresence:
         mod = _load_module()
         _setup(mod, tmp_path, monkeypatch, stamp_age=60)
         # Ensure presence is absent from sys.modules (do not inject a mock).
-        monkeypatch.delitem(sys.modules, "presence", raising=False)
+        # setitem-None (not delitem): delitem only clears the cache — if an
+        # earlier test made a real `presence` importable (sys.path pollution),
+        # the gate re-imports it and the "not importable" premise silently
+        # breaks under full-suite ordering. None poisons the slot so `import
+        # presence` raises ImportError deterministically.
+        monkeypatch.setitem(sys.modules, "presence", None)
 
         decision, defer_seconds, reason = mod.loop_gate_decision()
 
@@ -528,7 +533,12 @@ class TestLoopGatePresence:
         """When presence is NOT importable, no stamp → not-engaged (unchanged #1469)."""
         mod = _load_module()
         _setup(mod, tmp_path, monkeypatch)  # no stamp
-        monkeypatch.delitem(sys.modules, "presence", raising=False)
+        # setitem-None (not delitem): delitem only clears the cache — if an
+        # earlier test made a real `presence` importable (sys.path pollution),
+        # the gate re-imports it and the "not importable" premise silently
+        # breaks under full-suite ordering. None poisons the slot so `import
+        # presence` raises ImportError deterministically.
+        monkeypatch.setitem(sys.modules, "presence", None)
 
         decision, defer_seconds, reason = mod.loop_gate_decision()
 

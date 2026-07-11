@@ -1456,8 +1456,8 @@ def _add_observation_impl(
                     # Plain \b is Unicode-aware and treats CJK characters as
                     # \w, so it forms no boundary between a CJK char and an
                     # adjacent ASCII term — it silently misses "Lei" in
-                    # "我见到了Lei昨天" just as much as it misses "石磊" in
-                    # "我和石磊讨论了" (verified empirically: branching only on
+                    # "我见到了Wei昨天" just as much as it misses "王伟" in
+                    # "我和王伟讨论了" (verified empirically: branching only on
                     # term.isascii() still fails the ASCII-glued-to-CJK case,
                     # since \b itself is the thing that can't see a CJK-vs-
                     # ASCII transition as a boundary). Fix: define "boundary"

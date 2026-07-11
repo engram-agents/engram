@@ -49,7 +49,7 @@ def test_add_person_typed_fields_accepted():
     """Full typed-field payload creates a person with correct metadata."""
     server = fresh_server()
     payload = {
-        "name": "the child",
+        "name": "Mira",
         "relation": "daughter",
         "pronouns": "she/her",
         "trust_tier": "user_family",
@@ -61,7 +61,7 @@ def test_add_person_typed_fields_accepted():
     assert "error" not in r, r
     pid = r["person_id"]
     assert pid.startswith("pn_"), r
-    assert r["name"] == "the child"
+    assert r["name"] == "Mira"
     assert r["relation"] == "daughter"
 
     # Verify metadata contains typed fields
@@ -73,7 +73,7 @@ def test_add_person_typed_fields_accepted():
         ).fetchone()
         assert row is not None
         meta = json.loads(row["metadata"])
-        assert meta["name"] == "the child"
+        assert meta["name"] == "Mira"
         assert meta["relation"] == "daughter"
         assert meta["pronouns"] == "she/her"
         assert meta["trust_tier"] == "user_family"
@@ -83,7 +83,7 @@ def test_add_person_typed_fields_accepted():
         assert meta["special_moments"] == []        # §3: initialized empty
         assert meta["field_traces"] == {}           # §2: empty at creation
         # claim = "name — relation"
-        assert row["claim"] == "the child — daughter"
+        assert row["claim"] == "Mira — daughter"
         # trust_tier column set
         assert row["trust_tier"] == "user_family"
     finally:
@@ -187,7 +187,7 @@ def test_update_person_mutable_fields_traced():
     """Updating mutable fields stores prior values in field_traces."""
     server = fresh_server()
     r = json.loads(server.engram_add_person(payload_json=json.dumps({
-        "name": "the child",
+        "name": "Mira",
         "relation": "external",
         "trust_tier": "known_external",
     })))
@@ -472,38 +472,38 @@ def test_stage1_suggestion_fires_on_cjk_alias():
     \\b forms no boundary between adjacent CJK characters and a \\w-class
     term (Python's re treats CJK as \\w), so a pure word-boundary match
     silently misses bilingual mentions — exactly the case this feature is
-    meant to serve (aliases like ["Lei", "石磊"]).
+    meant to serve (aliases like ["Wei", "王伟"]).
     """
     server = fresh_server()
     r = json.loads(server.engram_add_person(payload_json=json.dumps({
-        "name": "ShiLei",
-        "aliases": ["Lei", "石磊"],
+        "name": "WangWei",
+        "aliases": ["Wei", "王伟"],
     })))
     assert "error" not in r, r
 
     obs = json.loads(server.engram_add_observation(payload_json=json.dumps({
-        "claim": "我和石磊讨论了这个设计",
-        "quoted_text": "石磊讨论了这个设计",
-        "interpretation": "discussed the design with Shi Lei",
+        "claim": "我和王伟讨论了这个设计",
+        "quoted_text": "王伟讨论了这个设计",
+        "interpretation": "discussed the design with Wang Wei",
         "quote_type": "personal_communication",
         "url": "https://example.com/test-evidence",
         "title": "test evidence",
     })))
     assert "person_mentions" in obs, f"CJK alias not detected: {obs}"
-    match = next((p for p in obs["person_mentions"] if p["person_name"] == "ShiLei"), None)
-    assert match is not None, f"ShiLei not found via CJK alias in: {obs['person_mentions']}"
+    match = next((p for p in obs["person_mentions"] if p["person_name"] == "WangWei"), None)
+    assert match is not None, f"WangWei not found via CJK alias in: {obs['person_mentions']}"
 
     obs2 = json.loads(server.engram_add_observation(payload_json=json.dumps({
-        "claim": "我见到了Lei昨天",
-        "quoted_text": "见到了Lei昨天",
-        "interpretation": "saw Lei yesterday",
+        "claim": "我见到了Wei昨天",
+        "quoted_text": "见到了Wei昨天",
+        "interpretation": "saw Wei yesterday",
         "quote_type": "personal_communication",
         "url": "https://example.com/test-evidence-2",
         "title": "test evidence 2",
     })))
     assert "person_mentions" in obs2, f"ASCII-alias-glued-to-CJK not detected: {obs2}"
-    match2 = next((p for p in obs2["person_mentions"] if p["person_name"] == "ShiLei"), None)
-    assert match2 is not None, f"ShiLei not found via ASCII-in-CJK alias in: {obs2['person_mentions']}"
+    match2 = next((p for p in obs2["person_mentions"] if p["person_name"] == "WangWei"), None)
+    assert match2 is not None, f"WangWei not found via ASCII-in-CJK alias in: {obs2['person_mentions']}"
 
 
 def test_stage1_no_match_no_suggestion():

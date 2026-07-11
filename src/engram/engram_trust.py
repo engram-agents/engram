@@ -104,7 +104,7 @@ def _add_person_impl(
                     If provided here, sets both metadata.trust_tier and the
                     nodes.trust_tier column.
         aliases: List of alternative names/identifiers for this person used by
-                 the Stage 1 auto-suggest pipeline (e.g. ["Lei", "石磊"]).
+                 the Stage 1 auto-suggest pipeline (e.g. ["Wei", "王伟"]).
                  Also accepted as a comma-separated string for backward compat.
                  Mutable-with-trace.
         location_contact: Address or contact info. Mutable-with-trace.

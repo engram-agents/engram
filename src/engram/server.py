@@ -1651,7 +1651,7 @@ def engram_add_observation(payload_json: str) -> str:
             domain (str, optional): Source domain (auto-extracted from URL if omitted).
             source_date (str, optional): Publication date in ISO format (e.g. '2026-03-20').
             evidence_id (str, optional): ID of an existing evidence node. Use this OR url+title OR session_id, not more than one.
-            session_id (str, optional): The current session's id (as injected at session start). The server resolves it to the session's transcript via <DATA_DIR>/sessions/<session_id>.json and cites that as the evidence source — mutually exclusive with url and evidence_id (passing session_id alongside either is an error). When session_id is the source, quote_type defaults to 'personal_communication' and source_class defaults to 'user_stated' if omitted. A wrong/stale session_id fails loud via the same server-side verbatim-quote check as every other path — it does not bypass verification.
+            session_id (str, optional): The current session's id (as injected at session start). The server resolves it to the session's transcript via the data directory's sessions/<session_id>.json and cites that as the evidence source — mutually exclusive with url and evidence_id (passing session_id alongside either is an error). When session_id is the source, quote_type defaults to 'personal_communication' and source_class defaults to 'user_stated' if omitted. A wrong/stale session_id fails loud via the same server-side verbatim-quote check as every other path — it does not bypass verification.
             is_predictive (bool, optional): Whether this observation records a forward-looking prediction.
             predicted_event (str, optional): Required if is_predictive. The event being predicted.
             resolution_timeframe (str, optional): Optional timeframe for when the prediction should be resolvable.
@@ -3267,7 +3267,7 @@ _ADD_PERSON_FIELDS = frozenset({
 # anchor has metadata.is_self=1; it's the implicit default for engram_link_about
 # when person_id is unset. Exactly ONE self-anchor per graph.
 #
-# aliases field: cross-mapping for names (e.g. Lei Shi / 石磊 / @LeiShi GitHub).
+# aliases field: cross-mapping for names (e.g. Jane Doe / 王伟 / @janedoe GitHub).
 # Recall queries match on any alias, so "did Lei mention X" finds claims
 # linked via the unified pn_NNNN (the primary-user person-node) regardless of which alias was used at filing.
 #

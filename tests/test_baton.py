@@ -1588,32 +1588,32 @@ class TestPoolSentinel:
         assert release_body["pool_sentinel"] == "alice"
 
     def test_sentinel_accepts_short_form_first_token(self, engram_home, monkeypatch):
-        """Pool initialized with turn='lei' works when primary_user='Lei Shi'.
+        """Pool initialized with turn='alex' works when primary_user='Alex Chen'.
 
-        Regression test for issue #1309: _pool_sentinel() returns 'lei shi',
-        but pools are often initialized with just the first token ('lei').
+        Regression test for issue #1309: _pool_sentinel() returns 'alex chen',
+        but pools are often initialized with just the first token ('alex').
         _is_pool_sentinel must accept both forms.
         """
-        lei_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
-        _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
 
         client = _make_client(
             post_return={"seq": 1},
             get_return={"raw": _make_raw_baton(
-                "pool-short-form-test", title="short-form sentinel test", turn="lei",
+                "pool-short-form-test", title="short-form sentinel test", turn="alex",
                 participants="[borges, ariadne]", status="in-progress",
             )},
         )
 
-        # Claim: _is_pool_sentinel("lei") must return True for sentinel "lei shi"
+        # Claim: _is_pool_sentinel("alex") must return True for sentinel "alex chen"
         args_claim = argparse.Namespace(project_id="pool-short-form-test")
-        _baton.cmd_claim(args_claim, lei_config, "borges", client)
+        _baton.cmd_claim(args_claim, owner_config, "borges", client)
 
         _, claim_body = client.post.call_args[0]
         assert claim_body["agent"] == "borges"
-        assert claim_body["pool_sentinel"] == "lei shi"
+        assert claim_body["pool_sentinel"] == "alex chen"
 
         # Simulate server write (borges holds baton after claim)
         client.reset_mock()
@@ -1623,25 +1623,25 @@ class TestPoolSentinel:
         )}
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
 
-        # Release: sentinel must be full "lei shi"
+        # Release: sentinel must be full "alex chen"
         args_release = argparse.Namespace(
             project_id="pool-short-form-test", done=False, reason="released",
         )
-        _baton.cmd_release(args_release, lei_config, "borges", client)
+        _baton.cmd_release(args_release, owner_config, "borges", client)
 
         _, release_body = client.post.call_args[0]
-        assert release_body["pool_sentinel"] == "lei shi"
+        assert release_body["pool_sentinel"] == "alex chen"
 
     def test_merge_gate2_accepts_short_form_sentinel(self, engram_home, monkeypatch, capsys):
-        """baton merge Gate 2 accepts short-form sentinel 'lei' with primary_user='Lei Shi'.
+        """baton merge Gate 2 accepts short-form sentinel 'alex' with primary_user='Alex Chen'.
 
         Regression test for the missed comparison site in cmd_merge (issue #1309):
         Gate 2 used raw != sentinel instead of _is_pool_sentinel, so a PR baton
-        with turn='lei' (short form, written by baton flip) would block merge
+        with turn='alex' (short form, written by baton flip) would block merge
         with "turn is with lei — not presented for merge."
         """
-        lei_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
-        _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
         monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr, repo=None: ("unknown", "no gh"))
@@ -1652,7 +1652,7 @@ class TestPoolSentinel:
         client = _make_client(
             post_return={"seq": 1},
             get_return={"raw": _make_raw_baton(
-                "PR-9999", title="short-form merge gate test", turn="lei",
+                "PR-9999", title="short-form merge gate test", turn="alex",
                 participants="[borges, ariadne]", status="in-progress",
             )},
         )
@@ -1660,7 +1660,7 @@ class TestPoolSentinel:
         # --dry-run --force: skips CI (Gate 3) + approval (Gate 4); no real gh call.
         # Should pass Gate 2 without "not presented for merge" error.
         args = argparse.Namespace(pr="PR-9999", dry_run=True, force=True)
-        _baton.cmd_merge(args, lei_config, "borges", client)
+        _baton.cmd_merge(args, owner_config, "borges", client)
 
         captured = capsys.readouterr()
         assert "gate 2 (turn=sentinel): PASS" in captured.out
@@ -1673,8 +1673,8 @@ class TestPoolSentinel:
         `gh pr merge --squash`, that's the most dangerous instance of the
         whole #1715 bug class. Prove the gate actually fires against the
         ANCHOR's repo, not just that some CI check happened."""
-        lei_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
-        _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
         calls = []
@@ -1688,12 +1688,12 @@ class TestPoolSentinel:
 
         client = _make_client(
             get_return={"raw": _make_raw_baton(
-                "PR-9300", turn="lei", github="pr/engram-agents/engram-paper/9300",
+                "PR-9300", turn="alex", github="pr/engram-agents/engram-paper/9300",
             )},
         )
         args = argparse.Namespace(pr="PR-9300", dry_run=False, force=False)
         with pytest.raises(SystemExit) as exc_info:
-            _baton.cmd_merge(args, lei_config, "borges", client)
+            _baton.cmd_merge(args, owner_config, "borges", client)
 
         assert exc_info.value.code == EXIT_VALIDATION
         assert ("ci", "9300", "engram-agents/engram-paper") in calls
@@ -1705,8 +1705,8 @@ class TestPoolSentinel:
         number is a red flag worth refusing on, not silently picking one --
         this would otherwise be a way for a mismatched/stale anchor to merge
         the wrong PR entirely."""
-        lei_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
-        _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
         monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr, repo=None: ("unknown", "no gh"))
@@ -1714,12 +1714,12 @@ class TestPoolSentinel:
 
         client = _make_client(
             get_return={"raw": _make_raw_baton(
-                "PR-9301", turn="lei", github="pr/engram-agents/engram-paper/9999",
+                "PR-9301", turn="alex", github="pr/engram-agents/engram-paper/9999",
             )},
         )
         args = argparse.Namespace(pr="PR-9301", dry_run=False, force=False)
         with pytest.raises(SystemExit) as exc_info:
-            _baton.cmd_merge(args, lei_config, "borges", client)
+            _baton.cmd_merge(args, owner_config, "borges", client)
 
         assert exc_info.value.code == EXIT_VALIDATION
         client.post.assert_not_called()
@@ -1730,8 +1730,8 @@ class TestPoolSentinel:
         """The actual gate-5 `gh pr merge` invocation must carry --repo --
         this is the single most consequential call in the whole #1715 bug
         class (an irreversible squash-merge)."""
-        lei_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
-        _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
         monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr, repo=None: ("green", "ok"))
@@ -1752,11 +1752,11 @@ class TestPoolSentinel:
         client = _make_client(
             post_return={"seq": 1},
             get_return={"raw": _make_raw_baton(
-                "PR-9302", turn="lei", github="pr/engram-agents/engram-paper/9302",
+                "PR-9302", turn="alex", github="pr/engram-agents/engram-paper/9302",
             )},
         )
         args = argparse.Namespace(pr="PR-9302", dry_run=False, force=False)
-        _baton.cmd_merge(args, lei_config, "borges", client)
+        _baton.cmd_merge(args, owner_config, "borges", client)
 
         assert len(captured_cmds) == 1
         cmd = captured_cmds[0]
@@ -1768,8 +1768,8 @@ class TestPoolSentinel:
         """Backward-compat: a baton with no github anchor at all (pre-#1715)
         still merges, resolving against DEFAULT_GITHUB_REPO rather than
         erroring or leaving repo unresolved."""
-        lei_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
-        _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
         calls = []
@@ -1783,10 +1783,10 @@ class TestPoolSentinel:
 
         client = _make_client(
             post_return={"seq": 1},
-            get_return={"raw": _make_raw_baton("PR-9303", turn="lei")},
+            get_return={"raw": _make_raw_baton("PR-9303", turn="alex")},
         )
         args = argparse.Namespace(pr="PR-9303", dry_run=True, force=False)
-        _baton.cmd_merge(args, lei_config, "borges", client)
+        _baton.cmd_merge(args, owner_config, "borges", client)
 
         assert ("ci", "9303", _baton.DEFAULT_GITHUB_REPO) in calls
 
@@ -1933,30 +1933,30 @@ class TestAddParticipant:
             post_return={"seq": 5, "added": True},
             get_return={"raw": _make_raw_baton("PR-600")},
         )
-        args = argparse.Namespace(project_id="PR-600", participant="lei")
+        args = argparse.Namespace(project_id="PR-600", participant="alex")
         _baton.cmd_add_participant(args, MULTI_CONFIG, "borges", client)
 
         url, body = client.post.call_args[0]
         assert url == "/api/projects/PR-600/participants"
         assert body["agent"] == "borges"
-        assert body["participant"] == "lei"
+        assert body["participant"] == "alex"
 
     def test_add_participant_normalizes_participant_case(self):
         client = _make_client(
             post_return={"seq": 5, "added": True},
             get_return={"raw": _make_raw_baton("PR-601")},
         )
-        args = argparse.Namespace(project_id="PR-601", participant="  LEI ")
+        args = argparse.Namespace(project_id="PR-601", participant="  ALEX ")
         _baton.cmd_add_participant(args, MULTI_CONFIG, "borges", client)
 
         _, body = client.post.call_args[0]
-        assert body["participant"] == "lei"
+        assert body["participant"] == "alex"
 
     def test_add_participant_missing_project_exits_nonzero(self, capsys):
         """add-participant on a non-existent project exits non-zero."""
         client = _make_client()
         client.get.side_effect = ForumHttpError(404, '{"error": "not found"}')
-        args = argparse.Namespace(project_id="PR-NONE", participant="lei")
+        args = argparse.Namespace(project_id="PR-NONE", participant="alex")
 
         with pytest.raises(SystemExit) as exc_info:
             _baton.cmd_add_participant(args, MULTI_CONFIG, "borges", client)
@@ -1968,7 +1968,7 @@ class TestAddParticipant:
         """add-participant with a malformed --project-id exits non-zero before any API call."""
         _write_config(engram_home, "borges")
         rc, stdout, stderr = _run_baton(
-            engram_home, "add-participant", "not a valid id!", "lei",
+            engram_home, "add-participant", "not a valid id!", "alex",
         )
         assert rc != 0
 
@@ -1976,7 +1976,7 @@ class TestAddParticipant:
         """Server-side NotAParticipant (agent not a current participant) → EXIT_VALIDATION."""
         client = _make_client(get_return={"raw": _make_raw_baton("PR-602")})
         client.post.side_effect = ForumHttpError(403, '{"error": "agent not a participant"}')
-        args = argparse.Namespace(project_id="PR-602", participant="lei")
+        args = argparse.Namespace(project_id="PR-602", participant="alex")
 
         with pytest.raises(SystemExit) as exc_info:
             _baton.cmd_add_participant(args, MULTI_CONFIG, "borges", client)
@@ -1999,7 +1999,7 @@ class TestAddParticipant:
     def test_add_participant_single_agent_mode_exits_state(self):
         """add-participant in single-agent mode refuses (write command)."""
         client = _make_client()
-        args = argparse.Namespace(project_id="PR-604", participant="lei")
+        args = argparse.Namespace(project_id="PR-604", participant="alex")
         with pytest.raises(SystemExit) as exc_info:
             _baton.cmd_add_participant(args, {"mode": "single"}, "borges", client)
         assert exc_info.value.code == EXIT_STATE
@@ -2021,7 +2021,7 @@ class TestAddParticipant:
         # Step 1: flip to a not-yet-participant fails client-side.
         client = _make_client(get_return={"raw": seed_raw})
         flip_args = argparse.Namespace(
-            project_id="PR-605", to="lei", reason="please review", force=False,
+            project_id="PR-605", to="dana", reason="please review", force=False,
         )
         with pytest.raises(SystemExit) as exc_info:
             _baton.cmd_flip(flip_args, MULTI_CONFIG, "borges", client)
@@ -2030,13 +2030,13 @@ class TestAddParticipant:
 
         # Step 2: add-participant succeeds (server would persist this).
         client.post.return_value = {"seq": 1, "added": True}
-        add_args = argparse.Namespace(project_id="PR-605", participant="lei")
+        add_args = argparse.Namespace(project_id="PR-605", participant="dana")
         _baton.cmd_add_participant(add_args, MULTI_CONFIG, "borges", client)
 
-        # Step 3: simulate the server's post-add state (lei now a participant),
-        # then flip to lei succeeds.
+        # Step 3: simulate the server's post-add state (dana now a participant),
+        # then flip to dana succeeds.
         client.get.return_value = {
-            "raw": _make_raw_baton("PR-605", participants="[borges, ariadne, lei]"),
+            "raw": _make_raw_baton("PR-605", participants="[borges, ariadne, dana]"),
         }
         client.post.reset_mock()
         client.post.return_value = {"seq": 2}
@@ -2044,7 +2044,7 @@ class TestAddParticipant:
         client.post.assert_called_once()
         url, body = client.post.call_args[0]
         assert url == "/api/projects/PR-605/flip"
-        assert body["to_agent"] == "lei"
+        assert body["to_agent"] == "dana"
 
 
 # ---------------------------------------------------------------------------

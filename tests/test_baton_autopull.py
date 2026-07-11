@@ -287,7 +287,10 @@ class TestCacheStale:
         with patch.object(mod, "_fetch_pr_status", return_value="MERGED") as mock_fetch:
             result = mod._get_live_status("pr/455", cache)
 
-        mock_fetch.assert_called_once_with("455")
+        # repo kwarg since #1715; bare anchors resolve to the shipped default
+        # repo (the PUBLIC engram repo — intentional: end-user installs anchor
+        # there; dev batons are repo-qualified so never hit the default).
+        mock_fetch.assert_called_once_with("455", repo=mod._DEFAULT_GITHUB_REPO)
         assert result == "MERGED"
 
     def test_stale_entry_updates_cache(self, tmp_engram_home):
@@ -627,6 +630,13 @@ def test_tools_resolution_in_flattened_deployed_topology(tmp_path):
         / "src" / "engram" / "hooks" / "claude" / "engram-baton-prompt-hook.py"
     )
     (root / "hooks" / "engram-baton-prompt-hook.py").write_text(hook_src.read_text())
+    # #1680 slice 1: the hook's prologue lives in _prompthooklib, deployed as a
+    # sibling in the flattened hooks/ dir (tiered in tiers.json). Without it the
+    # hook no-ops before the forum_api path this test exercises is reached.
+    for sibling in ("_prompthooklib.py", "_hooklib.py"):
+        # _prompthooklib delegates tools-dir resolution to _hooklib (#1657);
+        # both deploy as flattened-hooks/ siblings (tiered).
+        (root / "hooks" / sibling).write_text((hook_src.parent / sibling).read_text())
     # Stub forum_api whose ForumClient.get raises ForumNetworkError, so a
     # resolved import + passed mode-gate yields the banner (not a silent exit).
     (root / "tools" / "forum_api.py").write_text(
